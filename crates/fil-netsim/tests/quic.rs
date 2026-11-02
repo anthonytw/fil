@@ -180,7 +180,7 @@ async fn quic_echo_5pct_loss_with_jitter() {
     assert!(back == data, "echoed data differs");
     let s = env.net.stats();
     println!(
-        "echo 3 MiB, 5% loss: {:?} virtual, sent {} lost {} (reordering from jitter included)",
+        "echo 3 MiB, 5% loss: {:?} virtual, sent {} lost {}",
         t0.elapsed(),
         s.sent,
         s.lost

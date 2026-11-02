@@ -28,9 +28,14 @@ use tokio::time::{Instant, Sleep, sleep_until};
 pub struct Conditions {
     /// One-way delay.
     pub latency: Duration,
-    /// Extra delay uniform in `[0, jitter]`. Because each datagram draws its own delay, jitter
-    /// also reorders.
+    /// Extra delay uniform in `[0, jitter]`. By default order is preserved per (source,
+    /// destination) path, as with queueing delay on a real link: a datagram is never delivered
+    /// before one sent earlier on the same path (see `jitter_reorders`).
     pub jitter: Duration,
+    /// If true, every datagram draws an independent jitter delay, so jitter also reorders. Off by
+    /// default: at QUIC packet rates this reorders almost constantly, which is unlike real path
+    /// jitter. Use `reorder` and `reorder_delay` for deliberate reordering.
+    pub jitter_reorders: bool,
     /// Probability a datagram is dropped.
     pub loss: f64,
     /// Probability a datagram is held back by `reorder_delay` on top of its normal delay, so it
@@ -102,6 +107,8 @@ struct NetState {
     stats: NetStats,
     seq: u64,
     next_port: u16,
+    /// Due time of the last in-order datagram per (source, destination) path.
+    last_due: HashMap<(SocketAddr, SocketAddr), Instant>,
 }
 
 /// The simulated network and its control handle. Cheap to clone; all clones share state.
@@ -129,6 +136,7 @@ impl Net {
                 stats: NetStats::default(),
                 seq: 0,
                 next_port: 40000,
+                last_due: HashMap::new(),
             })),
         }
     }
@@ -243,12 +251,25 @@ impl NetState {
         c.latency + jitter + extra
     }
 
-    fn enqueue(&mut self, dest: &SharedInbox, from: SocketAddr, data: &[u8], delay: Duration) {
+    /// When a datagram sent now on `path` is due. In-order datagrams are clamped to the path's
+    /// last due time; deliberately reordered ones and (opt-in) free jitter are not, and do not
+    /// move the clamp.
+    fn due(&mut self, c: &Conditions, path: (SocketAddr, SocketAddr), reorder: bool) -> Instant {
+        let due = Instant::now() + self.delay(c, reorder);
+        if reorder || c.jitter_reorders {
+            return due;
+        }
+        let last = self.last_due.entry(path).or_insert(due);
+        *last = due.max(*last);
+        *last
+    }
+
+    fn enqueue(&mut self, dest: &SharedInbox, from: SocketAddr, data: &[u8], at: Instant) {
         self.seq += 1;
         self.stats.queued += 1;
         let mut inbox = lock(dest);
         inbox.heap.push(Reverse(Packet {
-            at: Instant::now() + delay,
+            at,
             seq: self.seq,
             from,
             data: data.to_vec(),
@@ -330,12 +351,13 @@ impl AsyncUdpSocket for SimSocket {
             return Ok(());
         }
         let reorder = st.rng.random_bool(c.reorder.clamp(0.0, 1.0));
-        let delay = st.delay(&c, reorder);
-        st.enqueue(&dest, from, transmit.contents, delay);
+        let at = st.due(&c, (from, transmit.destination), reorder);
+        st.enqueue(&dest, from, transmit.contents, at);
         if st.rng.random_bool(c.duplicate.clamp(0.0, 1.0)) {
             st.stats.duplicated += 1;
-            let delay = st.delay(&c, false);
-            st.enqueue(&dest, from, transmit.contents, delay);
+            // The copy takes its own delay and may overtake or trail the original.
+            let at = Instant::now() + st.delay(&c, false);
+            st.enqueue(&dest, from, transmit.contents, at);
         }
         Ok(())
     }

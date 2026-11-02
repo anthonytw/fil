@@ -216,21 +216,53 @@ async fn datagram_reordering_happens() {
     assert!(net.stats().reordered > 10);
 }
 
-#[tokio::test(start_paused = true)]
-async fn datagram_jitter_reorders_without_loss() {
-    let net = Net::new(5);
-    net.update_conditions(|c| c.jitter = 20 * MS);
-    let (a, b) = pair(&net);
-    for i in 0..100u32 {
-        send(&a, addr("192.0.2.2:2000"), &i.to_be_bytes());
-        tokio::time::sleep(MS).await;
-    }
+/// Send 100 numbered datagrams 1 ms apart and return them in arrival order with their delay.
+async fn jitter_run(net: &Net) -> Vec<(u32, Duration)> {
+    let (a, b) = pair(net);
+    let t0 = Instant::now();
+    tokio::spawn(async move {
+        for i in 0..100u32 {
+            send(&a, addr("192.0.2.2:2000"), &i.to_be_bytes());
+            tokio::time::sleep(MS).await;
+        }
+    });
     let mut seen = Vec::new();
     while let Ok((_, d)) = tokio::time::timeout(Duration::from_secs(1), recv(&b)).await {
-        seen.push(u32::from_be_bytes(d.try_into().unwrap()));
+        let i = u32::from_be_bytes(d.try_into().unwrap());
+        seen.push((i, t0.elapsed() - Duration::from_millis(u64::from(i))));
     }
     assert_eq!(seen.len(), 100);
-    assert!(seen.windows(2).any(|w| w[1] < w[0]));
+    seen
+}
+
+#[tokio::test(start_paused = true)]
+async fn datagram_jitter_keeps_order_by_default() {
+    let net = Net::new(5);
+    net.update_conditions(|c| {
+        c.latency = 10 * MS;
+        c.jitter = 20 * MS;
+    });
+    let seen = jitter_run(&net).await;
+    assert!(seen.windows(2).all(|w| w[1].0 > w[0].0), "reordered");
+    // Jitter is still applied: delays vary, within [latency, latency + jitter] plus the
+    // head-of-line wait behind slower predecessors (which is bounded by the max jitter).
+    let delays: Vec<_> = seen.iter().map(|s| s.1).collect();
+    assert!(
+        delays.iter().all(|d| *d >= 10 * MS && *d <= 30 * MS),
+        "{delays:?}"
+    );
+    assert!(delays.iter().max() != delays.iter().min());
+}
+
+#[tokio::test(start_paused = true)]
+async fn datagram_jitter_reorders_when_opted_in() {
+    let net = Net::new(5);
+    net.update_conditions(|c| {
+        c.jitter = 20 * MS;
+        c.jitter_reorders = true;
+    });
+    let seen = jitter_run(&net).await;
+    assert!(seen.windows(2).any(|w| w[1].0 < w[0].0));
 }
 
 #[tokio::test(start_paused = true)]

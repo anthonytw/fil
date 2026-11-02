@@ -18,7 +18,8 @@ use fil_netsim::{Net, StreamConfig, stream_pair};
 let net = Net::new(/* seed */ 1);
 net.update_conditions(|c| {
     c.latency = Duration::from_millis(20);
-    c.jitter = Duration::from_millis(10);   // also reorders
+    c.jitter = Duration::from_millis(10);   // in order per path; see jitter_reorders
+    c.jitter_reorders = false;               // true: independent delay per datagram
     c.loss = 0.05;
     c.reorder = 0.1;                         // held back by reorder_delay
     c.reorder_delay = Duration::from_millis(50);
@@ -53,7 +54,11 @@ Semantics worth knowing:
   chunk before it. Dropping one end gives the other end EOF after the buffered data drains (and
   `BrokenPipe` on write). `shutdown()` gives EOF as usual. The in-flight buffer is bounded
   (`StreamConfig::buffer`, 64 KiB), so a slow link applies backpressure to writers.
-- **Datagram link:** each datagram draws its own delay, so jitter alone reorders bursts. A
+- **Datagram link:** jitter keeps order per (source, destination) path by default. A datagram is
+  due at `max(now + latency + jitter, the path's last due time)`, as with queueing delay on a real
+  link, so reordering comes only from the explicit `reorder` and `reorder_delay` knobs. Set
+  `Conditions::jitter_reorders` to give every datagram an independent delay instead (this
+  reorders almost constantly at QUIC packet rates). Duplicates take their own delay. A
   blackout silently drops datagrams *sent* during it; datagrams already in flight still arrive.
 - **NAT:** a `bind_behind_nat` socket has a private address (quinn's `local_addr`) and a public
   one (the source the peer sees). `rebind` moves the public mapping. The old mapping stops
@@ -69,14 +74,14 @@ All in `just ci` unless noted. `cargo test -p fil-netsim` runs in about 0.4 s af
 
 | Test | What it shows |
 |---|---|
-| `tests/sim.rs` (15 tests) | latency applied exactly; stream order kept under 200 ms jitter; bandwidth limit (100 KB at 10 KB/s takes 10 s); stall/release; reset errors both ends, including a waiting reader; datagram loss rate in 18-22% for 20% set; reordering and jitter reordering happen; duplication; blackout; NAT rebind changes the source and kills the old mapping; same seed gives the same outcome |
-| `quic_echo_5pct_loss_with_jitter` | 3 MiB echo over 20 ms ± 10 ms and 5% loss, intact, one handshake |
+| `tests/sim.rs` (15 tests) | latency applied exactly; stream order kept under 200 ms jitter; bandwidth limit (100 KB at 10 KB/s takes 10 s); stall/release; reset errors both ends, including a waiting reader; datagram loss rate in 18-22% for 20% set; explicit reordering happens; jitter keeps order by default and reorders when `jitter_reorders` is set; duplication; blackout; NAT rebind changes the source and kills the old mapping; same seed gives the same outcome |
+| `quic_echo_5pct_loss_with_jitter` | 3 MiB echo over 20 ms ± 10 ms (in-order) jitter and 5% loss, intact, one handshake (36 s virtual) |
 | `quic_survives_nat_rebinding_mid_transfer` | two rebinds during a 3 MiB echo, intact, one handshake |
 | `quic_baseline_without_rebinding` | the same transfer without rebinds, for comparison |
 | `quic_survives_blackout_shorter_than_idle_timeout` | 4.5 s blackout, 5 s idle timeout: survives |
 | `quic_ends_on_blackout_longer_than_idle_timeout` | blackout with a 5 s idle timeout: `TimedOut` after 5 s, then a fresh handshake works |
 | `stream_echo_intact`, `stream_reset_mid_transfer_is_an_error` | the same echo over the stream link; a reset surfaces as `ConnectionReset` on read and write |
-| `soak_harsh_conditions_many_seeds` (`just netsim-soak`, ignored) | 25 seeds with 8% loss, 30 ms jitter, 10% reordering, 3% duplication, 6 rebinds and 3 blackouts per run; all intact, one handshake each (about 3 s real) |
+| `soak_harsh_conditions_many_seeds` (`just netsim-soak`, ignored) | 25 seeds with 8% loss, 30 ms jitter, 10% reordering, 3% duplication, 6 rebinds and 3 blackouts per run; all intact, one handshake each (about 2 s real); the reorder knob is on in the soak |
 
 The client in the QUIC tests pins the server's exact self-signed certificate (made with `rcgen`)
 as its only trust anchor. No TOFU.
@@ -119,15 +124,34 @@ the healed link worked, which is the "new QUIC handshake with the same key" path
 
 | Conditions | Time |
 |---|---|
-| 3% duplication only | 0.8 s |
+| clean link (baseline) | 0.8 s |
+| 3% duplication | 0.8 s |
+| 30 ms jitter, in order (default), no loss | 1.2 s |
+| 100 ms jitter, in order (default), no loss | 2.1 s |
 | 8% loss | 34 s |
-| 30 ms jitter, no loss | 53 s |
+| 30 ms jitter, in order, with 5% loss | 63 s |
+| 1% reordering by 80 ms, no loss | 12 s |
+| 10% reordering by 10 ms, no loss | 26 s |
 | 10% reordering by 80 ms, no loss | 31 s |
+| 30 ms jitter, **opt-in `jitter_reorders`**, no loss | 53 s |
 
-Reordering is much worse for quinn than its cost to a real application suggests: RFC 9002 loss
-detection (a packet-number threshold of 3 and a time threshold) declares reordered packets lost,
-so jitter alone causes spurious congestion events and a shrunken window. If fil's QUIC feels slow
-on a jittery path, suspect this before suspecting the code.
+Order-preserving jitter is cheap for quinn: 30 ms of jitter on a 40 ms path cost about 50% more
+time than a clean link (1.2 s against 0.8 s), and 100 ms cost under 3x (2.1 s). The cost is
+likely delay variation inflating the RTT estimate (not measured separately); the link
+stayed in order and lost nothing.
+
+Reordering is where quinn is sensitive, because RFC 9002 loss detection (a packet-number
+threshold of 3 and a time threshold) declares late packets lost, causing congestion events and a
+shrunken window. Even 1% of datagrams arriving 80 ms late costs 15x the clean time. The
+opt-in `jitter_reorders` row is the opt-in `jitter_reorders` mode: independent per-datagram delay,
+which reorders almost constantly at these packet rates. It is not how real path jitter behaves,
+and the first version of this report wrongly read it as quinn being slow on jittery paths. A path
+that really reorders, such as multipath or load balancing across links, would see something
+between the two. Tune M1 against in-order jitter and loss, and treat reordering as its own case.
+
+Loss behaves oddly too: the 5% loss plus in-order jitter row has less loss than the 8% row but
+takes about twice as long. These are single seeded runs, so treat differences of 2x between
+rows with loss as unexplained rather than as a measured effect.
 
 ## Surprises
 

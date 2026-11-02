@@ -1,0 +1,495 @@
+# fil — design
+
+> **Status: draft for discussion, 2026-11-02.** Nothing is implemented yet.
+> Items marked **(decided)** are the owner's decisions. Everything else is a proposal.
+
+*fil* is French for thread or wire. *Reprendre le fil*: to pick up the thread where you left off.
+
+## 1. What fil is
+
+fil is a remote shell for development over SSH. It keeps your place when the network drops or your local terminal dies. It combines:
+
+- **Eternal Terminal's reconnect and native scrollback.** Output reaches your terminal as raw bytes, so its own scrollback, search and copy keep working.
+- **tmux's detach and reattach, and only that.** A session survives your laptop sleeping, your network changing and your local terminal crashing. You can pick it up from another machine. There are no panes or windows, because your terminal emulator already has them.
+- **Port forwards that stay open** across reconnects, with a clear view of what each session holds.
+- **mosh-style predictive local echo**, as an optional, pluggable component.
+
+## 2. Goals and non-goals
+
+**Goals**
+
+1. Native scrollback. While connected, the screen is never redrawn from a model.
+2. Reconnect without user action, resuming exactly where the stream stopped.
+3. Named sessions that outlive the client. You can reattach after a local crash or take a session over from a second machine.
+4. Port forwards (`-L`, `-R`) that belong to the session and survive reconnects. `fil ports` shows them with context.
+5. No root and no system service on the remote host. Installing means putting one static binary in your home directory.
+6. SSH is the root of trust. fil adds no accounts, no key registry and no new identity system.
+7. Two first-class transports from the first release, with automatic fallback **(decided)**:
+   - a pipe (ssh by default)
+   - direct QUIC over UDP
+8. Prediction sits behind a trait so it can be improved independently **(decided)**.
+
+**Non-goals**
+
+- Panes, windows, tabs or layouts **(decided)**.
+- More than one attached client per session. A second client takes the session over **(decided)**.
+- Wire compatibility with mosh or ET (see §3).
+- Non-interactive use such as scp, rsync or git. Plain ssh already does that well.
+- Windows as a remote host. A Windows client is possible later.
+- Runtime-loaded plugins (§8.4).
+
+## 3. Prior art
+
+| Tool | Reconnect | Native scrollback | Reattach after a client crash | Port forwarding | Notes |
+|---|---|---|---|---|---|
+| Eternal Terminal | ✅ | ✅ | ❌ session tied to the client process | ✅ | system-wide `etserver` service on TCP 2022 |
+| mosh | ✅ roams over UDP | ❌ syncs screen state | ❌ the key lives only in the original client | ❌ | best on lossy links |
+| tmux / screen | — | ❌ redraws the screen (except iTerm2's `tmux -CC`) | ✅ | — | |
+| shpool, zmx | — | ✅ | ✅ | — | session persistence only |
+| ET + shpool | ✅ | ✅ | ✅ | ✅ | covers the features today, as two tools |
+| koh | ✅ | ✅ | numbered sessions per client key | ❌ | replaces SSH with iroh peer-to-peer QUIC; experimental |
+| mosh-rs | ✅ | opt-in, with its own server | ❌ | ❌ | Rust mosh rewrite, pre-alpha |
+| WezTerm multiplexer | ✅ | ✅ | ✅ | — | both ends must be WezTerm |
+
+**Why not reuse `mosh-server` or `etserver`?** Neither of them holds sessions.
+
+- mosh-server syncs screen state rather than a byte stream, so native scrollback is impossible. It also has no forwarding.
+- etserver has no reattach and no screen model to restore from, and it is a system-wide service.
+
+The daemon *is* the product. Ideas and libraries are reusable:
+
+- mosh's prediction design
+- the mosh-rs and `morsh_predict` prediction code, both GPL-3
+- shpool's restore crates (license to check)
+
+## 4. Architecture
+
+```
+ LAPTOP                              REMOTE HOST  (runs as you: no root, no system service)
+
+ ┌────────────┐                      ┌───────────────────── fil daemon ─────────────────────┐
+ │  terminal  │                      │ one per user per host; started on first attach;      │
+ └──▲──────┬──┘                      │ outlives connections, logouts and client crashes     │
+    │bytes │keys                     │                                                      │
+ ┌──┴──────▼──────────┐              │ session "main"                                       │
+ │ fil                │              │  ├ PTY ─▶ zsh, vim, …                                │
+ │  ├ shadow screen   │              │  ├ output log, seq-numbered          (resume)        │
+ │  ├ predictor (opt) │              │  ├ emulator: screen + history        (reattach)      │
+ │  ├ -L listeners    │              │  ├ forwards + their connections      (stay open)     │
+ │  └ agent relay     │              │  ├ stable SSH_AUTH_SOCK                              │
+ └───┬────────────┬───┘              │  └ epoch: who the subscriber is                      │
+     │            │                  │ session "build" …                                    │
+     │            │                  └─────▲─────────────────────────────────────▲──────────┘
+     │            │  direct: QUIC over UDP │ one UDP port per user               │ unix socket
+     │            └════════════════════════┘ (default)                           │ /tmp/fil-$UID/
+     │                                                                           │
+     │  pipe: ssh HOST fil server --stdio   (every bootstrap; fallback)          │
+     └──────── sshd ────────▶ fil server --stdio ────────────────────────────────┘
+                             (relay: lives and dies with the pipe)
+```
+
+fil is one static binary, used on both ends. The remote side runs as `fil server …`.
+
+- **Client** (`fil HOST [SESSION]`) owns the local terminal (in raw mode), the shadow screen that prediction uses, the local `-L` listeners and the agent relay. It holds its per-attach key in memory only.
+- **Daemon** runs once per user per host and holds the sessions. The first attach starts it, detached from the login session. It listens on a Unix socket and, when direct mode is enabled, on one UDP port.
+- **Relay** (`fil server --stdio`) is what the pipe runs. It connects its stdin and stdout to the daemon's socket. It keeps no state and dies with the pipe. Its first exchange is the **bootstrap**: start the daemon if needed, check versions, register the client's key and hand back the direct-mode details.
+
+### 4.1 Attach
+
+1. The client runs the pipe command (by default `ssh -T HOST fil server --stdio`). This is the one SSH login per attach, and the only Touch ID prompt for keys guarded by Touch ID.
+2. The relay connects to the daemon, starting it if needed, and the two sides compare versions.
+3. The client sends:
+   - the session name
+   - its terminal size and `TERM`
+   - its per-attach public key
+   - when resuming, its last epoch and sequence number
+4. The daemon finds or creates the session. If the session is attached elsewhere, it takes the session over (§5.2). It replies with:
+   - the epoch
+   - a snapshot or a resume point
+   - its UDP port and certificate fingerprint
+5. The terminal stream starts **over the pipe immediately**, with no extra round trips before the first screen.
+6. In the background, the client dials QUIC. If that succeeds, it moves every channel to QUIC and closes the pipe. If UDP is blocked, it stays on the pipe and tries again periodically, for example after a network change.
+
+### 4.2 Reconnect
+
+- **Liveness:** both transports send heartbeats, by default every 1 s. A link counts as dead after 5 s of silence. Both values are tunable.
+- **On QUIC:**
+  - A path change, such as Wi-Fi to cellular or a new IP address, is absorbed by QUIC connection migration with no new handshake.
+  - If the connection itself is gone (for example the laptop slept past the idle timeout), the client performs a new QUIC handshake with the same in-memory key. **No SSH is involved.**
+- **Fallback:** if QUIC can't be re-established within a few seconds, the client re-runs the pipe, which means a new SSH login.
+- **Resume:** either way, the client sends "resume session S, epoch E, from byte N", and the daemon continues from byte N (§6.2).
+- **While disconnected:**
+  - The client paints a one-line status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect.
+  - Keystrokes are buffered, up to a limit, and delivered on resume.
+
+## 5. Sessions
+
+### 5.1 Model
+
+- **Name:** `[A-Za-z0-9._-]{1,64}`, default `main`. Both ends validate it.
+- **Contents:**
+  - the PTY and its child process
+  - the output log and the emulator
+  - the forwards
+  - session environment such as `SSH_AUTH_SOCK`
+  - the epoch, and the current subscriber (client ID, host label, attach time)
+- **Lifetime:** a session lives until its shell exits or `fil kill` ends it. Detached sessions persist indefinitely; an idle reaper is available as an option.
+- **Process grouping:**
+  - On systemd hosts **with lingering enabled**, each session runs in its own transient user scope (`systemd-run --user --scope`). That gives reliable port attribution (§7.4) and clean teardown.
+  - Without lingering, the user manager stops at logout and would take the scopes with it. Those hosts fall back to the session's process tree.
+
+### 5.2 One subscriber, with takeover
+
+At most one client is attached to a session **(decided)**. Attaching to a session that is already attached takes it over:
+
+1. The daemon increments the epoch. It tells the old subscriber "taken over by `<host label>` at `<time>`", revokes that client's key and drops its transport.
+2. The new subscriber receives a snapshot sized to its terminal, and the PTY is resized (SIGWINCH).
+
+A client that resumes with a stale epoch is refused with the takeover message and asked whether to take the session back. A laptop waking up in a bag never steals the session silently.
+
+**Detach:** type `~.` after Enter (like ssh) or run `fil detach`. Detaching also revokes the client's key.
+
+### 5.3 Daemon location and lifecycle
+
+- **Socket location:** the directory `/tmp/fil-$UID/` (mode 0700) holds the socket.
+  - The daemon refuses to start if that directory exists with the wrong owner or mode. This defends against another user creating it first, as tmux does.
+  - The socket is deliberately not in `$XDG_RUNTIME_DIR`. systemd-logind deletes that directory when your last login ends, which would strand a live daemon.
+- **Logout cleanup:** hosts with `KillUserProcesses=yes` need `loginctl enable-linger`. The bootstrap detects this and warns.
+- **Peer check:** the daemon verifies every connection's peer UID (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and refuses mismatches.
+- **Upgrades:** the socket path includes the protocol major version, so daemons of different versions can run side by side.
+  - New sessions go to the newest daemon.
+  - Old sessions stay on their daemon until they end.
+  - `fil ls` asks every daemon.
+  - Live upgrade by passing PTY file descriptors to the new daemon is a possible later step (§16).
+
+## 6. The terminal stream
+
+### 6.1 Output path
+
+PTY output goes to three places:
+
+1. the session's output log, a byte ring buffer (default 8 MiB) with a global sequence number
+2. the daemon's terminal emulator
+3. the subscriber, if one is attached
+
+The client writes those bytes straight to the local terminal. That is why native scrollback, search, hyperlinks (OSC 8), clipboard writes (OSC 52) and graphics protocols behave exactly as they do over plain ssh.
+
+### 6.2 Resume or snapshot
+
+- **Resume** applies when the same client reconnects and its terminal is still open. The client acknowledges the bytes it has written. On reconnect it sends its last sequence number, and if that point is still in the log, the daemon sends the rest. Native scrollback has no gap.
+- **Snapshot** applies to a new client, or when the log has wrapped. The daemon renders from its emulator:
+  1. the last N history lines (default 1000), as text with SGR attributes, reflowed to the new width
+  2. the current screen
+  3. the terminal modes: alternate screen, cursor position and style, mouse, bracketed paste, focus and keypad modes, kitty keyboard flags, scroll region and title
+- **Catch-up rule:** if the subscriber falls behind by more than a threshold (default 1 MiB or 2 s of output), the daemon jumps to a snapshot instead of replaying the backlog. On a slow link, `cat hugefile` followed by Ctrl-C stays responsive, which is mosh's main advantage. The cost is a gap in native scrollback. The gap is visible: a marker line such as `── fil: skipped 48 MB of output ──` goes into the scrollback.
+
+### 6.3 Terminal queries
+
+Programs ask the terminal questions: cursor position, device attributes, colors, kitty keyboard support.
+
+- While a client is attached, queries pass through to the real terminal, and its replies come back as input.
+- While detached, the daemon's emulator answers, so programs don't hang waiting for a reply.
+
+A takeover that lands between a query and its reply is a known edge case (§16).
+
+### 6.4 `TERM`
+
+A session's `TERM` is fixed when the session is created, from the first client. Taking over from a different terminal emulator can't change it for programs that are already running. The options are in §16.
+
+### 6.5 Emulator
+
+The candidates are:
+
+- `alacritty_terminal`: battle-tested, Apache-2.0
+- `vt100`: small; a fork is used by shpool
+- libghostty-vt: C ABI; used by zmx
+
+The choice will be made with the restore-fidelity test suite (§12), not by taste.
+
+## 7. Port forwarding
+
+### 7.1 Kinds
+
+- `-L [bind:]port:host:hostport` listens on the client machine and connects out from the remote.
+- `-R [bind:]port:host:hostport` listens on the remote and connects out from the client machine.
+
+v1 is TCP only. Unix-socket forwards, dynamic SOCKS (`-D`) and UDP are open questions (§16). Both ends bind to loopback by default; anything wider needs an explicit address.
+
+### 7.2 Ownership and persistence
+
+Forwards must stay open across reconnects **(decided)**.
+
+- **Ownership:** forwards belong to the **session**, not to a connection.
+  - The list of forward specs persists.
+  - `-R` listeners live in the daemon and never close during a disconnect.
+  - `-L` listeners live in the client process and stay bound for as long as it runs.
+- **Open connections:** each forwarded connection is its own channel, with sequence numbers and acknowledgements like the terminal stream. A disconnect pauses it and the reconnect resumes it. No data is dropped.
+- **Bounded buffers:** each connection has a bounded buffer (default 1 MiB). When it fills, fil stops reading from the socket, and ordinary TCP flow control pauses the application.
+- **New connections during a disconnect** are accepted and wait, with a time limit, for the reconnect.
+- **Long disconnects:** after a configurable timeout (proposed default: 10 min), open connections close. The listeners stay.
+- **Takeover:**
+  - `-R` listeners stay and route to the new subscriber.
+  - `-L` connections that started on the old machine end, because their applications live there.
+  - The new client recreates the session's `-L` listeners, warning about any port already in use locally.
+
+### 7.3 Managing forwards
+
+- At attach time: `fil orin -L 5173 -R 9000`
+- Afterwards: `fil forward -L 5173`, `fil forward -R 9000`, `fil forward --rm 5173`
+
+These commands work from the client machine or from inside the session. Inside, `$FIL_SESSION` names the session and the command talks to the daemon over its socket.
+
+### 7.4 `fil ports`
+
+`fil ports` shows as much context as possible **(decided)**:
+
+```
+$ fil ports
+SESSION main on orin — attached from laptop since 09:12
+
+FORWARDED
+  DIR  LAPTOP            REMOTE          OWNER                      CONNS  ↓ / ↑           LAST
+  -L   localhost:5173 →  127.0.0.1:5173  vite (pid 41872, ~/app)    2      14 MB / 220 KB  now
+       http://localhost:5173 · HTTP 200 "Vite + React"
+  -R   localhost:9000 ←  127.0.0.1:9000  your laptop                0      —               10:40
+       detached: 1 connection waiting
+
+LISTENING IN THIS SESSION, NOT FORWARDED
+  8000  0.0.0.0 ⚠  python -m http.server (pid 42110, ~/tmp)  since 10:03  HTTP 200 "Directory listing for /"
+        ⚠ reachable by the whole network, not just through fil  →  fil forward 8000
+
+OTHER LISTENERS YOU OWN ON THIS HOST
+  5432  127.0.0.1  postgres (pid 1201), not started from a fil session
+```
+
+- **For every forward:** direction, both endpoints, the process that owns the target, open connections, traffic in each direction, last activity and state.
+- **Unforwarded listeners:** ports started inside the session that aren't forwarded yet, each with the one command that would forward it. Other listeners you own on the host are listed separately.
+- **Exposure warnings** for anything bound beyond loopback.
+- **Protocol probe:** a light probe labels what is listening (TLS handshake, HTTP `HEAD`, a Postgres or Redis greeting), with clickable URLs for HTTP. It can be turned off.
+- **Client side:** whether a local port is already taken.
+- **`--json`** for scripting.
+- **Where the data comes from:**
+  - Linux: `/proc/net/{tcp,tcp6,udp,udp6}` and `/proc/<pid>/fd`
+  - macOS: libproc
+  - Ports are attributed to a session through its scope (§5.1), or through the process tree as a fallback.
+- **Caveats:** container ports show up as `docker-proxy`, and listeners owned by root show no owner.
+- **Notifications:** new listeners can raise a desktop notification (OSC 9 / OSC 777, which iTerm2 and Ghostty support). This is opt-in. fil never prints inline text, which would corrupt full-screen programs.
+
+## 8. Transports
+
+### 8.1 The trait
+
+A transport provides one reliable, ordered, encrypted connection that carries many channels:
+
+- control
+- terminal
+- agent
+- one per forwarded connection
+
+It also reports liveness, round-trip time and path changes. Resume logic, sequence numbers and channel semantics all live above the transport, so they behave the same on every transport.
+
+```rust
+trait Transport {
+    async fn open(&self, kind: ChannelKind) -> Result<Channel>;
+    async fn accept(&self) -> Result<(ChannelKind, Channel)>;
+    fn events(&self) -> Events; // Up, PathChanged, Degraded, Down
+    fn rtt(&self) -> Duration;
+}
+```
+
+### 8.2 Pipe (ssh by default)
+
+- **What it runs:** a command whose stdin and stdout reach `fil server --stdio` on the remote. The default is `ssh -T HOST fil server --stdio`. Using the system `ssh` means everything in `~/.ssh/config` applies: ProxyJump, certificates, agents and ControlMaster.
+- **Fixed remote command:** the remote command is always exactly `fil server --stdio`. It is never assembled from user input, because ssh hands its command line to the remote shell as a string. Session names and everything else travel inside the protocol.
+- **Configurable per host:** for example `kubectl exec -i`, `docker exec -i`, `aws ssm start-session` or `tailscale ssh`. This is fil's runtime extension point (§8.4).
+- **Multiplexing:** all channels share one byte stream with fil's own framing.
+  - The scheduler sends terminal and control frames ahead of forward data.
+  - Forward frames are capped at 16 KiB, so a large transfer through a forward can't delay keystrokes.
+- **Reconnect:** re-run the command.
+
+### 8.3 Direct: QUIC over UDP
+
+Direct mode is first-class **(decided)**.
+
+- **Libraries:** `quinn` and `rustls` (TLS 1.3). Each channel is a QUIC stream, so forwards and the terminal never block each other.
+- **Mutual authentication, set up during the bootstrap:**
+  - **Daemon to client:** the daemon's certificate fingerprint arrives over the pipe and is pinned. Nothing is trusted on first use.
+  - **Client to daemon:** the client generates a key pair in memory for each attach. Only the public half is sent, over the pipe, and the daemon accepts only that key.
+  - Keys are revoked on detach and on takeover, and nothing is written to disk.
+- **Port:** one UDP port per user, not per session. The default range is 60000–61000, the same range mosh uses, so hosts already opened for mosh work unchanged. Both the range and the bind address are configurable, for example to bind only to the LAN or tailnet interface.
+- **Address:** the client dials the same host name it used for the pipe, resolved locally, unless the host config sets `direct.address`. Hosts reached through a jump host usually aren't directly reachable, so they stay on the pipe.
+- **Roaming:** QUIC connection migration covers both client IP changes and NAT rebinding (a router changing the outside port).
+- **Fallback and upgrade** work as in §4.1–4.2. Transport choice per host: `auto` (default), `pipe` or `direct`.
+- **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods.
+
+### 8.4 Extensibility is compile-time, not runtime
+
+Transports and predictors are Rust traits. Their implementations are compiled in, with optional ones behind cargo features. There are no dynamically loaded plugins, for two reasons:
+
+- Rust has no stable ABI.
+- A loadable transport would be arbitrary code running inside the process that holds your shells.
+
+The pipe command is the runtime extension point, in the Unix tradition of ssh's `ProxyCommand`.
+
+## 9. Prediction (optional, pluggable)
+
+Prediction is pluggable **(decided)**.
+
+**The core does these things, whatever predictor is in use:**
+
+- It keeps a shadow screen in the client, fed only by the authoritative byte stream.
+- It owns the overlay layer.
+- **Erase before write:** before writing server bytes, the client restores every overlaid cell, and the cursor, from the shadow screen.
+
+**The core enforces these rules on every predictor:**
+
+- Never paint anything that would scroll the screen or wrap a line.
+- Never predict while the daemon reports the PTY in canonical mode with echo off, which is what a password prompt looks like.
+- Stay off on the alternate screen unless the predictor opts in.
+
+**What a predictor sees and returns:** it receives keystrokes, a read-only view of the shadow screen, the RTT, and events that confirm or contradict its guesses. It returns overlay edits.
+
+```rust
+trait Predictor {
+    fn on_key(&mut self, key: &KeyEvent, screen: &Screen, rtt: Duration) -> Vec<OverlayEdit>;
+    fn on_output(&mut self, screen: &Screen) -> Vec<OverlayEdit>; // confirm or retract
+    fn reset(&mut self);
+}
+```
+
+**The default build** ships a conservative predictor modeled on mosh's:
+
+- It predicts printable characters and backspace at the cursor, on the normal screen only.
+- Unconfirmed predictions are underlined.
+- It is adaptive, switching off below an RTT threshold that still needs tuning.
+
+Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and WezTerm's local echo.
+
+## 10. Agent forwarding (opt-in)
+
+- **Stable path:** the session's `SSH_AUTH_SOCK` is `/tmp/fil-$UID/agent/<session>.sock`.
+- **Relaying:** connections to that socket go over the agent channel to the current subscriber's local agent. While detached, they are refused immediately rather than left hanging.
+- **What it fixes:** the socket survives reconnects and takeovers. This is the tmux-era problem where `git push` fails after you reattach.
+- **Risk:** the same as `ssh -A`. While you're attached, root or your own UID on the remote can use your agent. Keys that require confirmation per use (Secure Enclave or Touch ID) prompt for every signature. Plain keys don't.
+
+## 11. Security model
+
+**Principles**
+
+1. SSH (or the configured pipe) is the root of trust. Everything fil knows about who you are comes from that login.
+2. No root, no system service, no setuid.
+3. No secrets at rest. Per-attach keys live only in client memory, and crash recovery deliberately goes through a fresh login.
+4. Keep the attack surface small. Pipe mode opens no ports. Direct mode adds exactly one authenticated UDP port per user.
+
+| Who | What they could reach | Protection |
+|---|---|---|
+| Anyone on the network | sshd; the UDP port when direct mode is on | OpenSSH as before. The QUIC handshake succeeds only with the per-attach client key that was registered over the pipe. Everything else is dropped. |
+| A man in the middle | the direct connection | The client pins the daemon's certificate fingerprint received over the pipe. Nothing is trusted on first use. |
+| Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, and is revoked on detach and takeover. |
+| Other users on the remote host | the socket directory | 0700 and owned by you; the daemon refuses a directory created by someone else; every connection's peer UID is checked by the kernel. |
+| Other users on the remote host | `-R` ports on 127.0.0.1 | Reachable by every user on that host, the same as `ssh -R`. Documented. |
+| Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |
+| The remote host using your agent | signatures | Opt-in. The agent is relayed only while you're attached. Per-use confirmation keys prompt. |
+| A laptop waking up later | the session | Epoch fencing (§5.2). |
+| A stolen laptop disk | — | No tokens or keys are stored. |
+
+**Out of scope:** root on the remote host, a compromised client machine, and the terminal emulator's own escape-sequence handling. fil passes bytes through exactly as ssh does.
+
+**Server binary distribution:** if fil uploads its own server binary (§16), it uploads the build for the remote's architecture over the authenticated pipe into `~/.local/share/fil/<version>/`. It verifies a SHA-256 before running it.
+
+## 12. Testing
+
+- **Network harness:** an in-process link simulator covering latency, jitter, loss, reordering, blackouts and NAT rebinding, used by unit and integration tests. Linux CI also runs through `tc netem`.
+- **Transport matrix:** every integration test runs over both the pipe and QUIC.
+- **Restore fidelity:** recorded byte streams from real programs (shells, vim, less, htop, a build with progress bars) are replayed. A snapshot rendered into a fresh emulator must match the original screen and history.
+- **Fault injection:**
+  - kill the relay
+  - kill the client
+  - take over in the middle of output
+  - sleep past the QUIC idle timeout
+  - fill the forward buffers
+- **Fuzzing** (`cargo-fuzz`): the frame parser, control messages and the emulator's input path.
+- **Prediction:** a scripted latency harness compares what the user saw with the authoritative screen. Any mismatch left after confirmation is a failure.
+
+## 13. Implementation
+
+- **Language:** Rust.
+- **License:** GPL-3.0-or-later **(decided)**. GPLv3 rather than v2 because the planned dependencies include Apache-2.0 crates, which are compatible with v3 but not v2. Not AGPL, because users run fil on hosts they control, and many employers ban AGPL software outright.
+- **Crates:**
+  - async runtime: tokio
+  - PTY, termios and peer credentials: rustix
+  - direct mode: quinn and rustls
+  - terminal emulator: chosen per §6.5
+  - CLI: clap
+  - serialization: serde, with postcard for frames and toml for config
+  - JSON logs: tracing
+- **Builds:** static binaries for Linux (x86_64 and aarch64, musl) and macOS (aarch64).
+- **Workspace layout (proposed):**
+  - `fil-proto`: frames and channel semantics
+  - `fil-transport`: the trait, pipe and QUIC
+  - `fil-term`: the emulator wrapper and snapshots
+  - `fil-predict`: the trait and the default predictor
+  - `fil-daemon`
+  - `fil`: the CLI
+
+## 14. CLI and configuration (sketch)
+
+```
+fil HOST [SESSION] [-L SPEC]… [-R SPEC]…   attach, creating the session if needed (default: main)
+fil ls HOST                                sessions: name, subscriber, idle time, forwards
+fil kill HOST SESSION
+fil ports [HOST [SESSION]]                 inside a session: the current one
+fil forward (-L|-R) SPEC | --rm PORT
+fil detach
+fil server --stdio                         remote side; run by the pipe, not by people
+```
+
+Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde.
+
+`~/.config/fil/config.toml`:
+
+```toml
+[defaults]
+transport = "auto"        # auto | pipe | direct
+history_lines = 1000
+predict = "adaptive"      # off | adaptive | always
+
+[host.orin]
+forward = ["-L 5173", "-R 9000"]
+direct.port_range = "60000-61000"
+
+[host.k8s-dev]
+transport = "pipe"
+pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
+```
+
+## 15. Milestones, riskiest first
+
+| Milestone | Scope | Done when |
+|---|---|---|
+| **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison | the emulator is chosen, and the overlay never corrupts the screen in the harness |
+| **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback | usable as a daily driver for shells |
+| **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay | port forwards survive a pulled network cable |
+| **M3: prediction** | the trait, the default predictor and the status overlay | no visible mispredictions in the harness |
+| **M4: release** | install or upload, config, docs, packaging, license; go public | |
+
+Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
+
+## 16. Open questions
+
+1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
+2. **Emulator** (§6.5): decided by the fidelity tests in M0.
+3. **`TERM` when a different terminal takes over:** keep the session's value, ship a fil terminfo entry, or require `xterm-256color`?
+4. **Terminal-query replies in flight during a takeover** (§6.3).
+5. **Server binary:** manual install, or upload by the client (§11)?
+6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
+7. **Defaults to tune:**
+   - heartbeat interval and dead-link timeout
+   - catch-up threshold
+   - forward buffer size
+   - how long forwarded connections survive a disconnect
+   - prediction RTT threshold
+8. **More forward kinds:** Unix sockets, SOCKS (`-D`) and UDP.
+9. **macOS as a remote host:** fully supported, or best effort?
+10. **Keystrokes typed while disconnected:** buffer them and send on resume (proposed), or drop them?
+11. **Wire format:** postcard (proposed) or protobuf? Protobuf would make third-party clients easier, but they aren't a goal.

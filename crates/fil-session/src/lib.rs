@@ -6,14 +6,11 @@
 //! [`SessionHandle::spawn`], reads the first messages of each incoming [`fil_transport::Link`],
 //! and hands the link and the `Attach` request to [`serve_subscriber`].
 //!
-//! ```text
-//!   daemon ──spawn──▶ SessionHandle ◀── serve_subscriber(link, attach)   (one task per transport,
-//!                          │                      │  ▲                    generic over Link)
-//!                       Cmd│                      │  │ ConnEvent / the shared output log
-//!                          ▼                      ▼  │
-//!                       session core task (not generic): epoch machine, emulator,
-//!                       query answering, PTY mode and echo acks, PTY threads
-//! ```
+//! The session core is one task that is not generic: it owns the PTY, the emulator, the epoch
+//! machine, query answering, the PTY mode and the echo acknowledgements. Each attached transport
+//! is served by a task generic over the link ([`serve_subscriber`]), which sends the core
+//! commands through a channel, receives events from it, and reads the output log directly.
+//! Heartbeats are the link's job; this crate neither sends nor expects them.
 //!
 //! # What the session guarantees
 //!

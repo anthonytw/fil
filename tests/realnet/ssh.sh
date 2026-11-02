@@ -590,16 +590,16 @@ s_pipelink_netdown_heartbeat() {
 }
 
 s_pipelink_netdown_keepalive() {
-  # The default command, with the ServerAlive options fil adds (2 s x 4 = 8 s): fil's 5 s wins,
+  # The default command, with the ServerAlive options fil adds (2 s, so ssh gives up at 6 to 8 s): fil's 5 s wins,
   # kills ssh at once, and the backstop never has to fire.
   netdown_probe ka "--dead-after 5" -T viajumps pipe-probe -- 25
   assert "detected, not hung" test "$HUNG" -eq 0
   assert "by fil's liveness clock, before ssh's (got $FAIL_REASON)" test "$FAIL_REASON" = dead
   assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
-  assert_num "and well before ssh's own 8 s (ms)" "$DETECT_MS" -le 7500
+  assert_num "and before ssh's own give-up, 6 to 8 s (ms)" "$DETECT_MS" -le 7500
   assert "the dead link's ssh ($CHILD_PID) was killed, not left behind" \
     wait_pid_gone rn-client "$CHILD_PID" 5
-  note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2sx4"
+  note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2s"
 }
 
 ALL_SCENARIOS=(

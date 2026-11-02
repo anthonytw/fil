@@ -2,9 +2,10 @@
 //! and the status. Everything here is synchronous (`std::sync::Mutex`, never held across an
 //! await).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use bytes::Bytes;
 use fil_proto::sched::Scheduler;
 use fil_proto::{ChannelClass, ChannelId, Frame};
 use tokio::sync::{Notify, watch};
@@ -18,8 +19,29 @@ struct Queues {
     queued: HashMap<ChannelId, usize>,
 }
 
+/// Payloads received and not yet taken by `recv`.
+#[derive(Default)]
+struct Inbound {
+    q: VecDeque<(ChannelId, Bytes)>,
+    bytes: usize,
+    /// The driver has stopped: nothing more will arrive.
+    ended: bool,
+}
+
+/// What `recv` found.
+pub(super) enum Pop {
+    Item(ChannelId, Bytes),
+    Empty,
+    Ended,
+}
+
 pub(super) struct Shared {
     queues: Mutex<Queues>,
+    inbound: Mutex<Inbound>,
+    /// Signals `recv`: a payload arrived, the driver ended, or the link was closed.
+    pub inbound_ready: Notify,
+    /// Signals the driver: `recv` took a payload.
+    pub inbound_room: Notify,
     /// Signals the driver: a frame was queued, or the link was closed.
     pub wake: Notify,
     /// Signals senders: a frame left a queue, or the link went down.
@@ -35,6 +57,9 @@ impl Shared {
                 sched: Scheduler::with_forward_share(cfg.forward_share),
                 queued: HashMap::new(),
             }),
+            inbound: Mutex::new(Inbound::default()),
+            inbound_ready: Notify::new(),
+            inbound_room: Notify::new(),
             wake: Notify::new(),
             space: Notify::new(),
             status: watch::Sender::new(LinkStatus::new(LinkState::Up)),
@@ -72,12 +97,41 @@ impl Shared {
         Ok(())
     }
 
-    /// Queues an internal frame (a heartbeat) regardless of the bound, so liveness never waits
-    /// behind a full queue.
-    pub fn enqueue_internal(&self, frame: Frame) {
-        let mut q = self.queues();
-        *q.queued.entry(frame.channel).or_insert(0) += 1;
-        q.sched.push(frame);
+    fn inbound(&self) -> MutexGuard<'_, Inbound> {
+        self.inbound.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn push_inbound(&self, channel: ChannelId, payload: Bytes) {
+        let mut inb = self.inbound();
+        inb.bytes += payload.len();
+        inb.q.push_back((channel, payload));
+        drop(inb);
+        self.inbound_ready.notify_waiters();
+    }
+
+    /// Bytes of payload waiting for `recv`.
+    pub fn inbound_bytes(&self) -> usize {
+        self.inbound().bytes
+    }
+
+    pub fn pop_inbound(&self) -> Pop {
+        let mut inb = self.inbound();
+        match inb.q.pop_front() {
+            Some((channel, payload)) => {
+                inb.bytes = inb.bytes.saturating_sub(payload.len());
+                drop(inb);
+                self.inbound_room.notify_one();
+                Pop::Item(channel, payload)
+            }
+            None if inb.ended => Pop::Ended,
+            None => Pop::Empty,
+        }
+    }
+
+    /// The driver has stopped. Payloads already received stay readable.
+    pub fn end_inbound(&self) {
+        self.inbound().ended = true;
+        self.inbound_ready.notify_waiters();
     }
 
     /// The next frame to write, in scheduler order.
@@ -121,6 +175,7 @@ impl Shared {
             }
         });
         self.space.notify_waiters();
+        self.inbound_ready.notify_waiters();
         self.wake.notify_one();
         changed
     }

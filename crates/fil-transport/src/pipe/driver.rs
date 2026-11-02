@@ -4,27 +4,39 @@
 //! waits behind more than the frame already being written), decodes what arrives, answers and
 //! consumes heartbeats, keeps the liveness clock and, when it ends, tears down the stream and the
 //! pipe command.
+//!
+//! **Heartbeats are not queued.** At most one reply (the latest ping's nonce) and one ping of our
+//! own wait to be written, and both are encoded ahead of everything else when the writer is free.
+//! A peer that floods pings without reading therefore costs us one pending reply, not memory, and
+//! stale pings never pile up behind a stuck write.
+//!
+//! **A slow consumer.** Received payloads wait in the shared inbound queue. Reading continues
+//! while fewer than `inbound_budget` bytes wait there, so bytes keep proving the peer alive and
+//! `Dead` is still detected for any lag under the budget. Past the budget the driver stops
+//! reading (the stream's flow control pushes back on the peer), freezes the silence clock and
+//! reports `Degraded`; it returns to normal once the consumer has caught up to half the budget.
 
 use std::collections::VecDeque;
 use std::io;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
-use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout};
 
 use super::Shared;
 use crate::link::{DownReason, LinkParams, LinkState};
 
-use std::sync::Arc;
-
 /// How many of the latest pings wait for their reply, to measure RTT.
 const PINGS_KEPT: usize = 8;
 const READ_CHUNK: usize = 64 * 1024;
+/// When the stream ends, how long to wait for the command's exit status to put in the reason.
+/// The command is asked to finish (and reaped) after `Down` is reported, not before.
+const EXIT_STATUS_WAIT: Duration = Duration::from_millis(100);
 
 pub(super) struct Driver<R, W> {
     pub shared: Arc<Shared>,
@@ -32,7 +44,7 @@ pub(super) struct Driver<R, W> {
     pub write: W,
     pub params: LinkParams,
     pub decoder: FrameDecoder,
-    pub inbound: mpsc::Sender<(ChannelId, Bytes)>,
+    pub inbound_budget: usize,
     /// Frames from the handshake that are still to be handled.
     pub initial: Vec<Frame>,
     pub child: Option<Child>,
@@ -47,7 +59,6 @@ enum Event {
     Wrote(usize),
     Flushed,
     WriteError(io::Error),
-    Room,
     Wake,
     Timer,
 }
@@ -55,13 +66,16 @@ enum Event {
 struct State {
     last_rx: Instant,
     last_tx: Instant,
+    /// Silence has lasted `degraded_after`.
     degraded: bool,
+    /// The consumer is behind by more than the budget: not reading, clock frozen.
+    lagging: bool,
     pings: VecDeque<(u32, Instant)>,
     next_nonce: u32,
-    /// Decoded frames waiting for room in the inbound queue. While any wait, we stop reading
-    /// (backpressure reaches the peer through the stream) and the silence clock stands still:
-    /// the peer is not the one who is quiet.
-    pending_in: VecDeque<(ChannelId, Bytes)>,
+    /// The nonce of the latest ping we have not answered yet (older ones are dropped).
+    reply: Option<u32>,
+    /// A ping is due and not written yet.
+    ping_due: bool,
     out: Vec<u8>,
     out_pos: usize,
     dirty: bool,
@@ -80,9 +94,11 @@ where
             last_rx: now,
             last_tx: self.first_ping.map_or(now, |(_, t)| t),
             degraded: false,
+            lagging: false,
             pings: self.first_ping.into_iter().collect(),
             next_nonce: self.first_ping.map_or(0, |(n, _)| n.wrapping_add(1)),
-            pending_in: VecDeque::new(),
+            reply: None,
+            ping_due: false,
             out: Vec::new(),
             out_pos: 0,
             dirty: false,
@@ -94,9 +110,7 @@ where
 
     async fn main_loop(&mut self, st: &mut State) -> DownReason {
         for frame in std::mem::take(&mut self.initial) {
-            if let Err(reason) = self.on_frame(st, frame) {
-                return reason;
-            }
+            self.on_frame(st, frame);
         }
         let mut rbuf = vec![0u8; READ_CHUNK];
         let heartbeat = self.params.heartbeat.max(Duration::from_millis(1));
@@ -104,20 +118,17 @@ where
             if let Some(reason) = self.shared.down_reason() {
                 return reason;
             }
-            self.drain_pending(st);
+            self.update_lag(st);
             if st.out_pos >= st.out.len() && st.write_failed.is_none() {
                 self.fill_out(st);
             }
-            let paused = !st.pending_in.is_empty();
-            if paused {
-                st.last_rx = Instant::now();
-            }
             let writing = st.out_pos < st.out.len() && st.write_failed.is_none();
             let flushing = !writing && st.dirty && st.write_failed.is_none();
+            let lagging = st.lagging;
             let deadline = self.next_deadline(st, heartbeat);
 
             let event = tokio::select! {
-                read = self.read.read(&mut rbuf), if !paused => Event::Read(read),
+                read = self.read.read(&mut rbuf), if !lagging => Event::Read(read),
                 done = async {
                     if writing {
                         self.write.write(&st.out[st.out_pos..]).await.map(Event::Wrote)
@@ -128,12 +139,8 @@ where
                     Ok(event) => event,
                     Err(e) => Event::WriteError(e),
                 },
-                // Room in the inbound queue: the top of the loop moves the frames.
-                room = self.inbound.reserve(), if paused => match room {
-                    Ok(_) => Event::Room,
-                    // The link handle is gone.
-                    Err(_) => return DownReason::Closed,
-                },
+                // `recv` took something: the top of the loop re-checks the lag.
+                () = self.shared.inbound_room.notified(), if lagging => Event::Wake,
                 () = self.shared.wake.notified() => Event::Wake,
                 () = sleep_until(deadline) => Event::Timer,
             };
@@ -143,7 +150,7 @@ where
                     st.last_rx = Instant::now();
                     if st.degraded {
                         st.degraded = false;
-                        self.shared.set_live(LinkState::Up);
+                        self.sync_state(st);
                     }
                     if let Err(reason) = self.ingest(st, &rbuf[..n]) {
                         return reason;
@@ -165,7 +172,7 @@ where
                 Event::Flushed => st.dirty = false,
                 Event::WriteError(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Event::WriteError(e) => self.write_failed(st, format!("write failed: {e}")),
-                Event::Room | Event::Wake => {}
+                Event::Wake => {}
                 Event::Timer => {
                     if let Some(reason) = self.on_timer(st, heartbeat) {
                         return reason;
@@ -175,9 +182,42 @@ where
         }
     }
 
+    /// Enters or leaves the lagging state (with hysteresis), and keeps the silence clock still
+    /// while lagging.
+    fn update_lag(&mut self, st: &mut State) {
+        let waiting = self.shared.inbound_bytes();
+        if st.lagging {
+            if waiting <= self.inbound_budget / 2 {
+                st.lagging = false;
+                st.last_rx = Instant::now();
+                tracing::debug!(waiting, "consumer caught up; reading again");
+                self.sync_state(st);
+            }
+        } else if waiting >= self.inbound_budget {
+            st.lagging = true;
+            tracing::debug!(
+                waiting,
+                "consumer is behind; not reading until it catches up"
+            );
+            self.sync_state(st);
+        }
+        if st.lagging {
+            st.last_rx = Instant::now();
+        }
+    }
+
+    /// `Degraded` while silent or lagging, `Up` otherwise.
+    fn sync_state(&self, st: &State) {
+        self.shared.set_live(if st.degraded || st.lagging {
+            LinkState::Degraded
+        } else {
+            LinkState::Up
+        });
+    }
+
     fn next_deadline(&self, st: &State, heartbeat: Duration) -> Instant {
         let mut d = st.last_rx + self.params.dead_after;
-        if st.write_failed.is_none() {
+        if st.write_failed.is_none() && !st.ping_due {
             d = d.min(st.last_tx + heartbeat);
         }
         if !st.degraded {
@@ -202,37 +242,45 @@ where
         }
         if !st.degraded && now >= st.last_rx + self.params.degraded_after {
             st.degraded = true;
-            self.shared.set_live(LinkState::Degraded);
+            self.sync_state(st);
         }
         if now >= st.last_tx + heartbeat && st.write_failed.is_none() {
-            let nonce = st.next_nonce;
-            st.next_nonce = nonce.wrapping_add(1);
-            st.pings.push_back((nonce, now));
-            while st.pings.len() > PINGS_KEPT {
-                st.pings.pop_front();
-            }
-            self.send_control(
-                st,
-                ControlMsg::Heartbeat {
-                    nonce,
-                    reply: false,
-                },
-            );
+            // One pending ping at most; it is numbered when it is written.
+            st.ping_due = true;
         }
         None
     }
 
-    fn send_control(&mut self, st: &mut State, msg: ControlMsg) {
-        match msg.to_frame() {
-            Ok(frame) => {
-                st.last_tx = Instant::now();
-                self.shared.enqueue_internal(frame);
-            }
-            Err(e) => tracing::error!(error = %e, "could not encode a heartbeat"),
-        }
-    }
-
+    /// Picks the next frame into `out`: a pending heartbeat reply, our own ping, then the
+    /// scheduler's choice.
     fn fill_out(&mut self, st: &mut State) {
+        let msg = if let Some(nonce) = st.reply.take() {
+            Some(ControlMsg::Heartbeat { nonce, reply: true })
+        } else if st.ping_due {
+            st.ping_due = false;
+            let nonce = st.next_nonce;
+            st.next_nonce = nonce.wrapping_add(1);
+            st.pings.push_back((nonce, Instant::now()));
+            while st.pings.len() > PINGS_KEPT {
+                st.pings.pop_front();
+            }
+            Some(ControlMsg::Heartbeat {
+                nonce,
+                reply: false,
+            })
+        } else {
+            None
+        };
+        if let Some(msg) = msg {
+            match msg.to_frame().map(|f| f.encode_into(&mut st.out)) {
+                Ok(Ok(())) => {
+                    st.last_tx = Instant::now();
+                    st.out_pos = 0;
+                    return;
+                }
+                _ => tracing::error!("could not encode a heartbeat"),
+            }
+        }
         while let Some(frame) = self.shared.pop() {
             let before = st.out.len();
             match frame.encode_into(&mut st.out) {
@@ -264,7 +312,7 @@ where
         let mut input = data;
         loop {
             match self.decoder.push(&mut input) {
-                Ok(Some(frame)) => self.on_frame(st, frame)?,
+                Ok(Some(frame)) => self.on_frame(st, frame),
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(DownReason::Io(format!("protocol error: {e}"))),
             }
@@ -272,7 +320,7 @@ where
     }
 
     /// One frame from the peer: heartbeats are consumed here, everything else goes up.
-    fn on_frame(&mut self, st: &mut State, frame: Frame) -> Result<(), DownReason> {
+    fn on_frame(&mut self, st: &mut State, frame: Frame) {
         if frame.channel == ChannelId::CONTROL
             && let Ok(ControlMsg::Heartbeat { nonce, reply }) = ControlMsg::decode(&frame.payload)
         {
@@ -284,55 +332,39 @@ where
                         .set_rtt(Instant::now().saturating_duration_since(sent));
                 }
             } else {
-                self.send_control(st, ControlMsg::Heartbeat { nonce, reply: true });
+                // The latest ping wins; an older unanswered one is not worth a frame.
+                st.reply = Some(nonce);
             }
-            return Ok(());
+            return;
         }
         // An undecodable control message is passed up like any other: a newer minor version may
         // have added a variant that we do not know, and that is the layer above's call.
-        st.pending_in
-            .push_back((frame.channel, Bytes::from(frame.payload)));
-        Ok(())
+        self.shared
+            .push_inbound(frame.channel, Bytes::from(frame.payload));
     }
 
-    /// Moves what fits from `pending_in` into the inbound queue.
-    fn drain_pending(&mut self, st: &mut State) {
-        while let Some(item) = st.pending_in.pop_front() {
-            match self.inbound.try_send(item) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(item)) => {
-                    st.pending_in.push_front(item);
-                    return;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return,
-            }
-        }
-    }
-
-    /// EOF or a read error: the pipe is over. If there is a child, its exit status is the
-    /// reason worth reporting.
+    /// EOF or a read error: the pipe is over. If there is a child that has already exited, its
+    /// status is the reason worth reporting; a command that has closed its output but not
+    /// exited is asked to finish after `Down`, in `finish`.
     async fn stream_ended(&mut self, what: String) -> DownReason {
-        // Frames decoded before the end are already in the inbound queue: reading pauses while
-        // `pending_in` is non-empty, so nothing waits behind it.
-        match self.child.as_mut() {
-            Some(child) => {
-                let status = reap(child, self.grace).await;
-                DownReason::Io(format!("pipe command {status}"))
-            }
-            None => DownReason::Io(what),
+        if let Some(child) = self.child.as_mut() {
+            return match timeout(EXIT_STATUS_WAIT, child.wait()).await {
+                Ok(Ok(status)) => DownReason::Io(format!("pipe command {}", describe_exit(status))),
+                _ => DownReason::Io(format!("{what}; the pipe command had not exited")),
+            };
         }
+        DownReason::Io(what)
     }
 
-    /// Shuts everything down. The status is set first, so waiting callers learn at once.
+    /// Shuts everything down. The status is set first, so waiting callers learn at once; then
+    /// the stream is closed (a child's stdin with it, which is how a well-behaved command is
+    /// asked to finish) and the child is reaped within the grace period.
     async fn finish(mut self, reason: DownReason) {
         self.shared.set_down(reason.clone());
         self.shared.clear();
-        // Dropping the sender wakes a blocked `recv`, which then reports the reason.
-        drop(self.inbound);
+        self.shared.end_inbound();
         let mut write = self.write;
         let _ = timeout(Duration::from_millis(100), write.shutdown()).await;
-        // Closing the stream also closes a child's stdin, which is how a well-behaved command
-        // is asked to finish.
         drop(write);
         if let Some(mut child) = self.child.take() {
             // Dead means the far side is not answering, so there is nothing to wait for.

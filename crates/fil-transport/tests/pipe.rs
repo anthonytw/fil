@@ -472,29 +472,225 @@ async fn what_the_peer_sent_before_the_end_is_still_delivered() {
     ));
 }
 
+/// Reads the link's frames until it has answered ping `nonce`.
+async fn expect_reply(raw: &mut Raw, nonce: u32) {
+    loop {
+        let f = raw.frame().await;
+        if f.channel == ChannelId::CONTROL
+            && ControlMsg::decode(&f.payload).unwrap()
+                == (ControlMsg::Heartbeat { nonce, reply: true })
+        {
+            return;
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_slow_consumer_is_not_a_silent_peer() {
-    let mut small = cfg();
-    small.inbound_queue = 4;
-    let (link, mut raw) = client_vs_raw(small, b"", ControlMsg::Detach).await;
+async fn a_lagging_consumer_under_the_budget_does_not_pause_the_link() {
+    // Nobody calls `recv` for four times dead_after, but the peer keeps heartbeating: the link
+    // keeps reading and answering, and stays Up.
+    let (link, mut raw) = client_vs_raw(cfg(), b"", ControlMsg::Detach).await;
     for i in 0..100u64 {
         raw.put_frame(ChannelId::TERMINAL, &data(i * 10, 1, 10))
             .await;
     }
-    // Nobody calls `recv` for four times dead_after. The link stopped reading, which is not the
-    // peer's silence.
-    sleep(Duration::from_secs(20)).await;
-    assert_eq!(link.status().borrow().state, LinkState::Up);
-    let mut seqs = Vec::new();
-    // The first frame is the handshake Detach.
+    for n in 1..=20u32 {
+        sleep(Duration::from_secs(1)).await;
+        raw.put_ctl(ping(1000 + n)).await;
+        expect_reply(&mut raw, 1000 + n).await;
+        assert_eq!(link.status().borrow().state, LinkState::Up, "second {n}");
+    }
+    // The first payload is the handshake Detach; then everything, in order.
     assert_eq!(link.recv().await.unwrap().0, ChannelId::CONTROL);
+    let mut seqs = Vec::new();
     for _ in 0..100 {
         let (ch, p) = link.recv().await.unwrap();
         assert_eq!(ch, ChannelId::TERMINAL);
         seqs.push(DataSegment::parse(&p).unwrap().seq);
     }
     assert_eq!(seqs, (0..100).map(|i| i * 10).collect::<Vec<u64>>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_goes_silent_while_the_consumer_lags_is_still_found_dead() {
+    let (link, mut raw) = client_vs_raw(cfg(), b"", ControlMsg::Detach).await;
+    for i in 0..20u64 {
+        raw.put_frame(ChannelId::TERMINAL, &data(i * 10, 1, 10))
+            .await;
+    }
+    // The consumer is not reading; the peer says nothing more. Bytes stopped, so the clock runs.
+    let t = Instant::now();
+    let mut st = link.status();
+    st.wait_for(|s| matches!(s.state, LinkState::Down(_)))
+        .await
+        .unwrap();
+    let dead = t.elapsed();
+    assert_eq!(st.borrow().state, LinkState::Down(DownReason::Dead));
+    assert!(
+        (MS(4900)..=MS(5100)).contains(&dead),
+        "found dead after {dead:?}"
+    );
+    // What arrived before is still there for the consumer, then the error.
+    for _ in 0..21 {
+        assert!(link.recv().await.is_ok());
+    }
+    assert_eq!(link.recv().await.unwrap_err().0, DownReason::Dead);
+    drop(raw);
+}
+
+#[tokio::test(start_paused = true)]
+async fn past_the_budget_the_link_stops_reading_reports_degraded_and_recovers() {
+    let mut small = cfg();
+    small.inbound_budget = 1000;
+    let (link, mut raw) = client_vs_raw(small, b"", ControlMsg::Detach).await;
+    for i in 0..100u64 {
+        raw.put_frame(ChannelId::TERMINAL, &data(i * 10, 1, 10))
+            .await;
+    }
+    sleep(MS(10)).await;
+    assert_eq!(link.status().borrow().state, LinkState::Degraded);
+    // Frozen, not dead: the peer is silent but the consumer is the one holding things up.
+    sleep(Duration::from_secs(60)).await;
+    assert_eq!(link.status().borrow().state, LinkState::Degraded);
+    // The consumer catches up: reading resumes and the link is Up again.
+    assert_eq!(link.recv().await.unwrap().0, ChannelId::CONTROL);
+    let mut seqs = Vec::new();
+    for _ in 0..100 {
+        let (ch, p) = link.recv().await.unwrap();
+        assert_eq!(ch, ChannelId::TERMINAL);
+        seqs.push(DataSegment::parse(&p).unwrap().seq);
+    }
+    assert_eq!(seqs, (0..100).map(|i| i * 10).collect::<Vec<u64>>());
+    sleep(MS(10)).await;
     assert_eq!(link.status().borrow().state, LinkState::Up);
+    // And the silence clock runs again from there.
+    let t = Instant::now();
+    let mut st = link.status();
+    st.wait_for(|s| matches!(s.state, LinkState::Down(_)))
+        .await
+        .unwrap();
+    assert_eq!(st.borrow().state, LinkState::Down(DownReason::Dead));
+    assert!(t.elapsed() <= MS(5100), "{:?}", t.elapsed());
+    drop(raw);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ping_flood_from_a_peer_that_never_reads_costs_one_pending_reply() {
+    let (a, b) = duplex(4096);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    for n in 1..=100_000u32 {
+        raw.put_ctl(ping(n)).await;
+    }
+    // Only now does the peer read. What the link wrote is bounded by the 4 KiB pipe plus one
+    // pending reply, not by what was sent.
+    let mut frames = 0;
+    let mut last_reply = None;
+    while let Ok(f) = timeout(MS(100), raw.frame()).await {
+        frames += 1;
+        if let Ok(ControlMsg::Heartbeat { nonce, reply: true }) = ControlMsg::decode(&f.payload) {
+            last_reply = Some(nonce);
+        }
+    }
+    assert!(frames < 600, "{frames} frames written for 100000 pings");
+    assert_eq!(
+        last_reply,
+        Some(100_000),
+        "the latest ping is the one answered"
+    );
+    assert_eq!(link.status().borrow().state, LinkState::Up);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_write_does_not_pile_up_pings_or_replies() {
+    // The peer talks (so the link stays alive) but does not read for a minute. The pipe holds
+    // 64 bytes; whatever else is pending is one ping and one reply, not sixty of each.
+    let (a, b) = duplex(64);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    for n in 1..=60u32 {
+        sleep(Duration::from_secs(1)).await;
+        raw.put_ctl(ping(n)).await;
+    }
+    assert_eq!(link.status().borrow().state, LinkState::Up);
+    let mut frames = 0;
+    let mut last_reply = None;
+    while let Ok(f) = timeout(MS(100), raw.frame()).await {
+        frames += 1;
+        if let Ok(ControlMsg::Heartbeat { nonce, reply: true }) = ControlMsg::decode(&f.payload) {
+            last_reply = Some(nonce);
+        }
+    }
+    assert!(frames <= 12, "{frames} frames after a stuck minute");
+    assert_eq!(last_reply, Some(60));
+}
+
+#[tokio::test(start_paused = true)]
+async fn any_bytes_are_proof_of_life_even_if_no_frame_completes() {
+    // One 16 KiB frame arrives 64 bytes at a time over three minutes: never a whole frame in
+    // sight for longer than dead_after, never more than a second of silence.
+    let (link, mut raw) = client_vs_raw(cfg(), b"", ControlMsg::Detach).await;
+    assert_eq!(link.recv().await.unwrap().0, ChannelId::CONTROL);
+    let wire = Frame::new(ChannelId::TERMINAL, data(0, 9, 16 * 1024).to_vec())
+        .encode()
+        .unwrap();
+    let started = Instant::now();
+    for chunk in wire.chunks(64) {
+        raw.put(chunk).await;
+        sleep(MS(700)).await;
+        assert_eq!(link.status().borrow().state, LinkState::Up);
+    }
+    assert!(started.elapsed() > Duration::from_secs(150));
+    let (ch, payload) = link.recv().await.unwrap();
+    assert_eq!(ch, ChannelId::TERMINAL);
+    assert_eq!(DataSegment::parse(&payload).unwrap().data.len(), 16 * 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_send_leaves_nothing_behind() {
+    let forever = LinkParams {
+        degraded_after: Duration::from_secs(3600),
+        dead_after: Duration::from_secs(7200),
+        ..LinkParams::default()
+    };
+    let mk = || PipeConfig::new(forever);
+    let (a, b, ctl) = pair(StreamConfig::default(), mk(), mk()).await;
+    ctl.stall();
+    let mut accepted = 0u64;
+    while timeout(
+        MS(50),
+        a.send(ChannelId(16), data(accepted * 16384, 7, 16384)),
+    )
+    .await
+    .is_ok()
+    {
+        accepted += 1;
+        assert!(accepted < 100, "no backpressure");
+    }
+    // These sends wait on the full channel and are cancelled by their timeouts, three times,
+    // while the queue is full and while it frees up.
+    for _ in 0..3 {
+        assert!(
+            timeout(MS(50), a.send(ChannelId(16), data(0, 0xEE, 16384)))
+                .await
+                .is_err()
+        );
+    }
+    ctl.release();
+    // The channel works again afterwards, and the cancelled payloads never appear.
+    a.send(ChannelId(16), data(accepted * 16384, 7, 16384))
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while let Ok(Ok((ch, p))) = timeout(Duration::from_secs(2), b.recv()).await {
+        assert_eq!(ch, ChannelId(16));
+        let seg = DataSegment::parse(&p).unwrap();
+        assert_ne!(seg.data[0], 0xEE, "a cancelled send was delivered");
+        got.push(seg.seq);
+    }
+    assert_eq!(got, (0..=accepted).map(|i| i * 16384).collect::<Vec<u64>>());
 }
 
 #[tokio::test(start_paused = true)]
@@ -524,7 +720,7 @@ async fn unknown_control_messages_pass_up_untouched() {
 
 #[tokio::test(start_paused = true)]
 async fn a_banner_before_the_preamble_is_kept_and_sanitized() {
-    let banner = b"Last login: Mon\r\n\x1b]0;evil\x07\x1b[31mWelcome\x1b[0m \xe2\x80\xaeevil\n";
+    let banner = b"Last login: Mon\r\n\x1b]0;evil\x07\x1b[31mWelcome\x1b[0m \xe2\x80\xaeev\xe2\x80\xa8\xef\xbb\xbf\xd8\x9c\xe2\x81\xa0il\n";
     let (link, _raw) = client_vs_raw(cfg(), banner, ControlMsg::Detach).await;
     assert_eq!(link.banner(), banner);
     assert_eq!(link.peer_major(), Some(1));

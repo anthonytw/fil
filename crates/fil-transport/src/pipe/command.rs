@@ -1,6 +1,6 @@
 //! The command that runs the pipe (DESIGN.md §8.2).
 //!
-//! By default `ssh -T HOST fil server --stdio`. The remote part is fixed: nothing a user types
+//! By default `ssh -T -- HOST fil server --stdio`. The remote part is fixed: nothing a user types
 //! (a session name, a flag value) is ever added to it, because ssh hands the remote command to
 //! the remote shell as one string (§11). Session names and everything else travel inside the
 //! protocol. A per-host override replaces the whole command line and runs untouched, except that
@@ -20,17 +20,30 @@ const SERVER_ALIVE_COUNT: u32 = 3;
 
 /// The `(ServerAliveInterval seconds, ServerAliveCountMax)` fil gives ssh for `params`.
 ///
-/// ssh gives up after about `interval x (count + 1)` of silence (measured in
-/// `docs/m1/realnet.md`: 2 s and 3 gave 7.5 s). fil's heartbeat is the fast detector and drives
-/// the status line, so ssh's backstop must not fire first: the interval is
-/// `dead_after / (count + 1)`, rounded up to whole seconds (ssh takes seconds, at least 1), so
-/// ssh never gives up before `dead_after`. With the defaults (5 s) that is 2 s x 4 = 8 s. The
-/// backstop matters when the fil process is gone but a black-holed ssh would linger for the
-/// TCP retry limit (about 15 minutes); a live link kills its own ssh as soon as fil declares it
-/// dead.
+/// ssh gives up after `count` to `count + 1` intervals of silence, depending on where its check
+/// falls (`docs/m1/realnet.md`: 2 s and 3 gave 7.5 s, not 8). fil's heartbeat is the fast
+/// detector and drives the status line, so ssh's backstop must never fire first: the interval is
+/// `dead_after / count`, rounded up to whole seconds (ssh takes seconds, at least 1), so even
+/// ssh's earliest possible give-up, `interval x count`, is not before `dead_after`. With the
+/// defaults (5 s) that is 2 s, giving up between 6 and 8 s. The backstop matters when the fil
+/// process is gone but a black-holed ssh would linger for the TCP retry limit (about 15
+/// minutes); a live link kills its own ssh as soon as fil declares it dead.
 pub fn server_alive(params: &LinkParams) -> (u64, u32) {
-    let secs = params.dead_after.as_secs_f64() / f64::from(SERVER_ALIVE_COUNT + 1);
+    let secs = params.dead_after.as_secs_f64() / f64::from(SERVER_ALIVE_COUNT);
     ((secs.ceil() as u64).max(1), SERVER_ALIVE_COUNT)
+}
+
+/// Whether `host` is acceptable as the target of the default command: only characters that can
+/// appear in a host name, an `[IPv6]` literal with a zone, or `user@host`, and not starting with
+/// `-`. Nothing a shell would treat specially gets through, which matters because an
+/// `~/.ssh/config` may expand the host name in `ProxyCommand` or `Match exec`.
+fn host_is_acceptable(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.starts_with('-')
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '%' | '[' | ']' | '-')
+        })
 }
 
 /// What to run for the pipe.
@@ -41,19 +54,16 @@ pub struct PipeCommand {
 }
 
 impl PipeCommand {
-    /// The default: `ssh -T HOST fil server --stdio`. `host` is whatever the user typed
-    /// (`name`, `user@name`, an alias from `~/.ssh/config`); it must not start with `-` (ssh
-    /// would read it as an option) or contain whitespace or control characters.
+    /// The default: `ssh -T -- HOST fil server --stdio`. `host` is a host name, an alias from
+    /// `~/.ssh/config`, `user@host` or an IPv6 literal: letters, digits and `. _ @ : % [ ] -`,
+    /// not starting with `-`. The `--` keeps it from ever being read as an option as well.
     pub fn ssh(host: &str) -> Result<Self, PipeError> {
-        let bad = host.is_empty()
-            || host.starts_with('-')
-            || host.chars().any(|c| c.is_whitespace() || c.is_control());
-        if bad {
+        if !host_is_acceptable(host) {
             return Err(PipeError::new(PipeErrorKind::InvalidCommand(format!(
                 "{host:?} is not a usable host name"
             ))));
         }
-        let mut argv: Vec<OsString> = vec!["ssh".into(), "-T".into(), host.into()];
+        let mut argv: Vec<OsString> = vec!["ssh".into(), "-T".into(), "--".into(), host.into()];
         argv.extend(REMOTE_COMMAND.iter().map(OsString::from));
         Ok(Self {
             argv,
@@ -93,7 +103,7 @@ impl PipeCommand {
     }
 
     /// The program and arguments that will run for `params`: the configured argv, with the ssh
-    /// keepalive options right after `ssh` when applicable (an option already on the line is
+    /// keepalive options right after `ssh` (so before any `--`) when applicable (an option already on the line is
     /// left alone; ssh uses the first value it sees).
     pub fn effective_argv(&self, params: &LinkParams) -> Vec<OsString> {
         let mut argv = self.argv.clone();
@@ -140,7 +150,7 @@ mod tests {
         let cmd = PipeCommand::ssh("alice@box").unwrap();
         assert_eq!(
             strings(cmd.argv().to_vec()),
-            ["ssh", "-T", "alice@box", "fil", "server", "--stdio"]
+            ["ssh", "-T", "--", "alice@box", "fil", "server", "--stdio"]
         );
         assert_eq!(
             strings(cmd.effective_argv(&LinkParams::default())),
@@ -151,6 +161,7 @@ mod tests {
                 "-o",
                 "ServerAliveCountMax=3",
                 "-T",
+                "--",
                 "alice@box",
                 "fil",
                 "server",
@@ -165,31 +176,64 @@ mod tests {
             dead_after: Duration::from_secs(secs),
             ..LinkParams::default()
         };
-        assert_eq!(server_alive(&p(5)), (2, 3)); // 8 s >= 5 s
+        assert_eq!(server_alive(&p(5)), (2, 3));
         assert_eq!(server_alive(&p(1)), (1, 3));
-        assert_eq!(server_alive(&p(40)), (10, 3)); // 40 s
-        assert_eq!(server_alive(&p(41)), (11, 3));
+        assert_eq!(server_alive(&p(12)), (4, 3));
+        assert_eq!(server_alive(&p(40)), (14, 3));
+        // ssh's earliest give-up is `interval x count`; it must never beat fil's heartbeat.
         for secs in 1..200 {
             let (interval, count) = server_alive(&p(secs));
-            assert!(interval * u64::from(count + 1) >= secs, "dead_after {secs}");
+            assert!(interval * u64::from(count) >= secs, "dead_after {secs}");
         }
     }
 
     #[test]
-    fn hostile_host_names_are_refused() {
+    fn hostile_host_names_are_refused_and_ordinary_ones_work() {
         for host in [
             "",
             "-oProxyCommand=touch /tmp/x",
             "-x",
             "a b",
             "a\nb",
+            "a\tb",
             "host;rm",
+            "x$(touch${IFS}/tmp/p)",
+            "$HOME",
+            "`id`",
+            "a|b",
+            "a&b",
+            "a'b",
+            "a\"b",
+            "a(b)",
+            "a<b",
+            "a>b",
+            "a\\b",
+            "a*b",
             "a\u{7f}",
+            "h\u{f6}st",
+            "ssh://box",
         ] {
-            let ok = PipeCommand::ssh(host).is_ok();
-            // `host;rm` has no whitespace: ssh does not run a shell on it, so it is just a name
-            // that will not resolve. The others must be refused.
-            assert_eq!(ok, host == "host;rm", "{host:?}");
+            assert!(
+                PipeCommand::ssh(host).is_err(),
+                "{host:?} should be refused"
+            );
+        }
+        for host in [
+            "box",
+            "my-alias",
+            "alice@box.example.com",
+            "box_1.local",
+            "[::1]",
+            "::1",
+            "fe80::1%eth0",
+            "alice@[2001:db8::1]",
+        ] {
+            let cmd = PipeCommand::ssh(host).unwrap_or_else(|e| panic!("{host:?}: {e}"));
+            let argv = strings(cmd.effective_argv(&LinkParams::default()));
+            // The options come before `--`, the host right after it.
+            let dashes = argv.iter().position(|a| a == "--").unwrap();
+            assert_eq!(argv[dashes + 1], host);
+            assert!(argv[..dashes].contains(&"ServerAliveInterval=2".to_string()));
         }
     }
 

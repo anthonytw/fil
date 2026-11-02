@@ -16,14 +16,21 @@
 //!   already on the wire (16 KiB).
 //! - **Backpressure.** Every channel has its own bounded queue, counted in frames
 //!   (`control_queue`, `interactive_queue` and `forward_queue` in [`PipeConfig`]; at most 16 KiB
-//!   each). `send` waits only while *that channel's* queue is full. Heartbeats bypass the bound,
-//!   so liveness never queues behind a full channel. On the receive side the inbound queue is
-//!   bounded too: when the consumer stops calling `recv`, the driver stops reading, and the
-//!   stream's own flow control pushes back on the peer. Time spent paused that way does not
-//!   count as silence from the peer.
+//!   each). `send` waits only while *that channel's* queue is full. Heartbeats are not queued
+//!   at all (see below), so liveness never waits behind a full channel.
+//! - **A slow consumer.** Received payloads wait for `recv` in a queue with a byte budget
+//!   (`inbound_budget`, 2 MiB by default; one read, 64 KiB, may overshoot it). Under the budget
+//!   the driver keeps reading, so the peer's bytes keep proving it alive and a black hole is
+//!   still found by `Dead`, however far behind the consumer is. Past the budget it stops reading
+//!   (the stream's own flow control pushes back on the peer), freezes the silence clock and
+//!   reports `Degraded`; it reads again, and returns to `Up`, once the consumer has caught up to
+//!   half the budget. A well-behaved peer stays under the budget through acks (§8.5).
 //! - **Heartbeats (§8.5).** After [`LinkParams::heartbeat`] without sending, a
 //!   `Heartbeat { reply: false }` goes out on channel 0. Each ping is answered at once with
 //!   `reply: true` and the same nonce; the pair measures RTT. Heartbeats never reach `recv`.
+//!   They are encoded ahead of everything when the writer is free: at most one reply (the latest
+//!   ping's nonce) and one ping of our own are ever pending, so a peer that floods pings
+//!   without reading costs one pending frame, and a stuck write does not pile up stale pings.
 //! - **Liveness.** *Any* bytes from the peer count as proof of life, not only whole frames, so a
 //!   large frame crawling over a slow pipe does not look like silence. After
 //!   [`LinkParams::degraded_after`] of silence the link is `Degraded` (and `Up` again if the peer
@@ -48,14 +55,14 @@ use fil_proto::preamble::{PreambleError, PreambleScanner, Scan};
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder, FrameError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
 
 pub use command::{PipeCommand, server_alive};
 
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkStatus};
 use driver::{Driver, reap};
-use shared::Shared;
+use shared::{Pop, Shared};
 
 /// Knobs for a [`PipeLink`]. [`PipeConfig::new`] gives the defaults.
 #[derive(Clone, Debug)]
@@ -74,8 +81,9 @@ pub struct PipeConfig {
     pub forward_queue: usize,
     /// One forward frame after this many interactive frames while forwards wait. Default 8.
     pub forward_share: u32,
-    /// Frames received but not yet taken by `recv`. Default 256.
-    pub inbound_queue: usize,
+    /// Bytes of received payload that may wait for `recv` before the driver stops reading and
+    /// reports `Degraded`. Default 2 MiB.
+    pub inbound_budget: usize,
     /// How long a command that was asked to finish (its stdin closed) may take before it is
     /// killed. Default 1 s.
     pub close_grace: Duration,
@@ -91,7 +99,7 @@ impl PipeConfig {
             interactive_queue: 32,
             forward_queue: 8,
             forward_share: fil_proto::limits::DEFAULT_FORWARD_SHARE,
-            inbound_queue: 256,
+            inbound_budget: 2 * 1024 * 1024,
             close_grace: Duration::from_secs(1),
         }
     }
@@ -181,17 +189,41 @@ impl std::error::Error for PipeError {
 }
 
 /// Makes untrusted text safe to show: lossy UTF-8, with control characters (escape sequences
-/// included), carriage returns and invisible direction overrides removed. Newlines and tabs stay.
-/// DESIGN.md §8.5 requires this for the preamble's skipped text.
+/// included), carriage returns, line and paragraph separators, and every invisible Unicode
+/// format character (bidirectional controls, zero-width characters, byte order marks, tags)
+/// removed. Newlines and tabs stay. DESIGN.md §8.5 requires this for the preamble's skipped text.
 pub fn sanitize_banner(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
-        .filter(|c| {
-            matches!(c, '\n' | '\t')
-                || !(c.is_control()
-                    || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        })
+        .filter(|c| matches!(c, '\n' | '\t') || !(c.is_control() || is_invisible(*c)))
         .collect()
+}
+
+/// Unicode general category Cf (format), plus Zl and Zp. `std` has no category lookup, so the
+/// ranges are listed (Unicode 16).
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}')
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -203,7 +235,6 @@ enum Role {
 /// One live pipe. See the [module docs](self).
 pub struct PipeLink {
     shared: Arc<Shared>,
-    inbound: Mutex<mpsc::Receiver<(ChannelId, Bytes)>>,
     banner: Vec<u8>,
     peer_major: Option<u16>,
     child_id: Option<u32>,
@@ -308,7 +339,6 @@ impl PipeLink {
         };
 
         let shared = Shared::new(&cfg);
-        let (tx, rx) = mpsc::channel(cfg.inbound_queue.max(1));
         let (done_tx, done_rx) = watch::channel(false);
         tokio::spawn(
             Driver {
@@ -317,7 +347,7 @@ impl PipeLink {
                 write,
                 params: cfg.params,
                 decoder: hs.decoder,
-                inbound: tx,
+                inbound_budget: cfg.inbound_budget.max(1),
                 initial: hs.frames,
                 child,
                 grace: cfg.close_grace,
@@ -328,7 +358,6 @@ impl PipeLink {
         );
         Ok(Self {
             shared,
-            inbound: Mutex::new(rx),
             banner: hs.skipped,
             peer_major,
             child_id,
@@ -550,24 +579,26 @@ impl Link for PipeLink {
     }
 
     async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError> {
-        let mut rx = self.inbound.lock().await;
-        let closed = |this: &Self| match this.shared.down_reason() {
-            Some(DownReason::Closed) => Some(LinkError(DownReason::Closed)),
-            _ => None,
-        };
-        if let Some(e) = closed(self) {
-            return Err(e);
-        }
-        match rx.recv().await {
-            // Payloads that arrived before the stream ended are delivered; after our own close
-            // nothing is ("close discards").
-            Some(item) => match closed(self) {
-                Some(e) => Err(e),
-                None => Ok(item),
-            },
-            None => Err(LinkError(self.shared.down_reason().unwrap_or_else(|| {
-                DownReason::Io("the pipe driver stopped".into())
-            }))),
+        loop {
+            // Register for the next arrival before looking, so none is missed.
+            let ready = self.shared.inbound_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            // After our own close nothing is delivered ("close discards"); after the stream
+            // ended or failed, what arrived before the end still is.
+            if self.shared.down_reason() == Some(DownReason::Closed) {
+                return Err(LinkError(DownReason::Closed));
+            }
+            match self.shared.pop_inbound() {
+                Pop::Item(channel, payload) => return Ok((channel, payload)),
+                Pop::Ended => {
+                    return Err(LinkError(self.shared.down_reason().unwrap_or_else(|| {
+                        DownReason::Io("the pipe driver stopped".into())
+                    })));
+                }
+                Pop::Empty => {}
+            }
+            ready.await;
         }
     }
 

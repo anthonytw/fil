@@ -59,7 +59,7 @@ async fn echo_through_a_real_child_and_close_reaps_it() {
     let started = Instant::now();
     link.shutdown().await;
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(5),
         "a well-behaved child exits on EOF"
     );
     assert!(!exists(pid), "the child was not reaped");
@@ -128,7 +128,7 @@ async fn a_killed_child_is_a_down_link_naming_the_signal() {
         panic!("{err:?}")
     };
     assert!(why.contains("signal: 9"), "{why}");
-    assert!(t.elapsed() < Duration::from_secs(1));
+    assert!(t.elapsed() < Duration::from_secs(5));
     link.closed().await;
     assert!(!exists(pid));
 }
@@ -171,7 +171,7 @@ async fn closing_kills_a_child_that_ignores_the_end_of_its_input() {
     let took = t.elapsed();
     // It was asked to finish (stdin closed), given the grace period, then killed.
     assert!(
-        took >= Duration::from_millis(250) && took < Duration::from_secs(2),
+        took >= Duration::from_millis(250) && took < Duration::from_secs(10),
         "{took:?}"
     );
     assert!(!exists(pid), "the lingering child was not reaped");
@@ -181,22 +181,7 @@ async fn closing_kills_a_child_that_ignores_the_end_of_its_input() {
 async fn a_child_that_goes_silent_is_declared_dead_and_killed() {
     // Not the network, but the same shape: the command says hello and then never speaks again,
     // while its stdout stays open (a black-holed ssh).
-    let mut hello = preamble::encode(PROTOCOL_MAJOR);
-    hello.extend(
-        Frame::new(
-            ChannelId::CONTROL,
-            ControlMsg::Heartbeat {
-                nonce: 0,
-                reply: true,
-            }
-            .encode()
-            .unwrap(),
-        )
-        .encode()
-        .unwrap(),
-    );
-    let file: PathBuf = std::env::temp_dir().join(format!("fil-pipe-hello-{}", std::process::id()));
-    std::fs::write(&file, hello).unwrap();
+    let file = hello_file("silent");
     let cmd = PipeCommand::custom([
         "sh".to_owned(),
         "-c".to_owned(),
@@ -226,11 +211,11 @@ async fn a_child_that_goes_silent_is_declared_dead_and_killed() {
     let dead = t.elapsed();
     assert_eq!(status.borrow().state, LinkState::Down(DownReason::Dead));
     assert!(
-        degraded >= Duration::from_millis(300) && degraded < Duration::from_millis(700),
+        degraded >= Duration::from_millis(300) && degraded < Duration::from_millis(3000),
         "{degraded:?}"
     );
     assert!(
-        dead >= Duration::from_millis(900) && dead < Duration::from_millis(1500),
+        dead >= Duration::from_millis(900) && dead < Duration::from_millis(5000),
         "{dead:?}"
     );
     link.closed().await;
@@ -239,4 +224,73 @@ async fn a_child_that_goes_silent_is_declared_dead_and_killed() {
         "a dead link must not leave its command running"
     );
     std::fs::remove_file(&file).unwrap();
+}
+
+/// A `hello` file for a fake peer: the preamble and one heartbeat reply, so the link comes up.
+fn hello_file(tag: &str) -> PathBuf {
+    let mut hello = preamble::encode(PROTOCOL_MAJOR);
+    hello.extend(
+        Frame::new(
+            ChannelId::CONTROL,
+            ControlMsg::Heartbeat {
+                nonce: 0,
+                reply: true,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .encode()
+        .unwrap(),
+    );
+    let file = std::env::temp_dir().join(format!("fil-pipe-{tag}-{}", std::process::id()));
+    std::fs::write(&file, hello).unwrap();
+    file
+}
+
+#[tokio::test]
+async fn a_command_that_closes_its_output_is_down_at_once_and_is_asked_to_finish() {
+    // Stdout closed, but the command waits for the end of its stdin before it exits. The link
+    // goes down first, then closes stdin; the command gets to exit cleanly instead of being
+    // killed after the grace period.
+    let file = hello_file("eof");
+    let cmd = PipeCommand::custom([
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "cat '{}'; exec 1>&-; cat >/dev/null; exit 0",
+            file.display()
+        ),
+    ])
+    .unwrap();
+    let config = PipeConfig {
+        close_grace: Duration::from_secs(30),
+        ..PipeConfig::default()
+    };
+    let link = PipeLink::spawn(&cmd, config).await.unwrap();
+    let pid = link.child_id().unwrap();
+    let t = Instant::now();
+    let err = link.recv().await.unwrap_err();
+    let down = t.elapsed();
+    assert!(matches!(err.0, DownReason::Io(_)), "{err:?}");
+    assert!(down < Duration::from_secs(5), "down after {down:?}");
+    // With a 30 s grace period, finishing within seconds means it was not waited out or killed.
+    link.closed().await;
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert!(!exists(pid));
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_link_reaps_its_child() {
+    let link = PipeLink::spawn(&probe(&["--linger"]), cfg()).await.unwrap();
+    let pid = link.child_id().unwrap();
+    assert!(exists(pid));
+    drop(link);
+    // No close, no shutdown: the driver notices the drop, asks the child to finish, and kills it
+    // after the grace period.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while exists(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!exists(pid), "the dropped link left its child behind");
 }

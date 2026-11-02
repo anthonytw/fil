@@ -279,6 +279,65 @@ async fn control_overtakes_a_bulk_forward() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_terminal_is_sent_ahead_of_a_forward_that_is_already_queued() {
+    let mut w = World::new(31);
+    let (client, daemon, _) = w.pair().await;
+    let client = Arc::new(client);
+    const CHUNKS: u32 = 160; // 2.5 MiB each way
+    for (ch, tag) in [(FWD, 0u8), (TERM, 1u8)] {
+        let client = client.clone();
+        tokio::spawn(async move {
+            for n in 0..CHUNKS {
+                let mut p = seq_payload(n, 16 * 1024).to_vec();
+                p[4] = tag;
+                client.send(ch, Bytes::from(p)).await.unwrap();
+            }
+        });
+    }
+    // And a few control messages, once both are well under way.
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(150)).await;
+            for n in 0..5u8 {
+                client.send(CTRL, Bytes::from(vec![n])).await.unwrap();
+            }
+        });
+    }
+    // Both channels are saturating the link. When the last terminal payload arrives, the
+    // forward channel has only had its guaranteed share.
+    let (mut term, mut fwd, mut ctl) = (0u32, 0u32, 0u32);
+    let mut term_at_last_ctl = None;
+    while term < CHUNKS {
+        match daemon.recv().await.unwrap() {
+            (TERM, _) => term += 1,
+            (FWD, _) => fwd += 1,
+            (CTRL, _) => {
+                ctl += 1;
+                if ctl == 5 {
+                    term_at_last_ctl = Some(term);
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let at = term_at_last_ctl.expect("control messages arrived");
+    assert!(
+        at < CHUNKS / 2,
+        "control waited for {at} of {CHUNKS} terminal payloads"
+    );
+    assert!(
+        fwd < CHUNKS / 3,
+        "{fwd} of {CHUNKS} forward payloads arrived before the terminal finished"
+    );
+    // ...and the forward then completes.
+    while fwd < CHUNKS {
+        assert_eq!(daemon.recv().await.unwrap().0, FWD);
+        fwd += 1;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_stalled_channel_does_not_block_the_others() {
     let mut w = World::new(4);
     let (client, daemon, _) = w.pair().await;

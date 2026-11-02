@@ -343,6 +343,7 @@ dependencies = [
 name = "fil-testbins"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fil-proto",
  "fil-transport",
  "quinn",

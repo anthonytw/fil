@@ -35,7 +35,7 @@ fil is a remote shell for development over SSH. It keeps your place when the net
 - More than one attached client per session. A second client takes the session over **(decided)**.
 - Wire compatibility with mosh or ET (see §3).
 - Non-interactive use such as scp, rsync or git. Plain ssh already does that well.
-- Windows as a remote host. A Windows client is possible later.
+- Windows, as a remote host or as a client **(decided)**. Windows users can run fil inside WSL, which is a Linux host.
 - Runtime-loaded plugins (§8.4).
 
 ## 3. Prior art
@@ -557,9 +557,11 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback | usable as a daily driver for shells |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay | port forwards survive a pulled network cable |
 | **M3: prediction** | the trait, the default predictor and the status overlay | no visible mispredictions in the harness |
-| **M4: release** | install or upload, config, docs, packaging, license; go public | |
+| **M4: release** | install or upload, config, docs, packaging, license; go public; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners, which are free once the repo is public | |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
+
+**Project site (M4).** fil.anthonywertz.com, set up the same way as Sempere's site: the site source lives in its own repository, `fil-site`, and its deploy script pushes the built output to a public GitHub Pages repository. The site hosts the docs, install instructions and release notes.
 
 ## 16. Open questions
 
@@ -576,6 +578,6 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
    - how long forwarded connections survive a disconnect
    - prediction RTT threshold
 8. **More forward kinds:** Unix sockets, SOCKS (`-D`) and UDP.
-9. **macOS as a remote host:** fully supported, or best effort?
+9. **macOS as a remote host:** fully supported, or best effort? It can't be tested on hosted runners until the repo is public (M4), so it waits until then.
 10. ~~**Keystrokes typed while disconnected**~~ Resolved: a configurable buffer, an optional confirmation on resume, and an optional log **(decided)**. See §4.3.
 11. ~~**Wire format**~~ Resolved: postcard **(decided)**. See §13.

@@ -343,6 +343,9 @@ pub struct AttachReply {
     /// Direct-mode details; `None` when direct mode is off.
     pub udp_port: Option<u16>,
     pub fingerprint: Option<Fingerprint>,
+    /// The session's `TERM`, fixed when it was created (DESIGN.md section 6.4). The client warns
+    /// once when its own differs.
+    pub term: TermName,
 }
 
 /// "Taken over by `<host label>` at `<time>`" (DESIGN.md section 5.2).
@@ -417,6 +420,22 @@ pub enum ControlMsg {
         code: ErrorCode,
     },
     Error(ErrorCode),
+    /// Daemon to client: the PTY's line discipline changed (DESIGN.md section 9). Takes effect at
+    /// terminal-channel offset `at`, so the client applies it in order with the output.
+    /// `canonical && !echo` is what a password prompt looks like: no prediction.
+    PtyMode {
+        canonical: bool,
+        echo: bool,
+        at: u64,
+    },
+    /// Daemon to client, for prediction (mosh's echo ack): every keystroke byte below
+    /// `input_upto` was written to the PTY at least the echo window ago, and all output it caused
+    /// within that window is at terminal offsets below `output_at`. A prediction for such a
+    /// keystroke that the output has not confirmed by `output_at` will not be echoed.
+    EchoAck {
+        input_upto: u64,
+        output_at: u64,
+    },
 }
 
 impl ControlMsg {
@@ -547,6 +566,7 @@ mod tests {
                 start: StartPoint::Snapshot(snap),
                 udp_port: Some(60001),
                 fingerprint: Some(Fingerprint::new(vec![1; 32]).unwrap()),
+                term: "xterm-256color".parse().unwrap(),
             }),
             ControlMsg::AttachReply(AttachReply {
                 incarnation: 1,
@@ -554,12 +574,22 @@ mod tests {
                 start: StartPoint::Resume { from: 7 },
                 udp_port: None,
                 fingerprint: None,
+                term: "xterm-ghostty".parse().unwrap(),
             }),
             ControlMsg::AttachRefused(AttachRefusal::TakenOver(t.clone())),
             ControlMsg::AttachRefused(AttachRefusal::Detached),
             ControlMsg::AttachRefused(AttachRefusal::SessionReplaced),
             ControlMsg::AttachRefused(AttachRefusal::WrongKey),
             ControlMsg::TakenOver(t),
+            ControlMsg::PtyMode {
+                canonical: true,
+                echo: false,
+                at: 4096,
+            },
+            ControlMsg::EchoAck {
+                input_upto: 12,
+                output_at: 4100,
+            },
             ControlMsg::Detach,
             ControlMsg::Resize(TermSize::new(200, 50).unwrap()),
             ControlMsg::Heartbeat {

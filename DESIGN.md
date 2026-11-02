@@ -421,6 +421,13 @@ Frames still queued on the old transport are discarded. The send buffers rebuild
 
 An accepted resume keeps the epoch and drops the subscriber's previous transport. **On the direct transport the daemon must also require the connection's authenticated key (`fil_transport::auth::peer_key`) to equal the key in the attach request**, so the attach cannot claim a key the connection did not authenticate with. The epoch is a fence, not a secret.
 
+**Messages for the terminal and prediction.**
+- `AttachReply.term` carries the session's `TERM` (§6.4).
+- `PtyMode { canonical, echo, at }` reports a change in the PTY's line discipline at terminal offset `at`, so the client applies it in order with the output. A password prompt is `canonical && !echo`.
+- `EchoAck { input_upto, output_at }` is mosh's echo acknowledgement. Every keystroke byte below `input_upto` reached the PTY at least the echo window ago, and any output it caused is below `output_at`.
+
+Before v1 these changes are made in place, with no compatibility kept.
+
 **Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any frame received counts as proof of life.
 
 **QUIC stream mapping.**

@@ -208,6 +208,21 @@ wait_gone() {
   return 1
 }
 
+# wait_pid_gone CONTAINER PID SECONDS: the process must disappear. Unlike wait_gone this names one
+# process, so ssh processes left over from earlier scenarios (s_netdown_no_detection abandons one)
+# cannot be mistaken for ours.
+wait_pid_gone() {
+  local i
+  for ((i = 0; i < $3 * 5; i++)); do
+    if ! docker exec "$1" kill -0 "$2" 2> /dev/null; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+# ssh_count: how many ssh client processes the client container has.
+ssh_count() { docker exec rn-client pgrep -x -c ssh || true; }
+
 accepted_count() { docker exec "rn-$1" grep -c "Accepted publickey for ${2:-fil}" /var/log/sshd.log || true; }
 
 # ---------------------------------------------------------------------------------------------
@@ -530,7 +545,8 @@ s_pipelink_echo() {
 
 s_pipelink_flood() {
   # 100000 bytes of shell noise: the preamble bound holds and the error says why.
-  local rc=0 line
+  local rc=0 line before
+  before=$(ssh_count)
   run_probe flood --duration 4 -- ssh -T direct-flood pipe-probe || rc=$?
   assert "the probe gave up with a connect error (rc=$rc)" test "$rc" -eq 3
   line=$(last_line "$LASTOUT" PREAMBLE-ERROR)
@@ -538,7 +554,9 @@ s_pipelink_flood() {
   assert_num "memory stayed bounded (skipped bytes held)" "$(kv "$line" skipped_len)" -le 262144
   assert_num "it failed fast (ms)" "$(kv "$line" after_ms)" -lt 5000
   assert "the remote program was cleaned up (no orphan)" wait_gone rn-jump1 pipe-probe 5
-  assert "and so was the local ssh" wait_gone rn-client ssh 5
+  sleep 1
+  assert "and so was the local ssh (count $before before, $(ssh_count) after)" \
+    test "$(ssh_count)" -le "$before"
   note "gave_up_after_ms=$(kv "$line" after_ms)"
 }
 
@@ -566,7 +584,8 @@ s_pipelink_netdown_heartbeat() {
   assert "after it reported Degraded" grep -q 'STATE state=Degraded' "$STREAM_OUT"
   assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
   assert_num "and not much later (ms)" "$DETECT_MS" -le 9000
-  assert "the dead link's ssh was killed, not left behind" wait_gone rn-client ssh 5
+  assert "the dead link's ssh ($CHILD_PID) was killed, not left behind" \
+    wait_pid_gone rn-client "$CHILD_PID" 5
   note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=off"
 }
 
@@ -578,7 +597,8 @@ s_pipelink_netdown_keepalive() {
   assert "by fil's liveness clock, before ssh's (got $FAIL_REASON)" test "$FAIL_REASON" = dead
   assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
   assert_num "and well before ssh's own 8 s (ms)" "$DETECT_MS" -le 7500
-  assert "the dead link's ssh was killed, not left behind" wait_gone rn-client ssh 5
+  assert "the dead link's ssh ($CHILD_PID) was killed, not left behind" \
+    wait_pid_gone rn-client "$CHILD_PID" 5
   note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2sx4"
 }
 

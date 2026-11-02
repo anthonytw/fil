@@ -61,6 +61,38 @@ impl Default for PtyMode {
     }
 }
 
+/// Which edge of the screen a [`Status`] prefers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// The edge farthest from the cursor: content usually fills the screen down to the cursor,
+    /// so that is the edge least likely to cover any.
+    #[default]
+    Auto,
+    Top,
+    Bottom,
+}
+
+/// Lines of text the client pins to the screen with the same erase-before-write discipline as
+/// predictions (DESIGN.md section 4.2): the disconnect status line, notices and prompts.
+///
+/// The core, not the caller, decides where and whether it is safe to draw:
+///
+/// - Every cell goes through the same validation as a prediction (on screen, not in the last
+///   column, narrow over narrow, printable ASCII or Latin). Other characters are drawn as `?`.
+/// - The lines sit at the preferred edge unless the cursor is on one of those rows (the user's
+///   prompt stays visible) or a cell cannot be drawn there; then the other edge is tried, and then
+///   the first line alone. If nothing is safe, nothing is drawn.
+/// - It is drawn in inverse video, so it cannot be mistaken for the program's output.
+/// - It ignores the password and alternate-screen rules (those are about predicting what the
+///   program will echo; this text is not a guess), but not the hazard gates (pending wrap, parser
+///   not at rest, charsets, synchronized output, ...). While a gate is closed the text is simply
+///   not shown, and the next call to [`Overlay::set_status`] or the next server chunk retries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub lines: Vec<String>,
+    pub placement: Placement,
+}
+
 /// One switch per safety rule. All are on in every real configuration; the harness turns
 /// them off one at a time to show that it notices (`tests/mutants.rs`).
 #[derive(Clone, Copy, Debug)]
@@ -304,6 +336,7 @@ pub struct Overlay {
     pty: PtyMode,
     rtt: Duration,
     wanted: Wanted,
+    status: Option<Status>,
     on_screen: Option<OnScreen>,
 }
 
@@ -328,6 +361,7 @@ impl Overlay {
             pty: PtyMode::default(),
             rtt: Duration::ZERO,
             wanted: Wanted::default(),
+            status: None,
             on_screen: None,
         }
     }
@@ -413,7 +447,9 @@ impl Overlay {
         let _ = self.shadow.take_replies(); // the user's terminal answers queries
         self.tracker.feed(bytes);
         // 3. Let the predictor confirm or retract, then repaint what remains.
-        let tracking = self.predictor.has_outstanding() || !self.wanted.cells.is_empty();
+        let tracking = self.predictor.has_outstanding()
+            || !self.wanted.cells.is_empty()
+            || self.status.is_some();
         if tracking {
             let st = self.shadow.state(0);
             if !self.prediction_allowed(&st) {
@@ -487,12 +523,33 @@ impl Overlay {
         Flush::default()
     }
 
+    /// Shows, replaces or (with `None`) removes the pinned [`Status`]. Returns what to write to
+    /// the terminal: only the difference from what is already drawn.
+    pub fn set_status(&mut self, status: Option<Status>) -> Flush {
+        if self.status == status && (status.is_none() || self.on_screen.is_some()) {
+            return Flush::default();
+        }
+        self.status = status;
+        let st = self.shadow.state(0);
+        self.flush_paint(&st)
+    }
+
+    /// True while a [`Status`] is set (it may not be drawn: see [`Status`]).
+    pub fn has_status(&self) -> bool {
+        self.status.is_some()
+    }
+
     /// The user's terminal changed size. Best effort: the erase runs against the old
     /// geometry, which is only right if the terminal has not reflowed yet (see the report).
+    /// A pinned [`Status`] is redrawn at the new size.
     pub fn resize(&mut self, size: Size) -> Flush {
-        let f = self.retract();
+        let mut f = self.retract();
         self.shadow.resize(size);
         self.size = size;
+        if self.status.is_some() {
+            let st = self.shadow.state(0);
+            f.paint = self.paint(&st);
+        }
         f
     }
 
@@ -515,11 +572,16 @@ impl Overlay {
         self.wanted = Wanted::default();
     }
 
-    /// Forget every prediction and erase what is painted.
+    /// Forget every prediction and erase what is painted (a pinned status stays).
     fn retract(&mut self) -> Flush {
         self.drop_predictions();
         let mut f = self.new_flush();
-        f.erase = self.apply(None);
+        if self.status.is_some() {
+            let st = self.shadow.state(0);
+            f.paint = self.paint(&st);
+        } else {
+            f.erase = self.apply(None);
+        }
         f
     }
 
@@ -618,11 +680,80 @@ impl Overlay {
         !ch.is_control()
     }
 
+    /// The cells of the pinned status, placed and validated (see [`Status`]); empty if there is
+    /// no status or nowhere safe to draw it.
+    fn status_cells(&self, st: &TermState) -> BTreeMap<(u16, u16), (char, CellStyle)> {
+        let Some(s) = &self.status else {
+            return BTreeMap::new();
+        };
+        let (rows, cols) = (st.size.rows, st.size.cols);
+        if rows < 2 || cols < 3 || s.lines.is_empty() {
+            return BTreeMap::new();
+        }
+        let width = usize::from(cols) - 1;
+        let lines: Vec<Vec<char>> = s
+            .lines
+            .iter()
+            .take(usize::from(rows) - 1)
+            .map(|l| {
+                l.chars()
+                    .map(|c| if predictable(c) { c } else { '?' })
+                    .take(width)
+                    .collect()
+            })
+            .collect();
+        let placement = match s.placement {
+            Placement::Auto if u32::from(st.cursor.row) * 2 < u32::from(rows) => Placement::Bottom,
+            Placement::Auto => Placement::Top,
+            p => p,
+        };
+        let edges = match placement {
+            Placement::Bottom => [Placement::Bottom, Placement::Top],
+            _ => [Placement::Top, Placement::Bottom],
+        };
+        for n in [lines.len(), 1] {
+            for edge in edges {
+                let first = match edge {
+                    Placement::Bottom => rows - n as u16,
+                    _ => 0,
+                };
+                let used = first..first + n as u16;
+                if used.contains(&st.cursor.row) {
+                    continue;
+                }
+                let mut cells = BTreeMap::new();
+                let mut ok = true;
+                'rows: for (i, line) in lines.iter().take(n).enumerate() {
+                    for (col, &ch) in line.iter().enumerate() {
+                        let pos = (first + i as u16, col as u16);
+                        if !self.cell_ok(st, pos.0, pos.1, ch) {
+                            ok = false;
+                            break 'rows;
+                        }
+                        cells.insert(pos, (ch, CellStyle::Reverse));
+                    }
+                }
+                if ok {
+                    return cells;
+                }
+            }
+        }
+        BTreeMap::new()
+    }
+
     /// The validated plan for what to show, or `None` to show nothing.
     fn plan(&self, st: &TermState) -> Option<Plan> {
-        if !self.prediction_allowed(st) || self.gate(st).is_some() {
+        if self.gate(st).is_some() {
             return None;
         }
+        let predicting = self.prediction_allowed(st);
+        // The status goes last: where it overlaps a prediction, it wins.
+        let mut want = if predicting {
+            self.wanted.cells.clone()
+        } else {
+            BTreeMap::new()
+        };
+        want.extend(self.status_cells(st));
         let origin = self.tracker.origin() || st.modes.origin;
         let region = st.modes.scroll_region;
         let ctx = RestoreCtx {
@@ -635,7 +766,7 @@ impl Overlay {
             link: self.tracker.link().cloned(),
         };
         let mut cells = BTreeMap::new();
-        for (&(row, col), &(ch, style)) in &self.wanted.cells {
+        for (&(row, col), &(ch, style)) in &want {
             if !self.cell_ok(st, row, col, ch) {
                 continue;
             }
@@ -663,7 +794,10 @@ impl Overlay {
         if cells.is_empty() {
             return None;
         }
-        let cursor = self.wanted.cursor.unwrap_or((st.cursor.row, st.cursor.col));
+        let cursor = match (predicting, self.wanted.cursor) {
+            (true, Some(c)) => c,
+            _ => (st.cursor.row, st.cursor.col),
+        };
         let (crow, ccol) = cursor;
         let line = st.screen.get(usize::from(crow))?;
         let under = line.cells.get(usize::from(ccol))?;
@@ -840,8 +974,10 @@ impl Out {
         self.cup(row, col);
         self.set_link(None);
         let mut a = ctx.pen;
-        if s.style == CellStyle::Underline {
-            a.underline = Underline::Single;
+        match s.style {
+            CellStyle::Underline => a.underline = Underline::Single,
+            CellStyle::Reverse => a.inverse = true,
+            CellStyle::Plain => {}
         }
         self.set_pen(a);
         let mut b = [0u8; 4];

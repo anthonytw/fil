@@ -52,9 +52,9 @@ pub enum Blocker {
     /// and by the alacritty backend's shadow (which buffers them until `?2026 l`), so the
     /// shadow screen is stale and anything restored from it would be wrong.
     ProgramSync,
-    /// A soft terminal reset (DECSTR) left insert or origin mode unknown, or a cursor restore
-    /// left the open hyperlink unknown: terminals disagree on both. Cleared when the program
-    /// sets the mode or the link.
+    /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown, or a cursor restore
+    /// left the open hyperlink unknown: terminals disagree on all of them. Cleared when the
+    /// program sets the mode, the region or the link.
     Uncertain,
 }
 
@@ -77,6 +77,10 @@ struct Modes {
     /// and, as far as we know, more), so the modes are unknown until set explicitly.
     insert_unknown: bool,
     origin_unknown: bool,
+    /// DECSTR also resets the scroll region in xterm; alacritty keeps its own region while the
+    /// state it reports says there is none. The region decides where an origin-mode cursor
+    /// lands, so it is unknown until the program sets one (`CSI r`).
+    region_unknown: bool,
     autowrap: bool,
     lr_margins: bool,
     nrcs: bool,
@@ -102,6 +106,7 @@ impl Default for Modes {
             origin: false,
             insert_unknown: false,
             origin_unknown: false,
+            region_unknown: false,
             autowrap: true,
             lr_margins: false,
             nrcs: false,
@@ -224,6 +229,7 @@ impl Perform for Modes {
                 // less. Treat everything it touches as unknown until set explicitly.
                 self.insert_unknown = true;
                 self.origin_unknown = true;
+                self.region_unknown = true;
                 self.autowrap = true;
                 self.g = [Charset::Other; 4];
                 self.gl = 0;
@@ -233,6 +239,7 @@ impl Perform for Modes {
                     gl: 0,
                 });
             }
+            ([], 'r') => self.region_unknown = false,
             ([], 's') => self.save(),
             ([], 'u') => self.restore(),
             ([], 'J') => {
@@ -447,7 +454,10 @@ impl Tracker {
 
     /// A mode is unknown because of a soft reset (see [`Blocker::Uncertain`]).
     fn uncertain(&self) -> bool {
-        self.modes.insert_unknown || self.modes.origin_unknown || self.modes.link_unknown
+        self.modes.insert_unknown
+            || self.modes.origin_unknown
+            || self.modes.region_unknown
+            || self.modes.link_unknown
     }
 
     /// The program has synchronized output (`?2026`) on.
@@ -574,7 +584,10 @@ mod tests {
             t.blockers(),
             vec![Blocker::Insert, Blocker::Charset, Blocker::Uncertain]
         );
+        // The region is unknown too, until the program sets one.
         let t = fed(b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B");
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        let t = fed(b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B\x1b[r");
         assert!(t.blockers().is_empty());
         let t = fed(b"\x1b[4h\x1bc");
         assert!(!t.insert());
@@ -632,6 +645,18 @@ mod tests {
             fed(b"\x1b]8;;t\x07\x1b[?1049h\x1b[?1049l").blockers(),
             vec![Blocker::Uncertain]
         );
+    }
+
+    #[test]
+    fn a_soft_reset_leaves_the_scroll_region_uncertain_until_one_is_set() {
+        // xterm resets the region on DECSTR; alacritty keeps its own while reporting none.
+        let reset = b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B";
+        let t = fed(&[&b"\x1b[2;8r"[..], reset].concat());
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        for set in [&b"\x1b[r"[..], b"\x1b[1;5r"] {
+            let t = fed(&[&b"\x1b[2;8r"[..], reset, set].concat());
+            assert!(t.blockers().is_empty(), "{set:?}");
+        }
     }
 
     #[test]

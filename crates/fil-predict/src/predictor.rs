@@ -48,6 +48,9 @@ pub enum CellStyle {
     Underline,
     /// The cursor's pen, unchanged.
     Plain,
+    /// The cursor's pen with inverse video. Used for the client's own status line
+    /// ([`crate::Status`]); a predictor has no reason to ask for it.
+    Reverse,
 }
 
 /// One change to the overlay. Rows and columns are 0-based screen coordinates.

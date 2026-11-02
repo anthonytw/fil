@@ -121,7 +121,15 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
 - **Resume:** either way, the client sends "resume session S, epoch E, from byte N", and the daemon continues from byte N (§6.2).
 - **While disconnected:**
   - The client paints a one-line status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect.
-  - Keystrokes are buffered, up to a limit, and delivered on resume.
+  - Keystrokes typed while disconnected are handled as decided in §4.3.
+
+### 4.3 Input while disconnected
+
+The handling is configurable **(decided)**:
+
+- **Buffer:** keystrokes are buffered in client memory up to a configurable cap (proposed default: 4 KiB). The status overlay shows how much is buffered, and how much was dropped once the cap was reached. A cap of 0 drops all input while disconnected.
+- **Send on resume, or ask:** by default the buffer is sent as soon as the session resumes. Optionally (`offline_input.confirm`), when the disconnect lasted longer than a threshold, the client shows what was typed and asks before sending it. A Ctrl-C typed during a long outage then can't land late by surprise.
+- **Optional log:** `offline_input.log` keeps everything typed while disconnected, including anything over the cap, by appending it to a file or piping it to a command. It is **off by default**, because keystrokes can include passwords. See §11.
 
 ## 5. Sessions
 
@@ -195,7 +203,7 @@ A takeover that lands between a query and its reply is a known edge case (§16).
 
 ### 6.4 `TERM`
 
-A session's `TERM` is fixed when the session is created, from the first client. Taking over from a different terminal emulator can't change it for programs that are already running. The options are in §16.
+A session's `TERM` is fixed when the session is created, from the first client, and kept for the session's life **(decided)**. Taking over from a different terminal emulator can't change it for programs that are already running anyway. When the new client's `TERM` differs, fil warns once at attach.
 
 ### 6.5 Emulator
 
@@ -389,7 +397,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 1. SSH (or the configured pipe) is the root of trust. Everything fil knows about who you are comes from that login.
 2. No root, no system service, no setuid.
-3. No secrets at rest. Per-attach keys live only in client memory, and crash recovery deliberately goes through a fresh login.
+3. No secrets at rest. Per-attach keys live only in client memory, and crash recovery deliberately goes through a fresh login. The one opt-in exception is the offline-input log (§4.3). When the user turns it on, it can capture typed passwords. It is created with mode 0600 and never enabled by default.
 4. Keep the attack surface small. Pipe mode opens no ports. Direct mode adds exactly one authenticated UDP port per user.
 
 | Who | What they could reach | Protection |
@@ -402,7 +410,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 | Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |
 | The remote host using your agent | signatures | Opt-in. The agent is relayed only while you're attached. Per-use confirmation keys prompt. |
 | A laptop waking up later | the session | Epoch fencing (§5.2). |
-| A stolen laptop disk | — | No tokens or keys are stored. |
+| A stolen laptop disk | the opt-in offline-input log, if enabled | No tokens or keys are stored. The offline-input log (§4.3) is off by default, and when enabled it can contain typed passwords. |
 
 **Out of scope:** root on the remote host, a compromised client machine, and the terminal emulator's own escape-sequence handling. fil passes bytes through exactly as ssh does.
 
@@ -432,7 +440,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
   - direct mode: quinn and rustls
   - terminal emulator: chosen per §6.5
   - CLI: clap
-  - serialization: serde, with postcard for frames and toml for config
+  - serialization: serde, with postcard for frames **(decided)** and toml for config
   - JSON logs: tracing
 - **Builds:** static binaries for Linux (x86_64 and aarch64, musl) and macOS (aarch64).
 - **Workspace layout (proposed):**
@@ -466,6 +474,11 @@ transport = "auto"        # auto | pipe | direct
 history_lines = 1000
 predict = "adaptive"      # off | adaptive | always
 
+[defaults.offline_input]  # keystrokes typed while disconnected (§4.3)
+buffer = "4KiB"           # 0 drops them
+confirm = "off"           # off | "after 10s": ask before sending after a long disconnect
+# log = "~/.local/state/fil/offline-input.log"   # or a command: ["logger", "-t", "fil"]. Off by default; can capture passwords
+
 [host.orin]
 forward = ["-L 5173", "-R 9000"]
 direct.port_range = "60000-61000"
@@ -491,7 +504,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 
 1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
-3. **`TERM` when a different terminal takes over:** keep the session's value, ship a fil terminfo entry, or require `xterm-256color`?
+3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
 4. **Terminal-query replies in flight during a takeover** (§6.3).
 5. **Server binary:** manual install, or upload by the client (§11)?
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
@@ -503,5 +516,5 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
    - prediction RTT threshold
 8. **More forward kinds:** Unix sockets, SOCKS (`-D`) and UDP.
 9. **macOS as a remote host:** fully supported, or best effort?
-10. **Keystrokes typed while disconnected:** buffer them and send on resume (proposed), or drop them?
-11. **Wire format:** postcard (proposed) or protobuf? Protobuf would make third-party clients easier, but they aren't a goal.
+10. ~~**Keystrokes typed while disconnected**~~ Resolved: a configurable buffer, an optional confirmation on resume, and an optional log **(decided)**. See §4.3.
+11. ~~**Wire format**~~ Resolved: postcard **(decided)**. See §13.

@@ -94,6 +94,9 @@ pub struct Backend {
     pub create: fn(Size, usize) -> Box<dyn Emulator>,
 }
 
+/// The backend new sessions use unless configured otherwise (DESIGN.md §6.5, decided).
+pub const DEFAULT_BACKEND: &str = "alacritty";
+
 /// Every backend compiled into this build, in order of preference.
 pub fn backends() -> Vec<Backend> {
     // Each backend feature contributes its `Backend` here.
@@ -121,5 +124,13 @@ mod tests {
     fn unknown_backend_is_none() {
         let size = Size { cols: 80, rows: 24 };
         assert!(create("no-such-backend", size, 1000).is_none());
+    }
+
+    #[cfg(feature = "alacritty")]
+    #[test]
+    fn default_backend_is_built_in_and_preferred() {
+        assert_eq!(backends()[0].name, DEFAULT_BACKEND);
+        let size = Size { cols: 80, rows: 24 };
+        assert!(create(DEFAULT_BACKEND, size, 1000).is_some());
     }
 }

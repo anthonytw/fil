@@ -208,15 +208,14 @@ fil runs a headless emulator (no rendering) in two places: in the daemon, to ans
 - **One snapshot writer** turns any `TermState` into the bytes that recreate it, so a backend doesn't need its own serializer. The model also lets the fidelity suite compare backends cell by cell.
 - **Capabilities:** each backend declares what it can report, such as reflow or kitty keyboard flags. The suite then scores a field a backend can't see as unsupported rather than wrong.
 
-A session picks its backend when it is created and keeps it. The default is whichever backend scores best.
+A session picks its backend when it is created and keeps it.
 
-The candidates are:
+**The default backend is `alacritty_terminal` (decided).** The M0 restore-fidelity comparison (`docs/spikes/emulator.md`) chose it. Two backends are built in:
 
-- `alacritty_terminal`: battle-tested, Apache-2.0
-- `vt100`: small; a fork is used by shpool
-- libghostty-vt: C ABI; used by zmx; it needs a Zig toolchain, so it is evaluated only if the other two fall short
+- `alacritty_terminal` (Apache-2.0), the default. It is the only candidate with reflow, OSC 8 hyperlinks, underline styles and replies to terminal queries, and it parses about 1.9x faster than `vt100`. The costs are about 30% more memory per session and glue around an API that wasn't built for this use, so every upgrade re-runs `just fidelity`.
+- `vt100` (MIT), the light alternative. It tracks fewer fields: no reflow, no query replies, and no saved cursor or origin mode.
 
-The default will be chosen with the restore-fidelity test suite (§12), not by taste.
+libghostty-vt (C ABI, used by zmx) was not evaluated: it needs a Zig toolchain, and the default already meets the bar. It can be added later behind its own feature.
 
 ## 7. Port forwarding
 
@@ -491,7 +490,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 ## 16. Open questions
 
 1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
-2. **Default emulator** (§6.5): decided by the fidelity tests in M0.
+2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. **`TERM` when a different terminal takes over:** keep the session's value, ship a fil terminfo entry, or require `xterm-256color`?
 4. **Terminal-query replies in flight during a takeover** (§6.3).
 5. **Server binary:** manual install, or upload by the client (§11)?

@@ -64,28 +64,29 @@ The daemon *is* the product. Ideas and libraries are reusable:
 
 ## 4. Architecture
 
-```
- LAPTOP                              REMOTE HOST  (runs as you: no root, no system service)
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
+flowchart LR
+    subgraph laptop["Laptop"]
+        term["Terminal<br/>(Ghostty, iTerm2, …)"]
+        client["<b>fil</b> client<br/>shadow screen<br/>predictor (optional)<br/>-L listeners<br/>agent relay"]
+        term -- keys --> client
+        client -- raw bytes --> term
+    end
 
- ┌────────────┐                      ┌───────────────────── fil daemon ─────────────────────┐
- │  terminal  │                      │ one per user per host; started on first attach;      │
- └──▲──────┬──┘                      │ outlives connections, logouts and client crashes     │
-    │bytes │keys                     │                                                      │
- ┌──┴──────▼──────────┐              │ session "main"                                       │
- │ fil                │              │  ├ PTY ─▶ zsh, vim, …                                │
- │  ├ shadow screen   │              │  ├ output log, seq-numbered          (resume)        │
- │  ├ predictor (opt) │              │  ├ emulator: screen + history        (reattach)      │
- │  ├ -L listeners    │              │  ├ forwards + their connections      (stay open)     │
- │  └ agent relay     │              │  ├ stable SSH_AUTH_SOCK                              │
- └───┬────────────┬───┘              │  └ epoch: who the subscriber is                      │
-     │            │                  │ session "build" …                                    │
-     │            │                  └─────▲─────────────────────────────────────▲──────────┘
-     │            │  direct: QUIC over UDP │ one UDP port per user               │ unix socket
-     │            └════════════════════════┘ (default)                           │ /tmp/fil-$UID/
-     │                                                                           │
-     │  pipe: ssh HOST fil server --stdio   (every bootstrap; fallback)          │
-     └──────── sshd ────────▶ fil server --stdio ────────────────────────────────┘
-                             (relay: lives and dies with the pipe)
+    subgraph remote["Remote host: runs as you, no root, no system service"]
+        sshd["sshd"]
+        relay["fil server --stdio<br/><i>relay: lives and dies with the pipe</i>"]
+        subgraph daemon["fil daemon: one per user per host, outlives every connection"]
+            main["session #quot;main#quot;<br/>PTY → zsh, vim, …<br/>output log, seq-numbered <i>(resume)</i><br/>emulator: screen + history <i>(reattach)</i><br/>forwards + their connections <i>(stay open)</i><br/>stable SSH_AUTH_SOCK<br/>epoch: who the subscriber is"]
+            build["session #quot;build#quot; …"]
+        end
+        sshd --> relay
+        relay -- "unix socket<br/>/tmp/fil-$UID/" --> daemon
+    end
+
+    client == "<b>direct</b>: QUIC over UDP (default)<br/>one port per user" ==> daemon
+    client -. "<b>pipe</b>: ssh<br/>every bootstrap; fallback" .-> sshd
 ```
 
 fil is one static binary, used on both ends. The remote side runs as `fil server …`.

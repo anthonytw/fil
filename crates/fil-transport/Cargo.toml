@@ -1,0 +1,24 @@
+[package]
+name = "fil-transport"
+description = "Transports for fil: the pipe and direct QUIC, starting with QUIC authentication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# The ring provider only: aws-lc-rs/aws-lc-sys carry the OpenSSL license (CLAUDE.md, deny.toml).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+ring = "0.17"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+fil-netsim = { path = "../fil-netsim" }
+tokio = { version = "1", features = ["rt", "test-util", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

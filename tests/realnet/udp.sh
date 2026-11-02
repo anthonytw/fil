@@ -331,7 +331,7 @@ s_nat_rebind() {
   for spec in "$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999"; do
     sleep 3.5
     t=$(now_ms)
-    nsx "$NS_R" iptables -t nat -R POSTROUTING 1 -o rs -s 10.0.1.0/24 -j SNAT --to-source "$spec" --random
+    nsx "$NS_R" iptables -t nat -R POSTROUTING 1 -o rs -p udp -s 10.0.1.0/24 -j SNAT --to-source "$spec" --random
     nsx "$NS_R" conntrack -F > /dev/null 2>&1 || true
     ev+=("$t")
     log "NAT mapping moved to $spec"
@@ -393,13 +393,18 @@ s_ip_change() {
 # A UDP blackout of DURATION seconds in the middle of a stream, with idle timeout 5 s and
 # keep-alive 1 s (LivenessParams::default). Shorter than the idle timeout the connection should
 # survive; longer, it ends with a timeout and the client reconnects with a new handshake.
-blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either)
-  local dur=$1 expect=$2 label="blackout-$1s"
+blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
+  local dur=$1 expect=$2 traffic=${3:-active} rate=262144 label="blackout-$1s"
+  # "quiet": nothing but keep-alives on the link, as in the simulator's blackout table.
+  if [[ $traffic == quiet ]]; then
+    rate=0
+    label="blackout-quiet-$1s"
+  fi
   reset_net
   netem_apply delay 20ms
   new_run "$label"
   start_server
-  bg_client c --mode stream --duration $((3 + ${dur%.*} + 8)) --rate 262144 --reconnect --reconnect-for 40
+  bg_client c --mode stream --duration $((3 + ${dur%.*} + 8)) --rate "$rate" --reconnect --reconnect-for 40
   wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect: $(cat "$CLIENT_OUT")"
   sleep 3
   local t_block t_heal
@@ -444,6 +449,11 @@ s_blackouts() {
   blackout_case 4.5 either
   blackout_case 5.5 either
   blackout_case 8.0 lost
+  # The simulator's table (docs/spikes/netsim.md) used a quiet link: same sweep around the cutoff.
+  blackout_case 4.0 either quiet
+  blackout_case 4.5 either quiet
+  blackout_case 4.9 either quiet
+  blackout_case 5.5 either quiet
 }
 
 # UDP dropped by the router: how long until the client KNOWS? (The input for the pipe fallback.)

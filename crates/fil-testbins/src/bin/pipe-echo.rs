@@ -261,14 +261,13 @@ fn run_client(args: &Args) -> Result<ExitCode, String> {
     let mut done_at: Option<Instant> = None;
 
     let fail = |child: &mut Child, reason: &str, detail: &str, last_rx: Instant, v: &Verifier| {
+        // Timestamp first: reaping the child can take a while and is not part of detection.
+        let (at_ms, after_ms) = (epoch_ms(), last_rx.elapsed().as_millis());
         let status = reap(child);
         println!(
-            "FAIL at_ms={} reason={reason} after_last_rx_ms={} rx_bytes={} rx_frames={} \
-             child_status={status} detail={detail:?}",
-            epoch_ms(),
-            last_rx.elapsed().as_millis(),
-            v.rx,
-            v.frames,
+            "FAIL at_ms={at_ms} reason={reason} after_last_rx_ms={after_ms} rx_bytes={} \
+             rx_frames={} child_status={status} detail={detail:?}",
+            v.rx, v.frames,
         );
     };
 

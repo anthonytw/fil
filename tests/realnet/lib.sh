@@ -126,7 +126,7 @@ run_scenarios() {
     rc=${PIPESTATUS[0]}
     if [[ $rc -eq 0 ]]; then status=PASS; else status=FAIL; failed=1; fi
     printf '%s\t%s\t%s\t%s\n' "$s" "$status" "$((SECONDS - start))" \
-      "$(tr '\n' ' ' < "$OUT/notes/$s.txt" 2> /dev/null)" >> "$OUT/results-$part.tsv"
+      "$( (cat "$OUT/notes/$s.txt" 2> /dev/null || true) | tr '\n' ' ')" >> "$OUT/results-$part.tsv"
   done
   return $failed
 }

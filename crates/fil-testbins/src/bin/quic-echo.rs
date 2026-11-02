@@ -5,7 +5,7 @@
 //! quic-echo server --keys-dir DIR --fp-out FILE --port-out FILE [--port-range LO-HI]
 //!                  [--bind IP] [--idle-ms N] [--keepalive-ms N]
 //! quic-echo client --server IP:PORT --pub-out FILE --pin-file FILE [--local IP:PORT]
-//!                  [--mode bulk|stream] [--bytes N] [--duration S] [--rate BYTES_PER_S]
+//!                  [--mode bulk|stream] [--bytes N] [--duration S] [--rate BYTES_PER_S (0: quiet)]
 //!                  [--idle-ms N] [--keepalive-ms N] [--connect-timeout S] [--reconnect]
 //!                  [--reconnect-for S] [--connect-only]
 //! quic-echo udp-recv --bind IP:PORT [--idle-ms N]
@@ -512,15 +512,22 @@ async fn sender(mut send: SendStream, plan: &Plan, sent: &AtomicU64) -> Result<(
     if plan.stream {
         // A chunk every 50 ms. Ticks missed while blocked are made up in a burst.
         let tick = Duration::from_millis(50);
-        let per_tick = (plan.rate / 20).clamp(1, buf.len() as u64) as usize;
+        // Rate 0 is a quiet link: nothing is sent, so only keep-alives cross it.
+        let per_tick = if plan.rate == 0 {
+            0
+        } else {
+            (plan.rate / 20).clamp(1, buf.len() as u64) as usize
+        };
         let mut interval = tokio::time::interval(tick);
         let end = Instant::now() + plan.duration;
         while Instant::now() < end {
             interval.tick().await;
-            fill_pattern(SEED, offset, &mut buf[..per_tick]);
-            send.write_all(&buf[..per_tick]).await.map_err(werr)?;
-            offset += per_tick as u64;
-            sent.store(offset, Ordering::Relaxed);
+            if per_tick > 0 {
+                fill_pattern(SEED, offset, &mut buf[..per_tick]);
+                send.write_all(&buf[..per_tick]).await.map_err(werr)?;
+                offset += per_tick as u64;
+                sent.store(offset, Ordering::Relaxed);
+            }
         }
     } else {
         while offset < plan.bytes {

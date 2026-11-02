@@ -143,17 +143,13 @@ impl Inbox {
         }
     }
 
-    /// Marks the link down and wakes everyone. `discard` drops what was received but not yet
-    /// read (a local `close`); otherwise `recv` still returns it first.
-    pub(super) fn close(&self, reason: DownReason, discard: bool) {
+    /// Marks the link down and wakes everyone. Whatever was received but not yet read is still
+    /// returned by `recv` first, however the link ended (a `TakenOver` sent just before the close
+    /// must reach the layer above).
+    pub(super) fn close(&self, reason: DownReason) {
         let mut q = self.lock();
         if q.closed.is_none() {
             q.closed = Some(reason);
-        }
-        if discard {
-            q.control.clear();
-            q.interactive.clear();
-            q.forward.clear();
         }
         for chan in q.chans.values() {
             chan.wake.notify_one();
@@ -279,23 +275,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_returns_queued_payloads_first_unless_discarding() {
+    async fn close_returns_queued_payloads_first() {
         let inbox = Inbox::new();
         let w = inbox.register(ChannelId(1)).unwrap();
         push(&inbox, &w, 1, 4).await;
-        inbox.close(DownReason::Closed, false);
+        inbox.close(DownReason::Closed);
         assert!(inbox.recv().await.is_ok());
         assert!(inbox.recv().await.is_err());
         assert!(
             inbox.register(ChannelId(2)).is_none(),
             "no new streams after close"
         );
-
-        let inbox = Inbox::new();
-        let w = inbox.register(ChannelId(1)).unwrap();
-        push(&inbox, &w, 1, 4).await;
-        inbox.close(DownReason::Closed, true);
-        assert!(inbox.recv().await.is_err());
     }
 
     #[test]

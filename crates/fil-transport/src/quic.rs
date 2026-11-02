@@ -23,8 +23,11 @@
 //!   payloads in arrival order, with forwards guaranteed a share. Anything that must stay in
 //!   order across channels (a snapshot and the output after it) carries offsets (§8.5).
 //! - **Liveness:** the QUIC keep-alive is `heartbeat`, its idle timeout is `dead_after`, and
-//!   `Degraded` appears after `degraded_after` without a datagram from the peer. `Down(Dead)` is
-//!   quinn's idle timeout.
+//!   `Degraded` appears after `degraded_after` without a datagram from the peer, and the link
+//!   goes `Down(Dead)` after `dead_after` without one (quinn's idle timeout, which restarts when
+//!   it sends a keep-alive, is the backstop). Both are measured on what quinn receives from the
+//!   network, so a consumer that stopped calling `recv` neither hides a dead path nor looks like
+//!   one.
 //! - **`Up`:** the daemon's link sends one internal frame (a control-channel `Heartbeat` reply
 //!   that `recv` never returns) as soon as it accepts a connection. A client's [`connect`]
 //!   returns when that, or any other frame, has arrived. The daemon cannot be left waiting for the

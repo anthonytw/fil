@@ -179,16 +179,16 @@ Notes on the ssh results:
 
 ### QuicLink through the same faults
 
-P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink-probe` through the same topology. Two runs on a runner (the first stopped at the shellcheck lint, so the scenarios ran once); all three scenarios passed.
+P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink-probe` through the same topology. One run of the udp suite on a GitHub runner (linked in the pull request); all three scenarios passed, and the second run repeated the numbers within noise.
 
 | Scenario | Result |
 |---|---|
 | `s_quiclink_rebind` | one accepted link, echo intact, never lost. The daemon's link counted **3 path changes** (`path_generation` 3), the last one to the third public address, and never left `Up`. The client's own `path_generation` stayed 0: a client cannot see its NAT rebind. The listener's first packet from the client got a Retry |
 | `s_quiclink_udp_blocked`, blocked from the start | `Refused` after **2000 ms**, the connect timeout, against 5 s and 15 s (the idle timeout) for raw quinn in `s_udp_blocked`. The daemon never accepted anything |
-| `s_quiclink_udp_blocked`, blocked mid-session, never lifted | `Degraded` after **2.03 s**, `Down(Dead)` after **5.07 s** |
+| `s_quiclink_udp_blocked`, blocked mid-session, never lifted | `Degraded` after **2.0 to 2.1 s**, `Down(Dead)` after **5.07 s** |
 | `s_quiclink_blackouts` 3 s | survived: `Degraded`, then `Up` again, one link, echo intact |
-| `s_quiclink_blackouts` 4.5 s | **lost** (`Down(Dead)` 5.07 s after the block began, as in `s_blackouts`: an unprompted link does not survive 4.5 s); the probe's fresh handshake with the same key was up **669 ms** after the network came back (the redial loop in the probe waits 200 ms between tries, and the path manager redials at once) |
-| `s_quiclink_blackouts` 8 s | lost at 5.07 s; fresh handshake **272 ms** after the network returned |
+| `s_quiclink_blackouts` 4.5 s | **lost** (`Down(Dead)` 5.07 s after the block began, as in `s_blackouts`: an unprompted link does not survive 4.5 s); the probe's fresh handshake with the same key was up **670 ms** after the network came back (the redial loop in the probe waits 200 ms between tries, and the path manager redials at once) |
+| `s_quiclink_blackouts` 8 s | lost at 5.07 s; fresh handshake **275 ms** after the network returned |
 
 The quic-echo blackout result stands: a link that is quiet when the network comes back is lost at the idle timeout whether the blackout lasted 4.5 s or 8 s. What changes is what the layer above sees: the link says so (`Down(Dead)`) 5 s after the last datagram, never later, and the redial takes about 0.3 to 0.7 s, so the worst case for a blackout of N seconds is about max(N, 5) + 0.7 s.
 

@@ -83,7 +83,7 @@ impl Io {
     fn violation(&self, what: &str) {
         tracing::warn!(what, "QUIC link: protocol violation by the peer");
         self.inbox
-            .close(DownReason::Io(format!("protocol violation: {what}")), false);
+            .close(DownReason::Io(format!("protocol violation: {what}")));
         self.conn.close(code::PROTOCOL, what.as_bytes());
     }
 
@@ -279,7 +279,7 @@ impl Link for QuicLink {
     }
 
     fn close(&self) {
-        self.io.inbox.close(DownReason::Closed, true);
+        self.io.inbox.close(DownReason::Closed);
         self.io.conn.close(code::CLOSED, b"closed");
     }
 }
@@ -429,7 +429,15 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
             rx_datagrams = seen;
             last_rx = now;
         }
-        let degraded = now.duration_since(last_rx) >= params.degraded_after;
+        let silence = now.duration_since(last_rx);
+        let degraded = silence >= params.degraded_after;
+        if silence >= params.dead_after {
+            // quinn's idle timer restarts whenever it sends a keep-alive, so on its own it can
+            // take up to a heartbeat longer than `dead_after`. The contract is `dead_after`
+            // since the last thing heard, and what was heard does not depend on the consumer.
+            io.inbox.close(DownReason::Dead);
+            conn.close(code::CLOSED, b"dead");
+        }
 
         // Path changes. The daemon sees every client address change (quinn follows the peer to
         // its new source address). A client sees only a change of its own local IP, and only
@@ -481,7 +489,7 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
 
     let _ = io.last_error.set(err.to_string());
     let reason = io.inbox.down_reason().unwrap_or_else(|| reason_of(&err));
-    // A peer that closed normally leaves what it sent readable; a dead link does too.
-    io.inbox.close(reason.clone(), false);
+    // What was received stays readable, whatever ended the link.
+    io.inbox.close(reason.clone());
     status.send_modify(|s| s.state = LinkState::Down(reason));
 }

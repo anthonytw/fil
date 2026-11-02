@@ -532,6 +532,70 @@ async fn the_peer_sees_a_close() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn payloads_received_before_the_close_are_still_returned() {
+    let mut w = World::new(32);
+    let (client, daemon, _) = w.pair().await;
+    for n in 0..3u32 {
+        client.send(CTRL, seq_payload(n, 8)).await.unwrap();
+    }
+    daemon
+        .send(TERM, Bytes::from_static(b"taken over"))
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(200)).await;
+    // The daemon has not read anything yet when the client goes away.
+    client.close();
+    let mut ds = daemon.status();
+    wait_for(&mut ds, "daemon Down", is_down).await;
+    for n in 0..3u32 {
+        let (ch, p) = daemon.recv().await.unwrap();
+        assert_eq!((ch, seq_of(&p)), (CTRL, n));
+    }
+    assert_eq!(daemon.recv().await, Err(LinkError(DownReason::Closed)));
+    // The same on the side that closed: what had arrived is readable.
+    assert_eq!(
+        client.recv().await.unwrap().1,
+        Bytes::from_static(b"taken over")
+    );
+    assert!(client.recv().await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_consumer_that_stopped_reading_does_not_hide_a_dead_link() {
+    let mut w = World::new(33);
+    let (client, daemon, _) = w.pair().await;
+    let client = Arc::new(client);
+    // Fill the forward channel until the sender is held back; the daemon never calls `recv`.
+    loop {
+        let r = timeout(
+            Duration::from_secs(1),
+            client.send(FWD, seq_payload(0, 16 * 1024)),
+        )
+        .await;
+        if r.is_err() {
+            break;
+        }
+    }
+    // A stalled consumer on a healthy path is not Degraded: packets keep arriving.
+    sleep(Duration::from_secs(10)).await;
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+    assert_eq!(client.status().borrow().state, LinkState::Up);
+    // ...and a path that dies is still found within dead_after.
+    let mut ds = daemon.status();
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert_eq!(down_reason(&st), DownReason::Dead);
+    assert!(
+        t0.elapsed() <= Duration::from_millis(5500),
+        "{:?}",
+        t0.elapsed()
+    );
+    // What had arrived before is still there for the consumer.
+    assert!(daemon.recv().await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
 async fn payload_size_limits_are_enforced_without_taking_the_link_down() {
     let mut w = World::new(9);
     let (client, daemon, _) = w.pair().await;

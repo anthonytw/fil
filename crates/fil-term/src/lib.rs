@@ -63,6 +63,10 @@ pub struct Capabilities {
     pub cursor_shape: bool,
     /// Mouse encodings beyond default/UTF-8/SGR (urxvt, SGR-pixels).
     pub mouse_encoding_extra: bool,
+    /// Character set designations (G0 to G3), the invoked set, and the ones DECSC saved.
+    pub charsets: bool,
+    /// Custom tab stops (HTS, TBC).
+    pub tab_stops: bool,
 }
 
 /// A headless terminal emulator. Object-safe, so sessions can hold `Box<dyn Emulator>`.
@@ -79,6 +83,13 @@ pub trait Emulator: Send {
     /// Drains replies the emulator generated for terminal queries since the last call.
     /// While detached, the daemon writes them back to the PTY (DESIGN.md §6.3).
     fn take_replies(&mut self) -> Vec<u8>;
+
+    /// Applies output the emulator is holding back, so that [`Emulator::state`] reflects every
+    /// byte fed. alacritty holds a program's synchronized-update batch (`CSI ? 2026 h`) until
+    /// the program ends it, so `state` is stale in between; a snapshot taken then would miss
+    /// the batch. The daemon calls this before rendering a snapshot. The prediction shadow
+    /// screen does not: it relies on the stale view to know when not to paint.
+    fn apply_pending(&mut self) {}
 
     /// The current state, with at most `history_lines` of scrollback. Pass 0 for the
     /// screen alone, which is what the prediction shadow screen reads.

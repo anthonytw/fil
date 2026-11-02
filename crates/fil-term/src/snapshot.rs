@@ -6,26 +6,32 @@
 //!
 //! The order is chosen so that nothing depends on state a later step sets:
 //!
-//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen;
+//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen, and put
+//!    all four character sets back to ASCII with G0 invoked (the receiver may be mid-way
+//!    through line drawing);
 //! 2. history and the primary screen, written as ordinary text with line feeds, so that
 //!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
 //!    are written without a newline and left to autowrap, which restores the wrap flag;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
 //!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
-//! 4. the scroll region, origin mode, the cursor (with the pending-wrap flag), the pen;
-//! 5. input modes, mouse, kitty keyboard flags, title, cursor shape and visibility.
+//! 4. the scroll region, tab stops, the saved cursor with the character sets it saved, origin
+//!    mode, the cursor (with the pending-wrap flag), the pen;
+//! 5. the live character sets, input modes, mouse, kitty keyboard flags, title, cursor shape
+//!    and visibility.
+//!
+//! The writer assumes the receiver's tab stops are the defaults (every 8th column), as a
+//! fresh terminal's are, and only writes them when the state's differ.
 //!
 //! Everything that came from the remote program (cell text, titles, link targets) is
 //! stripped of control characters before it is written, so a snapshot cannot be used to
 //! smuggle escape sequences to the client's terminal.
 //!
-//! Known gaps, all rare: charset designations and tab stops are not part of [`TermState`]
-//! (the fidelity harness's continuation probe shows the effect); the pending-wrap flag of the
-//! primary cursor behind the alternate screen is not restored.
+//! Known gap, rare: the pending-wrap flag of the primary cursor behind the alternate screen
+//! is not restored.
 
 use crate::model::{
-    Attrs, Cell, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking, TermState,
-    Underline,
+    Attrs, Cell, Charset, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking,
+    TermState, Underline,
 };
 
 /// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
@@ -61,6 +67,8 @@ impl<'a> Writer<'a> {
         // 1. Known starting point. Not a full reset: that would drop the receiver's own
         // scrollback, which is the point of fil.
         self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r\x1b[H\x1b[J");
+        self.designate([Charset::Ascii; 4]);
+        self.put("\x0f");
         // 2. History and the primary screen.
         let (primary_rows, primary_cursor): (&[Line], Cursor) = match &st.primary_behind_alt {
             Some(p) => (&p.screen, p.cursor),
@@ -87,11 +95,22 @@ impl<'a> Writer<'a> {
             }
             None => self.put("\x1b[r"),
         }
-        // DECSC with origin mode still off, so the saved position is absolute.
+        // Tab stops. The cursor moves, but it is placed for good further down.
+        if let Some(stops) = &st.tab_stops {
+            self.put("\x1b[3g");
+            for &c in stops {
+                self.put(&format!("\x1b[{}G\x1bH", u32::from(c) + 1));
+            }
+        }
+        // DECSC with origin mode still off, so the saved position is absolute. It saves the
+        // character sets too, so designate the saved ones first and the ASCII ones after (the
+        // pending-wrap rewrite below prints a cell and must not go through line drawing).
         if let Some(sv) = st.saved_cursor {
             self.cup(sv.row, sv.col);
             self.set_pen(sv.pen);
+            self.designate(sv.charsets);
             self.put("\x1b7");
+            self.designate([Charset::Ascii; 4]);
             self.set_pen(Attrs::default());
         }
         self.put(if st.modes.origin {
@@ -100,7 +119,14 @@ impl<'a> Writer<'a> {
             "\x1b[?6l"
         });
         self.place_cursor();
-        // 5. Modes.
+        // 5. Character sets (after the cursor is placed, for the reason above), then modes.
+        self.designate(st.charsets.g);
+        self.put(match st.charsets.active {
+            0 => "\x0f",
+            1 => "\x0e",
+            2 => "\x1bn",
+            _ => "\x1bo",
+        });
         let m = &st.modes;
         self.put(if m.insert { "\x1b[4h" } else { "\x1b[4l" });
         self.put(if m.autowrap { "\x1b[?7h" } else { "\x1b[?7l" });
@@ -287,6 +313,17 @@ impl<'a> Writer<'a> {
             ));
         }
         self.set_pen(c.pen);
+    }
+
+    /// Designates G0 to G3 (`ESC ( x`, `ESC ) x`, `ESC * x`, `ESC + x`).
+    fn designate(&mut self, sets: [Charset; 4]) {
+        for (slot, set) in b"()*+".iter().zip(sets) {
+            let fin = match set {
+                Charset::Ascii => 'B',
+                Charset::LineDrawing => '0',
+            };
+            self.put(&format!("\x1b{}{fin}", *slot as char));
+        }
     }
 
     fn set_link(&mut self, link: Option<u32>) {

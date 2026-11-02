@@ -55,6 +55,8 @@ pub const FIELDS: &[&str] = &[
     "mode.kitty_keyboard",
     "mode.scroll_region",
     "mode.title",
+    "mode.charsets",
+    "mode.tab_stops",
 ];
 
 /// Compares `a` with `b`, scoring fields outside `caps` as unsupported.
@@ -332,6 +334,16 @@ pub fn compare(a: &TermState, b: &TermState, caps: &Capabilities) -> Vec<FieldRe
         caps.title,
         eq(&ma.title, &mb.title, ma.title == mb.title),
     );
+    add(
+        "mode.charsets",
+        caps.charsets,
+        eq(&a.charsets, &b.charsets, a.charsets == b.charsets),
+    );
+    add(
+        "mode.tab_stops",
+        caps.tab_stops,
+        eq(&a.tab_stops, &b.tab_stops, a.tab_stops == b.tab_stops),
+    );
     out
 }
 
@@ -356,6 +368,8 @@ pub fn intersect(a: &Capabilities, b: &Capabilities) -> Capabilities {
         history_in_alt: a.history_in_alt && b.history_in_alt,
         cursor_shape: a.cursor_shape && b.cursor_shape,
         mouse_encoding_extra: a.mouse_encoding_extra && b.mouse_encoding_extra,
+        charsets: a.charsets && b.charsets,
+        tab_stops: a.tab_stops && b.tab_stops,
     }
 }
 
@@ -434,6 +448,8 @@ mod tests {
             history_in_alt: true,
             cursor_shape: true,
             mouse_encoding_extra: true,
+            charsets: true,
+            tab_stops: true,
         }
     }
 

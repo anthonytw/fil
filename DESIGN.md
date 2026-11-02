@@ -308,14 +308,26 @@ A transport provides one reliable, ordered, encrypted connection that carries ma
 
 It also reports liveness, round-trip time and path changes. Resume logic, sequence numbers and channel semantics all live above the transport, so they behave the same on every transport.
 
+The trait is `fil_transport::Link`: one live connection, which carries fil-proto payloads on numbered channels (§8.5).
+
 ```rust
-trait Transport {
-    async fn open(&self, kind: ChannelKind) -> Result<Channel>;
-    async fn accept(&self) -> Result<(ChannelKind, Channel)>;
-    fn events(&self) -> Events; // Up, PathChanged, Degraded, Down
-    fn rtt(&self) -> Duration;
+trait Link {
+    fn kind(&self) -> LinkKind;                                    // Pipe | Direct
+    async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<(), LinkError>;
+    async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError>;
+    fn status(&self) -> watch::Receiver<LinkStatus>;               // Up | Degraded | Down(reason), RTT, path changes
+    fn close(&self);
 }
 ```
+
+What every link must do:
+
+- **Order and backpressure per channel.** A full forward channel never delays control or terminal.
+- **Liveness.** A link detects a dead path itself and goes `Down` within `dead_after` (default 5 s). It reports `Degraded` after `degraded_after` (default 2 s) of silence, which drives the status line (§4.2). The pipe needs fil's own heartbeats: ssh never notices a silent black hole by itself (`docs/m1/realnet.md`).
+- **`Up` means the peer has proven itself.** On the pipe, that is after the preamble and the first frame; on QUIC, after the daemon's first frame (§8.3).
+- **A link does not survive a disconnect.** The layer above opens a new one and resumes (§8.5). `fil_transport::link::mem` is an in-memory pair for testing those layers.
+
+The trait is not object-safe. A client that switches between the pipe and QUIC holds an enum of the two.
 
 ### 8.2 Pipe (ssh by default)
 
@@ -409,7 +421,16 @@ Frames still queued on the old transport are discarded. The send buffers rebuild
 
 An accepted resume keeps the epoch and drops the subscriber's previous transport. **On the direct transport the daemon must also require the connection's authenticated key (`fil_transport::auth::peer_key`) to equal the key in the attach request**, so the attach cannot claim a key the connection did not authenticate with. The epoch is a fence, not a secret.
 
-**Not specified yet:** the QUIC stream mapping, channel open and close messages for forwards (M2), and the offline-input buffer (§4.3), which belongs to the client.
+**Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any frame received counts as proof of life.
+
+**QUIC stream mapping.**
+- **Streams:** each channel uses one unidirectional stream per direction. The sender opens the stream when it first sends on that channel.
+- **Stream layout:** a stream starts with the channel id (a postcard varint `u32`). It then carries payloads, each with a `u32` big-endian length prefix and the same limits as a pipe frame body.
+- **Priority:** quinn stream priority puts control above interactive channels, and interactive channels above forwards.
+- **Liveness:** quinn's keep-alive is the heartbeat, and its idle timeout is `dead_after`. RTT comes from quinn.
+- **No preamble.**
+
+**Not specified yet:** channel open and close messages for forwards (M2), and the offline-input buffer (§4.3), which belongs to the client.
 
 ## 9. Prediction (optional, pluggable)
 

@@ -353,7 +353,9 @@ dependencies = [
 name = "fil-transport"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fil-netsim",
+ "fil-proto",
  "quinn",
  "rcgen",
  "ring",

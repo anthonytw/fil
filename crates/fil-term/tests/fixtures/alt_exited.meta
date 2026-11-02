@@ -1,0 +1,4 @@
+cols = 40
+rows = 8
+kind = synthetic
+description = as alt_active, then 1049l: the primary screen and cursor must come back

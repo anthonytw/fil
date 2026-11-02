@@ -1,0 +1,4 @@
+cols = 10
+rows = 4
+kind = synthetic
+description = stream ends with the cursor in the pending-wrap state on row 2, pen green

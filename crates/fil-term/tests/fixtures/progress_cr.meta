@@ -1,0 +1,4 @@
+cols = 60
+rows = 6
+kind = synthetic
+description = progress bar redrawn with carriage returns, then a backspace spinner

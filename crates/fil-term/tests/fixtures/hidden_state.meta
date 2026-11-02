@@ -1,0 +1,4 @@
+cols = 50
+rows = 8
+kind = synthetic
+description = DECSC saved cursor, G0 left in DEC graphics, custom tab stops (HTS/TBC): not in TermState

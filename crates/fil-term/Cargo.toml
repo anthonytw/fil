@@ -8,8 +8,18 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# One feature per emulator backend (DESIGN.md §6.5). Backends land with Spike A.
+# One feature per emulator backend (DESIGN.md §6.5).
 default = []
+alacritty = ["dep:alacritty_terminal", "dep:vte"]
+vt100 = ["dep:vt100", "dep:vte"]
 
 [lints]
 workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "0.26", default-features = false, optional = true }
+vt100 = { version = "0.18", optional = true }
+vte = { version = "0.15", optional = true }
+
+[dev-dependencies]
+portable-pty = "0.9"

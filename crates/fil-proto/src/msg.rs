@@ -279,10 +279,13 @@ impl Hello {
     }
 }
 
-/// "Resume session S at epoch E from byte N" (DESIGN.md section 4.2). `seq` is the client's next
-/// expected terminal sequence number, i.e. the count of terminal bytes it has written.
+/// "Resume session S (incarnation I) at epoch E from byte N" (DESIGN.md section 4.2). `seq` is
+/// the client's next expected terminal sequence number, i.e. the count of terminal bytes it has
+/// written. `incarnation` is echoed from the [`AttachReply`] it was given; it tells a session
+/// apart from a later one of the same name (the epoch counter restarts with every new session).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeRequest {
+    pub incarnation: u128,
     pub epoch: u64,
     pub seq: u64,
 }
@@ -333,6 +336,8 @@ pub enum StartPoint {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachReply {
+    /// Random per session creation (chosen by the daemon). The client echoes it when resuming.
+    pub incarnation: u128,
     pub epoch: u64,
     pub start: StartPoint,
     /// Direct-mode details; `None` when direct mode is off.
@@ -361,6 +366,11 @@ pub enum AttachRefusal {
     SessionGone,
     /// The resume request makes no sense (an epoch from the future).
     BadResume,
+    /// The session was killed and recreated (or the daemon restarted) since the client attached.
+    /// This is a different session of the same name: attach afresh.
+    SessionReplaced,
+    /// The resume did not present the key of the subscriber it claims to be. Nothing changed.
+    WrongKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,12 +542,14 @@ mod tests {
         let msgs = vec![
             ControlMsg::Hello(Hello::ours("fil test".parse().unwrap())),
             ControlMsg::AttachReply(AttachReply {
+                incarnation: u128::MAX - 5,
                 epoch: 2,
                 start: StartPoint::Snapshot(snap),
                 udp_port: Some(60001),
                 fingerprint: Some(Fingerprint::new(vec![1; 32]).unwrap()),
             }),
             ControlMsg::AttachReply(AttachReply {
+                incarnation: 1,
                 epoch: 2,
                 start: StartPoint::Resume { from: 7 },
                 udp_port: None,
@@ -545,6 +557,8 @@ mod tests {
             }),
             ControlMsg::AttachRefused(AttachRefusal::TakenOver(t.clone())),
             ControlMsg::AttachRefused(AttachRefusal::Detached),
+            ControlMsg::AttachRefused(AttachRefusal::SessionReplaced),
+            ControlMsg::AttachRefused(AttachRefusal::WrongKey),
             ControlMsg::TakenOver(t),
             ControlMsg::Detach,
             ControlMsg::Resize(TermSize::new(200, 50).unwrap()),

@@ -18,6 +18,7 @@ pub mod frame;
 pub mod limits;
 pub mod log;
 pub mod msg;
+pub mod preamble;
 pub mod ring;
 pub mod sched;
 

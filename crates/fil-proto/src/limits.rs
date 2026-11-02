@@ -45,3 +45,10 @@ pub const ACK_DELAY: Duration = Duration::from_millis(100);
 /// Heartbeat interval and the silence after which a link counts as dead (DESIGN.md section 4.2).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEAD_AFTER: Duration = Duration::from_secs(5);
+
+/// The pipe preamble must start within this many bytes of the stream (see [`crate::preamble`]).
+pub const MAX_PREAMBLE_SKIP: usize = 64 * 1024;
+
+/// After this many interactive frames while forward data waits, one forward frame goes out
+/// (see [`crate::sched::Scheduler`]).
+pub const DEFAULT_FORWARD_SHARE: u32 = 8;

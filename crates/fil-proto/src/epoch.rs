@@ -6,7 +6,8 @@
 //! Rules:
 //! - A fresh attach (no resume state) bumps the epoch and becomes the subscriber. Any previous
 //!   subscriber is told it was taken over, its key is revoked and its transport dropped.
-//! - A resume with the current epoch is accepted and keeps the epoch.
+//! - A resume must match the session's incarnation (else the session was replaced) and present
+//!   the current subscriber's key; with the current epoch it is accepted and keeps the epoch.
 //! - A resume with a stale epoch is refused with the takeover details. It never steals the
 //!   session; to take it back the client attaches afresh.
 //! - Detach bumps the epoch and revokes, so a late resume from the detached client is refused.
@@ -84,16 +85,28 @@ pub struct AttachInput {
     pub now_unix_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionEpoch {
+    incarnation: u128,
     epoch: u64,
     current: Option<Subscriber>,
     next_id: u64,
 }
 
 impl SessionEpoch {
-    pub fn new() -> Self {
-        Self::default()
+    /// A new session. `incarnation` must be random per session creation (the daemon supplies it;
+    /// this crate has no randomness). It goes into the attach reply and clients echo it on resume.
+    pub fn new(incarnation: u128) -> Self {
+        Self {
+            incarnation,
+            epoch: 0,
+            current: None,
+            next_id: 0,
+        }
+    }
+
+    pub fn incarnation(&self) -> u128 {
+        self.incarnation
     }
 
     pub fn epoch(&self) -> u64 {
@@ -148,6 +161,11 @@ impl SessionEpoch {
 
     fn attach_resume(&mut self, req: AttachInput, r: ResumeRequest) -> AttachOutcome {
         let refuse = |a| AttachOutcome::Refused(a);
+        // Epochs restart at 1 for every new session, so they only mean something within one
+        // incarnation. Without this check a client from a dead session could match a new one.
+        if r.incarnation != self.incarnation {
+            return refuse(AttachRefusal::SessionReplaced);
+        }
         if r.epoch > self.epoch {
             return refuse(AttachRefusal::BadResume);
         }
@@ -161,13 +179,17 @@ impl SessionEpoch {
                 epoch: self.epoch,
             }));
         }
-        // The same client, on a new connection. Its old transport (if half-dead) must go.
-        let mut effects = vec![Effect::DropTransport { subscriber: cur.id }];
+        // A legitimate resume is the same client process, which keeps its per-attach key in
+        // memory across reconnects. Any other key is not the subscriber: refuse, change nothing.
         if cur.key != req.key {
-            effects.push(Effect::RevokeKey(std::mem::replace(&mut cur.key, req.key)));
+            return refuse(AttachRefusal::WrongKey);
         }
+        // The same client, on a new connection. Its old transport (if half-dead) must go.
         cur.host = req.host;
-        effects.push(Effect::ResizePty(req.size));
+        let effects = vec![
+            Effect::DropTransport { subscriber: cur.id },
+            Effect::ResizePty(req.size),
+        ];
         AttachOutcome::Accepted {
             epoch: self.epoch,
             subscriber: cur.id,
@@ -207,6 +229,8 @@ impl SessionEpoch {
 mod tests {
     use super::*;
 
+    const INC: u128 = 0xABCD_0000_0000_0000_0000_0000_0000_1234;
+
     fn key(b: u8) -> PublicKey {
         PublicKey::new(vec![b; 32]).unwrap()
     }
@@ -231,12 +255,16 @@ mod tests {
         }
     }
     fn resume(epoch: u64) -> Option<ResumeRequest> {
-        Some(ResumeRequest { epoch, seq: 100 })
+        Some(ResumeRequest {
+            incarnation: INC,
+            epoch,
+            seq: 100,
+        })
     }
 
     #[test]
     fn first_attach_starts_epoch_one() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         assert_eq!(s.epoch(), 0);
         assert!(!s.is_current(0));
         let (e, id, mode, fx) = accepted(s.attach(input(1, "laptop", None, 10)));
@@ -249,7 +277,7 @@ mod tests {
 
     #[test]
     fn takeover_revokes_notifies_and_bumps() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         let (_, old, _, _) = accepted(s.attach(input(1, "laptop", None, 10)));
         let (e, new, mode, fx) = accepted(s.attach(input(2, "desktop", None, 99)));
         assert_eq!((e, mode), (2, AttachMode::Fresh));
@@ -277,7 +305,7 @@ mod tests {
 
     #[test]
     fn resume_with_current_epoch_is_accepted_and_keeps_the_epoch() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         let (_, id, _, _) = accepted(s.attach(input(1, "laptop", None, 10)));
         let r = resume(1);
         let (e, id2, mode, fx) = accepted(s.attach(input(1, "laptop", r, 20)));
@@ -292,18 +320,53 @@ mod tests {
     }
 
     #[test]
-    fn resume_with_a_new_key_swaps_and_revokes_the_old_one() {
-        let mut s = SessionEpoch::new();
-        accepted(s.attach(input(1, "laptop", None, 10)));
-        let (_, _, _, fx) = accepted(s.attach(input(5, "laptop", resume(1), 20)));
-        assert!(fx.contains(&Effect::RevokeKey(key(1))));
-        assert!(s.key_authorized(&key(5)));
-        assert!(!s.key_authorized(&key(1)));
+    fn resume_with_the_wrong_key_is_refused_and_touches_nothing() {
+        let mut s = SessionEpoch::new(INC);
+        let (_, id, _, _) = accepted(s.attach(input(1, "laptop", None, 10)));
+        // Right incarnation, right epoch, someone else's key: refused, no effects, and the
+        // subscriber is exactly as before.
+        let out = s.attach(input(5, "other", resume(1), 20));
+        assert_eq!(out, AttachOutcome::Refused(AttachRefusal::WrongKey));
+        assert_eq!(s.epoch(), 1);
+        let sub = s.subscriber().unwrap();
+        assert_eq!(
+            (sub.id, sub.key.clone(), sub.host.as_str()),
+            (id, key(1), "laptop")
+        );
+        assert!(s.key_authorized(&key(1)) && !s.key_authorized(&key(5)));
+    }
+
+    /// A session killed and recreated under the same name restarts at epoch 1. A client that
+    /// returns from the old incarnation with `{epoch: 1}` must not be taken for the new subscriber.
+    #[test]
+    fn resume_from_a_replaced_session_is_refused_even_with_a_matching_epoch() {
+        let mut first = SessionEpoch::new(INC);
+        accepted(first.attach(input(1, "laptop", None, 10)));
+        let late = resume(1); // what the laptop presents after waking up
+
+        let mut second = SessionEpoch::new(INC + 1);
+        accepted(second.attach(input(2, "desktop", None, 50)));
+        assert_eq!(
+            second.epoch(),
+            first.epoch(),
+            "same epoch number in both incarnations"
+        );
+        // Even with the right key it is a different session.
+        let out = second.attach(input(1, "laptop", late, 60));
+        assert_eq!(out, AttachOutcome::Refused(AttachRefusal::SessionReplaced));
+        assert!(second.key_authorized(&key(2)) && !second.key_authorized(&key(1)));
+        assert_eq!(second.subscriber().unwrap().host.as_str(), "desktop");
+        // A new session nobody has attached to yet refuses it the same way.
+        let mut empty = SessionEpoch::new(INC + 2);
+        assert_eq!(
+            empty.attach(input(1, "laptop", late, 70)),
+            AttachOutcome::Refused(AttachRefusal::SessionReplaced)
+        );
     }
 
     #[test]
     fn stale_resume_is_refused_with_takeover_details_and_changes_nothing() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         accepted(s.attach(input(1, "laptop", None, 10)));
         accepted(s.attach(input(2, "desktop", None, 99)));
         let out = s.attach(input(1, "laptop", resume(1), 500));
@@ -325,7 +388,7 @@ mod tests {
 
     #[test]
     fn detach_revokes_and_fences() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         let (_, id, _, _) = accepted(s.attach(input(1, "laptop", None, 10)));
         // A stale detach does nothing.
         assert_eq!(s.detach(7), DetachOutcome::Ignored);
@@ -361,14 +424,14 @@ mod tests {
 
     #[test]
     fn resume_from_the_future_is_bad() {
-        let mut s = SessionEpoch::new();
+        let mut s = SessionEpoch::new(INC);
         accepted(s.attach(input(1, "laptop", None, 10)));
         assert_eq!(
             s.attach(input(1, "laptop", resume(9), 20)),
             AttachOutcome::Refused(AttachRefusal::BadResume)
         );
         // And resuming against a session nobody ever attached to (e.g. a restarted daemon).
-        let mut fresh = SessionEpoch::new();
+        let mut fresh = SessionEpoch::new(INC);
         assert_eq!(
             fresh.attach(input(1, "laptop", resume(0), 20)),
             AttachOutcome::Refused(AttachRefusal::Detached)

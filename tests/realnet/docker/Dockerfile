@@ -28,7 +28,7 @@ COPY sshd_config /etc/ssh/sshd_config
 COPY banner /etc/fil-realnet/banner
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # In /usr/bin so they are on the default PATH of every ssh command, whatever sshd sets.
-COPY bin/pipe-echo bin/quic-echo /usr/bin/
+COPY bin/pipe-echo bin/pipe-probe bin/quic-echo /usr/bin/
 RUN chmod 755 /usr/local/bin/entrypoint.sh
 
 CMD ["/usr/local/bin/entrypoint.sh"]

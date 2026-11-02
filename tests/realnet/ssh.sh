@@ -29,7 +29,7 @@ ssh_setup() {
   rm -rf "$ctx"
   mkdir -p "$ctx/bin"
   cp "$REALNET_DIR"/docker/* "$ctx/"
-  cp "$BIN_DIR/pipe-echo" "$BIN_DIR/quic-echo" "$ctx/bin/"
+  cp "$BIN_DIR/pipe-echo" "$BIN_DIR/pipe-probe" "$BIN_DIR/quic-echo" "$ctx/bin/"
   docker build -q -t "$IMAGE" "$ctx" > /dev/null
 
   make_keys
@@ -209,6 +209,67 @@ wait_gone() {
 }
 
 accepted_count() { docker exec "rn-$1" grep -c "Accepted publickey for ${2:-fil}" /var/log/sshd.log || true; }
+
+# ---------------------------------------------------------------------------------------------
+# The same questions through fil's own PipeLink (pipe-probe at both ends) instead of the stand-in
+# framing code: the link, not the driver, finds the break.
+
+# run_probe NAME PROBE_OPTS... -- SSH_ARGS...: run the pipe-probe client in the client container
+# and wait for it. Output in $LASTOUT (stdout) and ${LASTOUT%.out}.err. Returns its status.
+run_probe() {
+  LASTOUT=$OUT/run/$SCENARIO-$1.out
+  shift
+  local rc=0
+  cx pipe-probe client "$@" > "$LASTOUT" 2> "${LASTOUT%.out}.err" || rc=$?
+  cat "$LASTOUT" >&2
+  return $rc
+}
+
+# start_probe NAME "PROBE_OPTS" SSH_ARGS...: a long-running probe in the background. Sets
+# STREAM_PID, STREAM_OUT and CHILD_PID (the ssh pid in the container), like start_stream.
+start_probe() {
+  STREAM_OUT=$OUT/run/$SCENARIO-$1.out
+  local popts=$2
+  shift 2
+  # shellcheck disable=SC2086
+  cx pipe-probe client --duration 120 --interval-ms 50 --size 4096 $popts \
+    -- ssh "$@" > "$STREAM_OUT" 2> "${STREAM_OUT%.out}.err" &
+  STREAM_PID=$!
+  wait_for_line "$STREAM_OUT" STREAMING 20 || fail "the probe never connected: $(cat "$STREAM_OUT" "${STREAM_OUT%.out}.err")"
+  CHILD_PID=$(kv "$(last_line "$STREAM_OUT" CHILD-PID)" pid)
+  sleep 1.5
+}
+
+# netdown_probe NAME "PROBE_OPTS" SSH_ARGS... -- OBSERVE_S: netdown, for the probe. Sets HUNG,
+# DETECT_MS and FAIL_REASON.
+netdown_probe() {
+  local name=$1 popts=$2 observe ssh_args=()
+  shift 2
+  while [[ $1 != -- ]]; do
+    ssh_args+=("$1")
+    shift
+  done
+  observe=$2
+  start_probe "$name" "$popts" "${ssh_args[@]}"
+  docker network disconnect rn-2 rn-jump2
+  local t0
+  t0=$(now_ms)
+  wait_exit "$STREAM_PID" "$observe"
+  if [[ $WAIT_RC -eq 124 ]]; then
+    HUNG=1
+    DETECT_MS=-1
+    FAIL_REASON=none
+    docker exec rn-client pkill -f 'pipe-probe client' || true
+    wait "$STREAM_PID" || true
+  else
+    HUNG=0
+    read_fail "$STREAM_OUT"
+    DETECT_MS=$((FAIL_AT - t0))
+  fi
+  docker network connect --alias jump2 rn-2 rn-jump2
+  docker exec rn-target pkill -9 -f 'sshd: fil@[n]otty' || true
+  sleep 1
+}
 
 # ---------------------------------------------------------------------------------------------
 # Scenarios
@@ -446,10 +507,87 @@ s_netdown_no_detection() {
   fi
 }
 
+s_pipelink_echo() {
+  # PipeLink at both ends, through a clean login, a noisy one, and the two jump hosts.
+  local rc=0 line
+  run_probe clean --duration 4 -- ssh -T viajumps pipe-probe || rc=$?
+  assert "clean login: the probe exited 0 (rc=$rc)" test "$rc" -eq 0
+  line=$(last_line "$LASTOUT" RESULT)
+  assert "clean login: ok=true" test "$(kv "$line" ok)" = true
+  assert "clean login: nothing skipped" test "$(kv "$(last_line "$LASTOUT" BANNER)" len)" = 0
+  assert "ssh was given its keepalive options" \
+    grep -q 'ServerAliveInterval=2,-o,ServerAliveCountMax=3' "$LASTOUT"
+  note "rtt_ms=$(kv "$line" rtt_ms)"
+  rc=0
+  run_probe noisy --duration 4 -- ssh -T direct-noisy pipe-probe || rc=$?
+  assert "noisy login: the probe exited 0 (rc=$rc)" test "$rc" -eq 0
+  line=$(last_line "$LASTOUT" BANNER)
+  assert "noisy login: the banner was kept" grep -q 'NOISY-BASHRC' <<< "$line"
+  assert "noisy login: control characters were stripped" \
+    bash -c '! grep -a -q "$(printf "\033")" "$1"' _ "$LASTOUT"
+  note "noisy_banner_len=$(kv "$line" len)"
+}
+
+s_pipelink_flood() {
+  # 100000 bytes of shell noise: the preamble bound holds and the error says why.
+  local rc=0 line
+  run_probe flood --duration 4 -- ssh -T direct-flood pipe-probe || rc=$?
+  assert "the probe gave up with a connect error (rc=$rc)" test "$rc" -eq 3
+  line=$(last_line "$LASTOUT" PREAMBLE-ERROR)
+  assert "the bound is the 64 KiB limit" test "$(kv "$line" limit)" -eq 65536
+  assert_num "memory stayed bounded (skipped bytes held)" "$(kv "$line" skipped_len)" -le 262144
+  assert_num "it failed fast (ms)" "$(kv "$line" after_ms)" -lt 5000
+  assert "the remote program was cleaned up (no orphan)" wait_gone rn-jump1 pipe-probe 5
+  assert "and so was the local ssh" wait_gone rn-client ssh 5
+  note "gave_up_after_ms=$(kv "$line" after_ms)"
+}
+
+s_pipelink_kill_ssh() {
+  start_probe kill "" -T viajumps pipe-probe
+  local ts
+  ts=$(docker exec -u tester rn-client sh -c "date +%s%3N; kill -9 $CHILD_PID" | head -n 1)
+  wait_exit "$STREAM_PID" 20
+  assert "the probe exited with its link-failure status (rc=$WAIT_RC)" test "$WAIT_RC" -eq 4
+  read_fail "$STREAM_OUT"
+  local ms=$((FAIL_AT - ts))
+  assert "the link went down as an I/O failure (got $FAIL_REASON)" test "$FAIL_REASON" = io
+  assert "and the reason names the signal" grep -q 'detail=.*signal' "$STREAM_OUT"
+  assert_num "detected within 3 s (ms)" "$ms" -lt 3000
+  assert "the remote pipe-probe exited too (no orphan)" wait_gone rn-target pipe-probe 10
+  note "detect_ms=$ms"
+}
+
+s_pipelink_netdown_heartbeat() {
+  # The black hole, found by fil alone: ssh keepalive is off for this run, so only PipeLink's
+  # own heartbeat can notice. Compare s_netdown_no_detection, where nothing does.
+  netdown_probe hb "--no-ssh-keepalive --dead-after 5" -T viajumps pipe-probe -- 25
+  assert "detected, not hung" test "$HUNG" -eq 0
+  assert "by fil's liveness clock (got $FAIL_REASON)" test "$FAIL_REASON" = dead
+  assert "after it reported Degraded" grep -q 'STATE state=Degraded' "$STREAM_OUT"
+  assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
+  assert_num "and not much later (ms)" "$DETECT_MS" -le 9000
+  assert "the dead link's ssh was killed, not left behind" wait_gone rn-client ssh 5
+  note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=off"
+}
+
+s_pipelink_netdown_keepalive() {
+  # The default command, with the ServerAlive options fil adds (2 s x 4 = 8 s): fil's 5 s wins,
+  # kills ssh at once, and the backstop never has to fire.
+  netdown_probe ka "--dead-after 5" -T viajumps pipe-probe -- 25
+  assert "detected, not hung" test "$HUNG" -eq 0
+  assert "by fil's liveness clock, before ssh's (got $FAIL_REASON)" test "$FAIL_REASON" = dead
+  assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
+  assert_num "and well before ssh's own 8 s (ms)" "$DETECT_MS" -le 7500
+  assert "the dead link's ssh was killed, not left behind" wait_gone rn-client ssh 5
+  note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2sx4"
+}
+
 ALL_SCENARIOS=(
   s_topology s_direct s_jumps s_controlmaster s_certs s_noisy s_flood s_hostile_names
   s_kill_ssh_client s_kill_sshd_child
   s_netdown_app_heartbeat s_netdown_ssh_keepalive s_netdown_no_detection
+  s_pipelink_echo s_pipelink_flood s_pipelink_kill_ssh s_pipelink_netdown_heartbeat
+  s_pipelink_netdown_keepalive
 )
 
 part_main ssh ssh_setup ssh_teardown "${ALL_SCENARIOS[@]}" -- "$@"

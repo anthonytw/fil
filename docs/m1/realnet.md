@@ -15,6 +15,8 @@ It is a manual check, like the rest of `linux-check`. It is never part of `just 
 |---|---|---|
 | `pipe-echo` (no arguments) | `fil server --stdio`: writes the preamble, then echoes every frame it decodes | `preamble::encode`, `FrameDecoder` |
 | `pipe-echo client [options] -- COMMAND...` | the client end of the pipe: runs `ssh ...`, finds the preamble, checks every echoed byte | `PreambleScanner`, `FrameDecoder`, `DataSegment` |
+| `pipe-probe` (no arguments) | `fil server --stdio` once the daemon exists: writes the preamble, then runs a real `PipeLink` on stdio and echoes every payload | `PipeLink::accept_halves` |
+| `pipe-probe client [options] -- COMMAND...` | the client end through the real `PipeLink::spawn`: sends numbered terminal data, verifies the echo, prints every state change and how the link ended | `PipeLink`, `PipeCommand` |
 | `quic-echo server` | the daemon's endpoint: binds a port in a range, echoes streams, logs every handshake and every path change | `DaemonIdentity`, `KeyRegistry`, `auth::server_config`, `peer_key` |
 | `quic-echo client` | the client: pins the fingerprint, presents a per-attach key, measures stalls, reconnects with a fresh handshake | `ClientKey`, `auth::client_config` |
 | `quic-echo udp-send`, `udp-recv` | nothing: a numbered-datagram probe that measures whether a path reorders | |

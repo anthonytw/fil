@@ -337,6 +337,8 @@ The trait is not object-safe. A client that switches between the pipe and QUIC h
 - **Multiplexing:** all channels share one byte stream with fil's own framing.
   - The scheduler sends terminal and control frames ahead of forward data.
   - Forward frames are capped at 16 KiB, so a large transfer through a forward can't delay keystrokes.
+- **Keepalive backstop:** when the program is `ssh`, fil adds `-o ServerAliveInterval=N -o ServerAliveCountMax=3`, unless the command line already sets them. `N` is `dead_after / 4` rounded up to whole seconds (2 s by default), so ssh itself gives up after `N x 4`, never before `dead_after` (8 s by default). fil's heartbeat (§8.5) is the fast detector and kills the ssh process the moment it declares the link dead; the backstop is for a fil process that is gone while a black-holed ssh would linger for the TCP retry limit. A command that is not `ssh` runs untouched.
+- **Process handling:** ssh's stderr stays attached to the user's terminal, so Touch ID and password prompts and errors remain visible. When the command exits, the link reports `Down(Io)` with its exit status. Closing the link closes the command's stdin, gives it a second to exit, then kills and reaps it. The host name is validated (no leading `-`, no whitespace or control characters) before it reaches the command line.
 - **Reconnect:** re-run the command.
 
 ### 8.3 Direct: QUIC over UDP
@@ -428,7 +430,7 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 Before v1 these changes are made in place, with no compatibility kept.
 
-**Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any frame received counts as proof of life.
+**Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any bytes received count as proof of life (so a large frame crawling over a slow pipe is not silence), except that time the link spends not reading because the layer above stopped calling `recv` is not counted against the peer. Each side sends a heartbeat as soon as the preamble is past (the daemon side: as soon as it accepts the stream), and the link is `Up` once the peer's first frame has arrived. The pipe has no goodbye frame: after `close()` the peer sees the stream end and reports `Down(Io)`, not `Down(Closed)`.
 
 **QUIC stream mapping.**
 - **Streams:** each channel uses one unidirectional stream per direction. The sender opens the stream when it first sends on that channel.

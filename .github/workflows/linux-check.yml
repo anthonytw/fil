@@ -1,0 +1,51 @@
+# Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH`), then `gh run watch`.
+name: linux-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to check
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+      - uses: Swatinem/rust-cache@v2
+      - name: just ci
+        run: just ci
+      - name: Emulator fidelity harness
+        run: just fidelity --no-perf
+      - name: Link simulator soak
+        run: just netsim-soak
+
+  musl:
+    # Static builds are a release target (DESIGN.md §13). Informational for now.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build for x86_64-unknown-linux-musl
+        run: cargo build --workspace --all-targets --target x86_64-unknown-linux-musl

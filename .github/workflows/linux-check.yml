@@ -1,5 +1,6 @@
 # Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
-# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH`), then `gh run watch`.
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|all`),
+# then `gh run watch`.
 name: linux-check
 
 on:
@@ -9,12 +10,18 @@ on:
         description: Branch, tag or commit to check
         required: false
         default: main
+      suite:
+        description: "check (just ci, harnesses, musl build), realnet (real OpenSSH and Linux network tests) or all"
+        type: choice
+        options: [check, realnet, all]
+        default: check
 
 permissions:
   contents: read
 
 jobs:
   check:
+    if: inputs.suite != 'realnet'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -40,6 +47,7 @@ jobs:
 
   musl:
     # Static builds are a release target (DESIGN.md §13). Informational for now.
+    if: inputs.suite != 'realnet'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -53,3 +61,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build for x86_64-unknown-linux-musl
         run: cargo build --workspace --all-targets --target x86_64-unknown-linux-musl
+
+  realnet:
+    # Tier 1 of the environment tests (docs/m1/realnet.md): real OpenSSH in Docker containers
+    # (ssh part) and the real Linux network stack with NAT and tc netem in network namespaces
+    # (udp part). Two parts, run in parallel, each through `just realnet PART`.
+    if: inputs.suite != 'check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [ssh, udp]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Packages (musl for static binaries; namespace and firewall tools)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint the harness scripts
+        run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
+      - name: Real-network suite (${{ matrix.part }})
+        run: just realnet ${{ matrix.part }}
+      - name: Logs and measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: realnet-${{ matrix.part }}
+          path: |
+            target/realnet/logs
+            target/realnet/run
+            target/realnet/results-*.tsv
+          if-no-files-found: ignore
+          retention-days: 14

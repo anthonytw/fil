@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
+# topology, network namespaces and root for the UDP/NAT topology.
+#
+#   run.sh [ssh|udp|all] [SCENARIO...]
+#
+# Exit status: 0 if every scenario passed, 1 if any failed, 2 if the host cannot run it.
+set -uo pipefail
+# shellcheck source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+require_linux
+
+part=${1:-all}
+shift || true
+case $part in
+  ssh) parts=(ssh) ;;
+  udp) parts=(udp) ;;
+  all) parts=(ssh udp) ;;
+  *)
+    echo "usage: run.sh [ssh|udp|all] [SCENARIO...]" >&2
+    exit 2
+    ;;
+esac
+
+rm -rf "$OUT/notes" "$OUT/logs"
+mkdir -p "$OUT"
+rc=0
+for p in "${parts[@]}"; do
+  # Part scripts exit 2 when the host lacks Docker, root or a tool; that is not a test failure.
+  bash "$REALNET_DIR/$p.sh" "$@"
+  prc=$?
+  if [[ $prc -eq 2 ]]; then exit 2; fi
+  if [[ $prc -ne 0 ]]; then rc=1; fi
+done
+
+echo
+if [[ $rc -eq 0 ]]; then echo "realnet: all scenarios passed"; else echo "realnet: FAILURES (see the tables above)"; fi
+exit $rc

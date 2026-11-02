@@ -1,0 +1,4 @@
+cols = 40
+rows = 14
+kind = synthetic
+description = wide characters, emoji, ZWJ sequences, combining marks, wide at the last column, half-overwritten wide cells

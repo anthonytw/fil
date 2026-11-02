@@ -1,0 +1,4 @@
+cols = 20
+rows = 10
+kind = synthetic
+description = autowrap at the last column, pending-wrap interactions with CR/BS/CUU, DECAWM off

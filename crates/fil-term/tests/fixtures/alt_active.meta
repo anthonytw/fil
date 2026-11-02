@@ -1,0 +1,4 @@
+cols = 40
+rows = 8
+kind = synthetic
+description = 30 lines of primary history and a prompt, then the alternate screen entered and left active

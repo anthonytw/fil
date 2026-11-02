@@ -1,0 +1,4 @@
+cols = 40
+rows = 5
+kind = synthetic
+description = kitty keyboard flags: push 1, 3, 7, pop one, then OR in 8 (leaves 3|8 = 11)

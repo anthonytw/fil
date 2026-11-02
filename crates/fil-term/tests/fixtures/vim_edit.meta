@@ -1,0 +1,4 @@
+cols = 80
+rows = 24
+kind = real
+description = vim with syntax highlighting: open a python file, insert a line, search, :set cursorline, quit

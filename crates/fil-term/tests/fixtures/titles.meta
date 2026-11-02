@@ -1,0 +1,4 @@
+cols = 40
+rows = 5
+kind = synthetic
+description = OSC 0, 1 and 2; the last window title wins

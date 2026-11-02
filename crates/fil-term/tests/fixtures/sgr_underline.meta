@@ -1,0 +1,4 @@
+cols = 60
+rows = 12
+kind = synthetic
+description = underline styles (4:n, SGR 21) and underline colors (58/59)

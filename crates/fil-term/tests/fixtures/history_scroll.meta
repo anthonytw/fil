@@ -1,0 +1,4 @@
+cols = 40
+rows = 10
+kind = synthetic
+description = 120 numbered, alternately colored lines: 110+ lines of scrollback

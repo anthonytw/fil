@@ -6,20 +6,63 @@
 //! features and chosen by name at run time, so several can coexist and the fidelity
 //! suite can compare them on the same recordings.
 
+pub mod compare;
 pub mod model;
+mod model_impls;
+pub mod snapshot;
+#[cfg(any(feature = "alacritty", feature = "vt100"))]
+mod sniff;
+
+#[cfg(feature = "alacritty")]
+mod be_alacritty;
+#[cfg(feature = "vt100")]
+mod be_vt100;
 
 pub use model::{Size, TermState};
 
 /// Which parts of [`TermState`] a backend can report. The fidelity suite scores a field
 /// a backend cannot see as unsupported, not as wrong.
+///
+/// The first five flags are from PR #3; Spike A split the rest out of what the recordings
+/// showed backends cannot see. A flag is true only if the backend reports the field
+/// correctly, not merely if it parses the sequence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
     pub reflow: bool,
+    /// Kitty keyboard protocol flags (`CSI ? u` state).
     pub kitty_keyboard: bool,
+    /// OSC 8 hyperlinks on cells.
     pub hyperlinks: bool,
+    /// Underline styles (double, curly, dotted, dashed) and underline color.
     pub underline_styles: bool,
     /// Generates replies to terminal queries (DA, DSR, …) for [`Emulator::take_replies`].
     pub query_replies: bool,
+    /// SGR blink (5/6).
+    pub blink: bool,
+    /// SGR hidden (8) and strikethrough (9).
+    pub strike_hidden: bool,
+    /// The primary screen and its cursor, while the alternate screen is active.
+    pub primary_behind_alt: bool,
+    /// DECSTBM scroll region.
+    pub scroll_region: bool,
+    /// Window title (OSC 0/2).
+    pub title: bool,
+    /// Focus reporting (`?1004`).
+    pub focus_events: bool,
+    /// Autowrap (`?7`), origin (`?6`) and insert (`4`) modes.
+    pub line_modes: bool,
+    /// The pending-wrap flag at the last column.
+    pub pending_wrap: bool,
+    /// The current SGR pen.
+    pub pen: bool,
+    /// The DECSC saved cursor.
+    pub saved_cursor: bool,
+    /// Scrollback can be read while the alternate screen is active.
+    pub history_in_alt: bool,
+    /// Cursor shape and blink (DECSCUSR).
+    pub cursor_shape: bool,
+    /// Mouse encodings beyond default/UTF-8/SGR (urxvt, SGR-pixels).
+    pub mouse_encoding_extra: bool,
 }
 
 /// A headless terminal emulator. Object-safe, so sessions can hold `Box<dyn Emulator>`.
@@ -53,10 +96,13 @@ pub struct Backend {
 
 /// Every backend compiled into this build, in order of preference.
 pub fn backends() -> Vec<Backend> {
-    #[allow(unused_mut)]
-    let mut list = Vec::new();
-    // Each backend feature pushes its `Backend` here.
-    list
+    // Each backend feature contributes its `Backend` here.
+    vec![
+        #[cfg(feature = "alacritty")]
+        be_alacritty::BACKEND,
+        #[cfg(feature = "vt100")]
+        be_vt100::BACKEND,
+    ]
 }
 
 /// Creates an emulator from the backend called `name`, if this build has it.

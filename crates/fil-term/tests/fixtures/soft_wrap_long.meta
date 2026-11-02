@@ -1,0 +1,4 @@
+cols = 40
+rows = 10
+kind = synthetic
+description = long soft-wrapped lines among short ones; exact-width and double-width lines; fills history

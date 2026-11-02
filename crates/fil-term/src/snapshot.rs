@@ -1,0 +1,643 @@
+//! The generic snapshot writer (DESIGN.md §6.2).
+//!
+//! [`snapshot`] turns any [`TermState`] into bytes that recreate it when fed to a fresh
+//! terminal of the same size: history lines, then the screen, then the modes. The writer
+//! knows nothing about backends, so a backend only has to convert its grid.
+//!
+//! The order is chosen so that nothing depends on state a later step sets:
+//!
+//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen;
+//! 2. history and the primary screen, written as ordinary text with line feeds, so that
+//!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
+//!    are written without a newline and left to autowrap, which restores the wrap flag;
+//! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
+//!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
+//! 4. the scroll region, origin mode, the cursor (with the pending-wrap flag), the pen;
+//! 5. input modes, mouse, kitty keyboard flags, title, cursor shape and visibility.
+//!
+//! Everything that came from the remote program (cell text, titles, link targets) is
+//! stripped of control characters before it is written, so a snapshot cannot be used to
+//! smuggle escape sequences to the client's terminal.
+//!
+//! Known gaps, all rare: charset designations and tab stops are not part of [`TermState`]
+//! (the fidelity harness's continuation probe shows the effect); the pending-wrap flag of the
+//! primary cursor behind the alternate screen is not restored.
+
+use crate::model::{
+    Attrs, Cell, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking, TermState,
+    Underline,
+};
+
+/// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
+pub fn snapshot(state: &TermState) -> Vec<u8> {
+    let mut w = Writer::new(state);
+    w.run();
+    w.out
+}
+
+struct Writer<'a> {
+    st: &'a TermState,
+    out: Vec<u8>,
+    pen: Attrs,
+    link: Option<u32>,
+}
+
+impl<'a> Writer<'a> {
+    fn new(st: &'a TermState) -> Self {
+        Writer {
+            st,
+            out: Vec::with_capacity(4096),
+            pen: Attrs::default(),
+            link: None,
+        }
+    }
+
+    fn put(&mut self, s: &str) {
+        self.out.extend_from_slice(s.as_bytes());
+    }
+
+    fn run(&mut self) {
+        let st = self.st;
+        // 1. Known starting point. Not a full reset: that would drop the receiver's own
+        // scrollback, which is the point of fil.
+        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r\x1b[H\x1b[J");
+        // 2. History and the primary screen.
+        let (primary_rows, primary_cursor): (&[Line], Cursor) = match &st.primary_behind_alt {
+            Some(p) => (&p.screen, p.cursor),
+            None => (&st.screen, st.cursor),
+        };
+        let mut rows: Vec<&Line> = st.history.iter().collect();
+        rows.extend(primary_rows.iter());
+        self.flow_lines(&rows);
+        if st.modes.alt_screen {
+            // 3. Park the primary cursor, then switch. `1049 h` saves it and clears the
+            // alternate screen.
+            self.end_link();
+            self.set_pen(Attrs::default());
+            self.cup(primary_cursor.row, primary_cursor.col);
+            self.set_pen(primary_cursor.pen);
+            self.put("\x1b[?1049h\x1b[0m\x1b[H\x1b[J");
+            self.pen = Attrs::default();
+            self.positioned_lines(&st.screen);
+        }
+        // 4. Scroll region, origin, cursor, pen.
+        match st.modes.scroll_region {
+            Some((top, bottom)) => {
+                self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
+            }
+            None => self.put("\x1b[r"),
+        }
+        // DECSC with origin mode still off, so the saved position is absolute.
+        if let Some(sv) = st.saved_cursor {
+            self.cup(sv.row, sv.col);
+            self.set_pen(sv.pen);
+            self.put("\x1b7");
+            self.set_pen(Attrs::default());
+        }
+        self.put(if st.modes.origin {
+            "\x1b[?6h"
+        } else {
+            "\x1b[?6l"
+        });
+        self.place_cursor();
+        // 5. Modes.
+        let m = &st.modes;
+        self.put(if m.insert { "\x1b[4h" } else { "\x1b[4l" });
+        self.put(if m.autowrap { "\x1b[?7h" } else { "\x1b[?7l" });
+        self.put(if m.app_cursor_keys {
+            "\x1b[?1h"
+        } else {
+            "\x1b[?1l"
+        });
+        self.put(if m.app_keypad { "\x1b=" } else { "\x1b>" });
+        self.put(if m.bracketed_paste {
+            "\x1b[?2004h"
+        } else {
+            "\x1b[?2004l"
+        });
+        self.put(if m.focus_events {
+            "\x1b[?1004h"
+        } else {
+            "\x1b[?1004l"
+        });
+        match m.mouse_tracking {
+            MouseTracking::Off => {}
+            MouseTracking::X10 => self.put("\x1b[?9h"),
+            MouseTracking::Normal => self.put("\x1b[?1000h"),
+            MouseTracking::ButtonEvent => self.put("\x1b[?1002h"),
+            MouseTracking::AnyEvent => self.put("\x1b[?1003h"),
+        }
+        match m.mouse_encoding {
+            MouseEncoding::Default => {}
+            MouseEncoding::Utf8 => self.put("\x1b[?1005h"),
+            MouseEncoding::Sgr => self.put("\x1b[?1006h"),
+            MouseEncoding::Urxvt => self.put("\x1b[?1015h"),
+            MouseEncoding::SgrPixels => self.put("\x1b[?1016h"),
+        }
+        if m.kitty_keyboard != 0 {
+            self.put(&format!("\x1b[>{}u", m.kitty_keyboard));
+        }
+        if !m.title.is_empty() {
+            let title = sanitize(&m.title);
+            self.put(&format!("\x1b]2;{title}\x1b\\"));
+        }
+        let c = &st.cursor;
+        let n = match (c.shape, c.blinking) {
+            (CursorShape::Default, _) => 0,
+            (CursorShape::Block, true) => 1,
+            (CursorShape::Block, false) => 2,
+            (CursorShape::Underline, true) => 3,
+            (CursorShape::Underline, false) => 4,
+            (CursorShape::Bar, true) => 5,
+            (CursorShape::Bar, false) => 6,
+        };
+        self.put(&format!("\x1b[{n} q"));
+        if c.visible {
+            self.put("\x1b[?25h");
+        }
+    }
+
+    /// Writes lines one after another with CR LF, leaving the cursor on the last one.
+    /// The last line gets no newline, so with `rows.len() >= screen rows` exactly
+    /// `rows.len() - screen rows` lines have scrolled off.
+    ///
+    /// A terminal fills a line it scrolls in with the pen's background (BCE). Before a line
+    /// feed the pen is reset, so those lines start out plain. A line entered by autowrap is
+    /// created with the pen of its first character, so if that has a background, the cells
+    /// after the text are erased with the default pen.
+    fn flow_lines(&mut self, rows: &[&Line]) {
+        let mut from_wrap = false;
+        for (i, line) in rows.iter().enumerate() {
+            let last = i + 1 == rows.len();
+            let wraps = line.wrapped && !last;
+            let upto = if wraps {
+                line.cells.len()
+            } else {
+                trimmed_len(&line.cells)
+            };
+            self.cells(&line.cells, upto);
+            let tinted = line
+                .cells
+                .first()
+                .is_some_and(|c| c.attrs.bg != Color::Default);
+            if from_wrap && upto < line.cells.len() && tinted {
+                self.end_link();
+                self.set_pen(Attrs::default());
+                self.put("\x1b[K");
+            }
+            if wraps {
+                // Autowrap carries on in the next line. If that line is empty nothing will
+                // trigger the wrap, so end this one with a newline.
+                if rows[i + 1].cells.iter().all(Cell::is_plain_blank) {
+                    self.newline();
+                    from_wrap = false;
+                } else {
+                    from_wrap = true;
+                }
+            } else {
+                if !last {
+                    self.newline();
+                }
+                from_wrap = false;
+            }
+        }
+        self.end_link();
+    }
+
+    /// Writes each row at its absolute position (used for the alternate screen, which has
+    /// no scrollback to feed).
+    fn positioned_lines(&mut self, rows: &[Line]) {
+        let mut continuing = false;
+        for (r, line) in rows.iter().enumerate() {
+            if !continuing {
+                self.cup(u16::try_from(r).unwrap_or(u16::MAX), 0);
+            }
+            if line.wrapped && r + 1 < rows.len() {
+                self.cells(&line.cells, line.cells.len());
+                continuing = !rows[r + 1].cells.iter().all(Cell::is_plain_blank);
+            } else {
+                self.cells(&line.cells, trimmed_len(&line.cells));
+                continuing = false;
+            }
+        }
+        self.end_link();
+    }
+
+    fn newline(&mut self) {
+        self.end_link();
+        self.set_pen(Attrs::default());
+        self.put("\r\n");
+    }
+
+    /// CUP with 0-based coordinates, absolute (origin mode must be off).
+    fn cup(&mut self, row: u16, col: u16) {
+        self.put(&format!(
+            "\x1b[{};{}H",
+            u32::from(row) + 1,
+            u32::from(col) + 1
+        ));
+    }
+
+    fn cells(&mut self, cells: &[Cell], upto: usize) {
+        for cell in &cells[..upto.min(cells.len())] {
+            if cell.width == 0 {
+                continue;
+            }
+            self.set_link(cell.hyperlink);
+            self.set_pen(cell.attrs);
+            if cell.text.is_empty() {
+                self.put(" ");
+            } else {
+                let t = sanitize(&cell.text);
+                // A cell whose text was entirely control characters still occupies space.
+                self.put(if t.is_empty() { " " } else { &t });
+            }
+        }
+    }
+
+    /// Positions the real cursor, in the coordinates origin mode uses, and re-creates a
+    /// pending wrap by rewriting the last-column cell it follows.
+    fn place_cursor(&mut self) {
+        let st = self.st;
+        let c = st.cursor;
+        let top = match (st.modes.origin, st.modes.scroll_region) {
+            (true, Some((top, _))) => top,
+            _ => 0,
+        };
+        let rel_row = c.row.saturating_sub(top);
+        let cols = st.size.cols;
+        if c.pending_wrap && st.modes.autowrap && cols > 0 && usize::from(c.row) < st.screen.len() {
+            let line = &st.screen[usize::from(c.row)];
+            let mut base = usize::from(cols) - 1;
+            if line.cells.get(base).is_some_and(|x| x.width == 0) && base > 0 {
+                base -= 1;
+            }
+            // Rewrite the cell the wrap follows. It lands on itself, so the grid is
+            // unchanged, and the terminal ends up with a wrap pending.
+            self.put(&format!("\x1b[{};{}H", u32::from(rel_row) + 1, base + 1));
+            if let Some(cell) = line.cells.get(base) {
+                self.cells(std::slice::from_ref(cell), 1);
+            }
+            self.end_link();
+        } else {
+            self.put(&format!(
+                "\x1b[{};{}H",
+                u32::from(rel_row) + 1,
+                u32::from(c.col) + 1
+            ));
+        }
+        self.set_pen(c.pen);
+    }
+
+    fn set_link(&mut self, link: Option<u32>) {
+        if link == self.link {
+            return;
+        }
+        match link.and_then(|i| self.st.hyperlinks.get(i as usize)) {
+            Some(h) => {
+                let id = h.id.as_deref().map(sanitize).unwrap_or_default();
+                let uri = sanitize(&h.uri);
+                if id.is_empty() {
+                    self.put(&format!("\x1b]8;;{uri}\x1b\\"));
+                } else {
+                    self.put(&format!("\x1b]8;id={id};{uri}\x1b\\"));
+                }
+                self.link = link;
+            }
+            None => self.end_link(),
+        }
+    }
+
+    fn end_link(&mut self) {
+        if self.link.take().is_some() {
+            self.put("\x1b]8;;\x1b\\");
+        }
+    }
+
+    fn set_pen(&mut self, a: Attrs) {
+        if a == self.pen {
+            return;
+        }
+        let mut s = String::from("\x1b[0");
+        if a.bold {
+            s.push_str(";1");
+        }
+        if a.dim {
+            s.push_str(";2");
+        }
+        if a.italic {
+            s.push_str(";3");
+        }
+        match a.underline {
+            Underline::None => {}
+            Underline::Single => s.push_str(";4"),
+            Underline::Double => s.push_str(";4:2"),
+            Underline::Curly => s.push_str(";4:3"),
+            Underline::Dotted => s.push_str(";4:4"),
+            Underline::Dashed => s.push_str(";4:5"),
+        }
+        if a.blink {
+            s.push_str(";5");
+        }
+        if a.inverse {
+            s.push_str(";7");
+        }
+        if a.hidden {
+            s.push_str(";8");
+        }
+        if a.strikethrough {
+            s.push_str(";9");
+        }
+        color(&mut s, 38, a.fg);
+        color(&mut s, 48, a.bg);
+        color(&mut s, 58, a.underline_color);
+        s.push('m');
+        self.put(&s);
+        self.pen = a;
+    }
+}
+
+fn color(s: &mut String, base: u8, c: Color) {
+    match c {
+        Color::Default => {}
+        Color::Indexed(n) => s.push_str(&format!(";{base};5;{n}")),
+        Color::Rgb(r, g, b) => s.push_str(&format!(";{base};2;{r};{g};{b}")),
+    }
+}
+
+/// Number of leading cells worth writing: everything up to the last cell that is not a
+/// plain blank.
+fn trimmed_len(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .rposition(|c| !c.is_plain_blank())
+        .map_or(0, |i| i + 1)
+}
+
+/// Drops C0 and C1 controls and DEL.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Hyperlink, Modes, PrimaryScreen, Size};
+
+    fn text_cell(t: &str) -> Cell {
+        Cell {
+            text: t.into(),
+            ..Cell::blank()
+        }
+    }
+
+    fn state(cols: u16, rows: u16) -> TermState {
+        TermState::blank(Size { cols, rows })
+    }
+
+    fn put_text(st: &mut TermState, row: usize, s: &str) {
+        for (i, ch) in s.chars().enumerate() {
+            st.screen[row].cells[i] = text_cell(&ch.to_string());
+        }
+    }
+
+    fn s(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn blank_screen_is_reset_plus_modes() {
+        let out = s(&snapshot(&state(10, 3)));
+        assert!(out.starts_with("\x1b[0m\x1b[?25l"));
+        assert!(out.contains("\x1b[?7h"));
+        assert!(out.contains("\x1b[?2004l"));
+        assert!(out.ends_with("\x1b[0 q\x1b[?25h"));
+        assert!(!out.contains("1049"));
+    }
+
+    #[test]
+    fn plain_text_rows_are_joined_by_crlf_without_trailing_blanks() {
+        let mut st = state(10, 3);
+        put_text(&mut st, 0, "hello");
+        put_text(&mut st, 1, "world");
+        let out = s(&snapshot(&st));
+        assert!(out.contains("hello\r\nworld\r\n\x1b[1;1H") || out.contains("hello\r\nworld\r\n"));
+        // Row 3 is blank, so nothing between the second CR LF and the cursor placement.
+        assert!(!out.contains("world "));
+    }
+
+    #[test]
+    fn history_comes_before_screen_and_scrolls_by_its_length() {
+        let mut st = state(10, 2);
+        put_text(&mut st, 0, "screen1");
+        st.history.push(Line {
+            cells: "old1".chars().map(|c| text_cell(&c.to_string())).collect(),
+            wrapped: false,
+        });
+        st.history.push(Line {
+            cells: "old2".chars().map(|c| text_cell(&c.to_string())).collect(),
+            wrapped: false,
+        });
+        let out = s(&snapshot(&st));
+        let (a, b, c) = (
+            out.find("old1").unwrap(),
+            out.find("old2").unwrap(),
+            out.find("screen1").unwrap(),
+        );
+        assert!(a < b && b < c);
+        // history(2) + screen rows(2) = 4 lines, 3 line feeds.
+        let body = &out[a..a + out[a..].find("\x1b[r").unwrap()];
+        assert_eq!(body.matches("\r\n").count(), 3);
+    }
+
+    #[test]
+    fn wrapped_line_is_written_full_width_without_newline() {
+        let mut st = state(4, 2);
+        for (i, ch) in "abcd".chars().enumerate() {
+            st.screen[0].cells[i] = text_cell(&ch.to_string());
+        }
+        st.screen[0].wrapped = true;
+        put_text(&mut st, 1, "ef");
+        let out = s(&snapshot(&st));
+        assert!(out.contains("abcdef"), "{out:?}");
+    }
+
+    #[test]
+    fn sgr_underline_style_and_colors() {
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = Cell {
+            text: "x".into(),
+            attrs: Attrs {
+                bold: true,
+                underline: Underline::Curly,
+                underline_color: Color::Rgb(1, 2, 3),
+                fg: Color::Indexed(200),
+                bg: Color::Rgb(9, 8, 7),
+                ..Attrs::default()
+            },
+            ..Cell::blank()
+        };
+        let out = s(&snapshot(&st));
+        assert!(
+            out.contains("\x1b[0;1;4:3;38;5;200;48;2;9;8;7;58;2;1;2;3mx"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn blank_cells_with_background_are_kept() {
+        let mut st = state(6, 1);
+        st.screen[0].cells[3].attrs.bg = Color::Indexed(1);
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[0;48;5;1m "), "{out:?}");
+    }
+
+    #[test]
+    fn wide_characters_skip_their_spacer() {
+        let mut st = state(6, 1);
+        st.screen[0].cells[0] = Cell {
+            text: "漢".into(),
+            width: 2,
+            ..Cell::blank()
+        };
+        st.screen[0].cells[1] = Cell {
+            width: 0,
+            ..Cell::blank()
+        };
+        st.screen[0].cells[2] = text_cell("x");
+        let out = s(&snapshot(&st));
+        assert!(out.contains("漢x"), "{out:?}");
+    }
+
+    #[test]
+    fn hyperlinks_open_and_close_around_runs() {
+        let mut st = state(8, 1);
+        st.hyperlinks.push(Hyperlink {
+            id: Some("a".into()),
+            uri: "https://example.com/x".into(),
+        });
+        for i in 0..3 {
+            st.screen[0].cells[i] = Cell {
+                text: "k".into(),
+                hyperlink: Some(0),
+                ..Cell::blank()
+            };
+        }
+        st.screen[0].cells[3] = text_cell("z");
+        let out = s(&snapshot(&st));
+        assert!(
+            out.contains("\x1b]8;id=a;https://example.com/x\x1b\\kkk\x1b]8;;\x1b\\z"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn alt_screen_writes_primary_first_then_switches() {
+        let mut st = state(10, 2);
+        put_text(&mut st, 0, "alt");
+        st.modes.alt_screen = true;
+        let mut behind = vec![Line::blank(10), Line::blank(10)];
+        behind[0].cells[0] = text_cell("P");
+        st.primary_behind_alt = Some(PrimaryScreen {
+            screen: behind,
+            cursor: Cursor {
+                row: 1,
+                col: 4,
+                ..Cursor::default()
+            },
+        });
+        let out = s(&snapshot(&st));
+        let p = out.find('P').unwrap();
+        let sw = out.find("\x1b[?1049h").unwrap();
+        let a = out.find("alt").unwrap();
+        assert!(p < sw && sw < a, "{out:?}");
+        assert!(out[p..sw].contains("\x1b[2;5H"), "primary cursor parked");
+    }
+
+    #[test]
+    fn modes_are_written() {
+        let mut st = state(10, 2);
+        st.modes = Modes {
+            app_cursor_keys: true,
+            app_keypad: true,
+            bracketed_paste: true,
+            focus_events: true,
+            mouse_tracking: MouseTracking::AnyEvent,
+            mouse_encoding: MouseEncoding::Sgr,
+            kitty_keyboard: 5,
+            scroll_region: Some((0, 1)),
+            origin: true,
+            insert: true,
+            autowrap: false,
+            title: "hi".into(),
+            ..Modes::default()
+        };
+        st.cursor.visible = false;
+        st.cursor.shape = CursorShape::Bar;
+        st.cursor.blinking = true;
+        let out = s(&snapshot(&st));
+        for want in [
+            "\x1b[1;2r",
+            "\x1b[?6h",
+            "\x1b[4h",
+            "\x1b[?7l",
+            "\x1b[?1h",
+            "\x1b=",
+            "\x1b[?2004h",
+            "\x1b[?1004h",
+            "\x1b[?1003h",
+            "\x1b[?1006h",
+            "\x1b[>5u",
+            "\x1b]2;hi\x1b\\",
+            "\x1b[5 q",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in {out:?}");
+        }
+        assert!(!out.ends_with("\x1b[?25h"));
+    }
+
+    #[test]
+    fn pending_wrap_rewrites_the_last_cell() {
+        let mut st = state(4, 1);
+        for (i, ch) in "abcd".chars().enumerate() {
+            st.screen[0].cells[i] = text_cell(&ch.to_string());
+        }
+        st.cursor.col = 3;
+        st.cursor.pending_wrap = true;
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[1;4Hd"), "{out:?}");
+    }
+
+    #[test]
+    fn origin_mode_cursor_is_relative_to_the_region() {
+        let mut st = state(10, 6);
+        st.modes.origin = true;
+        st.modes.scroll_region = Some((2, 4));
+        st.cursor.row = 3;
+        st.cursor.col = 1;
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[3;5r\x1b[?6h\x1b[2;2H"), "{out:?}");
+    }
+
+    #[test]
+    fn control_characters_cannot_escape_from_cell_text_titles_or_links() {
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = text_cell("a\x1b[31mb");
+        st.modes.title = "t\x07\x1b]0;evil".into();
+        st.hyperlinks.push(Hyperlink {
+            id: Some("i\x1b".into()),
+            uri: "http://x/\x07\x1b[2J".into(),
+        });
+        st.screen[0].cells[1] = Cell {
+            text: "l".into(),
+            hyperlink: Some(0),
+            ..Cell::blank()
+        };
+        let out = s(&snapshot(&st));
+        assert!(out.contains("a[31mb"));
+        assert!(out.contains("\x1b]2;t]0;evil\x1b\\"));
+        assert!(out.contains("\x1b]8;id=i;http://x/[2J\x1b\\"));
+        // The only BEL-free, ESC-led sequences are ours: count ESC ] 8 openers.
+        assert!(!out.contains('\x07'));
+    }
+}

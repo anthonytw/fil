@@ -1,0 +1,21 @@
+[package]
+name = "fil-netsim"
+description = "In-process link simulator for tests: stream (pipe) and datagram (UDP/QUIC) links with impairments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.9"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "io-util"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros", "io-util", "time", "sync"] }
+
+[lints]
+workspace = true

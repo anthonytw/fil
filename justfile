@@ -18,3 +18,7 @@ test:
 # License and source policy (deny.toml).
 deny:
     cargo deny check licenses bans sources
+
+# Slow link-simulator soak: many seeds, harsh conditions (not part of `ci`).
+netsim-soak:
+    cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak

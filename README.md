@@ -14,4 +14,4 @@ It has no panes: your terminal already does that.
 
 **Status:** design stage. There's nothing to install yet. See [DESIGN.md](DESIGN.md).
 
-**License:** GPL. The exact version is still to be decided.
+**License:** [GPL-3.0-or-later](LICENSE).

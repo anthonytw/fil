@@ -414,6 +414,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 ## 13. Implementation
 
 - **Language:** Rust.
+- **License:** GPL-3.0-or-later **(decided)**. GPLv3 rather than v2 because the planned dependencies include Apache-2.0 crates, which are compatible with v3 but not v2. Not AGPL, because users run fil on hosts they control, and many employers ban AGPL software outright.
 - **Crates:**
   - async runtime: tokio
   - PTY, termios and peer credentials: rustix
@@ -476,7 +477,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 
 ## 16. Open questions
 
-1. **License:** GPL-3.0-only or GPL-3.0-or-later? (GPL family **decided**.)
+1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
 2. **Emulator** (§6.5): decided by the fidelity tests in M0.
 3. **`TERM` when a different terminal takes over:** keep the session's value, ship a fil terminfo entry, or require `xterm-256color`?
 4. **Terminal-query replies in flight during a takeover** (§6.3).

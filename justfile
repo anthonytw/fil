@@ -35,3 +35,18 @@ record *scenarios:
 # Emulator restore-fidelity harness (docs/spikes/emulator.md). Flags: --only NAME, --no-perf, --verbose.
 fidelity *args:
     cargo run --release -p fil-term --example fidelity --all-features -- {{args}}
+
+# Prediction overlay harness (docs/spikes/prediction.md): real programs on a PTY behind fil-netsim
+# latency, checked against an independent emulator. Flags: --seeds N, --keys N, --latency MS,
+# --only PROGRAM, --backend NAME, --hostile, --guard-off NAME, --jobs N, --verbose.
+predict-harness *args:
+    cargo run --release -p fil-predict --features harness --example predict_harness -- {{args}}
+
+# Prediction demo in your own terminal: `just predict-demo 200ms` (latency each way).
+# Flags: --backend NAME, --no-predict, --plain, --no-sync.
+predict-demo *args:
+    cargo run --release -p fil-predict --features harness --example predict_demo -- {{args}}
+
+# Scripted prediction scenarios at scale (no PTY): many seeds, release build.
+predict-soak seeds="200":
+    FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim

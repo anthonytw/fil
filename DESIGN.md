@@ -102,6 +102,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
 3. The client sends:
    - the session name
    - its terminal size and `TERM`
+   - its host label (shown to the previous subscriber on a takeover, §5.2)
    - its per-attach public key
    - when resuming, its last epoch and sequence number
 4. The daemon finds or creates the session. If the session is attached elsewhere, it takes the session over (§5.2). It replies with:
@@ -349,6 +350,66 @@ Transports and predictors are Rust traits. Their implementations are compiled in
 - A loadable transport would be arbitrary code running inside the process that holds your shells.
 
 The pipe command is the runtime extension point, in the Unix tradition of ssh's `ProxyCommand`.
+
+### 8.5 Frames and channels (proposal)
+
+This is the byte-level contract implemented by `fil-proto`. It is a proposal, not decided, except for the postcard encoding (§13). It applies to the pipe. On QUIC each channel is a stream, and the same data segments and control messages are used within it.
+
+**Preamble (pipe only).** Before any frame, `fil server --stdio` writes one magic line: `ESC "FIL-CONNECT " <major, decimal> LF`, for example `\x1bFIL-CONNECT 1\n`. Anything the remote shell prints on stdout before fil starts (a banner, an `echo` in an rc file) would otherwise be read as a frame length. The client discards everything before the magic and hands the skipped text back so it can warn the user ("your shell printed this before fil started; check your shell's startup files"). The client must strip control characters from that text before showing it, because it is untrusted. The magic must start within the first 64 KiB; otherwise the client fails with a clear error (and still shows what it read, since that is probably the reason fil did not start). Frames begin right after the LF. The scanner is pure logic in `fil-proto`. QUIC streams have no preamble.
+
+**Frame.** Everything on the pipe is a frame:
+
+| Field | Encoding |
+|---|---|
+| `len` | `u32`, big endian: the size of the body in bytes (1 to 16 416) |
+| body: channel | postcard varint `u32` |
+| body: payload | the remaining bytes |
+
+**Channels.**
+
+| Id | Use | Scheduling |
+|---|---|---|
+| 0 | control messages (`ControlMsg`, one postcard value per frame, at most 4 KiB) | first |
+| 1 | terminal: PTY output to the client, keystrokes to the daemon | interactive |
+| 2 | snapshot bytes | interactive |
+| 3 | agent relay (M2) | interactive |
+| 4 to 15 | reserved | interactive |
+| 16 and up | forwarded connections (M2) | forward, round-robin |
+
+Interactive frames keep the order they were queued in, so a snapshot and the output after it stay in order. Control frames are strictly first. Forwards have a guaranteed share: while forward data waits, one forward frame is sent after every N interactive frames (N is configurable, default 8), so a terminal that never goes idle cannot stall them. Forward channels take turns, one frame each.
+
+**Data segment** (payload on every channel except 0): a postcard varint `u64` giving the offset of the first byte in that channel's byte stream, then 1 to 16 384 data bytes. Offsets are explicit even though the pipe is ordered, so a receiver can detect a gap or an overlap instead of silently corrupting a stream. On the terminal channel the offset is the output log's global sequence number (§6.1).
+
+**Limits.** The decoder refuses any `len` above 16 416 (16 KiB of data plus 32 bytes of slack; a channel id and an offset need at most 15) before allocating, and allocates only as bytes arrive. Session names are `[A-Za-z0-9._-]{1,64}`, `TERM` is `[A-Za-z0-9._+-]{1,64}`, host labels have no control characters, and opaque keys and fingerprints are at most 256 and 64 bytes. All of these are checked while decoding, so an invalid value cannot exist in memory.
+
+**Versioning.** `Hello { major, minor, agent }` is the first message each side sends; its layout and variant index (0) never change, so even a peer of another major can read it and report the mismatch. Majors must match. Minor versions only add control-message variants at the end of the enum; postcard identifies variants by index, so variants and fields are never reordered or removed. The major version is also part of the daemon's socket path (§5.3) and of the preamble.
+
+**Acks.** `Ack { channel, upto }` is cumulative: the sender has consumed every byte below `upto`. A receiver sends one after 32 KiB of unacknowledged data, or 100 ms after the first unacknowledged byte, whichever comes first. A sender keeps every unacknowledged byte, up to a bound: 1 MiB per forwarded connection (§7.2), and on the terminal channel the output log (8 MiB) in place of a per-subscriber buffer.
+
+**Reconnect.** After a new transport comes up:
+
+1. Each side sends `Hello`.
+2. Each side sends `Resume { channel, received }` for every channel it receives on. For the terminal channel the attach request carries it (§4.1), and the daemon answers with a start point.
+3. A sender sends on a channel only after the peer's `Resume` for it has arrived. It restarts exactly at `received`.
+4. If `received` is older than the oldest byte the sender still holds, the channel cannot resume: the sender answers with `Reset { channel, code: ResumeGone }`. The terminal channel never ends this way, because the daemon sends a snapshot instead (below). A forwarded connection closes.
+
+Frames still queued on the old transport are discarded. The send buffers rebuild them.
+
+**Snapshots.** The daemon decides between replay and snapshot from the client's position, the log's range and the catch-up threshold (§6.2), as a pure function. A snapshot is announced in `AttachReply.start` (or, for a mid-stream catch-up jump, in `ControlMsg::Snapshot`), which gives its byte length, the sequence number `at` where the terminal channel continues, and how many bytes were skipped for the marker line. The snapshot bytes then travel on channel 2. The snapshot channel is not resumable: if the link dies mid-snapshot the client reattaches without resume state and gets a new one.
+
+**Catch-up rule.** Snapshot when the subscriber is more than 1 MiB behind, or when output has waited unacknowledged for more than 2 s and at least 16 KiB is outstanding. The size floor on the time rule stops a quiet shell on a slow link from triggering a snapshot. These are the §16 item 7 defaults, still to be tuned.
+
+**Epoch rules.** A fresh attach (no resume state) increments the epoch, tells the old subscriber it was taken over, revokes its key and drops its transport. Detach increments the epoch and revokes. The attach request also carries a host label (§5.2), which the old subscriber sees in the takeover message.
+
+**Resume rules.** Epochs are small per-session counters that restart at 1 whenever a session is created, so a resume is checked in this order:
+
+1. **Incarnation.** The daemon picks a random 128-bit incarnation id when it creates a session (`fil-proto` has no randomness; the daemon passes it in). It is in `AttachReply`, and the client echoes it in its resume request. A mismatch means the session was killed and recreated, or the daemon restarted: refused with `SessionReplaced`, whatever the epoch says. The client tells the user it is a different session and offers a fresh attach.
+2. **Epoch.** An epoch from the future is `BadResume`. Nobody attached (the session was detached) is `Detached`. An older epoch is refused with `TakenOver` carrying the current subscriber's host label and attach time. The client asks whether to take the session back.
+3. **Key.** A resume with the current epoch must present the current subscriber's key. The client keeps its per-attach key in memory across reconnects (§4.2), on QUIC and on a re-run pipe, so a legitimate resume always has the same key. A different key is `WrongKey`: nothing changes and no effects are produced. Keys are never swapped on resume; only a fresh attach installs a new one.
+
+An accepted resume keeps the epoch and drops the subscriber's previous transport. **On the direct transport the daemon must also require the connection's authenticated key (`fil_transport::auth::peer_key`) to equal the key in the attach request**, so the attach cannot claim a key the connection did not authenticate with. The epoch is a fence, not a secret.
+
+**Not specified yet:** the QUIC stream mapping, channel open and close messages for forwards (M2), and the offline-input buffer (§4.3), which belongs to the client.
 
 ## 9. Prediction (optional, pluggable)
 

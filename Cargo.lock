@@ -304,6 +304,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fil-predict"
+version = "0.0.0"
+dependencies = [
+ "fil-netsim",
+ "fil-term",
+ "nix",
+ "portable-pty",
+ "rustix",
+ "tokio",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
 name = "fil-proto"
 version = "0.0.0"
 dependencies = [

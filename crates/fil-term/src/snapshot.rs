@@ -318,43 +318,49 @@ impl<'a> Writer<'a> {
         if a == self.pen {
             return;
         }
-        let mut s = String::from("\x1b[0");
-        if a.bold {
-            s.push_str(";1");
-        }
-        if a.dim {
-            s.push_str(";2");
-        }
-        if a.italic {
-            s.push_str(";3");
-        }
-        match a.underline {
-            Underline::None => {}
-            Underline::Single => s.push_str(";4"),
-            Underline::Double => s.push_str(";4:2"),
-            Underline::Curly => s.push_str(";4:3"),
-            Underline::Dotted => s.push_str(";4:4"),
-            Underline::Dashed => s.push_str(";4:5"),
-        }
-        if a.blink {
-            s.push_str(";5");
-        }
-        if a.inverse {
-            s.push_str(";7");
-        }
-        if a.hidden {
-            s.push_str(";8");
-        }
-        if a.strikethrough {
-            s.push_str(";9");
-        }
-        color(&mut s, 38, a.fg);
-        color(&mut s, 48, a.bg);
-        color(&mut s, 58, a.underline_color);
-        s.push('m');
+        let s = sgr(&a);
         self.put(&s);
         self.pen = a;
     }
+}
+
+/// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`).
+pub fn sgr(a: &Attrs) -> String {
+    let mut s = String::from("\x1b[0");
+    if a.bold {
+        s.push_str(";1");
+    }
+    if a.dim {
+        s.push_str(";2");
+    }
+    if a.italic {
+        s.push_str(";3");
+    }
+    match a.underline {
+        Underline::None => {}
+        Underline::Single => s.push_str(";4"),
+        Underline::Double => s.push_str(";4:2"),
+        Underline::Curly => s.push_str(";4:3"),
+        Underline::Dotted => s.push_str(";4:4"),
+        Underline::Dashed => s.push_str(";4:5"),
+    }
+    if a.blink {
+        s.push_str(";5");
+    }
+    if a.inverse {
+        s.push_str(";7");
+    }
+    if a.hidden {
+        s.push_str(";8");
+    }
+    if a.strikethrough {
+        s.push_str(";9");
+    }
+    color(&mut s, 38, a.fg);
+    color(&mut s, 48, a.bg);
+    color(&mut s, 58, a.underline_color);
+    s.push('m');
+    s
 }
 
 fn color(s: &mut String, base: u8, c: Color) {
@@ -375,7 +381,7 @@ fn trimmed_len(cells: &[Cell]) -> usize {
 }
 
 /// Drops C0 and C1 controls and DEL.
-fn sanitize(s: &str) -> String {
+pub fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 

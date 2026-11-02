@@ -1,0 +1,34 @@
+[package]
+name = "fil-predict"
+description = "Client-side prediction overlay with erase-before-write, and the default predictor (DESIGN.md §9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The PTY harness and demo: real programs on a PTY behind fil-netsim (examples/).
+harness = ["dep:fil-netsim", "dep:tokio", "dep:portable-pty", "dep:nix", "dep:rustix"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fil-term = { path = "../fil-term" }
+unicode-width = "0.2"
+vte = "0.15"
+fil-netsim = { path = "../fil-netsim", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "io-util"], optional = true }
+portable-pty = { version = "0.9", optional = true }
+nix = { version = "0.28", default-features = false, features = ["term"], optional = true }
+rustix = { version = "1", features = ["termios", "stdio"], optional = true }
+
+[[example]]
+name = "predict_harness"
+required-features = ["harness"]
+
+[[example]]
+name = "predict_demo"
+required-features = ["harness"]

@@ -33,6 +33,10 @@ jobs:
         run: just fidelity --no-perf
       - name: Link simulator soak
         run: just netsim-soak
+      - name: Prediction guard sweep
+        run: just predict-mutants
+      - name: Prediction PTY harness (real programs on Linux PTYs)
+        run: just predict-harness --seeds 2 --keys 60
 
   musl:
     # Static builds are a release target (DESIGN.md §13). Informational for now.

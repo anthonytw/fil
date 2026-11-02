@@ -119,6 +119,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
   - A path change, such as Wi-Fi to cellular or a new IP address, is absorbed by QUIC connection migration with no new handshake.
   - If the connection itself is gone (for example the laptop slept past the idle timeout), the client performs a new QUIC handshake with the same in-memory key. **No SSH is involved.**
 - **Fallback:** if QUIC can't be re-established within a few seconds, the client re-runs the pipe, which means a new SSH login.
+- **Which transport, when:** the choice is `fil_transport::path::PathManager`, a state machine with no IO (`docs/m1/quic-link.md`). Direct retries back off from 1 s to 2 min and the pipe's from 1 s to 30 s, with jitter. A link that dies within 10 s counts as a failure, so a flapping one slows down instead of cycling. A network-change hint tries direct at once, at most four times a minute. The pipe is closed only after the session has been moved to QUIC.
 - **Resume:** either way, the client sends "resume session S, epoch E, from byte N", and the daemon continues from byte N (§6.2).
 - **While disconnected:**
   - The client paints a one-line status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect.
@@ -352,7 +353,10 @@ Direct mode is first-class **(decided)**.
 - **Address:** the client dials the same host name it used for the pipe, resolved locally, unless the host config sets `direct.address`. Hosts reached through a jump host usually aren't directly reachable, so they stay on the pipe.
 - **Roaming:** QUIC connection migration covers both client IP changes and NAT rebinding (a router changing the outside port).
 - **Fallback and upgrade** work as in §4.1–4.2. Transport choice per host: `auto` (default), `pipe` or `direct`.
-- **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods.
+- **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods:
+  - **Retry:** the first packet from an address that has not been validated gets a stateless Retry and nothing else. No handshake state is kept and no crypto is done until the client answers it, so forged source addresses cost one small packet each.
+  - **Rate limits:** only validated addresses are counted, so a spoofed flood cannot spend a real client's allowance. Each source address has a token bucket (default burst 8, one a second) and the port has one (burst 100, 50 a second). Over the source limit the handshake is refused with a short close; over the global limit the packet is dropped silently. At most 128 handshakes are in progress at once.
+  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke`; a sweep every 500 ms catches a registry change made directly).
 
 ### 8.4 Extensibility is compile-time, not runtime
 
@@ -434,7 +438,11 @@ Before v1 these changes are made in place, with no compatibility kept.
 - **Streams:** each channel uses one unidirectional stream per direction. The sender opens the stream when it first sends on that channel.
 - **Stream layout:** a stream starts with the channel id (a postcard varint `u32`). It then carries payloads, each with a `u32` big-endian length prefix and the same limits as a pipe frame body.
 - **Priority:** quinn stream priority puts control above interactive channels, and interactive channels above forwards.
-- **Liveness:** quinn's keep-alive is the heartbeat, and its idle timeout is `dead_after`. RTT comes from quinn.
+- **Liveness:** quinn's keep-alive is the heartbeat, and its idle timeout is `dead_after`. RTT comes from quinn. `Degraded` is reported after `degraded_after` without a datagram from the peer.
+- **`Up`:** a connection the daemon accepts starts with one internal frame, a control-channel `Heartbeat { reply: true, nonce: 0 }` that the receiving link consumes and never passes up. The client's link is `Up` when it, or any other frame, has arrived. Without it the client would wait for the layer above on the daemon to speak first.
+- **Limits:** a peer may open 1,024 unidirectional streams and no bidirectional ones, and may not open a second stream for a channel. A payload length of 0 or over the frame body limit, or a bad channel id, ends the link. Datagrams are off.
+- **Across channels:** QUIC gives no order between streams. The link hands up control payloads first, then interactive ones in arrival order, with forwarded channels guaranteed one payload in every nine. Anything that must stay in order across channels, such as a snapshot and the output after it, is placed by its offsets.
+- **Path changes:** `path_generation` counts changes of the peer's address that the link saw. The daemon sees every change of the client's source address; a client sees only a change of its own local IP, and only where the OS reports it to quinn.
 - **No preamble.**
 
 **Not specified yet:** channel open and close messages for forwards (M2), and the offline-input buffer (§4.3), which belongs to the client.

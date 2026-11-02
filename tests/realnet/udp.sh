@@ -200,6 +200,7 @@ handshakes() { count_lines "$SRV_LOG" CONNECTED; }
 # ---------------------------------------------------------------------------------------------
 # The same, for quiclink-probe: the real QuicLink and QuicListener (fil-transport::quic)
 
+# shellcheck disable=SC2120 # callers may pass extra server arguments
 # ql_start_server [EXTRA_ARGS...]: sets SRV_PID, SRV_LOG, PORT. Uses D.
 ql_start_server() {
   SRV_LOG=$D/server.log

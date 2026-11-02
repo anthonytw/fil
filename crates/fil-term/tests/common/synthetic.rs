@@ -82,6 +82,8 @@ pub fn all() -> Vec<Fixture> {
         line_drawing(),
         hidden_state(),
         kitty_stack(),
+        kitty_alt(),
+        alt_decsc(),
     ]
 }
 
@@ -638,6 +640,45 @@ fn kitty_stack() -> Fixture {
         40,
         5,
         "kitty keyboard flags: push 1, 3, 7, pop one, then OR in 8 (leaves 3|8 = 11)",
+        &mut s,
+    )
+}
+
+/// Kitty keyboard flags on the alternate screen set without a push (`CSI = f u`), then changed
+/// after a push. The active flags then differ from the top of the stack, which a read that
+/// swaps screens and re-derives the flags from the stack would silently reset.
+fn kitty_alt() -> Fixture {
+    let mut s = S::new();
+    s.t("primary screen text").nl();
+    s.c(">2u");
+    s.c("?1049h").c("2J").c("H").t("alternate screen");
+    s.c("=1u").at(2, 1).t("flags set without a push");
+    s.c(">4u").c("=3u").at(3, 1).t("pushed 4, then set to 3");
+    fx(
+        "kitty_alt",
+        40,
+        6,
+        "alternate screen: kitty flags set with CSI = (no push), then pushed and changed, so flags differ from the stack top",
+        &mut s,
+    )
+}
+
+/// A DECSC on the primary screen at a position the cursor then leaves, then `?1049h`. Entering
+/// overwrites the saved cursor with the current one, and `1049 l` brings it back, so a state
+/// read taken on the alternate screen must leave that restore point alone.
+fn alt_decsc() -> Fixture {
+    let mut s = S::new();
+    s.t("primary text")
+        .at(3, 5)
+        .e("7")
+        .at(5, 2)
+        .t("cursor here");
+    s.c("?1049h").c("2J").c("H").t("alternate");
+    fx(
+        "alt_decsc",
+        30,
+        6,
+        "DECSC on the primary at (3,5), cursor moved on, then 1049h: leaving must restore the cursor taken at entry",
         &mut s,
     )
 }

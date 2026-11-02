@@ -6,6 +6,13 @@
 //!   public, so `state` swaps to the primary, reads it, swaps back and restores the alternate
 //!   grid from a copy. It works, but it means a read mutates the terminal, so the `Term`
 //!   sits in a `RefCell`.
+//! - `swap_alt` has side effects beyond swapping: the kitty flags are re-derived from the
+//!   stack top (restored explicitly afterwards, since `CSI = f u` changes the flags without
+//!   touching the stack), and entering from the primary copies the cursor into the saved
+//!   cursor (harmless: `1049 h`, the only way alacritty enters the alternate screen, does
+//!   exactly that already, and the primary cursor cannot move while the alternate is up).
+//!   Selection and damage tracking are also reset; nothing here uses them. The idempotence
+//!   test in `tests/roundtrip.rs` guards the whole class.
 //! - The scroll region (`Term::scroll_region`) is private, so it is shadowed by a second
 //!   tiny parser (`sniff::RegionTracker`) fed the same bytes.
 //! - `Term::cursor_style` folds "unset" into a configured default; a sentinel default
@@ -23,7 +30,8 @@ use alacritty_terminal::index::{Column, Line as GLine};
 use alacritty_terminal::term::cell::{Cell as ACell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color as AColor, CursorShape as AShape, CursorStyle as AStyle, NamedColor, Processor,
+    Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler, KeyboardModes,
+    KeyboardModesApplyBehavior, NamedColor, Processor,
 };
 
 use crate::model::{
@@ -165,6 +173,7 @@ impl Emulator for Alacritty {
         let mut links = Links::default();
         let style = term.cursor_style();
         let mode = *term.mode();
+        let kitty = kitty_flags(mode);
 
         let (screen, history, cursor, primary, saved) = if !alt {
             let (screen, history, cursor) = read_grid(term.grid(), history_lines, &mut links);
@@ -188,6 +197,13 @@ impl Emulator for Alacritty {
             term.swap_alt();
             let (p_screen, p_history, p_cursor) = read_grid(term.grid(), history_lines, &mut links);
             term.swap_alt();
+            // `swap_alt` re-derives the kitty flags from the stack top, but `CSI = f u`
+            // changes the flags without touching the stack, so put them back as they were.
+            Handler::set_keyboard_mode(
+                &mut *term,
+                KeyboardModes::from_bits_truncate(kitty),
+                KeyboardModesApplyBehavior::Replace,
+            );
             let grid = term.grid_mut();
             for (r, cells) in raw_rows.into_iter().enumerate() {
                 for (c, cell) in cells.into_iter().enumerate() {
@@ -215,18 +231,6 @@ impl Emulator for Alacritty {
         cursor.blinking = blinking;
         cursor.visible = mode.contains(TermMode::SHOW_CURSOR);
 
-        let mut kitty = 0u8;
-        for (flag, bit) in [
-            (TermMode::DISAMBIGUATE_ESC_CODES, 1),
-            (TermMode::REPORT_EVENT_TYPES, 2),
-            (TermMode::REPORT_ALTERNATE_KEYS, 4),
-            (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
-            (TermMode::REPORT_ASSOCIATED_TEXT, 16),
-        ] {
-            if mode.contains(flag) {
-                kitty |= bit;
-            }
-        }
         let mouse_tracking = if mode.contains(TermMode::MOUSE_MOTION) {
             MouseTracking::AnyEvent
         } else if mode.contains(TermMode::MOUSE_DRAG) {
@@ -277,6 +281,23 @@ fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>) -> Option<SavedCursor> 
         pen: attrs(&c.template),
     };
     (saved != SavedCursor::default()).then_some(saved)
+}
+
+/// The active kitty keyboard flags as the protocol's bit values.
+fn kitty_flags(mode: TermMode) -> u8 {
+    let mut kitty = 0u8;
+    for (flag, bit) in [
+        (TermMode::DISAMBIGUATE_ESC_CODES, 1),
+        (TermMode::REPORT_EVENT_TYPES, 2),
+        (TermMode::REPORT_ALTERNATE_KEYS, 4),
+        (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
+        (TermMode::REPORT_ASSOCIATED_TEXT, 16),
+    ] {
+        if mode.contains(flag) {
+            kitty |= bit;
+        }
+    }
+    kitty
 }
 
 fn shape_of(style: AStyle) -> (CursorShape, bool) {

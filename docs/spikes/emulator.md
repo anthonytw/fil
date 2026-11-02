@@ -10,9 +10,9 @@ Candidates built: `alacritty_terminal` 0.26.0 (Apache-2.0) and `vt100` 0.18.1 (M
 **Make `alacritty` the default backend; keep `vt100` compiled in as the small alternative.**
 The owner decides; DESIGN.md is not edited here.
 
-- On the 27-fixture corpus the generic snapshot writer restores **every field alacritty can report** (0 failures in
-  810 field checks per scenario, 4 scenarios). vt100 also has 0 failures there, but it can report far fewer fields
-  (167 of 810 are "unsupported" against 27), so its pass rate says less.
+- On the 29-fixture corpus the generic snapshot writer restores **every field alacritty can report** (0 failures in
+  870 field checks per scenario, 4 scenarios). vt100 also has 0 failures there, but it can report far fewer fields
+  (189 of 870 are "unsupported" against 29), so its pass rate says less.
 - The **continuation probe** (feed the same follow-up bytes to the original and the restored terminal) is where the
   difference shows. After a restore, vt100 loses the saved cursor, origin/autowrap/insert state, and (while the
   alternate screen is up) the whole scrollback. alacritty loses only tab stops and the charset designation.
@@ -20,7 +20,8 @@ The owner decides; DESIGN.md is not edited here.
   and colon sub-parameters, has no DECAWM, handles backspace in the pending-wrap state differently from xterm, and has
   no DEC graphics set.
 - alacritty is the only one with reflow, hyperlinks, underline styles, and query replies (DA, DSR, kitty query).
-- Cost: about 1.9x the parse throughput of vt100, about 30% more memory per session, and more glue (below).
+- It is also faster, about 1.9x the parse throughput of vt100. It costs about 30% more memory per session and
+  needs more glue (below).
 - Risk to weigh: `alacritty_terminal` is a library extracted from an application. Its API is not designed for
   this use (see "API and maintenance"), so every upgrade needs a re-run of this harness.
 
@@ -49,27 +50,29 @@ fixture bytes --feed--> emulator --state(1000)--> S1 --snapshot()--> bytes --fee
      saved cursor and the scroll region, so it exposes state that `TermState` does not carry or a backend cannot read.
 - **Cross-backend**: compare the two backends' S1 on the original stream; **cross-restore**: render A's snapshot
   and feed it to B (a stand-in for "another terminal reads the bytes").
-- Corpus: 22 synthetic streams (written as Rust source in `tests/common/synthetic.rs`, generated to `.raw` by
+- Corpus: 24 synthetic streams (written as Rust source in `tests/common/synthetic.rs`, generated to `.raw` by
   `just fixtures`, checked for drift by a `just ci` test) and 5 real recordings made by `just record` on a PTY
   with a scrubbed environment: bash with colored `ls`, vim editing a Python file, `less`, `top`, and a `\r`
   progress bar. Recorded on macOS 27.2: bash 3.2, Vim 9.1, less 668, macOS `top`. In `top_view`, process names
   and the clock are replaced with placeholders by the recorder (escape sequences untouched); all fixtures were
   grepped for usernames, hostnames, paths and IPs.
 - `just ci` includes a fast version of scenarios 1-3 over the whole corpus (0.2 s). `just fidelity` runs everything
-  plus the replies, performance and memory sections.
+  plus the replies, performance and memory sections. A second gate in `just ci` checks that reading the state
+  is harmless: for every fixture and backend, `state()` twice gives equal results, and an emulator that has been
+  read and then fed follow-up bytes ends in exactly the state (and replies) of a never-read one.
 
 ## Results
 
 All numbers are from `just fidelity` on an Apple Silicon Mac (release build). Cells are `pass/fail/unsupported` field
-counts summed over the 27 fixtures (27 x 30 = 810 per row).
+counts summed over the 29 fixtures (29 x 30 = 870 per row).
 
 | Scenario | alacritty | vt100 |
 |---|---|---|
-| round-trip | 783 / **0** / 27 | 643 / **0** / 167 |
-| narrow (reflow) | 783 / **0** / 27 | 643 / **0** / 167 |
-| wide | 783 / **0** / 27 | 643 / **0** / 167 |
-| probe (continuation) | 782 / **1** / 27 | 638 / **5** / 167 |
-| narrowing keeps logical line text | 26 of 26 fixtures (1 skipped: alt screen) | 16 of 26 (no reflow) |
+| round-trip | 841 / **0** / 29 | 681 / **0** / 189 |
+| narrow (reflow) | 841 / **0** / 29 | 681 / **0** / 189 |
+| wide | 841 / **0** / 29 | 681 / **0** / 189 |
+| probe (continuation) | 840 / **1** / 29 | 676 / **5** / 189 |
+| narrowing keeps logical line text | 26 of 26 fixtures (3 skipped: alt screen) | 16 of 26 (no reflow) |
 | cross-restore (A's snapshot fed to B) | alacritty to vt100: 4 diffs | vt100 to alacritty: 3 diffs |
 
 Probe failures (the only ones):
@@ -140,7 +143,7 @@ because neither crate exposes the scroll region.
 
 ## Cross-backend disagreements, adjudicated
 
-Nine of 27 fixtures differ in at least one supported field (18 are identical). Each row is a real difference
+Nine of 29 fixtures differ in at least one supported field (20 are identical). Each row is a real difference
 found by the harness; the verdict comes from the standard text (ECMA-48 / the xterm ctlseqs) or from xterm's
 documented behavior, **not** from running xterm or another reference terminal here.
 
@@ -156,6 +159,7 @@ documented behavior, **not** from running xterm or another reference terminal he
 | 8 | EL/ECH with bold set: does the erased cell keep bold? xterm erases with the background color only | bold dropped | bold kept on the blank cell | alacritty (invisible on screen) |
 | 9 | ED 2 (`CSI 2 J`): ECMA-48 and xterm erase, nothing goes to scrollback | pushes the visible lines into history (observed: 2 lines after `a CRLF b CRLF CSI 2J`; 1 on an empty screen) | erases only | vt100 by the letter; alacritty's behavior looks deliberate and is what many users expect from `clear`, but it changes what "history" means for a snapshot |
 | 10 | VS16 emoji presentation (`❤` U+FE0F) width | 1 cell | 2 cells | unresolved: terminals disagree (xterm 1, kitty/WezTerm/iTerm2 2). Width has to match the user's real terminal, which fil cannot know |
+| 11 | Alternate screen via `?47` / `?1047` (older terminfo entries use these) | only `?1049` is recognized (read from vte's mode list), so these are ignored | `?47` honored, `?1047` ignored | neither; xterm supports all three. Found by reading the sources, not by a fixture |
 
 Alacritty-side artifacts that are not disagreements, normalized in the adapter: it stores a literal TAB in cells it
 tabbed over (mapped to a blank), a leading blank filler before a wide character that did not fit at a line end, and
@@ -171,8 +175,14 @@ terminal's other state mostly is not. Glue that was needed (`src/be_alacritty.rs
 
 - the **inactive grid is private**. `Term::swap_alt` is public, so `state()` swaps to the primary, reads it, swaps back
   and writes the alternate grid back from a copy. That works (round-trip and probe pass on `alt_active`, `vim_edit`,
-  `less_view` and `top_view`), but a read mutates the terminal, so the `Term` sits in a `RefCell`. The second swap
-  also overwrites the primary's saved cursor with its current cursor; that is the value `1049 h` stored anyway;
+  `less_view` and `top_view`), but a read mutates the terminal, so the `Term` sits in a `RefCell`. `swap_alt` has side effects beyond swapping, and a first version of this adapter missed one: it re-derives the kitty
+  flags from the top of the flag stack, but `CSI = f u` changes the flags without touching the stack, so a read
+  on the alternate screen silently reset them (caught in review; the follow-up bytes then ran with the wrong flags).
+  The adapter now puts the flags back after the second swap. The other effects are harmless here: the second swap
+  copies the primary cursor into the primary's saved cursor, which is what `1049 h` (alacritty's only way into the
+  alternate screen) had stored already and the primary cursor cannot move meanwhile; selection and damage tracking
+  are reset, and nothing here uses them. The idempotence gate above covers this class of bug; with the fix, it
+  found nothing else on any fixture or backend;
 - **scroll region private**: the sidecar `vte` parser (`src/sniff.rs`, 115 lines);
 - **cursor style**: `Term::cursor_style` folds "unset" into a configured default, so the adapter sets a sentinel
   default (hollow, blinking) to tell "never set" from "steady block";

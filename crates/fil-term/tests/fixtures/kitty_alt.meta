@@ -1,0 +1,4 @@
+cols = 40
+rows = 6
+kind = synthetic
+description = alternate screen: kitty flags set with CSI = (no push), then pushed and changed, so flags differ from the stack top

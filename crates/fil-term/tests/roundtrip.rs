@@ -87,3 +87,59 @@ fn registry_creates_every_backend_by_name() {
         assert_eq!(e.state(0).screen_text()[0], "hello");
     }
 }
+
+/// Bytes fed after a stream, to show whether reading the state disturbed the emulator. They
+/// OR into the kitty flags (which depend on the flags as they were), draw, scroll, leave
+/// the alternate screen and restore the saved cursor.
+const FOLLOW_UP: &[u8] =
+    b"\x1b[=4;2uZ\r\nfollow\x1b[2;1Hq\x1b[?u\x1b[5n\r\n\r\n\r\nend\x1b[?1049l\x1b8Y";
+
+#[test]
+fn reading_state_is_idempotent_and_does_not_disturb_the_emulator() {
+    let mut failures = Vec::new();
+    for b in backends() {
+        for (name, size, bytes) in fixtures() {
+            let mut read = (b.create)(size, 1000);
+            read.feed(&bytes);
+            // Reads at different history depths, repeated.
+            let first = read.state(1000);
+            let screen_only = read.state(0);
+            let second = read.state(1000);
+            if first != second {
+                failures.push(format!(
+                    "{} / {name}: state(1000) changed between two reads",
+                    b.name
+                ));
+            }
+            if screen_only.screen != first.screen || screen_only.modes != first.modes {
+                failures.push(format!(
+                    "{} / {name}: state(0) differs from state(1000) beyond history",
+                    b.name
+                ));
+            }
+            // The same stream, never read, then the same follow-up bytes.
+            let mut fresh = (b.create)(size, 1000);
+            fresh.feed(&bytes);
+            read.feed(FOLLOW_UP);
+            fresh.feed(FOLLOW_UP);
+            let (a, c) = (read.state(1000), fresh.state(1000));
+            if a != c {
+                let diffs: Vec<String> = compare(&a, &c, &b.capabilities)
+                    .into_iter()
+                    .filter_map(|r| match r.verdict {
+                        Verdict::Fail(d) => Some(format!("{}: {d}", r.field)),
+                        _ => None,
+                    })
+                    .collect();
+                failures.push(format!(
+                    "{} / {name}: follow-up after a read differs from a never-read emulator: {diffs:?}",
+                    b.name
+                ));
+            }
+            if read.take_replies() != fresh.take_replies() {
+                failures.push(format!("{} / {name}: replies differ after a read", b.name));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

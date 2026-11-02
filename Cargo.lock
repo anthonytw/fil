@@ -340,6 +340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fil-testbins"
+version = "0.0.0"
+dependencies = [
+ "fil-proto",
+ "fil-transport",
+ "quinn",
+ "tokio",
+]
+
+[[package]]
 name = "fil-transport"
 version = "0.0.0"
 dependencies = [

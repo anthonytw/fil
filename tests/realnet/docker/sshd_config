@@ -1,0 +1,18 @@
+# sshd for the realnet topology. Public keys and the user CA are copied in by ssh.sh at run time.
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+# The key files are copied in as root-owned files, readable by everyone.
+AuthorizedKeysFile /etc/fil-realnet/authorized_keys
+TrustedUserCAKeys /etc/fil-realnet/ca.pub
+StrictModes no
+AllowTcpForwarding yes
+PermitTTY yes
+# A pre-authentication banner goes to the client's stderr, never its stdout.
+Banner /etc/fil-realnet/banner
+PrintMotd yes
+# VERBOSE logs how each login authenticated (key or certificate) and the source address.
+LogLevel VERBOSE

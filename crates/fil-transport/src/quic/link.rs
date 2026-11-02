@@ -370,7 +370,8 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
             Err(ReadExactError::ReadError(_)) => return,
         }
-        io.got_frame.send_replace(true);
+        io.got_frame
+            .send_if_modified(|seen| !std::mem::replace(seen, true));
         if proof_pending {
             proof_pending = false;
             if payload == accept_proof() {

@@ -64,6 +64,19 @@ impl Bucket {
     }
 }
 
+/// The key a source is counted under: its address, or for IPv6 its /64, which is what one
+/// subscriber normally gets and can rotate through freely.
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            IpAddr::from(o)
+        }
+    }
+}
+
 /// The most sources tracked at once. Beyond it the oldest idle entries go first.
 const MAX_SOURCES: usize = 4096;
 
@@ -84,6 +97,7 @@ impl Limiter {
 
     /// Asks for one handshake from `source`. Spends a token from both buckets on `Allow`.
     pub(super) fn check(&mut self, source: IpAddr, now: Instant) -> Verdict {
+        let source = source_key(source);
         let l = self.limits;
         if self.sources.len() >= MAX_SOURCES && !self.sources.contains_key(&source) {
             self.evict(now);
@@ -177,6 +191,22 @@ mod tests {
         // A refused handshake did not cost the source its token.
         let t1 = t0 + Duration::from_secs(1);
         assert_eq!(l.check(ip(4), t1), Verdict::Allow);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_subscriber_cannot_rotate_addresses_inside_its_prefix() {
+        let t0 = Instant::now();
+        let mut l = Limiter::new(limits(), t0);
+        let host = |n: u16| IpAddr::from([0x2001, 0xdb8, 1, 2, 0, 0, 0, n]);
+        for n in 0..3 {
+            assert_eq!(l.check(host(n), t0), Verdict::Allow);
+        }
+        assert_eq!(l.check(host(99), t0), Verdict::SourceLimited);
+        // Another /64 is another subscriber.
+        assert_eq!(
+            l.check(IpAddr::from([0x2001, 0xdb8, 1, 3, 0, 0, 0, 1]), t0),
+            Verdict::Allow
+        );
     }
 
     #[tokio::test(start_paused = true)]

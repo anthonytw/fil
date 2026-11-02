@@ -776,6 +776,7 @@ fn a_long_outage_makes_few_attempts() {
     // Nothing works for a day; no hints.
     for setting in [TransportSetting::Auto, TransportSetting::Direct] {
         let (runs, dials) = storm(setting, None, 24);
+        eprintln!("{setting:?}: {runs} ssh attempts and {dials} dials in a simulated day");
         // About 3 attempts a minute at the start, then one per 30 s (pipe) and per 2 min (direct).
         assert!(
             runs <= 24 * 60 * 22 / 10,
@@ -796,6 +797,9 @@ fn a_network_that_flaps_all_day_is_bounded_by_the_hint_budget() {
         TransportSetting::Pipe,
     ] {
         let (runs, dials) = storm(setting, Some(S(1)), 1);
+        eprintln!(
+            "{setting:?}: {runs} ssh attempts and {dials} dials in a simulated hour of hints"
+        );
         // Four honoured hints a minute; each restarts the backoff, so each is worth a handful of
         // attempts before the next one. Measured: about 6 ssh logins and 9 dials a minute.
         assert!(runs <= 60 * 7, "{setting:?}: {runs} ssh logins in an hour");

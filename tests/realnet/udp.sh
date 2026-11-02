@@ -394,17 +394,22 @@ s_ip_change() {
 # keep-alive 1 s (LivenessParams::default). Shorter than the idle timeout the connection should
 # survive; longer, it ends with a timeout and the client reconnects with a new handshake.
 blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
-  local dur=$1 expect=$2 traffic=${3:-active} rate=262144 label="blackout-$1s"
-  # "quiet": nothing but keep-alives on the link, as in the simulator's blackout table.
-  if [[ $traffic == quiet ]]; then
-    rate=0
-    label="blackout-quiet-$1s"
-  fi
+  local dur=$1 expect=$2 traffic=${3:-active} rate=262144 label="blackout-$1s" poke=()
+  # "quiet": nothing but keep-alives on the link. "poke": quiet, but one keystroke-sized write the
+  # moment the link returns, which is what the simulator's blackout table did (docs/spikes/netsim.md).
+  case $traffic in
+    quiet) rate=0 label="blackout-quiet-$1s" ;;
+    poke)
+      rate=0
+      label="blackout-poke-$1s"
+      poke=(--poke-file "$OUT/run/$SCENARIO/$label/poke")
+      ;;
+  esac
   reset_net
   netem_apply delay 20ms
   new_run "$label"
   start_server
-  bg_client c --mode stream --duration $((3 + ${dur%.*} + 8)) --rate "$rate" --reconnect --reconnect-for 40
+  bg_client c --mode stream --duration $((3 + ${dur%.*} + 8)) --rate "$rate" ${poke[@]+"${poke[@]}"} --reconnect --reconnect-for 40
   wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect: $(cat "$CLIENT_OUT")"
   sleep 3
   local t_block t_heal
@@ -413,6 +418,7 @@ blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
   sleep "$dur"
   udp_unblock
   t_heal=$(now_ms)
+  [[ $traffic != poke ]] || : > "$D/poke"
   wait_exit "$CLIENT_PID" 60
   cat "$CLIENT_OUT"
   local line lost=false lost_after="" recov=""
@@ -454,6 +460,9 @@ s_blackouts() {
   blackout_case 4.5 either quiet
   blackout_case 4.9 either quiet
   blackout_case 5.5 either quiet
+  blackout_case 4.5 survive poke
+  blackout_case 4.9 either poke
+  blackout_case 5.5 either poke
 }
 
 # UDP dropped by the router: how long until the client KNOWS? (The input for the pipe fallback.)

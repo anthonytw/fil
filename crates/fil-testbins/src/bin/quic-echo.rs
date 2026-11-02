@@ -5,7 +5,7 @@
 //! quic-echo server --keys-dir DIR --fp-out FILE --port-out FILE [--port-range LO-HI]
 //!                  [--bind IP] [--idle-ms N] [--keepalive-ms N]
 //! quic-echo client --server IP:PORT --pub-out FILE --pin-file FILE [--local IP:PORT]
-//!                  [--mode bulk|stream] [--bytes N] [--duration S] [--rate BYTES_PER_S (0: quiet)]
+//!                  [--mode bulk|stream] [--bytes N] [--duration S] [--rate BYTES_PER_S (0: quiet)] [--poke-file F]
 //!                  [--idle-ms N] [--keepalive-ms N] [--connect-timeout S] [--reconnect]
 //!                  [--reconnect-for S] [--connect-only]
 //! quic-echo udp-recv --bind IP:PORT [--idle-ms N]
@@ -249,6 +249,9 @@ struct Plan {
     bytes: u64,
     duration: Duration,
     rate: u64,
+    /// With rate 0: send one small chunk, once, as soon as this file exists (a user keystroke at
+    /// a moment the harness chooses).
+    poke_file: Option<String>,
 }
 
 /// What the receiving half saw.
@@ -277,6 +280,7 @@ async fn client(a: &Args) -> Result<u8, String> {
         bytes: a.num("bytes", 4 << 20)?,
         duration: Duration::from_secs_f64(a.num("duration", 10.0)?),
         rate: a.num("rate", 256 * 1024)?,
+        poke_file: a.get("poke-file").map(str::to_owned),
     };
     let connect_timeout = Duration::from_secs_f64(a.num("connect-timeout", 30.0)?);
     let reconnect_for = Duration::from_secs_f64(a.num("reconnect-for", 60.0)?);
@@ -473,6 +477,7 @@ async fn reconnect(
             bytes: 1 << 20,
             duration: Duration::ZERO,
             rate: 0,
+            poke_file: None,
         };
         let (s, r) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let stats = Arc::new(std::sync::Mutex::new(RxStats::default()));
@@ -512,20 +517,31 @@ async fn sender(mut send: SendStream, plan: &Plan, sent: &AtomicU64) -> Result<(
     if plan.stream {
         // A chunk every 50 ms. Ticks missed while blocked are made up in a burst.
         let tick = Duration::from_millis(50);
-        // Rate 0 is a quiet link: nothing is sent, so only keep-alives cross it.
-        let per_tick = if plan.rate == 0 {
+        // Rate 0 is a quiet link: only keep-alives cross it, plus one chunk when poked.
+        let steady = if plan.rate == 0 {
             0
         } else {
             (plan.rate / 20).clamp(1, buf.len() as u64) as usize
         };
+        let mut poked = false;
         let mut interval = tokio::time::interval(tick);
         let end = Instant::now() + plan.duration;
         while Instant::now() < end {
             interval.tick().await;
-            if per_tick > 0 {
-                fill_pattern(SEED, offset, &mut buf[..per_tick]);
-                send.write_all(&buf[..per_tick]).await.map_err(werr)?;
-                offset += per_tick as u64;
+            let mut n = steady;
+            if !poked
+                && plan
+                    .poke_file
+                    .as_deref()
+                    .is_some_and(|f| Path::new(f).exists())
+            {
+                poked = true;
+                n = 16;
+            }
+            if n > 0 {
+                fill_pattern(SEED, offset, &mut buf[..n]);
+                send.write_all(&buf[..n]).await.map_err(werr)?;
+                offset += n as u64;
                 sent.store(offset, Ordering::Relaxed);
             }
         }

@@ -18,7 +18,7 @@ removed. Nothing in `DESIGN.md` has to change.
 Numbers are in "Harness results". In short:
 
 - `just ci`: 15 scripted scenarios × 2 backends × 2 predictors, plus one deterministic trace per
-  hazard, plus the guard-off sweep: no violations.
+  hazard: no violations. The guard-off sweep runs on demand (`just predict-mutants`).
 - Soak (`just predict-soak 1000`, release): 60,000 scripted sessions, no violations.
 - 13 of 13 testable guards are each shown necessary: switching the guard off makes the harness
   fail (12 in the randomized sweep, 1 in a deterministic trace), and the failure shrinks to 1 to 20
@@ -358,7 +358,8 @@ Assumed, not verified:
 ## Reproduce
 
 ```
-just ci                                      # includes the scripted scenarios, mutants and hazards (adds about 10 s)
+just ci                                      # includes the scripted scenarios and hazard traces (adds about 3 s)
+just predict-mutants                         # guard-off sweep: every guard is needed (on demand, after changing a guard)
 just predict-soak 1000                       # 60,000 scripted sessions, release (about 3 minutes)
 cargo test -p fil-predict -- --nocapture     # the mutants test prints what each guard-off run caught
 just predict-harness --seeds 8               # real programs on a PTY, both backends

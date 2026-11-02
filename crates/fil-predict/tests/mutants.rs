@@ -99,6 +99,7 @@ const MUTANTS: &[Mutant] = &[
 ];
 
 #[test]
+#[ignore = "slow (~7 s debug); run with `just predict-mutants` when changing overlay guards"]
 fn every_guard_is_needed() {
     let mut missed = Vec::new();
     for m in MUTANTS {

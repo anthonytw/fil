@@ -50,3 +50,7 @@ predict-demo *args:
 # Scripted prediction scenarios at scale (no PTY): many seeds, release build.
 predict-soak seeds="200":
     FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim
+
+# Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
+predict-mutants:
+    cargo test -p fil-predict --release --test mutants -- --ignored

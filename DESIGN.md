@@ -147,6 +147,9 @@ The handling is configurable **(decided)**:
 - **Process grouping:**
   - On systemd hosts **with lingering enabled**, each session runs in its own transient user scope (`systemd-run --user --scope`). That gives reliable port attribution (§7.4) and clean teardown.
   - Without lingering, the user manager stops at logout and would take the scopes with it. Those hosts fall back to the session's process tree.
+  - Lingering is read from `loginctl show-user -p Linger` when the session is created. The child is a session leader, so its pid is also its process group id.
+  - **Teardown (`fil kill`):** a hangup to the group and to every descendant, as closing a terminal would send; after a short grace, SIGKILL to what is left, and `systemctl --user kill` on the scope. In the tree fallback the session records the descendants every few seconds, so a background job that was orphaned or moved to its own group (job control) is still found. A process that double-forks and dies between two scans escapes; the scope has no such limit.
+  - When the shell exits by itself, what it left running is sent the hangup but not killed.
 
 ### 5.2 One subscriber, with takeover
 
@@ -190,17 +193,24 @@ The client writes those bytes straight to the local terminal. That is why native
 - **Snapshot** applies to a new client, or when the log has wrapped. The daemon renders from its emulator:
   1. the last N history lines (default 1000), as text with SGR attributes, reflowed to the new width
   2. the current screen
-  3. the terminal modes: alternate screen, cursor position and style, mouse, bracketed paste, focus and keypad modes, kitty keyboard flags, scroll region and title
+  3. the terminal modes: alternate screen, cursor position and style, mouse, bracketed paste, focus and keypad modes, kitty keyboard flags, scroll region, title, tab stops and character sets (G0 to G3, the invoked one, and the ones the saved cursor holds)
 - **Catch-up rule:** if the subscriber falls behind by more than a threshold (default 1 MiB or 2 s of output), the daemon jumps to a snapshot instead of replaying the backlog. On a slow link, `cat hugefile` followed by Ctrl-C stays responsive, which is mosh's main advantage. The cost is a gap in native scrollback. The gap is visible: a marker line such as `── fil: skipped 48 MB of output ──` goes into the scrollback.
+
+Details the session implements (`fil-session`):
+
+- **Snapshots are only taken between escape sequences.** Neither emulator exposes its parser state, so a snapshot taken mid-sequence would lose the pending bytes. The session holds back the unfinished end of the output (it is in the log, but neither the emulator nor any subscriber sees it) until the sequence completes; a tail longer than 1 MiB is let through as it is. Every snapshot is therefore exact for the offset it announces.
+- **The daemon writes the marker**, as the first thing in the snapshot, together with what is needed to put it in the scrollback: leave an alternate screen, reset the scroll region and mouse and kitty keyboard state, then scroll the screen contents and the marker line above the visible area. The client must not add a marker of its own. A new client (`skipped` is 0) gets no marker.
+- **The rule is looked at between sends**, so a link that blocks the sender is judged when it unblocks. It does not fire when everything has already been sent and only the acknowledgements are late: a snapshot would rewrite what the client has.
 
 ### 6.3 Terminal queries
 
 Programs ask the terminal questions: cursor position, device attributes, colors, kitty keyboard support.
 
 - While a client is attached, queries pass through to the real terminal, and its replies come back as input.
-- While detached, the daemon's emulator answers, so programs don't hang waiting for a reply.
+- While detached, the daemon's emulator answers, so programs don't hang waiting for a reply. "Detached" includes a subscriber whose transport has died and not yet resumed. The emulator does not answer the color queries (OSC 10, 11, 12 and 4) or the text-area-size requests (`CSI 14 t`, `16 t`, `18 t`), so the session does: from the colors and cell size the last attached terminal reported (it watches the replies pass through as input), or dark-theme defaults.
+- Output that holds a query the daemon answered cannot be replayed to a client that missed it, because its terminal would answer a second time and the answer would arrive as keystrokes. That client gets a snapshot instead of a resume.
 
-A takeover that lands between a query and its reply is a known edge case (§16).
+**A takeover between a query and its reply** (§16 item 4): the query went to the old terminal, so its reply is lost. The old subscriber's input is ignored from the moment of the takeover, and the new terminal never sees the query (it gets a snapshot, which contains none). The program waits until its own timeout. This is the simplest behavior that cannot inject a stray reply into the new client's session.
 
 ### 6.4 `TERM`
 
@@ -423,8 +433,10 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 **Messages for the terminal and prediction.**
 - `AttachReply.term` carries the session's `TERM` (§6.4).
-- `PtyMode { canonical, echo, at }` reports a change in the PTY's line discipline at terminal offset `at`, so the client applies it in order with the output. A password prompt is `canonical && !echo`.
-- `EchoAck { input_upto, output_at }` is mosh's echo acknowledgement. Every keystroke byte below `input_upto` reached the PTY at least the echo window ago, and any output it caused is below `output_at`.
+- `PtyMode { canonical, echo, at }` reports a change in the PTY's line discipline at terminal offset `at`, so the client applies it in order with the output. A password prompt is `canonical && !echo`. The daemon reads `ICANON` and `ECHO` after every read of output (a change is positioned at the first byte of that read), after every write of input, and every 50 ms while a client is attached, because `read -s` changes the mode with no output at all. The attach starts with the mode in force at the start point; the message is sent once the output below `at` has been.
+- `EchoAck { input_upto, output_at }` is mosh's echo acknowledgement. Every keystroke byte below `input_upto` reached the PTY at least the echo window (50 ms) ago, and any output it caused is below `output_at`. `input_upto` counts the subscriber's input stream, which starts at 0 for a fresh attach and continues on a resume (the daemon sends `Resume { TERMINAL, received }` after the attach reply, and the client sends its input from there). The message is sent once the output below `output_at` has been.
+- `Link::close` discards what is queued and the trait has no flush, so before dropping a transport the daemon sends the last message (`TakenOver`, `AttachRefused`, an error), waits up to 300 ms for the client to hang up, and only then closes.
+- A session whose shell has exited ends: the daemon sends what is left, waits for it to be acknowledged, and closes the link. A later attach is refused with `SessionGone`. There is no message that carries the exit status to the client yet.
 
 Before v1 these changes are made in place, with no compatibility kept.
 
@@ -525,7 +537,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 - **License:** GPL-3.0-or-later **(decided)**. GPLv3 rather than v2 because the planned dependencies include Apache-2.0 crates, which are compatible with v3 but not v2. Not AGPL, because users run fil on hosts they control, and many employers ban AGPL software outright.
 - **Crates:**
   - async runtime: tokio
-  - PTY, termios and peer credentials: rustix
+  - PTY, termios and peer credentials: rustix. M1's sessions (`fil-session`) use portable-pty for the PTY and its child (`openpty` plus a spawn that makes the child a session leader with the PTY as its controlling terminal) and nix for termios flags and signals.
   - direct mode: quinn and rustls
   - terminal emulator: chosen per §6.5
   - CLI: clap
@@ -536,6 +548,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
   - `fil-proto`: frames and channel semantics
   - `fil-transport`: the trait, pipe and QUIC
   - `fil-term`: the emulator trait, its backends and snapshots
+  - `fil-session`: one session (PTY, log, emulator, the subscriber protocol over any `Link`)
   - `fil-predict`: the trait and the default predictor
   - `fil-netsim`: the in-process link simulator (§12), used only by tests
   - `fil-daemon`
@@ -596,7 +609,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
-4. **Terminal-query replies in flight during a takeover** (§6.3).
+4. ~~**Terminal-query replies in flight during a takeover**~~ Resolved for M1 (proposed, not decided): the reply is lost and nothing is repaired; the program's own timeout ends the wait. See §6.3.
 5. **Server binary:** manual install, or upload by the client (§11)?
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**

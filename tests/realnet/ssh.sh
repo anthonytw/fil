@@ -61,6 +61,7 @@ ssh_setup() {
   done
   cx ssh -T viajumps true || { echo "realnet: the topology did not come up" >&2; exit 1; }
   log "topology up: client -> jump1 -> jump2 -> target"
+  log "client $(cx ssh -V 2>&1), target openssh-server $(docker exec rn-target dpkg-query -W -f='${Version}' openssh-server)"
 }
 
 ssh_teardown() {

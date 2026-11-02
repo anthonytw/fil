@@ -479,7 +479,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 ## 12. Testing
 
-- **Network harness:** an in-process link simulator covering latency, jitter, loss, reordering, blackouts and NAT rebinding, used by unit and integration tests. Linux CI also runs through `tc netem`.
+- **Network harness:** an in-process link simulator covering latency, jitter, loss, reordering, blackouts and NAT rebinding, used by unit and integration tests. Linux CI also runs through `tc netem`: the real-network harness (`docs/m1/realnet.md`) puts real OpenSSH (jump hosts, certificates, ControlMaster) and real NAT, conntrack and `tc netem` under stand-in programs, and is run on demand.
 - **Transport matrix:** every integration test runs over both the pipe and QUIC.
 - **Restore fidelity:** recorded byte streams from real programs (shells, vim, less, htop, a build with progress bars) are replayed. A snapshot rendered into a fresh emulator must match the original screen and history.
 - **Fault injection:**

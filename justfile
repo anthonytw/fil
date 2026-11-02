@@ -55,6 +55,17 @@ predict-soak seeds="200":
 predict-mutants:
     cargo test -p fil-predict --release --test mutants -- --ignored
 
+# Status-line fuzz (crates/fil-predict/tests/status.rs): many random sessions checked against the
+# oracle, in release. Run after changing the overlay's status drawing.
+status-soak seeds="600":
+    FIL_STATUS_SEEDS={{seeds}} cargo test --release -p fil-predict --test status random
+
+# The client's real-terminal tests on a pseudo-terminal (crates/fil-client/tests/tty_pty.rs):
+# raw mode in and out, input, window size, signals, hangup, the panic hook. They raise signals at
+# their own process, so they run one at a time and are not part of `ci`.
+client-pty:
+    cargo test -p fil-client --test tty_pty -- --ignored --test-threads=1
+
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh` or `udp`; add scenario names to narrow.

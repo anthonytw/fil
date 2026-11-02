@@ -1,0 +1,521 @@
+//! A scripted daemon for the client tests, built from the real fil-proto pieces: the epoch state
+//! machine, the output log, the resume-or-snapshot decision, and fil-term's emulator and snapshot
+//! writer. It talks over `link::mem`. It is not P3's session; it is just faithful enough to the
+//! protocol (section 8.5) to exercise the client.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use fil_proto::ChannelId;
+use fil_proto::chan::{RecvChannel, Segment};
+use fil_proto::epoch::{AttachInput, AttachMode, AttachOutcome, Effect, SessionEpoch};
+use fil_proto::frame::DataSegment;
+use fil_proto::limits::MAX_DATA_PAYLOAD;
+use fil_proto::log::{CatchUpParams, OutputLog, StartDecision, decide_start};
+use fil_proto::msg::{
+    Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, SnapshotInfo, StartPoint,
+    TermName,
+};
+use fil_term::{Emulator, Size};
+use fil_transport::link::mem::{MemControl, MemLink};
+use fil_transport::{DownReason, Link};
+use tokio::sync::Mutex;
+
+pub const NOW_MS: u64 = 1_700_000_000_000;
+
+struct Conn {
+    link: Arc<MemLink>,
+    control: MemControl,
+}
+
+pub struct DState {
+    epoch: SessionEpoch,
+    log: OutputLog,
+    emu: Box<dyn Emulator>,
+    conns: HashMap<u64, Conn>,
+    current: Option<u64>,
+    /// Keystrokes taken in from the current subscriber.
+    input_rx: RecvChannel,
+    /// Everything ever received as keystrokes, across subscribers.
+    pub input_all: Vec<u8>,
+    sent: u64,
+    pub client_acked: u64,
+    pub sizes: Vec<(u16, u16)>,
+    pub attaches: Vec<Attach>,
+    pub detaches: u32,
+    pub snapshots: u32,
+    gone: bool,
+    refuse_next: Option<AttachRefusal>,
+    catch_up: CatchUpParams,
+    incarnation: u128,
+    epoch_no: u64,
+    /// Send `Resume` for the input stream after an attach (the contract the client relies on).
+    pub send_input_resume: bool,
+    /// Send only this many snapshot bytes, then kill the link.
+    cut_snapshot: Option<usize>,
+    /// Keystrokes arriving now are lost (as if the link dropped them).
+    lose_input: bool,
+    now_ms: u64,
+}
+
+pub struct FakeDaemon {
+    st: Mutex<DState>,
+}
+
+fn emu(size: Size) -> Box<dyn Emulator> {
+    fil_term::create(fil_term::DEFAULT_BACKEND, size, 1000).expect("default backend")
+}
+
+impl FakeDaemon {
+    pub fn new(log_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            st: Mutex::new(DState {
+                epoch: SessionEpoch::new(0xAB_CDEF),
+                log: OutputLog::new(log_capacity),
+                emu: emu(Size { cols: 80, rows: 24 }),
+                conns: HashMap::new(),
+                current: None,
+                input_rx: RecvChannel::new(),
+                input_all: Vec::new(),
+                sent: 0,
+                client_acked: 0,
+                sizes: Vec::new(),
+                attaches: Vec::new(),
+                detaches: 0,
+                snapshots: 0,
+                gone: false,
+                refuse_next: None,
+                catch_up: CatchUpParams::default(),
+                incarnation: 0xAB_CDEF,
+                epoch_no: 0,
+                send_input_resume: true,
+                cut_snapshot: None,
+                lose_input: false,
+                now_ms: NOW_MS,
+            }),
+        })
+    }
+
+    /// Takes the daemon's end of a new link.
+    pub fn accept(self: &Arc<Self>, link: MemLink, control: MemControl) {
+        let me = self.clone();
+        let link = Arc::new(link);
+        tokio::spawn(async move {
+            let hello = ControlMsg::Hello(Hello::ours(Agent::new("fake daemon").unwrap()));
+            let _ = send(&link, &hello).await;
+            loop {
+                let Ok((chan, payload)) = link.recv().await else {
+                    return;
+                };
+                let mut st = me.st.lock().await;
+                if chan == ChannelId::CONTROL {
+                    match ControlMsg::decode(&payload).expect("client sent a valid message") {
+                        ControlMsg::Attach(a) => {
+                            me.on_attach(&mut st, link.clone(), control.clone(), a)
+                                .await
+                        }
+                        ControlMsg::Ack { channel, upto } if channel == ChannelId::TERMINAL => {
+                            assert!(upto >= st.client_acked, "acks never go backwards");
+                            st.client_acked = upto;
+                        }
+                        ControlMsg::Resize(s) => st.sizes.push((s.cols(), s.rows())),
+                        ControlMsg::Detach => {
+                            st.detaches += 1;
+                            let e = st.epoch.epoch();
+                            let _ = st.epoch.detach(e);
+                            st.current = None;
+                        }
+                        _ => {}
+                    }
+                } else if chan == ChannelId::TERMINAL {
+                    if st.lose_input {
+                        continue;
+                    }
+                    let seg = DataSegment::parse(&payload).expect("valid segment");
+                    let fresh = st
+                        .input_rx
+                        .accept(seg.seq, seg.data)
+                        .expect("no gap")
+                        .to_vec();
+                    st.input_all.extend_from_slice(&fresh);
+                    let upto = st.input_rx.received();
+                    if let Some(a) = st.input_rx.ack_now() {
+                        let _ = upto;
+                        let _ = send(
+                            &link,
+                            &ControlMsg::Ack {
+                                channel: ChannelId::TERMINAL,
+                                upto: a,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn on_attach(&self, st: &mut DState, link: Arc<MemLink>, control: MemControl, a: Attach) {
+        st.attaches.push(a.clone());
+        if st.gone {
+            let _ = send(
+                &link,
+                &ControlMsg::AttachRefused(AttachRefusal::SessionGone),
+            )
+            .await;
+            return;
+        }
+        if let Some(r) = st.refuse_next.take() {
+            let _ = send(&link, &ControlMsg::AttachRefused(r)).await;
+            return;
+        }
+        let now = st.now_ms;
+        let outcome = st.epoch.attach(AttachInput {
+            key: a.key.clone(),
+            host: a.host.clone(),
+            size: a.size,
+            resume: a.resume,
+            now_unix_ms: now,
+        });
+        let (epoch, subscriber, mode, effects) = match outcome {
+            AttachOutcome::Refused(r) => {
+                let _ = send(&link, &ControlMsg::AttachRefused(r)).await;
+                return;
+            }
+            AttachOutcome::Accepted {
+                epoch,
+                subscriber,
+                mode,
+                effects,
+            } => (epoch, subscriber, mode, effects),
+        };
+        st.epoch_no = epoch;
+        for e in effects {
+            match e {
+                Effect::NotifyTakenOver { subscriber, info } => {
+                    if let Some(c) = st.conns.get(&subscriber.0) {
+                        let _ = send(&c.link, &ControlMsg::TakenOver(info)).await;
+                    }
+                    // Let the notice reach the old client before its transport goes.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Effect::DropTransport { subscriber } => {
+                    if let Some(c) = st.conns.remove(&subscriber.0) {
+                        c.control.kill(DownReason::Closed);
+                    }
+                }
+                Effect::ResizePty(s) => {
+                    st.sizes.push((s.cols(), s.rows()));
+                    st.emu.resize(Size {
+                        cols: s.cols(),
+                        rows: s.rows(),
+                    });
+                }
+                Effect::RevokeKey(_) => {}
+            }
+        }
+        st.conns.insert(
+            subscriber.0,
+            Conn {
+                link: link.clone(),
+                control,
+            },
+        );
+        st.current = Some(subscriber.0);
+
+        let resume_seq = match mode {
+            AttachMode::Fresh => None,
+            AttachMode::Resumed(r) => Some(r.seq),
+        };
+        let start = decide_start(&st.log, resume_seq, &st.catch_up);
+        let mut snapshot_bytes = None;
+        let start_point = match start {
+            StartDecision::Resume { from } => {
+                st.sent = from;
+                StartPoint::Resume { from }
+            }
+            StartDecision::Snapshot {
+                at,
+                skipped,
+                reason,
+            } => {
+                let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+                st.sent = at;
+                st.snapshots += 1;
+                let info = SnapshotInfo {
+                    at,
+                    len: bytes.len() as u64,
+                    skipped,
+                    reason,
+                };
+                snapshot_bytes = Some(bytes);
+                StartPoint::Snapshot(info)
+            }
+        };
+        if matches!(mode, AttachMode::Fresh) {
+            st.input_rx = RecvChannel::new();
+        }
+        let reply = AttachReply {
+            incarnation: st.incarnation,
+            epoch,
+            start: start_point,
+            udp_port: None,
+            fingerprint: None,
+            term: TermName::new("xterm-256color").unwrap(),
+        };
+        let _ = send(&link, &ControlMsg::AttachReply(reply)).await;
+        if let Some(mut bytes) = snapshot_bytes {
+            let cut = st.cut_snapshot.take();
+            if let Some(n) = cut {
+                bytes.truncate(n);
+            }
+            let mut off = 0u64;
+            for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+                let seg = Segment {
+                    seq: off,
+                    data: chunk.to_vec(),
+                };
+                off += chunk.len() as u64;
+                let _ = link
+                    .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                    .await;
+            }
+            if cut.is_some() {
+                // The link dies mid-snapshot, after what was sent had time to arrive.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if let Some(c) = st.conns.get(&subscriber.0) {
+                    c.control.kill(DownReason::Dead);
+                }
+                return;
+            }
+        }
+        if st.send_input_resume {
+            let received = st.input_rx.received();
+            let _ = send(
+                &link,
+                &ControlMsg::Resume {
+                    channel: ChannelId::TERMINAL,
+                    received,
+                },
+            )
+            .await;
+        }
+        self.pump(st).await;
+    }
+
+    /// Sends the log from `sent` to the current subscriber.
+    async fn pump(&self, st: &mut DState) {
+        let Some(id) = st.current else { return };
+        let Some(link) = st.conns.get(&id).map(|c| c.link.clone()) else {
+            return;
+        };
+        while st.sent < st.log.end() {
+            let data = st.log.read(st.sent, MAX_DATA_PAYLOAD);
+            if data.is_empty() {
+                break;
+            }
+            let seg = Segment { seq: st.sent, data };
+            st.sent += seg.data.len() as u64;
+            if link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    // ---- the test's controls ---------------------------------------------------------------
+
+    /// The session produced output.
+    pub async fn output(&self, bytes: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.log.append(bytes);
+        st.emu.feed(bytes);
+        self.pump(&mut st).await;
+    }
+
+    /// Output that the log records but the subscriber is not sent (as if the link were dead
+    /// and the daemon had not noticed): used for the "output during an outage" cases.
+    pub async fn output_unsent(&self, bytes: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.log.append(bytes);
+        st.emu.feed(bytes);
+    }
+
+    pub async fn pty_mode(&self, canonical: bool, echo: bool) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let at = st.log.end();
+            let _ = send(
+                &c.link,
+                &ControlMsg::PtyMode {
+                    canonical,
+                    echo,
+                    at,
+                },
+            )
+            .await;
+        }
+    }
+
+    pub async fn input(&self) -> Vec<u8> {
+        self.st.lock().await.input_all.clone()
+    }
+
+    pub async fn attaches(&self) -> Vec<Attach> {
+        self.st.lock().await.attaches.clone()
+    }
+
+    pub async fn sizes(&self) -> Vec<(u16, u16)> {
+        self.st.lock().await.sizes.clone()
+    }
+
+    pub async fn detaches(&self) -> u32 {
+        self.st.lock().await.detaches
+    }
+
+    pub async fn snapshots(&self) -> u32 {
+        self.st.lock().await.snapshots
+    }
+
+    pub async fn acked(&self) -> u64 {
+        self.st.lock().await.client_acked
+    }
+
+    pub async fn log_end(&self) -> u64 {
+        self.st.lock().await.log.end()
+    }
+
+    /// The daemon's own view of the screen, for the oracle.
+    pub async fn screen(&self, history: usize) -> fil_term::TermState {
+        self.st.lock().await.emu.state(history)
+    }
+
+    /// Kills the current subscriber's link, as a dead path would.
+    pub async fn kill_link(&self, reason: DownReason) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            c.control.kill(reason);
+        }
+    }
+
+    /// The current link goes `Degraded` (still up, but silent).
+    pub async fn degrade_link(&self) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            c.control.set_state(fil_transport::LinkState::Degraded);
+        }
+    }
+
+    pub async fn recover_link(&self) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            c.control.set_state(fil_transport::LinkState::Up);
+        }
+    }
+
+    /// Another client attaches (fresh) and takes the session over: the old subscriber is
+    /// notified and dropped.
+    pub async fn take_over(&self, host: &str) {
+        let mut st = self.st.lock().await;
+        let now = st.now_ms + 60_000;
+        st.now_ms = now;
+        let outcome = st.epoch.attach(AttachInput {
+            key: fil_proto::msg::PublicKey::new(vec![0xEE; 32]).unwrap(),
+            host: host.parse().unwrap(),
+            size: fil_proto::msg::TermSize::new(100, 30).unwrap(),
+            resume: None,
+            now_unix_ms: now,
+        });
+        let AttachOutcome::Accepted { effects, .. } = outcome else {
+            panic!("a fresh attach is accepted");
+        };
+        for e in effects {
+            match e {
+                Effect::NotifyTakenOver { subscriber, info } => {
+                    if let Some(c) = st.conns.get(&subscriber.0) {
+                        let _ = send(&c.link, &ControlMsg::TakenOver(info)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Effect::DropTransport { subscriber } => {
+                    if let Some(c) = st.conns.remove(&subscriber.0) {
+                        c.control.kill(DownReason::Closed);
+                    }
+                }
+                _ => {}
+            }
+        }
+        st.current = None;
+    }
+
+    /// Takes the session over silently: no notice, the old transport just dies. The client
+    /// finds out when it resumes.
+    pub async fn take_over_quietly(&self, host: &str) {
+        self.take_over(host).await;
+    }
+
+    /// The daemon restarted, or the session was killed and recreated: new incarnation, empty log.
+    pub async fn replace_session(&self) {
+        let mut st = self.st.lock().await;
+        st.incarnation = st.incarnation.wrapping_add(1);
+        st.epoch = SessionEpoch::new(st.incarnation);
+        let cap = 8 * 1024 * 1024;
+        st.log = OutputLog::new(cap);
+        st.emu = emu(Size { cols: 80, rows: 24 });
+        st.current = None;
+        st.sent = 0;
+        let conns: Vec<_> = st.conns.drain().collect();
+        for (_, c) in conns {
+            c.control.kill(DownReason::Closed);
+        }
+    }
+
+    /// The shell exited: the link closes, and every later attach hears `SessionGone`.
+    pub async fn end_session(&self) {
+        let mut st = self.st.lock().await;
+        st.gone = true;
+        let conns: Vec<_> = st.conns.drain().collect();
+        for (_, c) in conns {
+            c.control.kill(DownReason::Closed);
+        }
+    }
+
+    /// The next attach is refused with this, whatever it says.
+    pub async fn refuse_next(&self, r: AttachRefusal) {
+        self.st.lock().await.refuse_next = Some(r);
+    }
+
+    /// Another terminal ran `fil detach`.
+    pub async fn detach_elsewhere(&self) {
+        let mut st = self.st.lock().await;
+        let e = st.epoch.epoch();
+        let _ = st.epoch.detach(e);
+        if let Some(id) = st.current.take()
+            && let Some(c) = st.conns.remove(&id)
+        {
+            c.control.kill(DownReason::Closed);
+        }
+    }
+
+    pub async fn lose_input(&self, on: bool) {
+        self.st.lock().await.lose_input = on;
+    }
+
+    pub async fn cut_next_snapshot_after(&self, n: usize) {
+        self.st.lock().await.cut_snapshot = Some(n);
+    }
+
+    pub async fn set_send_input_resume(&self, on: bool) {
+        self.st.lock().await.send_input_resume = on;
+    }
+}
+
+async fn send(link: &MemLink, msg: &ControlMsg) -> Result<(), fil_transport::LinkError> {
+    link.send(ChannelId::CONTROL, Bytes::from(msg.encode().unwrap()))
+        .await
+}

@@ -199,13 +199,24 @@ A session's `TERM` is fixed when the session is created, from the first client. 
 
 ### 6.5 Emulator
 
+fil runs a headless emulator (no rendering) in two places: in the daemon, to answer terminal queries while detached (§6.3) and to render snapshots (§6.2), and in the client, as the prediction shadow screen (§9).
+
+**Emulators are modular.** `fil-term` defines one interface, and each emulator is a backend behind it, compiled in under its own cargo feature and chosen by name at run time:
+
+- **The `Emulator` trait:** feed bytes, resize, drain query replies, and report the current state.
+- **A backend-neutral state model** (`TermState`): the lines with their cells and attributes, history, cursor, the modes of §6.2, and hyperlinks. Every backend converts its own grid into it.
+- **One snapshot writer** turns any `TermState` into the bytes that recreate it, so a backend doesn't need its own serializer. The model also lets the fidelity suite compare backends cell by cell.
+- **Capabilities:** each backend declares what it can report, such as reflow or kitty keyboard flags. The suite then scores a field a backend can't see as unsupported rather than wrong.
+
+A session picks its backend when it is created and keeps it. The default is whichever backend scores best.
+
 The candidates are:
 
 - `alacritty_terminal`: battle-tested, Apache-2.0
 - `vt100`: small; a fork is used by shpool
-- libghostty-vt: C ABI; used by zmx
+- libghostty-vt: C ABI; used by zmx; it needs a Zig toolchain, so it is evaluated only if the other two fall short
 
-The choice will be made with the restore-fidelity test suite (§12), not by taste.
+The default will be chosen with the restore-fidelity test suite (§12), not by taste.
 
 ## 7. Port forwarding
 
@@ -428,8 +439,9 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 - **Workspace layout (proposed):**
   - `fil-proto`: frames and channel semantics
   - `fil-transport`: the trait, pipe and QUIC
-  - `fil-term`: the emulator wrapper and snapshots
+  - `fil-term`: the emulator trait, its backends and snapshots
   - `fil-predict`: the trait and the default predictor
+  - `fil-netsim`: the in-process link simulator (§12), used only by tests
   - `fil-daemon`
   - `fil`: the CLI
 
@@ -468,7 +480,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 
 | Milestone | Scope | Done when |
 |---|---|---|
-| **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison | the emulator is chosen, and the overlay never corrupts the screen in the harness |
+| **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison across the modular backends (§6.5) | the default emulator is chosen, and the overlay never corrupts the screen in the harness |
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback | usable as a daily driver for shells |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay | port forwards survive a pulled network cable |
 | **M3: prediction** | the trait, the default predictor and the status overlay | no visible mispredictions in the harness |
@@ -479,7 +491,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 ## 16. Open questions
 
 1. ~~**License**~~ Resolved: GPL-3.0-or-later **(decided)**. See §13.
-2. **Emulator** (§6.5): decided by the fidelity tests in M0.
+2. **Default emulator** (§6.5): decided by the fidelity tests in M0.
 3. **`TERM` when a different terminal takes over:** keep the session's value, ship a fil terminfo entry, or require `xterm-256color`?
 4. **Terminal-query replies in flight during a takeover** (§6.3).
 5. **Server binary:** manual install, or upload by the client (§11)?

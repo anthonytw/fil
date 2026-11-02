@@ -18,10 +18,8 @@ fil is a remote shell for development over SSH:
 
 ## Conventions
 
-- **Rust:** a cargo workspace, laid out as in `DESIGN.md` §13. Before any PR, these must pass:
-  - `cargo fmt --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test`
+- **Rust:** a cargo workspace, laid out as in `DESIGN.md` §13. Crates live in `crates/`. The toolchain is pinned in `rust-toolchain.toml`.
+- **Tests:** keep them proportionate. Unit-test the logic that is easy to get wrong, such as frame parsing, sequence numbers and the snapshot writer. Heavy harnesses, like the fidelity suite and randomized overlay runs, are commands you run on demand, not part of the merge gate.
 - **Logging:** `tracing`, with JSON output.
 - **License:** GPL-3.0-or-later. Every dependency must be GPL-3.0-compatible:
   - fine: MIT, Apache-2.0, BSD, ISC, MPL-2.0, LGPL, GPL-3.0
@@ -34,5 +32,6 @@ fil is a remote shell for development over SSH:
 ## Delivery
 
 - **Workflow:** branch, then PR, then squash merge, using `gh`. The repo is on GitHub (private for now). One task per PR.
+- **The merge gate is local.** There is no required CI on GitHub. Before merging, run `just ci` on the branch, rebased on current `main`. It runs `cargo fmt --check`, `clippy -D warnings`, `cargo test` and `cargo deny` (the license policy in `deny.toml`). Say in the PR that it passed.
 - **Signing:** the global git config SSH-signs commits. Don't disable it.
 - **The repo will go public.** Never commit secrets, IP addresses or personal data.

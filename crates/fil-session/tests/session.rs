@@ -329,7 +329,8 @@ async fn a_resume_further_back_than_the_threshold_gets_a_snapshot() {
     c.wait_screen("READY").await;
     let resume = c.resume_request();
     c.type_bytes(b"\n").await;
-    c.wait_out("abcdefgh").await;
+    // Some of the output (or a snapshot past it, if the client falls behind).
+    c.wait("output", |c| c.next > resume.seq + 1000).await;
     c.hang_up();
     c.serve_end().await;
     wait_log_end(&h, 300_000).await;
@@ -479,9 +480,11 @@ async fn output_holding_an_answered_query_is_not_replayed() {
 #[tokio::test]
 async fn pty_mode_follows_stty() {
     let sc = Scratch::new();
-    let script = "printf 'pw: '; stty -echo; read x; stty echo; echo done; sleep 30";
+    let script = "read go; printf 'pw: '; stty -echo; read x; stty echo; echo done; sleep 30";
     let h = spawn_plain(sh_config(&sc, "main", script)).await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait("the initial mode", |c| !c.modes.is_empty()).await;
+    c.type_bytes(b"\n").await;
     c.wait("echo switched off", |c| c.modes.iter().any(|m| !m.1))
         .await;
     c.type_bytes(b"secret\n").await;
@@ -613,15 +616,14 @@ async fn the_client_resizes_the_pty() {
 #[tokio::test]
 async fn the_shell_exiting_ends_the_session_after_the_client_has_the_output() {
     let sc = Scratch::new();
-    let h = spawn_plain(sh_config(&sc, "main", "echo bye; exit 3")).await;
+    let h = spawn_plain(sh_config(&sc, "main", "read go; echo bye; exit 3")).await;
     let mut c = Client::connect(&h, Connect::new(&h, key(1)));
     let end = c.serve.take().unwrap();
     // The serve task finishes by itself once everything is sent and acknowledged.
     let drive = async {
-        c.wait("the exit", |c| {
-            c.out_str().contains("bye") || c.screen().contains("bye")
-        })
-        .await;
+        c.wait("the attach reply", |c| c.reply.is_some()).await;
+        c.type_bytes(b"\n").await;
+        c.wait_out("bye").await;
         // Keep reading (and acking) until the link is closed.
         let _ = c.try_wait(Duration::from_secs(5), |_| false).await;
     };

@@ -404,3 +404,51 @@ async fn links_that_die_at_once_do_not_make_a_busy_loop() {
     );
     assert!(n > 3, "{n}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_snapshot_mid_stream_replaces_the_screen_and_the_stream_continues() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..10)).await;
+    settle().await;
+    // The subscriber fell behind: the daemon skips 200 lines and sends a snapshot instead.
+    rig.daemon.catch_up(&lines(10..210)).await;
+    rig.daemon.output(&lines(210..215)).await;
+    settle().await;
+    let want = rig.daemon.screen(0).await;
+    assert_eq!(rig.term.state().screen, want.screen);
+    assert!(rig.term.text().contains("line 0214"));
+    assert!(
+        !rig.term.text().contains("line 0009"),
+        "skipped output is not replayed"
+    );
+    // Still in step: a reconnect now resumes from after the snapshot, not before it.
+    rig.daemon.kill_link(DownReason::Dead).await;
+    rig.daemon.output_unsent(&lines(215..220)).await;
+    until_async("the resume", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    assert_eq!(
+        rig.daemon.snapshots().await,
+        2,
+        "one catch-up, and no snapshot for the resume"
+    );
+    assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_that_overtakes_its_snapshot_waits_behind_it() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..10)).await;
+    settle().await;
+    rig.daemon
+        .catch_up_overtaken(&lines(10..60), &lines(60..63))
+        .await;
+    settle().await;
+    // The snapshot clears and redraws the screen; the later output lands on top of it, in order.
+    assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
+    assert!(rig.term.text().contains("line 0062"));
+}

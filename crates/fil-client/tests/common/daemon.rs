@@ -502,6 +502,61 @@ impl FakeDaemon {
         }
     }
 
+    /// The catch-up rule (section 6.2): the subscriber fell behind, so the daemon jumps ahead
+    /// with a snapshot in the middle of the stream. `skip` bytes of output are never sent.
+    pub async fn catch_up(&self, skip: &[u8]) {
+        self.catch_up_overtaken(skip, b"").await
+    }
+
+    /// Like `catch_up`, but `after` (output past the snapshot) is sent on the terminal channel
+    /// *before* the snapshot bytes, as can happen when channels are separate QUIC streams.
+    pub async fn catch_up_overtaken(&self, skip: &[u8], after: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+        let at = st.log.end();
+        st.sent = at;
+        st.snapshots += 1;
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: skip.len() as u64,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+        };
+        let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        if !after.is_empty() {
+            st.log.append(after);
+            st.emu.feed(after);
+            let seg = Segment {
+                seq: at,
+                data: after.to_vec(),
+            };
+            st.sent = at + after.len() as u64;
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
     pub async fn lose_input(&self, on: bool) {
         self.st.lock().await.lose_input = on;
     }

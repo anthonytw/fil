@@ -454,7 +454,6 @@ dependencies = [
 name = "fil-netsim"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "quinn",
  "rand",
  "rcgen",
@@ -539,6 +538,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "ring",
+ "rustix",
  "rustls",
  "thiserror 2.0.21",
  "tokio",

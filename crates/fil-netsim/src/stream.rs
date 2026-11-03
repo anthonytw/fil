@@ -137,11 +137,6 @@ pub fn stream_pair(seed: u64, cfg: StreamConfig) -> (StreamEnd, StreamEnd, Strea
 }
 
 impl StreamControl {
-    /// Replace the conditions. Applies to data written from now on.
-    pub fn set_config(&self, cfg: StreamConfig) {
-        lock(&self.shared).cfg = cfg;
-    }
-
     /// Hold all data: nothing is delivered to either reader until [`release`](Self::release).
     /// Writers keep succeeding until the in-flight buffer fills, as a stalled ssh would.
     pub fn stall(&self) {

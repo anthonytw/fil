@@ -10,11 +10,24 @@
 //! A peer that floods pings without reading therefore costs us one pending reply, not memory, and
 //! stale pings never pile up behind a stuck write.
 //!
+//! **Heartbeats are asymmetric.** The client pings after `heartbeat` of silence in either
+//! direction; the daemon answers every ping at once and pings on its own only after one and a
+//! half heartbeats of silence in either direction. An idle link therefore carries one ping and one
+//! reply a second instead of two of each, and either side still hears the other at least every
+//! heartbeat and a half (plus the one-way delay): inside `degraded_after` by half a second.
+//!
+//! **Packing.** The writer fills its buffer with every frame that is ready, in scheduler order,
+//! while they fit in [`PACK_LIMIT`], and writes it with one `write`, so a keystroke's small
+//! frames share an SSH packet. A write is never longer than the limit unless it is a single
+//! larger frame.
+//!
 //! **A slow consumer.** Received payloads wait in the shared inbound queue. Reading continues
 //! while fewer than `inbound_budget` bytes wait there, so bytes keep proving the peer alive and
 //! `Dead` is still detected for any lag under the budget. Past the budget the driver stops
-//! reading (the stream's flow control pushes back on the peer), freezes the silence clock and
-//! reports `Degraded`; it returns to normal once the consumer has caught up to half the budget.
+//! reading (the stream's flow control pushes back on the peer) and freezes the silence clock; it
+//! reads again once the consumer has caught up to half the budget. The link stays `Up` while it
+//! does: `Degraded` means the *peer* has been silent, and a lagging local consumer is not that
+//! (the client would show "no reply" over a perfectly good link).
 
 use std::collections::VecDeque;
 use std::io;
@@ -28,17 +41,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::time::{Instant, sleep_until, timeout};
 
-use super::Shared;
+use super::{Role, Shared};
 use crate::link::{DownReason, LinkParams, LinkState};
 
 /// How many of the latest pings wait for their reply, to measure RTT.
 const PINGS_KEPT: usize = 8;
 const READ_CHUNK: usize = 64 * 1024;
+/// The writer packs frames into one `write` only while they fit in a buffer of this size (a frame
+/// that is larger goes alone), so a control frame that turns up meanwhile waits behind at most
+/// this or one frame, as it always did.
+const PACK_LIMIT: usize = 8 * 1024;
 /// When the stream ends, how long to wait for the command's exit status to put in the reason.
 /// The command is asked to finish (and reaped) after `Down` is reported, not before.
 const EXIT_STATUS_WAIT: Duration = Duration::from_millis(100);
 
 pub(super) struct Driver<R, W> {
+    pub role: Role,
     pub shared: Arc<Shared>,
     pub read: R,
     pub write: W,
@@ -47,7 +65,7 @@ pub(super) struct Driver<R, W> {
     pub inbound_budget: usize,
     /// Frames from the handshake that are still to be handled.
     pub initial: Vec<Frame>,
-    pub child: Option<Child>,
+    pub child: Option<ChildGuard>,
     pub grace: Duration,
     /// Our ping from the handshake, so its reply measures RTT.
     pub first_ping: Option<(u32, Instant)>,
@@ -66,6 +84,8 @@ enum Event {
 struct State {
     last_rx: Instant,
     last_tx: Instant,
+    /// When our latest ping was written.
+    last_ping: Instant,
     /// Silence has lasted `degraded_after`.
     degraded: bool,
     /// The consumer is behind by more than the budget: not reading, clock frozen.
@@ -93,6 +113,7 @@ where
         let mut st = State {
             last_rx: now,
             last_tx: self.first_ping.map_or(now, |(_, t)| t),
+            last_ping: self.first_ping.map_or(now, |(_, t)| t),
             degraded: false,
             lagging: false,
             pings: self.first_ping.into_iter().collect(),
@@ -213,19 +234,32 @@ where
         }
     }
 
-    /// `Degraded` while silent or lagging, `Up` otherwise.
+    /// `Degraded` while the peer is silent, `Up` otherwise. A lagging consumer is not the peer's
+    /// silence: the link reads nothing then, and says nothing about the path.
     fn sync_state(&self, st: &State) {
-        self.shared.set_live(if st.degraded || st.lagging {
+        self.shared.set_live(if st.degraded {
             LinkState::Degraded
         } else {
             LinkState::Up
         });
     }
 
+    /// When the next ping of our own is due. The client pings once a heartbeat has passed without
+    /// anything sent (so the peer hears us) or without anything received (so we hear the peer),
+    /// and not more than once per heartbeat. The daemon waits half a heartbeat longer, which
+    /// leaves the client's pings to do the work on an idle link.
+    fn ping_at(&self, st: &State, heartbeat: Duration) -> Instant {
+        let gap = match self.role {
+            Role::Client => heartbeat,
+            Role::Daemon => heartbeat * 3 / 2,
+        };
+        (st.last_tx + gap).min((st.last_rx + gap).max(st.last_ping + heartbeat))
+    }
+
     fn next_deadline(&self, st: &State, heartbeat: Duration) -> Instant {
         let mut d = st.last_rx + self.params.dead_after;
         if st.write_failed.is_none() && !st.ping_due {
-            d = d.min(st.last_tx + heartbeat);
+            d = d.min(self.ping_at(st, heartbeat));
         }
         if !st.degraded {
             d = d.min(st.last_rx + self.params.degraded_after);
@@ -251,58 +285,65 @@ where
             st.degraded = true;
             self.sync_state(st);
         }
-        if now >= st.last_tx + heartbeat && st.write_failed.is_none() {
+        if now >= self.ping_at(st, heartbeat) && st.write_failed.is_none() {
             // One pending ping at most; it is numbered when it is written.
             st.ping_due = true;
         }
         None
     }
 
-    /// Picks the next frame into `out`: a pending heartbeat reply, our own ping, then the
-    /// scheduler's choice.
+    /// Fills `out`: a pending heartbeat reply, our own ping, then the scheduler's frames in its
+    /// order for as long as they fit in [`PACK_LIMIT`].
     fn fill_out(&mut self, st: &mut State) {
-        let msg = if let Some(nonce) = st.reply.take() {
-            Some(ControlMsg::Heartbeat { nonce, reply: true })
-        } else if st.ping_due {
+        if let Some(nonce) = st.reply.take() {
+            self.put_heartbeat(st, ControlMsg::Heartbeat { nonce, reply: true });
+        }
+        if st.ping_due {
             st.ping_due = false;
             let nonce = st.next_nonce;
             st.next_nonce = nonce.wrapping_add(1);
-            st.pings.push_back((nonce, Instant::now()));
+            let now = Instant::now();
+            st.pings.push_back((nonce, now));
             while st.pings.len() > PINGS_KEPT {
                 st.pings.pop_front();
             }
-            Some(ControlMsg::Heartbeat {
-                nonce,
-                reply: false,
-            })
-        } else {
-            None
-        };
-        if let Some(msg) = msg {
-            match msg.to_frame().map(|f| f.encode_into(&mut st.out)) {
-                Ok(Ok(())) => {
-                    st.last_tx = Instant::now();
-                    st.out_pos = 0;
-                    return;
-                }
-                _ => tracing::error!("could not encode a heartbeat"),
+            st.last_ping = now;
+            self.put_heartbeat(
+                st,
+                ControlMsg::Heartbeat {
+                    nonce,
+                    reply: false,
+                },
+            );
+        }
+        // The first frame goes whatever its size; the rest only if they fit, so one write is never
+        // longer than `PACK_LIMIT` or a single frame, the bound a control frame always waited
+        // behind.
+        while st.out.len() < PACK_LIMIT {
+            let room = (!st.out.is_empty()).then(|| PACK_LIMIT - st.out.len());
+            let Some(frame) = self.shared.pop_fit(room) else {
+                break;
+            };
+            let before = st.out.len();
+            if let Err(e) = frame.encode_into(&mut st.out) {
+                // `send` checks sizes, so this is a bug; losing a frame from the middle of a
+                // byte stream is not recoverable, but skipping it here keeps the link framed.
+                st.out.truncate(before);
+                tracing::error!(error = %e, "dropped an unencodable frame");
             }
         }
-        while let Some(frame) = self.shared.pop() {
-            let before = st.out.len();
-            match frame.encode_into(&mut st.out) {
-                Ok(()) => {
-                    st.last_tx = Instant::now();
-                    st.out_pos = 0;
-                    return;
-                }
-                Err(e) => {
-                    // `send` checks sizes, so this is a bug; losing a frame from the middle of a
-                    // byte stream is not recoverable, but skipping it here keeps the link framed.
-                    st.out.truncate(before);
-                    tracing::error!(error = %e, "dropped an unencodable frame");
-                }
-            }
+        if !st.out.is_empty() {
+            st.last_tx = Instant::now();
+            st.out_pos = 0;
+        }
+    }
+
+    fn put_heartbeat(&self, st: &mut State, msg: ControlMsg) {
+        if !matches!(
+            msg.to_frame().map(|f| f.encode_into(&mut st.out)),
+            Ok(Ok(()))
+        ) {
+            tracing::error!("could not encode a heartbeat");
         }
     }
 
@@ -387,14 +428,71 @@ where
     }
 }
 
-/// Waits up to `grace` for `child` to exit on its own, then kills it. Always reaps it. Returns a
-/// description of how it ended.
-pub(super) async fn reap(child: &mut Child, grace: Duration) -> String {
+/// The pipe command's process. When it was started in a process group of its own
+/// (`PipeConfig::own_process_group`), killing it kills the whole group: `ssh -J` and a
+/// `ProxyCommand` run helpers in that group, and a helper that is stopped on a terminal read
+/// (`SIGTTIN`) must not outlive its leader.
+///
+/// The group is signalled only while the leader has not been reaped, because its process id is
+/// the group id and stays ours until then; after that a number could belong to someone else.
+pub(super) struct ChildGuard {
+    child: Child,
+    own_group: bool,
+}
+
+impl ChildGuard {
+    pub fn new(child: Child, own_group: bool) -> Self {
+        Self { child, own_group }
+    }
+
+    /// Kills the group (if the child leads one) and the child.
+    pub fn kill(&mut self) {
+        self.kill_group();
+        let _ = self.child.start_kill();
+    }
+
+    fn kill_group(&self) {
+        if !self.own_group {
+            return;
+        }
+        // `id` is `None` once the leader has been reaped.
+        if let Some(pid) = self.child.id().and_then(|p| i32::try_from(p).ok())
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildGuard {
+    /// A link dropped without being reaped (the runtime shut down under it) kills the group too;
+    /// tokio's `kill_on_drop` then kills the leader.
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+/// Waits up to `grace` for `child` to exit on its own, then kills it (and its group). Always
+/// reaps it. Returns a description of how it ended.
+pub(super) async fn reap(child: &mut ChildGuard, grace: Duration) -> String {
     match timeout(grace, child.wait()).await {
         Ok(Ok(status)) => describe_exit(status),
         Ok(Err(e)) => format!("could not be waited for: {e}"),
         Err(_) => {
-            let _ = child.start_kill();
+            child.kill();
             match child.wait().await {
                 Ok(status) => format!("was killed after {grace:?} ({})", describe_exit(status)),
                 Err(e) => format!("could not be killed: {e}"),

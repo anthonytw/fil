@@ -154,6 +154,7 @@ The handling is configurable **(decided)**:
   - On systemd hosts **with lingering enabled**, each session runs in its own transient user scope (`systemd-run --user --scope`). That gives reliable port attribution (§7.4) and clean teardown.
   - Without lingering, the user manager stops at logout and would take the scopes with it. Those hosts fall back to the session's process tree.
   - Lingering is read from `loginctl show-user -p Linger` when the session is created. The child is a session leader, so its pid is also its process group id.
+  - The scope's unit name is `fil-<incarnation as 32 hex digits>` and its description is `fil session`. Unit names are readable by other local users (`/proc/<pid>/cgroup`) and the journal keeps them, so the session name stays out of both (§11.1).
   - **Teardown (`fil kill`):** a hangup to the group and to every descendant, as closing a terminal would send; after a short grace, SIGKILL to what is left, and `systemctl --user kill` on the scope. In the tree fallback the session records the descendants every few seconds, so a background job that was orphaned or moved to its own group (job control) is still found. A process that double-forks and dies between two scans escapes; the scope has no such limit.
   - When the shell exits by itself, what it left running is sent the hangup but not killed (in a scope, `systemctl --user kill --signal=SIGHUP`).
   - **No usable scope:** with `auto`, a trial scope (`systemd-run --user --scope true`) must start before the session uses one; if lingering is on but the trial fails, the session falls back to the process tree and logs a warning. With `scope = "systemd"` set explicitly there is no fallback: creating the session fails with the reason.
@@ -577,7 +578,7 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
 4. **Show others as little as possible.**
    - **On the network:** SNI is a fixed name (`fil.invalid`), and the daemon's certificate carries no host or user name.
    - **To your other clients:** `fil ls` and the takeover message show the host label of the machine that attached. The label can be configured, and it is never sent to anyone but you.
-   - **Remote environment:** the remote session's environment drops ssh's connection details (`SSH_CONNECTION`, `SSH_CLIENT` and similar).
+   - **Remote environment:** the remote session's environment drops everything that describes the login that happened to start the daemon: ssh's connection details (`SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` and similar), the login's agent, X11 and Kerberos variables (`SSH_AUTH_SOCK`, `DISPLAY`, `XAUTHORITY`, `KRB5CCNAME`; tmux's `update-environment` set), logind's `XDG_SESSION_*`, the forwarded terminal identification (`LC_TERMINAL*`), and what a hand-started daemon inherits from a multiplexer or a local login (`TMUX`, `STY`, `XDG_SEAT`, `WAYLAND_DISPLAY` and similar). The session scrubs its environment with one list (`fil_session::env`); the daemon's launcher is to use the same list. Session names stay out of systemd unit names and descriptions, which other local users and the journal can read (§5.1).
 5. **No surprises on the remote host.** fil creates no shell history, dotfiles or configuration on the host beyond its own state directory and socket directory. It removes what it no longer needs.
 
 ## 12. Testing

@@ -50,7 +50,7 @@ use bytes::Bytes;
 use fil_forward::connect::connect_tcp;
 use fil_forward::listen::{self, Bound};
 use fil_forward::{
-    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, Policy,
+    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::ControlMsg;
@@ -223,7 +223,9 @@ impl Policy for ClientPolicy {
     fn check_incoming(&self, kind: &OpenKind) -> Result<(), OpenFailure> {
         lock(&self.0).incoming(kind)
     }
-    fn check_outgoing(&self, kind: &OpenKind) -> Result<(), OpenFailure> {
+    /// The local peer is not looked at: anyone on this machine may use a forward the user set
+    /// up, as with `ssh -L`.
+    fn check_outgoing(&self, kind: &OpenKind, _peer: &LocalPeer) -> Result<(), OpenFailure> {
         lock(&self.0).outgoing(kind)
     }
     fn check_address(&self, kind: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure> {
@@ -256,11 +258,6 @@ impl Connector for ClientConnector {
 }
 
 // ---- the forwards of one run ----------------------------------------------------------------
-
-/// Pointer identity of a link, to tell which one the endpoint is on.
-fn link_key<L>(link: &Arc<L>) -> usize {
-    Arc::as_ptr(link) as *const () as usize
-}
 
 /// The forwards of one run: the endpoint, the manager task, and what the readers need.
 pub(crate) struct Forwards<L: Link> {
@@ -303,8 +300,10 @@ impl<L: Link> Forwards<L> {
                 port: None,
             })
             .collect();
+        let current: Current<L> = Arc::new(Mutex::new(None));
         let mgr = Manager {
             ep: ep.clone(),
+            current: current.clone(),
             grants,
             own,
             entries: HashMap::new(),
@@ -329,7 +328,7 @@ impl<L: Link> Forwards<L> {
         let router = Router {
             ep,
             to_manager,
-            current: Arc::new(Mutex::new(None)),
+            current,
         };
         (Self { router, manager }, handle, notes_rx)
     }
@@ -361,8 +360,15 @@ impl<L: Link> Drop for Forwards<L> {
 pub(crate) struct Router<L: Link> {
     ep: Endpoint<L>,
     to_manager: mpsc::UnboundedSender<ToManager>,
-    /// The link the endpoint is attached to, by [`link_key`].
-    current: Arc<Mutex<Option<usize>>>,
+    /// The link the endpoint is attached to.
+    current: Current<L>,
+}
+
+/// The link the endpoint is on (shared by the readers and the manager).
+type Current<L> = Arc<Mutex<Option<Arc<L>>>>;
+
+fn is_on<L>(cur: &Option<Arc<L>>, link: &Arc<L>) -> bool {
+    cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, link))
 }
 
 impl<L: Link> Clone for Router<L> {
@@ -389,7 +395,7 @@ impl<L: Link> Router<L> {
         }
         let mut cur = lock(&self.current);
         self.ep.attach_link(link.clone(), resumed);
-        *cur = Some(link_key(link));
+        *cur = Some(link.clone());
     }
 
     /// Hands the endpoint a payload `link` delivered, if the endpoint is on `link`. Once it has
@@ -398,7 +404,7 @@ impl<L: Link> Router<L> {
     /// there (`Close { Violation }`).
     fn feed(&self, link: &Arc<L>, ch: ChannelId, payload: Bytes) {
         let cur = lock(&self.current);
-        if *cur == Some(link_key(link)) {
+        if is_on(&cur, link) {
             // A protocol error comes back as `EndpointEvent::Failed` too, which ends the run.
             let _ = self.ep.on_payload(ch, payload);
         }
@@ -407,7 +413,7 @@ impl<L: Link> Router<L> {
     /// An `Ack` or `Resume` of the endpoint's, under the same rule as [`Router::feed`].
     fn control(&self, link: &Arc<L>, msg: &ControlMsg) {
         let cur = lock(&self.current);
-        if *cur == Some(link_key(link)) {
+        if is_on(&cur, link) {
             let _ = self.ep.on_control(msg);
         }
     }
@@ -415,7 +421,7 @@ impl<L: Link> Router<L> {
     /// `link` is gone (or being closed): the endpoint leaves it, if it is on it.
     pub(crate) fn ended(&self, link: &Arc<L>) {
         let mut cur = lock(&self.current);
-        if *cur == Some(link_key(link)) {
+        if is_on(&cur, link) {
             self.ep.detach_link();
             *cur = None;
         }
@@ -549,9 +555,11 @@ async fn read_link<L: Link>(
 /// Where an own `-L` or `-D` listener stands.
 enum Listener {
     None,
-    /// Bound before the attach; handed to the endpoint once the daemon names the id.
+    /// Bound before the attach; handed to the endpoint (`listen_bound`) once the daemon names
+    /// the id, so the port is never let go.
     Prebound(Bound),
-    /// The endpoint listens for this id.
+    /// The endpoint listens for this id (paused from a fresh attach until the new table's answer
+    /// moves it to the id it gives).
     On(ForwardId),
 }
 
@@ -610,10 +618,6 @@ pub const MAX_OTHERS: usize = 2 * fil_proto::limits::MAX_FORWARDS;
 /// Most ids remembered as gone in one epoch (an id never comes back: section 2.4). A host that
 /// goes past it ends the run with a protocol error.
 const MAX_GONE: usize = 4096;
-/// After the listener of an own forward moved to another id: how long to wait for the old
-/// sockets to close before the bind under the new id.
-const REBIND_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
-const REBIND_TRIES: usize = 200;
 /// Refusals logged at info and shown as a notice; after that only at debug.
 const LOUD_REFUSALS: u32 = 8;
 
@@ -628,6 +632,8 @@ struct View {
 
 struct Manager<L: Link> {
     ep: Endpoint<L>,
+    /// The link the endpoint is on, to end it on `EndpointEvent::LinkFailed`.
+    current: Current<L>,
     grants: Arc<Mutex<Grants>>,
     own: Vec<Own>,
     entries: HashMap<ForwardId, Other>,
@@ -654,7 +660,7 @@ impl<L: Link> Manager<L> {
     async fn run(
         mut self,
         mut from_router: mpsc::UnboundedReceiver<ToManager>,
-        mut events: mpsc::UnboundedReceiver<EndpointEvent>,
+        mut events: mpsc::Receiver<EndpointEvent>,
     ) {
         loop {
             tokio::select! {
@@ -676,7 +682,8 @@ impl<L: Link> Manager<L> {
                 },
                 ev = events.recv() => match ev {
                     None => return,
-                    Some(EndpointEvent::Table(m)) => self.table(m).await,
+                    Some(EndpointEvent::Table(m)) => self.table(m),
+                    Some(EndpointEvent::LinkFailed) => self.link_failed(),
                     Some(EndpointEvent::Failed(e)) => {
                         debug!(error = %e, "forward protocol failed");
                         self.broken(format!("the host broke the forward protocol: {e}"));
@@ -718,6 +725,13 @@ impl<L: Link> Manager<L> {
         }
         self.note(Note::CancelAll);
         self.gone_ids.clear();
+        // The own listeners hold their ports and backlogs, but open nothing until the new
+        // table names their ids: an old id may name another entry now.
+        for o in &self.own {
+            if let Listener::On(old) = o.listener {
+                self.ep.pause_listener(old);
+            }
+        }
         for i in 0..self.own.len() {
             let req = self.next_req;
             self.next_req = self.next_req.wrapping_add(1);
@@ -733,7 +747,7 @@ impl<L: Link> Manager<L> {
         self.own.iter().position(|o| o.id == Some(id))
     }
 
-    async fn table(&mut self, msg: MuxMsg) {
+    fn table(&mut self, msg: MuxMsg) {
         if self.failed {
             return;
         }
@@ -750,7 +764,7 @@ impl<L: Link> Manager<L> {
             } => {
                 let _ = origin;
                 match self.own.iter().position(|o| o.req == Some(req)) {
-                    Some(i) => self.own_answer(i, id, &spec).await,
+                    Some(i) => self.own_answer(i, id, &spec),
                     None => debug!("an answer to no request of ours"),
                 }
             }
@@ -764,6 +778,13 @@ impl<L: Link> Manager<L> {
                 if let Some(i) = self.own.iter().position(|o| o.req == Some(req)) {
                     self.own[i].req = None;
                     debug!(why = ?why, "an own forward was refused");
+                    // Its listener (paused since the fresh attach) refuses what waits on it; the
+                    // bind is tried again at the next fresh attach.
+                    if let Listener::On(old) =
+                        std::mem::replace(&mut self.own[i].listener, Listener::None)
+                    {
+                        self.ep.unlisten(old);
+                    }
                     let text = format!(
                         "{}: refused by the host ({})",
                         describe(&self.own[i].spec),
@@ -781,7 +802,7 @@ impl<L: Link> Manager<L> {
 
     /// The daemon's answer to an own `AddForward`: entry `id`. What it said the spec is
     /// (`_wire`) is not used: the run's own copy is what the forward does.
-    async fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
+    fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
         if *_wire != self.own[i].spec {
             debug!("the host's entry differs from the spec asked for; the own copy is used");
         }
@@ -819,41 +840,35 @@ impl<L: Link> Manager<L> {
             }
             kind @ (ForwardKind::Local | ForwardKind::Dynamic) => {
                 lock(&self.grants).grant_local(id, kind);
-                self.listen_own(i, id).await;
+                self.listen_own(i, id);
             }
         }
     }
 
     /// Listens for own `-L` or `-D` entry `id` and reports it.
-    async fn listen_own(&mut self, i: usize, id: ForwardId) {
+    fn listen_own(&mut self, i: usize, id: ForwardId) {
         let spec = self.own[i].spec.clone();
-        match std::mem::replace(&mut self.own[i].listener, Listener::None) {
-            Listener::On(old) if old == id => {
-                self.own[i].listener = Listener::On(id);
-                if let Some(port) = self.own[i].port.and_then(std::num::NonZeroU16::new) {
-                    self.send(MuxMsg::Listening {
-                        id,
-                        state: ListenState::Listening { port },
-                    });
-                }
-                return;
+        let kind = spec.kind();
+        let listened = match std::mem::replace(&mut self.own[i].listener, Listener::None) {
+            // Paused since the fresh attach (or live, on a repeated answer): the socket and its
+            // backlog move to the id the new table gave, and accept again. No connection
+            // opened meanwhile, so none opened under a stale id.
+            Listener::On(old) if self.ep.rekey_listener(old, id) => {
+                self.ep.resume_listener(id);
+                self.own[i].port.ok_or(BindFailure::Other)
             }
             Listener::On(old) => {
+                // Not movable (`id` has a listener already, which the checks in `own_answer`
+                // rule out): let the old one go and bind again.
                 self.ep.unlisten(old);
-                // `unlisten` stops the accept tasks; their sockets close when the runtime next
-                // drops them, so the same port can be taken a moment later only.
-                for _ in 0..REBIND_TRIES {
-                    tokio::time::sleep(REBIND_PAUSE).await;
-                    if listen::bind(spec.bind(), spec.port()).is_ok() {
-                        break;
-                    }
-                }
+                self.ep.listen(id, kind, spec.bind(), spec.port())
             }
-            // The endpoint binds the address itself: the early socket goes first.
-            Listener::Prebound(b) => drop(b),
-            Listener::None => {}
-        }
-        match self.ep.listen(id, spec.kind(), spec.bind(), spec.port()) {
+            // Bound before the attach: handed over, so the port is never let go.
+            Listener::Prebound(b) => self.ep.listen_bound(id, kind, b),
+            // Its bind failed earlier: tried again.
+            Listener::None => self.ep.listen(id, kind, spec.bind(), spec.port()),
+        };
+        match listened {
             Ok(port) => {
                 let o = &mut self.own[i];
                 o.listener = Listener::On(id);
@@ -876,6 +891,19 @@ impl<L: Link> Manager<L> {
                     self.failed(r.to_string());
                 }
             }
+        }
+    }
+
+    /// The endpoint gave up on its link (a send the link refused while staying up): that link
+    /// is ended, and the client reconnects and resumes. Unless the endpoint is on another link
+    /// by now, which means the failed one is gone already.
+    fn link_failed(&mut self) {
+        if self.ep.snapshot().attached {
+            return;
+        }
+        if let Some(link) = lock(&self.current).take() {
+            debug!("forward send failed on a live link; ending it");
+            link.close();
         }
     }
 
@@ -1159,10 +1187,11 @@ fn short_bytes(n: u64) -> String {
 /// `~#`: two lines of at most 40 columns.
 fn summary_lines<L: Link>(v: &View, ep: &Endpoint<L>) -> Vec<String> {
     let stats = ep.all_stats();
-    let (mut open, mut down, mut up) = (0u64, 0u64, 0u64);
+    let (mut open, mut down, mut up, mut waiting) = (0u64, 0u64, 0u64, 0u64);
     for (id, s) in &stats {
         if v.ids.contains(id) {
             open += u64::from(s.open);
+            waiting += u64::from(s.waiting);
             down += s.to_local;
             up += s.from_local;
         }
@@ -1174,6 +1203,9 @@ fn summary_lines<L: Link>(v: &View, ep: &Endpoint<L>) -> Vec<String> {
         short_bytes(down),
         short_bytes(up)
     );
+    if waiting > 0 {
+        first.push_str(&format!(", {waiting} wait"));
+    }
     if v.asking > 0 {
         first.push_str(&format!(", {} asked", v.asking));
     }
@@ -1249,6 +1281,7 @@ mod tests {
         let (notes, rx) = mpsc::unbounded_channel();
         let m = Manager {
             ep,
+            current: Arc::new(Mutex::new(None)),
             grants,
             own: Vec::new(),
             entries: HashMap::new(),

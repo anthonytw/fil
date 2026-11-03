@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_forward::connect::connect_tcp;
 use fil_forward::{
-    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, Policy,
+    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::chan::RecvChannel;
@@ -1185,8 +1185,10 @@ pub struct FwdState {
     pub fail_listen_next: Option<fil_proto::mux::BindFailure>,
     /// Channels the daemon was asked to open by the client, by kind.
     pub incoming: Vec<OpenKind>,
-    /// Hostile: `AddForward`s are recorded and not answered (a test answers them by hand).
+    /// `AddForward`s are recorded and not answered (a test answers them by hand, or lets them go
+    /// with [`FakeFwd::release_adds`]).
     pub hold_adds: bool,
+    pub held: Vec<(u32, ForwardSpec)>,
     /// Every `Consent` received (`consents` keeps the first 5,000).
     pub nconsents: usize,
 }
@@ -1215,7 +1217,7 @@ impl Policy for DaemonPolicy {
         }
     }
     // The fake opens whatever a test asks it to: the client's checks are what is under test.
-    fn check_outgoing(&self, _: &OpenKind) -> Result<(), OpenFailure> {
+    fn check_outgoing(&self, _: &OpenKind, _: &LocalPeer) -> Result<(), OpenFailure> {
         Ok(())
     }
     fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
@@ -1270,7 +1272,7 @@ impl FakeFwd {
 
     async fn serve(
         me: std::sync::Weak<Self>,
-        mut events: tokio::sync::mpsc::UnboundedReceiver<EndpointEvent>,
+        mut events: tokio::sync::mpsc::Receiver<EndpointEvent>,
     ) {
         while let Some(ev) = events.recv().await {
             let Some(me) = me.upgrade() else { return };
@@ -1324,6 +1326,7 @@ impl FakeFwd {
                     let mut st = self.st.lock().unwrap();
                     st.added.push((req, spec.clone()));
                     if st.hold_adds {
+                        st.held.push((req, spec));
                         return;
                     }
                     (st.lie_next.take().unwrap_or(spec), st.refuse_next.take())
@@ -1444,10 +1447,24 @@ impl FakeFwd {
         let app = tokio::net::TcpStream::connect(l.local_addr().unwrap())
             .await
             .unwrap();
-        let (ours, _) = l.accept().await.unwrap();
+        let (ours, peer) = l.accept().await.unwrap();
         // A refusal here (the daemon's own policy) never happens: it allows everything.
-        let _ = self.ep.open_stream(kind, Box::new(ours));
+        let _ = self
+            .ep
+            .open_stream(kind, Box::new(ours), LocalPeer::Tcp(peer));
         app
+    }
+
+    /// Answers the `AddForward`s held back so far, and every later one.
+    pub fn release_adds(&self) {
+        let held = {
+            let mut st = self.st.lock().unwrap();
+            st.hold_adds = false;
+            std::mem::take(&mut st.held)
+        };
+        for (req, spec) in held {
+            self.table(MuxMsg::AddForward { req, spec });
+        }
     }
 
     /// Hostile: sends any table message, waiting while the MUX buffer is full.

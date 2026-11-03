@@ -439,3 +439,50 @@ async fn a_take_back_under_a_new_id_keeps_listening() -> Test {
     }
     Ok(())
 }
+
+/// Across a take-back the own listener is paused until the new table names its id, then moved
+/// to that id: a connection made meanwhile waits in the backlog and opens under the new id,
+/// never under the old one (which may name another entry in the new epoch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_during_a_take_back_opens_under_the_new_id_only() -> Test {
+    let server = echo_server().await;
+    let mine = free_port();
+    let rig = attached(vec![local(mine, server.port)], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+    let old = fwd.ids()[0].0;
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().table.remove(old);
+    // The new epoch's answer is held back: the listener stays paused.
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the own spec asked for again", 5, || {
+        !fwd.st.lock().unwrap().held.is_empty()
+    })
+    .await;
+    let before = fwd.st.lock().unwrap().incoming.len();
+    let mut app = connect(mine).await.expect("the backlog takes it");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fwd.st.lock().unwrap().incoming.len(),
+        before,
+        "a connection opened before the new table named the forward"
+    );
+    fwd.release_adds();
+    assert!(round_trip(&mut app, b"under the new id").await);
+    let new = fwd.ids()[0].0;
+    assert_ne!(new, old);
+    let opened: Vec<_> = fwd.st.lock().unwrap().incoming[before..].to_vec();
+    assert!(
+        opened
+            .iter()
+            .all(|k| *k == fil_proto::mux::OpenKind::Local { forward: new }),
+        "{opened:?}"
+    );
+    assert!(!opened.is_empty());
+    Ok(())
+}

@@ -72,6 +72,9 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// After a `Detach`, how long the client waits for the daemon to hang up (which it does once it
+/// has handled the `Detach`) before it closes the link and exits regardless.
+const DETACH_DELIVERY_WAIT: Duration = Duration::from_secs(2);
 
 /// Everything about the session that must survive a link.
 struct Session {
@@ -252,16 +255,36 @@ impl<L: Link> LinkCtx<L> {
     }
 
     /// Lets what was queued (a `Detach`) reach the daemon, then closes.
+    ///
+    /// "Reached" means the daemon saw it, and only the daemon can say so. `Link::flush` promises
+    /// no more than that the bytes left this side (written into ssh's stdin, on the pipe), and
+    /// closing then discards whatever the link still queues and lets the process exit under
+    /// ssh, which dies with its undelivered bytes. The session closes the link once it has
+    /// handled a `Detach`, so this waits for the link to go down, for at most
+    /// [`DETACH_DELIVERY_WAIT`], and only then closes its own side.
     async fn close_after_flush(self) {
         let Self {
             link,
             tx,
             writer,
+            mut rrx,
             reader,
             ..
         } = self;
         drop(tx);
-        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        let delivered = tokio::time::timeout(DETACH_DELIVERY_WAIT, async {
+            // The writer has handed everything to the link (it stops when the link is down) ...
+            let _ = writer.await;
+            // ... the link has written it out ...
+            let _ = link.flush().await;
+            // ... and the daemon, done with the `Detach`, has hung up. Anything it sent before
+            // that is of no interest.
+            while let Some(Ok(_)) = rrx.recv().await {}
+        })
+        .await;
+        if delivered.is_err() {
+            tracing::debug!("the daemon did not hang up after the detach; closing anyway");
+        }
         reader.abort();
         link.close();
     }

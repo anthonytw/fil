@@ -135,6 +135,10 @@ impl FakeDaemon {
                             let e = st.epoch.epoch();
                             let _ = st.epoch.detach(e);
                             st.current = None;
+                            // The session hangs up once it has handled a `Detach`; the client
+                            // waits for that before it closes its own side.
+                            link.close();
+                            return;
                         }
                         _ => {}
                     }

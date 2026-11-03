@@ -94,3 +94,11 @@ local-direct session="local-direct":
 pi-e2e *args:
     cargo build --release -p fil --bins --example pi_e2e
     target/release/examples/pi_e2e {{args}}
+
+# The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
+# floods, unicode, resizes, detach, takeover, a killed ssh, a sleeping client) through the real client
+# on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose; `--local` runs against this
+# machine instead (no targets needed). Targets as for pi-e2e. Never part of `ci`.
+dropin *args:
+    cargo build -q --release -p fil --bins --example dropin
+    target/release/examples/dropin {{args}}

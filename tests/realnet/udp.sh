@@ -11,6 +11,8 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=fil.sh
 source "$(dirname "${BASH_SOURCE[0]}")/fil.sh"
+# shellcheck source=dropin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/dropin.sh"
 
 NS_C=rn-client
 NS_R=rn-router
@@ -1004,6 +1006,123 @@ f_udp_blocked_start() {
   cx_fk bs
 }
 
+# ---------------------------------------------------------------------------------------------
+# The drop-in suite on the real network (docs/m1/dropin.md): everyday work while the network
+# misbehaves, and the same work through ssh for comparison. The pieces are in dropin.sh.
+
+DP_OUT=$OUT/dropin
+
+# UDP only: drop a fraction of the client's packets (TCP, so the ssh pipe, is untouched).
+udp_loss() { nsx "$NS_R" iptables -I FORWARD 1 -p udp -m statistic --mode random --probability "$1" -j DROP; }
+udp_loss_off() { nsx "$NS_R" iptables -D FORWARD -p udp -m statistic --mode random --probability "$1" -j DROP || true; }
+
+# Typing into vim while the NAT mapping moves three times (a new port, another, a new address):
+# every line arrives, in order, in the file; the session stays on direct.
+f_dropin_vim_nat() {
+  reset_net
+  netem_apply delay 20ms
+  NAT_UDP=
+  fil_attach_direct a dvn
+  if ! dp_start_vim a; then
+    note "SKIP=no vim or vi on this machine"
+    fc_detach a
+    cx_fk dvn
+    return 0
+  fi
+  local specs=("$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999") i spec t0 took worst=0 moved
+  for i in $(seq 1 12); do
+    moved=
+    case $i in
+      4 | 7 | 10)
+        spec=${specs[$(((i - 4) / 3))]}
+        nat_move "$spec"
+        nat_expect "$spec"
+        moved=1
+        ;;
+    esac
+    t0=$(now_ms)
+    fc_type a "ROW-$i\\r"
+    fc_wait a "ROW-$i" 20
+    took=$(($(now_ms) - t0))
+    [[ -z $moved ]] || note "row_${i}_after_nat_move_ms=$took"
+    if ((took > worst)); then worst=$took; fi
+    sleep 1
+  done
+  note "slowest_row_echo_ms=$worst"
+  dp_finish_vim a 1 12
+  ok "ROW-1 to ROW-12 are in the file, once each, in order, across three NAT moves"
+  [[ $(fc_count_log a 'Switched(') -eq 2 ]] || fail "the client switched transports again: $(fc_log a | grep -F 'Switched(')"
+  [[ -z $(pipe_ssh "$FIL_PID") ]] || fail "the client fell back to an ssh pipe"
+  if fc_has a 'skipped'; then fail "a gap marker on the screen"; fi
+  fc_detach a
+  cx_fk dvn
+}
+
+# Typing into vim while UDP gets lossy (30 %), dies for 6 s, comes back lossy (60 %), then clean:
+# every line arrives, in order, whichever transport carried it.
+f_dropin_vim_loss() {
+  reset_net
+  netem_apply delay 20ms
+  fil_attach_direct a dvl
+  if ! dp_start_vim a; then
+    note "SKIP=no vim or vi on this machine"
+    fc_detach a
+    cx_fk dvl
+    return 0
+  fi
+  local i t0
+  for i in $(seq 1 26); do
+    case $i in
+      5) udp_loss 0.3 ;;
+      11)
+        udp_loss_off 0.3
+        udp_block
+        ;;
+      17)
+        udp_unblock
+        udp_loss 0.6
+        ;;
+      23) udp_loss_off 0.6 ;;
+    esac
+    fc_type a "ROW-$i\\r"
+    sleep 1
+  done
+  t0=$(now_ms)
+  fc_wait a 'ROW-26' 90
+  note "last_row_on_screen_after_typing_ms=$(($(now_ms) - t0))"
+  dp_finish_vim a 1 26
+  ok "ROW-1 to ROW-26 are in the file, once each, in order, across 30 % loss, a 6 s blackout and 60 % loss"
+  note "to_pipe=$(fc_count_log a 'Switched(Pipe)') to_direct=$(fc_count_log a 'Switched(Direct)')"
+  if fc_has a 'different session'; then fail "the session was replaced"; fi
+  fc_detach a
+  cx_fk dvl
+}
+
+# The same everyday work through `ssh -tt` and through fil, side by side. Functional failures
+# fail the scenario; a difference between what the two screens ended up showing is a finding.
+f_dropin_vs_ssh() {
+  reset_net
+  netem_apply delay 20ms
+  rm -rf "$DP_OUT"
+  mkdir -p "$DP_OUT"
+  FC_PROG=ssh fc_start s -- -tt srv
+  fc_ready s 30
+  dp_battery s ssh
+  fc_start f -- srv dpf
+  fc_ready f 30
+  dp_battery f fil
+  local step
+  for step in less flood unicode.out; do
+    [[ -s $DP_OUT/ssh.$step && -s $DP_OUT/fil.$step ]] || fail "no $step snapshot from one of the clients"
+    if cmp -s "$DP_OUT/ssh.$step" "$DP_OUT/fil.$step"; then
+      ok "$step: the final screens are identical (ssh and fil)"
+    else
+      known_bug "$step: the screens differ between ssh and fil: $(diff "$DP_OUT/ssh.$step" "$DP_OUT/fil.$step" | head -n 6 | tr '\n' '|')"
+    fi
+  done
+  cx_fk dpf
+}
+
 # Retired from the default run (still runnable by name): s_quiclink_rebind is covered by
 # f_nat_rebind, which moves the NAT mapping the same way under the real client and daemon.
 ALL_SCENARIOS=(
@@ -1011,6 +1130,7 @@ ALL_SCENARIOS=(
   s_nat_rebind s_ip_change s_blackouts s_udp_blocked
   s_quiclink_udp_blocked s_quiclink_blackouts
   f_upgrade f_nat_rebind f_udp_blocked_mid f_udp_blocked_start
+  f_dropin_vim_nat f_dropin_vim_loss f_dropin_vs_ssh
 )
 
 part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"

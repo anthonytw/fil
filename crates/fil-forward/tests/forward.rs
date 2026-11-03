@@ -1198,3 +1198,47 @@ async fn a_slow_owner_holds_back_a_table_flood() {
     w.client.assert_no_errors();
     w.daemon.assert_no_errors();
 }
+
+/// Events of an epoch never reach the owner in the next one: a flood fills the owner's channel
+/// and the endpoint's own queue, a fresh attach starts a new epoch, and the first event the owner
+/// reads is the new epoch's (a stale `AddForward` or `Consent` must not act for the new
+/// subscriber).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_epoch_drops_the_old_epochs_events() {
+    use fil_proto::mux::MuxMsg;
+    let mut w = World::new_with(Transport::Mem, mux_config(), true).await;
+    for i in 0..(fil_forward::EVENT_QUEUE as u32 * 4) {
+        w.daemon
+            .ep
+            .send_table(MuxMsg::ForwardGone { id: ForwardId(i) })
+            .unwrap();
+    }
+    eventually(Duration::from_secs(10), || {
+        w.client.ep.snapshot().undelivered_events > 0
+    })
+    .await;
+    // The fresh attach: both sides start a new epoch on a new link.
+    let pair = w.factory.pair(Transport::Mem).await;
+    for end in [&mut w.client, &mut w.daemon] {
+        end.detach();
+        end.ep.new_epoch();
+    }
+    assert_eq!(w.client.ep.snapshot().undelivered_events, 0);
+    w.daemon.attach(pair.daemon.clone(), false);
+    w.client.attach(pair.client.clone(), false);
+    w.link = Some(pair);
+    let fresh = MuxMsg::ForwardGone {
+        id: ForwardId(1_000_000),
+    };
+    w.daemon.ep.send_table(fresh.clone()).unwrap();
+    let mut rx = w.client.events_rx.take().unwrap();
+    let first = timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the new epoch's event came")
+        .unwrap();
+    assert!(
+        first == fil_forward::EndpointEvent::Table(fresh),
+        "an event of the old epoch reached the owner"
+    );
+    assert!(rx.try_recv().is_err());
+}

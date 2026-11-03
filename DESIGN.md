@@ -126,7 +126,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
     - **Shown on** `Degraded` and `Down`, never before the first screen.
     - **Says** what is happening ("reconnecting over pipe", how long, which try), and on a second line how many bytes of input are held and how many were dropped.
     - **Drawn** in inverse video, at the edge of the screen farthest from the cursor, never on the cursor's row, and never over a wide character. If no place is safe, or the terminal is in the middle of an escape sequence, nothing is drawn; it comes back as soon as it is safe.
-    - **Short and unpadded:** at most 40 columns a line, with a space of margin each side. A terminal that reflows on a width change re-wraps anything wider than the new width, and the erase cannot undo that; so if the window narrows at all while something is drawn (the rows under it are re-wrapped too), the screen can no longer be trusted and the next attach starts from a snapshot instead of a resume.
+    - **Short and unpadded:** at most 40 columns a line, with a space of margin each side. A terminal that reflows on a width change re-wraps anything wider than the new width, and the erase cannot undo that; so if the window narrows at all while something is drawn (the rows under it are re-wrapped too), the screen can no longer be trusted and the next resume asks for a snapshot instead of a replay (`ResumeRequest.want_snapshot`). That is still a resume: the key, the epoch and the input stream are kept, so it needs no new login and loses no typed input, and the next swap between the pipe and QUIC repaints the screen too.
     - **The same overlay** carries the `~?` help and the questions the client asks (take the session back, confirm offline input, a replaced session), so none of them can corrupt the screen either.
   - Keystrokes typed while disconnected are handled as decided in §4.3.
 
@@ -136,7 +136,7 @@ The handling is configurable **(decided)**:
 
 - **Buffer:** keystrokes are buffered in client memory up to a configurable cap (proposed default: 4 KiB). The status overlay shows how much is buffered, and how much was dropped once the cap was reached. A cap of 0 drops all input while disconnected.
 - **Send on resume, or ask:** by default the buffer is sent as soon as the session resumes. Optionally (`offline_input.confirm`), when the disconnect lasted longer than a threshold, the client shows what was typed and asks before sending it. A Ctrl-C typed during a long outage then can't land late by surprise.
-- **Optional log:** `offline_input.log` keeps everything typed while disconnected, including anything over the cap, by appending it to a file or piping it to a command. It is **off by default**, because keystrokes can include passwords. See §11.
+- **Optional log:** `offline_input.log` keeps everything typed while disconnected, including anything over the cap, by appending it to a file or piping it to a command. It is **off by default**, because keystrokes can include passwords. A file log is bounded (rotated to `<file>.1` at 1 MiB, deleted when untouched for 30 days) and fil refuses one whose directory other users can write to. See §11.
 
 ## 5. Sessions
 

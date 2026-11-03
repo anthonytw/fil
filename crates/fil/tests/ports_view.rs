@@ -32,6 +32,8 @@ fn opts(host: Option<&str>) -> ViewOptions<'_> {
         host,
         now_unix_ms: NOW,
         utc_offset_secs: 0,
+        zone: None,
+        current_session: None,
     }
 }
 
@@ -432,6 +434,8 @@ fn the_json_is_the_same_whatever_the_clock_and_the_zone() {
             host: Some("orin"),
             now_unix_ms: 0,
             utc_offset_secs: -5 * 3600,
+            zone: None,
+            current_session: None,
         },
     );
     assert_eq!(a, b);
@@ -454,6 +458,8 @@ fn times_follow_the_zone_and_name_the_day_when_it_is_not_today() {
             host: None,
             now_unix_ms: NOW,
             utc_offset_secs: 3600,
+            zone: None,
+            current_session: None,
         },
     );
     assert!(
@@ -730,4 +736,73 @@ fn ipv6_is_bracketed_once_in_the_table() {
     ] {
         assert!(text.contains(want), "{want}:\n{text}");
     }
+}
+
+#[test]
+fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
+    let rows = vec![
+        PortsRow::Session(summary("main", None, 0, false)),
+        PortsRow::Listener(ListenerRow {
+            addr: ip("127.0.0.1"),
+            port: port(8000),
+            owner: ListenerOwner::Session {
+                session: name("main"),
+                process: proc(1, "python", None),
+            },
+            since_unix_ms: 0,
+            probe: None,
+        }),
+    ];
+    let hint = |host: Option<&str>, current: Option<&str>| {
+        let o = ViewOptions {
+            current_session: current,
+            ..opts(host)
+        };
+        render_text(&answer(rows.clone()), &o)
+    };
+    // From the laptop: the host and the session.
+    assert!(hint(Some("orin"), None).contains("fil forward orin main -L 8000"));
+    assert!(
+        hint(Some("me@orin.example.net"), None)
+            .contains("fil forward me@orin.example.net main -L 8000")
+    );
+    // A host the shell would take apart is quoted, and escapes in it are gone.
+    let t = hint(Some("or in;$x\x1b[2J"), None);
+    assert!(t.contains("fil forward 'or in;$x[2J' main -L 8000"), "{t}");
+    assert!(!t.contains('\x1b'));
+    // A session named like an option is given after `--`, so the hint cannot become a removal.
+    for odd in ["--rm", "-x"] {
+        let rows = vec![
+            PortsRow::Session(summary(odd, None, 0, false)),
+            PortsRow::Listener(ListenerRow {
+                addr: ip("127.0.0.1"),
+                port: port(8000),
+                owner: ListenerOwner::Session {
+                    session: name(odd),
+                    process: proc(1, "python", None),
+                },
+                since_unix_ms: 0,
+                probe: None,
+            }),
+        ];
+        let t = render_text(&answer(rows.clone()), &opts(Some("orin")));
+        assert!(
+            t.contains(&format!("fil forward orin -L 8000 -- {odd}")),
+            "{t}"
+        );
+        // Inside that very session the hint needs no name, and it never starts with the name.
+        let o = ViewOptions {
+            current_session: Some(odd),
+            ..opts(None)
+        };
+        assert!(render_text(&answer(rows), &o).contains("→  fil forward -L 8000"));
+    }
+    // Inside that session: neither. In another or none: the session through the environment.
+    let t = hint(None, Some("main"));
+    assert!(
+        t.contains("fil forward -L 8000") && !t.contains("FIL_SESSION"),
+        "{t}"
+    );
+    assert!(hint(None, Some("other")).contains("FIL_SESSION=main fil forward -L 8000"));
+    assert!(hint(None, None).contains("FIL_SESSION=main fil forward -L 8000"));
 }

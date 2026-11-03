@@ -26,11 +26,18 @@ pub const JSON_SCHEMA: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewOptions<'a> {
-    /// The host as the user typed it; `None` inside a session.
+    /// The host as the user typed it; `None` for the daemon on this machine (inside a session).
     pub host: Option<&'a str>,
+    /// The session this command runs in (`$FIL_SESSION`), when it runs in one. With no `host`,
+    /// the hint under a listener leaves the session out for this one and names it for the others.
+    pub current_session: Option<&'a str>,
     pub now_unix_ms: u64,
-    /// Seconds east of UTC, for the times of day.
+    /// Seconds east of UTC, for the times of day, when `zone` is `None`.
     pub utc_offset_secs: i32,
+    /// The zone as a function of the instant (Unix seconds in, seconds east of UTC out), so a
+    /// time from before a daylight-saving change is shown in the offset it had. When set it
+    /// replaces `utc_offset_secs`.
+    pub zone: Option<fn(i64) -> i32>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -172,7 +179,12 @@ fn group(rows: &[PortsRow]) -> View<'_> {
 
 /// `HH:MM` if `unix_ms` is on the same day as now in the view's zone, else `YYYY-MM-DD HH:MM`.
 fn when(unix_ms: u64, o: &ViewOptions<'_>) -> String {
-    let shift = |ms: u64| ms.saturating_add_signed(i64::from(o.utc_offset_secs) * 1000);
+    let shift = |ms: u64| {
+        let off = o
+            .zone
+            .map_or(o.utc_offset_secs, |zone| zone((ms / 1000) as i64));
+        ms.saturating_add_signed(i64::from(off) * 1000)
+    };
     let t = format_utc(shift(unix_ms));
     let now = format_utc(shift(o.now_unix_ms));
     // "2023-11-14 22:13:20 UTC"
@@ -332,9 +344,41 @@ fn widths(head: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
     w
 }
 
-/// The one command that would forward a listener's port.
-fn forward_hint(port: u16) -> String {
-    format!("fil forward -L {port}")
+/// The one command that would forward a listener's port, runnable where `fil ports` was run:
+/// from the laptop it names the host and the session; inside the session it needs neither; on
+/// the host, outside any session, it names the session through `$FIL_SESSION`. The host is what
+/// the user typed, the session a validated name, and both are cleaned and quoted for a shell.
+fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
+    let session = clean(session);
+    match (o.host, o.current_session) {
+        (Some(host), _) => {
+            // A session name may start with `-`, which the command line would read as an option
+            // (`--rm`): after `--`, it is only ever a session.
+            let tail = if session.starts_with('-') {
+                format!("-L {port} -- {}", shell_word(&session))
+            } else {
+                format!("{} -L {port}", shell_word(&session))
+            };
+            format!("fil forward {} {tail}", shell_word(&clean(host)))
+        }
+        (None, Some(current)) if clean(current) == session => format!("fil forward -L {port}"),
+        (None, _) => format!("FIL_SESSION={} fil forward -L {port}", shell_word(&session)),
+    }
+}
+
+/// `word` as one shell word: as it is when it has only characters a shell leaves alone, else in
+/// single quotes. (A host the user typed is the user's, but it is pasted into a command line.)
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '@' | '.' | '_' | '-' | ':' | '%' | '+' | '=' | ',' | '/')
+        });
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>) {
@@ -432,7 +476,12 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     (cells, detail)
 }
 
-fn listener_lines(rows: &[(&ListenerRow, &ProcessInfo)], o: &ViewOptions<'_>, out: &mut String) {
+fn listener_lines(
+    rows: &[(&ListenerRow, &ProcessInfo)],
+    session: &str,
+    o: &ViewOptions<'_>,
+    out: &mut String,
+) {
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|(l, p)| {
@@ -456,7 +505,7 @@ fn listener_lines(rows: &[(&ListenerRow, &ProcessInfo)], o: &ViewOptions<'_>, ou
         line.truncate(line.trim_end().len());
         out.push_str(&line);
         out.push('\n');
-        let hint = forward_hint(l.port.get());
+        let hint = forward_hint(l.port.get(), session, o);
         if exposed_listener(l.addr) {
             out.push_str(&format!(
                 "        ⚠ reachable from outside this host, not just through fil  →  {hint}\n"
@@ -549,7 +598,7 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
         }
         if !s.listeners.is_empty() {
             out.push_str("\nLISTENING IN THIS SESSION, NOT FORWARDED\n");
-            listener_lines(&s.listeners, o, &mut out);
+            listener_lines(&s.listeners, &s.name, o, &mut out);
         }
         if let Some(a) = s.agent {
             out.push_str("\nAGENT\n");

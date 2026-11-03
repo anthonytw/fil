@@ -35,6 +35,7 @@ mod harness;
 mod common;
 mod disrupt;
 mod forward;
+mod manage;
 mod netcut;
 mod output;
 mod session;
@@ -424,6 +425,11 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("fwd_dynamic", forward::fwd_dynamic),
         ("fwd_bulk_typing", forward::fwd_bulk_typing),
         ("fwd_churn", forward::fwd_churn),
+        // M2: managing forwards after the attach (F4 part 2).
+        ("fwd_inside_add_rm", manage::fwd_inside_add_rm),
+        ("fwd_hostile_remote", manage::fwd_hostile_remote),
+        ("fwd_ports_view", manage::fwd_ports_view),
+        ("detach_inside", manage::detach_inside),
     ]
 }
 

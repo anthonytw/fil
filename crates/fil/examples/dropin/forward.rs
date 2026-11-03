@@ -22,7 +22,7 @@ use crate::{Ctx, Variant};
 
 /// Ports on the host's loopback, inside the session: the `-L` target, the `-R` listener, a second
 /// server (the SOCKS target).
-const PL: u16 = 18000;
+pub const PL: u16 = 18000;
 const PR: u16 = 19000;
 const PS: u16 = 18100;
 
@@ -43,7 +43,7 @@ pub fn mac_ports() -> MacPorts {
     }
 }
 
-const KB: &str = "KNOWN-BUG: ";
+pub const KB: &str = "KNOWN-BUG: ";
 
 // ---------------------------------------------------------------------------------------------
 // fwdprobe on this machine
@@ -137,7 +137,7 @@ impl Drop for Mac {
 }
 
 /// The last value of `key` in `KEY=value` lines.
-fn kv(text: &str, key: &str) -> String {
+pub fn kv(text: &str, key: &str) -> String {
     let p = format!("{key}=");
     text.lines()
         .filter_map(|l| l.trim().strip_prefix(&p))
@@ -153,7 +153,7 @@ fn accepts(text: &str) -> usize {
 }
 
 /// The sha256 of `n` seeded bytes.
-fn digest(ctx: &Ctx, n: u64, seed: u64) -> Result<String, String> {
+pub fn digest(ctx: &Ctx, n: u64, seed: u64) -> Result<String, String> {
     let out = Command::new(&ctx.fwdprobe)
         .args(["digest", &n.to_string(), "--seed", &seed.to_string()])
         .output()
@@ -168,7 +168,7 @@ fn digest(ctx: &Ctx, n: u64, seed: u64) -> Result<String, String> {
 
 impl Ctx {
     /// The session's fwdprobe: the one the gate installed, or this machine's on `--local`.
-    fn fp(&self, host: &str) -> String {
+    pub fn fp(&self, host: &str) -> String {
         if Ctx::is_local(host) {
             self.fwdprobe.display().to_string()
         } else {
@@ -727,6 +727,32 @@ pub fn fwd_local_http(ctx: &Ctx, host: &str) -> Res {
             r.kv("IN_BYTES"),
             r.kv("IN_SHA256"),
             accepts(&srv)
+        ));
+    }
+    // `fil ports` from this machine lists the forward with the bytes it carried.
+    let v = ctx.ports_json(host, "dp-flh")?;
+    let row = v["sessions"]
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["name"] == "dp-flh"))
+        .and_then(|s| s["forwards"].as_array())
+        .and_then(|f| {
+            f.iter()
+                .find(|f| f["kind"] == "local" && f["port"] == p.l)
+                .cloned()
+        });
+    let (down, up) = row.as_ref().map_or((0, 0), |r| {
+        (
+            r["bytes_down"].as_u64().unwrap_or(0),
+            r["bytes_up"].as_u64().unwrap_or(0),
+        )
+    });
+    notes.push(format!(
+        "`fil ports --json` lists the -L ({}), {down} bytes down and {up} up (asserted: at least 64 MiB down)",
+        if row.is_some() { "found" } else { "MISSING" }
+    ));
+    if row.is_none() || down < n {
+        notes.push(format!(
+            "{KB}fil ports does not show the -L with its 64 MiB down: {row:?}"
         ));
     }
     finish(c)?;

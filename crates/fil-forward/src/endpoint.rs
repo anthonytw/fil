@@ -525,7 +525,7 @@ impl<L: Link> State<L> {
     fn emit(&mut self, ev: EndpointEvent) {
         if self.undelivered.is_empty() {
             match self.events.try_send(ev) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
                 Err(mpsc::error::TrySendError::Full(ev)) => self.undelivered.push_back(ev),
             }
         } else {

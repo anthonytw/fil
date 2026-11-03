@@ -186,9 +186,14 @@ impl fmt::Display for PolicySetting {
     }
 }
 
-/// The path, sanitized: it came from the remote host.
+/// The path on one line, inert: it came from the remote host. Control and invisible characters
+/// are dropped (`text::sanitize`), and the line breaks and tabs it keeps become spaces, so a
+/// hostile host cannot start a line of its own in an overlay, a shell or `fil ports`.
 fn path(p: &PortsPath) -> String {
     crate::text::sanitize(p.as_str().as_bytes())
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 impl fmt::Display for PolicySource {
@@ -264,14 +269,32 @@ mod tests {
     }
 
     #[test]
-    fn the_path_is_shown_inert() {
-        let r = PolicyRefusal {
-            setting: PolicySetting::DisableForwarding,
-            source: PolicySource::File {
-                file: PortsPath::capped("/etc/\x1b]0;owned\x07x"),
-            },
-        };
-        let s = r.to_string();
-        assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+    fn the_path_is_shown_inert_on_one_line() {
+        for hostile in [
+            "/etc/\x1b]0;owned\x07x",
+            "/etc/ssh/sshd_config\nfil: passphrase for ~/.ssh/id_ed25519: ",
+            "/etc/a\rb",
+            "/etc/a\tb",
+            "/etc/a\x0bb\x0cc\x00d\x7fe\u{85}f\u{2028}g\u{202e}h",
+        ] {
+            for source in [
+                PolicySource::File {
+                    file: PortsPath::capped(hostile),
+                },
+                PolicySource::Sshd {
+                    file: PortsPath::capped(hostile),
+                    line: 3,
+                    maybe: true,
+                },
+            ] {
+                let r = PolicyRefusal {
+                    setting: PolicySetting::DisableForwarding,
+                    source,
+                };
+                let s = r.to_string();
+                assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+                assert!(!s.contains('\u{2028}') && !s.contains('\u{202e}'), "{s:?}");
+            }
+        }
     }
 }

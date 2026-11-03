@@ -38,6 +38,7 @@
 pub mod file;
 mod mirror;
 pub mod sshd;
+mod stamp;
 
 pub use mirror::{POLICY_FILE, Policy, PolicySources, SSHD_CONFIG};
 

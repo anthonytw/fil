@@ -16,7 +16,7 @@ fil-transport = { path = "../fil-transport" }
 nix = { version = "0.28", default-features = false, features = ["term", "signal", "user", "process"] }
 portable-pty = "0.9"
 # The agent socket: the effective uid its directory and peers are checked against.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 # The policy file, /etc/fil/policy.toml (DESIGN.md section 11.2).
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

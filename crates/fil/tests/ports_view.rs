@@ -412,7 +412,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     assert_eq!(main["refused"][1]["what"], "agent");
     assert_eq!(
         v["server_policy"][0],
-        "fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes: what it sets is not mirrored"
+        "the sshd mirror is incomplete: fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes"
     );
     assert_eq!(
         keys(&main["forwards"][0]),

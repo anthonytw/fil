@@ -42,6 +42,7 @@ impl Host {
                 user: Some("dev".into()),
                 groups: Some(vec!["dev".into()]),
             }),
+            lookup: Account::current,
         };
         Host { base, sources }
     }
@@ -274,19 +275,23 @@ fn an_unsafe_or_unparsable_policy_file_refuses_everything() {
     }
 }
 
+/// RHEL and Fedora keep `sshd_config` 0600: `Unknown`, one line in `fil ports`, and OpenSSH's
+/// defaults in force (so a wide `-R` is refused, as sshd's `GatewayPorts no` would keep it on
+/// loopback). The same for a missing config.
 #[test]
-fn an_unreadable_sshd_config_mirrors_nothing_and_says_so() {
+fn an_unreadable_or_missing_sshd_config_is_openssh_s_defaults() {
     if rustix::process::geteuid().as_raw() == 0 {
         return; // root reads it anyway
     }
-    let h = Host::new("rhel", "AllowTcpForwarding no\n", None);
+    let h = Host::new("rhel", "AllowTcpForwarding no\nGatewayPorts yes\n", None);
     let cfg = h.base.join("sshd_config");
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o000)).unwrap();
     let p = h.policy();
+    assert_eq!(says(p.forward(&remote(BindAddr::Loopback, 9000))), "ok");
+    assert_eq!(says(p.forward(&local(1, "db", 1))), "ok");
     assert_eq!(
         says(p.forward(&remote(BindAddr::Any, 9000))),
-        "ok",
-        "no mirror, no defaults"
+        "GatewayPorts no (OpenSSH's default)"
     );
     assert_eq!(
         p.lines(),
@@ -294,6 +299,124 @@ fn an_unreadable_sshd_config_mirrors_nothing_and_says_so() {
             file: PortsPath::capped(&cfg.to_string_lossy())
         }]
     );
+    std::fs::remove_file(&cfg).unwrap();
+    let p = h.policy();
+    assert_eq!(
+        says(p.forward(&remote(BindAddr::Any, 9000))),
+        "GatewayPorts no (OpenSSH's default)",
+        "missing"
+    );
+    assert!(p.lines().is_empty(), "a missing config says nothing");
+    // fil's policy file can still allow it.
+    std::fs::write(h.base.join("etc/fil/policy.toml"), "gateway_ports = true\n").unwrap();
+    std::fs::set_permissions(
+        h.base.join("etc/fil/policy.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(says(p.forward(&remote(BindAddr::Any, 9000))), "ok");
+}
+
+/// The NixOS layout: `sshd_config` is a symbolic link into a tree that is swapped; and an
+/// include directory that is a link. A change behind either is read again.
+#[test]
+fn a_change_behind_a_symbolic_link_is_read_again() {
+    let h = Host::new("links", "", None);
+    let real = h.base.join("static");
+    std::fs::create_dir_all(real.join("conf.d")).unwrap();
+    std::fs::write(real.join("sshd_config"), "Include conf.d/*.conf\n").unwrap();
+    std::fs::remove_file(h.base.join("sshd_config")).unwrap();
+    std::os::unix::fs::symlink(real.join("sshd_config"), h.base.join("sshd_config")).unwrap();
+    std::os::unix::fs::symlink(real.join("conf.d"), h.base.join("conf.d")).unwrap();
+    let p = h.policy();
+    assert_eq!(says(p.agent()), "ok");
+    // Behind the file's link.
+    std::fs::write(
+        real.join("sshd_config"),
+        "Include conf.d/*.conf\nAllowTcpForwarding local\n",
+    )
+    .unwrap();
+    assert!(p.forward(&remote(BindAddr::Loopback, 9000)).is_err());
+    // A new file in the directory a link leads to.
+    std::fs::write(real.join("conf.d/10-x.conf"), "AllowAgentForwarding no\n").unwrap();
+    assert!(p.agent().is_err(), "the new include file was read");
+}
+
+/// The policy file's trust depends on the directories its canonical path goes through: a chmod
+/// there is seen, though the path as written goes through a link.
+#[test]
+fn a_chmod_above_the_policy_file_s_canonical_path_is_seen() {
+    let h = Host::new("canon", "", None);
+    // etc/fil -> opt/x: `opt` is above the canonical path only.
+    let opt = h.base.join("opt");
+    let real = opt.join("x");
+    std::fs::create_dir_all(&real).unwrap();
+    for d in [&opt, &real] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(real.join("policy.toml"), "").unwrap();
+    std::fs::set_permissions(
+        real.join("policy.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(h.base.join("etc/fil")).unwrap();
+    std::os::unix::fs::symlink(&real, h.base.join("etc/fil")).unwrap();
+    let p = h.policy();
+    assert_eq!(says(p.agent()), "ok");
+    std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        p.agent().unwrap_err().setting,
+        PolicySetting::FileUnsafe(FileFault::DirectoryUnsafe)
+    );
+}
+
+/// Group membership is looked up again on every read: a user added to a group that a
+/// `Match Group` block names is refused from the next read on (sshd looks it up at every login).
+#[test]
+fn group_membership_is_looked_up_again() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_NOFWD: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let mut groups = vec!["dev".to_string()];
+        if IN_NOFWD.load(Ordering::SeqCst) {
+            groups.push("nofwd".into());
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(groups),
+        }
+    }
+    let h = Host::new(
+        "groups",
+        "Match Group nofwd\n  AllowTcpForwarding no\n",
+        None,
+    );
+    let mut src = h.sources.clone();
+    src.account = None;
+    src.lookup = lookup;
+    let p = Policy::new(src.clone());
+    assert_eq!(says(p.forward(&local(1, "db", 1))), "ok");
+    IN_NOFWD.store(true, Ordering::SeqCst);
+    // The account files are watched: here a file change stands in for theirs.
+    std::fs::write(
+        h.base.join("sshd_config"),
+        "Match Group nofwd\n  AllowTcpForwarding no\n\n",
+    )
+    .unwrap();
+    assert_eq!(
+        p.forward(&local(1, "db", 1)).unwrap_err().setting,
+        PolicySetting::AllowTcpForwarding(TcpForwarding::No)
+    );
+    // And the account database's files are among what is watched.
+    let watched: Vec<_> = super::load(&src)
+        .stamps
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    for f in ["/etc/passwd", "/etc/group"] {
+        assert!(watched.contains(&PathBuf::from(f)), "{f}: {watched:?}");
+    }
 }
 
 #[test]

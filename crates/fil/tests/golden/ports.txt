@@ -50,6 +50,6 @@ LISTENERS OF OTHER USERS ON THIS HOST (port and address only)
   22  0.0.0.0 ⚠
 
 SERVER POLICY
-  fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes: what it sets is not mirrored
+  the sshd mirror is incomplete: fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes
 
 (incomplete: the scan on the host stopped at one of its bounds; listeners may be missing)

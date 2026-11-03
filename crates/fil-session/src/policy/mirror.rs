@@ -1,8 +1,8 @@
 //! [`Policy`]: the sshd mirror under fil's policy file, re-read when the files change (see the
 //! module documentation above).
 
+use super::stamp::Stamp;
 use std::net::IpAddr;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ pub const POLICY_FILE: &str = "/etc/fil/policy.toml";
 
 /// Where the policy comes from. Not in `daemon.toml`: the user must not be able to point the
 /// daemon elsewhere. Tests set it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PolicySources {
     /// The sshd config to mirror; `None` mirrors nothing.
     pub sshd_config: Option<PathBuf>,
@@ -32,8 +32,12 @@ pub struct PolicySources {
     pub trust: Trust,
     /// How often the files' metadata is looked at again.
     pub recheck: Duration,
-    /// Who `Match User` and `Match Group` are evaluated for; `None` is this process's account.
+    /// Who `Match User` and `Match Group` are evaluated for; `None` is this process's account,
+    /// looked up again on every read ([`PolicySources::lookup`]).
     pub account: Option<Account>,
+    /// How the account is looked up when `account` is `None`: [`Account::current`], except in
+    /// tests (a seam: group membership that changes between reads).
+    pub lookup: fn() -> Account,
 }
 
 impl PolicySources {
@@ -45,6 +49,7 @@ impl PolicySources {
             trust: Trust::default(),
             recheck: Duration::from_secs(1),
             account: None,
+            lookup: Account::current,
         }
     }
 
@@ -56,46 +61,39 @@ impl PolicySources {
             trust: Trust::default(),
             recheck: Duration::from_secs(1),
             account: None,
+            lookup: Account::current,
         }
     }
 }
 
-/// Device, inode, size, mtime (s, ns), ctime (s, ns) and mode.
-type Marks = (u64, u64, u64, i64, i64, i64, i64, u32);
+/// How often everything is read again even when no file changed: group membership from NSS
+/// (LDAP, SSSD) has no file to watch.
+const FULL_RELOAD: Duration = Duration::from_secs(300);
 
-/// A file's identity and change marks, to tell it changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Stamp {
-    path: PathBuf,
-    /// `None`: it was not there (or could not be looked at).
-    marks: Option<Marks>,
-}
-
-impl Stamp {
-    fn of(path: PathBuf) -> Self {
-        let marks = std::fs::symlink_metadata(&path).ok().map(|m| {
-            (
-                m.dev(),
-                m.ino(),
-                m.size(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-                m.mode(),
-            )
-        });
-        Stamp { path, marks }
-    }
-}
+/// The account database's files: a change there can change `Match User` and `Match Group`.
+const ACCOUNT_FILES: [&str; 2] = ["/etc/passwd", "/etc/group"];
 
 /// What was read, and what to look at to tell it changed.
 #[derive(Debug)]
 struct Loaded {
     sshd: Sshd,
+    /// OpenSSH's defaults, standing in for an sshd config that is missing or cannot be read.
+    defaults: Option<Settings>,
     file: FilePolicy,
     stamps: Vec<Stamp>,
     checked: Instant,
+    at: Instant,
+}
+
+impl Loaded {
+    /// The sshd settings in force: the mirror, or OpenSSH's defaults when the config is missing
+    /// or cannot be read; `None` only when no sshd config is configured at all (tests).
+    fn settings(&self) -> Option<&Settings> {
+        match &self.sshd {
+            Sshd::Mirrored(s) => Some(s),
+            Sshd::Missing | Sshd::Unknown => self.defaults.as_ref(),
+        }
+    }
 }
 
 /// The daemon's server policy: the sshd mirror under fil's policy file, re-read when the files
@@ -103,39 +101,37 @@ struct Loaded {
 #[derive(Debug)]
 pub struct Policy {
     src: PolicySources,
-    account: Account,
     loaded: Mutex<Loaded>,
 }
 
 impl Policy {
     pub fn new(src: PolicySources) -> Self {
-        let account = src.account.clone().unwrap_or_else(Account::current);
-        let loaded = Mutex::new(load(&src, &account));
-        Policy {
-            src,
-            account,
-            loaded,
-        }
+        let loaded = Mutex::new(load(&src));
+        Policy { src, loaded }
     }
 
-    /// The policy now (reading the files again if any changed), handed to `f`.
-    fn with<T>(&self, f: impl FnOnce(&Sshd, &FilePolicy) -> T) -> T {
+    /// The policy now (reading the files again if any changed, or every [`FULL_RELOAD`]),
+    /// handed to `f`.
+    ///
+    /// The re-read (a few `stat`s, and on a change the files' reads) runs under this lock, and
+    /// callers hold their session's state lock: it is short, local file IO, done at most once a
+    /// second, and keeps the check and the state it guards in one step.
+    fn with<T>(&self, f: impl FnOnce(Option<&Settings>, &Sshd, &FilePolicy) -> T) -> T {
         let mut l = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
         if l.checked.elapsed() >= self.src.recheck {
-            let changed = l.stamps.iter().any(|s| Stamp::of(s.path.clone()) != *s);
-            if changed {
-                tracing::debug!("server policy files changed; reading them again");
-                *l = load(&self.src, &self.account);
+            if l.at.elapsed() >= FULL_RELOAD || l.stamps.iter().any(Stamp::changed) {
+                tracing::debug!("server policy: reading the files again");
+                *l = load(&self.src);
             } else {
                 l.checked = Instant::now();
             }
         }
-        f(&l.sshd, &l.file)
+        f(l.settings(), &l.sshd, &l.file)
     }
 
     /// The direct transport is allowed (only fil's policy file says otherwise).
     pub fn direct(&self) -> Result<(), PolicyRefusal> {
-        self.with(|_, file| match file {
+        self.with(|_, _, file| match file {
             FilePolicy::Unsafe(why) => Err(self.unsafe_file(*why)),
             FilePolicy::Keys(k) if k.direct == Some(false) => Err(self.file_key(FileKey::Direct)),
             _ => Ok(()),
@@ -146,13 +142,14 @@ impl Policy {
     /// a policy file that refuses everything, the direct transport refused.
     pub fn lines(&self) -> Vec<PolicyLine> {
         let mut v = Vec::new();
-        self.with(|sshd, file| {
+        self.with(|_, sshd, file| {
             match sshd {
                 Sshd::Unknown => v.push(PolicyLine::Unreadable {
                     file: self.sshd_path(),
                 }),
                 Sshd::Mirrored(s) if !s.unreadable.is_empty() => {
                     let mut seen = s.unreadable.clone();
+                    seen.sort();
                     seen.dedup();
                     v.push(PolicyLine::Partial {
                         file: ports_path(&seen[0]),
@@ -250,7 +247,7 @@ impl Policy {
 
     fn forward_in(
         &self,
-        sshd: &Sshd,
+        s: Option<&Settings>,
         file: &FilePolicy,
         spec: &ForwardSpec,
     ) -> Result<(), PolicyRefusal> {
@@ -258,10 +255,6 @@ impl Policy {
             FilePolicy::Unsafe(why) => return Err(self.unsafe_file(*why)),
             FilePolicy::Keys(k) => k.clone(),
             FilePolicy::Absent => Keys::default(),
-        };
-        let s = match sshd {
-            Sshd::Mirrored(s) => Some(&**s),
-            Sshd::Missing | Sshd::Unknown => None,
         };
         match spec.kind() {
             ForwardKind::Local | ForwardKind::Dynamic => {
@@ -317,26 +310,22 @@ impl Policy {
 
 impl ServerPolicy for Policy {
     fn forward(&self, spec: &ForwardSpec) -> Result<(), PolicyRefusal> {
-        self.with(|sshd, file| self.forward_in(sshd, file, spec))
+        self.with(|s, _, file| self.forward_in(s, file, spec))
     }
 
     fn dynamic_target(&self, target: &Target) -> Result<(), PolicyRefusal> {
-        self.with(|sshd, file| {
+        self.with(|s, _, file| {
             let keys = match file {
                 FilePolicy::Unsafe(why) => return Err(self.unsafe_file(*why)),
                 FilePolicy::Keys(k) => k.clone(),
                 FilePolicy::Absent => Keys::default(),
-            };
-            let s = match sshd {
-                Sshd::Mirrored(s) => Some(&**s),
-                _ => None,
             };
             self.open(s, &keys, &host_text(target), target.port.get())
         })
     }
 
     fn agent(&self) -> Result<(), PolicyRefusal> {
-        self.with(|sshd, file| {
+        self.with(|s, _, file| {
             match file {
                 FilePolicy::Unsafe(why) => return Err(self.unsafe_file(*why)),
                 FilePolicy::Keys(k) if k.agent == Some(true) => return Ok(()),
@@ -345,7 +334,7 @@ impl ServerPolicy for Policy {
                 }
                 _ => {}
             }
-            let Sshd::Mirrored(s) = sshd else {
+            let Some(s) = s else {
                 return Ok(());
             };
             disabled(&s.disable)?;
@@ -362,24 +351,35 @@ impl ServerPolicy for Policy {
     }
 }
 
-fn load(src: &PolicySources, account: &Account) -> Loaded {
-    let (sshd, mut watched) = match &src.sshd_config {
-        Some(p) => sshd::read(p, account),
+fn load(src: &PolicySources) -> Loaded {
+    let at = Instant::now();
+    // Stamped before they are read, so a change while reading is seen at the next check. The
+    // account is looked up again on every read: sshd does at every login.
+    let mut stamps: Vec<Stamp> = Vec::new();
+    let account = match &src.account {
+        Some(a) => a.clone(),
+        None => {
+            stamps.extend(
+                ACCOUNT_FILES
+                    .iter()
+                    .map(|f| Stamp::of(std::path::Path::new(f))),
+            );
+            (src.lookup)()
+        }
+    };
+    let (sshd, watched) = match &src.sshd_config {
+        Some(p) => sshd::read(p, &account),
         None => (Sshd::Missing, Vec::new()),
     };
+    stamps.extend(watched);
+    // A configured config that is missing or cannot be read: OpenSSH's defaults are what sshd
+    // runs with unless the file says otherwise (so a wide -R stays refused, GatewayPorts no).
+    let defaults = src.sshd_config.as_ref().map(|_| Settings::defaults());
     let file = match &src.policy_file {
         Some(p) => {
-            watched.push(p.clone());
-            // Its directories too: a chmod there changes the verdict.
-            let mut d = p.parent();
-            while let Some(x) = d {
-                watched.push(x.to_path_buf());
-                if x == src.trust.top {
-                    break;
-                }
-                d = x.parent();
-            }
-            file::read(p, &src.trust)
+            let (f, s) = file::read(p, &src.trust);
+            stamps.extend(s);
+            f
         }
         None => FilePolicy::Absent,
     };
@@ -396,13 +396,13 @@ fn load(src: &PolicySources, account: &Account) -> Loaded {
         },
         "server policy read"
     );
-    watched.sort();
-    watched.dedup();
     Loaded {
         sshd,
+        defaults,
         file,
-        stamps: watched.into_iter().map(Stamp::of).collect(),
+        stamps,
         checked: Instant::now(),
+        at,
     }
 }
 

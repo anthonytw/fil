@@ -102,7 +102,7 @@ impl ClientAgent {
             rules: Arc::new(Rules {
                 keys: relay.keys,
                 confirm: asker.clone().map(|a| Arc::new(a) as Arc<dyn Confirm>),
-                bind: Some(bind),
+                bind: agent::Bind::Key(bind),
             }),
             uses: Arc::new(KeyUses::default()),
             asker,

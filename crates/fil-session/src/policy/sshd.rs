@@ -23,8 +23,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::Account;
 use fil_proto::mux::{Permit, TcpForwarding, Toggle};
+
+use super::Account;
+use super::stamp::Stamp;
 
 /// How deep `Include`s may nest (sshd's `SERVCONF_MAX_DEPTH`).
 const MAX_DEPTH: usize = 16;
@@ -146,12 +148,21 @@ impl PermitList {
 
     /// The entries of one `PermitOpen` line (`listen`: `PermitListen`, where a bare port means
     /// any host). A list that has `any` or `none` with anything else, or an entry fil cannot
-    /// read, permits nothing.
-    pub fn parse(args: &[String], listen: bool) -> PermitList {
+    /// read (port 0 among them, as sshd's `permitopen_port`), permits nothing. sshd compares
+    /// `any` and `none` case-sensitively (`ANY` is a bad port to it, and the config is refused):
+    /// `exact` does too; the policy file passes `false`.
+    pub fn parse(args: &[String], listen: bool, exact: bool) -> PermitList {
+        let is = |a: &str, w: &str| {
+            if exact {
+                a == w
+            } else {
+                a.eq_ignore_ascii_case(w)
+            }
+        };
         match args {
             [] => PermitList::Unrecognized,
-            [one] if one.eq_ignore_ascii_case("any") => PermitList::Any,
-            [one] if one.eq_ignore_ascii_case("none") => PermitList::None,
+            [one] if is(one, "any") => PermitList::Any,
+            [one] if is(one, "none") => PermitList::None,
             _ => args
                 .iter()
                 .map(|a| parse_host_port(a, listen))
@@ -178,7 +189,10 @@ fn parse_host_port(s: &str, listen: bool) -> Option<HostPort> {
     }
     let port = match port {
         "*" => None,
-        p if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => Some(p.parse().ok()?),
+        p if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => match p.parse() {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => Some(n),
+        },
         _ => return None,
     };
     Some(HostPort { host, port })
@@ -267,11 +281,31 @@ enum Applies {
     Maybe,
 }
 
+impl Applies {
+    /// Both must hold: the weaker of the two.
+    fn and(self, other: Applies) -> Applies {
+        match (self, other) {
+            (Applies::No, _) | (_, Applies::No) => Applies::No,
+            (Applies::Maybe, _) | (_, Applies::Maybe) => Applies::Maybe,
+            (Applies::Yes, Applies::Yes) => Applies::Yes,
+        }
+    }
+}
+
 /// Where a line is: outside `Match`, or in block number `n`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ctx {
     Global,
     Match(usize, Applies),
+}
+
+impl Ctx {
+    fn applies(self) -> Applies {
+        match self {
+            Ctx::Global => Applies::Yes,
+            Ctx::Match(_, a) => a,
+        }
+    }
 }
 
 /// The forwarding settings of a config that could be read.
@@ -287,19 +321,46 @@ pub struct Settings {
     pub unreadable: Vec<PathBuf>,
 }
 
+impl Settings {
+    /// OpenSSH's built-in defaults: what sshd runs with when its config does not say.
+    pub fn defaults() -> Settings {
+        let d = |v| Outcomes {
+            values: vec![(v, Src::Default)],
+        };
+        Settings {
+            disable: d(Flag::No),
+            tcp: Outcomes {
+                values: vec![(Tcp::All, Src::Default)],
+            },
+            agent: d(Flag::Yes),
+            permit_open: Outcomes {
+                values: vec![(PermitList::Any, Src::Default)],
+            },
+            permit_listen: Outcomes {
+                values: vec![(PermitList::Any, Src::Default)],
+            },
+            gateway: Outcomes {
+                values: vec![(Gateway::No, Src::Default)],
+            },
+            unreadable: Vec::new(),
+        }
+    }
+}
+
 /// What the main config gave.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sshd {
-    /// There is no config: nothing to mirror.
+    /// There is no config: OpenSSH's defaults stand in for it.
     Missing,
-    /// It is there but cannot be read (RHEL and Fedora keep it 0600): fil mirrors nothing.
+    /// It is there but cannot be read (RHEL and Fedora keep it 0600): `Unknown`, and OpenSSH's
+    /// defaults stand in for it.
     Unknown,
     Mirrored(Box<Settings>),
 }
 
 /// What a read looked at, for re-reading when any of it changes: every file read or tried and
-/// every directory a glob listed.
-pub type Watched = Vec<PathBuf>;
+/// every directory a glob listed, each stamped before it was read.
+pub type Watched = Vec<Stamp>;
 
 /// Reads `main` and what it includes, for `account`.
 pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
@@ -310,7 +371,7 @@ pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
         blocks: 0,
         files: 0,
         unreadable: Vec::new(),
-        watched: vec![main.to_path_buf()],
+        watched: vec![Stamp::of(main)],
     };
     let text = match std::fs::read(main) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -318,7 +379,7 @@ pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
         Err(_) => return (Sshd::Unknown, p.watched),
     };
     let mut ctx = Ctx::Global;
-    p.file(main, &text, &mut ctx, 0);
+    p.file(main, &text, &mut ctx, Applies::Yes, 0);
     let a = p.acc;
     let settings = Settings {
         disable: a.disable.finish(Flag::No),
@@ -376,8 +437,11 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     /// One file's lines; `ctx` is the `Match` context, which an included file starts in and
-    /// which goes back to the includer's when the file ends.
-    fn file(&mut self, path: &Path, text: &str, ctx: &mut Ctx, depth: usize) {
+    /// which goes back to the includer's when the file ends. `cap` is how far the block that
+    /// included the file applies: a `Match` in the file applies at most that far. That is sshd's
+    /// `SSHCFG_NEVERMATCH` for a file included from a block that does not apply, and the strict
+    /// side for one that might.
+    fn file(&mut self, path: &Path, text: &str, ctx: &mut Ctx, cap: Applies, depth: usize) {
         for (n, raw) in text.lines().enumerate() {
             let Some((keyword, args)) = split_line(raw) else {
                 continue;
@@ -393,9 +457,12 @@ impl Parser<'_> {
             match keyword.to_ascii_lowercase().as_str() {
                 "match" => {
                     self.blocks += 1;
-                    *ctx = Ctx::Match(self.blocks, self.applies(&args));
+                    *ctx = Ctx::Match(self.blocks, cap.and(self.applies(&args)));
                 }
-                "include" => self.include(&args, path, line, ctx, depth),
+                "include" => {
+                    let cap = cap.and(ctx.applies());
+                    self.include(&args, path, ctx, cap, depth)
+                }
                 "disableforwarding" => self.acc.disable.set(c, flag(&args), src(maybe)),
                 "allowagentforwarding" => self.acc.agent.set(c, flag(&args), src(maybe)),
                 "allowtcpforwarding" => self.acc.tcp.set(c, tcp(&args), src(maybe)),
@@ -403,45 +470,52 @@ impl Parser<'_> {
                 "permitopen" => {
                     self.acc
                         .permit_open
-                        .set(c, PermitList::parse(&args, false), src(maybe))
+                        .set(c, PermitList::parse(&args, false, true), src(maybe))
                 }
                 "permitlisten" => {
                     self.acc
                         .permit_listen
-                        .set(c, PermitList::parse(&args, true), src(maybe))
+                        .set(c, PermitList::parse(&args, true, true), src(maybe))
                 }
                 _ => {}
             }
         }
     }
 
-    fn include(&mut self, args: &[String], from: &Path, line: u32, ctx: &mut Ctx, depth: usize) {
+    fn include(&mut self, args: &[String], from: &Path, ctx: &mut Ctx, cap: Applies, depth: usize) {
         if depth + 1 > MAX_DEPTH {
             // sshd refuses to start on this; fil cannot know what was meant.
             self.unreadable.push(from.to_path_buf());
-            let _ = line;
             return;
         }
         for pattern in args {
+            // As sshd: a path that starts with neither `/` nor `~` is in SSHDIR (the main file's
+            // directory); one with `~` is globbed as written, from sshd's working directory `/`.
             let pattern = if Path::new(pattern).is_absolute() {
                 PathBuf::from(pattern)
+            } else if pattern.starts_with('~') {
+                Path::new("/").join(pattern)
             } else {
                 self.base.join(pattern)
             };
-            let (files, dirs) = glob(&pattern);
-            self.watched.extend(dirs);
-            for f in files {
+            let g = glob(&pattern);
+            self.watched.extend(g.dirs);
+            if g.truncated {
+                // More than fil reads: what it did not read is reported as not read.
+                self.unreadable.push(pattern.clone());
+            }
+            for f in g.files {
                 if self.files >= MAX_FILES {
                     self.unreadable.push(f);
                     continue;
                 }
                 self.files += 1;
-                self.watched.push(f.clone());
+                self.watched.push(Stamp::of(&f));
                 match std::fs::read(&f) {
                     Ok(b) => {
                         let text = String::from_utf8_lossy(&b).into_owned();
                         let outer = *ctx;
-                        self.file(&f, &text, ctx, depth + 1);
+                        self.file(&f, &text, ctx, cap, depth + 1);
                         *ctx = outer;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -453,21 +527,41 @@ impl Parser<'_> {
 
     /// A `Match` line, for the daemon's user. All criteria must hold; one that surely fails
     /// makes the block not apply, one fil cannot evaluate makes it one that might.
+    ///
+    /// Tokens are paired as sshd's `match_cfg_line` does: `crit=arg` is one criterion, `all`
+    /// and `invalid-user` take no argument, every other criterion takes the next token.
     fn applies(&self, args: &[String]) -> Applies {
-        if args.is_empty() || !args.len().is_multiple_of(2) {
+        if args.is_empty() {
             return Applies::Maybe;
         }
         let mut out = Applies::Yes;
-        for pair in args.chunks(2) {
-            let r = match pair[0].to_ascii_lowercase().as_str() {
-                "user" => match &self.account.user {
-                    Some(u) => yes_no(match_pattern_list(u, &pair[1]) == Some(true)),
+        let mut it = args.iter();
+        while let Some(tok) = it.next() {
+            let (crit, arg) = match tok.split_once('=') {
+                Some((c, a)) => (c.to_ascii_lowercase(), Some(a.to_string())),
+                None => {
+                    let c = tok.to_ascii_lowercase();
+                    match c.as_str() {
+                        "all" | "invalid-user" => (c, None),
+                        _ => (c, it.next().cloned()),
+                    }
+                }
+            };
+            let r = match (crit.as_str(), arg) {
+                // sshd always applies `all`; the owner reads it as a block that might (strict).
+                ("all", None) => Applies::Maybe,
+                // For logins of no account: never the daemon's own user.
+                ("invalid-user", None) => Applies::No,
+                ("user", Some(a)) => match &self.account.user {
+                    Some(u) => yes_no(match_pattern_list(u, &a) == Some(true)),
                     None => Applies::Maybe,
                 },
-                "group" => match &self.account.groups {
-                    Some(g) => yes_no(group_match(g, &pair[1])),
+                ("group", Some(a)) => match &self.account.groups {
+                    Some(g) => yes_no(group_match(g, &a)),
                     None => Applies::Maybe,
                 },
+                // A criterion fil cannot evaluate, one without its argument, a line sshd would
+                // refuse: might apply.
                 _ => Applies::Maybe,
             };
             match r {
@@ -623,11 +717,22 @@ fn group_match(groups: &[String], list: &str) -> bool {
     found
 }
 
-/// The files a glob names, sorted (as `glob(3)`), and the directories it listed. `*`, `?` and
-/// `[...]` in any component; a leading `.` is matched only by a pattern that starts with one.
-/// A path without a wildcard names itself, whether or not it exists.
-fn glob(pattern: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// What a glob found.
+struct Globbed {
+    /// The files it names, sorted (as `glob(3)`).
+    files: Vec<PathBuf>,
+    /// The directories it listed, stamped before they were listed.
+    dirs: Vec<Stamp>,
+    /// It named more than [`MAX_FILES`]; the rest were dropped.
+    truncated: bool,
+}
+
+/// The files a glob names. `*`, `?`, `[...]` and backslash escapes in any component; a leading
+/// `.` is matched only by a pattern that starts with one. A path without a wildcard names
+/// itself, whether or not it exists.
+fn glob(pattern: &Path) -> Globbed {
     let mut dirs = Vec::new();
+    let mut truncated = false;
     let mut paths = vec![PathBuf::from("/")];
     let comps: Vec<_> = pattern
         .components()
@@ -638,14 +743,14 @@ fn glob(pattern: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         })
         .collect();
     for comp in &comps {
-        let wild = comp.contains(['*', '?', '[']);
+        let wild = comp.contains(['*', '?', '[', '\\']);
         let mut next = Vec::new();
         for base in &paths {
             if !wild {
                 next.push(base.join(comp));
                 continue;
             }
-            dirs.push(base.clone());
+            dirs.push(Stamp::of(base));
             let Ok(rd) = std::fs::read_dir(base) else {
                 continue;
             };
@@ -660,6 +765,7 @@ fn glob(pattern: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         paths = next;
         if paths.len() > MAX_FILES {
             paths.truncate(MAX_FILES);
+            truncated = true;
         }
     }
     // Only files: a directory a glob names is not a config.
@@ -667,7 +773,11 @@ fn glob(pattern: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         .into_iter()
         .filter(|p| !p.is_dir())
         .collect::<Vec<_>>();
-    (files, dirs)
+    Globbed {
+        files,
+        dirs,
+        truncated,
+    }
 }
 
 /// One glob component: `*`, `?` and bracket classes (`[abc]`, `[a-z]`, `[!x]`).
@@ -714,6 +824,8 @@ fn glob_match(s: &str, p: &str) -> bool {
                 // An unclosed bracket is a literal `[`.
                 (Some(c), None) => *c == '[' && go(&s[1..], &p[1..]),
             },
+            // `glob(3)` without `GLOB_NOESCAPE`: a backslash makes the next character literal.
+            Some('\\') if p.len() > 1 => s.first() == Some(&p[1]) && go(&s[1..], &p[2..]),
             Some(c) => s.first() == Some(c) && go(&s[1..], &p[1..]),
         }
     }
@@ -743,6 +855,9 @@ mod tests {
             Src::Default => (0, false),
         }
     }
+
+    /// Where a value was set: (line, maybe); line 0 is the default.
+    type Line = (u32, bool);
 
     /// An outcome as (value, line, maybe).
     type Outcome = (Tcp, u32, bool);
@@ -1078,10 +1193,10 @@ mod tests {
         );
         assert_eq!(s.permit_open.values[0].0, PermitList::None);
         assert!(
-            watched.contains(&f("conf.d")),
+            watched.iter().any(|w| w.path == f("conf.d")),
             "the glob's directory is watched"
         );
-        assert!(watched.contains(&f("conf.d/20-b.conf")));
+        assert!(watched.iter().any(|w| w.path == f("conf.d/20-b.conf")));
 
         // An included file that cannot be read is skipped and reported; the rest is enforced.
         // (Root reads everything: there the check is moot.)
@@ -1137,6 +1252,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// sshd's `SSHCFG_NEVERMATCH`: a file included from a `Match` block that does not apply
+    /// never applies a `Match` of its own; from one that might apply, its blocks only might.
+    #[test]
+    fn an_include_inside_a_match_block_is_capped_by_it() {
+        let dir = std::env::temp_dir().join(format!("fil-inc-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("inner.conf"),
+            "Match User dev\n AllowTcpForwarding yes\n",
+        )
+        .unwrap();
+        let tcp = |outer: &str| {
+            std::fs::write(
+                dir.join("sshd_config"),
+                format!("AllowTcpForwarding no\n{outer}\n Include inner.conf\n"),
+            )
+            .unwrap();
+            let Sshd::Mirrored(s) = read(&dir.join("sshd_config"), &me()).0 else {
+                panic!()
+            };
+            s.tcp
+                .values
+                .iter()
+                .map(|(v, s)| (*v, line(s)))
+                .collect::<Vec<_>>()
+        };
+        // The outer block does not apply: neither does the inner one (sshd: `no`).
+        assert_eq!(tcp("Match User alice"), [(Tcp::No, (1, false))]);
+        // The outer block might apply: the inner one only might, and `no` stays an outcome.
+        assert_eq!(
+            tcp("Match Address 10.0.0.1"),
+            [(Tcp::All, (2, true)), (Tcp::No, (1, false))]
+        );
+        // The outer block applies: so does the inner one.
+        assert_eq!(tcp("Match User dev"), [(Tcp::All, (2, false))]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `crit=arg` tokens (current OpenSSH) are one criterion each; `all` and `invalid-user` take
+    /// no argument.
+    #[test]
+    fn match_criteria_pair_as_sshd_pairs_them() {
+        let account = Account {
+            user: Some("user".into()),
+            groups: Some(vec!["user".into()]),
+        };
+        let tcp = |text: &str| {
+            parse_text(Path::new("sshd_config"), text, &account)
+                .tcp
+                .values
+                .iter()
+                .map(|(v, s)| (*v, line(s)))
+                .collect::<Vec<_>>()
+        };
+        let cases: &[(&str, Vec<(Tcp, Line)>)] = &[
+            // The review's case: `User user` between two `crit=arg` tokens.
+            (
+                "AllowTcpForwarding yes\nMatch Address=10.0.0.1 User user LocalPort=22\n AllowTcpForwarding no\n",
+                vec![(Tcp::No, (3, true)), (Tcp::All, (1, false))],
+            ),
+            (
+                "Match User=user\n AllowTcpForwarding no\n",
+                vec![(Tcp::No, (2, false))],
+            ),
+            (
+                "Match user=alice\n AllowTcpForwarding no\n",
+                vec![(Tcp::All, (0, false))],
+            ),
+            (
+                "Match Group=user User user\n AllowTcpForwarding no\n",
+                vec![(Tcp::No, (2, false))],
+            ),
+            // `invalid-user` is never the daemon's own account.
+            (
+                "Match invalid-user\n AllowTcpForwarding no\n",
+                vec![(Tcp::All, (0, false))],
+            ),
+            // `all` takes no argument (and might apply: the owner's strict reading).
+            (
+                "Match all\n AllowTcpForwarding no\n",
+                vec![(Tcp::No, (2, true)), (Tcp::All, (0, false))],
+            ),
+            // A criterion without its argument: might apply.
+            (
+                "Match User user Group\n AllowTcpForwarding no\n",
+                vec![(Tcp::No, (2, true)), (Tcp::All, (0, false))],
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(&tcp(text), want, "{text:?}");
+        }
+    }
+
+    /// sshd reads `any` and `none` case-sensitively and refuses port 0: a list it would refuse
+    /// permits nothing.
+    #[test]
+    fn permit_lists_sshd_would_refuse_permit_nothing() {
+        let open = |t: &str| parse(t).permit_open.values[0].0.clone();
+        let listen = |t: &str| parse(t).permit_listen.values[0].0.clone();
+        for t in ["PermitOpen ANY\n", "PermitOpen None\n", "PermitOpen db:0\n"] {
+            assert_eq!(open(t), PermitList::Unrecognized, "{t:?}");
+        }
+        for t in [
+            "PermitListen Any\n",
+            "PermitListen 0\n",
+            "PermitListen localhost:0\n",
+        ] {
+            assert_eq!(listen(t), PermitList::Unrecognized, "{t:?}");
+        }
+        // The policy file is fil's own: there `ANY` is `any`.
+        assert_eq!(
+            PermitList::parse(&["ANY".to_string()], false, false),
+            PermitList::Any
+        );
+    }
+
     #[test]
     fn glob_components() {
         for (s, p, want) in [
@@ -1147,6 +1379,9 @@ mod tests {
             ("a]", "[]a]]", true),
             ("[x", "[x", true),
             ("a.conf", "*.txt", false),
+            ("a*b", "a\\*b", true),
+            ("axb", "a\\*b", false),
+            ("[x]", "\\[x\\]", true),
         ] {
             assert_eq!(glob_match(s, p), want, "{s} {p}");
         }

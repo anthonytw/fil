@@ -188,15 +188,15 @@ fn group(rows: &[PortsRow]) -> View<'_> {
 fn policy_line(p: &PolicyLine) -> String {
     match p {
         PolicyLine::Unreadable { file } => format!(
-            "fil cannot read {} (some systems keep it root's alone), so sshd's forwarding settings are not mirrored",
+            "fil cannot read {} (some systems keep it root's alone): OpenSSH's defaults apply instead, so a -R beyond loopback is refused",
             clean(file.as_str())
         ),
         PolicyLine::Partial { file, more: 0 } => format!(
-            "fil cannot read {}, which the sshd config includes: what it sets is not mirrored",
+            "the sshd mirror is incomplete: fil cannot read {}, which the sshd config includes",
             clean(file.as_str())
         ),
         PolicyLine::Partial { file, more } => format!(
-            "fil cannot read {} and {more} more file{} the sshd config includes: what they set is not mirrored",
+            "the sshd mirror is incomplete: fil cannot read {} and {more} more file{} the sshd config includes",
             clean(file.as_str()),
             if *more == 1 { "" } else { "s" }
         ),

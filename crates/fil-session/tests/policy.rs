@@ -65,6 +65,7 @@ impl Host {
                 user: Some("dev".into()),
                 groups: Some(vec!["dev".into()]),
             }),
+            lookup: Account::current,
         }))
     }
 }
@@ -330,4 +331,104 @@ async fn an_unsafe_policy_file_refuses_everything() {
         assert_eq!(named(&add(&mut c, spec).await.unwrap_err()), want);
     }
     h.kill(WAIT).await;
+}
+
+/// The port the daemon reported for `-R` `id`.
+async fn bound_port(c: &FwdClient, id: ForwardId) -> u16 {
+    c.wait_table("the -R listening", |m| match m {
+        MuxMsg::Listening {
+            id: i,
+            state: ListenState::Listening { port },
+        } if *i == id => Some(port.get()),
+        _ => None,
+    })
+    .await
+}
+
+/// One round trip through `port` on the remote; `None` if the connection was refused.
+async fn through_remote(port: u16) -> Option<Vec<u8>> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    s.write_all(b"hi").await.ok()?;
+    let mut got = [0u8; 2];
+    match tokio::time::timeout(WAIT, s.read_exact(&mut got)).await {
+        Ok(Ok(_)) => Some(got.to_vec()),
+        _ => None,
+    }
+}
+
+/// A policy change while the subscriber stays attached: each `-R` connection is checked as it
+/// is accepted, so the next one is refused at once (the listener closes at the next
+/// re-establish).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_remote_connection_is_checked_while_attached() {
+    let host = Host::new("racc");
+    host.sshd("Port 22\n");
+    let (_s, h) = session(&host, None).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    let (target, _srv) = echo().await;
+    let id = add(&mut c, remote(BindAddr::Loopback, target))
+        .await
+        .unwrap();
+    let port = bound_port(&c, id).await;
+    // The client connects to its own copy of the target.
+    c.side
+        .targets
+        .lock()
+        .unwrap()
+        .insert(id, ([127, 0, 0, 1], target).into());
+    let end = Instant::now() + WAIT;
+    while through_remote(port).await.is_none() {
+        assert!(Instant::now() < end, "no round trip through the -R");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    host.sshd("AllowTcpForwarding local\n");
+    assert_eq!(through_remote(port).await, None, "refused at its accept");
+    let row = h.forward_rows().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(
+        row.policy.map(|p| p.to_string()),
+        Some(format!(
+            "AllowTcpForwarding local ({}:1)",
+            host.sshd_config().display()
+        ))
+    );
+    h.kill(WAIT).await;
+}
+
+/// A policy change while the subscriber stays attached: each agent connection is checked as it
+/// is accepted, so the next one gets no answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_agent_connection_is_checked_while_attached() {
+    use fil_testkit::agent::{MiniAgent, REQUEST_IDENTITIES, framed, listed, read_answer};
+    let host = Host::new("aacc");
+    host.sshd("Port 22\n");
+    let dir = PathBuf::from(format!("/tmp/fil-s1b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = dir.join("a/s.sock");
+    let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
+    let (_s, h) = session(&host, Some(sock.clone())).await;
+    let _c = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
+    let ask = |sock: PathBuf| async move {
+        let mut s = tokio::net::UnixStream::connect(&sock).await.ok()?;
+        s.write_all(&framed(&[REQUEST_IDENTITIES])).await.ok()?;
+        tokio::time::timeout(WAIT, read_answer(&mut s))
+            .await
+            .ok()?
+            .ok()
+    };
+    let end = Instant::now() + WAIT;
+    loop {
+        if let Some(a) = ask(sock.clone()).await {
+            assert_eq!(listed(&a).unwrap().len(), 1);
+            break;
+        }
+        assert!(Instant::now() < end, "the agent socket never answered");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    host.sshd("AllowAgentForwarding no\n");
+    assert!(sock.exists(), "the socket stays until the next link change");
+    assert_eq!(ask(sock.clone()).await, None, "refused at its accept");
+    h.kill(WAIT).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

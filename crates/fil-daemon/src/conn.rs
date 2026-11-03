@@ -226,7 +226,13 @@ impl Inner {
                 tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
                 return;
             }
-            newly_registered = self.registry.register(key.clone());
+            // Only where server policy allows the direct transport (`direct = false` in
+            // /etc/fil/policy.toml): otherwise the key never reaches the QUIC listener at all.
+            if self.host.policy.direct().is_ok() {
+                newly_registered = self.registry.register(key.clone());
+            } else {
+                tracing::debug!("the key is not registered for QUIC: server policy");
+            }
         }
 
         let refuse = |why: ControlMsg| {
@@ -315,6 +321,14 @@ impl Inner {
             tracing::info!("direct attach with a revoked key");
             return Err(Fail::Drop("revoked key"));
         }
+        // Server policy refuses the direct transport now (it may have allowed it when the key
+        // was registered): the key goes, and the connection is dropped as for a revoked key, so
+        // the client falls back to the pipe, whose attach reply offers no direct mode.
+        if self.host.policy.direct().is_err() {
+            tracing::debug!("direct attach refused: server policy");
+            self.registry.revoke(peer);
+            return Err(Fail::Drop("server policy"));
+        }
         match self.host.binding(peer) {
             Some(b) if b.name == attach.name && b.incarnation == resume.incarnation => Ok(b),
             Some(_) => {
@@ -386,8 +400,9 @@ impl Inner {
                             tracing::info!("forward removed by a request");
                         }
                         // Which setting, at debug only (the session logs that).
+                        // Which setting is the admin's business and the user's, not the log's.
                         ForwardResult::Refused(fil_proto::mux::ForwardRefusal::Policy(_)) => {
-                            tracing::info!("forward request refused by server policy");
+                            tracing::debug!("forward request refused by server policy");
                         }
                         ForwardResult::Refused(why) => {
                             tracing::info!(?why, "forward request refused");

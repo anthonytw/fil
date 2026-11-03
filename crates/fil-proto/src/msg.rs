@@ -729,11 +729,11 @@ pub enum PortsRow {
 /// deciding setting or the file, never the config's contents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyLine {
-    /// The sshd config could not be read (RHEL and Fedora keep it 0600): fil mirrors nothing
-    /// from it.
+    /// The sshd config could not be read (RHEL and Fedora keep it 0600): OpenSSH's defaults
+    /// stand in for it.
     Unreadable { file: PortsPath },
-    /// Files the sshd config includes could not be read: fil mirrors the rest. `file` is the
-    /// first; `more` counts the others.
+    /// Files the sshd config includes could not be read: the mirror is incomplete (fil mirrors
+    /// the rest). `file` is the first; `more` counts the others. Names files, never contents.
     Partial { file: PortsPath, more: u16 },
     /// fil's policy file is there but cannot be used: every forward and the agent are refused.
     DenyAll(PolicyRefusal),

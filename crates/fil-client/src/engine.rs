@@ -2543,8 +2543,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    /// A different `TERM` than ours: noted now, printed with the other warnings before the
-    /// first snapshot (section 6.4: keep the session's, warn once).
     /// The host's server policy refuses the agent this run relays (DESIGN.md section 11.2): the
     /// session has no agent socket. Said once on the overlay, naming the setting.
     fn agent_policy(&mut self, why: Option<&fil_proto::mux::PolicyRefusal>) {
@@ -2562,6 +2560,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
+    /// A different `TERM` than ours: noted now, printed with the other warnings before the
+    /// first snapshot (section 6.4: keep the session's, warn once).
     fn term_warning(&mut self, session_term: &TermName) {
         if self.term_warned || self.first_attached {
             return;

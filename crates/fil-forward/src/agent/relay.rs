@@ -63,8 +63,22 @@ pub struct Rules {
     /// `agent = "confirm"`: every signature is asked about.
     pub confirm: Option<Arc<dyn Confirm>>,
     /// The run's key for the `session-bind@openssh.com` each connection starts with
-    /// ([`BindKey`]). Set by default; `None` only in tests whose stand-in agent cannot answer it.
-    pub bind: Option<Arc<BindKey>>,
+    /// ([`BindKey`]).
+    pub bind: Bind,
+}
+
+/// The `session-bind` a relayed connection starts with (OD-5). There is no way to relay unbound
+/// outside the crate's own tests: without a key every connection is refused.
+#[derive(Clone)]
+pub enum Bind {
+    Key(Arc<BindKey>),
+    /// No key could be made: the relay refuses every connection (it never relays unbound, which
+    /// would let the host use destination-constrained keys).
+    Missing,
+    /// Tests only: no bind, for a stand-in agent that cannot answer one, or to show what a bind
+    /// prevents.
+    #[cfg(feature = "test-hooks")]
+    Unbound,
 }
 
 /// Every key, no question, and a bind key of its own.
@@ -73,7 +87,7 @@ impl Default for Rules {
         Self {
             keys: Vec::new(),
             confirm: None,
-            bind: BindKey::generate(),
+            bind: BindKey::generate().map_or(Bind::Missing, Bind::Key),
         }
     }
 }
@@ -90,7 +104,7 @@ impl std::fmt::Debug for Rules {
         f.debug_struct("Rules")
             .field("keys", &self.keys.len())
             .field("confirm", &self.confirm.is_some())
-            .field("bind", &self.bind.is_some())
+            .field("bind", &matches!(self.bind, Bind::Key(_)))
             .finish()
     }
 }
@@ -384,8 +398,8 @@ fn ssh_string(b: &[u8]) -> Vec<u8> {
 }
 
 /// Relays one connection: requests from `remote` (the channel) through the filter and `rules`
-/// to `agent`, and the agent's answers back, checked. First, when `rules.bind` is set, the
-/// connection is bound ([`BindKey`]); an agent that does not know the extension (gpg-agent and
+/// to `agent`, and the agent's answers back, checked. First the connection is bound
+/// ([`BindKey`]; with [`Bind::Missing`] it is refused instead); an agent that does not know the extension (gpg-agent and
 /// others enforce no destination constraints either) answers `FAILURE`, which is ignored. Ends
 /// when either side ends, an oversize message arrives from either, or an IO error occurs.
 pub async fn relay<R, A>(remote: R, mut agent: A, rules: Arc<Rules>, uses: Arc<KeyUses>)
@@ -393,7 +407,16 @@ where
     R: AsyncRead + AsyncWrite + Unpin,
     A: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Some(key) = &rules.bind {
+    let key = match &rules.bind {
+        Bind::Key(k) => Some(k),
+        Bind::Missing => {
+            debug!("agent connection refused: no session-bind key");
+            return;
+        }
+        #[cfg(feature = "test-hooks")]
+        Bind::Unbound => None,
+    };
+    if let Some(key) = key {
         let Some(bind) = key.request() else {
             return;
         };
@@ -693,6 +716,34 @@ impl<S: ForwardStream> ForwardStream for CountingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a session-bind key the relay never relays unbound: the connection ends, and the
+    /// local agent hears nothing (OD-5).
+    #[tokio::test]
+    async fn no_bind_key_relays_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut remote, far) = tokio::io::duplex(1 << 12);
+        let (agent, mut agent_far) = tokio::io::duplex(1 << 12);
+        let rules = Arc::new(Rules {
+            bind: Bind::Missing,
+            ..Rules::default()
+        });
+        let _ = remote
+            .write_all(&[0, 0, 0, 1, filter::REQUEST_IDENTITIES])
+            .await;
+        relay(far, agent, rules, Arc::new(KeyUses::default())).await;
+        let mut b = [0u8; 8];
+        assert_eq!(
+            agent_far.read(&mut b).await.unwrap(),
+            0,
+            "the agent heard nothing"
+        );
+        assert_eq!(
+            remote.read(&mut b).await.unwrap(),
+            0,
+            "the connection ended"
+        );
+    }
 
     /// A key and its certificate share `ssh-add -l`'s fingerprint, and are counted apart.
     #[test]

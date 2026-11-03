@@ -175,12 +175,15 @@ impl Shared {
         let control_waits = q.queued.get(&ChannelId::CONTROL).is_some_and(|n| *n > 0);
         // A control frame goes first even if another frame is being held back (the scheduler
         // returns it first); otherwise the held frame is next.
-        let frame = if control_waits || q.held.is_none() {
-            q.sched.pop()?
+        let (frame, was_held) = if control_waits || q.held.is_none() {
+            (q.sched.pop()?, false)
         } else {
-            q.held.take()?
+            (q.held.take()?, true)
         };
+        // A frame held back once goes into the next write whatever else got there first (a
+        // heartbeat reply, a ping, a control frame), so it can't be held over and over.
         if let Some(room) = room
+            && !was_held
             && frame.channel.class() != ChannelClass::Control
             && LEN_PREFIX + super::channel_varint_len(frame.channel) + frame.payload.len() > room
         {

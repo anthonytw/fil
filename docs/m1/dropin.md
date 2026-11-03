@@ -33,13 +33,14 @@ The run is strict by default. It **fails** when:
 - a scenario is skipped on a lab host (`--allow-skip` to accept it);
 - a required tool is missing (`--require vim,less,top,htop,git` is the default list; `--allow-missing` to accept it): a reimaged Pi must not turn the gate green by quietly dropping the vim scenarios;
 - a gate verb cannot run or exits non-zero, including the final `status` (silence is not "clean");
+- `--only` names a scenario that does not exist (a typo is a usage error, exit 2), or no scenario ran at all (`pi_e2e` is the same);
 - a known failure starts to pass (XPASS), so its entry is removed with the fix; and a known-failing scenario that fails in any *other* way than its signature (the old size seen; the modes left set) is a failure too.
 
-The summary prints the number of scenarios run, failed, skipped (with their names) and expected failures. Every message the driver prints goes through a scrubber that swaps the real host names for `pi1`/`pi2`, and the shells use a neutral prompt (`fil$ `).
+The summary prints the number of scenarios run, failed, skipped (with their names) and expected failures. Every message the driver prints, verbose logs included, goes through a scrubber that swaps the real host names for `pi1`/`pi2` and every other IP address (what a name resolved to, what a log printed) for `<ip>`; loopback stays. The shells use a neutral prompt (`fil$ `) and a history that goes nowhere (`HISTFILE=/dev/null`), and `escape_handling` puts its helper script in the scratch directory, not in the account's home. In the realnet scenarios a missing vim or less is a failure, not a skip (the workflow installs both).
 
 Cleanup is that of `pi_e2e`: `fil kill` for this driver's sessions (all named `dp-*`), then the gate's `reset`, before and after every scenario; each scenario's scratch directory is `/tmp/dp.*` on the Pi, swept at the start of each shell and at the end of a full run.
 
-A driver stopped with Ctrl-C while it holds a client's process groups stopped (the sleep scenarios) leaves them stopped: `kill -CONT -- -PGID` for the groups of the `fil` clients it started. A panic or a failed check continues them (a drop guard).
+A driver stopped with Ctrl-C while it holds a client's process groups stopped (the sleep scenarios) leaves them stopped: `kill -CONT -- -PGID` for the groups of the `fil` clients it started. A panic or a failed check continues them (a drop guard). A Ctrl-C leaves the rest too, by design (no signal handler): on a Pi, `reset` through the gate clears the daemon and the `dp-*` sessions; on `--local`, the private daemon of `/tmp/fil-dropin-PID` stays up until you `kill` the pid in its `fil-*.lock`.
 
 Realnet: `just realnet udp f_dropin_vim_nat f_dropin_vim_loss f_dropin_vs_ssh` on a Linux box, or the `linux-check` workflow with `-f suite=realnet` (it runs everything; the three scenarios take about one minute each).
 

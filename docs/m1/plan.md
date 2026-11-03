@@ -1,5 +1,7 @@
 # M1 plan: sessions and both transports
 
+> **Historical: the M1 plan.** Every package below is merged (see `git log`) and the sweep is in its last steps. What was built is described in `DESIGN.md` and the other `docs/m1/*.md` files; this file keeps the plan and the order of work.
+
 Owner-approved 2026-11-02. M1 in DESIGN.md §15: daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; the pipe and QUIC with upgrade and fallback. Done when fil is usable as a daily driver for shells.
 
 ## Done when

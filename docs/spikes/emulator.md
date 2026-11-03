@@ -1,5 +1,7 @@
 # Spike A: emulator restore fidelity
 
+> **Historical: the M0 spike record.** Written while the spike was run; the code has moved on since (the crates, the numbers and some names differ). The current design is `DESIGN.md`; take the findings below as history, not as a description of today's code.
+
 Question (DESIGN.md §6.5, §16.2): which headless emulator should fil use by default, judged by how
 faithfully a snapshot restores a session (§6.2) rather than by taste?
 

@@ -1,5 +1,7 @@
 # Spike C: the prediction overlay with erase-before-write
 
+> **Historical: the M0 spike record.** Written while the spike was run; the code has moved on since (the crates, the numbers and some names differ). The current design is `DESIGN.md`; take the findings below as history, not as a description of today's code.
+
 Question (DESIGN.md §9, §15 M0): can the client paint predicted characters into the user's real
 terminal, and take them out again before the server's bytes arrive, **without ever corrupting
 the screen**? M0's exit criterion is that the overlay never corrupts the screen in the harness.

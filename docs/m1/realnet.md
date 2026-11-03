@@ -121,7 +121,7 @@ gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet
 
 The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `sysd.sh` (one bash function per scenario, each run in its own process so `set -euo pipefail` applies), `lib.sh` (assertions, parsing, the summary table), `fil.sh` (driving the real client through `ptydrive`: start, type, wait for text, exit status, the client's log), `build.sh` and `docker/`. `shellcheck` is part of the CI job. The scenarios named `f_*` use the real `fil`; `s_*` are the stand-in scenarios.
 
-**Known findings.** When a scenario catches a defect in fil itself, it records `KNOWN-BUG: ...` in its measurements and carries on, so one finding does not hide the results after it. A scenario that recorded one passes with the status `PASS*` in the table, so a green run cannot be skimmed as clean. `REALNET_STRICT=1` makes them fail (`just realnet` with the variable set; in the workflow, the `strict` input: `gh workflow run linux-check -f suite=realnet -f strict=true`, default off). The current list is under "Real binary: findings".
+**Known findings.** When a scenario catches a defect in fil itself, it records `KNOWN-BUG: ...` in its measurements and carries on, so one finding does not hide the results after it. A scenario that recorded one passes with the status `PASS*` in the table, so a green run cannot be skimmed as clean. `REALNET_STRICT=1` makes them fail (`just realnet` with the variable set; in the workflow, the `strict` input: `gh workflow run linux-check -f suite=realnet -f strict=true`, default off). No finding is open today (see "Real binary: findings").
 
 ## Results: the real `fil` binary
 
@@ -133,7 +133,7 @@ From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104
 |---|---|---|
 | `f_attach_detach` | attach to `direct`, run a command, `~.`; `fil ls`; attach again | pass: shell prompt 300 to 380 ms after the start; `~.` printed `detached from session` and exited 0; the second client saw the earlier output on its screen and the same shell (same pid) |
 | `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. `DETACH_LOST_MAX` is 0: any lost detach fails | **0 of 10 lost** since #31 ([run](https://github.com/anthonytw/fil/actions/runs/41580011372)); before the fix, finding 1: 3 of 10 never reached the daemon, in each of three runs. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
-| `f_ls_kill_detach` | `fil ls` shows who is attached; `fil detach` tells the client; `fil kill` of an attached session; kill again | pass; the client of a killed session exits **129** (SIGHUP), see finding 2 |
+| `f_ls_kill_detach` | `fil ls` shows who is attached; `fil detach` tells the client; `fil kill` of an attached session; kill again | pass; the client of a killed session exits **129** (SIGHUP), finding 2 |
 | `f_takeover` | a second machine (`client2`) attaches to a session held by `client` | pass: the first client was told `by client2` with the time, answered `n` and exited 1 with `was taken over by client2 ... (left alone)`; the second screen showed the earlier output; `fil ls` named `client2` |
 | `f_takeover_back` | the first client answers `y` (take it back) | pass: the second client is told in turn (`by client`, not `client2`); the first client's screen shows a line the second client printed while it held the session, so the take-back really carries the session's state; a working shell again |
 | `f_kill_ssh` | `kill -9` the client's ssh in the middle of a 15 s output run | pass: a new ssh was running **0.9 to 1.2 s** later; `TICK-1` to `TICK-60` each once, in order, no gap marker, the session continued |
@@ -171,11 +171,11 @@ A privileged container with systemd as PID 1 starts on GitHub's `ubuntu-24.04` r
 
 ### Real binary: findings
 
-These are defects or surprises in `fil` itself, found by this suite. None is fixed here (this package owns only the tests).
+Defects or surprises in `fil` that this suite found. None is open.
 
-1. **Fixed in #31.** A clean detach (`~.`) over ssh was lost about one time in three. The cause: the client closed its link without flushing or waiting, so the pipe dropped the queued `Detach` or `fil` exited and killed ssh before ssh sent it. Now the client waits up to 1 s for its typed input to be acknowledged, sends `Detach`, waits up to 2 s for the daemon to hang up (3 s at most in all), and `f_detach_delivery` requires 0 of 10 lost. The original report: The client sends `Detach` and closes; the daemon logs `attach ended ... LinkDown(Io("end of stream"))` instead of a detach, and `fil ls` keeps listing the client as attached (`client for 19s`, growing) until somebody takes the session over. Reproduce: `fil HOST s`, wait for the prompt, Enter then `~.`, then `fil ls HOST` at once; repeat (`just realnet ssh f_detach_delivery` counts it). It did not happen in the local run without ssh. Suspected cause: `Link::flush` on the pipe returns when the bytes are written to the ssh process's stdin, and the client then kills or closes ssh before ssh has sent them. Worth checking in `close_after_flush`.
-2. **`fil kill` makes the client exit 129, not 137.** `docs/m1/binary.md` says a killed session exits 137 (signal 9). The daemon hangs up first (SIGHUP, then SIGKILL after a grace), and bash dies of the hangup, so the client reports `killed by signal 1 (SIGHUP)` and exits 129. Either the document or the wording is out of date.
-3. **The first-attach banner warning scrolls out of the screen.** Not a defect: the warning is printed, then the snapshot pushes the screen into the scrollback (by design, so earlier work is kept). Recorded because a screen-based check misses it; the suite looks at the raw output.
+1. **Lost detach (fixed in #31).** A clean `~.` over ssh was lost about one time in three: the client closed its link without waiting, so the queued `Detach` never left ssh. The client now waits for the daemon to hang up (DESIGN.md §5.2), and `f_detach_delivery` requires 0 of 10 lost.
+2. **`fil kill` exits 129, not 137 (the document was wrong).** The daemon hangs up first (SIGHUP, then SIGKILL after a grace), so bash dies of the hangup. `docs/m1/binary.md` now says so.
+3. **The first-attach banner warning scrolls out of the screen.** Not a defect: the snapshot pushes the screen into the scrollback by design. Recorded because a screen-based check misses it; the suite reads the raw output.
 4. **Tree fallback limit (known).** `setsid` and other double-forked processes outlive `fil kill` without a systemd scope (`f_no_linger_tree`).
 
 ## Results: the stand-ins
@@ -308,14 +308,13 @@ The two agree on almost everything, which is the main result: the simulator's nu
 
 ## What the daemon and client should add
 
-Done in M1 P7a (the sections above): the multi-user and permission tests, the systemd scope with and without lingering, the real bootstrap (relay starting the daemon, the fingerprint and key crossing the real pipe, QUIC to the reported port through NAT), resume under a killed ssh and a killed daemon, and pipe to QUIC and back. Still open:
+Done in M1: the multi-user and permission tests, the systemd scope with and without lingering, the real bootstrap, resume under a killed ssh and a killed daemon, pipe to QUIC and back (P7a), the same scenarios on the lab Raspberry Pis (`docs/m1/pi.md`, `pi_e2e`), and the automated drop-in suite (`docs/m1/dropin.md`). Still open, for M2 or later:
 
-- **The unauthenticated surface of the UDP port:** a UDP flood and spoofed Initial packets from the router namespace, to check the stateless retry and handshake rate limits (section 8.3, "exposure before authentication"). The one-UDP-port-per-user rule with two users.
+- **The unauthenticated surface of the UDP port on the wire:** a UDP flood and spoofed Initial packets from the router namespace. The stateless retry and the handshake rate limit have in-process tests (`crates/fil-transport/tests/quic_link.rs`) but no real-network run (DESIGN.md §8.3, "exposure before authentication"). The one-UDP-port-per-user rule with two users.
 - **More faults under the real client:** the relay killed (not only ssh), a blackout of 4 to 5 s under a quiet session, a path-MTU black hole (`ip link set mtu`, drop fragments), IPv6, a NAT that keeps the old mapping, and a user logging out with `KillUserProcesses=yes`.
-- **Other pipes** (section 8.2): `docker exec -i` and `kubectl exec -i` are one-line additions to the Docker topology; remote shells other than bash (zsh, fish) for the noisy-login case; ssh agent forwarding.
-- **The lab Raspberry Pis**: the same scenarios on aarch64 (`build.sh` already builds for it).
+- **Other pipes** (section 8.2): `docker exec -i` and `kubectl exec -i` are one-line additions to the Docker topology; remote shells other than bash (zsh, fish) for the noisy-login case; ssh agent forwarding (M2).
 
-Out of scope here and later: lab hardware, macOS as a remote host, and real mobile networks (carrier-grade NAT, radio handoff).
+Out of scope here and later: macOS as a remote host, and real mobile networks (carrier-grade NAT, radio handoff).
 
 ## What was and was not verified
 

@@ -12,6 +12,6 @@ fil is a remote shell for development over SSH that keeps your place:
 
 It has no panes: your terminal already does that.
 
-**Status:** in development. The link simulator, the prediction overlay, sessions, the client and both transports are built and being hardened; there is no release yet, so there's nothing to install. See [DESIGN.md](DESIGN.md).
+**Status:** in development. The `fil` client, the daemon, sessions that survive a reconnect or a takeover, and both transports (the ssh pipe and direct QUIC) work, and M1 is being closed out. Port forwards, `fil ports`, the agent relay and predictive echo are not built yet, and there is no release, so there's nothing to install. See [DESIGN.md](DESIGN.md) (milestones in §15).
 
 **License:** [GPL-3.0-or-later](LICENSE).

@@ -192,10 +192,17 @@ fn scrub_addresses(s: &str) -> String {
         let run = &rest[..end];
         // Trailing punctuation belongs to the sentence ("at 10.0.0.1." or "to fe80::1:").
         let tok = run.trim_end_matches(['.', ':']);
-        match tok.parse::<IpAddr>() {
-            Ok(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+        // `1.2.3.4:443` is an address and a port; an IPv6 address has its port after a `]`.
+        let addr = match tok.parse::<IpAddr>() {
+            Ok(ip) => Some((ip, tok.len())),
+            Err(_) => tok
+                .split_once(':')
+                .and_then(|(h, _)| Some((h.parse::<IpAddr>().ok()?, h.len()))),
+        };
+        match addr {
+            Some((ip, n)) if !ip.is_loopback() && !ip.is_unspecified() => {
                 out.push_str("<ip>");
-                out.push_str(&run[tok.len()..]);
+                out.push_str(&run[n..]);
             }
             _ => out.push_str(run),
         }

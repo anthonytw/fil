@@ -1,5 +1,7 @@
 # Spike B: the link simulator (`fil-netsim`)
 
+> **Historical: the M0 spike record.** Written while the spike was run; the code has moved on since (the crates, the numbers and some names differ). The current design is `DESIGN.md`; take the findings below as history, not as a description of today's code.
+
 `crates/fil-netsim` is the in-process link simulator that DESIGN.md §12 asks for. It is a
 test-only crate (`publish = false`). It has two kinds of link:
 
@@ -74,7 +76,7 @@ All in `just ci` unless noted. `cargo test -p fil-netsim` runs in about 0.4 s af
 
 | Test | What it shows |
 |---|---|
-| `tests/sim.rs` (15 tests) | latency applied exactly; stream order kept under 200 ms jitter; bandwidth limit (100 KB at 10 KB/s takes 10 s); stall/release; reset errors both ends, including a waiting reader; datagram loss rate in 18-22% for 20% set; explicit reordering happens; jitter keeps order by default and reorders when `jitter_reorders` is set; duplication; blackout; NAT rebind changes the source and kills the old mapping; same seed gives the same outcome |
+| `tests/sim.rs` (16 tests) | latency applied exactly; stream order kept under 200 ms jitter; bandwidth limit (100 KB at 10 KB/s takes 10 s); stall/release; reset errors both ends, including a waiting reader; datagram loss rate in 18-22% for 20% set; explicit reordering happens; jitter keeps order by default and reorders when `jitter_reorders` is set; duplication; blackout; NAT rebind changes the source and kills the old mapping; same seed gives the same outcome |
 | `quic_echo_5pct_loss_with_jitter` | 3 MiB echo over 20 ms ± 10 ms (in-order) jitter and 5% loss, intact, one handshake (36 s virtual) |
 | `quic_survives_nat_rebinding_mid_transfer` | two rebinds during a 3 MiB echo, intact, one handshake |
 | `quic_baseline_without_rebinding` | the same transfer without rebinds, for comparison |

@@ -1,0 +1,27 @@
+# A host with systemd as PID 1, a user manager, logind, PAM sessions and sshd: the place where
+# `systemd-run --user --scope` can really be tested (sysd.sh). Run with --privileged.
+# Nothing secret is baked in: the host keys come from the openssh-server package, made when this
+# image is built on the machine running the tests; the client key is copied in at run time.
+FROM ubuntu:24.04
+
+ENV container=docker DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session \
+      libpam-systemd openssh-server procps util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd /etc/fil-realnet \
+ && useradd -m -s /bin/bash fil && usermod -p '*' fil \
+ && systemctl mask ssh.socket getty.target console-getty.service systemd-udevd.service \
+      systemd-networkd.service systemd-resolved.service systemd-timesyncd.service \
+ && systemctl enable ssh.service
+
+# Password logins are off; PAM stays on, because pam_systemd is what makes the login a logind
+# session with a user runtime directory, as on a real host.
+COPY sshd_config.systemd /etc/ssh/sshd_config
+COPY banner /etc/fil-realnet/banner
+# The daemon side: `fil server --stdio` on the default PATH of an ssh command.
+COPY bin/fil /usr/bin/fil
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

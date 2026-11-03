@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build the stand-in programs as static musl binaries into $OUT/bin, so they drop into any
-# container (and run unchanged in network namespaces). Idempotent; cargo does the caching.
+# Build the real `fil` binary and the test programs (the stand-ins, the PTY driver) as static musl
+# binaries into $OUT/bin, so they drop into any container (and run unchanged in network
+# namespaces). Idempotent; cargo does the caching.
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -11,11 +12,11 @@ case $(uname -m) in
   *) echo "realnet: unsupported architecture $(uname -m)" >&2; exit 2 ;;
 esac
 
-log "building fil-testbins for $TARGET"
-(cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil-testbins)
+log "building fil and fil-testbins for $TARGET"
+(cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil -p fil-testbins)
 
 mkdir -p "$BIN_DIR"
-for b in pipe-echo pipe-probe quic-echo quiclink-probe; do
+for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe; do
   cp "$REPO_ROOT/target/$TARGET/release/$b" "$BIN_DIR/$b"
   # Static means no dynamic loader: ldd says so. Anything else would not run in a bare container.
   if ldd "$BIN_DIR/$b" 2>&1 | grep -qE 'not a dynamic|statically linked'; then

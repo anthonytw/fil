@@ -440,9 +440,11 @@ lat_drain_field() {
 # every line. The clean network and the 40 ms one; the pipe and QUIC.
 l_catchup() {
   client_exec_on x mkdir -p "$PD"
-  local net kind tag big=/tmp/rn-lat-big.txt cmd line sum
+  local net kind tag cmd line sum
+  # Global, not local: the EXIT trap runs after this function has returned.
+  big=/tmp/rn-lat-big.txt
   # The file is made by the server-side user in a sticky /tmp.
-  trap 'as_root rm -f "$big"' EXIT
+  trap 'as_root rm -f "$big" || true' EXIT
   for net in clean rtt; do
     lat_net "$net"
     for kind in ssh pipe quic; do

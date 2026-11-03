@@ -579,13 +579,15 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 ```
 fil HOST [SESSION] [-L SPEC]… [-R SPEC]…   attach, creating the session if needed (default: main)
-fil ls HOST                                sessions: name, subscriber, idle time, forwards
+fil ls HOST                                sessions: name, term, subscriber, last output, age (forwards: M2)
 fil kill HOST SESSION
 fil ports [HOST [SESSION]]                 inside a session: the current one
 fil forward (-L|-R) SPEC | --rm PORT
-fil detach
+fil detach [HOST SESSION]                  with no arguments, inside a session (M2)
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
+
+M1 implements everything but forwards and `ports`; `-L`/`-R` are accepted and refused with a message. The option `--transport auto|pipe|direct` overrides the config for one attach. The command line, the exit statuses and the dialer are in `docs/m1/binary.md`.
 
 Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde. Pasted text (between the bracketed-paste markers) is never an escape.
 
@@ -604,7 +606,8 @@ confirm = "off"           # off | "after 10s": ask before sending after a long d
 
 [host.orin]
 forward = ["-L 5173", "-R 9000"]
-direct.port_range = "60000-61000"
+direct.port_range = "60000-61000"   # read by the daemon
+direct.address = "orin.example.net" # where the client dials UDP, when it is not the host name or what `ssh -G` reports
 
 [host.k8s-dev]
 transport = "pipe"

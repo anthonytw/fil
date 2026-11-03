@@ -82,20 +82,8 @@ fn read_logind_conf() -> Vec<String> {
     texts
 }
 
-/// Whether this user lingers, from `loginctl`. `None` when it cannot be told (no systemd).
-fn lingering(uid: u32) -> Option<bool> {
-    let out = std::process::Command::new("loginctl")
-        .args(["show-user", &uid.to_string(), "-p", "Linger"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| fil_session::proc::parse_linger(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// Checks this host. Linux only; blocking (it runs `loginctl`).
+/// Checks this host. Linux only; blocking (it runs `loginctl`, for at most five seconds): call it
+/// from a blocking context.
 pub fn check_host() -> Option<&'static str> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -106,7 +94,11 @@ pub fn check_host() -> Option<&'static str> {
     if kill != Some(true) {
         return None;
     }
-    warning_for(kill, lingering(crate::paths::current_uid()))
+    // The one linger probe, with its timeout: a hung `loginctl` must not hang an attach.
+    warning_for(
+        kill,
+        fil_session::proc::lingering(crate::paths::current_uid()),
+    )
 }
 
 #[cfg(test)]

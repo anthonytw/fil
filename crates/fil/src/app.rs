@@ -42,6 +42,10 @@ pub fn main() -> ExitCode {
         Action::ServerDaemon => return server::run_daemon(),
         _ => {}
     }
+    // The client's memory holds what was typed while disconnected: no core dumps. (After the
+    // server dispatch above: the daemon switches them off itself, without a core limit that its
+    // sessions would inherit.)
+    let _ = fil_daemon::hardening::disable_core_dumps(true);
     let config = match located
         .as_ref()
         .map(|l| Config::load(&l.path, l.required))
@@ -129,10 +133,12 @@ async fn attach(
             return FAILED;
         }
     };
-    let log = logging::init_client();
-    tracing::info!(host, %session, ?setting, log = ?log, "starting");
+    logging::init_client();
+    // Which host and which session is a record of the user's habits: debug, not the default.
+    tracing::info!(?setting, "starting");
+    tracing::debug!(host, %session, "starting for");
 
-    let mut cfg = ClientConfig::new(session, host_label());
+    let mut cfg = ClientConfig::new(session, host_label(settings.host_label.as_deref()));
     cfg.offline = settings.offline;
     // Only the path manager backs off; a second layer would double the waits.
     cfg.reconnect.backoff = Backoff::None;
@@ -229,13 +235,28 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The name shown to the previous subscriber on a takeover: this machine's hostname.
-pub fn host_label() -> HostLabel {
+/// The name shown to the previous subscriber on a takeover: the configured `host_label`, else
+/// this machine's short host name (what comes before the first dot: no `.local`, no domain).
+pub fn host_label(configured: Option<&str>) -> HostLabel {
+    if let Some(label) = configured {
+        return sanitize_label(label);
+    }
     let name = rustix::system::uname()
         .nodename()
         .to_string_lossy()
         .into_owned();
-    sanitize_label(&name)
+    sanitize_label(short_name(&name))
+}
+
+/// `box` for `box.example.net` and `laptop` for `laptop.local`; an address stays whole.
+pub fn short_name(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+    match host.split_once('.') {
+        Some((short, _)) if !short.is_empty() => short,
+        _ => host,
+    }
 }
 
 /// A valid label from anything: control characters are dropped, the length is cut at a
@@ -265,8 +286,19 @@ mod tests {
         let l = sanitize_label(&long);
         assert!(l.as_str().len() <= MAX_HOST_LABEL);
         assert!(l.as_str().chars().all(|c| c == 'é'));
-        // The real one works too.
-        assert!(!host_label().as_str().is_empty());
+        // The real one works too, and a configured one wins.
+        assert!(!host_label(None).as_str().is_empty());
+        assert_eq!(host_label(Some("work laptop")).as_str(), "work laptop");
+    }
+
+    #[test]
+    fn the_default_label_is_the_short_host_name() {
+        assert_eq!(short_name("host-a.local"), "host-a");
+        assert_eq!(short_name("box.example.net"), "box");
+        assert_eq!(short_name("box"), "box");
+        assert_eq!(short_name(".hidden"), ".hidden");
+        assert_eq!(short_name("192.0.2.7"), "192.0.2.7");
+        assert_eq!(short_name("2001:db8::1"), "2001:db8::1");
     }
 
     #[test]

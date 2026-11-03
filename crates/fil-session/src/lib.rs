@@ -25,7 +25,7 @@
 //!   line (`── fil: skipped 48 MB of output ──`) in the client's scrollback.
 //! - **Snapshots are only taken between escape sequences.** Output that ends in the middle of
 //!   a sequence is held back (not shown to the emulator, not sent to anyone) until the sequence
-//!   ends, so a snapshot is exact for the offset it is announced at ([`boundary`]).
+//!   ends, so a snapshot is exact for the offset it is announced at ([`fil_term::Boundary`]).
 //! - **Terminal queries** (DESIGN.md section 6.3). With a client attached they pass through to
 //!   its terminal and the replies come back as input. With none, the emulator answers (device
 //!   attributes, cursor position, kitty keyboard, the text area in characters) and the session
@@ -45,13 +45,14 @@
 //!   This is the simplest behavior that cannot inject a stray reply into the new client's
 //!   session.
 //! - **`PtyMode` and `EchoAck`** for prediction (DESIGN.md section 9): the PTY's `ICANON` and
-//!   `ECHO` flags are read after every read of output, after the PTY has taken input and every
-//!   `mode_poll` while attached, and a change is sent at the offset of the output that follows it,
+//!   `ECHO` flags are read once per batch of output, after the PTY has taken input and every
+//!   `mode_poll` while attached and within two seconds of the last input or output (ten times
+//!   that while it is quiet, except for a client that asked for `EchoAck`), and a change is sent at the offset of the output that follows it,
 //!   in order with that output. The mode in force is stated again after every attach reply and
 //!   every snapshot (a snapshot resets the client's picture, an open password prompt included).
 //!   After the PTY has taken a keystroke and the *echo window* (`echo_window`, 50 ms as in mosh)
 //!   has passed, an `EchoAck` says that no echo of it is still to come beyond a given output
-//!   offset.
+//!   offset. Only a client that sets `Attach::echo_ack` gets them.
 //! - **A connection that lost the session reads nothing more.** On a takeover, a detach or being
 //!   superseded, the core marks the connection and its task stops reading its link (a transport
 //!   that buffers, like QUIC, still holds what the old client had sent); the core also ignores
@@ -69,7 +70,6 @@
 //! primary screen. The session's `TERM` should name a terminfo entry that uses `1049`
 //! (xterm-256color, alacritty, screen and tmux do).
 
-pub mod boundary;
 mod config;
 mod core;
 pub mod echo;

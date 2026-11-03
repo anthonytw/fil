@@ -60,6 +60,12 @@ impl ByteRing {
     /// Append all of `data`, discarding the oldest bytes as needed. If `data` alone exceeds the
     /// capacity only its tail is kept (the sequence numbers still count every byte).
     pub fn push_evicting(&mut self, data: &[u8]) {
+        // Exactly the capacity, once. Left to grow, the deque doubles from the size of the
+        // first chunk and lands anywhere between the capacity and twice it, and the ring cycles
+        // through all of it (up to 8 MiB more resident per session).
+        if self.buf.capacity() < self.cap {
+            self.buf.reserve_exact(self.cap - self.buf.len());
+        }
         if data.len() >= self.cap {
             let skipped = data.len() - self.cap;
             self.start = self.end() + skipped as u64;
@@ -139,6 +145,24 @@ mod tests {
         r.push_evicting(b"WXYZ");
         assert_eq!((r.start(), r.end()), (16, 20));
         assert_eq!(r.read(16, 10), b"WXYZ");
+    }
+
+    /// The deque is sized once, to the capacity, whatever the first chunk was (it used to double
+    /// from the first chunk's size and land anywhere up to twice the capacity).
+    #[test]
+    fn an_evicting_ring_allocates_its_capacity_and_no_more() {
+        for first in [1usize, 300, 5000, 70_000] {
+            let mut r = ByteRing::new(1 << 20, 0);
+            r.push_evicting(&vec![7u8; first]);
+            for _ in 0..40 {
+                r.push_evicting(&[1u8; 60_000]);
+            }
+            let cap = r.buf.capacity();
+            assert!(
+                (1 << 20..(1 << 20) + 64).contains(&cap),
+                "first chunk {first}: capacity {cap}"
+            );
+        }
     }
 
     #[test]

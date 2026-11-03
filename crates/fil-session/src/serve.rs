@@ -31,6 +31,12 @@
 //! jumps ahead: `Snapshot` (control), the snapshot bytes on the snapshot channel, and the
 //! terminal channel continues at the snapshot's `at`. The snapshot starts with a gap marker in
 //! the client's scrollback, so the client must not add one of its own.
+//!
+//! **One snapshot at a time.** No further snapshot is announced until the previous one is
+//! confirmed by the client's ack at or past its offset (see `Flow`'s `unconfirmed`), because
+//! control overtakes data on every transport and the announcement would reach the client ahead of
+//! the previous snapshot's bytes. Nothing weaker confirms it: a QUIC flush only says the peer's
+//! link has queued the payloads, and its inbox hands control out before them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +68,9 @@ const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
 const EXIT_ACK_WAIT: Duration = Duration::from_secs(1);
 /// ... and the most it waits in all, so a client that never acknowledges cannot hold the session.
 const EXIT_ACK_CAP: Duration = Duration::from_secs(10);
+/// Most `(end, began)` entries `Flow::sent` keeps. A client that never acks would otherwise grow
+/// it by one entry per segment, for as long as it stays connected.
+const SENT_MAX: usize = 256;
 /// While output is unacknowledged, how often the "waited too long" half of the catch-up rule is
 /// looked at again.
 const AGE_CHECK: Duration = Duration::from_millis(250);
@@ -101,14 +110,21 @@ pub async fn serve_subscriber<L: Link>(
         .unwrap_or_else(|Gone| AttachAnswer::Refused(AttachRefusal::SessionGone));
     let acc = match answer {
         AttachAnswer::Refused(r) => {
-            let c = Conn::new(&link, handle, 0, 0, Arc::default());
+            let c = Conn::new(&link, handle, 0, 0, false, Arc::default());
             c.farewell(&ControlMsg::AttachRefused(r.clone())).await;
             link.close();
             return ServeEnd::Refused(r);
         }
         AttachAnswer::Accepted(a) => *a,
     };
-    let conn = Conn::new(&link, handle, acc.conn, acc.start, acc.kicked.clone());
+    let conn = Conn::new(
+        &link,
+        handle,
+        acc.conn,
+        acc.start,
+        acc.snapshot.is_some(),
+        acc.kicked.clone(),
+    );
     // If this future is dropped (an aborted task, a host-side timeout) or panics, the guard still
     // tells the core, in order behind anything this connection queued.
     let mut gone = GoneGuard {
@@ -155,6 +171,16 @@ struct Flow {
     high: u64,
     /// `(end offset, when sending it began)` of segments not yet acknowledged.
     sent: VecDeque<(u64, Instant)>,
+    /// The offset of a snapshot the client may not have applied yet.
+    ///
+    /// While it is set no further snapshot is announced. A `Snapshot` announcement travels on
+    /// control, which every transport delivers ahead of data, so a second announcement would
+    /// overtake the first snapshot's unsent bytes, and both number theirs from 0: the client
+    /// would take the old bytes for the new snapshot, or see a gap and reconnect.
+    ///
+    /// Cleared by an ack of `at` or beyond, which the client sends once it has applied the
+    /// snapshot (it acks no terminal position it has not reached). Nothing else confirms it.
+    unconfirmed: Option<u64>,
 }
 
 impl Flow {
@@ -164,13 +190,33 @@ impl Flow {
             acked: start,
             high: start,
             sent: VecDeque::new(),
+            unconfirmed: None,
         }
+    }
+
+    /// A stream that begins with a snapshot at `at`.
+    fn after_snapshot(at: u64) -> Self {
+        Self {
+            unconfirmed: Some(at),
+            ..Self::new(at)
+        }
+    }
+
+    /// Whether the snapshot last sent has not been confirmed to have arrived.
+    fn awaiting_snapshot(&self) -> bool {
+        self.unconfirmed.is_some()
     }
 
     fn record_send(&mut self, end: u64, began: Instant) {
         self.next = end;
         self.high = self.high.max(end);
-        self.sent.push_back((end, began));
+        // At the cap the newest entry grows instead: the entries are only popped by acks and
+        // read at the front, so coarser ones at the back cost nothing but granularity.
+        let full = self.sent.len() >= SENT_MAX;
+        match self.sent.back_mut() {
+            Some(last) if full => last.0 = end,
+            _ => self.sent.push_back((end, began)),
+        }
     }
 
     fn ack(&mut self, upto: u64) -> Result<(), AckError> {
@@ -181,6 +227,9 @@ impl Flow {
             });
         }
         self.acked = self.acked.max(upto);
+        if self.unconfirmed.is_some_and(|at| upto >= at) {
+            self.unconfirmed = None;
+        }
         while self.sent.front().is_some_and(|&(end, _)| end <= self.acked) {
             self.sent.pop_front();
         }
@@ -196,7 +245,7 @@ impl Flow {
 
     /// After a snapshot the stream continues at `at` and nothing earlier is owed.
     fn jump(&mut self, at: u64) {
-        *self = Self::new(at);
+        *self = Self::after_snapshot(at);
     }
 }
 
@@ -281,6 +330,7 @@ impl<'a, L: Link> Conn<'a, L> {
         handle: &'a SessionHandle,
         id: ConnId,
         start: u64,
+        snapshot: bool,
         kicked: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -288,7 +338,11 @@ impl<'a, L: Link> Conn<'a, L> {
             handle,
             id,
             kicked,
-            flow: Mutex::new(Flow::new(start)),
+            flow: Mutex::new(if snapshot {
+                Flow::after_snapshot(start)
+            } else {
+                Flow::new(start)
+            }),
             acked: Notify::new(),
             verdict: Mutex::new(None),
         }
@@ -487,12 +541,13 @@ impl<'a, L: Link> Conn<'a, L> {
             }
 
             let prog = *out.progress.borrow_and_update();
-            let (next, behind, age) = {
+            let (next, behind, age, awaiting) = {
                 let f = self.flow();
                 (
                     f.next,
                     prog.ready.saturating_sub(f.acked),
                     f.age(Instant::now()),
+                    f.awaiting_snapshot(),
                 )
             };
             let wrapped = self.handle.shared().lock_log().start() > next;
@@ -505,7 +560,16 @@ impl<'a, L: Link> Conn<'a, L> {
             // Nothing is gained by jumping when everything is already sent: the delay is in the
             // link, and a snapshot would only rewrite what the client has. And a finished
             // session sends the rest of its log: a snapshot would cost the client the tail.
+            //
+            // Not while the previous snapshot is unconfirmed: the announcement would overtake
+            // its bytes (see `Flow::unconfirmed`). Output past the snapshot is sent meanwhile,
+            // and the client's ack confirms the snapshot (it acks `at` itself once the snapshot
+            // is applied, so this needs no output). If the log has wrapped past the stream's
+            // position there is nothing to send: the connection waits for that ack below, still
+            // looking at its events.
+            let stalled = wrapped && awaiting;
             if !prog.exited
+                && !awaiting
                 && (wrapped || (prog.ready > next && should_snapshot(behind, age, &params)))
             {
                 match self.catch_up(out).await {
@@ -556,7 +620,7 @@ impl<'a, L: Link> Conn<'a, L> {
                 .modes
                 .front()
                 .map_or(prog.ready, |m| m.0.min(prog.ready));
-            if next < limit {
+            if next < limit && !stalled {
                 let want = (limit - next).min(MAX_DATA_PAYLOAD as u64) as usize;
                 let data = self.handle.shared().lock_log().read(next, want);
                 if data.is_empty() {
@@ -723,5 +787,53 @@ impl<'a, L: Link> Conn<'a, L> {
         self.farewell(&ControlMsg::SessionExited { code, signal })
             .await;
         ServeEnd::SessionExited(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snapshot_is_unconfirmed_until_an_ack_reaches_it() {
+        let mut f = Flow::new(0);
+        f.record_send(500, Instant::now());
+        assert!(!f.awaiting_snapshot());
+        f.jump(1000);
+        assert!(f.awaiting_snapshot());
+        // Acks of what was sent before the jump say nothing about the snapshot.
+        f.ack(500).unwrap();
+        assert!(f.awaiting_snapshot());
+        f.record_send(1200, Instant::now());
+        f.ack(1000).unwrap();
+        assert!(!f.awaiting_snapshot());
+    }
+
+    #[test]
+    fn an_attach_snapshot_is_unconfirmed_too() {
+        assert!(Flow::after_snapshot(7).awaiting_snapshot());
+        assert!(!Flow::new(7).awaiting_snapshot());
+    }
+
+    /// A client that reads but never acks must not make the sender's book of unacknowledged
+    /// segments grow without bound.
+    #[test]
+    fn the_unacknowledged_book_is_bounded() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0);
+        for i in 1..=100_000u64 {
+            f.record_send(i * 10, t0 + Duration::from_millis(i));
+        }
+        assert!(f.sent.len() <= SENT_MAX, "{}", f.sent.len());
+        assert_eq!(f.next, 1_000_000);
+        // The front is still the oldest unacknowledged output.
+        assert_eq!(f.sent.front().unwrap().1, t0 + Duration::from_millis(1));
+        assert!(f.age(t0 + Duration::from_secs(10)) >= Duration::from_secs(9));
+        // Acks still drain it, and an ack of everything empties it.
+        f.ack(500).unwrap();
+        assert!(f.sent.front().unwrap().0 > 500);
+        f.ack(1_000_000).unwrap();
+        assert!(f.sent.is_empty());
+        assert_eq!(f.age(t0), Duration::ZERO);
     }
 }

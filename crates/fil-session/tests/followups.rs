@@ -290,9 +290,11 @@ async fn a_takeover_between_the_catch_up_decision_and_its_answer_is_announced() 
     let h = spawn_plain(flood_config(&sc, "a")).await;
     let gate = h.gate_catch_up();
     let mut a = Client::connect(&h, Connect::new(&h, key(1)));
-    a.auto_ack = false; // behind from the start
     a.wait("the attach reply", |c| c.reply.is_some()).await;
+    // It acknowledges READY (which confirms the attach snapshot: no catch-up is announced
+    // before that), and nothing after, so it falls behind.
     a.wait_screen("READY").await;
+    a.auto_ack = false;
     a.type_bytes(b"\n").await;
 
     // The connection reaches the point of asking the core for a snapshot, and waits there.

@@ -132,6 +132,12 @@ pub enum PipeStderr {
     /// for a run nobody is watching: the terminal belongs to the session, and the reason ssh gave
     /// is worth showing in the status line and the log.
     Capture,
+    /// Kept like [`Capture`](Self::Capture), and also copied to our own stderr as it arrives,
+    /// until [`PipeLink::stop_stderr_tee`] is called. Right for the first attach: ssh's errors
+    /// and warnings show while the user waits, and from the moment the session owns the terminal
+    /// nothing the command prints later (`Connection to host closed.`) is written into the raw
+    /// screen. (Password and host-key prompts are not on stderr: ssh uses the terminal itself.)
+    Tee,
 }
 
 impl PipeConfig {
@@ -248,35 +254,142 @@ impl std::error::Error for PipeError {
 pub(crate) struct StderrCapture {
     buf: std::sync::Mutex<Vec<u8>>,
     done: watch::Sender<bool>,
+    /// Also write what arrives to our own stderr ([`PipeStderr::Tee`]), a line at a time and
+    /// sanitized, until [`stop_tee`](Self::stop_tee).
+    tee_on: std::sync::atomic::AtomicBool,
+    /// Wakes the task to show what has arrived and stop.
+    stop: tokio::sync::Notify,
+    /// Set by the task once it has shown it (or has ended).
+    shown: (std::sync::Mutex<bool>, std::sync::Condvar),
 }
 
 /// Most stderr kept: ssh's errors are a line or two.
 const STDERR_KEEP: usize = 4096;
+/// The longest line held back, waiting for its end, before it is shown anyway.
+const TEE_LINE_MAX: usize = 4096;
+/// How long [`StderrCapture::stop_tee`] waits for the task to show what had arrived.
+const TEE_STOP_WAIT: Duration = Duration::from_millis(100);
+
+/// Writes one chunk of the command's stderr to ours: control characters, escape sequences
+/// included, are removed (the text can come from a remote host's rc files or banner).
+// TODO(S2): use the shared text sanitizer (`fil_proto::text`) once it has landed.
+fn show_on_terminal(text: &[u8]) {
+    use std::io::Write;
+    let clean = sanitize_banner(text);
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(clean.as_bytes()).and_then(|()| err.flush());
+}
+
+/// Shows the complete lines in `pending` plus `new`, keeps the rest.
+fn show_lines(pending: &mut Vec<u8>, new: &[u8]) {
+    pending.extend_from_slice(new);
+    while let Some(i) = pending.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=i).collect();
+        show_on_terminal(&line);
+    }
+    if pending.len() > TEE_LINE_MAX {
+        show_rest(pending);
+    }
+}
+
+/// Shows an unfinished line, ended, so the next thing on the terminal starts on a new one.
+fn show_rest(pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        pending.push(b'\n');
+        show_on_terminal(pending);
+        pending.clear();
+    }
+}
 
 impl StderrCapture {
-    fn start(mut stderr: tokio::process::ChildStderr) -> Arc<Self> {
+    fn start(mut stderr: tokio::process::ChildStderr, tee: bool) -> Arc<Self> {
+        use std::sync::atomic::Ordering;
         let (done, _) = watch::channel(false);
         let cap = Arc::new(Self {
             buf: std::sync::Mutex::new(Vec::new()),
             done,
+            tee_on: std::sync::atomic::AtomicBool::new(tee),
+            stop: tokio::sync::Notify::new(),
+            shown: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
         });
         let task = cap.clone();
         tokio::spawn(async move {
             let mut chunk = [0u8; 1024];
-            while let Ok(n) = stderr.read(&mut chunk).await {
-                if n == 0 {
-                    break;
-                }
-                let mut b = task.buf.lock().unwrap_or_else(|e| e.into_inner());
-                b.extend_from_slice(&chunk[..n]);
-                if b.len() > STDERR_KEEP {
-                    let cut = b.len() - STDERR_KEEP;
-                    b.drain(..cut);
+            let mut line = Vec::new();
+            let mut teeing = tee;
+            loop {
+                let read = if teeing {
+                    tokio::select! {
+                        () = task.stop.notified() => {
+                            // Whatever the command has already written is shown before the
+                            // terminal changes hands.
+                            while let Ok(Ok(n)) =
+                                timeout(Duration::from_millis(1), stderr.read(&mut chunk)).await
+                            {
+                                if n == 0 {
+                                    break;
+                                }
+                                task.keep(&chunk[..n]);
+                                show_lines(&mut line, &chunk[..n]);
+                            }
+                            show_rest(&mut line);
+                            teeing = false;
+                            task.tee_on.store(false, Ordering::Relaxed);
+                            task.ack_shown();
+                            continue;
+                        }
+                        r = stderr.read(&mut chunk) => r,
+                    }
+                } else {
+                    stderr.read(&mut chunk).await
+                };
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        task.keep(&chunk[..n]);
+                        if teeing {
+                            show_lines(&mut line, &chunk[..n]);
+                        }
+                    }
                 }
             }
+            if teeing {
+                show_rest(&mut line);
+                task.tee_on.store(false, Ordering::Relaxed);
+            }
+            task.ack_shown();
             task.done.send_replace(true);
         });
         cap
+    }
+
+    fn keep(&self, bytes: &[u8]) {
+        let mut b = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        b.extend_from_slice(bytes);
+        if b.len() > STDERR_KEEP {
+            let cut = b.len() - STDERR_KEEP;
+            b.drain(..cut);
+        }
+    }
+
+    fn ack_shown(&self) {
+        *self.shown.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.shown.1.notify_all();
+    }
+
+    /// Stops copying to the terminal, after showing what the command had already written. Waits
+    /// (at most [`TEE_STOP_WAIT`]) for that, so that nothing is written to the terminal after
+    /// this returns; it blocks the calling thread, which is fine on a multi-threaded runtime
+    /// (the task runs on another worker) and merely times out on a current-thread one.
+    fn stop_tee(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.tee_on.load(Ordering::Relaxed) {
+            return;
+        }
+        self.stop.notify_one();
+        let (lock, cv) = &self.shown;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cv.wait_timeout_while(guard, TEE_STOP_WAIT, |shown| !*shown);
     }
 
     /// Waits (briefly) for the stream to end, then returns what was captured.
@@ -353,7 +466,7 @@ impl PipeLink {
             .stderr(match cfg.stderr {
                 PipeStderr::Inherit => std::process::Stdio::inherit(),
                 PipeStderr::Null => std::process::Stdio::null(),
-                PipeStderr::Capture => std::process::Stdio::piped(),
+                PipeStderr::Capture | PipeStderr::Tee => std::process::Stdio::piped(),
             })
             .kill_on_drop(true);
         if cfg.own_process_group {
@@ -373,7 +486,8 @@ impl PipeLink {
                 "the child has no stdin or stdout",
             ))));
         };
-        let capture = child.stderr.take().map(StderrCapture::start);
+        let tee = cfg.stderr == PipeStderr::Tee;
+        let capture = child.stderr.take().map(|e| StderrCapture::start(e, tee));
         Self::establish(stdout, stdin, Role::Client, cfg, Some(child), capture).await
     }
 
@@ -461,6 +575,14 @@ impl PipeLink {
             .as_ref()
             .map(|c| fil_proto::text::sanitize(&c.bytes()))
             .unwrap_or_default()
+    }
+
+    /// Stops copying the command's stderr to ours ([`PipeStderr::Tee`]); it is still captured.
+    /// Call when the session takes over the terminal. Does nothing for the other modes.
+    pub fn stop_stderr_tee(&self) {
+        if let Some(c) = &self.stderr {
+            c.stop_tee();
+        }
     }
 
     /// The protocol major from the preamble (client side).

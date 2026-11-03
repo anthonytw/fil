@@ -680,6 +680,37 @@ f_attach_detach() {
   fk direct ad
 }
 
+# Does `~.` always reach the daemon? Ten attach/detach cycles over ssh; after each, `fil ls` must
+# stop listing the client as attached within 3 s. (A detach that is lost leaves the daemon holding
+# a client that has gone: it shows as attached until somebody takes the session over.)
+f_detach_delivery() {
+  local n lost=0 i j out ok_one
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    fc_start "d$n" -- direct dd
+    fc_ready "d$n"
+    fc_detach "d$n"
+    ok_one=0
+    for ((i = 0; i < 30; i++)); do
+      out=$(cx fil ls direct)
+      if awk '$1 == "dd" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out"; then
+        ok_one=1
+        break
+      fi
+      sleep 0.1
+    done
+    j=$n
+    if [[ $ok_one -eq 0 ]]; then
+      lost=$((lost + 1))
+      log "cycle $j: the detach was not seen by the daemon: $out"
+    fi
+  done
+  note "detach_not_seen_by_daemon=$lost/10"
+  if [[ $lost -gt 0 ]]; then
+    known_bug "$lost of 10 clean detaches (~.) over ssh never reached the daemon: fil ls kept listing the client as attached"
+  fi
+  fk direct dd
+}
+
 # fil ls, fil detach (the attached client is told), fil kill (of an attached session; the client
 # reports how it ended), and the errors for a session that is gone.
 f_ls_kill_detach() {
@@ -967,7 +998,7 @@ ALL_SCENARIOS=(
   s_kill_ssh_client s_kill_sshd_child
   s_netdown_app_heartbeat s_netdown_ssh_keepalive s_netdown_no_detection
   s_pipelink_flood s_pipelink_netdown_heartbeat s_pipelink_netdown_keepalive
-  f_attach_detach f_ls_kill_detach f_takeover f_takeover_back f_kill_ssh f_daemon_restart
+  f_attach_detach f_detach_delivery f_ls_kill_detach f_takeover f_takeover_back f_kill_ssh f_daemon_restart
   f_noisy f_proxyjump f_tree_scope f_other_user
 )
 

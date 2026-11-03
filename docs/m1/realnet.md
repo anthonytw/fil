@@ -1,19 +1,24 @@
 # Real-network test harness (Tier 1)
 
-Everything fil has been tested against so far ran in process: `fil-netsim` stands in for ssh and for UDP. This harness runs the same questions against the real thing, with no mocks between the program and the network:
+Everything fil was first tested against ran in process: `fil-netsim` stands in for ssh and for UDP. This harness runs the same questions against the real thing, with no mocks between the program and the network:
 
-- **The pipe** over real OpenSSH (`ssh -T HOST pipe-echo`, DESIGN.md §8.2), through jump hosts, with certificates, ControlMaster and hostile shells.
-- **Direct QUIC** over the real Linux network stack (DESIGN.md §8.3): real NAT with conntrack, real `tc netem`, real route changes.
+- **The pipe** over real OpenSSH (`ssh -T HOST fil server --stdio`, DESIGN.md section 8.2), through jump hosts, with certificates, ControlMaster and hostile shells.
+- **Direct QUIC** over the real Linux network stack (DESIGN.md section 8.3): real NAT with conntrack, real `tc netem`, real route changes.
+- **systemd**, for the session scope (DESIGN.md section 5.1): a host with a real user manager, logind and PAM.
 
-The daemon and client (M1) do not exist yet, so the programs under test are two small stand-ins that use the real protocol code. When the daemon lands, swap the stand-in for `fil server --stdio` and the QUIC endpoint and keep the scenarios.
+Two kinds of program run under it. The **real `fil` binary** (since M1 P7a): the client on a pseudo-terminal, the relay (`fil server --stdio`) and the daemon, all started the way a user starts them. And the **stand-ins** in `fil-testbins`, which came first and use the real protocol code in small programs: they measure things the real binary does not print (raw quinn behaviour, netem, detection times of the bare pipe). The M1 "done when" item "the real-network suite passes on the real `fil` binary" is the first kind; the second stays because the numbers it gives are still the input to design decisions.
 
 It is a manual check, like the rest of `linux-check`. It is never part of `just ci`.
 
-## The stand-ins (`crates/fil-testbins`, test-only, `publish = false`)
+## The test programs (`crates/fil-testbins`, test-only, `publish = false`)
 
-| Program | Stands in for | Uses |
+The first two drive the real binary; the rest are the stand-ins.
+
+| Program | What it is | Uses |
 |---|---|---|
-| `pipe-echo` (no arguments) | `fil server --stdio`: writes the preamble, then echoes every frame it decodes | `preamble::encode`, `FrameDecoder` |
+| `ptydrive serve NAME -- COMMAND...` and `ptydrive ctl NAME VERB` | The terminal for the real `fil` client. `serve` runs COMMAND on a pseudo-terminal (200 rows by 100 columns, so a test's whole output stays on the screen) and keeps a headless screen of what it prints. `ctl` types (`send '\r~.'` is Enter, then the detach escape), waits for text on the screen or in the raw output, prints the screen, and reads the exit status. Scenarios call it between `docker exec`s and `kill`s | `portable-pty`, `vt100` |
+| `sockprobe PATH` | What a stranger sees when connecting to a Unix socket: refused, hung up on, or greeted | |
+| `pipe-echo` (no arguments) | stand-in for `fil server --stdio`: writes the preamble, then echoes every frame it decodes | `preamble::encode`, `FrameDecoder` |
 | `pipe-echo client [options] -- COMMAND...` | the client end of the pipe: runs `ssh ...`, finds the preamble, checks every echoed byte | `PreambleScanner`, `FrameDecoder`, `DataSegment` |
 | `pipe-probe` (no arguments) | `fil server --stdio` once the daemon exists: writes the preamble, then runs a real `PipeLink` on stdio and echoes every payload | `PipeLink::accept_halves` |
 | `pipe-probe client [options] -- COMMAND...` | the client end through the real `PipeLink::spawn`: sends numbered terminal data, verifies the echo, prints every state change and how the link ended | `PipeLink`, `PipeCommand` |
@@ -22,7 +27,7 @@ It is a manual check, like the rest of `linux-check`. It is never part of `just 
 | `quic-echo udp-send`, `udp-recv` | nothing: a numbered-datagram probe that measures whether a path reorders | |
 | `quiclink-probe server` / `client` | the same two roles, built on the real `QuicListener` and `QuicLink` (P2): Retry, rate limits, the accept proof, `Degraded`, `Down(Dead)`, `path_generation` | `fil_transport::quic` |
 
-`pipe-echo` takes no arguments on purpose. The harness runs it as the fixed remote command, as `fil server --stdio` will be run.
+`pipe-echo` takes no arguments on purpose. The harness runs it as the fixed remote command, as `fil server --stdio` is run.
 
 **The bootstrap is files.** In production the client's public key and the daemon's fingerprint cross the authenticated pipe (DESIGN.md §4.1). Here they cross the filesystem: the client writes its public key, the server registers it and writes an acknowledgement, and the client then reads the fingerprint and pins it. The server's registry and the client's pin are the real ones. Only the transport of those two values is faked. Keys are generated in memory, as in the design. The harness's SSH keys are generated at run time in a temporary directory that is removed at the end, and nothing secret is committed.
 
@@ -45,7 +50,9 @@ flowchart LR
 
 The three Docker networks are `--internal`, so the target is reachable only through the two jumps. The first scenario proves it: ssh to `target` by name and by address both fail from the client, and the target's sshd logs the login as coming from jump2's address. All four containers use one image (Ubuntu 24.04, OpenSSH 9.6, the two static binaries). Host keys are generated when each container starts.
 
-Accounts on every host: `fil` (clean), `noisy` (`.bashrc` echoes text), `loud` (prints 60000 bytes) and `flood` (prints 100000 bytes). The client runs as `tester`. A host reached without a jump is `jump1`; `ssh direct` goes there.
+Accounts on every host: `fil` (clean), `noisy` (`.bashrc` echoes text), `loud` (prints 60000 bytes) and `flood` (prints 100000 bytes), and for the real-`fil` scenarios `mallory` (a second ordinary user) and `victim`, `victim2`, `victim3` (users whose socket directory somebody else prepared). The client runs as `tester`. A host reached without a jump is `jump1`; `ssh direct` goes there. A second client machine, `client2` (same image, same user and keys), takes sessions over from `client`. Containers have their own host names, so the "taken over by ..." message names a real machine, and run under `--init` (a PID 1 that reaps orphans, so "the process is gone" is not fooled by zombies).
+
+The image carries the real `fil` (in `/usr/bin`, on the default PATH of an ssh command, as the default pipe command needs). The users `fil`, `noisy` and `mallory` have `~/.config/fil/daemon.toml` with `direct = false` (there is no UDP path here) and `idle_exit_secs = 0` (the daemon never retires between scenarios); `tester` has a client config with `transport = "pipe"`.
 
 ### Direct: network namespaces with NAT and netem
 
@@ -76,15 +83,29 @@ flowchart LR
 - Segmentation offloads are switched off on every interface. Otherwise netem would delay and drop 64 KiB GSO bursts instead of packets.
 - Documentation addresses (RFC 5737) and RFC 1918 only. Nothing here is a real host.
 
+**The real `fil` needs an ssh path in this topology too** (it logs in over the pipe first, then upgrades). The choice: run the runner's own `sshd` inside `rn-server` (on `198.51.100.10:22`, a throwaway host key, public-key logins only, one allowed user) and have the client reach it through the same router. The alternatives were a Docker container attached to the namespace (needs more plumbing and a second sshd build) and ssh over loopback (would skip the NAT, which is the point). The ssh traffic crosses the same NAT and netem as the UDP; only UDP is ever dropped, so the pipe keeps working while QUIC does not. The harness makes two users for the run, `rnclient` (runs `ptydrive` and `fil` in `rn-client`) and `rnfil` (the account on the "server"), a throwaway key pair and an ssh config with `Host srv` (`HostName 198.51.100.10`); it installs the three binaries in `/usr/local/bin` (so `ssh srv fil server --stdio` finds `fil`) and removes users, keys and binaries at the end. `fil srv` finds the UDP address the way a user's setup does, from `ssh -G srv`. Nothing secret is committed; the keys are made at run time.
+
+### systemd: a host with a user manager
+
+```mermaid
+flowchart LR
+    client["runner<br/>fil on a PTY (ptydrive), ssh"]
+    sysd["rn-sysd (privileged container)<br/>systemd as PID 1, logind, PAM, sshd<br/>fil relay, daemon and sessions"]
+    client ---|"Docker bridge, ssh"| sysd
+```
+
+A privileged container whose PID 1 is systemd (cgroup v2), with logind, dbus, `libpam-systemd` and an sshd with `UsePAM yes`, so each login is a logind session with `XDG_RUNTIME_DIR` and `systemd-run --user` works as on a real host. The client runs on the runner and logs in with a throwaway key over the Docker bridge. `loginctl enable-linger` and `disable-linger` switch the conditions. This works on GitHub's `ubuntu-24.04` runners without any special setup (see Results).
+
 ## Running it
 
 On a Linux box with Docker, passwordless root, `iproute2`, `iptables`, `conntrack` and `ethtool` (and `musl-tools` for the static build):
 
 ```bash
-just realnet            # both parts
+just realnet            # all three parts
 just realnet ssh        # Docker topology only
 just realnet udp        # namespaces only
-just realnet udp s_nat_rebind s_ip_change   # named scenarios
+just realnet sysd       # the systemd host only
+just realnet udp f_upgrade f_nat_rebind   # named scenarios
 ```
 
 On macOS (or without the tools) it refuses with a message and exits 2. From anywhere:
@@ -93,9 +114,11 @@ On macOS (or without the tools) it refuses with a message and exits 2. From anyw
 gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet
 ```
 
-`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet` or `all`. The two parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
+`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet` or `all`. The three parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
 
-The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh` and `udp.sh` (one bash function per scenario, each run in its own process so `set -euo pipefail` applies), `lib.sh` (assertions, parsing, the summary table), `build.sh` and `docker/`. `shellcheck` is part of the CI job.
+The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `sysd.sh` (one bash function per scenario, each run in its own process so `set -euo pipefail` applies), `lib.sh` (assertions, parsing, the summary table), `fil.sh` (driving the real client through `ptydrive`: start, type, wait for text, exit status, the client's log), `build.sh` and `docker/`. `shellcheck` is part of the CI job. The scenarios named `f_*` use the real `fil`; `s_*` are the stand-in scenarios.
+
+**Known findings.** When a scenario catches a defect in fil itself, it records `KNOWN-BUG: ...` in its measurements and carries on, so one finding does not hide the results after it. `REALNET_STRICT=1` makes them fail. The current list is under "Real binary: findings".
 
 ## Results
 

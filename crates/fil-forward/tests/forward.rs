@@ -1163,7 +1163,7 @@ async fn a_slow_owner_holds_back_a_table_flood() {
                 }
                 Err(e) => panic!("{e:?}"),
             }
-            if sent % 512 == 0 {
+            if sent.is_multiple_of(512) {
                 tokio::task::yield_now().await;
             }
         }

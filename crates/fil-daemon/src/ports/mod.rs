@@ -616,6 +616,7 @@ mod tests {
             last_unix_ms: 0,
             owner: None,
             probe: None,
+            target_other_user: false,
         }
     }
 

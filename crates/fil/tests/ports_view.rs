@@ -97,6 +97,7 @@ fn fwd(
         last_unix_ms: 0,
         owner: None,
         probe: None,
+        target_other_user: false,
     }
 }
 
@@ -576,6 +577,7 @@ fn an_answer_in_parts_is_one_table() {
     let extra = Response::Ports {
         part: PortsPart {
             rows: rows[..5].to_vec(),
+            incomplete: None,
         },
         more: false,
     };

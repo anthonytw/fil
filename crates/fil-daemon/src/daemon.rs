@@ -840,8 +840,11 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
     // One daemon serves every session, and their forwards may hold many descriptors: the soft
     // limit goes as high as it may, and every program the daemon starts gets the original back
     // (`fil_session::nofile`).
-    let raised = fil_session::nofile::own_executable().and_then(fil_session::nofile::raise);
-    match raised {
+    // A session's child starts through this binary, which gives it the original limit back.
+    if let Some(exe) = fil_session::nofile::own_executable() {
+        fil_session::nofile::set_trampoline(exe);
+    }
+    match fil_transport::fdlimit::raise() {
         Some(r) => tracing::info!(from = r.from, to = r.to, "descriptor limit raised"),
         None => tracing::debug!("descriptor limit left as it is"),
     }

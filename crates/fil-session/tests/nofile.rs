@@ -16,6 +16,9 @@ use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 const STOCK: u64 = 1024;
 
+/// This crate's trampoline binary.
+const EXEC: &str = env!("CARGO_BIN_EXE_fil-session-exec");
+
 /// The stock soft limit, then the daemon's raise (with this crate's trampoline binary). `false`
 /// when this host's hard limit leaves no room above the stock one (nothing to test).
 fn setup() -> bool {
@@ -33,7 +36,8 @@ fn setup() -> bool {
             },
         )
         .unwrap();
-        let raised = fil_session::nofile::raise(env!("CARGO_BIN_EXE_fil-session-exec").into());
+        fil_session::nofile::set_trampoline(EXEC.into());
+        let raised = fil_transport::fdlimit::raise();
         assert_eq!(
             raised.map(|r| r.from),
             Some(STOCK),
@@ -78,7 +82,7 @@ async fn children_start_with_the_original_limit() {
     // A `std::process::Command` child.
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.args(["-c", "ulimit -Sn"]);
-    fil_session::nofile::restore_on_exec(&mut cmd);
+    fil_transport::fdlimit::keep_for_std_child(&mut cmd);
     let out = cmd.output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
@@ -192,4 +196,50 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
     }
     let _ = h2.kill(Duration::from_secs(5)).await;
     let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// The trampoline runs only what it is given in full, and nothing otherwise: with any argument
+/// missing or malformed, or a program that is relative or not there, it exits 127 and the
+/// program (which would leave a file behind) never runs. Without its marker it is not a
+/// trampoline at all.
+#[test]
+fn the_trampoline_refuses_anything_incomplete() {
+    let s = Scratch::new();
+    let canary = s.path("ran");
+    let script = format!("touch {}", canary.display());
+    let marker = fil_session::nofile::TRAMPOLINE;
+    let cases: Vec<Vec<&str>> = vec![
+        vec![marker],
+        vec![marker, "1024"],
+        vec![marker, "1024", "/bin/sh"],
+        vec![marker, "many", "/bin/sh", "sh", "-c", &script],
+        vec![marker, "1024", "sh", "sh", "-c", &script],
+        vec![marker, "1024", "./sh", "sh", "-c", &script],
+        vec![marker, "1024", "/nonexistent/sh", "sh", "-c", &script],
+        vec![marker, "1024", "/bin", "sh", "-c", &script],
+    ];
+    for args in cases {
+        let out = std::process::Command::new(EXEC)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127), "{args:?}");
+        assert!(!canary.exists(), "ran with {args:?}");
+    }
+    let out = std::process::Command::new(EXEC)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "not a trampoline without its marker"
+    );
+    // In full, it runs the program as it was told.
+    let out = std::process::Command::new(EXEC)
+        .args([marker, "1024", "/bin/sh", "sh", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(canary.exists());
 }

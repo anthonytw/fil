@@ -15,8 +15,6 @@ fil-term = { path = "../fil-term", default-features = false, features = ["alacri
 fil-transport = { path = "../fil-transport" }
 nix = { version = "0.28", default-features = false, features = ["term", "signal", "user", "process"] }
 portable-pty = "0.9"
-# The descriptor limit (`nofile`): new code here uses rustix (CLAUDE.md).
-rustix = { version = "1", features = ["process"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"

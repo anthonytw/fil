@@ -9,8 +9,10 @@
 //! - [`quic`]: the QUIC link ([`quic::QuicLink`]) and the daemon's listener ([`quic::QuicListener`]).
 //! - [`path`]: the client's transport choice (pipe, direct, upgrade, fallback) as a pure state
 //!   machine.
+//! - [`fdlimit`]: the soft limit on open files, raised for the process and kept for its children.
 
 pub mod auth;
+pub mod fdlimit;
 pub mod link;
 pub mod path;
 pub mod pipe;

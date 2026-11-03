@@ -431,6 +431,9 @@ struct Slot {
     peer_eof: bool,
     /// Counted in its forward's `open`.
     counted: bool,
+    /// The peer's highest `Ack` (what it consumed): with the mux's send buffer, where the stream
+    /// ends, so the data sender can tell whether the mux holds bytes of it not yet sent.
+    peer_acked: u64,
 }
 
 /// One forward's listening sockets. The accept tasks poll the sockets through their slots, so
@@ -615,6 +618,7 @@ impl<L: Link> State<L> {
         self.ctl_out.clear();
         self.data_out.clear();
         self.data_out_bytes = 0;
+
         // Never fed, so never acknowledged: the peer sends them again on the next link.
         self.held_mux.clear();
         self.held_mux_bytes = 0;
@@ -756,6 +760,7 @@ impl<L: Link> State<L> {
             Out::Data(..) => self.pass_index()?,
         };
         let item = self.data_out.remove(idx).expect("an index into the queue");
+
         match &item {
             Out::Data(ch, p) => {
                 self.data_out_bytes -= p.len();
@@ -789,6 +794,24 @@ impl<L: Link> State<L> {
         None
     }
 
+    /// Whether the mux holds unsent bytes of an open channel that has nothing in the data queue
+    /// and that the pacer would let pass: then the data sender takes more from the mux to reach
+    /// them.
+    fn passable_waits(&self) -> bool {
+        self.slots.iter().any(|(&id, slot)| {
+            let ch = ChannelId(id);
+            self.pacer.free_pass(ch)
+                && self.mux.info(ch).is_some_and(|i| {
+                    i.state == ChannelState::Open
+                        && slot.peer_acked + i.send_buffered as u64 > i.sent_high
+                })
+                && !self
+                    .data_out
+                    .iter()
+                    .any(|o| matches!(o, Out::Data(c, _) if *c == ch))
+        })
+    }
+
     /// Whether the data sender is held: the pacer holds the queue's head, and nothing behind it
     /// may pass.
     fn held(&self) -> bool {
@@ -800,14 +823,21 @@ impl<L: Link> State<L> {
 
     /// Takes what the mux has to send, up to [`DATA_AHEAD`] of queued data (the data sender;
     /// control payloads it meets go to the control sender's queue). While the pacer holds the
-    /// queue, it takes one payload more at a time (up to [`PASS_SCAN`] queued), until one is of a
-    /// channel that may pass: the mux takes its channels in turn, so a new connection's first
-    /// payload is never stuck in the mux behind a held transfer.
+    /// queue and the mux holds bytes of a channel that may pass (nothing in flight, nothing
+    /// queued), it takes more, one payload at a time, until that channel's comes (the mux takes
+    /// its channels in turn) or [`PASS_SCAN`] items are queued: a new connection's first payload
+    /// is never stuck in the mux behind a held transfer, and a lone held transfer costs nothing
+    /// more than [`DATA_AHEAD`].
     fn pull(&mut self) {
         if self.link.is_none() {
             return;
         }
-        while self.data_out_bytes < DATA_AHEAD || (self.data_out.len() < PASS_SCAN && self.held()) {
+        loop {
+            if self.data_out_bytes >= DATA_AHEAD
+                && (self.data_out.len() >= PASS_SCAN || !self.held() || !self.passable_waits())
+            {
+                break;
+            }
             let Some((ch, payload)) = self.mux.poll_transmit() else {
                 break;
             };
@@ -1160,8 +1190,13 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         let r = st.mux.on_ack(ch, upto);
-        if r.is_ok() && st.link.is_some() {
-            st.pacer.on_ack(ch, upto, now());
+        if r.is_ok() {
+            if let Some(slot) = st.slots.get_mut(&ch.0) {
+                slot.peer_acked = slot.peer_acked.max(upto);
+            }
+            if st.link.is_some() {
+                st.pacer.on_ack(ch, upto, now());
+            }
         }
         inner.drain(&mut st);
         drop(st);
@@ -1640,6 +1675,7 @@ impl<L: Link> Inner<L> {
                 connect: Some(task.abort_handle()),
                 peer_eof: false,
                 counted: false,
+                peer_acked: 0,
             },
         );
     }
@@ -1753,6 +1789,7 @@ impl<L: Link> Inner<L> {
                 connect: None,
                 peer_eof: false,
                 counted: false,
+                peer_acked: 0,
             },
         );
         st.count_open(ch, t);

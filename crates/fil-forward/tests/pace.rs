@@ -112,12 +112,16 @@ async fn a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe() {
     // Paced: the round trip (40 ms) plus about the target (25 ms), with room for a busy machine.
     assert!(paced.0 <= Duration::from_millis(150), "{paced:?}");
     assert!(paced.1 >= 0.8 * unpaced.1, "{paced:?} against {unpaced:?}");
+    // While the pacer holds a lone transfer, the endpoint keeps about its usual 64 KiB queued
+    // (four payloads) and one more, not the channel's window.
+    assert!(paced.2 <= 8, "{paced:?}");
 }
 
 const RATE: u64 = 2_500_000;
 
-/// (median probe round trip, bulk bytes per second) on the slow pipe.
-async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64) {
+/// (median probe round trip, bulk bytes per second, most payloads the daemon's endpoint held
+/// queued for the link) on the slow pipe.
+async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
     let source = serve(|mut s| async move {
         let buf = vec![9u8; 64 * 1024];
         while s.write_all(&buf).await.is_ok() {}
@@ -150,8 +154,10 @@ async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
     let mut rtts = Vec::new();
+    let mut queued = 0;
     for i in 0..20 {
         rtts.push(probe(&mut w, i).await);
+        queued = queued.max(w.daemon.ep.snapshot().queued);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
@@ -164,5 +170,5 @@ async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64) {
         rate / 1e3,
         w.daemon.ep.pace_state()
     );
-    (rtts[rtts.len() / 2], rate)
+    (rtts[rtts.len() / 2], rate, queued)
 }

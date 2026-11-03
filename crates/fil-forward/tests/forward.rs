@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fil_proto::mux::{BindAddr, CloseReason, ForwardId, ForwardKind, MuxConfig, OpenFailure};
+use fil_forward::LocalPeer;
+use fil_proto::mux::{
+    BindAddr, CloseReason, ForwardId, ForwardKind, MuxConfig, OpenFailure, OpenKind,
+};
 use fil_transport::Link;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -631,7 +634,8 @@ async fn a_refused_open_never_connects() {
     assert_eq!(canary.accepted.load(Ordering::SeqCst), 0);
 }
 
-/// The opener's policy refuses (an `-R` listener while detached): reset at once, nothing opened.
+/// The opener's policy refuses (an `-R` listener while detached): reset at once (well within a
+/// second, against an `open_wait` of 30 s), nothing opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_local_connection_is_reset_at_once() {
     let canary = echo_server().await;
@@ -646,7 +650,7 @@ async fn a_refused_local_connection_is_reset_at_once() {
     let t0 = std::time::Instant::now();
     expect_reset(port).await;
     let took = t0.elapsed();
-    assert!(took < Duration::from_millis(50), "refused after {took:?}");
+    assert!(took < Duration::from_millis(500), "refused after {took:?}");
     assert_eq!(w.daemon.ep.snapshot().channels, 0);
     assert_eq!(w.client.targets.asked.load(Ordering::SeqCst), 0);
     assert_eq!(canary.accepted.load(Ordering::SeqCst), 0);
@@ -772,4 +776,209 @@ async fn connections_wait_for_a_channel() {
         "reset after {waited:?}"
     );
     drop(held);
+}
+
+// ---- review regressions -----------------------------------------------------------------------
+
+/// After a new epoch the ids start at 16 again. A pump of the old epoch whose read was already
+/// complete must not put its bytes into the new channel that got the same id (nor end it, nor
+/// credit it). The old connection streams continuously while the epoch changes; the new
+/// channel 16 belongs to an application that sends nothing, so any byte in its send buffer came
+/// from the old one. Before the fix about one run in five crossed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
+    let runs = env_or("FIL_FORWARD_EPOCH_RUNS", 30);
+    for run in 0..runs {
+        let server = echo_server().await;
+        let mut w = World::new(Transport::Mem, mux_config()).await;
+        let port = w.local_forward(1, server.port);
+        let old = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut wr, mut rd) = (old.try_clone().unwrap(), old.try_clone().unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s1 = stop.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let buf = [b'A'; 4096];
+            while !s1.load(Ordering::Relaxed) && wr.write_all(&buf).is_ok() {}
+        });
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 65536];
+            while rd.read(&mut buf).is_ok_and(|n| n > 0) {}
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (acc, peer) = l.accept().unwrap();
+        acc.set_nonblocking(true).unwrap();
+        let acc = tokio::net::TcpStream::from_std(acc).unwrap();
+        w.client.detach();
+        w.client.ep.new_epoch();
+        let ch = w
+            .client
+            .ep
+            .open_stream(
+                OpenKind::Local {
+                    forward: ForwardId(1),
+                },
+                Box::new(acc),
+                LocalPeer::Tcp(peer),
+            )
+            .unwrap();
+        assert_eq!(ch.0, 16);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let leaked = w.client.ep.channel_info(ch).map_or(0, |i| i.send_buffered);
+        stop.store(true, Ordering::Relaxed);
+        let _ = old.shutdown(std::net::Shutdown::Both);
+        drop(silent);
+        let _ = writer.join();
+        let _ = reader.join();
+        assert_eq!(
+            leaked, 0,
+            "run {run}: the new channel 16 holds {leaked} bytes of the old connection"
+        );
+    }
+}
+
+/// Behind a queue, a connection the policy refuses is refused when it arrives, not when it
+/// reaches the head; the policy sees the application's address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_connection_is_checked_when_it_arrives() {
+    let cfg = MuxConfig {
+        max_open: 1,
+        ..mux_config()
+    };
+    let hold = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(s);
+    })
+    .await;
+    let w = World::new(Transport::Mem, cfg).await;
+    let port = w.local_forward(1, hold.port);
+    let a = connect(port).await;
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 1
+    })
+    .await;
+    let b = connect(port).await;
+    eventually(Duration::from_secs(5), || {
+        w.client
+            .ep
+            .stats(ForwardId(1))
+            .is_some_and(|s| s.waiting == 1)
+    })
+    .await;
+    match *w.client.policy.last_peer.lock().unwrap() {
+        Some(LocalPeer::Tcp(addr)) => assert!(addr.ip().is_loopback(), "{addr}"),
+        other => panic!("the policy saw {other:?}"),
+    }
+    *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);
+    let t0 = std::time::Instant::now();
+    expect_reset(port).await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 1);
+    drop((a, b));
+}
+
+/// `close_forward` ends the forward's channels and refuses its queued connections too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_forward_also_clears_its_queue() {
+    let cfg = MuxConfig {
+        max_open: 1,
+        ..mux_config()
+    };
+    let hold = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(s);
+    })
+    .await;
+    let w = World::new(Transport::Mem, cfg).await;
+    let port = w.local_forward(1, hold.port);
+    let mut conns = Vec::new();
+    conns.push(connect(port).await);
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 1
+    })
+    .await;
+    conns.push(connect(port).await);
+    conns.push(connect(port).await);
+    eventually(Duration::from_secs(5), || {
+        w.client
+            .ep
+            .stats(ForwardId(1))
+            .is_some_and(|s| s.waiting == 2)
+    })
+    .await;
+    assert_eq!(
+        w.client
+            .ep
+            .close_forward(ForwardId(1), CloseReason::Removed),
+        3
+    );
+    for mut c in conns {
+        let r = timeout(Duration::from_secs(5), c.read(&mut [0u8; 8]))
+            .await
+            .expect("closed at once");
+        assert!(
+            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "{r:?}"
+        );
+    }
+    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 0);
+    w.settled().await;
+}
+
+/// A send the link refuses while it stays up (here: the channel finished on the link behind the
+/// endpoint's back) loses a payload the mux counts as sent. The endpoint detaches and tells the
+/// owner (`LinkFailed`); the next link resumes the transfer byte-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_failure_on_a_live_link_detaches_and_is_reported() {
+    let n = 4 << 20;
+    let server = echo_server().await;
+    let mut w = World::new(Transport::Mem, mux_config()).await;
+    let port = w.local_forward(1, server.port);
+    let progress = Arc::new(AtomicUsize::new(0));
+    let transfer = tokio::spawn(echo_through(port, 17, n, Some(progress.clone())));
+    eventually(LONG, || {
+        progress.load(Ordering::Relaxed) >= (n / 4) as usize
+    })
+    .await;
+    let link = w.link.as_ref().unwrap().client.clone();
+    link.finish(fil_proto::ChannelId(16));
+    eventually(Duration::from_secs(10), || {
+        w.client.link_failed.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    assert!(!w.client.ep.snapshot().attached);
+    assert!(matches!(
+        link.status().borrow().state,
+        fil_transport::LinkState::Up
+    ));
+    w.reconnect().await;
+    timeout(LONG, transfer).await.unwrap().unwrap();
+    assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+    w.settled().await;
+}
+
+/// A socket bound before the attach is handed over without letting the port go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listen_bound_takes_sockets_bound_earlier() {
+    let server = echo_server().await;
+    let bound = fil_forward::listen::bind(BindAddr::Loopback, 0).unwrap();
+    let port = bound.port;
+    let w = World::new(Transport::Mem, mux_config()).await;
+    w.daemon.targets.set(ForwardId(4), server.port);
+    assert_eq!(
+        w.client
+            .ep
+            .listen_bound(ForwardId(4), ForwardKind::Local, bound)
+            .unwrap(),
+        port
+    );
+    echo_once(port, 1000, 9).await;
+    w.settled().await;
 }

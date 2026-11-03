@@ -24,6 +24,8 @@ rand = "0.10"
 # SHA-256 for the byte-exact checks (already in the tree through fil-transport; its digest is
 # optimized even in a debug build).
 ring = "0.17"
+# The tests raise their soft RLIMIT_NOFILE (thousands of loopback sockets in one process).
+rustix = { version = "1", features = ["net", "process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
 
 [lints]

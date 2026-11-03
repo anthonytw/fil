@@ -990,38 +990,55 @@ f_dropin_vim_nat() {
   cx_fk dvn
 }
 
-# Typing into vim while UDP gets lossy (30 %), dies for 6 s, comes back lossy (60 %), then clean:
+# Typing into vim while UDP gets lossy (30 %), dies for 9 s, comes back lossy (60 %), then clean:
 # every line arrives, in order, whichever transport carried it.
+#
+# The blackout must be long enough that the pipe always starts. The path manager declares the QUIC
+# link dead about 4.6 s after the cut (`dead_after` is 5 s, less the sampling bracket), redials
+# direct at once, and gives that redial `fallback_after` (3 s) before it starts an ssh login: the
+# pipe starts about 7.6 s after the cut. With a blackout of 6 to 7 s the network is back by then,
+# and a direct redial that gets through (the 60 % loss that follows lets some) wins the race and
+# keeps the session off the pipe: the scenario then failed on "never moved to the pipe" although
+# nothing was wrong (x86_64 run 41645296491, attempt 1). A blackout of 9 s is past that point with
+# 1.4 s to spare for the ssh login to connect, on every run. The scenario still tests what it
+# did: loss, then a cut long enough to force the pipe, then loss on the way back, with the same
+# assertions (the file is exact, the pipe carried the session, it returned to QUIC).
+VIM_LOSS_BLACKOUT_ROWS=9 # one row a second: the cut lasts at least this many seconds
 f_dropin_vim_loss() {
   reset_net
   netem_apply delay 20ms
   fil_attach_direct a dvl
   dp_start_vim a
-  local i t0
-  for i in $(seq 1 26); do
+  local i t0 cut_at=11 heal_at last=29 cut_ms=0 healed_ms=0
+  heal_at=$((cut_at + VIM_LOSS_BLACKOUT_ROWS))
+  for i in $(seq 1 "$last"); do
     case $i in
       5) udp_loss 0.3 ;;
-      11)
+      "$cut_at")
         udp_loss_off 0.3
         udp_block
+        cut_ms=$(now_ms)
         ;;
-      17)
+      "$heal_at")
         udp_unblock
+        healed_ms=$(now_ms)
         udp_loss 0.6
         ;;
-      23) udp_loss_off 0.6 ;;
+      "$((heal_at + 6))") udp_loss_off 0.6 ;;
     esac
     fc_type a "ROW-$i\\r"
     sleep 1
   done
+  note "blackout_ms=$((healed_ms - cut_ms))"
+  [[ $((healed_ms - cut_ms)) -ge 8800 ]] || fail "the blackout lasted $((healed_ms - cut_ms)) ms, less than the 9 s that makes the pipe fallback certain"
   t0=$(now_ms)
-  fc_wait a 'ROW-26' 90
+  fc_wait a "ROW-$last" 90
   note "last_row_on_screen_after_typing_ms=$(($(now_ms) - t0))"
-  dp_finish_vim a 1 26
-  ok "the file is exactly start, ROW-1 to ROW-26 and an empty line, across 30 % loss, a 6 s blackout and 60 % loss"
+  dp_finish_vim a 1 "$last"
+  ok "the file is exactly start, ROW-1 to ROW-$last and an empty line, across 30 % loss, a 9 s blackout and 60 % loss"
   # The blackout must have moved the session to the pipe (the first Switched(Pipe) is the attach),
   # and with the loss gone it must come back to QUIC (the retry backoff is 11 to 16 s).
-  [[ $(fc_count_log a 'Switched(Pipe)') -ge 2 ]] || fail "the 6 s blackout never moved the session to the pipe: $(fc_log a | grep -F 'Switched(')"
+  [[ $(fc_count_log a 'Switched(Pipe)') -ge 2 ]] || fail "the 9 s blackout never moved the session to the pipe: $(fc_log a | grep -F 'Switched(')"
   wait_log a 'Switched(Direct)' 45 2
   note "to_pipe=$(fc_count_log a 'Switched(Pipe)') to_direct=$(fc_count_log a 'Switched(Direct)')"
   if fc_has a 'different session'; then fail "the session was replaced"; fi

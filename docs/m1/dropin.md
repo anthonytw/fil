@@ -94,7 +94,7 @@ Realnet adds, on a 40 ms round trip with real NAT and `tc netem`:
 | Scenario | What a person does | What is asserted |
 |---|---|---|
 | `f_dropin_vim_nat` | types into vim while the NAT mapping moves three times (a new port, another, a new address) | the file is exactly `start`, ROW-1..ROW-12 and the empty line; still on QUIC; no ssh; no gap marker. The router's conntrack proves each move. Measured: the line typed right after each move |
-| `f_dropin_vim_loss` | types into vim while UDP drops 30 %, then dies for 6 s, then drops 60 %, then is clean | the file is exactly `start`, ROW-1..ROW-26 and the empty line; the blackout moved the session to the pipe; it came back to QUIC |
+| `f_dropin_vim_loss` | types into vim while UDP drops 30 %, then dies for 9 s, then drops 60 %, then is clean | the file is exactly `start`, ROW-1..ROW-29 and the empty line; the blackout moved the session to the pipe; it came back to QUIC. The cut is 9 s, not 6: QUIC is declared dead about 4.6 s in and the pipe starts 3 s later, so a shorter cut lets a direct redial win and keep the session off the pipe |
 | `f_dropin_vs_ssh` | the same battery (vim edit, less, 200000-line flood, 50000-line `cat`, Ctrl-C in a flood, resize, unicode, color, title, Ctrl-Z/`fg`, exit status) through `ssh -tt` and then through fil | each step works on both (vim's file compared whole; `fg` proven by the job's own marker); the final screens of less, the flood and the unicode line are identical between ssh and fil (trailing blanks aside), or the scenario fails. Noted: timings, how many `cat` lines reached each |
 
 ## Results
@@ -141,7 +141,7 @@ Run on 2026-11-03 (ET). The client is this Mac's, built from the branch after ma
 | Scenario | Result |
 |---|---|
 | `f_dropin_vim_nat` | pass; three NAT moves while typing 12 lines into vim: the line typed right after each move was on screen in 79 to 82 ms; the file is exactly `start`, ROW-1..ROW-12 and the empty line; no further switch, no ssh, no gap marker |
-| `f_dropin_vim_loss` | pass; 26 lines typed over 30 % UDP loss, a 6 s blackout and 60 % loss: file exact; the blackout moved the session to the pipe and it came back to QUIC (asserted) |
+| `f_dropin_vim_loss` | pass (with a 6 s blackout, ROW-1..ROW-26; since then 9 s and ROW-1..ROW-29, see above); 26 lines typed over 30 % UDP loss, a 6 s blackout and 60 % loss: file exact; the blackout moved the session to the pipe and it came back to QUIC (asserted) |
 | `f_dropin_vs_ssh` | pass; every step works on both (vim's file compared whole, `fg` proven by the job's marker); the final screens of less, the flood and the unicode line are identical |
 
 ### ssh against fil (realnet, the same battery)

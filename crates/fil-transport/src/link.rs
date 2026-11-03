@@ -131,13 +131,18 @@ pub trait Link: Send + Sync + 'static {
         payload: Bytes,
     ) -> impl Future<Output = Result<(), LinkError>> + Send;
 
-    /// The next payload from the peer, on any channel. Fails once the link is down.
+    /// The next payload from the peer, on any channel. Returns the payloads received before the
+    /// link went down (a `TakenOver` sent just before the peer closed must not be lost), then
+    /// fails. After a local `close()` it fails at once.
     fn recv(&self) -> impl Future<Output = Result<(ChannelId, Bytes), LinkError>> + Send;
 
     /// Current health. The receiver sees every state change.
     fn status(&self) -> watch::Receiver<LinkStatus>;
 
-    /// Closes the link. Both sides then see `Down(Closed)`; queued payloads are dropped.
+    /// Closes the link; queued payloads are dropped. This side sees `Down(Closed)`. The peer
+    /// sees `Down(Closed)` where the transport can say so (QUIC); on a byte stream (the pipe)
+    /// it only sees the stream end, and reports `Down(Io)`. What the session means by closing
+    /// travels in control messages, not in the transport.
     fn close(&self);
 }
 

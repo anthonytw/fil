@@ -292,6 +292,10 @@ impl Targets {
     pub fn set(&self, id: ForwardId, port: u16) {
         self.map.lock().unwrap().insert(id, loopback(port));
     }
+
+    pub fn remove(&self, id: ForwardId) {
+        self.map.lock().unwrap().remove(&id);
+    }
 }
 
 pub fn loopback(port: u16) -> Target {

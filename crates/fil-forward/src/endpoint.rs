@@ -342,14 +342,84 @@ struct Slot {
     counted: bool,
 }
 
-/// A local connection accepted while the mux could not open a channel for it.
+/// One forward's listening sockets. The accept tasks poll the sockets through their slots, so
+/// [`Endpoint::unlisten`] can close them before it returns; the forward id and the pause can
+/// change under a live socket ([`Endpoint::rekey_listener`], [`Endpoint::pause_listener`]).
+struct Listener {
+    forward: std::sync::atomic::AtomicU32,
+    kind: ForwardKind,
+    paused: watch::Sender<bool>,
+    sockets: Vec<Mutex<Option<tokio::net::TcpListener>>>,
+}
+
+impl Listener {
+    fn forward(&self) -> ForwardId {
+        ForwardId(self.forward.load(Ordering::SeqCst))
+    }
+
+    fn paused(&self) -> bool {
+        *self.paused.borrow()
+    }
+
+    /// What a connection accepted here opens now (its forward id is read at the time).
+    fn open_kind(&self, target: Option<fil_proto::mux::Target>) -> OpenKind {
+        let forward = self.forward();
+        match (self.kind, target) {
+            (ForwardKind::Remote, _) => OpenKind::Remote { forward },
+            (ForwardKind::Dynamic, Some(target)) => OpenKind::Dynamic { forward, target },
+            _ => OpenKind::Local { forward },
+        }
+    }
+
+    /// Closes the sockets now (dropping them closes the descriptors).
+    fn close(&self) {
+        for s in &self.sockets {
+            drop(lock(s).take());
+        }
+    }
+}
+
+/// `kind` with its forward id replaced by `listener`'s current one.
+fn rekeyed(kind: &OpenKind, listener: &Listener) -> OpenKind {
+    let forward = listener.forward();
+    match kind.clone() {
+        OpenKind::Local { .. } => OpenKind::Local { forward },
+        OpenKind::Remote { .. } => OpenKind::Remote { forward },
+        OpenKind::Dynamic { target, .. } => OpenKind::Dynamic { forward, target },
+        OpenKind::Agent => OpenKind::Agent,
+    }
+}
+
+/// A local connection accepted while the mux could not open a channel for it (or while its
+/// listener is paused).
 struct Pending {
+    /// What it opens; for a listener's connection, the forward id is the listener's at the time
+    /// it opens ([`Pending::kind`]).
     kind: OpenKind,
+    listener: Option<Arc<Listener>>,
     peer: LocalPeer,
     stream: BoxStream,
     socks: Option<socks::Version>,
     early: Vec<u8>,
     since: std::time::Instant,
+}
+
+impl Pending {
+    fn kind(&self) -> OpenKind {
+        match &self.listener {
+            Some(l) => rekeyed(&self.kind, l),
+            None => self.kind.clone(),
+        }
+    }
+
+    fn key(&self) -> StatsKey {
+        stats_key(&self.kind())
+    }
+
+    /// Held back: its listener is paused.
+    fn held(&self) -> bool {
+        self.listener.as_ref().is_some_and(|l| l.paused())
+    }
 }
 
 /// Most accepted connections waiting for a channel, counting those still in their SOCKS
@@ -374,7 +444,7 @@ struct State<L> {
     slots: HashMap<u32, Slot>,
     stats: HashMap<ForwardId, ForwardStats>,
     agent: ForwardStats,
-    listeners: HashMap<ForwardId, Vec<JoinHandle<()>>>,
+    listeners: HashMap<ForwardId, (Arc<Listener>, Vec<JoinHandle<()>>)>,
     tasks: Vec<JoinHandle<()>>,
     /// Accepted connections waiting for the mux to allow an open.
     pending: VecDeque<Pending>,
@@ -402,11 +472,7 @@ impl<L: Link> State<L> {
 
     /// How many connections of `key` wait: queued, or opened by this side and unanswered.
     fn waiting(&self, key: StatsKey) -> u32 {
-        let queued = self
-            .pending
-            .iter()
-            .filter(|p| stats_key(&p.kind) == key)
-            .count();
+        let queued = self.pending.iter().filter(|p| p.key() == key).count();
         let opening = self
             .slots
             .iter()
@@ -853,38 +919,122 @@ impl<L: Link> Endpoint<L> {
         bound: listen::Bound,
     ) -> Result<u16, BindFailure> {
         let inner = self.inner();
-        let tasks: Vec<_> = bound
-            .listeners
-            .into_iter()
-            .map(|l| {
+        let listener = Arc::new(Listener {
+            forward: std::sync::atomic::AtomicU32::new(forward.0),
+            kind,
+            paused: watch::Sender::new(false),
+            sockets: bound
+                .listeners
+                .into_iter()
+                .map(|l| Mutex::new(Some(l)))
+                .collect(),
+        });
+        let tasks: Vec<_> = (0..listener.sockets.len())
+            .map(|i| {
                 inner
                     .runtime
-                    .spawn(inner.clone().accept_loop(l, forward, kind))
+                    .spawn(inner.clone().accept_loop(listener.clone(), i))
             })
             .collect();
         let mut st = lock(&inner.state);
         if st.closed {
+            listener.close();
             tasks.iter().for_each(JoinHandle::abort);
             return Err(BindFailure::Other);
         }
-        if let Some(old) = st.listeners.insert(forward, tasks) {
-            old.iter().for_each(JoinHandle::abort);
+        if let Some((old, old_tasks)) = st.listeners.insert(forward, (listener, tasks)) {
+            old.close();
+            old_tasks.iter().for_each(JoinHandle::abort);
+            let gone = inner.take_pending_of(&mut st, &old);
+            drop(st);
+            inner.refuse_all(gone);
         }
         debug!(kind = ?kind, "forward listening");
         Ok(bound.port)
     }
 
-    /// Closes `forward`'s listeners at once. Its open connections run until they close.
+    /// Closes `forward`'s listening sockets before it returns (so the port can be bound again at
+    /// once), and refuses its connections still queued for a channel. Its open connections run
+    /// until they close.
     pub fn unlisten(&self, forward: ForwardId) -> bool {
         let inner = self.inner();
         let mut st = lock(&inner.state);
-        match st.listeners.remove(&forward) {
-            Some(tasks) => {
-                tasks.iter().for_each(JoinHandle::abort);
-                true
-            }
-            None => false,
+        let Some((l, tasks)) = st.listeners.remove(&forward) else {
+            return false;
+        };
+        l.close();
+        tasks.iter().for_each(JoinHandle::abort);
+        let gone = inner.take_pending_of(&mut st, &l);
+        drop(st);
+        inner.refuse_all(gone);
+        true
+    }
+
+    /// Moves a live listener from forward `old` to forward `new` without rebinding: the socket
+    /// and its kernel backlog stay, connections accepted from now on (and those queued on it)
+    /// open under `new`, and `old`'s stats become `new`'s. `false` if `old` has no listener or
+    /// `new` has one.
+    ///
+    /// Across a fresh attach, where the old epoch's ids may name other entries in the new one:
+    /// [`Endpoint::pause_listener`] first, wait for the new table's answer, rekey to the id it
+    /// gave, then [`Endpoint::resume_listener`]. While paused no connection on it opens, so none
+    /// opens under a stale id.
+    pub fn rekey_listener(&self, old: ForwardId, new: ForwardId) -> bool {
+        let inner = self.inner();
+        let mut st = lock(&inner.state);
+        if old == new {
+            return st.listeners.contains_key(&old);
         }
+        if st.listeners.contains_key(&new) {
+            return false;
+        }
+        let Some(entry) = st.listeners.remove(&old) else {
+            return false;
+        };
+        entry.0.forward.store(new.0, Ordering::SeqCst);
+        st.listeners.insert(new, entry);
+        if let Some(s) = st.stats.remove(&old) {
+            let n = st.stats.entry(new).or_default();
+            n.open += s.open;
+            n.total += s.total;
+            n.from_local += s.from_local;
+            n.to_local += s.to_local;
+            n.last_activity = n.last_activity.max(s.last_activity);
+        }
+        for slot in st.slots.values_mut() {
+            if slot.key == StatsKey::Forward(old) {
+                slot.key = StatsKey::Forward(new);
+            }
+        }
+        drop(st);
+        inner.pending_kick.notify_one();
+        true
+    }
+
+    /// Stops accepting on `forward`'s listener: new connections stay in the kernel's backlog,
+    /// and its queued ones do not open, until [`Endpoint::resume_listener`]. They still expire
+    /// after `open_wait`. `false` if it has no listener.
+    pub fn pause_listener(&self, forward: ForwardId) -> bool {
+        self.set_paused(forward, true)
+    }
+
+    /// Accepts on `forward`'s listener again and lets its queued connections open.
+    pub fn resume_listener(&self, forward: ForwardId) -> bool {
+        self.set_paused(forward, false)
+    }
+
+    fn set_paused(&self, forward: ForwardId, paused: bool) -> bool {
+        let inner = self.inner();
+        let st = lock(&inner.state);
+        let Some((l, _)) = st.listeners.get(&forward) else {
+            return false;
+        };
+        l.paused.send_replace(paused);
+        drop(st);
+        if !paused {
+            inner.pending_kick.notify_one();
+        }
+        true
     }
 
     /// Opens a channel of `kind` for a local stream from `peer` accepted elsewhere (the agent
@@ -933,7 +1083,7 @@ impl<L: Link> Endpoint<L> {
         }
         let (gone, kept): (VecDeque<Pending>, VecDeque<Pending>) = std::mem::take(&mut st.pending)
             .into_iter()
-            .partition(|p| pick(stats_key(&p.kind)));
+            .partition(|p| pick(p.key()));
         st.pending = kept;
         inner.drain(&mut st);
         drop(st);
@@ -970,7 +1120,7 @@ impl<L: Link> Endpoint<L> {
         let st = lock(&self.inner().state);
         let mut ids: Vec<ForwardId> = st.stats.keys().copied().collect();
         for p in &st.pending {
-            if let StatsKey::Forward(id) = stats_key(&p.kind) {
+            if let StatsKey::Forward(id) = p.key() {
                 ids.push(id);
             }
         }
@@ -1047,7 +1197,8 @@ impl<L: Link> Inner<L> {
         for id in all {
             st.end_slot(ChannelId(id), CloseReason::Reset);
         }
-        for (_, tasks) in st.listeners.drain() {
+        for (_, (l, tasks)) in st.listeners.drain() {
+            l.close();
             tasks.iter().for_each(JoinHandle::abort);
         }
         for t in st.tasks.drain(..) {
@@ -1061,6 +1212,26 @@ impl<L: Link> Inner<L> {
         for (_, h) in st.handshakes.drain() {
             h.abort();
         }
+    }
+
+    /// Takes the queued connections accepted on `l` out of the queue.
+    fn take_pending_of(&self, st: &mut State<L>, l: &Arc<Listener>) -> Vec<Pending> {
+        let (gone, kept): (VecDeque<Pending>, VecDeque<Pending>) = std::mem::take(&mut st.pending)
+            .into_iter()
+            .partition(|p| p.listener.as_ref().is_some_and(|x| Arc::ptr_eq(x, l)));
+        st.pending = kept;
+        gone.into()
+    }
+
+    fn refuse_all(&self, gone: Vec<Pending>) {
+        if gone.is_empty() {
+            return;
+        }
+        for p in gone {
+            self.runtime
+                .spawn(refuse(p.stream, p.socks, OpenFailure::NotPermitted));
+        }
+        self.unblocked.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Acts on everything the mux has to say. Called, with the lock held, after every operation
@@ -1262,31 +1433,44 @@ impl<L: Link> Inner<L> {
 
     // ---- listeners ---------------------------------------------------------------------------
 
-    async fn accept_loop(
-        self: Arc<Self>,
-        listener: tokio::net::TcpListener,
-        forward: ForwardId,
-        kind: ForwardKind,
-    ) {
+    async fn accept_loop(self: Arc<Self>, l: Arc<Listener>, socket: usize) {
         loop {
             let mut unblocked = self.unblocked.subscribe();
+            let mut paused = l.paused.subscribe();
+            if *paused.borrow_and_update() {
+                // Paused by the owner: connections wait in the kernel's backlog.
+                if paused.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
             let may = {
                 let st = lock(&self.state);
                 !st.closed && st.pending.len() + st.handshakes.len() < MAX_PENDING
             };
             if !may {
-                // Paused: further connections wait in the kernel's backlog.
-                if unblocked.changed().await.is_err() {
-                    return;
+                // The queue is full: further connections wait in the kernel's backlog.
+                tokio::select! {
+                    r = unblocked.changed() => if r.is_err() { return },
+                    r = paused.changed() => if r.is_err() { return },
                 }
                 continue;
             }
-            match listener.accept().await {
-                Ok((stream, addr)) => {
+            let accepted = tokio::select! {
+                a = std::future::poll_fn(|cx| match &*lock(&l.sockets[socket]) {
+                    Some(sock) => sock.poll_accept(cx).map(Some),
+                    // Closed by `unlisten`.
+                    None => Poll::Ready(None),
+                }) => a,
+                _ = paused.changed() => continue,
+            };
+            match accepted {
+                None => return,
+                Some(Ok((stream, addr))) => {
                     let _ = stream.set_nodelay(true);
-                    self.local_accept(forward, kind, stream, LocalPeer::Tcp(addr));
+                    self.local_accept(&l, stream, LocalPeer::Tcp(addr));
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     // Out of descriptors and the like: try again shortly rather than spin.
                     debug!(kind = ?e.kind(), "forward accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1295,43 +1479,36 @@ impl<L: Link> Inner<L> {
         }
     }
 
-    fn local_accept(
-        self: &Arc<Self>,
-        forward: ForwardId,
-        kind: ForwardKind,
-        stream: TcpStream,
-        peer: LocalPeer,
-    ) {
-        let open = match kind {
-            ForwardKind::Local => OpenKind::Local { forward },
-            ForwardKind::Remote => OpenKind::Remote { forward },
-            ForwardKind::Dynamic => {
-                // The handshake holds a place in the queue's bound from now on.
-                let mut st = lock(&self.state);
-                if st.closed {
-                    return;
-                }
-                let id = st.next_handshake;
-                st.next_handshake += 1;
-                let guard = HandshakeGuard {
-                    inner: self.clone(),
-                    id,
-                };
-                let task = self
-                    .runtime
-                    .spawn(self.clone().socks_accept(forward, stream, peer, guard));
-                st.handshakes.insert(id, task.abort_handle());
+    fn local_accept(self: &Arc<Self>, l: &Arc<Listener>, stream: TcpStream, peer: LocalPeer) {
+        if l.kind == ForwardKind::Dynamic {
+            // The handshake holds a place in the queue's bound from now on.
+            let mut st = lock(&self.state);
+            if st.closed {
                 return;
             }
-        };
-        if let Err((_, s)) = self.open_or_wait(open, peer, Box::new(stream), None, Vec::new()) {
+            let id = st.next_handshake;
+            st.next_handshake += 1;
+            let guard = HandshakeGuard {
+                inner: self.clone(),
+                id,
+            };
+            let task =
+                self.runtime
+                    .spawn(self.clone().socks_accept(l.clone(), stream, peer, guard));
+            st.handshakes.insert(id, task.abort_handle());
+            return;
+        }
+        let open = l.open_kind(None);
+        if let Err((_, s)) =
+            self.open_or_wait(open, Some(l), peer, Box::new(stream), None, Vec::new())
+        {
             let _ = s.set_reset();
         }
     }
 
     async fn socks_accept(
         self: Arc<Self>,
-        forward: ForwardId,
+        l: Arc<Listener>,
         mut stream: TcpStream,
         peer: LocalPeer,
         guard: HandshakeGuard<L>,
@@ -1348,11 +1525,8 @@ impl<L: Link> Inner<L> {
                 Err(_) => return,
             };
         let version = req.version;
-        let kind = OpenKind::Dynamic {
-            forward,
-            target: req.target,
-        };
-        let r = self.open_or_wait(kind, peer, Box::new(stream), Some(version), early);
+        let kind = l.open_kind(Some(req.target));
+        let r = self.open_or_wait(kind, Some(&l), peer, Box::new(stream), Some(version), early);
         // Opened or queued: its place in the bound passes to the channel or the queue.
         drop(guard);
         if let Err((why, s)) = r {
@@ -1367,12 +1541,14 @@ impl<L: Link> Inner<L> {
     fn open_or_wait(
         self: &Arc<Self>,
         kind: OpenKind,
+        listener: Option<&Arc<Listener>>,
         peer: LocalPeer,
         stream: BoxStream,
         socks: Option<socks::Version>,
         early: Vec<u8>,
     ) -> Result<(), (OpenFailure, BoxStream)> {
-        let queued = !lock(&self.state).pending.is_empty();
+        // Behind others, or held by a paused listener: queued.
+        let queued = listener.is_some_and(|l| l.paused()) || !lock(&self.state).pending.is_empty();
         let stream = if queued {
             // Behind others: the policy still answers now, not when this one reaches the head.
             if let Err(why) = self.policy.check_outgoing(&kind, &peer) {
@@ -1397,6 +1573,7 @@ impl<L: Link> Inner<L> {
         }
         st.pending.push_back(Pending {
             kind,
+            listener: listener.cloned(),
             peer,
             stream,
             socks,
@@ -1419,15 +1596,13 @@ impl<L: Link> Inner<L> {
                     return;
                 }
                 let t = now();
-                let mut expired = Vec::new();
-                while st
-                    .pending
-                    .front()
-                    .is_some_and(|p| t >= p.since + self.open_wait)
-                {
-                    expired.extend(st.pending.pop_front());
-                }
-                let next = st.pending.front().map(|p| p.since + self.open_wait);
+                let open_wait = self.open_wait;
+                let (expired, kept): (VecDeque<Pending>, VecDeque<Pending>) =
+                    std::mem::take(&mut st.pending)
+                        .into_iter()
+                        .partition(|p| t >= p.since + open_wait);
+                st.pending = kept;
+                let next = st.pending.iter().map(|p| p.since + open_wait).min();
                 (expired, next)
             };
             let mut freed = !expired.is_empty();
@@ -1435,23 +1610,27 @@ impl<L: Link> Inner<L> {
                 refuse(p.stream, p.socks, OpenFailure::TimedOut).await;
             }
             loop {
+                // The oldest one whose listener is not paused.
                 let item = {
                     let mut st = lock(&self.state);
                     if !st.mux.can_open() {
                         break;
                     }
-                    st.pending.pop_front()
+                    st.pending
+                        .iter()
+                        .position(|p| !p.held())
+                        .and_then(|i| st.pending.remove(i).map(|p| (i, p)))
                 };
-                let Some(p) = item else {
+                let Some((at, p)) = item else {
                     break;
                 };
                 freed = true;
-                match self.open_local(p.kind.clone(), p.peer, p.stream, p.socks, &p.early) {
+                match self.open_local(p.kind(), p.peer, p.stream, p.socks, &p.early) {
                     Ok(_) => {}
                     Err((OpenFailure::Busy | OpenFailure::TooMany, stream)) => {
-                        lock(&self.state)
-                            .pending
-                            .push_front(Pending { stream, ..p });
+                        let mut st = lock(&self.state);
+                        let at = at.min(st.pending.len());
+                        st.pending.insert(at, Pending { stream, ..p });
                         break;
                     }
                     Err((why, s)) => refuse(s, p.socks, why).await,

@@ -982,3 +982,95 @@ async fn listen_bound_takes_sockets_bound_earlier() {
     echo_once(port, 1000, 9).await;
     w.settled().await;
 }
+
+/// `unlisten` closes the sockets before it returns: the same port binds again at once (a client
+/// that rebinds its own `-L` on a take-back).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlisten_frees_the_port_at_once() {
+    let w = World::new(Transport::Mem, mux_config()).await;
+    let ep = &w.client.ep;
+    for i in 0..50 {
+        let port = ep
+            .listen(ForwardId(1), ForwardKind::Local, BindAddr::Loopback, 0)
+            .unwrap();
+        assert!(ep.unlisten(ForwardId(1)));
+        assert_eq!(
+            ep.listen(ForwardId(1), ForwardKind::Local, BindAddr::Loopback, port),
+            Ok(port),
+            "round {i}: the port was still held"
+        );
+        assert!(ep.unlisten(ForwardId(1)));
+    }
+    assert!(!ep.unlisten(ForwardId(1)));
+}
+
+/// Across a fresh attach a client keeps its own listener: pause it, rekey it to the id the new
+/// table gave, resume. A connection queued on it before, and one waiting in the kernel's backlog
+/// meanwhile, both open under the new id; the old id names nothing on the daemon any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_listener_rekeys_without_rebinding() {
+    let cfg = MuxConfig {
+        max_open: 1,
+        ..mux_config()
+    };
+    let hold = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(s);
+    })
+    .await;
+    let echo = echo_server().await;
+    let w = World::new(Transport::Mem, cfg).await;
+    // Forward 7 holds the one channel; forward 1 is the listener that moves.
+    let hold_port = w.local_forward(7, hold.port);
+    let port = w.local_forward(1, echo.port);
+    echo_once(port, 100, 1).await;
+    let held = connect(hold_port).await;
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 1
+    })
+    .await;
+    // Queued on forward 1 (no channel free).
+    let queued = tokio::spawn(echo_once(port, 200, 2));
+    eventually(Duration::from_secs(5), || {
+        w.client
+            .ep
+            .stats(ForwardId(1))
+            .is_some_and(|s| s.waiting == 1)
+    })
+    .await;
+    assert!(w.client.ep.pause_listener(ForwardId(1)));
+    // While paused nothing is accepted: this one waits in the kernel's backlog.
+    let backlog = tokio::spawn(echo_once(port, 300, 3));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 1);
+    // The new table: the daemon knows the forward as 2 now, and 1 no more.
+    w.daemon.targets.remove(ForwardId(1));
+    w.daemon.targets.set(ForwardId(2), echo.port);
+    let before = w.client.ep.stats(ForwardId(1)).unwrap();
+    assert!(w.client.ep.rekey_listener(ForwardId(1), ForwardId(2)));
+    assert!(w.client.ep.stats(ForwardId(1)).is_none());
+    assert!(!w.client.ep.rekey_listener(ForwardId(1), ForwardId(3)));
+    // Free the channel (a reset ends it at once) while still paused: the queued one must not
+    // open (under any id).
+    fil_forward::stream::set_zero_linger(&held).unwrap();
+    drop(held);
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.client.ep.stats(ForwardId(2)).unwrap().waiting, 1);
+    assert!(w.client.ep.resume_listener(ForwardId(2)));
+    timeout(Duration::from_secs(20), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(20), backlog)
+        .await
+        .unwrap()
+        .unwrap();
+    let after = w.client.ep.stats(ForwardId(2)).unwrap();
+    assert_eq!(after.total, before.total + 2);
+    assert_eq!(echo.accepted.load(Ordering::SeqCst), 3);
+    w.settled().await;
+}

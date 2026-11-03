@@ -20,8 +20,8 @@
 //! - Listener tasks accept local connections and open channels. While the mux may not open one
 //!   (the budget, the open cap, a full MUX buffer) an accepted connection waits in a queue, oldest
 //!   first, for at most `open_wait`; connections still in their SOCKS handshake count against
-//!   the same bound, and past it the listeners stop accepting (the kernel's backlog holds the
-//!   rest).
+//!   the same bound (and at most [`MAX_HANDSHAKES`] are in one at once), and past it the
+//!   listeners stop accepting (the kernel's backlog holds the rest).
 //!
 //! **File descriptors.** Accepting and queueing costs descriptors, and a busy endpoint needs more
 //! than the default soft limits (256 on macOS, 1,024 on Linux):
@@ -55,6 +55,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
+use fil_proto::frame::DataSegment;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
     BindAddr, BindFailure, ChannelInfo, ChannelState, CloseReason, ForwardId, ForwardKind, Mux,
@@ -89,15 +90,32 @@ pub trait Connector: Send + Sync + 'static {
 }
 
 /// [`Policy::check_address`] for one open, handed to the [`Connector`].
+///
+/// It also carries the endpoint's share of the process's name resolutions
+/// ([`crate::connect::MAX_RESOLVING_PER_ENDPOINT`]).
 #[derive(Clone)]
 pub struct AddressCheck {
     policy: Arc<dyn Policy>,
     kind: OpenKind,
+    pub(crate) resolvers: Arc<tokio::sync::Semaphore>,
 }
 
 impl AddressCheck {
+    /// A check on its own, with a resolver share of its own (outside an endpoint).
     pub fn new(policy: Arc<dyn Policy>, kind: OpenKind) -> Self {
-        Self { policy, kind }
+        Self::with_resolvers(policy, kind, crate::connect::endpoint_resolvers())
+    }
+
+    pub(crate) fn with_resolvers(
+        policy: Arc<dyn Policy>,
+        kind: OpenKind,
+        resolvers: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            policy,
+            kind,
+            resolvers,
+        }
     }
 
     /// Whether this open may connect to `addr`.
@@ -136,8 +154,10 @@ pub trait Policy: Send + Sync + 'static {
     /// read names such as `0x7f.0x1` as addresses. Addresses arrive canonical (an IPv4-mapped
     /// IPv6 address as the IPv4 address it is), and the unspecified, multicast and broadcast
     /// destinations, which reach the local host or no single host, never get here: they are
-    /// refused first. An address refused here is skipped; if every one is, the open fails with the
-    /// first refusal.
+    /// refused first. Loopback is not the only way to the local host: services bound to the
+    /// wildcard are also reachable through the host's own interface addresses, so a rule meant
+    /// to keep the local host's services out refuses those addresses too. An address refused here
+    /// is skipped; if every one is, the open fails with the first refusal.
     fn check_address(&self, kind: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure>;
 }
 
@@ -201,6 +221,19 @@ impl EventReceiver {
         }
     }
 
+    /// [`EventReceiver::recv`], with the epoch the event belongs to. An owner that acts on events
+    /// under a lock of its own, which [`Endpoint::new_epoch`] is also called under, compares it
+    /// there with [`Endpoint::epoch`]: an event handed out just before a new epoch can reach that
+    /// lock after it.
+    pub async fn recv_with_epoch(&mut self) -> Option<(u64, EndpointEvent)> {
+        loop {
+            let (epoch, ev) = self.rx.recv().await?;
+            if epoch == self.epoch.load(Ordering::SeqCst) {
+                return Some((epoch, ev));
+            }
+        }
+    }
+
     /// The next event of the current epoch, if one is waiting.
     pub fn try_recv(&mut self) -> Result<EndpointEvent, mpsc::error::TryRecvError> {
         loop {
@@ -221,8 +254,12 @@ impl fmt::Debug for EventReceiver {
     }
 }
 
-/// What the endpoint tells its owner. Drain the receiver: it is unbounded, and table messages
-/// are never dropped.
+/// What the endpoint tells its owner, through its [`EventReceiver`]. The channel is bounded
+/// ([`EVENT_QUEUE`]) and no event is dropped: while the owner is behind, the endpoint holds the
+/// MUX stream back. That stalls **every** channel's lifecycle too (`Open`, `OpenOk` and `Close`
+/// are MUX records), and past the last quarter of the peer's MUX buffer the peer's mux fails, so
+/// the owner drains the receiver promptly and never behind something that waits on the user (a
+/// consent prompt).
 #[derive(Clone, PartialEq, Eq)]
 pub enum EndpointEvent {
     /// A forward-table message from the peer (`AddForward`, `Forward`, `Listening`, ...).
@@ -468,6 +505,11 @@ impl Pending {
 /// connection whose handshake completes is refused (`Busy`).
 pub const MAX_PENDING: usize = 1024;
 
+/// Most SOCKS handshakes in progress at once, within [`MAX_PENDING`]. Past it the `-D` listeners
+/// stop accepting (the kernel's backlog holds the rest) while every other listener goes on: a
+/// flood of clients that never send their request holds this many places, not the whole queue.
+pub const MAX_HANDSHAKES: usize = 64;
+
 enum Out {
     Data(ChannelId, Bytes),
     Finish(ChannelId),
@@ -504,6 +546,10 @@ struct State<L> {
     /// them, so the peer's MUX buffer fills and it stops sending table messages (`TableError::Full`).
     held_mux: VecDeque<Bytes>,
     held_mux_bytes: usize,
+    /// One past the highest MUX stream offset fed to the mux in this epoch: an honest peer never
+    /// sends past it by more than its MUX buffer (it keeps every unacknowledged byte, and this
+    /// side acknowledges only what it was fed).
+    mux_fed_end: u64,
     failed_told: bool,
     last_tick: std::time::Instant,
     active_until: Option<std::time::Instant>,
@@ -713,7 +759,10 @@ struct Inner<L> {
     events_kick: Notify,
     /// The current epoch, for the owner's [`EventReceiver`].
     epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Most MUX bytes held for a slow owner: twice what an honest peer may leave unacknowledged.
+    /// This endpoint's share of the process's name resolutions.
+    resolvers: Arc<tokio::sync::Semaphore>,
+    /// How far past what was fed a held MUX segment may reach: what an honest peer may leave
+    /// unacknowledged (its MUX buffer, the same constant as ours). Also the most segments held.
     max_held_mux: usize,
     open_wait: Duration,
     connector: Arc<dyn Connector>,
@@ -789,7 +838,7 @@ impl<L: Link> Endpoint<L> {
     ) -> (Self, EventReceiver) {
         let (events, events_rx) = mpsc::channel(EVENT_QUEUE);
         let epoch_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let max_held_mux = 2 * cfg.mux_buffer;
+        let max_held_mux = cfg.mux_buffer;
         let connect_timeout = cfg.connect_timeout;
         let open_wait = cfg.open_wait;
         let inner = Arc::new(Inner {
@@ -814,6 +863,7 @@ impl<L: Link> Endpoint<L> {
                 undelivered: VecDeque::new(),
                 held_mux: VecDeque::new(),
                 held_mux_bytes: 0,
+                mux_fed_end: 0,
                 failed_told: false,
                 last_tick: now(),
                 active_until: None,
@@ -826,6 +876,7 @@ impl<L: Link> Endpoint<L> {
             pending_kick: Notify::new(),
             events_kick: Notify::new(),
             epoch: epoch_seen.clone(),
+            resolvers: crate::connect::endpoint_resolvers(),
             max_held_mux,
             open_wait,
             connector,
@@ -925,6 +976,12 @@ impl<L: Link> Endpoint<L> {
         inner.kick();
     }
 
+    /// The current mux epoch (incremented by [`Endpoint::new_epoch`]), as the events of
+    /// [`EventReceiver::recv_with_epoch`] are tagged.
+    pub fn epoch(&self) -> u64 {
+        lock(&self.inner().state).epoch
+    }
+
     /// A fresh attach: a new mux epoch. Every channel is dropped (its local socket reset, no
     /// records: the old link is never read again), the MUX stream starts over, and the endpoint
     /// is detached; attach the new link with `resumed: false`. Listeners and stats stay.
@@ -932,6 +989,7 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         st.epoch += 1;
+        st.mux_fed_end = 0;
         // Events of the old epoch are not the new subscriber's (a stale `AddForward` or `Consent`
         // must not reach it): those still waiting here go now, and the receiver drops those
         // already in its channel.
@@ -964,10 +1022,24 @@ impl<L: Link> Endpoint<L> {
     pub fn on_payload(&self, ch: ChannelId, payload: Bytes) -> Result<(), MuxError> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
-        if ch == ChannelId::MUX && !(st.undelivered.is_empty() && st.held_mux.is_empty()) {
+        let mux_end = if ch == ChannelId::MUX {
+            match DataSegment::parse(&payload) {
+                Ok(seg) => Some(seg.seq + seg.data.len() as u64),
+                // Malformed: the mux says so.
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(end) = mux_end
+            && !(st.undelivered.is_empty() && st.held_mux.is_empty())
+        {
             // The owner is behind on events: hold the MUX stream (unacknowledged) until it
-            // catches up. An honest peer cannot get far ahead (its MUX buffer is bounded).
-            if st.held_mux_bytes + payload.len() > inner.max_held_mux {
+            // catches up. An honest peer sends nothing past what was fed plus its MUX buffer
+            // (exact: stream offsets, not payload bytes, so small segments cost no margin).
+            if end > st.mux_fed_end + inner.max_held_mux as u64
+                || st.held_mux.len() >= inner.max_held_mux
+            {
                 drop(st);
                 return Err(MuxError::Protocol(
                     "MUX data beyond what the peer may leave unacknowledged",
@@ -976,6 +1048,9 @@ impl<L: Link> Endpoint<L> {
             st.held_mux_bytes += payload.len();
             st.held_mux.push_back(payload);
             return Ok(());
+        }
+        if let Some(end) = mux_end {
+            st.mux_fed_end = st.mux_fed_end.max(end);
         }
         let r = st.mux.on_payload(ch, payload);
         st.active(now());
@@ -1140,13 +1215,15 @@ impl<L: Link> Endpoint<L> {
         };
         entry.0.forward.store(new.0, Ordering::SeqCst);
         st.listeners.insert(new, entry);
-        if let Some(s) = st.stats.remove(&old) {
-            let n = st.stats.entry(new).or_default();
-            n.open += s.open;
-            n.total += s.total;
-            n.from_local += s.from_local;
-            n.to_local += s.to_local;
-            n.last_activity = n.last_activity.max(s.last_activity);
+        // `new`'s row becomes `old`'s: leftovers of an earlier forward with that id (one whose
+        // stats were never forgotten) are not this listener's traffic.
+        match st.stats.remove(&old) {
+            Some(s) => {
+                st.stats.insert(new, s);
+            }
+            None => {
+                st.stats.remove(&new);
+            }
         }
         for slot in st.slots.values_mut() {
             if slot.key == StatsKey::Forward(old) {
@@ -1159,8 +1236,10 @@ impl<L: Link> Endpoint<L> {
     }
 
     /// Stops accepting on `forward`'s listener: new connections stay in the kernel's backlog,
-    /// and its queued ones do not open, until [`Endpoint::resume_listener`]. They still expire
-    /// after `open_wait`. `false` if it has no listener.
+    /// and its queued ones do not open, until [`Endpoint::resume_listener`]. Queued ones still
+    /// expire after `open_wait`, but the backlog does not: applications waiting there hang until
+    /// they give up. So a pause is short (across a fresh attach): resume a forward the new table
+    /// confirms, and `unlisten` one it doesn't. `false` if it has no listener.
     pub fn pause_listener(&self, forward: ForwardId) -> bool {
         self.set_paused(forward, true)
     }
@@ -1473,7 +1552,11 @@ impl<L: Link> Inner<L> {
         let result = match self.policy.check_incoming(&kind) {
             Err(why) => Err(why),
             Ok(()) => {
-                let check = AddressCheck::new(self.policy.clone(), kind.clone());
+                let check = AddressCheck::with_resolvers(
+                    self.policy.clone(),
+                    kind.clone(),
+                    self.resolvers.clone(),
+                );
                 match tokio::time::timeout(
                     self.connect_timeout,
                     self.connector.connect(&kind, check),
@@ -1526,6 +1609,13 @@ impl<L: Link> Inner<L> {
         early: &[u8],
     ) -> Result<ChannelId, (OpenFailure, BoxStream)> {
         // The policy answers for this epoch (consent, attachment); the open must go out in it.
+        //
+        // Timing: `kind`, with its forward id, was fixed by the caller before this read. A
+        // connection accepted just before a pause and a new epoch can therefore pass this check
+        // and open under its pre-rekey id. That is bounded: forward ids are unique for the
+        // session's life (never reused), so a stale id names the same entry or a removed one, and
+        // the acceptor answers `NoSuchForward`. If ids were ever reused, capture the epoch where
+        // the kind is computed instead.
         let epoch = lock(&self.state).epoch;
         if let Err(why) = self.policy.check_outgoing(&kind, &peer) {
             debug!(why = ?why, "local connection refused");
@@ -1608,10 +1698,13 @@ impl<L: Link> Inner<L> {
             }
             let may = {
                 let st = lock(&self.state);
-                !st.closed && st.pending.len() + st.handshakes.len() < MAX_PENDING
+                !st.closed
+                    && st.pending.len() + st.handshakes.len() < MAX_PENDING
+                    && (l.kind != ForwardKind::Dynamic || st.handshakes.len() < MAX_HANDSHAKES)
             };
             if !may {
-                // The queue is full: further connections wait in the kernel's backlog.
+                // The queue (or, for `-D`, the handshakes) is full: further connections wait in
+                // the kernel's backlog.
                 tokio::select! {
                     r = unblocked.changed() => if r.is_err() { return },
                     r = paused.changed() => if r.is_err() { return },
@@ -1836,6 +1929,10 @@ impl<L: Link> Inner<L> {
                     break;
                 };
                 st.held_mux_bytes -= p.len();
+                if let Ok(seg) = DataSegment::parse(&p) {
+                    let end = seg.seq + seg.data.len() as u64;
+                    st.mux_fed_end = st.mux_fed_end.max(end);
+                }
                 // A protocol error here fails the mux; `drain` reports it (`Failed`).
                 let _ = st.mux.on_payload(ChannelId::MUX, p);
                 st.active(now());

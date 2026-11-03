@@ -57,6 +57,9 @@ pub struct Client<L: Link> {
     pub input_acked: u64,
     pub input_resume: Option<u64>,
     pub errors: Vec<ErrorCode>,
+    /// Payloads on the MUX and dynamic channels, and their `Ack`s and `Resume`s, which this client
+    /// has no forwards for and ignores, as a real client with none does: counted only.
+    pub forward_traffic: usize,
     input_sent: u64,
     /// Acknowledge what arrives (terminal output and snapshots), as the real client does.
     pub auto_ack: bool,
@@ -103,6 +106,7 @@ impl<L: Link> Client<L> {
             input_acked: 0,
             input_resume: None,
             errors: Vec::new(),
+            forward_traffic: 0,
             input_sent: 0,
             auto_ack: true,
             emu,
@@ -293,6 +297,7 @@ impl<L: Link> Client<L> {
                     .await;
                 }
             }
+            ch if ch == ChannelId::MUX || ch.is_dynamic() => self.forward_traffic += 1,
             other => panic!("data on channel {}", other.0),
         }
     }
@@ -372,6 +377,7 @@ impl<L: Link> Client<L> {
                 self.input_resume = Some(received);
                 self.input_sent = self.input_sent.max(received);
             }
+            ControlMsg::Ack { .. } | ControlMsg::Resume { .. } => self.forward_traffic += 1,
             ControlMsg::Error(code) => self.errors.push(code),
             ControlMsg::SessionExited { code, signal } => self.exited = Some((code, signal)),
             other => panic!("unexpected control message {other:?}"),

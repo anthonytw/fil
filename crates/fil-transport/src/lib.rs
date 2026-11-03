@@ -7,9 +7,9 @@
 //! - [`pipe`]: the pipe link: [`pipe::PipeLink`] over any byte stream, and the command that
 //!   runs `ssh -T HOST fil server --stdio` (DESIGN.md §8.2).
 //! - [`quic`]: the QUIC link ([`quic::QuicLink`]) and the daemon's listener ([`quic::QuicListener`]).
-//! - [`fdlimit`]: the soft limit on open files, raised for the client and kept for its children.
 //! - [`path`]: the client's transport choice (pipe, direct, upgrade, fallback) as a pure state
 //!   machine.
+//! - [`fdlimit`]: the soft limit on open files, raised for the process and kept for its children.
 
 pub mod auth;
 pub mod fdlimit;

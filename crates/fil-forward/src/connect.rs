@@ -30,9 +30,20 @@ pub const MAX_ADDRESSES: usize = 16;
 
 static RESOLVERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RESOLVING);
 
+/// Name resolutions one endpoint (one session and side) may run at once, within
+/// [`MAX_RESOLVING`]: a session whose peer asks for names that never resolve holds at most this
+/// many of the process's, and the other sessions keep the rest.
+pub const MAX_RESOLVING_PER_ENDPOINT: usize = 8;
+
+/// A fresh per-endpoint share of the resolutions.
+pub(crate) fn endpoint_resolvers() -> std::sync::Arc<tokio::sync::Semaphore> {
+    std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_RESOLVING_PER_ENDPOINT))
+}
+
 /// Connects to `target`. A host name is resolved by the system resolver on tokio's blocking pool
-/// (so no worker waits on it), at most [`MAX_RESOLVING`] at a time; the wait for a turn counts
-/// against the caller's timeout.
+/// (so no worker waits on it), at most [`MAX_RESOLVING_PER_ENDPOINT`] at a time for the endpoint
+/// `check` belongs to and [`MAX_RESOLVING`] in the process; the wait for a turn counts against
+/// the caller's timeout.
 ///
 /// **Every resolved address is then made canonical and checked** before anything is tried:
 ///
@@ -57,7 +68,7 @@ pub async fn connect_tcp(target: &Target, check: &AddressCheck) -> Result<TcpStr
     let port = target.port.get();
     let addrs: Vec<SocketAddr> = match &target.host {
         TargetHost::Ip(ip) => vec![SocketAddr::new(*ip, port)],
-        TargetHost::Name(name) => resolve(name.as_str(), port).await?,
+        TargetHost::Name(name) => resolve(name.as_str(), port, &check.resolvers).await?,
     };
     let mut allowed = allowed(addrs, |a| check.check(a))?;
     allowed.truncate(MAX_ADDRESSES);
@@ -66,12 +77,22 @@ pub async fn connect_tcp(target: &Target, check: &AddressCheck) -> Result<TcpStr
     Ok(stream)
 }
 
-async fn resolve(name: &str, port: u16) -> Result<Vec<SocketAddr>, OpenFailure> {
+async fn resolve(
+    name: &str,
+    port: u16,
+    share: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<Vec<SocketAddr>, OpenFailure> {
+    // The endpoint's share first, so one endpoint's waiters never queue for the process's.
+    let mine = share
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| OpenFailure::Other)?;
     let permit = RESOLVERS.acquire().await.map_err(|_| OpenFailure::Other)?;
     let name = name.to_owned();
     tokio::task::spawn_blocking(move || {
         // Held until getaddrinfo really returns, even if the caller gave up on it.
-        let _permit = permit;
+        let _permits = (mine, permit);
         std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port))
             .map(Iterator::collect::<Vec<_>>)
     })
@@ -451,6 +472,26 @@ mod tests {
         assert_eq!(destination(a("[::ffff:127.0.0.1]:5")), Ok(a("127.0.0.1:5")));
         assert_eq!(destination(a("0.0.0.0:5")), Err(OpenFailure::NotPermitted));
         assert_eq!(destination(a("[::]:5")), Err(OpenFailure::NotPermitted));
+    }
+
+    /// One endpoint whose resolutions all hang (here: its share taken) does not hold up
+    /// another's: each has its own share under the process-wide bound.
+    #[tokio::test]
+    async fn an_endpoints_resolver_share_is_its_own() {
+        let stuck = check(false);
+        let other = check(false);
+        let _all: Vec<_> = (0..MAX_RESOLVING_PER_ENDPOINT)
+            .map(|_| stuck.resolvers.clone().try_acquire_owned().unwrap())
+            .collect();
+        let c = canary().await;
+        let t = name_target("localhost", c.port);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), connect_tcp(&t, &stuck))
+                .await
+                .is_err(),
+            "a resolution past the endpoint's share went ahead"
+        );
+        connect_tcp(&t, &other).await.unwrap();
     }
 
     #[test]

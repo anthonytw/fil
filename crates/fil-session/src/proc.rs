@@ -146,6 +146,7 @@ fn output_with_timeout(
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
+    fil_transport::fdlimit::keep_for_std_child(&mut cmd);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,10 +461,11 @@ pub fn scan_processes() -> Vec<ProcRow> {
             })
             .collect();
     }
-    Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
-        .env("LC_ALL", "C")
-        .output()
+    let mut ps = Command::new("ps");
+    ps.args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+        .env("LC_ALL", "C");
+    fil_transport::fdlimit::keep_for_std_child(&mut ps);
+    ps.output()
         .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }
@@ -505,6 +507,11 @@ impl Tracker {
         let live: HashMap<u32, &str> = rows.iter().map(|r| (r.pid, r.start.as_str())).collect();
         self.known
             .retain(|pid, start| live.get(pid).is_some_and(|s| s == start));
+    }
+
+    /// The recorded processes.
+    pub fn pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.known.keys().copied()
     }
 
     /// Every process to signal: the current descendants of `root`, plus the recorded ones that
@@ -576,7 +583,38 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
     if let Scope::Systemd { unit } = scope {
         systemctl_kill("systemctl", unit, "SIGKILL", KILL_CALL_TIMEOUT);
     }
+    // `kill(2)` returning says the signal was queued, not that the process has died: on a loaded
+    // or swapping machine a victim can take a while to be scheduled and torn down. Callers read
+    // this function's return as "the leftovers are gone" (`SessionHandle::kill`), so wait until
+    // the table shows they are, or give up after `KILL_CONFIRM` (a process in uninterruptible
+    // sleep can outlast any wait, and a stuck victim must not hang the teardown).
+    let deadline = Instant::now() + KILL_CONFIRM;
+    loop {
+        let table = scan_processes();
+        let left: Vec<u32> = victims
+            .iter()
+            .copied()
+            .filter(|v| {
+                table
+                    .iter()
+                    .find(|r| r.pid == *v)
+                    .is_some_and(|r| !r.zombie)
+            })
+            .collect();
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(?left, "processes survived SIGKILL");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
+
+/// How long [`kill_session`] waits, after SIGKILL, for the processes it killed to leave the
+/// process table (or become zombies).
+const KILL_CONFIRM: Duration = Duration::from_secs(2);
 
 /// How long `systemctl --user kill` may take. A user manager that does not answer must not hang
 /// the teardown (it runs on a blocking thread the session waits for).

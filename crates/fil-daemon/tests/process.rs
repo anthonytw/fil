@@ -56,8 +56,10 @@ fn count_processes(dir: &Path) -> usize {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| {
+            // The directory with the space after it: `/tmp/fil-t-P-1` must not match another
+            // test's `/tmp/fil-t-P-12`.
             l.contains("fil-daemon-dev")
-                && l.contains(&dir.display().to_string())
+                && l.contains(&format!("{} ", dir.display()))
                 && l.contains(" daemon")
         })
         .count()

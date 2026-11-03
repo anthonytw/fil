@@ -340,3 +340,469 @@ impl Link for DelayLink {
         self.inner.close()
     }
 }
+
+// ---- a client with forwards ---------------------------------------------------------------------
+
+pub use fwd::*;
+
+/// A scripted client with a real client-side forward endpoint (`fil_forward`, `Side::Client`)
+/// over `link::mem`, reading its link in the background so forwarded connections keep flowing
+/// while the test does something else. Unlike `Client` it is deliberately simple about the
+/// terminal (it keeps the output bytes and acknowledges them; snapshots are skipped).
+mod fwd {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+
+    use fil_forward::{
+        AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
+    };
+    use fil_proto::chan::RecvChannel;
+    use fil_proto::frame::DataSegment;
+    use fil_proto::msg::{
+        AttachRefusal, AttachReply, ControlMsg, ErrorCode, StartPoint, TakenOver,
+    };
+    use fil_proto::mux::{
+        ForwardId, MuxConfig, MuxMsg, OpenFailure, OpenKind, Side, Target, TargetHost,
+    };
+
+    /// The client's own targets for `-R` (by forward id: the target in its own copy of the
+    /// spec), and a count of every `Open` the daemon sent it.
+    #[derive(Default)]
+    pub struct ClientSide {
+        pub targets: Mutex<HashMap<ForwardId, SocketAddr>>,
+        /// `check_incoming` calls: every `Open Remote` the daemon made.
+        pub opens: AtomicUsize,
+    }
+
+    impl Policy for ClientSide {
+        fn check_incoming(&self, kind: &OpenKind) -> Result<(), OpenFailure> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            match kind {
+                OpenKind::Remote { forward }
+                    if self.targets.lock().unwrap().contains_key(forward) =>
+                {
+                    Ok(())
+                }
+                _ => Err(OpenFailure::NotPermitted),
+            }
+        }
+        fn check_outgoing(&self, _: &OpenKind, _: &LocalPeer) -> Result<(), OpenFailure> {
+            Ok(())
+        }
+        fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
+            Ok(())
+        }
+    }
+
+    impl Connector for ClientSide {
+        fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
+            let target = match kind {
+                OpenKind::Remote { forward } => self.targets.lock().unwrap().get(forward).copied(),
+                _ => None,
+            };
+            Box::pin(async move {
+                let addr = target.ok_or(OpenFailure::NoSuchForward)?;
+                let t = Target {
+                    host: TargetHost::Ip(addr.ip()),
+                    port: std::num::NonZeroU16::new(addr.port()).unwrap(),
+                };
+                let s = fil_forward::connect::connect_tcp(&t, &check).await?;
+                Ok(Box::new(s) as fil_forward::BoxStream)
+            })
+        }
+    }
+
+    /// What the client has seen.
+    #[derive(Default)]
+    pub struct Seen {
+        pub reply: Option<AttachReply>,
+        pub refused: Option<AttachRefusal>,
+        pub taken_over: Option<TakenOver>,
+        pub detached: bool,
+        pub exited: Option<(Option<i32>, Option<i32>)>,
+        pub errors: Vec<ErrorCode>,
+        /// The terminal's input stream continues here (the daemon's `Resume { TERMINAL }`).
+        pub input_resume: Option<u64>,
+        pub out: Vec<u8>,
+        /// Table records from the daemon, in order, over the client's life.
+        pub table: Vec<MuxMsg>,
+        pub mux_failed: Vec<String>,
+        pub down: bool,
+    }
+
+    pub struct FwdClient {
+        pub ep: Endpoint<MemLink>,
+        pub side: Arc<ClientSide>,
+        pub seen: Arc<Mutex<Seen>>,
+        pub link: Arc<MemLink>,
+        pub ctl: MemControl,
+        pub serve: Option<JoinHandle<ServeEnd>>,
+        reader: Option<JoinHandle<()>>,
+        events: JoinHandle<()>,
+        key: PublicKey,
+        host: &'static str,
+        /// The terminal received so far (shared with the reader).
+        recv: Arc<Mutex<(RecvChannel, u64)>>,
+        input_sent: u64,
+        next_req: u32,
+        /// The last attach reply: what a resume names.
+        last_reply: Option<AttachReply>,
+    }
+
+    impl Drop for FwdClient {
+        fn drop(&mut self) {
+            if let Some(r) = self.reader.take() {
+                r.abort();
+            }
+            self.events.abort();
+            self.ep.shutdown();
+        }
+    }
+
+    pub fn client_mux() -> MuxConfig {
+        MuxConfig::default()
+    }
+
+    impl FwdClient {
+        /// A fresh attach as `host` with key `key`; waits for the reply or the refusal.
+        pub async fn attach(h: &SessionHandle, key: PublicKey, host: &'static str) -> FwdClient {
+            let (mut c, daemon_end) = Self::unattached(key, host);
+            c.start(h, daemon_end, None).await;
+            c
+        }
+
+        /// A client that has not attached (for a resume it was never given: `set_last_reply`
+        /// first). Must be called inside a runtime.
+        pub fn attach_detached(key: PublicKey, host: &'static str) -> FwdClient {
+            Self::unattached(key, host).0
+        }
+
+        fn unattached(key: PublicKey, host: &'static str) -> (FwdClient, MemLink) {
+            let side = Arc::new(ClientSide::default());
+            let (ep, mut events) =
+                Endpoint::new(Side::Client, client_mux(), side.clone(), side.clone());
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let s = seen.clone();
+            let events = tokio::spawn(async move {
+                while let Some(e) = events.recv().await {
+                    let mut s = s.lock().unwrap();
+                    match e {
+                        EndpointEvent::Table(m) => s.table.push(m),
+                        EndpointEvent::Failed(e) => s.mux_failed.push(e.to_string()),
+                        EndpointEvent::LinkFailed => s.mux_failed.push("link failed".into()),
+                    }
+                }
+            });
+            let (daemon_end, client_end, ctl) = pair(LinkKind::Pipe, 256);
+            let c = FwdClient {
+                ep,
+                side,
+                seen,
+                link: Arc::new(client_end),
+                ctl,
+                serve: None,
+                reader: None,
+                events,
+                key,
+                host,
+                recv: Arc::new(Mutex::new((RecvChannel::new(), 0))),
+                input_sent: 0,
+                next_req: 0,
+                last_reply: None,
+            };
+            (c, daemon_end)
+        }
+
+        async fn start(
+            &mut self,
+            h: &SessionHandle,
+            daemon_end: MemLink,
+            resume: Option<ResumeRequest>,
+        ) {
+            let resumed = resume.is_some();
+            let attach = Attach {
+                name: h.name().clone(),
+                size: size(80, 24),
+                size_gen: 0,
+                term: "xterm-256color".parse().unwrap(),
+                host: self.host.parse().unwrap(),
+                key: self.key.clone(),
+                echo_ack: false,
+                agent: false,
+                resume,
+            };
+            {
+                let mut s = self.seen.lock().unwrap();
+                s.reply = None;
+                s.refused = None;
+                s.down = false;
+            }
+            let hh = h.clone();
+            self.serve = Some(tokio::spawn(
+                async move { hh.serve(daemon_end, attach).await },
+            ));
+            self.reader = Some(tokio::spawn(read_loop(
+                self.link.clone(),
+                self.ep.clone(),
+                self.seen.clone(),
+                self.recv.clone(),
+                resumed,
+            )));
+            self.wait("the attach reply", |s| {
+                s.reply.is_some() || s.refused.is_some()
+            })
+            .await;
+            if let Some(r) = self.seen.lock().unwrap().reply.clone() {
+                self.last_reply = Some(r);
+            }
+        }
+
+        /// The link dies (as a pulled cable), and the client resumes on a new one.
+        pub async fn reconnect(&mut self, h: &SessionHandle) {
+            self.drop_link().await;
+            self.resume(h).await;
+        }
+
+        /// The link dies; the client does not resume (yet).
+        pub async fn drop_link(&mut self) {
+            self.ctl.kill(fil_transport::DownReason::Io("cut".into()));
+            if let Some(r) = self.reader.take() {
+                let _ = r.await;
+            }
+            self.ep.detach_link();
+            if let Some(t) = self.serve.take() {
+                let _ = tokio::time::timeout(WAIT, t).await;
+            }
+        }
+
+        /// After losing the session (taken over), attaches afresh: a take-back, with a new mux
+        /// epoch on the client's side too.
+        pub async fn take_back(&mut self, h: &SessionHandle) {
+            self.drop_link().await;
+            self.ep.new_epoch();
+            {
+                let mut s = self.seen.lock().unwrap();
+                s.taken_over = None;
+                s.input_resume = None;
+            }
+            self.input_sent = 0;
+            *self.recv.lock().unwrap() = (RecvChannel::new(), 0);
+            let (daemon_end, client_end, ctl) = pair(LinkKind::Pipe, 256);
+            self.link = Arc::new(client_end);
+            self.ctl = ctl;
+            self.start(h, daemon_end, None).await;
+        }
+
+        /// The attach reply a resume would name.
+        pub fn last_reply(&self) -> Option<AttachReply> {
+            self.last_reply.clone()
+        }
+
+        /// Makes the next resume name `reply` (another client's, for a resume it may not make).
+        pub fn set_last_reply(&mut self, reply: AttachReply) {
+            self.last_reply = Some(reply);
+        }
+
+        /// Resumes on a new link (after `drop_link`).
+        pub async fn resume(&mut self, h: &SessionHandle) {
+            let reply = self.last_reply.clone().expect("attached once");
+            let seq = self.recv.lock().unwrap().0.received();
+            let r = ResumeRequest {
+                incarnation: reply.incarnation,
+                epoch: reply.epoch,
+                seq,
+                want_snapshot: false,
+            };
+            let (daemon_end, client_end, ctl) = pair(LinkKind::Pipe, 256);
+            self.link = Arc::new(client_end);
+            self.ctl = ctl;
+            self.start(h, daemon_end, Some(r)).await;
+        }
+
+        pub async fn wait(&self, what: &str, pred: impl Fn(&Seen) -> bool) {
+            let end = tokio::time::Instant::now() + WAIT;
+            loop {
+                if pred(&self.seen.lock().unwrap()) {
+                    return;
+                }
+                if tokio::time::Instant::now() > end {
+                    let s = self.seen.lock().unwrap();
+                    panic!(
+                        "timed out waiting for {what}: reply {} refused {:?} errors {:?} down {} table {} mux {:?} out {:?}",
+                        s.reply.is_some(),
+                        s.refused,
+                        s.errors,
+                        s.down,
+                        s.table.len(),
+                        s.mux_failed,
+                        String::from_utf8_lossy(&s.out)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        pub async fn wait_out(&self, needle: &str) {
+            let n = needle.as_bytes().to_vec();
+            self.wait(&format!("{needle:?} in the output"), move |s| {
+                s.out.windows(n.len()).any(|w| w == n.as_slice())
+            })
+            .await;
+        }
+
+        pub async fn type_bytes(&mut self, data: &[u8]) {
+            let start = self.seen.lock().unwrap().input_resume.unwrap_or(0);
+            self.input_sent = self.input_sent.max(start);
+            let payload = DataSegment::encode(self.input_sent, data).unwrap();
+            self.input_sent += data.len() as u64;
+            self.link
+                .send(ChannelId::TERMINAL, Bytes::from(payload))
+                .await
+                .unwrap();
+        }
+
+        pub async fn send_ctl(&self, msg: ControlMsg) {
+            self.link
+                .send(ChannelId::CONTROL, Bytes::from(msg.encode().unwrap()))
+                .await
+                .unwrap();
+        }
+
+        pub async fn detach(&self) {
+            self.send_ctl(ControlMsg::Detach).await;
+        }
+
+        pub fn send_table(&self, msg: MuxMsg) {
+            self.ep.send_table(msg).unwrap();
+        }
+
+        pub fn next_req(&mut self) -> u32 {
+            self.next_req += 1;
+            self.next_req
+        }
+
+        /// The table records seen so far.
+        pub fn table(&self) -> Vec<MuxMsg> {
+            self.seen.lock().unwrap().table.clone()
+        }
+
+        /// Waits for a table record that `pick` recognises and returns what it extracts.
+        pub async fn wait_table<T>(&self, what: &str, pick: impl Fn(&MuxMsg) -> Option<T>) -> T {
+            let end = tokio::time::Instant::now() + WAIT;
+            loop {
+                if let Some(t) = self.seen.lock().unwrap().table.iter().find_map(&pick) {
+                    return t;
+                }
+                assert!(
+                    tokio::time::Instant::now() < end,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        pub async fn serve_end(&mut self) -> ServeEnd {
+            let t = self.serve.take().expect("serve task");
+            tokio::time::timeout(WAIT, t)
+                .await
+                .expect("serve task did not end")
+                .unwrap()
+        }
+    }
+
+    /// The client's receive loop: the terminal into `seen.out` (acknowledged), control into
+    /// `seen`, the forwards' traffic into the endpoint (which never waits). The endpoint gets the
+    /// link the moment the attach reply arrives, before anything after it is fed.
+    async fn read_loop(
+        link: Arc<MemLink>,
+        ep: Endpoint<MemLink>,
+        seen: Arc<Mutex<Seen>>,
+        recv: Arc<Mutex<(RecvChannel, u64)>>,
+        resumed: bool,
+    ) {
+        let mut snapshot_left: Option<u64> = None;
+        while let Ok((ch, payload)) = link.recv().await {
+            match ch {
+                ChannelId::CONTROL => {
+                    let msg = ControlMsg::decode(&payload).unwrap();
+                    if let Some(r) = ep.on_control(&msg) {
+                        if let Err(e) = r {
+                            seen.lock().unwrap().mux_failed.push(e.to_string());
+                        }
+                        continue;
+                    }
+                    let mut s = seen.lock().unwrap();
+                    match msg {
+                        ControlMsg::AttachReply(r) => {
+                            let mut rc = recv.lock().unwrap();
+                            match r.start {
+                                StartPoint::Resume { from } => {
+                                    rc.0 = RecvChannel::starting_at(from)
+                                }
+                                StartPoint::Snapshot(info) => {
+                                    rc.0 = RecvChannel::starting_at(info.at);
+                                    snapshot_left = Some(info.len);
+                                }
+                            }
+                            s.reply = Some(r);
+                            drop(rc);
+                            ep.attach_link(link.clone(), resumed);
+                        }
+                        ControlMsg::AttachRefused(r) => s.refused = Some(r),
+                        ControlMsg::TakenOver(t) => s.taken_over = Some(t),
+                        ControlMsg::Detach => s.detached = true,
+                        ControlMsg::SessionExited { code, signal } => {
+                            s.exited = Some((code, signal))
+                        }
+                        ControlMsg::Error(e) => s.errors.push(e),
+                        ControlMsg::Resume {
+                            channel: ChannelId::TERMINAL,
+                            received,
+                        } => s.input_resume = Some(received),
+                        ControlMsg::Snapshot(info) => {
+                            recv.lock().unwrap().0 = RecvChannel::starting_at(info.at);
+                            snapshot_left = Some(info.len);
+                        }
+                        _ => {}
+                    }
+                }
+                ChannelId::SNAPSHOT => {
+                    let seg = DataSegment::parse(&payload).unwrap();
+                    if let Some(left) = &mut snapshot_left {
+                        *left = left.saturating_sub(seg.data.len() as u64);
+                    }
+                }
+                ChannelId::TERMINAL => {
+                    let seg = DataSegment::parse(&payload).unwrap();
+                    let upto = {
+                        let mut rc = recv.lock().unwrap();
+                        let fresh = rc.0.accept(seg.seq, seg.data).unwrap().to_vec();
+                        seen.lock().unwrap().out.extend_from_slice(&fresh);
+                        rc.0.received()
+                    };
+                    let ack = ControlMsg::Ack {
+                        channel: ChannelId::TERMINAL,
+                        upto,
+                    };
+                    let l = link.clone();
+                    // Never wait on our own sends in the receive loop.
+                    tokio::spawn(async move {
+                        let _ = l
+                            .send(ChannelId::CONTROL, Bytes::from(ack.encode().unwrap()))
+                            .await;
+                    });
+                }
+                ch if Endpoint::<MemLink>::handles(ch) => {
+                    if let Err(e) = ep.on_payload(ch, payload) {
+                        seen.lock().unwrap().mux_failed.push(e.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        seen.lock().unwrap().down = true;
+    }
+}

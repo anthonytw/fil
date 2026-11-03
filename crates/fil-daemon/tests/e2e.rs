@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use fil_proto::ChannelId;
-use fil_proto::msg::{AttachRefusal, ControlMsg, ErrorCode, Hello, Request, Response, StartPoint};
+use fil_proto::msg::{
+    AttachRefusal, ControlMsg, ErrorCode, ExitStatus, Hello, Request, Response, StartPoint,
+};
 use fil_transport::Link;
 use fil_transport::pipe::PipeLink;
 
@@ -290,10 +292,19 @@ async fn a_session_that_ends_is_reported_then_gone() {
     }
     let resume = a.resume_request();
 
-    // Reaped: the list is empty, and a late resume is told the session is gone.
+    // Reaped: the list is empty, and a late resume is told the session is gone, with how it
+    // ended (the tombstone keeps the status for a client that missed `SessionExited`).
     eventually(|| async { d.sessions_is_empty().await }).await;
     let c = Client::attach(d.pipe().await, Connect::new("main", k).resume(resume)).await;
-    assert_eq!(c.refused, Some(AttachRefusal::SessionGone { exit: None }));
+    assert_eq!(
+        c.refused,
+        Some(AttachRefusal::SessionGone {
+            exit: Some(ExitStatus {
+                code: Some(3),
+                signal: None
+            })
+        })
+    );
     d.stop().await;
 }
 

@@ -132,7 +132,7 @@ async fn attach(
         eprintln!("fil: warning: `agent` in the config is ignored: {AGENT_NOT_WIRED}");
     }
     // Many sockets with forwards; children keep the original limit (`fil_transport::fdlimit`).
-    fil_transport::fdlimit::raise();
+    let _ = fil_transport::fdlimit::raise();
     // `-L` and `-D` listen from now on, before the attach and before the terminal is raw: a port
     // that is taken is said here, and with `forward_failure = "exit"` nothing is attached.
     let mut forward_set = forward_set(&plan);

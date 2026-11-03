@@ -20,6 +20,8 @@ use std::process::ExitCode;
 use fil_daemon::{DaemonLauncher, Paths, RelayOptions, run_daemon_with, run_relay};
 
 fn main() -> ExitCode {
+    // A session's child is started through this binary (`fil_session::nofile`).
+    fil_daemon::run_trampoline_if_asked();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut dir = None;
     let mut revision: Option<u16> = None;

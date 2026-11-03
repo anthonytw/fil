@@ -517,6 +517,7 @@ name = "fil-session"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "fil-forward",
  "fil-proto",
  "fil-session",
  "fil-term",
@@ -524,6 +525,7 @@ dependencies = [
  "fil-transport",
  "nix",
  "portable-pty",
+ "rustix",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

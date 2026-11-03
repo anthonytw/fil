@@ -478,10 +478,23 @@ mod tests {
         assert!(!rustix::net::sockopt::ipv6_v6only(&sock).unwrap());
         let port = sock.local_addr().unwrap().port();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.send_to(b"hello", ("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // UDP may drop a datagram, and a loaded machine does (a 5 s wait for the one datagram
+        // timed out in a full `just ci`): send again until one arrives, up to 10 s. Any arrival
+        // proves what the test is about.
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
         let mut buf = [0u8; 16];
-        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let (n, from) = (0..40)
+            .find_map(|_| {
+                client.send_to(b"hello", ("127.0.0.1", port)).unwrap();
+                match sock.recv_from(&mut buf) {
+                    Ok(got) => Some(got),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
+                    Err(e) => panic!("recv_from: {e}"),
+                }
+            })
+            .expect("no datagram arrived in 10 s");
         assert_eq!(&buf[..n], b"hello");
         assert_eq!(from.ip().to_canonical(), client.local_addr().unwrap().ip());
     }

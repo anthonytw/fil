@@ -11,7 +11,7 @@ use common::fake_term::{TermHandle, fake_terminal};
 use common::*;
 use fil::dialer::{DialerConfig, PathDialer};
 use fil_client::{Backoff, ClientConfig, ClientError, Outcome};
-use fil_transport::path::TransportSetting;
+use fil_transport::path::{PathConfig, TransportSetting};
 use fil_transport::{DownReason, LinkKind};
 use tokio::task::JoinHandle;
 
@@ -299,6 +299,21 @@ async fn a_version_mismatch_ends_the_client_with_a_clear_message() {
     assert_eq!(rig.fake.pipe_runs(), 1, "never retried");
 }
 
+/// The most attempts a retrying lane can make in `window` of failures, starting with one at the
+/// start: each attempt takes `busy` before it fails, and the delay before the next doubles from
+/// `min` to `max` (`PathManager::backoff`) with jitter that may shorten it to 80%.
+fn most_attempts(min: Duration, max: Duration, busy: Duration, window: Duration) -> usize {
+    let mut at = Duration::ZERO;
+    let mut attempts = 1;
+    let mut delay = min;
+    while at + busy + delay.mul_f64(0.8) <= window {
+        at += busy + delay.mul_f64(0.8);
+        attempts += 1;
+        delay = delay.saturating_mul(2).min(max);
+    }
+    attempts
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_outage_during_the_session_ends_when_the_network_returns_with_no_ssh_storm() {
     let rig = rig_with_direct(TransportSetting::Auto).await;
@@ -318,8 +333,31 @@ async fn an_outage_during_the_session_ends_when_the_network_returns_with_no_ssh_
     );
     tokio::time::sleep(Duration::from_secs(280)).await;
     let (pipes, dials) = (rig.fake.pipe_runs(), rig.fake.direct_dials());
-    assert!(pipes <= 16, "{pipes} ssh runs in five minutes of outage");
-    assert!(dials <= 16, "{dials} dials");
+    // The path manager retries with a doubling delay and up to 20% jitter either way, seeded from
+    // the clock (`dialer::random_seed`), so the number of attempts differs from run to run and
+    // no fixed count is right: a flat 16 failed about one run in 200 (17 ssh runs) when every
+    // delay drew near its 80% floor. What "no storm" means is that the count stays within what
+    // the schedule allows at the fastest the jitter lets it go; a loop that retried without its
+    // delay would make hundreds. The runs before the outage are counted too: the pipe that
+    // attached, and the dial that upgraded.
+    let cfg = PathConfig::default();
+    let outage = Duration::from_secs(20 + 280);
+    let fastest_pipe = 1 + most_attempts(
+        cfg.pipe_retry_min,
+        cfg.pipe_retry_max,
+        Duration::ZERO,
+        outage,
+    );
+    let fastest_dial =
+        1 + most_attempts(cfg.retry_min, cfg.retry_max, Duration::from_secs(2), outage);
+    assert!(
+        pipes <= fastest_pipe,
+        "{pipes} ssh runs in five minutes of outage (at most {fastest_pipe} at the fastest jitter)"
+    );
+    assert!(
+        dials <= fastest_dial,
+        "{dials} dials (at most {fastest_dial} at the fastest jitter)"
+    );
     // Heal.
     rig.fake.set_pipe_default(Script::ok());
     rig.fake.set_direct_default(Script::ok());

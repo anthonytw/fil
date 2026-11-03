@@ -46,7 +46,7 @@ use fil_proto::msg::{self, Attach, SessionName};
 use fil_session::{DirectInfo, SessionConfig, SessionHandle, SessionHost};
 use fil_transport::auth::{AuthError, DaemonIdentity, KeyRegistry, PublicKey as TransportKey};
 use fil_transport::pipe::{PipeConfig, PipeLink};
-use fil_transport::quic::{ListenError, ListenerConfig, QuicListener};
+use fil_transport::quic::{DEFAULT_REVOKE_BACKSTOP, ListenError, ListenerConfig, QuicListener};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
@@ -174,13 +174,21 @@ impl SessionHost for Host {
 #[derive(Default)]
 struct State {
     live: std::collections::HashMap<SessionName, SessionHandle>,
-    /// `(name, incarnation)` of sessions that ended, oldest first.
-    ended: std::collections::VecDeque<(SessionName, u128)>,
+    /// Sessions that ended, oldest first: `(name, incarnation)` and how the shell ended, for a
+    /// client that missed `SessionExited` (`SessionGone { exit }`).
+    ended: std::collections::VecDeque<Tombstone>,
     /// Connections being served.
     conns: usize,
     /// Session creations that outlived their attach (it timed out) and are still running. Each
     /// kills what it produces, and keeps the daemon from idling out until it has.
     spawning: usize,
+}
+
+/// What the daemon remembers of a session that ended.
+struct Tombstone {
+    name: SessionName,
+    incarnation: u128,
+    exit: Option<msg::ExitStatus>,
 }
 
 /// Why a session could not be found or made for an attach.
@@ -331,18 +339,22 @@ impl Inner {
             return Ok(h.clone());
         }
         if let Some(r) = &attach.resume {
-            let gone = existing
+            // Ended and not reaped yet: its status is the handle's. Reaped: the tombstone's.
+            let gone = match existing
                 .as_ref()
-                .is_some_and(|dead| dead.incarnation() == r.incarnation)
-                || self
+                .filter(|dead| dead.incarnation() == r.incarnation)
+            {
+                Some(dead) => Some(dead.exit_status()),
+                None => self
                     .state()
                     .ended
                     .iter()
-                    .any(|(n, i)| *n == attach.name && *i == r.incarnation);
-            return Err(Lookup::Refuse(if gone {
-                msg::AttachRefusal::SessionGone { exit: None }
-            } else {
-                msg::AttachRefusal::SessionReplaced
+                    .find(|t| t.name == attach.name && t.incarnation == r.incarnation)
+                    .map(|t| t.exit),
+            };
+            return Err(Lookup::Refuse(match gone {
+                Some(exit) => msg::AttachRefusal::SessionGone { exit },
+                None => msg::AttachRefusal::SessionReplaced,
             }));
         }
 
@@ -403,7 +415,11 @@ impl Inner {
         {
             st.live.remove(h.name());
         }
-        st.ended.push_back((h.name().clone(), h.incarnation()));
+        st.ended.push_back(Tombstone {
+            name: h.name().clone(),
+            incarnation: h.incarnation(),
+            exit: h.exit_status(),
+        });
         while st.ended.len() > MAX_TOMBSTONES {
             st.ended.pop_front();
         }
@@ -753,11 +769,22 @@ fn bind_direct(
     cfg: &DaemonConfig,
     registry: &KeyRegistry,
 ) -> Result<(Option<QuicListener>, Option<DirectInfo>), StartError> {
+    bind_direct_with(cfg, registry, DEFAULT_REVOKE_BACKSTOP)
+}
+
+/// [`bind_direct`] with the delay after which the listener closes a revoked key's live
+/// connections (a test that checks what revoking itself does needs that delay out of the way).
+fn bind_direct_with(
+    cfg: &DaemonConfig,
+    registry: &KeyRegistry,
+    revoke_backstop: Duration,
+) -> Result<(Option<QuicListener>, Option<DirectInfo>), StartError> {
     let identity = DaemonIdentity::generate().map_err(StartError::Identity)?;
     let mut lcfg = ListenerConfig {
         bind: cfg.bind,
         ports: cfg.ports.clone(),
         params: cfg.link,
+        revoke_backstop,
         ..ListenerConfig::default()
     };
     let mut bound = QuicListener::bind(&identity, registry, &lcfg);
@@ -821,6 +848,21 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
         pid = std::process::id(),
         "daemon process starting"
     );
+    // One daemon serves every session, and their forwards may hold many descriptors: the soft
+    // limit goes as high as it may, and every program the daemon starts gets the original back
+    // (`fil_session::nofile`).
+    // A session's child starts through this binary, which gives it the original limit back.
+    // Without one the limit is not raised at all: the shells would inherit it.
+    match fil_session::nofile::own_executable() {
+        Some(exe) => {
+            fil_session::nofile::set_trampoline(exe);
+            match fil_transport::fdlimit::raise() {
+                Some(r) => tracing::info!(from = r.from, to = r.to, "descriptor limit raised"),
+                None => tracing::debug!("descriptor limit left as it is"),
+            }
+        }
+        None => tracing::info!("own executable unknown: descriptor limit left as it is"),
+    }
     let cfg = match DaemonConfig::load(&paths.config) {
         Ok(mut c) => {
             adjust(&mut c);
@@ -1193,7 +1235,13 @@ mod tests {
             ..DaemonConfig::default()
         };
         let registry = KeyRegistry::new();
-        let (Some(listener), Some(info)) = bind_direct(&cfg, &registry).unwrap() else {
+        // The backstop (2 s by default) closes a revoked key's live connections by itself; this
+        // test is about what revoking does on its own, so keep the backstop out of the way. At
+        // 2 s a test process starved of CPU for that long would see it fire, correctly, and
+        // read that as revoking having closed the connection.
+        let (Some(listener), Some(info)) =
+            bind_direct_with(&cfg, &registry, Duration::from_secs(3600)).unwrap()
+        else {
             panic!("direct mode starts");
         };
         let host = host(&registry, Some(info.clone()));
@@ -1201,17 +1249,34 @@ mod tests {
         registry.register(ck.public_key().clone());
         let pin = Fingerprint::from_bytes(info.fingerprint.as_bytes().try_into().unwrap());
         let addr = ([127, 0, 0, 1], info.udp_port).into();
-        let client = QuicLink::connect(addr, pin, &ck, LinkParams::default())
-            .await
-            .unwrap();
+        // The default `connect_timeout` (2 s) is the production fallback bound for a client that
+        // must move on to another path; it is not what this test is about. A handshake in a debug
+        // build on a loaded machine can take longer, so give it room: a timeout would fail the
+        // `unwrap`s below for a reason that has nothing to do with revocation.
+        let params = LinkParams {
+            connect_timeout: Duration::from_secs(60),
+            ..LinkParams::default()
+        };
+        let client = QuicLink::connect(addr, pin, &ck, params).await.unwrap();
         let _server_side = listener.accept().await.unwrap();
 
         host.revoke_key(&msg::PublicKey::new(ck.public_key().as_spki_der().to_vec()).unwrap());
         assert!(!registry.contains(ck.public_key()), "revoked at once");
-        let again = QuicLink::connect(addr, pin, &ck, LinkParams::default()).await;
-        assert!(again.is_err(), "no new handshake with a revoked key");
+        // With the long timeout an error here is the daemon's refusal; a timeout would only
+        // show as an error after a minute, and the message names it.
+        let again = QuicLink::connect(addr, pin, &ck, params).await;
+        let refused = again.err().expect("no new handshake with a revoked key");
+        assert!(
+            !format!("{refused}").contains("no answer from the daemon"),
+            "refused, not timed out: {refused}"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(matches!(client.status().borrow().state, LinkState::Up));
+        // Not closed. (Not `Up` exactly: a link reports `Degraded` after 2 s without hearing the
+        // peer, which a test process starved of CPU for that long does; that is not a close.)
+        assert!(
+            !matches!(client.status().borrow().state, LinkState::Down(_)),
+            "revoking closed a live connection"
+        );
         client.close();
     }
 }

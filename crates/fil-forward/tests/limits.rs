@@ -10,7 +10,7 @@ mod support;
 
 use std::time::Duration;
 
-use fil_forward::MAX_PENDING;
+use fil_forward::{MAX_HANDSHAKES, MAX_PENDING};
 use fil_proto::mux::{BindAddr, ForwardId, ForwardKind, MuxConfig};
 use support::*;
 use tokio::io::AsyncWriteExt;
@@ -51,7 +51,7 @@ async fn the_endpoint_holds_at_most_max_pending_connections() {
 }
 
 /// Silent clients on a `-D` listener (they never send their SOCKS request): the endpoint holds
-/// at most `MAX_PENDING` of them.
+/// at most `MAX_HANDSHAKES` of them (the rest wait in the kernel's backlog or are not let in).
 async fn socks_handshakes_count_against_the_bound() {
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = w
@@ -67,8 +67,8 @@ async fn socks_handshakes_count_against_the_bound() {
         "{} silent SOCKS clients connected; the endpoint holds {endpoint} descriptors",
         held.len()
     );
-    assert!(held.len() >= MAX_PENDING, "{} connected", held.len());
-    assert!(endpoint <= MAX_PENDING + 16, "{endpoint}");
+    assert!(held.len() >= MAX_HANDSHAKES, "{} connected", held.len());
+    assert!(endpoint <= MAX_HANDSHAKES + 16, "{endpoint}");
     drop(held);
     drop(w);
 }
@@ -94,9 +94,22 @@ async fn queued_socks_requests_stay_within_the_bound() {
     let mut req = vec![5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1];
     req.extend_from_slice(&hold.port.to_be_bytes());
     let before = open_fds();
-    let mut held = clients(port, 1500).await;
-    for s in &mut held {
-        let _ = s.write_all(&req).await;
+    // Each client sends its request at once, so handshakes end as fast as they start and the
+    // queue, not the handshake cap, is what fills.
+    let mut held = Vec::new();
+    for _ in 0..1500 {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        {
+            Ok(Ok(mut s)) => {
+                let _ = s.write_all(&req).await;
+                held.push(s);
+            }
+            _ => break,
+        }
     }
     // Let the queue fill (up to the bound): wait until it stops growing.
     let waiting_now = || w.client.ep.stats(ForwardId(9)).map_or(0, |s| s.waiting);
@@ -116,6 +129,10 @@ async fn queued_socks_requests_stay_within_the_bound() {
         held.len()
     );
     assert!(waiting as usize <= MAX_PENDING, "{waiting}");
+    assert!(
+        waiting as usize > MAX_HANDSHAKES,
+        "{waiting}: the queue never filled past the handshake cap"
+    );
     assert!(endpoint <= MAX_PENDING + 16, "{endpoint}");
     drop(held);
 }

@@ -463,6 +463,7 @@ dependencies = [
  "fil-forward",
  "fil-netsim",
  "fil-proto",
+ "fil-testkit",
  "fil-transport",
  "quinn",
  "rand",
@@ -564,6 +565,7 @@ dependencies = [
  "fil-proto",
  "fil-term",
  "fil-transport",
+ "ring",
  "tokio",
 ]
 

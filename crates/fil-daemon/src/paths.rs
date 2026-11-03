@@ -151,6 +151,14 @@ impl Paths {
         }
     }
 
+    /// `agent/<session>.sock`: the session's stable `SSH_AUTH_SOCK` (DESIGN.md section 10). The
+    /// session creates and checks `agent/` (mode 0700) when a client first relays its agent. The
+    /// name is the session's own and needs no revision: one session per name relays at a time,
+    /// and a session removes only the socket it bound.
+    pub fn agent_socket(&self, session: &fil_proto::msg::SessionName) -> PathBuf {
+        self.dir.join("agent").join(format!("{session}.sock"))
+    }
+
     /// `fil-<major>-<rev>.lock`: held by the running daemon.
     pub fn lock(&self) -> PathBuf {
         self.file("lock")

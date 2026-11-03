@@ -70,6 +70,7 @@
 //! primary screen. The session's `TERM` should name a terminfo entry that uses `1049`
 //! (xterm-256color, alacritty, screen and tmux do).
 
+mod agent;
 mod config;
 mod core;
 pub mod echo;

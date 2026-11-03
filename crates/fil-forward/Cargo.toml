@@ -11,6 +11,8 @@ publish.workspace = true
 bytes = "1"
 fil-proto = { path = "../fil-proto" }
 fil-transport = { path = "../fil-transport" }
+# SHA-256 for agent key fingerprints (already in the tree through rustls).
+ring = "0.17"
 rustix = { version = "1", features = ["net"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tracing = "0.1"
@@ -25,6 +27,8 @@ fil-forward = { path = ".", features = ["test-hooks"] }
 # `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.
 fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
 fil-netsim = { path = "../fil-netsim" }
+# The test-only mini ssh-agent.
+fil-testkit = { path = "../fil-testkit" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
 # SHA-256 for the byte-exact checks (already in the tree through fil-transport; its digest is

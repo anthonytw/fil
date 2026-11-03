@@ -36,17 +36,21 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use fil_forward::agent::{CountingStream, RequestCounts};
 use fil_forward::{
     AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, EventReceiver, LocalPeer,
     Policy,
 };
 use fil_proto::ChannelId;
-use fil_proto::msg::{ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, SessionName};
+use fil_proto::msg::{
+    AgentRow, ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, SessionName,
+};
 use fil_proto::mux::{
     Added, BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable,
     ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, Side,
@@ -56,6 +60,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+use crate::agent::{self, AgentSocket, Gate};
 use crate::core::{ConnEvent, ConnId};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -158,6 +163,10 @@ struct State {
     /// What the binder last reported for each entry: the daemon for `-R`, the current client for
     /// `-L` and `-D` (forgotten on a fresh attach: the new client binds its own).
     listen: HashMap<ForwardId, ListenState>,
+    /// The current subscriber relays its agent (`Attach.agent`).
+    agent: bool,
+    /// Whose agent connections are accepted: ours (a test hook changes it).
+    agent_uid: u32,
     ended: bool,
 }
 
@@ -166,6 +175,24 @@ impl State {
     /// is fresh, starts a new MUX stream and sends the whole table anyway.
     fn tells_client(&self) -> bool {
         self.sub == Sub::Held && !self.ended
+    }
+
+    /// Where the agent relay is (DESIGN.md section 10): on while a subscriber that relays holds
+    /// the session, ready while its link is up.
+    fn agent_gate(&self) -> Gate {
+        if self.ended || self.sub == Sub::Detached || !self.agent {
+            Gate::Off
+        } else if self.linked {
+            Gate::Ready
+        } else {
+            Gate::Waiting
+        }
+    }
+
+    /// The agent checks of one connection ([`agent::check_open`]).
+    fn agent_check(&self, peer: &LocalPeer) -> Result<(), OpenFailure> {
+        let detached = self.ended || self.sub == Sub::Detached;
+        agent::check_open(self.agent_gate(), detached, peer, self.agent_uid)
     }
 }
 
@@ -177,6 +204,7 @@ impl fmt::Debug for State {
             .field("sub", &self.sub)
             .field("linked", &self.linked)
             .field("consented", &self.consented.len())
+            .field("agent", &self.agent)
             .field("ended", &self.ended)
             .finish()
     }
@@ -196,6 +224,13 @@ pub(crate) struct Forwards {
     task: Mutex<Option<JoinHandle<()>>>,
     /// Where the MUX send buffer stops taking table records (three quarters of it).
     table_room: usize,
+    /// The agent socket, when the session has a path for it.
+    agent_sock: Mutex<Option<AgentSocket>>,
+    /// Where the agent relay is, for connections waiting on it.
+    agent_gate: watch::Sender<Gate>,
+    /// Agent requests relayed, for `fil ports`.
+    agent_counts: Arc<RequestCounts>,
+    me: Weak<Forwards>,
     #[cfg(feature = "test-hooks")]
     gate: Arc<Mutex<Option<Arc<crate::handle::SyncGate>>>>,
     /// Test hook: holds each endpoint event between the receiver and the lock.
@@ -214,7 +249,11 @@ impl fmt::Debug for Forwards {
 
 impl Forwards {
     /// Must be called inside a tokio runtime: the endpoint's tasks run there.
-    pub(crate) fn new(name: SessionName, cfg: MuxConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        name: SessionName,
+        cfg: MuxConfig,
+        agent_socket: Option<PathBuf>,
+    ) -> Arc<Self> {
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
             sub: Sub::Detached,
@@ -223,6 +262,8 @@ impl Forwards {
             fatal: None,
             consented: HashSet::new(),
             listen: HashMap::new(),
+            agent: false,
+            agent_uid: agent::our_uid(),
             ended: false,
         }));
         #[cfg(feature = "test-hooks")]
@@ -235,12 +276,16 @@ impl Forwards {
         let connector = Arc::new(SessionConnector { st: st.clone() });
         let table_room = cfg.mux_buffer / 4 * 3;
         let (ep, events) = Endpoint::new(Side::Daemon, cfg, connector, policy);
-        let fw = Arc::new(Forwards {
+        let fw = Arc::new_cyclic(|me| Forwards {
             name,
             ep,
             st,
             task: Mutex::new(None),
             table_room,
+            agent_sock: Mutex::new(agent_socket.map(AgentSocket::new)),
+            agent_gate: watch::Sender::new(Gate::Off),
+            agent_counts: Arc::new(RequestCounts::default()),
+            me: me.clone(),
             #[cfg(feature = "test-hooks")]
             gate,
             #[cfg(feature = "test-hooks")]
@@ -259,7 +304,13 @@ impl Forwards {
 
     /// A fresh attach of connection `conn` was accepted: a new subscriber, and a new mux epoch.
     /// The table goes to the new client once its link is up.
-    pub(crate) fn fresh_attach(&self, conn: ConnId, events: mpsc::UnboundedSender<ConnEvent>) {
+    /// `agent`: the new subscriber relays its agent (the socket is there while it does).
+    pub(crate) fn fresh_attach(
+        &self,
+        conn: ConnId,
+        events: mpsc::UnboundedSender<ConnEvent>,
+        agent: bool,
+    ) {
         let mut st = self.lock();
         if st.ended {
             return;
@@ -268,6 +319,8 @@ impl Forwards {
         st.sub = Sub::Held;
         st.conn = Some(conn);
         st.fatal = Some(events);
+        st.agent = agent;
+        self.sync_agent(&st);
         // The table, then the -R listeners' state; the new client adds its own specs after it.
         let entries: Vec<_> = st.table.iter().cloned().collect();
         for e in entries {
@@ -293,7 +346,12 @@ impl Forwards {
     }
 
     /// The same subscriber resumed on connection `conn`: the epoch goes on, on its link.
-    pub(crate) fn resumed_attach(&self, conn: ConnId, events: mpsc::UnboundedSender<ConnEvent>) {
+    pub(crate) fn resumed_attach(
+        &self,
+        conn: ConnId,
+        events: mpsc::UnboundedSender<ConnEvent>,
+        agent: bool,
+    ) {
         let mut st = self.lock();
         if st.ended {
             return;
@@ -306,6 +364,8 @@ impl Forwards {
         st.sub = Sub::Held;
         st.conn = Some(conn);
         st.fatal = Some(events);
+        st.agent = agent;
+        self.sync_agent(&st);
     }
 
     /// The subscriber detached (`~.` or `fil detach`): its channels are dropped, and the `-R`
@@ -317,6 +377,8 @@ impl Forwards {
         }
         self.new_epoch(&mut st);
         st.sub = Sub::Detached;
+        st.agent = false;
+        self.sync_agent(&st);
     }
 
     /// The session ended: every channel and every listener closes.
@@ -330,6 +392,8 @@ impl Forwards {
         st.conn = None;
         st.linked = false;
         st.fatal = None;
+        st.agent = false;
+        self.sync_agent(&st);
         drop(st);
         self.ep.shutdown();
         if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -368,6 +432,7 @@ impl Forwards {
         self.ep
             .attach_link(Arc::new(SessionLink::new(link)), resumed);
         st.linked = true;
+        self.sync_agent(&st);
     }
 
     /// Connection `conn` is over. If its link was the endpoint's, the subscriber is now between
@@ -383,6 +448,7 @@ impl Forwards {
         st.linked = false;
         st.conn = None;
         st.fatal = None;
+        self.sync_agent(&st);
     }
 
     /// A payload for the MUX channel or a dynamic channel, from connection `conn`. Never waits.
@@ -430,6 +496,60 @@ impl Forwards {
     /// Whether `ch` is the endpoint's.
     pub(crate) fn handles(ch: ChannelId) -> bool {
         Endpoint::<SessionLink>::handles(ch)
+    }
+
+    // ---- the agent relay ------------------------------------------------------------------------
+
+    /// After every change of the subscriber or its link: tells waiting agent connections where
+    /// the relay is, and binds or removes the socket (it exists only while the relay is on).
+    fn sync_agent(&self, st: &State) {
+        let g = st.agent_gate();
+        self.agent_gate.send_if_modified(|v| {
+            let changed = *v != g;
+            *v = g;
+            changed
+        });
+        let mut sock = self.agent_sock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sock) = sock.as_mut() {
+            if g == Gate::Off {
+                sock.close();
+            } else {
+                let me: Weak<dyn agent::Admit> = self.me.clone();
+                sock.open(me);
+            }
+        }
+    }
+
+    /// The agent is relayed now (`SessionSummary::agent`): the subscriber asked for it and the
+    /// socket is there.
+    pub(crate) fn agent_on(&self) -> bool {
+        self.lock().agent_gate() != Gate::Off
+            && self
+                .agent_sock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(AgentSocket::is_bound)
+    }
+
+    /// The `fil ports` agent row, while the relay is on. Counts only.
+    pub(crate) fn agent_row(&self) -> Option<AgentRow> {
+        if !self.agent_on() {
+            return None;
+        }
+        Some(AgentRow {
+            session: self.name.clone(),
+            conns: self.ep.agent_stats().open,
+            requests: self.agent_counts.requests(),
+            last_unix_ms: self.agent_counts.last_unix_ms(),
+        })
+    }
+
+    /// Test hook: agent connections are accepted from `uid` instead of ours, so a real
+    /// connection of ours stands for another user's.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn set_agent_uid(&self, uid: u32) {
+        self.lock().agent_uid = uid;
     }
 
     // ---- management (`fil forward`, `fil ports`, `fil ls`) --------------------------------------
@@ -813,11 +933,15 @@ impl Policy for SessionPolicy {
 
     /// `peer` is who connected: the seam for OD-9's `forward.remote_peers = "same-user"` (the
     /// peer socket's owner, from `/proc/net/tcp`). The default, `any`, is ssh's: not checked.
-    fn check_outgoing(&self, kind: &OpenKind, _peer: &LocalPeer) -> Result<(), OpenFailure> {
+    fn check_outgoing(&self, kind: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure> {
         let st = lock(&self.st);
-        let OpenKind::Remote { forward } = kind else {
-            // The agent relay (A1) is not here yet.
-            return Err(OpenFailure::AgentUnavailable);
+        let forward = match kind {
+            OpenKind::Remote { forward } => forward,
+            // The agent socket's connections (`crate::agent`).
+            OpenKind::Agent => return st.agent_check(peer),
+            OpenKind::Local { .. } | OpenKind::Dynamic { .. } => {
+                return Err(OpenFailure::NotPermitted);
+            }
         };
         if st.ended || st.sub == Sub::Detached {
             return Err(OpenFailure::Detached);
@@ -866,5 +990,22 @@ impl Connector for SessionConnector {
             let s = fil_forward::connect::connect_tcp(&target?, &check).await?;
             Ok(Box::new(s) as fil_forward::BoxStream)
         })
+    }
+}
+
+impl agent::Admit for Forwards {
+    fn check(&self, peer: &LocalPeer) -> Result<(), OpenFailure> {
+        self.lock().agent_check(peer)
+    }
+
+    fn gate(&self) -> watch::Receiver<Gate> {
+        self.agent_gate.subscribe()
+    }
+
+    fn open(&self, stream: tokio::net::UnixStream, peer: LocalPeer) {
+        let s = CountingStream::new(stream, self.agent_counts.clone());
+        if let Err(why) = self.ep.open_stream(OpenKind::Agent, Box::new(s), peer) {
+            debug!(why = ?why, "agent channel not opened");
+        }
     }
 }

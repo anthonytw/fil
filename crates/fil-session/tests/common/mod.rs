@@ -375,6 +375,8 @@ mod fwd {
         pub targets: Mutex<HashMap<ForwardId, SocketAddr>>,
         /// `check_incoming` calls: every `Open Remote` the daemon made.
         pub opens: AtomicUsize,
+        /// The local agent this client relays (A1), if it does.
+        pub agent: Mutex<Option<std::path::PathBuf>>,
     }
 
     impl Policy for ClientSide {
@@ -386,6 +388,7 @@ mod fwd {
                 {
                     Ok(())
                 }
+                OpenKind::Agent if self.agent.lock().unwrap().is_some() => Ok(()),
                 _ => Err(OpenFailure::NotPermitted),
             }
         }
@@ -399,6 +402,18 @@ mod fwd {
 
     impl Connector for ClientSide {
         fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
+            if let OpenKind::Agent = kind {
+                let path = self.agent.lock().unwrap().clone();
+                return Box::pin(async move {
+                    let path = path.ok_or(OpenFailure::AgentUnavailable)?;
+                    fil_forward::agent::connect_local(
+                        path,
+                        Arc::new(fil_forward::agent::Rules::default()),
+                        Arc::new(fil_forward::agent::KeyUses::default()),
+                    )
+                    .await
+                });
+            }
             let target = match kind {
                 OpenKind::Remote { forward } => self.targets.lock().unwrap().get(forward).copied(),
                 _ => None,
@@ -474,6 +489,19 @@ mod fwd {
             c
         }
 
+        /// A fresh attach that relays the agent at `agent` (`Attach.agent`).
+        pub async fn attach_agent(
+            h: &SessionHandle,
+            key: PublicKey,
+            host: &'static str,
+            agent: &std::path::Path,
+        ) -> FwdClient {
+            let (mut c, daemon_end) = Self::unattached(key, host);
+            *c.side.agent.lock().unwrap() = Some(agent.to_path_buf());
+            c.start(h, daemon_end, None).await;
+            c
+        }
+
         /// A client that has not attached (for a resume it was never given: `set_last_reply`
         /// first). Must be called inside a runtime.
         pub fn attach_detached(key: PublicKey, host: &'static str) -> FwdClient {
@@ -531,7 +559,7 @@ mod fwd {
                 host: self.host.parse().unwrap(),
                 key: self.key.clone(),
                 echo_ack: false,
-                agent: false,
+                agent: self.side.agent.lock().unwrap().is_some(),
                 resume,
             };
             {

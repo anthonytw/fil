@@ -24,6 +24,12 @@
 //! # "systemd" (always, failing if it cannot) or "tree" (always the process tree).
 //! scope = "auto"
 //!
+//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/agent/<session>.sock
+//! # (DESIGN.md section 10), whether or not a client relays its agent: a program started while
+//! # nobody relays finds the path and gets a refusal, and works once a client with -A attaches.
+//! # With `false` sessions get no SSH_AUTH_SOCK and the agent is never relayed.
+//! agent_socket = true
+//!
 //! [ports]
 //! # The protocol probe of `fil ports` (DESIGN.md section 7.4), on the user's own loopback
 //! # listeners only: "head" (TLS, HTTP `HEAD` for the status and `Server`, Postgres, Redis),
@@ -76,6 +82,7 @@ struct FileConfig {
     history_lines: Option<usize>,
     idle_exit_secs: Option<u64>,
     scope: Option<String>,
+    agent_socket: Option<bool>,
     ports: Option<PortsFile>,
 }
 
@@ -128,6 +135,9 @@ pub struct DaemonConfig {
     pub scope: ScopeMode,
     /// The `fil ports` probe (`[ports] probe`, default `head`).
     pub ports_probe: ProbeMode,
+    /// Sessions get the stable `SSH_AUTH_SOCK` and can relay an agent (`agent_socket`, default
+    /// true; OD-6).
+    pub agent_socket: bool,
     /// The only peer uid the socket accepts (default: this process's). Not in the file; tests
     /// change it to show a foreign user is refused.
     pub allowed_uid: u32,
@@ -157,6 +167,7 @@ impl Default for DaemonConfig {
             idle_exit: Some(DEFAULT_IDLE_EXIT),
             scope: ScopeMode::Auto,
             ports_probe: ProbeMode::Head,
+            agent_socket: true,
             allowed_uid: current_uid(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             lock_wait: Duration::from_secs(3),
@@ -224,6 +235,9 @@ impl DaemonConfig {
                     ));
                 }
             };
+        }
+        if let Some(a) = file.agent_socket {
+            cfg.agent_socket = a;
         }
         if let Some(p) = file.ports.and_then(|p| p.probe) {
             cfg.ports_probe = ProbeMode::parse(&p).ok_or_else(|| {

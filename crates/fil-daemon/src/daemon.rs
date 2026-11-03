@@ -371,6 +371,11 @@ impl Inner {
         sc.cwd = self.cfg.session.cwd.clone();
         sc.env = self.cfg.session.env.clone();
         sc.clear_env = self.cfg.session.clear_env;
+        // The stable SSH_AUTH_SOCK (DESIGN.md section 10, OD-6), in the socket directory.
+        sc.agent_socket = self
+            .cfg
+            .agent_socket
+            .then(|| self.paths.agent_socket(&attach.name));
         let host = self.host.clone() as Arc<dyn SessionHost>;
         let delay = self.cfg.spawn_delay;
         let spawn = async move {

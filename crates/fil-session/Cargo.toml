@@ -15,8 +15,10 @@ fil-term = { path = "../fil-term", default-features = false, features = ["alacri
 fil-transport = { path = "../fil-transport" }
 nix = { version = "0.28", default-features = false, features = ["term", "signal", "user", "process"] }
 portable-pty = "0.9"
+# The agent socket: the effective uid its directory and peers are checked against.
+rustix = { version = "1", features = ["process"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 tracing = "0.1"
 vte = "0.15"
 

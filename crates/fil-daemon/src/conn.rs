@@ -419,8 +419,7 @@ impl Inner {
                 summary,
                 membership,
                 forwards: h.forward_rows(),
-                // The agent relay arrives with M2's A1.
-                agent: None,
+                agent: h.agent_row(),
             });
         }
         // The focused session may have ended since it was looked up: then it is gone, as it
@@ -454,8 +453,7 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
                 since_unix_ms: s.since_unix_ms,
             }),
         forwards: h.forward_count(),
-        // The agent relay arrives with M2's A1.
-        agent: false,
+        agent: h.agent_relayed(),
     })
 }
 

@@ -317,7 +317,7 @@ Forwards must stay open across reconnects **(decided)**.
 - At attach time: `fil orin -L 5173 -R 9000`
 - Afterwards: `fil forward -L 5173`, `fil forward -R 9000`, `fil forward --rm 5173`
 
-These commands work from the client machine or from inside the session. Inside, `$FIL_SESSION` names the session and the command talks to the daemon over its socket.
+These commands work from the client machine (`fil forward orin -L 5173`, with the session `main` unless one is named) or from inside the session. Inside, `$FIL_SESSION` names the session and the command talks to the daemon over its socket, the one of its own wire revision; if the session's daemon is of another revision it says so and which side to upgrade. A `--rm` on a port two forwards share is `Ambiguous` until the kind is named (`--rm -L 5173`).
 
 Either way they are a management `Request::Forward { session, op }` (`Add(spec)` or `Remove { kind, port }`; without a kind, the one forward on that port, or `Ambiguous`), answered by `Response::Forward` (`Added(id)`, `Removed(id)` or `Refused(why)`). The daemon cannot tell a request from the laptop apart from one by a process on the remote, so such an entry has `Origin::Request` and the attached client asks its user once per entry (`remote_requests = "ask"`, or `"deny"`) before it binds or connects anything for it.
 
@@ -748,9 +748,9 @@ fil HOST [SESSION] [-L SPEC]… [-R SPEC]… [-D SPEC]… [-A|-a]
                                            attach, creating the session if needed (default: main)
 fil ls HOST                                sessions: name, term, forwards, subscriber, last output, age
 fil kill HOST SESSION
-fil ports [HOST [SESSION]]                 inside a session: the current one
-fil forward (-L|-R) SPEC | --rm PORT
-fil detach [HOST SESSION]                  with no arguments, inside a session (M2)
+fil ports [HOST [SESSION]] [--json]        inside a session: the current one
+fil forward [HOST [SESSION]] -L|-R|-D SPEC | --rm [-L|-R|-D] PORT
+fil detach [HOST SESSION]                  with no arguments, inside a session
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 

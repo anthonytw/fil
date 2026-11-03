@@ -16,6 +16,7 @@ use fil_proto::mux::{
     Origin, Target, TargetHost,
 };
 use fil_session::ServeEnd;
+use fil_transport::Link;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -257,6 +258,14 @@ async fn no_open_remote_before_consent() {
     assert_eq!(round_trip_eventually(port, b"hello", 5).await, b"hello");
     assert!(c.side.opens.load(Ordering::SeqCst) >= 1);
 
+    // `--rm 0` is not "every -R 0": an ephemeral -R is found by the port it got.
+    assert_eq!(
+        h.forward(ForwardOp::Remove {
+            kind: Some(ForwardKind::Remote),
+            port: 0
+        }),
+        ForwardResult::Refused(ForwardRefusal::NoSuchForward)
+    );
     // `fil forward --rm` by the port it got: the listener closes at once and the client hears.
     assert_eq!(
         h.forward(ForwardOp::Remove {
@@ -305,6 +314,66 @@ async fn hostile_requests_are_refused() {
     assert_eq!(h.forward_count(), 0);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(c.table().is_empty(), "{:?}", c.table().len());
+}
+
+/// While the client is between links its MUX stream is not acknowledged and fills up. A table
+/// change the client could not be told about is refused (`TooMany`) instead of made behind its
+/// back; once the resumed client has caught up, changes go through again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_the_client_cannot_hear_of_is_refused() {
+    let s = Scratch::new();
+    let mut cfg = cat(&s, "full");
+    cfg.forward.mux_buffer = 16 * 1024;
+    let h = spawn_plain(cfg).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    c.drop_link().await;
+    // Long target names make each `Forward` record large.
+    let spec = |n: u16| {
+        let label = "a".repeat(60);
+        let name = format!("{label}.{label}.{label}.n{n}.example");
+        ForwardSpec::new(
+            ForwardKind::Local,
+            BindAddr::Loopback,
+            40100 + n,
+            Some(Target {
+                host: TargetHost::Name(name.parse().unwrap()),
+                port: NonZeroU16::new(80).unwrap(),
+            }),
+        )
+        .unwrap()
+    };
+    let mut added = 0;
+    let mut refused_at = None;
+    for n in 0..60 {
+        match h.forward(ForwardOp::Add(spec(n))) {
+            ForwardResult::Added(_) => added += 1,
+            ForwardResult::Refused(ForwardRefusal::TooMany) => {
+                refused_at = Some(n);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let at = refused_at.expect("refused once the MUX buffer filled");
+    assert!(added > 0 && h.forward_count() == added, "{added} added");
+    // Every entry that was made reaches the client once it is back.
+    c.resume(&h).await;
+    c.wait("the queued table", |s| {
+        s.table
+            .iter()
+            .filter(|m| matches!(m, MuxMsg::Forward { .. }))
+            .count()
+            == added as usize
+    })
+    .await;
+    eventually("the client to acknowledge the MUX stream", || async {
+        h.forward_snapshot().mux_buffered == 0
+    })
+    .await;
+    assert!(matches!(
+        h.forward(ForwardOp::Add(spec(at))),
+        ForwardResult::Added(_)
+    ));
 }
 
 // ---- detach -------------------------------------------------------------------------------------
@@ -404,6 +473,45 @@ async fn forwards_survive_a_reconnect() {
     c.resume(&h).await;
     assert_eq!(waiting.await.unwrap().as_deref(), Some(&b"while down"[..]));
     let _ = app;
+}
+
+/// After the client breaks the MUX protocol the session's mux stays failed until a new epoch, so
+/// a resume is refused (`BadResume`) instead of being accepted and cut off again every time; a
+/// fresh attach starts the forwards over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_after_a_mux_failure_is_refused_and_a_fresh_attach_recovers() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "muxfail")).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    // A record whose length is not a valid varint: the stream cannot be read past it.
+    let garbage = fil_proto::frame::DataSegment::encode(0, &[0xff, 0xff, 0xff]).unwrap();
+    c.link
+        .send(fil_proto::ChannelId::MUX, bytes::Bytes::from(garbage))
+        .await
+        .unwrap();
+    c.wait("Error(Protocol)", |s| !s.errors.is_empty()).await;
+    assert!(matches!(c.serve_end().await, ServeEnd::Protocol(_)));
+    assert!(h.forward_snapshot().failed);
+
+    for _ in 0..2 {
+        c.drop_link().await;
+        c.resume(&h).await;
+        assert_eq!(
+            c.seen.lock().unwrap().refused,
+            Some(AttachRefusal::BadResume),
+            "a resume onto the failed mux"
+        );
+    }
+    // The session is untouched: a fresh attach (as the client does on this refusal) works, and
+    // its forwards with it.
+    c.take_back(&h).await;
+    assert!(c.seen.lock().unwrap().reply.is_some());
+    assert!(!h.forward_snapshot().failed);
+    let target = echo().await;
+    let id = add(&mut c, remote(0, target.port())).await;
+    let port = bound_port(&c, id, c.table().len().saturating_sub(2)).await;
+    c.side.targets.lock().unwrap().insert(id, target.addr);
+    assert_eq!(round_trip_eventually(port, b"back", 4).await, b"back");
 }
 
 // ---- takeover -----------------------------------------------------------------------------------

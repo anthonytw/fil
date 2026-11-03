@@ -800,8 +800,11 @@ impl Core {
             }
             Cmd::ProcessTable(rows) => {
                 self.tracker.refresh(self.pty.pid, &rows);
+                // The child may be among the recorded ones too: each pid once.
                 let pids = std::iter::once(self.pty.pid)
                     .chain(self.tracker.pids())
+                    .collect::<std::collections::BTreeSet<u32>>()
+                    .into_iter()
                     .collect();
                 *self.shared.pids.lock().unwrap_or_else(|e| e.into_inner()) = pids;
             }
@@ -1123,6 +1126,19 @@ impl Core {
         if self.exit.is_some() || a.name != self.name {
             let exit = self.exit.as_ref().and_then(ExitInfo::status);
             return AttachAnswer::Refused(AttachRefusal::SessionGone { exit });
+        }
+        // A resume that would be accepted, while the forwards' mux has failed, is refused: the
+        // mux is cleared only by a new epoch, which only a fresh attach starts (the client's mux
+        // must start over with it). The client attaches fresh on this refusal. Anything else
+        // about the resume (a stale epoch, another key) is answered as it would be anyway.
+        if let Some(r) = &a.resume
+            && r.incarnation == self.incarnation
+            && self.epoch.is_current(r.epoch)
+            && self.epoch.subscriber().is_some_and(|s| s.key == a.key)
+            && self.forwards.failed()
+        {
+            tracing::info!("resume refused: the forwards failed, so the next attach must be fresh");
+            return AttachAnswer::Refused(AttachRefusal::BadResume);
         }
         self.sample_mode();
         let echo_ack = a.echo_ack;

@@ -197,6 +197,8 @@ pub(crate) struct Forwards {
     task: Mutex<Option<JoinHandle<()>>>,
     /// For the tasks it starts (a rebind that waits for the replaced listener to let go).
     me: std::sync::Weak<Forwards>,
+    /// Where the MUX send buffer stops taking table records (three quarters of it).
+    table_room: usize,
 }
 
 /// Counts only.
@@ -227,6 +229,7 @@ impl Forwards {
         }));
         let policy = Arc::new(SessionPolicy { st: st.clone() });
         let connector = Arc::new(SessionConnector { st: st.clone() });
+        let table_room = cfg.mux_buffer / 4 * 3;
         let (ep, events) = Endpoint::new(Side::Daemon, cfg, connector, policy);
         lock(&st).events = events;
         let fw = Arc::new_cyclic(|me| Forwards {
@@ -235,6 +238,7 @@ impl Forwards {
             st,
             task: Mutex::new(None),
             me: me.clone(),
+            table_room,
         });
         let task = tokio::spawn(fw.clone().drain_events());
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -433,28 +437,22 @@ impl Forwards {
         if st.ended {
             return ForwardResult::Refused(ForwardRefusal::NotPermitted);
         }
+        // A change the client must hear about is not made when the record could not be queued:
+        // the client would never learn of it.
+        if !self.table_has_room(&st) {
+            debug!("forward request refused: the MUX buffer is full");
+            return ForwardResult::Refused(ForwardRefusal::TooMany);
+        }
         match op {
-            ForwardOp::Add(spec) => match st.table.add(spec.clone(), Origin::Request) {
+            ForwardOp::Add(spec) => match st.table.add(spec, Origin::Request) {
                 Ok(Added::Existing(id)) => ForwardResult::Added(id),
-                Ok(Added::New(id)) => {
-                    debug!(kind = ?spec.kind(), "forward added by a request");
-                    self.bind_remote(&mut st, id, &spec);
-                    self.tell(
-                        &st,
-                        MuxMsg::Forward {
-                            id,
-                            spec,
-                            origin: Origin::Request,
-                            req: None,
-                        },
-                    );
-                    if let Some(state) = st.listen.get(&id) {
-                        self.tell(&st, MuxMsg::Listening { id, state: *state });
-                    }
+                // A request never replaces (the table answers `Conflict`); if it ever did, it
+                // would be handled as the client's is.
+                Ok(added) => {
+                    let id = added.id();
+                    self.install(&mut st, added, None);
                     ForwardResult::Added(id)
                 }
-                // A request never replaces (that is a `Conflict`).
-                Ok(Added::Replaced { id, .. }) => ForwardResult::Added(id),
                 Err(why) => {
                     debug!(why = ?why, "forward request refused");
                     ForwardResult::Refused(why)
@@ -468,6 +466,13 @@ impl Forwards {
                 Err(why) => ForwardResult::Refused(why),
             },
         }
+    }
+
+    /// The forwards' mux has failed (the client broke its protocol, or stopped acknowledging
+    /// it). Only a new epoch clears that, so the next attach must be fresh: a resume would get
+    /// the failed mux back and be cut off with `Error(Protocol)` again, every time.
+    pub(crate) fn failed(&self) -> bool {
+        self.ep.snapshot().failed
     }
 
     /// Entries in the table, for `fil ls`.
@@ -515,13 +520,63 @@ impl Forwards {
 
     // ---- the table ------------------------------------------------------------------------------
 
+    /// What follows an add: a replaced entry goes (`ForwardGone`; its listener closes, its open
+    /// connections run until they close), a new `-R` is bound, and the client is told the entry
+    /// (`req` answers its `AddForward`) and, for `-R`, the bind.
+    fn install(&self, st: &mut State, added: Added, req: Option<u32>) {
+        let id = added.id();
+        if let Added::Replaced { old, .. } = added {
+            self.ep.unlisten(old);
+            st.listen.remove(&old);
+            st.consented.remove(&old);
+            self.ep.forget_stats(old);
+            self.tell(st, MuxMsg::ForwardGone { id: old });
+        }
+        let e = st.table.get(id).cloned().expect("just added");
+        match added {
+            Added::New(_) => {
+                debug!(kind = ?e.spec.kind(), "forward added");
+                self.bind_remote(st, id, &e.spec);
+            }
+            Added::Replaced { .. } => {
+                debug!(kind = ?e.spec.kind(), "forward replaced");
+                self.bind_replacing(st, id, &e.spec);
+            }
+            Added::Existing(_) => {}
+        }
+        self.tell(
+            st,
+            MuxMsg::Forward {
+                id,
+                spec: e.spec.clone(),
+                origin: e.origin,
+                req,
+            },
+        );
+        if e.spec.kind() == ForwardKind::Remote
+            && let Some(state) = st.listen.get(&id)
+        {
+            self.tell(st, MuxMsg::Listening { id, state: *state });
+        }
+    }
+
+    /// Whether the records one table change sends (at most `ForwardGone`, `Forward` and
+    /// `Listening`, a few hundred bytes) fit below the point where the MUX buffer refuses table
+    /// records. Always true while nobody is told.
+    fn table_has_room(&self, st: &State) -> bool {
+        const CHANGE: usize = 3 * fil_proto::limits::MAX_MUX_RECORD;
+        !st.tells_client() || self.ep.snapshot().mux_buffered + CHANGE <= self.table_room
+    }
+
     /// Queues a table record for the client, when there is one to tell.
     fn tell(&self, st: &State, msg: MuxMsg) {
         if !st.tells_client() {
             return;
         }
         if let Err(e) = self.ep.send_table(msg) {
-            // The MUX buffer is past three quarters: the client has stopped reading it. The
+            // The MUX buffer is past three quarters: the client has stopped reading it. Changes
+            // are refused before this can happen (`table_has_room`); what is left is a record
+            // that no change caused (the table after a fresh attach starts an empty stream). The
             // table is the daemon's either way, and a fresh attach sends all of it again.
             debug!(error = %e, "a forward table record was not queued");
         }
@@ -637,45 +692,29 @@ impl Forwards {
         }
         match msg {
             MuxMsg::AddForward { req, spec } => {
-                let added = st.table.add(spec, Origin::Client);
-                let id = match added {
-                    Ok(a) => a.id(),
+                // The answer must be able to go out, or the table would change behind the
+                // client's back: refused (the short refusal may still fit; if it does not, the
+                // client has stopped reading the MUX stream and hears nothing either way).
+                if !self.table_has_room(st) {
+                    debug!("forward refused: the MUX buffer is full");
+                    self.tell(
+                        st,
+                        MuxMsg::ForwardRefused {
+                            req,
+                            why: ForwardRefusal::TooMany,
+                        },
+                    );
+                    return;
+                }
+                match st.table.add(spec, Origin::Client) {
+                    Ok(added) => {
+                        st.consented.insert(added.id());
+                        self.install(st, added, Some(req));
+                    }
                     Err(why) => {
                         debug!(why = ?why, "forward refused");
                         self.tell(st, MuxMsg::ForwardRefused { req, why });
-                        return;
                     }
-                };
-                if let Ok(Added::Replaced { old, .. }) = added {
-                    // The client's spec takes the identity's place; the old entry's
-                    // connections run until they close.
-                    self.ep.unlisten(old);
-                    st.listen.remove(&old);
-                    st.consented.remove(&old);
-                    self.ep.forget_stats(old);
-                    self.tell(st, MuxMsg::ForwardGone { id: old });
-                }
-                let e = st.table.get(id).cloned().expect("just added");
-                debug!(kind = ?e.spec.kind(), "forward added by the client");
-                st.consented.insert(id);
-                match added {
-                    Ok(Added::New(_)) => self.bind_remote(st, id, &e.spec),
-                    Ok(Added::Replaced { .. }) => self.bind_replacing(st, id, &e.spec),
-                    _ => {}
-                }
-                self.tell(
-                    st,
-                    MuxMsg::Forward {
-                        id,
-                        spec: e.spec.clone(),
-                        origin: e.origin,
-                        req: Some(req),
-                    },
-                );
-                if e.spec.kind() == ForwardKind::Remote
-                    && let Some(state) = st.listen.get(&id)
-                {
-                    self.tell(st, MuxMsg::Listening { id, state: *state });
                 }
             }
             MuxMsg::RemoveForward { id } => self.remove(st, id),
@@ -723,7 +762,10 @@ fn find_port(
             }
             _ => None,
         };
-        (e.spec.port() == port || bound == Some(port)) && kind.is_none_or(|k| e.spec.kind() == k)
+        // An ephemeral `-R` (port 0) is found by the port it got, never by 0: `--rm 0` would
+        // otherwise match every one of them.
+        let by_spec = port != 0 && e.spec.port() == port;
+        (by_spec || bound == Some(port)) && kind.is_none_or(|k| e.spec.kind() == k)
     });
     let first = hits.next().ok_or(ForwardRefusal::NoSuchForward)?;
     if hits.next().is_some() {

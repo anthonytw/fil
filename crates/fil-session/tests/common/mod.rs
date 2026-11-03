@@ -446,6 +446,8 @@ mod fwd {
         recv: Arc<Mutex<(RecvChannel, u64)>>,
         input_sent: u64,
         next_req: u32,
+        /// The last attach reply: what a resume names.
+        last_reply: Option<AttachReply>,
     }
 
     impl Drop for FwdClient {
@@ -494,6 +496,7 @@ mod fwd {
                 recv: Arc::new(Mutex::new((RecvChannel::new(), 0))),
                 input_sent: 0,
                 next_req: 0,
+                last_reply: None,
             };
             c.start(h, daemon_end, None).await;
             c
@@ -538,6 +541,9 @@ mod fwd {
                 s.reply.is_some() || s.refused.is_some()
             })
             .await;
+            if let Some(r) = self.seen.lock().unwrap().reply.clone() {
+                self.last_reply = Some(r);
+            }
         }
 
         /// The link dies (as a pulled cable), and the client resumes on a new one.
@@ -578,13 +584,7 @@ mod fwd {
 
         /// Resumes on a new link (after `drop_link`).
         pub async fn resume(&mut self, h: &SessionHandle) {
-            let reply = self
-                .seen
-                .lock()
-                .unwrap()
-                .reply
-                .clone()
-                .expect("attached once");
+            let reply = self.last_reply.clone().expect("attached once");
             let seq = self.recv.lock().unwrap().0.received();
             let r = ResumeRequest {
                 incarnation: reply.incarnation,

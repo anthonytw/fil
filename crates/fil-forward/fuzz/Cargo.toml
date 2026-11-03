@@ -1,0 +1,26 @@
+# The cargo-fuzz targets of fil-forward. Not part of the workspace and not run by `just ci`:
+#   cargo +nightly fuzz run socks        (from crates/fil-forward)
+[package]
+name = "fil-forward-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil-forward = { path = ".." }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "socks"
+path = "fuzz_targets/socks.rs"
+test = false
+doc = false
+bench = false

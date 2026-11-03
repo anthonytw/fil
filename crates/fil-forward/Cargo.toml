@@ -1,0 +1,30 @@
+[package]
+name = "fil-forward"
+description = "Port forwards and the agent relay above the link: the async endpoint that drives fil-proto's MUX state machine, per-connection pumps, listeners, connects and SOCKS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+fil-proto = { path = "../fil-proto" }
+fil-transport = { path = "../fil-transport" }
+rustix = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+# `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.
+fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
+fil-netsim = { path = "../fil-netsim" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.10"
+# SHA-256 for the byte-exact checks (already in the tree through fil-transport; its digest is
+# optimized even in a debug build).
+ring = "0.17"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
+
+[lints]
+workspace = true

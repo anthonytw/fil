@@ -455,6 +455,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fil-forward"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fil-netsim",
+ "fil-proto",
+ "fil-transport",
+ "quinn",
+ "rand",
+ "ring",
+ "rustix",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fil-netsim"
 version = "0.0.0"
 dependencies = [

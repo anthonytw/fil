@@ -710,6 +710,7 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
   - `fil-transport`: the trait, pipe and QUIC
   - `fil-term`: the emulator trait, its backends and snapshots
   - `fil-session`: one session (PTY, log, emulator, the subscriber protocol over any `Link`)
+  - `fil-forward`: forwards above the link (§7, §8.5): the endpoint that drives `fil_proto::mux` for either side, with a pump per forwarded connection, listeners on loopback in both families, connects that apply address rules to every resolved address, the timers, the memory budget, a SOCKS5/4a CONNECT parser and per-forward stats; the session (daemon side), the client and the agent relay plug in their connector and policy
   - `fil-client`: the client engine (raw terminal, the attach, resume and reconnect loop, input while disconnected, the status line), independent of the transport
   - `fil-predict`: the trait, the default predictor and the overlay
   - `fil-netsim`: the in-process link simulator (§12), used only by tests

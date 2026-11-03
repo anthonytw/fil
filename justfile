@@ -60,6 +60,12 @@ netsim-soak:
 mux-soak seeds="5000":
     MUX_SEEDS={{seeds}} cargo test --release -p fil-proto --test mux_model -- --nocapture
 
+# The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
+# forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
+# tests at 8 MiB and 2,000. Release build. Also runs the SOCKS fuzz table with more seeds.
+forward-soak mib="256" seq="20000":
+    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture
+
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
     cargo run -q -p fil-term --example fixtures

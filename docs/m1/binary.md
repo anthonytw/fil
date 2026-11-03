@@ -136,8 +136,8 @@ Mutation checks (each change made by hand, the suites run, the change reverted):
 
 ## Not done here
 
-- `fil server --stdio` and `fil server --daemon` call `fil-daemon`, which is package P5. Until it merges they print a message and fail (`src/server.rs` says where the two calls go).
-- `Outcome::SessionEnded { code, signal }` and `Link::flush` are package F. Until then a session that ends exits 0, and the client's exit status is the placeholder in `app::exit_code`.
+- `fil server --stdio` and `fil server --daemon` call `fil-daemon`, which is package P5. Until it merges (PR #21) they print a message and fail; `src/server.rs` has the two calls (`run_relay`, `run_daemon`), and `app::main` already dispatches them before any runtime starts.
+- `Outcome::SessionEnded { code, signal }` and `Link::flush` are package F (PR #22). Until it merges a session that ends exits 0 (`app::exit_code`), and `Shared` and `AnyLink` (`src/link.rs`) have no `flush` to forward; both are small changes made when it lands.
 - Local time in the "taken over" message: the client formats UTC (labelled) because the local zone needs a database lookup this crate does not carry.
 - Port forwards (`-L`, `-R`, `forward = [...]`, `fil ports`, `fil forward`) are M2.
 

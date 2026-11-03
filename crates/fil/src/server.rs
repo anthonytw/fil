@@ -4,9 +4,14 @@
 //! on this branch yet; until it is, both say so and fail. The wiring will be a few lines:
 //!
 //! ```ignore
-//! fil_daemon::run_relay(std::env::current_exe()?, ..)   // fil server --stdio
-//! fil_daemon::run_daemon(..)                            // fil server --daemon
+//! // fil server --stdio: sync, no runtime.
+//! fil_daemon::run_relay(&RelayOptions::new(DaemonLauncher::fil(std::env::current_exe()?)))
+//! // fil server --daemon: builds its own runtime.
+//! fil_daemon::run_daemon(&Paths::for_current_user())
 //! ```
+//!
+//! Both return an `ExitCode`, and both are dispatched from `app::main` before any tokio runtime
+//! exists (`run_daemon` makes its own). That is why this module is sync.
 //!
 //! Nothing here may write to stdout (it is the pipe) or print to stderr beyond a short error
 //! (ssh shows it to the user).

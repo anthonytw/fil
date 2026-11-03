@@ -1,0 +1,975 @@
+//! The daemon: the per-user process that holds the sessions (DESIGN.md sections 4, 5.3, 8).
+//!
+//! [`Daemon::start`] takes the lock, binds the Unix socket (and the QUIC port when direct mode is
+//! on); [`Daemon::run`] accepts connections until the daemon is idle for too long or is told to
+//! stop. [`run_daemon`] is the whole process: detach from the login session, log to a file,
+//! read the configuration, run, exit.
+//!
+//! # Lifecycle
+//!
+//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>.lock` for its
+//!   whole life (its pid is written there). A second daemon for the same major waits briefly,
+//!   for one on its way out, then reports [`StartError::AlreadyRunning`] and exits cleanly. The
+//!   lock dies with the process, so a socket file that exists while the lock is free is stale
+//!   and is removed by the daemon that takes the lock.
+//! - **Idle exit.** With no session and no connection for `idle_exit` (five minutes by default,
+//!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
+//!   last look for a connection that raced it, and exits. A relay that arrives later starts a
+//!   new one. A session counts as long as its shell runs, attached or not.
+//! - **Upgrades.** The protocol major is in the socket path, so daemons of different versions
+//!   run side by side. New sessions go to the newest (the client dials the path of its own
+//!   major); old sessions stay on the old daemon until they end, and the old daemon then idles
+//!   out. [`list_sockets`](crate::list_sockets) finds them all for `fil ls`.
+//! - **Stopping.** SIGTERM and SIGINT stop the daemon after hanging up every session (as
+//!   closing their terminals would). SIGHUP is ignored.
+//!
+//! # Connections
+//!
+//! Every accepted connection is checked first: a Unix peer must have the uid in
+//! [`DaemonConfig::allowed_uid`] (the kernel reports it: `SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
+//! on macOS), and a QUIC peer must have authenticated with a key in the registry. Then each
+//! connection speaks the same protocol (see [`crate::conn`]).
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use fil_proto::msg::{self, Attach, SessionName};
+use fil_session::{DirectInfo, SessionConfig, SessionHandle, SessionHost};
+use fil_transport::auth::{AuthError, DaemonIdentity, KeyRegistry, PublicKey as TransportKey};
+use fil_transport::pipe::{PipeConfig, PipeLink};
+use fil_transport::quic::{ListenError, ListenerConfig, QuicListener};
+use rustix::fs::{FlockOperation, flock};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+
+use crate::config::{ConfigError, DaemonConfig};
+use crate::conn::Origin;
+use crate::linger;
+use crate::paths::{DirError, Paths, ensure_socket_dir};
+use crate::start::open_lock_file;
+
+/// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
+const MAX_TOMBSTONES: usize = 256;
+/// How long creating a session (the PTY, the child, the probes for a systemd scope) may take
+/// before the attach fails.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long stopping the daemon waits for each session to be killed.
+const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error(transparent)]
+    Dir(#[from] DirError),
+    #[error("another fil daemon is already running (lock {0})")]
+    AlreadyRunning(PathBuf),
+    #[error("cannot set up {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("daemon identity: {0}")]
+    Identity(AuthError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
+/// Why [`Daemon::run`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// No session and no connection for the idle time.
+    Idle,
+    /// [`DaemonHandle::shutdown`] was called.
+    Shutdown,
+}
+
+/// The session a registered key belongs to: the one its pipe attach was accepted for.
+///
+/// A key reaches exactly this session (DESIGN.md section 8.3): over QUIC it may resume this
+/// session, at this incarnation, and nothing else. It is dropped, and the key revoked, when the
+/// subscriber loses the session (takeover, detach), when the session ends, and when the attach
+/// is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub name: SessionName,
+    pub incarnation: u128,
+}
+
+/// What [`SessionHandle::spawn`] gets as the session's host: key revocation and the direct-mode
+/// details.
+///
+/// Revoking removes the key from the registry, so new handshakes with it fail at once. The
+/// listener closes the key's live QUIC connections a backstop delay later
+/// (`ListenerConfig::revoke_backstop`), which leaves time for the session to send `TakenOver` on
+/// the old connection and close it itself. That is safe because a session whose subscriber
+/// lost it neither reads from nor writes to the old connection.
+pub(crate) struct Host {
+    registry: KeyRegistry,
+    direct: Option<DirectInfo>,
+    bindings: Mutex<HashMap<TransportKey, Binding>>,
+}
+
+impl Host {
+    fn bindings(&self) -> MutexGuard<'_, HashMap<TransportKey, Binding>> {
+        self.bindings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn binding(&self, key: &TransportKey) -> Option<Binding> {
+        self.bindings().get(key).cloned()
+    }
+
+    /// Binds `key` to a session. `false` if it is already bound to another session's name (a
+    /// key is for one attach, so for one session).
+    pub(crate) fn bind(&self, key: &TransportKey, b: Binding) -> bool {
+        let mut map = self.bindings();
+        if map.get(key).is_some_and(|old| old.name != b.name) {
+            return false;
+        }
+        map.insert(key.clone(), b);
+        true
+    }
+
+    pub(crate) fn revoke(&self, key: &TransportKey) {
+        self.bindings().remove(key);
+        self.registry.revoke(key);
+    }
+
+    /// Revokes every key bound to the session `(name, incarnation)`: it has ended.
+    fn revoke_session(&self, name: &SessionName, incarnation: u128) {
+        let keys: Vec<TransportKey> = self
+            .bindings()
+            .iter()
+            .filter(|(_, b)| b.name == *name && b.incarnation == incarnation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            self.revoke(&k);
+        }
+    }
+
+    #[cfg(test)]
+    fn bound(&self) -> usize {
+        self.bindings().len()
+    }
+}
+
+impl SessionHost for Host {
+    fn revoke_key(&self, key: &msg::PublicKey) {
+        self.revoke(&TransportKey::from_spki_der(key.as_bytes()));
+    }
+
+    fn direct_info(&self) -> Option<DirectInfo> {
+        self.direct.clone()
+    }
+}
+
+/// The sessions, and what keeps the daemon from idling out.
+#[derive(Default)]
+struct State {
+    live: std::collections::HashMap<SessionName, SessionHandle>,
+    /// `(name, incarnation)` of sessions that ended, oldest first.
+    ended: std::collections::VecDeque<(SessionName, u128)>,
+    /// Connections being served.
+    conns: usize,
+}
+
+/// Why a session could not be found or made for an attach.
+pub(crate) enum Lookup {
+    Refuse(msg::AttachRefusal),
+    Failed(String),
+}
+
+pub(crate) struct Inner {
+    pub(crate) cfg: DaemonConfig,
+    pub(crate) registry: KeyRegistry,
+    pub(crate) host: Arc<Host>,
+    state: Mutex<State>,
+    /// Sessions plus connections: zero means idle.
+    busy: watch::Sender<usize>,
+    /// One lock per session name while it is being looked up or created, so two attaches to a
+    /// new name make one session and an attach to one name never waits for another's.
+    name_locks: Mutex<HashMap<SessionName, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Keeps the daemon from idling out while a connection is being served.
+pub(crate) struct ConnGuard(Arc<Inner>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut st = self.0.state();
+        st.conns -= 1;
+        self.0.publish(&st);
+    }
+}
+
+impl Inner {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn publish(&self, st: &State) {
+        self.busy.send_replace(st.live.len() + st.conns);
+    }
+
+    pub(crate) fn revoke_key(&self, key: &msg::PublicKey) {
+        self.host.revoke_key(key);
+    }
+
+    fn name_lock(&self, name: &SessionName) -> Arc<tokio::sync::Mutex<()>> {
+        self.name_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Drops the lock's map entry when nobody else holds or waits for it.
+    fn release_name_lock(&self, name: &SessionName, lock: Arc<tokio::sync::Mutex<()>>) {
+        let mut map = self.name_locks.lock().unwrap_or_else(|e| e.into_inner());
+        // The map's copy and ours.
+        if Arc::strong_count(&lock) == 2 {
+            map.remove(name);
+        }
+    }
+
+    pub(crate) fn guard(self: &Arc<Self>) -> ConnGuard {
+        let mut st = self.state();
+        st.conns += 1;
+        self.publish(&st);
+        ConnGuard(self.clone())
+    }
+
+    /// The live sessions, in name order.
+    pub(crate) fn sessions(&self) -> Vec<SessionHandle> {
+        let mut v: Vec<SessionHandle> = self
+            .state()
+            .live
+            .values()
+            .filter(|h| h.is_alive())
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
+        v
+    }
+
+    pub(crate) fn session(&self, name: &SessionName) -> Option<SessionHandle> {
+        self.state()
+            .live
+            .get(name)
+            .filter(|h| h.is_alive())
+            .cloned()
+    }
+
+    /// The session an attach is for: the existing one, or, for a fresh attach, a new one.
+    ///
+    /// A live session is found without any lock. Creating takes a lock for that name only, and
+    /// the spawn has a timeout, so a hung user manager delays attaches to that name alone.
+    ///
+    /// A resume of a session that is not here is refused: `SessionGone` if it ended while its
+    /// client was away (the daemon remembers recent endings, and a session whose exit has
+    /// been seen but not yet reaped counts as ended), `SessionReplaced` otherwise (it was killed
+    /// and recreated, or the daemon restarted and never heard of it).
+    pub(crate) async fn session_for(
+        self: &Arc<Self>,
+        attach: &Attach,
+    ) -> Result<SessionHandle, Lookup> {
+        if let Some(h) = self.session(&attach.name) {
+            return Ok(h);
+        }
+        let lock = self.name_lock(&attach.name);
+        let result = {
+            let _creating = lock.lock().await;
+            self.session_for_locked(attach).await
+        };
+        self.release_name_lock(&attach.name, lock);
+        result
+    }
+
+    async fn session_for_locked(
+        self: &Arc<Self>,
+        attach: &Attach,
+    ) -> Result<SessionHandle, Lookup> {
+        let existing = self.state().live.get(&attach.name).cloned();
+        if let Some(h) = existing.as_ref().filter(|h| h.is_alive()) {
+            return Ok(h.clone());
+        }
+        if let Some(r) = &attach.resume {
+            let gone = existing
+                .as_ref()
+                .is_some_and(|dead| dead.incarnation() == r.incarnation)
+                || self
+                    .state()
+                    .ended
+                    .iter()
+                    .any(|(n, i)| *n == attach.name && *i == r.incarnation);
+            return Err(Lookup::Refuse(if gone {
+                msg::AttachRefusal::SessionGone
+            } else {
+                msg::AttachRefusal::SessionReplaced
+            }));
+        }
+
+        let incarnation = random_incarnation().map_err(Lookup::Failed)?;
+        let mut sc = SessionConfig::new(
+            attach.name.clone(),
+            attach.term.clone(),
+            attach.size,
+            incarnation,
+        );
+        sc.scope = self.cfg.scope;
+        sc.command = self.cfg.session.command.clone();
+        sc.cwd = self.cfg.session.cwd.clone();
+        sc.env = self.cfg.session.env.clone();
+        sc.clear_env = self.cfg.session.clear_env;
+        let spawn = SessionHandle::spawn(sc, self.host.clone() as Arc<dyn SessionHost>);
+        let handle = match tokio::time::timeout(SPAWN_TIMEOUT, spawn).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => return Err(Lookup::Failed(format!("cannot start the session: {e}"))),
+            Err(_) => {
+                return Err(Lookup::Failed(format!(
+                    "starting the session took more than {SPAWN_TIMEOUT:?}"
+                )));
+            }
+        };
+        {
+            let mut st = self.state();
+            st.live.insert(attach.name.clone(), handle.clone());
+            self.publish(&st);
+        }
+        tracing::info!(session = %attach.name, pid = handle.pid(), "session created");
+        let inner = self.clone();
+        let h = handle.clone();
+        tokio::spawn(async move {
+            let exit = h.wait_exit().await;
+            inner.reap(&h, exit.code, exit.signal.as_deref());
+        });
+        Ok(handle)
+    }
+
+    /// Forgets an ended session, remembering its name and incarnation for a while.
+    fn reap(&self, h: &SessionHandle, code: u32, signal: Option<&str>) {
+        let mut st = self.state();
+        if st
+            .live
+            .get(h.name())
+            .is_some_and(|cur| cur.incarnation() == h.incarnation())
+        {
+            st.live.remove(h.name());
+        }
+        st.ended.push_back((h.name().clone(), h.incarnation()));
+        while st.ended.len() > MAX_TOMBSTONES {
+            st.ended.pop_front();
+        }
+        self.publish(&st);
+        drop(st);
+        // The session's keys die with it: a registered key must not outlive its session.
+        self.host.revoke_session(h.name(), h.incarnation());
+        tracing::info!(session = %h.name(), code, signal, "session ended");
+    }
+
+    /// Serves an accepted Unix connection on its own task.
+    fn spawn_unix(self: &Arc<Self>, stream: UnixStream) {
+        let guard = self.guard();
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let cfg = PipeConfig::new(inner.cfg.link);
+            match tokio::time::timeout(inner.cfg.handshake_timeout, PipeLink::accept(stream, cfg))
+                .await
+            {
+                Ok(Ok(link)) => inner.handle(link, Origin::Pipe).await,
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "pipe connection failed before it started")
+                }
+                Err(_) => tracing::debug!("pipe connection sent nothing"),
+            }
+        });
+    }
+
+    fn spawn_quic(self: &Arc<Self>, link: fil_transport::quic::QuicLink) {
+        use fil_transport::Link;
+        let Some(key) = link.peer_key() else {
+            link.close();
+            return;
+        };
+        let guard = self.guard();
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            inner.handle(link, Origin::Direct { key }).await;
+        });
+    }
+
+    /// Resolves after the daemon has had nothing to do for `idle`.
+    async fn idle_for(&self, idle: Option<Duration>) {
+        let Some(idle) = idle else {
+            return std::future::pending().await;
+        };
+        let mut rx = self.busy.subscribe();
+        loop {
+            let closed = rx.wait_for(|b| *b == 0).await.is_err();
+            if closed {
+                return std::future::pending().await;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(idle) => return,
+                busy = async { rx.wait_for(|b| *b != 0).await.is_ok() } => {
+                    if !busy {
+                        return std::future::pending().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn random_incarnation() -> Result<u128, String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut b = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut b)
+        .map_err(|_| "the system random number generator failed".to_string())?;
+    Ok(u128::from_le_bytes(b))
+}
+
+/// Stops a running [`Daemon`]. Cheap to clone.
+#[derive(Clone)]
+pub struct DaemonHandle {
+    stop: watch::Sender<Option<bool>>,
+}
+
+impl DaemonHandle {
+    /// Stops the daemon. With `kill_sessions` it hangs up every session first, as closing their
+    /// terminals would; without, the sessions are left running with nobody to serve them (for
+    /// tests).
+    pub fn shutdown(&self, kill_sessions: bool) {
+        self.stop.send_replace(Some(kill_sessions));
+    }
+}
+
+/// A running daemon. See the [module docs](self).
+pub struct Daemon {
+    inner: Arc<Inner>,
+    paths: Paths,
+    unix: UnixListener,
+    quic: Option<QuicListener>,
+    /// Held for the daemon's life.
+    _lock: File,
+    stop: watch::Sender<Option<bool>>,
+}
+
+impl Daemon {
+    /// Takes the lock, removes a stale socket, binds the Unix socket and, when `cfg.direct`, the
+    /// UDP port. Direct mode that cannot start (no free port) is logged and left off: the pipe
+    /// still works. Must be called inside a tokio runtime.
+    pub async fn start(paths: Paths, cfg: DaemonConfig) -> Result<Daemon, StartError> {
+        paths.check_socket_len()?;
+        ensure_socket_dir(&paths.dir)?;
+        let io = |path: PathBuf| move |source| StartError::Io { path, source };
+
+        let lock_path = paths.lock();
+        let mut lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?;
+        let deadline = tokio::time::Instant::now() + cfg.lock_wait;
+        loop {
+            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(StartError::AlreadyRunning(lock_path));
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(io(lock_path)(e.into())),
+            }
+        }
+        lock.set_len(0).map_err(io(lock_path.clone()))?;
+        writeln!(lock, "{}", std::process::id()).map_err(io(lock_path.clone()))?;
+
+        // Holding the lock, nothing else is serving this socket: whatever is there is stale.
+        let sock = paths.socket();
+        match std::fs::remove_file(&sock) {
+            Ok(()) => tracing::info!(path = %sock.display(), "removed a stale socket"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(sock)(e)),
+        }
+        let unix = UnixListener::bind(&sock).map_err(io(sock.clone()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+            .map_err(io(sock.clone()))?;
+
+        let registry = KeyRegistry::new();
+        let (quic, direct) = if cfg.direct {
+            bind_direct(&cfg, &registry)?
+        } else {
+            (None, None)
+        };
+        let host = Arc::new(Host {
+            registry: registry.clone(),
+            direct,
+            bindings: Mutex::default(),
+        });
+        let (busy, _) = watch::channel(0);
+        let inner = Arc::new(Inner {
+            cfg,
+            registry,
+            host,
+            state: Mutex::default(),
+            busy,
+            name_locks: Mutex::default(),
+        });
+        let (stop, _) = watch::channel(None);
+        tracing::info!(
+            socket = %sock.display(),
+            udp_port = inner.host.direct.as_ref().map_or(0, |d| d.udp_port),
+            "daemon started"
+        );
+        Ok(Daemon {
+            inner,
+            paths,
+            unix,
+            quic,
+            _lock: lock,
+            stop,
+        })
+    }
+
+    /// The Unix socket path.
+    pub fn socket_path(&self) -> PathBuf {
+        self.paths.socket()
+    }
+
+    /// The UDP port, when direct mode is on.
+    pub fn udp_port(&self) -> Option<u16> {
+        self.inner.host.direct.as_ref().map(|d| d.udp_port)
+    }
+
+    /// The certificate fingerprint clients pin, when direct mode is on.
+    pub fn fingerprint(&self) -> Option<msg::Fingerprint> {
+        self.inner
+            .host
+            .direct
+            .as_ref()
+            .map(|d| d.fingerprint.clone())
+    }
+
+    /// The registry of accepted client keys (the QUIC listener's).
+    pub fn registry(&self) -> &KeyRegistry {
+        &self.inner.registry
+    }
+
+    /// A handle that stops [`run`](Self::run).
+    pub fn handle(&self) -> DaemonHandle {
+        DaemonHandle {
+            stop: self.stop.clone(),
+        }
+    }
+
+    /// The live sessions.
+    pub fn sessions(&self) -> Vec<SessionHandle> {
+        self.inner.sessions()
+    }
+
+    /// Serves connections until the daemon is idle for `idle_exit` or is stopped.
+    pub async fn run(mut self) -> Exit {
+        let quic_task = self.quic.take().map(|l| {
+            let inner = self.inner.clone();
+            tokio::spawn(async move {
+                while let Some(link) = l.accept().await {
+                    inner.spawn_quic(link);
+                }
+            })
+        });
+        let mut stop = self.stop.subscribe();
+        let exit = loop {
+            tokio::select! {
+                accepted = self.unix.accept() => match accepted {
+                    Ok((stream, _)) => self.accept_unix(stream),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                },
+                () = self.inner.idle_for(self.inner.cfg.idle_exit) => {
+                    if self.retire().await {
+                        break Exit::Idle;
+                    }
+                }
+                _ = async { let _ = stop.wait_for(Option::is_some).await; } => {
+                    break Exit::Shutdown;
+                }
+            }
+        };
+        if let Some(t) = quic_task {
+            t.abort();
+        }
+        let _ = std::fs::remove_file(self.paths.socket());
+        if exit == Exit::Shutdown && *self.stop.borrow() == Some(true) {
+            self.kill_sessions().await;
+        }
+        tracing::info!(?exit, "daemon stopping");
+        exit
+    }
+
+    fn accept_unix(&self, stream: UnixStream) {
+        match stream.peer_cred() {
+            Ok(cred) if peer_allowed(cred.uid(), self.inner.cfg.allowed_uid) => {
+                self.inner.spawn_unix(stream);
+            }
+            Ok(cred) => {
+                tracing::warn!(
+                    peer_uid = cred.uid(),
+                    "refused a connection from another user"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read a connection's peer credentials; refused")
+            }
+        }
+    }
+
+    /// The idle time ran out. Removes the socket so no new connection can start, serves every
+    /// connection that was already waiting (on the same listener, until it has been quiet for a
+    /// moment), and then looks at `busy` again: a QUIC connection may have arrived meanwhile.
+    /// Returns whether to exit, which it does only if nothing at all came.
+    async fn retire(&mut self) -> bool {
+        let sock = self.paths.socket();
+        let _ = std::fs::remove_file(&sock);
+        let mut served = false;
+        while let Ok(Ok((stream, _))) =
+            tokio::time::timeout(Duration::from_millis(100), self.unix.accept()).await
+        {
+            served = true;
+            self.accept_unix(stream);
+        }
+        if !served && *self.inner.busy.borrow() == 0 {
+            return true;
+        }
+        tracing::info!("a connection arrived as the daemon was retiring; staying");
+        // Nothing is left in the old listener's backlog and nothing new can join it (its path
+        // is gone), so replacing it loses no connection.
+        match UnixListener::bind(&sock) {
+            Ok(l) => {
+                let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+                self.unix = l;
+            }
+            Err(e) => tracing::error!(error = %e, "cannot rebind the socket"),
+        }
+        false
+    }
+
+    async fn kill_sessions(&self) {
+        let mut set = tokio::task::JoinSet::new();
+        for s in self.inner.sessions() {
+            set.spawn(async move { s.kill(KILL_TIMEOUT).await });
+        }
+        while set.join_next().await.is_some() {}
+    }
+}
+
+/// Whether a Unix peer with `peer_uid` may use the socket. The daemon serves one user.
+pub fn peer_allowed(peer_uid: u32, allowed_uid: u32) -> bool {
+    peer_uid == allowed_uid
+}
+
+fn bind_direct(
+    cfg: &DaemonConfig,
+    registry: &KeyRegistry,
+) -> Result<(Option<QuicListener>, Option<DirectInfo>), StartError> {
+    let identity = DaemonIdentity::generate().map_err(StartError::Identity)?;
+    let lcfg = ListenerConfig {
+        bind: cfg.bind,
+        ports: cfg.ports.clone(),
+        params: cfg.link,
+        ..ListenerConfig::default()
+    };
+    match QuicListener::bind(&identity, registry, &lcfg) {
+        Ok(l) => {
+            let port = l.local_addr().map(|a| a.port()).unwrap_or(0);
+            let fingerprint = msg::Fingerprint::new(identity.fingerprint().as_bytes().to_vec())
+                .expect("a SHA-256 fingerprint fits");
+            Ok((
+                Some(l),
+                Some(DirectInfo {
+                    udp_port: port,
+                    fingerprint,
+                }),
+            ))
+        }
+        Err(ListenError::Config(e)) => Err(StartError::Identity(e)),
+        Err(e) => {
+            tracing::warn!(error = %e, "direct mode is off: the UDP port could not be opened");
+            Ok((None, None))
+        }
+    }
+}
+
+/// The daemon as a process, for `fil server --daemon`. Returns the exit code for `main`.
+///
+/// In order: detach from the login session (`setsid`; a process that is already a group
+/// leader, such as one started by hand, stays where it is), log as JSON to `paths.log`, read
+/// `paths.config`, run until idle or stopped, exit. A daemon that finds another running exits
+/// with success and no noise; a start that fails exits with failure, the reason in the log.
+///
+/// It builds its own tokio runtime, so call it from a plain `main` before any runtime exists
+/// (not from inside `#[tokio::main]`), and exit with the result.
+pub fn run_daemon(paths: &Paths) -> ExitCode {
+    run_daemon_with(paths, |_| {})
+}
+
+/// [`run_daemon`], with `adjust` applied to the configuration read from the file. For
+/// development binaries and tests that need, say, a particular session command; the `fil`
+/// binary has no use for it.
+pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) -> ExitCode {
+    let detached = rustix::process::setsid().is_ok();
+    crate::logging::init(&paths.log);
+    tracing::info!(
+        detached,
+        pid = std::process::id(),
+        "daemon process starting"
+    );
+    let cfg = match DaemonConfig::load(&paths.config) {
+        Ok(mut c) => {
+            adjust(&mut c);
+            c
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "bad daemon configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("fil-daemon")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start the runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = rt.block_on(async {
+        let signals = match Signals::install() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot install signal handlers");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(w) = linger::check_host() {
+            tracing::warn!("{w}");
+        }
+        let daemon = match Daemon::start(paths.clone(), cfg).await {
+            Ok(d) => d,
+            Err(StartError::AlreadyRunning(_)) => {
+                tracing::info!("another daemon is running; exiting");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot start");
+                return ExitCode::FAILURE;
+            }
+        };
+        let handle = daemon.handle();
+        tokio::spawn(signals.forward(handle));
+        daemon.run().await;
+        ExitCode::SUCCESS
+    });
+    // A thread blocked reading a PTY of a session that outlived its shell cannot be stopped.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    code
+}
+
+/// The signals the daemon handles, installed before anything else so none is missed while it
+/// starts.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// SIGTERM and SIGINT stop the daemon, hanging up its sessions. SIGHUP, the hangup of the
+    /// login that started it, means nothing to a daemon.
+    async fn forward(mut self, handle: DaemonHandle) {
+        loop {
+            tokio::select! {
+                _ = self.term.recv() => break,
+                _ = self.int.recv() => break,
+                _ = self.hup.recv() => tracing::debug!("ignoring SIGHUP"),
+            }
+        }
+        tracing::info!("stopping on a signal");
+        handle.shutdown(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fil_transport::auth::{ClientKey, Fingerprint};
+    use fil_transport::quic::QuicLink;
+    use fil_transport::{Link, LinkParams, LinkState};
+
+    fn host(registry: &KeyRegistry, direct: Option<DirectInfo>) -> Host {
+        Host {
+            registry: registry.clone(),
+            direct,
+            bindings: Mutex::default(),
+        }
+    }
+
+    fn binding(name: &str, incarnation: u128) -> Binding {
+        Binding {
+            name: name.parse().unwrap(),
+            incarnation,
+        }
+    }
+
+    #[test]
+    fn a_key_is_bound_to_one_session_and_dies_with_it() {
+        let registry = KeyRegistry::new();
+        let host = host(&registry, None);
+        let (k1, k2, k3) = (
+            TransportKey::from_spki_der(vec![1]),
+            TransportKey::from_spki_der(vec![2]),
+            TransportKey::from_spki_der(vec![3]),
+        );
+        for k in [&k1, &k2, &k3] {
+            registry.register(k.clone());
+        }
+        assert!(host.bind(&k1, binding("main", 7)));
+        assert!(
+            host.bind(&k2, binding("main", 8)),
+            "another incarnation of the name"
+        );
+        assert!(host.bind(&k3, binding("other", 7)));
+        assert!(
+            !host.bind(&k1, binding("other", 7)),
+            "a key is for one session"
+        );
+        assert_eq!(host.binding(&k1), Some(binding("main", 7)));
+
+        // The session main/7 ends: its key goes, the others stay.
+        host.revoke_session(&"main".parse().unwrap(), 7);
+        assert!(!registry.contains(&k1) && host.binding(&k1).is_none());
+        assert!(registry.contains(&k2) && registry.contains(&k3));
+        assert_eq!(host.bound(), 2);
+
+        // A takeover or detach (the session's `RevokeKey`) drops binding and key too.
+        host.revoke_key(&msg::PublicKey::new(vec![3]).unwrap());
+        assert!(!registry.contains(&k3) && host.binding(&k3).is_none());
+    }
+
+    fn attach_to(name: &str) -> Attach {
+        Attach {
+            name: name.parse().unwrap(),
+            size: msg::TermSize::new(80, 24).unwrap(),
+            term: "xterm".parse().unwrap(),
+            host: "test".parse().unwrap(),
+            key: msg::PublicKey::new(vec![9; 32]).unwrap(),
+            resume: None,
+        }
+    }
+
+    /// Creating a session takes a lock for its name only: an attach to a name whose creation is
+    /// stuck waits, and nothing else does; and the lock table does not grow.
+    #[tokio::test]
+    async fn a_stuck_creation_blocks_only_its_own_name() {
+        let dir = std::path::PathBuf::from(format!("/tmp/fil-u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = DaemonConfig {
+            direct: false,
+            idle_exit: None,
+            ..DaemonConfig::default()
+        };
+        cfg.session.command = Some(vec!["/bin/sh".into(), "-c".into(), "exec cat".into()]);
+        cfg.session.clear_env = true;
+        cfg.scope = fil_session::ScopeMode::Tree;
+        let daemon = Daemon::start(Paths::in_dir(&dir), cfg).await.unwrap();
+        let inner = daemon.inner.clone();
+
+        // "slow" is being created, and the creation hangs.
+        let stuck_lock = inner.name_lock(&"slow".parse().unwrap());
+        let stuck = stuck_lock.lock().await;
+
+        let slow = {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.session_for(&attach_to("slow")).await.map(|_| ()) })
+        };
+        // Another name is created, and found again, meanwhile.
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            inner.session_for(&attach_to("other")),
+        )
+        .await
+        .expect("an unrelated name is not blocked")
+        .ok()
+        .expect("created");
+        let again = inner.session_for(&attach_to("other")).await.ok().unwrap();
+        assert_eq!(other.incarnation(), again.incarnation());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!slow.is_finished(), "the stuck name waits");
+
+        drop(stuck);
+        drop(stuck_lock);
+        tokio::time::timeout(Duration::from_secs(5), slow)
+            .await
+            .expect("it proceeds once the lock is free")
+            .unwrap()
+            .ok()
+            .expect("created");
+        assert!(
+            inner.name_locks.lock().unwrap().is_empty(),
+            "no lock is left in the table"
+        );
+        daemon.handle().shutdown(true);
+        daemon.run().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Revoking blocks new handshakes at once and leaves a live connection alone: closing it is
+    /// the listener's backstop (tested in fil-transport) or the session's own doing.
+    #[tokio::test]
+    async fn revoking_a_key_blocks_new_handshakes_and_leaves_live_connections_to_the_backstop() {
+        let cfg = DaemonConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            ..DaemonConfig::default()
+        };
+        let registry = KeyRegistry::new();
+        let (Some(listener), Some(info)) = bind_direct(&cfg, &registry).unwrap() else {
+            panic!("direct mode starts");
+        };
+        let host = host(&registry, Some(info.clone()));
+        let ck = ClientKey::generate().unwrap();
+        registry.register(ck.public_key().clone());
+        let pin = Fingerprint::from_bytes(info.fingerprint.as_bytes().try_into().unwrap());
+        let addr = ([127, 0, 0, 1], info.udp_port).into();
+        let client = QuicLink::connect(addr, pin, &ck, LinkParams::default())
+            .await
+            .unwrap();
+        let _server_side = listener.accept().await.unwrap();
+
+        host.revoke_key(&msg::PublicKey::new(ck.public_key().as_spki_der().to_vec()).unwrap());
+        assert!(!registry.contains(ck.public_key()), "revoked at once");
+        let again = QuicLink::connect(addr, pin, &ck, LinkParams::default()).await;
+        assert!(again.is_err(), "no new handshake with a revoked key");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(matches!(client.status().borrow().state, LinkState::Up));
+        client.close();
+    }
+}

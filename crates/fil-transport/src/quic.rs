@@ -68,7 +68,9 @@ pub use limiter::HandshakeLimits;
 pub use link::QuicLink;
 #[cfg(feature = "test-hooks")]
 pub use listener::TestHook;
-pub use listener::{ListenError, ListenerConfig, ListenerStats, QuicListener};
+pub use listener::{
+    DEFAULT_REVOKE_BACKSTOP, ListenError, ListenerConfig, ListenerStats, QuicListener,
+};
 
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).
 pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;

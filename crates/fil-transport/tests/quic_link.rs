@@ -652,6 +652,138 @@ async fn dead_comes_within_dead_after_of_the_last_datagram_whatever_the_sampling
     }
 }
 
+/// A client link streaming 256 KiB/s to a daemon that echoes it, as `s_quiclink_blackouts` in
+/// the real-network harness does. Returns the links; the tasks run until the links go down.
+async fn busy_pair(w: &mut World) -> (Arc<QuicLink>, Arc<QuicLink>) {
+    let (client, daemon, _) = w.pair().await;
+    let (client, daemon) = (Arc::new(client), Arc::new(daemon));
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        while let Ok((ch, p)) = d.recv().await {
+            if d.send(ch, p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let c = client.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            for _ in 0..26 {
+                match timeout(Duration::from_millis(50), c.send(FWD, seq_payload(0, 1000))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(_) => break, // backpressure: next tick
+                }
+            }
+            tick.tick().await;
+        }
+    });
+    let c = client.clone();
+    tokio::spawn(async move { while c.recv().await.is_ok() {} });
+    (client, daemon)
+}
+
+/// The times, from `t0`, at which `link` sent datagrams, sampled every 5 ms until `until`.
+async fn send_times(link: &QuicLink, t0: Instant, until: Instant) -> Vec<Duration> {
+    let mut sent = link.quic_stats().udp_tx.datagrams;
+    let mut times = Vec::new();
+    while Instant::now() < until {
+        sleep(Duration::from_millis(5)).await;
+        let now = link.quic_stats().udp_tx.datagrams;
+        if now != sent {
+            sent = now;
+            times.push(t0.elapsed());
+        }
+    }
+    times
+}
+
+/// When the path of a busy link dies, the bytes in flight fill its congestion window, and without
+/// acknowledgements quinn holds every packet back but its probe timeouts, which back off
+/// exponentially (gaps of 1 s, 2 s, ...). The window floor (`quic::floor`) lets a probe out every
+/// half heartbeat instead, and no more than that.
+#[tokio::test(start_paused = true)]
+async fn a_busy_link_keeps_probing_through_a_blackout_at_a_bounded_rate() {
+    let mut w = World::new(80);
+    let (client, daemon) = busy_pair(&mut w).await;
+    sleep(Duration::from_secs(3)).await;
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    let early = send_times(&client, t0, t0 + Duration::from_millis(500)).await;
+    let before = client.quic_stats().udp_tx.datagrams;
+    let times = send_times(&client, t0, t0 + Duration::from_millis(4000)).await;
+    let during = client.quic_stats().udp_tx.datagrams - before;
+    w.net.set_blackout(false);
+    assert!(
+        !early.is_empty(),
+        "the client was not sending when the path died"
+    );
+    // From half a second into the blackout (the window is full by then) to 4 s (before either
+    // side's dead timer), never more than half a heartbeat and a sample without a datagram.
+    let start = Duration::from_millis(500);
+    let mut last = start;
+    let mut longest = Duration::ZERO;
+    for &t in &times {
+        longest = longest.max(t - last);
+        last = t;
+    }
+    longest = longest.max(Duration::from_millis(4000) - last);
+    assert!(
+        longest <= w.params.heartbeat / 2 + Duration::from_millis(60),
+        "the client went {longest:?} without sending during the blackout ({times:?})"
+    );
+    // At most two datagrams per lift, and quinn's own probes (two each): a few dozen at most.
+    assert!(
+        during <= 20,
+        "{during} datagrams sent into 3.5 s of the blackout: {times:?}"
+    );
+    assert!(!is_down(&client.status().borrow()));
+    assert!(!is_down(&daemon.status().borrow()));
+}
+
+/// The blackout `s_quiclink_blackouts` expects a link to survive (3 s, with `dead_after` 5 s) on
+/// a busy link, at several round trips and phases against the stream. Before the window floor the
+/// busy side was heard again only at its next backed-off probe and could not even acknowledge the
+/// daemon's keep-alive, so whether it survived depended on the round trip: here 30 ms one way at
+/// the third phase was lost (`Down(Dead)` on the daemon 4.7 s after the cut).
+#[tokio::test(start_paused = true)]
+async fn a_busy_link_survives_a_three_second_blackout_at_any_round_trip() {
+    for one_way in [5u64, 20, 30, 45, 70] {
+        for (n, lead) in [0u64, 170, 340].into_iter().enumerate() {
+            let mut w = World::new(81 + 10 * one_way + n as u64);
+            w.net
+                .update_conditions(|c| c.latency = Duration::from_millis(one_way));
+            let (client, daemon) = busy_pair(&mut w).await;
+            sleep(Duration::from_millis(3000 + lead)).await;
+            let (mut cs, mut ds) = (client.status(), daemon.status());
+            w.net.blackout_for(Duration::from_secs(3)).await;
+            let healed = Instant::now();
+            sleep(Duration::from_secs(4)).await;
+            let what = format!("{one_way} ms one way, phase {lead} ms");
+            assert!(
+                !is_down(&cs.borrow_and_update()),
+                "client lost the link at {what}"
+            );
+            assert!(
+                !is_down(&ds.borrow_and_update()),
+                "daemon lost the link at {what}"
+            );
+            assert_eq!(cs.borrow().state, LinkState::Up, "{what}");
+            assert_eq!(ds.borrow().state, LinkState::Up, "{what}");
+            // And data flows again: the client hears echoes after the heal.
+            let recvd = client.quic_stats().udp_rx.datagrams;
+            sleep(Duration::from_millis(500)).await;
+            assert!(
+                client.quic_stats().udp_rx.datagrams > recvd,
+                "nothing received {:?} after the heal at {what}",
+                healed.elapsed()
+            );
+            assert_eq!(w.listener.stats().accepted, 1, "one handshake at {what}");
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_short_blackout_degrades_and_recovers() {
     let mut w = World::new(7);

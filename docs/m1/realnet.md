@@ -289,6 +289,26 @@ P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink
 
 The quic-echo blackout result stands: a link that is quiet when the network comes back is lost at the idle timeout whether the blackout lasted 4.5 s or 8 s. What changes is what the layer above sees: the link says so (`Down(Dead)`) 5 s after the last datagram, never later, and the redial takes about 0.3 to 0.7 s, so the worst case for a blackout of N seconds is about max(N, 5) + 0.7 s.
 
+### A busy link through a 3 s blackout (the window floor)
+
+`s_quiclink_blackouts` expects the 3 s case to survive (`dead_after` is 5 s), and on the seat's aarch64 VM (`docs/dev/vm.md`) it did not, most of the time: `Down(Dead)` about 4.6 to 4.7 s after the cut, then a fresh handshake. A packet-gap log in `quiclink-probe` (quinn's datagram counters sampled every 2 ms, on both ends) showed why, in a lost run (times from the cut, heal at 3.0 s, 20 ms each way):
+
+| | What it sent |
+|---|---|
+| client (streaming 256 KiB/s, window full) | quinn's probe timeouts only, two datagrams each, about 0.43, 0.74, 1.34 and 2.54 s (gaps 0.15, 0.3, 0.6, 1.2 s); the next would have been about 4.9 s. No keep-alive and no acknowledgements: quinn 0.11 skips the whole packet space while it is congestion-blocked |
+| daemon (echo, window not full) | its own probe timeouts, then its 1.5 s keep-alive at 3.85 s, which got through |
+| result | the client heard the daemon at 3.88 s and could not answer it; the daemon heard nothing after the cut and declared `Down(Dead)` at 4.62 s (silence measured from the sample before the last datagram, up to 0.5 s early, §8.5) |
+
+In the runs that survived, a probe from the daemon that carried acknowledgements got through after the heal and freed the client's window. Which happened first depended on a few tens of milliseconds, which is why `tcpdump` on the server made it pass. On a quieter link (window not full) quinn's keep-alive caps the gap at a heartbeat, so the quiet blackouts above were never affected.
+
+The fix is in `crates/fil-transport/src/quic/floor.rs` (DESIGN.md §8.5, liveness): while a link's window is full and nothing has been sent or acknowledged for half a heartbeat, one transmit may take two datagrams past it, and the link's supervisor wakes quinn when that is due. With it, the logged run shows the client sending two datagrams every 0.5 s through the outage (1.22, 1.73, 2.23, 2.73, 3.23 s); the one at 3.23 s, just after the heal, reached the daemon, and both ends were `Up` at 3.33 s. Same VM, the `s_quiclink_blackouts` cases repeated, no packet log (it shifts the timing):
+
+| Blackout | Before | After |
+|---|---|---|
+| 3.0 s | 11 of 20 survived; the 9 lost were all `Down(Dead)` 4.68 s after the cut | **20 of 20 survived** |
+| 4.5 s | 5 of 5 lost (4.53 to 5.19 s) | 5 of 5 lost (`Down(Dead)` 4.58 to 4.68 s after the cut), fresh handshake 0.19 to 0.28 s after the network returned |
+| 8.0 s | 3 of 3 lost (4.63 to 4.68 s) | 3 of 3 lost at 4.58 to 4.63 s, fresh handshake 1.08 to 1.14 s after it returned |
+
 ## Real versus simulator
 
 The two agree on almost everything, which is the main result: the simulator's numbers were a good predictor.

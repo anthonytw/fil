@@ -561,23 +561,26 @@ impl<'a, L: Link> Conn<'a, L> {
             // session sends the rest of its log: a snapshot would cost the client the tail.
             //
             // Not while the previous snapshot is unconfirmed: the announcement would overtake
-            // its bytes (see `Flow::unconfirmed`). Its ack normally confirms it, but a client
-            // acks only output it has applied, and the log may have wrapped past the stream's
-            // position, leaving nothing to send and so nothing to ack. So the wait ends too when
-            // the link's flush says the snapshot has been delivered (written, on the pipe;
-            // read by the peer's link, on QUIC), which also keeps the announcement behind it.
+            // its bytes (see `Flow::unconfirmed`). Output past the snapshot is sent meanwhile,
+            // and the client's ack of it confirms the snapshot. Only when the log has wrapped
+            // past the stream's position is there nothing to send, and so nothing for the client
+            // to ack: the link's flush then stands in for the ack. It resolves once the snapshot
+            // has been delivered (written, on the pipe; read by the peer's link, on QUIC), which
+            // also keeps the next announcement behind it.
             if !prog.exited
                 && (wrapped || (prog.ready > next && should_snapshot(behind, age, &params)))
             {
-                if awaiting {
-                    match self.settle_snapshot().await {
+                if !awaiting {
+                    match self.catch_up(out).await {
                         Ok(()) => continue,
                         Err(end) => return end,
                     }
                 }
-                match self.catch_up(out).await {
-                    Ok(()) => continue,
-                    Err(end) => return end,
+                if wrapped {
+                    match self.settle_snapshot().await {
+                        Ok(()) => continue,
+                        Err(end) => return end,
+                    }
                 }
             }
 

@@ -31,6 +31,21 @@ struct Inner {
     tx: mpsc::Sender<Cmd>,
     shared: Arc<Shared>,
     exit: watch::Receiver<Option<ExitInfo>>,
+    #[cfg(feature = "test-hooks")]
+    gate: std::sync::Mutex<Option<Arc<CatchUpGate>>>,
+    #[cfg(feature = "test-hooks")]
+    gone_gate: std::sync::Mutex<Option<Arc<CatchUpGate>>>,
+}
+
+/// Holds every connection of a session just before it asks the core for a catch-up snapshot, so a
+/// test can make something else happen in that window. See [`SessionHandle::gate_catch_up`].
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+pub struct CatchUpGate {
+    /// Signalled when a connection reaches the gate.
+    pub arrived: tokio::sync::Notify,
+    /// Signal it to let the connection through.
+    pub proceed: tokio::sync::Notify,
 }
 
 /// One running session. Cheap to clone; every clone refers to the same session.
@@ -77,6 +92,10 @@ impl SessionHandle {
                 tx: started.tx,
                 shared: started.shared,
                 exit: started.exit,
+                #[cfg(feature = "test-hooks")]
+                gate: std::sync::Mutex::new(None),
+                #[cfg(feature = "test-hooks")]
+                gone_gate: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -172,6 +191,25 @@ impl SessionHandle {
         tokio::time::timeout(timeout, all).await.ok()
     }
 
+    /// Test hook: from now on a connection that decides to catch up waits at the returned gate
+    /// before it asks the core. Only with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn gate_catch_up(&self) -> Arc<CatchUpGate> {
+        let gate = Arc::new(CatchUpGate::default());
+        *self.inner.gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Test hook: from now on a connection that has ended waits at the returned gate just before
+    /// it tells the core (`ConnGone`), as if the core's queue were full. Only with the
+    /// `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn gate_conn_gone(&self) -> Arc<CatchUpGate> {
+        let gate = Arc::new(CatchUpGate::default());
+        *self.inner.gone_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
     // --- used by the subscriber task ---
 
     pub(crate) fn catch_up_params(&self) -> &CatchUpParams {
@@ -193,6 +231,14 @@ impl SessionHandle {
     }
 
     pub(crate) async fn catch_up(&self, conn: ConnId, sent: u64) -> Option<CatchUp> {
+        #[cfg(feature = "test-hooks")]
+        {
+            let gate = self.inner.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.arrived.notify_one();
+                gate.proceed.notified().await;
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.inner
             .tx
@@ -206,7 +252,33 @@ impl SessionHandle {
         rx.await.ok().flatten()
     }
 
+    /// Tells the core a connection is gone, from a context that cannot wait (a destructor). The
+    /// message goes in the queue behind everything the connection sent; if the queue is full it
+    /// is sent from a task, still in order, because the task's send waits in the same line.
+    pub(crate) fn conn_gone_nowait(&self, conn: ConnId) {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.inner.tx.try_send(Cmd::ConnGone { conn }) {
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(cmd)) => {
+                let tx = self.inner.tx.clone();
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move {
+                        let _ = tx.send(cmd).await;
+                    });
+                }
+            }
+        }
+    }
+
     pub(crate) async fn send(&self, cmd: Cmd) {
+        #[cfg(feature = "test-hooks")]
+        if matches!(cmd, Cmd::ConnGone { .. }) {
+            let gate = self.inner.gone_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.arrived.notify_one();
+                gate.proceed.notified().await;
+            }
+        }
         let _ = self.inner.tx.send(cmd).await;
     }
 }

@@ -3,6 +3,7 @@
 //! await).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
@@ -17,7 +18,17 @@ struct Queues {
     sched: Scheduler,
     /// Frames queued per channel (user frames and internal heartbeats alike), for the bound.
     queued: HashMap<ChannelId, usize>,
+    /// Per channel: frames accepted by `try_enqueue`, frames taken by the driver, and frames the
+    /// driver knows have been written and flushed. A channel's frames leave in the order they
+    /// were accepted, so comparing counts per channel is exact even though the scheduler mixes
+    /// channels.
+    sent: HashMap<ChannelId, u64>,
+    popped: HashMap<ChannelId, u64>,
+    written: HashMap<ChannelId, u64>,
 }
+
+/// What a `flush` waits for: per channel, how many frames must have been written.
+pub(super) struct FlushTarget(Vec<(ChannelId, u64)>);
 
 /// Payloads received and not yet taken by `recv`.
 #[derive(Default)]
@@ -50,6 +61,10 @@ pub(super) struct Shared {
     pub wake: Notify,
     /// Signals senders: a frame left a queue, or the link went down.
     pub space: Notify,
+    /// Signals `flush`: the driver has flushed the stream.
+    pub flushed: Notify,
+    /// `flush` calls in progress; the driver flushes ahead of new frames while there are any.
+    flushers: AtomicUsize,
     pub status: watch::Sender<LinkStatus>,
     limits: [usize; 3],
 }
@@ -60,12 +75,17 @@ impl Shared {
             queues: Mutex::new(Queues {
                 sched: Scheduler::with_forward_share(cfg.forward_share),
                 queued: HashMap::new(),
+                sent: HashMap::new(),
+                popped: HashMap::new(),
+                written: HashMap::new(),
             }),
             inbound: Mutex::new(Inbound::default()),
             inbound_ready: Notify::new(),
             inbound_room: Notify::new(),
             wake: Notify::new(),
             space: Notify::new(),
+            flushed: Notify::new(),
+            flushers: AtomicUsize::new(0),
             status: watch::Sender::new(LinkStatus::new(LinkState::Up)),
             limits: [
                 cfg.control_queue.max(1),
@@ -95,6 +115,7 @@ impl Shared {
             return Err(frame);
         }
         *n += 1;
+        *q.sent.entry(frame.channel).or_insert(0) += 1;
         q.sched.push(frame);
         drop(q);
         self.wake.notify_one();
@@ -142,6 +163,7 @@ impl Shared {
     pub fn pop(&self) -> Option<Frame> {
         let mut q = self.queues();
         let frame = q.sched.pop()?;
+        *q.popped.entry(frame.channel).or_insert(0) += 1;
         if let Some(n) = q.queued.get_mut(&frame.channel) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -151,6 +173,48 @@ impl Shared {
         drop(q);
         self.space.notify_waiters();
         Some(frame)
+    }
+
+    /// The driver has written and flushed everything it has taken from the queues so far.
+    pub fn mark_written(&self) {
+        let mut q = self.queues();
+        let popped = q.popped.clone();
+        q.written = popped;
+        drop(q);
+        self.flushed.notify_waiters();
+    }
+
+    /// What a flush called now must wait for: every frame accepted so far.
+    pub fn flush_target(&self) -> FlushTarget {
+        let q = self.queues();
+        FlushTarget(
+            q.sent
+                .iter()
+                .filter(|(c, n)| q.written.get(c).copied().unwrap_or(0) < **n)
+                .map(|(c, n)| (*c, *n))
+                .collect(),
+        )
+    }
+
+    /// Whether every frame in `target` has been written.
+    pub fn is_written(&self, target: &FlushTarget) -> bool {
+        let q = self.queues();
+        target
+            .0
+            .iter()
+            .all(|(c, n)| q.written.get(c).copied().unwrap_or(0) >= *n)
+    }
+
+    /// Registers a `flush` for as long as the guard lives, and wakes the driver.
+    pub fn flushing(self: &Arc<Self>) -> FlushGuard {
+        self.flushers.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+        FlushGuard(self.clone())
+    }
+
+    /// A `flush` is waiting.
+    pub fn flush_wanted(&self) -> bool {
+        self.flushers.load(Ordering::SeqCst) > 0
     }
 
     /// Drops everything queued (the link is going down).
@@ -179,6 +243,7 @@ impl Shared {
             }
         });
         self.space.notify_waiters();
+        self.flushed.notify_waiters();
         self.inbound_ready.notify_waiters();
         self.wake.notify_one();
         changed
@@ -205,5 +270,14 @@ impl Shared {
                 true
             }
         });
+    }
+}
+
+/// Keeps [`Shared::flush_wanted`] true while a `flush` is waiting.
+pub(super) struct FlushGuard(Arc<Shared>);
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.0.flushers.fetch_sub(1, Ordering::SeqCst);
     }
 }

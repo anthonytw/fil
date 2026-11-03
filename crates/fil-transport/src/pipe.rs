@@ -36,6 +36,11 @@
 //!   [`LinkParams::degraded_after`] of silence the link is `Degraded` (and `Up` again if the peer
 //!   speaks); after [`LinkParams::dead_after`] it is `Down(Dead)`. ssh alone never notices a
 //!   silent black hole (`docs/m1/realnet.md`), which is why this is fil's own clock.
+//! - **Flushing.** [`Link::flush`] counts frames per channel: those accepted before the call must
+//!   all have been written to the stream and the stream flushed. While a flush waits, the driver
+//!   flushes the stream before it takes another frame, so a busy channel cannot hold it back.
+//!   If the stream fails first, the frames still queued are dropped and the flush fails with the
+//!   link's `Down` reason.
 //! - **Ending.** EOF or an I/O error is `Down(Io)`; with a child process the message carries its
 //!   exit status. [`Link::close`] is `Down(Closed)` on this side. The peer sees the stream end, so
 //!   it reports `Down(Io)`: the pipe has no goodbye frame, and adding one would be a wire change.
@@ -694,6 +699,30 @@ impl Link for PipeLink {
                 Pop::Empty => {}
             }
             ready.await;
+        }
+    }
+
+    /// Resolves once the driver has written to the stream, and flushed it, every frame accepted
+    /// before the call. "Left this side" ends there: bytes the pipe command's stdin holds
+    /// (ssh's, say) are ssh's, and the peer may still be a network round trip from having them.
+    async fn flush(&self) -> Result<(), LinkError> {
+        if let Some(reason) = self.shared.down_reason() {
+            return Err(LinkError(reason));
+        }
+        let target = self.shared.flush_target();
+        let _guard = self.shared.flushing();
+        loop {
+            // Register for the next "flushed" signal before looking, so none is missed.
+            let flushed = self.shared.flushed.notified();
+            tokio::pin!(flushed);
+            flushed.as_mut().enable();
+            if self.shared.is_written(&target) {
+                return Ok(());
+            }
+            if let Some(reason) = self.shared.down_reason() {
+                return Err(LinkError(reason));
+            }
+            flushed.await;
         }
     }
 

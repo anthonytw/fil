@@ -135,3 +135,60 @@ async fn connecting_to_a_closed_port_is_refused_at_the_connect_timeout() {
         t0.elapsed()
     );
 }
+
+/// A flush, then a close, over real UDP: everything sent before the flush is delivered, which a
+/// close right after the sends would not guarantee.
+#[tokio::test]
+async fn flush_then_close_delivers_everything_over_real_udp() {
+    const N: u32 = 2000;
+    let identity = DaemonIdentity::generate().unwrap();
+    let registry = KeyRegistry::new();
+    let p = free_port();
+    let listener = QuicListener::bind(&identity, &registry, &cfg(p..=p)).unwrap();
+    let key = ClientKey::generate().unwrap();
+    registry.register(key.public_key().clone());
+    let addr = SocketAddr::new(LOCALHOST, p);
+    let client = QuicLink::connect(addr, identity.fingerprint(), &key, LinkParams::default())
+        .await
+        .unwrap();
+    let daemon = listener.accept().await.unwrap();
+
+    let sender = tokio::spawn(async move {
+        for n in 0..N {
+            let mut payload = n.to_be_bytes().to_vec();
+            payload.resize(1200, 0xAB);
+            daemon
+                .send(ChannelId::TERMINAL, Bytes::from(payload))
+                .await
+                .unwrap();
+        }
+        daemon
+            .send(ChannelId::CONTROL, Bytes::from_static(b"the last word"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), daemon.flush())
+            .await
+            .expect("the flush finished")
+            .unwrap();
+        daemon.close();
+    });
+
+    let (mut terminal, mut control) = (0u32, None);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("the daemon's payloads arrive")
+        {
+            Ok((ChannelId::TERMINAL, p)) => {
+                assert_eq!(u32::from_be_bytes(p[..4].try_into().unwrap()), terminal);
+                terminal += 1;
+            }
+            Ok((ChannelId::CONTROL, p)) => control = Some(p),
+            Ok((other, _)) => panic!("channel {other:?}"),
+            Err(_) => break,
+        }
+    }
+    sender.await.unwrap();
+    assert_eq!(terminal, N);
+    assert_eq!(control, Some(Bytes::from_static(b"the last word")));
+}

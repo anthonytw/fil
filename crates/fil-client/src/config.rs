@@ -99,8 +99,14 @@ pub enum Outcome {
     /// The terminal closed or stdin ended. The session keeps running, still attached to this
     /// client's key until another client takes it over.
     InputClosed,
-    /// The session is gone: its shell exited, or `fil kill` ended it.
-    SessionEnded,
+    /// The session is over. The daemon says how when the shell exits while we are attached:
+    /// `code` is its exit code, `signal` the signal that killed it. Both are `None` when we only
+    /// learned later that the session is gone (a reconnect that was refused with `SessionGone`),
+    /// or when the daemon could not tell. `fil kill` ends a session by a signal too.
+    SessionEnded {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
     /// Someone else took the session over and the user chose not to take it back.
     TakenOver { by: String, at_unix_ms: u64 },
     /// The session was killed and recreated (or the daemon restarted) and the user chose not to
@@ -123,7 +129,17 @@ impl Outcome {
             Outcome::InputClosed => format!(
                 "fil: terminal closed; session \"{session}\" keeps running (attach again to resume)"
             ),
-            Outcome::SessionEnded => {
+            Outcome::SessionEnded {
+                code: Some(code), ..
+            } => format!("fil: session \"{session}\" exited {code}"),
+            Outcome::SessionEnded {
+                signal: Some(signal),
+                ..
+            } => format!(
+                "fil: session \"{session}\" killed by signal {signal}{}",
+                signal_name(*signal).map_or(String::new(), |n| format!(" ({n})"))
+            ),
+            Outcome::SessionEnded { .. } => {
                 format!("fil: session \"{session}\" ended (its shell exited, or it was killed)")
             }
             Outcome::TakenOver { by, at_unix_ms } => format!(
@@ -143,6 +159,23 @@ impl Outcome {
             ),
         }
     }
+}
+
+/// The usual name of a signal, for the message. The numbers are those of Linux and macOS, which
+/// agree on these.
+fn signal_name(n: i32) -> Option<&'static str> {
+    Some(match n {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]

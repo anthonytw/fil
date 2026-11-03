@@ -1151,3 +1151,229 @@ async fn finished_handshakes_do_not_hold_the_handshake_cap_until_accept() {
     }
     assert_eq!(w.listener.stats().refused_busy, 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Flush
+
+#[tokio::test(start_paused = true)]
+async fn flush_waits_for_the_peer_and_a_close_after_it_loses_nothing() {
+    let mut w = World::new(50);
+    let (client, daemon, _) = w.pair().await;
+    // Nothing outstanding yet: nothing to wait for.
+    client.flush().await.unwrap();
+
+    let t0 = Instant::now();
+    for n in 0..30u32 {
+        for ch in [CTRL, TERM, FWD] {
+            client.send(ch, seq_payload(n, 600)).await.unwrap();
+        }
+    }
+    client.flush().await.unwrap();
+    // The answer had to come back from the other side of a 20 ms link.
+    assert!(
+        t0.elapsed() >= Duration::from_millis(40),
+        "{:?}",
+        t0.elapsed()
+    );
+    // Closing right after the flush: the peer still gets every payload.
+    client.close();
+    let mut got = [0u32; 3];
+    loop {
+        match daemon.recv().await {
+            Ok((ch, p)) => {
+                let i = [CTRL, TERM, FWD].iter().position(|c| *c == ch).unwrap();
+                assert_eq!(seq_of(&p), got[i], "channel {ch:?} in order");
+                got[i] += 1;
+            }
+            Err(e) => {
+                assert_eq!(e.0, DownReason::Closed);
+                break;
+            }
+        }
+    }
+    assert_eq!(got, [30, 30, 30]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_works_from_the_daemon_side_and_through_loss() {
+    let mut w = World::new(51);
+    w.net.update_conditions(|c| {
+        c.loss = 0.05;
+        c.jitter = Duration::from_millis(5);
+    });
+    let (client, daemon, _) = w.pair().await;
+    for n in 0..100u32 {
+        daemon.send(TERM, seq_payload(n, 900)).await.unwrap();
+    }
+    daemon
+        .send(CTRL, Bytes::from_static(b"taken over"))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), daemon.flush())
+        .await
+        .expect("flush finished")
+        .unwrap();
+    daemon.close();
+    let mut terminal = 0;
+    let mut last_control = None;
+    while let Ok((ch, p)) = client.recv().await {
+        match ch {
+            TERM => {
+                assert_eq!(seq_of(&p), terminal);
+                terminal += 1;
+            }
+            CTRL => last_control = Some(p),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(terminal, 100);
+    assert_eq!(last_control, Some(Bytes::from_static(b"taken over")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_when_the_path_dies_mid_flush() {
+    let mut w = World::new(52);
+    let (client, _daemon, _) = w.pair().await;
+    let client = Arc::new(client);
+    client.send(TERM, seq_payload(0, 500)).await.unwrap();
+    // The path goes dark before the peer can answer.
+    w.net.update_conditions(|c| c.loss = 1.0);
+    let flushing = tokio::spawn({
+        let client = client.clone();
+        async move { client.flush().await }
+    });
+    sleep(Duration::from_millis(500)).await;
+    assert!(!flushing.is_finished(), "nothing has been acknowledged");
+    let err = timeout(Duration::from_secs(30), flushing)
+        .await
+        .expect("the flush ended with the link")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.0, DownReason::Dead);
+    // And on a link that is down already.
+    assert_eq!(client.flush().await.unwrap_err().0, DownReason::Dead);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_when_the_link_is_closed_mid_flush() {
+    let mut w = World::new(53);
+    let (client, _daemon, _) = w.pair().await;
+    let client = Arc::new(client);
+    client.send(TERM, seq_payload(0, 500)).await.unwrap();
+    w.net.update_conditions(|c| c.loss = 1.0);
+    let flushing = tokio::spawn({
+        let client = client.clone();
+        async move { client.flush().await }
+    });
+    sleep(Duration::from_millis(300)).await;
+    assert!(!flushing.is_finished());
+    client.close();
+    let err = flushing.await.unwrap().unwrap_err();
+    assert_eq!(err.0, DownReason::Closed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_flush_leaves_the_link_usable() {
+    let mut w = World::new(54);
+    let (client, daemon, _) = w.pair().await;
+    client.send(TERM, seq_payload(0, 500)).await.unwrap();
+    // Cut off before the answer can arrive (it is 40 ms away).
+    assert!(
+        timeout(Duration::from_millis(5), client.flush())
+            .await
+            .is_err()
+    );
+    client.send(TERM, seq_payload(1, 500)).await.unwrap();
+    client.flush().await.unwrap();
+    assert_eq!(seq_of(&daemon.recv().await.unwrap().1), 0);
+    assert_eq!(seq_of(&daemon.recv().await.unwrap().1), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_may_send_flush_markers_and_nothing_else_does_it_harm() {
+    let mut w = World::new(55);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    // Channel 1: a payload, a marker, a payload.
+    let mut s = conn.open_uni().await.unwrap();
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(&[0, 0, 0, 1, 42]);
+    bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 77]);
+    bytes.extend_from_slice(&[0, 0, 0, 1, 43]);
+    s.write_all(&bytes).await.unwrap();
+    assert_eq!(
+        daemon.recv().await.unwrap(),
+        (TERM, Bytes::from_static(&[42]))
+    );
+    assert_eq!(
+        daemon.recv().await.unwrap(),
+        (TERM, Bytes::from_static(&[43]))
+    );
+    // The marker was answered on the daemon's control stream: after the accept proof, a
+    // heartbeat reply carrying the id.
+    let mut ctl = conn.accept_uni().await.unwrap();
+    let want = fil_proto::ControlMsg::Heartbeat {
+        nonce: 77,
+        reply: true,
+    }
+    .encode()
+    .unwrap();
+    let found = timeout(Duration::from_secs(1), async {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 64];
+        while let Some(n) = ctl.read(&mut buf).await.unwrap() {
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(want.len()).any(|w| w == &want[..]) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the marker was answered");
+    assert!(found, "no acknowledgement of the marker");
+    assert!(matches!(daemon.status().borrow().state, LinkState::Up));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_truncated_flush_marker_ends_the_link() {
+    let mut w = World::new(56);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    let mut s = conn.open_uni().await.unwrap();
+    s.write_all(&[1, 0, 0, 0, 0, 0, 7]).await.unwrap(); // channel 1, a marker with half an id
+    s.finish().unwrap();
+    let mut ds = daemon.status();
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("flush marker")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_when_a_channels_writer_gave_up_on_payloads_it_had_accepted() {
+    let mut w = World::new(57);
+    let (client, _daemon, _) = w.pair().await;
+    // The peer grants 1,024 streams; the next new channel can never get one.
+    for ch in 100..100 + 1024u32 {
+        client
+            .send(ChannelId(ch), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    client.flush().await.unwrap();
+    client
+        .send(ChannelId(5000), Bytes::from_static(b"stuck"))
+        .await
+        .unwrap();
+    // The flush must not report that the stuck payload left, and must not sit there until the
+    // caller gives up: it ends when the writer does (after `dead_after`).
+    let t0 = Instant::now();
+    let err = timeout(Duration::from_secs(60), client.flush())
+        .await
+        .expect("the flush ended on its own")
+        .unwrap_err();
+    assert!(
+        matches!(err.0, DownReason::Io(ref m) if m.contains("lost")),
+        "{err:?}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // From then on a flush fails at once.
+    assert!(client.flush().await.is_err());
+}

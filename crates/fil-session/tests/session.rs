@@ -632,6 +632,8 @@ async fn the_shell_exiting_ends_the_session_after_the_client_has_the_output() {
         ServeEnd::SessionExited(info) => assert_eq!((info.code, info.signal), (3, None)),
         other => panic!("{other:?}"),
     }
+    // The client was told how it ended, after the last of the output.
+    assert_eq!(c.exited, Some((Some(3), None)));
     assert_eq!(h.wait_exit().await.code, 3);
     assert!(!h.is_alive());
     assert!(h.info().await.is_none());

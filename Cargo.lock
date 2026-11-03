@@ -530,6 +530,8 @@ dependencies = [
  "nix",
  "portable-pty",
  "quinn",
+ "ring",
+ "rustix",
  "tokio",
  "vt100",
 ]

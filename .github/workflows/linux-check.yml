@@ -116,7 +116,8 @@ jobs:
 
   aarch64:
     # The release binary for aarch64 Linux (DESIGN.md §13): static, musl. `ring` needs a musl C
-    # cross compiler, which `cross` brings in its Docker image. Uploads `fil` and `fil.sha256`
+    # cross compiler, which `cross` brings in its Docker image. Uploads `fil`, `fwdprobe` (the TCP
+    # test tool for the forward scenarios, docs/m2/pi.md) and their `.sha256` files
     # for the lab Raspberry Pis (docs/m1/pi.md): `gh run download RUN -n fil-aarch64-musl`.
     # No rust-cache here: this job produces the artifact that gets installed, and a cache entry
     # saved by a run of any other ref could otherwise seed what a later release build restores.
@@ -138,12 +139,17 @@ jobs:
           tool: cross@0.2.5
       - name: Build fil for aarch64-unknown-linux-musl
         run: cross build --locked --release -p fil --target aarch64-unknown-linux-musl
+      # A separate build, so `fil` above is built exactly as before.
+      - name: Build fwdprobe for aarch64-unknown-linux-musl
+        run: cross build --locked --release -p fil-testbins --bin fwdprobe --target aarch64-unknown-linux-musl
       - name: Check and checksum
         run: |
           mkdir -p out
-          cp target/aarch64-unknown-linux-musl/release/fil out/fil
-          file out/fil | tee /dev/stderr | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)'
-          (cd out && sha256sum fil | tee fil.sha256)
+          for b in fil fwdprobe; do
+            cp target/aarch64-unknown-linux-musl/release/$b out/$b
+            file out/$b | tee /dev/stderr | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)'
+            (cd out && sha256sum $b | tee $b.sha256)
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fil-aarch64-musl

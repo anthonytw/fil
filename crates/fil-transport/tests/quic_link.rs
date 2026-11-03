@@ -15,7 +15,7 @@ use fil_transport::quic::{self, HandshakeLimits, ListenerConfig, QuicLink, QuicL
 use fil_transport::{DownReason, Link, LinkError, LinkParams, LinkState, LinkStatus};
 use quinn::{Endpoint, EndpointConfig, TokioRuntime};
 use tokio::sync::watch;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 const CTRL: ChannelId = ChannelId(0);
 const TERM: ChannelId = ChannelId(1);
@@ -496,6 +496,162 @@ async fn a_blackout_gives_degraded_then_down_dead_and_a_new_handshake_recovers()
     drop(again);
 }
 
+/// Efficiency sweep #4: the supervisor used to wake ten times a second on every link, forever.
+/// A healthy idle link now looks at its connection a few times a second (twice, by default).
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_does_not_wake_its_supervisor_ten_times_a_second() {
+    let mut w = World::new(61);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(1)).await;
+    let (c0, d0) = (client.supervisor_ticks(), daemon.supervisor_ticks());
+    sleep(Duration::from_secs(20)).await;
+    let (c, d) = (
+        client.supervisor_ticks() - c0,
+        daemon.supervisor_ticks() - d0,
+    );
+    // 500 ms ticks would be 40; a few more are fine when the silence between heartbeats makes
+    // the supervisor look closely for a moment. The old 100 ms tick was 200.
+    assert!(c <= 80 && d <= 80, "client {c}, daemon {d} ticks in 20 s");
+    assert_eq!(client.status().borrow().state, LinkState::Up);
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+}
+
+/// Efficiency sweep #7: both ends used to send a keep-alive every second, doubling an idle
+/// link's packets. Now only the client's keep-alive (its heartbeat) runs; the daemon's packets
+/// are the acknowledgements of it. Either side still finds a dead path (the blackout tests).
+#[tokio::test(start_paused = true)]
+async fn an_idle_direct_link_sends_one_ping_and_one_ack_a_second() {
+    let mut w = World::new(62);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(3)).await;
+    let before = w.net.stats().sent;
+    sleep(Duration::from_secs(30)).await;
+    let sent = w.net.stats().sent - before;
+    // A ping up and its acknowledgement back, about once a second: about 60 packets in 30 s.
+    // With both ends pinging it was 86.
+    assert!(sent <= 70, "{sent} datagrams in 30 s of idle");
+    assert_eq!(client.status().borrow().state, LinkState::Up);
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+}
+
+/// The daemon sends no keep-alive of its own, so its silence detector rests on the client's
+/// pings. A path that dies is still found by it within `dead_after`, and `Degraded` comes first.
+#[tokio::test(start_paused = true)]
+async fn the_daemon_without_a_keep_alive_still_finds_a_dead_path_within_dead_after() {
+    let mut w = World::new(63);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(5)).await; // idle: only the client's pings keep it company
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+    let mut ds = daemon.status();
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    wait_for(&mut ds, "daemon Degraded", |s| {
+        s.state == LinkState::Degraded
+    })
+    .await;
+    let degraded = t0.elapsed();
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert_eq!(down_reason(&st), DownReason::Dead);
+    let dead = t0.elapsed();
+    assert!(degraded <= Duration::from_millis(2500), "{degraded:?}");
+    assert!(dead <= Duration::from_millis(5100), "{dead:?}");
+    drop(client);
+}
+
+/// Review of PR 38, finding 1: with the client alone pinging and the supervisor sampling every
+/// 500 ms, an idle link flapped `Degraded` on paths with a long round trip (9 times a minute at
+/// 250 ms one way, 11 to 13 at 500 ms; main never did). Counts the `Degraded` transitions of both
+/// ends over a minute of idle.
+async fn degraded_flaps_when_idle(one_way_ms: u64, jitter_ms: u64, seed: u64) -> (u32, u32) {
+    let mut w = World::new(seed);
+    let (client, daemon, _) = w.pair().await;
+    w.net.update_conditions(|c| {
+        c.latency = Duration::from_millis(one_way_ms);
+        c.jitter = Duration::from_millis(jitter_ms);
+    });
+    sleep(Duration::from_secs(3)).await;
+    let (mut cs, mut ds) = (client.status(), daemon.status());
+    let mut last = [
+        cs.borrow_and_update().state.clone(),
+        ds.borrow_and_update().state.clone(),
+    ];
+    let mut flaps = [0u32; 2];
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::select! {
+            r = cs.changed() => {
+                r.unwrap();
+                let s = cs.borrow_and_update().state.clone();
+                if s == LinkState::Degraded && last[0] != s { flaps[0] += 1; }
+                last[0] = s;
+            }
+            r = ds.changed() => {
+                r.unwrap();
+                let s = ds.borrow_and_update().state.clone();
+                if s == LinkState::Degraded && last[1] != s { flaps[1] += 1; }
+                last[1] = s;
+            }
+            () = sleep_until(end) => break,
+        }
+    }
+    (flaps[0], flaps[1])
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_does_not_flap_degraded_on_long_round_trips() {
+    // 250 ms one way; 200 ms one way with 100 ms of jitter; a 1 s round trip. Several seeds,
+    // because where the samples fall against the ping cycle decides whether a bad build flaps.
+    for (one_way, jitter) in [(250, 0), (200, 100), (500, 0)] {
+        for seed in [500, 501, 502] {
+            let (c, d) = degraded_flaps_when_idle(one_way, jitter, seed).await;
+
+            assert_eq!(
+                (c, d),
+                (0, 0),
+                "Degraded flaps (client, daemon) in 60 s idle at {one_way} ms one way, \
+                 {jitter} ms jitter, seed {seed}"
+            );
+        }
+    }
+}
+
+/// Review of PR 38, finding 3: `Down(Dead)` must not be late. A change in quinn's receive
+/// counter is dated at the previous look, the earliest the datagram can have arrived; dating it
+/// at the look that saw it would make `Dead` up to a whole sample (500 ms) late. The datagram
+/// below lands just after a look, and the path then dies.
+#[tokio::test(start_paused = true)]
+async fn dead_comes_within_dead_after_of_the_last_datagram_whatever_the_sampling_phase() {
+    for offset_ms in [0u64, 130, 260, 390] {
+        let mut w = World::new(90 + offset_ms);
+        let (client, daemon, _) = w.pair().await;
+        sleep(Duration::from_millis(2000 + offset_ms)).await;
+        // Just after one of the client's looks...
+        let ticks = client.supervisor_ticks();
+        while client.supervisor_ticks() == ticks {
+            sleep(Duration::from_millis(1)).await;
+        }
+        let look = Instant::now();
+        // ...the daemon sends, the datagram lands 20 ms later, and the path dies.
+        daemon
+            .send(TERM, Bytes::from_static(b"last words"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(21)).await;
+        w.net.set_blackout(true);
+        let mut cs = client.status();
+        let st = wait_for(&mut cs, "client Down", is_down).await;
+        assert_eq!(down_reason(&st), DownReason::Dead);
+        // The last datagram arrived at `look` + 20 ms. Dead may be late by one fast period
+        // (100 ms) and no more.
+        let late =
+            (Instant::now() - look).saturating_sub(Duration::from_millis(20) + w.params.dead_after);
+        assert!(
+            late <= Duration::from_millis(105),
+            "Dead came {late:?} after dead_after (look phase {offset_ms} ms)"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_short_blackout_degrades_and_recovers() {
     let mut w = World::new(7);
@@ -770,6 +926,34 @@ async fn revoking_in_the_registry_alone_closes_live_links_only_after_the_backsto
     );
 }
 
+/// Efficiency sweep #6: the sweep used to tick twice a second for the life of the daemon, so a
+/// daemon with direct mode on and nothing connected never slept. It now runs only while a
+/// connection is live, and a connection that arrives after a long idle is still swept.
+#[tokio::test(start_paused = true)]
+async fn the_listener_sweeps_only_while_connections_are_live() {
+    let mut w = World::with(64, |c, _| c.revoke_backstop = Duration::from_secs(2));
+    sleep(Duration::from_secs(30)).await;
+    assert_eq!(w.listener.sweeps(), 0, "swept with nothing to sweep");
+
+    let (client, daemon, key) = w.pair().await;
+    sleep(Duration::from_secs(5)).await;
+    let busy = w.listener.sweeps();
+    assert!(busy >= 4, "the sweep did not run for a live link: {busy}");
+
+    // A revocation made in the registry alone still closes the link after the backstop, though
+    // the sweep slept for 30 s before this connection woke it.
+    let mut ds = daemon.status();
+    w.registry.revoke(key.public_key());
+    wait_for(&mut ds, "daemon Down", is_down).await;
+    drop((client, daemon));
+
+    // Once the connection is gone the sweep goes back to sleep.
+    sleep(Duration::from_secs(2)).await;
+    let after = w.listener.sweeps();
+    sleep(Duration::from_secs(30)).await;
+    assert_eq!(w.listener.sweeps(), after, "the sweep kept ticking");
+}
+
 /// The backstop is measured from the revocation, and registering the key again cancels it.
 #[tokio::test(start_paused = true)]
 async fn registering_a_revoked_key_again_cancels_the_pending_close() {
@@ -912,6 +1096,50 @@ async fn a_second_stream_for_one_channel_ends_the_link() {
     let mut ds = daemon.status();
     let st = wait_for(&mut ds, "daemon Down", is_down).await;
     assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("second stream")));
+}
+
+/// Security sweep #3: quinn grants new stream credit as finished streams are freed, so the
+/// concurrent limit alone is no lifetime cap. A peer that finishes its streams used to register
+/// an unbounded number of channels (5,000 in the proof of concept). Now the 1,025th stream of one
+/// link ends it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_finishes_its_streams_still_hits_the_lifetime_cap() {
+    let mut w = World::new(77);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    let mut ds = daemon.status();
+    let mut opened = 0u32;
+    for ch in 0..5000u32 {
+        // Forward channels, never the same id twice; one 1-byte frame each, then finish.
+        let id = 100_000 + ch;
+        let Ok(mut s) = conn.open_uni().await else {
+            break; // the daemon has closed the connection
+        };
+        let mut b = Vec::new();
+        let mut v = id;
+        while v >= 0x80 {
+            b.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        b.push(v as u8);
+        b.extend_from_slice(&[0, 0, 0, 1, 42]);
+        if s.write_all(&b).await.is_err() || s.finish().is_err() {
+            break;
+        }
+        opened += 1;
+        // Let the daemon take the stream, which is what returns the credit.
+        if opened.is_multiple_of(64) {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(
+        matches!(down_reason(&st), DownReason::Io(m) if m.contains("too many streams")),
+        "{st:?}"
+    );
+    assert!(
+        opened <= 1100,
+        "the peer opened {opened} streams before the daemon closed the link"
+    );
 }
 
 #[tokio::test(start_paused = true)]

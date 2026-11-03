@@ -143,12 +143,17 @@ async fn requests_ls_detach_kill() {
     assert_eq!(list[1].attached.as_ref().unwrap().host.as_str(), "laptop");
     assert_eq!(list[1].term.as_str(), "xterm-256color");
 
-    // Detach: the client is dropped, the session lives.
+    // Detach: the client is told (`Detach`, as a takeover is announced) and then dropped; the
+    // session lives. It must not have to find out through a reconnect.
     let detach = Request::DetachSession {
         name: "main".parse().unwrap(),
     };
     assert_eq!(ask(&d, detach).await, Response::Done);
     a.wait_down().await;
+    assert!(
+        a.detached,
+        "the client was sent Detach before the link closed"
+    );
     let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
         panic!();
     };

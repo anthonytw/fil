@@ -300,6 +300,32 @@ async fn a_takeover_during_a_stall_is_still_announced() {
     let _ = h.kill(kill_wait()).await;
 }
 
+/// The same for `fil detach`: a client stalled with a catch-up pending is still told.
+#[tokio::test]
+async fn a_forced_detach_during_a_stall_is_still_announced() {
+    let sc = Scratch::new();
+    let script = "stty -echo; echo READY; read go; \
+                  yes 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz' | head -c 600000; \
+                  echo; echo END; sleep 30";
+    let mut cfg = sh_config(&sc, "main", script);
+    cfg.catch_up = CatchUpParams {
+        max_bytes: 64 * 1024,
+        ..Default::default()
+    };
+    let h = spawn_plain(cfg).await;
+    let mut a = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
+    a.wait("the attach reply", |c| c.reply.is_some()).await;
+    a.wait_screen("READY").await;
+    a.type_bytes(b"\n").await;
+    wait_log_end(&h, 600_000).await;
+    // `a` is stalled with the catch-up pending. Someone runs `fil detach`.
+    h.force_detach().await;
+    a.wait("the Detach notice", |c| c.detached).await;
+    a.hang_up();
+    assert_eq!(a.serve_end().await, ServeEnd::Detached);
+    let _ = h.kill(kill_wait()).await;
+}
+
 /// A process that ignores the hangup is killed before `kill` returns, not some time later.
 #[tokio::test]
 async fn kill_returns_after_the_leftovers_have_been_killed() {

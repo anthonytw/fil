@@ -232,12 +232,15 @@ async fn detach_revokes_and_a_later_resume_is_refused() {
 }
 
 #[tokio::test]
-async fn forcing_a_detach_revokes_and_drops_the_transport() {
+async fn forcing_a_detach_tells_the_client_revokes_and_drops_the_transport() {
     let sc = Scratch::new();
     let (h, host) = spawn(sh_config(&sc, "main", "cat")).await;
     let mut a = Client::attach(&h, Connect::new(&h, key(1))).await;
     h.force_detach().await;
-    assert_eq!(a.serve_end().await, ServeEnd::Superseded);
+    // The client is told, as on a takeover, before the link closes: it does not have to find out
+    // through a reconnect.
+    a.wait("the Detach notice", |c| c.detached).await;
+    assert_eq!(a.serve_end().await, ServeEnd::Detached);
     assert_eq!(*host.revoked.lock().unwrap(), vec![key(1)]);
     assert!(h.info().await.unwrap().subscriber.is_none());
     let _ = h.kill(Duration::from_secs(5)).await;

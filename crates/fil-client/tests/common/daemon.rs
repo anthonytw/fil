@@ -45,6 +45,8 @@ pub struct DState {
     pub sizes: Vec<(u16, u16)>,
     pub attaches: Vec<Attach>,
     pub detaches: u32,
+    /// Everything the daemon had received as input when the first `Detach` arrived.
+    pub input_at_detach: Option<Vec<u8>>,
     pub snapshots: u32,
     gone: bool,
     refuse_next: Option<AttachRefusal>,
@@ -90,6 +92,7 @@ impl FakeDaemon {
                 sizes: Vec::new(),
                 attaches: Vec::new(),
                 detaches: 0,
+                input_at_detach: None,
                 snapshots: 0,
                 gone: false,
                 refuse_next: None,
@@ -132,9 +135,15 @@ impl FakeDaemon {
                         ControlMsg::Resize(s) => st.sizes.push((s.cols(), s.rows())),
                         ControlMsg::Detach => {
                             st.detaches += 1;
+                            let seen = st.input_all.clone();
+                            st.input_at_detach.get_or_insert(seen);
                             let e = st.epoch.epoch();
                             let _ = st.epoch.detach(e);
                             st.current = None;
+                            // The session hangs up once it has handled a `Detach`; the client
+                            // waits for that before it closes its own side.
+                            link.close();
+                            return;
                         }
                         _ => {}
                     }
@@ -390,6 +399,11 @@ impl FakeDaemon {
 
     pub async fn sizes(&self) -> Vec<(u16, u16)> {
         self.st.lock().await.sizes.clone()
+    }
+
+    /// The input the daemon had received when the first `Detach` came in (`None`: no `Detach`).
+    pub async fn input_at_detach(&self) -> Option<Vec<u8>> {
+        self.st.lock().await.input_at_detach.clone()
     }
 
     pub async fn detaches(&self) -> u32 {

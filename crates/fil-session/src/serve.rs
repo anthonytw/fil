@@ -333,8 +333,31 @@ impl<'a, L: Link> Conn<'a, L> {
         .await;
     }
 
+    /// Whether a `Detach` is among what a dead link still holds. Reads until the link fails (it
+    /// is down already), for at most [`FAREWELL_TIMEOUT`].
+    async fn detach_left_in_queue(&self) -> bool {
+        tokio::time::timeout(FAREWELL_TIMEOUT, async {
+            while let Ok((channel, payload)) = self.link.recv().await {
+                if channel == ChannelId::CONTROL
+                    && matches!(ControlMsg::decode(&payload), Ok(ControlMsg::Detach))
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     async fn run(&self, acc: Accepted) -> ServeEnd {
         if let Err(e) = self.greet(&acc).await {
+            // The link died while the reply or snapshot went out. A `~.` typed meanwhile may
+            // still be in its inbound queue (`recv` hands out what arrived before the end).
+            if self.detach_left_in_queue().await {
+                self.handle.send(Cmd::Detach { conn: self.id }).await;
+                return ServeEnd::Detached;
+            }
             return ServeEnd::LinkDown(e.0);
         }
         let mut out = Out {

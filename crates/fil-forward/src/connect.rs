@@ -136,6 +136,27 @@ pub fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     }
 }
 
+/// Connect attempts to one address. A connect reset during the handshake is what a BSD kernel
+/// does when the target's listen queue is full (macOS caps it at 128): a burst of opens to one
+/// local server (a queue of forwarded connections opening at once) is common, so such a
+/// refusal is tried again after a short backoff, a few times, within the caller's timeout.
+async fn attempt(addr: SocketAddr) -> io::Result<TcpStream> {
+    let mut backoff = Duration::from_millis(20);
+    for _ in 0..RESET_RETRIES {
+        match TcpStream::connect(addr).await {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            r => return r,
+        }
+    }
+    TcpStream::connect(addr).await
+}
+
+/// How often a connect reset by a full listen queue is tried again (20, 40, 80, 160 ms apart).
+const RESET_RETRIES: usize = 4;
+
 async fn race(addrs: Vec<SocketAddr>, stagger: Duration) -> Result<TcpStream, OpenFailure> {
     let mut attempts = JoinSet::new();
     let mut next = 0;
@@ -144,7 +165,7 @@ async fn race(addrs: Vec<SocketAddr>, stagger: Duration) -> Result<TcpStream, Op
     loop {
         if next < addrs.len() && (attempts.is_empty() || Instant::now() >= next_at) {
             let addr = addrs[next];
-            attempts.spawn(TcpStream::connect(addr));
+            attempts.spawn(attempt(addr));
             next += 1;
             next_at = Instant::now() + stagger;
         }

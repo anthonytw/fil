@@ -4,7 +4,7 @@
 //!
 //! The heavy sizes run scaled down here and at full size with `just forward-soak`:
 //! `FIL_FORWARD_BULK_MIB` (default 8, soak 256), `FIL_FORWARD_SEQ` (default 2,000, soak 20,000),
-//! `FIL_FORWARD_CONCURRENT` (default 1,000).
+//! `FIL_FORWARD_CONCURRENT` (default 1,000 on QUIC and 300 on the others, soak 1,000).
 
 mod support;
 
@@ -181,7 +181,14 @@ async fn reset_propagates(t: Transport) {
 /// Many applications at once. Up to `MAX_OPEN_CHANNELS` are channels at a time; the rest are
 /// accepted and wait for a channel (within `open_wait`), oldest first.
 async fn concurrent_connections(t: Transport) {
-    let n = env_or("FIL_FORWARD_CONCURRENT", 1000);
+    // 1,000 on QUIC (the M2 "done when" transport), 300 on the others in `just ci`: each
+    // connection leaves two sockets in TIME_WAIT on ephemeral ports for 30 s, and macOS has
+    // about 16,000 of them, so the suite run twice in a row must not use a third of them each time.
+    // `just forward-soak` runs 1,000 on all three.
+    let n = env_or(
+        "FIL_FORWARD_CONCURRENT",
+        if t == Transport::Quic { 1000 } else { 300 },
+    );
     // The server answers nobody until `hold` connections reached it: that many channels are
     // then open at once (DESIGN.md section 15, M2: 200 concurrent forwarded connections).
     let hold = n.min(200) as usize;
@@ -937,7 +944,7 @@ async fn close_forward_also_clears_its_queue() {
 /// owner (`LinkFailed`); the next link resumes the transfer byte-exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_failure_on_a_live_link_detaches_and_is_reported() {
-    let n = 4 << 20;
+    let n = 16 << 20;
     let server = echo_server().await;
     let mut w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -947,13 +954,15 @@ async fn a_send_failure_on_a_live_link_detaches_and_is_reported() {
         progress.load(Ordering::Relaxed) >= (n / 4) as usize
     })
     .await;
-    let link = w.link.as_ref().unwrap().client.clone();
+    // The daemon still has most of the echo to send back on channel 16 (the upload may be
+    // done already, so the client's side may send nothing more on it).
+    let link = w.link.as_ref().unwrap().daemon.clone();
     link.finish(fil_proto::ChannelId(16));
     eventually(Duration::from_secs(10), || {
-        w.client.link_failed.load(Ordering::SeqCst) >= 1
+        w.daemon.link_failed.load(Ordering::SeqCst) >= 1
     })
     .await;
-    assert!(!w.client.ep.snapshot().attached);
+    assert!(!w.daemon.ep.snapshot().attached);
     assert!(matches!(
         link.status().borrow().state,
         fil_transport::LinkState::Up

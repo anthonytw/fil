@@ -812,12 +812,44 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
 
 /// Seconds into the day of a client-log line's `"timestamp":"...THH:MM:SS.ffffffZ"`.
 fn log_seconds(line: &str) -> Option<f64> {
-    let t = line.split("\"timestamp\":\"").nth(1)?.split('T').nth(1)?;
-    let mut parts = t.get(..15)?.split(':');
+    // Seconds since the Unix epoch, date included, so a window that crosses midnight UTC still
+    // gives a positive difference.
+    let ts = line.split("\"timestamp\":\"").nth(1)?;
+    let (date, time) = ts.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let mo: i64 = d.next()?.parse().ok()?;
+    let da: i64 = d.next()?.parse().ok()?;
+    let mut parts = time.get(..15)?.split(':');
     let h: f64 = parts.next()?.parse().ok()?;
     let m: f64 = parts.next()?.parse().ok()?;
     let s: f64 = parts.next()?.parse().ok()?;
-    Some(h * 3600.0 + m * 60.0 + s)
+    Some(days_from_civil(y, mo, da) as f64 * 86400.0 + h * 3600.0 + m * 60.0 + s)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_across_midnight_utc_stay_ordered() {
+        let a = log_seconds(r#"{"timestamp":"2026-11-02T23:59:59.900000Z"}"#).unwrap();
+        let b = log_seconds(r#"{"timestamp":"2026-11-03T00:00:00.100000Z"}"#).unwrap();
+        assert!((b - a - 0.2).abs() < 1e-6, "{}", b - a);
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    }
 }
 
 /// The time of the first log line containing `needle`.
@@ -888,9 +920,12 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
         eprintln!("--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}");
     }
     ensure(
-        pi_logs
-            .lines()
-            .any(|l| l.contains("\"message\":\"attach\"") && l.contains("\"direct\":true")),
+        pi_logs.lines().any(|l| {
+            // This session's attach only: the journal keeps earlier scenarios' lines too.
+            l.contains("\"message\":\"attach\"")
+                && l.contains("\"direct\":true")
+                && l.contains("\"session\":\"e2e-dm\"")
+        }),
         || "the Pi's daemon log has no direct attach".to_string(),
     )?;
     notes.push(format!(

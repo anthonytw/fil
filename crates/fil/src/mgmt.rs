@@ -9,11 +9,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_client::text::sanitize_inline;
 use fil_proto::ChannelId;
+use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    Agent, ControlMsg, ErrorCode, Hello, OtherDaemon, Request, Response, SessionSummary,
+    Agent, ControlMsg, ErrorCode, ForwardOp, ForwardResult, Hello, OtherDaemon, Request, Response,
+    SessionName, SessionSummary,
 };
+use fil_proto::mux::{ForwardKind, ForwardRefusal};
 use fil_proto::version::{Peer, VersionMismatch};
 use fil_transport::{Link, LinkError};
+
+use crate::forward_spec;
 
 /// How long to wait for the daemon's answer once the pipe is up.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,11 +45,27 @@ pub enum MgmtError {
     Protocol(String),
 }
 
-/// Sends `request` over `link` and waits for the response. Closes the link.
-pub async fn ask<L: Link>(link: &L, request: Request) -> Result<Response, MgmtError> {
+/// Sends `request` over `link` and waits for the whole answer: one response, or for
+/// `Request::Ports` every part of it, in order. Never empty. Closes the link.
+///
+/// A daemon is not trusted to stop: the parts are counted and the rows in them are counted, so a
+/// daemon that never says `more: false` costs a bounded amount of memory and ends in an error,
+/// and one that sends too many rows is cut off at the protocol's cap (the caller notes that).
+pub async fn ask<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, MgmtError> {
     let result = tokio::time::timeout(ANSWER_TIMEOUT, exchange(link, request)).await;
     link.close();
     result.unwrap_or(Err(MgmtError::Timeout(ANSWER_TIMEOUT)))
+}
+
+/// [`ask`] for a request with a one-response answer.
+pub async fn ask_one<L: Link>(link: &L, request: Request) -> Result<Response, MgmtError> {
+    let mut parts = ask(link, request).await?;
+    match (parts.pop(), parts.is_empty()) {
+        (Some(r), true) => Ok(r),
+        _ => Err(MgmtError::Protocol(
+            "the daemon answered in parts to a request with one answer".into(),
+        )),
+    }
 }
 
 async fn send<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), MgmtError> {
@@ -56,12 +77,14 @@ async fn send<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), MgmtError> {
         .map_err(MgmtError::Lost)
 }
 
-async fn exchange<L: Link>(link: &L, request: Request) -> Result<Response, MgmtError> {
+async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, MgmtError> {
     let agent = Agent::new(format!("fil {}", env!("CARGO_PKG_VERSION")))
         .map_err(|e| MgmtError::Protocol(e.to_string()))?;
     let ours = Hello::ours(agent);
     send(link, &ControlMsg::Hello(ours.clone())).await?;
     send(link, &ControlMsg::Request(request)).await?;
+    let mut parts: Vec<Response> = Vec::new();
+    let mut rows = 0usize;
     loop {
         let (channel, payload) = link.recv().await.map_err(MgmtError::Lost)?;
         if channel != ChannelId::CONTROL {
@@ -71,7 +94,28 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Response, MgmtE
             ControlMsg::Hello(peer) => {
                 ours.check(&peer).map_err(MgmtError::Version)?;
             }
-            ControlMsg::Response(r) => return Ok(r),
+            ControlMsg::Response(Response::Ports { part, more }) => {
+                rows += part.rows.len();
+                parts.push(Response::Ports { part, more });
+                // A whole answer is at most MAX_PORTS_ROWS rows, and every part but an empty
+                // single one holds a row: past either bound the daemon is not following the
+                // protocol. Rows beyond the cap are dropped by the view and said so; a stream of
+                // empty parts is an error.
+                if !more || rows > MAX_PORTS_ROWS {
+                    return Ok(parts);
+                }
+                if parts.len() > MAX_PORTS_ROWS {
+                    return Err(MgmtError::Protocol(
+                        "the daemon sent more parts of the answer than the protocol allows".into(),
+                    ));
+                }
+            }
+            ControlMsg::Response(r) if parts.is_empty() => return Ok(vec![r]),
+            ControlMsg::Response(_) => {
+                return Err(MgmtError::Protocol(
+                    "a different answer came in the middle of a `fil ports` answer".into(),
+                ));
+            }
             ControlMsg::AttachRefused(r) => return Err(MgmtError::Refused(format!("{r:?}"))),
             ControlMsg::Error(ErrorCode::VersionMismatch) => return Err(MgmtError::VersionRefused),
             ControlMsg::Error(code) => return Err(MgmtError::Refused(format!("{code:?}"))),
@@ -106,14 +150,70 @@ pub fn render(
         (Request::DetachSession { name }, Response::Done) => {
             Ok(format!("detached session \"{name}\" (it keeps running)\n"))
         }
+        (Request::Forward { session, op }, Response::Forward(result)) => {
+            render_forward(session, op, result)
+        }
         (
-            Request::KillSession { name } | Request::DetachSession { name },
+            Request::KillSession { name: session }
+            | Request::DetachSession { name: session }
+            | Request::Forward { session, .. }
+            | Request::Ports {
+                session: Some(session),
+            },
             Response::NoSuchSession,
         ) => Err(format!(
-            "no session \"{name}\" on {}",
+            "no session \"{session}\" on {}",
             sanitize_inline(host)
         )),
         (_, other) => Err(format!("unexpected answer from the daemon: {other:?}")),
+    }
+}
+
+/// What `fil forward` says about the daemon's answer. Everything in it is a number, a flag we
+/// formatted or a validated session name: nothing the daemon chose.
+fn render_forward(
+    session: &SessionName,
+    op: &ForwardOp,
+    result: &ForwardResult,
+) -> Result<String, String> {
+    let port = match op {
+        ForwardOp::Add(spec) => spec.port(),
+        ForwardOp::Remove { port, .. } => *port,
+    };
+    match (op, result) {
+        (ForwardOp::Add(spec), ForwardResult::Added(_)) => Ok(format!(
+            "added {} to session \"{session}\"; the client attached to it asks you before it listens or connects for it\n",
+            forward_spec::format_flag(spec)
+        )),
+        (ForwardOp::Remove { kind, .. }, ForwardResult::Removed(_)) => Ok(format!(
+            "removed the {}forward on port {port} from session \"{session}\"; connections already open run until they close\n",
+            kind.map_or("", |k| match k {
+                ForwardKind::Local => "-L ",
+                ForwardKind::Remote => "-R ",
+                ForwardKind::Dynamic => "-D ",
+            })
+        )),
+        (_, ForwardResult::Refused(why)) => Err(refusal(*why, port)),
+        (_, other) => Err(format!("unexpected answer from the daemon: {other:?}")),
+    }
+}
+
+/// Why the daemon refused a forward request, in words that say what to do.
+fn refusal(why: ForwardRefusal, port: u16) -> String {
+    match why {
+        ForwardRefusal::Conflict => format!(
+            "port {port} already has a forward with another target; remove it first (`fil forward --rm {port}`)"
+        ),
+        ForwardRefusal::TooMany => format!(
+            "the session's forward table is full ({} forwards)",
+            fil_proto::limits::MAX_FORWARDS
+        ),
+        ForwardRefusal::BadSpec => "the daemon refused that forward as malformed".to_string(),
+        ForwardRefusal::NotPermitted => "a forward added with `fil forward` may not listen beyond loopback on your machine (-L, -D) or connect to a non-loopback target from it (-R); put it on the attach command line or in the config instead".to_string(),
+        ForwardRefusal::NoSuchForward => format!("the session has no forward on port {port}"),
+        ForwardRefusal::Ambiguous => format!(
+            "more than one forward listens on port {port} (a -L and a -R, say); name the kind: `fil forward --rm -L {port}` (or -R, -D)"
+        ),
     }
 }
 
@@ -406,7 +506,7 @@ mod tests {
             others: vec![],
         });
         let d = tokio::spawn(daemon_answers(daemon, Some(reply)));
-        let got = ask(&client, Request::ListSessions).await.unwrap();
+        let got = ask_one(&client, Request::ListSessions).await.unwrap();
         assert_eq!(
             got,
             Response::Sessions {
@@ -435,7 +535,7 @@ mod tests {
             // Keep the link open: the client must stop on the hello alone.
             std::future::pending::<()>().await;
         });
-        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
         assert!(matches!(err, MgmtError::Version(_)), "{err}");
         assert!(err.to_string().contains("major"));
         d.abort();
@@ -462,7 +562,7 @@ mod tests {
             // Keep the link open: the client must stop on the hello alone.
             std::future::pending::<()>().await;
         });
-        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
         assert!(matches!(err, MgmtError::Version(_)), "{err}");
         let text = err.to_string();
         assert!(
@@ -553,7 +653,7 @@ mod tests {
             let _ = daemon_answers(daemon, None).await;
             ctl.kill(DownReason::Io("ssh exited".into()));
         });
-        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
         assert!(matches!(err, MgmtError::Lost(_)), "{err}");
         d.await.unwrap();
     }
@@ -561,7 +661,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_silent_daemon_times_out() {
         let (client, _daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
-        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
         assert!(matches!(err, MgmtError::Timeout(_)), "{err}");
     }
 
@@ -570,8 +670,208 @@ mod tests {
         let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
         let reply = ControlMsg::Error(fil_proto::msg::ErrorCode::Protocol);
         let d = tokio::spawn(daemon_answers(daemon, Some(reply)));
-        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
         assert!(matches!(err, MgmtError::Refused(_)), "{err}");
         d.await.unwrap();
+    }
+
+    fn listener_row(port: u16) -> fil_proto::msg::PortsRow {
+        fil_proto::msg::PortsRow::Listener(fil_proto::msg::ListenerRow {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: std::num::NonZeroU16::new(port).unwrap(),
+            owner: fil_proto::msg::ListenerOwner::Other,
+            since_unix_ms: 0,
+            probe: None,
+        })
+    }
+
+    /// Plays a daemon that answers with `replies`, one control message each.
+    async fn daemon_says(peer: mem::MemLink, replies: Vec<ControlMsg>) {
+        peer.recv().await.unwrap(); // the client's Hello
+        peer.recv().await.unwrap(); // and its request
+        let hello = Hello::ours(Agent::new("test-daemon").unwrap());
+        peer.send(
+            ChannelId::CONTROL,
+            Bytes::from(ControlMsg::Hello(hello).encode().unwrap()),
+        )
+        .await
+        .unwrap();
+        for r in replies {
+            peer.send(ChannelId::CONTROL, Bytes::from(r.encode().unwrap()))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn ports_request() -> Request {
+        Request::Ports { session: None }
+    }
+
+    #[tokio::test]
+    async fn every_part_of_a_ports_answer_is_collected() {
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 64);
+        let rows: Vec<_> = (1..=40).map(listener_row).collect();
+        let parts = Response::ports(rows);
+        let parts = {
+            // Force several parts whatever the size of a row.
+            let all: Vec<_> = parts
+                .into_iter()
+                .flat_map(|r| match r {
+                    Response::Ports { part, .. } => part.rows,
+                    _ => unreachable!(),
+                })
+                .collect();
+            all.chunks(7)
+                .enumerate()
+                .map(|(i, c)| Response::Ports {
+                    part: fil_proto::msg::PortsPart {
+                        rows: c.to_vec(),
+                        incomplete: None,
+                    },
+                    more: (i + 1) * 7 < all.len(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(parts.len() > 3);
+        let d = tokio::spawn(daemon_says(
+            daemon,
+            parts.iter().cloned().map(ControlMsg::Response).collect(),
+        ));
+        let got = ask(&client, ports_request()).await.unwrap();
+        assert_eq!(got, parts, "every part, in order");
+        d.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_ends_a_ports_answer_costs_a_bounded_amount() {
+        // Empty parts that all say `more`: a daemon that does not follow the protocol.
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 1024);
+        let part = Response::Ports {
+            part: fil_proto::msg::PortsPart::default(),
+            more: true,
+        };
+        let d = tokio::spawn(daemon_says(
+            daemon,
+            vec![ControlMsg::Response(part); MAX_PORTS_ROWS + 10],
+        ));
+        let err = ask(&client, ports_request()).await.unwrap_err();
+        assert!(matches!(err, MgmtError::Protocol(_)), "{err}");
+        let _ = d.await;
+    }
+
+    #[tokio::test]
+    async fn more_rows_than_the_protocol_allows_stop_the_collecting() {
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 1024);
+        let full = Response::Ports {
+            part: fil_proto::msg::PortsPart {
+                rows: (1..=100).map(listener_row).collect(),
+                incomplete: None,
+            },
+            more: true,
+        };
+        let d = tokio::spawn(daemon_says(daemon, vec![ControlMsg::Response(full); 50]));
+        let got = ask(&client, ports_request()).await.unwrap();
+        // Three parts hold 300 rows, past the cap of 256: nothing more is read.
+        assert_eq!(got.len(), 3);
+        let _ = d.await;
+    }
+
+    #[tokio::test]
+    async fn another_answer_inside_a_ports_answer_is_a_protocol_error() {
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
+        let first = Response::Ports {
+            part: fil_proto::msg::PortsPart::default(),
+            more: true,
+        };
+        let d = tokio::spawn(daemon_says(
+            daemon,
+            vec![
+                ControlMsg::Response(first),
+                ControlMsg::Response(Response::Done),
+            ],
+        ));
+        let err = ask(&client, ports_request()).await.unwrap_err();
+        assert!(matches!(err, MgmtError::Protocol(_)), "{err}");
+        d.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_one_answer_request_given_parts_is_a_protocol_error() {
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
+        let part = Response::Ports {
+            part: fil_proto::msg::PortsPart::default(),
+            more: false,
+        };
+        let d = tokio::spawn(daemon_says(daemon, vec![ControlMsg::Response(part)]));
+        // One part with no more is a single response: `ask_one` hands it back for `render` to
+        // call unexpected.
+        let got = ask_one(&client, Request::ListSessions).await.unwrap();
+        assert!(matches!(got, Response::Ports { .. }));
+        d.await.unwrap();
+    }
+
+    #[test]
+    fn forward_answers_say_what_happened_and_what_to_do() {
+        use fil_proto::mux::{ForwardId, ForwardRefusal};
+        let session = SessionName::new("main").unwrap();
+        let spec = crate::forward_spec::parse(ForwardKind::Local, "5173").unwrap();
+        let add = Request::Forward {
+            session: session.clone(),
+            op: ForwardOp::Add(spec),
+        };
+        let done = render(
+            &add,
+            &Response::Forward(ForwardResult::Added(ForwardId(3))),
+            "orin",
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            done.contains("added -L 5173:localhost:5173 to session \"main\"")
+                && done.contains("asks you"),
+            "{done}"
+        );
+        let rm = |kind, port| Request::Forward {
+            session: session.clone(),
+            op: ForwardOp::Remove { kind, port },
+        };
+        let gone = render(
+            &rm(None, 5173),
+            &Response::Forward(ForwardResult::Removed(ForwardId(3))),
+            "orin",
+            NOW,
+        )
+        .unwrap();
+        assert!(gone.contains("removed the forward on port 5173"), "{gone}");
+        let ambiguous = render(
+            &rm(None, 5173),
+            &Response::Forward(ForwardResult::Refused(ForwardRefusal::Ambiguous)),
+            "orin",
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            ambiguous.contains("more than one forward") && ambiguous.contains("--rm -L 5173"),
+            "{ambiguous}"
+        );
+        for why in [
+            ForwardRefusal::Conflict,
+            ForwardRefusal::TooMany,
+            ForwardRefusal::BadSpec,
+            ForwardRefusal::NotPermitted,
+            ForwardRefusal::NoSuchForward,
+        ] {
+            let e = render(
+                &rm(None, 80),
+                &Response::Forward(ForwardResult::Refused(why)),
+                "orin",
+                NOW,
+            )
+            .unwrap_err();
+            assert!(!e.is_empty() && !e.contains('{'), "{why:?}: {e}");
+        }
+        // The session is missing, on a host with a hostile name.
+        let e = render(&add, &Response::NoSuchSession, "or\u{1b}[2Jin", NOW).unwrap_err();
+        assert_eq!(e, "no session \"main\" on or[2Jin");
     }
 }

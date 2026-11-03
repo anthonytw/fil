@@ -27,6 +27,9 @@ fil-client = { path = "../fil-client" }
 fil-daemon = { path = "../fil-daemon" }
 fil-proto = { path = "../fil-proto" }
 fil-transport = { path = "../fil-transport" }
+# `localtime_r`, for the time zone of `fil ports` (rustix has no time zone calls): one narrow
+# `unsafe` in src/localtime.rs.
+libc = "0.2"
 rustix = { version = "1", features = ["system", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

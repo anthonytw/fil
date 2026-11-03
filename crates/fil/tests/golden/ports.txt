@@ -21,11 +21,11 @@ FORWARDED
 
 LISTENING IN THIS SESSION, NOT FORWARDED
   8000  0.0.0.0 ⚠      python3 (pid 42110, ~/tmp)  since 10:03  HTTP 200 "Directory listing for /"
-        ⚠ reachable from outside this host, not just through fil  →  fil forward -L 8000
+        ⚠ reachable from outside this host, not just through fil  →  fil forward orin main -L 8000
   3000  127.0.0.1      node (pid 42200)
-        →  fil forward -L 3000
+        →  fil forward orin main -L 3000
   7000  2001:db8::5 ⚠  deno (pid 42300, ~/web)
-        ⚠ reachable from outside this host, not just through fil  →  fil forward -L 7000
+        ⚠ reachable from outside this host, not just through fil  →  fil forward orin main -L 7000
 
 AGENT
   relayed to this client: 1 connection open, 14 requests, last used 10:40

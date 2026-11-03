@@ -308,6 +308,9 @@ pub(crate) enum ConnEvent {
     TakenOver(TakenOver),
     /// This transport is superseded by a newer one of the same client: drop it quietly.
     Drop,
+    /// The forwards' endpoint let go of this connection's link (a payload the link refused while
+    /// up): end it as a link failure, so the client resumes on a new one.
+    LinkFailed,
     /// The session was detached from outside (`fil detach`): tell this client with `Detach`, then
     /// drop the transport. The client's key is already revoked.
     Detached,

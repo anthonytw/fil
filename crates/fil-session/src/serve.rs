@@ -263,6 +263,8 @@ enum Reason {
     TakenOver(TakenOver),
     Detached,
     Superseded,
+    /// The forwards' endpoint could not send on the link.
+    LinkFailed,
     Fatal(ErrorCode),
 }
 
@@ -301,6 +303,7 @@ impl Out {
             ConnEvent::TakenOver(info) => return Some(Reason::TakenOver(info)),
             ConnEvent::Detached => return Some(Reason::Detached),
             ConnEvent::Drop => return Some(Reason::Superseded),
+            ConnEvent::LinkFailed => return Some(Reason::LinkFailed),
             ConnEvent::Fatal(code) => return Some(Reason::Fatal(code)),
             ConnEvent::Mode {
                 canonical,
@@ -780,6 +783,10 @@ impl<'a, L: Link> Conn<'a, L> {
                 ServeEnd::Detached
             }
             Reason::Superseded => ServeEnd::Superseded,
+            // Quietly, as a link that went down: the client resumes on a new one.
+            Reason::LinkFailed => {
+                ServeEnd::LinkDown(DownReason::Io("a forward payload was refused".into()))
+            }
             Reason::Fatal(code) => {
                 self.decide(ServeEnd::Protocol(format!("{code:?}")));
                 self.farewell(&ControlMsg::Error(code)).await;

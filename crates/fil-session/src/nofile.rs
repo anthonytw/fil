@@ -93,19 +93,23 @@ pub(crate) fn wrap(cmd: &mut CommandBuilder) -> Result<(), String> {
     Ok(())
 }
 
-/// Where `program` is, the way portable-pty looks: a path with a `/` relative to the working
-/// directory, a bare name on the builder's `PATH`.
+/// Where `program` is, the way portable-pty looks for it: an absolute path as it is; one that
+/// starts with `.` or `..` in the session's directory; anything else in each `PATH` entry, a
+/// relative entry being relative to the session's directory too. The session's directory is
+/// portable-pty's: the configured one if it is a directory, the home directory otherwise (never
+/// the daemon's own, which is `/`).
 fn resolve(program: &OsStr, cmd: &CommandBuilder) -> Option<OsString> {
+    use std::path::Component;
     let path = Path::new(program);
     if path.is_absolute() {
         return executable(path).then(|| program.to_os_string());
     }
-    if program.as_encoded_bytes().contains(&b'/') {
-        let cwd = cmd
-            .get_cwd()
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())?;
-        let full = cwd.join(path);
+    let dir = session_dir(cmd);
+    if matches!(
+        path.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    ) {
+        let full = dir.join(path);
         return executable(&full).then(|| full.into_os_string());
     }
     let search = cmd
@@ -113,9 +117,24 @@ fn resolve(program: &OsStr, cmd: &CommandBuilder) -> Option<OsString> {
         .map(OsString::from)
         .or_else(|| std::env::var_os("PATH"))?;
     std::env::split_paths(&search)
-        .map(|dir| dir.join(path))
+        .map(|entry| dir.join(entry).join(path))
         .find(|p| executable(p))
         .map(PathBuf::into_os_string)
+}
+
+/// The directory portable-pty starts the child in: the builder's, if it is a directory, else
+/// the home directory (the builder's `HOME`, else the password database's).
+fn session_dir(cmd: &CommandBuilder) -> PathBuf {
+    if let Some(dir) = cmd.get_cwd().map(PathBuf::from).filter(|d| d.is_dir()) {
+        return dir;
+    }
+    if let Some(home) = cmd.get_env("HOME") {
+        return PathBuf::from(home);
+    }
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map_or_else(|| PathBuf::from("/"), |u| u.dir)
 }
 
 /// A regular file someone may execute.

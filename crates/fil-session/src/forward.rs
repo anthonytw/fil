@@ -158,12 +158,6 @@ struct State {
     /// What the binder last reported for each entry: the daemon for `-R`, the current client for
     /// `-L` and `-D` (forgotten on a fresh attach: the new client binds its own).
     listen: HashMap<ForwardId, ListenState>,
-    /// Set by a new epoch until the next link is up. The endpoint's receiver already drops the
-    /// events of an ended epoch, but one it handed out just before `new_epoch` can still be on
-    /// its way to this lock; nothing of the new epoch can arrive before its link does, so what
-    /// arrives meanwhile is dropped (defense in depth: a late `AddForward` or `Consent` of the
-    /// old client must never count for the new one).
-    stale: bool,
     ended: bool,
 }
 
@@ -204,6 +198,9 @@ pub(crate) struct Forwards {
     table_room: usize,
     #[cfg(feature = "test-hooks")]
     gate: Arc<Mutex<Option<Arc<crate::handle::SyncGate>>>>,
+    /// Test hook: holds each endpoint event between the receiver and the lock.
+    #[cfg(feature = "test-hooks")]
+    event_gate: Mutex<Option<Arc<crate::handle::SyncGate>>>,
 }
 
 /// Counts only.
@@ -226,7 +223,6 @@ impl Forwards {
             fatal: None,
             consented: HashSet::new(),
             listen: HashMap::new(),
-            stale: false,
             ended: false,
         }));
         #[cfg(feature = "test-hooks")]
@@ -247,6 +243,8 @@ impl Forwards {
             table_room,
             #[cfg(feature = "test-hooks")]
             gate,
+            #[cfg(feature = "test-hooks")]
+            event_gate: Mutex::new(None),
         });
         let task = tokio::spawn(fw.clone().drain_events(events));
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -342,10 +340,9 @@ impl Forwards {
     /// A new mux epoch, with nothing of the previous subscriber's left: its channels, its
     /// consent, the binds its client reported, and the endpoint's events about them.
     fn new_epoch(&self, st: &mut State) {
-        // The endpoint's receiver drops the old epoch's events from here on; `stale` covers one
-        // already handed out.
+        // The old epoch's events are dropped from here on: by the endpoint's receiver, and here
+        // under this lock for one it handed out just before (`drain_events`).
         self.ep.new_epoch();
-        st.stale = true;
         st.linked = false;
         st.conn = None;
         st.fatal = None;
@@ -371,7 +368,6 @@ impl Forwards {
         self.ep
             .attach_link(Arc::new(SessionLink::new(link)), resumed);
         st.linked = true;
-        st.stale = false;
     }
 
     /// Connection `conn` is over. If its link was the endpoint's, the subscriber is now between
@@ -637,19 +633,33 @@ impl Forwards {
         self.tell(st, MuxMsg::ForwardGone { id });
     }
 
-    /// The endpoint's events (those of the current epoch; see `State::stale` for the rest).
+    /// The endpoint's events. Each is acted on only if its epoch is still the endpoint's,
+    /// compared under the state's lock, which every `new_epoch` is called under: an event the
+    /// receiver handed out just before a takeover (a late `AddForward` or `Consent` of the old
+    /// client) never counts for the new subscriber, however long it took to get here.
     async fn drain_events(self: Arc<Self>, mut events: EventReceiver) {
-        while let Some(ev) = events.recv().await {
+        while let Some((epoch, ev)) = events.recv_with_epoch().await {
+            #[cfg(feature = "test-hooks")]
+            {
+                let gate = self
+                    .event_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(g) = gate {
+                    g.pass();
+                }
+            }
             let mut st = self.lock();
+            if epoch != self.ep.epoch() {
+                debug!("an event of the previous mux epoch dropped");
+                continue;
+            }
             self.on_event(&mut st, ev);
         }
     }
 
     fn on_event(&self, st: &mut State, ev: EndpointEvent) {
-        if st.stale {
-            debug!("an event of the previous mux epoch dropped");
-            return;
-        }
         match ev {
             EndpointEvent::Table(msg) => self.on_table(st, msg),
             // A payload the link refused while it stays up: the endpoint has let go of the link,
@@ -658,7 +668,7 @@ impl Forwards {
             EndpointEvent::LinkFailed => {
                 debug!("a forward send failed on a live link");
                 if let Some(tx) = &st.fatal {
-                    let _ = tx.send(ConnEvent::Drop);
+                    let _ = tx.send(ConnEvent::LinkFailed);
                 }
             }
             EndpointEvent::Failed(e) => {
@@ -733,6 +743,15 @@ impl Forwards {
     pub(crate) fn gate_outgoing(&self) -> Arc<crate::handle::SyncGate> {
         let g = Arc::new(crate::handle::SyncGate::default());
         *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(g.clone());
+        g
+    }
+
+    /// Test hook: from now on each endpoint event waits at the returned gate between the
+    /// receiver and the state's lock.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn gate_events(&self) -> Arc<crate::handle::SyncGate> {
+        let g = Arc::new(crate::handle::SyncGate::default());
+        *self.event_gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(g.clone());
         g
     }
 

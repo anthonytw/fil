@@ -423,6 +423,13 @@ impl Inner {
                 agent: None,
             });
         }
+        // The focused session may have ended since it was looked up: then it is gone, as it
+        // would have been a moment earlier.
+        if let Some(name) = &focus
+            && !sessions.iter().any(|s| &s.summary.name == name)
+        {
+            return vec![Response::NoSuchSession];
+        }
         let q = PortsQuery::new(sessions, focus, self.cfg.ports_probe);
         crate::ports::ports(q).await.into_responses()
     }

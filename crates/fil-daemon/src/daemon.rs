@@ -841,12 +841,16 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
     // limit goes as high as it may, and every program the daemon starts gets the original back
     // (`fil_session::nofile`).
     // A session's child starts through this binary, which gives it the original limit back.
-    if let Some(exe) = fil_session::nofile::own_executable() {
-        fil_session::nofile::set_trampoline(exe);
-    }
-    match fil_transport::fdlimit::raise() {
-        Some(r) => tracing::info!(from = r.from, to = r.to, "descriptor limit raised"),
-        None => tracing::debug!("descriptor limit left as it is"),
+    // Without one the limit is not raised at all: the shells would inherit it.
+    match fil_session::nofile::own_executable() {
+        Some(exe) => {
+            fil_session::nofile::set_trampoline(exe);
+            match fil_transport::fdlimit::raise() {
+                Some(r) => tracing::info!(from = r.from, to = r.to, "descriptor limit raised"),
+                None => tracing::debug!("descriptor limit left as it is"),
+            }
+        }
+        None => tracing::info!("own executable unknown: descriptor limit left as it is"),
     }
     let cfg = match DaemonConfig::load(&paths.config) {
         Ok(mut c) => {

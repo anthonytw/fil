@@ -198,6 +198,43 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 
+/// Through the trampoline a program is found where portable-pty would find it: `./prog` and a
+/// relative `PATH` entry in the session's directory, which is the home directory when none is
+/// configured (not the daemon's own directory).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_trampoline_finds_programs_where_portable_pty_does() {
+    use std::os::unix::fs::PermissionsExt;
+    if !setup() {
+        eprintln!("the hard limit is the stock one: nothing to raise");
+        return;
+    }
+    let s = Scratch::new();
+    std::fs::create_dir_all(s.path("bin")).unwrap();
+    for (file, word) in [("here.sh", "here"), ("bin/tool", "tool")] {
+        let p = s.path(file);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\necho \"{word}=$(ulimit -Sn).\"\nexec cat\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (argv0, word) in [("./here.sh", "here"), ("tool", "tool")] {
+        let mut cfg = sh_config(&s, word, "unused");
+        cfg.command = Some(vec![argv0.into()]);
+        // No working directory: the home directory (the scratch one) is the session's.
+        cfg.cwd = None;
+        cfg.env = vec![
+            ("PATH".into(), "bin:/usr/bin:/bin".into()),
+            ("HOME".into(), s.0.display().to_string()),
+        ];
+        let h = spawn_plain(cfg).await;
+        let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+        c.wait_out(&format!("{word}={STOCK}.")).await;
+        let _ = h.kill(Duration::from_secs(5)).await;
+    }
+}
+
 /// The trampoline runs only what it is given in full, and nothing otherwise: with any argument
 /// missing or malformed, or a program that is relative or not there, it exits 127 and the
 /// program (which would leave a file behind) never runs. Without its marker it is not a

@@ -710,6 +710,35 @@ async fn consent_checked_before_a_takeover_does_not_open_toward_the_new_client()
     assert_eq!(bt.accepts.load(Ordering::SeqCst), 0);
 }
 
+/// The old client's `Consent`, handed out by the endpoint just before a takeover but acted on
+/// after it, must not count for the new client (PR #68 re-check, N1): the gate holds the event
+/// between the receiver and the forwards' lock while B takes over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consent_delayed_past_a_takeover_does_not_count_for_the_new_client() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "late-consent")).await;
+    let a = FwdClient::attach(&h, key(1), "laptop").await;
+    let bt = echo().await;
+    let ForwardResult::Added(id) = h.forward(ForwardOp::Add(remote(0, bt.port()))) else {
+        panic!("not added");
+    };
+    let port = bound_port(&a, id, 0).await;
+
+    let gate = h.gate_forward_events();
+    a.send_table(MuxMsg::Consent { id, accepted: true });
+    eventually("A's Consent to reach the gate", || async { gate.arrived() }).await;
+    let b = FwdClient::attach(&h, key(2), "desk").await;
+    b.side.targets.lock().unwrap().insert(id, bt.addr);
+    gate.open();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row = h.forward_rows().into_iter().find(|r| r.id == id).unwrap();
+    assert!(!row.consented, "A's consent counted for B");
+    refused(port).await;
+    assert_eq!(b.side.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(bt.accepts.load(Ordering::SeqCst), 0);
+}
+
 /// The same race against a detach: the connection is refused at once, not left to wait for a
 /// link that no subscriber will bring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

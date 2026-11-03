@@ -314,6 +314,14 @@ impl SessionHandle {
         self.inner.forwards.gate_outgoing()
     }
 
+    /// Test hook: from now on each event of the forwards' endpoint (a table record from the
+    /// client) waits at the returned gate before it is acted on, so a test can take the session
+    /// over in between. Only with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn gate_forward_events(&self) -> Arc<SyncGate> {
+        self.inner.forwards.gate_events()
+    }
+
     /// Test hook: records the session's process tree now, from a fresh scan, and returns once the
     /// core has taken it. The periodic recording is at 100 ms and then every 5 s, from a table that
     /// may be shared and up to 2 s old, so a test that needs a process recorded at a known moment

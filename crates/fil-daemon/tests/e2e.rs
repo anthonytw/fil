@@ -302,3 +302,37 @@ async fn two_attaches_to_a_new_name_make_one_session() {
     assert_eq!(list.len(), 1);
     d.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_reports_when_a_session_last_printed() {
+    let unix_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let last = |list: Vec<fil_proto::msg::SessionSummary>| list[0].last_output_unix_ms;
+    let s = Scratch::new();
+    let d = start(&s, config(CAT)).await;
+    let t0 = unix_ms();
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+    a.wait_screen("ready").await;
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    let first = last(list);
+    assert!(
+        first >= t0 && first <= unix_ms(),
+        "`fil ls` would say \"never\" or a wrong age: {first} not in [{t0}, now]"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    a.type_bytes(b"more\n").await;
+    a.wait("more echoed", |c| c.out_str().contains("more"))
+        .await;
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    assert!(last(list) > first, "later output moves the time");
+    d.stop().await;
+}

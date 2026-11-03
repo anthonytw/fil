@@ -639,10 +639,10 @@ client_bg_on() {
 fk() { cx fil kill "$1" "$2" > /dev/null 2>&1 || true; }
 
 # Of the ten clean detaches (`~.`) in f_detach_delivery, how many may be lost before the scenario
-# fails. A lost detach is a known defect in fil (see "Real binary: findings" in
-# docs/m1/realnet.md) and is recorded as KNOWN-BUG up to this number. When the fix lands, set it
-# to 0 (or run with REALNET_STRICT=1, which fails on any known finding).
-DETACH_LOST_MAX=${DETACH_LOST_MAX:-7}
+# fails. Losing them was finding 1 in docs/m1/realnet.md, fixed by #31 (the client now waits for
+# the daemon to hang up), so the default is 0: any lost detach fails. Raise it only to look at a
+# regression without failing the run.
+DETACH_LOST_MAX=${DETACH_LOST_MAX:-0}
 
 # ls_detached HOST SESSION [MS]: polls `fil ls HOST` until SESSION is listed as not attached (the
 # ATTACHED column is "-"), for at most MS milliseconds (default 5000). Returns 0 once it is, 1 if

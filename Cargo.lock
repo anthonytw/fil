@@ -522,6 +522,7 @@ dependencies = [
  "bytes",
  "fil-proto",
  "fil-transport",
+ "nix",
  "portable-pty",
  "quinn",
  "tokio",

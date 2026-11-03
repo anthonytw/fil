@@ -287,6 +287,8 @@ pub struct SessionInfo {
     pub log_start: u64,
     pub log_end: u64,
     pub created_unix_ms: u64,
+    /// When the shell last printed anything (wall clock, ms), or `None` if it has not yet.
+    pub last_output_unix_ms: Option<u64>,
     pub scope: Scope,
 }
 
@@ -315,6 +317,8 @@ pub(crate) struct Core {
     term: TermName,
     incarnation: u128,
     created_unix_ms: u64,
+    /// When the last chunk of PTY output arrived, if any.
+    last_output_unix_ms: Option<u64>,
     cfg: SessionConfig,
     host: Arc<dyn SessionHost>,
     shared: Arc<Shared>,
@@ -450,6 +454,7 @@ pub(crate) fn start(
         term: cfg.term.clone(),
         incarnation: cfg.incarnation,
         created_unix_ms: now_unix_ms(),
+        last_output_unix_ms: None,
         host,
         shared: shared.clone(),
         tx: tx.clone(),
@@ -654,6 +659,7 @@ impl Core {
     // --- output ---
 
     fn on_output(&mut self, chunk: Vec<u8>) {
+        self.last_output_unix_ms = Some(now_unix_ms());
         // The mode is read before the bytes are logged, so a change is recorded at the offset of
         // the first byte that may have been written under it.
         self.sample_mode();
@@ -1025,6 +1031,7 @@ impl Core {
             log_start: log.start(),
             log_end: log.end(),
             created_unix_ms: self.created_unix_ms,
+            last_output_unix_ms: self.last_output_unix_ms,
             scope: self.scope.clone(),
         }
     }

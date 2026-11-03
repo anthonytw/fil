@@ -562,9 +562,9 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 **Server binary distribution:** if fil uploads its own server binary (§16), it uploads the build for the remote's architecture over the authenticated pipe into `~/.local/share/fil/<version>/`. It verifies a SHA-256 before running it.
 
-### 11.1 Privacy: what fil reveals about its users (proposal)
+### 11.1 Privacy: what fil reveals about its users
 
-Security keeps attackers out. Privacy is about the people using fil: what fil itself sends, records, keeps or shows about their sessions, commands, hosts and habits. These principles are a proposal for the owner to approve. Every sweep (§15) audits the code against them.
+Security keeps attackers out. Privacy is about the people using fil: what fil itself sends, records, keeps or shows about their sessions, commands, hosts and habits. These principles are **decided** (owner, 2026-11-02). Every sweep (§15) and every review audits the code against them.
 
 1. **Nothing leaves your machines.** fil talks only to the hosts you point it at, through the pipe command you chose. There is no telemetry, update check, crash reporting or third-party service.
 2. **Logs record what fil does, not what you do.** No log at any level contains terminal output, keystrokes, command lines, environment variables or offline input. Identifying details (host names, addresses, user names, session names, paths) appear only where a person debugging fil needs them, and the defaults keep them to a minimum. Log files are private to the user (files 0600, directories 0700), rotated, and bounded in size and age.
@@ -656,7 +656,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | Milestone | Scope | Done when |
 |---|---|---|
 | **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison across the modular backends (§6.5) | the default emulator is chosen, and the overlay never corrupts the screen in the harness |
-| **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, and the sweep is closed |
+| **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed |
 | **M3: prediction** | the trait, the default predictor and the status overlay; then the M3 sweep | no visible mispredictions in the harness, and the sweep is closed |
 | **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-public sweep; go public; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners, which are free once the repo is public | the pre-public sweep is closed before the repo goes public |

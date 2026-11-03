@@ -4,7 +4,7 @@ default:
     @just --list
 
 # The merge gate: run before every merge (CLAUDE.md § Delivery).
-ci: fmt-check clippy test deny
+ci: fmt-check clippy check-default test deny
 
 fmt-check:
     cargo fmt --all --check
@@ -12,12 +12,18 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# Default-feature build of `fil`, as released. The other recipes use --all-features, which also
+# compiles the vt100 backend and the test hooks; this proves `fil` builds without them.
+check-default:
+    cargo check -p fil
+
 test:
     cargo test --workspace --all-features
 
-# License and source policy (deny.toml).
+# Fetches the RustSec advisory database, so it needs network access.
+# License, source and ban policy, RustSec advisories and yanked crates (deny.toml).
 deny:
-    cargo deny check licenses bans sources
+    cargo deny check advisories licenses bans sources
 
 # Slow link-simulator soak: many seeds, harsh conditions (not part of `ci`).
 netsim-soak:
@@ -73,19 +79,22 @@ realnet *args:
     tests/realnet/run.sh {{args}}
 
 # A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
-# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session
-# "local" over the pipe only; `just local-direct` also lets it upgrade to QUIC on loopback.
-local session="local":
+# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session "local" over
+# the pipe only; `just local auto` also lets it upgrade to QUIC on loopback. Arguments:
+# transport (`pipe` or `auto`) and session name.
+local transport="pipe" session="local":
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo build -q -p fil
     mkdir -p target/local
-    printf '[defaults]\ntransport = "pipe"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{justfile_directory()}}" > target/local/config.toml
-    target/debug/fil --config target/local/config.toml localhost {{session}}
-
-local-direct session="local-direct":
-    cargo build -q -p fil
-    mkdir -p target/local
-    printf '[defaults]\ntransport = "auto"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n[defaults.direct]\naddress = "127.0.0.1"\n' "{{justfile_directory()}}" > target/local/config-direct.toml
-    target/debug/fil --config target/local/config-direct.toml localhost {{session}}
+    config=target/local/config-{{transport}}.toml
+    {
+      printf '[defaults]\ntransport = "%s"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{justfile_directory()}}"
+      if [ "{{transport}}" != pipe ]; then
+        printf '[defaults.direct]\naddress = "127.0.0.1"\n'
+      fi
+    } > "$config"
+    exec target/debug/fil --config "$config" localhost {{session}}
 
 # M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be

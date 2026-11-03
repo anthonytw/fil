@@ -638,6 +638,10 @@ impl Core {
             if self.finished() {
                 break;
             }
+            // A batch of output is milliseconds of work, and the subscribers it wakes are woken
+            // onto this worker's own queue: without a yield they wait for the runtime's
+            // cooperative budget (128 operations, over a second of batches), and nothing is sent.
+            tokio::task::yield_now().await;
         }
         self.finish();
     }

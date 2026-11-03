@@ -118,3 +118,25 @@ async fn a_wrapped_log_does_not_wait_for_an_ack_that_cannot_come() {
     c.wait_screen("END").await;
     let _ = h.kill(Duration::from_secs(5)).await;
 }
+
+/// A shell printing faster than the connection can send must not starve the connection's task:
+/// the core handles output in batches of milliseconds, and the task it wakes is queued on the
+/// core's own worker, so without a yield in the core the first byte reached the client over a
+/// second late (and the flood had wrapped the log by then). Found on the Linux runner, where
+/// `a_dropped_connection_is_reaped_during_an_output_flood` timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fast_flood_does_not_starve_the_connection() {
+    let sc = Scratch::new();
+    let script =
+        "stty raw -echo; yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; sleep 30";
+    let h = spawn_plain(sh_config(&sc, "main", script)).await;
+    let started = std::time::Instant::now();
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_out("xxxx").await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the first output took {:?}",
+        started.elapsed()
+    );
+    let _ = h.kill(Duration::from_secs(5)).await;
+}

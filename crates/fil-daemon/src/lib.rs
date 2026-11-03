@@ -24,11 +24,14 @@
 //! - [`relay`] is the stdio relay.
 //! - [`daemon`] has [`Daemon`] (the library object tests and embedders use) and [`run_daemon`] (the
 //!   process).
+//! - [`logging`] is the log the daemon and the client both write: private, rotated, bounded in age.
+//! - [`hardening`] switches core dumps off.
 //! - [`config`] reads `~/.config/fil/daemon.toml`.
 //! - [`linger`] is the warning for hosts that kill your processes at logout.
 
 pub mod config;
 pub mod daemon;
+pub mod hardening;
 pub mod linger;
 pub mod logging;
 pub mod paths;

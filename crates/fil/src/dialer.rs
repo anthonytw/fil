@@ -137,6 +137,11 @@ pub trait Connector: Send + Sync + 'static {
         interactive: bool,
     ) -> impl Future<Output = Result<PipeUp<Self::Link>, PipeFailure>> + Send;
 
+    /// The session has started over this pipe link (an attach was accepted on it): from here on
+    /// the terminal belongs to the session, so the command's stderr must no longer be written to
+    /// it. Default: nothing to do.
+    fn session_started(&self, _link: &Self::Link) {}
+
     /// What the pipe command said on its way out (the last line of its stderr), for a link that
     /// went down on its own, as a status-line note. Default: nothing.
     fn diagnostics(&self, _link: &Self::Link) -> Option<String> {
@@ -168,7 +173,9 @@ impl DialerConfig {
                 jitter_seed: random_seed(),
                 ..PathConfig::default()
             },
-            watch_network: true,
+            // A hint for the path manager's upgrade and redial; with the pipe only there is
+            // nothing to upgrade to and nobody to hint (and no wakeups to pay for).
+            watch_network: setting != TransportSetting::Pipe,
         }
     }
 }
@@ -578,7 +585,10 @@ impl<C: Connector> PathDialer<C> {
                         self.feed(at, PathInput::PipeUp);
                     }
                     Err(f) => {
-                        tracing::info!(error = %f.message, note = ?f.note, "pipe failed");
+                        // What ssh said names hosts and users: the reason class is the record, the
+                        // words are for someone debugging.
+                        tracing::info!(severity = ?f.severity, "pipe failed");
+                        tracing::debug!(error = %f.message, note = ?f.note, "pipe failed: why");
                         self.note = f.note.clone();
                         let reason = DownReason::Io(f.message.clone());
                         self.pipe_error = Some(f);
@@ -601,7 +611,8 @@ impl<C: Connector> PathDialer<C> {
                         self.feed(at, PathInput::DirectUp);
                     }
                     Err(LinkError(reason)) => {
-                        tracing::info!(?reason, "direct dial failed");
+                        tracing::info!("direct dial failed");
+                        tracing::debug!(?reason, "direct dial failed: why");
                         self.feed(at, PathInput::DirectDialFailed(reason));
                     }
                 }
@@ -612,7 +623,8 @@ impl<C: Connector> PathDialer<C> {
                         && reason != DownReason::Closed
                         && let Some(n) = self.connector.diagnostics(&h.link.0)
                     {
-                        tracing::info!(note = %n, ?reason, "pipe ended");
+                        tracing::info!("pipe ended");
+                        tracing::debug!(note = %n, ?reason, "pipe ended: why");
                         self.note = Some(n);
                     }
                     if self.handed_dial == Some(LinkKind::Pipe) {
@@ -870,6 +882,11 @@ impl<C: Connector> Dialer for PathDialer<C> {
             ),
             None => self.feed(now, PathInput::DirectUnavailable),
         }
+        if info.kind == LinkKind::Pipe
+            && let Some(h) = &self.pipe_link
+        {
+            self.connector.session_started(&h.link.0);
+        }
         if self.handed_dial == Some(info.kind) {
             self.handed_dial = None;
             self.feed(now, PathInput::Switched(info.kind));
@@ -884,7 +901,8 @@ impl<C: Connector> Dialer for PathDialer<C> {
         match result {
             Ok(done) => self.feed(now, PathInput::Switched(done)),
             Err(e) => {
-                tracing::info!(?kind, error = %e, "switch failed");
+                tracing::info!(?kind, "switch failed");
+                tracing::debug!(error = %e, "switch failed: why");
                 self.feed(now, PathInput::SwitchFailed(kind));
                 // The loop closes its candidate; make sure ours is gone too.
                 let slot = match kind {

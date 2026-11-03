@@ -1,10 +1,30 @@
 //! The production [`Connector`]: the real pipe command and a real QUIC dial.
+//!
+//! # Where the UDP dial goes (DESIGN.md sections 8.3 and 11.1)
+//!
+//! Only to a name the user has given for it or that ssh itself would use:
+//!
+//! - `direct.address`, when set;
+//! - otherwise, for the default `ssh` pipe, the `hostname` that `ssh -G` reports, unless ssh
+//!   reaches the host through a `ProxyJump` or `ProxyCommand` (then the host is not directly
+//!   reachable, and its name is nobody's business but the jump host's);
+//! - otherwise nothing: a custom `pipe` command (`kubectl`, `tailscale ssh`, ...) names a host
+//!   that is not a DNS name at all, and looking it up would tell the local network's resolver
+//!   what the user is connecting to.
+//!
+//! A refused dial costs nothing: no lookup, no packet. A name that is looked up is looked up
+//! once per [`LOOKUP_TTL`], however often the path manager redials, and an IP literal is not
+//! looked up at all. The addresses a name has are dialed together, one starting [`STAGGER`] after
+//! the other (RFC 8305), so an IPv6 address nobody answers on costs a fraction of a second, not
+//! the whole connect timeout.
 
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::pipe::{
@@ -24,17 +44,61 @@ const BACKGROUND_PREAMBLE: Duration = Duration::from_secs(30);
 /// `ssh -G` only reads configuration; it should answer at once.
 const SSH_G_TIMEOUT: Duration = Duration::from_secs(3);
 /// Addresses tried for one direct dial. Each can take the whole connect timeout.
-const MAX_ADDRESSES: usize = 2;
+const MAX_ADDRESSES: usize = 4;
+/// Each further address is dialed this long after the one before it, or at once if that one has
+/// already failed.
+const STAGGER: Duration = Duration::from_millis(250);
+/// How long what a lookup found is kept. Past that the name is looked up again (the network may
+/// have changed, and so what the name means).
+const LOOKUP_TTL: Duration = Duration::from_secs(300);
+
+type LookupFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<IpAddr>>> + Send>>;
+/// Resolves a name to its addresses. The system resolver in production.
+type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
+
+fn system_lookup() -> Lookup {
+    Arc::new(|name| {
+        Box::pin(async move {
+            let found = tokio::net::lookup_host((name.as_str(), 0)).await?;
+            Ok(found.map(|a| a.ip()).collect())
+        })
+    })
+}
+
+/// What `ssh -G` says about a host that matters here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SshHost {
+    /// The name ssh would connect to.
+    hostname: Option<String>,
+    /// Reached through `ProxyJump` or `ProxyCommand`.
+    proxied: bool,
+}
+
+/// Where the UDP dial goes, if anywhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    Dial(String),
+    /// Direct mode is not tried; the reason is for the log.
+    PipeOnly(&'static str),
+}
 
 pub struct Connect {
     command: PipeCommand,
-    /// The host as typed (for DNS when `direct_address` is not set).
+    /// The host as typed (a name to look up only with the default ssh pipe, when `ssh -G` fails).
     host: String,
     direct_address: Option<String>,
-    /// Ask `ssh -G` for the real host name behind an alias (only when the pipe is plain ssh).
-    resolve_with_ssh: bool,
+    /// The pipe is a command of the user's own (`pipe = [...]`).
+    custom_pipe: bool,
     params: LinkParams,
-    ssh_hostname: OnceCell<Option<String>>,
+    ssh_host: OnceCell<Option<SshHost>>,
+    lookup: Lookup,
+    resolved: Mutex<Option<Resolved>>,
+}
+
+struct Resolved {
+    name: String,
+    at: Instant,
+    ips: Vec<IpAddr>,
 }
 
 impl Connect {
@@ -53,28 +117,118 @@ impl Connect {
         Ok(Self {
             command,
             host: host.to_string(),
-            resolve_with_ssh: custom.is_none() && direct_address.is_none(),
             direct_address,
+            custom_pipe: custom.is_some(),
             params,
-            ssh_hostname: OnceCell::new(),
+            ssh_host: OnceCell::new(),
+            lookup: system_lookup(),
+            resolved: Mutex::new(None),
         })
     }
 
-    /// The name to resolve for the UDP dial.
-    async fn target(&self) -> String {
+    /// The name to resolve for the UDP dial, or why there is none.
+    async fn target(&self) -> Target {
         if let Some(a) = &self.direct_address {
-            return dns_name(a);
+            return Target::Dial(dns_name(a));
         }
-        if self.resolve_with_ssh {
-            let found = self
-                .ssh_hostname
-                .get_or_init(|| ssh_hostname(&self.host))
-                .await;
-            if let Some(name) = found {
-                return name.clone();
+        if self.custom_pipe {
+            return Target::PipeOnly("a custom pipe command names no host to dial");
+        }
+        match self.ssh_host.get_or_init(|| ssh_host(&self.host)).await {
+            Some(h) if h.proxied => {
+                Target::PipeOnly("the host is reached through a proxy or jump host")
+            }
+            Some(SshHost {
+                hostname: Some(name),
+                ..
+            }) => Target::Dial(name.clone()),
+            // ssh could not say (it is not there, or too slow): the host as typed is what ssh
+            // would have looked up too.
+            _ => Target::Dial(dns_name(&self.host)),
+        }
+    }
+
+    /// The addresses of `name`: an IP literal as it is, otherwise from the cache or the resolver.
+    async fn resolve(&self, name: &str) -> std::io::Result<Vec<IpAddr>> {
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        {
+            let cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(r) = cache.as_ref()
+                && r.name == name
+                && r.at.elapsed() < LOOKUP_TTL
+            {
+                return Ok(r.ips.clone());
             }
         }
-        dns_name(&self.host)
+        let ips = (self.lookup)(name.to_string()).await?;
+        *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(Resolved {
+            name: name.to_string(),
+            at: Instant::now(),
+            ips: ips.clone(),
+        });
+        Ok(ips)
+    }
+}
+
+/// Orders addresses for dialing: the family the resolver listed first leads, and the families
+/// alternate after that, so a name with several addresses of one family still reaches the other.
+fn interleave(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let first_is_v6 = ips.first().is_some_and(IpAddr::is_ipv6);
+    let (v6, v4): (Vec<IpAddr>, Vec<IpAddr>) = ips.into_iter().partition(IpAddr::is_ipv6);
+    let (mut lead, mut other) = if first_is_v6 { (v6, v4) } else { (v4, v6) };
+    lead.reverse();
+    other.reverse();
+    let mut out = Vec::new();
+    loop {
+        match (lead.pop(), other.pop()) {
+            (None, None) => return out,
+            (a, b) => out.extend(a.into_iter().chain(b)),
+        }
+    }
+}
+
+/// Dials `addrs` (first one now, each next one `stagger` later or as soon as the one before it
+/// has failed) and returns the first that connects, dropping the others. The last error if none
+/// does. `addrs` must not be empty.
+async fn race<T, E, F, Fut>(addrs: Vec<SocketAddr>, stagger: Duration, connect: F) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T, E>> + Send + 'static,
+{
+    let mut pending = addrs.into_iter();
+    let mut set = tokio::task::JoinSet::new();
+    let mut last = None;
+    let mut timer = None;
+    loop {
+        if timer.is_none()
+            && let Some(addr) = pending.next()
+        {
+            set.spawn(connect(addr));
+            timer = Some(Box::pin(tokio::time::sleep(stagger)));
+        }
+        if set.is_empty() {
+            return Err(last.expect("at least one address"));
+        }
+        tokio::select! {
+            done = set.join_next() => match done {
+                Some(Ok(Ok(v))) => return Ok(v),
+                Some(Ok(Err(e))) => {
+                    last = Some(e);
+                    timer = None; // start the next one at once
+                }
+                _ => timer = None, // a task that panicked is a failed address
+            },
+            () = async {
+                match timer.as_mut() {
+                    Some(t) => t.await,
+                    None => std::future::pending().await,
+                }
+            } => timer = None,
+        }
     }
 }
 
@@ -85,6 +239,10 @@ impl Connector for Connect {
         let mut cfg = PipeConfig::new(self.params);
         let command = if interactive {
             // The user is waiting for the first attach: ssh's prompts and errors are theirs.
+            // ssh's own messages reach the terminal through the tee until the session starts
+            // (`session_started`), so a `Connection to X closed` in the middle of the raw-mode
+            // screen cannot happen; they are kept for the status line either way.
+            cfg.stderr = PipeStderr::Tee;
             self.command.clone()
         } else {
             // The terminal belongs to the session: ssh must not prompt, and what it says goes
@@ -105,6 +263,12 @@ impl Connector for Connect {
         }
     }
 
+    fn session_started(&self, link: &AnyLink) {
+        if let AnyLink::Pipe(p) = link {
+            p.stop_stderr_tee();
+        }
+    }
+
     fn diagnostics(&self, link: &AnyLink) -> Option<String> {
         match link {
             AnyLink::Pipe(p) => stderr_note(&p.stderr_text()),
@@ -118,20 +282,37 @@ impl Connector for Connect {
         pin: Fingerprint,
         key: Arc<ClientKey>,
     ) -> Result<AnyLink, LinkError> {
-        let name = self.target().await;
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), port))
-            .await
-            .map_err(|e| LinkError(DownReason::Refused(format!("cannot resolve {name}: {e}"))))?
-            .take(MAX_ADDRESSES)
-            .collect();
-        let mut last = LinkError(DownReason::Refused(format!("{name} has no address")));
-        for addr in addrs {
-            match QuicLink::connect(addr, pin, &key, self.params).await {
-                Ok(link) => return Ok(AnyLink::Direct(link)),
-                Err(e) => last = e,
+        let refused = |why: String| LinkError(DownReason::Refused(why));
+        let name = match self.target().await {
+            Target::Dial(name) => name,
+            Target::PipeOnly(why) => {
+                return Err(refused(format!(
+                    "direct mode is not tried: {why} (set direct.address to dial one)"
+                )));
             }
+        };
+        let ips = self
+            .resolve(&name)
+            .await
+            .map_err(|e| refused(format!("cannot resolve {name}: {e}")))?;
+        let addrs: Vec<SocketAddr> = interleave(ips)
+            .into_iter()
+            .take(MAX_ADDRESSES)
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        if addrs.is_empty() {
+            return Err(refused(format!("{name} has no address")));
         }
-        Err(last)
+        let params = self.params;
+        race(addrs, STAGGER, move |addr| {
+            let key = key.clone();
+            async move {
+                QuicLink::connect(addr, pin, &key, params)
+                    .await
+                    .map(AnyLink::Direct)
+            }
+        })
+        .await
     }
 }
 
@@ -246,16 +427,29 @@ pub fn dns_name(host: &str) -> String {
 
 /// The `hostname` line of `ssh -G` output, which is what `HostName` and `Hostname %h` expand to.
 pub fn parse_ssh_g(output: &str) -> Option<String> {
+    ssh_g_value(output, "hostname")
+}
+
+fn ssh_g_value(output: &str, key: &str) -> Option<String> {
     output
         .lines()
-        .find_map(|l| l.strip_prefix("hostname "))
+        .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(' ')))
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .map(str::to_string)
 }
 
-/// Asks the local ssh what `host` really is (an alias from `~/.ssh/config`). Best effort.
-async fn ssh_hostname(host: &str) -> Option<String> {
+/// Whether `ssh -G` output says the host is reached through `ProxyJump` or `ProxyCommand`
+/// (`none` is how a config switches either off).
+fn ssh_g_proxied(output: &str) -> bool {
+    ["proxyjump", "proxycommand"]
+        .iter()
+        .any(|k| ssh_g_value(output, k).is_some_and(|v| !v.eq_ignore_ascii_case("none")))
+}
+
+/// Asks the local ssh what `host` really is (an alias from `~/.ssh/config`) and whether it is
+/// reached through a proxy. Best effort.
+async fn ssh_host(host: &str) -> Option<SshHost> {
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.args(["-G", "--", host])
         .stdin(std::process::Stdio::null())
@@ -269,11 +463,16 @@ async fn ssh_hostname(host: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let name = parse_ssh_g(&String::from_utf8_lossy(&out.stdout))?;
+    let text = String::from_utf8_lossy(&out.stdout);
     // Same rule as the rest of the program: only what can be a host name.
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
-        .then_some(name)
+    let hostname = parse_ssh_g(&text).filter(|name| {
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    });
+    Some(SshHost {
+        hostname,
+        proxied: ssh_g_proxied(&text),
+    })
 }
 
 #[cfg(test)]
@@ -433,5 +632,169 @@ mod tests {
         });
         assert!(f.message.contains("Permission denied"), "{}", f.message);
         assert!(f.note.unwrap().contains("interactive login"));
+    }
+
+    // ---- privacy #3: what is looked up, and how often ------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A resolver that counts its calls and answers with `ips`.
+    fn counting(ips: Vec<IpAddr>) -> (Lookup, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let lookup: Lookup = Arc::new(move |_name| {
+            c.fetch_add(1, Ordering::SeqCst);
+            let ips = ips.clone();
+            Box::pin(async move { Ok(ips) })
+        });
+        (lookup, calls)
+    }
+
+    fn connect_with(custom: Option<&[String]>, address: Option<&str>) -> Connect {
+        Connect::new(
+            "k8s-dev",
+            custom,
+            address.map(str::to_string),
+            LinkParams::default(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_custom_pipe_names_no_host_to_dial_unless_direct_address_is_set() {
+        let argv = vec![
+            "kubectl".to_string(),
+            "exec".into(),
+            "-i".into(),
+            "pod".into(),
+        ];
+        let c = connect_with(Some(&argv), None);
+        assert!(matches!(c.target().await, Target::PipeOnly(_)));
+        let (lookup, calls) = counting(vec!["192.0.2.1".parse().unwrap()]);
+        let mut c = c;
+        c.lookup = lookup;
+        let pin = Fingerprint::from_bytes([0; 32]);
+        let key = Arc::new(ClientKey::generate().unwrap());
+        let err = c.dial_direct(60000, pin, key).await.err().unwrap();
+        assert!(matches!(err.0, DownReason::Refused(_)), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no lookup for k8s-dev");
+        // The user can say where to dial.
+        let c = connect_with(Some(&argv), Some("box.example.net"));
+        assert_eq!(c.target().await, Target::Dial("box.example.net".into()));
+    }
+
+    #[tokio::test]
+    async fn a_name_is_looked_up_once_and_an_address_not_at_all() {
+        let ips: Vec<IpAddr> = vec!["192.0.2.7".parse().unwrap()];
+        let (lookup, calls) = counting(ips.clone());
+        let mut c = connect_with(None, Some("box.example.net"));
+        c.lookup = lookup;
+        for _ in 0..5 {
+            assert_eq!(c.resolve("box.example.net").await.unwrap(), ips);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cached across redials");
+        // Another name is another lookup.
+        c.resolve("other.example.net").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A literal is not a name.
+        assert_eq!(
+            c.resolve("2001:db8::1").await.unwrap(),
+            vec!["2001:db8::1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // What was looked up long ago is looked up again.
+        c.resolved.lock().unwrap().as_mut().unwrap().at -= LOOKUP_TTL + Duration::from_secs(1);
+        c.resolve("other.example.net").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn ssh_says_when_a_host_is_behind_a_proxy() {
+        let jump = "user me\nhostname db7.internal.example\nproxyjump bastion\nport 22\n";
+        assert!(ssh_g_proxied(jump));
+        assert_eq!(parse_ssh_g(jump).as_deref(), Some("db7.internal.example"));
+        assert!(ssh_g_proxied("hostname x\nproxycommand nc %h %p\n"));
+        assert!(!ssh_g_proxied("hostname x\nport 22\n"));
+        assert!(!ssh_g_proxied("hostname x\nproxyjump none\n"));
+        assert!(!ssh_g_proxied("hostname x\nproxycommand none\n"));
+        // A key that merely starts with the word is not it.
+        assert_eq!(ssh_g_value("hostnameX y\n", "hostname"), None);
+    }
+
+    // ---- bugs #3: dual-stack names ---------------------------------------------------------
+
+    #[test]
+    fn addresses_alternate_families_starting_with_the_first_listed() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let got = interleave(vec![
+            ip("::1"),
+            ip("::2"),
+            ip("10.0.0.1"),
+            ip("::3"),
+            ip("10.0.0.2"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                ip("::1"),
+                ip("10.0.0.1"),
+                ip("::2"),
+                ip("10.0.0.2"),
+                ip("::3")
+            ]
+        );
+        let got = interleave(vec![ip("10.0.0.1"), ip("::1")]);
+        assert_eq!(got, [ip("10.0.0.1"), ip("::1")]);
+        assert!(interleave(Vec::new()).is_empty());
+    }
+
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, n], 1))
+    }
+
+    /// The first address never answers (nobody listens there); the second does. The dial takes
+    /// one stagger, not the connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_first_address_costs_one_stagger_not_a_timeout() {
+        let t = tokio::time::Instant::now();
+        let got = race(vec![addr(1), addr(2)], STAGGER, |a| async move {
+            if a == addr(1) {
+                std::future::pending::<Result<SocketAddr, &'static str>>().await
+            } else {
+                Ok(a)
+            }
+        })
+        .await;
+        assert_eq!(got, Ok(addr(2)));
+        assert_eq!(t.elapsed(), STAGGER);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_address_is_followed_at_once_and_all_failing_gives_the_last_error() {
+        let t = tokio::time::Instant::now();
+        let got = race(vec![addr(1), addr(2)], STAGGER, |a| async move {
+            if a == addr(1) { Err("refused") } else { Ok(a) }
+        })
+        .await;
+        assert_eq!(got, Ok(addr(2)));
+        assert_eq!(t.elapsed(), Duration::ZERO, "no waiting for the stagger");
+        let got: Result<SocketAddr, &str> =
+            race(vec![addr(1), addr(2)], STAGGER, |_| async { Err("nope") }).await;
+        assert_eq!(got, Err("nope"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loser_of_a_race_is_dropped() {
+        // The slow first address would connect after a minute; the second wins at once.
+        let t = tokio::time::Instant::now();
+        let got = race(vec![addr(1), addr(2)], STAGGER, |a| async move {
+            if a == addr(1) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok::<_, ()>(a)
+        })
+        .await;
+        assert_eq!(got, Ok(addr(2)));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }

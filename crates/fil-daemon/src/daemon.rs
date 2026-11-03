@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -52,12 +53,15 @@ use crate::config::{ConfigError, DaemonConfig};
 use crate::conn::Origin;
 use crate::linger;
 use crate::paths::{DirError, Paths, ensure_socket_dir};
-use crate::start::open_lock_file;
+use crate::start::{clean_up_files, is_current, open_lock_file};
 
 /// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
 const MAX_TOMBSTONES: usize = 256;
 /// How long stopping the daemon waits for each session to be killed.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long stopping the daemon then waits for the connections to tell their clients how the
+/// session ended and hang up.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -346,6 +350,7 @@ impl Inner {
             incarnation,
         );
         sc.scope = self.cfg.scope;
+        sc.history_lines = self.cfg.history_lines;
         sc.command = self.cfg.session.command.clone();
         sc.cwd = self.cfg.session.cwd.clone();
         sc.env = self.cfg.session.env.clone();
@@ -491,7 +496,7 @@ pub struct Daemon {
     unix: UnixListener,
     quic: Option<QuicListener>,
     /// Held for the daemon's life.
-    _lock: File,
+    lock: File,
     stop: watch::Sender<Option<bool>>,
 }
 
@@ -509,12 +514,18 @@ impl Daemon {
         let deadline = tokio::time::Instant::now() + cfg.lock_wait;
         loop {
             match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => break,
+                // A daemon on its way out removes the lock file it held (see `clean_up_files`).
+                // A lock taken on a file that is no longer at the path would exclude nobody.
+                Ok(()) if is_current(&lock, &lock_path) => break,
+                Ok(()) => lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?,
                 Err(rustix::io::Errno::WOULDBLOCK) => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(StartError::AlreadyRunning(lock_path));
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
+                    if !is_current(&lock, &lock_path) {
+                        lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?;
+                    }
                 }
                 Err(e) => return Err(io(lock_path)(e.into())),
             }
@@ -565,7 +576,7 @@ impl Daemon {
             paths,
             unix,
             quic,
-            _lock: lock,
+            lock,
             stop,
         })
     }
@@ -636,15 +647,33 @@ impl Daemon {
                 }
             }
         };
-        if let Some(t) = quic_task {
-            t.abort();
-        }
         let _ = std::fs::remove_file(self.paths.socket());
         if exit == Exit::Shutdown && *self.stop.borrow() == Some(true) {
             self.kill_sessions().await;
+            // Each attached client's connection is still telling it how its session ended
+            // (`SessionExited` after the last acknowledgements, then a flush). Dropping the
+            // runtime now would cut that off, and the client would reconnect to a new daemon
+            // and hear `SessionReplaced` instead of "killed by signal".
+            self.drain_connections().await;
         }
+        if let Some(t) = quic_task {
+            t.abort();
+        }
+        clean_up_files(&self.paths, &self.lock);
         tracing::info!(?exit, "daemon stopping");
         exit
+    }
+
+    /// Waits, for at most [`DRAIN_TIMEOUT`], for the connections being served to finish.
+    async fn drain_connections(&self) {
+        let mut busy = self.inner.busy.subscribe();
+        let waited = tokio::time::timeout(DRAIN_TIMEOUT, busy.wait_for(|b| *b == 0)).await;
+        if waited.is_err() {
+            tracing::warn!(
+                open = *self.inner.busy.borrow(),
+                "connections were still open at shutdown; closing them"
+            );
+        }
     }
 
     fn accept_unix(&self, stream: UnixStream) {
@@ -724,13 +753,22 @@ fn bind_direct(
     registry: &KeyRegistry,
 ) -> Result<(Option<QuicListener>, Option<DirectInfo>), StartError> {
     let identity = DaemonIdentity::generate().map_err(StartError::Identity)?;
-    let lcfg = ListenerConfig {
+    let mut lcfg = ListenerConfig {
         bind: cfg.bind,
         ports: cfg.ports.clone(),
         params: cfg.link,
         ..ListenerConfig::default()
     };
-    match QuicListener::bind(&identity, registry, &lcfg) {
+    let mut bound = QuicListener::bind(&identity, registry, &lcfg);
+    // The default is the IPv6 wildcard, which serves IPv4 too. A host without IPv6 cannot bind it.
+    if let Err(ListenError::Bind(e)) = &bound
+        && cfg.bind == IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    {
+        tracing::info!(error = %e, "no IPv6 wildcard; binding the IPv4 one");
+        lcfg.bind = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        bound = QuicListener::bind(&identity, registry, &lcfg);
+    }
+    match bound {
         Ok(l) => {
             let port = l.local_addr().map(|a| a.port()).unwrap_or(0);
             let fingerprint = msg::Fingerprint::new(identity.fingerprint().as_bytes().to_vec())
@@ -768,8 +806,15 @@ pub fn run_daemon(paths: &Paths) -> ExitCode {
 /// development binaries and tests that need, say, a particular session command; the `fil`
 /// binary has no use for it.
 pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) -> ExitCode {
+    // First of all, before anything that could crash holds a session's output: no core dumps.
+    let _ = crate::hardening::disable_core_dumps(false);
     let detached = rustix::process::setsid().is_ok();
-    crate::logging::init(&paths.log);
+    // The log may live in the socket directory (no home directory): that directory is checked
+    // before anything is opened in it, as `Daemon::start` will check it again.
+    if ensure_socket_dir(&paths.dir).is_err() {
+        return ExitCode::FAILURE;
+    }
+    crate::logging::init(&paths.log, true);
     tracing::info!(
         detached,
         pid = std::process::id(),

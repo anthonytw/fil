@@ -254,28 +254,66 @@ pub(crate) struct StartLock {
 
 impl StartLock {
     fn acquire(path: &Path, timeout: Duration) -> Result<Self, EnsureError> {
-        let file = open_lock_file(path).map_err(|source| EnsureError::Connect {
+        let io = |source| EnsureError::Connect {
             path: path.to_path_buf(),
             source,
-        })?;
+        };
+        let mut file = open_lock_file(path).map_err(io)?;
         let deadline = Instant::now() + timeout;
         loop {
             match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(rustix::io::Errno::WOULDBLOCK) => {}
-                Err(e) => {
-                    return Err(EnsureError::Connect {
-                        path: path.to_path_buf(),
-                        source: e.into(),
-                    });
+                // A daemon on its way out removes the start file (see `clean_up_files`); a lock
+                // taken on a file that is no longer at the path would exclude nobody.
+                Ok(()) if is_current(&file, path) => return Ok(Self { _file: file }),
+                Ok(()) => file = open_lock_file(path).map_err(io)?,
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    if Instant::now() >= deadline {
+                        return Err(EnsureError::StartLockTimeout(timeout));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    if !is_current(&file, path) {
+                        file = open_lock_file(path).map_err(io)?;
+                    }
                 }
+                Err(e) => return Err(io(e.into())),
             }
-            if Instant::now() >= deadline {
-                return Err(EnsureError::StartLockTimeout(timeout));
-            }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// Whether `file` is still the file `path` names (it has not been removed or replaced).
+pub(crate) fn is_current(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// A daemon that is exiting removes `fil-<major>.lock` and `fil-<major>.start`, so nothing of a
+/// finished daemon (its pid, the time it last started) stays in `/tmp` (DESIGN.md section 11.1,
+/// principle 5). A crashed daemon leaves them; the next one reuses them.
+///
+/// Removing a lock file under an `flock` is racy, so it is done only while holding the start
+/// lock: no relay is in the middle of starting a daemon then. A relay or a daemon that had
+/// already opened the files notices (the lock it got is on a file that is no longer at the path
+/// and it opens the new one: see [`is_current`]). `own_lock` is the daemon's lock; the path is
+/// removed only if it still names that file. The directory stays, as with tmux.
+pub(crate) fn clean_up_files(paths: &Paths, own_lock: &std::fs::File) {
+    let start_path = paths.start_lock();
+    let Ok(start) = open_lock_file(&start_path) else {
+        return;
+    };
+    if flock(&start, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return; // a relay is starting a daemon; it will use the files
+    }
+    if !is_current(&start, &start_path) {
+        return;
+    }
+    if is_current(own_lock, &paths.lock()) {
+        let _ = std::fs::remove_file(paths.lock());
+    }
+    let _ = std::fs::remove_file(&start_path);
 }
 
 /// Opens (creating, mode 0600) a lock file. Rust opens files close-on-exec, so a daemon spawned

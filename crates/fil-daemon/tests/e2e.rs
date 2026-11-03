@@ -413,3 +413,43 @@ async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
         .unwrap();
     assert!(!pid_alive(pid));
 }
+
+/// bugs #9: a session that cannot be created is not "protocol error": the client is told the
+/// daemon could not start it (and where to look).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_cannot_start_is_reported_as_such() {
+    let s = Scratch::new();
+    let mut cfg = config(CAT);
+    cfg.session.command = Some(vec!["/nonexistent/fil-test-shell".into()]);
+    let d = start(&s, cfg).await;
+    let link = d.pipe().await;
+    let c = Client::attach(link, Connect::new("main", key(1))).await;
+    assert_eq!(c.errors, [ErrorCode::SessionStartFailed], "{:?}", c.errors);
+    assert!(c.reply.is_none() && c.refused.is_none());
+    d.stop().await;
+}
+
+/// bugs #12b: a laptop that dropped off hours ago still holds the session, but `fil ls` does not
+/// say it is attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_does_not_show_a_dropped_connection_as_attached() {
+    let s = Scratch::new();
+    let d = start(&s, config(CAT)).await;
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1)).host("laptop")).await;
+    a.wait_screen("ready").await;
+    let attached = |list: &[fil_proto::msg::SessionSummary]| list[0].attached.is_some();
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    assert!(attached(&list));
+    // The connection dies without a goodbye.
+    a.link.close();
+    eventually(|| async {
+        let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+            return false;
+        };
+        list.len() == 1 && !attached(&list)
+    })
+    .await;
+    d.stop().await;
+}

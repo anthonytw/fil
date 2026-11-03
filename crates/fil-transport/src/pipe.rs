@@ -109,6 +109,12 @@ pub enum PipeStderr {
     /// for a run nobody is watching: the terminal belongs to the session, and the reason ssh gave
     /// is worth showing in the status line and the log.
     Capture,
+    /// Kept like [`Capture`](Self::Capture), and also copied to our own stderr as it arrives,
+    /// until [`PipeLink::stop_stderr_tee`] is called. Right for the first attach: ssh's errors
+    /// and warnings show while the user waits, and from the moment the session owns the terminal
+    /// nothing the command prints later (`Connection to host closed.`) is written into the raw
+    /// screen. (Password and host-key prompts are not on stderr: ssh uses the terminal itself.)
+    Tee,
 }
 
 impl PipeConfig {
@@ -262,17 +268,22 @@ fn is_invisible(c: char) -> bool {
 pub(crate) struct StderrCapture {
     buf: std::sync::Mutex<Vec<u8>>,
     done: watch::Sender<bool>,
+    /// Also write what arrives to our own stderr ([`PipeStderr::Tee`]).
+    tee: std::sync::atomic::AtomicBool,
 }
 
 /// Most stderr kept: ssh's errors are a line or two.
 const STDERR_KEEP: usize = 4096;
 
 impl StderrCapture {
-    fn start(mut stderr: tokio::process::ChildStderr) -> Arc<Self> {
+    fn start(mut stderr: tokio::process::ChildStderr, tee: bool) -> Arc<Self> {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
         let (done, _) = watch::channel(false);
         let cap = Arc::new(Self {
             buf: std::sync::Mutex::new(Vec::new()),
             done,
+            tee: std::sync::atomic::AtomicBool::new(tee),
         });
         let task = cap.clone();
         tokio::spawn(async move {
@@ -280,6 +291,10 @@ impl StderrCapture {
             while let Ok(n) = stderr.read(&mut chunk).await {
                 if n == 0 {
                     break;
+                }
+                if task.tee.load(Ordering::Relaxed) {
+                    let mut err = std::io::stderr().lock();
+                    let _ = err.write_all(&chunk[..n]).and_then(|()| err.flush());
                 }
                 let mut b = task.buf.lock().unwrap_or_else(|e| e.into_inner());
                 b.extend_from_slice(&chunk[..n]);
@@ -291,6 +306,10 @@ impl StderrCapture {
             task.done.send_replace(true);
         });
         cap
+    }
+
+    fn stop_tee(&self) {
+        self.tee.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Waits (briefly) for the stream to end, then returns what was captured.
@@ -376,7 +395,7 @@ impl PipeLink {
             .stderr(match cfg.stderr {
                 PipeStderr::Inherit => std::process::Stdio::inherit(),
                 PipeStderr::Null => std::process::Stdio::null(),
-                PipeStderr::Capture => std::process::Stdio::piped(),
+                PipeStderr::Capture | PipeStderr::Tee => std::process::Stdio::piped(),
             })
             .kill_on_drop(true)
             .spawn()
@@ -388,7 +407,8 @@ impl PipeLink {
                 "the child has no stdin or stdout",
             ))));
         };
-        let capture = child.stderr.take().map(StderrCapture::start);
+        let tee = cfg.stderr == PipeStderr::Tee;
+        let capture = child.stderr.take().map(|e| StderrCapture::start(e, tee));
         Self::establish(stdout, stdin, Role::Client, cfg, Some(child), capture).await
     }
 
@@ -475,6 +495,14 @@ impl PipeLink {
             .as_ref()
             .map(|c| sanitize_banner(&c.bytes()))
             .unwrap_or_default()
+    }
+
+    /// Stops copying the command's stderr to ours ([`PipeStderr::Tee`]); it is still captured.
+    /// Call when the session takes over the terminal. Does nothing for the other modes.
+    pub fn stop_stderr_tee(&self) {
+        if let Some(c) = &self.stderr {
+            c.stop_tee();
+        }
     }
 
     /// The protocol major from the preamble (client side).

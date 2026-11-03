@@ -23,7 +23,10 @@ use crate::start::{DaemonLauncher, EnsureError, ensure_daemon};
 /// After the client's side of the pipe ends, how long the daemon's side may take to finish
 /// (it normally closes at once, having seen the end of the stream).
 const HALF_CLOSE_GRACE: Duration = Duration::from_secs(2);
-const BUF: usize = 16 * 1024;
+/// The copy buffer: several full frames (a frame is at most `MAX_FRAME_BODY`, a little over
+/// 16 KiB), so one read and one write carry a whole burst instead of splitting every full frame.
+const BUF: usize = 64 * 1024;
+const _: () = assert!(BUF >= 2 * fil_proto::limits::MAX_FRAME_BODY);
 
 /// What the relay needs: where the daemon is and how to start it.
 #[derive(Clone, Debug)]

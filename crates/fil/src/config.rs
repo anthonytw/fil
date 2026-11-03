@@ -4,7 +4,8 @@
 //! [defaults]
 //! transport = "auto"          # auto | pipe | direct
 //! pipe = ["fil", "server", "--stdio"]   # an argv; default: ssh -T -- HOST fil server --stdio
-//! history_lines = 1000        # read by the daemon, on the host where it runs
+//! host_label = "laptop"      # what other clients are shown when you take a session over;
+//!                             # default: this machine's short host name
 //! predict = "adaptive"        # off | adaptive | always; accepted, used from M3
 //! forward = ["-L 5173"]       # accepted, used from M2
 //!
@@ -14,8 +15,7 @@
 //! # log = "~/.local/state/fil/offline-input.log"   # or a command: ["logger", "-t", "fil"]
 //!
 //! [defaults.direct]
-//! address = "box.example.net" # where to dial UDP, if not the host name
-//! port_range = "60000-61000"  # the daemon's range (read by the daemon)
+//! address = "box.example.net" # where to dial UDP; required with a custom pipe or a ProxyJump
 //!
 //! [host.k8s-dev]              # selected by the HOST argument, as typed
 //! transport = "pipe"
@@ -26,20 +26,20 @@
 //! too). A missing file means the defaults. Unknown keys are errors, so a typo does not silently
 //! do nothing; every section is checked when the file is read, and the error names the file, the
 //! section and the key.
+//!
+//! `history_lines` and `direct.port_range` are settings of the daemon, on the host where it runs:
+//! they go in that host's `~/.config/fil/daemon.toml`. Here they are an error that says so.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use fil_client::{OfflineInput, OfflineLog, parse_byte_size, parse_confirm};
+use fil_proto::limits::MAX_HOST_LABEL;
 use fil_transport::path::TransportSetting;
 use serde::Deserialize;
 
-/// The daemon's default UDP range (DESIGN.md section 8.3).
-pub const DEFAULT_PORT_RANGE: RangeInclusive<u16> = fil_transport::quic::DEFAULT_PORT_RANGE;
-/// The default scrollback the daemon keeps per session.
-pub const DEFAULT_HISTORY_LINES: usize = 1000;
+pub use fil_daemon::paths::{base_dir, home_dir};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -115,7 +115,8 @@ struct RawOffline {
 #[serde(deny_unknown_fields)]
 struct RawDirect {
     address: Option<String>,
-    port_range: Option<String>,
+    /// A daemon setting; only here to be refused with a pointer to `daemon.toml`.
+    port_range: Option<toml::Value>,
 }
 
 /// One `[defaults]` or `[host.NAME]` section as written.
@@ -124,7 +125,9 @@ struct RawDirect {
 struct RawSection {
     transport: Option<Transport>,
     pipe: Option<Vec<String>>,
-    history_lines: Option<usize>,
+    /// A daemon setting; only here to be refused with a pointer to `daemon.toml`.
+    history_lines: Option<toml::Value>,
+    host_label: Option<String>,
     predict: Option<Predict>,
     forward: Option<Vec<String>>,
     offline_input: Option<RawOffline>,
@@ -158,7 +161,11 @@ impl RawSection {
         RawSection {
             transport: self.transport.or(base.transport),
             pipe: self.pipe.clone().or_else(|| base.pipe.clone()),
-            history_lines: self.history_lines.or(base.history_lines),
+            history_lines: self
+                .history_lines
+                .clone()
+                .or_else(|| base.history_lines.clone()),
+            host_label: self.host_label.clone().or_else(|| base.host_label.clone()),
             predict: self.predict.or(base.predict),
             forward: self.forward.clone().or_else(|| base.forward.clone()),
             offline_input: nested(
@@ -190,16 +197,14 @@ pub struct HostSettings {
     pub transport: TransportSetting,
     /// The pipe command as an argv; `None` is `ssh -T -- HOST fil server --stdio`.
     pub pipe: Option<Vec<String>>,
-    /// Scrollback lines the daemon keeps per session (read by the daemon).
-    pub history_lines: usize,
+    /// What other clients are shown for this machine; `None` is the short host name.
+    pub host_label: Option<String>,
     pub predict: Predict,
     /// `-L`/`-R` specs from the file. Forwards arrive in M2; the client warns and ignores them.
     pub forward: Vec<String>,
     pub offline: OfflineInput,
     /// Where to dial UDP when it is not the host name (an ssh alias, a different interface).
     pub direct_address: Option<String>,
-    /// The daemon's UDP range (read by the daemon).
-    pub port_range: RangeInclusive<u16>,
 }
 
 impl Default for HostSettings {
@@ -207,12 +212,11 @@ impl Default for HostSettings {
         Self {
             transport: TransportSetting::Auto,
             pipe: None,
-            history_lines: DEFAULT_HISTORY_LINES,
+            host_label: None,
             predict: Predict::Adaptive,
             forward: Vec::new(),
             offline: OfflineInput::default(),
             direct_address: None,
-            port_range: DEFAULT_PORT_RANGE,
         }
     }
 }
@@ -258,22 +262,6 @@ pub fn locate(cli: Option<&Path>, env_fil_config: Option<std::ffi::OsString>) ->
         path,
         required: false,
     })
-}
-
-/// `$VAR` if it is an absolute path, else `$HOME/fallback`.
-pub fn base_dir(var: &str, fallback: &str) -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os(var).map(PathBuf::from)
-        && p.is_absolute()
-    {
-        return Some(p);
-    }
-    home_dir().map(|h| h.join(fallback))
-}
-
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
 }
 
 impl Config {
@@ -343,13 +331,11 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
     if let Some(argv) = &s.pipe {
         out.pipe = Some(check_argv("pipe", argv)?);
     }
-    if let Some(n) = s.history_lines {
-        if !(1..=1_000_000).contains(&n) {
-            return Err(format!(
-                "history_lines = {n}: must be between 1 and 1000000"
-            ));
-        }
-        out.history_lines = n;
+    if s.history_lines.is_some() {
+        return Err(DAEMON_SETTING.replace("KEY", "history_lines"));
+    }
+    if let Some(l) = &s.host_label {
+        out.host_label = Some(check_label(l)?);
     }
     if let Some(p) = s.predict {
         out.predict = p;
@@ -385,8 +371,8 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
         if let Some(a) = &d.address {
             out.direct_address = Some(check_address(a)?);
         }
-        if let Some(r) = &d.port_range {
-            out.port_range = parse_port_range(r).map_err(|e| format!("direct.port_range: {e}"))?;
+        if d.port_range.is_some() {
+            return Err(DAEMON_SETTING.replace("KEY", "direct.port_range"));
         }
     }
     Ok(out)
@@ -441,22 +427,18 @@ fn check_address(a: &str) -> Result<String, String> {
     }
 }
 
-/// `"60000-61000"` (or one port).
-pub fn parse_port_range(s: &str) -> Result<RangeInclusive<u16>, String> {
-    let bad = || format!("{s:?} is not a port range like \"60000-61000\"");
-    let (lo, hi) = match s.trim().split_once('-') {
-        Some((lo, hi)) => (lo.trim(), hi.trim()),
-        None => (s.trim(), s.trim()),
-    };
-    let lo: u16 = lo.parse().map_err(|_| bad())?;
-    let hi: u16 = hi.parse().map_err(|_| bad())?;
-    if lo == 0 || lo > hi {
+/// A label other clients are shown: text, at most [`MAX_HOST_LABEL`] bytes, nothing invisible.
+fn check_label(l: &str) -> Result<String, String> {
+    let l = l.trim();
+    if l.is_empty() || l.len() > MAX_HOST_LABEL || l.chars().any(char::is_control) {
         return Err(format!(
-            "{s:?}: ports run from 1 up, and the first must not exceed the last"
+            "host_label = {l:?}: expected 1 to {MAX_HOST_LABEL} bytes of text, without control characters"
         ));
     }
-    Ok(lo..=hi)
+    Ok(l.to_string())
 }
+
+const DAEMON_SETTING: &str = "KEY is a setting of the daemon, not of the client: put it in ~/.config/fil/daemon.toml on the host where the daemon runs";
 
 #[cfg(test)]
 mod tests {
@@ -508,7 +490,7 @@ mod tests {
             r#"
 [defaults]
 transport = "auto"
-history_lines = 1000
+host_label = "laptop"
 predict = "adaptive"
 
 [defaults.offline_input]
@@ -517,7 +499,7 @@ confirm = "off"
 
 [host.orin]
 forward = ["-L 5173", "-R 9000"]
-direct.port_range = "60000-61000"
+direct.address = "orin.example.net"
 
 [host.k8s-dev]
 transport = "pipe"
@@ -528,6 +510,8 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
         let orin = cfg.for_host("orin");
         assert_eq!(orin.forward, ["-L 5173", "-R 9000"]);
         assert_eq!(orin.transport, TransportSetting::Auto);
+        assert_eq!(orin.host_label.as_deref(), Some("laptop"));
+        assert_eq!(orin.direct_address.as_deref(), Some("orin.example.net"));
         let k = cfg.for_host("k8s-dev");
         assert_eq!(k.transport, TransportSetting::Pipe);
         assert_eq!(k.pipe.unwrap()[0], "kubectl");
@@ -636,12 +620,16 @@ offline_input.log = ["logger", "-t", "fil"]
                 vec!["offline_input.log", "empty"],
             ),
             (
-                "[defaults.direct]\nport_range = \"61000-60000\"",
-                vec!["direct.port_range", "first"],
+                "[defaults.direct]\nport_range = \"60000-61000\"",
+                vec!["[defaults]", "direct.port_range", "daemon.toml"],
             ),
             (
-                "[defaults.direct]\nport_range = \"abc\"",
-                vec!["direct.port_range", "abc"],
+                "[host.x]\nhost_label = \"\"",
+                vec!["[host.x]", "host_label"],
+            ),
+            (
+                "[defaults]\nhost_label = \"a\\u0007b\"",
+                vec!["host_label", "control"],
             ),
             (
                 "[defaults.direct]\naddress = \"a b\"",
@@ -651,7 +639,10 @@ offline_input.log = ["logger", "-t", "fil"]
                 "[defaults.direct]\naddress = \"box:60001\"",
                 vec!["direct.address"],
             ),
-            ("[defaults]\nhistory_lines = 0", vec!["history_lines"]),
+            (
+                "[defaults]\nhistory_lines = 500",
+                vec!["[defaults]", "history_lines", "daemon.toml"],
+            ),
             ("[defaults]\npredict = \"maybe\"", vec!["unknown variant"]),
             ("[defaults\n", vec!["test.toml"]),
         ] {
@@ -664,12 +655,13 @@ offline_input.log = ["logger", "-t", "fil"]
     }
 
     #[test]
-    fn port_ranges() {
-        assert_eq!(parse_port_range("60000-61000").unwrap(), 60000..=61000);
-        assert_eq!(parse_port_range("7000").unwrap(), 7000..=7000);
-        assert!(parse_port_range("0-5").is_err());
-        assert!(parse_port_range("5-").is_err());
-        assert!(parse_port_range("70000").is_err());
+    fn the_host_label_is_a_setting_with_a_checked_value() {
+        let cfg =
+            parse("[defaults]\nhost_label = \"  work laptop \"\n[host.a]\nhost_label = \"a\"")
+                .unwrap();
+        assert_eq!(cfg.for_host("b").host_label.as_deref(), Some("work laptop"));
+        assert_eq!(cfg.for_host("a").host_label.as_deref(), Some("a"));
+        assert_eq!(Config::default().for_host("x").host_label, None);
     }
 
     #[test]

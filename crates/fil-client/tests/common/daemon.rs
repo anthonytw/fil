@@ -50,6 +50,8 @@ pub struct DState {
     pub snapshots: u32,
     gone: bool,
     refuse_next: Option<AttachRefusal>,
+    /// The next attach is answered with this error instead.
+    error_next: Option<fil_proto::msg::ErrorCode>,
     catch_up: CatchUpParams,
     incarnation: u128,
     epoch_no: u64,
@@ -66,6 +68,46 @@ pub struct DState {
     /// Wait this long before sending snapshot bytes.
     snapshot_delay: Option<Duration>,
     now_ms: u64,
+    /// How far the client has acknowledged on each link (by link identity), as the real
+    /// daemon's `Flow` counts it: from the point the link resumed (or its snapshot's), and it
+    /// never moves on its own.
+    flows: HashMap<usize, u64>,
+    /// Protocol errors the real daemon ends a connection for (an ack beyond what it sent).
+    pub violations: Vec<String>,
+    /// The next attach is only looked at this long after it arrives (a slow path).
+    attach_delay: Option<Duration>,
+    /// The next accepted attach is answered this long after the old transport was dropped.
+    reply_delay: Option<Duration>,
+    /// The offset of the last snapshot the client has not acknowledged. Like the real daemon,
+    /// no further catch-up jump is made while it is set: it waits for the client's ack (not for
+    /// the link to flush, which on QUIC only means the client's reader queued the bytes).
+    pending_jump: Option<u64>,
+    /// Catch-ups that were held back for want of that ack.
+    pub blocked_catch_ups: u32,
+}
+
+fn key_of(link: &Arc<MemLink>) -> usize {
+    Arc::as_ptr(link) as usize
+}
+
+impl DState {
+    /// `link` is the current subscriber's.
+    fn is_current(&self, link: &Arc<MemLink>) -> bool {
+        self.current
+            .and_then(|id| self.conns.get(&id))
+            .is_some_and(|c| key_of(&c.link) == key_of(link))
+    }
+
+    /// How much of what the current link was sent the daemon still counts as unacknowledged.
+    fn unacked(&self) -> u64 {
+        let acked = self
+            .current
+            .and_then(|id| self.conns.get(&id))
+            .and_then(|c| self.flows.get(&key_of(&c.link)))
+            .copied()
+            .unwrap_or(self.sent);
+        self.sent.saturating_sub(acked)
+    }
 }
 
 pub struct FakeDaemon {
@@ -96,6 +138,7 @@ impl FakeDaemon {
                 snapshots: 0,
                 gone: false,
                 refuse_next: None,
+                error_next: None,
                 catch_up: CatchUpParams::default(),
                 incarnation: 0xAB_CDEF,
                 epoch_no: 0,
@@ -106,6 +149,12 @@ impl FakeDaemon {
                 data_before_reply: false,
                 snapshot_delay: None,
                 now_ms: NOW_MS,
+                flows: HashMap::new(),
+                violations: Vec::new(),
+                attach_delay: None,
+                reply_delay: None,
+                pending_jump: None,
+                blocked_catch_ups: 0,
             }),
         })
     }
@@ -117,20 +166,59 @@ impl FakeDaemon {
         tokio::spawn(async move {
             let hello = ControlMsg::Hello(Hello::ours(Agent::new("fake daemon").unwrap()));
             let _ = send(&link, &hello).await;
+            // After an attach the reply is out but the resent output is not: like the real
+            // daemon's outbound half, it goes once the inbound messages already queued have been
+            // handled.
+            let mut pump_due = false;
             loop {
-                let Ok((chan, payload)) = link.recv().await else {
-                    return;
+                let (chan, payload) = tokio::select! {
+                    biased;
+                    r = link.recv() => match r {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    },
+                    _ = std::future::ready(()), if pump_due => {
+                        pump_due = false;
+                        let mut st = me.st.lock().await;
+                        if st.is_current(&link) {
+                            me.pump(&mut st).await;
+                        }
+                        continue;
+                    }
                 };
+                if chan == ChannelId::CONTROL
+                    && matches!(ControlMsg::decode(&payload), Ok(ControlMsg::Attach(_)))
+                {
+                    let delay = me.st.lock().await.attach_delay.take();
+                    if let Some(d) = delay {
+                        tokio::time::sleep(d).await;
+                    }
+                }
                 let mut st = me.st.lock().await;
                 if chan == ChannelId::CONTROL {
                     match ControlMsg::decode(&payload).expect("client sent a valid message") {
                         ControlMsg::Attach(a) => {
-                            me.on_attach(&mut st, link.clone(), control.clone(), a)
-                                .await
+                            pump_due = me
+                                .on_attach(&mut st, link.clone(), control.clone(), a)
+                                .await;
                         }
                         ControlMsg::Ack { channel, upto } if channel == ChannelId::TERMINAL => {
-                            assert!(upto >= st.client_acked, "acks never go backwards");
-                            st.client_acked = upto;
+                            let key = key_of(&link);
+                            let flow = st.flows.get(&key).copied().unwrap_or(0);
+                            if upto > st.sent {
+                                let why = format!(
+                                    "ack of {upto} on a link that was sent {} (it resumed at {flow})",
+                                    st.sent
+                                );
+                                st.violations.push(why);
+                                control.kill(DownReason::Dead);
+                                return;
+                            }
+                            st.flows.insert(key, flow.max(upto));
+                            st.client_acked = st.client_acked.max(upto);
+                            if st.pending_jump.is_some_and(|at| upto >= at) {
+                                st.pending_jump = None;
+                            }
                         }
                         ControlMsg::Resize(s) => st.sizes.push((s.cols(), s.rows())),
                         ControlMsg::Detach => {
@@ -175,7 +263,15 @@ impl FakeDaemon {
         });
     }
 
-    async fn on_attach(&self, st: &mut DState, link: Arc<MemLink>, control: MemControl, a: Attach) {
+    /// Handles an attach. True if the output still owed to the link should be sent once the
+    /// messages already queued from the client have been handled.
+    async fn on_attach(
+        &self,
+        st: &mut DState,
+        link: Arc<MemLink>,
+        control: MemControl,
+        a: Attach,
+    ) -> bool {
         st.attaches.push(a.clone());
         if st.gone {
             let _ = send(
@@ -183,11 +279,15 @@ impl FakeDaemon {
                 &ControlMsg::AttachRefused(AttachRefusal::SessionGone),
             )
             .await;
-            return;
+            return false;
         }
         if let Some(r) = st.refuse_next.take() {
             let _ = send(&link, &ControlMsg::AttachRefused(r)).await;
-            return;
+            return false;
+        }
+        if let Some(code) = st.error_next.take() {
+            let _ = send(&link, &ControlMsg::Error(code)).await;
+            return false;
         }
         let now = st.now_ms;
         let outcome = st.epoch.attach(AttachInput {
@@ -200,7 +300,7 @@ impl FakeDaemon {
         let (epoch, subscriber, mode, effects) = match outcome {
             AttachOutcome::Refused(r) => {
                 let _ = send(&link, &ControlMsg::AttachRefused(r)).await;
-                return;
+                return false;
             }
             AttachOutcome::Accepted {
                 epoch,
@@ -247,7 +347,17 @@ impl FakeDaemon {
             AttachMode::Fresh => None,
             AttachMode::Resumed(r) => Some(r.seq),
         };
-        let start = decide_start(&st.log, resume_seq, &st.catch_up);
+        // A resume that asks for a snapshot (its screen no longer matches its position) keeps
+        // the key, epoch and input stream but repaints.
+        let start = if resume_seq.is_some() && a.resume.is_some_and(|r| r.want_snapshot) {
+            StartDecision::Snapshot {
+                at: st.log.end(),
+                skipped: 0,
+                reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            }
+        } else {
+            decide_start(&st.log, resume_seq, &st.catch_up)
+        };
         let mut snapshot_bytes = None;
         let start_point = match start {
             StartDecision::Resume { from } => {
@@ -262,6 +372,7 @@ impl FakeDaemon {
                 let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
                 st.sent = at;
                 st.snapshots += 1;
+                st.pending_jump = Some(at);
                 let info = SnapshotInfo {
                     at,
                     len: bytes.len() as u64,
@@ -274,6 +385,11 @@ impl FakeDaemon {
         };
         if matches!(mode, AttachMode::Fresh) {
             st.input_rx = RecvChannel::new();
+        }
+        // The flow starts at the resume point, or at the snapshot's.
+        st.flows.insert(key_of(&link), st.sent);
+        if let Some(d) = st.reply_delay.take() {
+            tokio::time::sleep(d).await;
         }
         let reply = AttachReply {
             incarnation: st.incarnation,
@@ -315,7 +431,7 @@ impl FakeDaemon {
                 if let Some(c) = st.conns.get(&subscriber.0) {
                     c.control.kill(DownReason::Dead);
                 }
-                return;
+                return false;
             }
         }
         if st.send_input_resume {
@@ -329,7 +445,7 @@ impl FakeDaemon {
             )
             .await;
         }
-        self.pump(st).await;
+        true
     }
 
     /// Sends the log from `sent` to the current subscriber.
@@ -410,16 +526,17 @@ impl FakeDaemon {
         self.st.lock().await.detaches
     }
 
+    /// Catch-up jumps held back because the previous snapshot was not acknowledged yet.
+    pub async fn blocked_catch_ups(&self) -> u32 {
+        self.st.lock().await.blocked_catch_ups
+    }
+
     pub async fn snapshots(&self) -> u32 {
         self.st.lock().await.snapshots
     }
 
     pub async fn acked(&self) -> u64 {
         self.st.lock().await.client_acked
-    }
-
-    pub async fn log_end(&self) -> u64 {
-        self.st.lock().await.log.end()
     }
 
     /// The daemon's own view of the screen, for the oracle.
@@ -566,6 +683,11 @@ impl FakeDaemon {
     }
 
     /// The next attach is refused with this, whatever it says.
+    /// The next attach is answered with this error (`SessionStartFailed`, say).
+    pub async fn error_next(&self, code: fil_proto::msg::ErrorCode) {
+        self.st.lock().await.error_next = Some(code);
+    }
+
     pub async fn refuse_next(&self, r: AttachRefusal) {
         self.st.lock().await.refuse_next = Some(r);
     }
@@ -597,6 +719,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -606,6 +735,8 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.sent = at;
         st.snapshots += 1;
         let info = SnapshotInfo {
@@ -646,6 +777,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -655,6 +793,8 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,
@@ -690,6 +830,27 @@ impl FakeDaemon {
         self.st.lock().await.direct = Some((port, fingerprint));
     }
 
+    /// The next attach is only looked at `d` after it arrives (a slow path).
+    pub async fn delay_next_attach(&self, d: Duration) {
+        self.st.lock().await.attach_delay = Some(d);
+    }
+
+    /// The next accepted attach is answered `d` after the old transport was dropped.
+    pub async fn delay_next_reply(&self, d: Duration) {
+        self.st.lock().await.reply_delay = Some(d);
+    }
+
+    /// What the real daemon would have ended a connection for (an ack beyond what it sent).
+    pub async fn violations(&self) -> Vec<String> {
+        self.st.lock().await.violations.clone()
+    }
+
+    /// Output the current link was sent that the daemon's flow control still counts as
+    /// unacknowledged (a daemon that sees acks stop will, in time, jump to a snapshot).
+    pub async fn unacked(&self) -> u64 {
+        self.st.lock().await.unacked()
+    }
+
     pub async fn set_data_before_reply(&self, on: bool) {
         self.st.lock().await.data_before_reply = on;
     }
@@ -719,6 +880,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -728,6 +896,8 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,

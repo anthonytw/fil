@@ -446,6 +446,55 @@ fn review_print_origin_after_decrc() {
     }
 }
 
+/// A run of adjacent cells costs one cursor move, not one each (the old painter spent about 450
+/// bytes on a two-line status, mostly on `ESC [ r ; c H` before every cell).
+#[test]
+fn a_status_paint_moves_the_cursor_once_per_run_of_cells() {
+    each_backend(|r| {
+        r.server(b"$ ");
+        let status = lines(&[" fil: no reply for 3s ", " 12 bytes held "]);
+        let f = r.overlay.set_status(status);
+        let cups = f.paint.iter().filter(|&&b| b == b'H').count();
+        // One move to each of the two lines, one to put the cursor back: well under one per
+        // cell (about 40).
+        assert!(cups <= 4, "{cups} cursor moves in {:?}", f.paint);
+        assert!(f.paint.len() < 160, "{} bytes", f.paint.len());
+        r.user.write(&f.erase);
+        r.user.write(&f.paint);
+        r.check();
+        r.assert_clean();
+    });
+}
+
+/// Only plain ASCII cells are trusted to move the cursor by one column: a terminal may draw `é`
+/// or `─` wider than `unicode-width` says (ambiguous width), and a run built on the guess would
+/// shift every cell after it. Each such cell gets its own cursor move when it is put back.
+#[test]
+fn restoring_cells_that_are_not_plain_ascii_moves_the_cursor_for_each() {
+    each_backend(|r| {
+        let row = "é".repeat(40);
+        r.server(format!("\x1b[1;1H{row}\x1b[2;1H{row}\x1b[10;1H$ ").as_bytes());
+        let f = r.overlay.set_status(lines(&[" abc "]));
+        r.user.write(&f.erase);
+        r.user.write(&f.paint);
+        r.check();
+        // Painting ASCII over them is one run.
+        let paint_moves = f.paint.iter().filter(|&&b| b == b'H').count();
+        assert!(paint_moves <= 3, "{paint_moves} moves painting ASCII");
+        let f = r.overlay.set_status(None);
+        let erase_moves = f.paint.iter().filter(|&&b| b == b'H').count();
+        // 5 restored `é` cells, each at its own address, then the cursor back.
+        assert!(
+            erase_moves >= 5,
+            "{erase_moves} moves restoring accented cells: {:?}",
+            String::from_utf8_lossy(&f.paint)
+        );
+        r.user.write(&f.erase);
+        r.user.write(&f.paint);
+        r.check();
+    });
+}
+
 #[test]
 fn review_resize_with_status_and_predictions_shown() {
     each_backend(|r| {

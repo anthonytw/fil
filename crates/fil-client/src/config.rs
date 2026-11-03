@@ -194,6 +194,10 @@ pub enum ClientError {
         "the daemon rejected our resume point for session \"{0}\" as impossible (a bug in fil); attach again"
     )]
     BadResume(String),
+    #[error(
+        "the daemon could not start session \"{0}\"; the reason is in the fil daemon log on the remote host (daemon.log under $XDG_STATE_HOME/fil, default ~/.local/state/fil)"
+    )]
+    SessionStartFailed(String),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("terminal error: {0}")]

@@ -43,7 +43,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
 use fil_proto::frame::DataSegment;
-use fil_proto::limits::ACK_DELAY;
+use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
     SnapshotInfo, StartPoint, TakenOver, TermName, TermSize,
@@ -72,6 +72,13 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// A yes/no question ignores the keyboard until the user has paused this long, and a lone key
+/// answers it only if nothing else is typed for this long afterwards: it is only answered by
+/// someone who has read it, and the first letter of a word is not an answer.
+const PROMPT_QUIET: Duration = Duration::from_millis(300);
+/// After a question is answered, a lone Enter that arrives within this long is the end of the
+/// answer (`y`, then Enter) and is not passed on to the session.
+const ANSWER_ENTER_WINDOW: Duration = Duration::from_secs(1);
 /// After `~.`, how long the client waits for the daemon to acknowledge the input typed before it,
 /// so the `Detach` does not overtake it. Past this the `Detach` goes anyway: it matters more than
 /// the typed-ahead input, and acks that do not come (a slow path, a daemon that dropped the link)
@@ -91,10 +98,26 @@ struct Session {
     epoch: u64,
     /// Terminal output given to the user's terminal (or skipped by a snapshot) so far.
     recv: RecvChannel,
+    /// The highest terminal offset told to the daemon on the current link: what its flow control
+    /// counts as acknowledged. It starts at the point the daemon resumed (or jumped) to, not at
+    /// ours: a swap's old link may have delivered further than the candidate's resume point.
+    acked: u64,
+    /// The highest terminal offset the current link has delivered (`seq + len` of its segments,
+    /// duplicates of what the terminal already has included). The daemon rejects an ack beyond
+    /// what it sent on the link, so we never acknowledge beyond this.
+    link_high: u64,
+    /// Acks may go out: the current link's attach reply is in, so `acked` is known. A candidate
+    /// that took over before its reply has no position yet and must not be told one.
+    acking: bool,
     /// Keystrokes sent and not yet acknowledged, plus those queued.
     input: SendChannel,
     /// The daemon has said where to continue the input stream on this link.
     input_ready: bool,
+    /// The screen no longer matches the byte position (the window narrowed under something we
+    /// had drawn, and the terminal re-wrapped it): the next resume asks the daemon for a
+    /// snapshot instead of a replay from `recv`. Epoch, key and input stream are kept, so it is
+    /// still a resume, and a swap or a reconnect over QUIC needs no ssh login.
+    want_snapshot: bool,
     /// `PtyMode` reports waiting for the output to reach their offset: (at, canonical, echo).
     modes: VecDeque<(u64, bool, bool)>,
     /// The daemon said the shell exited: `(code, signal, when to stop waiting for the link to
@@ -110,8 +133,12 @@ impl Session {
             incarnation: 0,
             epoch: 0,
             recv: RecvChannel::new(),
+            acked: 0,
+            link_high: 0,
+            acking: false,
             input: SendChannel::new(window),
             input_ready: false,
+            want_snapshot: false,
             modes: VecDeque::new(),
             exited: None,
         }
@@ -121,12 +148,56 @@ impl Session {
         *self = Session::new(window);
     }
 
+    /// A different link is now the session's: nothing is acknowledged on it until its attach
+    /// reply says where the daemon's flow starts.
+    fn link_changed(&mut self) {
+        self.acking = false;
+        self.link_high = 0;
+    }
+
+    /// The daemon's flow on this link starts at `at` (a resume point or a snapshot's position).
+    fn start_acks(&mut self, at: u64) {
+        self.acked = at;
+        self.link_high = self.link_high.max(at);
+        self.acking = true;
+    }
+
+    /// What the terminal can be acknowledged up to on this link.
+    fn ack_target(&self) -> u64 {
+        self.recv.received().min(self.link_high)
+    }
+
+    fn unacked(&self) -> u64 {
+        if self.acking {
+            self.ack_target().saturating_sub(self.acked)
+        } else {
+            0
+        }
+    }
+
+    fn ack_now(&mut self) -> Option<u64> {
+        let upto = self.ack_target();
+        (self.acking && upto > self.acked).then(|| {
+            self.acked = upto;
+            upto
+        })
+    }
+
+    /// The ack to send now if enough has built up.
+    fn ack_if_due(&mut self) -> Option<u64> {
+        if self.unacked() >= ACK_AFTER_BYTES {
+            self.ack_now()
+        } else {
+            None
+        }
+    }
+
     fn resume_request(&self) -> Option<ResumeRequest> {
         self.established.then(|| ResumeRequest {
             incarnation: self.incarnation,
             epoch: self.epoch,
             seq: self.recv.received(),
-            want_snapshot: false,
+            want_snapshot: self.want_snapshot,
         })
     }
 }
@@ -187,10 +258,122 @@ enum Served {
 
 enum Confirm {
     /// Offline keystrokes waiting for y or n.
-    Typed { secs: u64 },
+    Typed { secs: u64, answer: Answer },
 }
 
-type Outbox = mpsc::UnboundedSender<(ChannelId, Bytes)>;
+/// Reading the answer to a yes/no question from the keyboard, for the questions after a refusal
+/// and the confirmation of offline input. A question is a decision the user has to mean:
+///
+/// - input that arrives before the user has paused for [`PROMPT_QUIET`] (typing that was already
+///   under way) is dropped, and extends the pause;
+/// - `y` or `n` plus Enter, in one read, answers at once;
+/// - a lone `y`, `n`, `q`, ESC or ^C is only a candidate. It answers when nothing else is typed
+///   for [`PROMPT_QUIET`] (so the first letter of a word typed after a pause is not an answer),
+///   or when an Enter follows it;
+/// - anything else (an arrow key, which starts with ESC, other letters) is ignored, and the
+///   question stays.
+struct Answer {
+    armed_at: Instant,
+    candidate: Option<(bool, Instant)>,
+    /// The answer included its Enter (so there is none left to swallow).
+    enter_seen: bool,
+}
+
+impl Answer {
+    fn new() -> Self {
+        Self {
+            armed_at: Instant::now() + PROMPT_QUIET,
+            candidate: None,
+            enter_seen: false,
+        }
+    }
+
+    /// When a lone key becomes the answer, if nothing else is typed.
+    fn deadline(&self) -> Option<Instant> {
+        self.candidate.map(|c| c.1)
+    }
+
+    /// The candidate's quiet time is up.
+    fn due(&self) -> bool {
+        self.candidate.is_some_and(|(_, at)| Instant::now() >= at)
+    }
+
+    /// The candidate's quiet time is up: it is the answer. **Only the deadline timer may call
+    /// this**, and only after looking for input that is already waiting: if the loop was blocked
+    /// past the deadline, a key that follows the candidate in the queue cancels it.
+    fn tick(&mut self) -> Option<bool> {
+        match self.candidate {
+            Some((yes, at)) if Instant::now() >= at => {
+                self.candidate = None;
+                Some(yes)
+            }
+            _ => None,
+        }
+    }
+
+    /// A read from the keyboard. `Some` is the answer. Input never commits a lone key by the
+    /// clock: whatever arrives after a candidate cancels it, however late the timer is.
+    fn input(&mut self, bytes: &[u8]) -> Option<bool> {
+        let chunk = classify(bytes);
+        // The release of a key (kitty's event types) is not typing.
+        if matches!(chunk, Chunk::Release) {
+            return None;
+        }
+        let now = Instant::now();
+        if let Some((yes, _)) = self.candidate {
+            if matches!(chunk, Chunk::Enter) {
+                self.candidate = None;
+                self.enter_seen = true;
+                return Some(yes);
+            }
+            // More typing: the lone key was the start of something else.
+            self.candidate = None;
+            self.armed_at = now + PROMPT_QUIET;
+            return None;
+        }
+        if now < self.armed_at {
+            self.armed_at = now + PROMPT_QUIET;
+            return None;
+        }
+        match chunk {
+            Chunk::Key { yes, enter: true } => {
+                self.enter_seen = true;
+                Some(yes)
+            }
+            Chunk::Key { yes, enter: false } => {
+                self.candidate = Some((yes, now + PROMPT_QUIET));
+                None
+            }
+            _ => {
+                self.armed_at = now + PROMPT_QUIET;
+                None
+            }
+        }
+    }
+}
+
+/// The queues to a link's two writer tasks. Control and data have a writer each: a `send` blocked
+/// on a full terminal channel (a big paste on a slow path) must not hold back an ack, a
+/// `Resize` or a `Detach` queued after it (DESIGN.md section 8.1: a full channel never delays
+/// control).
+#[derive(Clone)]
+struct Outbox {
+    control: mpsc::UnboundedSender<Bytes>,
+    data: mpsc::UnboundedSender<(ChannelId, Bytes)>,
+}
+
+impl Outbox {
+    fn control(&self, msg: &ControlMsg) {
+        if let Ok(bytes) = msg.encode() {
+            let _ = self.control.send(Bytes::from(bytes));
+        }
+    }
+
+    fn data(&self, channel: ChannelId, payload: Vec<u8>) {
+        let _ = self.data.send((channel, Bytes::from(payload)));
+    }
+}
+
 type Inbox = mpsc::Receiver<Result<(ChannelId, Bytes), LinkError>>;
 
 /// One link and the tasks that move its payloads.
@@ -200,7 +383,7 @@ struct LinkCtx<L> {
     tx: Outbox,
     rrx: Inbox,
     status: watch::Receiver<LinkStatus>,
-    writer: JoinHandle<()>,
+    writers: [JoinHandle<()>; 2],
     reader: JoinHandle<()>,
     conn: Conn,
     /// The link said `Down`; what it queued before is still being read out.
@@ -215,11 +398,22 @@ impl<L: Link> LinkCtx<L> {
     fn open(link: L, resumed: bool) -> Self {
         let kind = link.kind();
         let link = Arc::new(link);
-        let (tx, mut wrx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
-        let writer = {
+        let (control, mut crx) = mpsc::unbounded_channel::<Bytes>();
+        let (data, mut drx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
+        let control_writer = {
             let link = link.clone();
             tokio::spawn(async move {
-                while let Some((c, p)) = wrx.recv().await {
+                while let Some(p) = crx.recv().await {
+                    if link.send(ChannelId::CONTROL, p).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let data_writer = {
+            let link = link.clone();
+            tokio::spawn(async move {
+                while let Some((c, p)) = drx.recv().await {
                     if link.send(c, p).await.is_err() {
                         break;
                     }
@@ -243,10 +437,10 @@ impl<L: Link> LinkCtx<L> {
         Self {
             link,
             kind,
-            tx,
+            tx: Outbox { control, data },
             rrx,
             status,
-            writer,
+            writers: [control_writer, data_writer],
             reader,
             conn: Conn::new(kind, resumed),
             down: false,
@@ -257,7 +451,9 @@ impl<L: Link> LinkCtx<L> {
 
     fn close(self) {
         self.reader.abort();
-        self.writer.abort();
+        for w in &self.writers {
+            w.abort();
+        }
         self.link.close();
     }
 }
@@ -362,6 +558,10 @@ pub(crate) struct Core<I, O> {
     buf: OfflineBuffer,
     log: Option<LogSink>,
     confirm: Option<Confirm>,
+    /// Events read ahead by [`Core::input_waiting`], delivered before any new one.
+    stashed: VecDeque<TermEvent>,
+    /// An answer was just given without its Enter: a lone Enter before this is swallowed.
+    swallow_enter: Option<Instant>,
     /// The confirmation is due but could not be drawn yet; nothing is sent until it is shown
     /// and answered.
     confirm_pending: Option<u64>,
@@ -424,6 +624,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             buf,
             log,
             confirm: None,
+            stashed: VecDeque::new(),
+            swallow_enter: None,
             confirm_pending: None,
             prompt: None,
             prompt_plain: false,
@@ -449,6 +651,37 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             banner: None,
             banner_shown: false,
         })
+    }
+
+    /// The next event from the user. Cancel-safe, like the terminal's own.
+    async fn next_input(&mut self) -> TermEvent {
+        if let Some(ev) = self.stashed.pop_front() {
+            return ev;
+        }
+        self.input.next().await
+    }
+
+    /// Whether an event is already waiting. It is read ahead (once) and kept for
+    /// [`Core::next_input`]: nothing is lost.
+    fn input_waiting(&mut self) -> bool {
+        if !self.stashed.is_empty() {
+            return true;
+        }
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let ev = {
+            let fut = std::pin::pin!(self.input.next());
+            match std::future::Future::poll(fut, &mut cx) {
+                std::task::Poll::Ready(ev) => Some(ev),
+                std::task::Poll::Pending => None,
+            }
+        };
+        match ev {
+            Some(ev) => {
+                self.stashed.push_back(ev);
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- the top-level loop ------------------------------------------------------------
@@ -634,7 +867,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let wake = self.next_wake();
             tokio::select! {
                 out = &mut fut => return Ok(Pumped::Ready(out)),
-                ev = self.input.next() => {
+                ev = self.next_input() => {
                     match self.on_event(ev)? {
                         Ev::Continue => {}
                         Ev::Detach => return Ok(Pumped::Done(Outcome::Detached)),
@@ -663,6 +896,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let mut primary = LinkCtx::open(dialed.link, resume.is_some());
         self.last_kind = Some(primary.kind);
         self.sess.input_ready = false;
+        self.sess.link_changed();
         self.link_ok = false;
         self.ack_due = None;
         self.quiet = false;
@@ -713,6 +947,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             let state = primary.status.borrow_and_update().state.clone();
                             match state {
                                 LinkState::Up => self.link_recovered(&primary.conn)?,
+                                // `Degraded` means the peer has been silent (the link contract,
+                                // DESIGN.md section 8.1; the pipe keeps a link whose *consumer*
+                                // lags `Up`). It is the only thing that puts "no reply" on the
+                                // status line: our own slowness never does.
                                 LinkState::Degraded => {
                                     if primary.conn.awaiting_reply || self.link_ok {
                                         self.link_quiet()?;
@@ -767,21 +1005,20 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             }
                             CandStep::Refused(r) => {
                                 dialer.swapped(Err(SwapError::Refused(format!("{r:?}"))));
+                                tracing::debug!(?r, "the candidate link was refused");
                                 if let Some(c) = cand.take() {
                                     c.close();
                                 }
-                                ended = match r {
-                                    // Nothing wrong with the session: stay on the old link.
-                                    AttachRefusal::WrongKey | AttachRefusal::BadResume => None,
-                                    other => match self.on_refusal(other)? {
-                                        Flow::End(s) => Some(s),
-                                        Flow::Continue => None,
-                                    },
-                                };
+                                // Whatever the candidate was told, the old link is still the
+                                // session and is still delivering: if the session is gone, taken
+                                // over or replaced, it carries the real ending (`SessionExited`,
+                                // `TakenOver`) and then closes, and the reconnect that follows
+                                // hears the refusal again. Ending the run here would cut the tail
+                                // of the output off and make up an exit status.
                             }
                         }
                     }
-                    ev = self.input.next(), if self.pending.len() < MAX_PENDING_INPUT => {
+                    ev = self.next_input(), if self.pending.len() < MAX_PENDING_INPUT => {
                         match self.on_event(ev)? {
                             Ev::Continue => {}
                             // The `Detach` itself is sent by `detach_and_wait`, once the input
@@ -996,8 +1233,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn take_over_tx<L: Link>(&mut self, primary: &LinkCtx<L>) {
         self.tx = Some(primary.tx.clone());
         self.last_kind = Some(primary.kind);
-        // The new link's daemon tells us where its input stream stands.
+        // The new link's daemon tells us where its input stream stands, and its reply where its
+        // output flow starts: an ack that fell due for the old link means nothing to it.
         self.sess.input_ready = false;
+        self.sess.link_changed();
+        self.ack_due = None;
         // The old link may have been quiet; the session is only as quiet as the link it now
         // runs on (a new link's status watch has nothing to report while it stays `Up`).
         self.quiet = matches!(primary.status.borrow().state, LinkState::Degraded);
@@ -1138,20 +1378,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // A report for an offset already written applies now.
                 self.apply_modes(self.sess.recv.received())?;
             }
-            ControlMsg::EchoAck {
-                input_upto,
-                output_at,
-            } => {
-                if let Some(d) = self.display.as_mut() {
-                    d.echo_ack(input_upto, output_at);
-                }
-            }
+            // Only sent to a client that asked (`Attach::echo_ack`, which M1 never does); the
+            // predictor will read it in M3.
+            ControlMsg::EchoAck { .. } => {}
             ControlMsg::Error(code) => {
                 return Err(match code {
                     fil_proto::msg::ErrorCode::VersionMismatch => ClientError::VersionMismatch {
                         ours: fil_proto::limits::PROTOCOL_MAJOR,
                         peer: 0,
                     },
+                    fil_proto::msg::ErrorCode::SessionStartFailed => {
+                        ClientError::SessionStartFailed(self.cfg.session.to_string())
+                    }
                     other => ClientError::Protocol(format!("the daemon reported {other:?}")),
                 });
             }
@@ -1205,6 +1443,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn on_attach_reply(&mut self, conn: &mut Conn, r: AttachReply) -> Result<Flow, ClientError> {
         conn.awaiting_reply = false;
+        // The daemon states the PTY mode in force after every reply and snapshot, so reports
+        // still waiting for their offset (from before this link) are stale: applied when the
+        // resent output reached them, they would put back a mode the PTY has since left.
+        // Control is ordered on every link, so this link's own restatement comes after.
+        self.sess.modes.clear();
         self.sess.established = true;
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;
@@ -1230,7 +1473,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         self.sess.recv.received()
                     ));
                 }
-                self.sess.recv.on_reconnect();
+                // The daemon's flow starts at `from`, which may be behind us (a swap's old link
+                // went on delivering while the candidate was being set up): what it resends from
+                // there is acknowledged as it arrives, duplicates or not.
+                self.sess.start_acks(from);
                 self.sess.input_ready = false;
                 // Keystrokes wait for the daemon's `Resume` (section 8.5). Output that arrived
                 // before this reply can be applied now.
@@ -1256,6 +1502,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // The daemon's position replaces ours, even if it is behind (a resume point it
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
+                self.sess.start_acks(info.at);
+                // This is the repaint that was asked for (or a fresh screen anyway).
+                self.sess.want_snapshot = false;
                 return self.begin_snapshot(conn, info);
             }
         }
@@ -1281,6 +1530,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             return Self::reconnect("a catch-up snapshot behind the terminal position");
         }
         self.sess.recv.skip_to(info.at);
+        self.sess.start_acks(info.at);
         self.begin_snapshot(conn, info)
     }
 
@@ -1370,6 +1620,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.write(&bytes)?;
         // The PTY mode in force at the snapshot's point (the last report below it).
         self.apply_modes(snap.info.at)?;
+        // The snapshot is on the screen: say so at once. The daemon waits for this ack (not for
+        // the link to flush: on QUIC that only means our reader queued the bytes) before it
+        // lets a further catch-up jump past the snapshot, so it does not wait for the periodic
+        // ack. `at` is where the snapshot's position is; it is never beyond what was sent.
+        self.send_ctl(&ControlMsg::Ack {
+            channel: ChannelId::TERMINAL,
+            upto: snap.info.at,
+        });
         if let Flow::End(s) = self.drain_terminal(conn)? {
             return Ok(Flow::End(s));
         }
@@ -1381,6 +1639,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.held_bytes + data.len() > self.cfg.max_held_output {
             return Self::reconnect("too much terminal data held back");
         }
+        self.sess.link_high = self.sess.link_high.max(seq + data.len() as u64);
         if let Some(old) = conn.term_held.insert(seq, data.to_vec()) {
             conn.held_bytes -= old.len();
         }
@@ -1395,7 +1654,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.awaiting_reply || conn.snap.is_some() {
             return Ok(Flow::Continue);
         }
-        let mut applied = false;
         while let Some(&seq) = conn.term_held.keys().next() {
             if seq > self.sess.recv.received() {
                 break;
@@ -1409,7 +1667,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             if !fresh.is_empty() {
                 let fresh = fresh.to_vec();
                 self.apply_output(pos, &fresh)?;
-                applied = true;
             }
         }
         conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
@@ -1417,9 +1674,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             (false, None) => Some(Instant::now()),
             (false, since) => since,
         };
-        if applied {
-            self.after_output();
-        }
+        // Also when nothing was new: a resend of what the terminal already has (a swap's) is
+        // still owed an ack on this link.
+        self.after_output();
         Ok(Flow::Continue)
     }
 
@@ -1467,13 +1724,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// Acks, when due, after output was applied.
     fn after_output(&mut self) {
-        if let Some(upto) = self.sess.recv.ack_if_due() {
+        if let Some(upto) = self.sess.ack_if_due() {
             self.send_ctl(&ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
                 upto,
             });
             self.ack_due = None;
-        } else if self.sess.recv.unacked() > 0 && self.ack_due.is_none() {
+        } else if self.sess.unacked() > 0 && self.ack_due.is_none() {
             self.ack_due = Some(Instant::now() + ACK_DELAY);
         }
     }
@@ -1521,10 +1778,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.awaiting_reply || conn.snap.is_some() || self.quiet {
             return Ok(());
         }
-        if !self.link_ok {
-            self.link_ok = true;
-            self.sess.recv.on_reconnect();
-        }
+        self.link_ok = true;
         self.ready_since.get_or_insert_with(Instant::now);
         // The window may have changed size while the daemon could not be told (a quiet link,
         // a snapshot on its way).
@@ -1581,7 +1835,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         while let Some(seg) = self.sess.input.next_segment() {
             if let Some(tx) = &self.tx {
-                let _ = tx.send((ChannelId::TERMINAL, Bytes::from(seg.payload())));
+                tx.data(ChannelId::TERMINAL, seg.payload());
             }
         }
     }
@@ -1610,9 +1864,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(&bytes)?;
             if damaged {
                 // The window narrowed under something we had drawn; the terminal re-wrapped it
-                // and the erase cannot undo that. The next attach starts from a snapshot.
-                tracing::warn!("window narrowed under the overlay; the next attach is fresh");
-                self.sess.established = false;
+                // and the erase cannot undo that. The next resume repaints from a snapshot.
+                tracing::debug!("window narrowed under the overlay; the next resume repaints");
+                self.sess.want_snapshot = true;
             }
         }
         if self.link_ok && self.tx.is_some() {
@@ -1623,16 +1877,23 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn on_keys(&mut self, bytes: &[u8]) -> Result<Ev, ClientError> {
+        // The Enter that ends "y, Enter" is not the session's: it would run whatever the other
+        // client left half-typed on the shell's line.
+        if let Some(until) = self.swallow_enter.take()
+            && Instant::now() < until
+            && classify(bytes) == Chunk::Enter
+        {
+            return Ok(Ev::Continue);
+        }
         // A confirmation that output has since let the overlay draw is entered now, so the key
         // that answers it is read as an answer and not as typing.
         if self.confirm_pending.is_some() {
             self.refresh_display()?;
         }
-        if self.confirm.is_some() {
-            let rest = self.confirm_keys(bytes);
-            if !rest.is_empty() {
-                // What followed the answer in the same read is ordinary typing.
-                return self.on_keys(&rest);
+        if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm {
+            if let Some(yes) = answer.input(bytes) {
+                let enter_seen = answer.enter_seen;
+                self.confirmed(yes, enter_seen);
             }
             self.refresh_display()?;
             self.pump_input();
@@ -1683,24 +1944,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    /// Reads the answer to the confirmation; returns what followed it in the same read.
-    fn confirm_keys(&mut self, bytes: &[u8]) -> Vec<u8> {
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'y' | b'Y' => {
-                    self.confirm = None;
-                    self.release_offline();
-                    return bytes[i + 1..].to_vec();
-                }
-                b'n' | b'N' | 0x1b | 0x03 | b'q' => {
-                    self.confirm = None;
-                    self.buf.reset();
-                    return bytes[i + 1..].to_vec();
-                }
-                _ => {}
-            }
+    /// The user answered the confirmation of offline input: send it, or forget it.
+    fn confirmed(&mut self, yes: bool, enter_seen: bool) {
+        self.confirm = None;
+        if yes {
+            self.release_offline();
+        } else {
+            self.buf.reset();
         }
-        Vec::new()
+        if !enter_seen {
+            self.swallow_enter = Some(Instant::now() + ANSWER_ENTER_WINDOW);
+        }
     }
 
     // ---- prompts after a refusal -------------------------------------------------------
@@ -1749,12 +2003,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(text.as_bytes())?;
             self.prompt_plain = true;
         }
+        let mut keys = Answer::new();
         let answer = loop {
             let wake = self.next_wake();
+            // Input first: a candidate's deadline that passed while the loop was blocked does
+            // not commit it over a key that is already waiting.
             tokio::select! {
-                ev = self.input.next() => match ev {
+                biased;
+                ev = self.next_input() => match ev {
                     TermEvent::Input(bytes) => {
-                        if let Some(yes) = prompt_answer(&bytes) {
+                        if let Some(yes) = keys.input(&bytes) {
                             break if yes { Ok(()) } else { Err(no) };
                         }
                     }
@@ -1762,9 +2020,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     TermEvent::Signal(n) => break Err(Outcome::Signalled(n)),
                     TermEvent::Eof => break Err(Outcome::InputClosed),
                 },
+                () = at(keys.deadline()) => {
+                    if let Some(yes) = keys.tick() {
+                        break if yes { Ok(()) } else { Err(no) };
+                    }
+                }
                 _ = at(wake) => self.on_tick()?,
             }
         };
+        if answer.is_ok() && !keys.enter_seen {
+            self.swallow_enter = Some(Instant::now() + ANSWER_ENTER_WINDOW);
+        }
         self.prompt = None;
         if !self.prompt_plain {
             self.show_lines(Vec::new())?;
@@ -1878,12 +2144,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let lines = self.confirm_text(secs);
             if self.show_or_open(lines, false)? {
                 self.confirm_pending = None;
-                self.confirm = Some(Confirm::Typed { secs });
+                self.confirm = Some(Confirm::Typed {
+                    secs,
+                    answer: Answer::new(),
+                });
             }
             return Ok(());
         }
         let mut lines = Vec::new();
-        if let Some(Confirm::Typed { secs }) = &self.confirm {
+        if let Some(Confirm::Typed { secs, .. }) = &self.confirm {
             lines = self.confirm_text(*secs);
         } else if let (false, Some(since)) = (self.link_ok, self.disconnected_since) {
             let secs = since.elapsed().as_secs();
@@ -1922,6 +2191,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         min(self.ack_due);
         min(self.notice_until);
         min(self.sess.exited.map(|e| e.2));
+        if let Some(Confirm::Typed { answer, .. }) = &self.confirm {
+            min(answer.deadline());
+        }
         if self.display.is_some()
             && ((!self.link_ok && self.disconnected_since.is_some())
                 || self.confirm_pending.is_some())
@@ -1937,12 +2209,24 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             && Instant::now() >= due
         {
             self.ack_due = None;
-            if let Some(upto) = self.sess.recv.ack_now() {
+            if let Some(upto) = self.sess.ack_now() {
                 self.send_ctl(&ControlMsg::Ack {
                     channel: ChannelId::TERMINAL,
                     upto,
                 });
             }
+        }
+        // A candidate whose time is up becomes the answer, unless the loop was late and a key
+        // is already waiting: that key cancels it, so it is left for the input branch.
+        let due = matches!(&self.confirm, Some(Confirm::Typed { answer, .. }) if answer.due());
+        if due
+            && !self.input_waiting()
+            && let Some(Confirm::Typed { answer, .. }) = &mut self.confirm
+            && let Some(yes) = answer.tick()
+        {
+            let enter_seen = answer.enter_seen;
+            self.confirmed(yes, enter_seen);
+            self.pump_input();
         }
         self.refresh_display()
     }
@@ -2026,15 +2310,101 @@ fn term_size(s: (u16, u16)) -> TermSize {
     TermSize::clamped(s.0, s.1)
 }
 
-fn prompt_answer(bytes: &[u8]) -> Option<bool> {
-    for &b in bytes {
-        match b {
-            b'y' | b'Y' => return Some(true),
-            b'n' | b'N' | b'q' | 0x1b | 0x03 => return Some(false),
-            _ => {}
-        }
+/// What a read from the keyboard says to a yes/no question.
+#[derive(Debug, PartialEq, Eq)]
+enum Chunk {
+    /// Exactly an answer key, optionally with its Enter in the same read.
+    Key { yes: bool, enter: bool },
+    /// Exactly an Enter.
+    Enter,
+    /// The release of a key (the kitty protocol's event types): not typing.
+    Release,
+    /// Anything else: other keys, a word, an arrow key (it starts with ESC), a paste.
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Yes,
+    No,
+    Enter,
+    Release,
+}
+
+/// Classifies a read. Only a chunk that is exactly the key counts, so a `y` somewhere in a word
+/// (`python`) or an escape sequence that merely starts with ESC is not an answer: taking a
+/// session back is a decision, and a stray key must not make it. The key may also arrive the
+/// way a terminal with an enhanced keyboard mode reports it (the remote program may have
+/// switched one on and our own terminal still be in it): kitty's `CSI 121 u` style (`y`, `n`,
+/// `q`, Enter `CSI 13 u`, ESC `CSI 27 u`, ^C `CSI 99;5 u`) and xterm's `modifyOtherKeys`
+/// (`CSI 27;5;99 ~`). Nothing is sent to the terminal to leave those modes.
+fn classify(bytes: &[u8]) -> Chunk {
+    let Some((first, n)) = token(bytes) else {
+        return Chunk::Other;
+    };
+    match (first, token(&bytes[n..])) {
+        (Tok::Release, None) if n == bytes.len() => Chunk::Release,
+        (Tok::Enter, None) if n == bytes.len() => Chunk::Enter,
+        (Tok::Yes | Tok::No, None) if n == bytes.len() => Chunk::Key {
+            yes: first == Tok::Yes,
+            enter: false,
+        },
+        (Tok::Yes | Tok::No, Some((Tok::Enter, m))) if n + m == bytes.len() => Chunk::Key {
+            yes: first == Tok::Yes,
+            enter: true,
+        },
+        _ => Chunk::Other,
     }
-    None
+}
+
+/// The first key in `bytes`, and how many bytes it takes.
+fn token(bytes: &[u8]) -> Option<(Tok, usize)> {
+    match bytes {
+        [b'y' | b'Y', ..] => Some((Tok::Yes, 1)),
+        [b'n' | b'N' | b'q' | 0x03, ..] => Some((Tok::No, 1)),
+        [b'\r' | b'\n', ..] => Some((Tok::Enter, 1)),
+        [0x1b, b'[', rest @ ..] => csi_key(rest).map(|(t, n)| (t, n + 2)),
+        // A bare ESC (anything after it that is not a key makes the chunk `Other`).
+        [0x1b, ..] => Some((Tok::No, 1)),
+        _ => None,
+    }
+}
+
+/// A key reported as a CSI sequence; `rest` follows `ESC [`.
+fn csi_key(rest: &[u8]) -> Option<(Tok, usize)> {
+    let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+    let (params, fin) = (std::str::from_utf8(&rest[..end]).ok()?, rest[end]);
+    let num = |s: &str| s.split(':').next().and_then(|n| n.parse::<u32>().ok());
+    let fields: Vec<&str> = params.split(';').collect();
+    // (key code, modifier field)
+    let (code, mods) = match (fin, fields.as_slice()) {
+        // kitty: CSI code[:alternates] ; modifiers[:event] u
+        (b'u', [code]) => (num(code)?, "1"),
+        (b'u', [code, mods]) => (num(code)?, *mods),
+        // xterm modifyOtherKeys: CSI 27 ; modifiers ; code ~
+        (b'~', [marker, mods, code]) if *marker == "27" => (num(code)?, *mods),
+        _ => return None,
+    };
+    let event = mods
+        .split(':')
+        .nth(1)
+        .and_then(|e| e.parse::<u32>().ok())
+        .unwrap_or(1);
+    let used = end + 1;
+    if event == 3 {
+        return Some((Tok::Release, used));
+    }
+    // Shift is part of Y/N; Caps Lock and Num Lock (bits 64 and 128) change nothing.
+    let bits = num(mods)?.saturating_sub(1) & !(64 | 128);
+    let tok = match (code, bits) {
+        (121 | 89, 0 | 1) => Tok::Yes,
+        (110 | 78 | 113 | 81, 0 | 1) => Tok::No,
+        (13, 0) => Tok::Enter,
+        (27, 0) => Tok::No,
+        (99, 4) => Tok::No, // Ctrl-C
+        _ => return None,
+    };
+    Some((tok, used))
 }
 
 async fn at(t: Option<Instant>) {
@@ -2070,7 +2440,104 @@ fn refused(chan: ChannelId, payload: &[u8]) -> bool {
 }
 
 fn send_on(tx: &Outbox, msg: &ControlMsg) {
-    if let Ok(bytes) = msg.encode() {
-        let _ = tx.send((ChannelId::CONTROL, Bytes::from(bytes)));
+    tx.control(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Keys(mpsc::UnboundedReceiver<TermEvent>);
+
+    impl TermInput for Keys {
+        async fn next(&mut self) -> TermEvent {
+            self.0.recv().await.unwrap_or(TermEvent::Eof)
+        }
+    }
+
+    struct Screen;
+
+    impl TermOutput for Screen {
+        fn size(&mut self) -> std::io::Result<(u16, u16)> {
+            Ok((80, 24))
+        }
+        fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn set_raw(&mut self, _: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn core() -> (Core<Keys, Screen>, mpsc::UnboundedSender<TermEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let term = Terminal {
+            input: Keys(rx),
+            output: Screen,
+            local_term: None,
+        };
+        let cfg = ClientConfig::new("main".parse().unwrap(), "host".parse().unwrap());
+        (Core::new(term, cfg, None).expect("core"), tx)
+    }
+
+    /// A confirmation whose lone `y` has waited out its 300 ms.
+    fn due_confirmation() -> Confirm {
+        let now = Instant::now();
+        Confirm::Typed {
+            secs: 0,
+            answer: Answer {
+                armed_at: now,
+                candidate: Some((true, now)),
+                enter_seen: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_due_candidate_waits_for_a_key_that_is_already_queued() {
+        let (mut core, keys) = core();
+        core.buf.push(b"ls\r");
+        core.confirm = Some(due_confirmation());
+        // The timer fires late and the next letter is already waiting: the tick leaves the
+        // candidate alone (the letter will cancel it), and loses nothing.
+        keys.send(TermEvent::Input(b"o".to_vec())).unwrap();
+        core.on_tick().unwrap();
+        assert!(core.confirm.is_some(), "the clock committed the key");
+        assert_eq!(core.stashed.len(), 1, "the waiting key was read ahead");
+        assert!(matches!(core.next_input().await, TermEvent::Input(b) if b == b"o"));
+        // With nothing waiting, the same tick commits it.
+        core.on_tick().unwrap();
+        assert!(core.confirm.is_none());
+        assert_eq!(core.pending, b"ls\r");
+    }
+
+    #[test]
+    fn answer_keys_are_classified_exactly() {
+        use Chunk::*;
+        let key = |yes, enter| Key { yes, enter };
+        assert_eq!(classify(b"y"), key(true, false));
+        assert_eq!(classify(b"Y\r"), key(true, true));
+        assert_eq!(classify(b"n\n"), key(false, true));
+        assert_eq!(classify(b"\x1b"), key(false, false));
+        assert_eq!(classify(b"\x03"), key(false, false));
+        assert_eq!(classify(b"\r"), Enter);
+        assert_eq!(classify(b"\x1b[121u"), key(true, false));
+        assert_eq!(classify(b"\x1b[121;1:1u"), key(true, false));
+        assert_eq!(classify(b"\x1b[121;1:3u"), Release);
+        assert_eq!(classify(b"\x1b[27;5;99~"), key(false, false));
+        assert_eq!(classify(b"\x1b[13u"), Enter);
+        for other in [
+            &b"yes"[..],
+            b"",
+            b"\x1b[A",
+            b"\x1bOP",
+            b"yy",
+            b"\x1b[121;5u",
+            b"\x1b[121",
+            b"y\r\r",
+            b"\x1b[121u\x1b[121u",
+        ] {
+            assert_eq!(classify(other), Other, "{other:?}");
+        }
     }
 }

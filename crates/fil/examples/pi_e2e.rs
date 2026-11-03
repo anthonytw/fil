@@ -257,6 +257,13 @@ impl Client {
         self.writer.flush().ok();
     }
 
+    /// Answers a yes/no question on the screen. The client ignores the keyboard until the typing
+    /// has paused for 300 ms, so that a word typed ahead cannot answer for the user.
+    fn answer(&mut self, key: &str) {
+        std::thread::sleep(Duration::from_millis(500));
+        self.send(key);
+    }
+
     /// The output with terminal escapes removed. The status line is painted one character at a
     /// time with cursor moves between, so a message reads straight once those are gone.
     fn plain(&self) -> Vec<u8> {
@@ -532,7 +539,7 @@ fn ls_detach_kill(ctx: &Ctx, host: &str) -> Res {
         })?;
     let told = t_det.elapsed();
     // The client asks whether to attach again; "n" leaves it alone and ends the client.
-    c1.send("n");
+    c1.answer("n");
     let (_, code) = c1
         .wait_exit(Duration::from_secs(10))
         .ok_or_else(|| format!("client did not exit after answering n\n{}", c1.tail()))?;
@@ -606,7 +613,7 @@ fn takeover(ctx: &Ctx, host: &str) -> Res {
         .ok_or_else(|| format!("first client was not told it was taken over\n{}", c1.tail()))?;
     let told = t0.elapsed();
     let msg = screen_fil_line(&c1.screen());
-    c1.send("n");
+    c1.answer("n");
     let (_, code) = c1
         .wait_exit(Duration::from_secs(10))
         .ok_or_else(|| format!("first client did not exit after answering n\n{}", c1.tail()))?;
@@ -749,7 +756,7 @@ fn daemon_restart(ctx: &Ctx, host: &str) -> Res {
         }
     }
     // Answer "y": a fresh session, in which the old shell's variable must be gone.
-    c.send("y");
+    c.answer("y");
     let from = c.len();
     thread::sleep(Duration::from_millis(500));
     c.send("echo DR3-$ZV-$((6*7))\r");

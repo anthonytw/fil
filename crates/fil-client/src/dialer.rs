@@ -176,8 +176,9 @@ pub enum SwapError {
     /// client carries on over the old link.
     #[error("the candidate link failed: {0}")]
     LinkFailed(String),
-    /// The daemon refused the resume on the candidate. The client carries on over the old link
-    /// (a refusal that also ends the session is handled as usual).
+    /// The daemon refused the resume on the candidate, whatever the reason. The client carries on
+    /// over the old link, which is still delivering and carries the real ending if the session
+    /// is gone, taken over or replaced.
     #[error("the daemon refused the resume: {0}")]
     Refused(String),
     /// The candidate had taken over (the old link was already dropped) and then died before its

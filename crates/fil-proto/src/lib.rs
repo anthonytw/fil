@@ -9,6 +9,7 @@
 //!   the resume-or-snapshot decision.
 //! - [`epoch`]: the one-subscriber-with-takeover state machine for a session.
 //! - [`sched`]: the pipe's frame scheduler (control and terminal ahead of forwarded data).
+//! - [`text`]: untrusted text made safe to show.
 //!
 //! The byte layout and the limits are documented in DESIGN.md section 8.5 ("Frames and channels").
 
@@ -21,6 +22,7 @@ pub mod msg;
 pub mod preamble;
 pub mod ring;
 pub mod sched;
+pub mod text;
 
 pub use frame::{ChannelClass, ChannelId, Frame, FrameDecoder, FrameError};
 pub use msg::ControlMsg;

@@ -24,10 +24,6 @@ async fn reconnect(rig: &Rig, attaches: usize) {
     settle().await;
 }
 
-fn lines(range: std::ops::Range<usize>) -> Vec<u8> {
-    range.flat_map(|i| numbered(i).into_bytes()).collect()
-}
-
 /// Terminal data that overtakes the catch-up `Snapshot` announcement (legal across channels).
 #[tokio::test(start_paused = true)]
 async fn review_output_overtaking_the_catch_up_announcement() {
@@ -42,7 +38,7 @@ async fn review_output_overtaking_the_catch_up_announcement() {
     rig.daemon.output(b"more\r\n").await;
     settle().await;
     assert!(!rig.is_finished(), "client died: {:?}", rig.finish().await);
-    let want = common::term::rows_of(&rig.daemon.screen(0).await);
+    let want = rig.daemon.screen(0).await.screen_text();
     assert_eq!(rig.term.rows(), want);
 }
 
@@ -205,7 +201,7 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     let row = st
         .screen
         .iter()
-        .position(|l| common::term::line_text(l).contains("fil:"))
+        .position(|l| l.text().contains("fil:"))
         .unwrap();
     eprintln!("status row {row}");
     rig.term.resize(60, 24);
@@ -223,20 +219,30 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     r.resize(fil_term::Size { cols: 60, rows: 24 });
     let want = r.state(1000);
     let got = rig.term.state();
-    assert_eq!(
-        common::term::rows_of(&got),
-        common::term::rows_of(&want),
-        "screen differs"
-    );
+    assert_eq!(got.screen_text(), want.screen_text(), "screen differs");
     // The window narrowed under the overlay, so the client did not trust the screen and took a
-    // snapshot (a fresh attach). The terminal had already re-wrapped the overlay's rows into
-    // its scrollback by then, which nothing can undo: the history keeps those fragments and
-    // gains the snapshot's lines, but loses nothing.
+    // snapshot. That is still a resume (same key, same epoch, no new ssh login, input kept) that
+    // asks to be repainted. The terminal had already re-wrapped the overlay's rows into its
+    // scrollback by then, which nothing can undo: the history keeps those fragments and gains
+    // the snapshot's lines, but loses nothing.
     assert!(
-        attaches[1].resume.is_none(),
-        "narrowing under the overlay forces a snapshot"
+        attaches[1].resume.is_some_and(|r| r.want_snapshot),
+        "narrowing under the overlay asks for a snapshot: {:?}",
+        attaches[1].resume
     );
-    let wh: Vec<_> = want.history.iter().map(common::term::line_text).collect();
+    assert_eq!(attaches[0].key, attaches[1].key, "the key is kept");
+    assert_eq!(
+        rig.dial.purposes(),
+        vec![
+            fil_client::DialPurpose::Attach,
+            fil_client::DialPurpose::Resume
+        ]
+    );
+    let wh: Vec<_> = want
+        .history
+        .iter()
+        .map(fil_term::model::Line::text)
+        .collect();
     let have = rig.term.history();
     assert!(have.len() >= wh.len());
     let mut it = have.iter();
@@ -246,9 +252,9 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     );
 }
 
-/// R2: a confirmation that a server chunk draws (after the light gates could not): the first `y`.
+/// R2: a confirmation that a server chunk draws (after the light gates could not): a `y` answers it.
 #[tokio::test(start_paused = true)]
-async fn review2_first_y_answers_a_confirmation_drawn_by_output() {
+async fn review2_y_answers_a_confirmation_drawn_by_output() {
     let mut cfg = config();
     cfg.offline.confirm_after = Some(Duration::from_secs(1));
     let daemon = FakeDaemon::new(4096);
@@ -272,7 +278,7 @@ async fn review2_first_y_answers_a_confirmation_drawn_by_output() {
     rig.daemon.output(b"\x1b[4l").await;
     settle().await;
     assert!(rig.term.text().contains("Send it?"), "{}", rig.term.text());
-    rig.type_str("y");
+    rig.answer("y").await;
     settle().await;
     let input = rig.daemon.input().await;
     assert_eq!(

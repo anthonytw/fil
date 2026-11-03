@@ -6,8 +6,9 @@
 //! then redraw the overlay. With nothing drawn, the result is exactly the server's bytes.
 //!
 //! Prediction is M3 and is not enabled: the overlay gets a predictor that never predicts. The
-//! hooks it will need are wired already: [`Display::input`] (keystrokes), [`Display::set_pty_mode`]
-//! (`PtyMode`, applied in order with the output) and [`Display::echo_ack`] (`EchoAck`).
+//! hooks it will need are wired already: [`Display::input`] (keystrokes) and
+//! [`Display::set_pty_mode`] (`PtyMode`, applied in order with the output). `EchoAck` is not
+//! asked for until M3 (the attach says `echo_ack: false`).
 
 use std::time::Duration;
 
@@ -52,8 +53,6 @@ pub struct Display {
     size: Size,
     start: Instant,
     pty: PtyMode,
-    echo_ack: Option<(u64, u64)>,
-    lines: Vec<String>,
 }
 
 impl Display {
@@ -76,8 +75,6 @@ impl Display {
             size,
             start: Instant::now(),
             pty: PtyMode::default(),
-            echo_ack: None,
-            lines: Vec::new(),
         }
     }
 
@@ -101,7 +98,6 @@ impl Display {
     pub fn reset(&mut self) {
         self.overlay = Self::overlay_for(&self.backend, self.size, &self.make_predictor);
         let _ = self.overlay.set_pty_mode(self.pty);
-        self.lines.clear();
     }
 
     /// The session is a different one: forget what is known about its PTY.
@@ -196,21 +192,11 @@ impl Display {
         self.pty.is_password()
     }
 
-    /// `EchoAck` from the daemon. The predictor will read it in M3; for now it is only kept.
-    pub fn echo_ack(&mut self, input_upto: u64, output_at: u64) {
-        self.echo_ack = Some((input_upto, output_at));
-    }
-
-    pub fn last_echo_ack(&self) -> Option<(u64, u64)> {
-        self.echo_ack
-    }
-
     /// Shows these lines (inverse video, one space of margin each side, wrapped to at most 40
     /// columns), or removes them when empty.
     /// Returns what to write; only the difference from what is already drawn. Calling it again
     /// with the same lines is cheap, and retries the drawing if a gate was closed before.
     pub fn set_lines(&mut self, lines: Vec<String>) -> Vec<u8> {
-        self.lines = lines.clone();
         let wrap_at = usize::from(self.size.cols).saturating_sub(4).clamp(8, 40);
         let status = if lines.is_empty() {
             None
@@ -225,10 +211,6 @@ impl Display {
             })
         };
         self.overlay.set_status(status).to_bytes()
-    }
-
-    pub fn has_lines(&self) -> bool {
-        !self.lines.is_empty()
     }
 
     /// Time since the display was created, for the overlay's clock.

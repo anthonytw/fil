@@ -5,17 +5,27 @@
 //!   panic hook that restores the saved settings before the panic message prints, and by the
 //!   [`TermEvent::Signal`] the loop turns into a normal return. `kill -9` and `process::exit`
 //!   skip all of them; a caller that exits the process must drop the terminal first.
-//! - **Input** is read on a thread that polls the terminal and only reads while raw mode is on, so
-//!   keystrokes typed while fil is connecting stay in the kernel's queue instead of being eaten
-//!   early. (kqueue cannot watch a tty on macOS, so tokio's async fd is not an option.)
+//! - **Input** is read on a thread that only reads while raw mode is on, so keystrokes typed while
+//!   fil is connecting stay in the kernel's queue instead of being eaten early. (kqueue cannot
+//!   watch a tty on macOS, so tokio's async fd is not an option.) The thread sleeps in `poll`
+//!   with no timeout, on the terminal (while raw mode is on) and on a self-pipe that raw-mode
+//!   changes and shutdown write to: an idle client makes no wakeups for it.
 //! - **Output** is written with blocking writes, in a loop that handles partial writes and
-//!   `EINTR`/`EAGAIN`.
+//!   `EINTR`/`EAGAIN`. The client loop runs on the main thread (`block_on`), so a terminal that
+//!   cannot keep up applies backpressure to that loop, by design: the loop stops reading the
+//!   link, stops acknowledging output the terminal has not taken, and the daemon's catch-up rule
+//!   (DESIGN.md section 6.2) skips a slow client ahead with a snapshot instead of buffering
+//!   without bound. Liveness does not wait on the loop: the links' heartbeats and watchdogs run
+//!   on the runtime's worker threads. What does wait is the user's own input, resizes and
+//!   signals, which are read by the same loop; against a terminal that has stopped for good (XOFF,
+//!   a hung emulator) the way out is the terminal's, not ours. If that ever matters, the fix is a
+//!   dedicated writer thread with a bounded queue, not `block_in_place` (which has no worker to
+//!   hand off from the main thread).
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -65,7 +75,8 @@ impl RawGuard {
         if let Ok(mut slot) = PANIC_RESTORE.lock() {
             *slot = Some((for_panic, saved.clone()));
         }
-        // Drain, not flush: typeahead stays queued for the session.
+        // Drain, not flush: typeahead stays queued for the session. (Entering only: output
+        // still queued must reach the terminal as it was written, in cooked mode.)
         tcsetattr(&fd, OptionalActions::Drain, &raw).map_err(errno)?;
         Ok(RawGuard { fd, saved })
     }
@@ -73,7 +84,9 @@ impl RawGuard {
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = tcsetattr(&self.fd, OptionalActions::Drain, &self.saved);
+        // `Now`, not `Drain`: draining waits for the terminal to take all queued output, and a
+        // terminal that has stopped reading (XOFF, a stuck emulator) would hang the exit forever.
+        let _ = tcsetattr(&self.fd, OptionalActions::Now, &self.saved);
         if let Ok(mut slot) = PANIC_RESTORE.lock() {
             *slot = None;
         }
@@ -84,6 +97,41 @@ struct Shared {
     /// Raw mode is on: the reader may read.
     enabled: AtomicBool,
     stop: AtomicBool,
+    /// The write end of the reader thread's self-pipe.
+    wake_tx: OwnedFd,
+}
+
+impl Shared {
+    /// Wakes the reader thread out of `poll` to look at `enabled` and `stop` again.
+    fn wake(&self) {
+        // Non-blocking: a full pipe already holds a wakeup.
+        let _ = rustix::io::write(&self.wake_tx, &[1]);
+    }
+}
+
+/// A pipe whose two ends never block and do not leak into children.
+///
+/// Where the OS has `pipe2` (Linux, the BSDs) both flags are set atomically, so a child spawned
+/// by another thread at the same moment cannot inherit it. macOS has no `pipe2`: there the flags
+/// are set right after `pipe()`, and a `fork`+`exec` on another thread between the two calls
+/// could inherit the two ends. That child would only hold a pipe open (it never writes to
+/// it, and the reader thread never sees EOF on it), so the window is harmless; it is closed as
+/// far as the platform allows by setting the flags before anything else is done with the fds.
+fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(not(any(target_vendor = "apple", target_os = "haiku", target_os = "aix")))]
+    {
+        use rustix::pipe::{PipeFlags, pipe_with};
+        pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map_err(errno)
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "haiku", target_os = "aix"))]
+    {
+        let (rx, tx) = rustix::pipe::pipe().map_err(errno)?;
+        for fd in [&rx, &tx] {
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).map_err(errno)?;
+            rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(errno)?;
+        }
+        Ok((rx, tx))
+    }
 }
 
 /// The output half of a real terminal.
@@ -103,6 +151,7 @@ pub struct TtyInput {
 impl Drop for TtyInput {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.wake();
         for t in &self.tasks {
             t.abort();
         }
@@ -127,9 +176,11 @@ pub fn from_fds(
     if !rustix::termios::isatty(&input) || !rustix::termios::isatty(&output) {
         return Err(io::Error::other("fil needs a terminal on stdin and stdout"));
     }
+    let (wake_rx, wake_tx) = self_pipe()?;
     let shared = Arc::new(Shared {
         enabled: AtomicBool::new(false),
         stop: AtomicBool::new(false),
+        wake_tx,
     });
     // Bounded: when the client stops reading (a big paste on a slow link) the reader thread
     // blocks, and the kernel's queue pushes back on the terminal.
@@ -166,7 +217,7 @@ pub fn from_fds(
     let reader_shared = shared.clone();
     std::thread::Builder::new()
         .name("fil-tty-input".into())
-        .spawn(move || read_loop(input, tx, reader_shared))?;
+        .spawn(move || read_loop(input, wake_rx, tx, reader_shared))?;
 
     Ok(Terminal {
         input: TtyInput {
@@ -190,23 +241,21 @@ fn winsize<Fd: AsFd>(fd: Fd) -> (u16, u16) {
     }
 }
 
-fn read_loop(fd: OwnedFd, tx: mpsc::Sender<TermEvent>, shared: Arc<Shared>) {
+fn read_loop(fd: OwnedFd, wake_rx: OwnedFd, tx: mpsc::Sender<TermEvent>, shared: Arc<Shared>) {
     let mut buf = [0u8; 4096];
-    let tick = rustix::event::Timespec {
-        tv_sec: 0,
-        tv_nsec: 50_000_000,
-    };
     loop {
         if shared.stop.load(Ordering::SeqCst) {
             return;
         }
-        if !shared.enabled.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&tick)) {
-            Ok(0) => continue,
+        // Sleep until the terminal has something (only while raw mode is on) or someone wakes
+        // us: no timeout, so an idle client costs nothing here.
+        let enabled = shared.enabled.load(Ordering::SeqCst);
+        let mut fds = [
+            PollFd::new(&wake_rx, PollFlags::IN),
+            PollFd::new(&fd, PollFlags::IN),
+        ];
+        let watched = if enabled { 2 } else { 1 };
+        match poll(&mut fds[..watched], None) {
             Ok(_) => {}
             Err(Errno::INTR) => continue,
             Err(_) => {
@@ -214,8 +263,14 @@ fn read_loop(fd: OwnedFd, tx: mpsc::Sender<TermEvent>, shared: Arc<Shared>) {
                 return;
             }
         }
+        if !fds[0].revents().is_empty() {
+            // Raw mode changed, or we are to stop: drain the pipe and look again.
+            let mut sink = [0u8; 64];
+            while matches!(rustix::io::read(&wake_rx, &mut sink[..]), Ok(n) if n > 0) {}
+            continue;
+        }
         // Raw mode may have been left while we waited: do not eat the shell's input.
-        if !shared.enabled.load(Ordering::SeqCst) {
+        if !enabled || !shared.enabled.load(Ordering::SeqCst) {
             continue;
         }
         match rustix::io::read(&fd, &mut buf[..]) {
@@ -247,25 +302,31 @@ impl TermInput for TtyInput {
     }
 }
 
+/// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`.
+fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                // The terminal is full: wait for room (backpressure, see the module docs).
+                let mut fds = [PollFd::new(fd, PollFlags::OUT)];
+                let _ = poll(&mut fds, None);
+            }
+            Err(e) => return Err(errno(e)),
+        }
+    }
+    Ok(())
+}
+
 impl TermOutput for TtyOutput {
     fn size(&mut self) -> io::Result<(u16, u16)> {
         Ok(winsize(&self.fd))
     }
 
-    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            match rustix::io::write(&self.fd, bytes) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => bytes = &bytes[n..],
-                Err(Errno::INTR) => {}
-                Err(Errno::AGAIN) => {
-                    let mut fds = [PollFd::new(&self.fd, PollFlags::OUT)];
-                    let _ = poll(&mut fds, None);
-                }
-                Err(e) => return Err(errno(e)),
-            }
-        }
-        Ok(())
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write_fd(&self.fd, bytes)
     }
 
     fn set_raw(&mut self, raw: bool) -> io::Result<()> {
@@ -278,6 +339,7 @@ impl TermOutput for TtyOutput {
             self.shared.enabled.store(false, Ordering::SeqCst);
             self.raw = None;
         }
+        self.shared.wake();
         Ok(())
     }
 }
@@ -285,6 +347,7 @@ impl TermOutput for TtyOutput {
 impl Drop for TtyOutput {
     fn drop(&mut self) {
         self.shared.enabled.store(false, Ordering::SeqCst);
+        self.shared.wake();
         // Dropping the guard restores the saved settings.
         self.raw = None;
     }

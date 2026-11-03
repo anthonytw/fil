@@ -10,12 +10,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fil_client::{
-    ClientConfig, ClientError, DialError, DialPurpose, Dialed, Dialer, Outcome, TermEvent,
-};
+use fil_client::{ClientConfig, ClientError, DialError, DialPurpose, Dialed, Dialer, Outcome};
 use fil_proto::msg::PublicKey;
+use fil_transport::LinkKind;
 use fil_transport::link::mem::{self, MemControl, MemLink};
-use fil_transport::{LinkKind, LinkState};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -96,7 +94,7 @@ impl DialShared {
     }
 
     fn connect(&self, kind: LinkKind) -> MemLink {
-        let (a, b, ctl) = mem::pair(kind, 4096);
+        let (a, b, ctl) = mem::pair_with(kind, 4096, mem::Delivery::ControlFirst);
         self.controls.lock().unwrap().push(ctl.clone());
         self.daemon.accept(b, ctl);
         a
@@ -110,7 +108,7 @@ impl DialShared {
 
     /// A candidate whose daemon end nobody serves: it never answers.
     pub fn offer_silent_swap(&self, kind: LinkKind) -> MemControl {
-        let (a, b, ctl) = mem::pair(kind, 4096);
+        let (a, b, ctl) = mem::pair_with(kind, 4096, mem::Delivery::ControlFirst);
         // Keep the far end alive so the link does not die by itself.
         std::mem::forget(b);
         let _ = self.swap_tx.send(Dialed::new(a));
@@ -180,7 +178,7 @@ impl Dialer for TestDialer {
             Some(Step::Fail(e)) => Err(e),
             Some(Step::Hang) => std::future::pending().await,
             Some(Step::DeadOnArrival) => {
-                let (a, _b, ctl) = mem::pair(LinkKind::Pipe, 8);
+                let (a, _b, ctl) = mem::pair_with(LinkKind::Pipe, 8, mem::Delivery::ControlFirst);
                 ctl.kill(fil_transport::DownReason::Dead);
                 Ok(Dialed::new(a))
             }
@@ -307,13 +305,13 @@ impl Rig {
         self.term.type_bytes(s.as_bytes());
     }
 
-    pub fn press(&self, ev: TermEvent) {
-        match ev {
-            TermEvent::Input(b) => self.term.type_bytes(&b),
-            TermEvent::Resize { cols, rows } => self.term.resize(cols, rows),
-            TermEvent::Signal(n) => self.term.signal(n),
-            TermEvent::Eof => self.term.eof(),
-        }
+    /// Answers a yes/no question the client has put on the screen: after the pause a person
+    /// who has read it takes (a question ignores the keyboard until the typing has stopped).
+    /// The key is a candidate until the typing has stayed quiet for 300 ms, which this waits out.
+    pub async fn answer(&self, s: &str) {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        self.type_str(s);
+        tokio::time::sleep(Duration::from_millis(350)).await;
     }
 }
 
@@ -322,6 +320,24 @@ pub fn numbered(i: usize) -> String {
     format!("line {i:04}\r\n")
 }
 
-pub fn is_up(s: &LinkState) -> bool {
-    matches!(s, LinkState::Up)
+/// The numbered lines `range`, as one chunk of output.
+pub fn lines(range: std::ops::Range<usize>) -> Vec<u8> {
+    range.flat_map(|i| numbered(i).into_bytes()).collect()
+}
+
+/// What an 80x24 emulator that saw only `output` shows (the oracle for "the terminal got the
+/// server's bytes exactly).
+pub fn reference(output: &[u8]) -> fil_term::TermState {
+    reference_sized(output, 80, 24)
+}
+
+pub fn reference_sized(output: &[u8], cols: u16, rows: u16) -> fil_term::TermState {
+    let mut r = fil_term::create(
+        fil_term::DEFAULT_BACKEND,
+        fil_term::Size { cols, rows },
+        1000,
+    )
+    .expect("default backend");
+    r.feed(output);
+    r.state(1000)
 }

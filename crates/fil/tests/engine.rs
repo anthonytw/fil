@@ -239,6 +239,8 @@ async fn a_fresh_attach_after_a_replaced_session_gets_a_new_key_through_a_new_pi
         rig.term.text().contains("is a different session now")
     })
     .await;
+    // A question only takes an answer after the typing has paused.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     rig.term.type_bytes(b"y");
     until_async("the fresh attach", 60, || async {
         rig.fake.pipe_runs() >= 2
@@ -356,6 +358,8 @@ async fn review_links_dying_mid_snapshot_do_not_storm_ssh() {
         }
     });
     let before = rig.fake.pipe_runs();
+    // A question only takes an answer after the typing has paused.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     rig.term.type_bytes(b"y");
     until_async("the fresh run", 10, || async {
         rig.fake.pipe_runs() > before
@@ -446,6 +450,8 @@ async fn the_fresh_attach_pipe_after_a_long_healthy_pipe_is_a_background_run() {
     })
     .await;
     let before = rig.fake.pipe_runs();
+    // A question only takes an answer after the typing has paused.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     rig.term.type_bytes(b"y");
     until_async("the fresh run", 30, || async {
         rig.fake.pipe_runs() > before

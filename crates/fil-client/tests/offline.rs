@@ -168,7 +168,7 @@ async fn a_long_outage_shows_what_was_typed_and_asks() {
     // Held until answered: a late Ctrl-C cannot land by surprise.
     assert_eq!(rig.daemon.input().await, b"");
     // Other keys are not an answer, and are not sent either.
-    rig.type_str("q");
+    rig.answer("q").await;
     // (q means no, like Esc.)
     settle().await;
     assert!(!rig.term.text().contains("Send it?"));
@@ -190,7 +190,7 @@ async fn answering_yes_sends_the_buffer_and_the_prompt_leaves_no_trace() {
     rig.type_str("x"); // not an answer
     settle().await;
     assert!(rig.term.text().contains("Send it?"));
-    rig.type_str("y");
+    rig.answer("y").await;
     settle().await;
     assert_eq!(rig.daemon.input().await, b"pwd\r");
     assert_eq!(rig.term.state(), before);
@@ -208,7 +208,7 @@ async fn answering_no_discards_the_buffer() {
     rig.type_str("dangerous\r");
     tokio::time::sleep(Duration::from_secs(20)).await;
     back(&rig, 2).await;
-    rig.type_str("n");
+    rig.answer("n").await;
     settle().await;
     assert_eq!(rig.daemon.input().await, b"");
     assert!(!rig.term.text().contains("Send it?"));
@@ -249,7 +249,7 @@ async fn losing_the_link_during_the_confirmation_asks_again_later() {
     tokio::time::sleep(Duration::from_secs(20)).await;
     back(&rig, 3).await;
     assert!(rig.term.text().contains("Send it?"));
-    rig.type_str("y");
+    rig.answer("y").await;
     settle().await;
     assert_eq!(rig.daemon.input().await, b"ls\r");
 }
@@ -366,18 +366,141 @@ async fn a_log_command_gets_the_keystrokes_on_stdin() {
 
 // ---- confirmation details ------------------------------------------------------------------
 
-#[tokio::test(start_paused = true)]
-async fn what_follows_the_answer_in_the_same_read_is_ordinary_typing() {
+/// A confirmation that has just appeared, with `ls\r` held behind it.
+async fn confirming_rig() -> Rig {
     let rig = start(confirming());
     rig.attached().await;
     offline(&rig).await;
-    rig.type_str("pwd\r");
+    rig.type_str("ls\r");
     tokio::time::sleep(Duration::from_secs(20)).await;
     back(&rig, 2).await;
     assert!(rig.term.text().contains("Send it?"));
+    rig
+}
+
+#[tokio::test(start_paused = true)]
+async fn typing_that_was_under_way_does_not_answer_the_confirmation() {
+    let rig = confirming_rig().await;
+    // The user is in the middle of "python": the `y` is a letter of it, whether it came in a read
+    // of its own or inside the chunk.
+    for part in ["p", "y", "t", "h", "o", "n"] {
+        rig.type_str(part);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
     rig.type_str("yls\r");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.term.text().contains("Send it?"), "still asking");
+    assert_eq!(rig.daemon.input().await, b"", "the held keys were released");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_that_starts_a_word_after_a_pause_is_not_an_answer() {
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // "you": the `y` is alone in its read, but more typing follows it at once.
+    rig.type_str("y");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.type_str("o");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.type_str("u");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.term.text().contains("Send it?"), "still asking");
+    assert_eq!(rig.daemon.input().await, b"");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_deadline_does_not_commit_a_key_over_the_one_that_follows_it() {
+    // The loop picks between its timer and the keyboard at random when both are ready, so the
+    // late-timer case is repeated until a wrong choice would have shown.
+    for _ in 0..20 {
+        let rig = confirming_rig().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.type_str("y");
+        settle().await;
+        rig.type_str("o"); // already waiting when the 300 ms are up
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            rig.daemon.input().await,
+            b"",
+            "\"yo\" released the held keys"
+        );
+        assert!(rig.term.text().contains("Send it?"), "still asking");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_confirmation_takes_enhanced_keyboard_reports_too() {
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Ctrl-C as kitty reports it, and an arrow key: only the first answers (no).
+    rig.type_str("\x1b[A");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(rig.term.text().contains("Send it?"));
+    rig.type_str("\x1b[99;5u");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!rig.term.text().contains("Send it?"));
+    assert_eq!(rig.daemon.input().await, b"");
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("\x1b[121u"); // y
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.type_str("\x1b[13u"); // Enter
     settle().await;
-    assert_eq!(rig.daemon.input().await, b"pwd\rls\r");
+    assert_eq!(rig.daemon.input().await, b"ls\r");
+}
+
+#[tokio::test(start_paused = true)]
+async fn arrow_keys_and_escape_sequences_do_not_discard_the_buffer() {
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for seq in ["\x1b[A", "\x1b[B", "\x1bOP", "\x1b[1;5C"] {
+        rig.type_str(seq);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(rig.term.text().contains("Send it?"), "still asking");
+    // A bare ESC is a "no" (after a pause), and does discard.
+    rig.answer("\x1b").await;
+    assert!(!rig.term.text().contains("Send it?"));
+    assert_eq!(rig.daemon.input().await, b"");
+}
+
+#[tokio::test(start_paused = true)]
+async fn y_with_its_enter_in_one_read_answers_at_once_and_a_late_enter_is_swallowed() {
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("y\r");
+    settle().await;
+    assert_eq!(
+        rig.daemon.input().await,
+        b"ls\r",
+        "answered without the quiet wait"
+    );
+    // The Enter of "y, Enter" typed as two reads is the end of the answer, not the session's.
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("y");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.type_str("\r");
+    settle().await;
+    assert_eq!(
+        rig.daemon.input().await,
+        b"ls\r",
+        "the Enter answered; it was not typed"
+    );
+    // And an Enter after the quiet period has already committed the answer is swallowed once.
+    let rig = confirming_rig().await;
+    rig.answer("y").await;
+    rig.type_str("\r");
+    settle().await;
+    assert_eq!(
+        rig.daemon.input().await,
+        b"ls\r",
+        "the late Enter reached the session"
+    );
+    rig.type_str("\r");
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"ls\r\r", "but only the first");
 }
 
 #[tokio::test(start_paused = true)]
@@ -396,7 +519,7 @@ async fn the_confirmation_is_drawn_even_when_the_stream_stopped_at_a_pending_wra
     back(&rig, 2).await;
     let text = rig.term.text();
     assert!(text.contains("Send it?"), "{text}");
-    rig.type_str("y");
+    rig.answer("y").await;
     settle().await;
     assert_eq!(rig.daemon.input().await, b"ls\r");
 }

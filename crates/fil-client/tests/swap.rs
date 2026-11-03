@@ -7,19 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use fil_client::{Backoff, DialPurpose, SwapError};
-use fil_term::Size;
 use fil_transport::{DownReason, LinkKind};
-
-fn reference(output: &[u8]) -> fil_term::TermState {
-    let mut r =
-        fil_term::create(fil_term::DEFAULT_BACKEND, Size { cols: 80, rows: 24 }, 1000).unwrap();
-    r.feed(output);
-    r.state(1000)
-}
-
-fn lines(range: std::ops::Range<usize>) -> Vec<u8> {
-    range.flat_map(|i| numbered(i).into_bytes()).collect()
-}
 
 // ---- attached ------------------------------------------------------------------------------
 

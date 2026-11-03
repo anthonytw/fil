@@ -51,7 +51,7 @@ async fn taking_it_back_is_a_fresh_attach_with_a_new_key() {
     rig.type_str("x");
     settle().await;
     assert!(rig.term.text().contains("Take it back?"));
-    rig.type_str("y");
+    rig.answer("y").await;
     until_async("the new attach", 30, || async {
         rig.daemon.attaches().await.len() == 2
     })
@@ -84,7 +84,7 @@ async fn declining_to_take_it_back_ends_with_the_message_and_a_restored_terminal
         rig.term.text().contains("Take it back?")
     })
     .await;
-    rig.type_str("n");
+    rig.answer("n").await;
     let term = rig.term.clone();
     let out = rig.finish().await.unwrap();
     assert_eq!(
@@ -120,7 +120,7 @@ async fn a_takeover_found_out_on_resume_is_the_same_prompt() {
         a.last().unwrap().resume.is_some(),
         "the resume was refused, not granted"
     );
-    rig.type_str("n");
+    rig.answer("n").await;
     assert!(matches!(
         rig.finish().await.unwrap(),
         Outcome::TakenOver { .. }
@@ -144,7 +144,7 @@ async fn a_replaced_session_says_so_and_offers_a_fresh_attach() {
     let text = rig.term.text();
     assert!(text.contains("killed and recreated"), "{text}");
     assert!(text.contains("will be discarded"), "{text}");
-    rig.type_str("y");
+    rig.answer("y").await;
     until_async("the fresh attach", 30, || async {
         rig.daemon.attaches().await.len() == 3
     })
@@ -167,7 +167,7 @@ async fn declining_a_replaced_session_ends_cleanly() {
         rig.term.text().contains("different session now")
     })
     .await;
-    rig.type_str("n");
+    rig.answer("n").await;
     let term = rig.term.clone();
     assert_eq!(rig.finish().await.unwrap(), Outcome::SessionReplaced);
     assert!(term.text().contains("is a different session now"));
@@ -184,7 +184,7 @@ async fn a_session_detached_from_elsewhere_offers_to_attach_again() {
     .await;
     // The daemon told the client: it did not reconnect to find out.
     assert_eq!(rig.daemon.attaches().await.len(), 1);
-    rig.type_str("y");
+    rig.answer("y").await;
     until_async("the fresh attach", 30, || async {
         rig.daemon.attaches().await.len() == 2
     })
@@ -200,7 +200,7 @@ async fn declining_a_detached_session_ends_cleanly() {
         rig.term.text().contains("detached from elsewhere")
     })
     .await;
-    rig.type_str("n");
+    rig.answer("n").await;
     assert_eq!(rig.finish().await.unwrap(), Outcome::DetachedElsewhere);
 }
 
@@ -239,19 +239,15 @@ async fn the_prompt_leaves_the_screen_as_it_was() {
     .await;
     assert_ne!(rig.term.state().screen, before.screen);
     // Answering no restores everything before the closing message is printed.
-    rig.type_str("n");
+    rig.answer("n").await;
     let term = rig.term.clone();
     let _ = rig.finish().await.unwrap();
     // The scrollback is untouched, and the rows above the message are the originals.
     assert_eq!(term.state().history, before.history);
     let after = term.rows();
-    let was = fil_term_rows(&before);
+    let was = before.screen_text();
     // The closing message goes below the cursor row (row 2); everything above is original.
     for i in 0..3 {
         assert_eq!(after[i], was[i], "row {i}");
     }
-}
-
-fn fil_term_rows(s: &fil_term::TermState) -> Vec<String> {
-    common::term::rows_of(s)
 }

@@ -1,26 +1,9 @@
 //! Text shown to the user: sanitizing untrusted text, rendering keystrokes, formatting times.
 
-/// Characters the transport's sanitizer (`fil_transport::pipe::sanitize_banner`) does not catch
-/// but that are invisible or reorder text all the same: filler and combining joiners,
-/// variation selectors, the whole tag block.
-fn is_extra_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{034F}'
-        | '\u{115F}'..='\u{1160}'
-        | '\u{3164}'
-        | '\u{FE00}'..='\u{FE0F}'
-        | '\u{E0000}'..='\u{E007F}'
-        | '\u{E0100}'..='\u{E01EF}')
-}
-
 /// Untrusted text made safe to show: invalid UTF-8 replaced, control and invisible characters
-/// removed (the transport's list plus [`is_extra_invisible`]), tabs turned into spaces.
+/// removed ([`fil_proto::text::sanitize`], the one list), tabs turned into spaces.
 fn clean(raw: &[u8]) -> String {
-    fil_transport::pipe::sanitize_banner(raw)
-        .chars()
-        .filter(|&c| !is_extra_invisible(c))
-        .map(|c| if c == '\t' { ' ' } else { c })
-        .collect()
+    fil_proto::text::sanitize(raw).replace('\t', " ")
 }
 
 /// Untrusted text (the pipe's skipped banner, for one) as a list of lines. At most `max_lines`
@@ -161,7 +144,7 @@ mod tests {
         let joined = lines.join(" / ");
         for c in joined.chars() {
             assert!(
-                !c.is_control() && !is_extra_invisible(c),
+                !c.is_control() && !fil_proto::text::is_invisible(c),
                 "{c:?} survived in {joined:?}"
             );
         }

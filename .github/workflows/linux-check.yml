@@ -65,8 +65,9 @@ jobs:
   realnet:
     # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
     # in Docker containers (ssh part), the real Linux network stack with NAT and tc netem in
-    # network namespaces (udp part) and a systemd host in a privileged container (sysd part).
-    # Three parts, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
+    # network namespaces (udp part), a systemd host in a privileged container (sysd part) and the
+    # M2 port forwards in the udp part's topology (fwd part, docs/m2/realnet.md).
+    # Four parts, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
     # the one part `latency` (the latency lab, docs/m2/latency.md) instead. It builds `fil` and the test
     # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
     # release-target check.
@@ -75,11 +76,11 @@ jobs:
     # runner.
     if: inputs.suite != 'check' && inputs.suite != 'aarch64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd"]') }}
+        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd","fwd"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -254,6 +254,7 @@ impl Client {
             term: "xterm-256color".parse().unwrap(),
             host: c.host.parse().unwrap(),
             key: c.key,
+            echo_ack: false,
             resume: c.resume,
         };
         let h = h.clone();
@@ -310,6 +311,7 @@ impl Client {
             incarnation: r.incarnation,
             epoch: r.epoch,
             seq: self.next,
+            want_snapshot: false,
         }
     }
 

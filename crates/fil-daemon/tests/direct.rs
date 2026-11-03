@@ -255,6 +255,7 @@ async fn a_key_does_not_outlive_its_session() {
         incarnation: 1,
         epoch: 1,
         seq: 0,
+        want_snapshot: false,
     };
     let ck2 = ClientKey::generate().unwrap();
     let r = Client::attach(

@@ -259,6 +259,7 @@ mod tests {
             incarnation: INC,
             epoch,
             seq: 100,
+            want_snapshot: false,
         })
     }
 

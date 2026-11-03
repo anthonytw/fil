@@ -76,6 +76,7 @@ pub mod echo;
 pub mod env;
 mod forward;
 mod handle;
+pub mod nofile;
 pub mod proc;
 mod pty;
 pub mod queries;

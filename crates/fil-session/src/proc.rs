@@ -146,6 +146,7 @@ fn output_with_timeout(
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
+    crate::nofile::restore_on_exec(&mut cmd);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,10 +461,11 @@ pub fn scan_processes() -> Vec<ProcRow> {
             })
             .collect();
     }
-    Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
-        .env("LC_ALL", "C")
-        .output()
+    let mut ps = Command::new("ps");
+    ps.args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+        .env("LC_ALL", "C");
+    crate::nofile::restore_on_exec(&mut ps);
+    ps.output()
         .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }

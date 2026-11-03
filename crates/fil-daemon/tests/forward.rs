@@ -143,7 +143,10 @@ async fn forward_requests_and_the_ports_answer() {
     let Some(ListenState::Listening { port }) = f.listen else {
         panic!("not bound: {:?}", f.listen);
     };
-    assert_eq!(ports(&d, Some("main")).await.unwrap(), rows);
+    // The same forward row for the session alone (the session row's output time moves on).
+    let focused = ports(&d, Some("main")).await.unwrap();
+    assert_eq!(focused.len(), 2);
+    assert_eq!(focused[1], rows[1]);
     // The -R listener is the daemon's own: discovery never lists it as anyone's listener.
     let all = all_ports(&d, None).await.unwrap();
     assert!(

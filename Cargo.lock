@@ -522,6 +522,7 @@ dependencies = [
  "fil-transport",
  "nix",
  "portable-pty",
+ "rustix",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

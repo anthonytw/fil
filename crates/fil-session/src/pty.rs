@@ -131,7 +131,10 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
 static OPEN_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, SpawnError> {
-    let cmd = build_command(cfg, scope)?;
+    let mut cmd = build_command(cfg, scope)?;
+    // The child starts with the descriptor limit the daemon had before it raised its own
+    // (`crate::nofile`), through the trampoline.
+    crate::nofile::wrap(&mut cmd).map_err(SpawnError::Pty)?;
     let _open = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let pair = native_pty_system()
         .openpty(size_of(cfg.size))

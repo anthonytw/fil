@@ -1314,3 +1314,24 @@ async fn own_process_group_puts_the_command_in_a_group_of_its_own() {
     assert_ne!(child, ours, "still in our group");
     assert!(!child.is_empty());
 }
+
+/// Efficiency sweep #7: the round-trip time differs a little on every heartbeat, and each change
+/// used to be published, waking the engine and the link watchers once a second for nothing. Only
+/// a change of 10 % or 2 ms is published now.
+#[tokio::test(start_paused = true)]
+async fn jitter_in_the_round_trip_time_does_not_wake_the_status_watchers() {
+    let jittery = StreamConfig {
+        latency: MS(50),
+        jitter: MS(3),
+        ..StreamConfig::default()
+    };
+    let (a, _b, _) = pair(jittery, cfg(), cfg()).await;
+    let mut st = a.status();
+    st.borrow_and_update();
+    let mut updates = 0;
+    let end = Instant::now() + Duration::from_secs(30);
+    while let Ok(Ok(())) = tokio::time::timeout_at(end, st.changed()).await {
+        updates += 1;
+    }
+    assert!(updates <= 3, "{updates} status updates in 30 s of idle");
+}

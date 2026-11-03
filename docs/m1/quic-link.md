@@ -71,9 +71,9 @@ A peer that breaks a rule (length 0 or too large, a bad channel id, a second str
 
 ### Liveness and path changes
 
-- quinn's keep-alive is `heartbeat`, its idle timeout is `dead_after`. The link also closes itself with `Down(Dead)` once `dead_after` has passed without a datagram from the peer: quinn's idle timer restarts when it sends a keep-alive, so alone it can run up to a heartbeat late (5.8 s instead of 5 s was seen in the simulator).
+- The client's quinn keep-alive is `heartbeat` (the daemon sends none; see DESIGN.md §8.5), the idle timeout is `dead_after`. The link also closes itself with `Down(Dead)` once `dead_after` has passed without a datagram from the peer: quinn's idle timer restarts when it sends a keep-alive, so alone it can run up to a heartbeat late (5.8 s instead of 5 s was seen in the simulator).
 - Liveness counts datagrams received from the network, not frames handed to `recv`. A consumer that stops reading backs up one channel at a time (QUIC flow control), but never hides a dead path and never makes a healthy one look dead.
-- `Degraded` appears after `degraded_after` without a datagram from the peer, and clears when one arrives. The link samples quinn's counters every 100 ms at most.
+- `Degraded` appears after `degraded_after` without a datagram from the peer, and clears when one arrives. The link samples quinn's counters every 500 ms while healthy and every 100 ms or less once the peer has been quiet for a heartbeat and a half.
 - `path_generation` counts changes of the peer's address. **The daemon sees every change of the client's source address** (that is how quinn follows a NAT rebind or a new IP), so its link's generation rises with each. **A client cannot see its own NAT rebind**, and sees a change of its local IP only where the OS reports the local address of received packets to quinn. Nothing on the client needs it: the daemon's link is where a path change matters (the status line can say "roaming" there), and the client's own sockets keep working.
 - `QuicLink::send` with a payload outside the allowed size is a caller bug: it returns an `Io` error and the link stays up.
 

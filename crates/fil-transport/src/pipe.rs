@@ -92,6 +92,23 @@ pub struct PipeConfig {
     /// How long a command that was asked to finish (its stdin closed) may take before it is
     /// killed. Default 1 s.
     pub close_grace: Duration,
+    /// What happens to the command's stderr ([`PipeLink::spawn`] only). Default `Inherit`.
+    pub stderr: PipeStderr,
+}
+
+/// Where a pipe command's stderr goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PipeStderr {
+    /// The user's terminal: ssh's password and Touch ID prompts and its errors stay visible. Right
+    /// while the user is waiting for the first attach.
+    #[default]
+    Inherit,
+    /// Discarded.
+    Null,
+    /// Kept, the last few KiB, for [`PipeLink::stderr_text`] and [`PipeError::stderr_text`]. Right
+    /// for a run nobody is watching: the terminal belongs to the session, and the reason ssh gave
+    /// is worth showing in the status line and the log.
+    Capture,
 }
 
 impl PipeConfig {
@@ -106,6 +123,7 @@ impl PipeConfig {
             forward_share: fil_proto::limits::DEFAULT_FORWARD_SHARE,
             inbound_budget: 2 * 1024 * 1024,
             close_grace: Duration::from_secs(1),
+            stderr: PipeStderr::Inherit,
         }
     }
 }
@@ -149,6 +167,9 @@ pub struct PipeError {
     pub skipped: Vec<u8>,
     /// How the pipe command ended, if it did and we waited for it.
     pub exit: Option<String>,
+    /// What the command wrote to stderr (the last few KiB), with [`PipeStderr::Capture`].
+    /// Untrusted; use [`PipeError::stderr_text`].
+    pub stderr: Vec<u8>,
 }
 
 impl PipeError {
@@ -157,7 +178,13 @@ impl PipeError {
             kind,
             skipped: Vec::new(),
             exit: None,
+            stderr: Vec::new(),
         }
+    }
+
+    /// The captured stderr, safe to show: see [`sanitize_banner`].
+    pub fn stderr_text(&self) -> String {
+        sanitize_banner(&self.stderr)
     }
 
     /// What was read before the failure, safe to show: see [`sanitize_banner`].
@@ -231,6 +258,53 @@ fn is_invisible(c: char) -> bool {
         | '\u{E0020}'..='\u{E007F}')
 }
 
+/// The tail of a command's stderr, filled by a task until the stream ends.
+pub(crate) struct StderrCapture {
+    buf: std::sync::Mutex<Vec<u8>>,
+    done: watch::Sender<bool>,
+}
+
+/// Most stderr kept: ssh's errors are a line or two.
+const STDERR_KEEP: usize = 4096;
+
+impl StderrCapture {
+    fn start(mut stderr: tokio::process::ChildStderr) -> Arc<Self> {
+        let (done, _) = watch::channel(false);
+        let cap = Arc::new(Self {
+            buf: std::sync::Mutex::new(Vec::new()),
+            done,
+        });
+        let task = cap.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = stderr.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let mut b = task.buf.lock().unwrap_or_else(|e| e.into_inner());
+                b.extend_from_slice(&chunk[..n]);
+                if b.len() > STDERR_KEEP {
+                    let cut = b.len() - STDERR_KEEP;
+                    b.drain(..cut);
+                }
+            }
+            task.done.send_replace(true);
+        });
+        cap
+    }
+
+    /// Waits (briefly) for the stream to end, then returns what was captured.
+    async fn finish(&self, wait: Duration) -> Vec<u8> {
+        let mut done = self.done.subscribe();
+        let _ = timeout(wait, done.wait_for(|d| *d)).await;
+        self.bytes()
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.buf.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     Client,
@@ -244,6 +318,7 @@ pub struct PipeLink {
     peer_major: Option<u16>,
     child_id: Option<u32>,
     finished: watch::Receiver<bool>,
+    stderr: Option<Arc<StderrCapture>>,
 }
 
 impl PipeLink {
@@ -254,7 +329,7 @@ impl PipeLink {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (r, w) = tokio::io::split(stream);
-        Self::establish(r, w, Role::Client, cfg, None).await
+        Self::establish(r, w, Role::Client, cfg, None, None).await
     }
 
     /// Daemon side over a byte stream (the relay's Unix socket): no preamble. Waits for the
@@ -264,7 +339,7 @@ impl PipeLink {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (r, w) = tokio::io::split(stream);
-        Self::establish(r, w, Role::Daemon, cfg, None).await
+        Self::establish(r, w, Role::Daemon, cfg, None, None).await
     }
 
     /// Like [`connect`](Self::connect), for a stream that comes as two halves.
@@ -273,7 +348,7 @@ impl PipeLink {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        Self::establish(read, write, Role::Client, cfg, None).await
+        Self::establish(read, write, Role::Client, cfg, None, None).await
     }
 
     /// Like [`accept`](Self::accept), for a stream that comes as two halves (a process's stdin
@@ -283,11 +358,11 @@ impl PipeLink {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        Self::establish(read, write, Role::Daemon, cfg, None).await
+        Self::establish(read, write, Role::Daemon, cfg, None, None).await
     }
 
-    /// Runs the pipe command and connects to it as the client. ssh's stderr is left attached to
-    /// ours, so its prompts and errors stay visible. The child is reaped when the link ends,
+    /// Runs the pipe command and connects to it as the client. its stderr goes where `cfg.stderr` says: by default
+    /// (`Inherit`) to ours, so ssh's prompts and errors stay visible. The child is reaped when the link ends,
     /// whatever the reason.
     pub async fn spawn(command: &PipeCommand, cfg: PipeConfig) -> Result<Self, PipeError> {
         let argv = command.effective_argv(&cfg.params);
@@ -298,7 +373,11 @@ impl PipeLink {
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(match cfg.stderr {
+                PipeStderr::Inherit => std::process::Stdio::inherit(),
+                PipeStderr::Null => std::process::Stdio::null(),
+                PipeStderr::Capture => std::process::Stdio::piped(),
+            })
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?;
@@ -309,7 +388,8 @@ impl PipeLink {
                 "the child has no stdin or stdout",
             ))));
         };
-        Self::establish(stdout, stdin, Role::Client, cfg, Some(child)).await
+        let capture = child.stderr.take().map(StderrCapture::start);
+        Self::establish(stdout, stdin, Role::Client, cfg, Some(child), capture).await
     }
 
     async fn establish<R, W>(
@@ -318,6 +398,7 @@ impl PipeLink {
         role: Role,
         cfg: PipeConfig,
         mut child: Option<Child>,
+        stderr: Option<Arc<StderrCapture>>,
     ) -> Result<Self, PipeError>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -338,6 +419,9 @@ impl PipeLink {
                 if let Some(child) = child.as_mut() {
                     drop(write);
                     err.exit = Some(reap(child, cfg.close_grace).await);
+                }
+                if let Some(cap) = &stderr {
+                    err.stderr = cap.finish(Duration::from_millis(200)).await;
                 }
                 return Err(err);
             }
@@ -367,6 +451,7 @@ impl PipeLink {
             peer_major,
             child_id,
             finished: done_rx,
+            stderr,
         })
     }
 
@@ -380,6 +465,16 @@ impl PipeLink {
     /// shell printed this before fil started; check your shell's startup files".
     pub fn banner_text(&self) -> String {
         sanitize_banner(&self.banner)
+    }
+
+    /// What the command wrote to stderr so far (the last few KiB), safe to show, with
+    /// [`PipeStderr::Capture`]; empty otherwise. After the link went down it is what the command
+    /// said on its way out ("Connection to host closed.").
+    pub fn stderr_text(&self) -> String {
+        self.stderr
+            .as_ref()
+            .map(|c| sanitize_banner(&c.bytes()))
+            .unwrap_or_default()
     }
 
     /// The protocol major from the preamble (client side).

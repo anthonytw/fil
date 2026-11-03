@@ -71,3 +71,18 @@ client-pty:
 # `just realnet` runs everything; `just realnet ssh` or `udp`; add scenario names to narrow.
 realnet *args:
     tests/realnet/run.sh {{args}}
+
+# A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
+# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session
+# "local" over the pipe only; `just local-direct` also lets it upgrade to QUIC on loopback.
+local session="local":
+    cargo build -q -p fil
+    mkdir -p target/local
+    printf '[defaults]\ntransport = "pipe"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{justfile_directory()}}" > target/local/config.toml
+    target/debug/fil --config target/local/config.toml localhost {{session}}
+
+local-direct session="local-direct":
+    cargo build -q -p fil
+    mkdir -p target/local
+    printf '[defaults]\ntransport = "auto"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n[defaults.direct]\naddress = "127.0.0.1"\n' "{{justfile_directory()}}" > target/local/config-direct.toml
+    target/debug/fil --config target/local/config-direct.toml localhost {{session}}

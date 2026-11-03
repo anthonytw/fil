@@ -388,6 +388,8 @@ pub(crate) struct Core<I, O> {
     quiet: bool,
     last_kind: Option<LinkKind>,
     next_kind: Option<LinkKind>,
+    /// The dialer's reason for the last failed attempt, sanitized, for the status line.
+    dial_note: Option<String>,
     attempt: u32,
     notice: Vec<String>,
     notice_until: Option<Instant>,
@@ -437,6 +439,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             quiet: false,
             last_kind: None,
             next_kind: None,
+            dial_note: None,
             attempt: 0,
             notice: Vec::new(),
             notice_until: None,
@@ -566,6 +569,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let give_up = self.give_up_deadline();
             self.attempt += 1;
             self.next_kind = dialer.next_kind();
+            self.dial_note = dialer
+                .status_note()
+                .map(|n| ascii_note(&sanitize_inline(&n)))
+                .filter(|n| !n.is_empty());
             self.refresh_display()?;
             let pumped = self.pump(give_up, dialer.dial(purpose)).await?;
             let result = match pumped {
@@ -1768,6 +1775,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 buffered: self.buf.len(),
                 dropped: self.buf.dropped(),
                 discarding: self.cfg.offline.buffer == 0,
+                note: self.dial_note.clone(),
             }));
         }
         if let Some(until) = self.notice_until {
@@ -1875,6 +1883,22 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             "fil: warning: this session's TERM is {theirs:?} but your terminal says {ours}; the session keeps {theirs:?} (programs already running cannot change it).\r\n"
         ));
     }
+}
+
+/// The status line is ASCII: anything else (wide characters would break its column arithmetic)
+/// becomes `?`.
+fn ascii_note(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn term_size(s: (u16, u16)) -> TermSize {

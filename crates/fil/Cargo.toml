@@ -1,0 +1,34 @@
+[package]
+name = "fil"
+description = "The fil binary: the CLI, the config file, the client's dialer (pipe and direct QUIC under the path manager) and the remote-side entry points (DESIGN.md sections 8, 14)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fil"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+fil-client = { path = "../fil-client" }
+fil-daemon = { path = "../fil-daemon" }
+fil-proto = { path = "../fil-proto" }
+fil-transport = { path = "../fil-transport" }
+rustix = { version = "1", features = ["system", "fs"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
+
+[dev-dependencies]
+fil-term = { path = "../fil-term" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
+
+[lints]
+workspace = true

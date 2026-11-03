@@ -134,6 +134,14 @@ pub trait Dialer: Send + 'static {
         None
     }
 
+    /// A short reason the last attempt failed (what ssh said, "needs an interactive login"), for
+    /// the status line while the client is disconnected. Read before each `dial`, so a dialer
+    /// that wants a new note shown returns from `dial` with an error. **Untrusted text is
+    /// fine**: the client sanitizes it. Default: none.
+    fn status_note(&self) -> Option<String> {
+        None
+    }
+
     /// An `AttachReply` was accepted (on the first link, after every reconnect, and on a swapped
     /// link). Feed `udp_port` and `fingerprint` to the path manager. Default: nothing.
     fn attached(&mut self, _info: &AttachInfo) {}

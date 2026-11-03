@@ -26,7 +26,7 @@ ssh_setup() {
   ssh_teardown quiet
   mkdir -p "$OUT/run" "$OUT/logs"
 
-  "$REALNET_DIR/build.sh"
+  "$REALNET_DIR/build.sh" || exit $?
   local ctx=$OUT/ctx
   rm -rf "$ctx"
   mkdir -p "$ctx/bin"

@@ -4,6 +4,10 @@
 # just ci` checks against the cached database instead: that is NOT a merge pass (CLAUDE.md § Delivery).
 deny_flags := env("FIL_DENY_FLAGS", "")
 
+# Where cargo puts its output. The recipes that run a built binary use this, so they work under
+# `just vm-run` (docs/dev/vm.md), which gives each worktree its own CARGO_TARGET_DIR.
+target_dir := if env("CARGO_TARGET_DIR", "") == "" { source_directory() / "target" } else { env("CARGO_TARGET_DIR") }
+
 default:
     @just --list
 
@@ -110,6 +114,33 @@ client-pty:
 realnet *args:
     tests/realnet/run.sh {{args}}
 
+# Local Linux VM (docs/dev/vm.md): root-only tests without GitHub. The Lima instance `fil` (override
+# with FIL_VM) is Ubuntu aarch64 with Docker, netem and no access to this Mac; code reaches it by
+# rsync. GitHub's linux-check stays the x86_64 reference.
+
+# Once after creating the VM: conntrack, the pinned toolchain, just and cargo-deny.
+vm-setup:
+    tests/realnet/vm.sh setup
+
+# Copy this worktree (uncommitted work included) to ~/src/<worktree name> in the VM.
+vm-sync:
+    tests/realnet/vm.sh sync
+
+# Sync, then run a command in that directory in the VM, with the pinned toolchain: `just vm-run just ci`.
+[positional-arguments]
+vm-run +cmd:
+    tests/realnet/vm.sh run "$@"
+
+# Sync, then `just realnet PART` in the VM, one run at a time across the whole VM (a lock). Parts and
+# scenario names as for `realnet`; none runs everything. Killed after FIL_VM_TIMEOUT (default 60m).
+[positional-arguments]
+vm-realnet *args:
+    tests/realnet/vm.sh realnet "$@"
+
+# Remove this worktree's copy and build directory from the VM.
+vm-clean:
+    tests/realnet/vm.sh clean
+
 # A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
 # (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session "local-pipe"
 # over the pipe only; `just local auto` (session "local-auto") also lets it upgrade to QUIC on
@@ -125,12 +156,12 @@ local transport="pipe" session=("local-" + transport):
     mkdir -p target/local
     config=target/local/config-{{transport}}.toml
     {
-      printf '[defaults]\ntransport = "%s"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{source_directory()}}"
+      printf '[defaults]\ntransport = "%s"\npipe = ["%s/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{target_dir}}"
       if [ "{{transport}}" != pipe ]; then
         printf '[defaults.direct]\naddress = "127.0.0.1"\n'
       fi
     } > "$config"
-    exec target/debug/fil --config "$config" localhost "{{session}}"
+    exec "{{target_dir}}/debug/fil" --config "$config" localhost "{{session}}"
 
 # M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
@@ -139,8 +170,8 @@ local transport="pipe" session=("local-" + transport):
 pi-e2e *args:
     cargo build --release -p fil --bins
     cargo build --release -p fil --example pi_e2e
-    just no-test-hooks target/release/fil
-    target/release/examples/pi_e2e {{args}}
+    just no-test-hooks "{{target_dir}}/release/fil"
+    "{{target_dir}}/release/examples/pi_e2e" {{args}}
 
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
@@ -152,8 +183,8 @@ dropin *args:
     cargo build -q --release -p fil --bins
     cargo build -q --release -p fil --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
-    just no-test-hooks target/release/fil target/release/fil-daemon-dev
-    target/release/examples/dropin {{args}}
+    just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
+    "{{target_dir}}/release/examples/dropin" {{args}}
 
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil
@@ -164,8 +195,17 @@ no-test-hooks +binaries:
     #!/usr/bin/env bash
     set -euo pipefail
     for b in {{binaries}}; do
-      if grep -aq 'FIL_TEST_' "$b"; then
-        echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
-        exit 1
-      fi
+      # A missing binary must fail, not pass: grep reports it as an error (status 2), which an
+      # `if grep` would read as "no hooks found".
+      [[ -f $b && -r $b ]] || { echo "no-test-hooks: $b is missing or unreadable (build it first)" >&2; exit 1; }
+      rc=0
+      grep -aq 'FIL_TEST_' "$b" || rc=$?
+      case $rc in
+        0)
+          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
+          exit 1
+          ;;
+        1) ;;
+        *) echo "no-test-hooks: could not read $b (grep status $rc)" >&2; exit 1 ;;
+      esac
     done

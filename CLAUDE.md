@@ -36,3 +36,7 @@ fil is a remote shell for development over SSH:
 - **Linux check:** a manual GitHub workflow (`gh workflow run linux-check -f ref=BRANCH`) runs `just ci`, the on-demand harnesses and a static musl build on Linux. Use it when a change touches PTYs, termios, sockets or anything else platform-specific. It is a check, not a gate. `-f suite=realnet` runs the real-network harness instead (real OpenSSH in Docker, NAT and `tc netem` in network namespaces; `just realnet` on a Linux box, see `docs/m1/realnet.md`); `-f suite=aarch64` builds the static aarch64 binary for the lab Pis (`docs/m1/pi.md`, `just pi-e2e`); `-f suite=all` runs all three.
 - **Signing:** the global git config SSH-signs commits. Don't disable it.
 - **The repo will go public.** Never commit secrets, IP addresses or personal data.
+- **Reviews and sweeps.**
+  - Every PR gets an independent review, and the review always covers **user privacy** (DESIGN.md §11.1) alongside correctness and security.
+  - Every milestone ends with a whole-tree **sweep** (DESIGN.md §15): independent audits for redundancy, efficiency, user privacy, security and bugs, then fix PRs, then a verification pass.
+  - Privacy here means what fil reveals about the people using it, not just keeping our own secrets out of the repo.

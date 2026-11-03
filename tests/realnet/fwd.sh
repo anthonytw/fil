@@ -71,7 +71,7 @@ fwd_verdict() {
 # The named finding: on --transport pipe the network watcher is off, so after a long outage the
 # client returns only at its next pipe retry (backoff up to 30 s). The fix runs the watcher for the
 # pipe too (a separate PR); when it lands, this becomes a miss like any other.
-FWD_PIPE_RECOVERY_FIX="the pipe network-watcher fix (separate PR): it makes this check strict"
+FWD_PIPE_RECOVERY_FIX="PR #77 (the network watcher for every transport), which makes this check strict"
 # How soon after the cable is back the forwards must move again. auto measured 0.6 to 1.9 s in four
 # runs (its watcher sees the route return); 5 s is that and margin.
 FWD_RECOVERY_MS=5000

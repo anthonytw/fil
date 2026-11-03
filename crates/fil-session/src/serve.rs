@@ -20,9 +20,10 @@
 //! 4. `PtyMode` for the start point, then the terminal channel: output as data segments, with
 //!    `PtyMode` and `EchoAck` in order with it.
 //!
-//! **Ending a connection on purpose.** The last message (`TakenOver`, `AttachRefused`, `Error`,
-//! `SessionExited`) is sent and then `Link::flush`ed, bounded by a timeout, before the link is
-//! closed, so the client always gets to read it.
+//! **Ending a connection on purpose.** The last message (`TakenOver`, `Detach` when the session
+//! is detached from outside, `AttachRefused`, `Error`, `SessionExited`) is sent and then
+//! `Link::flush`ed, bounded by a timeout, before the link is closed, so the client always gets to
+//! read it.
 //!
 //! **Flow control.** The client acks the terminal channel cumulatively. The session never sends
 //! beyond what the emulator has seen at a sequence boundary. When the client falls too far
@@ -70,7 +71,8 @@ const AGE_CHECK: Duration = Duration::from_millis(250);
 pub enum ServeEnd {
     /// The attach was refused (the refusal was sent to the client).
     Refused(AttachRefusal),
-    /// The client detached on purpose. Its key has been revoked.
+    /// The client detached on purpose, or `fil detach` detached it (it was sent `Detach`). Its key
+    /// has been revoked.
     Detached,
     /// Another client took the session over; this one was told.
     TakenOver(TakenOver),
@@ -201,6 +203,7 @@ impl Flow {
 /// How the connection ends, decided by an event from the core.
 enum Reason {
     TakenOver(TakenOver),
+    Detached,
     Superseded,
     Fatal(ErrorCode),
 }
@@ -238,6 +241,7 @@ impl Out {
     fn absorb(&mut self, ev: ConnEvent) -> Option<Reason> {
         match ev {
             ConnEvent::TakenOver(info) => return Some(Reason::TakenOver(info)),
+            ConnEvent::Detached => return Some(Reason::Detached),
             ConnEvent::Drop => return Some(Reason::Superseded),
             ConnEvent::Fatal(code) => return Some(Reason::Fatal(code)),
             ConnEvent::Mode {
@@ -641,6 +645,11 @@ impl<'a, L: Link> Conn<'a, L> {
                 self.decide(ServeEnd::TakenOver(info.clone()));
                 self.farewell(&ControlMsg::TakenOver(info.clone())).await;
                 ServeEnd::TakenOver(info)
+            }
+            Reason::Detached => {
+                self.decide(ServeEnd::Detached);
+                self.farewell(&ControlMsg::Detach).await;
+                ServeEnd::Detached
             }
             Reason::Superseded => ServeEnd::Superseded,
             Reason::Fatal(code) => {

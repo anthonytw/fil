@@ -270,6 +270,8 @@ pub struct Client<L: Link> {
     pub reply: Option<AttachReply>,
     pub refused: Option<AttachRefusal>,
     pub taken_over: Option<TakenOver>,
+    /// The daemon sent `Detach` (the session was detached from outside).
+    pub detached: bool,
     pub exited: Option<(Option<i32>, Option<i32>)>,
     pub errors: Vec<ErrorCode>,
     /// Terminal bytes received after the start point.
@@ -321,6 +323,7 @@ impl<L: Link> Client<L> {
             reply: None,
             refused: None,
             taken_over: None,
+            detached: false,
             exited: None,
             errors: Vec::new(),
             out: Vec::new(),
@@ -472,6 +475,7 @@ impl<L: Link> Client<L> {
             }
             ControlMsg::AttachRefused(r) => self.refused = Some(r),
             ControlMsg::TakenOver(t) => self.taken_over = Some(t),
+            ControlMsg::Detach => self.detached = true,
             ControlMsg::Snapshot(info) => {
                 self.snap_info = Some(info);
                 self.finish_snapshot();

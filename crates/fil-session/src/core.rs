@@ -188,6 +188,9 @@ pub(crate) enum ConnEvent {
     TakenOver(TakenOver),
     /// This transport is superseded by a newer one of the same client: drop it quietly.
     Drop,
+    /// The session was detached from outside (`fil detach`): tell this client with `Detach`, then
+    /// drop the transport. The client's key is already revoked.
+    Detached,
     /// The PTY's line discipline changed at terminal offset `at`.
     Mode {
         canonical: bool,
@@ -1003,13 +1006,15 @@ impl Core {
             return;
         }
         let epoch = self.epoch.epoch();
-        // The effects revoke the key and drop the live transport, if there is one.
-        if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(epoch) {
-            self.apply_effects(effects);
-        }
+        // The attached client is told, like a takeover, and not left to find out through a
+        // reconnect. Taking it out first leaves nothing for the `DropTransport` effect to drop
+        // quietly; the effects then only revoke its key.
         if let Some(l) = self.live.take() {
             l.kick();
-            let _ = l.events.send(ConnEvent::Drop);
+            let _ = l.events.send(ConnEvent::Detached);
+        }
+        if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(epoch) {
+            self.apply_effects(effects);
         }
         self.next_mode_poll = None;
     }

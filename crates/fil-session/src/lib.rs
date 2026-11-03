@@ -16,7 +16,8 @@
 //!
 //! - **One subscriber, with takeover.** Attaching takes the session over; the old subscriber is
 //!   told (`TakenOver`), its key is revoked through [`SessionHost::revoke_key`], and its
-//!   transport dropped. Resuming checks, in order: incarnation, epoch, key (`fil_proto::epoch`).
+//!   transport dropped. `fil detach` (`SessionHandle::force_detach`) likewise sends the attached
+//!   client `Detach` before revoking its key and dropping its transport. Resuming checks, in order: incarnation, epoch, key (`fil_proto::epoch`).
 //! - **Resume without a gap, or a snapshot with a visible one.** A snapshot is announced in the
 //!   attach reply or, mid-stream, as `ControlMsg::Snapshot`, when the client is too far behind or
 //!   the log has wrapped. When it replaces output the client never saw, it starts with a marker

@@ -1091,15 +1091,19 @@ f_dropin_vim_loss() {
   fc_wait a 'ROW-26' 90
   note "last_row_on_screen_after_typing_ms=$(($(now_ms) - t0))"
   dp_finish_vim a 1 26
-  ok "ROW-1 to ROW-26 are in the file, once each, in order, across 30 % loss, a 6 s blackout and 60 % loss"
+  ok "the file is exactly start, ROW-1 to ROW-26 and an empty line, across 30 % loss, a 6 s blackout and 60 % loss"
+  # The blackout must have moved the session to the pipe (the first Switched(Pipe) is the attach),
+  # and with the loss gone it must come back to QUIC (the retry backoff is 11 to 16 s).
+  [[ $(fc_count_log a 'Switched(Pipe)') -ge 2 ]] || fail "the 6 s blackout never moved the session to the pipe: $(fc_log a | grep -F 'Switched(')"
+  wait_log a 'Switched(Direct)' 45 2
   note "to_pipe=$(fc_count_log a 'Switched(Pipe)') to_direct=$(fc_count_log a 'Switched(Direct)')"
   if fc_has a 'different session'; then fail "the session was replaced"; fi
   fc_detach a
   cx_fk dvl
 }
 
-# The same everyday work through `ssh -tt` and through fil, side by side. Functional failures
-# fail the scenario; a difference between what the two screens ended up showing is a finding.
+# The same everyday work through `ssh -tt` and through fil, side by side. A step that fails fails
+# the scenario, and so does a difference between what the two screens ended up showing.
 f_dropin_vs_ssh() {
   reset_net
   netem_apply delay 20ms
@@ -1114,10 +1118,11 @@ f_dropin_vs_ssh() {
   local step
   for step in less flood unicode.out; do
     [[ -s $DP_OUT/ssh.$step && -s $DP_OUT/fil.$step ]] || fail "no $step snapshot from one of the clients"
-    if cmp -s "$DP_OUT/ssh.$step" "$DP_OUT/fil.$step"; then
+    # Trailing blanks are not content (a terminal does not draw them); nothing else is normalised.
+    if diff <(sed 's/[[:space:]]*$//' "$DP_OUT/ssh.$step") <(sed 's/[[:space:]]*$//' "$DP_OUT/fil.$step") > "$DP_OUT/$step.diff"; then
       ok "$step: the final screens are identical (ssh and fil)"
     else
-      known_bug "$step: the screens differ between ssh and fil: $(diff "$DP_OUT/ssh.$step" "$DP_OUT/fil.$step" | head -n 6 | tr '\n' '|')"
+      fail "$step: the screens differ between ssh and fil: $(head -n 8 "$DP_OUT/$step.diff" | tr '\n' '|')"
     fi
   done
   cx_fk dpf

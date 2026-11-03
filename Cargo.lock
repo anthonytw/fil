@@ -406,6 +406,7 @@ dependencies = [
  "fil-proto",
  "fil-term",
  "fil-transport",
+ "nix",
  "portable-pty",
  "rustix",
  "serde",

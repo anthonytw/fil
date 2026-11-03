@@ -40,6 +40,7 @@ dp_battery() {
   mkdir -p "$DP_OUT"
   # An ordinary window: 30 rows (ptydrive's 200 would show a whole page of everything).
   fc "$n" resize 30 100 > /dev/null
+  fc_line "$n" "PS1='fil\$ '"
   fc_line "$n" "rm -rf $d; mkdir $d && cd $d"
   fc_ready "$n"
 
@@ -54,8 +55,9 @@ dp_battery() {
     fc_type "$n" ':wq\r'
     sleep 1 # vim discards what is typed ahead while it leaves
     fc_ready "$n"
-    fc_line "$n" 'echo FILE-$(wc -c < e.txt | tr -d " ")-$(grep -c editor e.txt)'
-    fc_wait "$n" 'FILE-22-1' 10
+    # The whole file, not a piece of it: exactly what was typed above alpha.
+    fc_line "$n" '{ echo from the editor; echo alpha; } | cmp -s - e.txt && echo VIMEXACT-$((6*7))'
+    fc_wait "$n" 'VIMEXACT-42' 10
     note "$tag.vim=ok"
   else
     note "$tag.vim=SKIP(no vim or vi)"
@@ -63,13 +65,15 @@ dp_battery() {
 
   # less: page forward, search, quit.
   if command -v less > /dev/null 2>&1; then
-    fc_line "$n" 'seq 1 500 > nums.txt'
+    # Lines N1 .. N500: the typed commands never contain a line of the file, so a match on the
+    # screen is less's output.
+    fc_line "$n" "seq -f 'N%g' 1 500 > nums.txt"
     fc_line "$n" 'less nums.txt'
-    fc_wait "$n" 'nums.txt' 10
+    fc_wait "$n" 'N29' 10
     fc_type "$n" ' '
-    fc_wait "$n" '58' 10
-    fc_type "$n" '/^333$\r'
-    fc_wait "$n" '361' 10
+    fc_wait "$n" 'N58' 10
+    fc_type "$n" '/^N333$\r'
+    fc_wait "$n" 'N361' 10
     dp_snap "$n" "$DP_OUT/$tag.less"
     fc_type "$n" 'q'
     sleep 1
@@ -104,15 +108,19 @@ dp_battery() {
   t1=$(now_ms)
   note "$tag.ctrl_c_flood_ms=$((t1 - t0))"
 
-  # A resize reaches the remote.
+  # A resize reaches the remote. (A command typed at the same instant can see the old size: that
+  # race is the Pi suite's expected failure `resize_order`, docs/m1/dropin.md finding 1; over
+  # ptydrive the keystrokes cannot be that close, so this step looks at the settled size.)
   fc "$n" resize 40 120 > /dev/null
+  sleep 1
   fc_line "$n" 'echo SZ-$(stty size | tr " " x)'
   fc_wait "$n" 'SZ-40x120' 15
   note "$tag.resize=ok"
 
-  # Unicode and wide characters (typed as UTF-8; the last UNI- row is the output).
-  fc_line "$n" 'echo UNI-é-日本語-🎉-END'
-  fc_wait "$n" 'UNI-é-日本語-🎉-END' 10
+  # Unicode and wide characters (typed as UTF-8). The result carries a computed 42, so the typed
+  # line (which has the arithmetic) is never mistaken for the output; the last UNI- row is it.
+  fc_line "$n" 'echo UNI-é-日本語-🎉-$((6*7))'
+  fc_wait "$n" 'UNI-é-日本語-🎉-42' 10
   fc_screen "$n" | grep -F 'UNI-' | tail -n 1 > "$DP_OUT/$tag.unicode.out"
 
   # Colors: the escape reaches the terminal.
@@ -123,17 +131,19 @@ dp_battery() {
   fc_line "$n" 'printf "\\033]0;TTL-%s\\007\\n" 42'
   fc_wait_raw "$n" ']0;TTL-42' 10
 
-  # Ctrl-Z, fg, Ctrl-C.
-  fc_line "$n" 'sleep 300'
+  # Ctrl-Z, fg, Ctrl-C. The job prints RESUMED-42 when it gets SIGCONT (the typed text holds
+  # `RESUMED-%s 42`, never the result), so the output proves that `fg` resumed it.
+  local job="bash -c \"trap 'printf RESUMED-%s 42; echo' CONT; while :; do sleep 0.2; done\""
+  fc_line "$n" "$job"
   sleep 1
   fc_type "$n" '\x1a'
   fc_wait "$n" 'Stopped' 10
   fc_line "$n" 'fg'
-  sleep 1
+  fc_wait "$n" 'RESUMED-42' 10
   fc_type "$n" '\x03'
   sleep 0.3 # as a person: readline can drop a character typed at the instant of a Ctrl-C
-  fc_line "$n" 'echo RC-$?'
-  fc_wait "$n" 'RC-130' 10
+  fc_line "$n" 'jobs > j.txt; echo JOBS-$(wc -l < j.txt | tr -d " ")'
+  fc_wait "$n" 'JOBS-0' 10
   note "$tag.job_control=ok"
 
   # The shell's exit status reaches the client.
@@ -149,6 +159,7 @@ dp_start_vim() {
   local n=$1
   DP_ED=$(dp_editor)
   [[ -n $DP_ED ]] || return 1
+  fc_line "$n" "PS1='fil\$ '"
   fc_line "$n" 'cd $(mktemp -d) && echo start > e.txt'
   fc_ready "$n"
   fc_line "$n" "$DP_ED e.txt"
@@ -156,16 +167,14 @@ dp_start_vim() {
   fc_type "$n" 'o'
 }
 
-# dp_finish_vim NAME FIRST LAST: leave insert mode, :wq, and the file must have ROW-FIRST ..
-# ROW-LAST once each, in order.
+# dp_finish_vim NAME FIRST LAST: leave insert mode, :wq, and the whole file must be exactly
+# `start`, ROW-FIRST .. ROW-LAST once each in order, and the empty line the last Enter made. (A
+# doubled keystroke or a replayed tail makes `cmp` fail; a substring match would not.)
 dp_finish_vim() {
-  local n=$1 i want=
+  local n=$1
   fc_type "$n" '\e:wq\r'
   sleep 1 # vim discards what is typed ahead while it leaves
   fc_ready "$n" 60
-  fc_line "$n" 'echo ORD-$(grep ^ROW- e.txt | cut -d- -f2 | paste -sd, -)'
-  for ((i = $2; i <= $3; i++)); do want+="${want:+,}$i"; done
-  fc_wait "$n" "ORD-$want" 20
-  fc_line "$n" 'echo HEAD-$(head -n 1 e.txt)'
-  fc_wait "$n" 'HEAD-start' 10
+  fc_line "$n" "{ echo start; seq -f 'ROW-%g' $2 $3; echo; } | cmp -s - e.txt && echo EXACT-\$((6*7))"
+  fc_wait "$n" 'EXACT-42' 20
 }

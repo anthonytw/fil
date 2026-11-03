@@ -3,6 +3,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fil_client::{TermEvent, TermInput, TermOutput, Terminal};
 use fil_term::{Emulator, Size, TermState};
@@ -16,6 +17,13 @@ pub struct TermShared {
     pub size: (u16, u16),
     /// Every write, one entry per call, to check what went out together.
     pub writes: Vec<Vec<u8>>,
+    /// The bounded writes of the end of the run: whether the terminal was still raw when each
+    /// was made, and what it was given.
+    pub exit_writes: Vec<(bool, Vec<u8>)>,
+    /// The terminal has stopped reading: bounded writes time out and put nothing on the screen.
+    pub stalled: bool,
+    /// The window size cannot be read (no size on the tty, a transient failure).
+    pub size_unreadable: bool,
 }
 
 pub struct FakeIn(mpsc::UnboundedReceiver<TermEvent>);
@@ -40,6 +48,9 @@ pub fn fake_terminal(
         raw_changes: Vec::new(),
         size: (cols, rows),
         writes: Vec::new(),
+        exit_writes: Vec::new(),
+        stalled: false,
+        size_unreadable: false,
     }));
     let term = Terminal {
         input: FakeIn(rx),
@@ -57,7 +68,11 @@ impl TermInput for FakeIn {
 
 impl TermOutput for FakeOut {
     fn size(&mut self) -> io::Result<(u16, u16)> {
-        Ok(self.0.lock().unwrap().size)
+        let s = self.0.lock().unwrap();
+        if s.size_unreadable {
+            return Err(io::Error::other("no window size"));
+        }
+        Ok(s.size)
     }
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         let mut s = self.0.lock().unwrap();
@@ -65,6 +80,18 @@ impl TermOutput for FakeOut {
         s.written.extend_from_slice(bytes);
         s.writes.push(bytes.to_vec());
         Ok(())
+    }
+    fn write_all_within(&mut self, bytes: &[u8], _within: Duration) -> io::Result<()> {
+        let stalled = {
+            let mut s = self.0.lock().unwrap();
+            let raw = s.raw;
+            s.exit_writes.push((raw, bytes.to_vec()));
+            s.stalled
+        };
+        if stalled {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.write_all(bytes)
     }
     fn set_raw(&mut self, raw: bool) -> io::Result<()> {
         let mut s = self.0.lock().unwrap();
@@ -120,6 +147,21 @@ impl TermHandle {
 
     pub fn raw_changes(&self) -> Vec<bool> {
         self.shared.lock().unwrap().raw_changes.clone()
+    }
+
+    /// Reading the window size fails from now on (`false`: it works again).
+    pub fn size_unreadable(&self, on: bool) {
+        self.shared.lock().unwrap().size_unreadable = on;
+    }
+
+    /// The terminal stops taking the writes at the end of the run (they time out).
+    pub fn stall(&self) {
+        self.shared.lock().unwrap().stalled = true;
+    }
+
+    /// The bounded writes of the end of the run: was the terminal still raw, and the bytes.
+    pub fn exit_writes(&self) -> Vec<(bool, Vec<u8>)> {
+        self.shared.lock().unwrap().exit_writes.clone()
     }
 
     pub fn written(&self) -> Vec<u8> {

@@ -378,3 +378,70 @@ async fn a_resize_during_the_first_snapshot_reaches_the_daemon() {
         vec![resize(0, 1, (100, 30)), keys(0, b"ls\n", (100, 30))]
     );
 }
+
+/// A swap whose resume comes with a snapshot (QUIC: the `Resume` on the control stream overtakes
+/// the snapshot stream). The window changes after the promotion but before the `Resume`, and keys
+/// are typed after the `Resume` but before the snapshot has landed: the record must still go out
+/// before those keys, or they run at the old size.
+#[tokio::test(start_paused = true)]
+async fn keys_typed_while_a_swapped_links_snapshot_arrives_follow_the_resize_record() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.type_str("a");
+    settle().await;
+    // The candidate: its reply, then (100 ms) the `Resume`, then (600 ms later) the snapshot.
+    rig.daemon.set_force_snapshot(true).await;
+    rig.daemon
+        .set_resume_before_snapshot(Some(Duration::from_millis(100)))
+        .await;
+    rig.daemon
+        .set_snapshot_delay(Some(Duration::from_millis(600)))
+        .await;
+    rig.dial.offer_swap(LinkKind::Direct);
+    tokio::time::sleep(Duration::from_millis(40)).await; // the reply is in, the `Resume` is not
+    rig.term.resize(100, 30);
+    tokio::time::sleep(Duration::from_millis(200)).await; // the `Resume` is in, the snapshot is not
+    rig.type_str("b");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        rig.daemon.term_log().await,
+        vec![
+            keys(0, b"a", (80, 24)),
+            resize(1, 1, (100, 30)),
+            keys(1, b"b", (100, 30)),
+        ]
+    );
+    assert_eq!(rig.daemon.pty_size().await, ((100, 30), 1));
+}
+
+/// A window size that cannot be read (no size on the tty, a transient failure) is not a size:
+/// the client sees every batch of keys with the last size it knew, and no resize record or new
+/// generation comes of it. When the size can be read again, a real change is told as usual.
+#[tokio::test(start_paused = true)]
+async fn a_size_that_cannot_be_read_is_not_a_resize() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.term.resize(100, 30);
+    rig.type_str("a");
+    settle().await;
+    rig.term.size_unreadable(true);
+    for key in ["b", "c", "d"] {
+        rig.type_str(key);
+        settle().await;
+    }
+    rig.term.size_unreadable(false);
+    rig.type_str("e");
+    settle().await;
+    assert_eq!(
+        rig.daemon.term_log().await,
+        vec![
+            resize(0, 1, (100, 30)),
+            keys(0, b"a", (100, 30)),
+            keys(1, b"b", (100, 30)),
+            keys(2, b"c", (100, 30)),
+            keys(3, b"d", (100, 30)),
+            keys(4, b"e", (100, 30)),
+        ]
+    );
+    assert_eq!(rig.daemon.pty_size().await, ((100, 30), 1));
+}

@@ -93,6 +93,11 @@ pub struct DState {
     data_before_reply: bool,
     /// Wait this long before sending snapshot bytes.
     snapshot_delay: Option<Duration>,
+    /// Answer every resume with a snapshot, as a daemon does when the resume point is gone.
+    force_snapshot: bool,
+    /// Send the input `Resume` this long after the reply and ahead of the snapshot bytes (QUIC:
+    /// the control stream overtakes the snapshot stream).
+    resume_before_snapshot: Option<Duration>,
     now_ms: u64,
     /// How far the client has acknowledged on each link (by link identity), as the real
     /// daemon's `Flow` counts it: from the point the link resumed (or its snapshot's), and it
@@ -178,6 +183,8 @@ impl FakeDaemon {
                 direct: None,
                 data_before_reply: false,
                 snapshot_delay: None,
+                force_snapshot: false,
+                resume_before_snapshot: None,
                 now_ms: NOW_MS,
                 flows: HashMap::new(),
                 violations: Vec::new(),
@@ -428,7 +435,9 @@ impl FakeDaemon {
         };
         // A resume that asks for a snapshot (its screen no longer matches its position) keeps
         // the key, epoch and input stream but repaints.
-        let start = if resume_seq.is_some() && a.resume.is_some_and(|r| r.want_snapshot) {
+        let start = if resume_seq.is_some()
+            && (st.force_snapshot || a.resume.is_some_and(|r| r.want_snapshot))
+        {
             StartDecision::Snapshot {
                 at: st.log.end(),
                 skipped: 0,
@@ -485,6 +494,20 @@ impl FakeDaemon {
             self.pump(st).await;
         }
         let _ = send(&link, &ControlMsg::AttachReply(reply)).await;
+        let mut resume_sent = false;
+        if let (Some(d), true) = (st.resume_before_snapshot, snapshot_bytes.is_some()) {
+            tokio::time::sleep(d).await;
+            let received = st.input_rx.received();
+            let _ = send(
+                &link,
+                &ControlMsg::Resume {
+                    channel: ChannelId::TERMINAL,
+                    received,
+                },
+            )
+            .await;
+            resume_sent = true;
+        }
         if let Some(mut bytes) = snapshot_bytes {
             if let Some(d) = st.snapshot_delay {
                 tokio::time::sleep(d).await;
@@ -513,7 +536,7 @@ impl FakeDaemon {
                 return false;
             }
         }
-        if st.send_input_resume {
+        if st.send_input_resume && !resume_sent {
             let received = st.input_rx.received();
             let _ = send(
                 &link,
@@ -945,6 +968,16 @@ impl FakeDaemon {
 
     pub async fn set_data_before_reply(&self, on: bool) {
         self.st.lock().await.data_before_reply = on;
+    }
+
+    /// Every resume is answered with a snapshot.
+    pub async fn set_force_snapshot(&self, on: bool) {
+        self.st.lock().await.force_snapshot = on;
+    }
+
+    /// The input `Resume` goes out this long after the reply, before the snapshot bytes.
+    pub async fn set_resume_before_snapshot(&self, d: Option<Duration>) {
+        self.st.lock().await.resume_before_snapshot = d;
     }
 
     pub async fn set_snapshot_delay(&self, d: Option<Duration>) {

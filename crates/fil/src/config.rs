@@ -13,6 +13,7 @@
 //! buffer = "4KiB"             # 0 drops them
 //! confirm = "off"             # "off" | "after 10s"
 //! # log = "~/.local/state/fil/offline-input.log"   # or a command: ["logger", "-t", "fil"]
+//!                             # (that path is also the one fil tidies at every start, log or not)
 //!
 //! [defaults.direct]
 //! address = "box.example.net" # where to dial UDP; required with a custom pipe or a ProxyJump
@@ -387,6 +388,13 @@ fn check_argv(key: &str, argv: &[String]) -> Result<Vec<String>, String> {
         }
         _ => Ok(argv.to_vec()),
     }
+}
+
+/// Where the documented offline-input log goes: `offline-input.log` in fil's state directory
+/// (`~/.local/state/fil`). Nothing writes there unless the config says so; the client tidies it
+/// at every start (see `app::tidy_offline_log`).
+pub fn default_offline_log() -> Option<PathBuf> {
+    fil_daemon::paths::state_dir().map(|d| d.join("offline-input.log"))
 }
 
 /// An absolute path, or `~/...`.

@@ -263,11 +263,28 @@ fn tmp(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A file log starts with a line that dates it (DESIGN.md section 4.3); the rest is what was typed.
+fn without_header(bytes: &[u8]) -> &[u8] {
+    const PREFIX: &[u8] = b"# fil offline-input log, started ";
+    if bytes.starts_with(PREFIX) {
+        let end = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1);
+        &bytes[end..]
+    } else {
+        bytes
+    }
+}
+
 /// The log is written by a helper thread or a task, and the clock is paused: wait in real time,
 /// but without blocking the runtime (the log's writer task needs it to run).
 async fn wait_for_file(path: &std::path::Path, want: &[u8]) {
     for _ in 0..300 {
-        if std::fs::read(path).map(|b| b == want).unwrap_or(false) {
+        if std::fs::read(path)
+            .map(|b| without_header(&b) == want)
+            .unwrap_or(false)
+        {
             return;
         }
         tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(10)))

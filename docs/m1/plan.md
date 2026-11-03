@@ -11,7 +11,15 @@ Owner-approved 2026-11-02. M1 in DESIGN.md §15: daemon and sessions; attach, de
   - a clear "taken over" or "session replaced" message.
 - Attaching from a second machine takes the session over, and the first one is told.
 - The real-network suite (`docs/m1/realnet.md`) passes on the real `fil` binary, not stand-ins. It also runs on the lab Raspberry Pis.
-- The owner has used it for a few days instead of plain ssh.
+- **An automated drop-in suite** shows fil doing everyday ssh, et and mosh work:
+  - interactive tools;
+  - long output;
+  - reconnects and roaming;
+  - takeovers;
+  - real hardware.
+
+  It replaces the owner's hands-on checkpoint (owner decision 2026-11-02: no human testing in the pipeline; automate it).
+- The M1 sweep is closed (DESIGN.md §15).
 
 ## Already merged
 
@@ -66,7 +74,8 @@ All but the last are done in package F's PR; the last stays an M2 item.
 | Package | Builds |
 |---|---|
 | **P7: end to end** | Every scenario below runs on the real `fil`, not stand-ins. **Session events:** attach, kill ssh and resume; a takeover from a second client; a daemon restart giving `SessionReplaced`. **Network:** a NAT rebind mid-session; UDP blocked, falling back to the pipe. **Isolation:** a second Unix user refused at the socket. **Lingering:** `systemd-run` in a container running systemd. **Where:** local runs on macOS through the local pipe command, the realnet suite on GitHub's Linux runners, and the same scenarios on the lab Raspberry Pis. |
-| **Checkpoint (owner)** | The owner installs the binary on a Pi by hand and uses it, and tries Tier 3: Wi-Fi to a hotspot, sleep in a bag, real terminals, `just predict-demo`. |
+| **P8: drop-in suite** | Replaces the owner checkpoint (owner, 2026-11-02). An automated suite uses fil the way people use ssh, et and mosh: vim, less, top, git, shell history and completion, long and fast output, unicode, resizes, background jobs, sleep-like client stalls, reconnects, takeovers and roaming. It runs on the Pis (`pi-e2e`-style) and in realnet. |
+| **M1 sweep** | Independent whole-tree audits for redundancy, efficiency, user privacy (DESIGN.md §11.1), security and bugs; fix PRs; a verification pass (DESIGN.md §15). |
 
 ## Carried in from M0 and early M1
 

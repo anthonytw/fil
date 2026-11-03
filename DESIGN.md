@@ -174,8 +174,13 @@ A client that resumes with a stale epoch is refused with the takeover message an
 - **Socket location:** the directory `/tmp/fil-$UID/` (mode 0700) holds the socket.
   - The daemon refuses to start if that directory exists with the wrong owner or mode. This defends against another user creating it first, as tmux does.
   - The socket is deliberately not in `$XDG_RUNTIME_DIR`. systemd-logind deletes that directory when your last login ends, which would strand a live daemon.
-- **Logout cleanup:** hosts with `KillUserProcesses=yes` need `loginctl enable-linger`. The bootstrap detects this and warns.
+- **Logout cleanup:** hosts with `KillUserProcesses=yes` need `loginctl enable-linger`. The bootstrap detects this and warns (see below).
 - **Peer check:** the daemon verifies every connection's peer UID (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and refuses mismatches.
+- **Files:** the socket is `/tmp/fil-$UID/fil-<major>.sock` (mode 0600). Next to it, `fil-<major>.lock` is held (`flock`) by the running daemon for its whole life and holds its pid, and `fil-<major>.start` is held for a moment by a relay that is starting a daemon. The directory is checked with `lstat` (a symbolic link in its place is refused), for its owner first and then for mode exactly 0700. The daemon logs JSON lines to `~/.local/state/fil/daemon.log` (mode 0600, moved to `daemon.log.1` at 4 MiB when a daemon starts; `FIL_LOG` sets the level).
+- **Starting:** the relay tries the socket; if nobody answers it takes the start lock, tries again, and runs the same binary with the daemon subcommand (null stdio, in `/`, without the SSH login's `SSH_*` variables). The daemon calls `setsid` first thing, so a hangup of the login does not reach it. Relays that start together serialize on the start lock, so one daemon starts. A daemon that finds the daemon lock taken waits briefly (one may be on its way out), then exits quietly. The lock dies with the process, so a socket file left by a crash is known to be stale and is removed by the next daemon.
+- **Idle exit:** with no session and no connection for five minutes (`idle_exit_secs`, 0 for never), the daemon removes its socket and exits. A session counts for as long as its shell runs, attached or not.
+- **Configuration:** `~/.config/fil/daemon.toml`, all keys optional, unknown keys an error: `direct` (default true), `bind` (default the wildcard), `port_range` (default `[60000, 61000]`), `idle_exit_secs` (default 300) and `scope` (`auto`, `systemd` or `tree`).
+- **Logout warning:** the relay prints a warning on its stderr, which ssh shows on the user's terminal, when it started the daemon on a host whose `logind.conf` says `KillUserProcesses=yes` and where the user does not linger (and the daemon logs it). Only an explicit `yes` warns.
 - **Upgrades:** the socket path includes the protocol major version, so daemons of different versions can run side by side.
   - New sessions go to the newest daemon.
   - Old sessions stay on their daemon until they end.
@@ -455,6 +460,8 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 **Session management.** `fil ls`, `fil kill` and `fil detach` reuse the fixed remote command. The client sends `Hello`, then one `Request` (`ListSessions`, `KillSession { name }` or `DetachSession { name }`) in place of an `Attach`. The daemon answers with one `Response`: `Sessions { list, truncated }`, `Done` or `NoSuchSession`. A session list is cut to fit one control message (4 KiB) and marked `truncated`.
 
+**What the daemon does with a connection** (`fil-daemon`). It sends its `Hello` at once and expects the client's `Hello` and then an `Attach` or a `Request`, all within 10 s. A different major gets `Error(VersionMismatch)`. A pipe `Attach` registers its key for QUIC (the bootstrap); if the attach is refused, a key it newly registered is revoked again. A QUIC `Attach` must carry the key the connection authenticated with (otherwise `Error(Protocol)`) and never registers one; a `Request` on QUIC is refused. A resume for a session the daemon does not have is refused with `SessionGone` if it ended recently (the daemon remembers the last 256 endings) and with `SessionReplaced` otherwise, and never creates a session. A revoked key stops being accepted at once; its live QUIC connections are closed one second later, so that `TakenOver` can reach the old client first (the session closes the link itself within about 300 ms of sending it).
+
 Before v1 these changes are made in place, with no compatibility kept.
 
 **Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any bytes received count as proof of life (so a large frame crawling over a slow pipe is not silence). At most one reply (to the latest ping) and one ping of our own are ever pending, and they are written ahead of everything else, so a flood of pings costs nothing and stale pings do not pile up behind a stuck write. Received payloads wait for the layer above in a queue with a byte budget (2 MiB by default). Under the budget the link keeps reading, so a lagging consumer does not hide a dead peer; past it the link stops reading, freezes the silence clock and reports `Degraded` until the consumer has caught up to half the budget. `recv` still returns the payloads received before the link went down, then fails (a `TakenOver` sent just before the peer closed must not be lost). Each side sends a heartbeat as soon as the preamble is past (the daemon side: as soon as it accepts the stream), and the link is `Up` once the peer's first frame has arrived. The pipe has no goodbye frame: after `close()` the peer sees the stream end and reports `Down(Io)`, not `Down(Closed)`.
@@ -572,7 +579,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
   - `fil-session`: one session (PTY, log, emulator, the subscriber protocol over any `Link`)
   - `fil-predict`: the trait and the default predictor
   - `fil-netsim`: the in-process link simulator (§12), used only by tests
-  - `fil-daemon`
+  - `fil-daemon`: the daemon, its socket and lifecycle, and the stdio relay (`fil server --stdio`)
   - `fil`: the CLI
 
 ## 14. CLI and configuration (sketch)

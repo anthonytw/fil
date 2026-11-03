@@ -38,12 +38,12 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fil_forward::{
-    AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
+    AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, EventReceiver, LocalPeer,
+    Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::{ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, SessionName};
@@ -158,13 +158,11 @@ struct State {
     /// What the binder last reported for each entry: the daemon for `-R`, the current client for
     /// `-L` and `-D` (forgotten on a fresh attach: the new client binds its own).
     listen: HashMap<ForwardId, ListenState>,
-    /// The endpoint's events. Read only under this lock, so a fresh attach can drop the old
-    /// epoch's leftovers before the new client is heard (see [`Forwards::new_epoch`]).
-    events: mpsc::Receiver<EndpointEvent>,
-    /// Set by a new epoch until the next link is up: any event that arrives meanwhile is of the
-    /// previous epoch (the endpoint may still hold some that its bounded channel had no room
-    /// for, and delivers them after `new_epoch`), since nothing of the new one can arrive before
-    /// its link does.
+    /// Set by a new epoch until the next link is up. The endpoint's receiver already drops the
+    /// events of an ended epoch, but one it handed out just before `new_epoch` can still be on
+    /// its way to this lock; nothing of the new epoch can arrive before its link does, so what
+    /// arrives meanwhile is dropped (defense in depth: a late `AddForward` or `Consent` of the
+    /// old client must never count for the new one).
     stale: bool,
     ended: bool,
 }
@@ -220,9 +218,6 @@ impl fmt::Debug for Forwards {
 impl Forwards {
     /// Must be called inside a tokio runtime: the endpoint's tasks run there.
     pub(crate) fn new(name: SessionName, cfg: MuxConfig) -> Arc<Self> {
-        // The policy and the connector need the table, and the endpoint's events go into the
-        // state they read: the state is made first with a stand-in receiver.
-        let (_, placeholder) = mpsc::channel(1);
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
             sub: Sub::Detached,
@@ -231,7 +226,6 @@ impl Forwards {
             fatal: None,
             consented: HashSet::new(),
             listen: HashMap::new(),
-            events: placeholder,
             stale: false,
             ended: false,
         }));
@@ -245,7 +239,6 @@ impl Forwards {
         let connector = Arc::new(SessionConnector { st: st.clone() });
         let table_room = cfg.mux_buffer / 4 * 3;
         let (ep, events) = Endpoint::new(Side::Daemon, cfg, connector, policy);
-        lock(&st).events = events;
         let fw = Arc::new(Forwards {
             name,
             ep,
@@ -255,7 +248,7 @@ impl Forwards {
             #[cfg(feature = "test-hooks")]
             gate,
         });
-        let task = tokio::spawn(fw.clone().drain_events());
+        let task = tokio::spawn(fw.clone().drain_events(events));
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         fw
     }
@@ -349,11 +342,9 @@ impl Forwards {
     /// A new mux epoch, with nothing of the previous subscriber's left: its channels, its
     /// consent, the binds its client reported, and the endpoint's events about them.
     fn new_epoch(&self, st: &mut State) {
+        // The endpoint's receiver drops the old epoch's events from here on; `stale` covers one
+        // already handed out.
         self.ep.new_epoch();
-        // Everything the old epoch said was queued before `new_epoch` returned, and nothing of the
-        // new one can come before its link is attached: what is waiting now is all stale (a late
-        // `AddForward` of the old client must not be answered to the new one).
-        while st.events.try_recv().is_ok() {}
         st.stale = true;
         st.linked = false;
         st.conn = None;
@@ -646,19 +637,12 @@ impl Forwards {
         self.tell(st, MuxMsg::ForwardGone { id });
     }
 
-    /// The endpoint's events, read under the state's lock (see [`Forwards::new_epoch`]).
-    async fn drain_events(self: Arc<Self>) {
-        std::future::poll_fn(|cx| {
+    /// The endpoint's events (those of the current epoch; see `State::stale` for the rest).
+    async fn drain_events(self: Arc<Self>, mut events: EventReceiver) {
+        while let Some(ev) = events.recv().await {
             let mut st = self.lock();
-            loop {
-                match st.events.poll_recv(cx) {
-                    Poll::Ready(Some(ev)) => self.on_event(&mut st, ev),
-                    Poll::Ready(None) => return Poll::Ready(()),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await;
+            self.on_event(&mut st, ev);
+        }
     }
 
     fn on_event(&self, st: &mut State, ev: EndpointEvent) {

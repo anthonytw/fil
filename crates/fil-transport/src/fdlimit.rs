@@ -42,14 +42,7 @@ pub fn raise() -> Option<Raised> {
         return None;
     }
     let lim = getrlimit(Resource::Nofile);
-    let from = lim.current?;
-    let mut want = lim.maximum.unwrap_or(u64::MAX);
-    if cfg!(target_os = "macos") {
-        want = want.min(MACOS_MAX);
-    }
-    if from >= want {
-        return None;
-    }
+    let (from, want) = target(lim, cfg!(target_os = "macos"))?;
     let raised = Rlimit {
         current: Some(want),
         maximum: lim.maximum,
@@ -57,6 +50,18 @@ pub fn raise() -> Option<Raised> {
     setrlimit(Resource::Nofile, raised).ok()?;
     let _ = ORIGINAL.set(lim);
     Some(Raised { from, to: want })
+}
+
+/// What [`raise`] would set: `(from, to)`, or `None` when it must leave the limit alone. It only
+/// ever raises: an unlimited soft limit (`RLIM_INFINITY`, `None`) stays unlimited, and one at or
+/// above the target (macOS's `OPEN_MAX` can be below a soft limit someone set) stays as it is.
+fn target(lim: Rlimit, macos: bool) -> Option<(u64, u64)> {
+    let from = lim.current?;
+    let mut want = lim.maximum.unwrap_or(u64::MAX);
+    if macos {
+        want = want.min(MACOS_MAX);
+    }
+    (from < want).then_some((from, want))
 }
 
 /// The limit this process started with, if [`raise`] changed it.
@@ -97,8 +102,9 @@ pub fn set_soft_limit(soft: u64) -> std::io::Result<()> {
 /// outside tests. `pre_exec` is unsafe because the closure runs in the forked child, where only
 /// async-signal-safe calls are allowed. This closure:
 ///
-/// - makes a single `setrlimit` system call (rustix calls it directly on Linux; on other systems
-///   through the C library's `setrlimit`, a thin system-call wrapper that takes no lock);
+/// - makes a single `setrlimit` call: on Linux rustix makes the system call itself; on macOS it
+///   calls libc's `setrlimit`, a stub that traps into the kernel and takes no lock (POSIX does not
+///   list `setrlimit` as async-signal-safe, but the stub does nothing a signal handler could not);
 /// - allocates nothing, touches no lock, and uses only `limit`, a `Copy` value captured by move;
 /// - ignores the result: lowering a soft limit to a value at or below the hard limit cannot fail,
 ///   and if it did the child would only keep the higher limit, which is what it had without this.
@@ -117,6 +123,30 @@ fn restore_in_child(cmd: &mut std::process::Command, limit: Rlimit) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lim(current: Option<u64>, maximum: Option<u64>) -> Rlimit {
+        Rlimit { current, maximum }
+    }
+
+    /// `raise` only ever raises: an unlimited soft limit is never lowered, nor one above the
+    /// macOS cap.
+    #[test]
+    fn the_target_never_lowers_the_limit() {
+        // Unlimited soft limit (`RLIM_INFINITY`): left alone, whatever the hard limit.
+        assert_eq!(target(lim(None, None), false), None);
+        assert_eq!(target(lim(None, None), true), None);
+        // Already at the hard limit.
+        assert_eq!(target(lim(Some(4096), Some(4096)), false), None);
+        // Above the macOS cap: left alone, not lowered to it.
+        assert_eq!(target(lim(Some(20_000), None), true), None);
+        // Raised to the hard limit, or to the cap on macOS.
+        assert_eq!(
+            target(lim(Some(1024), Some(1_048_576)), false),
+            Some((1024, 1_048_576))
+        );
+        assert_eq!(target(lim(Some(256), None), true), Some((256, MACOS_MAX)));
+        assert_eq!(target(lim(Some(256), Some(4096)), true), Some((256, 4096)));
+    }
 
     /// A child sees the soft limit the process started with, not the raised one.
     #[tokio::test]

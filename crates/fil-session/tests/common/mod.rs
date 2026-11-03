@@ -469,6 +469,18 @@ mod fwd {
     impl FwdClient {
         /// A fresh attach as `host` with key `key`; waits for the reply or the refusal.
         pub async fn attach(h: &SessionHandle, key: PublicKey, host: &'static str) -> FwdClient {
+            let (mut c, daemon_end) = Self::unattached(key, host);
+            c.start(h, daemon_end, None).await;
+            c
+        }
+
+        /// A client that has not attached (for a resume it was never given: `set_last_reply`
+        /// first). Must be called inside a runtime.
+        pub fn attach_detached(key: PublicKey, host: &'static str) -> FwdClient {
+            Self::unattached(key, host).0
+        }
+
+        fn unattached(key: PublicKey, host: &'static str) -> (FwdClient, MemLink) {
             let side = Arc::new(ClientSide::default());
             let (ep, mut events) =
                 Endpoint::new(Side::Client, client_mux(), side.clone(), side.clone());
@@ -485,7 +497,7 @@ mod fwd {
                 }
             });
             let (daemon_end, client_end, ctl) = pair(LinkKind::Pipe, 256);
-            let mut c = FwdClient {
+            let c = FwdClient {
                 ep,
                 side,
                 seen,
@@ -501,8 +513,7 @@ mod fwd {
                 next_req: 0,
                 last_reply: None,
             };
-            c.start(h, daemon_end, None).await;
-            c
+            (c, daemon_end)
         }
 
         async fn start(
@@ -583,6 +594,16 @@ mod fwd {
             self.link = Arc::new(client_end);
             self.ctl = ctl;
             self.start(h, daemon_end, None).await;
+        }
+
+        /// The attach reply a resume would name.
+        pub fn last_reply(&self) -> Option<AttachReply> {
+            self.last_reply.clone()
+        }
+
+        /// Makes the next resume name `reply` (another client's, for a resume it may not make).
+        pub fn set_last_reply(&mut self, reply: AttachReply) {
+            self.last_reply = Some(reply);
         }
 
         /// Resumes on a new link (after `drop_link`).

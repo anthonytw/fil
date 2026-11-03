@@ -524,6 +524,54 @@ async fn a_resume_after_a_mux_failure_is_refused_and_a_fresh_attach_recovers() {
     assert_eq!(round_trip_eventually(port, b"back", 4).await, b"back");
 }
 
+/// The `BadResume` of a failed mux goes only to the subscriber that holds the session (its
+/// client attaches fresh on it without asking, which is safe only then). Another client's resume
+/// gets the refusal it would get anyway: `TakenOver` for the one taken over, `WrongKey` for one
+/// that names the current epoch with another key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_holder_gets_bad_resume_for_a_failed_mux() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "badresume")).await;
+    let mut b = FwdClient::attach(&h, key(2), "desk").await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    b.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    // A, which holds the session, breaks the MUX protocol.
+    let garbage = fil_proto::frame::DataSegment::encode(0, &[0xff, 0xff, 0xff]).unwrap();
+    a.link
+        .send(fil_proto::ChannelId::MUX, bytes::Bytes::from(garbage))
+        .await
+        .unwrap();
+    a.wait("Error(Protocol)", |s| !s.errors.is_empty()).await;
+    assert!(h.forward_snapshot().failed);
+
+    // B, taken over earlier, resumes: told it was taken over, as ever.
+    b.drop_link().await;
+    b.resume(&h).await;
+    assert!(
+        matches!(
+            b.seen.lock().unwrap().refused,
+            Some(AttachRefusal::TakenOver(_))
+        ),
+        "{:?}",
+        b.seen.lock().unwrap().refused
+    );
+    // A client that names A's epoch with another key: `WrongKey`.
+    let mut c = FwdClient::attach_detached(key(3), "other");
+    c.set_last_reply(a.last_reply().unwrap());
+    c.resume(&h).await;
+    assert_eq!(
+        c.seen.lock().unwrap().refused,
+        Some(AttachRefusal::WrongKey)
+    );
+    // A itself: `BadResume`.
+    a.drop_link().await;
+    a.resume(&h).await;
+    assert_eq!(
+        a.seen.lock().unwrap().refused,
+        Some(AttachRefusal::BadResume)
+    );
+}
+
 // ---- takeover -----------------------------------------------------------------------------------
 
 /// A takeover starts a new mux epoch: the old subscriber's channels are dropped (its

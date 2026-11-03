@@ -1129,8 +1129,14 @@ impl Core {
         }
         // A resume that would be accepted, while the forwards' mux has failed, is refused: the
         // mux is cleared only by a new epoch, which only a fresh attach starts (the client's mux
-        // must start over with it). The client attaches fresh on this refusal. Anything else
-        // about the resume (a stale epoch, another key) is answered as it would be anyway.
+        // must start over with it).
+        //
+        // **The rule the client relies on:** `BadResume` for this reason goes only to the
+        // subscriber that holds the session (this incarnation, the current epoch, its own key),
+        // so the client attaches fresh on it without asking, and a fresh attach then takes the
+        // session from nobody but itself. Every other resume (another client's, a stale epoch,
+        // another key, a detached session) is answered as it would be anyway, by the epoch
+        // checks below, and never gets this `BadResume`.
         if let Some(r) = &a.resume
             && r.incarnation == self.incarnation
             && self.epoch.is_current(r.epoch)

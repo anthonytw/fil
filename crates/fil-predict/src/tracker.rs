@@ -5,9 +5,10 @@
 //!
 //! - **Is the terminal's parser at rest?** If the last server chunk ended inside an escape
 //!   sequence, an OSC string or a UTF-8 character, our bytes would be swallowed by it (or
-//!   would break it). Neither emulator exposes its parser state, so [`Scanner`] is a small
-//!   conservative state machine: it may say "busy" when the terminal is at rest, never the
-//!   reverse.
+//!   would break it). Neither emulator exposes its parser state, so this runs the same
+//!   [`Boundary`] machine the session uses to decide where it may cut the output: the two must
+//!   agree on where a sequence ends. It is conservative: it may say "busy" when the terminal is
+//!   at rest, never the reverse.
 //! - **Modes the model cannot report on both backends**: insert (IRM), origin (DECOM),
 //!   left/right margins (DECLRMM), national charset mode, synchronized output.
 //! - **Charsets.** Neither backend reports G0-G3 or which one is invoked, but with DEC
@@ -23,6 +24,7 @@
 //! `docs/spikes/prediction.md` is to move charsets and these modes into `Modes` for M1,
 //! where a snapshot needs them as well.
 
+use fil_term::Boundary;
 use vte::{Params, Parser, Perform};
 
 /// A hyperlink the program has open (OSC 8), exactly as the program wrote it.
@@ -290,135 +292,11 @@ impl Perform for Modes {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Scan {
-    Ground,
-    Esc,
-    /// After `ESC` and an intermediate byte: waiting for the final byte.
-    EscInter,
-    Csi,
-    /// Inside OSC (`true`), or DCS/APC/PM/SOS (`false`).
-    Str(bool),
-    StrEsc(bool),
-    /// This many UTF-8 continuation bytes to go.
-    Utf8(u8),
-}
-
-/// Conservative "is the terminal's parser at rest" tracker. See the module docs.
-pub struct Scanner {
-    state: Scan,
-    /// The string kind just started was an APC whose first byte decides if it is graphics.
-    apc_first: bool,
-    graphics: bool,
-}
-
-impl Scanner {
-    fn new() -> Self {
-        Scanner {
-            state: Scan::Ground,
-            apc_first: false,
-            graphics: false,
-        }
-    }
-
-    pub fn at_rest(&self) -> bool {
-        self.state == Scan::Ground
-    }
-
-    fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.step(b);
-        }
-    }
-
-    fn step(&mut self, b: u8) {
-        use Scan::*;
-        // CAN and SUB abort anything.
-        if (b == 0x18 || b == 0x1a) && self.state != Ground {
-            self.state = Ground;
-            self.apc_first = false;
-            return;
-        }
-        self.state = match self.state {
-            Ground => match b {
-                0x1b => Esc,
-                0xc2..=0xdf => Utf8(1),
-                0xe0..=0xef => Utf8(2),
-                0xf0..=0xf4 => Utf8(3),
-                _ => Ground,
-            },
-            Utf8(n) => match b {
-                0x80..=0xbf => {
-                    if n <= 1 {
-                        Ground
-                    } else {
-                        Utf8(n - 1)
-                    }
-                }
-                0x1b => Esc,
-                // Not a continuation: the terminal treats the broken character as an error
-                // and handles this byte normally. Re-run it from the ground state.
-                _ => {
-                    self.state = Ground;
-                    self.step(b);
-                    return;
-                }
-            },
-            Esc => match b {
-                b'[' => Csi,
-                b']' => Str(true),
-                b'_' => {
-                    self.apc_first = true;
-                    Str(false)
-                }
-                b'P' | b'^' | b'X' => Str(false),
-                0x20..=0x2f => EscInter,
-                0x30..=0x7e => Ground,
-                0x1b => Esc,
-                _ => Esc,
-            },
-            EscInter => match b {
-                0x20..=0x2f => EscInter,
-                0x30..=0x7e => Ground,
-                0x1b => Esc,
-                _ => EscInter,
-            },
-            Csi => match b {
-                0x40..=0x7e => Ground,
-                0x1b => Esc,
-                _ => Csi,
-            },
-            Str(osc) => {
-                if self.apc_first {
-                    self.apc_first = false;
-                    if b == b'G' {
-                        self.graphics = true;
-                    }
-                }
-                match b {
-                    0x07 if osc => Ground,
-                    0x1b => StrEsc(osc),
-                    _ => Str(osc),
-                }
-            }
-            StrEsc(osc) => match b {
-                b'\\' => Ground,
-                _ => {
-                    self.state = Esc;
-                    self.step(b);
-                    let _ = osc;
-                    return;
-                }
-            },
-        };
-    }
-}
-
 /// Everything the overlay tracks about the byte stream.
 pub struct Tracker {
     parser: Parser,
     modes: Modes,
-    scan: Scanner,
+    scan: Boundary,
 }
 
 impl Default for Tracker {
@@ -432,16 +310,15 @@ impl Tracker {
         Tracker {
             parser: Parser::new(),
             modes: Modes::default(),
-            scan: Scanner::new(),
+            scan: Boundary::new(),
         }
     }
 
     /// Feeds server bytes (in order, exactly those the real terminal receives).
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.modes, bytes);
-        self.scan.feed(bytes);
-        if self.scan.graphics {
-            self.scan.graphics = false;
+        self.scan.scan(bytes);
+        if self.scan.take_graphics() {
             self.modes.tainted = true;
         }
     }

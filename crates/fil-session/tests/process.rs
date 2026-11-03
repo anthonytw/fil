@@ -173,9 +173,10 @@ async fn an_endless_escape_sequence_is_eventually_released() {
         panic!("expected a snapshot");
     };
     // Released when the tail passed 1 MiB, not chunk by chunk as it came in (which would put
-    // `at` near the end), and the rest is held again.
+    // `at` near the end), and the rest is held again. Output arrives in batches of up to 256 KiB
+    // now, so the release can be that far past the limit.
     assert!(
-        (1_000_000..1_200_000).contains(&info.at),
+        (1_000_000..1_400_000).contains(&info.at),
         "released up to {}",
         info.at
     );

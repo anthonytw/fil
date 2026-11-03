@@ -68,8 +68,10 @@ pub struct SessionConfig {
     /// How long after a keystroke reached the PTY its echo is expected, before the daemon
     /// reports "no echo is coming" (mosh uses 50 ms).
     pub echo_window: Duration,
-    /// How often the PTY's ICANON and ECHO flags are re-read while a client is attached, in
-    /// addition to after every read of output and every write of input.
+    /// How often the PTY's ICANON and ECHO flags are re-read while a client is attached and
+    /// there was input or output in the last two seconds (ten times as long otherwise, but a
+    /// client that asked for `EchoAck` always gets this period), in
+    /// addition to once per batch of output and after every write of input.
     pub mode_poll: Duration,
     /// How long after the shell exits the rest of its output is waited for.
     ///

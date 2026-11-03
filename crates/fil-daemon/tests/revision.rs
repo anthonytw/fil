@@ -156,12 +156,28 @@ fn hello_rev(revision: u16) -> ControlMsg {
     ControlMsg::Hello(Hello::with_revision(Agent::new("test").unwrap(), revision))
 }
 
-/// Everything the daemon sends until it closes the link (or `WAIT` passes).
+/// Sends `msg` to a daemon that is refusing this connection: it may already have said so and
+/// hung up, and then the send fails. Which it is depends on timing, and neither is wrong: what
+/// the tests assert is that the request is never acted on and the link ends.
+async fn send_to_a_refusing_daemon<L: Link>(link: &L, msg: &ControlMsg) {
+    let _ = link
+        .send(ChannelId::CONTROL, Bytes::from(msg.encode().unwrap()))
+        .await;
+}
+
+/// Everything the daemon sends until it closes the link (or 5 seconds pass).
 async fn drain<L: Link>(link: &L) -> Vec<ControlMsg> {
+    drain_to_end(link).await.0
+}
+
+/// [`drain`], and whether the link ended (the daemon closed it) as opposed to going quiet.
+async fn drain_to_end<L: Link>(link: &L) -> (Vec<ControlMsg>, bool) {
     let mut seen = Vec::new();
-    while let Ok(Ok((chan, payload))) =
-        tokio::time::timeout(Duration::from_secs(5), link.recv()).await
-    {
+    let ended = loop {
+        let Ok(got) = tokio::time::timeout(Duration::from_secs(5), link.recv()).await else {
+            break false;
+        };
+        let Ok((chan, payload)) = got else { break true };
         if chan == ChannelId::CONTROL
             && let Ok(m) = ControlMsg::decode(&payload)
         {
@@ -170,8 +186,8 @@ async fn drain<L: Link>(link: &L) -> Vec<ControlMsg> {
             }
             seen.push(m);
         }
-    }
-    seen
+    };
+    (seen, ended)
 }
 
 /// A client of another revision may have encoded its `Attach` in a way this daemon cannot decode.
@@ -186,13 +202,15 @@ async fn another_revision_is_refused_at_the_hello_before_its_request_is_read() {
     let started = std::time::Instant::now();
     send_ctl(&link, &hello_rev(rev_new() + 1)).await;
     // What an Attach of a changed layout looks like to this daemon: bytes that do not decode.
-    link.send(
-        ChannelId::CONTROL,
-        Bytes::from_static(&[1, 0xFF, 0xFF, 0xFF, 0x7F, 0, 1]),
-    )
-    .await
-    .unwrap();
-    let seen = drain(&link).await;
+    // (The daemon may have refused and hung up by now: the send is allowed to fail.)
+    let _ = link
+        .send(
+            ChannelId::CONTROL,
+            Bytes::from_static(&[1, 0xFF, 0xFF, 0xFF, 0x7F, 0, 1]),
+        )
+        .await;
+    let (seen, ended) = drain_to_end(&link).await;
+    assert!(ended, "the daemon hangs up after refusing: {seen:?}");
     assert!(
         matches!(seen.first(), Some(ControlMsg::Hello(h)) if h.revision == rev_new()),
         "the daemon states its revision first: {seen:?}"
@@ -235,8 +253,15 @@ async fn a_daemon_never_acts_on_a_request_from_a_client_of_another_revision() {
     ] {
         let link = d.direct_link().await;
         send_ctl(&link, &hello_rev(rev_old() + 1)).await;
-        send_ctl(&link, &request).await;
-        let seen = drain(&link).await;
+        // The daemon refuses at the Hello and hangs up without reading the request, so by the time
+        // it is sent the link may be closed. Whether the send succeeds is timing; that nothing
+        // was done about it is what is asserted, here and by the state checked after the loop.
+        send_to_a_refusing_daemon(&link, &request).await;
+        let (seen, ended) = drain_to_end(&link).await;
+        assert!(
+            ended,
+            "{request:?}: the daemon hangs up after refusing: {seen:?}"
+        );
         assert!(
             seen.contains(&ControlMsg::Error(ErrorCode::VersionMismatch)),
             "{request:?}: {seen:?}"

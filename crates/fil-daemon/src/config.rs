@@ -5,12 +5,16 @@
 //! # opens no UDP port and every client stays on the pipe.
 //! direct = true
 //!
-//! # The address the UDP port is bound to. The wildcard by default; set a LAN or tailnet address
-//! # to keep the port off other interfaces.
-//! bind = "0.0.0.0"
+//! # The address the UDP port is bound to. The IPv6 wildcard by default, which also takes IPv4
+//! # (a host without IPv6 falls back to "0.0.0.0"); set a LAN or tailnet address to keep the port
+//! # off other interfaces.
+//! bind = "::"
 //!
 //! # The UDP ports to try (inclusive), from a random starting point. The same range mosh uses.
 //! port_range = [60000, 61000]
+//!
+//! # Lines of scrollback each session keeps for a client that reattaches (1 to 1,000,000).
+//! history_lines = 1000
 //!
 //! # Seconds with no session and no connection after which the daemon exits on its own.
 //! # 0 means never. Default 300.
@@ -25,7 +29,7 @@
 //! is the defaults. A file that cannot be read or parsed stops the daemon from starting (and
 //! `ensure_daemon` reports it before it starts one).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::time::Duration;
@@ -38,6 +42,12 @@ use crate::paths::current_uid;
 
 /// How long the daemon with nothing to do waits before it exits (the `idle_exit_secs` default).
 pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
+
+/// The scrollback lines a session keeps (the `history_lines` default).
+pub const DEFAULT_HISTORY_LINES: usize = 1000;
+
+/// The most `history_lines` may be.
+pub const MAX_HISTORY_LINES: usize = 1_000_000;
 
 /// How long creating a session (the PTY, the child, the probes for a systemd scope) may take
 /// before the attach fails.
@@ -54,6 +64,7 @@ struct FileConfig {
     direct: Option<bool>,
     bind: Option<IpAddr>,
     port_range: Option<[u16; 2]>,
+    history_lines: Option<usize>,
     idle_exit_secs: Option<u64>,
     scope: Option<String>,
 }
@@ -88,10 +99,12 @@ pub struct SessionDefaults {
 pub struct DaemonConfig {
     /// Open the UDP port (default true).
     pub direct: bool,
-    /// The address to bind the UDP port to (default the wildcard).
+    /// The address to bind the UDP port to (default the IPv6 wildcard, which takes IPv4 as well).
     pub bind: IpAddr,
     /// The ports to try (default 60000-61000).
     pub ports: RangeInclusive<u16>,
+    /// Scrollback lines each session keeps (default 1000).
+    pub history_lines: usize,
     /// Exit after this long with no session and no connection; `None` never (default 5 minutes).
     pub idle_exit: Option<Duration>,
     /// How sessions group their processes (default `auto`).
@@ -119,8 +132,9 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             direct: true,
-            bind: IpAddr::from([0, 0, 0, 0]),
+            bind: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             ports: fil_transport::quic::DEFAULT_PORT_RANGE,
+            history_lines: DEFAULT_HISTORY_LINES,
             idle_exit: Some(DEFAULT_IDLE_EXIT),
             scope: ScopeMode::Auto,
             allowed_uid: current_uid(),
@@ -168,6 +182,14 @@ impl DaemonConfig {
             }
             cfg.ports = lo..=hi;
         }
+        if let Some(n) = file.history_lines {
+            if !(1..=MAX_HISTORY_LINES).contains(&n) {
+                return Err(format!(
+                    "history_lines = {n}: must be between 1 and {MAX_HISTORY_LINES}"
+                ));
+            }
+            cfg.history_lines = n;
+        }
         if let Some(s) = file.idle_exit_secs {
             cfg.idle_exit = (s > 0).then(|| Duration::from_secs(s));
         }
@@ -198,13 +220,19 @@ mod tests {
         assert_eq!(c.ports, 60000..=61000);
         assert_eq!(c.idle_exit, Some(DEFAULT_IDLE_EXIT));
         assert_eq!(c.scope, ScopeMode::Auto);
+        assert_eq!(c.history_lines, 1000);
+        assert_eq!(
+            c.bind,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "dual-stack by default"
+        );
     }
 
     #[test]
     fn every_key() {
         let c = DaemonConfig::parse(
             "direct = false\nbind = \"127.0.0.1\"\nport_range = [50000, 50010]\n\
-             idle_exit_secs = 0\nscope = \"tree\"\n",
+             idle_exit_secs = 0\nscope = \"tree\"\nhistory_lines = 250\n",
         )
         .unwrap();
         assert!(!c.direct);
@@ -212,6 +240,7 @@ mod tests {
         assert_eq!(c.ports, 50000..=50010);
         assert_eq!(c.idle_exit, None);
         assert_eq!(c.scope, ScopeMode::Tree);
+        assert_eq!(c.history_lines, 250);
     }
 
     #[test]
@@ -224,6 +253,8 @@ mod tests {
             "port_range = [0, 10]",
             "port_range = [1]",
             "scope = \"docker\"",
+            "history_lines = 0",
+            "history_lines = 1000001",
             "idle_exit_secs = -1",
         ] {
             assert!(DaemonConfig::parse(bad).is_err(), "{bad}");

@@ -86,3 +86,11 @@ local-direct session="local-direct":
     mkdir -p target/local
     printf '[defaults]\ntransport = "auto"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n[defaults.direct]\naddress = "127.0.0.1"\n' "{{justfile_directory()}}" > target/local/config-direct.toml
     target/debug/fil --config target/local/config-direct.toml localhost {{session}}
+
+# M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
+# client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
+# installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
+# Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
+pi-e2e *args:
+    cargo build --release -p fil --bins --example pi_e2e
+    target/release/examples/pi_e2e {{args}}

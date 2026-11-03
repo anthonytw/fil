@@ -57,3 +57,42 @@ fn the_first_run_shows_the_pipe_commands_stderr() {
     assert_eq!(err.matches("said-on-stderr").count(), 1, "{err}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Until the forwards are connected to the engine (M2 in progress), a forward on the command line
+/// is refused before anything is dialed: never accepted and silently dropped. A bad spec is a
+/// usage error.
+#[test]
+fn forward_flags_are_refused_until_they_are_connected_and_bad_ones_are_usage_errors() {
+    let home = home_with_pipe("fwd", "echo dialed >&2; exit 1");
+    let run = |args: &[&str]| {
+        Command::new(FIL)
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["-L", "5173", "probe"][..],
+        &["-R", "9000:localhost:9000", "probe"][..],
+        &["-D", "1080", "probe"][..],
+        &["-A", "probe"][..],
+    ] {
+        let out = run(args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("not connected yet"), "{args:?}: {err}");
+        assert!(!err.contains("dialed"), "{args:?} dialed: {err}");
+    }
+    for args in [
+        &["-L", "0:h:80", "probe"][..],
+        &["-R", "*:9000:h:80", "probe"][..],
+        &["-D", "nope", "probe"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("dialed"));
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

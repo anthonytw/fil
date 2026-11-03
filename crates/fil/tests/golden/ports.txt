@@ -1,0 +1,37 @@
+SESSION main on orin — attached from laptop since 09:12
+
+FORWARDED
+  DIR  LAPTOP            REMOTE               OWNER                    CONNS  ↓ / ↑           LAST
+  -L   localhost:5173 →  localhost:5173       vite (pid 41872, ~/app)  2      14 MB / 220 KB  now
+       http://localhost:5173 · HTTP 200 "Vite + React"
+  -R   localhost:9000 ←  127.0.0.1:9000       your laptop              0      —               10:40
+       1 connection waiting for the link
+  -D   *:1080 →          (SOCKS)              —                        0      —               —
+       ⚠ not listening on the laptop: the port is already in use
+       ⚠ bound beyond loopback: reachable from outside the laptop, not only through fil
+  -R   localhost:22 ←    127.0.0.1:41234      your laptop              0      —               —
+       asked for by a process on the host (fil forward); not confirmed at this client yet
+       asked the host for a free port
+  -L   [::1]:8443 →      web.example.net:443  —                        0      —               —
+       not listening yet: no client has bound it
+
+LISTENING IN THIS SESSION, NOT FORWARDED
+  8000  0.0.0.0 ⚠  python3 (pid 42110, ~/tmp)  since 10:03  HTTP 200 "Directory listing for /"
+        ⚠ reachable from outside this host, not just through fil  →  fil forward -L 8000
+  3000  127.0.0.1  node (pid 42200)
+        →  fil forward -L 3000
+
+AGENT
+  relayed to this client: 1 connection open, 14 requests, last used 10:40
+
+SESSION build on orin — not attached
+
+FORWARDED
+  none
+
+OTHER LISTENERS YOU OWN ON THIS HOST
+  5432  127.0.0.1  postgres (pid 1201), not started from a fil session  Postgres
+  9999  :: ⚠  owner unknown, not started from a fil session
+
+LISTENERS OF OTHER USERS ON THIS HOST (port and address only)
+  22  0.0.0.0 ⚠

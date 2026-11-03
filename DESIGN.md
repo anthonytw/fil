@@ -272,7 +272,7 @@ libghostty-vt (C ABI, used by zmx) was not evaluated: it needs a Zig toolchain, 
 - `-R [bind:]port:host:hostport` listens on the remote and connects out from the client machine. Port 0 asks the remote for an ephemeral port; the one it got is reported back.
 - `-D [bind:]port` is a SOCKS5 and SOCKS4a server (CONNECT only) on the client machine; each connection goes out from the remote to the target the SOCKS client names (M2, OD-1 in `docs/m2/plan.md`).
 
-v1 is TCP only. Unix-socket forwards and UDP are open questions (§16). Both ends bind to loopback by default; anything wider needs an explicit address. A target is an IP address or a host name (letters, digits and inner hyphens, labels of 1 to 63 bytes, 253 bytes in all, the last label not all digits, so an address written as a name is always an address).
+v1 is TCP only. Unix-socket forwards and UDP are open questions (§16). Both ends bind to loopback by default; anything wider needs an explicit address. Specs are written as in ssh, with a few differences (`docs/m2/binary.md`). A target is an IP address or a host name (letters, digits and inner hyphens, labels of 1 to 63 bytes, 253 bytes in all, the last label not all digits, so an address written as a name is always an address).
 
 ### 7.2 Ownership and persistence
 
@@ -721,8 +721,9 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
 ## 14. CLI and configuration (sketch)
 
 ```
-fil HOST [SESSION] [-L SPEC]… [-R SPEC]…   attach, creating the session if needed (default: main)
-fil ls HOST                                sessions: name, term, subscriber, last output, age (forwards: M2)
+fil HOST [SESSION] [-L SPEC]… [-R SPEC]… [-D SPEC]… [-A|-a]
+                                           attach, creating the session if needed (default: main)
+fil ls HOST                                sessions: name, term, forwards, subscriber, last output, age
 fil kill HOST SESSION
 fil ports [HOST [SESSION]]                 inside a session: the current one
 fil forward (-L|-R) SPEC | --rm PORT
@@ -730,7 +731,7 @@ fil detach [HOST SESSION]                  with no arguments, inside a session (
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 
-M1 implements everything but forwards and `ports`; `-L`/`-R` are accepted and refused with a message. The option `--transport auto|pipe|direct` overrides the config for one attach. The command line, the exit statuses and the dialer are in `docs/m1/binary.md`.
+M1 implements everything but forwards and `ports`. In M2 the forward flags and config keys are parsed and checked first (specs are written as in ssh: `docs/m2/binary.md`) and connected to the session afterwards; until then a run that asks for a forward is refused with a message. `-A` relays the local agent (§10), `-a` turns it off. The option `--transport auto|pipe|direct` overrides the config for one attach. The command line, the exit statuses and the dialer are in `docs/m1/binary.md`.
 
 Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde. Pasted text (between the bracketed-paste markers) is never an escape.
 
@@ -747,8 +748,16 @@ buffer = "4KiB"           # 0 drops them
 confirm = "off"           # off | "after 10s": ask before sending after a long disconnect
 # log = "~/.local/state/fil/offline-input.log"   # or a command: ["logger", "-t", "fil"]. Off by default; can capture passwords
 
+[defaults.forward]        # tunables for forwards (M2); `forward` is either a list of specs or this table
+# specs = ["-L 5173"]     # the list, when there are tunables too
+# window = "1MiB"         # 16KiB to 4MiB; buffer 16KiB to 16MiB; open_wait 0 to 1h; linger 0 to 24h
+
 [host.orin]
-forward = ["-L 5173", "-R 9000"]
+forward = ["-L 5173", "-R 9000", "-D 1080"]   # same specs as the flags; a bare port binds loopback
+agent = "off"             # off | on | confirm; -A and -a override
+agent_keys = []           # SHA256 fingerprints the agent relay answers for; empty is every key
+remote_requests = "ask"   # ask | deny: forwards a process on the host asks for with `fil forward`
+forward_failure = "warn"  # warn | exit (status 255, as ssh's ExitOnForwardFailure)
 direct.address = "orin.example.net" # where the client dials UDP, when it is not what `ssh -G` reports; needed with a custom pipe or a jump host
 
 [host.k8s-dev]

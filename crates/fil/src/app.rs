@@ -14,6 +14,7 @@ use crate::cli::{Action, Cli};
 use crate::config::{self, Config, HostSettings};
 use crate::connect::Connect;
 use crate::dialer::{Connector, DialerConfig, PathDialer};
+use crate::forward_spec::{CliForwards, ForwardPlan};
 use crate::{logging, mgmt, server};
 
 /// How long the message printed after a run may take to reach the terminal.
@@ -21,6 +22,9 @@ const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Exit status of a normal end.
 const OK: u8 = 0;
+/// Why forwards and the agent do nothing yet.
+const NOT_WIRED: &str = "port forwards and agent relaying are parsed but not connected yet (milestone 2 is in progress)";
+
 /// Exit status of an error, and of a session that was taken, replaced or detached from elsewhere.
 const FAILED: u8 = 1;
 
@@ -83,9 +87,10 @@ async fn run(action: Action, config: &Config) -> u8 {
             host,
             session,
             transport,
+            forwards,
         } => {
             let settings = config.for_host(&host);
-            attach(&host, session, transport, settings).await
+            attach(&host, session, transport, forwards, settings).await
         }
         Action::List { host } => manage(&host, Request::ListSessions, config).await,
         Action::Kill { host, session } => {
@@ -102,13 +107,26 @@ async fn attach(
     host: &str,
     session: SessionName,
     transport: Option<TransportSetting>,
+    forwards: CliForwards,
     settings: HostSettings,
 ) -> u8 {
     tidy_offline_log(&settings);
-    if !settings.forward.is_empty() {
-        eprintln!(
-            "fil: warning: `forward` in the config is ignored: port forwards arrive in milestone 2"
-        );
+    // Parsed and checked, not connected: the engine learns about forwards in the next part of
+    // M2. Until then what the command line asks for is refused (never dropped silently), and
+    // what only the config says is warned about.
+    let plan = match ForwardPlan::resolve(&settings, &forwards) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fil: {e}");
+            return FAILED;
+        }
+    };
+    if !forwards.specs.is_empty() || forwards.agent == Some(crate::forward_spec::AgentFlag::On) {
+        eprintln!("fil: {NOT_WIRED}. Attach without -L, -R, -D and -A, or use ssh for now");
+        return FAILED;
+    }
+    if !plan.is_empty() {
+        eprintln!("fil: warning: `forward` and `agent` in the config are ignored: {NOT_WIRED}");
     }
     let connector = match Connect::new(
         host,

@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use fil_proto::msg::SessionName;
 use fil_transport::path::TransportSetting;
 
@@ -179,6 +179,48 @@ pub enum Unsupported {
 }
 
 impl Cli {
+    /// Rejects what clap lets through but would be dropped silently: a command together with the
+    /// arguments for attaching (`fil orin ls box` would list `box` and ignore `orin`; `fil -L 80
+    /// ls box` would ignore the forward). Returns a usage error (exit status 2).
+    pub fn validate(&self) -> Result<(), clap::Error> {
+        let Some(command) = &self.command else {
+            return Ok(());
+        };
+        let a = &self.attach;
+        let mut stray = Vec::new();
+        if let Some(h) = &a.host {
+            stray.push(format!("the host `{h}`"));
+        }
+        if let Some(s) = &a.session {
+            stray.push(format!("the session `{s}`"));
+        }
+        if !a.local.is_empty() {
+            stray.push("-L".to_string());
+        }
+        if !a.remote.is_empty() {
+            stray.push("-R".to_string());
+        }
+        if a.transport.is_some() {
+            stray.push("--transport".to_string());
+        }
+        if stray.is_empty() {
+            return Ok(());
+        }
+        let name = match command {
+            Command::Ls { .. } => "ls",
+            Command::Kill { .. } => "kill",
+            Command::Detach { .. } => "detach",
+            Command::Server(_) => "server",
+        };
+        Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "{} before the command `{name}` would be ignored; put the command first (`fil {name} HOST ...`), or use `--` if a host or session is named `{name}`",
+                stray.join(" and ")
+            ),
+        ))
+    }
+
     pub fn action(self) -> Result<Action, Unsupported> {
         match self.command {
             Some(Command::Ls { host }) => Ok(Action::List { host }),
@@ -213,7 +255,6 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
     use clap::error::ErrorKind;
 
     use super::*;
@@ -361,6 +402,35 @@ mod tests {
         assert_eq!(action(&["--config", "/tmp/c.toml", "ls", "orin"]), want);
         assert_eq!(action(&["ls", "orin", "--config", "/tmp/c.toml"]), want);
         assert_eq!(action(&["ls", "--config", "/tmp/c.toml", "orin"]), want);
+    }
+
+    #[test]
+    fn attach_arguments_with_a_command_are_a_usage_error_not_dropped() {
+        for args in [
+            &["orin", "ls", "box"][..],
+            &["-L", "5173", "ls", "box"][..],
+            &["-R", "9000", "kill", "box", "main"][..],
+            &["--transport", "pipe", "ls", "box"][..],
+            &["--transport", "pipe", "detach", "box", "main"][..],
+        ] {
+            let cli = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let e = cli.validate().expect_err(&format!("{args:?}"));
+            assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{args:?}");
+            assert!(e.to_string().contains("ignored"), "{e}");
+        }
+        // The legitimate forms pass.
+        for args in [
+            &["ls", "box"][..],
+            &["--config", "/tmp/c.toml", "ls", "box"][..],
+            &["orin"][..],
+            &["--transport", "pipe", "-L", "1", "orin", "main"][..],
+            &["server", "--stdio"][..],
+        ] {
+            parse(args)
+                .unwrap()
+                .validate()
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
     }
 
     #[test]

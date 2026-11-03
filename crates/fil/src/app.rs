@@ -26,7 +26,10 @@ pub fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => e.exit(), // 0 for --help and --version, 2 for a usage error
     };
-    let config_path = cli.config.clone().or_else(config::default_path);
+    if let Err(e) = cli.validate() {
+        e.exit(); // 2, like any usage error
+    }
+    let located = config::locate(cli.config.as_deref(), std::env::var_os("FIL_CONFIG"));
     let action = match cli.action() {
         Ok(a) => a,
         Err(e) => {
@@ -39,7 +42,11 @@ pub fn main() -> ExitCode {
         Action::ServerDaemon => return server::run_daemon(),
         _ => {}
     }
-    let config = match config_path.as_deref().map(Config::load).transpose() {
+    let config = match located
+        .as_ref()
+        .map(|l| Config::load(&l.path, l.required))
+        .transpose()
+    {
         Ok(c) => c.unwrap_or_default(),
         Err(e) => {
             eprintln!("fil: {e}");

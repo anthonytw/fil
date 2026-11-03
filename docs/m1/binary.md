@@ -16,19 +16,20 @@ fil server --daemon                            the daemon itself (hidden; starte
 | Option | Meaning |
 |---|---|
 | `--transport auto\|pipe\|direct` | Overrides the config for this attach. `auto`: ssh first, QUIC in the background. `pipe`: never dial. `direct`: as auto, but an ssh re-login waits 10 s after QUIC is lost. |
-| `--config FILE` | Another config file (also `$FIL_CONFIG`). |
+| `--config FILE` | Another config file (also `$FIL_CONFIG`). A file named this way must exist: a typo is an error, not "no config" (only the default path may be missing). |
 | `-L SPEC`, `-R SPEC` | Accepted; port forwards are M2, so they fail with a clear "not yet" message (exit 1). |
 | `fil detach` with no host | Same: it needs the session's control socket (M2). |
+| a HOST, SESSION, `-L`, `-R` or `--transport` together with a command | A usage error (exit 2): `fil orin ls box` would list `box` and drop `orin`. |
 
 A host or session named `ls`, `kill`, `detach` or `server` is attached with `--`: `fil -- ls`, `fil orin -- ls`. (Without it `fil orin ls` fails loudly, because `ls` wants a host.)
 
 **Exit status.** 0: detached, input closed, or the session ended (package F will make it the shell's own status). 1: an error, or the session was taken over, replaced or detached elsewhere. 2: a usage error (clap). 128+N: stopped by signal N.
 
-**Logs.** JSON lines in `~/.local/state/fil/client.log` (directory 0700, file 0600, rotated at 5 MiB). `FIL_LOG=debug` for more. Nothing reaches the terminal during a session except the client's own messages. The log holds no keystrokes, output or keys.
+**Logs.** JSON lines in `~/.local/state/fil/client.log` (directory 0700, file 0600, rotated at 5 MiB). `FIL_LOG=debug` for more. Once the first attach has been accepted, nothing reaches the terminal except the client's own messages: a background run's stderr (ssh's, or any pipe command's) is captured, not inherited, and its last line goes to the status line and to the log. Until then ssh runs as written, with its prompts and errors on your terminal. The log holds no keystrokes, output or keys.
 
 ## Config: `~/.config/fil/config.toml`
 
-A missing file means the defaults. Unknown keys are errors. Every section is checked when the file is read, and an error names the file, the section and the key (`config.toml: [host.orin]: offline_input.buffer: not a size: "lots"`).
+A missing default file means the defaults; a file named with `--config` or `$FIL_CONFIG` that is missing is an error. Unknown keys are errors. Every section is checked when the file is read, and an error names the file, the section and the key (`config.toml: [host.orin]: offline_input.buffer: not a size: "lots"`).
 
 | Key | Values | Used by |
 |---|---|---|
@@ -74,7 +75,7 @@ sequenceDiagram
     D->>M: DirectUp
     M-->>D: SwitchTo(Direct)
     L->>D: next_swap()
-    D-->>L: the direct link (candidate; the pipe stays open)
+    D-->>L: the direct link (candidate, the pipe stays open)
     L->>D: swapped(Ok(Direct))
     D->>M: Switched(Direct)
     M-->>D: ClosePipe
@@ -108,9 +109,11 @@ sequenceDiagram
 ### Decisions worth knowing
 
 - **Only the manager backs off.** The binary sets the client's `Backoff::None`, and `dial` waits for the manager's timers. A `dial` that cannot connect on a first attach returns the error at once (a typo in the host name must not retry forever); if the loop calls again, the manager's backoff holds, so a persistent failure is not an ssh storm.
-- **A re-run of ssh must not need the terminal.** Only a fresh attach (`DialPurpose::Attach`) runs ssh as written. Every reconnect and every background run adds `-o BatchMode=yes -o ConnectTimeout=10` (unless the command already sets them), waits at most 30 s for fil's preamble, and so fails instead of prompting while the session owns the terminal. Other pipe commands run untouched.
-- **Keys.** A `ClientKey` is made when the dialer is built (memory only) and again on every `DialPurpose::Attach`, never on `Resume`. A fresh attach starts the manager over: closes every link of the old key, forgets its timers and backoffs, and runs the pipe first, because the new key must be registered through it. The one exception is a retry of a failed `Attach`.
-- **Links are shared.** Each link is held in an `Arc` by the loop and the dialer, so `ClosePipe` can close what the loop is using and a watcher can report its death. Events carry a link id: the late death of an old pipe is never taken for the death of the one that replaced it.
+- **ssh uses the terminal only for the process's first attach.** The user is waiting for it, so ssh runs as written: Touch ID, passwords and host-key questions work. Once an attach has been accepted the terminal belongs to the session (raw mode, fil reading the keys), so every later run, a fresh attach after a take-over or a replaced session included, is a background run. A background run of an `ssh` pipe command, the default one or one from `pipe = [...]`, adds `-o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR` (each unless the command already sets it) and waits at most 30 s for fil's preamble; its stderr is captured (`PipeStderr::Capture`, the last 4 KiB). A command whose program is not `ssh` (`kubectl`, `tailscale ssh`, `docker exec`) runs untouched apart from the captured stderr, so it may prompt on a reconnect.
+- **When a background ssh cannot log in** (it needs a password, a passphrase or a host-key answer: "Permission denied", "Host key verification failed", ...) the dialer returns a retryable error for each failure, and the status line says `ssh needs an interactive login: detach (~.) and run fil again. ssh said: ...`. It keeps retrying with the manager's backoff, so a login that starts working (an agent unlocked elsewhere) recovers by itself. Any other failure shows ssh's last stderr line there. The same line goes to the log. This needs one hook in fil-client: `Dialer::status_note`, shown under the "reconnecting" lines.
+- **Keys.** A `ClientKey` is made when the dialer is built (memory only) and again on every `DialPurpose::Attach`, never on `Resume`. A fresh attach closes every link of the old key, aborts a direct dial in flight, forgets the pinned details, and tells the manager that direct is unavailable until the new reply, so the next link is a pipe: the new key is registered through it, and the daemon accepts a fresh attach nowhere else (`dial(Attach)` never returns a direct link). **The path manager is kept**, with its pipe backoff: a pipe that dies before the session is established (the engine dials `Attach` again whenever the session is not established) counts as a young death, so ssh logins stay bounded by the manager's 1 s to 30 s backoff however many fresh attaches follow. The one exception to rotating is a retry of a failed `Attach`.
+- **The pin and the port** come from the bootstrap over the pipe only. A reply over direct (a resume, a swap) is still reported to the manager, but with the details in force; it cannot move the pin.
+- **Links are shared.** Each link is held in an `Arc` by the loop and the dialer, so `ClosePipe` can close what the loop is using and a watcher can report its death. Events carry a link id: in a normal upgrade the loop closes the old pipe when the candidate's reply is in, so the pipe's death report is queued before `swapped(Ok)` and the `ClosePipe` it causes; without the id it would be read as the death of the direct link that now carries the session (`tests/dialer.rs` has the test; it fails when the direct-side check is weakened).
 - **A first-attach failure is worded for the user.** A version mismatch says so and what to do; "no preamble" says fil may not be installed on the remote host or on the PATH of a non-interactive login; what the remote shell printed before failing is shown, sanitized.
 - **Direct address.** The UDP dial goes to `direct.address` if set; otherwise to the name `ssh -G` reports for HOST (so an alias from `~/.ssh/config` works); otherwise to HOST itself, without `user@`. The first two addresses it resolves to are tried.
 - **Network changes** are hints (the manager rate-limits them). The detector (`src/netwatch.rs`) polls, every 2 s, which local address the kernel would use toward a documentation-range address (no packet is sent) for IPv4 and IPv6, and whether the wall clock ran ahead of the timer (sleep). It misses a move between two networks that hand out the same address; the periodic retry covers that within the manager's backoff.
@@ -125,14 +128,14 @@ All run in `just ci`. Times are debug builds on an Apple M-series laptop.
 
 | Where | What | Time |
 |---|---|---|
-| `src/cli.rs` (14) | each form of the command line, defaults, `--`, `-L`/`-R` refused, usage errors, help text | under 0.05 s |
-| `src/config.rs` (8) | the DESIGN.md sketch, field-by-field override, `user@host` matching, every kind of bad value (message names section and key) | under 0.05 s |
+| `src/cli.rs` (15) | each form of the command line, defaults, `--`, `-L`/`-R` refused, usage errors, help text | under 0.05 s |
+| `src/config.rs` (10) | the DESIGN.md sketch, field-by-field override, `user@host` matching, every kind of bad value (message names section and key) | under 0.05 s |
 | `src/mgmt.rs` (10) | the `fil ls` table, truncation, hostile labels, answers as sentences, and the exchange over `link::mem` (version mismatch, dropped link, silent daemon, error message) | under 0.05 s |
-| `src/connect.rs` (5), `src/logging.rs` (2), `src/app.rs` (2), `src/netwatch.rs` (1) | the background ssh command, `ssh -G` parsing, failure wording, log permissions and rotation, host labels, exit statuses | under 0.05 s |
-| `tests/dialer.rs` (20), paused clock | the dialer called as the loop calls it, over fake transports and `link::mem`: upgrade (the pipe closes only after the switch), failed switch, candidate dying, UDP blocked (bounded dials), fallback after 3 s, a QUIC redial with no ssh, a refused redial going straight to ssh, ssh storms (first attach and mid-session), ten minutes of direct flapping, keys (rotated on a fresh attach, kept on resume, old links closed), version mismatch, hints and their budget, stale death reports | 0.01 s |
-| `tests/engine.rs` (9), paused clock | the real `fil_client::run` with the real dialer and fil-client's scripted daemon: upgrade with the same key, a QUIC blip with no ssh, UDP dying and the fallback, return to direct, ssh dying mid-session, a replaced session getting a new key through the pipe, first-attach failure, version mismatch, five minutes of outage | about 1 s |
+| `src/connect.rs` (8), `src/logging.rs` (2), `src/app.rs` (2), `src/netwatch.rs` (1) | the background ssh command, `ssh -G` parsing, failure wording, log permissions and rotation, host labels, exit statuses | under 0.05 s |
+| `tests/dialer.rs` (28), paused clock | the dialer called as the loop calls it, over fake transports and `link::mem`: upgrade (the pipe closes only after the switch), failed switch, candidate dying, UDP blocked (bounded dials), fallback after 3 s, a QUIC redial with no ssh, a refused redial going straight to ssh, ssh storms (first attach, mid-session, and across fresh attaches whose pipes die young), ssh interactive only until the first attach, status notes, a direct dial cancelled on a key change, the pin taken only from the pipe, ten minutes of direct flapping, keys (rotated on a fresh attach, kept on resume, old links closed), version mismatch, hints and their budget, stale death reports | 0.01 s |
+| `tests/engine.rs` (11), paused clock | the real `fil_client::run` with the real dialer and fil-client's scripted daemon: upgrade with the same key, a QUIC blip with no ssh, UDP dying and the fallback, return to direct, ssh dying mid-session, a replaced session getting a new key through the pipe, first-attach failure, version mismatch, five minutes of outage | about 1 s |
 
-Mutation checks (each change made by hand, the suites run, the change reverted): no reset on a fresh attach, no `Switched` after a swap, no `Switched` for a link from `dial`, ssh always interactive, `PipeUp` not reported, and a resume reply counted as a fresh attach each fail at least one test. The link-id check on death reports is defense in depth: events reach the dialer in order and a closed link's watcher is aborted, so no test can tell it from a plain "is there a pipe link" check.
+Mutation checks (each change made by hand, the suites run, the change reverted): see the pull request for the list and results.
 
 ## Not done here
 

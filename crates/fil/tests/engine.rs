@@ -249,8 +249,8 @@ async fn a_fresh_attach_after_a_replaced_session_gets_a_new_key_through_a_new_pi
     let last = keys.last().unwrap();
     assert_ne!(last, &keys[0], "a fresh attach brings a new key");
     assert!(
-        rig.fake.runs(LinkKind::Pipe)[1].interactive,
-        "the user is at the keyboard"
+        !rig.fake.runs(LinkKind::Pipe)[1].interactive,
+        "the terminal is the session's: this ssh must not prompt"
     );
     rig.works("new session").await;
     assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
@@ -317,5 +317,91 @@ async fn an_outage_during_the_session_ends_when_the_network_returns_with_no_ssh_
     until_async("recovery", 200, || async { rig.attaches().await >= 3 }).await;
     settle().await;
     rig.works("recovered").await;
+    assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_links_dying_mid_snapshot_do_not_storm_ssh() {
+    // The session is replaced and the user says yes; every new pipe dies before its snapshot
+    // lands. The reviewer's scratch test: 601 ssh runs in a minute before the fix.
+    let rig = rig_with_direct(TransportSetting::Pipe).await;
+    rig.wait_attaches(1).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    rig.daemon.replace_session().await;
+    rig.fake.kill_latest(LinkKind::Pipe, DownReason::Dead);
+    until_async("the question", 60, || async {
+        rig.term.text().contains("is a different session now")
+    })
+    .await;
+    rig.daemon
+        .set_snapshot_delay(Some(Duration::from_secs(1)))
+        .await;
+    let fake = rig.fake.clone();
+    let killer = tokio::spawn(async move {
+        let mut killed = fake.links_made(LinkKind::Pipe);
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let n = fake.links_made(LinkKind::Pipe);
+            if n > killed {
+                fake.kill_latest(LinkKind::Pipe, DownReason::Io("exited".into()));
+                killed = n;
+            }
+        }
+    });
+    let before = rig.fake.pipe_runs();
+    rig.term.type_bytes(b"y");
+    until_async("the fresh run", 10, || async {
+        rig.fake.pipe_runs() > before
+    })
+    .await;
+    // The session's terminal: nothing may ask for it.
+    assert!(rig.term.is_raw());
+    assert!(!rig.fake.runs(LinkKind::Pipe)[before].interactive);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    killer.abort();
+    let new = rig.fake.pipe_runs() - before;
+    assert!(new <= 10, "{new} ssh logins in a minute");
+    assert!(new >= 3, "it keeps trying: {new}");
+    assert!(
+        rig.fake
+            .runs(LinkKind::Pipe)
+            .iter()
+            .skip(before)
+            .all(|r| !r.interactive)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_background_ssh_that_needs_a_login_says_so_in_the_status_line() {
+    let rig = rig_with_direct(TransportSetting::Pipe).await;
+    rig.wait_attaches(1).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    rig.fake.set_pipe_default(Script::FailNote(
+        "ssh failed (Permission denied (publickey))".into(),
+        "ssh needs an interactive login: detach (~.) and run fil again. ssh said: Permission denied"
+            .into(),
+    ));
+    rig.fake.kill_latest(LinkKind::Pipe, DownReason::Dead);
+    until_async("the note", 60, || async {
+        rig.term.text().contains("ssh needs an interactive login")
+    })
+    .await;
+    let text = rig.term.text();
+    assert!(text.contains("fil: disconnected"), "{text}");
+    assert!(
+        text.contains("detach") && text.contains("(~.) and run fil again"),
+        "{text}"
+    );
+    // It keeps trying quietly, with the manager's backoff, and recovers when the login works.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(rig.fake.pipe_runs() <= 12, "{}", rig.fake.pipe_runs());
+    rig.fake.set_pipe_default(Script::ok());
+    until_async("recovery", 200, || async { rig.attaches().await >= 2 }).await;
+    settle().await;
+    rig.works("back").await;
+    assert!(
+        !rig.term.text().contains("interactive login"),
+        "the note goes away with the outage"
+    );
     assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
 }

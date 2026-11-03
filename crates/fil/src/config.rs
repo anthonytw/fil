@@ -224,12 +224,40 @@ pub struct Config {
     hosts: BTreeMap<String, RawSection>,
 }
 
-/// `$FIL_CONFIG`, else `$XDG_CONFIG_HOME/fil/config.toml`, else `~/.config/fil/config.toml`.
+/// `$XDG_CONFIG_HOME/fil/config.toml`, else `~/.config/fil/config.toml`: the file used when
+/// nobody named one. It may be missing.
 pub fn default_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("FIL_CONFIG").filter(|p| !p.is_empty()) {
-        return Some(PathBuf::from(p));
-    }
     base_dir("XDG_CONFIG_HOME", ".config").map(|d| d.join("fil").join("config.toml"))
+}
+
+/// The config file to read, and whether it must exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Located {
+    pub path: PathBuf,
+    /// Named by `--config` or `$FIL_CONFIG`: a file that is not there is a mistake (a typo
+    /// would silently run fil with settings other than the ones meant, perhaps against a real
+    /// host). Only the default path may be missing.
+    pub required: bool,
+}
+
+/// `--config FILE`, else `$FIL_CONFIG`, else [`default_path`].
+pub fn locate(cli: Option<&Path>, env_fil_config: Option<std::ffi::OsString>) -> Option<Located> {
+    if let Some(p) = cli {
+        return Some(Located {
+            path: p.to_path_buf(),
+            required: true,
+        });
+    }
+    if let Some(p) = env_fil_config.filter(|p| !p.is_empty()) {
+        return Some(Located {
+            path: PathBuf::from(p),
+            required: true,
+        });
+    }
+    default_path().map(|path| Located {
+        path,
+        required: false,
+    })
 }
 
 /// `$VAR` if it is an absolute path, else `$HOME/fallback`.
@@ -249,12 +277,15 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 impl Config {
-    /// Reads `path`. A file that does not exist is the defaults; one that cannot be read or does
-    /// not parse is an error that says where.
-    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    /// Reads `path`. A file that does not exist is the defaults, unless `required` (it was named
+    /// on the command line or in `$FIL_CONFIG`); one that cannot be read or does not parse is an
+    /// error that says where.
+    pub fn load(path: &Path, required: bool) -> Result<Config, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(text) => Config::parse(&text, &path.display().to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
+                Ok(Config::default())
+            }
             Err(source) => Err(ConfigError::Read {
                 path: path.to_path_buf(),
                 source,
@@ -439,9 +470,36 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_the_defaults() {
-        let cfg = Config::load(Path::new("/nonexistent/fil/config.toml")).unwrap();
+        let cfg = Config::load(Path::new("/nonexistent/fil/config.toml"), false).unwrap();
         assert_eq!(cfg.for_host("anything"), HostSettings::default());
         assert_eq!(HostSettings::default().offline.buffer, 4096);
+    }
+
+    #[test]
+    fn a_file_that_was_named_must_exist() {
+        let e = Config::load(Path::new("/nonexistent/fil/typo.toml"), true).unwrap_err();
+        let text = e.to_string();
+        assert!(text.contains("/nonexistent/fil/typo.toml"), "{text}");
+        assert!(text.to_lowercase().contains("no such file"), "{text}");
+    }
+
+    #[test]
+    fn which_file_and_whether_it_may_be_missing() {
+        let cli = Path::new("/x/cli.toml");
+        let env = Some(std::ffi::OsString::from("/x/env.toml"));
+        // The command line wins over the environment; both are required.
+        let l = locate(Some(cli), env.clone()).unwrap();
+        assert_eq!((l.path.as_path(), l.required), (cli, true));
+        let l = locate(None, env).unwrap();
+        assert_eq!(
+            (l.path.as_path(), l.required),
+            (Path::new("/x/env.toml"), true)
+        );
+        // An empty variable is no variable. The default may be missing.
+        if let Some(l) = locate(None, Some(std::ffi::OsString::new())) {
+            assert!(!l.required);
+            assert!(l.path.ends_with("fil/config.toml"));
+        }
     }
 
     #[test]

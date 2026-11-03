@@ -103,6 +103,9 @@ pub struct PipeFailure {
     /// client sanitizes it.
     pub skipped: Vec<u8>,
     pub severity: Severity,
+    /// A short line for the status line while the client reconnects ("ssh: Permission denied",
+    /// "ssh needs an interactive login: ..."). Untrusted text is fine; the client cleans it.
+    pub note: Option<String>,
 }
 
 impl PipeFailure {
@@ -111,6 +114,7 @@ impl PipeFailure {
             message: message.into(),
             skipped: Vec::new(),
             severity: Severity::Transient,
+            note: None,
         }
     }
 }
@@ -132,6 +136,12 @@ pub trait Connector: Send + Sync + 'static {
         &self,
         interactive: bool,
     ) -> impl Future<Output = Result<PipeUp<Self::Link>, PipeFailure>> + Send;
+
+    /// What the pipe command said on its way out (the last line of its stderr), for a link that
+    /// went down on its own, as a status-line note. Default: nothing.
+    fn diagnostics(&self, _link: &Self::Link) -> Option<String> {
+        None
+    }
 
     /// Dials the daemon's UDP port, pinned to `pin`, authenticated with `key`.
     fn dial_direct(
@@ -229,6 +239,7 @@ pub struct PathDialer<C: Connector> {
     pipe_run: Option<u64>,
     pipe_task: Option<AbortHandle>,
     direct_run: Option<u64>,
+    direct_task: Option<AbortHandle>,
     pipe_link: Option<Held<C::Link>>,
     direct_link: Option<Held<C::Link>>,
     /// The daemon's UDP port and certificate fingerprint, from the last attach reply.
@@ -240,12 +251,16 @@ pub struct PathDialer<C: Connector> {
     /// A pipe failure not yet returned from `dial`.
     pipe_error: Option<PipeFailure>,
     started: bool,
-    /// An attach was accepted under the current key.
-    attach_ok: bool,
-    /// `dial(Attach)` returned an error and the next one continues instead of starting over.
+    /// The process's first attach has been accepted. Until then the user is waiting and ssh may
+    /// use the terminal; from then on the terminal belongs to the session.
+    ever_attached: bool,
+    /// `dial(Attach)` returned an error and the next one continues instead of rotating the key
+    /// again.
     retrying_attach: bool,
-    /// The user is still waiting for the first link: ssh may use the terminal.
+    /// The next pipe run may use the terminal (ssh prompts).
     interactive: bool,
+    /// Why the last pipe attempt failed, for the status line.
+    note: Option<String>,
     netwatch: Option<AbortHandle>,
 }
 
@@ -276,6 +291,7 @@ impl<C: Connector> PathDialer<C> {
             pipe_run: None,
             pipe_task: None,
             direct_run: None,
+            direct_task: None,
             pipe_link: None,
             direct_link: None,
             bootstrap: None,
@@ -284,9 +300,10 @@ impl<C: Connector> PathDialer<C> {
             handed_swap: None,
             pipe_error: None,
             started: false,
-            attach_ok: false,
+            ever_attached: false,
             retrying_attach: false,
             interactive: true,
+            note: None,
             netwatch,
         })
     }
@@ -303,22 +320,51 @@ impl<C: Connector> PathDialer<C> {
 
     // ---- starting over -----------------------------------------------------------------
 
-    /// Everything from the old key and old links goes; a new key, a new manager, pipe first.
-    fn reset(&mut self) -> Result<(), AuthError> {
-        self.teardown();
-        self.key = Arc::new(ClientKey::generate()?);
+    /// A fresh attach: a new key, and nothing that belongs to the old one survives (its links,
+    /// a dial in flight, the pinned details). The **path manager is kept**: its pipe backoff must
+    /// outlive a key rotation, or a pipe that keeps dying before the session is established
+    /// would be re-run with no wait at all. The manager is told every link is gone and that
+    /// direct is unavailable until the new reply says otherwise, so the next link is a pipe: the
+    /// new key is registered through it, and a daemon accepts a fresh attach only there.
+    fn rekey(&mut self) -> Result<(), AuthError> {
+        let key = Arc::new(ClientKey::generate()?);
+        self.drain();
+        let now = Instant::now();
+        // First of all: no dialing until the new reply (and none under the old key's details),
+        // whatever the closing below makes the manager want.
+        self.bootstrap = None;
+        self.feed(now, PathInput::DirectUnavailable);
+        if let Some(t) = self.direct_task.take() {
+            t.abort();
+        }
+        if self.direct_run.take().is_some() {
+            self.feed(now, PathInput::DirectDialFailed(DownReason::Closed));
+        }
+        if let Some(h) = self.direct_link.take() {
+            h.close();
+            self.feed(now, PathInput::DirectDown(DownReason::Closed));
+        }
+        if let Some(h) = self.pipe_link.take() {
+            h.close();
+            self.feed(now, PathInput::PipeDown(DownReason::Closed));
+        }
+        // A pipe run in flight is kept: it does not depend on the key.
+        self.offer = None;
+        self.handed_dial = None;
+        self.handed_swap = None;
+        self.pipe_error = None;
+        self.key = key;
         self.public = public_of(&self.key);
-        self.mgr = PathManager::new(self.cfg.path);
-        self.started = false;
-        self.attach_ok = false;
         self.retrying_attach = false;
-        self.interactive = true;
         Ok(())
     }
 
     /// Closes every link and forgets every task, timer and offer.
     fn teardown(&mut self) {
         if let Some(t) = self.pipe_task.take() {
+            t.abort();
+        }
+        if let Some(t) = self.direct_task.take() {
             t.abort();
         }
         self.pipe_run = None;
@@ -421,14 +467,17 @@ impl<C: Connector> PathDialer<C> {
         let run = self.serial;
         self.direct_run = Some(run);
         let (c, tx, key) = (self.connector.clone(), self.tx.clone(), self.key.clone());
-        tokio::spawn(async move {
-            let result = c.dial_direct(port, pin, key).await;
-            let _ = tx.send(Event::Direct {
-                run,
-                at: Instant::now(),
-                result,
-            });
-        });
+        self.direct_task = Some(
+            tokio::spawn(async move {
+                let result = c.dial_direct(port, pin, key).await;
+                let _ = tx.send(Event::Direct {
+                    run,
+                    at: Instant::now(),
+                    result,
+                });
+            })
+            .abort_handle(),
+        );
     }
 
     fn hold(&mut self, link: C::Link, banner: Vec<u8>) -> Held<C::Link> {
@@ -463,7 +512,8 @@ impl<C: Connector> PathDialer<C> {
                         self.feed(at, PathInput::PipeUp);
                     }
                     Err(f) => {
-                        tracing::info!(error = %f.message, "pipe failed");
+                        tracing::info!(error = %f.message, note = ?f.note, "pipe failed");
+                        self.note = f.note.clone();
                         let reason = DownReason::Io(f.message.clone());
                         self.pipe_error = Some(f);
                         self.feed(at, PathInput::PipeDown(reason));
@@ -475,6 +525,7 @@ impl<C: Connector> PathDialer<C> {
                     return;
                 }
                 self.direct_run = None;
+                self.direct_task = None;
                 match result {
                     Ok(link) => {
                         let held = self.hold(link, Vec::new());
@@ -491,7 +542,13 @@ impl<C: Connector> PathDialer<C> {
             }
             Event::Down { id, at, reason } => {
                 if self.pipe_link.as_ref().is_some_and(|h| h.id == id) {
-                    self.pipe_link = None;
+                    if let Some(h) = self.pipe_link.take()
+                        && reason != DownReason::Closed
+                        && let Some(n) = self.connector.diagnostics(&h.link.0)
+                    {
+                        tracing::info!(note = %n, ?reason, "pipe ended");
+                        self.note = Some(n);
+                    }
                     if self.handed_dial == Some(LinkKind::Pipe) {
                         self.handed_dial = None;
                     }
@@ -561,8 +618,17 @@ impl<C: Connector> PathDialer<C> {
 
     // ---- handing links out -------------------------------------------------------------
 
-    fn take_offer(&mut self, how: Handed) -> Option<Dialed<Shared<C::Link>>> {
+    /// `pipe_only`: a fresh attach must arrive on a pipe (the daemon accepts a fresh attach nowhere
+    /// else, and the new key is registered through it), so an offer of anything else is dropped.
+    fn take_offer(&mut self, how: Handed, pipe_only: bool) -> Option<Dialed<Shared<C::Link>>> {
         let kind = self.offer?;
+        if pipe_only && kind != LinkKind::Pipe {
+            self.offer = None;
+            if let Some(h) = self.direct_link.take() {
+                h.close();
+            }
+            return None;
+        }
         let slot = match kind {
             LinkKind::Pipe => &mut self.pipe_link,
             LinkKind::Direct => &mut self.direct_link,
@@ -578,10 +644,7 @@ impl<C: Connector> PathDialer<C> {
         }
         self.offer = None;
         match how {
-            Handed::Dial => {
-                self.handed_dial = Some(kind);
-                self.interactive = false;
-            }
+            Handed::Dial => self.handed_dial = Some(kind),
             Handed::Swap => self.handed_swap = Some(kind),
         }
         Some(Dialed {
@@ -595,10 +658,10 @@ impl<C: Connector> PathDialer<C> {
         let f = self.pipe_error.take()?;
         let fatal = match purpose {
             DialPurpose::Attach => f.severity != Severity::Transient,
-            // In a running session only a version mismatch ends the client; everything else is
-            // the manager's to retry, quietly.
-            DialPurpose::Resume if f.severity == Severity::Version => true,
-            DialPurpose::Resume => return None,
+            // In a running session only a version mismatch ends the client. Anything else is
+            // returned as a retryable error (the loop shows our note in its status line and
+            // asks again); the manager's timers decide when the next run happens.
+            DialPurpose::Resume => f.severity == Severity::Version,
         };
         let message = match f.severity {
             Severity::Version => format!(
@@ -673,15 +736,17 @@ impl<C: Connector> Dialer for PathDialer<C> {
     }
 
     async fn dial(&mut self, purpose: DialPurpose) -> Result<Dialed<Self::Link>, DialError> {
-        // A fresh attach starts over, unless nothing has happened yet or the last one failed and
-        // this is its retry.
+        // A fresh attach rotates the key, unless nothing has happened yet or the last one failed
+        // and this is its retry.
         if purpose == DialPurpose::Attach && self.started && !self.retrying_attach {
-            self.reset()
+            self.rekey()
                 .map_err(|e| DialError::fatal(format!("cannot make a session key: {e}")))?;
         }
         self.handed_dial = None;
-        // Only a fresh attach has a user waiting for ssh; a reconnect must not touch the tty.
-        self.interactive = purpose == DialPurpose::Attach;
+        // ssh may use the terminal only while the user is waiting for the process's first
+        // attach. After that the terminal belongs to the session: a fresh attach (a take-back,
+        // a replaced session) runs ssh the background way too.
+        self.interactive = purpose == DialPurpose::Attach && !self.ever_attached;
         // A failure seen before this call belongs to an earlier dial; what `drain` finds is fresh.
         self.pipe_error = None;
         self.drain();
@@ -691,7 +756,7 @@ impl<C: Connector> Dialer for PathDialer<C> {
         }
         let mut stalls = 0u32;
         loop {
-            if let Some(d) = self.take_offer(Handed::Dial) {
+            if let Some(d) = self.take_offer(Handed::Dial, purpose == DialPurpose::Attach) {
                 self.retrying_attach = false;
                 return Ok(d);
             }
@@ -730,11 +795,15 @@ impl<C: Connector> Dialer for PathDialer<C> {
     async fn next_swap(&mut self) -> Dialed<Self::Link> {
         loop {
             self.drain();
-            if let Some(d) = self.take_offer(Handed::Swap) {
+            if let Some(d) = self.take_offer(Handed::Swap, false) {
                 return d;
             }
             self.step().await;
         }
+    }
+
+    fn status_note(&self) -> Option<String> {
+        self.note.clone()
     }
 
     fn next_kind(&self) -> Option<LinkKind> {
@@ -753,35 +822,35 @@ impl<C: Connector> Dialer for PathDialer<C> {
     }
 
     fn attached(&mut self, info: &AttachInfo) {
-        self.attach_ok = true;
+        self.ever_attached = true;
+        self.note = None;
         let now = Instant::now();
-        let offered = match (info.udp_port, info.fingerprint.as_ref()) {
-            (Some(port), Some(fp)) => <[u8; 32]>::try_from(fp.as_bytes())
-                .ok()
-                .map(|b| (port, Fingerprint::from_bytes(b))),
-            _ => None,
-        };
-        match offered {
-            Some((port, pin)) => {
-                self.bootstrap = Some((port, pin));
-                self.feed(
-                    now,
-                    PathInput::DirectAvailable {
-                        port,
-                        fingerprint: pin.as_bytes().to_vec(),
-                        fresh_attach: !info.resumed,
-                    },
+        // The pin and the port come from the bootstrap over the pipe only (DESIGN.md section
+        // 8.3). A reply over direct was authenticated by the pin in force; it cannot move it.
+        // The manager still hears about every reply.
+        if info.kind == LinkKind::Pipe {
+            self.bootstrap = match (info.udp_port, info.fingerprint.as_ref()) {
+                (Some(port), Some(fp)) => <[u8; 32]>::try_from(fp.as_bytes())
+                    .ok()
+                    .map(|b| (port, Fingerprint::from_bytes(b))),
+                _ => None,
+            };
+            if self.bootstrap.is_none() && (info.udp_port.is_some() || info.fingerprint.is_some()) {
+                tracing::warn!(
+                    "the daemon's direct-mode details are unusable; staying on the pipe"
                 );
             }
-            None => {
-                if info.udp_port.is_some() || info.fingerprint.is_some() {
-                    tracing::warn!(
-                        "the daemon's direct-mode details are unusable; staying on the pipe"
-                    );
-                }
-                self.bootstrap = None;
-                self.feed(now, PathInput::DirectUnavailable);
-            }
+        }
+        match self.bootstrap {
+            Some((port, pin)) => self.feed(
+                now,
+                PathInput::DirectAvailable {
+                    port,
+                    fingerprint: pin.as_bytes().to_vec(),
+                    fresh_attach: !info.resumed,
+                },
+            ),
+            None => self.feed(now, PathInput::DirectUnavailable),
         }
         if self.handed_dial == Some(info.kind) {
             self.handed_dial = None;

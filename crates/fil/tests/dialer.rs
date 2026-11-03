@@ -271,11 +271,9 @@ async fn a_pipe_that_keeps_failing_is_not_rerun_in_a_storm() {
     fake.set_pipe_default(Script::fail("ssh: connect: network unreachable"));
     let mut d = auto(&fake);
     // Ten minutes of outage in the middle of a session.
-    assert!(
-        within(secs(600), &mut d, DialPurpose::Resume)
-            .await
-            .is_none()
-    );
+    let (link, errors) = dial_for(secs(600), &mut d, DialPurpose::Resume).await;
+    assert!(link.is_none());
+    assert!(!errors.is_empty() && errors.iter().all(|e| !e.fatal));
     let n = fake.pipe_runs();
     assert!((10..=30).contains(&n), "{n} ssh runs in ten minutes");
     // The waits grow: later runs are far apart.
@@ -410,7 +408,10 @@ async fn the_key_is_new_on_every_fresh_attach_and_kept_on_resume() {
     assert!(is_down(&old_direct_link), "links of the old key are closed");
     assert!(is_down(&pipe.link) && is_down(&cand.link));
     let last_pipe = fake.runs(LinkKind::Pipe).last().cloned().unwrap();
-    assert!(last_pipe.interactive);
+    assert!(
+        !last_pipe.interactive,
+        "the session owns the terminal: a fresh attach after the first is not interactive"
+    );
     d.attached(&info(LinkKind::Pipe, false, true));
     let upgrade = swap_within(secs(5), &mut d).await.unwrap();
     assert_eq!(upgrade.link.kind(), LinkKind::Direct);
@@ -448,11 +449,15 @@ async fn an_ordinary_pipe_failure_is_retried_quietly_in_a_running_session() {
     let fake = Fake::new();
     fake.push_pipe(Script::fail("ssh: connection refused"));
     let mut d = auto(&fake);
-    let link = within(secs(30), &mut d, DialPurpose::Resume).await.unwrap();
-    assert!(
-        link.is_ok(),
-        "the second run worked; the loop never saw the first failure"
-    );
+    // The loop is told about the failure (it shows it) and asks again; the manager's timer
+    // decides when the second run happens.
+    let t0 = Instant::now();
+    let (link, errors) = dial_for(secs(30), &mut d, DialPurpose::Resume).await;
+    assert!(link.is_some(), "the second run worked");
+    assert_eq!(errors.len(), 1);
+    assert!(!errors[0].fatal);
+    assert!(errors[0].message.contains("connection refused"));
+    assert!(t0.elapsed() >= ms(700), "{:?}", t0.elapsed());
     assert_eq!(fake.pipe_runs(), 2);
 }
 
@@ -534,4 +539,234 @@ async fn the_death_of_an_old_link_is_not_taken_for_the_death_of_its_replacement(
     assert!(!is_down(&p1.link));
     assert_eq!(d.view().carrier, Some(LinkKind::Pipe));
     assert_eq!(fake.pipe_runs(), 2);
+}
+
+// ---- review fixes -------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn pipes_that_die_before_the_session_is_established_back_off_across_fresh_attaches() {
+    // The reviewer's storm, at the dialer: the engine dials `Attach` whenever the session is not
+    // established, and each pipe dies young. A key rotation must not forget the pipe backoff.
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _first = first_attach(&mut d).await;
+    tokio::time::sleep(secs(30)).await;
+    fake.kill_latest(LinkKind::Pipe, DownReason::Dead);
+    let before = fake.pipe_runs();
+    let start = Instant::now();
+    let mut keys = vec![d.public_key()];
+    while start.elapsed() < secs(60) {
+        let (link, _) = dial_for(secs(60), &mut d, DialPurpose::Attach).await;
+        let Some(link) = link else { break };
+        keys.push(d.public_key());
+        tokio::time::sleep(ms(100)).await;
+        // It dies before the snapshot lands, so the loop dials a fresh attach again.
+        link.link.close();
+    }
+    let runs = fake.pipe_runs() - before;
+    assert!(runs <= 10, "{runs} ssh logins in a minute");
+    assert!(runs >= 3, "it does keep trying: {runs}");
+    assert!(
+        keys.windows(2).all(|w| w[0] != w[1]),
+        "each fresh attach still brings its own key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_attach_is_always_a_pipe_even_with_direct_up_and_healthy() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    let cand = swap_within(secs(5), &mut d).await.unwrap();
+    d.swapped(Ok(LinkKind::Direct));
+    tokio::time::sleep(secs(30)).await;
+    // The session is replaced while direct is healthy: the engine asks for a fresh attach.
+    let direct_before = fake.direct_dials();
+    let fresh = within(secs(30), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.link.kind(), LinkKind::Pipe);
+    assert!(is_down(&cand.link), "the old key's direct link is closed");
+    assert_eq!(
+        fake.direct_dials(),
+        direct_before,
+        "no dial under the new key yet"
+    );
+    // Not before the new reply: direct is off until the pipe's reply says what is on offer.
+    assert!(swap_within(secs(20), &mut d).await.is_none());
+    assert_eq!(fake.direct_dials(), direct_before);
+    d.attached(&info(LinkKind::Pipe, false, true));
+    let up = swap_within(secs(5), &mut d).await.unwrap();
+    assert_eq!(up.link.kind(), LinkKind::Direct);
+    assert_eq!(
+        fake.runs(LinkKind::Direct).last().unwrap().key,
+        d.public_key().as_bytes()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ssh_may_use_the_terminal_only_until_the_first_attach_is_accepted() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let first = within(secs(5), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fake.runs(LinkKind::Pipe)[0].interactive);
+    // The pipe dies before the attach is accepted: still the first attach, the user is waiting.
+    first.link.close();
+    let second = dial_for(secs(30), &mut d, DialPurpose::Attach)
+        .await
+        .0
+        .unwrap();
+    assert!(fake.runs(LinkKind::Pipe)[1].interactive);
+    d.attached(&info(LinkKind::Pipe, false, false));
+    // From then on, every run is the background kind, fresh attaches included.
+    second.link.close();
+    let third = dial_for(secs(30), &mut d, DialPurpose::Attach)
+        .await
+        .0
+        .unwrap();
+    d.attached(&info(LinkKind::Pipe, false, false));
+    third.link.close();
+    let _fourth = dial_for(secs(60), &mut d, DialPurpose::Resume)
+        .await
+        .0
+        .unwrap();
+    let runs = fake.runs(LinkKind::Pipe);
+    assert_eq!(runs.len(), 4);
+    assert!(runs[2..].iter().all(|r| !r.interactive), "{runs:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn why_a_background_run_failed_is_offered_to_the_status_line_until_the_next_attach() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _p = within(secs(5), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    // No direct mode in this world: the pipe is the only way back.
+    d.attached(&info(LinkKind::Pipe, false, false));
+    assert_eq!(d.status_note(), None);
+    tokio::time::sleep(secs(30)).await;
+    fake.push_pipe(Script::FailNote(
+        "ssh failed (Permission denied)".into(),
+        "ssh needs an interactive login: detach (~.) and run fil again".into(),
+    ));
+    fake.kill_latest(LinkKind::Pipe, DownReason::Dead);
+    // Direct is not available in this world, so the pipe is the only way back.
+    let (link, errors) = dial_for(secs(30), &mut d, DialPurpose::Resume).await;
+    assert!(link.is_some());
+    assert_eq!(errors.len(), 1, "the loop heard of the failure");
+    assert!(errors[0].message.contains("Permission denied"));
+    // After the failure, and until the next accepted attach, the note is there to show.
+    // (The link that then came up has not attached yet.)
+    assert!(d.status_note().unwrap().contains("interactive login"));
+    d.attached(&info(LinkKind::Pipe, true, false));
+    assert_eq!(d.status_note(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pipe_that_dies_by_itself_leaves_what_it_said_as_a_note() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _p = first_attach(&mut d).await;
+    d.attached(&info(LinkKind::Pipe, false, false));
+    fake.set_diagnostics(Some("Connection to orin closed by remote host."));
+    fake.kill_latest(LinkKind::Pipe, DownReason::Io("exited".into()));
+    let _ = dial_for(secs(30), &mut d, DialPurpose::Resume).await;
+    assert_eq!(
+        d.status_note().as_deref(),
+        Some("Connection to orin closed by remote host.")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_direct_dial_in_flight_is_cancelled_when_the_key_changes() {
+    let fake = Fake::new();
+    fake.set_direct_default(Script::Hang);
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    assert!(swap_within(secs(10), &mut d).await.is_none());
+    assert_eq!(fake.direct_dials(), 1);
+    assert_eq!(fake.direct_cancelled(), 0);
+    // A fresh attach: the handshake under the old key must not run on.
+    let _fresh = within(secs(30), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(fake.direct_cancelled(), 1);
+    // And dropping the dialer cancels one that is running.
+    d.attached(&info(LinkKind::Pipe, false, true));
+    assert!(swap_within(secs(10), &mut d).await.is_none());
+    assert_eq!(fake.direct_dials(), 2);
+    drop(d);
+    tokio::task::yield_now().await;
+    assert_eq!(fake.direct_cancelled(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pin_and_port_come_from_the_pipe_not_from_replies_over_direct() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    let _cand = swap_within(secs(5), &mut d).await.unwrap();
+    d.swapped(Ok(LinkKind::Direct));
+    // A reply over direct claiming other details (a compromised or confused peer): ignored.
+    d.attached(&info_with(LinkKind::Direct, true, Some((60099, 9))));
+    tokio::time::sleep(secs(30)).await;
+    fake.kill_latest(LinkKind::Direct, DownReason::Dead);
+    let _ = within(secs(30), &mut d, DialPurpose::Resume)
+        .await
+        .unwrap()
+        .unwrap();
+    let last = fake.runs(LinkKind::Direct).last().cloned().unwrap();
+    assert_eq!((last.port, last.pin), (60001, [7; 32]));
+    // The daemon restarted (a new port and certificate): direct fails, ssh comes back, and its
+    // reply over the pipe is how the details change.
+    tokio::time::sleep(secs(30)).await;
+    fake.set_direct_default(Script::Fail(secs(2), "no answer".into()));
+    fake.kill_latest(LinkKind::Direct, DownReason::Dead);
+    let link = dial_for(secs(30), &mut d, DialPurpose::Resume)
+        .await
+        .0
+        .unwrap();
+    assert_eq!(link.link.kind(), LinkKind::Pipe);
+    fake.set_direct_default(Script::ok());
+    d.attached(&info_with(LinkKind::Pipe, true, Some((60002, 8))));
+    assert!(swap_within(secs(5), &mut d).await.is_some());
+    let last = fake.runs(LinkKind::Direct).last().cloned().unwrap();
+    assert_eq!((last.port, last.pin), (60002, [8; 32]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_late_death_of_a_closed_pipe_is_not_taken_for_the_death_of_direct() {
+    // The normal upgrade: the client closes the old pipe on the candidate's reply, so the pipe's
+    // death report is queued before `swapped(Ok)` and the `ClosePipe` it causes. Reading that
+    // report as a death of the direct link would drop the session's carrier.
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let pipe = first_attach(&mut d).await;
+    let _direct = swap_within(secs(5), &mut d).await.unwrap();
+    pipe.link.close(); // what the loop does when the candidate's reply is in
+    tokio::task::yield_now().await; // the watcher reports it
+    tokio::task::yield_now().await;
+    d.swapped(Ok(LinkKind::Direct));
+    let _ = swap_within(secs(5), &mut d).await; // processes everything queued
+    let v = d.view();
+    assert_eq!(v.carrier, Some(LinkKind::Direct));
+    assert_eq!(
+        v.direct,
+        fil_transport::path::Lane::Up,
+        "direct was not reported down"
+    );
+    assert_eq!(v.direct_failures, 0);
+    assert_eq!(
+        fake.pipe_runs(),
+        1,
+        "and no ssh was started to replace the carrier"
+    );
 }

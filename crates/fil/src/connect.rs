@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fil_transport::auth::{ClientKey, Fingerprint};
-use fil_transport::pipe::{PipeCommand, PipeConfig, PipeError, PipeErrorKind, PipeLink};
+use fil_transport::pipe::{
+    PipeCommand, PipeConfig, PipeError, PipeErrorKind, PipeLink, PipeStderr,
+};
 use fil_transport::quic::QuicLink;
 use fil_transport::{DownReason, LinkError, LinkParams};
 use tokio::sync::OnceCell;
@@ -82,9 +84,13 @@ impl Connector for Connect {
     async fn run_pipe(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
         let mut cfg = PipeConfig::new(self.params);
         let command = if interactive {
+            // The user is waiting for the first attach: ssh's prompts and errors are theirs.
             self.command.clone()
         } else {
+            // The terminal belongs to the session: ssh must not prompt, and what it says goes
+            // to the status line and the log, not onto the screen.
             cfg.preamble_timeout = Some(BACKGROUND_PREAMBLE);
+            cfg.stderr = PipeStderr::Capture;
             without_tty(&self.command)
         };
         match PipeLink::spawn(&command, cfg).await {
@@ -96,6 +102,13 @@ impl Connector for Connect {
                 })
             }
             Err(e) => Err(failure(e)),
+        }
+    }
+
+    fn diagnostics(&self, link: &AnyLink) -> Option<String> {
+        match link {
+            AnyLink::Pipe(p) => stderr_note(&p.stderr_text()),
+            AnyLink::Direct(_) => None,
         }
     }
 
@@ -143,20 +156,62 @@ pub fn failure(e: PipeError) -> PipeFailure {
         }
         _ => (Severity::Transient, e.to_string()),
     };
+    let stderr = e.stderr_text();
+    let note = stderr_note(&stderr);
+    let message = match last_line(&stderr) {
+        Some(l) => format!("{message} ({l})"),
+        None => message,
+    };
     PipeFailure {
         message,
         skipped: e.skipped.clone(),
         severity,
+        note,
     }
+}
+
+/// The last non-empty line, cut to a length the status line can show.
+fn last_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(100).collect())
+}
+
+/// What a background pipe command said, as a status-line note. When it says what a command that
+/// needs the terminal says (a password, a passphrase, a host key to confirm), the note is the
+/// instruction the user needs: a background run cannot answer, and retrying will not help until
+/// they do.
+pub fn stderr_note(text: &str) -> Option<String> {
+    let last = last_line(text)?;
+    let lower = text.to_ascii_lowercase();
+    let needs_login = [
+        "permission denied",
+        "host key verification failed",
+        "remote host identification has changed",
+        "passphrase",
+        "password",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    Some(if needs_login {
+        let short: String = last.chars().take(60).collect();
+        format!("ssh needs an interactive login: detach (~.) and run fil again. ssh said: {short}")
+    } else {
+        last
+    })
 }
 
 fn is_ssh(program: &OsString) -> bool {
     Path::new(program).file_name().is_some_and(|n| n == "ssh")
 }
 
-/// The same command for a run nobody is watching: when it is `ssh`, never ask for a password,
-/// a passphrase or a host-key decision (there is no one to answer, and the terminal belongs to
-/// the session), and give up on an unreachable host in ten seconds. Other commands run as given.
+/// The same command for a run nobody is watching. When its program is `ssh`, whether it is the
+/// default command or one from `pipe = [...]`: never ask for a password, a passphrase or a
+/// host-key decision (there is no one to answer, and the terminal belongs to the session), give
+/// up on an unreachable host in ten seconds, and say only errors. Options the command already
+/// sets are left alone. Any other program runs as given (it may prompt on a reconnect).
 pub fn without_tty(command: &PipeCommand) -> PipeCommand {
     let mut argv: Vec<OsString> = command.argv().to_vec();
     if argv.first().is_some_and(is_ssh) {
@@ -170,6 +225,9 @@ pub fn without_tty(command: &PipeCommand) -> PipeCommand {
         }
         if !mentions("connecttimeout") {
             extra.extend(["-o".into(), "ConnectTimeout=10".into()]);
+        }
+        if !mentions("loglevel") {
+            extra.extend(["-o".into(), "LogLevel=ERROR".into()]);
         }
         argv.splice(1..1, extra);
     }
@@ -240,6 +298,8 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
                 "-T",
                 "--",
                 "box",
@@ -258,6 +318,8 @@ mod tests {
             "BatchMode=no",
             "-o",
             "ConnectTimeout=3",
+            "-o",
+            "LogLevel=INFO",
             "box",
             "fil",
             "server",
@@ -293,6 +355,7 @@ mod tests {
             kind: PipeErrorKind::Version { ours: 1, theirs: 2 },
             skipped: Vec::new(),
             exit: None,
+            stderr: Vec::new(),
         });
         assert_eq!(v.severity, Severity::Version);
         assert!(v.message.contains("major 1") && v.message.contains("major 2"));
@@ -300,6 +363,7 @@ mod tests {
             kind: PipeErrorKind::NoPreamble { limit: 65536 },
             skipped: b"bash: fil: command not found\n".to_vec(),
             exit: None,
+            stderr: Vec::new(),
         });
         assert_eq!(n.severity, Severity::Permanent);
         assert!(n.message.contains("installed"));
@@ -308,8 +372,66 @@ mod tests {
             kind: PipeErrorKind::Closed,
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
+            stderr: Vec::new(),
         });
         assert_eq!(c.severity, Severity::Transient);
         assert!(c.message.contains("255"));
+    }
+
+    #[test]
+    fn a_custom_ssh_gets_the_background_rule_and_other_programs_do_not() {
+        let jump =
+            PipeCommand::custom(["ssh", "-J", "bastion", "orin", "fil", "server", "--stdio"])
+                .unwrap();
+        let bg = strings(&without_tty(&jump));
+        assert!(bg.contains(&"BatchMode=yes".to_string()), "{bg:?}");
+        assert!(bg.contains(&"LogLevel=ERROR".to_string()));
+        // The rest of the line is the user's, in order.
+        assert_eq!(&bg[bg.len() - 6..], &strings(&jump)[1..]);
+        let abs =
+            PipeCommand::custom(["/usr/bin/ssh", "orin", "fil", "server", "--stdio"]).unwrap();
+        assert!(strings(&without_tty(&abs)).contains(&"BatchMode=yes".to_string()));
+        let tsh =
+            PipeCommand::custom(["tailscale", "ssh", "orin", "fil", "server", "--stdio"]).unwrap();
+        assert_eq!(strings(&without_tty(&tsh)), strings(&tsh));
+    }
+
+    #[test]
+    fn what_a_background_ssh_says_becomes_a_status_note() {
+        // Needing a login is said as an instruction, with what ssh said after it.
+        for said in [
+            "orin: Permission denied (publickey,password).\n",
+            "Host key verification failed.\n",
+            "Enter passphrase for key '/x/id': \n",
+            "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n",
+        ] {
+            let n = stderr_note(said).unwrap();
+            assert!(
+                n.starts_with("ssh needs an interactive login: detach (~.)"),
+                "{n}"
+            );
+            assert!(n.contains("ssh said:"));
+        }
+        // Anything else is its last line.
+        assert_eq!(
+            stderr_note("ssh: Could not resolve hostname orin\n\n").as_deref(),
+            Some("ssh: Could not resolve hostname orin")
+        );
+        assert_eq!(stderr_note("  \n"), None);
+        assert_eq!(stderr_note(""), None);
+        let long = "x".repeat(500);
+        assert_eq!(stderr_note(&long).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn a_failed_background_run_carries_the_reason_in_message_and_note() {
+        let f = failure(PipeError {
+            kind: PipeErrorKind::Closed,
+            skipped: Vec::new(),
+            exit: Some("exited: exit status: 255".into()),
+            stderr: b"orin: Permission denied (publickey).\n".to_vec(),
+        });
+        assert!(f.message.contains("Permission denied"), "{}", f.message);
+        assert!(f.note.unwrap().contains("interactive login"));
     }
 }

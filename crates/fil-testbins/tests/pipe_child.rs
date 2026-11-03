@@ -10,7 +10,7 @@ use fil_proto::frame::DataSegment;
 use fil_proto::limits::PROTOCOL_MAJOR;
 use fil_proto::{ChannelId, ControlMsg, Frame, preamble};
 use fil_transport::link::{DownReason, Link, LinkParams, LinkState};
-use fil_transport::pipe::{PipeCommand, PipeConfig, PipeErrorKind, PipeLink};
+use fil_transport::pipe::{PipeCommand, PipeConfig, PipeErrorKind, PipeLink, PipeStderr};
 
 const PROBE: &str = env!("CARGO_BIN_EXE_pipe-probe");
 
@@ -293,4 +293,56 @@ async fn dropping_a_link_reaps_its_child() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!exists(pid), "the dropped link left its child behind");
+}
+
+// ---- stderr -------------------------------------------------------------------------------
+
+fn sh(script: &str) -> PipeCommand {
+    PipeCommand::custom(["sh", "-c", script]).unwrap()
+}
+
+#[tokio::test]
+async fn captured_stderr_comes_back_with_the_error_and_is_cleaned() {
+    let cmd =
+        sh("printf 'ssh: Permission denied (publickey).\\n\\033[2Jsecond line\\n' >&2; exit 255");
+    let cfg = PipeConfig {
+        stderr: PipeStderr::Capture,
+        ..cfg()
+    };
+    let e = PipeLink::spawn(&cmd, cfg).await.err().unwrap();
+    assert!(matches!(e.kind, PipeErrorKind::Closed), "{e}");
+    let text = e.stderr_text();
+    assert!(text.contains("Permission denied"), "{text:?}");
+    assert!(text.contains("second line"));
+    assert!(!text.contains('\u{1b}'), "escape sequences removed");
+}
+
+#[tokio::test]
+async fn stderr_is_not_captured_unless_asked_and_a_flood_is_bounded() {
+    let e = PipeLink::spawn(&sh("echo hidden >&2; exit 1"), cfg())
+        .await
+        .err()
+        .unwrap();
+    assert!(e.stderr.is_empty());
+    let cfg = PipeConfig {
+        stderr: PipeStderr::Capture,
+        ..cfg()
+    };
+    let flood = sh("head -c 300000 /dev/zero | tr '\\0' x >&2; echo END >&2; exit 1");
+    let e = PipeLink::spawn(&flood, cfg).await.err().unwrap();
+    assert!(e.stderr.len() <= 4096, "{}", e.stderr.len());
+    assert!(e.stderr_text().contains("END"), "the tail is what is kept");
+}
+
+#[tokio::test]
+async fn null_stderr_discards_it() {
+    let cfg = PipeConfig {
+        stderr: PipeStderr::Null,
+        ..cfg()
+    };
+    let e = PipeLink::spawn(&sh("echo gone >&2; exit 1"), cfg)
+        .await
+        .err()
+        .unwrap();
+    assert!(e.stderr.is_empty());
 }

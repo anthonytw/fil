@@ -32,6 +32,8 @@ pub enum Script {
     Ok(Duration),
     /// Fails after this long.
     Fail(Duration, String),
+    /// Fails with a status-line note, as ssh does when it needs a login (message, note).
+    FailNote(String, String),
     /// Fails like a version mismatch.
     Version,
     /// Never finishes.
@@ -65,6 +67,10 @@ struct State {
     pipe: VecDeque<Script>,
     direct: VecDeque<Script>,
     pipe_default: Option<Script>,
+    /// What `diagnostics` says about a pipe that went down.
+    diagnostics: Option<String>,
+    /// Direct dials dropped while still running (cancelled).
+    direct_cancelled: usize,
     direct_default: Option<Script>,
     runs: Vec<Run>,
     /// The far end of every link made, with its control: tests kill links through these.
@@ -107,6 +113,12 @@ impl Fake {
     }
     pub fn set_direct_default(&self, s: Script) {
         self.state.lock().unwrap().direct_default = Some(s);
+    }
+    pub fn set_diagnostics(&self, note: Option<&str>) {
+        self.state.lock().unwrap().diagnostics = note.map(str::to_string);
+    }
+    pub fn direct_cancelled(&self) -> usize {
+        self.state.lock().unwrap().direct_cancelled
     }
     pub fn set_banner(&self, b: &[u8]) {
         self.state.lock().unwrap().banner = b.to_vec();
@@ -207,15 +219,24 @@ impl Connector for Fake {
                 tokio::time::sleep(d).await;
                 Err(PipeFailure::transient(msg))
             }
+            Script::FailNote(msg, note) => Err(PipeFailure {
+                note: Some(note),
+                ..PipeFailure::transient(msg)
+            }),
             Script::Version => Err(PipeFailure {
                 message:
                     "protocol version mismatch: this fil speaks major 1, the remote speaks major 2"
                         .into(),
                 skipped: Vec::new(),
                 severity: Severity::Version,
+                note: None,
             }),
             Script::Hang => std::future::pending().await,
         }
+    }
+
+    fn diagnostics(&self, _link: &MemLink) -> Option<String> {
+        self.state.lock().unwrap().diagnostics.clone()
     }
 
     async fn dial_direct(
@@ -241,22 +262,65 @@ impl Connector for Fake {
                 tokio::time::sleep(d).await;
                 Err(LinkError(DownReason::Refused(msg)))
             }
-            Script::Version => unreachable!("direct has no preamble"),
-            Script::Hang => std::future::pending().await,
+            Script::FailNote(..) | Script::Version => unreachable!("pipe-only script"),
+            Script::Hang => {
+                // Counts the dial as cancelled if it is dropped while hanging.
+                struct Guard(Arc<Mutex<State>>);
+                impl Drop for Guard {
+                    fn drop(&mut self) {
+                        self.0.lock().unwrap().direct_cancelled += 1;
+                    }
+                }
+                let _g = Guard(self.state.clone());
+                std::future::pending().await
+            }
         }
     }
 }
 
 /// What an accepted reply says, as the loop would report it to the dialer.
 pub fn info(kind: LinkKind, resumed: bool, direct: bool) -> AttachInfo {
+    info_with(kind, resumed, direct.then_some((60001, 7)))
+}
+
+/// The same with other direct details: a port and the byte the fingerprint repeats.
+pub fn info_with(kind: LinkKind, resumed: bool, direct: Option<(u16, u8)>) -> AttachInfo {
     AttachInfo {
         kind,
         incarnation: 1,
         epoch: 1,
         resumed,
-        udp_port: direct.then_some(60001),
-        fingerprint: direct.then(|| WireFingerprint::new(vec![7; 32]).unwrap()),
+        udp_port: direct.map(|d| d.0),
+        fingerprint: direct.map(|d| WireFingerprint::new(vec![d.1; 32]).unwrap()),
         term: TermName::new("xterm-256color").unwrap(),
+    }
+}
+
+/// Calls `dial` the way the loop does after a failure: again at once, until a link comes, a
+/// fatal error, or `total` has passed. Returns the link (if any) and the errors seen.
+pub async fn dial_for<D: Dialer>(
+    total: Duration,
+    dialer: &mut D,
+    purpose: fil_client::DialPurpose,
+) -> (
+    Option<fil_client::Dialed<D::Link>>,
+    Vec<fil_client::DialError>,
+) {
+    let end = tokio::time::Instant::now() + total;
+    let mut errors = Vec::new();
+    loop {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, dialer.dial(purpose)).await {
+            Err(_) => return (None, errors),
+            Ok(Ok(d)) => return (Some(d), errors),
+            Ok(Err(e)) => {
+                let fatal = e.fatal;
+                errors.push(e);
+                if fatal {
+                    return (None, errors);
+                }
+            }
+        }
     }
 }
 

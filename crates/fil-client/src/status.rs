@@ -27,6 +27,8 @@ pub struct Connection {
     pub dropped: u64,
     /// The offline-input cap is 0: typing is discarded.
     pub discarding: bool,
+    /// Why the last attempt failed, as the dialer put it (already sanitized), if it said.
+    pub note: Option<String>,
 }
 
 /// The status line: short lines (at most about 40 columns, see [`crate::text::wrap`]) about the
@@ -52,6 +54,9 @@ pub fn connection_lines(c: &Connection) -> Vec<String> {
         }
         lines.push(l);
         lines.push("(~. detaches)".to_string());
+        if let Some(n) = &c.note {
+            lines.extend(crate::text::wrap(n, 38).into_iter().take(3));
+        }
     }
     if c.discarding {
         lines.push("typing is discarded".to_string());
@@ -155,6 +160,7 @@ mod tests {
             buffered: 0,
             dropped: 0,
             discarding: false,
+            note: None,
         }
     }
 
@@ -210,5 +216,20 @@ mod tests {
         let l = confirm_lines(&long, 9, 42, false, 36);
         assert!(l.iter().any(|x| x == "(9 bytes dropped)"), "{l:?}");
         assert!(l.iter().all(|x| x.chars().count() <= 40), "{l:?}");
+    }
+
+    #[test]
+    fn a_note_from_the_dialer_is_shown_short_and_only_while_reconnecting() {
+        let mut c = conn();
+        c.note = Some(
+            "ssh needs an interactive login: detach with ~. and run fil again, then answer its prompt"
+                .into(),
+        );
+        let l = connection_lines(&c);
+        assert!(l.len() <= 6, "{l:?}");
+        assert!(l.iter().any(|x| x.starts_with("ssh needs")));
+        assert!(l.iter().all(|x| x.chars().count() <= 40), "{l:?}");
+        c.quiet = true;
+        assert!(!connection_lines(&c).iter().any(|x| x.contains("ssh needs")));
     }
 }

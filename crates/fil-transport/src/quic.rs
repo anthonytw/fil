@@ -27,6 +27,11 @@
 //!   (finishing a stream and freeing its slot) belongs to M2, with forwarded connections.
 //!   (M2 note: up to 8 payloads `send` already accepted on such a channel are dropped when its
 //!   writer gives up.)
+//! - **Flush:** [`Link::flush`] puts a marker (a zero-length frame and an id) behind everything
+//!   sent on each channel's stream. The peer's reader answers each marker, on the control
+//!   channel, once it has read everything before it, and the flush resolves when all are
+//!   answered. quinn reports a stream's acknowledgements only when the stream is finished, and
+//!   these streams live as long as the link.
 //! - **Order across channels:** none from QUIC. `recv` hands out control first, then interactive
 //!   payloads in arrival order, with forwards guaranteed a share of what has already arrived.
 //!   On the wire forwards and interactive channels take turns per packet (see above), so the exact

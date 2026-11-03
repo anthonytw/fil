@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::Bytes;
 use fil_proto::limits::DEFAULT_FORWARD_SHARE;
 use fil_proto::{ChannelClass, ChannelId};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::link::DownReason;
 
@@ -58,6 +58,8 @@ pub(super) struct Inbox {
     q: Mutex<Queues>,
     /// Wakes the one task in `recv`.
     ready: Notify,
+    /// True once the link is down, for tasks that wait for that (`flush`).
+    down: watch::Sender<bool>,
 }
 
 /// The link is down; this is why.
@@ -68,6 +70,7 @@ impl Inbox {
         Self {
             q: Mutex::new(Queues::default()),
             ready: Notify::new(),
+            down: watch::Sender::new(false),
         }
     }
 
@@ -191,7 +194,13 @@ impl Inbox {
             chan.wake.notify_one();
         }
         drop(q);
+        self.down.send_replace(true);
         self.ready.notify_one();
+    }
+
+    /// Becomes `true` when the link goes down.
+    pub(super) fn subscribe_down(&self) -> watch::Receiver<bool> {
+        self.down.subscribe()
     }
 
     /// Bytes received and not yet returned by `recv`.

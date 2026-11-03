@@ -3,7 +3,8 @@
 //!
 //! Simplifications, compared with the real links: one queue per direction rather than one per
 //! channel (so backpressure is not per channel), no heartbeats (health changes only when the
-//! test says so, through [`MemControl`]), and no RTT unless the test sets one.
+//! test says so, through [`MemControl`]), and no RTT unless the test sets one. [`Link::flush`]
+//! waits until the peer has read everything sent.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,6 +144,23 @@ impl Link for MemLink {
         }
     }
 
+    /// Resolves once the peer's `recv` has taken everything sent: the closest thing to "the
+    /// payloads left this side" that an in-memory queue has. A peer that does not read holds it
+    /// back, as a stalled QUIC peer or a full pipe would.
+    async fn flush(&self) -> Result<(), LinkError> {
+        if let Some(r) = self.down_reason() {
+            return Err(LinkError(r));
+        }
+        // Every slot of the queue free means nothing is waiting in it.
+        let all = self.tx.max_capacity();
+        tokio::select! {
+            slots = self.tx.reserve_many(all) => slots
+                .map(drop)
+                .map_err(|_| LinkError(DownReason::Closed)),
+            r = self.wait_down() => Err(LinkError(r)),
+        }
+    }
+
     fn status(&self) -> watch::Receiver<LinkStatus> {
         self.status.subscribe()
     }
@@ -228,5 +246,52 @@ mod tests {
         assert_eq!(b.recv().await.unwrap().1, bytes("1"));
         let _a = blocked.await.unwrap();
         assert_eq!(b.recv().await.unwrap().1, bytes("2"));
+    }
+
+    #[tokio::test]
+    async fn flush_waits_until_the_peer_has_read_everything() {
+        let (a, b, _) = pair(LinkKind::Pipe, 4);
+        a.flush().await.unwrap(); // nothing outstanding
+        a.send(ChannelId::CONTROL, bytes("1")).await.unwrap();
+        a.send(ChannelId::TERMINAL, bytes("2")).await.unwrap();
+        let a = Arc::new(a);
+        let flushing = tokio::spawn({
+            let a = a.clone();
+            async move { a.flush().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished(), "the peer has read nothing yet");
+        b.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished(), "one payload is still waiting");
+        b.recv().await.unwrap();
+        assert_eq!(flushing.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn flush_fails_when_the_link_dies_mid_flush() {
+        let (a, _b, control) = pair(LinkKind::Direct, 4);
+        a.send(ChannelId::CONTROL, bytes("never read"))
+            .await
+            .unwrap();
+        let a = Arc::new(a);
+        let flushing = tokio::spawn({
+            let a = a.clone();
+            async move { a.flush().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished());
+        control.kill(DownReason::Dead);
+        assert_eq!(flushing.await.unwrap(), Err(LinkError(DownReason::Dead)));
+        // And on a link that is already down, even with nothing outstanding.
+        assert_eq!(a.flush().await, Err(LinkError(DownReason::Dead)));
+    }
+
+    #[tokio::test]
+    async fn flush_fails_when_the_peer_is_dropped() {
+        let (a, b, _) = pair(LinkKind::Pipe, 4);
+        a.send(ChannelId::CONTROL, bytes("lost")).await.unwrap();
+        drop(b);
+        assert!(a.flush().await.is_err());
     }
 }

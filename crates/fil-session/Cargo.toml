@@ -19,7 +19,13 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 vte = "0.15"
 
+[features]
+# Hooks for tests of races. Not for daemon code: only the test targets enable it.
+test-hooks = []
+
 [dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-session = { path = ".", features = ["test-hooks"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [lints]

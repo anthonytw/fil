@@ -12,7 +12,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep, sleep_until};
 

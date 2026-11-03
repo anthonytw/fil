@@ -143,6 +143,18 @@ sd_user() {
 # The cgroup of a process in the container, one line.
 sd_cgroup() { docker exec "$SD" cat "/proc/$1/cgroup" 2> /dev/null | tr '\n' ' '; }
 
+# sd_environ_of PID: that process's environment, one NAME=value per line (empty if unreadable).
+sd_environ_of() { docker exec "$SD" sh -c "tr '\\0' '\\n' < /proc/$1/environ" 2> /dev/null || true; }
+
+# sd_environ PATTERN: the environment of the first process of user fil whose command line matches
+# the regex PATTERN. Write it as '[f]il server' so this very command line does not match it.
+sd_environ() {
+  local pid
+  pid=$(docker exec "$SD" pgrep -u fil -f "$1" | head -n 1 || true)
+  [[ -n $pid ]] && sd_environ_of "$pid"
+  return 0
+}
+
 # sd_wait_gone PID SECONDS
 sd_wait_gone() {
   local i
@@ -196,15 +208,40 @@ f_linger_scope() {
   log "shell cgroup:  $cg_shell"
   log "plain job:     $cg_plain"
   log "setsid job:    $cg_setsid"
-  units=$(sd_user systemctl --user list-units --type=scope --no-legend --plain 'fil-ls1-*' 2>&1 || true)
+  units=$(sd_user systemctl --user list-units --type=scope --no-legend --plain 'fil-*' 2>&1 || true)
   log "user scopes: $units"
-  [[ $units == *fil-ls1-*scope*running* ]] || fail "no running scope fil-ls1-*.scope: $units"
+  [[ $units == *fil-[0-9a-f]*scope*running* ]] || fail "no running scope fil-HEX.scope: $units"
   ok "the session has a running user scope"
-  [[ $cg_shell == *fil-ls1-*.scope* ]] || fail "the shell is not in the scope: $cg_shell"
-  [[ $cg_plain == *fil-ls1-*.scope* ]] || fail "the background job is not in the scope: $cg_plain"
-  [[ $cg_setsid == *fil-ls1-*.scope* ]] || fail "the setsid job is not in the scope: $cg_setsid"
+  [[ $cg_shell == *fil-[0-9a-f]*.scope* ]] || fail "the shell is not in the scope: $cg_shell"
+  [[ $cg_plain == *fil-[0-9a-f]*.scope* ]] || fail "the background job is not in the scope: $cg_plain"
+  [[ $cg_setsid == *fil-[0-9a-f]*.scope* ]] || fail "the setsid job is not in the scope: $cg_setsid"
   ok "shell, background job and the job that left the process tree are all in the scope"
-  note "scope=$(sed -n 's/.*\(fil-ls1-[0-9a-f]*\.scope\).*/\1/p' <<< "$cg_shell" | head -n 1)"
+  local scope desc env
+  scope=$(sed -n 's/.*\(fil-[0-9a-f]*\.scope\).*/\1/p' <<< "$cg_shell" | head -n 1)
+  note "scope=$scope"
+  # Privacy (DESIGN.md 11.1): what other users can read about the scope (its name is in every
+  # process's /proc/PID/cgroup, its description in the journal) carries no session name.
+  local scope_re='^fil-[0-9a-f]{32}\.scope$'
+  [[ $scope =~ $scope_re ]] || fail "the scope is not named fil-<32 hex>.scope: '$scope'"
+  desc=$(sd_user systemctl --user show -p Description --value "$scope" 2>&1 || true)
+  [[ $desc == "fil session" ]] || fail "the scope's description is not the plain 'fil session': $desc"
+  ok "the scope's name and description do not carry the session name"
+  # The shell does not inherit the login that started the daemon. First prove there was something
+  # to drop: the login's relay (a live `fil server --stdio` under sshd and PAM) has the logind
+  # variables, so their absence from the shell is the session's doing. (The daemon itself may
+  # already have been scrubbed by its launcher; the relay is the login's own environment.)
+  local login_env daemon_env
+  login_env=$(sd_environ '[f]il server --stdio')
+  daemon_env=$(sd_environ '[f]il server --daemon')
+  grep -q '^XDG_SESSION_ID=' <<< "$login_env"$'\n'"$daemon_env" \
+    || fail "setup: neither the login's relay nor the daemon has XDG_SESSION_ID, so there is nothing to drop; relay=[$(cut -d= -f1 <<< "$login_env" | tr '\n' ' ')]"
+  note "login_vars=$(grep -E '^(XDG_SESSION_|SSH_|DISPLAY|LC_TERMINAL)' <<< "$login_env" | cut -d= -f1 | tr '\n' ' ')"
+  ok "the login that started the daemon carried XDG_SESSION_ID (and the rest listed above)"
+  env=$(sd_environ_of "$SHELL_PID")
+  [[ -n $env ]] || fail "could not read the shell's environment"
+  ! grep -Eq '^(XDG_SESSION_[A-Z]*|SSH_CONNECTION|SSH_CLIENT|SSH_TTY|DISPLAY|LC_TERMINAL|LC_TERMINAL_VERSION)=' <<< "$env" \
+    || fail "the shell inherited the login's environment: $(grep -E '^(XDG_SESSION_|SSH_|DISPLAY|LC_TERMINAL)' <<< "$env" | cut -d= -f1 | tr '\n' ' ')"
+  ok "the shell's environment carries nothing of the login (XDG_SESSION_*, SSH_*, DISPLAY, LC_TERMINAL*)"
 
   fil_cmd kill sysd ls1 > /dev/null || fail "fil kill failed"
   fc_wait_exit a 30
@@ -213,7 +250,7 @@ f_linger_scope() {
   sd_wait_gone "$JOB_SETSID" 10 || fail "the setsid job survived fil kill (the scope should hold it)"
   ok "fil kill ended the shell and both background jobs"
   for ((i = 0; i < 50; i++)); do
-    units=$(sd_user systemctl --user list-units --all --type=scope --no-legend --plain 'fil-ls1-*' 2>&1 || true)
+    units=$(sd_user systemctl --user list-units --all --type=scope --no-legend --plain 'fil-*' 2>&1 || true)
     [[ -z $units ]] && break
     sleep 0.2
   done
@@ -236,7 +273,7 @@ f_no_linger_tree() {
   log "shell cgroup:  $cg_shell"
   log "plain job:     $cg_plain"
   log "setsid job:    $cg_setsid"
-  [[ $cg_shell != *fil-nl1-* && $cg_plain != *fil-nl1-* ]] || fail "a scope was used with lingering off: $cg_shell"
+  [[ $cg_shell != *fil-[0-9a-f]*.scope* && $cg_plain != *fil-[0-9a-f]*.scope* ]] || fail "a scope was used with lingering off: $cg_shell"
   # The processes sit where the login put them: the PAM session's scope, not a scope of fil's.
   [[ $cg_shell == *session-*.scope* && $cg_plain == *session-*.scope* ]] \
     || fail "the session's processes are not in the login's session scope: $cg_shell | $cg_plain"

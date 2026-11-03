@@ -2,7 +2,7 @@
 
 Everything fil was first tested against ran in process: `fil-netsim` stands in for ssh and for UDP. This harness runs the same questions against the real thing, with no mocks between the program and the network:
 
-- **The pipe** over real OpenSSH (`ssh -T HOST fil server --stdio`, DESIGN.md section 8.2), through jump hosts, with certificates, ControlMaster and hostile shells.
+- **The pipe** over real OpenSSH (`ssh -T -- HOST fil server --stdio`, DESIGN.md section 8.2), through jump hosts, with certificates, ControlMaster and hostile shells.
 - **Direct QUIC** over the real Linux network stack (DESIGN.md section 8.3): real NAT with conntrack, real `tc netem`, real route changes.
 - **systemd**, for the session scope (DESIGN.md section 5.1): a host with a real user manager, logind and PAM.
 
@@ -22,6 +22,7 @@ The first two drive the real binary; the rest are the stand-ins.
 | `pipe-echo client [options] -- COMMAND...` | the client end of the pipe: runs `ssh ...`, finds the preamble, checks every echoed byte | `PreambleScanner`, `FrameDecoder`, `DataSegment` |
 | `pipe-probe` (no arguments) | `fil server --stdio` once the daemon exists: writes the preamble, then runs a real `PipeLink` on stdio and echoes every payload | `PipeLink::accept_halves` |
 | `pipe-probe client [options] -- COMMAND...` | the client end through the real `PipeLink::spawn`: sends numbered terminal data, verifies the echo, prints every state change and how the link ended | `PipeLink`, `PipeCommand` |
+| `pipe-detach daemon` and `pipe-detach slow` | the detach-delivery test: the daemon side of a detach (writes `detached` or `lost` to a file), and an ssh stand-in that holds inbound chunks back and takes them with it when killed | `PipeLink` |
 | `quic-echo server` | the daemon's endpoint: binds a port in a range, echoes streams, logs every handshake and every path change | `DaemonIdentity`, `KeyRegistry`, `auth::server_config`, `peer_key` |
 | `quic-echo client` | the client: pins the fingerprint, presents a per-attach key, measures stalls, reconnects with a fresh handshake | `ClientKey`, `auth::client_config` |
 | `quic-echo udp-send`, `udp-recv` | nothing: a numbered-datagram probe that measures whether a path reorders | |
@@ -162,7 +163,7 @@ From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104
 
 | Scenario | What it checks | Result |
 |---|---|---|
-| `f_linger_scope` | `loginctl enable-linger`; a session with a plain background job and one started with `setsid nohup` | pass: a running user scope `fil-ls1-XXXXXXXX.scope`; the shell, the background job and the job that left the process tree are all in it; `fil kill` ended all three, and the scope was gone |
+| `f_linger_scope` | `loginctl enable-linger`; a session with a plain background job and one started with `setsid nohup` | pass: a running user scope `fil-<32 hex>.scope` (no session name in it or its description); the shell, the background job and the job that left the process tree are all in it; `fil kill` ended all three, and the scope was gone |
 | `f_no_linger_tree` | lingering off | pass: no scope; the shell is in the session scope of the login; `fil kill` ended the shell and the plain background job. The `setsid` job **survived** (it left the process tree and was reparented to init): the documented limit of the fallback, which the scope does not have |
 
 A privileged container with systemd as PID 1 starts on GitHub's `ubuntu-24.04` runners without any setup beyond `--privileged` and tmpfs on `/run` (boot in a few seconds, state `running`). The run is not special-cased.

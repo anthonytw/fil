@@ -1,6 +1,6 @@
 [package]
 name = "fil-transport"
-description = "Transports for fil: the pipe and direct QUIC, starting with QUIC authentication"
+description = "Transports for fil: the Link trait, the pipe (any byte stream, ssh by default) and direct QUIC with its authentication and path manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

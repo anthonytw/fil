@@ -1,5 +1,5 @@
 # Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
-# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|all`),
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|all`),
 # then `gh run watch`.
 name: linux-check
 
@@ -111,22 +111,27 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      # TODO (before the repo goes public): pin every action in this file to a commit SHA.
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          # `cross` mounts the workspace into a third-party image; leave no token in .git/config.
+          persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          # Pinned, with the image in Cross.toml pinned by digest: the same commit builds the same
+          # binary. Bump both together.
+          tool: cross@0.2.5
       - uses: Swatinem/rust-cache@v2
       - name: Build fil for aarch64-unknown-linux-musl
-        run: cross build --release -p fil --target aarch64-unknown-linux-musl
+        run: cross build --locked --release -p fil --target aarch64-unknown-linux-musl
       - name: Check and checksum
         run: |
           mkdir -p out
           cp target/aarch64-unknown-linux-musl/release/fil out/fil
-          file out/fil
+          file out/fil | tee /dev/stderr | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)'
           (cd out && sha256sum fil | tee fil.sha256)
       - uses: actions/upload-artifact@v4
         with:

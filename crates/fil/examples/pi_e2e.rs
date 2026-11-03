@@ -3,12 +3,14 @@
 //! `fil-test` gate. `just pi-e2e`.
 //!
 //! Needs: the Pi binary installed through the gate (docs/m1/pi.md), and ssh reaching the targets
-//! without a prompt. Targets: `FIL_PI_TARGETS="mars=fil-test@HOST,venus=fil-test@HOST"`; a
-//! name without an entry is `fil-test@NAME` (so an ssh alias works). After every scenario the
-//! driver runs the gate's `reset`, which leaves no daemon or session behind.
+//! without a prompt. `FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST"` is **required**: its
+//! keys are the host labels and the only hosts the driver will touch (the gate's `reset` kills
+//! everything the account runs, so nothing is ever guessed or defaulted). After every scenario
+//! the driver ends its sessions with `fil kill` and runs the gate's `reset`, and at the end it
+//! fails if a daemon is left.
 //!
 //! ```text
-//! pi_e2e [--hosts mars,venus] [--only NAME[,NAME]] [--fil PATH] [--verbose] [--list]
+//! pi_e2e [--hosts pi1,pi2] [--only NAME[,NAME]] [--fil PATH] [--verbose] [--list]
 //! ```
 
 use std::collections::BTreeMap;
@@ -55,11 +57,13 @@ impl Variant {
 }
 
 impl Ctx {
+    /// The ssh target of a host label. `main` has checked that every label in use is a key of
+    /// `FIL_PI_TARGETS`, so there is no default to fall back on.
     fn target(&self, host: &str) -> String {
         self.targets
             .get(host)
-            .cloned()
-            .unwrap_or_else(|| format!("fil-test@{host}"))
+            .unwrap_or_else(|| panic!("host label {host} is not in FIL_PI_TARGETS"))
+            .clone()
     }
 
     /// While this file exists, a `Gated` client cannot start ssh.
@@ -77,16 +81,18 @@ impl Ctx {
         } else {
             "auto"
         };
+        // The flag path and the target reach `sh` as $1 and $2, never inside the script text, so
+        // a space or a quote in either cannot change what the script does.
         let pipe = if variant == Variant::Gated {
             format!(
-                "[\"sh\", \"-c\", \"[ -e {} ] && exit 1; exec ssh -o BatchMode=yes {} fil server --stdio\"]",
-                self.flag().display(),
-                self.target(host)
+                "[\"sh\", \"-c\", \"[ -e \\\"$1\\\" ] && exit 1; exec ssh -o BatchMode=yes \\\"$2\\\" fil server --stdio\", \"sh\", {}, {}]",
+                toml_str(&self.flag().display().to_string()),
+                toml_str(&self.target(host))
             )
         } else {
             format!(
-                "[\"ssh\", \"-o\", \"BatchMode=yes\", \"{}\", \"fil\", \"server\", \"--stdio\"]",
-                self.target(host)
+                "[\"ssh\", \"-o\", \"BatchMode=yes\", {}, \"fil\", \"server\", \"--stdio\"]",
+                toml_str(&self.target(host))
             )
         };
         let mut s =
@@ -99,7 +105,10 @@ impl Ctx {
             Variant::Pipe | Variant::Gated => None,
         };
         if let Some(a) = address {
-            s.push_str(&format!("\n[host.{host}.direct]\naddress = \"{a}\"\n"));
+            s.push_str(&format!(
+                "\n[host.{host}.direct]\naddress = {}\n",
+                toml_str(&a)
+            ));
         }
         std::fs::write(&path, s).expect("write config");
         path
@@ -150,6 +159,27 @@ impl Ctx {
         s.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.code().unwrap_or(-1), s)
     }
+}
+
+/// A TOML basic string.
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A host label: lower-case letters, digits and dashes. It becomes a TOML key and a file name.
+fn label_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// An ssh target (`user@host`): no spaces, quotes or shell characters, and not an option.
+fn target_ok(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-'))
 }
 
 /// A client on a pseudo-terminal, its output collected by a thread.
@@ -589,7 +619,7 @@ fn takeover(ctx: &Ctx, host: &str) -> Res {
     Ok(vec![
         format!("second client shows the session after {}", ms(seen)),
         format!(
-            "first client told {} after the second client started",
+            "first client told within {} of the second client starting (an upper bound: checked after the second client's own round trip)",
             ms(told)
         ),
         format!("first client exit status {code}; message: {msg}"),
@@ -619,12 +649,29 @@ fn killed_ssh(ctx: &Ctx, host: &str) -> Res {
         .ok_or_else(|| format!("no resume after the ssh kill\n{}", c.tail()))?;
     let resume = t0.elapsed();
     let now = c.ssh_children();
-    // A second kill, with nothing typed: the client must come back on its own.
+    ensure(now.len() == 1, || {
+        format!("expected one ssh child before the second kill, found {now:?}")
+    })?;
+    // A second kill, with nothing typed until the client has started a new ssh by itself.
     let t1 = Instant::now();
-    if let Some(p) = now.first() {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).status();
-    }
-    thread::sleep(Duration::from_millis(100));
+    let st = Command::new("kill")
+        .args(["-9", &now[0].to_string()])
+        .status()
+        .map_err(|e| e.to_string())?;
+    ensure(st.success(), || "second kill failed".into())?;
+    let relogin = loop {
+        let kids = c.ssh_children();
+        if kids.len() == 1 && kids[0] != now[0] {
+            break t1.elapsed();
+        }
+        if t1.elapsed() > Duration::from_secs(30) {
+            return Err(format!(
+                "the client did not start a new ssh by itself within 30 s\n{}",
+                c.tail()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     let from = c.len();
     c.send("echo KS3-$((6*7))\r");
     c.expect_from("KS3-42", from, Duration::from_secs(60))
@@ -636,7 +683,11 @@ fn killed_ssh(ctx: &Ctx, host: &str) -> Res {
             "resume after kill -9 of ssh (input typed right after, same shell) {}",
             ms(resume)
         ),
-        format!("resume after a second kill {}", ms(resume2)),
+        format!(
+            "second kill, nothing typed until the client started a new ssh itself ({}): resume {}",
+            ms(relogin),
+            ms(resume2)
+        ),
     ])
 }
 
@@ -683,12 +734,11 @@ fn daemon_restart(ctx: &Ctx, host: &str) -> Res {
             break;
         }
         if let Some((_, code)) = c.wait_exit(Duration::from_millis(10)) {
-            notes.push(format!(
-                "client exited {code} {} after it could log in again: {}",
+            return Err(format!(
+                "client exited {code} {} after it could log in again, without the \"different session\" prompt: {}",
                 ms(t0.elapsed()),
                 last_fil_line(&c.text())
             ));
-            return Ok(notes);
         }
         if t0.elapsed() > deadline {
             return Err(format!(
@@ -738,7 +788,10 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
         format!("daemon gone after the login ended\n{late}")
     })?;
     let journal = ctx.gate(host, "logs 800");
-    let scope = journal.contains("fil session e2e-ln");
+    ensure(journal.contains("fil session e2e-ln"), || {
+        "no `fil session e2e-ln` systemd scope in the user journal: the shell did not run in a scope"
+            .to_string()
+    })?;
     let mut c2 = Client::spawn(ctx, host, Variant::Pipe, "e2e-ln");
     c2.expect("BG-42", ATTACH_TIMEOUT).ok_or_else(|| {
         format!(
@@ -753,9 +806,7 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
             "daemon and shell alive {} after the last login ended; background job's output waited in the session",
             ms(away)
         ),
-        format!(
-            "the daemon ran the shell in a systemd scope (`fil session e2e-ln` in the user journal): {scope}"
-        ),
+        "the shell ran in a systemd scope (`fil session e2e-ln` in the user journal)".to_string(),
     ])
 }
 
@@ -835,17 +886,40 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
     ]
 }
 
+fn usage() -> ! {
+    eprintln!(
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... pi_e2e [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--verbose] [--list]"
+    );
+    std::process::exit(2);
+}
+
 fn main() {
-    let mut hosts = vec!["mars".to_string(), "venus".to_string()];
+    let mut hosts: Option<Vec<String>> = None;
     let mut only: Option<Vec<String>> = None;
     let mut fil = PathBuf::from("target/release/fil");
     let mut verbose = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--hosts" => hosts = args.next().unwrap().split(',').map(String::from).collect(),
-            "--only" => only = Some(args.next().unwrap().split(',').map(String::from).collect()),
-            "--fil" => fil = PathBuf::from(args.next().unwrap()),
+            "--hosts" => {
+                hosts = Some(
+                    args.next()
+                        .unwrap_or_else(|| usage())
+                        .split(',')
+                        .map(String::from)
+                        .collect(),
+                )
+            }
+            "--only" => {
+                only = Some(
+                    args.next()
+                        .unwrap_or_else(|| usage())
+                        .split(',')
+                        .map(String::from)
+                        .collect(),
+                )
+            }
+            "--fil" => fil = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             "--verbose" => verbose = true,
             "--list" => {
                 for (n, _) in scenarios() {
@@ -853,21 +927,35 @@ fn main() {
                 }
                 return;
             }
-            _ => {
-                eprintln!(
-                    "usage: pi_e2e [--hosts a,b] [--only NAME,..] [--fil PATH] [--verbose] [--list]"
-                );
-                std::process::exit(2);
-            }
+            _ => usage(),
         }
     }
+    // The targets are required and are the whole list of hosts this program may touch.
     let mut targets = BTreeMap::new();
-    if let Ok(v) = std::env::var("FIL_PI_TARGETS") {
-        for kv in v.split(',').filter(|s| !s.is_empty()) {
-            if let Some((k, t)) = kv.split_once('=') {
-                targets.insert(k.to_string(), t.to_string());
-            }
+    let raw = std::env::var("FIL_PI_TARGETS").unwrap_or_default();
+    for kv in raw.split(',').filter(|s| !s.is_empty()) {
+        let Some((k, t)) = kv.split_once('=') else {
+            eprintln!("FIL_PI_TARGETS: \"{kv}\" is not LABEL=USER@HOST");
+            std::process::exit(2);
+        };
+        if !label_ok(k) || !target_ok(t) {
+            eprintln!(
+                "FIL_PI_TARGETS: label \"{k}\" must be lower-case letters, digits and dashes, and the target a plain user@host"
+            );
+            std::process::exit(2);
         }
+        targets.insert(k.to_string(), t.to_string());
+    }
+    if targets.is_empty() {
+        eprintln!(
+            "FIL_PI_TARGETS is required, e.g. pi1=fil-test@HOST,pi2=fil-test@HOST (docs/m1/pi.md). The driver runs the gate's `reset` on every host it uses, so it never guesses one."
+        );
+        std::process::exit(2);
+    }
+    let hosts = hosts.unwrap_or_else(|| targets.keys().cloned().collect());
+    if let Some(bad) = hosts.iter().find(|h| !targets.contains_key(*h)) {
+        eprintln!("--hosts: \"{bad}\" is not a label in FIL_PI_TARGETS");
+        std::process::exit(2);
     }
     let fil = std::fs::canonicalize(&fil).unwrap_or_else(|_| {
         eprintln!(
@@ -901,7 +989,17 @@ fn main() {
             }
             ctx.reset(host);
             let t = Instant::now();
-            let r = f(&ctx, host);
+            // A panic (a write to a dead client, a bug here) is a failure of this scenario, and
+            // the cleanup below still runs.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&ctx, host)))
+                .unwrap_or_else(|p| {
+                    let what = p
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    Err(format!("the driver panicked: {what}"))
+                });
             let took = t.elapsed();
             ctx.reset(host);
             match r {
@@ -923,8 +1021,15 @@ fn main() {
             }
         }
         let status = ctx.gate(host, "status");
-        let leftovers = status.contains("server --daemon");
-        println!("   after reset on {host}: daemon left: {leftovers}");
+        if status.contains("server --daemon") || status.contains(".sock") {
+            failures += 1;
+            println!("FAIL {host}: a fil daemon or socket is left after the final reset\n{status}");
+            table.push(format!(
+                "| {host} | cleanup | FAIL | a daemon is left after reset |"
+            ));
+        } else {
+            println!("   after the final reset on {host}: no daemon left");
+        }
     }
     println!("\n| host | scenario | result | details |\n|---|---|---|---|");
     for l in table {

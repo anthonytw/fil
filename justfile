@@ -89,8 +89,8 @@ local-direct session="local-direct":
 
 # M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
-# installed first (docs/m1/pi.md). Flags: --hosts mars,venus, --only NAME, --verbose, --list.
-# Targets: FIL_PI_TARGETS="mars=fil-test@HOST,venus=fil-test@HOST". Never part of `ci`.
+# installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
+# Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
 pi-e2e *args:
     cargo build --release -p fil --bins --example pi_e2e
     target/release/examples/pi_e2e {{args}}

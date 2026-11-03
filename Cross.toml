@@ -1,0 +1,4 @@
+# Used by `cross` in the `aarch64` job of .github/workflows/linux-check.yml (docs/m1/pi.md).
+# The image is pinned by digest (it is the one cross 0.2.5 pulls for this target).
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"

@@ -20,7 +20,8 @@
 //!   frame. On QUIC, after the daemon's first frame: in TLS 1.3 the client's handshake finishes
 //!   before the daemon has judged the client key (`docs/m1/quic-auth.md`).
 //! - **Close discards.** Payloads still queued when the link closes or dies are dropped; the
-//!   send buffers above rebuild them on the next link.
+//!   send buffers above rebuild them on the next link. [`Link::flush`] is how a last message is
+//!   made to arrive before a deliberate close.
 
 use std::future::Future;
 use std::time::Duration;
@@ -138,6 +139,19 @@ pub trait Link: Send + Sync + 'static {
 
     /// Current health. The receiver sees every state change.
     fn status(&self) -> watch::Receiver<LinkStatus>;
+
+    /// Resolves when every payload sent before the call has left this side: written to the byte
+    /// stream (pipe), or acknowledged by the peer's QUIC stack (direct). Fails if the link goes
+    /// down first.
+    ///
+    /// This is what makes a graceful close possible: [`close`](Self::close) discards what is
+    /// still queued, so a last message (`TakenOver`, `SessionExited`) is sent, flushed and only
+    /// then followed by `close`. Callers bound it with their own timeout; a peer that stops
+    /// reading holds a flush back for as long as it likes.
+    ///
+    /// Payloads sent after the call are not waited for. On a link that is already down it fails
+    /// at once, even if nothing was outstanding.
+    fn flush(&self) -> impl Future<Output = Result<(), LinkError>> + Send;
 
     /// Closes the link; queued payloads are dropped. This side sees `Down(Closed)`. The peer
     /// sees `Down(Closed)` where the transport can say so (QUIC); on a byte stream (the pipe)

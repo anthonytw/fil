@@ -1,7 +1,8 @@
 //! [`QuicLink`]: one authenticated QUIC connection as a [`Link`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -9,11 +10,11 @@ use bytes::Bytes;
 use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::{ChannelClass, ChannelId, ControlMsg};
 use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, WriteError};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::inbox::{Closed, Inbox};
-use super::wire::{MAX_VARINT_LEN, VarintReader, parse_len, put_varint};
+use super::wire::{self, Frame, MAX_VARINT_LEN, VarintReader, parse_prefix, put_varint};
 use crate::auth::{self, ClientKey, Fingerprint, PublicKey, SERVER_NAME};
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkState, LinkStatus};
 
@@ -29,6 +30,37 @@ pub(super) mod code {
 /// How many payloads may wait in front of one channel's stream. A full queue is what makes
 /// `send` wait; what QUIC flow control holds back backs up into it.
 const WRITE_QUEUE: usize = 8;
+
+/// What waits in front of a channel's stream.
+enum Item {
+    Payload(Bytes),
+    /// A flush marker (`wire::flush_marker`): written in order with the payloads, so when the
+    /// peer reads it, it has read everything sent before it.
+    Flush(u32),
+}
+
+/// The acknowledgement of a flush marker: a control-channel `Heartbeat` reply whose nonce is
+/// the marker's id. The accept proof is the same message with nonce 0, and the link never sends
+/// any other heartbeat, so a non-zero nonce is free to mean this.
+fn flush_ack(id: u32) -> Bytes {
+    let msg = ControlMsg::Heartbeat {
+        nonce: id,
+        reply: true,
+    };
+    Bytes::from(msg.encode().expect("a heartbeat encodes"))
+}
+
+/// The id in a flush acknowledgement, if `payload` is one. Acks are tiny, so anything longer is
+/// not looked at.
+fn parse_flush_ack(payload: &[u8]) -> Option<u32> {
+    if payload.len() > 16 {
+        return None;
+    }
+    match ControlMsg::decode(payload) {
+        Ok(ControlMsg::Heartbeat { nonce, reply: true }) if nonce != 0 => Some(nonce),
+        _ => None,
+    }
+}
 
 /// quinn stream priorities: higher goes first (DESIGN.md §8.5). Control is strictly ahead of
 /// everything. Interactive and forward channels share one priority on purpose: quinn then
@@ -70,7 +102,12 @@ struct Io {
     /// How long opening a stream may wait for stream credit before `send` gives up.
     open_timeout: Duration,
     inbox: Inbox,
-    writers: Mutex<HashMap<ChannelId, mpsc::Sender<Bytes>>>,
+    writers: Mutex<HashMap<ChannelId, mpsc::Sender<Item>>>,
+    /// Flush markers sent and not yet acknowledged by the peer.
+    flush_pending: Mutex<HashSet<u32>>,
+    /// Signalled when an acknowledgement arrives.
+    flush_acked: Notify,
+    next_flush: AtomicU32,
     /// True once any frame from the peer has arrived.
     got_frame: watch::Sender<bool>,
     /// The text of the error that ended the connection, for `Refused` messages.
@@ -92,7 +129,7 @@ impl Io {
     }
 
     /// The queue in front of `channel`'s stream; starts the stream's writer on first use.
-    fn writer_for(self: &Arc<Self>, channel: ChannelId) -> Result<mpsc::Sender<Bytes>, LinkError> {
+    fn writer_for(self: &Arc<Self>, channel: ChannelId) -> Result<mpsc::Sender<Item>, LinkError> {
         if self.inbox.down_reason().is_some() {
             return Err(self.down_error());
         }
@@ -104,6 +141,46 @@ impl Io {
         tokio::spawn(write_stream(self.clone(), channel, rx));
         writers.insert(channel, tx.clone());
         Ok(tx)
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
+        self.flush_pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Resolves once every marker in `ids` has been acknowledged, or fails when the link is down.
+    async fn wait_acked(&self, ids: &[u32]) -> Result<(), LinkError> {
+        let mut status = self.inbox.subscribe_down();
+        loop {
+            // Register for the next acknowledgement before looking, so none is missed.
+            let acked = self.flush_acked.notified();
+            tokio::pin!(acked);
+            acked.as_mut().enable();
+            {
+                let pending = self.pending();
+                if ids.iter().all(|id| !pending.contains(id)) {
+                    return Ok(());
+                }
+            }
+            if self.inbox.down_reason().is_some() {
+                return Err(self.down_error());
+            }
+            tokio::select! {
+                () = &mut acked => {}
+                _ = status.changed() => {}
+            }
+        }
+    }
+}
+
+/// Forgets the markers of a `flush` that ended, however it ended.
+struct PendingIds<'a>(&'a Io, Vec<u32>);
+
+impl Drop for PendingIds<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.0.pending();
+        for id in &self.1 {
+            pending.remove(id);
+        }
     }
 }
 
@@ -197,6 +274,9 @@ impl QuicLink {
             open_timeout: params.dead_after,
             inbox: Inbox::new(),
             writers: Mutex::new(HashMap::new()),
+            flush_pending: Mutex::new(HashSet::new()),
+            flush_acked: Notify::new(),
+            next_flush: AtomicU32::new(1),
             got_frame: watch::Sender::new(false),
             last_error: OnceLock::new(),
         });
@@ -212,7 +292,7 @@ impl QuicLink {
             && let Ok(tx) = link.io.writer_for(ChannelId::CONTROL)
         {
             // The queue is empty, so this cannot wait.
-            let _ = tx.try_send(Bytes::from_static(accept_proof()));
+            let _ = tx.try_send(Item::Payload(Bytes::from_static(accept_proof())));
         }
         link
     }
@@ -280,7 +360,7 @@ impl Link for QuicLink {
             ))));
         }
         let tx = self.io.writer_for(channel)?;
-        tx.send(payload).await.map_err(|_| {
+        tx.send(Item::Payload(payload)).await.map_err(|_| {
             if self.io.inbox.down_reason().is_some() {
                 self.io.down_error()
             } else {
@@ -296,6 +376,50 @@ impl Link for QuicLink {
 
     async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError> {
         self.io.inbox.recv().await.map_err(|Closed(r)| LinkError(r))
+    }
+
+    /// Puts a marker behind everything sent on every channel and waits for the peer to read them
+    /// all. quinn can say when a stream's data is acknowledged only once the stream is finished,
+    /// and a channel's stream lives as long as the link, so the markers do the job: a marker is a
+    /// zero-length frame in the channel's own stream (`wire`), the peer's reader answers it once
+    /// it has read everything before it, and the answer comes back on the control channel. The
+    /// guarantee is therefore a little stronger than QUIC's acknowledgement: the peer's link
+    /// has the payloads, not just its network stack.
+    async fn flush(&self) -> Result<(), LinkError> {
+        if self.io.inbox.down_reason().is_some() {
+            return Err(self.io.down_error());
+        }
+        let writers: Vec<mpsc::Sender<Item>> = self
+            .io
+            .writers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut ids = PendingIds(&self.io, Vec::new());
+        let mut down = self.io.inbox.subscribe_down();
+        for tx in writers {
+            let id = self.io.next_flush.fetch_add(1, Ordering::Relaxed).max(1);
+            self.io.pending().insert(id);
+            ids.1.push(id);
+            let queued = tokio::select! {
+                sent = tx.send(Item::Flush(id)) => sent.is_ok(),
+                _ = down.wait_for(|d| *d) => false,
+            };
+            if !queued {
+                return Err(if self.io.inbox.down_reason().is_some() {
+                    self.io.down_error()
+                } else {
+                    // The channel's writer gave up (no stream could be opened): what was sent
+                    // on it is lost, which a flush must not report as done.
+                    LinkError(DownReason::Io(
+                        "a channel's stream could not be opened".into(),
+                    ))
+                });
+            }
+        }
+        self.io.wait_acked(&ids.1).await
     }
 
     fn status(&self) -> watch::Receiver<LinkStatus> {
@@ -314,10 +438,10 @@ impl Link for QuicLink {
 /// One channel's outgoing stream: opened with the first payload, then a stream of length-prefixed
 /// payloads. Ends when the connection does (a link that is dropped or dies must not leave its
 /// writers behind), and when no stream can be opened.
-async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<Bytes>) {
+async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<Item>) {
     /// The next payload to write, or `None` when the queue's senders are gone or the connection
     /// has ended.
-    async fn next(io: &Io, rx: &mut mpsc::Receiver<Bytes>) -> Option<Bytes> {
+    async fn next(io: &Io, rx: &mut mpsc::Receiver<Item>) -> Option<Item> {
         tokio::select! {
             p = rx.recv() => p,
             _ = io.conn.closed() => None,
@@ -346,18 +470,25 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<By
     let mut pending = Some(first);
     let mut header = Some(Bytes::from(header));
     loop {
-        let payload = match pending.take() {
+        let item = match pending.take() {
             Some(p) => p,
             None => match next(&io, &mut rx).await {
                 Some(p) => p,
                 None => return,
             },
         };
-        let len = Bytes::copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        let res = match header.take() {
-            Some(h) => stream.write_all_chunks(&mut [h, len, payload]).await,
-            None => stream.write_all_chunks(&mut [len, payload]).await,
-        };
+        let mut chunks = Vec::with_capacity(3);
+        chunks.extend(header.take());
+        match item {
+            Item::Payload(payload) => {
+                chunks.push(Bytes::copy_from_slice(
+                    &(payload.len() as u32).to_be_bytes(),
+                ));
+                chunks.push(payload);
+            }
+            Item::Flush(id) => chunks.push(Bytes::copy_from_slice(&wire::flush_marker(id))),
+        }
+        let res = stream.write_all_chunks(&mut chunks).await;
         match res {
             Ok(()) => {}
             Err(WriteError::Stopped(_)) => {
@@ -407,8 +538,28 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
             Err(ReadExactError::ReadError(_)) => return,
         }
-        let Some(len) = parse_len(prefix) else {
-            return io.violation("frame length out of range");
+        let len = match parse_prefix(prefix) {
+            Some(Frame::Payload(len)) => len,
+            Some(Frame::Flush) => {
+                // The peer wants to know we have read everything before this point.
+                let mut id = [0u8; 4];
+                match stream.read_exact(&mut id).await {
+                    Ok(()) => {}
+                    Err(ReadExactError::FinishedEarly(_)) => {
+                        return io.violation("truncated flush marker");
+                    }
+                    Err(ReadExactError::ReadError(_)) => return,
+                }
+                let Ok(ack) = io.writer_for(ChannelId::CONTROL) else {
+                    return;
+                };
+                let id = u32::from_be_bytes(id);
+                if ack.send(Item::Payload(flush_ack(id))).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            None => return io.violation("frame length out of range"),
         };
         let mut payload = vec![0u8; len];
         match stream.read_exact(&mut payload).await {
@@ -423,6 +574,14 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             if payload == accept_proof() {
                 continue; // consumed here
             }
+        }
+        if channel == ChannelId::CONTROL
+            && let Some(id) = parse_flush_ack(&payload)
+        {
+            // Ours, consumed here. An id we never sent is ignored.
+            io.pending().remove(&id);
+            io.flush_acked.notify_waiters();
+            continue;
         }
         if io
             .inbox

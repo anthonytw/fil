@@ -3,7 +3,13 @@
 //! ```text
 //! stream := channel:varint-u32 frame*
 //! frame  := len:u32-BE payload   (len = 1 to MAX_FRAME_BODY)
+//!         | 0:u32-BE id:u32-BE   (a flush marker)
 //! ```
+//!
+//! A flush marker is not a payload and is never passed up. The reader of a stream answers it
+//! with the id on the control channel once it has read every frame before it ([`Link::flush`]).
+//!
+//! [`Link::flush`]: crate::Link::flush
 //!
 //! The channel id is postcard's varint encoding of a `u32`, the same bytes the pipe puts at the
 //! start of a frame body, so one decoder's rules cover both transports.
@@ -56,10 +62,30 @@ impl VarintReader {
     }
 }
 
-/// The length prefix of a frame. `None` if the length is outside `1..=MAX_FRAME_BODY`.
-pub(super) fn parse_len(prefix: [u8; 4]) -> Option<usize> {
+/// What a frame's length prefix announces.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Frame {
+    /// A payload of this many bytes follows.
+    Payload(usize),
+    /// A four-byte flush id follows.
+    Flush,
+}
+
+/// Reads a frame's length prefix. `None` if the length is outside `0..=MAX_FRAME_BODY`.
+pub(super) fn parse_prefix(prefix: [u8; 4]) -> Option<Frame> {
     let len = u32::from_be_bytes(prefix) as usize;
-    (1..=MAX_FRAME_BODY).contains(&len).then_some(len)
+    match len {
+        0 => Some(Frame::Flush),
+        1..=MAX_FRAME_BODY => Some(Frame::Payload(len)),
+        _ => None,
+    }
+}
+
+/// The bytes of a flush marker (the length prefix 0, then the id).
+pub(super) fn flush_marker(id: u32) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[4..].copy_from_slice(&id.to_be_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -105,13 +131,21 @@ mod tests {
 
     #[test]
     fn length_limits() {
-        assert_eq!(parse_len(0u32.to_be_bytes()), None);
-        assert_eq!(parse_len(1u32.to_be_bytes()), Some(1));
+        assert_eq!(parse_prefix(0u32.to_be_bytes()), Some(Frame::Flush));
+        assert_eq!(parse_prefix(1u32.to_be_bytes()), Some(Frame::Payload(1)));
         assert_eq!(
-            parse_len((MAX_FRAME_BODY as u32).to_be_bytes()),
-            Some(MAX_FRAME_BODY)
+            parse_prefix((MAX_FRAME_BODY as u32).to_be_bytes()),
+            Some(Frame::Payload(MAX_FRAME_BODY))
         );
-        assert_eq!(parse_len((MAX_FRAME_BODY as u32 + 1).to_be_bytes()), None);
-        assert_eq!(parse_len(u32::MAX.to_be_bytes()), None);
+        assert_eq!(
+            parse_prefix((MAX_FRAME_BODY as u32 + 1).to_be_bytes()),
+            None
+        );
+        assert_eq!(parse_prefix(u32::MAX.to_be_bytes()), None);
+    }
+
+    #[test]
+    fn a_flush_marker_is_a_zero_length_and_its_id() {
+        assert_eq!(flush_marker(0x0102_0304), [0, 0, 0, 0, 1, 2, 3, 4]);
     }
 }

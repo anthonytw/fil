@@ -119,7 +119,10 @@ where
                 return reason;
             }
             self.update_lag(st);
-            if st.out_pos >= st.out.len() && st.write_failed.is_none() {
+            // While a `flush` waits and the stream has unflushed bytes, flush before taking more
+            // frames, so a busy channel cannot hold a flush back.
+            let flush_first = st.dirty && self.shared.flush_wanted();
+            if st.out_pos >= st.out.len() && st.write_failed.is_none() && !flush_first {
                 self.fill_out(st);
             }
             let writing = st.out_pos < st.out.len() && st.write_failed.is_none();
@@ -169,7 +172,11 @@ where
                         st.out_pos = 0;
                     }
                 }
-                Event::Flushed => st.dirty = false,
+                Event::Flushed => {
+                    st.dirty = false;
+                    // The buffer is empty, so every frame taken so far is on the stream.
+                    self.shared.mark_written();
+                }
                 Event::WriteError(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Event::WriteError(e) => self.write_failed(st, format!("write failed: {e}")),
                 Event::Wake => {}

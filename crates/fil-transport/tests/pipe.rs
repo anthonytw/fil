@@ -888,3 +888,153 @@ async fn the_daemon_side_has_no_preamble() {
     );
     drop(link);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Flush
+
+/// A daemon-side link over a tiny pipe, against a raw peer that has said hello.
+async fn tiny_pipe(capacity: usize) -> (std::sync::Arc<PipeLink>, Raw) {
+    let (a, b) = duplex(capacity);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    (std::sync::Arc::new(link), raw)
+}
+
+/// Reads frames until one on `channel` arrives.
+async fn frame_on(raw: &mut Raw, channel: ChannelId) -> Frame {
+    loop {
+        let f = raw.frame().await;
+        if f.channel == channel {
+            return f;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_resolves_once_everything_is_on_the_stream() {
+    // Nothing outstanding: at once.
+    let (link, mut raw) = tiny_pipe(64).await;
+    link.flush().await.unwrap();
+
+    // A frame the 64-byte pipe cannot hold yet: the flush waits for the peer to read it.
+    link.send(ChannelId::TERMINAL, data(0, 7, 1000))
+        .await
+        .unwrap();
+    let flushing = tokio::spawn({
+        let link = link.clone();
+        async move { link.flush().await }
+    });
+    sleep(MS(50)).await;
+    assert!(!flushing.is_finished(), "the peer has read nothing");
+    let f = frame_on(&mut raw, ChannelId::TERMINAL).await;
+    assert!(f.payload.len() > 1000);
+    assert_eq!(flushing.await.unwrap(), Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_waits_for_older_frames_even_when_newer_ones_overtake_them() {
+    // The scheduler sends control before forwards, so a frame sent later can leave first. A
+    // flush counts per channel and must still wait for the older forward frame.
+    let (link, mut raw) = tiny_pipe(64).await;
+    let fwd = ChannelId(16);
+    link.send(fwd, data(0, 1, 1000)).await.unwrap(); // the driver takes it and blocks writing
+    sleep(MS(10)).await;
+    link.send(fwd, data(1000, 2, 1000)).await.unwrap(); // waits in the queue
+    let flushing = tokio::spawn({
+        let link = link.clone();
+        async move { link.flush().await }
+    });
+    sleep(MS(10)).await;
+    let detach = Bytes::from(ControlMsg::Detach.encode().unwrap());
+    link.send(ChannelId::CONTROL, detach).await.unwrap(); // overtakes the second forward frame
+
+    let first = frame_on(&mut raw, fwd).await;
+    assert!(first.payload.len() > 1000);
+    // The control frame goes next.
+    let ctl = frame_on(&mut raw, ChannelId::CONTROL).await;
+    assert_eq!(
+        ControlMsg::decode(&ctl.payload).unwrap(),
+        ControlMsg::Detach
+    );
+    sleep(MS(50)).await;
+    assert!(
+        !flushing.is_finished(),
+        "two frames have been written, but not the one the flush is for"
+    );
+    let second = frame_on(&mut raw, fwd).await;
+    assert!(second.payload.len() > 1000);
+    assert_eq!(flushing.await.unwrap(), Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_when_the_stream_dies_mid_flush() {
+    let (link, raw) = tiny_pipe(64).await;
+    link.send(ChannelId::TERMINAL, data(0, 7, 1000))
+        .await
+        .unwrap();
+    let flushing = tokio::spawn({
+        let link = link.clone();
+        async move { link.flush().await }
+    });
+    sleep(MS(50)).await;
+    assert!(!flushing.is_finished());
+    drop(raw); // the peer goes away with the frame half written
+    let err = flushing.await.unwrap().unwrap_err();
+    assert!(matches!(err.0, DownReason::Io(_)), "{err:?}");
+    // And a flush on a link that is already down fails too.
+    assert!(link.flush().await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_after_close_and_when_the_link_goes_dead() {
+    let (link, _raw) = tiny_pipe(1 << 16).await;
+    link.close();
+    assert_eq!(
+        link.flush().await.unwrap_err().0,
+        DownReason::Closed,
+        "a closed link has nothing to flush"
+    );
+
+    // A peer that neither reads nor speaks: the link is found dead, which ends the wait.
+    let (link, _raw) = tiny_pipe(64).await;
+    link.send(ChannelId::TERMINAL, data(0, 7, 1000))
+        .await
+        .unwrap();
+    let err = timeout(Duration::from_secs(30), link.flush())
+        .await
+        .expect("the flush ended with the link")
+        .unwrap_err();
+    assert_eq!(err.0, DownReason::Dead);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_delivers_everything_sent_before_it_over_a_simulated_stream() {
+    let (a, b, _) = pair(StreamConfig::default(), cfg(), cfg()).await;
+    let b = std::sync::Arc::new(b);
+    let reader = tokio::spawn({
+        let b = b.clone();
+        async move {
+            let mut n = 0u32;
+            while let Ok((_, p)) = b.recv().await {
+                if p[..].starts_with(&[0xEE]) {
+                    n += 1;
+                }
+            }
+            n
+        }
+    });
+    for _ in 0..4 {
+        a.send(ChannelId::TERMINAL, Bytes::from_static(&[0xEE; 64]))
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(5), a.flush())
+        .await
+        .expect("flush finished")
+        .unwrap();
+    a.close();
+    // The close that follows a flush loses nothing.
+    sleep(MS(100)).await;
+    assert_eq!(reader.await.unwrap(), 4);
+}

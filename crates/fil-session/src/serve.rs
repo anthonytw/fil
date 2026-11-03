@@ -108,7 +108,7 @@ pub async fn serve_subscriber<L: Link>(
     let answer = handle
         .attach(attach)
         .await
-        .unwrap_or_else(|Gone| AttachAnswer::Refused(AttachRefusal::SessionGone));
+        .unwrap_or_else(|Gone| AttachAnswer::Refused(AttachRefusal::SessionGone { exit: None }));
     let acc = match answer {
         AttachAnswer::Refused(r) => {
             let c = Conn::new(&link, handle, 0, 0, false, Arc::default());

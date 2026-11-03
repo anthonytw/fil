@@ -157,7 +157,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 - `Request::Forward { session, op: ForwardOp }`, where `ForwardOp` is `Add(ForwardSpec)` or `Remove { kind: Option<ForwardKind>, port: u16 }`.
 - `Request::Ports { session: Option<SessionName> }`.
 - `Response::Forward(ForwardResult)`, either `Added(ForwardId)` or `Refused(ForwardRefusal)`.
-- `Response::Ports { part: PortsPart, more: bool }`. It is chunked: one control message is capped at 4 KiB, there are at most 256 rows, and every string field is capped (process name 32 B, path 128 B, probe label 64 B). Strings are sanitized on display, never trusted.
+- `Response::Ports { part: PortsPart, more: bool }`. It is chunked: one control message is capped at 4 KiB, there are at most 256 rows, and every string field is capped (process name 32 B, path 128 B, probe label 64 B). Strings are sanitized on display, never trusted. Since wire revision 6 (P1): every part carries `incomplete: Option<PortsIncomplete>` (`NoSocketTable`, `Bounded`, `TimedOut`, `Unsupported`; a reason only), and `ForwardRow.target_other_user` marks a `-L` target that another user's listener takes (no owner, no probe).
 - `ControlMsg::Reset` removed.
 
 ### 2.5 Forward table semantics

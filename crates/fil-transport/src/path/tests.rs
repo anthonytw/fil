@@ -1162,23 +1162,23 @@ fn storm_slow(
         let timer = w.timers.iter().next().copied();
         let mut next = next_hint;
         let mut which = 0; // 0 hint, 1 timer, 2 pipe failure, 3 dial failure
-        if let Some((due, _)) = timer {
-            if due < next {
-                next = due;
-                which = 1;
-            }
+        if let Some((due, _)) = timer
+            && due < next
+        {
+            next = due;
+            which = 1;
         }
-        if let Some(t) = pipe_fails_at {
-            if t < next {
-                next = t;
-                which = 2;
-            }
+        if let Some(t) = pipe_fails_at
+            && t < next
+        {
+            next = t;
+            which = 2;
         }
-        if let Some(t) = dial_fails_at {
-            if t < next {
-                next = t;
-                which = 3;
-            }
+        if let Some(t) = dial_fails_at
+            && t < next
+        {
+            next = t;
+            which = 3;
         }
         if next > w.t.at {
             w.t.at = next;
@@ -1242,11 +1242,11 @@ fn hints_during_slow_failing_pipe_runs_cost_no_more_than_before() {
             1,
         );
         eprintln!(
-            "{setting:?} fail {fail_ms} ms hint {hint_ms} ms: {runs} runs {dials} dials (main {main_runs})"
+            "{setting:?} fail {fail_ms} ms hint {hint_ms} ms: {runs} runs {dials} dials (main {main_runs} and {main_dials})"
         );
         assert!(
-            runs <= *main_runs,
-            "{setting:?}: {runs} ssh runs, main had {main_runs}"
+            runs <= *main_runs && dials <= *main_dials,
+            "{setting:?} fail {fail_ms} hint {hint_ms}: {runs} ssh runs and {dials} dials, main had {main_runs} and {main_dials}"
         );
     }
 }

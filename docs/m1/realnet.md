@@ -309,6 +309,8 @@ The fix is in `crates/fil-transport/src/quic/floor.rs` (DESIGN.md §8.5, livenes
 | 4.5 s | 5 of 5 lost (4.53 to 5.19 s) | 5 of 5 lost (`Down(Dead)` 4.58 to 4.68 s after the cut), fresh handshake 0.19 to 0.28 s after the network returned |
 | 8.0 s | 3 of 3 lost (4.63 to 4.68 s) | 3 of 3 lost at 4.58 to 4.63 s, fresh handshake 1.08 to 1.14 s after it returned |
 
+On GitHub's x86_64 runner the 3 s case had survived in all 22 earlier attempts of the suite, so there the margin was thin but held; the 4.5 s and 8 s cases were lost at the same 4.67 s. With the floor, two runs of this branch: 3 s survived, 4.5 s lost at 4.67 s (fresh handshake 0.26 to 0.27 s after the heal), 8 s lost at 4.67 s (1.17 to 1.18 s), as DESIGN expects: a link survives an outage that ends early enough for a probe sent at most half a heartbeat later to arrive within `dead_after` of the last datagram.
+
 ## Real versus simulator
 
 The two agree on almost everything, which is the main result: the simulator's numbers were a good predictor.

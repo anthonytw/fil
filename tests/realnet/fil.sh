@@ -21,6 +21,15 @@ FC_N=0
 # fc_on HOST: the clients started from now on run on HOST.
 fc_on() { FC_HOST=$1; }
 
+# known_bug DESCRIPTION: a finding about fil itself that the suite has caught. It is recorded in
+# the results and the log, and does not fail the scenario (so one finding does not hide the
+# results after it); REALNET_STRICT=1 makes it fail.
+known_bug() {
+  note "KNOWN-BUG: $1"
+  log "KNOWN BUG: $1"
+  [[ ${REALNET_STRICT:-0} != 1 ]] || fail "known bug (REALNET_STRICT=1): $1"
+}
+
 # fc_start NAME [-- FIL_ARGS...]: the client `fil FIL_ARGS...` in a PTY of 200 rows by 100
 # columns, with debug logging into its own state directory (so its client.log is only its own).
 # Extra environment for it: FC_ENV=(K=V ...). It runs on FC_HOST.
@@ -31,7 +40,7 @@ fc_start() {
   printf -v "FC_WHERE_$name" '%s' "$FC_HOST"
   FC_NAMES+=("$name")
   trap fc_finish EXIT
-  local envargs=(--env FIL_LOG=debug --env "XDG_STATE_HOME=$PD/state-$name")
+  local envargs=(--env FIL_LOG=debug --env "XDG_STATE_HOME=$PD/state-${SCENARIO:-x}-$name")
   for e in ${FC_ENV[@]+"${FC_ENV[@]}"}; do envargs+=(--env "$e"); done
   client_bg_on "$FC_HOST" ptydrive serve --dir "$PD" "${envargs[@]}" "$name" -- fil "$@"
   local i
@@ -152,7 +161,7 @@ fc_detach() {
 }
 
 # fc_log NAME: the client's log (JSON lines).
-fc_log() { client_exec_on "$(fc_where "$1")" cat "$PD/state-$1/fil/client.log" 2> /dev/null || true; }
+fc_log() { client_exec_on "$(fc_where "$1")" cat "$PD/state-${SCENARIO:-x}-$1/fil/client.log" 2> /dev/null || true; }
 
 # fc_count_log NAME TEXT: how many log lines contain TEXT.
 fc_count_log() { fc_log "$1" | grep -cF -- "$2" || true; }

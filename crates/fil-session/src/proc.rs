@@ -79,7 +79,46 @@ fn on_path(program: &str) -> bool {
 /// answer, common right after logout without lingering, must not hang session creation.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How much of each of a probe's output streams is kept. The rest is read and thrown away.
+const PROBE_OUTPUT_CAP: usize = 64 * 1024;
+
+/// How long to wait for the output readers once the probe has exited. A pipe held open by a
+/// process the probe left behind would otherwise keep them going.
+const READER_GRACE: Duration = Duration::from_millis(500);
+
+/// Reads `r` to the end on its own thread, keeping the first `cap` bytes. Reading continues past
+/// the cap so that the writer never blocks on a full pipe.
+fn drain<R: std::io::Read + Send + 'static>(
+    mut r: R,
+    cap: usize,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = kept.clone();
+    let t = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut v = out.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = cap.saturating_sub(v.len());
+                    v.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (kept, t)
+}
+
 /// Runs `cmd` with its output captured and kills it after `timeout`.
+///
+/// Both output streams are drained while waiting, so a probe that prints more than a pipe holds
+/// is not mistaken for a hung one. At most [`PROBE_OUTPUT_CAP`] bytes of each are kept.
 fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -90,10 +129,29 @@ fn output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let (stdout, t_out) = drain(
+        child.stdout.take().expect("stdout was piped"),
+        PROBE_OUTPUT_CAP,
+    );
+    let (stderr, t_err) = drain(
+        child.stderr.take().expect("stderr was piped"),
+        PROBE_OUTPUT_CAP,
+    );
     let end = Instant::now() + timeout;
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
+        if let Some(status) = child.try_wait()? {
+            let grace = Instant::now() + READER_GRACE;
+            while !(t_out.is_finished() && t_err.is_finished()) && Instant::now() < grace {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let take = |m: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+                std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
+            };
+            return Ok(std::process::Output {
+                status,
+                stdout: take(&stdout),
+                stderr: take(&stderr),
+            });
         }
         if Instant::now() >= end {
             let _ = child.kill();
@@ -444,6 +502,34 @@ mod tests {
         quick.arg("hi");
         let out = output_with_timeout(quick, Duration::from_secs(5)).unwrap();
         assert!(out.status.success() && out.stdout.starts_with(b"hi"));
+    }
+
+    #[test]
+    fn a_probe_that_prints_more_than_a_pipe_holds_is_drained_and_capped() {
+        // Well over any pipe buffer on both streams. Undrained, the probe blocks on its write
+        // and looks hung.
+        let mut noisy = Command::new("sh");
+        noisy.args([
+            "-c",
+            "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; echo done >&2",
+        ]);
+        let t = Instant::now();
+        let out = output_with_timeout(noisy, Duration::from_secs(20)).expect("not a timeout");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), PROBE_OUTPUT_CAP, "kept up to the cap");
+        assert_eq!(out.stderr.len(), PROBE_OUTPUT_CAP);
+        assert!(t.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_probe_that_leaves_a_process_holding_its_pipes_still_returns() {
+        // The background `sleep` inherits the pipes and outlives the probe.
+        let mut leaky = Command::new("sh");
+        leaky.args(["-c", "echo out; sleep 3 & exit 0"]);
+        let t = Instant::now();
+        let out = output_with_timeout(leaky, Duration::from_secs(20)).unwrap();
+        assert!(out.status.success() && out.stdout.starts_with(b"out"));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     fn row(pid: u32, ppid: u32, start: &str) -> ProcRow {

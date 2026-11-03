@@ -4,7 +4,8 @@
 //! nothing reordered or removed). **Any change to what a message encodes as, additive or not
 //! (here, in `frame.rs` or in the preamble), needs a new `PROTOCOL_REVISION`**:
 //! `tests/wire_golden.rs` fails until it has one. [`Hello`] must stay decodable by every build,
-//! so its layout and its variant index (0) are frozen within a protocol major.
+//! so its layout and its variant index (0) are frozen within a protocol major, as are the opening
+//! ping and pong of a pipe (`crate::opening`), which are not control messages at all.
 //!
 //! Untrusted strings and byte blobs are newtypes that validate while deserializing, so a value of
 //! these types cannot exist with invalid contents, whether it came from the wire or a constructor.
@@ -478,7 +479,24 @@ pub struct OtherDaemon {
     pub revision: u16,
 }
 
-/// The most [`OtherDaemon`]s one answer names.
+impl OtherDaemon {
+    /// Words for it, numbers only: the major is named when it is not ours (`fil-2-3.sock` is not
+    /// "wire rev 3" of this fil).
+    pub fn describe(&self) -> String {
+        match (self.major == PROTOCOL_MAJOR, self.revision) {
+            (true, 0) => "a daemon from an older fil (before wire revisions)".to_string(),
+            (true, rev) => format!("a daemon of wire rev {rev}"),
+            (false, 0) => format!(
+                "a daemon of protocol major {} (before wire revisions)",
+                self.major
+            ),
+            (false, rev) => format!("a daemon of protocol major {} (wire rev {rev})", self.major),
+        }
+    }
+}
+
+/// The most [`OtherDaemon`]s one answer names. The sender cuts its list to this and the decoder
+/// refuses a longer one.
 pub const MAX_OTHER_DAEMONS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,10 +507,38 @@ pub enum Response {
     Sessions {
         list: Vec<SessionSummary>,
         truncated: bool,
+        #[serde(deserialize_with = "capped_others")]
         others: Vec<OtherDaemon>,
     },
     Done,
     NoSuchSession,
+}
+
+/// Reads `others`, refusing a list longer than [`MAX_OTHER_DAEMONS`] as soon as it is seen to be:
+/// the sender caps it, and a receiver does not rely on that (a hostile daemon could otherwise make
+/// `fil ls` print a line per entry that fits in a control message).
+fn capped_others<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OtherDaemon>, D::Error> {
+    struct Capped;
+    impl<'de> serde::de::Visitor<'de> for Capped {
+        type Value = Vec<OtherDaemon>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX_OTHER_DAEMONS} daemons")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(one) = seq.next_element()? {
+                if v.len() == MAX_OTHER_DAEMONS {
+                    return Err(serde::de::Error::custom("too many other daemons"));
+                }
+                v.push(one);
+            }
+            Ok(v)
+        }
+    }
+    d.deserialize_seq(Capped)
 }
 
 impl Response {
@@ -679,6 +725,35 @@ mod tests {
         let mut w = vec![1u8 /* Attach variant */, 0 /* empty name */];
         w.extend_from_slice(&wire[6..]);
         assert!(ControlMsg::decode(&w).is_err());
+    }
+
+    /// The receiver caps the list of other daemons too: a hostile daemon cannot make `fil ls` read
+    /// (or print) more than the sender would have sent.
+    #[test]
+    fn a_response_names_at_most_the_most_other_daemons() {
+        let other = OtherDaemon {
+            major: 1,
+            revision: 2,
+        };
+        let sessions = |n: usize| {
+            // Built by hand: `Response::sessions` would cut the list.
+            ControlMsg::Response(Response::Sessions {
+                list: vec![],
+                truncated: false,
+                others: vec![other; n],
+            })
+        };
+        let at_the_cap = sessions(MAX_OTHER_DAEMONS).encode().unwrap();
+        assert!(ControlMsg::decode(&at_the_cap).is_ok());
+        let past = sessions(MAX_OTHER_DAEMONS + 1).encode().unwrap();
+        assert_eq!(ControlMsg::decode(&past), Err(MsgError::Malformed));
+        let flood = sessions(1000).encode().unwrap();
+        assert_eq!(ControlMsg::decode(&flood), Err(MsgError::Malformed));
+        // The sender's own cut still holds.
+        match Response::sessions(vec![], vec![other; 100]) {
+            Response::Sessions { others, .. } => assert_eq!(others.len(), MAX_OTHER_DAEMONS),
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]

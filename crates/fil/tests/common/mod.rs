@@ -238,7 +238,7 @@ impl Connector for Fake {
             }),
             Script::Version => Err(PipeFailure {
                 message:
-                    "protocol version mismatch: this fil speaks major 1, the remote speaks major 2"
+                    "the fil on the remote host is newer: it speaks protocol major 2, this fil speaks major 1: upgrade this fil to match"
                         .into(),
                 skipped: Vec::new(),
                 severity: Severity::Version,

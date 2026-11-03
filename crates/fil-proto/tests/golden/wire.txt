@@ -1,11 +1,11 @@
 # The wire golden (crates/fil-proto/tests/wire_golden.rs). Do not edit by hand:
 # regenerate with `just wire-golden`, after bumping PROTOCOL_REVISION in limits.rs
 # if any encoding or limit changed (or PROTOCOL_MAJOR if a [frozen] one did).
-# [history] only ever grows: one line per revision, the hash of [limits] and
-# [revisioned] as that revision shipped it. Two branches that each bump to the same
+# [history] only ever grows: one line per revision, the hash of [frozen],
+# [limits] and [revisioned] as that revision shipped it. Two branches that each bump to the same
 # revision add different lines at the end and conflict in git: that is the point.
 major = 1
-revision = 2
+revision = 3
 [frozen]
 preamble/1 = 1b46494c2d434f4e4e45435420310a
 preamble/65535 = 1b46494c2d434f4e4e4543542036353533350a
@@ -13,6 +13,12 @@ hello = 0001070866696c2074657374
 hello/widest = 00ffff03ffff034061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161
 error/version-mismatch = 0b00
 limit/MAX_AGENT = 64
+opening/ping = ff7f00
+opening/pong = ff7f01
+frame/opening-ping = 0000000400ff7f00
+frame/opening-pong = 0000000400ff7f01
+decode/opening-ping-as-control = err
+decode/opening-pong-as-control = err
 frame/channel-0 = 000000040078797a
 frame/channel-1 = 000000040178797a
 frame/channel-2 = 000000040278797a
@@ -24,6 +30,8 @@ frame/channel-300 = 00000005ac0278797a
 frame/channel-70000 = 00000006f0a20478797a
 frame/channel-4294967295 = 00000008ffffffff0f78797a
 frame/hello = 0000000d000001070866696c2074657374
+decode/hello-by-opening = ok
+decode/hello-by-opening-trailing-byte = err
 decode/hello-agent-64 = ok
 decode/hello-agent-65 = err malformed
 decode/hello-agent-escape = err malformed
@@ -190,6 +198,8 @@ decode/other-daemon-major-65535 = ok
 decode/other-daemon-revision-65535 = ok
 decode/other-daemon-major-65536 = err malformed
 decode/other-daemon-revision-65536 = err malformed
+decode/others-8 = ok
+decode/others-9 = err malformed
 decode/error-code-3 = ok
 decode/error-code-4 = err
 decode/snapshot-reason-4 = ok
@@ -203,3 +213,4 @@ decode/response-3 = err
 [history]
 1 = 9534726b9f61a7db
 2 = 46a624dcce668487
+3 = 5bc45255045b0f43

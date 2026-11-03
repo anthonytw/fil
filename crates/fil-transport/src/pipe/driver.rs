@@ -94,6 +94,8 @@ struct State {
     next_nonce: u32,
     /// The nonce of the latest ping we have not answered yet (older ones are dropped).
     reply: Option<u32>,
+    /// The peer's opening ping (frozen bytes, not a control message) is unanswered.
+    reply_opening: bool,
     /// A ping is due and not written yet.
     ping_due: bool,
     out: Vec<u8>,
@@ -119,6 +121,7 @@ where
             pings: self.first_ping.into_iter().collect(),
             next_nonce: self.first_ping.map_or(0, |(n, _)| n.wrapping_add(1)),
             reply: None,
+            reply_opening: false,
             ping_due: false,
             out: Vec::new(),
             out_pos: 0,
@@ -295,6 +298,12 @@ where
     /// Fills `out`: a pending heartbeat reply, our own ping, then the scheduler's frames in its
     /// order for as long as they fit in [`PACK_LIMIT`].
     fn fill_out(&mut self, st: &mut State) {
+        if std::mem::take(&mut st.reply_opening) {
+            match fil_proto::opening::frame_of(fil_proto::opening::PONG) {
+                Ok(f) => st.out.extend_from_slice(&f),
+                Err(_) => tracing::error!("could not encode the opening pong"),
+            }
+        }
         if let Some(nonce) = st.reply.take() {
             self.put_heartbeat(st, ControlMsg::Heartbeat { nonce, reply: true });
         }
@@ -369,16 +378,23 @@ where
 
     /// One frame from the peer: heartbeats are consumed here, everything else goes up.
     fn on_frame(&mut self, st: &mut State, frame: Frame) {
+        if frame.channel == ChannelId::CONTROL {
+            // The opening exchange is fixed bytes, whatever wire the peer speaks (the relay
+            // answers a client's, and the daemon's own goes through it).
+            if frame.payload == fil_proto::opening::PING {
+                st.reply_opening = true;
+                return;
+            }
+            if frame.payload == fil_proto::opening::PONG {
+                self.on_pong(st, 0);
+                return;
+            }
+        }
         if frame.channel == ChannelId::CONTROL
             && let Ok(ControlMsg::Heartbeat { nonce, reply }) = ControlMsg::decode(&frame.payload)
         {
             if reply {
-                if let Some(i) = st.pings.iter().position(|(n, _)| *n == nonce) {
-                    let (_, sent) = st.pings[i];
-                    st.pings.drain(..=i);
-                    self.shared
-                        .set_rtt(Instant::now().saturating_duration_since(sent));
-                }
+                self.on_pong(st, nonce);
             } else {
                 // The latest ping wins; an older unanswered one is not worth a frame.
                 st.reply = Some(nonce);
@@ -390,6 +406,16 @@ where
         // a bug or a hostile peer, and the layer above ends the run).
         self.shared
             .push_inbound(frame.channel, Bytes::from(frame.payload));
+    }
+
+    /// The answer to our ping `nonce`: its round trip is the link's RTT.
+    fn on_pong(&self, st: &mut State, nonce: u32) {
+        if let Some(i) = st.pings.iter().position(|(n, _)| *n == nonce) {
+            let (_, sent) = st.pings[i];
+            st.pings.drain(..=i);
+            self.shared
+                .set_rtt(Instant::now().saturating_duration_since(sent));
+        }
     }
 
     /// EOF or a read error: the pipe is over. If there is a child that has already exited, its

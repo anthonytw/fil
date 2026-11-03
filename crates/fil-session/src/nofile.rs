@@ -80,11 +80,9 @@ pub fn raise(trampoline: PathBuf) -> Option<Raised> {
     let original = getrlimit(Resource::Nofile);
     // `None` is unlimited.
     let from = original.current?;
-    let mut to = original.maximum.unwrap_or(u64::MAX);
+    let to = original.maximum.unwrap_or(u64::MAX);
     #[cfg(target_os = "macos")]
-    {
-        to = to.min(MACOS_MAX);
-    }
+    let to = to.min(MACOS_MAX);
     if to <= from {
         return None;
     }

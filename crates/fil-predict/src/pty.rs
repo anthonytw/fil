@@ -632,8 +632,3 @@ pub fn programs() -> Vec<Program> {
         },
     ]
 }
-
-/// The directory a spec runs in, for messages.
-pub fn dir_of(spec: &Spec) -> &Path {
-    &spec.cwd
-}

@@ -63,10 +63,6 @@ async fn attach_output_detach_resume() {
     d.stop().await;
 }
 
-fn transport_key(k: &fil_proto::msg::PublicKey) -> fil_transport::auth::PublicKey {
-    fil_transport::auth::PublicKey::from_spki_der(k.as_bytes())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn takeover_between_two_clients() {
     let s = Scratch::new();

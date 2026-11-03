@@ -127,7 +127,7 @@ impl Ctx {
         }
         let out = self.targets.gate_reset(host)?;
         if self.verbose {
-            eprintln!("[{host}] {}", out.trim());
+            eprintln!("[{host}] {}", self.targets.scrub(out.trim()));
         }
         Ok(())
     }
@@ -645,7 +645,12 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
     let rt = c.roundtrip("DM1", Duration::from_secs(20))?;
     let pi_logs = ctx.gate(host, "logs 200")?;
     if ctx.verbose {
-        eprintln!("--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}");
+        eprintln!(
+            "{}",
+            ctx.targets.scrub(&format!(
+                "--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}"
+            ))
+        );
     }
     // This client's attach only: the journal keeps earlier scenarios' lines too, and the daemon's
     // log no longer names the session (privacy, S4), so go by time: a direct attach after this
@@ -757,6 +762,15 @@ fn main() {
             _ => usage(),
         }
     }
+    // A typo in --only must not give a green run that tested nothing.
+    if let Some(o) = &only
+        && let Some(bad) = o
+            .iter()
+            .find(|x| !scenarios().iter().any(|(n, _)| *n == x.as_str()))
+    {
+        eprintln!("--only: \"{bad}\" is not a scenario (`--list` shows them)");
+        std::process::exit(2);
+    }
     // The targets are required and are the whole list of hosts this program may touch.
     let raw = std::env::var("FIL_PI_TARGETS").unwrap_or_default();
     let targets = Targets::parse(&raw, &[]).unwrap_or_else(|e| {
@@ -794,13 +808,14 @@ fn main() {
     };
 
     let mut failures = 0;
+    let mut ran = 0;
     let mut table = Vec::new();
     for host in &hosts {
         let version = ctx.gate(host, "run fil --version").unwrap_or_else(|e| {
             eprintln!("{}", ctx.targets.scrub(&e));
             std::process::exit(2);
         });
-        println!("== {host}: {}", version.trim());
+        println!("== {host}: {}", ctx.targets.scrub(version.trim()));
         for (name, f) in scenarios() {
             if let Some(o) = &only
                 && !o.iter().any(|x| x == name)
@@ -818,6 +833,7 @@ fn main() {
                 ));
                 continue;
             }
+            ran += 1;
             let t = Instant::now();
             // A panic (a write to a dead client, a bug here) is a failure of this scenario, and
             // the cleanup below still runs.
@@ -839,9 +855,12 @@ fn main() {
                 Ok(notes) => {
                     println!("PASS {host} {name} ({:.1} s)", took.as_secs_f64());
                     for n in &notes {
-                        println!("       {n}");
+                        println!("       {}", ctx.targets.scrub(n));
                     }
-                    table.push(format!("| {host} | {name} | pass | {} |", notes.join("; ")));
+                    table.push(format!(
+                        "| {host} | {name} | pass | {} |",
+                        ctx.targets.scrub(&notes.join("; "))
+                    ));
                 }
                 Err(e) => {
                     failures += 1;
@@ -852,7 +871,7 @@ fn main() {
                     );
                     table.push(format!(
                         "| {host} | {name} | FAIL | {} |",
-                        e.lines().next().unwrap_or("")
+                        ctx.targets.scrub(e.lines().next().unwrap_or(""))
                     ));
                 }
             }
@@ -886,6 +905,10 @@ fn main() {
     println!("\n| host | scenario | result | details |\n|---|---|---|---|");
     for l in table {
         println!("{l}");
+    }
+    if ran == 0 {
+        println!("FAIL: no scenario ran");
+        failures += 1;
     }
     if failures > 0 {
         std::process::exit(1);

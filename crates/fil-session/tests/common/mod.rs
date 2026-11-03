@@ -335,11 +335,3 @@ impl Link for DelayLink {
         self.inner.close()
     }
 }
-
-pub fn exit_code(info: &ExitInfo) -> u32 {
-    info.code
-}
-
-pub fn path_str(p: &Path) -> String {
-    p.display().to_string()
-}

@@ -378,9 +378,10 @@ pub fn terminal_modes(ctx: &Ctx, host: &str) -> Res {
 pub fn escape_handling(ctx: &Ctx, host: &str) -> Res {
     let mut c = ctx.shell(host, Variant::Auto, "esc")?;
     // A program in $HOME that names its argument, so that a command line starting with `~/` runs
-    // it only when exactly one `~` reached the shell.
+    // it only when exactly one `~` reached the shell. $HOME is the scratch directory for the
+    // duration: the account's real home is never written (it is the developer's own on --local).
     c.run(
-        "printf '#!/bin/sh\\necho TILDE-$1-$((6*7))\\n' > ~/.dp_tilde.sh; chmod +x ~/.dp_tilde.sh",
+        "H=$HOME; HOME=$D; printf '#!/bin/sh\\necho TILDE-$1-$((6*7))\\n' > ~/.dp_tilde.sh; chmod +x ~/.dp_tilde.sh",
         CMD_TIMEOUT,
     )?;
     let from = c.len();
@@ -414,7 +415,7 @@ pub fn escape_handling(ctx: &Ctx, host: &str) -> Res {
     ensure(has_line(&seen, "PASTE-A-42"), || {
         format!("the first pasted line did not run\n{seen}")
     })?;
-    c.run("rm -f ~/.dp_tilde.sh", CMD_TIMEOUT)?;
+    c.run("rm -f ~/.dp_tilde.sh; HOME=$H", CMD_TIMEOUT)?;
     // An unmarked paste of the same text detaches, as ssh's escape does.
     c.send("echo RAW-A-$((6*7))\r~.\r");
     let (_, code) = c.wait_exit(Duration::from_secs(10)).ok_or_else(|| {

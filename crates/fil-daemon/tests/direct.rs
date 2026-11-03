@@ -11,14 +11,6 @@ use fil_transport::LinkParams;
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::quic::QuicLink;
 
-fn proto_key(k: &ClientKey) -> msg::PublicKey {
-    msg::PublicKey::new(k.public_key().as_spki_der().to_vec()).unwrap()
-}
-
-fn transport_key(k: &msg::PublicKey) -> fil_transport::auth::PublicKey {
-    fil_transport::auth::PublicKey::from_spki_der(k.as_bytes())
-}
-
 async fn dial(d: &Running, key: &ClientKey) -> Result<QuicLink, fil_transport::LinkError> {
     let port = d.udp_port.expect("direct mode is on");
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();

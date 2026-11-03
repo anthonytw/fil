@@ -960,12 +960,7 @@ f_dropin_vim_nat() {
   netem_apply delay 20ms
   NAT_UDP=
   fil_attach_direct a dvn
-  if ! dp_start_vim a; then
-    note "SKIP=no vim or vi on this machine"
-    fc_detach a
-    cx_fk dvn
-    return 0
-  fi
+  dp_start_vim a
   local specs=("$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999") i spec t0 took worst=0 moved
   for i in $(seq 1 12); do
     moved=
@@ -1001,12 +996,7 @@ f_dropin_vim_loss() {
   reset_net
   netem_apply delay 20ms
   fil_attach_direct a dvl
-  if ! dp_start_vim a; then
-    note "SKIP=no vim or vi on this machine"
-    fc_detach a
-    cx_fk dvl
-    return 0
-  fi
+  dp_start_vim a
   local i t0
   for i in $(seq 1 26); do
     case $i in

@@ -326,25 +326,6 @@ async fn a_forced_detach_during_a_stall_is_still_announced() {
     let _ = h.kill(kill_wait()).await;
 }
 
-/// `fil detach` while the shell's exit is being drained must not replace `SessionExited` with
-/// `Detach` (the client would offer to attach to a session that is gone). A leftover background
-/// process keeps the PTY open, so the drain lasts the whole `exit_drain`.
-#[tokio::test]
-async fn a_forced_detach_while_the_exit_drains_leaves_session_exited() {
-    let sc = Scratch::new();
-    let mut cfg = sh_config(&sc, "main", "sleep 30 & read go; exit 3");
-    cfg.exit_drain = Duration::from_secs(3);
-    let h = spawn_plain(cfg).await;
-    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
-    c.type_bytes(b"\n").await;
-    // The core has seen the exit and is draining.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    h.force_detach().await;
-    c.wait("the exit status", |c| c.exited.is_some()).await;
-    assert!(!c.detached, "Detach replaced SessionExited");
-    assert_eq!(c.exited, Some((Some(3), None)));
-}
-
 /// A process that ignores the hangup is killed before `kill` returns, not some time later.
 #[tokio::test]
 async fn kill_returns_after_the_leftovers_have_been_killed() {

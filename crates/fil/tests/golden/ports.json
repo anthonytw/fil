@@ -143,6 +143,81 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null
+        },
+        {
+          "id": 6,
+          "kind": "local",
+          "spec": "-L 9443:[2001:db8::1]:443",
+          "bind": "loopback",
+          "port": 9443,
+          "target": {
+            "host": "2001:db8::1",
+            "port": 443
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 9443
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null
+        },
+        {
+          "id": 7,
+          "kind": "remote",
+          "spec": "-R 9100:[::1]:3000",
+          "bind": "loopback",
+          "port": 9100,
+          "target": {
+            "host": "::1",
+            "port": 3000
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 9100
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null
+        },
+        {
+          "id": 8,
+          "kind": "local",
+          "spec": "-L [2001:db8::2]:8444:web.example.net:80",
+          "bind": "2001:db8::2",
+          "port": 8444,
+          "target": {
+            "host": "web.example.net",
+            "port": 80
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 8444
+          },
+          "exposed": true,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null
         }
       ],
       "listeners": [
@@ -172,6 +247,19 @@
             "pid": 42200,
             "name": "node",
             "cwd": null
+          },
+          "since_unix_ms": null,
+          "probe": null
+        },
+        {
+          "addr": "2001:db8::5",
+          "port": 7000,
+          "scope": "session",
+          "exposed": true,
+          "process": {
+            "pid": 42300,
+            "name": "deno",
+            "cwd": "~/web"
           },
           "since_unix_ms": null,
           "probe": null

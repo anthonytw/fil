@@ -11,7 +11,7 @@ use fil_transport::LinkParams;
 use fil_transport::path::TransportSetting;
 
 use crate::cli::{Action, Cli};
-use crate::config::{self, Config, HostSettings};
+use crate::config::{self, Config, ForwardFailure, HostSettings};
 use crate::connect::Connect;
 use crate::dialer::{Connector, DialerConfig, PathDialer};
 use crate::forward_spec::{CliForwards, ForwardPlan};
@@ -123,6 +123,15 @@ async fn attach(
     };
     if !forwards.specs.is_empty() || forwards.agent == Some(crate::forward_spec::AgentFlag::On) {
         eprintln!("fil: {NOT_WIRED}. Attach without -L, -R, -D and -A, or use ssh for now");
+        return FAILED;
+    }
+    // The config asked for forwards that cannot be set up yet. With `forward_failure = "exit"`
+    // the user said a forward that is not there must not leave a running session: refuse, as
+    // for the command line. Otherwise say so and carry on.
+    if plan.forward_failure == ForwardFailure::Exit && !plan.specs.is_empty() {
+        eprintln!(
+            "fil: {NOT_WIRED}, and `forward_failure = \"exit\"` is set: not attaching. Remove `forward` from the config for now, or use ssh"
+        );
         return FAILED;
     }
     if !plan.is_empty() {

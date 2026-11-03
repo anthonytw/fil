@@ -19,7 +19,7 @@ use fil_proto::msg::{
 use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin};
 use serde::Serialize;
 
-use crate::forward_spec::{self, host_port, is_loopback_ip, target_host};
+use crate::forward_spec::{self, host_port, is_loopback_ip, target_host_bare};
 
 /// The JSON layout's version. A field is never renamed or retyped within a version.
 pub const JSON_SCHEMA: u32 = 1;
@@ -341,10 +341,10 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         (ForwardKind::Local, Some(t)) => (
             own,
             "→",
-            host_port(&clean(&target_host(&t.host)), t.port.get()),
+            host_port(&clean(&target_host_bare(&t.host)), t.port.get()),
         ),
         (ForwardKind::Remote, Some(t)) => (
-            host_port(&clean(&target_host(&t.host)), t.port.get()),
+            host_port(&clean(&target_host_bare(&t.host)), t.port.get()),
             "←",
             own,
         ),
@@ -729,7 +729,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         bind: json_bind(spec.bind()),
         port: spec.port(),
         target: spec.target().map(|t| JsonTarget {
-            host: target_host(&t.host),
+            host: target_host_bare(&t.host),
             port: t.port.get(),
         }),
         origin: match f.origin {

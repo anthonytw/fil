@@ -56,8 +56,12 @@ pub enum SpecError {
     Fields(&'static str),
     #[error("the {0} is not a port number (digits, 1 to 65535)")]
     Port(&'static str),
-    #[error("the {0} port cannot be 0 (only a -R listener can ask the host for a free port)")]
-    PortZero(&'static str),
+    #[error("the port cannot be 0 (only a -R listener can ask the host for a free port)")]
+    ListenPortZero,
+    #[error("the target port cannot be 0")]
+    TargetPortZero,
+    #[error("-R 0 needs a target: write 0:HOST:HOSTPORT")]
+    RemoteZeroNeedsTarget,
     #[error(
         "the bind address must be empty or *, localhost, an IPv4 address or a bracketed IP \
          address (not a host name)"
@@ -159,7 +163,7 @@ fn parse_port(f: Field<'_>, what: &'static str, allow_zero: bool) -> Result<u16,
     let n: u32 = s.parse().map_err(|_| SpecError::Port(what))?;
     let n = u16::try_from(n).map_err(|_| SpecError::Port(what))?;
     if n == 0 && !allow_zero {
-        return Err(SpecError::PortZero(what));
+        return Err(SpecError::ListenPortZero);
     }
     Ok(n)
 }
@@ -197,7 +201,7 @@ fn parse_host(f: Field<'_>, what: &'static str) -> Result<TargetHost, SpecError>
 
 fn target(host: TargetHost, port: u16) -> Result<Target, SpecError> {
     // A target port is never 0, whatever the kind.
-    let port = NonZeroU16::new(port).ok_or(SpecError::PortZero("target"))?;
+    let port = NonZeroU16::new(port).ok_or(SpecError::TargetPortZero)?;
     Ok(Target { host, port })
 }
 
@@ -258,6 +262,9 @@ pub fn parse(kind: ForwardKind, spec: &str) -> Result<ForwardSpec, SpecError> {
             let listen_zero = kind == ForwardKind::Remote;
             let port = parse_port(rest[0], "port", listen_zero)?;
             let t = if rest.len() == 1 {
+                if port == 0 {
+                    return Err(SpecError::RemoteZeroNeedsTarget);
+                }
                 // The short form: the same port on the other side, on its loopback.
                 target(localhost(), port)?
             } else {
@@ -288,7 +295,11 @@ pub fn parse_flag(text: &str) -> Result<ForwardSpec, SpecError> {
 
 /// Whether the forward's listener is beyond loopback (on whichever machine it binds).
 pub fn is_exposed(spec: &ForwardSpec) -> bool {
-    !spec.bind().is_loopback()
+    match spec.bind() {
+        // `::ffff:127.0.0.1` is loopback too (the wire's `is_loopback` says no to it).
+        BindAddr::Ip(ip) => !is_loopback_ip(ip),
+        other => !other.is_loopback(),
+    }
 }
 
 /// Policy for a spec fil is about to carry out for its own user (their CLI or config).
@@ -315,10 +326,18 @@ pub fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// A target host as written in a spec.
+/// A target host as written in a spec: an IPv6 address in brackets.
 pub fn target_host(host: &TargetHost) -> String {
     match host {
         TargetHost::Ip(ip) => fmt_ip(*ip),
+        TargetHost::Name(n) => n.to_string(),
+    }
+}
+
+/// A target host on its own, never bracketed (for [`host_port`] and for data).
+pub fn target_host_bare(host: &TargetHost) -> String {
+    match host {
+        TargetHost::Ip(ip) => ip.to_string(),
         TargetHost::Name(n) => n.to_string(),
     }
 }
@@ -391,8 +410,6 @@ pub enum AgentFlag {
 pub struct ForwardPlan {
     /// The config's `forward` list, then the command line's, later winning on an identity.
     pub specs: Vec<ForwardSpec>,
-    /// How many of `specs` came from the command line.
-    pub from_cli: usize,
     pub agent: AgentMode,
     /// SHA256 fingerprints the agent relay answers for; empty is every key.
     pub agent_keys: Vec<String>,
@@ -407,6 +424,52 @@ pub enum PlanError {
     TooMany(usize),
     #[error("{}: {why}", quote(&format_flag(spec)))]
     Policy { spec: ForwardSpec, why: PolicyError },
+    #[error(
+        "{} and {} would listen on the same port; give one of them another port or bind address",
+        quote(a),
+        quote(b)
+    )]
+    Collision { a: String, b: String },
+}
+
+/// Which machine a forward's listener is on: `-L` and `-D` bind here, `-R` on the host.
+fn listens_on_host(spec: &ForwardSpec) -> bool {
+    spec.kind() == ForwardKind::Remote
+}
+
+fn unspecified(ip: IpAddr) -> bool {
+    ip.to_canonical().is_unspecified()
+}
+
+/// Whether two binds can take the same port number on one machine.
+fn binds_overlap(a: BindAddr, b: BindAddr) -> bool {
+    use BindAddr::{Any, Ip, Loopback};
+    match (a, b) {
+        (Any, _) | (_, Any) | (Loopback, Loopback) => true,
+        (Ip(x), Ip(y)) => {
+            // A wildcard address takes every address (dual-stack sockets: of both families).
+            unspecified(x) || unspecified(y) || x.to_canonical() == y.to_canonical()
+        }
+        (Loopback, Ip(x)) | (Ip(x), Loopback) => unspecified(x) || is_loopback_ip(x),
+    }
+}
+
+/// The first two forwards that would listen on the same port of the same machine (`-L` and
+/// `-D` share the laptop), though they are different table entries.
+fn find_collision(specs: &[ForwardSpec]) -> Option<(&ForwardSpec, &ForwardSpec)> {
+    for (i, a) in specs.iter().enumerate() {
+        for b in &specs[i + 1..] {
+            // Port 0 is the host's choice: it never collides.
+            if a.port() != 0
+                && a.port() == b.port()
+                && listens_on_host(a) == listens_on_host(b)
+                && binds_overlap(a.bind(), b.bind())
+            {
+                return Some((a, b));
+            }
+        }
+    }
+    None
 }
 
 impl ForwardPlan {
@@ -433,13 +496,18 @@ impl ForwardPlan {
                 why,
             })?;
         }
+        if let Some((a, b)) = find_collision(&specs) {
+            return Err(PlanError::Collision {
+                a: format_flag(a),
+                b: format_flag(b),
+            });
+        }
         let agent = match (cli.agent, settings.agent) {
             (Some(AgentFlag::Off), _) => AgentMode::Off,
             (Some(AgentFlag::On), AgentMode::Off) => AgentMode::On,
             (_, mode) => mode,
         };
         Ok(Self {
-            from_cli: specs.iter().filter(|s| cli.specs.contains(s)).count(),
             specs,
             agent,
             agent_keys: settings.agent_keys.clone(),

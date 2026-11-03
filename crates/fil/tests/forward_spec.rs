@@ -153,14 +153,14 @@ fn hostile_and_malformed_input_is_refused_with_a_reason() {
         (Local,   long_name,                             SpecError::Host),
         (Local,   long_host,                             SpecError::Host),
         // Port 0 is for -R listeners only; a target port is never 0.
-        (Local,   "0:h:80".into(),                       SpecError::PortZero("port")),
-        (Local,   "0".into(),                            SpecError::PortZero("port")),
-        (Local,   "127.0.0.1:0:h:80".into(),             SpecError::PortZero("port")),
-        (Dynamic, "0".into(),                            SpecError::PortZero("port")),
-        (Dynamic, "localhost:0".into(),                  SpecError::PortZero("port")),
-        (Local,   "80:h:0".into(),                       SpecError::PortZero("target")),
-        (Remote,  "0".into(),                            SpecError::PortZero("target")),
-        (Remote,  "9000:h:0".into(),                     SpecError::PortZero("target")),
+        (Local,   "0:h:80".into(),                       SpecError::ListenPortZero),
+        (Local,   "0".into(),                            SpecError::ListenPortZero),
+        (Local,   "127.0.0.1:0:h:80".into(),             SpecError::ListenPortZero),
+        (Dynamic, "0".into(),                            SpecError::ListenPortZero),
+        (Dynamic, "localhost:0".into(),                  SpecError::ListenPortZero),
+        (Local,   "80:h:0".into(),                       SpecError::TargetPortZero),
+        (Remote,  "0".into(),                            SpecError::RemoteZeroNeedsTarget),
+        (Remote,  "9000:h:0".into(),                     SpecError::TargetPortZero),
         // Out of range, signed, not numbers.
         (Local,   "65536:h:80".into(),                   SpecError::Port("port")),
         (Local,   "80:h:65536".into(),                   SpecError::Port("host port")),
@@ -312,7 +312,7 @@ fn a_parsed_spec_formats_back_to_itself() {
 #[test]
 fn nothing_panics_on_random_bytes() {
     // A small deterministic generator: a spec-like alphabet, every length up to 12.
-    let alphabet: &[u8] = b"0123456789:[]*.-/ahz%\x1b \0";
+    let alphabet: &[u8] = b"0123456789:[]*.-/ahz%\x1b \0\xc3\xa9";
     let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next = || {
         seed ^= seed << 13;
@@ -320,6 +320,14 @@ fn nothing_panics_on_random_bytes() {
         seed ^= seed << 17;
         seed
     };
+    // Multibyte characters and lengths around the cap must be refused, never sliced into.
+    for len in [MAX_SPEC_LEN - 1, MAX_SPEC_LEN, MAX_SPEC_LEN + 1, 4000] {
+        for unit in [":", "[", "\u{e9}", "\u{202e}", "1:"] {
+            for kind in [Local, Remote, Dynamic] {
+                let _ = parse(kind, &unit.repeat(len));
+            }
+        }
+    }
     for _ in 0..20_000 {
         let len = (next() % 13) as usize;
         let s: String = (0..len)
@@ -398,7 +406,6 @@ fn the_plan_puts_the_command_line_over_the_config() {
             "-L 5173:localhost:5173"
         ]
     );
-    assert_eq!(plan.from_cli, 3);
     assert_eq!(plan.agent, AgentMode::Confirm);
     assert!(!plan.is_empty());
     assert!(
@@ -477,4 +484,92 @@ fn targets_keep_the_name_as_written() {
         parse(Local, "8080:localhost:80").unwrap().target().unwrap().host,
         TargetHost::Name(ref n) if n.is_localhost()
     ));
+}
+
+#[test]
+fn an_ipv4_mapped_loopback_bind_is_loopback() {
+    for (kind, text) in [
+        (Local, "[::ffff:127.0.0.1]:8080:h:80"),
+        (Remote, "[::ffff:127.0.0.1]:9000:h:1"),
+        (Dynamic, "[::ffff:127.0.0.1]:1080"),
+    ] {
+        let spec = parse(kind, text).unwrap();
+        assert!(!forward_spec::is_exposed(&spec), "{text}");
+        assert_eq!(forward_spec::check_policy(&spec), Ok(()), "{text}");
+    }
+    // The mapped wildcard is still wide.
+    assert!(forward_spec::is_exposed(
+        &parse(Local, "[::ffff:0.0.0.0]:8080:h:80").unwrap()
+    ));
+}
+
+#[test]
+fn the_zero_port_messages_read_properly() {
+    let say = |kind, text| parse(kind, text).unwrap_err().to_string();
+    assert_eq!(
+        say(Local, "0"),
+        "the port cannot be 0 (only a -R listener can ask the host for a free port)"
+    );
+    assert_eq!(say(Dynamic, "0"), say(Local, "0"));
+    assert_eq!(say(Local, "80:h:0"), "the target port cannot be 0");
+    assert_eq!(
+        say(Remote, "0"),
+        "-R 0 needs a target: write 0:HOST:HOSTPORT"
+    );
+}
+
+#[test]
+fn listeners_that_would_take_the_same_port_are_refused_at_plan_time() {
+    let plan = |specs: &[(ForwardKind, &str)]| {
+        let cli = CliForwards {
+            specs: specs.iter().map(|(k, s)| parse(*k, s).unwrap()).collect(),
+            agent: None,
+        };
+        ForwardPlan::resolve(&settings(""), &cli)
+    };
+    // Three spellings of one socket (what binary.md used to promise could not happen).
+    for pair in [
+        [(Local, "8080"), (Local, "127.0.0.1:8080:x:80")],
+        [(Local, "8080"), (Local, "[::1]:8080:x:80")],
+        [(Local, "8080"), (Local, "*:8080:y:80")],
+        [(Local, "127.0.0.1:8080:x:80"), (Local, "*:8080:y:80")],
+        [(Local, "0.0.0.0:8080:x:80"), (Local, "127.0.0.1:8080:y:80")],
+        [(Local, "8080"), (Dynamic, "8080")],
+        [(Dynamic, "1080"), (Dynamic, ":1080")],
+        [(Remote, "9000"), (Remote, "127.0.0.1:9000:x:1")],
+    ] {
+        let err = plan(&pair).unwrap_err();
+        assert!(
+            matches!(err, PlanError::Collision { .. }),
+            "{pair:?}: {err}"
+        );
+        assert!(err.to_string().contains("same port"), "{err}");
+    }
+    // Different machines, different ports, different explicit addresses, and port 0 are fine.
+    for ok in [
+        [(Local, "9000"), (Remote, "9000")],
+        [(Local, "8080"), (Local, "8081")],
+        [(Local, "127.0.0.1:8080:x:80"), (Local, "[::1]:8080:y:80")],
+        [
+            (Local, "127.0.0.1:8080:x:80"),
+            (Local, "192.0.2.1:8080:y:80"),
+        ],
+        [(Remote, "0:x:1"), (Remote, "0:y:2")],
+    ] {
+        plan(&ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+    }
+    // Config and command line collide the same way; an identical identity still replaces.
+    let s = settings("[defaults]\nforward = [\"-L 8080\"]");
+    let cli = |t| CliForwards {
+        specs: vec![parse(Local, t).unwrap()],
+        agent: None,
+    };
+    assert!(ForwardPlan::resolve(&s, &cli("*:8080:x:80")).is_err());
+    assert_eq!(
+        ForwardPlan::resolve(&s, &cli("8080:x:80"))
+            .unwrap()
+            .specs
+            .len(),
+        1
+    );
 }

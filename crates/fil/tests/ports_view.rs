@@ -168,13 +168,45 @@ fn fixed_rows() -> Vec<PortsRow> {
         true,
     );
 
+    // IPv6 in each place it can appear: a target, a target of a -R, a bind.
+    let v6_target = fwd(
+        "main",
+        6,
+        ForwardKind::Local,
+        "9443:[2001:db8::1]:443",
+        listening(9443),
+        Origin::Client,
+        true,
+    );
+    let v6_back = fwd(
+        "main",
+        7,
+        ForwardKind::Remote,
+        "9100:[::1]:3000",
+        listening(9100),
+        Origin::Client,
+        true,
+    );
+    let v6_bind = fwd(
+        "main",
+        8,
+        ForwardKind::Local,
+        "[2001:db8::2]:8444:web.example.net:80",
+        listening(8444),
+        Origin::Client,
+        true,
+    );
+
     vec![
-        PortsRow::Session(summary("main", Some(("laptop", at(9, 12))), 5, true)),
+        PortsRow::Session(summary("main", Some(("laptop", at(9, 12))), 8, true)),
         PortsRow::Forward(vite),
         PortsRow::Forward(back),
         PortsRow::Forward(socks),
         PortsRow::Forward(asked),
         PortsRow::Forward(unbound),
+        PortsRow::Forward(v6_target),
+        PortsRow::Forward(v6_back),
+        PortsRow::Forward(v6_bind),
         PortsRow::Listener(ListenerRow {
             addr: ip("0.0.0.0"),
             port: port(8000),
@@ -194,6 +226,16 @@ fn fixed_rows() -> Vec<PortsRow> {
             owner: ListenerOwner::Session {
                 session: name("main"),
                 process: proc(42200, "node", None),
+            },
+            since_unix_ms: 0,
+            probe: None,
+        }),
+        PortsRow::Listener(ListenerRow {
+            addr: ip("2001:db8::5"),
+            port: port(7000),
+            owner: ListenerOwner::Session {
+                session: name("main"),
+                process: proc(42300, "deno", Some("~/web")),
             },
             since_unix_ms: 0,
             probe: None,
@@ -340,6 +382,14 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     assert_eq!(v["sessions"][1]["attached"], serde_json::Value::Null);
     assert_eq!(v["host_listeners"][1]["scope"], "mine");
     assert_eq!(v["host_listeners"][2]["scope"], "other");
+    // IPv6 is a bare address in every field; brackets are for the text table only.
+    assert_eq!(f[5]["target"]["host"], "2001:db8::1");
+    assert_eq!(f[5]["spec"], "-L 9443:[2001:db8::1]:443");
+    assert_eq!(f[6]["target"]["host"], "::1");
+    assert_eq!(f[7]["bind"], "2001:db8::2");
+    assert_eq!(f[7]["exposed"], true);
+    assert_eq!(main["listeners"][2]["addr"], "2001:db8::5");
+    assert_eq!(v["host_listeners"][1]["addr"], "::");
 }
 
 #[test]
@@ -569,4 +619,20 @@ fn a_forward_with_no_session_row_still_shows_under_its_session() {
     let text = render_text(&answer(rows), &opts(Some("orin")));
     assert!(text.starts_with("SESSION orphan on orin\n"), "{text}");
     assert!(text.contains("-L"), "{text}");
+}
+
+#[test]
+fn ipv6_is_bracketed_once_in_the_table() {
+    let text = render_text(&answer(fixed_rows()), &opts(Some("orin")));
+    assert!(!text.contains("[["), "{text}");
+    for want in [
+        "localhost:9443 →",
+        "[2001:db8::1]:443",
+        "[::1]:3000 ←",
+        "127.0.0.1:9100",
+        "[2001:db8::2]:8444 →",
+        "[::1]:8443 →",
+    ] {
+        assert!(text.contains(want), "{want}:\n{text}");
+    }
 }

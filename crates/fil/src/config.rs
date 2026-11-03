@@ -62,15 +62,52 @@ use crate::forward_spec;
 
 pub use fil_daemon::paths::{base_dir, home_dir};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{origin}: {message}")]
-    Invalid { origin: String, message: String },
+    Invalid {
+        origin: String,
+        message: String,
+    },
+}
+
+/// `text` with every control and invisible character written out (`\u{1b}`), newlines kept. Serde
+/// and toml quote the file's own values in their messages (an unknown variant, say), and a value
+/// can hold a terminal escape: errors are shown only like this.
+pub fn escape_unprintable(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c != '\n' && (c.is_control() || fil_proto::text::is_invisible(c)) {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let raw = match self {
+            ConfigError::Read { path, source } => {
+                format!("cannot read {}: {source}", path.display())
+            }
+            ConfigError::Invalid { origin, message } => format!("{origin}: {message}"),
+        };
+        f.write_str(&escape_unprintable(&raw))
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::Read { source, .. } => Some(source),
+            ConfigError::Invalid { .. } => None,
+        }
+    }
 }
 
 fn invalid(origin: &str, message: impl fmt::Display) -> ConfigError {
@@ -245,9 +282,9 @@ fn parse_duration(v: &DurationValue) -> Result<Duration, String> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(text.len());
     let (num, unit) = text.split_at(split);
-    let n: u64 = num
-        .parse()
-        .map_err(|_| format!("not a duration: {text:?} (examples: \"30s\", \"10m\")"))?;
+    let n: u64 = num.parse().map_err(|_| {
+        format!("not a duration: {text:?} (whole numbers; examples: \"30s\", \"10m\")")
+    })?;
     let secs = |mult: u64| {
         n.checked_mul(mult)
             .map(Duration::from_secs)
@@ -273,6 +310,9 @@ fn size_value(key: &str, v: &SizeValue) -> Result<usize, String> {
             .map_err(|e| format!("forward.{key}: {e} (examples: \"1MiB\", \"64KiB\")")),
     }
 }
+
+/// The most fingerprints `agent_keys` may list.
+pub const MAX_AGENT_KEYS: usize = 64;
 
 /// An ssh fingerprint, `SHA256:` and 43 base64 characters.
 fn check_fingerprint(f: &str) -> Result<String, String> {
@@ -585,8 +625,8 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
         out.agent = a;
     }
     if let Some(keys) = &s.agent_keys {
-        if keys.len() > MAX_FORWARDS {
-            return Err(format!("agent_keys: more than {MAX_FORWARDS} entries"));
+        if keys.len() > MAX_AGENT_KEYS {
+            return Err(format!("agent_keys: more than {MAX_AGENT_KEYS} entries"));
         }
         out.agent_keys = keys
             .iter()
@@ -1131,6 +1171,14 @@ forward = ["-R *:8080:h:80"]"#,
             }
             assert!(!err.contains('\u{1b}'), "{err:?}");
         }
+        let keys = format!(
+            "[defaults]\nagent_keys = [{}]",
+            (0..65)
+                .map(|_| "\"SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8\"")
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse(&keys).unwrap_err().contains("more than 64"));
         let many = format!(
             "[defaults]\nforward = [{}]",
             (1..=65)
@@ -1139,5 +1187,32 @@ forward = ["-R *:8080:h:80"]"#,
                 .join(",")
         );
         assert!(parse(&many).unwrap_err().contains("more than 64"));
+    }
+
+    #[test]
+    fn errors_never_carry_a_terminal_escape_whatever_key_they_come_from() {
+        // Serde quotes the file's value in its own words: a title-setting escape, a bidi
+        // override. `predict` is an old key, the others are new.
+        for key in [
+            "predict",
+            "agent",
+            "remote_requests",
+            "forward_failure",
+            "transport",
+        ] {
+            let text = format!("[defaults]\n{key} = \"x\\u001b]0;pwned\\u0007\\u202e\"");
+            let err = parse(&text).expect_err(&text);
+            assert!(
+                err.contains("pwned") && err.contains("\\u{1b}"),
+                "{key}: {err:?}"
+            );
+            assert!(
+                !err.chars().any(|c| c.is_control() && c != '\n') && !err.contains('\u{202e}'),
+                "{key}: {err:?}"
+            );
+        }
+        // A path with an escape in it, too.
+        let e = Config::load(Path::new("/nonexistent/\x1b[2J/c.toml"), true).unwrap_err();
+        assert!(!e.to_string().contains('\x1b'), "{e}");
     }
 }

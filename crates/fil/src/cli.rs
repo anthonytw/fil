@@ -95,16 +95,17 @@ pub struct AttachArgs {
     /// Listen here, connect from the host: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same port
     /// on the host's localhost. A bare port binds loopback; * or an empty BIND is every
     /// interface. Repeatable
-    #[arg(short = 'L', value_name = "SPEC", value_parser = parse_local)]
+    #[arg(short = 'L', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Local))]
     pub local: Vec<ForwardSpec>,
 
     /// Listen on the host, connect from here: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same
-    /// port on this machine's localhost. PORT 0 asks the host for a free port. Repeatable
-    #[arg(short = 'R', value_name = "SPEC", value_parser = parse_remote)]
+    /// port on this machine's localhost (not ssh's reverse SOCKS proxy). PORT 0 asks the host for a free
+    /// port. Repeatable
+    #[arg(short = 'R', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Remote))]
     pub remote: Vec<ForwardSpec>,
 
     /// A SOCKS proxy here that connects from the host: [BIND:]PORT. Repeatable
-    #[arg(short = 'D', value_name = "SPEC", value_parser = parse_dynamic)]
+    #[arg(short = 'D', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Dynamic))]
     pub dynamic: Vec<ForwardSpec>,
 
     /// Relay your ssh-agent to the session while you are attached (the config's agent = "confirm"
@@ -182,16 +183,34 @@ fn parse_forward(kind: ForwardKind, s: &str) -> Result<ForwardSpec, String> {
     Ok(spec)
 }
 
-fn parse_local(s: &str) -> Result<ForwardSpec, String> {
-    parse_forward(ForwardKind::Local, s)
-}
+/// The value parser of `-L`, `-R` and `-D`. A bad value is reported by this parser's own words,
+/// the value quoted ASCII-escaped: clap's `ValueValidation` message would repeat the raw value,
+/// and on a terminal that is an escape sequence the user's script may have passed through.
+#[derive(Clone, Copy)]
+struct SpecParser(ForwardKind);
 
-fn parse_remote(s: &str) -> Result<ForwardSpec, String> {
-    parse_forward(ForwardKind::Remote, s)
-}
+impl clap::builder::TypedValueParser for SpecParser {
+    type Value = ForwardSpec;
 
-fn parse_dynamic(s: &str) -> Result<ForwardSpec, String> {
-    parse_forward(ForwardKind::Dynamic, s)
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<ForwardSpec, clap::Error> {
+        let raw = value.to_string_lossy();
+        parse_forward(self.0, &raw).map_err(|why| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "invalid {} spec {}: {why}\n",
+                    forward_spec::flag(self.0),
+                    forward_spec::quote(&raw)
+                ),
+            )
+            .with_cmd(cmd)
+        })
+    }
 }
 
 impl AttachArgs {
@@ -494,6 +513,14 @@ mod tests {
             let e = parse(args).expect_err(&format!("{args:?}"));
             assert_eq!(e.kind(), ErrorKind::ValueValidation, "{args:?}: {e}");
             assert!(e.to_string().contains(why), "{args:?}: {e}");
+            // Nothing of the refused text comes back raw, however the error is drawn.
+            for shown in [e.to_string(), e.render().ansi().to_string()] {
+                assert!(
+                    !shown.contains("[2J") || shown.contains("\\u{1b}[2J"),
+                    "{shown:?}"
+                );
+                assert!(!shown.contains('\u{202e}') && !shown.contains("8080:h:80\x1b"));
+            }
         }
         // A flag in the place of a spec is not taken for the spec: clap reads it as an option,
         // and nothing runs. Joined to the flag it reaches the parser, which refuses it.

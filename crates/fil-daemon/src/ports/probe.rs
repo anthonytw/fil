@@ -19,8 +19,9 @@
 //!   one connection to the probe: `nc` prints the request and exits.
 //! - **Postgres** logs `invalid length of startup packet` once (it reads the HTTP request line as
 //!   a length), and possibly a failed SSL accept after the `SSLRequest`.
-//! - **Redis** answers the request line with an error and is left before the `Host:` header,
-//!   which it would log as `Possible SECURITY ATTACK detected`.
+//! - **Redis** answers the request line with an error and is usually left before the `Host:`
+//!   header, which it logs as `Possible SECURITY ATTACK detected`. A Redis that takes longer than
+//!   [`LINE_WAIT`] to answer (busy with a long script or `KEYS`) is sent the header and logs it.
 //!
 //! What keeps this small: a program that speaks first (ssh, SMTP, MySQL, FTP) is sent nothing; a
 //! port gets one connection unless it hangs up on the HTTP request line without a word (then two
@@ -657,8 +658,8 @@ mod tests {
         }
     }
 
-    /// Redis answers the request line, and is left before it sees a `Host:` header (which it
-    /// logs as an attack): one connection, no `Host:`.
+    /// Redis answers the request line, and (answering in time, as here) is left before it sees a
+    /// `Host:` header, which it logs as an attack: one connection, no `Host:`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn redis_is_known_from_the_request_line_alone() {
         let s = server(Behaviour::Redis).await;

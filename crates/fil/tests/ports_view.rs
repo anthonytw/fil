@@ -648,13 +648,21 @@ fn an_incomplete_answer_says_why() {
         let a = PortsAnswer::from_parts(&Response::ports_with(vec![], Some(why))).unwrap();
         assert_eq!(a.incomplete, Some(why));
         let t = render_text(&a, &opts(None));
-        assert!(t.contains("(incomplete: ") && t.contains(text), "{t}");
+        let lead = match why {
+            PortsIncomplete::TimedOut | PortsIncomplete::Unsupported => "(no listeners shown: ",
+            _ => "(incomplete: ",
+        };
+        assert!(t.contains(lead) && t.contains(text), "{t}");
         let v: serde_json::Value = serde_json::from_str(&render_json(&a, &opts(None))).unwrap();
         assert_eq!(v["incomplete"], json);
     }
     let a = answer(vec![]);
     assert_eq!(a.incomplete, None);
-    assert!(!render_text(&a, &opts(None)).contains("incomplete"));
+    let t = render_text(&a, &opts(None));
+    assert!(
+        !t.contains("incomplete") && !t.contains("no listeners shown"),
+        "{t}"
+    );
     let v: serde_json::Value = serde_json::from_str(&render_json(&a, &opts(None))).unwrap();
     assert_eq!(v["incomplete"], serde_json::Value::Null);
 }

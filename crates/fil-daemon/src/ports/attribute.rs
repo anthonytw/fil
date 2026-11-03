@@ -20,7 +20,11 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use rustix::fs::{CWD, Dir, Mode, OFlags, fstat, openat, readlinkat};
+use rustix::io::Errno;
 
 use fil_proto::msg::{PortsPath, ProcessInfo, ProcessName, SessionName};
 
@@ -57,15 +61,41 @@ const MAX_STAT: u64 = 4096;
 
 /// A `/proc` directory.
 #[derive(Clone, Debug)]
-pub struct ProcRoot(PathBuf);
+pub struct ProcRoot {
+    path: PathBuf,
+    /// An open failed for want of descriptors (`EMFILE`, `ENFILE`): what was not opened is
+    /// missing from the answer, which is then incomplete.
+    exhausted: Rc<Cell<bool>>,
+}
+
+/// `r`, noting in `exhausted` a failure for want of descriptors.
+fn opened<T>(r: rustix::io::Result<T>, exhausted: &Cell<bool>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if e == Errno::MFILE || e == Errno::NFILE {
+                exhausted.set(true);
+            }
+            None
+        }
+    }
+}
 
 impl ProcRoot {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
+        Self {
+            path: path.into(),
+            exhausted: Rc::default(),
+        }
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// Whether an open failed for want of descriptors since this root was made.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.get()
     }
 
     /// `ROOT/<pid>`, opened, if it is `uid`'s. This is the filter: the owner is read from the
@@ -74,22 +104,30 @@ impl ProcRoot {
     /// (reads fail once it exits), so a pid reused by another user in the meantime is never read
     /// in its place.
     pub fn open(&self, uid: u32, pid: u32) -> Option<ProcDir> {
-        let fd = openat(
-            CWD,
-            self.0.join(pid.to_string()),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .ok()?;
-        (fstat(&fd).ok()?.st_uid == uid).then_some(ProcDir { fd, pid })
+        let fd = opened(
+            openat(
+                CWD,
+                self.path.join(pid.to_string()),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ),
+            &self.exhausted,
+        )?;
+        (fstat(&fd).ok()?.st_uid == uid).then(|| ProcDir {
+            fd,
+            pid,
+            exhausted: self.exhausted.clone(),
+        })
     }
 }
 
-/// One of the user's processes' `/proc/<pid>`, open.
+/// One of the user's processes' `/proc/<pid>`, open. Keep it only while reading that process:
+/// a scan holds a few of these at a time, never one per process.
 #[derive(Debug)]
 pub struct ProcDir {
     fd: OwnedFd,
     pid: u32,
+    exhausted: Rc<Cell<bool>>,
 }
 
 impl ProcDir {
@@ -99,13 +137,15 @@ impl ProcDir {
 
     /// At most `cap` bytes of the file `name` in it.
     fn read(&self, name: &str, cap: u64) -> Option<Vec<u8>> {
-        let fd = openat(
-            &self.fd,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .ok()?;
+        let fd = opened(
+            openat(
+                &self.fd,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ),
+            &self.exhausted,
+        )?;
         let mut v = Vec::new();
         std::fs::File::from(fd).take(cap).read_to_end(&mut v).ok()?;
         Some(v)
@@ -119,14 +159,16 @@ impl ProcDir {
 
     /// Its `fd` directory, open, and an iterator over its entries.
     fn fds(&self) -> Option<(OwnedFd, Dir)> {
-        let fd = openat(
-            &self.fd,
-            "fd",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .ok()?;
-        let dir = Dir::read_from(&fd).ok()?;
+        let fd = opened(
+            openat(
+                &self.fd,
+                "fd",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ),
+            &self.exhausted,
+        )?;
+        let dir = opened(Dir::read_from(&fd), &self.exhausted)?;
         Some((fd, dir))
     }
 }
@@ -136,16 +178,16 @@ impl ProcDir {
 pub struct Owners {
     /// Socket inode to the pid holding it (the first found).
     pub by_inode: HashMap<u64, u32>,
-    /// The open `/proc/<pid>` of each of those pids, from the scan itself: what is read about
-    /// them later is read from the same process.
-    pub dirs: HashMap<u32, ProcDir>,
     /// A bound was reached before every wanted inode was found.
     pub truncated: bool,
 }
 
 /// Finds which of `uid`'s processes hold the sockets in `wanted`, looking first at `first`
 /// (a session's known processes), then at every other process of `uid`, until every inode is
-/// found, a bound is reached or `deadline` passes.
+/// found, a bound is reached or `deadline` passes. `holder` is called with the open directory of
+/// each process found holding one, while the scan is on it: what is read about the process is
+/// read from the same one, and its descriptor is closed before the scan moves on (so a scan has a
+/// handful open, whatever the number of processes).
 pub fn inode_owners(
     root: &ProcRoot,
     uid: u32,
@@ -153,6 +195,7 @@ pub fn inode_owners(
     first: &[u32],
     limits: &ScanLimits,
     deadline: Instant,
+    mut holder: impl FnMut(&ProcDir),
 ) -> Owners {
     let mut out = Owners::default();
     if wanted.is_empty() {
@@ -161,7 +204,15 @@ pub fn inode_owners(
     let mut visited = HashSet::new();
     let mut procs = 0usize;
     let mut fds = 0usize;
-    let rest = std::fs::read_dir(root.path())
+    let listing = std::fs::read_dir(root.path());
+    if let Err(e) = &listing
+        && [Errno::MFILE, Errno::NFILE]
+            .iter()
+            .any(|x| e.raw_os_error() == Some(x.raw_os_error()))
+    {
+        root.exhausted.set(true);
+    }
+    let rest = listing
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok());
@@ -209,8 +260,9 @@ pub fn inode_owners(
                 holds = true;
             }
         }
+        drop(fd_dir);
         if holds {
-            out.dirs.insert(pid, dir);
+            holder(&dir);
         }
         if out.by_inode.len() == wanted.len() || fds == limits.max_fds {
             break;
@@ -500,6 +552,7 @@ mod tests {
             &[],
             &ScanLimits::default(),
             later(),
+            |_| {},
         );
         assert_eq!(o.by_inode, HashMap::from([(40127, 100), (40200, 200)]));
     }
@@ -520,6 +573,7 @@ mod tests {
             &[100],
             &ScanLimits::default(),
             later(),
+            |_| {},
         );
         assert!(o.by_inode.is_empty(), "{o:?}");
         assert_eq!(info(&f.root(), them, 100, None), None);
@@ -617,7 +671,7 @@ mod tests {
             max_fds_per_proc: 10,
             ..ScanLimits::default()
         };
-        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later());
+        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later(), |_| {});
         assert!(o.truncated);
         assert_eq!(
             o.by_inode.get(&9000),
@@ -629,14 +683,14 @@ mod tests {
             max_procs: 1,
             ..ScanLimits::default()
         };
-        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later());
+        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later(), |_| {});
         assert!(o.truncated);
         assert_eq!(o.by_inode, HashMap::from([(50, 100)]));
         let limits = ScanLimits {
             max_fds: 20,
             ..ScanLimits::default()
         };
-        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later());
+        let o = inode_owners(&f.root(), me(), &wanted, &[100], &limits, later(), |_| {});
         assert!(o.truncated);
         assert!(!o.by_inode.contains_key(&9000));
         // A deadline already past reads nothing.
@@ -647,6 +701,7 @@ mod tests {
             &[],
             &ScanLimits::default(),
             Instant::now(),
+            |_| {},
         );
         assert!(o.truncated && o.by_inode.is_empty());
     }

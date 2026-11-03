@@ -589,10 +589,8 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
         out.push_str("(the answer ended early: some rows may be missing)\n");
     }
     if let Some(why) = answer.incomplete {
-        out.push_str(&format!(
-            "(incomplete: {}; listeners may be missing)\n",
-            incomplete_text(why)
-        ));
+        out.push_str(&incomplete_note(why));
+        out.push('\n');
     }
     // One blank line between blocks, none at the very end.
     let trimmed = out.trim_end_matches('\n').len();
@@ -601,13 +599,24 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
     out
 }
 
-fn incomplete_text(why: PortsIncomplete) -> &'static str {
+/// The note under an answer whose listeners are not all there. With a timeout or no discovery,
+/// none are shown; otherwise some may be missing.
+fn incomplete_note(why: PortsIncomplete) -> String {
     match why {
-        PortsIncomplete::NoSocketTable => "the host's socket table could not be read",
-        PortsIncomplete::Bounded => "the scan on the host stopped at one of its bounds",
-        PortsIncomplete::TimedOut => "the scan on the host did not finish in time",
-        PortsIncomplete::Unsupported => "fil finds listeners on Linux hosts only",
+        PortsIncomplete::NoSocketTable => {
+            "(incomplete: the host's socket table could not be read; listeners may be missing)"
+        }
+        PortsIncomplete::Bounded => {
+            "(incomplete: the scan on the host stopped at one of its bounds; listeners may be missing)"
+        }
+        PortsIncomplete::TimedOut => {
+            "(no listeners shown: the scan on the host did not finish in time)"
+        }
+        PortsIncomplete::Unsupported => {
+            "(no listeners shown: fil finds listeners on Linux hosts only)"
+        }
     }
+    .to_string()
 }
 
 fn incomplete_json(why: PortsIncomplete) -> &'static str {

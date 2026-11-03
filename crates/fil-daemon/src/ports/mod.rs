@@ -183,17 +183,18 @@ pub fn discover(
     let split = procnet::split(net.sockets, uid);
     let wanted = split.own.iter().map(|s| s.inode).collect();
     let mut membership = attribute::Sessions::new(root, uid, sessions);
-    let owners = attribute::inode_owners(
-        root,
-        uid,
-        &wanted,
-        &membership.known_pids(),
-        limits,
-        deadline,
-    );
-    let mut truncated = net.truncated || owners.truncated;
-    let missing = net.missing;
+    let first = membership.known_pids();
+    // What each holder is, read while the scan has its directory open (and closed after).
     let mut infos: HashMap<u32, Option<Holder>> = HashMap::new();
+    let owners = attribute::inode_owners(root, uid, &wanted, &first, limits, deadline, |dir| {
+        let holder = attribute::process_info(dir, home).map(|process| Holder::Process {
+            process,
+            session: membership.of(dir),
+        });
+        infos.insert(dir.pid(), holder);
+    });
+    let truncated = net.truncated || owners.truncated || root.exhausted();
+    let missing = net.missing;
     let mut out: Vec<Found> = Vec::new();
     let mut at: HashMap<(IpAddr, NonZeroU16), usize> = HashMap::new();
     let mut put = |out: &mut Vec<Found>, f: Found| match at.get(&(f.addr, f.port)) {
@@ -214,24 +215,9 @@ pub fn discover(
         if pid.is_some() && pid == daemon_pid {
             continue;
         }
-        let holder = match pid {
-            Some(pid) if Instant::now() < deadline => infos
-                .entry(pid)
-                .or_insert_with(|| {
-                    // The directory the scan found the socket in, already checked as the user's.
-                    let dir = owners.dirs.get(&pid)?;
-                    let process = attribute::process_info(dir, home)?;
-                    let session = membership.of(dir);
-                    Some(Holder::Process { process, session })
-                })
-                .clone()
-                .unwrap_or(Holder::Unattributed),
-            Some(_) => {
-                truncated = true;
-                Holder::Unattributed
-            }
-            None => Holder::Unattributed,
-        };
+        let holder = pid
+            .and_then(|pid| infos.get(&pid).cloned().flatten())
+            .unwrap_or(Holder::Unattributed);
         put(
             &mut out,
             Found {
@@ -319,7 +305,12 @@ struct TargetMatch {
 /// no probe. A port that is one of the `-R` listeners (the daemon's own) is never probed.
 fn target_listener(d: &Discovery, t: &Target, remote_ports: &[NonZeroU16]) -> TargetMatch {
     let candidates: Vec<IpAddr> = match &t.host {
-        TargetHost::Ip(ip) => vec![ip.to_canonical()],
+        // A connection to a wildcard address goes to the loopback of its family on Linux.
+        TargetHost::Ip(ip) => vec![match ip.to_canonical() {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        }],
         TargetHost::Name(n) if n.is_localhost() => {
             vec![
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -949,6 +940,36 @@ mod tests {
         }
     }
 
+    /// R1 (re-check of #64): a target of `0.0.0.0` or `::` is a connection to the loopback of its
+    /// family, so it is ranked (and probed) there.
+    #[test]
+    fn a_wildcard_target_is_its_familys_loopback() {
+        let d = Discovery {
+            listeners: vec![
+                found("::", 18231, proc_in(500, "python3", Some("main"))),
+                found("127.0.0.1", 18231, Holder::Other),
+                found("0.0.0.0", 5000, proc_in(501, "srv", None)),
+            ],
+            incomplete: None,
+        };
+        let s = one_session(vec![
+            forward("main", ForwardKind::Local, 1, Some(("0.0.0.0", 18231))),
+            forward("main", ForwardKind::Local, 2, Some(("::", 18231))),
+            forward("main", ForwardKind::Local, 3, Some(("0.0.0.0", 5000))),
+        ]);
+        let (rows, slots) = layout(&s, None, &d);
+        let (fwds, _) = forwards_and_listeners(&rows, &slots);
+        assert_eq!(
+            fwds,
+            vec![
+                (None, None),
+                (Some(500), Some("[::1]:18231".parse().unwrap())),
+                (Some(501), Some("127.0.0.1:5000".parse().unwrap())),
+            ]
+        );
+        assert_eq!(squats(&rows), vec![true, false, false]);
+    }
+
     /// The other direction: the user holds `127.0.0.1:P`, another user `[::1]:P`. `localhost`
     /// may resolve to either, so it has no owner; `127.0.0.1` is the user's.
     #[test]
@@ -1091,6 +1112,83 @@ mod tests {
             r,
             Response::Ports { part, .. } if part.incomplete == Some(PortsIncomplete::Bounded)
         )));
+    }
+
+    /// R2 (re-check of #64): a scan keeps a handful of descriptors open, however many processes
+    /// hold listeners, and an answer that ran out of them says so. In a child process (this test
+    /// binary run again), because it lowers the descriptor limit: 300 processes each holding a
+    /// listener are all attributed with room for 16 more descriptors (the scan used to keep one
+    /// open per holder), and with room for 2 the answer is `Bounded`.
+    #[test]
+    fn the_scan_holds_few_descriptors_and_says_when_it_runs_out() {
+        const CHILD: &str = "FIL_PORTS_FD_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["roomy", "starved"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "ports::tests::the_scan_holds_few_descriptors_and_says_when_it_runs_out",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    out.status.success() && text.contains("1 passed"),
+                    "{mode}: {text}{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        const N: u32 = 300;
+        let f = FakeProc::new("fds");
+        let mut tcp = HEADER.to_string();
+        for i in 0..N {
+            tcp += &tcp_row(
+                Ipv4Addr::LOCALHOST,
+                20000 + i as u16,
+                me(),
+                70000 + u64::from(i),
+            );
+            f.process(1000 + i, 1, "srv", "/", &[70000 + u64::from(i)]);
+        }
+        f.net("tcp", &tcp);
+        let open = std::fs::read_dir("/dev/fd").unwrap().count() as u64 - 1;
+        let room = if mode == "roomy" { 16 } else { 2 };
+        let lim = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(open + room),
+                maximum: lim.maximum,
+            },
+        )
+        .unwrap();
+        let d = discover(
+            &f.root(),
+            me(),
+            None,
+            &[],
+            None,
+            &ScanLimits {
+                budget: std::time::Duration::from_secs(10),
+                ..ScanLimits::default()
+            },
+        );
+        let attributed = d
+            .listeners
+            .iter()
+            .filter(|l| matches!(l.holder, Holder::Process { .. }))
+            .count();
+        if mode == "roomy" {
+            assert_eq!(attributed, N as usize);
+            assert_eq!(d.incomplete, None);
+        } else {
+            assert!(attributed < N as usize, "{attributed}");
+            assert_eq!(d.incomplete, Some(PortsIncomplete::Bounded));
+        }
     }
 
     #[test]

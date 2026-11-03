@@ -1063,6 +1063,8 @@ async fn flush_delivers_everything_sent_before_it_over_a_simulated_stream() {
 struct Counting<S> {
     inner: S,
     writes: Writes,
+    /// The longest single write seen.
+    longest: Writes,
 }
 
 type Writes = std::sync::Arc<std::sync::atomic::AtomicUsize>;
@@ -1091,6 +1093,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counting<S> {
         if matches!(r, std::task::Poll::Ready(Ok(n)) if n > 0) {
             self.writes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let std::task::Poll::Ready(Ok(n)) = &r {
+                self.longest
+                    .fetch_max(*n, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         r
     }
@@ -1118,6 +1124,7 @@ async fn an_idle_pipe_carries_one_ping_and_one_reply_a_second() {
     let a = Counting {
         inner: a,
         writes: wa.clone(),
+        longest: Default::default(),
     };
     let (client, daemon) = tokio::join!(
         async { PipeLink::connect(a, cfg()).await.unwrap() },
@@ -1126,6 +1133,7 @@ async fn an_idle_pipe_carries_one_ping_and_one_reply_a_second() {
             let b = Counting {
                 inner: b,
                 writes: wb.clone(),
+                longest: Default::default(),
             };
             PipeLink::accept(b, cfg()).await.unwrap()
         }
@@ -1190,6 +1198,7 @@ async fn queued_small_frames_share_one_write() {
         Counting {
             inner: a,
             writes: writes.clone(),
+            longest: Default::default(),
         },
         cfg(),
     )
@@ -1285,7 +1294,8 @@ async fn spawn_reporting_pgid(own_process_group: bool) -> (String, String) {
     let link = PipeLink::spawn(&cmd, c).await.unwrap();
     // The shell wrote its group to stderr before the link came up.
     let mut seen = String::new();
-    for _ in 0..50 {
+    // (`ps` can be slow on a loaded machine: poll for up to 10 s, not 1.)
+    for _ in 0..500 {
         seen = link.stderr_text().trim().to_owned();
         if !seen.is_empty() {
             break;
@@ -1334,4 +1344,142 @@ async fn jitter_in_the_round_trip_time_does_not_wake_the_status_watchers() {
         updates += 1;
     }
     assert!(updates <= 3, "{updates} status updates in 30 s of idle");
+}
+
+/// Review of PR 38, finding 5: packing must not make a control frame wait behind more than it
+/// ever did (one frame, 16 KiB). No write is longer than the pack limit (8 KiB) unless it is a
+/// single frame, however the scheduler's frames add up.
+#[tokio::test(start_paused = true)]
+async fn no_write_is_longer_than_the_pack_limit_unless_it_is_one_frame() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let longest: Writes = Default::default();
+    let link = PipeLink::accept(
+        Counting {
+            inner: a,
+            writes: Default::default(),
+            longest: longest.clone(),
+        },
+        cfg(),
+    )
+    .await
+    .unwrap();
+    sleep(MS(10)).await;
+    // Frames of 3 to 5 KiB on the terminal and a forward: two fit in 8 KiB, three do not.
+    for i in 0..12u64 {
+        let (ch, len) = [(1, 3000), (16, 5000), (1, 4500)][(i % 3) as usize];
+        link.send(ChannelId(ch), data(i * 10_000, 1, len))
+            .await
+            .unwrap();
+    }
+    link.flush().await.unwrap();
+    assert!(
+        writes_of(&longest) <= 8 * 1024,
+        "a packed write of {} bytes",
+        writes_of(&longest)
+    );
+    // A 16 KiB frame behind small ones goes alone, with nothing packed in front of it: the
+    // longest write is that frame (16 KiB and a few bytes of header), not 8 KiB plus it.
+    for i in 0..3u64 {
+        link.send(ChannelId(1), data(2_000_000 + i, 1, 2000))
+            .await
+            .unwrap();
+    }
+    link.send(ChannelId(1), data(1_000_000, 2, 16 * 1024))
+        .await
+        .unwrap();
+    link.flush().await.unwrap();
+    assert!(writes_of(&longest) < 17 * 1024, "{}", writes_of(&longest));
+    let mut n = 0;
+    while n < 16 {
+        if raw.frame().await.channel != ChannelId::CONTROL {
+            n += 1;
+        }
+    }
+}
+
+/// A frame that did not fit is held for the next write, and a control frame that arrives in the
+/// meantime still goes ahead of it; the order within a channel is kept.
+#[tokio::test(start_paused = true)]
+async fn a_held_frame_does_not_let_a_later_frame_or_control_overtake_wrongly() {
+    let (a, b) = duplex(64);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    // The 64-byte pipe is full of the handshake; nothing more is written until the peer reads.
+    sleep(MS(10)).await;
+    for i in 0..3u64 {
+        link.send(ChannelId::TERMINAL, data(i * 10_000, 1, 5000))
+            .await
+            .unwrap();
+    }
+    sleep(MS(10)).await; // the driver packs frame 0, holds frame 1, and blocks writing
+    let detach = Bytes::from(ControlMsg::Detach.encode().unwrap());
+    link.send(ChannelId::CONTROL, detach).await.unwrap();
+    sleep(MS(10)).await;
+    let mut order = Vec::new();
+    while order.len() < 4 {
+        let f = raw.frame().await;
+        if f.channel == ChannelId::TERMINAL {
+            order.push(DataSegment::parse(&f.payload).unwrap().seq);
+        } else if ControlMsg::decode(&f.payload) == Ok(ControlMsg::Detach) {
+            order.push(u64::MAX);
+        }
+    }
+    // Frame 0 was already on its way; the control frame precedes the held frame 1; 1 precedes 2.
+    assert_eq!(order, [0, u64::MAX, 10_000, 20_000]);
+}
+
+/// Whether a process with this id still exists.
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", pid])
+        .output()
+        .unwrap();
+    !String::from_utf8(out.stdout).unwrap().trim().is_empty()
+}
+
+/// Review of PR 38, finding 6: closing a link whose command leads its own process group kills
+/// the whole group, not only the leader. The shell below ignores its stdin, so it has to be
+/// killed, and leaves a helper behind in its group (as `ssh -J` or a `ProxyCommand` does).
+#[tokio::test]
+async fn killing_an_own_group_command_kills_its_helpers_too() {
+    let hb = Frame::new(
+        ChannelId::CONTROL,
+        ControlMsg::Heartbeat {
+            nonce: 9,
+            reply: true,
+        }
+        .encode()
+        .unwrap(),
+    )
+    .encode()
+    .unwrap();
+    let octal: String = hb.iter().map(|b| format!("\\{b:03o}")).collect();
+    let script =
+        format!("printf '\\033FIL-CONNECT 1\\n'; printf '{octal}'; sleep 300 & echo $! >&2; wait");
+    let cmd = PipeCommand::custom(["sh", "-c", &script]).unwrap();
+    let mut c = cfg();
+    c.stderr = PipeStderr::Capture;
+    c.own_process_group = true;
+    c.close_grace = MS(100);
+    let link = PipeLink::spawn(&cmd, c).await.unwrap();
+    let mut helper = String::new();
+    for _ in 0..500 {
+        helper = link.stderr_text().trim().to_owned();
+        if !helper.is_empty() {
+            break;
+        }
+        tokio::time::sleep(MS(20)).await;
+    }
+    assert!(alive(&helper), "the helper did not start: {helper:?}");
+    link.shutdown().await;
+    for _ in 0..500 {
+        if !alive(&helper) {
+            return;
+        }
+        tokio::time::sleep(MS(20)).await;
+    }
+    panic!("the helper {helper} outlived its command's group");
 }

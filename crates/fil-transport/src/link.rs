@@ -15,10 +15,17 @@
 //! - **Liveness is the link's job.** It detects a dead path within [`LinkParams::dead_after`]
 //!   and reports `Down`, even when the underlying transport would hang (ssh never notices a
 //!   silent black hole by itself; see `docs/m1/realnet.md`). Heartbeats are internal and never
-//!   appear in [`Link::recv`]. They are asymmetric: the client pings every
-//!   [`LinkParams::heartbeat`] and the daemon answers (and pings itself only after one and a half
-//!   heartbeats of silence), which is enough for *both* sides to hear each other well inside
-//!   `degraded_after`. `Degraded` is the peer's silence only, never this side's slow consumer.
+//!   appear in [`Link::recv`]. They are asymmetric: the client pings and the daemon answers (and
+//!   pings itself only after one and a half heartbeats of silence). On the pipe each side then
+//!   hears the other at least every 1.5 heartbeats; on QUIC the client's pings and their
+//!   acknowledgements are a heartbeat plus a round trip apart, with the daemon's fallback keep-alive
+//!   at 1.5 heartbeats behind them, and `Degraded` allows for a long round trip. `Degraded` is
+//!   the peer's silence only, never this side's slow consumer.
+//! - **The consumer must keep up.** A pipe link whose consumer falls more than the inbound budget
+//!   behind stops reading and freezes its silence clock (the peer's silence cannot be told apart
+//!   from the link not reading), so a peer that dies while the consumer is stuck is not reported
+//!   until the consumer catches up; `recv` must be called promptly. QUIC measures silence on what
+//!   the network delivers and is not affected.
 //! - **`Up` means the peer has proven itself.** On the pipe, after the preamble and the first
 //!   frame. On QUIC, after the daemon's first frame: in TLS 1.3 the client's handshake finishes
 //!   before the daemon has judged the client key (`docs/m1/quic-auth.md`).

@@ -14,11 +14,12 @@
 //! direction; the daemon answers every ping at once and pings on its own only after one and a
 //! half heartbeats of silence in either direction. An idle link therefore carries one ping and one
 //! reply a second instead of two of each, and either side still hears the other at least every
-//! heartbeat and a half, well inside `degraded_after`.
+//! heartbeat and a half (plus the one-way delay): inside `degraded_after` by half a second.
 //!
 //! **Packing.** The writer fills its buffer with every frame that is ready, in scheduler order,
-//! up to [`PACK_LIMIT`], and writes it with one `write`, so a keystroke's small frames share an
-//! SSH packet.
+//! while they fit in [`PACK_LIMIT`], and writes it with one `write`, so a keystroke's small
+//! frames share an SSH packet. A write is never longer than the limit unless it is a single
+//! larger frame.
 //!
 //! **A slow consumer.** Received payloads wait in the shared inbound queue. Reading continues
 //! while fewer than `inbound_budget` bytes wait there, so bytes keep proving the peer alive and
@@ -46,8 +47,9 @@ use crate::link::{DownReason, LinkParams, LinkState};
 /// How many of the latest pings wait for their reply, to measure RTT.
 const PINGS_KEPT: usize = 8;
 const READ_CHUNK: usize = 64 * 1024;
-/// The writer stops adding frames to one `write` once its buffer holds this much. A control frame
-/// that turns up meanwhile waits behind at most this plus one more frame.
+/// The writer packs frames into one `write` only while they fit in a buffer of this size (a frame
+/// that is larger goes alone), so a control frame that turns up meanwhile waits behind at most
+/// this or one frame, as it always did.
 const PACK_LIMIT: usize = 8 * 1024;
 /// When the stream ends, how long to wait for the command's exit status to put in the reason.
 /// The command is asked to finish (and reaped) after `Down` is reported, not before.
@@ -63,7 +65,7 @@ pub(super) struct Driver<R, W> {
     pub inbound_budget: usize,
     /// Frames from the handshake that are still to be handled.
     pub initial: Vec<Frame>,
-    pub child: Option<Child>,
+    pub child: Option<ChildGuard>,
     pub grace: Duration,
     /// Our ping from the handshake, so its reply measures RTT.
     pub first_ping: Option<(u32, Instant)>,
@@ -291,7 +293,7 @@ where
     }
 
     /// Fills `out`: a pending heartbeat reply, our own ping, then the scheduler's frames in its
-    /// order until the buffer holds [`PACK_LIMIT`].
+    /// order for as long as they fit in [`PACK_LIMIT`].
     fn fill_out(&mut self, st: &mut State) {
         if let Some(nonce) = st.reply.take() {
             self.put_heartbeat(st, ControlMsg::Heartbeat { nonce, reply: true });
@@ -314,8 +316,12 @@ where
                 },
             );
         }
+        // The first frame goes whatever its size; the rest only if they fit, so one write is never
+        // longer than `PACK_LIMIT` or a single frame, the bound a control frame always waited
+        // behind.
         while st.out.len() < PACK_LIMIT {
-            let Some(frame) = self.shared.pop() else {
+            let room = (!st.out.is_empty()).then(|| PACK_LIMIT - st.out.len());
+            let Some(frame) = self.shared.pop_fit(room) else {
                 break;
             };
             let before = st.out.len();
@@ -422,14 +428,71 @@ where
     }
 }
 
-/// Waits up to `grace` for `child` to exit on its own, then kills it. Always reaps it. Returns a
-/// description of how it ended.
-pub(super) async fn reap(child: &mut Child, grace: Duration) -> String {
+/// The pipe command's process. When it was started in a process group of its own
+/// (`PipeConfig::own_process_group`), killing it kills the whole group: `ssh -J` and a
+/// `ProxyCommand` run helpers in that group, and a helper that is stopped on a terminal read
+/// (`SIGTTIN`) must not outlive its leader.
+///
+/// The group is signalled only while the leader has not been reaped, because its process id is
+/// the group id and stays ours until then; after that a number could belong to someone else.
+pub(super) struct ChildGuard {
+    child: Child,
+    own_group: bool,
+}
+
+impl ChildGuard {
+    pub fn new(child: Child, own_group: bool) -> Self {
+        Self { child, own_group }
+    }
+
+    /// Kills the group (if the child leads one) and the child.
+    pub fn kill(&mut self) {
+        self.kill_group();
+        let _ = self.child.start_kill();
+    }
+
+    fn kill_group(&self) {
+        if !self.own_group {
+            return;
+        }
+        // `id` is `None` once the leader has been reaped.
+        if let Some(pid) = self.child.id().and_then(|p| i32::try_from(p).ok())
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildGuard {
+    /// A link dropped without being reaped (the runtime shut down under it) kills the group too;
+    /// tokio's `kill_on_drop` then kills the leader.
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+/// Waits up to `grace` for `child` to exit on its own, then kills it (and its group). Always
+/// reaps it. Returns a description of how it ended.
+pub(super) async fn reap(child: &mut ChildGuard, grace: Duration) -> String {
     match timeout(grace, child.wait()).await {
         Ok(Ok(status)) => describe_exit(status),
         Ok(Err(e)) => format!("could not be waited for: {e}"),
         Err(_) => {
-            let _ = child.start_kill();
+            child.kill();
             match child.wait().await {
                 Ok(status) => format!("was killed after {grace:?} ({})", describe_exit(status)),
                 Err(e) => format!("could not be killed: {e}"),

@@ -539,6 +539,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "ring",
+ "rustix",
  "rustls",
  "thiserror 2.0.21",
  "tokio",

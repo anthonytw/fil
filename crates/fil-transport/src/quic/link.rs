@@ -683,15 +683,35 @@ fn sample_periods(params: &LinkParams) -> (Duration, Duration) {
     (slow, fast)
 }
 
+/// The silence after which a link is `Degraded`: `degraded_after`, or more on a path with a long
+/// round trip. An idle link hears its peer once per heartbeat plus a round trip (the client's
+/// ping goes out a heartbeat after the last acknowledgement came back), so silence up to that is
+/// what a healthy link produces and must not show as trouble. Never more than three quarters of
+/// `dead_after`.
+fn degraded_threshold(params: &LinkParams, rtt: Duration) -> Duration {
+    let healthy_gap = params.heartbeat + rtt * 3 / 2;
+    params
+        .degraded_after
+        .max(healthy_gap)
+        .min(params.dead_after * 3 / 4)
+}
+
 /// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
 /// final `Down`.
 ///
-/// The only clock available is quinn's count of received datagrams, so "when did we last hear
-/// the peer" is known to the precision of the sampling period. A change seen at a tick is
-/// dated at the *previous* tick, the earliest it can have happened: the silence measured is
-/// never shorter than the real one, so `Down(Dead)` is never later than `dead_after` after the
-/// last datagram, and `Degraded` appears after between `degraded_after` minus one period and
-/// `degraded_after` of silence.
+/// The only clock available is quinn's count of received datagrams, so when the peer was last
+/// heard is known only to the precision of the sampling period (`slow`, 500 ms by default). A
+/// change seen at a look means a datagram arrived since the previous look, so the datagram's time
+/// is bracketed: no earlier than the previous look (`heard_after`), no later than this one
+/// (`heard_by`). Each decision uses the bound that errs the safe way:
+///
+/// - `Dead` uses the *earliest* bound, so the silence measured is never shorter than the real
+///   one and the link is never declared dead late by more than one fast period (100 ms at most,
+///   as before this sampling was coarser).
+/// - `Degraded` uses the *latest* bound, so it is never early: it shows after between
+///   `degraded_after` and `degraded_after` plus one sample (0.5 s) of real silence. Using the
+///   earliest bound here made an idle link on a long round trip flap `Degraded` (the client's
+///   pings and their acknowledgements are a heartbeat plus a round trip apart).
 async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: LinkParams) {
     let conn = &io.conn;
     let closed = conn.closed();
@@ -699,8 +719,9 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
     let (slow, fast) = sample_periods(&params);
 
     let mut rx_datagrams = conn.stats().udp_rx.datagrams;
-    let mut last_rx = Instant::now();
-    let mut last_tick = last_rx;
+    let mut heard_after = Instant::now();
+    let mut heard_by = heard_after;
+    let mut last_tick = heard_after;
     // The first look comes early, so a fresh link has its first round-trip estimate soon.
     let mut period = fast;
     let mut remote: SocketAddr = conn.remote_address();
@@ -716,11 +737,13 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
         let seen = conn.stats().udp_rx.datagrams;
         if seen != rx_datagrams {
             rx_datagrams = seen;
-            last_rx = last_tick;
+            heard_after = last_tick;
+            heard_by = now;
         }
         last_tick = now;
-        let silence = now.duration_since(last_rx);
-        let degraded = silence >= params.degraded_after;
+        let rtt = conn.rtt();
+        let silence = now.duration_since(heard_after); // the longest it can have been
+        let degraded = now.duration_since(heard_by) >= degraded_threshold(&params, rtt);
         // Watch closely once the peer has been quiet for longer than a heartbeat and a half.
         period = if degraded || silence >= params.heartbeat * 3 / 2 {
             fast
@@ -753,7 +776,6 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
             local_ip = now_local;
         }
 
-        let rtt = conn.rtt();
         status.send_if_modified(|s| {
             let mut modified = false;
             if !matches!(s.state, LinkState::Down(_)) {

@@ -15,7 +15,7 @@ use fil_transport::quic::{self, HandshakeLimits, ListenerConfig, QuicLink, QuicL
 use fil_transport::{DownReason, Link, LinkError, LinkParams, LinkState, LinkStatus};
 use quinn::{Endpoint, EndpointConfig, TokioRuntime};
 use tokio::sync::watch;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 const CTRL: ChannelId = ChannelId(0);
 const TERM: ChannelId = ChannelId(1);
@@ -556,6 +556,100 @@ async fn the_daemon_without_a_keep_alive_still_finds_a_dead_path_within_dead_aft
     assert!(degraded <= Duration::from_millis(2500), "{degraded:?}");
     assert!(dead <= Duration::from_millis(5100), "{dead:?}");
     drop(client);
+}
+
+/// Review of PR 38, finding 1: with the client alone pinging and the supervisor sampling every
+/// 500 ms, an idle link flapped `Degraded` on paths with a long round trip (9 times a minute at
+/// 250 ms one way, 11 to 13 at 500 ms; main never did). Counts the `Degraded` transitions of both
+/// ends over a minute of idle.
+async fn degraded_flaps_when_idle(one_way_ms: u64, jitter_ms: u64, seed: u64) -> (u32, u32) {
+    let mut w = World::new(seed);
+    let (client, daemon, _) = w.pair().await;
+    w.net.update_conditions(|c| {
+        c.latency = Duration::from_millis(one_way_ms);
+        c.jitter = Duration::from_millis(jitter_ms);
+    });
+    sleep(Duration::from_secs(3)).await;
+    let (mut cs, mut ds) = (client.status(), daemon.status());
+    let mut last = [
+        cs.borrow_and_update().state.clone(),
+        ds.borrow_and_update().state.clone(),
+    ];
+    let mut flaps = [0u32; 2];
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::select! {
+            r = cs.changed() => {
+                r.unwrap();
+                let s = cs.borrow_and_update().state.clone();
+                if s == LinkState::Degraded && last[0] != s { flaps[0] += 1; }
+                last[0] = s;
+            }
+            r = ds.changed() => {
+                r.unwrap();
+                let s = ds.borrow_and_update().state.clone();
+                if s == LinkState::Degraded && last[1] != s { flaps[1] += 1; }
+                last[1] = s;
+            }
+            () = sleep_until(end) => break,
+        }
+    }
+    (flaps[0], flaps[1])
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_does_not_flap_degraded_on_long_round_trips() {
+    // 250 ms one way; 200 ms one way with 100 ms of jitter; a 1 s round trip. Several seeds,
+    // because where the samples fall against the ping cycle decides whether a bad build flaps.
+    for (one_way, jitter) in [(250, 0), (200, 100), (500, 0)] {
+        for seed in [500, 501, 502] {
+            let (c, d) = degraded_flaps_when_idle(one_way, jitter, seed).await;
+
+            assert_eq!(
+                (c, d),
+                (0, 0),
+                "Degraded flaps (client, daemon) in 60 s idle at {one_way} ms one way, \
+                 {jitter} ms jitter, seed {seed}"
+            );
+        }
+    }
+}
+
+/// Review of PR 38, finding 3: `Down(Dead)` must not be late. A change in quinn's receive
+/// counter is dated at the previous look, the earliest the datagram can have arrived; dating it
+/// at the look that saw it would make `Dead` up to a whole sample (500 ms) late. The datagram
+/// below lands just after a look, and the path then dies.
+#[tokio::test(start_paused = true)]
+async fn dead_comes_within_dead_after_of_the_last_datagram_whatever_the_sampling_phase() {
+    for offset_ms in [0u64, 130, 260, 390] {
+        let mut w = World::new(90 + offset_ms);
+        let (client, daemon, _) = w.pair().await;
+        sleep(Duration::from_millis(2000 + offset_ms)).await;
+        // Just after one of the client's looks...
+        let ticks = client.supervisor_ticks();
+        while client.supervisor_ticks() == ticks {
+            sleep(Duration::from_millis(1)).await;
+        }
+        let look = Instant::now();
+        // ...the daemon sends, the datagram lands 20 ms later, and the path dies.
+        daemon
+            .send(TERM, Bytes::from_static(b"last words"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(21)).await;
+        w.net.set_blackout(true);
+        let mut cs = client.status();
+        let st = wait_for(&mut cs, "client Down", is_down).await;
+        assert_eq!(down_reason(&st), DownReason::Dead);
+        // The last datagram arrived at `look` + 20 ms. Dead may be late by one fast period
+        // (100 ms) and no more.
+        let late =
+            (Instant::now() - look).saturating_sub(Duration::from_millis(20) + w.params.dead_after);
+        assert!(
+            late <= Duration::from_millis(105),
+            "Dead came {late:?} after dead_after (look phase {offset_ms} ms)"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

@@ -12,10 +12,11 @@
 //!   itself (§8.1). A frame that arrives first and is not a heartbeat is delivered by `recv`.
 //! - **Sending.** Frames go through [`fil_proto::sched::Scheduler`]: control first, then
 //!   terminal/snapshot/agent in order, then forwards round-robin with a guaranteed share. The
-//!   driver fills one buffer with every frame that is ready, in that order, up to 8 KiB (one
-//!   more frame may overshoot it), and writes it with a single `write`, so the small frames of a
-//!   keystroke (the echo, the acks) share an SSH packet. A control frame therefore waits behind
-//!   at most what is already on the wire: one buffer, 8 KiB plus a 16 KiB frame at worst.
+//!   driver fills one buffer with every frame that is ready, in that order, while they fit in
+//!   8 KiB (a frame that does not is held for the next write, and a control frame still goes
+//!   ahead of it), and writes it with a single `write`, so the small frames of a keystroke (the
+//!   echo, the acks) share an SSH packet. A write is never longer than 8 KiB unless it is one
+//!   larger frame, so a control frame waits behind at most one frame's worth, as it always did.
 //! - **Backpressure.** Every channel has its own bounded queue, counted in frames
 //!   (`control_queue`, `interactive_queue` and `forward_queue` in [`PipeConfig`]; at most 16 KiB
 //!   each). `send` waits only while *that channel's* queue is full. Heartbeats are not queued
@@ -67,14 +68,13 @@ use fil_proto::limits::{MAX_FRAME_BODY, MAX_PREAMBLE_SKIP, PROTOCOL_MAJOR};
 use fil_proto::preamble::{PreambleError, PreambleScanner, Scan};
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder, FrameError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Child;
 use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
 
 pub use command::{PipeCommand, server_alive};
 
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkStatus};
-use driver::{Driver, reap};
+use driver::{ChildGuard, Driver, reap};
 use shared::{Pop, Shared};
 
 /// Knobs for a [`PipeLink`]. [`PipeConfig::new`] gives the defaults.
@@ -399,11 +399,13 @@ impl PipeLink {
             // `setpgid` between fork and exec.
             cmd.process_group(0);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?;
+        let mut child = ChildGuard::new(
+            cmd.spawn()
+                .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?,
+            cfg.own_process_group,
+        );
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            let _ = child.start_kill();
+            child.kill();
             let _ = child.wait().await;
             return Err(PipeError::new(PipeErrorKind::Io(io::Error::other(
                 "the child has no stdin or stdout",
@@ -418,14 +420,14 @@ impl PipeLink {
         mut write: W,
         role: Role,
         cfg: PipeConfig,
-        mut child: Option<Child>,
+        mut child: Option<ChildGuard>,
         stderr: Option<Arc<StderrCapture>>,
     ) -> Result<Self, PipeError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let child_id = child.as_ref().and_then(Child::id);
+        let child_id = child.as_ref().and_then(|c| c.id());
         let mut hs = Handshake {
             skipped: Vec::new(),
             decoder: FrameDecoder::default(),

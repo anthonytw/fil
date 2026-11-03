@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
+use fil_proto::limits::LEN_PREFIX;
 use fil_proto::sched::Scheduler;
 use fil_proto::{ChannelClass, ChannelId, Frame};
 use tokio::sync::{Notify, watch};
@@ -16,6 +17,10 @@ use crate::link::{DownReason, LinkState, LinkStatus};
 
 struct Queues {
     sched: Scheduler,
+    /// A frame the scheduler chose that did not fit in the buffer being packed (never a control
+    /// frame). It is still counted as queued and not as taken, and it is the next frame out
+    /// unless a control frame is waiting, which goes ahead of it as the scheduler would have it.
+    held: Option<Frame>,
     /// Frames queued per channel (user frames and internal heartbeats alike), for the bound.
     queued: HashMap<ChannelId, usize>,
     /// Per channel: frames accepted by `try_enqueue`, frames taken by the driver, and frames the
@@ -74,6 +79,7 @@ impl Shared {
         Arc::new(Self {
             queues: Mutex::new(Queues {
                 sched: Scheduler::with_forward_share(cfg.forward_share),
+                held: None,
                 queued: HashMap::new(),
                 sent: HashMap::new(),
                 popped: HashMap::new(),
@@ -159,10 +165,29 @@ impl Shared {
         self.inbound_ready.notify_waiters();
     }
 
-    /// The next frame to write, in scheduler order.
-    pub fn pop(&self) -> Option<Frame> {
+    /// The next frame to write, in scheduler order, if it fits in `room` bytes on the wire (its
+    /// length prefix and channel included). `None` for `room` takes whatever comes. A frame that
+    /// does not fit is kept for the next call, so a buffer being packed never grows past what
+    /// the writer allows, however large the scheduler's next frame is. Control frames are small
+    /// and always fit.
+    pub fn pop_fit(&self, room: Option<usize>) -> Option<Frame> {
         let mut q = self.queues();
-        let frame = q.sched.pop()?;
+        let control_waits = q.queued.get(&ChannelId::CONTROL).is_some_and(|n| *n > 0);
+        // A control frame goes first even if another frame is being held back (the scheduler
+        // returns it first); otherwise the held frame is next.
+        let frame = if control_waits || q.held.is_none() {
+            q.sched.pop()?
+        } else {
+            q.held.take()?
+        };
+        if let Some(room) = room
+            && frame.channel.class() != ChannelClass::Control
+            && LEN_PREFIX + super::channel_varint_len(frame.channel) + frame.payload.len() > room
+        {
+            debug_assert!(q.held.is_none());
+            q.held = Some(frame);
+            return None;
+        }
         *q.popped.entry(frame.channel).or_insert(0) += 1;
         if let Some(n) = q.queued.get_mut(&frame.channel) {
             *n = n.saturating_sub(1);
@@ -221,6 +246,7 @@ impl Shared {
     pub fn clear(&self) {
         let mut q = self.queues();
         q.sched.clear();
+        q.held = None;
         q.queued.clear();
     }
 

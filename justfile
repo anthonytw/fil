@@ -1,10 +1,15 @@
 # fil command index. `just` lists recipes.
 
+# Extra flags for `cargo deny` (the advisory database is fetched on each run). `FIL_DENY_FLAGS=--offline
+# just ci` checks against the cached database instead: that is NOT a merge pass (CLAUDE.md § Delivery).
+deny_flags := env("FIL_DENY_FLAGS", "")
+
 default:
     @just --list
 
-# The merge gate: run before every merge (CLAUDE.md § Delivery).
-ci: fmt-check clippy check-default test deny
+# The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
+# failure (the advisory database) shows up at once, not after the whole test suite.
+ci: deny fmt-check clippy check-default release-deps test
 
 fmt-check:
     cargo fmt --all --check
@@ -17,13 +22,19 @@ clippy:
 check-default:
     cargo check -p fil
 
+# The vt100 emulator backend must stay out of the release binary (only alacritty ships; DESIGN.md
+# §6.5). `cargo tree -i` exits 0 even when it prints "nothing to print" to stderr, so test its
+# output: it lists vt100's dependents on stdout when vt100 is in the graph.
+release-deps:
+    test -z "$(cargo tree -q -p fil -e normal,build --target all -i vt100 2>/dev/null)" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
+
 test:
     cargo test --workspace --all-features
 
 # Fetches the RustSec advisory database, so it needs network access.
 # License, source and ban policy, RustSec advisories and yanked crates (deny.toml).
 deny:
-    cargo deny check advisories licenses bans sources
+    cargo deny {{deny_flags}} check advisories licenses bans sources
 
 # Slow link-simulator soak: many seeds, harsh conditions (not part of `ci`).
 netsim-soak:
@@ -79,22 +90,26 @@ realnet *args:
     tests/realnet/run.sh {{args}}
 
 # A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
-# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session "local" over
-# the pipe only; `just local auto` also lets it upgrade to QUIC on loopback. Arguments:
-# transport (`pipe` or `auto`) and session name.
-local transport="pipe" session="local":
+# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session "local-pipe"
+# over the pipe only; `just local auto` (session "local-auto") also lets it upgrade to QUIC on
+# loopback. The session defaults to local-TRANSPORT so one run never takes over another.
+local transport="pipe" session=("local-" + transport):
     #!/usr/bin/env bash
     set -euo pipefail
+    case "{{transport}}" in
+      pipe | auto | direct) ;;
+      *) echo "usage: just local [pipe|auto|direct] [session]" >&2; exit 2 ;;
+    esac
     cargo build -q -p fil
     mkdir -p target/local
     config=target/local/config-{{transport}}.toml
     {
-      printf '[defaults]\ntransport = "%s"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{justfile_directory()}}"
+      printf '[defaults]\ntransport = "%s"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{source_directory()}}"
       if [ "{{transport}}" != pipe ]; then
         printf '[defaults.direct]\naddress = "127.0.0.1"\n'
       fi
     } > "$config"
-    exec target/debug/fil --config "$config" localhost {{session}}
+    exec target/debug/fil --config "$config" localhost "{{session}}"
 
 # M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be

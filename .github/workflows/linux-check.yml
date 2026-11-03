@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           # The ref's build scripts and tests run in this job; leave no token in .git/config.
@@ -45,6 +45,10 @@ jobs:
         with:
           tool: just@1.59.0,cargo-deny@0.20.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main: a run on any other ref must not seed a cache
+          # that a later run of main restores.
+          save-if: ${{ inputs.ref == 'main' }}
       - name: just ci
         run: just ci
       - name: Emulator fidelity harness
@@ -76,7 +80,7 @@ jobs:
       matrix:
         part: [ssh, udp, sysd]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
@@ -88,6 +92,9 @@ jobs:
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main (see the check job).
+          save-if: ${{ inputs.ref == 'main' }}
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
@@ -97,7 +104,7 @@ jobs:
         run: just realnet ${{ matrix.part }}
       - name: Logs and measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: realnet-${{ matrix.part }}
           path: |
@@ -117,7 +124,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           # `cross` mounts the workspace into a third-party image; leave no token in .git/config.
@@ -137,7 +144,7 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/fil out/fil
           file out/fil | tee /dev/stderr | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)'
           (cd out && sha256sum fil | tee fil.sha256)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fil-aarch64-musl
           path: out/

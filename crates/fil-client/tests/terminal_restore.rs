@@ -290,3 +290,42 @@ async fn a_snapshot_in_the_middle_of_a_program_keeps_the_modes_it_cannot_restore
     let all = String::from_utf8_lossy(&term.written()).into_owned();
     assert!(all.contains("?2031l"), "the exit still resets it");
 }
+
+/// The termios goes back before anything is written, and a terminal that has stopped reading
+/// (the bounded write times out) cannot keep the user's shell from getting it: the run still
+/// ends, cooked, and says why it ended to the caller.
+#[tokio::test(start_paused = true)]
+async fn the_terminal_is_cooked_before_the_exit_writes_and_a_stalled_one_cannot_hold_it() {
+    let rig = in_a_program().await;
+    rig.term.stall();
+    rig.type_str("\r~.");
+    let term = rig.term.clone();
+    assert_eq!(rig.finish().await.unwrap(), Outcome::Detached);
+    assert!(!term.is_raw());
+    let writes = term.exit_writes();
+    assert!(!writes.is_empty());
+    assert!(
+        writes.iter().all(|(raw, _)| !raw),
+        "the exit sequence was written while the terminal was still raw: {writes:?}"
+    );
+    // The restore and the message went out as one bounded write, not three that each wait.
+    assert!(
+        writes[0].1.windows(5).any(|w| w == b"\x1b[?1l"),
+        "the restore bytes are in the first exit write"
+    );
+}
+
+/// The same on the way out of an error.
+#[tokio::test(start_paused = true)]
+async fn an_error_exit_on_a_stalled_terminal_still_ends_cooked() {
+    let rig = in_a_program().await;
+    rig.term.stall();
+    rig.daemon.refuse_next(AttachRefusal::WrongKey).await;
+    rig.daemon.kill_link(DownReason::Dead).await;
+    let term = rig.term.clone();
+    assert!(rig.finish().await.is_err());
+    assert!(!term.is_raw());
+    let writes = term.exit_writes();
+    assert!(!writes.is_empty());
+    assert!(writes.iter().all(|(raw, _)| !raw), "{writes:?}");
+}

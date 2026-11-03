@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use fil_client::{Backoff, ClientConfig, ClientError, Outcome};
+use fil_client::{Backoff, ClientConfig, ClientError, OfflineLog, Outcome};
 use fil_proto::limits::MAX_HOST_LABEL;
 use fil_proto::msg::{HostLabel, Request, SessionName};
 use fil_transport::LinkParams;
@@ -15,6 +15,9 @@ use crate::config::{self, Config, HostSettings};
 use crate::connect::Connect;
 use crate::dialer::{Connector, DialerConfig, PathDialer};
 use crate::{logging, mgmt, server};
+
+/// How long the message printed after a run may take to reach the terminal.
+const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Exit status of a normal end.
 const OK: u8 = 0;
@@ -101,6 +104,7 @@ async fn attach(
     transport: Option<TransportSetting>,
     settings: HostSettings,
 ) -> u8 {
+    tidy_offline_log(&settings);
     if !settings.forward.is_empty() {
         eprintln!(
             "fil: warning: `forward` in the config is ignored: port forwards arrive in milestone 2"
@@ -145,19 +149,36 @@ async fn attach(
 
     let result = fil_client::run(dialer, term, cfg).await;
     // The client has restored the terminal and printed how it ended; an error still needs saying.
+    // Through a bounded write: a terminal that stopped reading would hold `eprintln!` for good,
+    // and the shell would not get the terminal back.
     if let Err(e) = &result {
         // A version error is about "the fil on the remote host": say which host, here at the
         // print site (the host is what the user typed; the error type and the logs never carry it).
-        if matches!(
+        let line = if matches!(
             e,
             ClientError::VersionMismatch(_) | ClientError::VersionRefused
         ) {
-            eprintln!("fil: {}: {e}", fil_client::text::sanitize_inline(host));
+            format!("fil: {}: {e}\n", fil_client::text::sanitize_inline(host))
         } else {
-            eprintln!("fil: {e}");
-        }
+            format!("fil: {e}\n")
+        };
+        fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
     exit_code(&result)
+}
+
+/// Applies the offline-input log's age rules to the log in the default place at the start of a
+/// run, whether or not it is on: turning the log off must not leave what was typed on disk for
+/// good, and nothing else would open the file to age it (DESIGN.md section 4.3). The log this
+/// run writes to is tidied when it is opened.
+fn tidy_offline_log(settings: &HostSettings) {
+    let Some(path) = config::default_offline_log() else {
+        return;
+    };
+    let in_use = matches!(&settings.offline.log, Some(OfflineLog::File(p)) if *p == path);
+    if !in_use {
+        fil_client::offline::tidy_file_log(&path);
+    }
 }
 
 /// How a run ended, as an exit status (the list is in `fil --help`).

@@ -73,6 +73,10 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// How long the writes at the end of a run (the terminal restore and the closing message) may
+/// take. A terminal that has not taken them by then has stopped reading; the client goes on
+/// without them, and the user's shell gets the terminal back.
+const EXIT_WRITE_BUDGET: Duration = Duration::from_secs(1);
 /// A yes/no question ignores the keyboard until the user has paused this long, and a lone key
 /// answers it only if nothing else is typed for this long afterwards: it is only answered by
 /// someone who has read it, and the first letter of a word is not an answer.
@@ -786,10 +790,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if std::mem::replace(&mut self.screen_left, true) {
             return;
         }
+        // The termios first. `set_raw(false)` never waits for the terminal, and everything after
+        // it can: a terminal that has stopped reading would hold the writes below for good, and
+        // the client in raw mode with it, with only SIGKILL left to the user. Cooked, the
+        // explicit `\r\n` below at worst print as `\r\r\n`.
+        if self.raw {
+            let _ = self.out.set_raw(false);
+            self.raw = false;
+        }
+        let mut bytes = Vec::new();
         // Take our drawing off the screen first; the screen is the user's again.
         if let Some(d) = self.display.as_mut() {
-            let bytes = d.set_lines(Vec::new());
-            let _ = self.out.write_all(&bytes);
+            bytes.extend_from_slice(&d.set_lines(Vec::new()));
         }
         // Give the terminal back as it was: whatever the session's programs left on (the
         // alternate screen, mouse reporting, application keys, a hidden cursor...) goes off,
@@ -798,7 +810,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if self.first_attached
             && let Some(d) = self.display.as_ref()
         {
-            let _ = self.out.write_all(&d.restore_bytes());
+            bytes.extend_from_slice(&d.restore_bytes());
         }
         let mut text = String::new();
         if !self.first_attached {
@@ -811,11 +823,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             Err(_) => text.push_str("\r\n"),
         }
-        let _ = self.out.write_all(text.as_bytes());
-        if self.raw {
-            let _ = self.out.set_raw(false);
-            self.raw = false;
-        }
+        bytes.extend_from_slice(text.as_bytes());
+        // One bounded write: if the terminal does not take it in time, the rest is dropped.
+        self.write_at_exit(&bytes);
+    }
+
+    /// A write at the end of the run: given up on after [`EXIT_WRITE_BUDGET`].
+    fn write_at_exit(&mut self, bytes: &[u8]) {
+        let _ = self.out.write_all_within(bytes, EXIT_WRITE_BUDGET);
     }
 
     // ---- dialing -----------------------------------------------------------------------
@@ -1221,7 +1236,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if let Some(o) = &ended {
             // "Detached" is already on the screen: say why the exit status is the shell's.
             let m = o.message(self.cfg.session.as_str(), self.cfg.time_format);
-            let _ = self.out.write_all(format!("{m}\r\n").as_bytes());
+            self.write_at_exit(format!("{m}\r\n").as_bytes());
         }
         ended
     }
@@ -1864,10 +1879,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     /// Moves queued keystrokes into the send window and sends what it releases.
+    ///
+    /// A resize record still owed to this link goes first, here, whatever got us here: keys can
+    /// reach the wire while `link_became_ready` is still held back (a swapped link's `Resume`
+    /// arrives ahead of its snapshot), and they must not run at the old size.
     fn pump_input(&mut self) {
         if self.tx.is_none() || !self.sess.input_ready || !self.link_ok {
             return;
         }
+        self.send_size();
         if !self.pending.is_empty() {
             let n = self.sess.input.write(&self.pending);
             self.pending.drain(..n);
@@ -1894,13 +1914,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // The event says the size changed, not what it is now: it may have been queued
                 // behind later changes. Read the window, so a stale one cannot overwrite a
                 // newer one that keys already saw.
-                let (cols, rows) = self.out.size().unwrap_or((cols, rows));
+                let (cols, rows) = self.window_or(cols, rows);
                 self.on_resize(cols, rows)?;
                 Ok(Ev::Continue)
             }
             TermEvent::Signal(n) => Ok(Ev::End(Outcome::Signalled(n))),
             TermEvent::Eof => Ok(Ev::End(Outcome::InputClosed)),
         }
+    }
+
+    /// The window as it is now; when it cannot be read, the size the event named.
+    fn window_or(&mut self, cols: u16, rows: u16) -> (u16, u16) {
+        self.out.size().unwrap_or((cols, rows))
     }
 
     /// Notices a change of window size that has no event yet (or whose event is still queued).
@@ -2079,7 +2104,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         }
                     }
                     TermEvent::Resize { cols, rows } => {
-                        let (cols, rows) = self.out.size().unwrap_or((cols, rows));
+                        let (cols, rows) = self.window_or(cols, rows);
                         self.on_resize(cols, rows)?;
                     }
                     TermEvent::Signal(n) => break Err(Outcome::Signalled(n)),

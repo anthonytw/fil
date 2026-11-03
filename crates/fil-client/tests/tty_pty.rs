@@ -238,3 +238,118 @@ async fn a_panic_puts_the_terminal_back_before_unwinding_reaches_anyone() {
     }
     assert!(!text.contains("?1049"), "{text:?}");
 }
+
+/// A terminal that has stopped reading (its queue is full and nobody drains the master) cannot
+/// hold the end of a run: the bounded write gives up at its deadline and the termios is restored
+/// anyway, and nothing of the write is left behind to reach the terminal later. (A plain blocking
+/// write on the same descriptor never returns.)
+#[tokio::test]
+#[ignore = "on demand: just client-pty"]
+async fn a_terminal_that_stopped_reading_cannot_hold_the_exit_writes() {
+    let p = pty();
+    let before = tcgetattr(&p.slave).unwrap();
+    let mut term = from_fds(dup(&p.slave), dup(&p.slave), None).unwrap();
+    term.output.set_raw(true).unwrap();
+    assert!(!is_cooked(&tcgetattr(&p.slave).unwrap()));
+
+    // Fill the terminal's output queue through a second, non-blocking open of the same slave.
+    let name = ptsname(&p.master, Vec::new()).unwrap();
+    let filler = open(
+        name.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .unwrap();
+    let chunk = [b'.'; 1024];
+    let mut filled = 0usize;
+    loop {
+        match rustix::io::write(&filler, &chunk) {
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("{e}"),
+        }
+        assert!(filled < 64 << 20, "the queue never filled");
+    }
+
+    let started = std::time::Instant::now();
+    let err = term
+        .output
+        .write_all_within(b"\x1b[?25h\r\ndetached\r\n", Duration::from_millis(300))
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // The termios does not wait for the queue, so it is back at once.
+    term.output.set_raw(false).unwrap();
+    assert_eq!(lflags(&p.slave), before.local_modes);
+
+    // When the terminal reads again, nothing of the abandoned write turns up late: it left no
+    // thread behind, and a terminal that never had room never got half a sequence.
+    let sink = drain(&p.master);
+    std::thread::sleep(Duration::from_millis(300));
+    {
+        let seen = sink.lock().unwrap();
+        assert!(
+            !seen.contains(&0x1b) && !String::from_utf8_lossy(&seen).contains("detached"),
+            "part of the abandoned write reached the terminal"
+        );
+    }
+    // And a bounded write goes through whole.
+    term.output
+        .write_all_within(b"after\r\n", Duration::from_secs(5))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        String::from_utf8_lossy(&sink.lock().unwrap()).contains("after"),
+        "a bounded write on a terminal that reads was lost"
+    );
+}
+
+/// No window size on the terminal (a fresh pty reports 0x0), or one that cannot be read, is an
+/// error from `size()` and no `Resize` event: the client keeps the size it has instead of
+/// treating a made-up 80x24 as the user resizing the window.
+#[tokio::test]
+#[ignore = "on demand: just client-pty"]
+async fn an_unreadable_window_size_is_an_error_and_no_resize_event() {
+    let p = pty();
+    let _seen = drain(&p.master);
+    let mut term = from_fds(dup(&p.slave), dup(&p.slave), None).unwrap();
+    assert!(
+        term.output.size().is_err(),
+        "an empty size was reported as {:?}",
+        term.output.size()
+    );
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::WINCH)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), term.input.next())
+            .await
+            .is_err(),
+        "a SIGWINCH with no readable size became an event"
+    );
+    // A real size is reported again, by `size()` and by the event.
+    tcsetwinsize(
+        &p.master,
+        Winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(term.output.size().unwrap(), (100, 30));
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::WINCH)
+        .unwrap();
+    assert_eq!(
+        next(&mut term.input).await,
+        TermEvent::Resize {
+            cols: 100,
+            rows: 30
+        }
+    );
+}

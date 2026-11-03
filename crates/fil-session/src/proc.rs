@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill, killpg};
@@ -35,10 +36,19 @@ impl Scope {
     }
 }
 
-/// The transient unit name for a session: `fil-<name>-<8 hex digits of the incarnation>`.
-pub fn unit_name(name: &str, incarnation: u128) -> String {
-    format!("fil-{name}-{:08x}", incarnation as u32)
+/// The transient unit name for a session: `fil-<the incarnation in 32 hex digits>`.
+///
+/// The session's name is deliberately not part of it (DESIGN.md section 11.1): unit names show up
+/// in `/proc/<pid>/cgroup` (world-readable) and in the journal, where other users and log
+/// collectors can read them. The incarnation is random per session, so it is as unique as the
+/// name was and tells a reader nothing.
+pub fn unit_name(incarnation: u128) -> String {
+    format!("fil-{incarnation:032x}")
 }
+
+/// The description of every session scope. It carries no session name, for the same reason as
+/// [`unit_name`].
+pub const SCOPE_DESCRIPTION: &str = "fil session";
 
 /// Reads `loginctl show-user -p Linger` output.
 pub fn parse_linger(show_user_output: &str) -> bool {
@@ -192,15 +202,26 @@ fn output_with_timeout(
     }
 }
 
-/// Blocking: runs `loginctl`. Call from a blocking context.
-fn linger_enabled() -> bool {
-    let uid = nix::unistd::getuid();
+/// Whether user `uid` lingers (their user manager and processes outlive their last login), from
+/// `loginctl show-user <uid> -p Linger`.
+///
+/// `None` when it cannot be told: there is no `loginctl`, it failed (no systemd, no such user), or
+/// it did not answer within 5 seconds. This is the one linger probe; the daemon's logout warning
+/// (`fil_daemon::linger`) uses it too.
+///
+/// Blocking: runs `loginctl`. Call it from a blocking context, never on an async worker.
+pub fn lingering(uid: u32) -> Option<bool> {
     let mut cmd = Command::new("loginctl");
     cmd.args(["show-user", &uid.to_string(), "-p", "Linger"]);
-    output_with_timeout(cmd, PROBE_TIMEOUT)
-        .ok()
-        .filter(|o| o.status.success())
-        .is_some_and(|o| parse_linger(&String::from_utf8_lossy(&o.stdout)))
+    let out = output_with_timeout(cmd, PROBE_TIMEOUT).ok()?;
+    out.status
+        .success()
+        .then(|| parse_linger(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `lingering` for the user this process runs as; "cannot tell" counts as no.
+fn linger_enabled() -> bool {
+    lingering(nix::unistd::getuid().as_raw()).unwrap_or(false)
 }
 
 /// What is known about the host before choosing a scope.
@@ -296,7 +317,7 @@ pub fn resolve_scope(
     };
     match decide_scope(mode, facts, linger_enabled, trial_scope) {
         Decision::Systemd => Ok(Scope::Systemd {
-            unit: unit_name(name, incarnation),
+            unit: unit_name(incarnation),
         }),
         Decision::Tree => Ok(Scope::Tree),
         Decision::TreeWithWarning(why) => {
@@ -354,8 +375,56 @@ pub fn parse_ps(out: &str) -> Vec<ProcRow> {
         .collect()
 }
 
-/// The process table. Blocking.
+/// How old [`list_processes`] may let the table it returns be.
+///
+/// The tree fallback records descendants every few seconds, per session. Each scan reads every
+/// process (a `ps` on macOS, `/proc/*/stat` on Linux), so N sessions scanning on their own
+/// clocks cost N scans per interval for the same table. Sessions that ask within this age share
+/// one scan. It is well under the recording interval, so it costs the recording a little
+/// freshness at most; teardown never uses it.
+pub const SHARED_TABLE_MAX_AGE: Duration = Duration::from_secs(2);
+
+type TableSlot = Mutex<Option<(Instant, std::sync::Arc<Vec<ProcRow>>)>>;
+
+static SHARED_TABLE: TableSlot = Mutex::new(None);
+
+/// The table in `slot` if it is no older than `max_age` at `now`; otherwise `scan()`'s result,
+/// which is stored. The slot stays locked during the scan, so concurrent callers wait for it and
+/// share its result instead of each scanning.
+fn table_from(
+    slot: &TableSlot,
+    max_age: Duration,
+    now: Instant,
+    scan: impl FnOnce() -> Vec<ProcRow>,
+) -> std::sync::Arc<Vec<ProcRow>> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, rows)) = slot.as_ref()
+        && now.saturating_duration_since(*at) <= max_age
+    {
+        return rows.clone();
+    }
+    let rows = std::sync::Arc::new(scan());
+    *slot = Some((now, rows.clone()));
+    rows
+}
+
+/// The process table for the periodic recording of a session's descendants, shared between
+/// sessions: it may be up to [`SHARED_TABLE_MAX_AGE`] old. Blocking.
+///
+/// Use [`scan_processes`] where the table must be current (teardown).
 pub fn list_processes() -> Vec<ProcRow> {
+    table_from(
+        &SHARED_TABLE,
+        SHARED_TABLE_MAX_AGE,
+        Instant::now(),
+        scan_processes,
+    )
+    .as_ref()
+    .clone()
+}
+
+/// The process table, read now. Blocking.
+pub fn scan_processes() -> Vec<ProcRow> {
     if let Ok(dir) = std::fs::read_dir("/proc")
         && std::path::Path::new("/proc/self/stat").exists()
     {
@@ -453,7 +522,7 @@ pub const KILL_GRACE: Duration = Duration::from_millis(600);
 /// A hangup first, as closing a terminal would send, so shells and their jobs exit cleanly;
 /// then SIGKILL to whatever is left, in the group, in the tree and in the scope.
 pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration) {
-    let rows = list_processes();
+    let rows = scan_processes();
     let victims = tracker.victims(root, &rows);
     let pgid = Pid::from_raw(root as i32);
     let _ = killpg(pgid, Signal::SIGHUP);
@@ -463,7 +532,7 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
 
     let deadline = Instant::now() + grace;
     loop {
-        let table = list_processes();
+        let table = scan_processes();
         let gone = victims
             .iter()
             .all(|v| table.iter().find(|r| r.pid == *v).is_none_or(|r| r.zombie));
@@ -482,14 +551,26 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
         }
     }
     if let Scope::Systemd { unit } = scope {
-        let _ = Command::new("systemctl")
-            .args([
-                "--user",
-                "kill",
-                "--signal=SIGKILL",
-                &format!("{unit}.scope"),
-            ])
-            .output();
+        systemctl_kill("systemctl", unit, "SIGKILL", KILL_CALL_TIMEOUT);
+    }
+}
+
+/// How long `systemctl --user kill` may take. A user manager that does not answer must not hang
+/// the teardown (it runs on a blocking thread the session waits for).
+const KILL_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sends `signal` to every process in the scope of `unit` with `<systemctl> --user kill`, giving
+/// up after `timeout`. Failures are logged, not returned: the callers have already signalled the
+/// group and the recorded tree, and there is nothing else to do.
+fn systemctl_kill(systemctl: &str, unit: &str, signal: &str, timeout: Duration) {
+    let mut cmd = Command::new(systemctl);
+    cmd.args(["--user", "kill"])
+        .arg(format!("--signal={signal}"))
+        .arg(format!("{unit}.scope"));
+    match output_with_timeout(cmd, timeout) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(status = %out.status, signal, "systemctl kill failed"),
+        Err(e) => tracing::warn!(error = %e, signal, "systemctl kill did not complete"),
     }
 }
 
@@ -497,19 +578,12 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
 /// Used when the shell exits by itself: what it left running in the background is told, not
 /// killed.
 pub fn hang_up(root: u32, scope: &Scope, tracker: &Tracker) {
-    let rows = list_processes();
+    let rows = scan_processes();
     let victims = tracker.victims(root, &rows);
     let _ = killpg(Pid::from_raw(root as i32), Signal::SIGHUP);
     signal_all(&victims, Signal::SIGHUP);
     if let Scope::Systemd { unit } = scope {
-        let _ = Command::new("systemctl")
-            .args([
-                "--user",
-                "kill",
-                "--signal=SIGHUP",
-                &format!("{unit}.scope"),
-            ])
-            .output();
+        systemctl_kill("systemctl", unit, "SIGHUP", KILL_CALL_TIMEOUT);
     }
 }
 
@@ -569,9 +643,102 @@ mod tests {
     }
 
     #[test]
-    fn unit_names_are_valid_and_distinct_per_incarnation() {
-        assert_eq!(unit_name("main", 0xdead_beef_1234), "fil-main-beef1234");
-        assert_ne!(unit_name("main", 1), unit_name("main", 2));
+    fn unit_names_are_valid_and_distinct_per_incarnation_and_hold_no_session_name() {
+        assert_eq!(
+            unit_name(0xdead_beef_1234),
+            "fil-00000000000000000000deadbeef1234"
+        );
+        assert_ne!(unit_name(1), unit_name(2));
+        // Incarnations that differ only in their high bits must not collide.
+        assert_ne!(unit_name(1), unit_name(1 | (1 << 100)));
+        let u = unit_name(u128::MAX);
+        assert!(u.starts_with("fil-") && u[4..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn linger_probe_gives_up_quietly_when_it_cannot_tell() {
+        // No such user (or no loginctl at all): "cannot tell", not a panic or a hang.
+        assert_eq!(lingering(u32::MAX - 1), None);
+    }
+
+    #[test]
+    fn a_systemctl_that_hangs_does_not_hang_the_kill() {
+        let dir = std::env::temp_dir().join(format!("fil-systemctl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let t = Instant::now();
+        systemctl_kill(
+            fake.to_str().unwrap(),
+            "fil-x",
+            "SIGKILL",
+            Duration::from_millis(300),
+        );
+        let took = t.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    fn table(n: u32) -> Vec<ProcRow> {
+        vec![row(n, 1, "a")]
+    }
+
+    #[test]
+    fn the_shared_process_table_is_scanned_once_per_max_age() {
+        let slot: TableSlot = Mutex::new(None);
+        let age = Duration::from_secs(2);
+        let t0 = Instant::now();
+        let mut scans = 0;
+        let mut ask = |at: Instant| {
+            table_from(&slot, age, at, || {
+                scans += 1;
+                table(scans)
+            })
+            .first()
+            .unwrap()
+            .pid
+        };
+        assert_eq!(ask(t0), 1, "the first caller scans");
+        assert_eq!(
+            ask(t0 + Duration::from_millis(1900)),
+            1,
+            "a second session shares it"
+        );
+        assert_eq!(
+            ask(t0 + Duration::from_secs(2)),
+            1,
+            "the limit itself is still fresh"
+        );
+        assert_eq!(
+            ask(t0 + Duration::from_millis(2100)),
+            2,
+            "past the age it is scanned again"
+        );
+        assert_eq!(ask(t0 + Duration::from_millis(2200)), 2);
+        // A caller whose clock reading predates the stored scan (it waited on the lock) shares.
+        assert_eq!(ask(t0), 2);
+    }
+
+    #[test]
+    fn concurrent_sessions_share_one_scan() {
+        let slot: TableSlot = Mutex::new(None);
+        let scans = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    table_from(&slot, Duration::from_secs(60), Instant::now(), || {
+                        scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        table(1)
+                    });
+                });
+            }
+        });
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -585,8 +752,8 @@ mod tests {
     #[test]
     fn systemd_run_command_line() {
         let argv = systemd_run_argv(
-            "fil-main-00000001",
-            "fil session main",
+            &unit_name(1),
+            SCOPE_DESCRIPTION,
             &["/bin/zsh".into(), "-l".into()],
         );
         assert_eq!(
@@ -597,8 +764,8 @@ mod tests {
                 "--scope",
                 "--quiet",
                 "--collect",
-                "--unit=fil-main-00000001",
-                "--description=fil session main",
+                "--unit=fil-00000000000000000000000000000001",
+                "--description=fil session",
                 "--",
                 "/bin/zsh",
                 "-l"
@@ -665,7 +832,7 @@ mod tests {
     #[test]
     fn the_process_table_includes_this_process_and_its_child() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let rows = list_processes();
+        let rows = scan_processes();
         let me = std::process::id();
         let found = rows
             .iter()

@@ -96,7 +96,7 @@ With the UDP address set to a documentation address nothing answers on, the clie
 
 - **`reset` can take 90 seconds.** It stops the daemon's systemd scope with SIGTERM; an interactive bash ignores SIGTERM, so with a live shell it waits for the unit's 90 s stop timeout, then SIGKILLs. A client attached at the time sees "session killed by signal 9" after about 91 s (observed once, on pi1). End sessions with `fil kill` first, as the driver does, or replace the shell with `exec sleep N`.
 - **`reset` restarts the whole systemd user manager** (it kills every process of the account, `systemd --user` included, and lingering starts it again). That is harmless for fil.
-- **The `logs` verb shows the user journal**, which has a `Started fil-SESSION-….scope - fil session SESSION` line for each session (it proves the process-scope path). The daemon's own log lines are in that journal too.
+- **The `logs` verb shows the user journal**, which has a `Started fil-HEX.scope - fil session` line for each session (it proves the process-scope path; the session name is deliberately not in it). The daemon's own log lines are in that journal too.
 
 Runs: the `aarch64` job builds, [run 41565928944](https://github.com/anthonytw/fil/actions/runs/41565928944) (first tree), [run 41569420955](https://github.com/anthonytw/fil/actions/runs/41569420955) (merged tree) and [run 41571148759](https://github.com/anthonytw/fil/actions/runs/41571148759) (pinned `cross`, `--locked`, static check: same binary hash). The scenarios in the results table ran against that binary.
 

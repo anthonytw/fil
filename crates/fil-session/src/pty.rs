@@ -11,7 +11,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use fil_proto::msg::TermSize;
 
 use crate::config::SessionConfig;
-use crate::proc::{Scope, systemd_run_argv};
+use crate::env::{SESSION_ONLY_DROPPED_VARS, is_login_session_var};
+use crate::proc::{SCOPE_DESCRIPTION, Scope, systemd_run_argv};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -52,15 +53,22 @@ fn size_of(s: TermSize) -> PtySize {
     }
 }
 
-/// The variables that describe the SSH login which happened to start the daemon, not the
-/// session's user.
-const STALE_SSH_VARS: [&str; 5] = [
-    "SSH_TTY",
-    "SSH_CONNECTION",
-    "SSH_CLIENT",
-    "SSH_ORIGINAL_COMMAND",
-    "SSH_USER_AUTH",
-];
+/// Removes what describes the login that started the daemon ([`crate::env`]) from the inherited
+/// environment. What the configuration sets afterwards is the caller's choice and stays.
+fn drop_login_vars(cmd: &mut CommandBuilder) {
+    let names: Vec<String> = cmd
+        .iter_full_env_as_str()
+        .map(|(k, _)| k)
+        .filter(|k| is_login_session_var(k.as_ref()))
+        .map(str::to_string)
+        .collect();
+    for k in names {
+        cmd.env_remove(k);
+    }
+    for k in SESSION_ONLY_DROPPED_VARS {
+        cmd.env_remove(k);
+    }
+}
 
 fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, SpawnError> {
     if cfg.command.as_ref().is_some_and(|c| c.is_empty()) {
@@ -78,9 +86,8 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
                 // `systemd-run` cannot set argv[0], so ask for a login shell with `-l`.
                 None => vec![CommandBuilder::new_default_prog().get_shell(), "-l".into()],
             };
-            let description = format!("fil session {}", cfg.name);
             CommandBuilder::from_argv(
-                systemd_run_argv(unit, &description, &inner)
+                systemd_run_argv(unit, SCOPE_DESCRIPTION, &inner)
                     .into_iter()
                     .map(OsString::from)
                     .collect(),
@@ -101,9 +108,7 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
     for (k, v) in keep {
         cmd.env(k, v);
     }
-    for k in STALE_SSH_VARS {
-        cmd.env_remove(k);
-    }
+    drop_login_vars(&mut cmd);
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
@@ -219,5 +224,72 @@ impl Pty {
             t.local_flags.contains(LocalFlags::ICANON),
             t.local_flags.contains(LocalFlags::ECHO),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    #[test]
+    fn the_login_environment_is_dropped_and_the_rest_kept() {
+        let mut cmd = CommandBuilder::new("true");
+        for (k, v) in [
+            ("DISPLAY", "localhost:10.0"),
+            ("XDG_SESSION_ID", "42"),
+            ("XDG_SESSION_TYPE", "tty"),
+            ("SSH_CONNECTION", "a b c d"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("FIL_LOG", "trace"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("LANG", "C"),
+        ] {
+            cmd.env(k, v);
+        }
+        drop_login_vars(&mut cmd);
+        for k in [
+            "DISPLAY",
+            "XDG_SESSION_ID",
+            "XDG_SESSION_TYPE",
+            "SSH_CONNECTION",
+            "LC_TERMINAL",
+            "FIL_LOG",
+        ] {
+            assert_eq!(cmd.get_env(k), None, "{k} must be dropped");
+        }
+        assert_eq!(
+            cmd.get_env("XDG_RUNTIME_DIR"),
+            Some(OsStr::new("/run/user/1000"))
+        );
+        assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("C")));
+    }
+
+    #[test]
+    fn a_systemd_scope_names_the_session_neither_in_its_unit_nor_in_its_description() {
+        let mut cfg = SessionConfig::new(
+            "acme-incident".parse().unwrap(),
+            "xterm-256color".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            0x1234_5678_9abc_def0_1111_2222_3333_4444,
+        );
+        cfg.command = Some(vec!["/bin/true".into()]);
+        let unit = crate::proc::unit_name(cfg.incarnation);
+        let cmd = build_command(&cfg, &Scope::Systemd { unit }).unwrap();
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.iter().any(|a| a.starts_with("--unit=fil-")),
+            "{argv:?}"
+        );
+        assert!(
+            argv.iter().all(|a| !a.contains("acme")),
+            "the session name is in the command line systemd records: {argv:?}"
+        );
+        assert!(argv.contains(&format!("--description={SCOPE_DESCRIPTION}")));
     }
 }

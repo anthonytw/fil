@@ -788,8 +788,8 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
         format!("daemon gone after the login ended\n{late}")
     })?;
     let journal = ctx.gate(host, "logs 800");
-    ensure(journal.contains("fil session e2e-ln"), || {
-        "no `fil session e2e-ln` systemd scope in the user journal: the shell did not run in a scope"
+    ensure(journal.contains(".scope - fil session"), || {
+        "no `fil-<hex>.scope - fil session` systemd scope in the user journal: the shell did not run in a scope"
             .to_string()
     })?;
     let mut c2 = Client::spawn(ctx, host, Variant::Pipe, "e2e-ln");
@@ -806,7 +806,8 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
             "daemon and shell alive {} after the last login ended; background job's output waited in the session",
             ms(away)
         ),
-        "the shell ran in a systemd scope (`fil session e2e-ln` in the user journal)".to_string(),
+        "the shell ran in a systemd scope (`fil-<hex>.scope - fil session` in the user journal)"
+            .to_string(),
     ])
 }
 

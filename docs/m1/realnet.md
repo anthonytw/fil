@@ -162,7 +162,7 @@ From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104
 
 | Scenario | What it checks | Result |
 |---|---|---|
-| `f_linger_scope` | `loginctl enable-linger`; a session with a plain background job and one started with `setsid nohup` | pass: a running user scope `fil-ls1-XXXXXXXX.scope`; the shell, the background job and the job that left the process tree are all in it; `fil kill` ended all three, and the scope was gone |
+| `f_linger_scope` | `loginctl enable-linger`; a session with a plain background job and one started with `setsid nohup` | pass: a running user scope `fil-<32 hex>.scope` (no session name in it or its description); the shell, the background job and the job that left the process tree are all in it; `fil kill` ended all three, and the scope was gone |
 | `f_no_linger_tree` | lingering off | pass: no scope; the shell is in the session scope of the login; `fil kill` ended the shell and the plain background job. The `setsid` job **survived** (it left the process tree and was reparented to init): the documented limit of the fallback, which the scope does not have |
 
 A privileged container with systemd as PID 1 starts on GitHub's `ubuntu-24.04` runners without any setup beyond `--privileged` and tmpfs on `/run` (boot in a few seconds, state `running`). The run is not special-cased.

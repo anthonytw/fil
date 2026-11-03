@@ -32,6 +32,10 @@ pub(super) mod code {
 /// `send` wait; what QUIC flow control holds back backs up into it.
 const WRITE_QUEUE: usize = 8;
 
+/// Payloads up to this size are copied into one buffer with their length prefix before they are
+/// written; larger ones are handed to quinn as they are.
+const COPY_BELOW: usize = 2048;
+
 /// What waits in front of a channel's stream.
 enum Item {
     Payload(Bytes),
@@ -512,18 +516,34 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
                 None => return,
             },
         };
-        let mut chunks = Vec::with_capacity(3);
-        chunks.extend(header.take());
-        match item {
-            Item::Payload(payload) => {
-                chunks.push(Bytes::copy_from_slice(
-                    &(payload.len() as u32).to_be_bytes(),
-                ));
-                chunks.push(payload);
+        let res = match item {
+            // A small payload (a keystroke, an ack) is copied behind its prefix into one buffer:
+            // one allocation and one chunk, where prefix, payload and a chunk list were three.
+            Item::Payload(payload) if payload.len() <= COPY_BELOW => {
+                let mut buf = Vec::with_capacity(MAX_VARINT_LEN + 4 + payload.len());
+                if let Some(h) = header.take() {
+                    buf.extend_from_slice(&h);
+                }
+                buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&payload);
+                stream.write_all_chunks(&mut [Bytes::from(buf)]).await
             }
-            Item::Flush(id) => chunks.push(Bytes::copy_from_slice(&wire::flush_marker(id))),
-        }
-        let res = stream.write_all_chunks(&mut chunks).await;
+            // A large one is handed to quinn as it is, with no copy.
+            Item::Payload(payload) => {
+                let prefix = Bytes::copy_from_slice(&(payload.len() as u32).to_be_bytes());
+                match header.take() {
+                    Some(h) => stream.write_all_chunks(&mut [h, prefix, payload]).await,
+                    None => stream.write_all_chunks(&mut [prefix, payload]).await,
+                }
+            }
+            Item::Flush(id) => {
+                let marker = Bytes::copy_from_slice(&wire::flush_marker(id));
+                match header.take() {
+                    Some(h) => stream.write_all_chunks(&mut [h, marker]).await,
+                    None => stream.write_all_chunks(&mut [marker]).await,
+                }
+            }
+        };
         match res {
             Ok(()) => {}
             Err(WriteError::Stopped(_)) => {

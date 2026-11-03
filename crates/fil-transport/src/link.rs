@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
+use fil_proto::limits::{DEAD_AFTER, HEARTBEAT_INTERVAL};
 use tokio::sync::watch;
 
 /// Which transport a link runs on.
@@ -109,9 +110,9 @@ pub struct LinkParams {
 impl Default for LinkParams {
     fn default() -> Self {
         Self {
-            heartbeat: Duration::from_secs(1),
+            heartbeat: HEARTBEAT_INTERVAL,
             degraded_after: Duration::from_secs(2),
-            dead_after: Duration::from_secs(5),
+            dead_after: DEAD_AFTER,
             connect_timeout: Duration::from_secs(2),
         }
     }

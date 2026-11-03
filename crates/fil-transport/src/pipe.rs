@@ -102,6 +102,21 @@ pub struct PipeConfig {
     pub close_grace: Duration,
     /// What happens to the command's stderr ([`PipeLink::spawn`] only). Default `Inherit`.
     pub stderr: PipeStderr,
+    /// Start the command in its own process group, which is a *background* group of the
+    /// terminal the client runs on ([`PipeLink::spawn`] only). Default `false`.
+    ///
+    /// Set it for a run nobody is watching, that is every reconnect after the first attach. The
+    /// terminal then belongs to the session, and a prompt from the command (a password, a
+    /// passphrase, a 2FA code from `ssh -J` or a `ProxyCommand`) must not compete with the
+    /// client's raw-mode reader: with the group in the background, a read from or a mode change on
+    /// `/dev/tty` stops the command (`SIGTTIN`/`SIGTTOU`) instead of taking the user's keystrokes
+    /// and sending them to the remote shell. The command's `connect` then ends at the preamble
+    /// timeout or at the connect timeout of the layer above, and the client reports that the
+    /// pipe needs an interactive login (security sweep #2).
+    ///
+    /// Leave it off for the first, interactive run, whose prompts the user answers, and for
+    /// anything that must receive the terminal's `^C`: a command in another group no longer does.
+    pub own_process_group: bool,
 }
 
 /// Where a pipe command's stderr goes.
@@ -132,6 +147,7 @@ impl PipeConfig {
             inbound_budget: 2 * 1024 * 1024,
             close_grace: Duration::from_secs(1),
             stderr: PipeStderr::Inherit,
+            own_process_group: false,
         }
     }
 }
@@ -350,15 +366,6 @@ impl PipeLink {
         Self::establish(r, w, Role::Daemon, cfg, None, None).await
     }
 
-    /// Like [`connect`](Self::connect), for a stream that comes as two halves.
-    pub async fn connect_halves<R, W>(read: R, write: W, cfg: PipeConfig) -> Result<Self, PipeError>
-    where
-        R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
-    {
-        Self::establish(read, write, Role::Client, cfg, None, None).await
-    }
-
     /// Like [`accept`](Self::accept), for a stream that comes as two halves (a process's stdin
     /// and stdout).
     pub async fn accept_halves<R, W>(read: R, write: W, cfg: PipeConfig) -> Result<Self, PipeError>
@@ -377,8 +384,8 @@ impl PipeLink {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| PipeError::new(PipeErrorKind::InvalidCommand("empty command".into())))?;
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(match cfg.stderr {
@@ -386,7 +393,13 @@ impl PipeLink {
                 PipeStderr::Null => std::process::Stdio::null(),
                 PipeStderr::Capture => std::process::Stdio::piped(),
             })
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if cfg.own_process_group {
+            // A new group with the child as its leader. Safe Rust: the standard library does the
+            // `setpgid` between fork and exec.
+            cmd.process_group(0);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -670,7 +683,9 @@ impl Link for PipeLink {
             self.shared.set_down(reason.clone());
             return Err(LinkError(reason));
         }
-        let mut frame = Frame::new(channel, payload.to_vec());
+        // (No copy when `payload` is the only handle on its buffer, which it is for everything
+        // the session and the client build.)
+        let mut frame = Frame::new(channel, Vec::from(payload));
         loop {
             // Register for the next "space freed" signal before looking, so none is missed.
             let space = self.shared.space.notified();

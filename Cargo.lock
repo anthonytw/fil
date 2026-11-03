@@ -455,7 +455,6 @@ dependencies = [
 name = "fil-netsim"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "quinn",
  "rand 0.9.5",
  "rcgen",

@@ -10,7 +10,7 @@ use fil_proto::limits::{MAX_FRAME_BODY, MAX_PREAMBLE_SKIP};
 use fil_proto::preamble;
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder};
 use fil_transport::link::{DownReason, Link, LinkParams, LinkState};
-use fil_transport::pipe::{PipeConfig, PipeErrorKind, PipeLink};
+use fil_transport::pipe::{PipeCommand, PipeConfig, PipeErrorKind, PipeLink, PipeStderr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex};
 use tokio::time::{Instant, sleep, timeout};
 
@@ -1245,4 +1245,72 @@ async fn control_still_goes_ahead_of_packed_forward_data() {
     }
     assert_eq!(order.len(), 9, "{order:?}");
     assert_eq!(order[0], ChannelId::CONTROL, "{order:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security sweep #2: the pipe command's process group
+
+/// The process group of `pid`, from `ps`.
+fn pgid_of(pid: u32) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Spawns a shell that reports its own process group, announces itself like `fil server --stdio`
+/// and then reads its stdin to the end. Returns the group the shell was in, and ours.
+async fn spawn_reporting_pgid(own_process_group: bool) -> (String, String) {
+    // A heartbeat frame, as the octal escapes `printf` understands.
+    let hb = Frame::new(
+        ChannelId::CONTROL,
+        ControlMsg::Heartbeat {
+            nonce: 9,
+            reply: true,
+        }
+        .encode()
+        .unwrap(),
+    )
+    .encode()
+    .unwrap();
+    let octal: String = hb.iter().map(|b| format!("\\{b:03o}")).collect();
+    let script = format!(
+        "printf '\\033FIL-CONNECT 1\\n'; printf '{octal}'; ps -o pgid= -p $$ >&2; cat >/dev/null"
+    );
+    let cmd = PipeCommand::custom(["sh", "-c", &script]).unwrap();
+    let mut c = cfg();
+    c.stderr = PipeStderr::Capture;
+    c.own_process_group = own_process_group;
+    let link = PipeLink::spawn(&cmd, c).await.unwrap();
+    // The shell wrote its group to stderr before the link came up.
+    let mut seen = String::new();
+    for _ in 0..50 {
+        seen = link.stderr_text().trim().to_owned();
+        if !seen.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!seen.is_empty(), "the shell reported no process group");
+    let child_pid = link.child_id().expect("a child");
+    assert_eq!(seen, pgid_of(child_pid), "ps and the shell disagree");
+    link.shutdown().await;
+    (seen, pgid_of(std::process::id()))
+}
+
+#[tokio::test]
+async fn the_command_shares_our_process_group_by_default() {
+    let (child, ours) = spawn_reporting_pgid(false).await;
+    assert_eq!(child, ours);
+}
+
+/// A command in the client's own group would race its raw-mode reader for the keys typed at a
+/// prompt (security sweep #2). With `own_process_group` it leads a group of its own, which is in
+/// the background, so a read from the terminal stops it instead.
+#[tokio::test]
+async fn own_process_group_puts_the_command_in_a_group_of_its_own() {
+    let (child, ours) = spawn_reporting_pgid(true).await;
+    assert_ne!(child, ours, "still in our group");
+    assert!(!child.is_empty());
 }

@@ -15,7 +15,10 @@
 //! - **Liveness is the link's job.** It detects a dead path within [`LinkParams::dead_after`]
 //!   and reports `Down`, even when the underlying transport would hang (ssh never notices a
 //!   silent black hole by itself; see `docs/m1/realnet.md`). Heartbeats are internal and never
-//!   appear in [`Link::recv`].
+//!   appear in [`Link::recv`]. They are asymmetric: the client pings every
+//!   [`LinkParams::heartbeat`] and the daemon answers (and pings itself only after one and a half
+//!   heartbeats of silence), which is enough for *both* sides to hear each other well inside
+//!   `degraded_after`. `Degraded` is the peer's silence only, never this side's slow consumer.
 //! - **`Up` means the peer has proven itself.** On the pipe, after the preamble and the first
 //!   frame. On QUIC, after the daemon's first frame: in TLS 1.3 the client's handshake finishes
 //!   before the daemon has judged the client key (`docs/m1/quic-auth.md`).
@@ -96,7 +99,8 @@ pub struct LinkError(pub DownReason);
 /// measurements in `docs/m1/realnet.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkParams {
-    /// How often the link proves it is alive when there is no other traffic.
+    /// How often the client proves it is alive when there is no other traffic (the daemon waits
+    /// half as long again before it pings on its own, and normally only replies).
     pub heartbeat: Duration,
     /// Silence after which the link reports [`LinkState::Degraded`].
     pub degraded_after: Duration,

@@ -23,6 +23,13 @@
 //! # How sessions group their processes: "auto" (a systemd user scope where lingering is on),
 //! # "systemd" (always, failing if it cannot) or "tree" (always the process tree).
 //! scope = "auto"
+//!
+//! [ports]
+//! # The protocol probe of `fil ports` (DESIGN.md section 7.4), on the user's own loopback
+//! # listeners only: "head" (TLS, HTTP `HEAD` for the status and `Server`, Postgres, Redis),
+//! # "full" (HTTP `GET`, for the page title too; a `GET` can have side effects on a dev
+//! # server) or "off".
+//! probe = "head"
 //! ```
 //!
 //! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file
@@ -39,6 +46,7 @@ use fil_transport::LinkParams;
 use serde::Deserialize;
 
 use crate::paths::current_uid;
+use crate::ports::ProbeMode;
 
 /// How long the daemon with nothing to do waits before it exits (the `idle_exit_secs` default).
 pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
@@ -67,6 +75,14 @@ struct FileConfig {
     history_lines: Option<usize>,
     idle_exit_secs: Option<u64>,
     scope: Option<String>,
+    ports: Option<PortsFile>,
+}
+
+/// `[ports]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortsFile {
+    probe: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +125,8 @@ pub struct DaemonConfig {
     pub idle_exit: Option<Duration>,
     /// How sessions group their processes (default `auto`).
     pub scope: ScopeMode,
+    /// The `fil ports` probe (`[ports] probe`, default `head`).
+    pub ports_probe: ProbeMode,
     /// The only peer uid the socket accepts (default: this process's). Not in the file; tests
     /// change it to show a foreign user is refused.
     pub allowed_uid: u32,
@@ -137,6 +155,7 @@ impl Default for DaemonConfig {
             history_lines: DEFAULT_HISTORY_LINES,
             idle_exit: Some(DEFAULT_IDLE_EXIT),
             scope: ScopeMode::Auto,
+            ports_probe: ProbeMode::Head,
             allowed_uid: current_uid(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             lock_wait: Duration::from_secs(3),
@@ -205,6 +224,11 @@ impl DaemonConfig {
                 }
             };
         }
+        if let Some(p) = file.ports.and_then(|p| p.probe) {
+            cfg.ports_probe = ProbeMode::parse(&p).ok_or_else(|| {
+                format!("ports.probe = {p:?}: expected \"head\", \"full\" or \"off\"")
+            })?;
+        }
         Ok(cfg)
     }
 }
@@ -221,6 +245,7 @@ mod tests {
         assert_eq!(c.idle_exit, Some(DEFAULT_IDLE_EXIT));
         assert_eq!(c.scope, ScopeMode::Auto);
         assert_eq!(c.history_lines, 1000);
+        assert_eq!(c.ports_probe, ProbeMode::Head);
         assert_eq!(
             c.bind,
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -232,7 +257,8 @@ mod tests {
     fn every_key() {
         let c = DaemonConfig::parse(
             "direct = false\nbind = \"127.0.0.1\"\nport_range = [50000, 50010]\n\
-             idle_exit_secs = 0\nscope = \"tree\"\nhistory_lines = 250\n",
+             idle_exit_secs = 0\nscope = \"tree\"\nhistory_lines = 250\n\
+             [ports]\nprobe = \"off\"\n",
         )
         .unwrap();
         assert!(!c.direct);
@@ -241,6 +267,9 @@ mod tests {
         assert_eq!(c.idle_exit, None);
         assert_eq!(c.scope, ScopeMode::Tree);
         assert_eq!(c.history_lines, 250);
+        assert_eq!(c.ports_probe, ProbeMode::Off);
+        let c = DaemonConfig::parse("[ports]\nprobe = \"full\"\n").unwrap();
+        assert_eq!(c.ports_probe, ProbeMode::Full);
     }
 
     #[test]
@@ -256,6 +285,8 @@ mod tests {
             "history_lines = 0",
             "history_lines = 1000001",
             "idle_exit_secs = -1",
+            "[ports]\nprobe = \"get\"",
+            "[ports]\nprob = \"off\"",
         ] {
             assert!(DaemonConfig::parse(bad).is_err(), "{bad}");
         }

@@ -12,8 +12,10 @@
 //!   itself (§8.1). A frame that arrives first and is not a heartbeat is delivered by `recv`.
 //! - **Sending.** Frames go through [`fil_proto::sched::Scheduler`]: control first, then
 //!   terminal/snapshot/agent in order, then forwards round-robin with a guaranteed share. The
-//!   driver writes **one frame at a time**, so a control frame waits behind at most the frame
-//!   already on the wire (16 KiB).
+//!   driver fills one buffer with every frame that is ready, in that order, up to 8 KiB (one
+//!   more frame may overshoot it), and writes it with a single `write`, so the small frames of a
+//!   keystroke (the echo, the acks) share an SSH packet. A control frame therefore waits behind
+//!   at most what is already on the wire: one buffer, 8 KiB plus a 16 KiB frame at worst.
 //! - **Backpressure.** Every channel has its own bounded queue, counted in frames
 //!   (`control_queue`, `interactive_queue` and `forward_queue` in [`PipeConfig`]; at most 16 KiB
 //!   each). `send` waits only while *that channel's* queue is full. Heartbeats are not queued
@@ -22,15 +24,21 @@
 //!   (`inbound_budget`, 2 MiB by default; one read, 64 KiB, may overshoot it). Under the budget
 //!   the driver keeps reading, so the peer's bytes keep proving it alive and a black hole is
 //!   still found by `Dead`, however far behind the consumer is. Past the budget it stops reading
-//!   (the stream's own flow control pushes back on the peer), freezes the silence clock and
-//!   reports `Degraded`; it reads again, and returns to `Up`, once the consumer has caught up to
-//!   half the budget. A well-behaved peer stays under the budget through acks (§8.5).
-//! - **Heartbeats (§8.5).** After [`LinkParams::heartbeat`] without sending, a
-//!   `Heartbeat { reply: false }` goes out on channel 0. Each ping is answered at once with
-//!   `reply: true` and the same nonce; the pair measures RTT. Heartbeats never reach `recv`.
-//!   They are encoded ahead of everything when the writer is free: at most one reply (the latest
-//!   ping's nonce) and one ping of our own are ever pending, so a peer that floods pings
-//!   without reading costs one pending frame, and a stuck write does not pile up stale pings.
+//!   (the stream's own flow control pushes back on the peer) and freezes the silence clock; it
+//!   reads again once the consumer has caught up to half the budget. The link stays `Up`
+//!   throughout: `Degraded` means the *peer* has been silent, never that the local consumer is
+//!   slow (the client would paint "no reply" over a healthy link for as long as a flood outpaces
+//!   its terminal). A well-behaved peer stays under the budget through acks (§8.5).
+//! - **Heartbeats (§8.5).** They are asymmetric. A `Heartbeat { reply: false }` goes out on
+//!   channel 0 from the *client* once [`LinkParams::heartbeat`] has passed without anything sent
+//!   or anything received (at most one per heartbeat), and from the *daemon* only after one and a
+//!   half heartbeats of either. Every ping is answered at once with `reply: true` and the same
+//!   nonce; the pair measures RTT (so the daemon's RTT is the one from its handshake ping,
+//!   refreshed only when it has had to ping). Heartbeats never reach `recv`. An idle link carries
+//!   one ping and one reply a second, not two of each. They are encoded ahead of everything when
+//!   the writer is free: at most one reply (the latest ping's nonce) and one ping of our own are
+//!   ever pending, so a peer that floods pings without reading costs one pending frame, and a
+//!   stuck write does not pile up stale pings.
 //! - **Liveness.** *Any* bytes from the peer count as proof of life, not only whole frames, so a
 //!   large frame crawling over a slow pipe does not look like silence. After
 //!   [`LinkParams::degraded_after`] of silence the link is `Degraded` (and `Up` again if the peer
@@ -431,6 +439,7 @@ impl PipeLink {
         let (done_tx, done_rx) = watch::channel(false);
         tokio::spawn(
             Driver {
+                role,
                 shared: shared.clone(),
                 read,
                 write,

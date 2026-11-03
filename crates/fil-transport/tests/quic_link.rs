@@ -1033,7 +1033,7 @@ async fn a_peer_that_finishes_its_streams_still_hits_the_lifetime_cap() {
         }
         opened += 1;
         // Let the daemon take the stream, which is what returns the credit.
-        if opened % 64 == 0 {
+        if opened.is_multiple_of(64) {
             sleep(Duration::from_millis(100)).await;
         }
     }

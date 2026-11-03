@@ -261,14 +261,19 @@ impl Shared {
         });
     }
 
+    /// Records a round-trip measurement. Only a real change is published (the same threshold as
+    /// the QUIC link: 10 % or 2 ms), because every update wakes the engine and the tasks that
+    /// watch the link; a measurement that differs by a few microseconds on every heartbeat would
+    /// wake them once a second for nothing.
     pub fn set_rtt(&self, rtt: std::time::Duration) {
         self.status.send_if_modified(|s| {
-            if s.rtt == Some(rtt) {
-                false
-            } else {
+            let moved = s.rtt.is_none_or(|old| {
+                old.abs_diff(rtt) >= (old / 10).max(std::time::Duration::from_millis(2))
+            });
+            if moved {
                 s.rtt = Some(rtt);
-                true
             }
+            moved
         });
     }
 }

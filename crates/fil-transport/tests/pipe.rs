@@ -11,7 +11,7 @@ use fil_proto::preamble;
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder};
 use fil_transport::link::{DownReason, Link, LinkParams, LinkState};
 use fil_transport::pipe::{PipeConfig, PipeErrorKind, PipeLink};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex};
 use tokio::time::{Instant, sleep, timeout};
 
 /// The most the preamble scanner may hold beyond its bound: one read.
@@ -331,20 +331,30 @@ async fn heartbeat_timing_follows_the_spec() {
     let rtt = link.status().borrow().rtt.unwrap();
     assert!((MS(40)..=MS(45)).contains(&rtt), "{rtt:?}");
 
-    // Anything we send counts: no ping while data keeps flowing out.
+    // The client also pings when it has *heard* nothing for a heartbeat, however busy it is
+    // sending: otherwise a daemon with nothing to say would look dead to a client that is typing.
+    // (Efficiency sweep #7 made the daemon quieter; this is what keeps the client sound.)
     let t1 = Instant::now();
+    let mut pings = Vec::new();
     while t1.elapsed() < Duration::from_secs(3) {
         link.send(ChannelId::TERMINAL, data(0, 1, 10))
             .await
             .unwrap();
         sleep(MS(400)).await;
-        let f = raw.frame().await;
-        assert_eq!(
-            f.channel,
-            ChannelId::TERMINAL,
-            "unexpected heartbeat while sending"
-        );
+        while let Ok(f) = timeout(MS(1), raw.frame()).await {
+            if f.channel == ChannelId::CONTROL {
+                pings.push(t1.elapsed());
+            }
+        }
     }
+    assert!(
+        (2..=4).contains(&pings.len()),
+        "pings while sending: {pings:?}"
+    );
+    assert!(
+        pings.windows(2).all(|w| w[1] - w[0] >= MS(800)),
+        "more than one ping per heartbeat: {pings:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -539,7 +549,7 @@ async fn a_peer_that_goes_silent_while_the_consumer_lags_is_still_found_dead() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn past_the_budget_the_link_stops_reading_reports_degraded_and_recovers() {
+async fn past_the_budget_the_link_stops_reading_but_stays_up_and_recovers() {
     let mut small = cfg();
     small.inbound_budget = 1000;
     let (link, mut raw) = client_vs_raw(small, b"", ControlMsg::Detach).await;
@@ -548,11 +558,14 @@ async fn past_the_budget_the_link_stops_reading_reports_degraded_and_recovers() 
             .await;
     }
     sleep(MS(10)).await;
-    assert_eq!(link.status().borrow().state, LinkState::Degraded);
+    // A lagging consumer is not the peer's silence (efficiency sweep #2): the link is not
+    // `Degraded`, or the client would paint "no reply" over a perfectly good link for as long as
+    // a flood outpaces its terminal.
+    assert_eq!(link.status().borrow().state, LinkState::Up);
     // Frozen, not dead: the peer is silent but the consumer is the one holding things up.
     sleep(Duration::from_secs(60)).await;
-    assert_eq!(link.status().borrow().state, LinkState::Degraded);
-    // The consumer catches up: reading resumes and the link is Up again.
+    assert_eq!(link.status().borrow().state, LinkState::Up);
+    // The consumer catches up: reading resumes.
     assert_eq!(link.recv().await.unwrap().0, ChannelId::CONTROL);
     let mut seqs = Vec::new();
     for _ in 0..100 {
@@ -589,7 +602,11 @@ async fn a_flood_of_empty_frames_reaches_the_budget_too() {
         raw
     });
     sleep(Duration::from_secs(1)).await;
-    assert_eq!(link.status().borrow().state, LinkState::Degraded);
+    assert_eq!(
+        link.status().borrow().state,
+        LinkState::Up,
+        "lag is not silence"
+    );
     assert!(!flood.is_finished(), "the link kept reading");
     // How many entries the link holds: bounded by the 2 MiB budget at 64 per entry plus one
     // read's worth of tiny frames, not by the million sent. (Each recv completes without
@@ -1037,4 +1054,195 @@ async fn flush_delivers_everything_sent_before_it_over_a_simulated_stream() {
     // The close that follows a flush loses nothing.
     sleep(MS(100)).await;
     assert_eq!(reader.await.unwrap(), 4);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sweep S3: asymmetric heartbeats, packed writes
+
+/// A stream that counts the `write` calls that reach it.
+struct Counting<S> {
+    inner: S,
+    writes: Writes,
+}
+
+type Writes = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+fn writes_of(w: &Writes) -> usize {
+    w.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counting<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counting<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(r, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Efficiency sweep #7: both ends used to send a ping and a reply every second. Now the client
+/// pings and the daemon replies, so an idle link carries half the writes. Neither side loses
+/// sight of the other: both stay `Up` and both have a round-trip time.
+#[tokio::test(start_paused = true)]
+async fn an_idle_pipe_carries_one_ping_and_one_reply_a_second() {
+    let (a, mut b, _) = stream_pair(1, StreamConfig::default());
+    let (wa, wb): (Writes, Writes) = Default::default();
+    let a = Counting {
+        inner: a,
+        writes: wa.clone(),
+    };
+    let (client, daemon) = tokio::join!(
+        async { PipeLink::connect(a, cfg()).await.unwrap() },
+        async {
+            b.write_all(&preamble::encode(1)).await.unwrap();
+            let b = Counting {
+                inner: b,
+                writes: wb.clone(),
+            };
+            PipeLink::accept(b, cfg()).await.unwrap()
+        }
+    );
+    sleep(Duration::from_secs(2)).await;
+    let (a0, b0) = (writes_of(&wa), writes_of(&wb));
+    sleep(Duration::from_secs(30)).await;
+    let (ca, cb) = (writes_of(&wa) - a0, writes_of(&wb) - b0);
+    // The client's ping about every second and the daemon's reply: 30 each. Both pinging was 60
+    // each (a ping and a reply).
+    assert!((28..=34).contains(&ca), "client wrote {ca} times in 30 s");
+    assert!((28..=34).contains(&cb), "daemon wrote {cb} times in 30 s");
+    for link in [&client, &daemon] {
+        assert_eq!(link.status().borrow().state, LinkState::Up);
+        assert!(link.status().borrow().rtt.is_some());
+    }
+}
+
+/// The daemon does not ping while the client keeps talking to it, but it does ping on its own
+/// after one and a half heartbeats of silence from the client, and goes `Dead` by its own clock.
+#[tokio::test(start_paused = true)]
+async fn the_daemon_pings_on_its_own_only_after_a_heartbeat_and_a_half_of_silence() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(5)).await;
+    let t0 = Instant::now();
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    // The handshake ping and the reply to the peer's, at once.
+    assert_eq!(
+        ControlMsg::decode(&raw.frame().await.payload).unwrap(),
+        ping(0)
+    );
+    assert_eq!(
+        ControlMsg::decode(&raw.frame().await.payload).unwrap(),
+        ControlMsg::Heartbeat {
+            nonce: 5,
+            reply: true
+        }
+    );
+    // Then nothing for a heartbeat and a half.
+    let next = ControlMsg::decode(&raw.frame().await.payload).unwrap();
+    assert_eq!(next, ping(1));
+    let waited = t0.elapsed();
+    assert!((MS(1500)..=MS(1520)).contains(&waited), "{waited:?}");
+    // Unanswered, the link is Down(Dead) 5 s after the last thing it heard.
+    let mut st = link.status();
+    st.wait_for(|s| matches!(s.state, LinkState::Down(_)))
+        .await
+        .unwrap();
+    assert_eq!(st.borrow().state, LinkState::Down(DownReason::Dead));
+    assert!(t0.elapsed() <= MS(5100), "{:?}", t0.elapsed());
+}
+
+/// Efficiency sweep #8: every frame that is ready goes out in one `write`.
+#[tokio::test(start_paused = true)]
+async fn queued_small_frames_share_one_write() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let writes: Writes = Default::default();
+    let link = PipeLink::accept(
+        Counting {
+            inner: a,
+            writes: writes.clone(),
+        },
+        cfg(),
+    )
+    .await
+    .unwrap();
+    sleep(MS(10)).await;
+    let before = writes_of(&writes);
+    // 30 small frames, queued before the driver gets to run.
+    for i in 0..30u64 {
+        link.send(ChannelId::TERMINAL, data(i * 10, 1, 10))
+            .await
+            .unwrap();
+    }
+    link.flush().await.unwrap();
+    let used = writes_of(&writes) - before;
+    assert!(used <= 2, "{used} writes for 30 small frames");
+    // In order, all of them.
+    let mut seen = Vec::new();
+    while seen.len() < 30 {
+        let f = raw.frame().await;
+        if f.channel == ChannelId::TERMINAL {
+            seen.push(DataSegment::parse(&f.payload).unwrap().seq);
+        }
+    }
+    assert_eq!(seen, (0..30).map(|i| i * 10).collect::<Vec<u64>>());
+}
+
+/// Packing must not let bulk data hold a control frame back for more than about one write's
+/// worth: a control frame queued behind forward data still goes out first.
+#[tokio::test(start_paused = true)]
+async fn control_still_goes_ahead_of_packed_forward_data() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put_ctl(ping(0)).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    sleep(MS(10)).await;
+    for i in 0..8u64 {
+        link.send(ChannelId(16), data(i * 4000, 1, 4000))
+            .await
+            .unwrap();
+    }
+    let detach = Bytes::from(ControlMsg::Detach.encode().unwrap());
+    link.send(ChannelId::CONTROL, detach).await.unwrap();
+    // Drain what the link wrote: the control message precedes every forward frame.
+    sleep(MS(10)).await;
+    let mut order = Vec::new();
+    while let Ok(f) = timeout(MS(10), raw.frame()).await {
+        let is_detach = f.channel == ChannelId::CONTROL
+            && ControlMsg::decode(&f.payload) == Ok(ControlMsg::Detach);
+        if f.channel != ChannelId::CONTROL || is_detach {
+            order.push(f.channel);
+        }
+    }
+    assert_eq!(order.len(), 9, "{order:?}");
+    assert_eq!(order[0], ChannelId::CONTROL, "{order:?}");
 }

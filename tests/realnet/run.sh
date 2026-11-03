@@ -2,7 +2,7 @@
 # The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
 # topology, network namespaces and root for the UDP/NAT topology.
 #
-#   run.sh [ssh|udp|sysd|latency|all] [SCENARIO...]
+#   run.sh [ssh|udp|sysd|policy|latency|all] [SCENARIO...]
 #
 # Exit status: 0 if every scenario passed, 1 if any failed, 2 if the host cannot run it.
 set -uo pipefail
@@ -17,10 +17,11 @@ case $part in
   ssh) parts=(ssh) ;;
   udp) parts=(udp) ;;
   sysd) parts=(sysd) ;;
+  policy) parts=(policy) ;; # server policy, tests/realnet/policy.sh (plan S1)
   latency) parts=(latency) ;; # not in `all`: the latency lab, docs/m2/latency.md
-  all) parts=(ssh udp sysd) ;;
+  all) parts=(ssh udp sysd policy) ;;
   *)
-    echo "usage: run.sh [ssh|udp|sysd|latency|all] [SCENARIO...]" >&2
+    echo "usage: run.sh [ssh|udp|sysd|policy|latency|all] [SCENARIO...]" >&2
     exit 2
     ;;
 esac

@@ -605,6 +605,8 @@ pub(crate) struct Core<I, O> {
     attempt: u32,
     notice: Vec<String>,
     notice_until: Option<Instant>,
+    /// The server-policy refusal of the agent last shown (each new one is shown once).
+    agent_refused_shown: Option<fil_proto::mux::PolicyRefusal>,
     ack_due: Option<Instant>,
     first_attached: bool,
     /// The screen has been given back (overlay gone, cooked mode, the ending shown). A detach does
@@ -678,6 +680,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             attempt: 0,
             notice: Vec::new(),
             notice_until: None,
+            agent_refused_shown: None,
             ack_due: None,
             first_attached: false,
             screen_left: false,
@@ -1528,6 +1531,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;
         self.term_warning(&r.term);
+        self.agent_policy(r.agent_refused.as_ref());
         self.attached = Some(AttachInfo {
             kind: conn.kind,
             incarnation: r.incarnation,
@@ -2541,6 +2545,23 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// A different `TERM` than ours: noted now, printed with the other warnings before the
     /// first snapshot (section 6.4: keep the session's, warn once).
+    /// The host's server policy refuses the agent this run relays (DESIGN.md section 11.2): the
+    /// session has no agent socket. Said once on the overlay, naming the setting.
+    fn agent_policy(&mut self, why: Option<&fil_proto::mux::PolicyRefusal>) {
+        if why == self.agent_refused_shown.as_ref() {
+            return;
+        }
+        self.agent_refused_shown = why.cloned();
+        if let Some(why) = why {
+            tracing::debug!("the agent is refused by server policy");
+            self.notice = crate::text::wrap(
+                &format!("fil: agent forwarding refused by server policy: {why}"),
+                38,
+            );
+            self.notice_until = Some(Instant::now() + self.cfg.notice_for);
+        }
+    }
+
     fn term_warning(&mut self, session_term: &TermName) {
         if self.term_warned || self.first_attached {
             return;

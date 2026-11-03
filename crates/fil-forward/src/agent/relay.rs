@@ -125,7 +125,9 @@ pub struct KeyUses(Mutex<Uses>);
 #[derive(Default)]
 struct Uses {
     total: AgentUse,
-    by_fp: HashMap<String, usize>,
+    /// By fingerprint and whether it is a certificate: a key and its certificate share a
+    /// fingerprint (`ssh-add -l`'s) but are listed, and used, apart.
+    by_fp: HashMap<(String, bool), usize>,
     /// The agent's own last list: each key's blob, as it sent it, and what it shows.
     agent_keys: Vec<(Vec<u8>, KeyInfo)>,
 }
@@ -153,7 +155,7 @@ impl KeyUses {
     }
 
     fn entry(u: &mut Uses, info: KeyInfo) -> Option<&mut KeyUse> {
-        let i = match u.by_fp.get(&info.fingerprint) {
+        let i = match u.by_fp.get(&(info.fingerprint.clone(), info.certificate)) {
             Some(&i) => {
                 // The newest comment the agent gave wins (a key without one keeps its last).
                 if !info.comment.is_empty() {
@@ -162,7 +164,10 @@ impl KeyUses {
                 i
             }
             None if u.total.keys.len() < MAX_KEYS => {
-                u.by_fp.insert(info.fingerprint.clone(), u.total.keys.len());
+                u.by_fp.insert(
+                    (info.fingerprint.clone(), info.certificate),
+                    u.total.keys.len(),
+                );
                 u.total.keys.push(KeyUse {
                     info,
                     signs: 0,
@@ -688,6 +693,29 @@ impl<S: ForwardStream> ForwardStream for CountingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key and its certificate share `ssh-add -l`'s fingerprint, and are counted apart.
+    #[test]
+    fn a_key_and_its_certificate_are_two_rows() {
+        let info = |certificate| KeyInfo {
+            fingerprint: "SHA256:same".into(),
+            key_type: "ssh-ed25519".into(),
+            certificate,
+            comment: "me".into(),
+        };
+        let uses = KeyUses::default();
+        uses.listed(vec![info(false), info(true)]);
+        uses.signed(info(true));
+        let u = uses.snapshot();
+        assert_eq!(u.keys.len(), 2);
+        assert_eq!(
+            u.keys
+                .iter()
+                .map(|k| (k.info.certificate, k.signs))
+                .collect::<Vec<_>>(),
+            [(false, 0), (true, 1)]
+        );
+    }
 
     #[test]
     fn the_daemon_counts_messages_across_any_split() {

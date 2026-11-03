@@ -29,6 +29,8 @@
 //! - [`config`] reads `~/.config/fil/daemon.toml`.
 //! - [`linger`] is the warning for hosts that kill your processes at logout.
 //! - [`ports`] answers `fil ports`: the listeners, whose they are, and the probe.
+//! - The host's server policy (the sshd mirror and `/etc/fil/policy.toml`) is
+//!   [`fil_session::policy`]; the daemon reads it once ([`DaemonConfig::policy`]) for every session.
 
 pub mod config;
 pub mod daemon;

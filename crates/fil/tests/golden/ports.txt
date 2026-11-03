@@ -9,7 +9,8 @@ FORWARDED
   -D   *:1080 →              (SOCKS)              —                        0      —               —
        ⚠ not listening on the laptop: the port is already in use
        ⚠ bound beyond loopback: reachable from outside the laptop, not only through fil
-  -R   localhost:22 ←        127.0.0.1:41234      your laptop              0      —               —
+  -R   localhost:22 ←        127.0.0.1:0          your laptop              0      —               —
+       ⚠ refused by server policy: AllowTcpForwarding local (/etc/ssh/sshd_config:3)
        asked for by a process on the host (fil forward); not confirmed at this client yet
        asked the host for a free port
   -L   [::1]:8443 →          web.example.net:443  —                        0      —               —
@@ -30,6 +31,10 @@ LISTENING IN THIS SESSION, NOT FORWARDED
 AGENT
   relayed to this client: 1 connection open, 14 requests, last used 10:40
 
+REFUSED BY SERVER POLICY
+  -R *:8080:localhost:80: GatewayPorts no (OpenSSH's default)
+  agent forwarding: AllowAgentForwarding no (/etc/ssh/sshd_config:12)
+
 SESSION build on orin — not attached
 
 FORWARDED
@@ -43,5 +48,8 @@ OTHER LISTENERS YOU OWN ON THIS HOST
 
 LISTENERS OF OTHER USERS ON THIS HOST (port and address only)
   22  0.0.0.0 ⚠
+
+SERVER POLICY
+  fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes: what it sets is not mirrored
 
 (incomplete: the scan on the host stopped at one of its bounds; listeners may be missing)

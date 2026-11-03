@@ -122,11 +122,13 @@ fn a_stale_socket_is_not_reported_and_a_live_legacy_daemon_is() {
     fil_daemon::ensure_socket_dir(&s.dir).unwrap();
     let paths = Paths::in_dir(&s.dir).with_revision(rev_new());
 
-    // A crashed daemon of revision 9: socket and lock files left, nobody holds the lock.
-    drop(UnixListener::bind(s.dir.join("fil-1-9.sock")).unwrap());
-    std::fs::write(s.dir.join("fil-1-9.lock"), "12345\n").unwrap();
+    // A crashed daemon of another revision: socket and lock files left, nobody holds the lock.
+    // (Revisions past ours and `rev_new`'s, whatever ours is.)
+    let (crashed, clean) = (rev_new() + 2, rev_new() + 1);
+    drop(UnixListener::bind(s.dir.join(format!("fil-1-{crashed}.sock"))).unwrap());
+    std::fs::write(s.dir.join(format!("fil-1-{crashed}.lock")), "12345\n").unwrap();
     // A socket with no lock file at all (a daemon that exited cleanly removes both).
-    drop(UnixListener::bind(s.dir.join("fil-1-8.sock")).unwrap());
+    drop(UnixListener::bind(s.dir.join(format!("fil-1-{clean}.sock"))).unwrap());
     assert_eq!(fil_daemon::list_sockets(&s.dir).len(), 2);
     assert!(
         other_daemons(&paths).is_empty(),

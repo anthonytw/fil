@@ -380,10 +380,14 @@ impl Inner {
                 None => Response::NoSuchSession,
                 Some(h) => {
                     let result = h.forward(op);
-                    match result {
+                    match &result {
                         ForwardResult::Added(_) => tracing::info!("forward added by a request"),
                         ForwardResult::Removed(_) => {
                             tracing::info!("forward removed by a request");
+                        }
+                        // Which setting, at debug only (the session logs that).
+                        ForwardResult::Refused(fil_proto::mux::ForwardRefusal::Policy(_)) => {
+                            tracing::info!("forward request refused by server policy");
                         }
                         ForwardResult::Refused(why) => {
                             tracing::info!(?why, "forward request refused");
@@ -420,6 +424,7 @@ impl Inner {
                 membership,
                 forwards: h.forward_rows(),
                 agent: h.agent_row(),
+                refused: h.refused_rows(),
             });
         }
         // The focused session may have ended since it was looked up: then it is gone, as it
@@ -429,7 +434,8 @@ impl Inner {
         {
             return vec![Response::NoSuchSession];
         }
-        let q = PortsQuery::new(sessions, focus, self.cfg.ports_probe);
+        let mut q = PortsQuery::new(sessions, focus, self.cfg.ports_probe);
+        q.policy = self.host.policy.lines();
         crate::ports::ports(q).await.into_responses()
     }
 }

@@ -78,6 +78,7 @@ pub mod env;
 mod forward;
 mod handle;
 pub mod nofile;
+pub mod policy;
 pub mod proc;
 mod pty;
 pub mod queries;

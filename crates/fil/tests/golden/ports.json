@@ -50,7 +50,8 @@
             "http_status": 200,
             "label": "Vite + React"
           },
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 2,
@@ -76,7 +77,8 @@
           "last_unix_ms": 1699958400000,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 3,
@@ -99,7 +101,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 4,
@@ -114,8 +117,8 @@
           "origin": "request",
           "consented": false,
           "listen": {
-            "state": "listening",
-            "port": 41234
+            "state": "failed",
+            "reason": "policy"
           },
           "exposed": false,
           "connections": 0,
@@ -125,7 +128,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": "AllowTcpForwarding local (/etc/ssh/sshd_config:3)"
         },
         {
           "id": 5,
@@ -148,7 +152,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 6,
@@ -174,7 +179,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 7,
@@ -200,7 +206,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         },
         {
           "id": 8,
@@ -226,7 +233,8 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": false
+          "target_other_user": false,
+          "policy": null
         }
       ],
       "listeners": [
@@ -273,6 +281,16 @@
           "since_unix_ms": null,
           "probe": null
         }
+      ],
+      "refused": [
+        {
+          "what": "-R *:8080:localhost:80",
+          "reason": "GatewayPorts no (OpenSSH's default)"
+        },
+        {
+          "what": "agent",
+          "reason": "AllowAgentForwarding no (/etc/ssh/sshd_config:12)"
+        }
       ]
     },
     {
@@ -305,10 +323,12 @@
           "last_unix_ms": null,
           "owner": null,
           "probe": null,
-          "target_other_user": true
+          "target_other_user": true,
+          "policy": null
         }
       ],
-      "listeners": []
+      "listeners": [],
+      "refused": []
     }
   ],
   "host_listeners": [
@@ -347,5 +367,8 @@
       "since_unix_ms": null,
       "probe": null
     }
+  ],
+  "server_policy": [
+    "fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes: what it sets is not mirrored"
   ]
 }

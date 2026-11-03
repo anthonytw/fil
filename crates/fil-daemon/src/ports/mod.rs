@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsRow, ProcessInfo,
-    Response, SessionName, SessionSummary,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsRow,
+    ProcessInfo, RefusedRow, Response, SessionName, SessionSummary,
 };
 use fil_proto::mux::{ForwardKind, ListenState, Target, TargetHost};
 
@@ -60,6 +60,8 @@ pub struct SessionPorts {
     /// Its forward table as rows; `owner` and `probe` are filled in here for `-L` entries.
     pub forwards: Vec<ForwardRow>,
     pub agent: Option<AgentRow>,
+    /// What server policy refused in the session's current run.
+    pub refused: Vec<RefusedRow>,
 }
 
 /// Everything one `fil ports` answer needs.
@@ -86,6 +88,8 @@ pub struct PortsQuery {
     /// never attributed at all; they are kept out by their forward rows' ports and because only
     /// attributed listeners are probed.
     pub daemon_pid: Option<u32>,
+    /// What to say about the host's server policy (DESIGN.md section 11.2), after the rest.
+    pub policy: Vec<PolicyLine>,
 }
 
 impl PortsQuery {
@@ -102,6 +106,7 @@ impl PortsQuery {
             probe_limits: LIMITS,
             scan: ScanLimits::default(),
             daemon_pid: Some(std::process::id()),
+            policy: Vec::new(),
         }
     }
 }
@@ -482,6 +487,7 @@ pub fn layout(
         if let Some(a) = &s.agent {
             rows.push(PortsRow::Agent(a.clone()));
         }
+        rows.extend(s.refused.iter().cloned().map(PortsRow::Refused));
     }
     let known = |n: &SessionName| sessions.iter().any(|s| &s.summary.name == n);
     let picked = |want_own: bool| -> Vec<(&Found, ListenerOwner)> {
@@ -555,6 +561,8 @@ pub async fn ports(q: PortsQuery) -> Answer {
         tracing::debug!(?why, "the listener scan is incomplete");
     }
     let (mut rows, slots) = layout(&q.sessions, q.focus.as_ref(), &d);
+    // At the end, so the probe slots' row numbers stay right.
+    rows.extend(q.policy.iter().cloned().map(PortsRow::Policy));
     let mut addrs: Vec<SocketAddr> = slots.iter().map(|s| s.addr).collect();
     addrs.sort();
     addrs.dedup();
@@ -643,6 +651,7 @@ mod tests {
             owner: None,
             probe: None,
             target_other_user: false,
+            policy: None,
         }
     }
 
@@ -693,12 +702,14 @@ mod tests {
                     forward("main", ForwardKind::Remote, 9000, Some(("127.0.0.1", 9000))),
                 ],
                 agent: None,
+                refused: vec![],
             },
             SessionPorts {
                 summary: summary("other"),
                 membership: Membership::Pids(vec![9999]),
                 forwards: vec![],
                 agent: None,
+                refused: vec![],
             },
         ]
     }
@@ -800,6 +811,8 @@ mod tests {
                     }
                 ),
                 PortsRow::Agent(_) => "agent".into(),
+                PortsRow::Policy(_) => "policy".into(),
+                PortsRow::Refused(_) => "refused".into(),
             })
             .collect();
         assert_eq!(
@@ -896,6 +909,7 @@ mod tests {
             membership: Membership::Pids(vec![]),
             forwards,
             agent: None,
+            refused: vec![],
         }]
     }
 
@@ -1064,6 +1078,7 @@ mod tests {
                 membership: Membership::Pids(vec![9]),
                 forwards: vec![],
                 agent: None,
+                refused: vec![],
             },
             SessionPorts {
                 summary: summary("b"),
@@ -1075,6 +1090,7 @@ mod tests {
                     Some(("127.0.0.1", 5000)),
                 )],
                 agent: None,
+                refused: vec![],
             },
         ];
         let (rows, _) = layout(&s, Some(&name("a")), &d);
@@ -1396,6 +1412,7 @@ mod tests {
             membership: Membership::Pids(vec![mine.id()]),
             forwards: vec![target("127.0.0.1", 1), target("localhost", 2)],
             agent: None,
+            refused: vec![],
         }];
         let mut q = PortsQuery::new(s, None, ProbeMode::Full);
         q.daemon_pid = None;

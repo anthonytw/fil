@@ -187,7 +187,7 @@ impl Ctx {
         }
         let out = self.targets.gate_reset(host)?;
         if self.verbose {
-            eprintln!("[{host}] {}", out.trim());
+            eprintln!("[{host}] {}", self.targets.scrub(out.trim()));
         }
         Ok(())
     }
@@ -390,6 +390,15 @@ fn main() {
             _ => usage(),
         }
     }
+    // A typo in --only must not give a green run that tested nothing.
+    if let Some(o) = &only
+        && let Some(bad) = o
+            .iter()
+            .find(|x| !scenarios().iter().any(|(n, _)| *n == x.as_str()))
+    {
+        eprintln!("--only: \"{bad}\" is not a scenario (`--list` shows them)");
+        std::process::exit(2);
+    }
     // The targets are required and are the whole list of hosts this program may touch.
     let raw = if local {
         String::new()
@@ -453,7 +462,7 @@ fn main() {
                     std::process::exit(2);
                 })
         };
-        println!("== {host}: {}", version.trim());
+        println!("== {host}: {}", ctx.targets.scrub(version.trim()));
         for (name, f) in scenarios() {
             if let Some(o) = &only
                 && !o.iter().any(|x| x == name)
@@ -504,8 +513,14 @@ fn main() {
                 }
                 End::Skip(notes) => {
                     skipped.push(format!("{host} {name}"));
-                    println!("SKIP {host} {name} ({secs:.1} s): {}", notes.join("; "));
-                    table.push(format!("| {host} | {name} | skip | {} |", notes.join("; ")));
+                    println!(
+                        "SKIP {host} {name} ({secs:.1} s): {}",
+                        ctx.targets.scrub(&notes.join("; "))
+                    );
+                    table.push(format!(
+                        "| {host} | {name} | skip | {} |",
+                        ctx.targets.scrub(&notes.join("; "))
+                    ));
                 }
                 End::Xfail(e) => {
                     xfailed.push(format!("{host} {name}"));
@@ -603,6 +618,10 @@ fn main() {
             format!(" ({})", xfailed.join(", "))
         },
     );
+    if ran == 0 {
+        println!("FAIL: no scenario ran");
+        failures += 1;
+    }
     if failures > 0 {
         std::process::exit(1);
     }

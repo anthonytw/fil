@@ -23,8 +23,9 @@ pub struct FieldResult {
     pub verdict: Verdict,
 }
 
-/// Every field name [`compare`] reports, in order.
-pub const FIELDS: &[&str] = &[
+/// Every field name [`compare`] reports, in order (the tests hold the report to it).
+#[cfg(test)]
+const FIELDS: &[&str] = &[
     "screen.text",
     "screen.wide",
     "screen.colors",

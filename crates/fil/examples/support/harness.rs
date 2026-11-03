@@ -151,20 +151,64 @@ impl Targets {
         status.contains("server --daemon") || status.contains(".sock")
     }
 
-    /// Real host names out of a message, labels in. For anything a driver prints.
+    /// Real host names and addresses out of a message, labels in. For anything a driver prints.
     pub fn scrub(&self, s: &str) -> String {
         let mut s = s.to_string();
         for (label, target) in &self.map {
             let host = target.rsplit('@').next().unwrap_or_default();
-            let short = host.split('.').next().unwrap_or_default();
+            // The first component of an address is not a name ("192" would also hit "1923 ms").
+            let short = if host.parse::<std::net::IpAddr>().is_ok() {
+                ""
+            } else {
+                host.split('.').next().unwrap_or_default()
+            };
             for needle in [target.as_str(), host, short] {
                 if needle.len() >= 3 {
                     s = s.replace(needle, label);
                 }
             }
         }
-        s
+        scrub_addresses(&s)
     }
+}
+
+/// Every IP address in the text except loopback and the unspecified address becomes `<ip>`: a
+/// hostname target resolves to addresses the target list never named, and logs print them.
+fn scrub_addresses(s: &str) -> String {
+    use std::net::IpAddr;
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        // A candidate is a maximal run of address characters: it parses whole or not at all.
+        let end = rest
+            .find(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let run = &rest[..end];
+        // Trailing punctuation belongs to the sentence ("at 10.0.0.1." or "to fe80::1:").
+        let tok = run.trim_end_matches(['.', ':']);
+        // `1.2.3.4:443` is an address and a port; an IPv6 address has its port after a `]`.
+        let addr = match tok.parse::<IpAddr>() {
+            Ok(ip) => Some((ip, tok.len())),
+            Err(_) => tok
+                .split_once(':')
+                .and_then(|(h, _)| Some((h.parse::<IpAddr>().ok()?, h.len()))),
+        };
+        match addr {
+            Some((ip, n)) if !ip.is_loopback() && !ip.is_unspecified() => {
+                out.push_str("<ip>");
+                out.push_str(&run[n..]);
+            }
+            _ => out.push_str(run),
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 /// The sessions in `fil ls` output whose names start with `prefix`.
@@ -673,6 +717,24 @@ mod tests {
         assert!(Targets::parse("pi1=-oProxyCommand=x", &[]).is_err());
         assert!(Targets::parse("pi1=u@h;rm", &[]).is_err());
         assert!(Targets::parse("pi1", &[]).is_err());
+    }
+
+    #[test]
+    fn addresses_are_scrubbed_but_a_target_that_is_one_keeps_its_numbers() {
+        let t = Targets::parse("pi1=fil-test@192.0.2.9", &[]).unwrap();
+        let s = t.scrub(
+            "ok in 1923 ms, peer 198.51.100.3:4433 via fe80::1a2b, lo 127.0.0.1 [::1], to 192.0.2.9.",
+        );
+        assert_eq!(
+            s,
+            "ok in 1923 ms, peer <ip>:4433 via <ip>, lo 127.0.0.1 [::1], to pi1."
+        );
+        // A name's addresses never appear in the target list; they are scrubbed all the same.
+        let t = Targets::parse("pi2=u@alpha.example", &[]).unwrap();
+        assert_eq!(
+            t.scrub("dialled 203.0.113.5. Time 10:30:45"),
+            "dialled <ip>. Time 10:30:45"
+        );
     }
 
     #[test]

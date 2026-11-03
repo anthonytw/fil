@@ -124,7 +124,8 @@ pub fn has_line(out: &str, want: &str) -> bool {
 
 impl Ctx {
     /// A client with a shell that works, a neutral prompt (so no host name is ever on screen),
-    /// and a scratch directory `$D` of its own under `/tmp/dp.*`.
+    /// a history that goes nowhere (on --local it would be the developer's own), and a scratch directory
+    /// `$D` of its own under `/tmp/dp.*`.
     pub fn shell(&self, host: &str, variant: Variant, name: &str) -> Result<Client, String> {
         self.shell_sized(host, variant, name, 30, 100)
     }
@@ -148,7 +149,7 @@ impl Ctx {
         };
         c.run(
             &format!(
-                "PS1='fil$ '; unset PROMPT_COMMAND; {sweep}D=$(mktemp -d /tmp/dp.XXXXXX) && cd \"$D\""
+                "PS1='fil$ '; unset PROMPT_COMMAND; HISTFILE=/dev/null; {sweep}D=$(mktemp -d /tmp/dp.XXXXXX) && cd \"$D\""
             ),
             CMD_TIMEOUT,
         )?;

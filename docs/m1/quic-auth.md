@@ -76,4 +76,4 @@ Not covered here: stateless retry and handshake rate limiting (§8.3, "exposure 
 
 ## Tests
 
-`cargo test -p fil-transport` runs 8 handshake tests over `fil-netsim`'s datagram link (paused time, about 20 ms) plus 3 unit tests. Mutation check: replacing either verifier's signature check with an unconditional `Ok` makes the two signature tests fail (right certificate with a different signing key, and registered public key without its private key).
+`cargo test -p fil-transport` runs 9 handshake tests over `fil-netsim`'s datagram link (paused time, about 20 ms) plus 3 unit tests. Mutation check: replacing either verifier's signature check with an unconditional `Ok` makes the two signature tests fail (right certificate with a different signing key, and registered public key without its private key).

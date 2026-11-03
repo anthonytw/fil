@@ -85,7 +85,7 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Packages (musl for static binaries; namespace and firewall tools)
-        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server
+        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server vim less
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1

@@ -121,7 +121,14 @@ pub fn client_sleep(ctx: &Ctx, host: &str) -> Res {
             ms(settled)
         ));
         if ctx.verbose {
-            eprintln!("--- client log ({}) ---\n{}", variant.tag(), c.log());
+            eprintln!(
+                "{}",
+                ctx.targets.scrub(&format!(
+                    "--- client log ({}) ---\n{}",
+                    variant.tag(),
+                    c.log()
+                ))
+            );
         }
         finish(c)?;
         ctx.reset(host)?;

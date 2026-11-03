@@ -35,7 +35,7 @@ pub const MAX_SESSION_NAME: usize = 64;
 pub const MAX_TERM: usize = 64;
 /// Longest host label.
 pub const MAX_HOST_LABEL: usize = 128;
-/// Longest opaque public key (a raw Ed25519 key is 32 bytes; room for other encodings).
+/// Longest opaque public key (an ECDSA P-256 SubjectPublicKeyInfo is 91 bytes; room for other encodings).
 pub const MAX_PUBLIC_KEY: usize = 256;
 /// Longest opaque certificate fingerprint (SHA-256 is 32 bytes).
 pub const MAX_FINGERPRINT: usize = 64;

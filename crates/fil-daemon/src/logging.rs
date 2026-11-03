@@ -26,6 +26,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -130,15 +131,28 @@ impl RotatingLog {
     /// Runs [`maintain`](Self::maintain) every `every` on a thread of its own, for as long as the
     /// process lives. The daemon and the client do this hourly ([`MAINTAIN_EVERY`]).
     pub fn keep_tidy(self: &Arc<Self>, every: Duration) {
+        let _ = self.tidy_thread(every, Arc::new(AtomicBool::new(false)));
+    }
+
+    /// The thread behind [`keep_tidy`](Self::keep_tidy): it ends, between two rounds, once `stop`
+    /// is set (a test joins it before it removes the log's directory).
+    fn tidy_thread(
+        self: &Arc<Self>,
+        every: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
         let log = Arc::clone(self);
-        let _ = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("fil-log".into())
             .spawn(move || {
                 loop {
                     std::thread::sleep(every);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     log.maintain();
                 }
-            });
+            })
     }
 
     fn rotate(&self, st: &mut State) {
@@ -632,12 +646,21 @@ mod tests {
         };
         let log = Arc::new(RotatingLog::open(&path, policy).unwrap());
         write(&log, "once\n");
-        log.keep_tidy(Duration::from_millis(40));
+        let stop = Arc::new(AtomicBool::new(false));
+        let tick = log
+            .tidy_thread(Duration::from_millis(40), Arc::clone(&stop))
+            .unwrap();
         let end = Instant::now() + Duration::from_secs(5);
-        while !rotated_path(&path).exists() {
-            assert!(Instant::now() < end, "nothing rotated an idle log");
+        let mut rotated = rotated_path(&path).exists();
+        while !rotated && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
+            rotated = rotated_path(&path).exists();
         }
+        // Stop the tick before the directory goes: it may be rotating right now, and a rename
+        // into a directory being removed leaves it not empty.
+        stop.store(true, Ordering::Relaxed);
+        tick.join().unwrap();
+        assert!(rotated, "nothing rotated an idle log");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

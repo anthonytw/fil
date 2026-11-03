@@ -56,7 +56,8 @@ impl EscapeFilter {
     }
 
     /// True while a `~` is being held back.
-    pub fn holding_tilde(&self) -> bool {
+    #[cfg(test)]
+    fn holding_tilde(&self) -> bool {
         self.state == State::Tilde
     }
 

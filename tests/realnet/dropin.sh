@@ -60,7 +60,7 @@ dp_battery() {
     fc_wait "$n" 'VIMEXACT-42' 10
     note "$tag.vim=ok"
   else
-    note "$tag.vim=SKIP(no vim or vi)"
+    fail "$tag: no vim or vi on this machine (the drop-in battery needs an editor: install vim)"
   fi
 
   # less: page forward, search, quit.
@@ -79,6 +79,8 @@ dp_battery() {
     sleep 1
     fc_ready "$n"
     note "$tag.less=ok"
+  else
+    fail "$tag: no less on this machine (the drop-in battery needs a pager: install less)"
   fi
 
   # A long, fast flood: complete and in order.
@@ -154,11 +156,12 @@ dp_battery() {
 }
 
 # dp_start_vim NAME: in the client's shell: a scratch directory, a file, the editor
-# open on it, in insert mode on a new last line. Sets DP_ED. Returns 1 if there is no editor.
+# open on it, in insert mode on a new last line. Sets DP_ED. Fails the scenario if there is no
+# editor: a skipped drop-in check is not a pass.
 dp_start_vim() {
   local n=$1
   DP_ED=$(dp_editor)
-  [[ -n $DP_ED ]] || return 1
+  [[ -n $DP_ED ]] || fail "no vim or vi on this machine (the drop-in scenarios need an editor: install vim)"
   fc_line "$n" "PS1='fil\$ '"
   fc_line "$n" 'cd $(mktemp -d) && echo start > e.txt'
   fc_ready "$n"

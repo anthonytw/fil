@@ -170,7 +170,8 @@ impl MemControl {
     }
 
     /// Both ends report a path change (QUIC migration).
-    pub fn path_changed(&self) {
+    #[cfg(test)]
+    fn path_changed(&self) {
         self.a.send_modify(|s| s.path_generation += 1);
         self.b.send_modify(|s| s.path_generation += 1);
     }

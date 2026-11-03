@@ -190,6 +190,16 @@ pub async fn pipe_through_relay(opts: RelayOptions) -> PipeLink {
         .expect("pipe link through the relay")
 }
 
+/// A client key as the protocol carries it.
+pub fn proto_key(k: &fil_transport::auth::ClientKey) -> fil_proto::msg::PublicKey {
+    fil_proto::msg::PublicKey::new(k.public_key().as_spki_der().to_vec()).unwrap()
+}
+
+/// A protocol key as the transport's registry holds it.
+pub fn transport_key(k: &fil_proto::msg::PublicKey) -> fil_transport::auth::PublicKey {
+    fil_transport::auth::PublicKey::from_spki_der(k.as_bytes())
+}
+
 pub fn hello() -> ControlMsg {
     ControlMsg::Hello(Hello::ours(Agent::new("test").unwrap()))
 }

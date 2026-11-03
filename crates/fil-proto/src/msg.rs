@@ -376,6 +376,75 @@ pub enum AttachRefusal {
     WrongKey,
 }
 
+/// Who is attached to a session, as `fil ls` shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriberSummary {
+    pub host: HostLabel,
+    /// Milliseconds since the Unix epoch.
+    pub since_unix_ms: u64,
+}
+
+/// One session, as `fil ls` shows it (DESIGN.md section 14).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub name: SessionName,
+    pub term: TermName,
+    /// Milliseconds since the Unix epoch.
+    pub created_unix_ms: u64,
+    /// Milliseconds since the Unix epoch of the last PTY output; 0 if there was none.
+    pub last_output_unix_ms: u64,
+    /// `None` when detached.
+    pub attached: Option<SubscriberSummary>,
+}
+
+/// Session management (`fil ls`, `fil kill`, `fil detach`). The remote command is fixed
+/// (section 8.2), so these travel inside the protocol: a client sends `Hello`, then one
+/// `Request` instead of an `Attach`, and the daemon answers with one `Response`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    ListSessions,
+    /// End the session: its process group is killed (section 5.1).
+    KillSession {
+        name: SessionName,
+    },
+    /// Detach whoever is attached (section 5.2): their key is revoked and their transport
+    /// dropped. The session keeps running.
+    DetachSession {
+        name: SessionName,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Response {
+    /// `truncated` is set when the list did not fit in one control message; see
+    /// [`Response::sessions`].
+    Sessions {
+        list: Vec<SessionSummary>,
+        truncated: bool,
+    },
+    Done,
+    NoSuchSession,
+}
+
+impl Response {
+    /// A `Sessions` response holding as many of `list` as fit in one control message (the list is
+    /// kept in order and cut at the end).
+    pub fn sessions(mut list: Vec<SessionSummary>) -> Self {
+        let mut truncated = false;
+        loop {
+            let r = Response::Sessions {
+                list: list.clone(),
+                truncated,
+            };
+            if ControlMsg::Response(r.clone()).encode().is_ok() || list.is_empty() {
+                return r;
+            }
+            list.pop();
+            truncated = true;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     VersionMismatch,
@@ -436,6 +505,16 @@ pub enum ControlMsg {
         input_upto: u64,
         output_at: u64,
     },
+    /// Daemon to client: the session's shell exited, after all of its output was sent. The link
+    /// closes after this. Exactly one of `code` and `signal` is set when the status is known.
+    SessionExited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// Client to daemon, in place of `Attach`: see [`Request`].
+    Request(Request),
+    /// Daemon to client: the answer to a [`Request`].
+    Response(Response),
 }
 
 impl ControlMsg {
@@ -590,6 +669,33 @@ mod tests {
                 input_upto: 12,
                 output_at: 4100,
             },
+            ControlMsg::SessionExited {
+                code: Some(0),
+                signal: None,
+            },
+            ControlMsg::SessionExited {
+                code: None,
+                signal: Some(9),
+            },
+            ControlMsg::Request(Request::ListSessions),
+            ControlMsg::Request(Request::KillSession {
+                name: "build".parse().unwrap(),
+            }),
+            ControlMsg::Request(Request::DetachSession {
+                name: "main".parse().unwrap(),
+            }),
+            ControlMsg::Response(Response::Done),
+            ControlMsg::Response(Response::NoSuchSession),
+            ControlMsg::Response(Response::sessions(vec![SessionSummary {
+                name: "main".parse().unwrap(),
+                term: "xterm-256color".parse().unwrap(),
+                created_unix_ms: 1,
+                last_output_unix_ms: 2,
+                attached: Some(SubscriberSummary {
+                    host: "laptop".parse().unwrap(),
+                    since_unix_ms: 3,
+                }),
+            }])),
             ControlMsg::Detach,
             ControlMsg::Resize(TermSize::new(200, 50).unwrap()),
             ControlMsg::Heartbeat {
@@ -661,5 +767,33 @@ mod tests {
         // Huge declared string/bytes lengths against a tiny buffer must fail without allocating.
         let huge = [1u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, b'a'];
         assert!(ControlMsg::decode(&huge).is_err());
+    }
+
+    #[test]
+    fn a_long_session_list_is_cut_to_fit_one_control_message() {
+        let one = |i: usize| SessionSummary {
+            name: format!("session-{i:04}").parse().unwrap(),
+            term: "xterm-256color".parse().unwrap(),
+            created_unix_ms: u64::MAX,
+            last_output_unix_ms: u64::MAX,
+            attached: Some(SubscriberSummary {
+                host: "a-fairly-long-host-label.example".parse().unwrap(),
+                since_unix_ms: u64::MAX,
+            }),
+        };
+        let r = Response::sessions((0..500).map(one).collect());
+        let Response::Sessions { list, truncated } = &r else {
+            panic!("not a session list")
+        };
+        assert!(truncated);
+        assert!(!list.is_empty() && list.len() < 500);
+        assert_eq!(list[0], one(0), "kept in order, cut at the end");
+        let wire = ControlMsg::Response(r.clone()).encode().unwrap();
+        assert_eq!(ControlMsg::decode(&wire).unwrap(), ControlMsg::Response(r));
+
+        let short = Response::sessions((0..3).map(one).collect());
+        assert!(
+            matches!(short, Response::Sessions { truncated: false, ref list } if list.len() == 3)
+        );
     }
 }

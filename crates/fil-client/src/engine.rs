@@ -1014,6 +1014,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     )));
                 }
             }
+            // The link closes right after this; reporting the exit status lands with the
+            // M1 follow-ups (docs/m1/plan.md).
+            ControlMsg::SessionExited { .. } => {}
+            // Management messages belong to `fil ls`/`kill`/`detach`, never to an attach.
+            ControlMsg::Request(_) | ControlMsg::Response(_) => {
+                return Err(ClientError::Protocol(
+                    "the daemon sent a management message during an attach".into(),
+                ));
+            }
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }

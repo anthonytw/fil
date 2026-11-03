@@ -323,6 +323,10 @@ pub struct ResumeRequest {
 pub struct Attach {
     pub name: SessionName,
     pub size: TermSize,
+    /// The generation of `size` (DESIGN.md section 8.5): the client counts its size changes. A
+    /// resumed attach whose generation is not newer than the session's is stale and resizes
+    /// nothing; a fresh attach always sets the size.
+    pub size_gen: u64,
     pub term: TermName,
     /// Shown to the previous subscriber if this attach takes the session over.
     pub host: HostLabel,
@@ -501,7 +505,6 @@ pub enum ControlMsg {
     /// To the old subscriber, just before its transport is dropped.
     TakenOver(TakenOver),
     Detach,
-    Resize(TermSize),
     /// A ping (`reply: false`) is answered with the same nonce and `reply: true`.
     Heartbeat {
         nonce: u32,
@@ -618,6 +621,7 @@ mod tests {
         let good = ControlMsg::Attach(Attach {
             name: name("main"),
             size: TermSize::new(80, 24).unwrap(),
+            size_gen: 3,
             term: "xterm-256color".parse().unwrap(),
             host: "laptop".parse().unwrap(),
             key: PublicKey::new(vec![7; 32]).unwrap(),
@@ -656,10 +660,11 @@ mod tests {
         assert!(Fingerprint::new(vec![0; 65]).is_err());
         assert!(Fingerprint::new(vec![]).is_err());
         // A zero size or an oversize key on the wire is refused.
-        let bad = postcard::to_allocvec(&ControlMsg::Resize(TermSize::new(1, 1).unwrap())).unwrap();
-        let mut zero = bad.clone();
+        let ok = postcard::to_allocvec(&TermSize::new(1, 1).unwrap()).unwrap();
+        assert!(postcard::from_bytes::<TermSize>(&ok).is_ok());
+        let mut zero = ok.clone();
         *zero.last_mut().unwrap() = 0;
-        assert!(ControlMsg::decode(&zero).is_err());
+        assert!(postcard::from_bytes::<TermSize>(&zero).is_err());
     }
 
     #[test]
@@ -735,7 +740,6 @@ mod tests {
                 }),
             }])),
             ControlMsg::Detach,
-            ControlMsg::Resize(TermSize::new(200, 50).unwrap()),
             ControlMsg::Heartbeat {
                 nonce: 9,
                 reply: true,
@@ -798,7 +802,7 @@ mod tests {
             let n = rng.random_range(0..300);
             let mut d: Vec<u8> = (0..n).map(|_| rng.random()).collect();
             if !d.is_empty() {
-                d[0] = rng.random_range(0..14); // hit real variants
+                d[0] = rng.random_range(0..17); // hit real variants
             }
             let _ = ControlMsg::decode(&d);
         }

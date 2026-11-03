@@ -81,6 +81,12 @@ impl SendChannel {
         self.ring.end() - self.next
     }
 
+    /// The offset of the next byte to put on the wire: where a record placed in the stream now
+    /// sits (see [`crate::input`]).
+    pub fn next_seq(&self) -> u64 {
+        self.next
+    }
+
     /// Sequence number the peer has acknowledged up to.
     pub fn acked(&self) -> u64 {
         self.ring.start()

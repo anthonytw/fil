@@ -47,6 +47,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::{AckError, Segment};
 use fil_proto::frame::DataSegment;
+use fil_proto::input::{InputRecord, TerminalInput};
 use fil_proto::limits::MAX_DATA_PAYLOAD;
 use fil_proto::log::should_snapshot;
 use fil_proto::msg::{Attach, AttachRefusal, ControlMsg, ErrorCode, TakenOver};
@@ -485,14 +486,6 @@ impl<'a, L: Link> Conn<'a, L> {
                         }
                         self.acked.notify_one();
                     }
-                    Ok(ControlMsg::Resize(size)) => {
-                        self.handle
-                            .send(Cmd::Resize {
-                                conn: self.id,
-                                size,
-                            })
-                            .await;
-                    }
                     Ok(ControlMsg::Detach) => {
                         self.handle.send(Cmd::Detach { conn: self.id }).await;
                         return ServeEnd::Detached;
@@ -502,13 +495,24 @@ impl<'a, L: Link> Conn<'a, L> {
                     Ok(other) => tracing::debug!(?other, "ignored control message"),
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },
-                ChannelId::TERMINAL => match DataSegment::parse(&payload) {
-                    Ok(seg) => {
+                ChannelId::TERMINAL => match TerminalInput::parse(&payload) {
+                    Ok(TerminalInput::Keys(seg)) => {
                         self.handle
                             .send(Cmd::Input {
                                 conn: self.id,
                                 seq: seg.seq,
                                 data: seg.data.to_vec(),
+                            })
+                            .await;
+                    }
+                    // In order with the keys: both come off this one channel.
+                    Ok(TerminalInput::Record(InputRecord::Resize { at, size_gen, size })) => {
+                        self.handle
+                            .send(Cmd::Resize {
+                                conn: self.id,
+                                at,
+                                size_gen,
+                                size,
                             })
                             .await;
                     }

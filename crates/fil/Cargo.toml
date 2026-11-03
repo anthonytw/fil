@@ -26,6 +26,7 @@ toml = "0.9"
 tracing = "0.1"
 
 [dev-dependencies]
+fil-session = { path = "../fil-session" }
 fil-term = { path = "../fil-term" }
 portable-pty = "0.9"
 vt100 = "0.18"

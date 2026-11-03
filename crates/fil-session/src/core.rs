@@ -362,8 +362,11 @@ pub(crate) enum Cmd {
         seq: u64,
         data: Vec<u8>,
     },
+    /// An [`fil_proto::InputRecord::Resize`] from the terminal channel, in order with the input.
     Resize {
         conn: ConnId,
+        at: u64,
+        size_gen: u64,
         size: TermSize,
     },
     Detach {
@@ -447,6 +450,9 @@ pub(crate) struct Core {
     live: Option<Live>,
     next_conn: ConnId,
     size: TermSize,
+    /// The generation of `size` (DESIGN.md section 8.5): a size is applied only if its generation
+    /// is newer, so a stale one can never replace a newer one.
+    size_gen: u64,
 
     emu: Box<dyn Emulator>,
     boundary: Boundary,
@@ -595,6 +601,7 @@ pub(crate) fn start(
         live: None,
         next_conn: 0,
         size: cfg.size,
+        size_gen: 0,
         emu,
         boundary: Boundary::new(),
         tail: Vec::new(),
@@ -738,11 +745,12 @@ impl Core {
                 });
             }
             Cmd::Input { conn, seq, data } => self.on_input(conn, seq, data),
-            Cmd::Resize { conn, size } => {
-                if self.live.as_ref().is_some_and(|l| l.conn == conn) {
-                    self.apply_resize(size);
-                }
-            }
+            Cmd::Resize {
+                conn,
+                at,
+                size_gen,
+                size,
+            } => self.on_resize_record(conn, at, size_gen, size),
             Cmd::Detach { conn } => self.on_detach(conn),
             Cmd::ConnGone { conn } => {
                 if self.live.as_ref().is_some_and(|l| l.conn == conn) {
@@ -1012,6 +1020,29 @@ impl Core {
         });
     }
 
+    /// A resize record arrived between the input bytes before `at` and the ones from `at` on. It
+    /// is applied here, before any later input is handed to the PTY, which is the whole point of
+    /// sending it in band.
+    fn on_resize_record(&mut self, conn: ConnId, at: u64, size_gen: u64, size: TermSize) {
+        if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
+            return;
+        }
+        // The client puts a record at the offset of the next byte it will send, which it knows
+        // from our `Resume`: beyond what we have received is a gap, as for input.
+        if at > self.input.received() {
+            tracing::warn!("resize record beyond the input received");
+            tracing::debug!(session = %self.name, "resize record beyond the input received in");
+            self.send(ConnEvent::Fatal(ErrorCode::Protocol));
+            return;
+        }
+        // An older or repeated generation is stale (the attach already carried it, or a newer
+        // record did): ignored, not an error.
+        if size_gen > self.size_gen {
+            self.size_gen = size_gen;
+            self.apply_resize(size);
+        }
+    }
+
     fn apply_effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -1058,6 +1089,20 @@ impl Core {
                 mode,
                 effects,
             } => (epoch, subscriber, mode, effects),
+        };
+        // A fresh attach sets the size (and its generation) unconditionally: it is a new
+        // subscriber, whose generations count from its own start. A resumed one is the same
+        // client again, whose size the session may already know better (a record on the old link
+        // can have outrun this attach): it applies only if it is newer.
+        let size_is_news = matches!(mode, AttachMode::Fresh) || a.size_gen > self.size_gen;
+        let effects = if size_is_news {
+            self.size_gen = a.size_gen;
+            effects
+        } else {
+            effects
+                .into_iter()
+                .filter(|e| !matches!(e, Effect::ResizePty(_)))
+                .collect()
         };
         self.apply_effects(effects);
 

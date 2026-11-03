@@ -1118,6 +1118,7 @@ mod tests {
             host: "test".parse().unwrap(),
             key: msg::PublicKey::new(vec![9; 32]).unwrap(),
             echo_ack: false,
+            size_gen: 0,
             resume: None,
         }
     }

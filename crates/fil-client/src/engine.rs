@@ -815,6 +815,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             let state = primary.status.borrow_and_update().state.clone();
                             match state {
                                 LinkState::Up => self.link_recovered(&primary.conn)?,
+                                // `Degraded` means the peer has been silent (the link contract,
+                                // DESIGN.md section 8.1; the pipe keeps a link whose *consumer*
+                                // lags `Up`). It is the only thing that puts "no reply" on the
+                                // status line: our own slowness never does.
                                 LinkState::Degraded => {
                                     if primary.conn.awaiting_reply || self.link_ok {
                                         self.link_quiet()?;

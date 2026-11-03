@@ -12,6 +12,6 @@ fil is a remote shell for development over SSH that keeps your place:
 
 It has no panes: your terminal already does that.
 
-**Status:** design stage. There's nothing to install yet. See [DESIGN.md](DESIGN.md).
+**Status:** in development. The link simulator, the prediction overlay, sessions, the client and both transports are built and being hardened; there is no release yet, so there's nothing to install. See [DESIGN.md](DESIGN.md).
 
 **License:** [GPL-3.0-or-later](LICENSE).

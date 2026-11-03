@@ -1,12 +1,16 @@
 //! Shared helpers for the real-network harness binaries (`tests/realnet`, `docs/m1/realnet.md`).
 //!
-//! Three programs live here, both test-only and never shipped:
+//! Seven programs live here, all test-only and never shipped. The two drivers for the real `fil`
+//! binary (`ptydrive`, a terminal; `sockprobe`, a stranger at a Unix socket) have their own docs;
+//! the rest stand in for one end of a link:
 //!
 //! - `pipe-echo`: stands in for `fil server --stdio` (server mode, the default) and for the
 //!   client side of the pipe (`pipe-echo client`). Real preamble and frame code from `fil-proto`.
 //! - `quic-echo`: stands in for the daemon's QUIC endpoint and for the client, using the real
 //!   `fil_transport::auth` configs. Also `udp-send`/`udp-recv`, a probe that measures reordering.
 //! - `quiclink-probe`: the same two roles, built on the real `QuicLink` and `QuicListener`.
+//! - `pipe-probe`: the same for the real `PipeLink`, on a pipe command.
+//! - `pipe-detach`: the daemon side and a slow ssh stand-in for the detach-delivery test.
 //!
 //! Output is line-oriented text meant for `grep` in the bash harness: `KEY k=v k=v ...`.
 

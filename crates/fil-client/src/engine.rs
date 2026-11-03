@@ -1620,6 +1620,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.write(&bytes)?;
         // The PTY mode in force at the snapshot's point (the last report below it).
         self.apply_modes(snap.info.at)?;
+        // The snapshot is on the screen: say so at once. The daemon waits for this ack (not for
+        // the link to flush: on QUIC that only means our reader queued the bytes) before it
+        // lets a further catch-up jump past the snapshot, so it does not wait for the periodic
+        // ack. `at` is where the snapshot's position is; it is never beyond what was sent.
+        self.send_ctl(&ControlMsg::Ack {
+            channel: ChannelId::TERMINAL,
+            upto: snap.info.at,
+        });
         if let Flow::End(s) = self.drain_terminal(conn)? {
             return Ok(Flow::End(s));
         }

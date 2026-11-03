@@ -78,6 +78,12 @@ pub struct DState {
     attach_delay: Option<Duration>,
     /// The next accepted attach is answered this long after the old transport was dropped.
     reply_delay: Option<Duration>,
+    /// The offset of the last snapshot the client has not acknowledged. Like the real daemon,
+    /// no further catch-up jump is made while it is set: it waits for the client's ack (not for
+    /// the link to flush, which on QUIC only means the client's reader queued the bytes).
+    pending_jump: Option<u64>,
+    /// Catch-ups that were held back for want of that ack.
+    pub blocked_catch_ups: u32,
 }
 
 fn key_of(link: &Arc<MemLink>) -> usize {
@@ -147,6 +153,8 @@ impl FakeDaemon {
                 violations: Vec::new(),
                 attach_delay: None,
                 reply_delay: None,
+                pending_jump: None,
+                blocked_catch_ups: 0,
             }),
         })
     }
@@ -208,6 +216,9 @@ impl FakeDaemon {
                             }
                             st.flows.insert(key, flow.max(upto));
                             st.client_acked = st.client_acked.max(upto);
+                            if st.pending_jump.is_some_and(|at| upto >= at) {
+                                st.pending_jump = None;
+                            }
                         }
                         ControlMsg::Resize(s) => st.sizes.push((s.cols(), s.rows())),
                         ControlMsg::Detach => {
@@ -361,6 +372,7 @@ impl FakeDaemon {
                 let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
                 st.sent = at;
                 st.snapshots += 1;
+                st.pending_jump = Some(at);
                 let info = SnapshotInfo {
                     at,
                     len: bytes.len() as u64,
@@ -512,6 +524,11 @@ impl FakeDaemon {
 
     pub async fn detaches(&self) -> u32 {
         self.st.lock().await.detaches
+    }
+
+    /// Catch-up jumps held back because the previous snapshot was not acknowledged yet.
+    pub async fn blocked_catch_ups(&self) -> u32 {
+        self.st.lock().await.blocked_catch_ups
     }
 
     pub async fn snapshots(&self) -> u32 {
@@ -702,6 +719,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -712,6 +736,7 @@ impl FakeDaemon {
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.sent = at;
         st.snapshots += 1;
         let info = SnapshotInfo {
@@ -752,6 +777,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -762,6 +794,7 @@ impl FakeDaemon {
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,
@@ -847,6 +880,13 @@ impl FakeDaemon {
         let mut st = self.st.lock().await;
         st.log.append(skip);
         st.emu.feed(skip);
+        if st.pending_jump.is_some() {
+            // The last snapshot has not been acknowledged: no further jump. The output goes on
+            // as ordinary output.
+            st.blocked_catch_ups += 1;
+            self.pump(&mut st).await;
+            return;
+        }
         let Some(link) = st
             .current
             .and_then(|id| st.conns.get(&id))
@@ -857,6 +897,7 @@ impl FakeDaemon {
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,

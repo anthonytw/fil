@@ -30,6 +30,41 @@ async fn a_catch_up_jump_owes_nothing_for_what_it_skipped() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_second_catch_up_waits_for_the_client_to_acknowledge_the_first() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..5)).await;
+    settle().await;
+    let before = rig.daemon.snapshots().await;
+    // Two jumps back to back: the client has not applied the first snapshot, so has not
+    // acknowledged it, and the daemon makes no second jump (the output goes on as ordinary
+    // output). Without that, the second announcement could overtake the first snapshot's bytes.
+    rig.daemon.catch_up(&lines(5..30)).await;
+    rig.daemon.catch_up(&lines(30..60)).await;
+    assert_eq!(rig.daemon.snapshots().await, before + 1);
+    assert_eq!(rig.daemon.blocked_catch_ups().await, 1);
+    // The client puts the snapshot on the screen and acknowledges it at once, not at the next
+    // periodic ack (which is 100 ms away): the daemon sees it in a few milliseconds.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    rig.daemon.catch_up(&lines(60..90)).await;
+    assert_eq!(
+        rig.daemon.snapshots().await,
+        before + 2,
+        "the ack never came"
+    );
+    assert_eq!(rig.daemon.blocked_catch_ups().await, 1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(rig.daemon.violations().await.is_empty());
+    let mut all = lines(0..5);
+    all.extend(lines(5..90));
+    // (The scrollback differs by design: a snapshot carries the screen, and what it skipped is gone.)
+    assert_eq!(
+        rig.term.state().screen_text(),
+        reference(&all).screen_text()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_swap_whose_old_link_ran_ahead_is_acknowledged_in_full() {
     let rig = start(config());
     rig.attached().await;

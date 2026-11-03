@@ -53,6 +53,8 @@ impl Link for DeadWithQueue {
     fn status(&self) -> watch::Receiver<LinkStatus> {
         self.status.subscribe()
     }
+    fn finish(&self, _channel: ChannelId) {}
+
     fn close(&self) {}
 }
 

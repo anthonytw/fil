@@ -1292,6 +1292,97 @@ async fn a_peer_that_finishes_streams_faster_than_they_are_read_waits_for_credit
     assert_eq!(daemon.channel_state().inbox_channels, 0);
 }
 
+/// Review of PR 57: a peer that reads every stream to its end (so the stream credit keeps coming)
+/// and never answers the end markers used to leave this side a writer entry, a task and a pending
+/// marker per finished channel for the life of the link (5,000 channels: 5,001 writers, link
+/// `Up`). Now no task waits per channel, and past 2,048 unanswered stream ends the link ends.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_never_answers_stream_ends_has_its_link_ended() {
+    let mut w = World::new(78);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    // Read every stream the daemon opens to its end; answer nothing.
+    let reader = tokio::spawn(async move {
+        while let Ok(mut s) = conn.accept_uni().await {
+            tokio::spawn(async move {
+                let _ = s.read_to_end(1 << 20).await;
+            });
+        }
+    });
+    let base = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    let mut most = (0, 0);
+    let mut finished = 0u32;
+    for ch in 0..5000u32 {
+        let ch = ChannelId(1001 + 2 * ch);
+        if daemon.send(ch, Bytes::from_static(b"x")).await.is_err() {
+            break;
+        }
+        daemon.finish(ch);
+        finished += 1;
+        let st = daemon.channel_state();
+        most = (most.0.max(st.writers), most.1.max(st.flush_pending));
+        if ch.0 % 64 == 1 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let mut ds = daemon.status();
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(
+        matches!(down_reason(&st), DownReason::Io(ref m) if m.contains("does not answer stream ends")),
+        "{st:?}"
+    );
+    eprintln!(
+        "finished {finished} channels; at most {} writers and {} unanswered markers",
+        most.0, most.1
+    );
+    assert!(
+        finished <= 2049 + 1,
+        "the link stayed up for {finished} channels"
+    );
+    assert!(most.0 <= 2049 + 1 && most.1 <= 2049 + 1, "{most:?}");
+    // No task was left waiting per finished channel (the reader's own tasks are the peer's).
+    let alive = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    assert!(alive <= base + 64, "{alive} tasks alive, {base} before");
+    reader.abort();
+}
+
+/// Review of PR 57: a flush that waited only on a finished channel's end marker returned `Ok`
+/// after the link died, because the dying writer took its marker out of the pending set.
+#[tokio::test(start_paused = true)]
+async fn a_flush_waiting_on_a_finished_channel_fails_when_the_link_dies() {
+    let mut w = World::new(53);
+    let (client, daemon, _) = w.pair().await;
+    // More than the daemon's per-channel budget, so its reader stops before the end marker.
+    for n in 0..20 {
+        client.send(FWD, seq_payload(n, 16 * 1024)).await.unwrap();
+    }
+    client.finish(FWD);
+    let client = Arc::new(client);
+    let flush = tokio::spawn({
+        let client = client.clone();
+        async move { client.flush().await }
+    });
+    sleep(Duration::from_millis(500)).await;
+    assert!(!flush.is_finished(), "the flush did not wait");
+    daemon.close();
+    let res = timeout(Duration::from_secs(10), flush)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        res.is_err(),
+        "the flush reported success after the link died: {res:?}"
+    );
+    // The unanswered end marker stays pending once the link is down: nothing may take it out
+    // without an answer, or a flush racing the link's death could see it as answered.
+    sleep(Duration::from_millis(100)).await;
+    let st = client.channel_state();
+    assert_eq!((st.flush_pending, st.ending), (1, 1), "{st:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn bidirectional_streams_are_not_allowed() {
     let mut w = World::new(20);

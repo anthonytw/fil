@@ -143,9 +143,17 @@ fn quic_held(a: &QuicLink, b: &QuicLink) -> usize {
         .unwrap()
 }
 
-/// After a churn, with nothing in flight: each side holds its control channel at most.
+/// After a churn, with nothing in flight: each side holds its control channel at most, once the
+/// last answers are in (polled, with a deadline, so a loaded machine does not make it flaky).
 async fn assert_quic_idle(client: &QuicLink, daemon: &QuicLink) {
-    sleep(Duration::from_millis(500)).await;
+    let idle = |l: &QuicLink| {
+        let st = l.channel_state();
+        st.writers <= 1 && st.inbox_channels <= 1 && st.flush_pending == 0
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(idle(client) && idle(daemon)) && tokio::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(20)).await;
+    }
     for (who, link) in [("client", client), ("daemon", daemon)] {
         let st = link.channel_state();
         assert!(st.writers <= 1, "{who}: {st:?}");
@@ -159,8 +167,9 @@ async fn assert_quic_idle(client: &QuicLink, daemon: &QuicLink) {
 }
 
 /// RSS may grow while allocator pools and quinn's buffers warm up, but not with the channels
-/// carried: what 18,000 more channels add stays far below what keeping a few hundred bytes for
-/// each would.
+/// carried. This is a backstop for leaks the size of a task (a writer task or a quinn stream per
+/// channel): its limit would let about 230 bytes a channel through, so the proof that no map entry
+/// is kept per channel is the `channel_state` bound, not this.
 fn assert_rss_flat(what: &str, c: &Churn) {
     let grew = c.rss_end.saturating_sub(c.rss_early);
     eprintln!(

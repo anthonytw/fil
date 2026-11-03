@@ -331,6 +331,10 @@ impl Link for DelayLink {
         }
         self.inner.flush().await
     }
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }

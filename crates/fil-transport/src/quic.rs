@@ -22,8 +22,9 @@
 //!   unread bytes stops being read, which stops only that stream. Unread data is also capped for
 //!   the connection as a whole (`inbox::CONNECTION_BUDGET`).
 //! - **Streams end with their channel:** [`Link::finish`](crate::Link::finish) makes the
-//!   channel's writer send what is queued, a flush marker and the stream's end; it forgets the
-//!   channel once the peer's reader has read the marker. The peer's reader, at the stream's end,
+//!   channel's writer send what is queued, a flush marker and the stream's end; the link forgets
+//!   the channel once the peer's reader has answered the marker. A peer that reads stream ends
+//!   and never answers has its link ended once 2,048 finished channels wait for answers. The peer's reader, at the stream's end,
 //!   has its channel deregistered once `recv` has handed up its payloads, and a later stream for
 //!   the same channel is read after that. quinn gives a stream back as it ends, so a link
 //!   carries any number of channels over its life; at most [`MAX_STREAMS`] (1,024) are open at
@@ -157,6 +158,8 @@ pub struct ChannelState {
     pub inbox_channels: usize,
     /// Flush markers waiting for the peer's answer.
     pub flush_pending: usize,
+    /// Of those, the end markers of finished channels.
+    pub ending: usize,
     /// Flush markers sent over the link's life (flushes and stream ends).
     pub markers_sent: u32,
 }

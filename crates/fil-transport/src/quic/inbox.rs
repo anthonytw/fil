@@ -112,6 +112,16 @@ impl Inbox {
         self.slots.clone().acquire_owned().await.ok()
     }
 
+    /// [`register_parking`](Self::register_parking) for tests that have nothing to let go of.
+    #[cfg(test)]
+    pub(super) async fn register(
+        &self,
+        channel: ChannelId,
+        slot: OwnedSemaphorePermit,
+    ) -> Option<Arc<Notify>> {
+        self.register_parking(channel, slot, || {}).await
+    }
+
     /// Registers the reader of `channel`'s stream, in the place `slot` took. `None` if the link
     /// is down.
     ///
@@ -120,10 +130,13 @@ impl Inbox {
     /// channel's payloads stay in order. A correct peer opens a later stream for a channel only
     /// after it finished the earlier one (`Link::finish`); one that opens two at once stalls
     /// only the second, which holds one of its own streams and nothing else.
-    pub(super) async fn register(
+    ///
+    /// `on_park` is called each time before it waits (the reader lets go of quinn's buffer there).
+    pub(super) async fn register_parking(
         &self,
         channel: ChannelId,
         slot: OwnedSemaphorePermit,
+        mut on_park: impl FnMut(),
     ) -> Option<Arc<Notify>> {
         loop {
             // Register for the next deregistration before looking, so none is missed.
@@ -146,6 +159,7 @@ impl Inbox {
                     return Some(wake);
                 }
             }
+            on_park();
             gone.await;
         }
     }

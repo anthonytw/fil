@@ -41,11 +41,18 @@ const COPY_BELOW: usize = 2048;
 enum Writer {
     /// The queue in front of the channel's stream.
     Live(mpsc::Sender<Item>),
-    /// [`Link::finish`] was called. The writer is sending what was queued, then the flush marker
-    /// with this id and the stream's end, and it removes this entry once the peer has read the
-    /// marker. Until then `send` on the channel fails.
+    /// [`Link::finish`] was called. The writer sends what was queued, then the flush marker with
+    /// this id and the stream's end, and exits. The peer's answer to the marker removes this
+    /// entry (`Io::answered`). Until then `send` on the channel fails.
     Finishing(u32),
 }
+
+/// Most finished channels whose end marker the peer has not answered yet. A peer's link answers a
+/// marker before it reads the stream end that gives the stream back, so an honest peer has at
+/// most its stream credit plus the answers in flight outstanding; one that reads stream ends and
+/// never answers would otherwise make this side keep an entry per channel for the life of the
+/// link. Past this the link ends as a protocol violation.
+const MAX_ENDING: usize = 2 * super::MAX_STREAMS as usize;
 
 /// What waits in front of a channel's stream.
 enum Item {
@@ -118,11 +125,14 @@ struct Io {
     /// How long opening a stream may wait for stream credit before `send` gives up.
     open_timeout: Duration,
     inbox: Inbox,
-    /// The channels this side sends on and has not finished, and the finished ones whose stream
-    /// end the peer has not read yet. Nothing else: a finished channel is forgotten.
+    /// The channels this side sends on and has not finished, and the finished ones whose end
+    /// marker the peer has not answered yet. Nothing else: a finished channel is forgotten.
     writers: Mutex<HashMap<ChannelId, Writer>>,
     /// Flush markers sent and not yet acknowledged by the peer.
     flush_pending: Mutex<HashSet<u32>>,
+    /// The end markers of finished channels that the peer has not answered: marker id to channel,
+    /// so the answer frees the channel's writer entry. At most [`MAX_ENDING`].
+    ending: Mutex<HashMap<u32, ChannelId>>,
     /// Signalled when an acknowledgement arrives.
     flush_acked: Notify,
     next_flush: AtomicU32,
@@ -198,7 +208,26 @@ impl Io {
         );
         self.inbox
             .close(DownReason::Io("no stream credit".to_string()));
-        self.conn.close(code::CLOSED, b"no stream credit");
+        // A fault of the peer's, not a close of ours.
+        self.conn.close(code::PROTOCOL, b"no stream credit");
+    }
+
+    fn ending(&self) -> std::sync::MutexGuard<'_, HashMap<u32, ChannelId>> {
+        self.ending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The peer answered flush marker `id`. If it ended a finished channel, the channel's writer
+    /// entry goes now: the peer's link has read everything on that stream.
+    fn answered(&self, id: u32) {
+        self.pending().remove(&id);
+        let channel = self.ending().remove(&id);
+        if let Some(channel) = channel {
+            let mut writers = self.writers();
+            if matches!(writers.get(&channel), Some(Writer::Finishing(m)) if *m == id) {
+                writers.remove(&channel);
+            }
+        }
+        self.flush_acked.notify_waiters();
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
@@ -213,14 +242,16 @@ impl Io {
             let acked = self.flush_acked.notified();
             tokio::pin!(acked);
             acked.as_mut().enable();
+            // Down first: a flush never reports success once the link has died, whatever it was
+            // waiting for.
+            if self.inbox.down_reason().is_some() {
+                return Err(self.down_error());
+            }
             {
                 let pending = self.pending();
                 if ids.iter().all(|id| !pending.contains(id)) {
                     return Ok(());
                 }
-            }
-            if self.inbox.down_reason().is_some() {
-                return Err(self.down_error());
             }
             tokio::select! {
                 () = &mut acked => {}
@@ -333,6 +364,7 @@ impl QuicLink {
             inbox: Inbox::new(),
             writers: Mutex::new(HashMap::new()),
             flush_pending: Mutex::new(HashSet::new()),
+            ending: Mutex::new(HashMap::new()),
             flush_acked: Notify::new(),
             next_flush: AtomicU32::new(1),
             got_frame: watch::Sender::new(false),
@@ -407,6 +439,7 @@ impl QuicLink {
             writers: self.io.writers().len(),
             inbox_channels: self.io.inbox.channels(),
             flush_pending: self.io.pending().len(),
+            ending: self.io.ending().len(),
             markers_sent: self.io.next_flush.load(Ordering::Relaxed).wrapping_sub(1),
         }
     }
@@ -491,19 +524,31 @@ impl Link for QuicLink {
     }
 
     /// Drops the channel's queue: the writer sends what is in it, a flush marker and the stream's
-    /// end, and forgets the channel once the peer has read the marker. quinn then gives the peer
-    /// back the stream, so a link carries any number of channels over its life.
+    /// end, and the peer's answer to the marker frees the channel. quinn then gives the peer back
+    /// the stream, so a link carries any number of channels over its life. More than
+    /// [`MAX_ENDING`] finished channels waiting for answers end the link.
     fn finish(&self, channel: ChannelId) {
         if channel.0 < ChannelId::FORWARD_BASE {
             return;
         }
-        let mut writers = self.io.writers();
-        if let Some(w) = writers.get_mut(&channel)
-            && matches!(w, Writer::Live(_))
-        {
+        let too_many = {
+            let mut writers = self.io.writers();
+            let Some(w) = writers.get_mut(&channel) else {
+                return; // never sent on: nothing to free
+            };
+            if !matches!(w, Writer::Live(_)) {
+                return; // already finishing
+            }
             // Replacing the entry drops the map's sender. The writer sees its queue end once the
             // sends already holding a sender have queued their payloads.
-            *w = Writer::Finishing(self.io.new_marker());
+            let id = self.io.new_marker();
+            *w = Writer::Finishing(id);
+            let mut ending = self.io.ending();
+            ending.insert(id, channel);
+            ending.len() > MAX_ENDING
+        };
+        if too_many {
+            self.io.violation("the peer does not answer stream ends");
         }
     }
 
@@ -538,8 +583,12 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
     }
 
     let Some(first) = next(&io, &mut rx).await else {
-        // Finished before anything was queued (or the connection ended): no stream to end.
-        forget_writer(&io, channel);
+        // Finished before anything was queued: no stream to end. (If the connection ended
+        // instead, everything stays as it is: the link is down, and a flush must not see the
+        // marker gone.)
+        if io.conn.close_reason().is_none() {
+            forget_writer(&io, channel);
+        }
         return;
     };
     let opened = tokio::select! {
@@ -593,21 +642,18 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
         }
     }
 
-    // Finished. The stream ends with a marker, so this side knows when the peer's link has read
-    // everything on it (quinn would only say that its QUIC stack acknowledged it), and only then
-    // forgets the channel: a `flush` meanwhile waits for the same marker.
+    // Finished. The stream ends with a marker, so this side learns when the peer's link has read
+    // everything on it (quinn would only say that its QUIC stack acknowledged it). The answer
+    // frees the channel (`Io::answered`); a `flush` meanwhile waits for the same marker. If the
+    // link goes down first, the marker stays pending, so no flush reports it as answered.
     let marker = match io.writers().get(&channel) {
         Some(Writer::Finishing(id)) => *id,
         _ => return, // cannot happen: only `finish` drops the map's sender
     };
     let res = write_marker(&mut stream, &mut header, marker).await;
-    if !wrote(&io, res) {
-        return;
+    if wrote(&io, res) {
+        let _ = stream.finish();
     }
-    let _ = stream.finish();
-    drop(stream);
-    let _ = io.wait_acked(&[marker]).await;
-    forget_writer(&io, channel);
 }
 
 /// Writes flush marker `id`, behind the stream header if nothing was written yet.
@@ -635,14 +681,16 @@ fn wrote(io: &Io, res: Result<(), WriteError>) -> bool {
     }
 }
 
-/// Removes a finished channel's writer and its marker (a marker the peer never answered, when the
-/// link went down first, would otherwise stay pending).
+/// Removes a finished channel that never sent anything, with its end marker, which was never
+/// written: there is nothing for the peer to answer.
 fn forget_writer(io: &Io, channel: ChannelId) {
     let mut writers = io.writers();
     if let Some(Writer::Finishing(id)) = writers.get(&channel) {
-        io.pending().remove(id);
+        let id = *id;
         writers.remove(&channel);
-        // A flush waiting for the marker is done with it either way.
+        drop(writers);
+        io.ending().remove(&id);
+        io.pending().remove(&id);
         io.flush_acked.notify_waiters();
     }
 }
@@ -718,7 +766,12 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream, slot: OwnedSemaphorePe
             Err(_) => return io.violation("bad channel id"),
         }
     };
-    let Some(wake) = io.inbox.register(channel, slot).await else {
+    // A later stream for a channel waits for the earlier one; it lets go of quinn's buffer first.
+    let Some(wake) = io
+        .inbox
+        .register_parking(channel, slot, || chunks.detach())
+        .await
+    else {
         return; // the link is down
     };
     // However the stream ends, the channel is deregistered once its payloads are handed up. A
@@ -775,8 +828,7 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream, slot: OwnedSemaphorePe
             && let Some(id) = parse_flush_ack(&payload)
         {
             // Ours, consumed here. An id we never sent is ignored.
-            io.pending().remove(&id);
-            io.flush_acked.notify_waiters();
+            io.answered(id);
             continue;
         }
         if io

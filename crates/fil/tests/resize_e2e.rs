@@ -51,6 +51,10 @@ impl Link for HoldControl {
     async fn flush(&self) -> Result<(), LinkError> {
         self.inner.flush().await
     }
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }

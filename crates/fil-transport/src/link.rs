@@ -173,19 +173,17 @@ pub trait Link: Send + Sync + 'static {
     /// the stream, so the peer gets it back and a link carries any number of channels over its
     /// life; pipe: forgets its counters). Idempotent. A no-op for the fixed channels (`0..=15`).
     ///
-    /// Sending on the channel again fails with an `Io` error while the link still holds it, which
-    /// it does until those payloads have left (QUIC: until the peer's link has read the stream's
-    /// end). After that the link no longer knows the channel was finished: remembering every
-    /// finished channel is what this method exists to avoid. A later send then opens the channel
-    /// afresh, and the peer's layer above drops it as a closed channel (DESIGN.md §8.5, M2's
-    /// channel map). The layer above never does that: it finishes a channel only once it is
-    /// released on both sides.
+    /// Sending on the channel again fails with an `Io` error while the link still holds it: until
+    /// those payloads have been written (pipe), or until the peer's link has answered the marker
+    /// that ends the stream (QUIC). After that the link no longer knows the channel was finished:
+    /// remembering every finished channel is what this method exists to avoid. A later send then
+    /// opens the channel afresh, and the peer's layer above drops it as a closed channel
+    /// (DESIGN.md §8.5, M2's channel map). The layer above never does that: it finishes a channel
+    /// only once it is released on both sides.
     ///
-    /// The provided body does nothing, for test doubles. Every real link and every wrapper of one
-    /// overrides it.
-    fn finish(&self, channel: ChannelId) {
-        let _ = channel;
-    }
+    /// Every implementation, wrappers included, must free or forward: a wrapper that dropped it
+    /// would leak per-channel state for the life of the link.
+    fn finish(&self, channel: ChannelId);
 
     /// Closes the link; queued payloads are dropped. This side sees `Down(Closed)`. The peer
     /// sees `Down(Closed)` where the transport can say so (QUIC); on a byte stream (the pipe)

@@ -65,7 +65,9 @@
 //! - **Direct goes first after a loss, the pipe second.** When direct was healthy until it died,
 //!   the manager redials at once and gives it `fallback_after` before starting an ssh login. When
 //!   direct has been failing, the pipe starts at once: waiting would only delay a session that
-//!   cannot come back any other way.
+//!   cannot come back any other way. A dial that times out does not shorten the wait, but one
+//!   the daemon answers with a refusal in under [`PathConfig::quick_refusal`] (it no longer knows
+//!   the key) does: only a new bootstrap helps, so the pipe starts at once.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -105,6 +107,10 @@ pub struct PathConfig {
     /// bounds the work a network that keeps flapping can cause.
     pub hint_budget: usize,
     pub hint_window: Duration,
+    /// A dial that fails sooner than this was answered (the daemon refused, for example because
+    /// it no longer knows the key after a restart), not timed out. Waiting for the fallback timer
+    /// would help nothing, so the pipe starts at once.
+    pub quick_refusal: Duration,
     /// Seeds the retry jitter. Any value; the client passes a random one.
     pub jitter_seed: u64,
 }
@@ -124,6 +130,7 @@ impl Default for PathConfig {
             hint_pipe_gap: Duration::from_secs(5),
             hint_budget: 4,
             hint_window: Duration::from_secs(60),
+            quick_refusal: Duration::from_secs(1),
             jitter_seed: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -270,6 +277,7 @@ pub struct PathManager {
     info: Info,
     /// The port and fingerprint of the last `DirectAvailable`.
     last_info: Option<(u16, Vec<u8>)>,
+    dial_started: Option<Instant>,
     pipe: Lane,
     direct: Lane,
     carrier: Option<LinkKind>,
@@ -291,6 +299,7 @@ impl PathManager {
             cfg,
             info: Info::Unknown,
             last_info: None,
+            dial_started: None,
             pipe: Lane::Idle,
             direct: Lane::Idle,
             carrier: None,
@@ -360,7 +369,7 @@ impl PathManager {
                 }
             }
             PathInput::DirectUp => self.on_direct_up(now, &mut out),
-            PathInput::DirectDialFailed(reason) => self.on_dial_failed(reason, &mut out),
+            PathInput::DirectDialFailed(reason) => self.on_dial_failed(reason, now, &mut out),
             PathInput::DirectDown(_) => self.on_direct_down(now, &mut out),
             PathInput::Switched(kind) => self.on_switched(kind, &mut out),
             PathInput::SwitchFailed(kind) => self.on_switch_failed(kind, &mut out),
@@ -449,15 +458,24 @@ impl PathManager {
         self.cancel(PathTimer::DirectRetry, out);
     }
 
-    fn on_dial_failed(&mut self, reason: DownReason, out: &mut Vec<PathAction>) {
+    fn on_dial_failed(&mut self, reason: DownReason, now: Instant, out: &mut Vec<PathAction>) {
         if self.direct != Lane::Busy {
             return;
         }
+        let answered = self
+            .dial_started
+            .is_some_and(|t| now.duration_since(t) < self.cfg.quick_refusal);
         self.last_direct_error = Some(reason);
         self.direct_failures += 1;
         self.direct = Lane::Waiting;
         let after = self.backoff(self.cfg.retry_min, self.cfg.retry_max, self.direct_failures);
         self.schedule(PathTimer::DirectRetry, after, out);
+        if answered && self.needs_carrier() && self.pipe == Lane::Idle {
+            // An outright refusal: direct will not come back without a new bootstrap, which only
+            // the pipe can give. Do not wait for the fallback timer.
+            self.cancel(PathTimer::PipeFallback, out);
+            self.start_pipe(now, out);
+        }
     }
 
     fn on_direct_down(&mut self, now: Instant, out: &mut Vec<PathAction>) {
@@ -617,6 +635,7 @@ impl PathManager {
         // or carrying.
         if self.dialable() && self.direct == Lane::Idle {
             self.direct = Lane::Busy;
+            self.dial_started = Some(now);
             self.cancel(PathTimer::DirectRetry, out);
             out.push(PathAction::DialDirect);
         }

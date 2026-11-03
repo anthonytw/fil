@@ -197,19 +197,32 @@ fn direct_back_within_the_grace_period_means_no_ssh_login() {
 }
 
 #[test]
-fn a_refused_dial_leaves_the_pipe_to_the_fallback_timer() {
+fn a_dial_that_times_out_leaves_the_pipe_to_the_fallback_timer() {
     let mut t = T::on_direct();
     t.feed(I::DirectDown(DownReason::Dead)); // dialing, pipe fallback pending (3 s)
-    let a = t.after(Duration::from_millis(500), I::DirectDialFailed(refused()));
+    let a = t.after(S(2), I::DirectDialFailed(refused())); // the 2 s connect timeout
     assert!(!a.contains(&RunPipe), "{a:?}");
     assert!(delay_of(&a, PathTimer::DirectRetry).is_some());
-    assert_eq!(
-        t.after(
-            Duration::from_millis(2500),
-            I::Timer(PathTimer::PipeFallback)
-        ),
-        [RunPipe]
-    );
+    assert_eq!(t.after(S(1), I::Timer(PathTimer::PipeFallback)), [RunPipe]);
+}
+
+#[test]
+fn a_dial_the_daemon_refuses_outright_starts_the_pipe_at_once() {
+    // After a daemon restart the key is unknown: the handshake is answered with a refusal, and
+    // only a new bootstrap over the pipe helps.
+    for setting in [TransportSetting::Auto, TransportSetting::Direct] {
+        let mut t = T::on_pipe_with_direct_info(setting);
+        t.feed(avail());
+        t.advance(S(1));
+        t.feed(I::DirectUp);
+        t.feed(I::Switched(LinkKind::Direct));
+        t.advance(S(60));
+        let a = t.feed(I::DirectDown(DownReason::Dead));
+        assert!(a.contains(&DialDirect));
+        let a = t.after(Duration::from_millis(200), I::DirectDialFailed(refused()));
+        assert!(a.contains(&RunPipe), "{setting:?}: {a:?}");
+        assert!(a.contains(&CancelTimer(PathTimer::PipeFallback)), "{a:?}");
+    }
 }
 
 #[test]
@@ -369,8 +382,7 @@ fn a_direct_link_that_dies_young_does_not_cause_an_ssh_login_storm() {
 fn a_daemon_restart_needs_a_new_bootstrap_and_dials_the_new_port() {
     let mut t = T::on_direct();
     t.feed(I::DirectDown(DownReason::Dead));
-    t.after(Duration::from_millis(500), I::DirectDialFailed(refused())); // key unknown now
-    t.after(S(3), I::Timer(PathTimer::PipeFallback)); // RunPipe
+    t.after(Duration::from_millis(500), I::DirectDialFailed(refused())); // key unknown: RunPipe
     t.feed(I::PipeUp);
     t.feed(I::Switched(LinkKind::Pipe));
     // Bootstrap over the new pipe: a new daemon, so a new fingerprint. The backoff is forgotten.

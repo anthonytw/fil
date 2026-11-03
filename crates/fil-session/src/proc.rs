@@ -704,22 +704,46 @@ mod tests {
         assert!(took < Duration::from_secs(5), "took {took:?}");
     }
 
-    /// Spawns `sh` as a process group leader with a background `sleep` in a group of its own (job
-    /// control), the shape the tree fallback exists for. Returns the shell and the sleep's pid.
+    const OWN_GROUP_JOB: &str = "FIL_TEST_JOB_IN_ITS_OWN_GROUP";
+
+    /// Not a test by itself: when the test binary is started as the job below, it moves into a
+    /// process group of its own (what job control does to a background job), prints its pid and
+    /// waits to be killed.
+    #[test]
+    fn job_in_its_own_group_helper() {
+        if std::env::var_os(OWN_GROUP_JOB).is_none() {
+            return;
+        }
+        nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
+        println!("JOB {}", std::process::id());
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Spawns `sh` as a process group leader with a background job (this test binary, running
+    /// `job_in_its_own_group_helper`) in a group of its own: the shape the tree fallback exists
+    /// for. Returns the shell and the job's pid.
     fn shell_with_a_job_in_its_own_group() -> (std::process::Child, u32) {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         let mut sh = Command::new("sh")
-            .args(["-c", "set -m; sleep 30 & echo $!; wait"])
+            .args([
+                "-c",
+                "\"$0\" --exact proc::tests::job_in_its_own_group_helper --nocapture & wait",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env(OWN_GROUP_JOB, "1")
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let mut line = String::new();
-        std::io::BufReader::new(sh.stdout.as_mut().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let job: u32 = line.trim().parse().expect("the job's pid");
+        let mut job = None;
+        for line in std::io::BufReader::new(sh.stdout.as_mut().unwrap()).lines() {
+            if let Some(pid) = line.unwrap().strip_prefix("JOB ") {
+                job = Some(pid.trim().parse::<u32>().unwrap());
+                break;
+            }
+        }
+        let job = job.expect("the job did not report its pid");
         let pgid = |pid: u32| {
             let out = Command::new("ps")
                 .args(["-o", "pgid=", "-p", &pid.to_string()])

@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 bytes = "1"
 fil-proto = { path = "../fil-proto" }
-tokio = { version = "1", features = ["sync", "macros"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "time", "io-util", "process"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # The ring provider only: aws-lc-rs/aws-lc-sys carry the OpenSSL license (CLAUDE.md, deny.toml).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -21,7 +21,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 fil-netsim = { path = "../fil-netsim" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "io-util"] }
 
 [lints]
 workspace = true

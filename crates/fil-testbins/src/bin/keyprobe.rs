@@ -14,7 +14,7 @@
 //!
 //! **`keys`** types one key every `1/rate` seconds on a fixed schedule (not "a period after the
 //! last echo", so a slow echo cannot slow the typing) and timestamps the echo of each. The keys
-//! cycle `a` to `z`, and the program under test must send each one back, in order. With `--shell`
+//! cycle through 62 symbols (`a`-`z`, `A`-`Z`, `0`-`9`), and the program under test must send each one back, in order. With `--shell`
 //! the command is an interactive shell: `keyprobe` types `stty raw -echo; echo KP-READY-$((6*7));
 //! exec cat` into it and waits for `KP-READY-42` (the typed text holds the arithmetic, never the
 //! result, so its own echo cannot satisfy the wait). Every echo is then made by `cat`, one round
@@ -324,25 +324,46 @@ fn prep_from<'a>(a: &'a Args) -> Result<Prep<'a>, String> {
 // ---------------------------------------------------------------------------------------------
 // keys
 
-/// For each key sent (byte, time), the time its echo was read, if it was. The i-th byte that
-/// equals the i-th key sent after that key went out is its echo; any other byte is skipped.
-/// Returns the latencies and the number of bytes skipped.
-fn match_echoes(sent: &[(u8, Instant)], chunks: &[Chunk]) -> (Vec<Option<Duration>>, usize) {
-    let mut lat = vec![None; sent.len()];
-    let mut next = 0;
-    let mut unexpected = 0;
-    for (at, bytes) in chunks {
+/// The keys, in turn. Longer than the number of keys that can be in flight at once, so a byte
+/// names one key unambiguously.
+const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+fn key_for(i: usize) -> u8 {
+    ALPHABET[i % ALPHABET.len()]
+}
+
+/// Matches the bytes read to the keys sent, as they arrive. Echoes come back in order, so a byte
+/// that equals the next expected key (sent before the byte was read) is its echo. A byte that
+/// equals a later key's letter, and not the expected one, means the keys in between got no echo:
+/// they are skipped (lost), and the cycle stays in step. Any other byte is `unexpected`.
+struct Matcher {
+    /// The first key with no echo yet.
+    next: usize,
+    lat: Vec<Option<Duration>>,
+    unexpected: usize,
+}
+
+impl Matcher {
+    fn new(keys: usize) -> Self {
+        Matcher {
+            next: 0,
+            lat: vec![None; keys],
+            unexpected: 0,
+        }
+    }
+
+    fn feed(&mut self, sent: &[(u8, Instant)], at: Instant, bytes: &[u8]) {
         for &b in bytes {
-            match sent.get(next) {
-                Some(&(key, t)) if b == key && *at >= t => {
-                    lat[next] = Some(*at - t);
-                    next += 1;
+            let end = (self.next + ALPHABET.len()).min(sent.len());
+            match (self.next..end).find(|&j| sent[j].0 == b && sent[j].1 <= at) {
+                Some(j) => {
+                    self.lat[j] = Some(at - sent[j].1);
+                    self.next = j + 1;
                 }
-                _ => unexpected += 1,
+                None => self.unexpected += 1,
             }
         }
     }
-    (lat, unexpected)
 }
 
 #[derive(Debug, PartialEq)]
@@ -402,7 +423,7 @@ fn keys(a: &Args) -> Result<u8, Fail> {
         if due > now {
             std::thread::sleep(due - now);
         }
-        let key = b'a' + (i % 26) as u8;
+        let key = key_for(i);
         // Stamped before the write: the cost of getting the key into the pty is part of the latency.
         let t = Instant::now();
         if let Err(e) = term.send(&[key]) {
@@ -412,26 +433,23 @@ fn keys(a: &Args) -> Result<u8, Fail> {
         sent.push((key, t));
     }
 
-    // Collect the echoes until every key is back or nothing has come for `--drain-ms`.
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut got = 0;
+    // Collect the echoes until the last key's is back, or nothing has come for `--drain-ms`. (Not
+    // "until as many bytes as keys": strays would end it early.)
+    let mut m = Matcher::new(total);
     let mut quiet_since = Instant::now();
-    while got < total && quiet_since.elapsed() < drain {
+    while m.next < total && quiet_since.elapsed() < drain {
         match term.rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(c) => {
-                got += c.1.len();
-                chunks.push(c);
+            Ok((at, bytes)) => {
+                m.feed(&sent, at, &bytes);
                 quiet_since = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    // Keys sent in the run's last moments may have been echoed after the loop above stopped
-    // counting bytes, but `got` counts every byte, so only a lost or long-delayed key gets here.
     term.finish();
 
-    let (lat, unexpected) = match_echoes(&sent, &chunks);
+    let (lat, unexpected) = (m.lat, m.unexpected);
     let measured: Vec<f64> = lat[warmup..]
         .iter()
         .flatten()
@@ -519,6 +537,16 @@ fn drain(a: &Args) -> Result<u8, Fail> {
 mod tests {
     use super::*;
 
+    /// For each key sent (byte, time), the time its echo was read, if it was, and the number of
+    /// bytes that were no key's echo.
+    fn match_echoes(sent: &[(u8, Instant)], chunks: &[Chunk]) -> (Vec<Option<Duration>>, usize) {
+        let mut m = Matcher::new(sent.len());
+        for (at, bytes) in chunks {
+            m.feed(sent, *at, bytes);
+        }
+        (m.lat, m.unexpected)
+    }
+
     fn t(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
     }
@@ -555,6 +583,35 @@ mod tests {
         );
         // ESC, '[', '0', 'm' were not the next key.
         assert_eq!(unexpected, 4);
+    }
+
+    #[test]
+    fn one_lost_echo_in_a_hundred_costs_one_key_and_not_the_cycle() {
+        let b = Instant::now();
+        let sent: Vec<(u8, Instant)> = (0..100)
+            .map(|i| (key_for(i), t(b, 50 * i as u64)))
+            .collect();
+        // Every echo 40 ms after its key, except key 5's, which never comes.
+        let chunks: Vec<Chunk> = (0..100)
+            .filter(|&i| i != 5)
+            .map(|i| (t(b, 50 * i as u64 + 40), vec![key_for(i)]))
+            .collect();
+        let (lat, unexpected) = match_echoes(&sent, &chunks);
+        assert_eq!(lat.iter().filter(|l| l.is_none()).count(), 1);
+        assert!(lat[5].is_none());
+        assert_eq!(unexpected, 0);
+        let ms: Vec<f64> = lat
+            .iter()
+            .flatten()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect();
+        assert_eq!(stats(&ms).unwrap().p50, 40.0);
+        // And with a stray byte that is no pending key's letter.
+        let mut with_stray = chunks.clone();
+        with_stray.insert(10, (t(b, 300), b"\x1b".to_vec()));
+        let (lat, unexpected) = match_echoes(&sent, &with_stray);
+        assert_eq!(lat.iter().filter(|l| l.is_none()).count(), 1);
+        assert_eq!(unexpected, 1);
     }
 
     #[test]

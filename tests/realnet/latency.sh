@@ -6,7 +6,7 @@
 # `-f suite=latency`. Run: latency.sh [SCENARIO...]
 #
 #   l_nodelay       1. does ssh (client and sshd) set TCP_NODELAY for `ssh -T` and for `ssh -tt`?
-#   l_keys_idle     2. keystroke-to-echo p50/p99 at 5, 20 and 50 keys/s, 40 ms round trip +-5 ms,
+#   l_keys_idle     2. keystroke-to-echo p50/p99 at 5, 20 and 50 keys/s, 40 ms round trip, +-5 ms per direction,
 #                      through `ssh -tt`, fil on the pipe and fil on QUIC (and with no netem)
 #   l_keys_bulk     3. the same while a bulk transfer runs through `ssh -L`, up and down, with the
 #                      link rate-limited so a queue forms: the baseline fil's forwards are held to
@@ -15,7 +15,7 @@
 #
 # Measurements go to the results table (notes) and, per keystroke cell, to
 # $OUT/results-latency-cells.tsv (also appended to the job summary). Knobs (environment):
-#   LAT_DELAY_MS=20  LAT_JITTER_MS=5   one-way netem delay and jitter (40 ms round trip, +-5 ms)
+#   LAT_DELAY_MS=20  LAT_JITTER_MS=5   one-way netem delay and jitter (40 ms round trip, +-5 ms per direction)
 #   LAT_SECS=20      minimum seconds of typing per cell (at least 300 keys)
 #   LAT_BULK_RATE=20mbit LAT_BULK_LIMIT=500   the bottleneck of l_keys_bulk (rate; queue, packets)
 #   LAT_CATCH_RUNS=5 runs of the 4 MB cat per cell in l_catchup
@@ -172,7 +172,9 @@ l_nodelay() {
 }
 
 # lat_count_nodelay FILE: how many successful setsockopt(..., TCP_NODELAY, [1], ...) calls.
-lat_count_nodelay() { grep -a 'TCP_NODELAY, \[1\]' "$1" | grep -a -c '= 0$' || true; }
+# (A call strace split into "<unfinished ...>" and "resumed" lines counts once, on its first line;
+# one that failed does not count.)
+lat_count_nodelay() { grep -a 'TCP_NODELAY, \[1\]' "$1" | grep -a -v -c '= -1' || true; }
 
 # ---------------------------------------------------------------------------------------------
 # 2 and 3. Keystroke latency
@@ -217,7 +219,7 @@ lat_finish() {
 # lat_check_path TAG KIND FIRST_KEY_MS: the fil client's log must show the path the cell claims:
 # pipe: never on QUIC; quic: on QUIC before the first measured key.
 lat_check_path() {
-  local tag=$1 kind=$2 first=$3 sw
+  local tag=$1 kind=$2 first=$3 sw n back
   printf -v "FC_WHERE_$tag" x
   case $kind in
     pipe)
@@ -227,9 +229,22 @@ lat_check_path() {
       sw=$(fc_log_ms "$tag" 'Switched(Direct)')
       [[ $sw =~ ^[0-9]+$ ]] || fail "$tag: the client never moved to QUIC: $(fc_log "$tag" | tail -n 3)"
       [[ $sw -lt $first ]] || fail "$tag: the move to QUIC ($sw) came after the first key ($first)"
+      # And no fall back to the pipe after it.
+      n=$(fc_count_log "$tag" 'Switched(Pipe)')
+      if [[ $n -gt 0 ]]; then
+        back=$(fc_log_ms "$tag" 'Switched(Pipe)' "$n")
+        [[ ! $back =~ ^[0-9]+$ || $back -lt $sw ]] || fail "$tag: the path fell back to the pipe during the cell"
+      fi
       ;;
   esac
   ok "$tag: on the $kind path for the whole cell"
+}
+
+# lat_save_log TAG: the fil client's debug log of the cell, kept in the artifact (the test users
+# and their state directories are removed at the end of the run).
+lat_save_log() {
+  printf -v "FC_WHERE_$1" x
+  fc_log "$1" > "$OUT/run/$SCENARIO-$1.clientlog"
 }
 
 # lat_cell KIND RATE LOAD: one cell. KIND is ssh (`ssh -tt`), pipe or quic (fil with
@@ -246,6 +261,7 @@ lat_cell() {
   lat_kp "$tag" "$rate" "$settle" -- "${cmd[@]}" || fail "$tag: keyprobe failed: $(cat "$OUT/run/$SCENARIO-$tag.err" "$OUT/run/$SCENARIO-$tag.keyprobe" 2> /dev/null | tail -n 5)"
   lat_finish "$kind" "$tag" "$load" "$rate"
   if [[ $kind == pipe || $kind == quic ]]; then
+    lat_save_log "$tag"
     lat_check_path "$tag" "$kind" "$(kv "$(last_line "$OUT/run/$SCENARIO-$tag.keyprobe" KEYPROBE)" first_key_ms)"
     cx_fk "${cmd[-1]}"
   fi
@@ -381,8 +397,8 @@ l_keys_bulk() {
       b0=$(lat_tx_bytes "$dev")
       t0=$(now_ms)
     fi
-    wait "$kp"
-    local rc=$?
+    local rc=0
+    wait "$kp" || rc=$?
     if [[ -n $bulk ]]; then
       b1=$(lat_tx_bytes "$dev")
       t1=$(now_ms)
@@ -418,7 +434,7 @@ lat_drain_field() {
   done
 }
 
-# l_catchup: a 4 MB `cat` (50000 lines) read by a consumer that parses nothing and throws
+# l_catchup: a 4 MB `cat` (55000 lines of 73 bytes, 4.0 MB) read by a consumer that parses nothing and throws
 # everything away (keyprobe drain), LAT_CATCH_RUNS times per cell: how many runs make the daemon
 # jump to a snapshot (the `fil: skipped` marker). `ssh -tt` is the control: it must deliver
 # every line. The clean network and the 40 ms one; the pipe and QUIC.
@@ -441,7 +457,7 @@ l_catchup() {
       [[ $kind != quic ]] || settle=3000
       client_exec_on x timeout $((LAT_CATCH_RUNS * 150 + 200)) env FIL_LOG=debug "XDG_STATE_HOME=$PD/state-$SCENARIO-$tag" \
         keyprobe drain --settle-ms "$settle" \
-        --setup "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 50000 > $big; echo KP-READY-\$((6*7))" \
+        --setup "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 55000 > $big; echo KP-READY-\$((6*7))" \
         --ready KP-READY-42 \
         --run "cat $big; echo CATEND-\$((6*7))" --end CATEND-42 --tally LINE- \
         --repeat "$LAT_CATCH_RUNS" --timeout 150 -- "${cmd[@]}" \
@@ -452,11 +468,12 @@ l_catchup() {
       printf -v "FC_WHERE_$tag" x
       note "catchup.$kind.$net=$(kv "$sum" runs_with_marks)/$(kv "$sum" runs) marks=$(kv "$sum" marks) ms=$(lat_drain_field "$OUT/run/$SCENARIO-$tag.drain" ms | paste -sd, -)"
       if [[ $kind == ssh ]]; then
-        # The control: every one of the 50000 lines reached the consumer, in every run.
+        # The control: every one of the 55000 lines reached the consumer, in every run.
         for line in $(lat_drain_field "$OUT/run/$SCENARIO-$tag.drain" tally); do
-          [[ $line -eq 50000 ]] || fail "$tag: the consumer saw $line of 50000 lines through ssh: it is not a fast consumer"
+          [[ $line -eq 55000 ]] || fail "$tag: the consumer saw $line of 55000 lines through ssh: it is not a fast consumer"
         done
       else
+        lat_save_log "$tag"
         cx_fk "${cmd[-1]}"
       fi
       if [[ $kind == quic ]]; then lat_check_path "$tag" quic 9999999999999 > /dev/null; fi

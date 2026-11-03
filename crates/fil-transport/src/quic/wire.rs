@@ -94,24 +94,23 @@ pub(super) fn flush_marker(id: u32) -> [u8; 8] {
 /// the piece in hand is that the rest stays in [`Chunks`] and starts the next piece.
 pub const READ_MAX: usize = MAX_FRAME_BODY + 4;
 
-/// A payload at least this long that lies inside one chunk is passed up as a slice of the chunk,
-/// without a copy. A shorter one is copied: a slice keeps the whole chunk (a packet's worth of
-/// memory, shared with the frames around it) alive for as long as the slice is, and a peer that
-/// sends one-byte frames and a consumer that reads slowly would make that a thousand times what
-/// the inbox budget counts.
-pub const SHARE_FROM: usize = 512;
-
 /// The unread rest of the chunk the stream reader last got from quinn, and the pieces it cuts out
 /// of the stream: a length prefix, a channel id, a payload.
 ///
 /// This is the pure half of the read path (the async half is `link::read_stream`, which only
-/// feeds it chunks): a payload that lies inside the held chunk is a slice of it, and one that
-/// spans chunks is assembled into a single buffer of exactly its size. Neither zero-fills a buffer
-/// first, which `read_exact` into `vec![0; len]` did for every payload.
+/// feeds it chunks). A payload is **always copied** into a buffer of exactly its size, never
+/// passed up as a slice of a chunk: a chunk is a slice of the buffer quinn received the datagram
+/// into, which on Linux with GRO is one allocation of up to about 64 KiB for a whole batch of
+/// packets, so a held slice would pin that for as long as the payload is queued while the inbox
+/// budget counts only the payload (a peer interleaving held and consumed payloads would make
+/// that a hundred times the budget). The copy is the one the pipe makes too; what is gone is the
+/// zero-fill `read_exact` into `vec![0; len]` did first.
 #[derive(Default)]
 pub struct Chunks {
     held: Bytes,
-    /// The payload being assembled across chunks, and its full length.
+    /// `held` is a private copy, not a slice of quinn's buffer (see [`Chunks::detach`]).
+    detached: bool,
+    /// The payload being assembled, and its full length.
     acc: Option<(BytesMut, usize)>,
 }
 
@@ -123,6 +122,7 @@ impl Chunks {
             "a chunk is read only when none is held"
         );
         self.held = chunk;
+        self.detached = false;
     }
 
     /// Copies up to `out.len()` held bytes into `out`; returns how many.
@@ -132,31 +132,29 @@ impl Chunks {
         n
     }
 
+    /// Lets go of quinn's buffer: what is left of the held chunk becomes a small buffer of its own
+    /// (once; later calls do nothing). The reader calls it before it parks, so a stream waiting
+    /// for room in the inbox does not keep a receive buffer alive.
+    pub fn detach(&mut self) {
+        if !self.detached && !self.held.is_empty() {
+            self.held = Bytes::copy_from_slice(&self.held);
+        }
+        self.detached = true;
+    }
+
     /// Starts a payload of `len` bytes (1 or more).
     pub fn start_payload(&mut self, len: usize) {
         debug_assert!(self.acc.is_none() && len > 0);
         self.acc = Some((BytesMut::new(), len));
     }
 
-    /// The payload started with [`Chunks::start_payload`], once all of it has been pushed.
-    ///
-    /// If the held chunk has all of it, it is a slice of the chunk when it is at least
-    /// [`SHARE_FROM`] bytes and a copy of its own otherwise; if not, the payload is assembled in
-    /// a buffer of exactly its length. `None` means more chunks are needed
-    /// ([`Chunks::missing`] says how much).
+    /// The payload started with [`Chunks::start_payload`], once all of it has been pushed: a
+    /// buffer of exactly its length, filled from the chunks (no zero-fill first). `None` means
+    /// more chunks are needed ([`Chunks::missing`] says how much).
     pub fn poll_payload(&mut self) -> Option<Bytes> {
         let (acc, len) = self.acc.as_mut()?;
         let len = *len;
         if acc.capacity() == 0 {
-            if self.held.len() >= len {
-                let piece = self.held.split_to(len);
-                self.acc = None;
-                return Some(if len >= SHARE_FROM {
-                    piece
-                } else {
-                    Bytes::copy_from_slice(&piece)
-                });
-            }
             *acc = BytesMut::with_capacity(len);
         }
         let n = (len - acc.len()).min(self.held.len());
@@ -300,25 +298,51 @@ mod tests {
         }
     }
 
+    /// A payload is never a slice of a chunk, however long and wherever it lies: a slice would pin
+    /// quinn's receive buffer (see [`Chunks`]).
     #[test]
-    fn a_payload_inside_one_chunk_is_a_slice_of_it_when_long_and_a_copy_when_short() {
+    fn a_payload_is_always_a_copy_of_its_own() {
+        for len in [1usize, 511, 512, 1500, 1996] {
+            let big = chunk(0..2000);
+            let (base, end) = (big.as_ptr() as usize, big.as_ptr() as usize + big.len());
+            let mut c = Chunks::default();
+            c.push(big);
+            let mut prefix = [0u8; 4];
+            assert_eq!(c.copy_to(&mut prefix), 4);
+            c.start_payload(len);
+            let p = c.poll_payload().unwrap();
+            let at = p.as_ptr() as usize;
+            assert!(
+                at + p.len() <= base || at >= end,
+                "len {len}: inside the chunk"
+            );
+            assert_eq!(p[..], chunk(4..4 + len)[..]);
+        }
+    }
+
+    /// What is left of a chunk is copied before the reader parks, and not again.
+    #[test]
+    fn detach_copies_the_rest_of_the_chunk_once() {
         let big = chunk(0..2000);
-        let base = big.as_ptr() as usize;
+        let (base, end) = (big.as_ptr() as usize, big.as_ptr() as usize + big.len());
         let mut c = Chunks::default();
         c.push(big);
         let mut prefix = [0u8; 4];
-        assert_eq!(c.copy_to(&mut prefix), 4);
-        c.start_payload(SHARE_FROM);
-        let p = c.poll_payload().unwrap();
-        assert_eq!(p.as_ptr() as usize, base + 4, "no copy");
-        c.start_payload(SHARE_FROM - 1);
-        let p = c.poll_payload().unwrap();
-        let at = p.as_ptr() as usize;
-        assert!(
-            at < base || at >= base + 2000,
-            "a short payload must not pin the chunk"
-        );
-        assert_eq!(p[0], (4 + SHARE_FROM) as u8);
+        c.copy_to(&mut prefix);
+        c.detach();
+        let held_at = c.held.as_ptr() as usize;
+        assert!(held_at + c.held.len() <= base || held_at >= end);
+        c.detach();
+        assert_eq!(c.held.as_ptr() as usize, held_at, "copied twice");
+        c.start_payload(10);
+        assert_eq!(c.poll_payload().unwrap()[..], chunk(4..14)[..]);
+        // Detaching with nothing held is harmless, and the next chunk is a fresh one.
+        c.start_payload(1996 - 10);
+        assert!(c.poll_payload().is_some());
+        c.detach();
+        c.push(chunk(0..5));
+        c.detach();
+        assert_eq!(c.held.len(), 5);
     }
 
     #[test]

@@ -13,9 +13,10 @@
 //!   chopped up; no zero-filled buffer; the payload handed up is that buffer.
 //! - **Building a data payload from a ring or the output log:** one allocation, of the payload's
 //!   size (varint and bytes together), one copy.
-//! - **QUIC read** (`quic::chunks::Chunks`, which `read_stream` feeds with quinn's chunks): a
-//!   payload inside one chunk is a slice of it, with no allocation and no copy; one that spans
-//!   chunks is one allocation of its size, not zero-filled first.
+//! - **QUIC read** (`quic::chunks::Chunks`, which `read_stream` feeds with quinn's chunks): every
+//!   payload, whether it lies inside one chunk or spans several, is one allocation of exactly its
+//!   size, filled by one copy and not zero-filled first. It is never a slice of a chunk (that
+//!   would pin quinn's receive buffer).
 
 // A global allocator is unsafe by definition; this file is the only place in the workspace that
 // writes one, and it only counts and forwards to the system allocator.
@@ -30,7 +31,7 @@ use fil_proto::chan::SendChannel;
 use fil_proto::frame::{DataSegment, Frame, FrameDecoder};
 use fil_proto::limits::{MAX_DATA_PAYLOAD, MAX_FRAME_BODY};
 use fil_proto::log::OutputLog;
-use fil_transport::quic::chunks::{Chunks, SHARE_FROM};
+use fil_transport::quic::chunks::Chunks;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Counts {
@@ -60,16 +61,16 @@ struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump(|c| {
-            c.allocs += 1;
-            c.bytes += layout.size() as u64;
+            c.allocs = c.allocs.wrapping_add(1);
+            c.bytes = c.bytes.wrapping_add(layout.size() as u64);
         });
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         bump(|c| {
-            c.zeroed += 1;
-            c.bytes += layout.size() as u64;
+            c.zeroed = c.zeroed.wrapping_add(1);
+            c.bytes = c.bytes.wrapping_add(layout.size() as u64);
         });
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -80,8 +81,8 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         bump(|c| {
-            c.allocs += 1;
-            c.bytes += new_size as u64;
+            c.allocs = c.allocs.wrapping_add(1);
+            c.bytes = c.bytes.wrapping_add(new_size as u64);
         });
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -246,39 +247,53 @@ fn datagram_slice(data: &[u8]) -> Bytes {
     packet.split_to(data.len()).freeze()
 }
 
-/// A QUIC payload that lies inside one chunk quinn delivered is passed up as a slice of that
-/// chunk: nothing is allocated and nothing is copied (the pointer is inside the chunk).
+/// A QUIC payload is always copied into a buffer of its own, even when it lies inside one chunk
+/// quinn delivered: one allocation of exactly its size, no zero-fill, and the pointer is not
+/// inside the chunk. (A slice of the chunk would pin quinn's receive buffer, up to about 64 KiB
+/// for a GRO batch on Linux, for as long as the payload is queued.)
 #[test]
-fn a_quic_payload_inside_one_chunk_copies_nothing() {
-    let len = 1200;
-    let mut chunk = vec![0u8; 4 + len + 4];
-    chunk[..4].copy_from_slice(&(len as u32).to_be_bytes());
-    for (i, b) in chunk[4..4 + len].iter_mut().enumerate() {
-        *b = (i % 251) as u8;
+fn a_quic_payload_inside_one_chunk_is_one_exact_copy() {
+    for len in [100usize, 511, 512, 1200] {
+        let mut chunk = vec![0u8; 4 + len + 4];
+        chunk[..4].copy_from_slice(&(len as u32).to_be_bytes());
+        for (i, b) in chunk[4..4 + len].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let chunk = datagram_slice(&chunk);
+        let (base, end) = (
+            chunk.as_ptr() as usize,
+            chunk.as_ptr() as usize + chunk.len(),
+        );
+        let mut chunks = Chunks::default();
+        let mut prefix = [0u8; 4];
+        let (payload, c) = measure(|| {
+            chunks.push(chunk);
+            assert_eq!(chunks.copy_to(&mut prefix), 4);
+            chunks.start_payload(u32::from_be_bytes(prefix) as usize);
+            chunks
+                .poll_payload()
+                .expect("the whole payload is in the chunk")
+        });
+        assert_eq!(c.allocs, 1, "len {len}: {c:?}");
+        assert_eq!(c.zeroed, 0, "len {len}: zero-filled: {c:?}");
+        assert_eq!(c.bytes as usize, len, "len {len}: not an exact buffer");
+        let at = payload.as_ptr() as usize;
+        assert!(
+            at + payload.len() <= base || at >= end,
+            "len {len}: a slice of the chunk"
+        );
+        assert_eq!(payload.len(), len);
+        assert_eq!(payload[7 % len], (7 % len) as u8);
+
+        // The reader lets go of the rest of the chunk before it parks: one small allocation,
+        // once, and the tail no longer points into quinn's buffer.
+        let ((), c) = measure(|| {
+            chunks.detach();
+            chunks.detach();
+        });
+        assert_eq!(c.allocs, 1, "len {len}: {c:?}");
+        assert_eq!(c.bytes, 4, "len {len}: only the 4 bytes left");
     }
-    let chunk = datagram_slice(&chunk);
-    let (base, end) = (
-        chunk.as_ptr() as usize,
-        chunk.as_ptr() as usize + chunk.len(),
-    );
-    let mut chunks = Chunks::default();
-    let mut prefix = [0u8; 4];
-    let (payload, c) = measure(|| {
-        chunks.push(chunk);
-        assert_eq!(chunks.copy_to(&mut prefix), 4);
-        chunks.start_payload(u32::from_be_bytes(prefix) as usize);
-        chunks
-            .poll_payload()
-            .expect("the whole payload is in the chunk")
-    });
-    assert_eq!(c, Counts::default(), "a read inside a chunk allocated");
-    let at = payload.as_ptr() as usize;
-    assert!(
-        at >= base && at + payload.len() <= end,
-        "copied out of the chunk"
-    );
-    assert_eq!(payload.len(), len);
-    assert_eq!(payload[7], 7);
 }
 
 /// A payload that spans chunks has to be put together once: one allocation of its size, filled
@@ -304,16 +319,6 @@ fn a_quic_payload_across_chunks_is_one_allocation_without_a_zero_fill() {
     assert_eq!(c.allocs, 1, "{c:?}");
     assert_eq!(c.zeroed, 0, "the payload buffer was zero-filled: {c:?}");
     assert_eq!(c.bytes as usize, len);
-
-    // A short payload is its own small buffer even when it lies inside a chunk (it must not pin
-    // the chunk), and still one allocation.
-    chunks.push(datagram_slice(&[9u8; 2000]));
-    let (short, c) = measure(|| {
-        chunks.start_payload(SHARE_FROM - 1);
-        chunks.poll_payload().unwrap()
-    });
-    assert_eq!((c.allocs, c.zeroed), (1, 0), "{c:?}");
-    assert_eq!(short.len(), SHARE_FROM - 1);
 }
 
 /// Through a whole `PipeLink` pair (both drivers, both queues, a stream between them), on one

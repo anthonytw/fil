@@ -131,7 +131,7 @@ pub mod pinned {
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub mod chunks {
-    pub use super::wire::{Chunks, READ_MAX, SHARE_FROM};
+    pub use super::wire::{Chunks, READ_MAX};
 }
 
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).

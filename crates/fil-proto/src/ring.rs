@@ -87,8 +87,8 @@ impl ByteRing {
 
     /// Discard everything below `seq` (clamped to the retained range).
     ///
-    /// A ring that this empties gives its buffer back unless it is small: a forward that moved
-    /// a megabyte and went idle must not pin the megabyte until the connection ends (the buffer
+    /// A ring that this empties keeps at most 4 KiB of its buffer: a forward that moved a
+    /// megabyte and went idle must not pin the megabyte until the connection ends (the buffer
     /// regrows on the next write).
     pub fn drop_to(&mut self, seq: u64) {
         let seq = seq.clamp(self.start, self.end());
@@ -96,7 +96,7 @@ impl ByteRing {
         self.buf.drain(..n);
         self.start = seq;
         if self.buf.is_empty() && self.buf.capacity() > KEEP_WHEN_DRAINED {
-            self.buf = VecDeque::new();
+            self.buf.shrink_to(KEEP_WHEN_DRAINED);
         }
     }
 

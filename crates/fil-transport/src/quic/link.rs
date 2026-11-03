@@ -691,7 +691,12 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             io.flush_acked.notify_waiters();
             continue;
         }
-        if io.inbox.push(channel, payload, &wake).await.is_err() {
+        if io
+            .inbox
+            .push_parking(channel, payload, &wake, || chunks.detach())
+            .await
+            .is_err()
+        {
             return;
         }
     }

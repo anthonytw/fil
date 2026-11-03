@@ -494,6 +494,19 @@ pub(crate) struct Core {
     exit_deadline: Option<Instant>,
 }
 
+/// The new part of an input segment (`fresh`, a suffix of `data` that `RecvChannel::accept`
+/// returned), as a `Bytes` for the PTY writer. The whole segment is passed on without a copy. A
+/// part of it is copied: the input backlog limit counts the bytes queued, and a slice would keep
+/// the whole frame alive, so segments that each overlap what was received by all but a byte
+/// would hold the limit's worth of frames, not the limit's worth of bytes.
+fn fresh_input(data: &Bytes, fresh: &[u8]) -> Bytes {
+    if fresh.len() == data.len() {
+        data.slice_ref(fresh)
+    } else {
+        Bytes::copy_from_slice(fresh)
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1251,8 +1264,7 @@ impl Core {
             return;
         }
         let fresh = match self.input.accept(seq, &data) {
-            // The new part of the segment, as a slice of it: no copy on the way to the PTY.
-            Ok(f) => data.slice_ref(f),
+            Ok(f) => fresh_input(&data, f),
             Err(e) => {
                 tracing::warn!(error = %e, "input channel gap");
                 tracing::debug!(session = %self.name, "input channel gap in");
@@ -1438,6 +1450,25 @@ mod tests {
 
     /// Many small reads are one wake-up and one batch (efficiency #1): the core is told once
     /// while output is waiting, and takes it all, in order, in one go.
+    /// A whole new segment is passed on as it is; the new tail of an overlapping one is a copy of
+    /// its own, so it does not keep the rest of the frame alive.
+    #[test]
+    fn fresh_input_copies_a_partial_segment_and_shares_a_whole_one() {
+        let data = Bytes::from(vec![7u8; 16 * 1024]);
+        let (base, end) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
+        let inside = |b: &Bytes| {
+            let at = b.as_ptr() as usize;
+            at >= base && at + b.len() <= end
+        };
+        let whole = fresh_input(&data, &data[..]);
+        assert_eq!(whole, data);
+        assert!(inside(&whole), "a whole segment needs no copy");
+        let tail = fresh_input(&data, &data[data.len() - 1..]);
+        assert_eq!(tail.len(), 1);
+        assert!(!inside(&tail), "one new byte must not pin 16 KiB");
+        assert!(fresh_input(&data, &data[data.len()..]).is_empty());
+    }
+
     #[test]
     fn small_reads_are_one_wakeup_and_one_batch() {
         let (tx, mut rx) = mpsc::channel(8);

@@ -164,9 +164,9 @@ enum State {
 
 /// Incremental frame decoder. Feed it whatever the transport read; it yields complete frames.
 ///
-/// Memory is bounded by the limit given to [`FrameDecoder::new`]: the body buffer is sized from
-/// the declared length only after the length has been checked against the limit, and it grows only
-/// as bytes actually arrive. After an error the decoder is poisoned and returns the same error
+/// Memory is bounded by the limit given to [`FrameDecoder::new`]: the body buffer is allocated at
+/// the declared length, once the length has passed the check against the limit (so a peer that
+/// declares the limit and stalls costs us the limit, and no more). After an error the decoder is poisoned and returns the same error
 /// forever; the connection must be dropped.
 ///
 /// Each frame gets one allocation of exactly its size, which becomes the frame's payload

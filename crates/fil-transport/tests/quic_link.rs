@@ -914,6 +914,50 @@ async fn a_second_stream_for_one_channel_ends_the_link() {
     assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("second stream")));
 }
 
+/// Security sweep #3: quinn grants new stream credit as finished streams are freed, so the
+/// concurrent limit alone is no lifetime cap. A peer that finishes its streams used to register
+/// an unbounded number of channels (5,000 in the proof of concept). Now the 1,025th stream of one
+/// link ends it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_finishes_its_streams_still_hits_the_lifetime_cap() {
+    let mut w = World::new(77);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    let mut ds = daemon.status();
+    let mut opened = 0u32;
+    for ch in 0..5000u32 {
+        // Forward channels, never the same id twice; one 1-byte frame each, then finish.
+        let id = 100_000 + ch;
+        let Ok(mut s) = conn.open_uni().await else {
+            break; // the daemon has closed the connection
+        };
+        let mut b = Vec::new();
+        let mut v = id;
+        while v >= 0x80 {
+            b.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        b.push(v as u8);
+        b.extend_from_slice(&[0, 0, 0, 1, 42]);
+        if s.write_all(&b).await.is_err() || s.finish().is_err() {
+            break;
+        }
+        opened += 1;
+        // Let the daemon take the stream, which is what returns the credit.
+        if opened % 64 == 0 {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(
+        matches!(down_reason(&st), DownReason::Io(m) if m.contains("too many streams")),
+        "{st:?}"
+    );
+    assert!(
+        opened <= 1100,
+        "the peer opened {opened} streams before the daemon closed the link"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn bidirectional_streams_are_not_allowed() {
     let mut w = World::new(20);

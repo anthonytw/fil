@@ -13,6 +13,7 @@ use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, W
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
+use super::MAX_STREAMS;
 use super::inbox::{Closed, Inbox};
 use super::wire::{self, Frame, MAX_VARINT_LEN, VarintReader, parse_prefix, put_varint};
 use crate::auth::{self, ClientKey, Fingerprint, PublicKey, SERVER_NAME};
@@ -525,8 +526,19 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
 }
 
 /// Accepts the peer's streams and starts a reader for each.
+///
+/// A peer may open [`MAX_STREAMS`] streams over the life of the link. quinn only limits how many
+/// are open at once and hands out new credit as streams finish, so the lifetime cap is counted
+/// here: a peer that finishes its streams would otherwise register an unbounded number of
+/// channels in the inbox (security sweep #3).
 async fn accept_streams(io: Arc<Io>) {
+    let mut accepted: u32 = 0;
     while let Ok(stream) = io.conn.accept_uni().await {
+        accepted += 1;
+        if accepted > MAX_STREAMS {
+            io.violation("too many streams");
+            return;
+        }
         tokio::spawn(read_stream(io.clone(), stream));
     }
 }

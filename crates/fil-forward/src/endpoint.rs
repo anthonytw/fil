@@ -11,9 +11,9 @@
 //!   silence clock (DESIGN.md section 8.5, "Memory": a full forward never blocks the receive loop).
 //! - Two tasks per endpoint send on the link: one for acks, the MUX stream and the restatements
 //!   of a resumed link (and the mux's timers), one for the data of the dynamic channels and
-//!   `Link::finish`. A data channel whose link queue is full never holds up an ack or a MUX record
-//!   already taken from the mux, and the control sender keeps taking acks and MUX records from
-//!   the mux while data waits, until [`DATA_AHEAD_MAX`] of data is queued ahead of a stalled link.
+//!   `Link::finish`. The control sender takes only acks and MUX records from the mux
+//!   (`Mux::poll_transmit_control`), so they never wait behind a dynamic channel's data, however
+//!   full a data channel's link queue is.
 //! - One pump task per channel moves bytes between its local socket and the mux, in both
 //!   directions, with backpressure: it reads the socket only while the channel's send buffer has
 //!   room, and acknowledges (`consumed`) only what it wrote to the socket.
@@ -256,11 +256,6 @@ pub struct Snapshot {
 /// time; keeping this small keeps the copy outside the mux's own accounting small, and makes the
 /// mux, not a queue, the place bytes wait.
 const DATA_AHEAD: usize = 64 * 1024;
-/// While the data sender waits on a full link queue, the control sender keeps taking acks and
-/// MUX records from the mux (which hands out data among them, queued behind) up to this much
-/// queued data. Past it, acks and MUX records wait too: a bound on the copy, reached only behind
-/// a stalled link. (A control-only poll in `fil_proto::mux` would remove even that.)
-pub const DATA_AHEAD_MAX: usize = 1024 * 1024;
 
 /// How often the mux's timers run while something is time-bound (an ack due, an open waiting, a
 /// link down with channels), and not at all otherwise, so an idle endpoint costs no wakeups.
@@ -632,14 +627,23 @@ impl<L: Link> State<L> {
         self.clear_queues();
     }
 
-    /// Takes what the mux has to send, up to `limit` bytes of queued data: [`DATA_AHEAD`] for the
-    /// data sender, [`DATA_AHEAD_MAX`] for the control sender (so acks and MUX records keep moving
-    /// while a data send waits).
-    fn pull(&mut self, limit: usize) {
+    /// Takes the acks and MUX records the mux has to send, never data (the control sender).
+    fn pull_control(&mut self) {
         if self.link.is_none() {
             return;
         }
-        while self.data_out_bytes < limit {
+        while let Some(t) = self.mux.poll_transmit_control() {
+            self.ctl_out.push_back(t);
+        }
+    }
+
+    /// Takes what the mux has to send, up to [`DATA_AHEAD`] of queued data (the data sender;
+    /// control payloads it meets go to the control sender's queue).
+    fn pull(&mut self) {
+        if self.link.is_none() {
+            return;
+        }
+        while self.data_out_bytes < DATA_AHEAD {
             let Some((ch, payload)) = self.mux.poll_transmit() else {
                 break;
             };
@@ -1804,7 +1808,7 @@ impl<L: Link> Inner<L> {
                     st.tick(t);
                     self.drain(&mut st);
                 }
-                st.pull(DATA_AHEAD_MAX);
+                st.pull_control();
                 let item = match st.link.clone() {
                     Some(link) => {
                         let generation = st.generation;
@@ -1850,7 +1854,7 @@ impl<L: Link> Inner<L> {
                 if st.closed {
                     return;
                 }
-                st.pull(DATA_AHEAD);
+                st.pull();
                 let item = match &st.link {
                     Some(link) => {
                         let link = link.clone();

@@ -1346,3 +1346,88 @@ fn a_window_that_is_not_a_raise_is_a_protocol_error() {
     let _ = ch;
     assert!(feed(&mut q, bad).is_err());
 }
+
+/// Every channel up to `max_open` gets at least the smallest share, also under churn at the cap
+/// with full windows: here the acceptor closes a channel, tops its others up while that channel
+/// still counts as open (its `Close` in flight), releases it, and the opener opens the next one.
+/// A channel that has given its share back must not count as holding one, or the top-up spends
+/// the floor kept for the next channel and the acceptor answers `Busy` below the cap.
+#[test]
+fn every_channel_up_to_the_cap_is_accepted_with_full_windows_under_churn() {
+    let full = MuxConfig::default();
+    let mut p = Pair::with(full.clone(), full.clone());
+    let mut open: VecDeque<ChannelId> = (0..full.max_open).map(|_| open_pair(&mut p)).collect();
+    assert_eq!(open.len(), full.max_open);
+    for round in 0..600 {
+        // The daemon ends the oldest channel; its Close is not delivered yet.
+        let ch = open.pop_front().unwrap();
+        p.d.abort(ch, CloseReason::Reset);
+        // Its share came back: the daemon's next tick tops the others up.
+        p.advance(Duration::from_millis(1));
+        // Now the Close crosses, both sides release, and the client opens the next channel.
+        p.pump();
+        events(&mut p.c);
+        events(&mut p.d);
+        let next =
+            p.c.open(local())
+                .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        p.pump();
+        let ev = events(&mut p.d);
+        assert!(
+            ev.contains(&MuxEvent::Incoming {
+                channel: next,
+                kind: local()
+            }),
+            "round {round}: the daemon refused channel {} with {} open: {:?}",
+            next.0,
+            open.len(),
+            events(&mut p.c)
+        );
+        p.d.accept(next);
+        p.pump();
+        events(&mut p.c);
+        assert!(p.c.reserved() <= full.budget / 2 && p.d.reserved() <= full.budget / 2);
+        open.push_back(next);
+    }
+}
+
+/// The control-only poll hands out acks and the MUX stream and never data, however much data
+/// waits; the full poll still hands out everything, control first.
+#[test]
+fn the_control_poll_never_hands_out_data() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    // An ack is due on the client for data it consumed...
+    let back = open_pair(&mut p);
+    p.d.write(back, &[1u8; 4096]);
+    p.pump();
+    drain(&mut p.c, back);
+    p.advance(ACK_DELAY);
+    // ...data waits on the client, and a record on its MUX stream (its `Eof`).
+    assert_eq!(p.c.write(ch, &[7u8; 8 * 1024]), 8 * 1024);
+    p.c.eof(ch);
+    let mut seen = vec![];
+    while let Some((c, _)) = p.c.poll_transmit_control() {
+        seen.push(c);
+    }
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter()
+            .all(|c| *c == ChannelId::CONTROL || *c == ChannelId::MUX),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&ChannelId::CONTROL) && seen.contains(&ChannelId::MUX),
+        "{seen:?}"
+    );
+    // The data is still there for the full poll.
+    let mut data = 0;
+    while let Some((c, pl)) = p.c.poll_transmit() {
+        assert!(
+            c.is_dynamic(),
+            "control after the control poll was drained: {c:?}"
+        );
+        data += DataSegment::parse(&pl).unwrap().data.len();
+    }
+    assert_eq!(data, 8 * 1024);
+}

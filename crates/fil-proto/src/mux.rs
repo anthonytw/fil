@@ -534,6 +534,11 @@ pub struct Mux {
     /// Budget held by the channels this side opened, and by those the peer opened.
     reserved_ours: usize,
     reserved_theirs: usize,
+    /// Channels of each opener that hold a share. A channel gives its share back when it closes,
+    /// before it is released; until then it counts in `ours_open`/`theirs_open` but holds
+    /// nothing, and the floor kept for channels yet to open must count its place too.
+    granted_ours: usize,
+    granted_theirs: usize,
     /// A share came back: top up the channels that got less than the configured one (next
     /// tick).
     topup_due: bool,
@@ -592,6 +597,8 @@ impl Mux {
             theirs_open: 0,
             reserved_ours: 0,
             reserved_theirs: 0,
+            granted_ours: 0,
+            granted_theirs: 0,
             topup_due: false,
             mux_tx: Sender::new(mux_buffer),
             mux_gate: true,
@@ -657,6 +664,7 @@ impl Mux {
         chan.opened_at_pending = self.now.is_none();
         self.chans.insert(channel.0, chan);
         self.ours_open += 1;
+        self.granted_ours += 1;
         self.reserved_ours += grant.total();
         self.queue(MuxMsg::Open {
             channel,
@@ -919,11 +927,11 @@ impl Mux {
 
     // ---- what to send and what happened ------------------------------------------------------
 
-    /// The next payload to send, and its channel: an `Ack` (on [`ChannelId::CONTROL`], an
-    /// encoded control message), the MUX stream, then the dynamic channels in turn. Honours the
-    /// credit, the Resume gates, and the rule that no data leaves before `OpenOk`. `None` while
-    /// the link is down.
-    pub fn poll_transmit(&mut self) -> Option<(ChannelId, Bytes)> {
+    /// Like [`Mux::poll_transmit`], but only acks and the MUX stream, never data: for a sender
+    /// that must not wait behind a dynamic channel's data (a full link queue for a bulk
+    /// channel), so acknowledgements and channel records always move. No wire change: these are
+    /// the same payloads, in the same order among themselves.
+    pub fn poll_transmit_control(&mut self) -> Option<(ChannelId, Bytes)> {
         if !self.up || self.failed.is_some() {
             return None;
         }
@@ -954,6 +962,20 @@ impl Mux {
             && let Some(p) = self.mux_tx.next_payload(u64::MAX)
         {
             return Some((ChannelId::MUX, p));
+        }
+        None
+    }
+
+    /// The next payload to send, and its channel: an `Ack` (on [`ChannelId::CONTROL`], an
+    /// encoded control message), the MUX stream, then the dynamic channels in turn. Honours the
+    /// credit, the Resume gates, and the rule that no data leaves before `OpenOk`. `None` while
+    /// the link is down.
+    pub fn poll_transmit(&mut self) -> Option<(ChannelId, Bytes)> {
+        if let Some(t) = self.poll_transmit_control() {
+            return Some(t);
+        }
+        if !self.up || self.failed.is_some() {
+            return None;
         }
         // The acceptor's data goes only once its OpenOk is on this link's wire (or was received
         // on an earlier one): MUX not gated, and sent past the OpenOk.
@@ -1176,10 +1198,12 @@ impl Mux {
     /// up to the open cap fits, and nothing is buffered beyond the budget.
     fn grant(&self, ours: bool) -> Option<Grant> {
         let pool = self.cfg.budget / 2;
+        // Channels holding a share: a closing one gave its share back and its place will be
+        // free again, so the floor for it is kept too.
         let (reserved, open) = if ours {
-            (self.reserved_ours, self.ours_open)
+            (self.reserved_ours, self.granted_ours)
         } else {
-            (self.reserved_theirs, self.theirs_open)
+            (self.reserved_theirs, self.granted_theirs)
         };
         let free = pool.saturating_sub(reserved);
         let want_window = self.cfg.window.get() as usize;
@@ -1207,9 +1231,9 @@ impl Mux {
     /// every channel it may yet open.
     fn spare(&self, ours: bool) -> usize {
         let (reserved, open) = if ours {
-            (self.reserved_ours, self.ours_open)
+            (self.reserved_ours, self.granted_ours)
         } else {
-            (self.reserved_theirs, self.theirs_open)
+            (self.reserved_theirs, self.granted_theirs)
         };
         let floor = crate::limits::MIN_WINDOW as usize + MIN_BUFFER.min(self.cfg.buffer);
         let keep = floor * self.cfg.max_open.saturating_sub(open);
@@ -1280,14 +1304,17 @@ impl Mux {
             return;
         };
         let g = std::mem::take(&mut c.grant);
+        if g == 0 {
+            return;
+        }
         if c.ours {
             self.reserved_ours -= g;
+            self.granted_ours -= 1;
         } else {
             self.reserved_theirs -= g;
+            self.granted_theirs -= 1;
         }
-        if g > 0 {
-            self.topup_due = true;
-        }
+        self.topup_due = true;
     }
 
     /// Put a record on the MUX stream. A full stream means the peer stopped acknowledging it:
@@ -1373,6 +1400,7 @@ impl Mux {
                 c.peer_window = u64::from(window.get());
                 self.chans.insert(channel.0, c);
                 self.theirs_open += 1;
+                self.granted_theirs += 1;
                 self.reserved_theirs += grant.total();
                 self.events.push_back(MuxEvent::Incoming { channel, kind });
             }

@@ -1605,3 +1605,40 @@ async fn flush_fails_when_a_channels_writer_gave_up_on_payloads_it_had_accepted(
     // From then on a flush fails at once.
     assert!(client.flush().await.is_err());
 }
+
+/// The `Degraded` threshold grows with the round trip (a healthy idle link is silent for a
+/// heartbeat plus a round trip) but is capped at three quarters of `dead_after`: on a path so slow
+/// that the grown threshold would pass `dead_after`, `Degraded` must still come before `Down(Dead)`,
+/// not never. Here 1.5 s each way: a heartbeat plus 1.5 round trips is 5.5 s, past `dead_after`
+/// (5 s); the cap makes it 3.75 s.
+#[tokio::test(start_paused = true)]
+async fn degraded_still_comes_before_dead_on_a_huge_round_trip() {
+    let mut w = World::new(75);
+    let (client, daemon, _) = w.pair().await;
+    w.net
+        .update_conditions(|c| c.latency = Duration::from_millis(1500));
+    // Long enough for the round-trip estimate to follow.
+    sleep(Duration::from_secs(30)).await;
+    let mut cs = client.status();
+    wait_for(&mut cs, "client Up", |s| s.state == LinkState::Up).await;
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    let first = wait_for(&mut cs, "client Degraded or Down", |s| {
+        s.state == LinkState::Degraded || is_down(s)
+    })
+    .await;
+    let degraded = t0.elapsed();
+    assert_eq!(
+        first.state,
+        LinkState::Degraded,
+        "Down(Dead) came with no Degraded before it"
+    );
+    let st = wait_for(&mut cs, "client Down", is_down).await;
+    assert_eq!(down_reason(&st), DownReason::Dead);
+    let dead = t0.elapsed();
+    // Datagrams already in flight still land for up to 1.5 s after the blackout starts; after
+    // the last, about three quarters of dead_after of silence (and a sample for where it fell).
+    assert!(degraded <= Duration::from_millis(6000), "{degraded:?}");
+    assert!(degraded < dead, "{degraded:?} {dead:?}");
+    drop(daemon);
+}

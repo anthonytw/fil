@@ -96,7 +96,7 @@ async fn quic_attach_with_the_registered_key() {
     let q3 = dial(&d, &ck2).await.unwrap();
     send_ctl(&q3, &hello()).await;
     send_ctl(&q3, &ControlMsg::Request(Request::ListSessions)).await;
-    let mut c = Client::new(q3, pk2, size(80, 24));
+    let mut c = Client::new(q3, size(80, 24));
     c.wait("an error", |c| !c.errors.is_empty()).await;
     assert_eq!(c.errors, [ErrorCode::Protocol]);
     d.stop().await;
@@ -175,7 +175,7 @@ async fn a_direct_key_can_only_resume_its_own_session() {
             c.resume = resume;
             let cl = Client::attach(q, c).await;
             assert!(cl.reply.is_none(), "{name}: attached");
-            cl.errors
+            cl.errors.clone()
         }
     };
     // A fresh attach to its own session (this would be a takeover), and to a new name (this

@@ -222,7 +222,7 @@ async fn protocol_violations_get_an_error() {
     let link = d.pipe().await;
     let attach = Connect::new("main", key(1)).attach();
     send_ctl(&link, &ControlMsg::Attach(attach)).await;
-    let mut cl = Client::new(link, key(1), size(80, 24));
+    let mut cl = Client::new(link, size(80, 24));
     cl.wait("an error", |c| !c.errors.is_empty()).await;
     assert_eq!(cl.errors, [ErrorCode::Protocol]);
     assert!(d.sessions_is_empty().await, "no session was created");
@@ -232,7 +232,7 @@ async fn protocol_violations_get_an_error() {
     link.send(ChannelId::TERMINAL, bytes::Bytes::from_static(b"\x00x"))
         .await
         .unwrap();
-    let mut cl = Client::new(link, key(1), size(80, 24));
+    let mut cl = Client::new(link, size(80, 24));
     cl.wait("an error", |c| !c.errors.is_empty()).await;
     assert_eq!(cl.errors, [ErrorCode::Protocol]);
     d.stop().await;

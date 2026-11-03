@@ -668,6 +668,7 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
   - `fil-daemon`: the daemon, its socket and lifecycle, and the stdio relay (`fil server --stdio`)
   - `fil`: the CLI
   - `fil-testbins`: test programs for the real-network harness, used only by tests
+  - `fil-testkit`: the scripted protocol client the fil-session and fil-daemon tests share; a dev-dependency only
 
 ## 14. CLI and configuration (sketch)
 

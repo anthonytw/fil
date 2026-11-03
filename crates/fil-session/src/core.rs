@@ -444,6 +444,10 @@ pub(crate) struct Core {
     pty: Pty,
     scope: Scope,
     tracker: Tracker,
+    /// When the session was spawned, and whether its first recording of the process tree has
+    /// been asked for (that one must not use a shared table from before the spawn).
+    spawned_at: Instant,
+    tracked_once: bool,
     next_track: Option<Instant>,
 
     epoch: SessionEpoch,
@@ -597,6 +601,8 @@ pub(crate) fn start(
         tracker: Tracker::default(),
         next_track: matches!(scope, Scope::Tree)
             .then(|| Instant::now() + Duration::from_millis(100)),
+        spawned_at: Instant::now(),
+        tracked_once: false,
         epoch: SessionEpoch::new(cfg.incarnation),
         live: None,
         next_conn: 0,
@@ -793,8 +799,11 @@ impl Core {
         if self.next_track.is_some_and(|t| t <= now) {
             self.next_track = Some(now + TRACK_INTERVAL);
             let tx = self.tx.clone();
+            // The first recording may not share a table taken before this session existed.
+            let not_before = (!self.tracked_once).then_some(self.spawned_at);
+            self.tracked_once = true;
             tokio::task::spawn_blocking(move || {
-                let _ = tx.blocking_send(Cmd::ProcessTable(proc::list_processes()));
+                let _ = tx.blocking_send(Cmd::ProcessTable(proc::list_processes_since(not_before)));
             });
         }
     }

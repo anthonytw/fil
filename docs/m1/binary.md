@@ -123,7 +123,7 @@ sequenceDiagram
 
 ## Management commands
 
-`fil ls`, `kill` and `detach` open a pipe link (ssh may prompt: the user is waiting), send `Hello` and one `Request`, print the `Response` and close. `fil ls` prints a table (`NAME TERM ATTACHED LAST OUTPUT CREATED`, ages relative to now so no time zone is involved) and says when the daemon cut the list. ATTACHED is `-` when no transport is connected, even if a client that dropped off could still resume. A daemon of another protocol major is reported as a version mismatch; `fil ls` asks the daemon of its own major only, since an older major's wire format is not one it can speak.
+`fil ls`, `kill` and `detach` open a pipe link (ssh may prompt: the user is waiting), send `Hello` and one `Request`, print the `Response` and close. `fil ls` prints a table (`NAME TERM FORWARDS ATTACHED LAST OUTPUT CREATED`, ages relative to now so no time zone is involved; FORWARDS came in with M2 F4 part 1, so a script finds a column by its header name, never by counting words: `tests/realnet/ssh.sh` `ls_cell`, the dropin example's `ls_row_of`) and says when the daemon cut the list. ATTACHED is `-` when no transport is connected, even if a client that dropped off could still resume. A daemon of another protocol major is reported as a version mismatch; `fil ls` asks the daemon of its own major only, since an older major's wire format is not one it can speak.
 
 When the daemon cannot create a session (no `XDG_RUNTIME_DIR` for `scope = "systemd"`, a bad `session.command`, a spawn that takes over 30 s) it answers `Error(SessionStartFailed)` and logs the reason; the client says so and points at `daemon.log`.
 

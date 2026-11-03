@@ -17,6 +17,7 @@ pub mod agent;
 pub mod connect;
 mod endpoint;
 pub mod listen;
+pub mod pace;
 pub mod socks;
 pub mod stream;
 

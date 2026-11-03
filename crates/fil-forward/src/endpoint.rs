@@ -70,6 +70,7 @@ use tokio::time::sleep_until;
 use tracing::debug;
 
 use crate::listen;
+use crate::pace::{PaceConfig, PaceState, Pacer};
 use crate::socks::{self, Handshake, Progress};
 use crate::stream::BoxStream;
 
@@ -333,6 +334,13 @@ pub struct Snapshot {
 /// mux, not a queue, the place bytes wait.
 const DATA_AHEAD: usize = 64 * 1024;
 
+/// While the pacer holds the head of the data queue, how far into the queue the data sender
+/// looks for a payload the pacer lets through anyway (a channel with nothing in flight).
+const PASS_SCAN: usize = 64;
+/// While the pacer holds the queue, the data sender looks again at least this often (an ack
+/// wakes it sooner; this is for the pacer's own timers).
+const PACE_RECHECK: Duration = Duration::from_millis(50);
+
 /// How often the mux's timers run while something is time-bound (an ack due, an open waiting, a
 /// link down with channels), and not at all otherwise, so an idle endpoint costs no wakeups.
 const TICK: Duration = Duration::from_millis(50);
@@ -526,6 +534,10 @@ struct State<L> {
     ctl_out: VecDeque<(ChannelId, Bytes)>,
     data_out: VecDeque<Out>,
     data_out_bytes: usize,
+    /// The current link's forward pacing (H1, [`crate::pace`]): what the data sender may hand to
+    /// the link. A new one with every link.
+    pacer: Pacer,
+    pace_cfg: PaceConfig,
     slots: HashMap<u32, Slot>,
     stats: HashMap<ForwardId, ForwardStats>,
     agent: ForwardStats,
@@ -713,6 +725,7 @@ impl<L: Link> State<L> {
         self.link = None;
         self.generation += 1;
         self.clear_queues();
+        self.pacer = Pacer::new(self.pace_cfg, t);
     }
 
     /// Takes the acks and MUX records the mux has to send, never data (the control sender).
@@ -725,13 +738,71 @@ impl<L: Link> State<L> {
         }
     }
 
+    /// The next item the data sender may hand to the current link: the queue's head if the pacer
+    /// admits it (a `Finish` always goes), otherwise the first payload of a channel that has
+    /// nothing earlier in the queue and that the pacer lets through anyway (nothing in flight).
+    /// What it takes is recorded with the pacer. `None` with a non-empty queue: held.
+    fn next_out(&mut self, t: std::time::Instant) -> Option<Out> {
+        let path = self.link.as_ref()?.status().borrow().path_generation;
+        self.pacer.path_changed(path);
+        let idx = match self.data_out.front()? {
+            Out::Finish(_) => 0,
+            Out::Data(ch, _) if self.pacer.admit(*ch, t) => 0,
+            Out::Data(..) => self.pass_index()?,
+        };
+        let item = self.data_out.remove(idx).expect("an index into the queue");
+        match &item {
+            Out::Data(ch, p) => {
+                self.data_out_bytes -= p.len();
+                if let Ok(seg) = DataSegment::parse(p) {
+                    let start = seg.seq;
+                    self.pacer
+                        .on_sent(*ch, start, start + seg.data.len() as u64, t);
+                }
+            }
+            Out::Finish(ch) => self.pacer.forget(*ch),
+        }
+        Some(item)
+    }
+
+    /// Where in the data queue (within [`PASS_SCAN`]) the first item is that may go although
+    /// the pacer holds the head: the first item of its channel in the queue (per-channel order
+    /// holds), and either a `Finish` (it frees the link's stream, and is never paced) or a payload
+    /// on a channel with nothing in flight.
+    fn pass_index(&self) -> Option<usize> {
+        let mut seen: Vec<u32> = Vec::new();
+        for (i, o) in self.data_out.iter().enumerate().take(PASS_SCAN) {
+            let (ch, may) = match o {
+                Out::Data(ch, _) => (*ch, self.pacer.free_pass(*ch)),
+                Out::Finish(ch) => (*ch, true),
+            };
+            if i > 0 && may && !seen.contains(&ch.0) {
+                return Some(i);
+            }
+            seen.push(ch.0);
+        }
+        None
+    }
+
+    /// Whether the data sender is held: the pacer holds the queue's head, and nothing behind it
+    /// may pass.
+    fn held(&self) -> bool {
+        match self.data_out.front() {
+            Some(Out::Data(ch, _)) => self.pacer.holds(*ch) && self.pass_index().is_none(),
+            _ => false,
+        }
+    }
+
     /// Takes what the mux has to send, up to [`DATA_AHEAD`] of queued data (the data sender;
-    /// control payloads it meets go to the control sender's queue).
+    /// control payloads it meets go to the control sender's queue). While the pacer holds the
+    /// queue, it takes one payload more at a time (up to [`PASS_SCAN`] queued), until one is of a
+    /// channel that may pass: the mux takes its channels in turn, so a new connection's first
+    /// payload is never stuck in the mux behind a held transfer.
     fn pull(&mut self) {
         if self.link.is_none() {
             return;
         }
-        while self.data_out_bytes < DATA_AHEAD {
+        while self.data_out_bytes < DATA_AHEAD || (self.data_out.len() < PASS_SCAN && self.held()) {
             let Some((ch, payload)) = self.mux.poll_transmit() else {
                 break;
             };
@@ -851,6 +922,8 @@ impl<L: Link> Endpoint<L> {
                 ctl_out: VecDeque::new(),
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
+                pacer: Pacer::new(PaceConfig::default(), now()),
+                pace_cfg: PaceConfig::default(),
                 slots: HashMap::new(),
                 stats: HashMap::new(),
                 agent: ForwardStats::default(),
@@ -921,6 +994,20 @@ impl<L: Link> Endpoint<L> {
         self.inner().side
     }
 
+    /// Sets the forward pacing of this endpoint (feature `test-hooks`): from the next link on,
+    /// and for the current one at once (its measurements start over).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_pacing(&self, cfg: PaceConfig) {
+        let mut st = lock(&self.inner().state);
+        st.pace_cfg = cfg;
+        st.pacer = Pacer::new(cfg, now());
+    }
+
+    /// What the current link's pacer knows: counts only (DESIGN.md §11.1).
+    pub fn pace_state(&self) -> PaceState {
+        lock(&self.inner().state).pacer.state()
+    }
+
     /// Whether `ch` is the endpoint's: the MUX channel or a dynamic one. Route its payloads to
     /// [`Endpoint::on_payload`] and its `Ack`s and `Resume`s to [`Endpoint::on_control`].
     pub fn handles(ch: ChannelId) -> bool {
@@ -955,6 +1042,9 @@ impl<L: Link> Endpoint<L> {
             st.ctl_out
                 .push_back((ChannelId::CONTROL, Bytes::from(payload)));
         }
+        st.pacer = Pacer::new(st.pace_cfg, t);
+        let path = link.status().borrow().path_generation;
+        st.pacer.path_changed(path);
         st.link = Some(link);
         st.generation += 1;
         st.active(t);
@@ -1065,6 +1155,9 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         let r = st.mux.on_ack(ch, upto);
+        if r.is_ok() && st.link.is_some() {
+            st.pacer.on_ack(ch, upto, now());
+        }
         inner.drain(&mut st);
         drop(st);
         inner.kick();
@@ -1404,11 +1497,6 @@ impl<L: Link> State<L> {
 
 // ---- the tasks ------------------------------------------------------------------------------
 
-/// Where pacing of forward data (H1, `docs/m2/plan.md`; a delay-based in-flight cap measured
-/// from fil-level ack round trips) would go: the data sender calls it before it hands each data
-/// payload to the link. Today it lets everything through at once.
-async fn pace(_channel: ChannelId, _len: usize) {}
-
 impl<L: Link> Inner<L> {
     fn kick(&self) {
         self.ctl_kick.notify_one();
@@ -1501,6 +1589,9 @@ impl<L: Link> Inner<L> {
                 }
                 MuxEvent::Closed { channel, why } => {
                     debug!(channel = channel.0, why = ?why, "forward channel closed");
+                    // Nothing it sent is still owed: the peer's `Close` says it consumed all
+                    // of it (or gave up on it), and a `Close` ends the peer's acks for it.
+                    st.pacer.forget(channel);
                     st.end_slot(channel, why);
                 }
                 MuxEvent::Released { channel } => {
@@ -2000,36 +2091,39 @@ impl<L: Link> Inner<L> {
     async fn data_loop(self: Arc<Self>) {
         loop {
             let kick = self.data_kick.notified();
-            let (item, ctl_ready) = {
+            let (item, held, ctl_ready) = {
                 let mut st = lock(&self.state);
                 if st.closed {
                     return;
                 }
                 st.pull();
-                let item = match &st.link {
+                let item = match st.link.clone() {
                     Some(link) => {
-                        let link = link.clone();
                         let generation = st.generation;
-                        st.data_out.pop_front().map(|o| (o, link, generation))
+                        st.next_out(now()).map(|o| (o, link, generation))
                     }
                     None => None,
                 };
-                if let Some((Out::Data(_, p), _, _)) = &item {
-                    st.data_out_bytes -= p.len();
-                }
-                (item, !st.ctl_out.is_empty())
+                let held = item.is_none() && st.link.is_some() && !st.data_out.is_empty();
+                (item, held, !st.ctl_out.is_empty())
             };
             if ctl_ready {
                 self.ctl_kick.notify_one();
             }
             match item {
                 Some((Out::Data(ch, payload), link, generation)) => {
-                    pace(ch, payload.len()).await;
                     if link.send(ch, payload).await.is_err() {
                         self.send_failed(&link, generation);
                     }
                 }
                 Some((Out::Finish(ch), link, _)) => link.finish(ch),
+                // The pacer holds the queue: an ack (which kicks) or its own timers free it.
+                None if held => {
+                    tokio::select! {
+                        () = kick => {}
+                        () = tokio::time::sleep(PACE_RECHECK) => {}
+                    }
+                }
                 None => kick.await,
             }
         }

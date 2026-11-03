@@ -424,12 +424,17 @@ async fn stuck_consumer(t: Transport) {
     let mut w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
     let stuck = connect(port).await;
-    // Wait until the client holds a full window for the application.
+    // Wait until the client holds a full window for the application, or as much as the daemon's
+    // pacer lets out for a channel that is never acknowledged (its cap: DESIGN.md §8.5, "Pacing").
     let ep = w.client.ep.clone();
+    let daemon = w.daemon.ep.clone();
     eventually(Duration::from_secs(60), || {
+        let pace = daemon.pace_state();
         ep.channels().iter().any(|&c| {
-            ep.channel_info(c)
-                .is_some_and(|i| i.recv_buffered as u32 >= i.window)
+            ep.channel_info(c).is_some_and(|i| {
+                i.recv_buffered as u32 >= i.window
+                    || (i.recv_buffered >= fil_forward::pace::MIN_CAP && pace.in_flight >= pace.cap)
+            })
         })
     })
     .await;

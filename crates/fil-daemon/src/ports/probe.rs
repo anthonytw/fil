@@ -4,16 +4,45 @@
 //! - **Loopback only.** An address that is not loopback is never connected to.
 //! - **Bounded.** [`LIMITS`]: 300 ms per port, 1 s for the whole answer, 8 ports at a time. Every
 //!   connect, write and read has a deadline; a port that is not done in time is cut off.
-//! - **No side effects by default.** HTTP is asked with `HEAD`, which a server must not act on.
-//!   `ports.probe = "full"` asks with `GET` instead, for the page title (a `GET` can have side
-//!   effects on a dev server); `"off"` probes nothing.
 //! - **Never logged.** Nothing a probe returns is logged at any level: this module has no
 //!   tracing events at all, and the rows it fills are user data (plan section 4.4).
 //!
-//! Each port gets up to four short connections, stopping at the first that is recognised: an
-//! HTTP request (a TLS record in the answer also counts), a Redis `PING`, a Postgres
-//! `SSLRequest`, then a TLS `ClientHello`. A port that accepts and says nothing recognisable is
-//! [`ProbeKind::Unknown`]; one that refuses has no probe.
+//! # What a probe does to the program it reaches
+//!
+//! A probe is a real connection, and the program behind the port sees it:
+//!
+//! - **HTTP.** `HEAD /` by default. A `HEAD` is usually served by the *same handler* as a `GET`,
+//!   with the body dropped (Flask, Express, Django and Rails all do this), so whatever `GET /`
+//!   does on a dev server, a `HEAD` does too. `ports.probe = "full"` sends a `GET` (for the page
+//!   title); `"off"` sends nothing. The server logs the request like any other.
+//! - **One-shot listeners** (`nc -l`, `gdbserver --once`, a script that accepts once) lose their
+//!   one connection to the probe: `nc` prints the request and exits.
+//! - **Postgres** logs `invalid length of startup packet` once (it reads the HTTP request line as
+//!   a length), and possibly a failed SSL accept after the `SSLRequest`.
+//! - **Redis** answers the request line with an error and is left before the `Host:` header,
+//!   which it would log as `Possible SECURITY ATTACK detected`.
+//!
+//! What keeps this small: a program that speaks first (ssh, SMTP, MySQL, FTP) is sent nothing; a
+//! port gets one connection unless it hangs up on the HTTP request line without a word (then two
+//! more, for Postgres and TLS); nothing is ever sent past what identifies it.
+//!
+//! The sockets are read from `/proc` up to a second before the probe connects. A listener that
+//! closes in between, and another user's that takes its place on the same address and port, would
+//! get the probe instead; the window is inherent and short.
+//!
+//! # The steps
+//!
+//! 1. Connect, and wait [`GREETING`] for the server to speak first. If it does, the probe stops
+//!    there ([`ProbeKind::Unknown`], or TLS).
+//! 2. Send the HTTP request line alone and wait [`LINE_WAIT`]: Redis (a RESP error) and TLS
+//!    (an alert) answer at once. An HTTP server waits for the headers.
+//! 3. Send the headers and read the answer: the status, the `Server` header and (with `full`) the
+//!    title.
+//! 4. Only if the server hung up without a word: a Postgres `SSLRequest`, then a TLS `ClientHello`
+//!    with no SNI, each on a new connection.
+//!
+//! A port that accepts and says nothing recognisable is [`ProbeKind::Unknown`]; one that refuses
+//! has no probe.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,10 +59,11 @@ use tokio::time::{Instant, timeout_at};
 pub enum ProbeMode {
     /// No probe at all.
     Off,
-    /// TLS, HTTP `HEAD` (status and `Server`), Postgres, Redis. The default.
+    /// TLS, HTTP `HEAD` (status and `Server`), Postgres, Redis. The default. A `HEAD` usually
+    /// runs the same handler as a `GET` (see the module documentation).
     #[default]
     Head,
-    /// As `Head`, but HTTP is asked with `GET`, for the page title.
+    /// As `Head`, but HTTP is asked with `GET`, for the page title too.
     Full,
 }
 
@@ -63,8 +93,8 @@ pub const LIMITS: ProbeLimits = ProbeLimits {
     parallel: 8,
 };
 
-/// The share of a port's time each step may take at most (the rest stays for the next steps).
-/// The HTTP step is first and the most common answer, so it gets the most.
+/// The share of a port's time each later step may take at most (the rest stays for the next
+/// steps). The HTTP answer is the most common, so it gets the most.
 const HTTP_STEP: Duration = Duration::from_millis(150);
 const STEP: Duration = Duration::from_millis(50);
 /// The most read from one connection.
@@ -108,99 +138,167 @@ pub async fn probe_all(
     out
 }
 
+/// How long a new connection is watched for a server that speaks first.
+pub const GREETING: Duration = Duration::from_millis(50);
+/// How long the HTTP request line alone waits for an answer (Redis, TLS).
+pub const LINE_WAIT: Duration = Duration::from_millis(30);
+
 /// One port, done by `deadline`.
 pub async fn probe_one(addr: SocketAddr, mode: ProbeMode, deadline: Instant) -> Option<Probe> {
-    if mode == ProbeMode::Off || !addr.ip().to_canonical().is_loopback() {
+    // `timeout_at` polls what it wraps before the clock, so a loopback connect would still be
+    // made past the deadline: check first.
+    if mode == ProbeMode::Off
+        || !addr.ip().to_canonical().is_loopback()
+        || Instant::now() >= deadline
+    {
         return None;
     }
     let step = |d: Duration| deadline.min(Instant::now() + d);
     let full = mode == ProbeMode::Full;
+    let unknown = Some(Probe {
+        kind: ProbeKind::Unknown,
+        label: None,
+    });
 
-    let request = http_request(addr.port(), full);
+    let Ok(Ok(mut s)) = timeout_at(deadline, TcpStream::connect(addr)).await else {
+        return None;
+    };
+    let mut buf = Vec::new();
+    // 1. A server that speaks first is sent nothing.
+    let got = read_some(&mut s, &mut buf, step(GREETING), SMALL_CAP, |b| {
+        !b.is_empty()
+    })
+    .await;
+    if !buf.is_empty() || matches!(got, Got::Closed) {
+        return classify_tls(&buf).or(unknown);
+    }
+    // 2. The request line alone.
+    let (line, headers) = http_request(addr.port(), full);
+    if !send(&mut s, &line, deadline).await {
+        return unknown;
+    }
     let cap = if full { GET_CAP } else { HEAD_CAP };
-    let mut accepted =
-        match exchange(addr, &request, step(HTTP_STEP), cap, |b| http_done(b, full)).await {
-            Got::NoConnection => return None,
-            Got::Accepted(b) => {
-                if let Some(p) = classify_http(&b, full).or_else(|| classify_tls(&b)) {
-                    return Some(p);
-                }
-                true
-            }
-        };
-
-    type Step = (&'static [u8], fn(&[u8]) -> bool, fn(&[u8]) -> Option<Probe>);
+    let answered = |b: &[u8]| http_done(b, full) || resp_line(b);
+    let mut got = read_some(&mut s, &mut buf, step(LINE_WAIT), cap, answered).await;
+    // 3. The headers, and the answer.
+    if buf.is_empty() && matches!(got, Got::Quiet) {
+        if !send(&mut s, &headers, deadline).await {
+            return unknown;
+        }
+        got = read_some(&mut s, &mut buf, step(HTTP_STEP), cap, |b| {
+            http_done(b, full)
+        })
+        .await;
+    }
+    if !buf.is_empty() {
+        return classify_answer(&buf, full).or(unknown);
+    }
+    let closed = matches!(got, Got::Closed);
+    drop(s);
+    if !closed {
+        // Accepted and silent (or slow): nothing more is sent.
+        return unknown;
+    }
+    // 4. It hung up on an HTTP request without a word: Postgres, or TLS.
     let hello = client_hello();
-    let steps: [Step; 3] = [
-        (b"PING\r\n", |b| b.contains(&b'\n'), classify_redis),
+    type Step<'a> = (&'a [u8], fn(&[u8]) -> bool, fn(&[u8]) -> Option<Probe>);
+    let steps: [Step; 2] = [
         (&SSL_REQUEST, |b| !b.is_empty(), classify_postgres),
-        (&[], |b| b.len() >= 2, classify_tls),
+        (&hello, |b| b.len() >= 2, classify_tls),
     ];
     for (req, done, classify) in steps {
         if Instant::now() >= deadline {
             break;
         }
-        let req = if req.is_empty() { &hello[..] } else { req };
-        match exchange(addr, req, step(STEP), SMALL_CAP, done).await {
-            Got::NoConnection => break,
-            Got::Accepted(b) => {
-                accepted = true;
-                if let Some(p) = classify(&b) {
-                    return Some(p);
-                }
-            }
+        let Some(b) = exchange(addr, req, step(STEP), SMALL_CAP, done).await else {
+            break;
+        };
+        if let Some(p) = classify(&b) {
+            return Some(p);
         }
     }
-    accepted.then_some(Probe {
-        kind: ProbeKind::Unknown,
-        label: None,
-    })
+    unknown
 }
 
+/// HTTP, then a TLS record or a Redis error in its place.
+fn classify_answer(b: &[u8], full: bool) -> Option<Probe> {
+    classify_http(b, full)
+        .or_else(|| classify_tls(b))
+        .or_else(|| classify_redis(b))
+}
+
+/// How a read ended (what arrived is in the buffer).
 enum Got {
-    /// Refused, unreachable, or not connected by the deadline.
-    NoConnection,
-    /// What came back before the server closed, `done` said so, `cap` was reached or the
-    /// deadline passed (possibly nothing).
-    Accepted(Vec<u8>),
+    /// `done` said so, or the cap was reached.
+    Done,
+    /// The server hung up.
+    Closed,
+    /// The deadline passed.
+    Quiet,
 }
 
-/// Connects, sends `request` and reads the answer, all by `deadline`.
+/// A whole RESP simple string or error line (`+PONG\r\n`, `-ERR ...\r\n`).
+fn resp_line(b: &[u8]) -> bool {
+    matches!(b.first(), Some(b'+' | b'-')) && b.contains(&b'\n')
+}
+
+/// Reads into `buf` until `done`, `cap`, the server hangs up or `deadline`.
+async fn read_some(
+    s: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+    cap: usize,
+    done: impl Fn(&[u8]) -> bool,
+) -> Got {
+    let mut chunk = [0u8; 2048];
+    while buf.len() < cap {
+        match timeout_at(deadline, s.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                buf.extend_from_slice(&chunk[..n.min(cap - buf.len())]);
+                if done(buf) {
+                    return Got::Done;
+                }
+            }
+            Ok(_) => return Got::Closed,
+            Err(_) => return Got::Quiet,
+        }
+    }
+    Got::Done
+}
+
+async fn send(s: &mut TcpStream, b: &[u8], deadline: Instant) -> bool {
+    matches!(timeout_at(deadline, s.write_all(b)).await, Ok(Ok(())))
+}
+
+/// A fresh connection: sends `request` and reads the answer, all by `deadline`. `None` if it
+/// could not connect.
 async fn exchange(
     addr: SocketAddr,
     request: &[u8],
     deadline: Instant,
     cap: usize,
     done: impl Fn(&[u8]) -> bool,
-) -> Got {
+) -> Option<Vec<u8>> {
     let Ok(Ok(mut s)) = timeout_at(deadline, TcpStream::connect(addr)).await else {
-        return Got::NoConnection;
+        return None;
     };
     let mut buf = Vec::new();
-    if !matches!(timeout_at(deadline, s.write_all(request)).await, Ok(Ok(()))) {
-        return Got::Accepted(buf);
+    if send(&mut s, request, deadline).await {
+        read_some(&mut s, &mut buf, deadline, cap, done).await;
     }
-    let mut chunk = [0u8; 2048];
-    while buf.len() < cap {
-        match timeout_at(deadline, s.read(&mut chunk)).await {
-            Ok(Ok(n)) if n > 0 => {
-                buf.extend_from_slice(&chunk[..n.min(cap - buf.len())]);
-                if done(&buf) {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    Got::Accepted(buf)
+    Some(buf)
 }
 
-fn http_request(port: u16, full: bool) -> Vec<u8> {
+/// The request line, and the headers that complete it.
+fn http_request(port: u16, full: bool) -> (Vec<u8>, Vec<u8>) {
     let method = if full { "GET" } else { "HEAD" };
-    format!(
-        "{method} / HTTP/1.1\r\nHost: localhost:{port}\r\nUser-Agent: fil-ports\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    (
+        format!("{method} / HTTP/1.1\r\n").into_bytes(),
+        format!(
+            "Host: localhost:{port}\r\nUser-Agent: fil-ports\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes(),
     )
-    .into_bytes()
 }
 
 fn http_done(b: &[u8], full: bool) -> bool {
@@ -365,8 +463,24 @@ mod tests {
         TlsAlert,
         /// Says nothing until it sees a TLS record, then a handshake record.
         TlsQuiet,
+        /// Answers each line: `+PONG` to `PING`, an error to anything else, and hangs up on a
+        /// `Host:` line (as Redis does, logging an attack).
         Redis,
+        /// Answers an `SSLRequest` with `N`; hangs up on anything else.
         Postgres,
+        /// Greets first (an ssh banner), and records what it is sent.
+        Greeting,
+    }
+
+    /// Reads until `needle` (or the peer goes), keeping everything.
+    async fn read_until(c: &mut tokio::net::TcpStream, all: &mut Vec<u8>, needle: &[u8]) {
+        let mut b = [0u8; 4096];
+        while find(all, needle).is_none() {
+            match c.read(&mut b).await {
+                Ok(n) if n > 0 => all.extend_from_slice(&b[..n]),
+                _ => return,
+            }
+        }
     }
 
     struct Server {
@@ -392,17 +506,15 @@ mod tests {
                 let requests = requests.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
+                    let mut all = Vec::new();
                     match b {
                         Behaviour::Slow => {
-                            // Hold the connection, read nothing, say nothing, until the peer goes.
-                            let _ = c.read(&mut buf).await;
-                            let _ = c.read(&mut buf).await;
+                            // Read whatever comes, say nothing, until the peer goes.
+                            read_until(&mut c, &mut all, b"\0never").await;
                         }
                         Behaviour::Http => {
-                            let n = c.read(&mut buf).await.unwrap_or(0);
-                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                            let get = req.starts_with("GET ");
-                            requests.lock().unwrap().push(req);
+                            read_until(&mut c, &mut all, b"\r\n\r\n").await;
+                            let get = all.starts_with(b"GET ");
                             let body =
                                 "<html><head>\n<TITLE> Vite  +\n React </TITLE></head></html>";
                             let mut r = format!(
@@ -415,7 +527,8 @@ mod tests {
                             let _ = c.write_all(r.as_bytes()).await;
                         }
                         Behaviour::Garbage => {
-                            let _ = c.read(&mut buf).await;
+                            let n = c.read(&mut buf).await.unwrap_or(0);
+                            all.extend_from_slice(&buf[..n]);
                             let _ = c.write_all(b"\x00\x01garbage\xff\xfe\r\n").await;
                         }
                         Behaviour::Flood => {
@@ -434,30 +547,50 @@ mod tests {
                             }
                             // Otherwise close without a word.
                         }
-                        Behaviour::Redis => loop {
+                        Behaviour::Redis => 'conn: loop {
                             let n = c.read(&mut buf).await.unwrap_or(0);
                             if n == 0 {
                                 break;
                             }
-                            let r: &[u8] = if buf[..n].starts_with(b"PING") {
-                                b"+PONG\r\n"
-                            } else if find_ci(&buf[..n], b"host:").is_some() {
-                                break; // Redis drops what looks like HTTP.
-                            } else {
-                                b"-ERR unknown command\r\n"
-                            };
-                            if c.write_all(r).await.is_err() {
-                                break;
+                            let from = all.len();
+                            all.extend_from_slice(&buf[..n]);
+                            let mut rest = &all[from..];
+                            while let Some(end) = find(rest, b"\n") {
+                                let line = &rest[..end];
+                                rest = &rest[end + 1..];
+                                let r: &[u8] = if line.starts_with(b"PING") {
+                                    b"+PONG\r\n"
+                                } else if line.len() >= 5
+                                    && line[..5].eq_ignore_ascii_case(b"host:")
+                                {
+                                    break 'conn;
+                                } else {
+                                    b"-ERR unknown command\r\n"
+                                };
+                                if c.write_all(r).await.is_err() {
+                                    break 'conn;
+                                }
                             }
                         },
                         Behaviour::Postgres => {
-                            let n = c.read(&mut buf).await.unwrap_or(0);
-                            if buf[..n] == SSL_REQUEST {
-                                let _ = c.write_all(b"N").await;
-                                let _ = c.read(&mut buf).await;
+                            let mut first = [0u8; 8];
+                            if c.read_exact(&mut first).await.is_ok() {
+                                all.extend_from_slice(&first);
+                                if first == SSL_REQUEST {
+                                    let _ = c.write_all(b"N").await;
+                                    let _ = c.read(&mut buf).await;
+                                }
                             }
                         }
+                        Behaviour::Greeting => {
+                            let _ = c.write_all(b"SSH-2.0-test\r\n").await;
+                            read_until(&mut c, &mut all, b"\0never").await;
+                        }
                     }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&all).into_owned());
                 });
             }
         });
@@ -478,9 +611,15 @@ mod tests {
         let p = probe(s.addr, ProbeMode::Head).await.unwrap();
         assert_eq!(p.kind, ProbeKind::Http { status: 200 });
         assert_eq!(p.label.unwrap().as_str(), "test-srv/1.0");
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let reqs = s.requests.lock().unwrap().clone();
+        assert_eq!(s.accepted.load(Ordering::SeqCst), 1, "one connection");
         assert_eq!(reqs.len(), 1, "one request");
-        assert!(reqs[0].starts_with("HEAD / HTTP/1.1\r\n"), "{:?}", reqs[0]);
+        assert!(
+            reqs[0].starts_with("HEAD / HTTP/1.1\r\nHost: "),
+            "{:?}",
+            reqs[0]
+        );
         assert!(!reqs.iter().any(|r| r.starts_with("GET")), "never a GET");
     }
 
@@ -490,6 +629,7 @@ mod tests {
         let p = probe(s.addr, ProbeMode::Full).await.unwrap();
         assert_eq!(p.kind, ProbeKind::Http { status: 200 });
         assert_eq!(p.label.unwrap().as_str(), "Vite + React");
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(s.requests.lock().unwrap()[0].starts_with("GET / HTTP/1.1\r\n"));
     }
 
@@ -515,6 +655,41 @@ mod tests {
             assert_eq!(kind(&p), Some(want));
             assert!(t.elapsed() < LIMITS.per_port + Duration::from_millis(100));
         }
+    }
+
+    /// Redis answers the request line, and is left before it sees a `Host:` header (which it
+    /// logs as an attack): one connection, no `Host:`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redis_is_known_from_the_request_line_alone() {
+        let s = server(Behaviour::Redis).await;
+        assert_eq!(
+            kind(&probe(s.addr, ProbeMode::Head).await),
+            Some(ProbeKind::Redis)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.accepted.load(Ordering::SeqCst), 1);
+        let reqs = s.requests.lock().unwrap().clone();
+        assert!(
+            reqs.iter()
+                .all(|r| !r.to_ascii_lowercase().contains("host:")),
+            "{reqs:?}"
+        );
+    }
+
+    /// A server that speaks first (ssh, SMTP, MySQL) is sent nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_that_speaks_first_is_sent_nothing() {
+        let s = server(Behaviour::Greeting).await;
+        assert_eq!(
+            probe(s.addr, ProbeMode::Full).await,
+            Some(Probe {
+                kind: ProbeKind::Unknown,
+                label: None
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(*s.requests.lock().unwrap(), vec![String::new()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -549,13 +724,14 @@ mod tests {
             took < LIMITS.per_port + Duration::from_millis(100),
             "a silent server costs at most the per-port budget: {took:?}"
         );
+        assert_eq!(s.accepted.load(Ordering::SeqCst), 1, "and one connection");
     }
 
     /// Mutation: drop the deadline on the read in `exchange`, and this exceeds its budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_slow_servers_stay_within_the_total_budget_eight_at_a_time() {
         let mut servers = Vec::new();
-        for _ in 0..40 {
+        for _ in 0..64 {
             servers.push(server(Behaviour::Slow).await);
         }
         let addrs: Vec<SocketAddr> = servers.iter().map(|s| s.addr).collect();
@@ -571,20 +747,21 @@ mod tests {
             took < LIMITS.total + Duration::from_millis(150),
             "the whole answer within the total budget: {took:?}"
         );
-        assert_eq!(r.len(), 40);
+        assert_eq!(r.len(), 64);
         assert!(
             r.iter().any(Option::is_none),
             "the ports past the budget have no probe"
         );
         assert!(r.iter().any(Option::is_some));
-        // Eight at a time, 300 ms each, in one second: at most four waves of eight ports are
-        // ever connected to. Without the bound all forty would be.
+        // Eight at a time, a silent port takes 230 ms (greeting, request line, headers), in one
+        // second: at most five waves of eight ports are ever connected to. Without the bound all
+        // 64 would be.
         let reached = servers
             .iter()
             .filter(|s| s.accepted.load(Ordering::SeqCst) > 0)
             .count();
         assert!(
-            (16..=32).contains(&reached),
+            (24..=40).contains(&reached),
             "ports reached: {reached} (8 at a time)"
         );
     }

@@ -27,8 +27,9 @@
 //! [ports]
 //! # The protocol probe of `fil ports` (DESIGN.md section 7.4), on the user's own loopback
 //! # listeners only: "head" (TLS, HTTP `HEAD` for the status and `Server`, Postgres, Redis),
-//! # "full" (HTTP `GET`, for the page title too; a `GET` can have side effects on a dev
-//! # server) or "off".
+//! # "full" (HTTP `GET`, for the page title too) or "off". A probe is a real connection: most
+//! # web frameworks run the `GET` handler for a `HEAD` too, a one-shot listener (`nc -l`) is
+//! # used up, and Postgres logs a line. "off" if that matters.
 //! probe = "head"
 //! ```
 //!

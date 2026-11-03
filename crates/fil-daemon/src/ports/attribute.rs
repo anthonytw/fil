@@ -2,8 +2,9 @@
 //! which session started it.
 //!
 //! Everything here reads a `/proc` root (the real one, or a fake one in tests) and looks only at
-//! the user's own processes: [`ProcRoot::owner`] (the owner of `ROOT/<pid>`, which is the
-//! process's) is checked before anything inside `ROOT/<pid>` is opened. Another user's processes
+//! the user's own processes: [`ProcRoot::open`] checks the owner of `ROOT/<pid>` (the process's)
+//! on the open directory before anything inside it is opened, and everything else is read
+//! relative to that directory. Another user's processes
 //! are not read at all, even where the permissions would allow it. The scan is bounded in
 //! processes, file descriptors and time ([`ScanLimits`]): a process with a million descriptors, or
 //! a host with a hundred thousand processes, costs a bounded amount and leaves the rest
@@ -12,10 +13,14 @@
 //! These functions block: call them from `spawn_blocking`.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use rustix::fs::{CWD, Dir, Mode, OFlags, fstat, openat, readlinkat};
 
 use fil_proto::msg::{PortsPath, ProcessInfo, ProcessName, SessionName};
 
@@ -63,25 +68,77 @@ impl ProcRoot {
         &self.0
     }
 
-    /// The uid that owns process `pid` (the owner of `ROOT/<pid>`). This is the filter: nothing
-    /// inside `ROOT/<pid>` is read unless it is the user's.
-    fn owner(&self, pid: u32) -> Option<u32> {
-        std::fs::metadata(self.0.join(pid.to_string()))
-            .ok()
-            .map(|m| m.uid())
+    /// `ROOT/<pid>`, opened, if it is `uid`'s. This is the filter: the owner is read from the
+    /// open directory (`fstat`) before anything in it is opened, and everything after is read
+    /// relative to it. A `/proc/<pid>` descriptor stays bound to the process it was opened for
+    /// (reads fail once it exits), so a pid reused by another user in the meantime is never read
+    /// in its place.
+    pub fn open(&self, uid: u32, pid: u32) -> Option<ProcDir> {
+        let fd = openat(
+            CWD,
+            self.0.join(pid.to_string()),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+        (fstat(&fd).ok()?.st_uid == uid).then_some(ProcDir { fd, pid })
+    }
+}
+
+/// One of the user's processes' `/proc/<pid>`, open.
+#[derive(Debug)]
+pub struct ProcDir {
+    fd: OwnedFd,
+    pid: u32,
+}
+
+impl ProcDir {
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
-    /// `ROOT/<pid>/<file>`, if `pid` is `uid`'s.
-    fn own(&self, uid: u32, pid: u32, file: &str) -> Option<PathBuf> {
-        (self.owner(pid) == Some(uid)).then(|| self.0.join(pid.to_string()).join(file))
+    /// At most `cap` bytes of the file `name` in it.
+    fn read(&self, name: &str, cap: u64) -> Option<Vec<u8>> {
+        let fd = openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+        let mut v = Vec::new();
+        std::fs::File::from(fd).take(cap).read_to_end(&mut v).ok()?;
+        Some(v)
+    }
+
+    /// The target of the link `name` in it (never followed).
+    fn readlink(&self, name: &str) -> Option<PathBuf> {
+        let target = readlinkat(&self.fd, name, Vec::new()).ok()?;
+        Some(PathBuf::from(OsString::from_vec(target.into_bytes())))
+    }
+
+    /// Its `fd` directory, open, and an iterator over its entries.
+    fn fds(&self) -> Option<(OwnedFd, Dir)> {
+        let fd = openat(
+            &self.fd,
+            "fd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+        let dir = Dir::read_from(&fd).ok()?;
+        Some((fd, dir))
     }
 }
 
 /// What [`inode_owners`] found.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Owners {
     /// Socket inode to the pid holding it (the first found).
     pub by_inode: HashMap<u64, u32>,
+    /// The open `/proc/<pid>` of each of those pids, from the scan itself: what is read about
+    /// them later is read from the same process.
+    pub dirs: HashMap<u32, ProcDir>,
     /// A bound was reached before every wanted inode was found.
     pub truncated: bool,
 }
@@ -117,7 +174,7 @@ pub fn inode_owners(
             break;
         }
         // The uid filter, before anything in the process's directory is opened.
-        let Some(fd_dir) = root.own(uid, pid, "fd") else {
+        let Some(dir) = root.open(uid, pid) else {
             continue;
         };
         procs += 1;
@@ -125,9 +182,10 @@ pub fn inode_owners(
             out.truncated = true;
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&fd_dir) else {
+        let Some((fd_dir, entries)) = dir.fds() else {
             continue;
         };
+        let mut holds = false;
         for (n, e) in entries.enumerate() {
             if n == limits.max_fds_per_proc || fds == limits.max_fds {
                 out.truncated = true;
@@ -140,14 +198,19 @@ pub fn inode_owners(
             }
             let Some(inode) = e
                 .ok()
-                .and_then(|e| std::fs::read_link(e.path()).ok())
-                .and_then(|l| socket_inode(&l))
+                .filter(|e| !e.file_name().to_bytes().starts_with(b"."))
+                .and_then(|e| readlinkat(&fd_dir, e.file_name(), Vec::new()).ok())
+                .and_then(|l| socket_inode(l.as_bytes()))
             else {
                 continue;
             };
-            if wanted.contains(&inode) {
-                out.by_inode.entry(inode).or_insert(pid);
+            if wanted.contains(&inode) && !out.by_inode.contains_key(&inode) {
+                out.by_inode.insert(inode, pid);
+                holds = true;
             }
+        }
+        if holds {
+            out.dirs.insert(pid, dir);
         }
         if out.by_inode.len() == wanted.len() || fds == limits.max_fds {
             break;
@@ -160,41 +223,25 @@ pub fn inode_owners(
 }
 
 /// `socket:[12345]` to 12345.
-fn socket_inode(link: &Path) -> Option<u64> {
-    link.to_str()?
+fn socket_inode(link: &[u8]) -> Option<u64> {
+    std::str::from_utf8(link)
+        .ok()?
         .strip_prefix("socket:[")?
         .strip_suffix(']')?
         .parse()
         .ok()
 }
 
-/// At most `cap` bytes of a file.
-fn read_capped(path: &Path, cap: u64) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(cap)
-        .read_to_end(&mut v)
-        .ok()?;
-    Some(v)
-}
-
-/// The name (`comm`) and working directory (with `~` for `home`) of `uid`'s process `pid`;
-/// `None` if it is not `uid`'s or is gone.
-pub fn process_info(
-    root: &ProcRoot,
-    uid: u32,
-    pid: u32,
-    home: Option<&Path>,
-) -> Option<ProcessInfo> {
-    let comm = read_capped(&root.own(uid, pid, "comm")?, MAX_COMM)?;
+/// The name (`comm`) and working directory (with `~` for `home`) of the process; `None` if it
+/// is gone.
+pub fn process_info(dir: &ProcDir, home: Option<&Path>) -> Option<ProcessInfo> {
+    let comm = dir.read("comm", MAX_COMM)?;
     let comm = String::from_utf8_lossy(&comm);
-    let cwd = root
-        .own(uid, pid, "cwd")
-        .and_then(|p| std::fs::read_link(p).ok())
+    let cwd = dir
+        .readlink("cwd")
         .map(|p| PortsPath::capped(&tilde(&p, home)));
     Some(ProcessInfo {
-        pid,
+        pid: dir.pid(),
         name: ProcessName::capped(comm.trim_end_matches('\n')),
         cwd,
     })
@@ -266,11 +313,10 @@ impl<'a> Sessions<'a> {
         v
     }
 
-    /// The session `uid`'s process `pid` was started in, if any.
-    pub fn of(&mut self, pid: u32) -> Option<SessionName> {
+    /// The session the process was started in, if any.
+    pub fn of(&mut self, dir: &ProcDir) -> Option<SessionName> {
         if !self.units.is_empty()
-            && let Some(path) = self.root.own(self.uid, pid, "cgroup")
-            && let Some(text) = read_capped(&path, MAX_CGROUP)
+            && let Some(text) = dir.read("cgroup", MAX_CGROUP)
         {
             let text = String::from_utf8_lossy(&text);
             for line in text.lines() {
@@ -288,26 +334,33 @@ impl<'a> Sessions<'a> {
         if self.pids.is_empty() {
             return None;
         }
-        let mut p = pid;
+        let mut p = dir.pid();
+        if let Some(name) = self.pids.get(&p) {
+            return Some((*name).clone());
+        }
+        p = self.parent(p, Some(dir))?;
         for _ in 0..MAX_DEPTH {
             if let Some(name) = self.pids.get(&p) {
                 return Some((*name).clone());
             }
-            p = self.parent(p)?;
+            p = self.parent(p, None)?;
         }
         None
     }
 
-    /// The parent of `uid`'s process `pid`; `None` at the top, for another user's process (the
-    /// walk stops there) and for anything unreadable.
-    fn parent(&mut self, pid: u32) -> Option<u32> {
+    /// The parent of the user's process `pid` (read from `dir` when it is open already); `None`
+    /// at the top, for another user's process (the walk stops there) and for anything
+    /// unreadable.
+    fn parent(&mut self, pid: u32, dir: Option<&ProcDir>) -> Option<u32> {
         if let Some(p) = self.parent.get(&pid) {
             return *p;
         }
-        let ppid = self
-            .root
-            .own(self.uid, pid, "stat")
-            .and_then(|p| read_capped(&p, MAX_STAT))
+        let read = |d: &ProcDir| d.read("stat", MAX_STAT);
+        let stat = match dir {
+            Some(d) => read(d),
+            None => self.root.open(self.uid, pid).and_then(|d| read(&d)),
+        };
+        let ppid = stat
             .and_then(|s| parse_ppid(&String::from_utf8_lossy(&s)))
             .filter(|&pp| pp != 0 && pp != pid);
         self.parent.insert(pid, ppid);
@@ -403,6 +456,28 @@ mod tests {
     use super::fake::FakeProc;
     use super::*;
 
+    fn info(root: &ProcRoot, uid: u32, pid: u32, home: Option<&Path>) -> Option<ProcessInfo> {
+        process_info(&root.open(uid, pid)?, home)
+    }
+
+    fn of_pid(s: &mut Sessions<'_>, pid: u32) -> Option<SessionName> {
+        let d = s.root.open(s.uid, pid)?;
+        s.of(&d)
+    }
+
+    /// Everything about a process is read from the directory that passed the owner check: a new
+    /// directory at the same path (a reused pid) is not read in its place.
+    #[test]
+    fn reads_stay_with_the_directory_that_was_checked() {
+        let f = FakeProc::new("reuse");
+        f.process(100, 1, "first", "/a", &[]);
+        let dir = f.root().open(me(), 100).unwrap();
+        std::fs::rename(f.dir.join("100"), f.dir.join("gone")).unwrap();
+        f.process(100, 1, "second", "/b", &[]);
+        let i = process_info(&dir, None).unwrap();
+        assert_eq!((i.name.as_str(), i.cwd.unwrap().as_str()), ("first", "/a"));
+    }
+
     fn me() -> u32 {
         rustix::process::getuid().as_raw()
     }
@@ -429,7 +504,7 @@ mod tests {
         assert_eq!(o.by_inode, HashMap::from([(40127, 100), (40200, 200)]));
     }
 
-    /// The uid filter on processes (mutation: skip the owner check in `ProcRoot::own`, and this
+    /// The uid filter on processes (mutation: skip the owner check in `ProcRoot::open`, and this
     /// fails). The fake processes are the test user's, so asking as anyone else must find, and
     /// read, nothing.
     #[test]
@@ -447,13 +522,18 @@ mod tests {
             later(),
         );
         assert!(o.by_inode.is_empty(), "{o:?}");
-        assert_eq!(process_info(&f.root(), them, 100, None), None);
+        assert_eq!(info(&f.root(), them, 100, None), None);
         let sessions = [(
             SessionName::new("s").unwrap(),
             Membership::Unit("fil-1".into()),
         )];
         f.cgroup(100, "/user.slice/fil-1.scope");
-        assert_eq!(Sessions::new(&f.root(), them, &sessions).of(100), None);
+        let root = f.root();
+        assert_eq!(
+            of_pid(&mut Sessions::new(&root, them, &sessions), 100),
+            None
+        );
+        assert!(root.open(them, 100).is_none());
     }
 
     #[test]
@@ -469,15 +549,15 @@ mod tests {
         );
         f.process(102, 1, "x", "/srv/data (deleted)", &[]);
         let home = Path::new("/home/u");
-        let i = process_info(&f.root(), me(), 100, Some(home)).unwrap();
+        let i = info(&f.root(), me(), 100, Some(home)).unwrap();
         assert_eq!((i.pid, i.name.as_str()), (100, "vite"));
         assert_eq!(i.cwd.unwrap().as_str(), "~/app");
-        let i = process_info(&f.root(), me(), 101, Some(home)).unwrap();
+        let i = info(&f.root(), me(), 101, Some(home)).unwrap();
         assert_eq!(i.name.as_str().len(), 32);
         assert_eq!(i.cwd.unwrap().as_str(), "~");
-        let i = process_info(&f.root(), me(), 102, Some(home)).unwrap();
+        let i = info(&f.root(), me(), 102, Some(home)).unwrap();
         assert_eq!(i.cwd.unwrap().as_str(), "/srv/data (deleted)");
-        assert_eq!(process_info(&f.root(), me(), 999, Some(home)), None);
+        assert_eq!(info(&f.root(), me(), 999, Some(home)), None);
         // `/home/user2` is not under `/home/u`.
         assert_eq!(tilde(Path::new("/home/u2/x"), Some(home)), "/home/u2/x");
         assert_eq!(tilde(Path::new("/x"), Some(Path::new("/"))), "/x");
@@ -515,14 +595,14 @@ mod tests {
         let root = f.root();
         let mut s = Sessions::new(&root, me(), &list);
         assert_eq!(s.known_pids(), vec![200]);
-        assert_eq!(s.of(100), Some(a.clone()));
-        assert_eq!(s.of(110), Some(a));
-        assert_eq!(s.of(200), Some(b.clone()));
-        assert_eq!(s.of(220), Some(b));
-        assert_eq!(s.of(300), None);
-        assert_eq!(s.of(400), None);
-        assert_eq!(s.of(500), None);
-        assert_eq!(s.of(999), None);
+        assert_eq!(of_pid(&mut s, 100), Some(a.clone()));
+        assert_eq!(of_pid(&mut s, 110), Some(a));
+        assert_eq!(of_pid(&mut s, 200), Some(b.clone()));
+        assert_eq!(of_pid(&mut s, 220), Some(b));
+        assert_eq!(of_pid(&mut s, 300), None);
+        assert_eq!(of_pid(&mut s, 400), None);
+        assert_eq!(of_pid(&mut s, 500), None);
+        assert_eq!(of_pid(&mut s, 999), None);
     }
 
     #[test]
@@ -578,10 +658,10 @@ mod tests {
         assert_eq!(parse_ppid("1 (a"), None);
         assert_eq!(parse_ppid(")"), None);
         assert_eq!(parse_ppid("1 (a) S x"), None);
-        assert_eq!(socket_inode(Path::new("socket:[12]")), Some(12));
-        assert_eq!(socket_inode(Path::new("socket:[]")), None);
-        assert_eq!(socket_inode(Path::new("socket:[-1]")), None);
-        assert_eq!(socket_inode(Path::new("anon_inode:[eventfd]")), None);
+        assert_eq!(socket_inode(b"socket:[12]"), Some(12));
+        assert_eq!(socket_inode(b"socket:[]"), None);
+        assert_eq!(socket_inode(b"socket:[-1]"), None);
+        assert_eq!(socket_inode(b"anon_inode:[eventfd]"), None);
         let f = FakeProc::new("odd");
         f.process(100, 1, "x", "/", &[]);
         std::fs::write(f.dir.join("100/stat"), b"\xff\xfe garbage").unwrap();
@@ -589,7 +669,7 @@ mod tests {
         std::fs::write(f.dir.join("100/cgroup"), b"no colons here\n::\n").unwrap();
         std::fs::create_dir_all(f.dir.join("notapid")).unwrap();
         let root = f.root();
-        let i = process_info(&root, me(), 100, None).unwrap();
+        let i = info(&root, me(), 100, None).unwrap();
         assert_eq!(
             i.name.as_str(),
             "\u{fffd}\u{1b}[31m",
@@ -599,8 +679,8 @@ mod tests {
             SessionName::new("a").unwrap(),
             Membership::Unit("fil-aa".into()),
         )];
-        assert_eq!(Sessions::new(&root, me(), &list).of(100), None);
+        assert_eq!(of_pid(&mut Sessions::new(&root, me(), &list), 100), None);
         let list = [(SessionName::new("a").unwrap(), Membership::Pids(vec![5]))];
-        assert_eq!(Sessions::new(&root, me(), &list).of(100), None);
+        assert_eq!(of_pid(&mut Sessions::new(&root, me(), &list), 100), None);
     }
 }

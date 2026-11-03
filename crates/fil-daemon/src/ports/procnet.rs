@@ -85,7 +85,7 @@ pub fn parse_line(line: &str) -> Option<Row> {
 fn parse_endpoint(s: &str) -> Option<(IpAddr, u16)> {
     let (addr, port) = s.split_once(':')?;
     // ASCII first: the IPv6 form is sliced by byte offsets.
-    if port.len() != 4 || !addr.is_ascii() {
+    if port.len() != 4 || !port.bytes().all(|b| b.is_ascii_hexdigit()) || !addr.is_ascii() {
         return None;
     }
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -164,13 +164,14 @@ pub struct NetRead {
 }
 
 /// Reads `ROOT/net/tcp` and `ROOT/net/tcp6`, line by line within the bounds and before
-/// `deadline`. A missing file (no IPv6) is not an error.
+/// `deadline`. A missing `tcp6` is a host without IPv6; a missing `tcp` (a `/proc` mounted with
+/// `subset=pid`, a sandbox) means the listeners cannot be known, which is incomplete, not "none".
 pub fn read(root: &Path, deadline: Instant) -> NetRead {
     let mut out = NetRead::default();
     for name in ["tcp", "tcp6"] {
         match std::fs::File::open(root.join("net").join(name)) {
             Ok(f) => read_from(f, deadline, &mut out),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && name == "tcp6" => {}
             Err(_) => out.truncated = true,
         }
     }
@@ -340,6 +341,7 @@ mod tests {
             "0: 0100007F:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 -5",
             "x: 0100007F:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 1",
             "0: +100007F:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 1",
+            "0: 0100007F:+F90 00000000:0000 0A 0:0 0:0 0 1000 0 1",
             // 32 bytes, not 32 ASCII digits.
             "0: ％％％％％％％％％％AA:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 1",
         ] {
@@ -347,13 +349,19 @@ mod tests {
         }
     }
 
+    /// S4 (review of #64): no `net/tcp` is "cannot tell", not "no listeners".
     #[test]
-    fn a_missing_root_reads_as_nothing() {
-        let r = read(
-            Path::new("/nonexistent/fil-ports-test"),
-            Instant::now() + std::time::Duration::from_secs(1),
-        );
+    fn a_missing_tcp_table_is_incomplete_and_a_missing_tcp6_is_not() {
+        let later = Instant::now() + std::time::Duration::from_secs(1);
+        let r = read(Path::new("/nonexistent/fil-ports-test"), later);
         assert!(r.sockets.is_empty());
+        assert!(r.truncated);
+        let dir = std::env::temp_dir().join(format!("fil-procnet-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("net")).unwrap();
+        std::fs::write(dir.join("net/tcp"), fixture("tcp")).unwrap();
+        let r = read(&dir, later);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(!r.truncated);
+        assert_eq!(r.sockets.len(), 5);
     }
 }

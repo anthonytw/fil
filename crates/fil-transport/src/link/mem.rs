@@ -4,7 +4,10 @@
 //! Simplifications, compared with the real links: at most two queues per direction rather than
 //! one per channel (so backpressure is not per channel), no heartbeats (health changes only when
 //! the test says so, through [`MemControl`]), and no RTT unless the test sets one.
-//! [`Link::flush`] waits until the peer has read everything sent.
+//! [`Link::flush`] waits until the peer has read everything sent. [`Link::finish`] is stricter
+//! than on the real links: the pair remembers every finished channel (it is a test link; the
+//! memory is the test's) and fails every later send on one, so a layer above that sends after
+//! finishing is caught here, where the real links, which forget, would let it through.
 //!
 //! **Delivery order.** [`pair`] delivers everything in the order it was sent, which neither real
 //! link does. The pipe's scheduler sends control frames strictly ahead of queued terminal data,
@@ -13,6 +16,7 @@
 //! pair and breaks on both transports. [`pair_with`] with [`Delivery::ControlFirst`] keeps
 //! control on its own queue and hands it up ahead of any data that is waiting.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +98,8 @@ pub struct MemLink {
     rx: Mutex<Rx>,
     status: Arc<watch::Sender<LinkStatus>>,
     peer_status: Arc<watch::Sender<LinkStatus>>,
+    /// Channels this end finished.
+    finished: std::sync::Mutex<HashSet<ChannelId>>,
 }
 
 /// Drives both ends' health from a test.
@@ -126,6 +132,7 @@ pub fn pair_with(
         rx: Mutex::new(rx_ba),
         status: a_status.clone(),
         peer_status: b_status.clone(),
+        finished: Default::default(),
     };
     let b = MemLink {
         kind,
@@ -133,6 +140,7 @@ pub fn pair_with(
         rx: Mutex::new(rx_ab),
         status: b_status.clone(),
         peer_status: a_status.clone(),
+        finished: Default::default(),
     };
     let control = MemControl {
         a: a_status,
@@ -178,6 +186,10 @@ impl MemControl {
 }
 
 impl MemLink {
+    fn finished(&self) -> std::sync::MutexGuard<'_, HashSet<ChannelId>> {
+        self.finished.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn down_reason(&self) -> Option<DownReason> {
         match &self.status.borrow().state {
             LinkState::Down(r) => Some(r.clone()),
@@ -207,6 +219,12 @@ impl Link for MemLink {
     async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<(), LinkError> {
         if let Some(r) = self.down_reason() {
             return Err(LinkError(r));
+        }
+        if self.finished().contains(&channel) {
+            return Err(LinkError(DownReason::Io(format!(
+                "channel {} was finished",
+                channel.0
+            ))));
         }
         tokio::select! {
             sent = self.tx.queue(channel).send((channel, payload)) => {
@@ -251,6 +269,13 @@ impl Link for MemLink {
 
     fn status(&self) -> watch::Receiver<LinkStatus> {
         self.status.subscribe()
+    }
+
+    /// Remembers the channel; every later send on it fails (see the module docs).
+    fn finish(&self, channel: ChannelId) {
+        if channel.0 >= ChannelId::FORWARD_BASE {
+            self.finished().insert(channel);
+        }
     }
 
     fn close(&self) {
@@ -409,6 +434,25 @@ mod tests {
         assert_eq!(flushing.await.unwrap(), Err(LinkError(DownReason::Dead)));
         // And on a link that is already down, even with nothing outstanding.
         assert_eq!(a.flush().await, Err(LinkError(DownReason::Dead)));
+    }
+
+    #[tokio::test]
+    async fn finish_fails_later_sends_on_that_channel_only() {
+        let (a, b, _) = pair(LinkKind::Pipe, 8);
+        let ch = ChannelId(16);
+        a.send(ch, bytes("one")).await.unwrap();
+        a.finish(ch);
+        a.finish(ch); // idempotent
+        assert!(matches!(
+            a.send(ch, bytes("two")).await,
+            Err(LinkError(DownReason::Io(_)))
+        ));
+        // What was sent before is still delivered; fixed channels and the peer are unaffected.
+        assert_eq!(b.recv().await.unwrap(), (ch, bytes("one")));
+        a.finish(ChannelId::TERMINAL);
+        a.send(ChannelId::TERMINAL, bytes("t")).await.unwrap();
+        b.send(ch, bytes("back")).await.unwrap();
+        assert_eq!(b.recv().await.unwrap(), (ChannelId::TERMINAL, bytes("t")));
     }
 
     #[tokio::test]

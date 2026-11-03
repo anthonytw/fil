@@ -77,7 +77,10 @@ pub use command::{PipeCommand, server_alive};
 
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkStatus};
 use driver::{ChildGuard, Driver, reap};
-use shared::{Pop, Shared};
+use shared::{Pop, Refused, Shared};
+
+#[cfg(feature = "test-hooks")]
+pub use shared::ChannelState;
 
 /// Knobs for a [`PipeLink`]. [`PipeConfig::new`] gives the defaults.
 #[derive(Clone, Debug)]
@@ -725,6 +728,13 @@ impl PipeLink {
         fil_proto::text::sanitize(&self.banner)
     }
 
+    /// What the link holds per channel (feature `test-hooks`), which tests of channel churn keep
+    /// bounded by the channels in use.
+    #[cfg(feature = "test-hooks")]
+    pub fn channel_state(&self) -> ChannelState {
+        self.shared.channel_state()
+    }
+
     /// What the command wrote to stderr so far (the last few KiB), safe to show, with
     /// [`PipeStderr::Capture`]; empty otherwise. After the link went down it is what the command
     /// said on its way out ("Connection to host closed.").
@@ -937,7 +947,13 @@ impl Link for PipeLink {
             }
             match self.shared.try_enqueue(frame) {
                 Ok(()) => return Ok(()),
-                Err(back) => frame = back,
+                Err(Refused::Full(back)) => frame = back,
+                Err(Refused::Finished) => {
+                    return Err(LinkError(DownReason::Io(format!(
+                        "channel {} was finished",
+                        channel.0
+                    ))));
+                }
             }
             space.await;
         }
@@ -993,6 +1009,12 @@ impl Link for PipeLink {
 
     fn status(&self) -> watch::Receiver<LinkStatus> {
         self.shared.status.subscribe()
+    }
+
+    /// The frames already accepted on the channel still go out in order; its counters are
+    /// forgotten once the driver has written them all.
+    fn finish(&self, channel: ChannelId) {
+        self.shared.finish(channel);
     }
 
     fn close(&self) {

@@ -29,6 +29,9 @@
 //! - **`Up` means the peer has proven itself.** On the pipe, after the preamble and the first
 //!   frame. On QUIC, after the daemon's first frame: in TLS 1.3 the client's handshake finishes
 //!   before the daemon has judged the client key (`docs/m1/quic-auth.md`).
+//! - **Channels end.** [`Link::finish`] frees what the link holds for a channel once what was
+//!   sent on it has left, so a link carries any number of channels over its life (every
+//!   forwarded connection is one) while holding only the open ones.
 //! - **Close discards.** Payloads still queued when the link closes or dies are dropped; the
 //!   send buffers above rebuild them on the next link. [`Link::flush`] is how a last message is
 //!   made to arrive before a deliberate close.
@@ -164,6 +167,23 @@ pub trait Link: Send + Sync + 'static {
     /// Payloads sent after the call are not waited for. On a link that is already down it fails
     /// at once, even if nothing was outstanding.
     fn flush(&self) -> impl Future<Output = Result<(), LinkError>> + Send;
+
+    /// This side sends nothing more on `channel` over this link. Payloads already accepted are
+    /// still delivered in order; then the link frees what it holds for the channel (QUIC: ends
+    /// the stream, so the peer gets it back and a link carries any number of channels over its
+    /// life; pipe: forgets its counters). Idempotent. A no-op for the fixed channels (`0..=15`).
+    ///
+    /// Sending on the channel again fails with an `Io` error while the link still holds it: until
+    /// those payloads have been written (pipe), or until the peer's link has answered the marker
+    /// that ends the stream (QUIC). After that the link no longer knows the channel was finished:
+    /// remembering every finished channel is what this method exists to avoid. A later send then
+    /// opens the channel afresh, and the peer's layer above drops it as a closed channel
+    /// (DESIGN.md §8.5, M2's channel map). The layer above never does that: it finishes a channel
+    /// only once it is released on both sides.
+    ///
+    /// Every implementation, wrappers included, must free or forward: a wrapper that dropped it
+    /// would leak per-channel state for the life of the link.
+    fn finish(&self, channel: ChannelId);
 
     /// Closes the link; queued payloads are dropped. This side sees `Down(Closed)`. The peer
     /// sees `Down(Closed)` where the transport can say so (QUIC); on a byte stream (the pipe)

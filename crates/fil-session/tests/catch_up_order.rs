@@ -85,6 +85,10 @@ impl Link for GateLink {
     async fn flush(&self) -> Result<(), LinkError> {
         self.inner.flush().await
     }
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }
@@ -247,6 +251,10 @@ impl Link for InboxLink {
     async fn flush(&self) -> Result<(), LinkError> {
         self.inner.flush().await
     }
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }

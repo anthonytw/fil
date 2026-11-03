@@ -5,7 +5,7 @@
 # [limits] and [revisioned] as that revision shipped it. Two branches that each bump to the same
 # revision add different lines at the end and conflict in git: that is the point.
 major = 1
-revision = 4
+revision = 5
 [frozen]
 preamble/1 = 1b46494c2d434f4e4e45435420310a
 preamble/65535 = 1b46494c2d434f4e4e4543542036353533350a
@@ -79,7 +79,6 @@ MAX_DNS_LABEL = 63
 MAX_PROCESS_NAME = 32
 MAX_PORTS_PATH = 128
 MAX_PROBE_LABEL = 64
-quic::MAX_STREAMS = 1024
 quic::MAX_VARINT_LEN = 5
 alpn/rev7 = fil/1.7
 [revisioned]
@@ -247,6 +246,14 @@ quic/length-prefix-0 = flush
 quic/length-prefix-1 = payload 1
 quic/length-prefix-16416 = payload 16416
 quic/length-prefix-16417 = refused
+quic/streams-open-at-once = 1024
+quic/streams-over-the-link-life = unbounded
+quic/finished-stream = payloads, then a flush marker, then FIN
+quic/finished-stream-forgotten = when its end marker is answered
+quic/unanswered-stream-ends-max = 2048
+quic/unanswered-stream-ends-past-max = protocol violation
+quic/later-stream-for-a-channel = read after the earlier stream ended and its payloads were handed up
+quic/no-stream-credit-within-dead-after = the link goes down (Io)
 decode/session-name-64 = ok
 decode/session-name-65 = err
 decode/term-64 = ok
@@ -418,3 +425,4 @@ ports/chunked-widest = parts 43 rows 256 fit true more-on-all-but-last true
 2 = 46a624dcce668487
 3 = 5bc45255045b0f43
 4 = a40001718a924f1b
+5 = e95b36059f8e1cc6

@@ -673,6 +673,25 @@ pub enum Response {
 pub struct PortsPart {
     #[serde(deserialize_with = "capped_rows")]
     pub rows: Vec<PortsRow>,
+    /// Set (the same on every part of an answer) when the host's listeners could not all be
+    /// found: the answer may be missing listeners, or have some without an owner. Forward,
+    /// session and agent rows are complete either way.
+    pub incomplete: Option<PortsIncomplete>,
+}
+
+/// Why a `fil ports` answer may be missing listeners. A reason only: no counts, paths or other
+/// data (M2 plan section 4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PortsIncomplete {
+    /// The host's socket table could not be read (no `/proc/net/tcp`: a `/proc` mounted with
+    /// `subset=pid`, a sandbox).
+    NoSocketTable,
+    /// The scan stopped at one of its bounds (processes, descriptors, time).
+    Bounded,
+    /// The scan did not finish in time, and the answer was sent without it.
+    TimedOut,
+    /// This host has no listener discovery (fil finds listeners on Linux only).
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,6 +726,11 @@ pub struct ForwardRow {
     /// The process listening on the target on the remote host (`-L`), if it is the user's.
     pub owner: Option<ProcessInfo>,
     pub probe: Option<Probe>,
+    /// The `-L` target is taken by another user's listener (a port squat: their `127.0.0.1:P` in
+    /// front of the user's `[::]:P`, say), so a connection through the forward reaches them. The
+    /// client warns. `owner` and `probe` are `None` then: fil neither reads nor probes another
+    /// user's process.
+    pub target_other_user: bool,
 }
 
 /// A TCP listener on the remote host that no forward owns.
@@ -839,8 +863,16 @@ impl Response {
 
     /// A `fil ports` answer in parts: `rows` cut to [`MAX_PORTS_ROWS`], each part as many rows
     /// as fit in one control message (in order), `more` on all but the last. Always at least one
-    /// part.
-    pub fn ports(mut rows: Vec<PortsRow>) -> Vec<Response> {
+    /// part. Complete: see [`Response::ports_with`].
+    pub fn ports(rows: Vec<PortsRow>) -> Vec<Response> {
+        Self::ports_with(rows, None)
+    }
+
+    /// [`Response::ports`], with `incomplete` on every part.
+    pub fn ports_with(
+        mut rows: Vec<PortsRow>,
+        incomplete: Option<PortsIncomplete>,
+    ) -> Vec<Response> {
         rows.truncate(MAX_PORTS_ROWS);
         let mut parts = Vec::new();
         let mut part: Vec<PortsRow> = Vec::new();
@@ -848,6 +880,7 @@ impl Response {
             ControlMsg::Response(Response::Ports {
                 part: PortsPart {
                     rows: rows.to_vec(),
+                    incomplete,
                 },
                 more: true,
             })
@@ -876,7 +909,7 @@ impl Response {
             .into_iter()
             .enumerate()
             .map(|(i, rows)| Response::Ports {
-                part: PortsPart { rows },
+                part: PortsPart { rows, incomplete },
                 more: i + 1 < n,
             })
             .collect()

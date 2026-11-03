@@ -195,6 +195,14 @@ pub enum LogError {
 pub struct LogSink {
     tx: mpsc::Sender<Vec<u8>>,
     warned: std::sync::atomic::AtomicBool,
+    /// The file log's writer thread, for [`LogSink::close`]. The thread is otherwise detached:
+    /// when the sink is dropped it finishes the chunks already queued (typed text is not lost
+    /// because the session ended), including a pending age check, and then ends. So it can still
+    /// be writing a moment after its owner is gone, which is harmless to the product (it writes
+    /// only to the log's own directory) but is what a test that removes that directory must wait
+    /// for.
+    #[cfg(test)]
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Chunks the log may have queued before new ones are dropped (a stalled command must not grow
@@ -587,7 +595,7 @@ impl LogSink {
                 let dir = LogDir::open(path).map_err(err)?;
                 let mut log = FileLog::open(dir, SystemTime::now()).map_err(err)?;
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
-                std::thread::spawn(move || {
+                let writer = std::thread::spawn(move || {
                     // An empty chunk is the tick of the ticker below (`write` never sends one).
                     while let Some(b) = rx.blocking_recv() {
                         let now = SystemTime::now();
@@ -611,7 +619,15 @@ impl LogSink {
                         let _ = tx.try_send(Vec::new());
                     }
                 });
-                Ok(LogSink::new(tx))
+                #[cfg_attr(not(test), allow(unused_mut))]
+                let mut sink = LogSink::new(tx);
+                #[cfg(test)]
+                {
+                    sink.writer = Some(writer);
+                }
+                #[cfg(not(test))]
+                drop(writer);
+                Ok(sink)
             }
             OfflineLog::Command(argv) => {
                 let cmd = argv.join(" ");
@@ -651,6 +667,19 @@ impl LogSink {
         Self {
             tx,
             warned: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            writer: None,
+        }
+    }
+
+    /// Closes the sink and waits for its writer thread to finish what is queued and end, so that
+    /// nothing writes to the log's directory afterwards.
+    #[cfg(test)]
+    fn close(self) {
+        let LogSink { tx, writer, .. } = self;
+        drop(tx);
+        if let Some(w) = writer {
+            w.join().expect("the log writer thread panicked");
         }
     }
 
@@ -1013,6 +1042,7 @@ mod tests {
         assert!(b.len() > 0, "the full log moved aside");
         assert_eq!(a.permissions().mode() & 0o777, 0o600);
         assert_eq!(b.permissions().mode() & 0o777, 0o600);
+        sink.close();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1159,7 +1189,9 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         drop(held);
-        drop(sink);
+        // The writer thread may still be going through a tick; it must be done before the
+        // directory goes, or it can create a file in it while it is being removed.
+        sink.close();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1244,7 +1276,7 @@ mod tests {
             "{took:?}"
         );
         drop(held);
-        drop(sink);
+        sink.close();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

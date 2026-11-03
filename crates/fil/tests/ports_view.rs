@@ -12,9 +12,9 @@ use fil::forward_spec::parse;
 use fil::ports_view::{JSON_SCHEMA, PortsAnswer, ViewError, ViewOptions, render_json, render_text};
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsPart, PortsPath, PortsRow, Probe,
-    ProbeKind, ProbeLabel, ProcessInfo, ProcessName, Response, SessionName, SessionSummary,
-    SubscriberSummary, TermName,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsPart, PortsPath,
+    PortsRow, Probe, ProbeKind, ProbeLabel, ProcessInfo, ProcessName, Response, SessionName,
+    SessionSummary, SubscriberSummary, TermName,
 };
 use fil_proto::mux::{BindFailure, ForwardId, ForwardKind, ListenState, Origin};
 
@@ -97,6 +97,7 @@ fn fwd(
         last_unix_ms: 0,
         owner: None,
         probe: None,
+        target_other_user: false,
     }
 }
 
@@ -197,6 +198,18 @@ fn fixed_rows() -> Vec<PortsRow> {
         true,
     );
 
+    // A `-L` whose target another user's listener takes on the host (a port squat).
+    let mut squatted = fwd(
+        "build",
+        9,
+        ForwardKind::Local,
+        "6379",
+        listening(6379),
+        Origin::Client,
+        true,
+    );
+    squatted.target_other_user = true;
+
     vec![
         PortsRow::Session(summary("main", Some(("laptop", at(9, 12))), 8, true)),
         PortsRow::Forward(vite),
@@ -246,7 +259,8 @@ fn fixed_rows() -> Vec<PortsRow> {
             requests: 14,
             last_unix_ms: at(10, 40),
         }),
-        PortsRow::Session(summary("build", None, 0, false)),
+        PortsRow::Session(summary("build", None, 1, false)),
+        PortsRow::Forward(squatted),
         PortsRow::Listener(ListenerRow {
             addr: ip("127.0.0.1"),
             port: port(5432),
@@ -275,6 +289,15 @@ fn answer(rows: Vec<PortsRow>) -> PortsAnswer {
     PortsAnswer::from_parts(&Response::ports(rows)).unwrap()
 }
 
+/// The fixed rows, from a host whose scan stopped at a bound.
+fn fixed_answer() -> PortsAnswer {
+    PortsAnswer::from_parts(&Response::ports_with(
+        fixed_rows(),
+        Some(PortsIncomplete::Bounded),
+    ))
+    .unwrap()
+}
+
 fn golden(file: &str, actual: &str) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
@@ -295,13 +318,13 @@ fn golden(file: &str, actual: &str) {
 fn the_text_table_matches_the_golden() {
     golden(
         "ports.txt",
-        &render_text(&answer(fixed_rows()), &opts(Some("orin"))),
+        &render_text(&fixed_answer(), &opts(Some("orin"))),
     );
 }
 
 #[test]
 fn the_json_matches_the_golden_and_keeps_its_layout() {
-    let text = render_json(&answer(fixed_rows()), &opts(Some("orin")));
+    let text = render_json(&fixed_answer(), &opts(Some("orin")));
     golden("ports.json", &text);
 
     // The layout scripts rely on: these keys, with these types, in schema 1.
@@ -310,6 +333,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     assert_eq!(v["host"], "orin");
     assert_eq!(v["truncated"], false);
     assert_eq!(v["complete"], true);
+    assert_eq!(v["incomplete"], "bounded");
     let keys = |v: &serde_json::Value| -> Vec<String> {
         let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         k.sort();
@@ -321,6 +345,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "complete",
             "host",
             "host_listeners",
+            "incomplete",
             "schema",
             "sessions",
             "truncated"
@@ -350,6 +375,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "probe",
             "spec",
             "target",
+            "target_other_user",
             "waiting"
         ]
     );
@@ -380,6 +406,11 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     assert_eq!(f[3]["consented"], false);
     assert_eq!(f[4]["listen"], serde_json::Value::Null);
     assert_eq!(v["sessions"][1]["attached"], serde_json::Value::Null);
+    assert_eq!(f[0]["target_other_user"], false);
+    let squat = &v["sessions"][1]["forwards"][0];
+    assert_eq!(squat["target_other_user"], true);
+    assert_eq!(squat["owner"], serde_json::Value::Null);
+    assert_eq!(squat["probe"], serde_json::Value::Null);
     assert_eq!(v["host_listeners"][1]["scope"], "mine");
     assert_eq!(v["host_listeners"][2]["scope"], "other");
     // IPv6 is a bare address in every field; brackets are for the text table only.
@@ -576,6 +607,7 @@ fn an_answer_in_parts_is_one_table() {
     let extra = Response::Ports {
         part: PortsPart {
             rows: rows[..5].to_vec(),
+            incomplete: None,
         },
         more: false,
     };
@@ -585,6 +617,69 @@ fn an_answer_in_parts_is_one_table() {
     assert_eq!(a.rows.len(), MAX_PORTS_ROWS);
     assert!(a.truncated);
     assert!(render_text(&a, &opts(None)).contains("cut at 256 rows"));
+}
+
+/// Every reason an answer can be incomplete is said, in the text and in JSON; a complete answer
+/// says nothing.
+#[test]
+fn an_incomplete_answer_says_why() {
+    for (why, text, json) in [
+        (
+            PortsIncomplete::NoSocketTable,
+            "socket table could not be read",
+            "no_socket_table",
+        ),
+        (
+            PortsIncomplete::Bounded,
+            "stopped at one of its bounds",
+            "bounded",
+        ),
+        (
+            PortsIncomplete::TimedOut,
+            "did not finish in time",
+            "timed_out",
+        ),
+        (
+            PortsIncomplete::Unsupported,
+            "Linux hosts only",
+            "unsupported",
+        ),
+    ] {
+        let a = PortsAnswer::from_parts(&Response::ports_with(vec![], Some(why))).unwrap();
+        assert_eq!(a.incomplete, Some(why));
+        let t = render_text(&a, &opts(None));
+        let lead = match why {
+            PortsIncomplete::TimedOut | PortsIncomplete::Unsupported => "(no listeners shown: ",
+            _ => "(incomplete: ",
+        };
+        assert!(t.contains(lead) && t.contains(text), "{t}");
+        let v: serde_json::Value = serde_json::from_str(&render_json(&a, &opts(None))).unwrap();
+        assert_eq!(v["incomplete"], json);
+    }
+    let a = answer(vec![]);
+    assert_eq!(a.incomplete, None);
+    let t = render_text(&a, &opts(None));
+    assert!(
+        !t.contains("incomplete") && !t.contains("no listeners shown"),
+        "{t}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&render_json(&a, &opts(None))).unwrap();
+    assert_eq!(v["incomplete"], serde_json::Value::Null);
+}
+
+/// A squatted `-L` target is flagged on its row and names no process.
+#[test]
+fn a_target_another_user_holds_is_flagged_on_its_row() {
+    let text = render_text(&fixed_answer(), &opts(Some("orin")));
+    let row = text
+        .lines()
+        .find(|l| l.contains("localhost:6379 →"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains("another user ⚠"), "{row}");
+    assert!(
+        text.contains("⚠ another user's listener holds this target on the host"),
+        "{text}"
+    );
 }
 
 #[test]

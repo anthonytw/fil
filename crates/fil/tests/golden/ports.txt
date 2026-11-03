@@ -33,7 +33,9 @@ AGENT
 SESSION build on orin — not attached
 
 FORWARDED
-  none
+  DIR  LAPTOP            REMOTE          OWNER           CONNS  ↓ / ↑  LAST
+  -L   localhost:6379 →  localhost:6379  another user ⚠  0      —      —
+       ⚠ another user's listener holds this target on the host: connections through this forward reach them
 
 OTHER LISTENERS YOU OWN ON THIS HOST
   5432  127.0.0.1  postgres (pid 1201), not started from a fil session  Postgres
@@ -41,3 +43,5 @@ OTHER LISTENERS YOU OWN ON THIS HOST
 
 LISTENERS OF OTHER USERS ON THIS HOST (port and address only)
   22  0.0.0.0 ⚠
+
+(incomplete: the scan on the host stopped at one of its bounds; listeners may be missing)

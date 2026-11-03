@@ -3,6 +3,7 @@
   "host": "orin",
   "truncated": false,
   "complete": true,
+  "incomplete": "bounded",
   "sessions": [
     {
       "name": "main",
@@ -48,7 +49,8 @@
             "kind": "http",
             "http_status": 200,
             "label": "Vite + React"
-          }
+          },
+          "target_other_user": false
         },
         {
           "id": 2,
@@ -73,7 +75,8 @@
           "bytes_up": 0,
           "last_unix_ms": 1699958400000,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 3,
@@ -95,7 +98,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 4,
@@ -120,7 +124,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 5,
@@ -142,7 +147,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 6,
@@ -167,7 +173,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 7,
@@ -192,7 +199,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         },
         {
           "id": 8,
@@ -217,7 +225,8 @@
           "bytes_up": 0,
           "last_unix_ms": null,
           "owner": null,
-          "probe": null
+          "probe": null,
+          "target_other_user": false
         }
       ],
       "listeners": [
@@ -271,7 +280,34 @@
       "term": "xterm-256color",
       "attached": null,
       "agent": null,
-      "forwards": [],
+      "forwards": [
+        {
+          "id": 9,
+          "kind": "local",
+          "spec": "-L 6379:localhost:6379",
+          "bind": "loopback",
+          "port": 6379,
+          "target": {
+            "host": "localhost",
+            "port": 6379
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 6379
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": true
+        }
+      ],
       "listeners": []
     }
   ],

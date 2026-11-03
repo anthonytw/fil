@@ -1,0 +1,541 @@
+//! [`QuicLink`]: one authenticated QUIC connection as a [`Link`].
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use fil_proto::limits::MAX_FRAME_BODY;
+use fil_proto::{ChannelClass, ChannelId, ControlMsg};
+use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, WriteError};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, MissedTickBehavior};
+
+use super::inbox::{Closed, Inbox};
+use super::wire::{MAX_VARINT_LEN, VarintReader, parse_len, put_varint};
+use crate::auth::{self, ClientKey, Fingerprint, PublicKey, SERVER_NAME};
+use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkState, LinkStatus};
+
+/// Application close codes (the peer sees `ApplicationClosed` with this code and reason text).
+pub(super) mod code {
+    use quinn::VarInt;
+    pub const CLOSED: VarInt = VarInt::from_u32(0);
+    /// The daemon closed the connection because its client key was revoked (detach or takeover).
+    pub const REVOKED: VarInt = VarInt::from_u32(1);
+    pub const PROTOCOL: VarInt = VarInt::from_u32(2);
+}
+
+/// How many payloads may wait in front of one channel's stream. A full queue is what makes
+/// `send` wait; what QUIC flow control holds back backs up into it.
+const WRITE_QUEUE: usize = 8;
+
+/// quinn stream priorities: higher goes first (DESIGN.md §8.5). Control is strictly ahead of
+/// everything. Interactive and forward channels share one priority on purpose: quinn then
+/// round-robins their streams, so a terminal that never goes idle cannot starve a forward.
+fn priority(channel: ChannelId) -> i32 {
+    match channel.class() {
+        ChannelClass::Control => 100,
+        ChannelClass::Interactive | ChannelClass::Forward => 10,
+    }
+}
+
+/// The first frame a daemon-side link sends, on the control channel, as soon as the connection
+/// is accepted. It is a `Heartbeat` reply with nonce 0, which the receiving link consumes. It
+/// exists so that a client's link can become `Up` ("the daemon's first frame", DESIGN.md §8.3)
+/// without waiting for the layer above to say something first.
+fn accept_proof() -> &'static [u8] {
+    static PROOF: OnceLock<Vec<u8>> = OnceLock::new();
+    PROOF.get_or_init(|| {
+        ControlMsg::Heartbeat {
+            nonce: 0,
+            reply: true,
+        }
+        .encode()
+        .expect("a heartbeat encodes")
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Role {
+    Client,
+    Daemon,
+}
+
+/// State shared between a link and its tasks. Holds no reference back to the link, so dropping
+/// the link can close the connection.
+struct Io {
+    conn: Connection,
+    role: Role,
+    /// How long opening a stream may wait for stream credit before `send` gives up.
+    open_timeout: Duration,
+    inbox: Inbox,
+    writers: Mutex<HashMap<ChannelId, mpsc::Sender<Bytes>>>,
+    /// True once any frame from the peer has arrived.
+    got_frame: watch::Sender<bool>,
+    /// The text of the error that ended the connection, for `Refused` messages.
+    last_error: OnceLock<String>,
+}
+
+impl Io {
+    fn down_error(&self) -> LinkError {
+        LinkError(self.inbox.down_reason().unwrap_or(DownReason::Closed))
+    }
+
+    /// Ends the link because the peer broke the stream rules. The reason is recorded before the
+    /// connection closes, so it is what `status` reports.
+    fn violation(&self, what: &str) {
+        tracing::warn!(what, "QUIC link: protocol violation by the peer");
+        self.inbox
+            .close(DownReason::Io(format!("protocol violation: {what}")));
+        self.conn.close(code::PROTOCOL, what.as_bytes());
+    }
+
+    /// The queue in front of `channel`'s stream; starts the stream's writer on first use.
+    fn writer_for(self: &Arc<Self>, channel: ChannelId) -> Result<mpsc::Sender<Bytes>, LinkError> {
+        if self.inbox.down_reason().is_some() {
+            return Err(self.down_error());
+        }
+        let mut writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = writers.get(&channel) {
+            return Ok(tx.clone());
+        }
+        let (tx, rx) = mpsc::channel(WRITE_QUEUE);
+        tokio::spawn(write_stream(self.clone(), channel, rx));
+        writers.insert(channel, tx.clone());
+        Ok(tx)
+    }
+}
+
+/// One authenticated QUIC connection, carrying fil-proto payloads on numbered channels.
+///
+/// Each channel is one unidirectional stream per direction (§8.5), so a stalled channel stops
+/// only itself. See [`super`] for how the daemon accepts these and how a client makes one.
+pub struct QuicLink {
+    io: Arc<Io>,
+    status: Arc<watch::Sender<LinkStatus>>,
+    /// Keeps a client's UDP socket alive for the life of the link.
+    _endpoint: Option<Endpoint>,
+}
+
+impl QuicLink {
+    /// Dials `addr` from a new UDP socket and returns once the daemon has sent its first frame.
+    /// Must run inside a tokio runtime.
+    ///
+    /// Fails with `Refused` if that takes longer than `params.connect_timeout`, if the daemon's
+    /// certificate does not match `pin`, or if the daemon does not accept `key`.
+    pub async fn connect(
+        addr: SocketAddr,
+        pin: Fingerprint,
+        key: &ClientKey,
+        params: LinkParams,
+    ) -> Result<Self, LinkError> {
+        let wildcard = match addr {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        };
+        let endpoint = std::net::UdpSocket::bind(wildcard)
+            .and_then(|socket| {
+                Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    socket,
+                    Arc::new(quinn::TokioRuntime),
+                )
+            })
+            .map_err(|e| LinkError(DownReason::Io(format!("cannot open a UDP socket: {e}"))))?;
+        Self::connect_on(endpoint, addr, pin, key, params).await
+    }
+
+    /// Like [`connect`](Self::connect), on an endpoint the caller made (a simulated socket in
+    /// tests, or a socket with a particular source address).
+    pub async fn connect_on(
+        endpoint: Endpoint,
+        addr: SocketAddr,
+        pin: Fingerprint,
+        key: &ClientKey,
+        params: LinkParams,
+    ) -> Result<Self, LinkError> {
+        let refused = |why: String| LinkError(DownReason::Refused(why));
+        let cfg = super::client_config(pin, key, &params)
+            .map_err(|e| refused(format!("client configuration: {e}")))?;
+        let attempt = async {
+            let connecting = endpoint
+                .connect_with(cfg, addr, SERVER_NAME)
+                .map_err(|e| refused(format!("cannot connect: {e}")))?;
+            let conn = connecting
+                .await
+                .map_err(|e| refused(format!("handshake failed: {e}")))?;
+            let link = Self::start(conn, Some(endpoint.clone()), Role::Client, params);
+            // In TLS 1.3 the client finishes first: this connection may still be one the daemon
+            // is about to reject. Only a frame from the daemon says it was accepted.
+            link.wait_first_frame().await.map_err(|reason| {
+                let detail = link.io.last_error.get().cloned();
+                refused(detail.unwrap_or_else(|| format!("no reply from the daemon ({reason:?})")))
+            })?;
+            Ok(link)
+        };
+        match tokio::time::timeout(params.connect_timeout, attempt).await {
+            Ok(res) => res,
+            Err(_) => Err(refused(format!(
+                "no answer from the daemon within {:?}",
+                params.connect_timeout
+            ))),
+        }
+    }
+
+    /// Wraps a connection the daemon's listener accepted. The client is authenticated (its key
+    /// was in the registry), so the link starts `Up`.
+    pub(super) fn accepted(conn: Connection, params: LinkParams) -> Self {
+        Self::start(conn, None, Role::Daemon, params)
+    }
+
+    fn start(conn: Connection, endpoint: Option<Endpoint>, role: Role, params: LinkParams) -> Self {
+        let io = Arc::new(Io {
+            conn: conn.clone(),
+            role,
+            open_timeout: params.dead_after,
+            inbox: Inbox::new(),
+            writers: Mutex::new(HashMap::new()),
+            got_frame: watch::Sender::new(false),
+            last_error: OnceLock::new(),
+        });
+        let status = Arc::new(watch::Sender::new(LinkStatus::new(LinkState::Up)));
+        tokio::spawn(accept_streams(io.clone()));
+        tokio::spawn(supervise(io.clone(), status.clone(), params));
+        let link = Self {
+            io,
+            status,
+            _endpoint: endpoint,
+        };
+        if role == Role::Daemon
+            && let Ok(tx) = link.io.writer_for(ChannelId::CONTROL)
+        {
+            // The queue is empty, so this cannot wait.
+            let _ = tx.try_send(Bytes::from_static(accept_proof()));
+        }
+        link
+    }
+
+    async fn wait_first_frame(&self) -> Result<(), DownReason> {
+        let mut got = self.io.got_frame.subscribe();
+        let mut status = self.status.subscribe();
+        loop {
+            if *got.borrow() {
+                return Ok(());
+            }
+            if let LinkState::Down(reason) = &status.borrow().state {
+                return Err(reason.clone());
+            }
+            tokio::select! {
+                _ = got.changed() => {}
+                _ = status.changed() => {}
+            }
+        }
+    }
+
+    /// The peer's current address. On the daemon this follows the client through NAT rebinding
+    /// and address changes; see [`LinkStatus::path_generation`].
+    pub fn remote_address(&self) -> SocketAddr {
+        self.io.conn.remote_address()
+    }
+
+    /// Bytes received from the peer that `recv` has not returned yet. Bounded: a channel holds at
+    /// most 256 KiB, and once all channels together hold 16 MiB only channels with more than
+    /// 16 KiB are held back.
+    pub fn unread_bytes(&self) -> usize {
+        self.io.inbox.unread_bytes()
+    }
+
+    /// The client key this connection authenticated with (daemon side). The daemon compares it
+    /// with the key in the attach request on a resume (DESIGN.md §8.5, resume rules).
+    pub fn peer_key(&self) -> Option<PublicKey> {
+        auth::peer_key(&self.io.conn)
+    }
+
+    /// Closes the link because the client's key was revoked. The client sees `Down(Closed)`.
+    pub(super) fn close_revoked(conn: &Connection) {
+        conn.close(code::REVOKED, b"key revoked");
+    }
+}
+
+impl Drop for QuicLink {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl Link for QuicLink {
+    fn kind(&self) -> LinkKind {
+        LinkKind::Direct
+    }
+
+    /// Waits while this channel's queue is full. A payload outside `1..=MAX_FRAME_BODY` bytes
+    /// is a caller bug: it is refused with an `Io` error and the link stays up.
+    async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<(), LinkError> {
+        if payload.is_empty() || payload.len() > MAX_FRAME_BODY {
+            return Err(LinkError(DownReason::Io(format!(
+                "payload of {} bytes (allowed: 1 to {MAX_FRAME_BODY})",
+                payload.len()
+            ))));
+        }
+        let tx = self.io.writer_for(channel)?;
+        tx.send(payload).await.map_err(|_| {
+            if self.io.inbox.down_reason().is_some() {
+                self.io.down_error()
+            } else {
+                // The writer gave up because no stream could be opened (the peer's limit on
+                // streams is spent, see `MAX_STREAMS`). The link itself is fine.
+                LinkError(DownReason::Io(format!(
+                    "cannot open a stream for channel {}",
+                    channel.0
+                )))
+            }
+        })
+    }
+
+    async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError> {
+        self.io.inbox.recv().await.map_err(|Closed(r)| LinkError(r))
+    }
+
+    fn status(&self) -> watch::Receiver<LinkStatus> {
+        self.status.subscribe()
+    }
+
+    fn close(&self) {
+        self.io.inbox.close(DownReason::Closed);
+        self.io.conn.close(code::CLOSED, b"closed");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tasks
+
+/// One channel's outgoing stream: opened with the first payload, then a stream of length-prefixed
+/// payloads. Ends when the connection does (a link that is dropped or dies must not leave its
+/// writers behind), and when no stream can be opened.
+async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<Bytes>) {
+    /// The next payload to write, or `None` when the queue's senders are gone or the connection
+    /// has ended.
+    async fn next(io: &Io, rx: &mut mpsc::Receiver<Bytes>) -> Option<Bytes> {
+        tokio::select! {
+            p = rx.recv() => p,
+            _ = io.conn.closed() => None,
+        }
+    }
+
+    let Some(first) = next(&io, &mut rx).await else {
+        return;
+    };
+    let opened = tokio::select! {
+        r = tokio::time::timeout(io.open_timeout, io.conn.open_uni()) => r,
+        _ = io.conn.closed() => return, // `supervise` reports why
+    };
+    let Ok(Ok(mut stream)) = opened else {
+        // The peer's stream limit is spent (or the connection just ended). Forget this writer,
+        // which fails the senders waiting on it; the link stays up.
+        io.writers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&channel);
+        return;
+    };
+    let _ = stream.set_priority(priority(channel));
+    let mut header = Vec::with_capacity(MAX_VARINT_LEN);
+    put_varint(channel.0, &mut header);
+    let mut pending = Some(first);
+    let mut header = Some(Bytes::from(header));
+    loop {
+        let payload = match pending.take() {
+            Some(p) => p,
+            None => match next(&io, &mut rx).await {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let len = Bytes::copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        let res = match header.take() {
+            Some(h) => stream.write_all_chunks(&mut [h, len, payload]).await,
+            None => stream.write_all_chunks(&mut [len, payload]).await,
+        };
+        match res {
+            Ok(()) => {}
+            Err(WriteError::Stopped(_)) => {
+                io.violation("peer stopped a stream we write");
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Accepts the peer's streams and starts a reader for each.
+async fn accept_streams(io: Arc<Io>) {
+    while let Ok(stream) = io.conn.accept_uni().await {
+        tokio::spawn(read_stream(io.clone(), stream));
+    }
+}
+
+async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
+    // The channel id.
+    let mut varint = VarintReader::default();
+    let channel = loop {
+        let mut byte = [0u8; 1];
+        if stream.read_exact(&mut byte).await.is_err() {
+            return;
+        }
+        match varint.push(byte[0]) {
+            Ok(Some(id)) => break ChannelId(id),
+            Ok(None) => {}
+            Err(_) => return io.violation("bad channel id"),
+        }
+    };
+    let Some(wake) = io.inbox.register(channel) else {
+        if io.inbox.down_reason().is_none() {
+            io.violation("second stream for one channel");
+        }
+        return;
+    };
+    // Only a client expects the daemon's accept frame; a daemon passes up whatever the client's
+    // first control frame is.
+    let mut proof_pending = io.role == Role::Client && channel == ChannelId::CONTROL;
+    loop {
+        let mut prefix = [0u8; 4];
+        match stream.read_exact(&mut prefix).await {
+            Ok(()) => {}
+            Err(ReadExactError::FinishedEarly(0)) => return, // the peer finished this channel
+            Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
+            Err(ReadExactError::ReadError(_)) => return,
+        }
+        let Some(len) = parse_len(prefix) else {
+            return io.violation("frame length out of range");
+        };
+        let mut payload = vec![0u8; len];
+        match stream.read_exact(&mut payload).await {
+            Ok(()) => {}
+            Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
+            Err(ReadExactError::ReadError(_)) => return,
+        }
+        io.got_frame
+            .send_if_modified(|seen| !std::mem::replace(seen, true));
+        if proof_pending {
+            proof_pending = false;
+            if payload == accept_proof() {
+                continue; // consumed here
+            }
+        }
+        if io
+            .inbox
+            .push(channel, Bytes::from(payload), &wake)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn reason_of(err: &ConnectionError) -> DownReason {
+    match err {
+        ConnectionError::TimedOut => DownReason::Dead,
+        ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed => {
+            DownReason::Closed
+        }
+        other => DownReason::Io(other.to_string()),
+    }
+}
+
+/// How often the link looks at the connection's counters.
+fn sample_period(params: &LinkParams) -> Duration {
+    (params.degraded_after / 10).clamp(Duration::from_millis(10), Duration::from_millis(100))
+}
+
+/// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
+/// final `Down`.
+async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: LinkParams) {
+    let conn = &io.conn;
+    let closed = conn.closed();
+    tokio::pin!(closed);
+    let mut tick = tokio::time::interval(sample_period(&params));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut rx_datagrams = conn.stats().udp_rx.datagrams;
+    let mut last_rx = Instant::now();
+    let mut remote: SocketAddr = conn.remote_address();
+    let mut local_ip: Option<IpAddr> = conn.local_ip();
+
+    let err = loop {
+        tokio::select! {
+            err = &mut closed => break err,
+            _ = tick.tick() => {}
+        }
+        let now = Instant::now();
+        let seen = conn.stats().udp_rx.datagrams;
+        if seen != rx_datagrams {
+            rx_datagrams = seen;
+            last_rx = now;
+        }
+        let silence = now.duration_since(last_rx);
+        let degraded = silence >= params.degraded_after;
+        if silence >= params.dead_after {
+            // quinn's idle timer restarts whenever it sends a keep-alive, so on its own it can
+            // take up to a heartbeat longer than `dead_after`. The contract is `dead_after`
+            // since the last thing heard, and what was heard does not depend on the consumer.
+            io.inbox.close(DownReason::Dead);
+            conn.close(code::CLOSED, b"dead");
+        }
+
+        // Path changes. The daemon sees every client address change (quinn follows the peer to
+        // its new source address). A client sees only a change of its own local IP, and only
+        // where the OS tells quinn which local address a packet arrived on; a NAT rebind that
+        // changes nothing the client can see is invisible to it.
+        let mut changed = false;
+        let now_remote = conn.remote_address();
+        if now_remote != remote {
+            remote = now_remote;
+            changed = true;
+        }
+        let now_local = conn.local_ip();
+        if now_local.is_some() && local_ip.is_some() && now_local != local_ip {
+            changed = true;
+        }
+        if now_local.is_some() {
+            local_ip = now_local;
+        }
+
+        let rtt = conn.rtt();
+        status.send_if_modified(|s| {
+            let mut modified = false;
+            if !matches!(s.state, LinkState::Down(_)) {
+                let wanted = if degraded {
+                    LinkState::Degraded
+                } else {
+                    LinkState::Up
+                };
+                if s.state != wanted {
+                    s.state = wanted;
+                    modified = true;
+                }
+            }
+            // Only a real change: a watch update wakes every subscriber.
+            let moved = s
+                .rtt
+                .is_none_or(|old| old.abs_diff(rtt) >= (old / 10).max(Duration::from_millis(2)));
+            if moved {
+                s.rtt = Some(rtt);
+                modified = true;
+            }
+            if changed {
+                s.path_generation += 1;
+                modified = true;
+            }
+            modified
+        });
+    };
+
+    let _ = io.last_error.set(err.to_string());
+    let reason = io.inbox.down_reason().unwrap_or_else(|| reason_of(&err));
+    // What was received stays readable, whatever ended the link.
+    io.inbox.close(reason.clone());
+    status.send_modify(|s| s.state = LinkState::Down(reason));
+}

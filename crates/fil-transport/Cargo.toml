@@ -19,7 +19,13 @@ ring = "0.17"
 thiserror = "2"
 tracing = "0.1"
 
+[features]
+# Hooks for tests of the listener. Not for daemon code: only the test targets enable it.
+test-hooks = []
+
 [dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-transport = { path = ".", features = ["test-hooks"] }
 fil-netsim = { path = "../fil-netsim" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "io-util"] }
 

@@ -99,11 +99,25 @@ impl Inbox {
 
     /// Adds a payload, waiting while the channel is over budget. `wake` is what `register`
     /// returned.
+    #[cfg(test)]
     pub(super) async fn push(
         &self,
         channel: ChannelId,
         payload: Bytes,
         wake: &Notify,
+    ) -> Result<(), Closed> {
+        self.push_parking(channel, payload, wake, || {}).await
+    }
+
+    /// [`Inbox::push`], calling `on_park` each time before it waits for room, so the caller can
+    /// let go of what it holds while it is parked (the stream reader copies the rest of its last
+    /// chunk, which would otherwise keep quinn's receive buffer alive for as long as it waits).
+    pub(super) async fn push_parking(
+        &self,
+        channel: ChannelId,
+        payload: Bytes,
+        wake: &Notify,
+        mut on_park: impl FnMut(),
     ) -> Result<(), Closed> {
         loop {
             {
@@ -133,6 +147,7 @@ impl Inbox {
                     return Ok(());
                 }
             }
+            on_park();
             // `notify_one` keeps a permit, so a wake-up between the check and this await is not
             // lost.
             wake.notified().await;
@@ -323,6 +338,41 @@ mod tests {
         // Reading from the full channel lets its reader go on.
         assert_eq!(pop_ch(&inbox), Some(16));
         tokio::task::yield_now().await;
+        assert!(blocked.await.unwrap().is_some());
+    }
+
+    /// A reader that has to wait for room is told before it waits (so it can let go of quinn's
+    /// receive buffer), and one that does not have to wait is not told at all.
+    #[tokio::test]
+    async fn a_reader_is_told_before_it_parks() {
+        let inbox = Arc::new(Inbox::new());
+        let fwd = inbox.register(ChannelId(16)).unwrap();
+        let parked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = |parked: &Arc<std::sync::atomic::AtomicU32>| {
+            let parked = parked.clone();
+            move || {
+                parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        inbox
+            .push_parking(ChannelId(16), b(10), &fwd, count(&parked))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(parked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        while inbox.lock().chans[&ChannelId(16)].queued < CHANNEL_BUDGET {
+            push(&inbox, &fwd, 16, 16 * 1024).await;
+        }
+        let (i2, f2, p2) = (inbox.clone(), fwd.clone(), parked.clone());
+        let blocked = tokio::spawn(async move {
+            i2.push_parking(ChannelId(16), b(10), &f2, count(&p2))
+                .await
+                .ok()
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        assert_eq!(parked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        while pop_ch(&inbox).is_some() {}
         assert!(blocked.await.unwrap().is_some());
     }
 

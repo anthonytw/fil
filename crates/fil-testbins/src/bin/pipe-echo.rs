@@ -23,6 +23,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bytes::BytesMut;
 use fil_proto::frame::DataSegment;
 use fil_proto::limits::{MAX_DATA_PAYLOAD, MAX_PREAMBLE_SKIP, PROTOCOL_MAJOR};
 use fil_proto::preamble::{self, PreambleError, PreambleScanner, Scan};
@@ -94,7 +95,7 @@ fn server() -> ExitCode {
             }
         };
         let mut input = &buf[..n];
-        let mut wire = Vec::new();
+        let mut wire = BytesMut::new();
         loop {
             match decoder.push(&mut input) {
                 Ok(Some(frame)) => {
@@ -440,7 +441,7 @@ fn reap(child: &mut Child) -> String {
 
 fn send_bulk(out: &mut impl Write, total: u64) -> io::Result<u64> {
     let mut offset = 0u64;
-    let mut wire = Vec::new();
+    let mut wire = BytesMut::new();
     while offset < total {
         let len = (total - offset).min(MAX_DATA_PAYLOAD as u64) as usize;
         data_frame(&mut wire, offset, len)?;
@@ -459,7 +460,7 @@ fn send_stream(
 ) -> io::Result<u64> {
     let end = Instant::now() + duration;
     let mut offset = 0u64;
-    let mut wire = Vec::new();
+    let mut wire = BytesMut::new();
     while Instant::now() < end {
         data_frame(&mut wire, offset, size)?;
         out.write_all(&wire)?;
@@ -481,7 +482,7 @@ fn send_names(out: &mut impl Write) -> io::Result<u64> {
     Ok(HOSTILE.len() as u64)
 }
 
-fn data_frame(wire: &mut Vec<u8>, offset: u64, len: usize) -> io::Result<()> {
+fn data_frame(wire: &mut BytesMut, offset: u64, len: usize) -> io::Result<()> {
     wire.clear();
     let payload = DataSegment::encode(offset, &pattern(SEED, offset, len))
         .map_err(|e| io::Error::other(e.to_string()))?;

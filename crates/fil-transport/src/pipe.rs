@@ -879,24 +879,13 @@ impl Handshake {
     }
 }
 
-/// Bytes the varint encoding of `channel` takes in a frame body.
-fn channel_varint_len(channel: ChannelId) -> usize {
-    match channel.0 {
-        0..0x80 => 1,
-        0x80..0x4000 => 2,
-        0x4000..0x20_0000 => 3,
-        0x20_0000..0x1000_0000 => 4,
-        _ => 5,
-    }
-}
-
 impl Link for PipeLink {
     fn kind(&self) -> LinkKind {
         LinkKind::Pipe
     }
 
     async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<(), LinkError> {
-        if channel_varint_len(channel) + payload.len() > MAX_FRAME_BODY {
+        if channel.varint_len() + payload.len() > MAX_FRAME_BODY {
             // Dropping the payload would leave a hole in the channel's byte stream, which the
             // layers above cannot repair on a live link. Treat it as the bug it is.
             let reason = DownReason::Io(format!(
@@ -906,9 +895,7 @@ impl Link for PipeLink {
             self.shared.set_down(reason.clone());
             return Err(LinkError(reason));
         }
-        // (No copy when `payload` is the only handle on its buffer, which it is for everything
-        // the session and the client build.)
-        let mut frame = Frame::new(channel, Vec::from(payload));
+        let mut frame = Frame::new(channel, payload);
         loop {
             // Register for the next "space freed" signal before looking, so none is missed.
             let space = self.shared.space.notified();

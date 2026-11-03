@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use fil_proto::chan::RecvChannel;
 use fil_proto::epoch::{
     AttachInput, AttachMode, AttachOutcome, DetachOutcome, Effect, SessionEpoch, SubscriberId,
@@ -360,7 +361,7 @@ pub(crate) enum Cmd {
     Input {
         conn: ConnId,
         seq: u64,
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// An [`fil_proto::InputRecord::Resize`] from the terminal channel, in order with the input.
     Resize {
@@ -491,6 +492,19 @@ pub(crate) struct Core {
     exit: Option<ExitInfo>,
     eof: bool,
     exit_deadline: Option<Instant>,
+}
+
+/// The new part of an input segment (`fresh`, a suffix of `data` that `RecvChannel::accept`
+/// returned), as a `Bytes` for the PTY writer. The whole segment is passed on without a copy. A
+/// part of it is copied: the input backlog limit counts the bytes queued, and a slice would keep
+/// the whole frame alive, so segments that each overlap what was received by all but a byte
+/// would hold the limit's worth of frames, not the limit's worth of bytes.
+fn fresh_input(data: &Bytes, fresh: &[u8]) -> Bytes {
+    if fresh.len() == data.len() {
+        data.slice_ref(fresh)
+    } else {
+        Bytes::copy_from_slice(fresh)
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -923,7 +937,7 @@ impl Core {
                 replies.extend(self.terminal.answer(q, self.size.cols(), self.size.rows()));
             }
             if !replies.is_empty() {
-                self.pty.write(replies);
+                self.pty.write(Bytes::from(replies));
                 self.poison_end = self.ready();
             }
         }
@@ -1237,7 +1251,7 @@ impl Core {
         }
     }
 
-    fn on_input(&mut self, conn: ConnId, seq: u64, data: Vec<u8>) {
+    fn on_input(&mut self, conn: ConnId, seq: u64, data: Bytes) {
         if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
             return;
         }
@@ -1250,7 +1264,7 @@ impl Core {
             return;
         }
         let fresh = match self.input.accept(seq, &data) {
-            Ok(f) => f.to_vec(),
+            Ok(f) => fresh_input(&data, f),
             Err(e) => {
                 tracing::warn!(error = %e, "input channel gap");
                 tracing::debug!(session = %self.name, "input channel gap in");
@@ -1433,6 +1447,25 @@ pub(crate) fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole new segment is passed on as it is; the new tail of an overlapping one is a copy of
+    /// its own, so it does not keep the rest of the frame alive.
+    #[test]
+    fn fresh_input_copies_a_partial_segment_and_shares_a_whole_one() {
+        let data = Bytes::from(vec![7u8; 16 * 1024]);
+        let (base, end) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
+        let inside = |b: &Bytes| {
+            let at = b.as_ptr() as usize;
+            at >= base && at + b.len() <= end
+        };
+        let whole = fresh_input(&data, &data[..]);
+        assert_eq!(whole, data);
+        assert!(inside(&whole), "a whole segment needs no copy");
+        let tail = fresh_input(&data, &data[data.len() - 1..]);
+        assert_eq!(tail.len(), 1);
+        assert!(!inside(&tail), "one new byte must not pin 16 KiB");
+        assert!(fresh_input(&data, &data[data.len()..]).is_empty());
+    }
 
     /// Many small reads are one wake-up and one batch (efficiency #1): the core is told once
     /// while output is waiting, and takes it all, in order, in one go.
@@ -1637,14 +1670,14 @@ mod tests {
             .send(Cmd::Input {
                 conn: first.conn,
                 seq: 0,
-                data: b"stale\n".to_vec(),
+                data: Bytes::from_static(b"stale\n"),
             })
             .await;
         handle
             .send(Cmd::Input {
                 conn: second.conn,
                 seq: 0,
-                data: b"live\n".to_vec(),
+                data: Bytes::from_static(b"live\n"),
             })
             .await;
         // The core handles its queue in order, so once the live line has got through, the stale

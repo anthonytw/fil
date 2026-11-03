@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
-use fil_proto::chan::{AckError, Segment};
+use fil_proto::chan::AckError;
 use fil_proto::frame::DataSegment;
 use fil_proto::input::{InputRecord, TerminalInput};
 use fil_proto::limits::MAX_DATA_PAYLOAD;
@@ -501,7 +501,7 @@ impl<'a, L: Link> Conn<'a, L> {
                             .send(Cmd::Input {
                                 conn: self.id,
                                 seq: seg.seq,
-                                data: seg.data.to_vec(),
+                                data: payload.slice_ref(seg.data),
                             })
                             .await;
                     }
@@ -626,12 +626,15 @@ impl<'a, L: Link> Conn<'a, L> {
                 .map_or(prog.ready, |m| m.0.min(prog.ready));
             if next < limit && !stalled {
                 let want = (limit - next).min(MAX_DATA_PAYLOAD as u64) as usize;
-                let data = self.handle.shared().lock_log().read(next, want);
-                if data.is_empty() {
+                // The frame payload (offset, then bytes) is built under the lock in one allocation:
+                // one copy out of the log, and nothing more between here and the wire.
+                let Some((payload, taken)) =
+                    self.handle.shared().lock_log().read_payload(next, want)
+                else {
                     // The log wrapped since the check above; the next round sees it.
                     continue;
-                }
-                let end = next + data.len() as u64;
+                };
+                let end = next + taken as u64;
                 // Right before the send, not only at the top of the loop: the core may have taken
                 // the session since the events were looked at, and this client must not be sent
                 // output produced after that.
@@ -639,12 +642,7 @@ impl<'a, L: Link> Conn<'a, L> {
                     return self.lost(out).await;
                 }
                 self.flow().record_send(end, Instant::now());
-                let seg = Segment { seq: next, data };
-                if let Err(e) = self
-                    .link
-                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
-                    .await
-                {
+                if let Err(e) = self.link.send(ChannelId::TERMINAL, payload).await {
                     return ServeEnd::LinkDown(e.0);
                 }
                 continue;

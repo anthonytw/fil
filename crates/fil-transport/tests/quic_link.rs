@@ -734,15 +734,52 @@ async fn revoking_a_key_closes_its_live_links_at_once() {
     );
 }
 
+/// Revoking in the registry alone: new handshakes fail at once, and the live connection is
+/// closed by the sweep once the backstop has passed since the revocation: not before (the
+/// layer above is still sending its last message on it), and not never.
 #[tokio::test(start_paused = true)]
-async fn revoking_in_the_registry_alone_is_caught_by_the_sweep() {
-    let mut w = World::new(14);
+async fn revoking_in_the_registry_alone_closes_live_links_only_after_the_backstop() {
+    let mut w = World::with(14, |c, _| c.revoke_backstop = Duration::from_secs(3));
+    let (client, _daemon, key) = w.pair().await;
+    let revoked = Instant::now();
+    assert!(w.registry.revoke(key.public_key()));
+
+    // New handshakes with the key are refused at once.
+    let ep = w.client_endpoint();
+    let err = QuicLink::connect_on(ep, w.server, w.pin(), &key, w.params)
+        .await
+        .err();
+    assert!(
+        matches!(err, Some(LinkError(DownReason::Refused(_)))),
+        "{err:?}"
+    );
+
+    // Still open just before the backstop (the sweep has run several times by now).
+    tokio::time::sleep_until(revoked + Duration::from_millis(2900)).await;
+    assert!(matches!(client.status().borrow().state, LinkState::Up));
+    assert_eq!(w.listener.live_connections(), 1);
+
+    // Closed soon after it: the sweep runs every 500 ms.
+    let mut cs = client.status();
+    let st = wait_for(&mut cs, "client Down", is_down).await;
+    assert_eq!(down_reason(&st), DownReason::Closed);
+    let after = revoked.elapsed();
+    assert!(
+        after >= Duration::from_secs(3) && after <= Duration::from_millis(3700),
+        "closed {after:?} after the revocation"
+    );
+}
+
+/// The backstop is measured from the revocation, and registering the key again cancels it.
+#[tokio::test(start_paused = true)]
+async fn registering_a_revoked_key_again_cancels_the_pending_close() {
+    let mut w = World::with(17, |c, _| c.revoke_backstop = Duration::from_secs(2));
     let (client, _daemon, key) = w.pair().await;
     w.registry.revoke(key.public_key());
-    let mut cs = client.status();
-    let t0 = Instant::now();
-    wait_for(&mut cs, "client Down", is_down).await;
-    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    w.registry.register(key.public_key().clone());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(matches!(client.status().borrow().state, LinkState::Up));
 }
 
 // ---------------------------------------------------------------------------------------------

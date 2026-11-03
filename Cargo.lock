@@ -402,6 +402,7 @@ dependencies = [
  "bytes",
  "clap",
  "fil-client",
+ "fil-daemon",
  "fil-proto",
  "fil-term",
  "fil-transport",
@@ -427,6 +428,25 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "fil-daemon"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fil-proto",
+ "fil-session",
+ "fil-term",
+ "fil-transport",
+ "ring",
+ "rustix",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

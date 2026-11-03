@@ -15,6 +15,7 @@ path = "src/main.rs"
 bytes = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 fil-client = { path = "../fil-client" }
+fil-daemon = { path = "../fil-daemon" }
 fil-proto = { path = "../fil-proto" }
 fil-transport = { path = "../fil-transport" }
 rustix = { version = "1", features = ["system", "fs"] }

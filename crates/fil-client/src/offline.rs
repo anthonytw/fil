@@ -5,14 +5,18 @@
 //! - [`LogSink`]: the optional log. **It is off by default because it can capture passwords**:
 //!   anything typed while disconnected goes to it, including what the cap dropped, and including
 //!   input for a prompt that does not echo. A file sink creates the file with mode 0600 and
-//!   refuses an existing file that other users can read or write. A command sink pipes the bytes
-//!   to the command's stdin; the command decides where they end up.
+//!   refuses an existing file that other users can read or write. It is bounded in size (1 MiB)
+//!   and in age: the file in use is moved to `<path>.1` once its first entry is 7 days old, and
+//!   that file is deleted 7 days after its last write, so nothing typed stays on disk for more
+//!   than about 14 days, however little is logged and however often fil runs. The age comes from
+//!   a header line the file starts with. A command sink pipes the bytes to the command's stdin;
+//!   the command decides where they end up.
 
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
@@ -190,9 +194,21 @@ const LOG_QUEUE: usize = 4096;
 /// a log that can hold passwords is not kept without bound (DESIGN.md section 11.1, point 2).
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-/// A file log (and its rotated twin) that has not been written to for this long is deleted when
-/// fil next opens it.
-const LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// The file in use is moved aside to `<path>.1` once its first entry is this old.
+const LOG_ROTATE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// A rotated file is deleted this long after its last write. With [`LOG_ROTATE_AFTER`]: nothing
+/// typed stays on disk for more than about 14 days.
+const LOG_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How often a running file log looks at its own age and its rotated file's, with nothing being
+/// written (a client attached for weeks must not keep an old log because it was never written to).
+const LOG_MAINTAIN_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// What a file log starts with. Its entries are raw keystrokes with no time stamps, so the age
+/// of the file is kept here, as Unix seconds; the daemon's logs take theirs from the first line
+/// the same way, because file birth times are not on every platform (musl).
+const LOG_HEADER_PREFIX: &str = "# fil offline-input log, started ";
 
 /// The directory a file log lives in, opened once. The directory is checked through that
 /// descriptor, and every later operation on the log (open, rotate, expire) is relative to it
@@ -246,23 +262,20 @@ impl LogDir {
         n
     }
 
-    /// Deletes the log and its rotated twin if they have not been written to for
-    /// [`LOG_MAX_AGE`]. Only regular files, and never through a symlink.
-    fn expire(&self, now: std::time::SystemTime) {
+    /// Deletes the rotated twin if its last write is older than [`LOG_KEEP_FOR`]. Only a regular
+    /// file, and never through a symlink.
+    fn prune_twin(&self, now: SystemTime) {
         use rustix::fs::{AtFlags, FileType, statat, unlinkat};
-        let now = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        for name in [self.name.clone(), self.rotated_name()] {
-            let Ok(st) = statat(&self.dir, &name, AtFlags::SYMLINK_NOFOLLOW) else {
-                continue;
-            };
-            let age = u64::try_from(now as i64 - st.st_mtime).unwrap_or(0);
-            if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
-                && age > LOG_MAX_AGE.as_secs()
-            {
-                let _ = unlinkat(&self.dir, &name, AtFlags::empty());
-            }
+        let name = self.rotated_name();
+        let Ok(st) = statat(&self.dir, &name, AtFlags::SYMLINK_NOFOLLOW) else {
+            return;
+        };
+        let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let age = u64::try_from(now as i64 - st.st_mtime).unwrap_or(0);
+        if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+            && age > LOG_KEEP_FOR.as_secs()
+        {
+            let _ = unlinkat(&self.dir, &name, AtFlags::empty());
         }
     }
 
@@ -279,7 +292,7 @@ impl LogDir {
         let fd = openat(
             &self.dir,
             &self.name,
-            OFlags::WRONLY
+            OFlags::RDWR
                 | OFlags::CREATE
                 | OFlags::APPEND
                 | OFlags::NOFOLLOW
@@ -323,6 +336,104 @@ impl LogDir {
     }
 }
 
+/// A file log in use: the open file, how much it holds and when its first entry was written.
+struct FileLog {
+    dir: LogDir,
+    f: std::fs::File,
+    written: u64,
+    /// When the first entry in the file was written; `None` while the file is empty.
+    born: Option<SystemTime>,
+}
+
+fn header(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format!("{LOG_HEADER_PREFIX}{secs}\n")
+}
+
+/// The start time in the first line of `f`, if it is one of ours.
+fn read_started(f: &std::fs::File) -> Option<SystemTime> {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0u8; 96];
+    let n = f.read_at(&mut head, 0).ok()?;
+    let line = head[..n].split(|b| *b == b'\n').next()?;
+    let secs: u64 = std::str::from_utf8(line)
+        .ok()?
+        .strip_prefix(LOG_HEADER_PREFIX)?
+        .parse()
+        .ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+impl FileLog {
+    /// Opens the log at its directory's name. A file that is full, or whose first entry is too
+    /// old, or that does not start with our header (one from before the header, or not ours), is
+    /// moved aside first; a rotated file past its age is deleted.
+    fn open(dir: LogDir, now: SystemTime) -> Result<FileLog, String> {
+        let (f, written) = dir.open_file()?;
+        // A time in the future (a clock set back, or a header written by hand) is not trusted:
+        // an age that cannot be told is the file's worst case, not its best.
+        let born = read_started(&f).filter(|t| *t <= now + Duration::from_secs(60));
+        let mut log = FileLog {
+            dir,
+            f,
+            written,
+            born,
+        };
+        if written > 0 && (log.born.is_none() || log.too_old(now) || written >= LOG_MAX_BYTES) {
+            log.rotate()?;
+        }
+        log.dir.prune_twin(now);
+        Ok(log)
+    }
+
+    fn too_old(&self, now: SystemTime) -> bool {
+        self.born.is_some_and(|b| {
+            now.duration_since(b)
+                .is_ok_and(|age| age > LOG_ROTATE_AFTER)
+        })
+    }
+
+    /// Moves the file aside (replacing the older twin) and starts an empty one.
+    fn rotate(&mut self) -> Result<(), String> {
+        (self.f, self.written) = self.dir.rotate()?;
+        self.born = None;
+        Ok(())
+    }
+
+    /// Appends one entry, first moving the file aside if it would outgrow its size or is too old.
+    fn append(&mut self, bytes: &[u8], now: SystemTime) -> Result<(), String> {
+        if self.written > 0
+            && (self.written + bytes.len() as u64 > LOG_MAX_BYTES || self.too_old(now))
+        {
+            self.rotate()?;
+            self.dir.prune_twin(now);
+        }
+        let mut out = Vec::with_capacity(bytes.len() + 48);
+        if self.born.is_none() {
+            // The first entry of a file starts its clock.
+            out.extend_from_slice(header(now).as_bytes());
+            self.born = Some(now);
+        }
+        out.extend_from_slice(bytes);
+        self.f
+            .write_all(&out)
+            .and_then(|_| self.f.flush())
+            .map_err(|e| e.to_string())?;
+        self.written += out.len() as u64;
+        Ok(())
+    }
+
+    /// What a log does with no writes: the file in use is moved aside when it has grown old, and
+    /// a rotated file past its age is deleted.
+    fn maintain(&mut self, now: SystemTime) -> Result<(), String> {
+        if self.too_old(now) {
+            self.rotate()?;
+        }
+        self.dir.prune_twin(now);
+        Ok(())
+    }
+}
+
 impl LogSink {
     /// Opens the log. A file is created with mode 0600 and appended to; an existing file is
     /// refused unless it is a regular file that only the owner can access.
@@ -335,30 +446,30 @@ impl LogSink {
                     why,
                 };
                 let dir = LogDir::open(path).map_err(err)?;
-                dir.expire(std::time::SystemTime::now());
-                let (mut f, mut written) = dir.open_file().map_err(err)?;
-                if written >= LOG_MAX_BYTES {
-                    (f, written) = dir.rotate().map_err(err)?;
-                }
+                let mut log = FileLog::open(dir, SystemTime::now()).map_err(err)?;
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
                 std::thread::spawn(move || {
+                    // An empty chunk is the tick of the ticker below (`write` never sends one).
                     while let Some(b) = rx.blocking_recv() {
-                        if written + b.len() as u64 > LOG_MAX_BYTES {
-                            match dir.rotate() {
-                                Ok(next) => (f, written) = next,
-                                Err(why) => {
-                                    tracing::warn!(
-                                        why,
-                                        "cannot rotate the offline-input log; stopping it"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        if f.write_all(&b).and_then(|_| f.flush()).is_err() {
+                        let now = SystemTime::now();
+                        let done = if b.is_empty() {
+                            log.maintain(now)
+                        } else {
+                            log.append(&b, now)
+                        };
+                        if let Err(why) = done {
+                            tracing::warn!(why, "the offline-input log failed; stopping it");
                             break;
                         }
-                        written += b.len() as u64;
+                    }
+                });
+                // Holds the channel only weakly: the writer ends when the sink is dropped.
+                let ticker = tx.downgrade();
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(LOG_MAINTAIN_EVERY);
+                        let Some(tx) = ticker.upgrade() else { return };
+                        let _ = tx.try_send(Vec::new());
                     }
                 });
                 Ok(LogSink::new(tx))
@@ -525,33 +636,200 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn open_log(path: &Path, now: SystemTime) -> FileLog {
+        FileLog::open(LogDir::open(path).unwrap(), now).unwrap()
+    }
+
+    /// Everything in the directory, as text: what a reader of the disk would find.
+    fn everything_in(dir: &Path) -> String {
+        let mut all = String::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            all.push_str(&String::from_utf8_lossy(
+                &std::fs::read(e.unwrap().path()).unwrap(),
+            ));
+        }
+        all
+    }
+
     #[test]
-    fn a_log_nobody_has_written_to_for_a_month_is_deleted() {
-        let dir = scratch("age");
+    fn a_rotated_log_is_deleted_a_week_after_its_last_write() {
+        let dir = scratch("twin");
         let path = dir.join("log");
-        std::fs::write(&path, b"old secrets").unwrap();
         let twin = dir.join("log.1");
         std::fs::write(&twin, b"older secrets").unwrap();
-        let week = Duration::from_secs(7 * 24 * 3600);
-        let now = std::time::SystemTime::now();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(now - week)
-            .unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&twin)
-            .unwrap()
-            .set_modified(now - 5 * week)
-            .unwrap();
+        let now = SystemTime::now();
         let log_dir = LogDir::open(&path).unwrap();
-        log_dir.expire(now);
-        assert!(path.exists(), "a week-old log stays");
-        assert!(!twin.exists(), "five weeks old goes");
-        log_dir.expire(now + 4 * week);
-        assert!(!path.exists());
+        set_mtime(&twin, now - 6 * DAY);
+        log_dir.prune_twin(now);
+        assert!(twin.exists(), "six days since the last write: it stays");
+        set_mtime(&twin, now - 8 * DAY);
+        log_dir.prune_twin(now);
+        assert!(!twin.exists(), "eight days: it goes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_entry_starts_the_clock_and_the_file_says_so() {
+        let dir = scratch("header");
+        let path = dir.join("log");
+        let t0 = SystemTime::now();
+        let mut log = open_log(&path, t0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "an empty log has no clock yet"
+        );
+        log.append(b"first", t0).unwrap();
+        log.append(b"second", t0 + DAY).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (head, body) = text.split_once('\n').unwrap();
+        assert!(head.starts_with(LOG_HEADER_PREFIX), "{head}");
+        assert_eq!(body, "firstsecond");
+        let again = std::fs::File::open(&path).unwrap();
+        let started = read_started(&again).unwrap();
+        let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(secs(started), secs(t0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The case the old rule got wrong: a log written to every few days stayed "fresh" for ever,
+    /// so keystrokes typed months ago were still on disk.
+    #[test]
+    fn a_log_that_is_written_to_often_still_forgets_what_is_a_week_old() {
+        let dir = scratch("often");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        let t0 = SystemTime::now();
+        let mut log = open_log(&path, t0);
+        log.append(b"day0-secret ", t0).unwrap();
+        log.append(b"day6 ", t0 + 6 * DAY).unwrap();
+        set_mtime(&path, t0 + 6 * DAY);
+        assert!(!twin.exists(), "a log under a week old is not rotated");
+        // Day 8: the first entry is eight days old. The file is moved aside whole, and what is
+        // typed now starts a new one.
+        log.append(b"day8 ", t0 + 8 * DAY).unwrap();
+        let moved = std::fs::read_to_string(&twin).unwrap();
+        assert!(
+            moved.contains("day0-secret") && moved.contains("day6"),
+            "{moved}"
+        );
+        let now_file = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            now_file.ends_with("\nday8 ") && !now_file.contains("day0"),
+            "{now_file}"
+        );
+        // The moved file's last write was day 6: it goes a week after that.
+        set_mtime(&twin, t0 + 6 * DAY);
+        log.maintain(t0 + 12 * DAY).unwrap();
+        assert!(twin.exists(), "day 12");
+        log.maintain(t0 + 14 * DAY).unwrap();
+        assert!(!twin.exists(), "day 14: nothing from day 0 is left");
+        assert!(!everything_in(&dir).contains("day0"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A log written once a month (the old rule's "touched within 30 days") keeps nothing from the
+    /// month before: opening it moves the old file aside, and its last write is far past a week.
+    #[test]
+    fn a_log_touched_monthly_keeps_nothing_from_the_month_before() {
+        let dir = scratch("monthly");
+        let path = dir.join("log");
+        let t0 = SystemTime::now();
+        let mut log = open_log(&path, t0);
+        log.append(b"month0-password\r", t0).unwrap();
+        drop(log);
+        for month in 1..=3u32 {
+            let now = t0 + 29 * DAY * month;
+            let mut log = open_log(&path, now);
+            log.append(format!("month{month}\r").as_bytes(), now)
+                .unwrap();
+            let on_disk = everything_in(&dir);
+            assert!(
+                !on_disk.contains(&format!("month{}", month - 1)),
+                "month {month}: {on_disk:?}"
+            );
+            assert!(on_disk.contains(&format!("month{month}")));
+            // (The disk's real mtimes are all "now", so make the file say when it was written.)
+            set_mtime(&path, now);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_idle_log_is_moved_aside_when_it_grows_old_and_then_deleted() {
+        let dir = scratch("idle");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        let t0 = SystemTime::now();
+        let mut log = open_log(&path, t0);
+        log.append(b"typed once", t0).unwrap();
+        log.append(b" and again", t0 + 3 * DAY).unwrap();
+        set_mtime(&path, t0 + 3 * DAY);
+        log.maintain(t0 + 6 * DAY).unwrap();
+        assert!(!twin.exists());
+        log.maintain(t0 + 8 * DAY).unwrap();
+        assert!(twin.exists(), "no write needed to age it out");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        // Its last write was on day 3: a week later, day 10, it goes.
+        log.maintain(t0 + 9 * DAY).unwrap();
+        assert!(twin.exists());
+        log.maintain(t0 + 11 * DAY).unwrap();
+        assert!(!twin.exists());
+        assert!(!everything_in(&dir).contains("typed once"));
+        // Nothing to age: an empty log stays empty, and a later entry starts a new clock.
+        log.append(b"later", t0 + 20 * DAY).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("\nlater"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file from before the header (or not ours) has no age we can trust: it goes aside, and is
+    /// deleted a week after its last write.
+    #[test]
+    fn a_log_without_a_header_is_moved_aside_at_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("legacy");
+        let path = dir.join("log");
+        std::fs::write(&path, b"typed long ago").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let now = SystemTime::now();
+        let _log = open_log(&path, now);
+        assert_eq!(std::fs::read(dir.join("log.1")).unwrap(), b"typed long ago");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A start time in the future (a header written by hand, a clock set back) cannot keep a log
+    /// alive until that time comes.
+    #[test]
+    fn a_header_dated_in_the_future_is_not_believed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("future");
+        let path = dir.join("log");
+        let now = SystemTime::now();
+        let far = (now + 400 * DAY)
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(&path, format!("{LOG_HEADER_PREFIX}{far}\nsecret")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _log = open_log(&path, now);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert!(
+            std::fs::read_to_string(dir.join("log.1"))
+                .unwrap()
+                .ends_with("secret")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -573,7 +851,7 @@ mod tests {
         for _ in 0..500 {
             let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             // (Not just the new file's size: after the first chunk it is that size too.)
-            if len(&dir.join("log.1")) > 0 && len(&path) == chunk.len() as u64 {
+            if len(&dir.join("log.1")) > 0 && len(&path) >= chunk.len() as u64 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));

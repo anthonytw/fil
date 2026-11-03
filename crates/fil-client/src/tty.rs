@@ -20,14 +20,17 @@
 //!   signals, which are read by the same loop; against a terminal that has stopped for good (XOFF,
 //!   a hung emulator) the way out is the terminal's, not ours. If that ever matters, the fix is a
 //!   dedicated writer thread with a bounded queue, not `block_in_place` (which has no worker to
-//!   hand off from the main thread).
+//!   hand off from the main thread). The writes at the end of a run are the exception: they go
+//!   through [`TermOutput::write_all_within`], on a thread of their own and with a deadline, after
+//!   the termios is back, so a terminal that stopped reading cannot hold the client in raw mode.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use tokio::signal::unix::{SignalKind, signal};
@@ -211,7 +214,11 @@ pub fn from_fds(
     let txw = tx.clone();
     tasks.push(tokio::spawn(async move {
         while winch.recv().await.is_some() {
-            let (cols, rows) = winsize(&size_fd);
+            // A window that cannot be read right now is not a new size: no event, and the client
+            // goes on with the size it has (the next good read, or the next event, corrects it).
+            let Ok((cols, rows)) = winsize(&size_fd) else {
+                continue;
+            };
             if txw.send(TermEvent::Resize { cols, rows }).await.is_err() {
                 break;
             }
@@ -252,10 +259,16 @@ pub fn from_fds(
     })
 }
 
-fn winsize<Fd: AsFd>(fd: Fd) -> (u16, u16) {
+/// The window size, or an error when it cannot be read or reads as empty (no terminal size on
+/// the descriptor, a transient failure, a size of 0x0). There is no default here on purpose: a
+/// made-up 80x24 would look like the user resizing the window.
+fn winsize<Fd: AsFd>(fd: Fd) -> io::Result<(u16, u16)> {
     match tcgetwinsize(fd) {
-        Ok(w) if w.ws_col > 0 && w.ws_row > 0 => (w.ws_col, w.ws_row),
-        _ => (80, 24),
+        Ok(w) if w.ws_col > 0 && w.ws_row > 0 => Ok((w.ws_col, w.ws_row)),
+        Ok(_) => Err(io::Error::other(
+            "the terminal reports an empty window size",
+        )),
+        Err(e) => Err(errno(e)),
     }
 }
 
@@ -320,8 +333,10 @@ impl TermInput for TtyInput {
     }
 }
 
-/// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`.
-fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
+/// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`. With a `deadline`, a
+/// non-blocking descriptor that stays full past it fails with `TimedOut` (a blocking one is
+/// stuck inside the kernel, out of reach: see [`TtyOutput::write_all_within`]).
+fn write_fd(fd: &OwnedFd, mut bytes: &[u8], deadline: Option<Instant>) -> io::Result<()> {
     while !bytes.is_empty() {
         match rustix::io::write(fd, bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -330,7 +345,22 @@ fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
             Err(Errno::AGAIN) => {
                 // The terminal is full: wait for room (backpressure, see the module docs).
                 let mut fds = [PollFd::new(fd, PollFlags::OUT)];
-                let _ = poll(&mut fds, None);
+                match deadline {
+                    None => {
+                        let _ = poll(&mut fds, None);
+                    }
+                    Some(d) => {
+                        let left = d.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        let t = Timespec {
+                            tv_sec: left.as_secs() as _,
+                            tv_nsec: left.subsec_nanos() as _,
+                        };
+                        let _ = poll(&mut fds, Some(&t));
+                    }
+                }
             }
             Err(e) => return Err(errno(e)),
         }
@@ -340,11 +370,30 @@ fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
 
 impl TermOutput for TtyOutput {
     fn size(&mut self) -> io::Result<(u16, u16)> {
-        Ok(winsize(&self.fd))
+        winsize(&self.fd)
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        write_fd(&self.fd, bytes)
+        write_fd(&self.fd, bytes, None)
+    }
+
+    /// The write runs on a thread of its own, on a duplicate of the descriptor, and is waited
+    /// for up to `within`: the descriptor is usually blocking, and a write to a terminal that
+    /// has stopped reading never returns, so nothing on this thread could bound it. A write
+    /// that is still stuck at the deadline is left to the thread; the process is about to end.
+    fn write_all_within(&mut self, bytes: &[u8], within: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + within;
+        let fd = rustix::io::dup(&self.fd).map_err(errno)?;
+        let bytes = bytes.to_vec();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("fil-tty-exit-write".into())
+            .spawn(move || {
+                let _ = done_tx.send(write_fd(&fd, &bytes, Some(deadline)));
+            })?;
+        done_rx
+            .recv_timeout(within)
+            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
     }
 
     fn set_raw(&mut self, raw: bool) -> io::Result<()> {

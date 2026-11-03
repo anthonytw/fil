@@ -631,10 +631,7 @@ async fn an_own_forward_the_new_table_never_answers_is_closed_not_left_hanging()
     );
     assert!(started.elapsed() >= wait - Duration::from_millis(500));
     assert!(connect(mine).await.is_none(), "still listening");
-    until("the warning", 5, || {
-        rig.term.text().contains("did not")
-    })
-    .await;
+    until("the warning", 5, || rig.term.text().contains("did not")).await;
     assert!(!rig.is_finished());
     Ok(())
 }

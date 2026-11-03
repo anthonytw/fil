@@ -654,10 +654,16 @@ f_attach_detach() {
   [[ -n $pid1 ]] || fail "no shell pid on the screen: $(fc_screen a)"
   fc_detach a
 
-  local out
-  out=$(cx fil ls direct)
-  log "fil ls: $out"
+  # The daemon notices the closed link a moment after the client has gone; allow it a few seconds.
+  local out i t0
+  t0=$(now_ms)
+  for ((i = 0; i < 50; i++)); do
+    out=$(cx fil ls direct)
+    awk '$1 == "ad" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" && break
+    sleep 0.1
+  done
   awk '$1 == "ad" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls: 'ad' should be listed as detached: $out"
+  note "listed_as_detached_after_ms=$(($(now_ms) - t0))"
   ok "fil ls lists the session as detached"
 
   fc_start b -- direct ad
@@ -821,8 +827,10 @@ f_daemon_restart() {
 # A login shell that prints at startup: the banner warning is shown, and the session works.
 f_noisy() {
   fc_start a -- direct-noisy nz
-  fc_wait a 'printed this before fil started' 30
-  fc_wait a 'NOISY-BASHRC' 5
+  # The warning is written before the session's screen is drawn, and the first snapshot pushes it
+  # into the scrollback, so look at everything the client printed rather than at the screen.
+  fc_wait_raw a 'your shell printed this before fil started' 30
+  fc_wait_raw a 'fil:   | NOISY-BASHRC: welcome back' 5
   fc_ready a
   local err
   err=$(cx fil ls direct-noisy 2>&1 > /dev/null)
@@ -895,10 +903,10 @@ f_other_user() {
   # Open the directory and the socket by hand (as root) so only the daemon's own check is left.
   docker exec rn-target sh -c "chmod 711 /tmp/fil-$FUID; chmod 666 $sock"
   probe=$(docker exec -u fil rn-target sockprobe "$sock")
-  [[ $probe == WAITING ]] || fail "control: fil's own connection got: $probe"
+  [[ $probe == DATA* ]] || fail "control: fil's own connection got: $probe"
   probe=$(docker exec -u mallory rn-target sockprobe "$sock")
   [[ $probe == CLOSED* ]] || fail "mallory with the door open got: $probe"
-  ok "with the directory and socket opened, the daemon hangs up on mallory (fil itself is let in)"
+  ok "with the directory and socket opened, the daemon hangs up on mallory (fil itself is let in and greeted)"
   local i
   for ((i = 0; i < 20; i++)); do
     docker exec rn-target grep -q "\"peer_uid\":$muid" /home/fil/.local/state/fil/daemon.log && break

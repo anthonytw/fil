@@ -710,11 +710,13 @@ PD=/tmp/rn-pd-udp
 
 client_exec_on() {
   shift
-  nsx "$NS_C" runuser -u rnclient -- env "HOME=$UC_HOME" "$@"
+  nsx "$NS_C" runuser -u rnclient -- env -i "HOME=$UC_HOME" USER=rnclient LOGNAME=rnclient \
+    PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin "$@"
 }
 client_bg_on() {
   shift
-  nsx "$NS_C" runuser -u rnclient -- env "HOME=$UC_HOME" "$@" > /dev/null 2>&1 &
+  nsx "$NS_C" runuser -u rnclient -- env -i "HOME=$UC_HOME" USER=rnclient LOGNAME=rnclient \
+    PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin "$@" > /dev/null 2>&1 &
 }
 
 udp_fil_setup() {

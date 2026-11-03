@@ -2,9 +2,9 @@
 //!
 //! Connects to PATH, then waits up to 3 s for the other side to speak or hang up. Prints one
 //! line: `REFUSED errno=... msg=...` (the connect failed), `CLOSED` (the peer hung up at once,
-//! which is how the fil daemon treats a connection from another user), `DATA bytes=N` or
-//! `WAITING` (the peer accepted us and is waiting for us to say something: the daemon's answer
-//! to its own user). The realnet suite runs it as a second Unix user.
+//! which is how the fil daemon treats a connection from another user), `DATA bytes=N` (the peer
+//! spoke first: the daemon greets its own user with its `Hello`) or `WAITING` (the peer accepted
+//! us and is silent). The realnet suite runs it as a second Unix user.
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;

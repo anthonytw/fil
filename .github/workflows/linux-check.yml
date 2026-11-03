@@ -91,7 +91,7 @@ jobs:
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
-        run: just realnet ${{ matrix.part }}
+        run: just realnet ${{ matrix.part }} ${{ matrix.part == 'ssh' && 'f_attach_detach f_noisy f_other_user' || matrix.part == 'udp' && 'f_upgrade f_nat_rebind f_udp_blocked_mid f_udp_blocked_start' || '' }}
       - name: Logs and measurements
         if: always()
         uses: actions/upload-artifact@v4

@@ -70,9 +70,10 @@ sysd_setup() {
   docker exec "$SD" systemctl --failed --no-legend >&2 || true
   docker cp "$SD_DIR/id.pub" "$SD:/etc/fil-realnet/authorized_keys"
   docker exec "$SD" chmod 644 /etc/fil-realnet/authorized_keys
-  docker exec "$SD" systemctl is-active ssh.service > /dev/null || {
-    docker exec "$SD" journalctl --no-pager -u ssh.service >&2 || true
-    echo "realnet: sshd is not running in the systemd container" >&2
+  # Ubuntu starts sshd on demand: ssh.socket listens on port 22 and starts ssh.service.
+  docker exec "$SD" systemctl is-active ssh.socket > /dev/null || {
+    docker exec "$SD" systemctl status ssh.socket ssh.service --no-pager >&2 || true
+    echo "realnet: sshd is not listening in the systemd container" >&2
     exit 1
   }
 

@@ -412,7 +412,8 @@ fn reopen_tty(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
     .ok()?;
     // The name could have been reused since: it must be the terminal we were given.
     let (a, b) = (fstat(fd).ok()?, fstat(&w).ok()?);
-    (a.st_rdev == b.st_rdev && rustix::termios::isatty(&w)).then_some(w)
+    let same = a.st_rdev == b.st_rdev && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+    (same && rustix::termios::isatty(&w)).then_some(w)
 }
 
 /// Splits `bytes` before each escape sequence, except that a synchronized update stays whole and

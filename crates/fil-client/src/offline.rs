@@ -18,6 +18,8 @@
 //!   - **Several clients on one path** share it safely: every step that reads or changes the
 //!     file's clock is done under a lock on its directory, after looking at the file again, so one
 //!     client's rotation is seen by the others and nothing is written to a rotated file.
+//!     The lock is waited for at most 1 s (a step that cannot get it is skipped and counted), and
+//!     on a file system without locks the log goes on unlocked: there, two clients lose this.
 //!
 //!   A command sink pipes the bytes to the command's stdin; the command decides where they end up.
 
@@ -230,7 +232,17 @@ const LOG_HEADER_PREFIX: &str = "# fil offline-input log, started ";
 struct LogDir {
     dir: std::fs::File,
     name: OsString,
+    /// How long [`LogDir::lock`] keeps trying before it gives up.
+    lock_wait: Duration,
 }
+
+/// The lock could not be had in time: someone else holds it.
+struct Busy;
+
+/// How long a step waits for the directory's lock (another client is rotating or writing, which
+/// takes microseconds). Past it the step is skipped: the lock is taken on the runtime's thread at
+/// startup, and a wedged holder must not hang the client or keep Ctrl-C from ending it.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
 
 /// The directory's lock, released on drop.
 struct DirLock(std::fs::File);
@@ -275,7 +287,11 @@ impl LogDir {
                 md.mode() & 0o7777
             ));
         }
-        Ok(LogDir { dir, name })
+        Ok(LogDir {
+            dir,
+            name,
+            lock_wait: LOCK_WAIT,
+        })
     }
 
     fn rotated_name(&self) -> OsString {
@@ -305,20 +321,29 @@ impl LogDir {
     /// (look at the file, rotate it, write to it) happens under it, so that two fil clients on
     /// one log path cannot rotate it under each other or both start its clock. A lock on the
     /// directory, not the file, because the file is replaced by a rotation.
-    fn lock(&self) -> Result<DirLock, String> {
+    ///
+    /// Never blocks for more than [`LOCK_WAIT`]: a non-blocking `flock`, retried. `Err(Busy)` is
+    /// the caller's cue to skip its step. `Ok(None)` is a file system that has no locks (NFS
+    /// without a lock daemon, some FUSE mounts: `ENOTSUP`, `ENOLCK`): the log goes on without
+    /// one, and two clients on such a file system lose the guarantee above (they can rotate it
+    /// under each other, or both start its clock).
+    fn lock(&self) -> Result<Option<DirLock>, Busy> {
         use rustix::fs::{FlockOperation, flock};
+        use rustix::io::Errno;
         // A duplicate shares the open file description the lock belongs to; it is the guard's, so
         // that the guard does not borrow the directory while the file is replaced.
-        let held = self.dir.try_clone().map_err(|e| e.to_string())?;
+        let held = self.dir.try_clone().map_err(|_| Busy)?;
+        let give_up = std::time::Instant::now() + self.lock_wait;
         loop {
-            match flock(&held, FlockOperation::LockExclusive) {
-                Ok(()) => return Ok(DirLock(held)),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(e) => {
-                    return Err(format!(
-                        "cannot lock its directory: {}",
-                        std::io::Error::from(e)
-                    ));
+            match flock(&held, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(Some(DirLock(held))),
+                Err(Errno::NOTSUP | Errno::NOLCK) => return Ok(None),
+                Err(Errno::INTR) => {}
+                Err(_) => {
+                    if std::time::Instant::now() >= give_up {
+                        return Err(Busy);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             }
         }
@@ -387,6 +412,8 @@ impl LogDir {
 struct FileLog {
     dir: LogDir,
     f: std::fs::File,
+    /// Steps (writes and maintenance passes) skipped because the directory's lock stayed taken.
+    skipped: u64,
 }
 
 /// What a file log holds, as found.
@@ -422,7 +449,7 @@ impl FileLog {
     /// moved aside first; a rotated file past its age is deleted.
     fn open(dir: LogDir, now: SystemTime) -> Result<FileLog, String> {
         let (f, _) = dir.open_file()?;
-        let mut log = FileLog { dir, f };
+        let mut log = FileLog { dir, f, skipped: 0 };
         log.maintain(now)?;
         Ok(log)
     }
@@ -455,6 +482,16 @@ impl FileLog {
         Ok(Look { len, born })
     }
 
+    /// Counts a step given up on for want of the lock; says so once.
+    fn skip(&mut self) {
+        self.skipped += 1;
+        if self.skipped == 1 {
+            tracing::warn!(
+                "the offline-input log's directory stayed locked; skipping log steps (counted)"
+            );
+        }
+    }
+
     /// Moves the file aside (replacing the older twin) and starts an empty one. Locked.
     fn rotate(&mut self) -> Result<(), String> {
         (self.f, _) = self.dir.rotate()?;
@@ -463,7 +500,10 @@ impl FileLog {
 
     /// Appends one entry, first moving the file aside if it would outgrow its size or is too old.
     fn append(&mut self, bytes: &[u8], now: SystemTime) -> Result<(), String> {
-        let _held = self.dir.lock()?;
+        let Ok(_held) = self.dir.lock() else {
+            self.skip();
+            return Ok(());
+        };
         let mut look = self.look(now)?;
         if look.len > 0
             && (look.born.is_none()
@@ -489,7 +529,10 @@ impl FileLog {
     /// What a log does with no writes: the file in use is moved aside when it has grown old (or
     /// full, or has no clock), and a rotated file past its age is deleted.
     fn maintain(&mut self, now: SystemTime) -> Result<(), String> {
-        let _held = self.dir.lock()?;
+        let Ok(_held) = self.dir.lock() else {
+            self.skip();
+            return Ok(());
+        };
         let look = self.look(now)?;
         if look.len > 0
             && (look.born.is_none() || too_old(look.born, now) || look.len >= LOG_MAX_BYTES)
@@ -954,7 +997,8 @@ mod tests {
             })
         };
         for _ in 0..500 {
-            if body(&path) == 2 * chunk.len() {
+            // (The new file also holds exactly two chunks early on: wait for the rotation too.)
+            if body(&dir.join("log.1")) == 15 * chunk.len() && body(&path) == 2 * chunk.len() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1137,6 +1181,62 @@ mod tests {
         set_mtime(&path, SystemTime::now() - 19 * DAY);
         tidy_file_log(&path);
         assert!(!everything_in(&dir).contains("last month"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Another process holds the directory's lock and never lets go: starting the log and writing
+    /// to it must not hang (the startup runs on the runtime's thread and Ctrl-C could not end
+    /// it). Steps are skipped and counted, and the log works again once the lock is free.
+    #[test]
+    fn a_lock_that_stays_taken_skips_steps_instead_of_hanging() {
+        let dir = scratch("busy");
+        let path = dir.join("log");
+        let t0 = SystemTime::now();
+        let mut mine = LogDir::open(&path).unwrap();
+        mine.lock_wait = Duration::from_millis(50);
+        let holder = LogDir::open(&path).unwrap();
+        let held = holder.lock().ok().flatten().expect("the first lock");
+        let started = std::time::Instant::now();
+        let mut log = FileLog::open(mine, t0).unwrap();
+        log.append(b"while locked", t0).unwrap();
+        log.maintain(t0 + 30 * DAY).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            log.skipped, 3,
+            "the open's pass, the write and the pass after it"
+        );
+        assert_eq!(
+            everything_in(&dir),
+            "",
+            "nothing was written without the lock"
+        );
+        drop(held);
+        log.append(b"after", t0).unwrap();
+        assert!(everything_in(&dir).ends_with("after"));
+        assert_eq!(log.skipped, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same through the sink, with the real wait: opening takes about a second and returns.
+    #[test]
+    fn opening_a_sink_while_the_lock_is_taken_returns() {
+        let dir = scratch("busy-sink");
+        let path = dir.join("log");
+        let holder = LogDir::open(&path).unwrap();
+        let held = holder.lock().ok().flatten().expect("the first lock");
+        let started = std::time::Instant::now();
+        let sink = LogSink::open(&OfflineLog::File(path.clone())).unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= LOCK_WAIT / 2 && took < Duration::from_secs(10),
+            "{took:?}"
+        );
+        drop(held);
+        drop(sink);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

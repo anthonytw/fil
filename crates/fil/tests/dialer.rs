@@ -949,8 +949,8 @@ async fn on_the_pipe_only_a_hint_just_after_a_run_waits_for_the_gap() {
         next - last
     );
     assert!(next - last < secs(6), "{:?}", next - last);
-    // Only the restart a hint causes is held to the gap; after it the backoff starts over
-    // (about a second), so the later runs are bounded by the hint budget instead.
+    // Only the restart a hint causes is held to the gap; the later runs follow the backoff, which
+    // a hint does not reset, and the hint budget.
     assert!(
         runs.len() <= n + 6,
         "{} runs in 7 s of hints",

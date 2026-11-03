@@ -678,27 +678,78 @@ fn a_hint_during_a_long_pipe_run_that_then_fails_restarts_the_pipe_at_once() {
 }
 
 #[test]
-fn a_hint_before_a_pipe_run_does_not_shorten_the_backoff_after_the_next_failure() {
-    // The memory is of a hint during *this* run, not of every hint ever.
-    let mut t = pipe_run_in_flight_after_deep_backoff();
-    let a = t.after(S(9), I::PipeDown(DownReason::Io("timed out".into())));
+fn a_hint_that_started_a_run_is_not_carried_into_it_and_the_backoff_keeps_growing() {
+    // The hint found the pipe waiting and started this run; it is spent. When the run fails,
+    // the wait is the backoff for the failures so far (a hint does not reset them).
+    let mut t = pipe_in_deep_backoff();
+    let a = t.after(S(6), I::NetworkChanged);
+    assert!(a.contains(&RunPipe), "{a:?}");
+    let a = t.after(S(1), I::PipeDown(DownReason::Io("timed out".into())));
     assert!(
         delay_of(&a, PathTimer::PipeRetry).unwrap() >= S(24),
         "{a:?}"
     );
     assert!(!a.contains(&RunPipe), "{a:?}");
+    assert_eq!(delay_of(&a, PathTimer::PipeHint), None, "{a:?}");
 }
 
 #[test]
-fn a_deferred_pipe_hint_does_nothing_if_the_pipe_is_no_longer_waiting() {
-    let mut t = pipe_in_deep_backoff();
-    t.after(Duration::from_millis(700), I::NetworkChanged);
-    // The pipe's own retry ran it meanwhile, and it is up.
-    t.advance(S(1));
-    t.feed(I::Timer(PathTimer::PipeRetry));
-    t.feed(I::PipeUp);
-    t.feed(I::Switched(LinkKind::Pipe));
-    assert_eq!(t.after(S(3), I::Timer(PathTimer::PipeHint)), []);
+fn a_hint_during_a_run_that_came_up_is_not_carried_to_the_next_failure() {
+    // The flag is for the run it arrived in. This run comes up, carries the session for 2 s and
+    // dies young: that is an ordinary failure with an ordinary backoff.
+    let mut t = T::new(TransportSetting::Pipe);
+    assert_eq!(t.feed(I::Start), [RunPipe]);
+    assert_eq!(t.after(S(1), I::NetworkChanged), []); // mid-run
+    assert_eq!(t.feed(I::PipeUp), [SwitchTo(LinkKind::Pipe)]);
+    assert_eq!(t.feed(I::Switched(LinkKind::Pipe)), []);
+    let a = t.after(S(2), I::PipeDown(DownReason::Io("reset".into())));
+    assert!(delay_of(&a, PathTimer::PipeRetry).is_some(), "{a:?}");
+    assert_eq!(delay_of(&a, PathTimer::PipeHint), None, "{a:?}");
+    assert!(!a.contains(&RunPipe), "{a:?}");
+}
+
+#[test]
+fn a_hint_during_a_run_that_direct_overtook_is_not_carried_to_the_next_run() {
+    let mut t = T::new(TransportSetting::Auto);
+    assert_eq!(t.feed(I::Start), [RunPipe]);
+    assert_eq!(t.feed(avail()), [DialDirect]);
+    assert_eq!(t.after(S(1), I::NetworkChanged), []); // mid-run
+    t.advance(Duration::from_millis(200));
+    assert_eq!(t.feed(I::DirectUp), [SwitchTo(LinkKind::Direct)]);
+    // Direct wins; the pipe run in flight is abandoned.
+    assert_eq!(t.feed(I::Switched(LinkKind::Direct)), [ClosePipe]);
+    // Direct dies young; the pipe runs (direct has been failing) and fails at once.
+    let a = t.after(S(1), I::DirectDown(DownReason::Dead));
+    let run = if a.contains(&RunPipe) {
+        a
+    } else {
+        t.after(S(3), I::Timer(PathTimer::PipeFallback))
+    };
+    assert!(run.contains(&RunPipe), "{run:?}");
+    t.advance(Duration::from_millis(300));
+    let a = t.feed(I::PipeDown(DownReason::Io("timed out".into())));
+    assert!(delay_of(&a, PathTimer::PipeRetry).is_some(), "{a:?}");
+    assert_eq!(delay_of(&a, PathTimer::PipeHint), None, "{a:?}");
+    assert!(!a.contains(&RunPipe), "{a:?}");
+}
+
+#[test]
+fn direct_winning_cancels_a_deferred_pipe_hint() {
+    let mut t = T::new(TransportSetting::Auto);
+    assert_eq!(t.feed(I::Start), [RunPipe]);
+    t.feed(avail());
+    t.after(
+        Duration::from_millis(500),
+        I::PipeDown(DownReason::Io("net down".into())),
+    );
+    // The network is back, but the pipe's last run began 1 s ago: its restart is deferred.
+    let a = t.after(Duration::from_millis(500), I::NetworkChanged);
+    assert!(delay_of(&a, PathTimer::PipeHint).is_some(), "{a:?}");
+    // The direct dial that began with the session succeeds before the gap is over.
+    assert_eq!(t.view().direct, Lane::Busy);
+    t.feed(I::DirectUp);
+    let a = t.after(S(1), I::Switched(LinkKind::Direct));
+    assert!(a.contains(&CancelTimer(PathTimer::PipeHint)), "{a:?}");
 }
 
 #[test]
@@ -1056,6 +1107,148 @@ fn storm(setting: TransportSetting, hint_every: Option<Duration>, hours: u64) ->
         }
     }
     (w.runs, w.dials)
+}
+
+/// Like [`storm`], but ssh takes `fail_after` to fail and the hints land wherever they fall,
+/// mid-run included. Returns (ssh runs, direct dials).
+fn storm_slow(
+    setting: TransportSetting,
+    fail_after: Duration,
+    hint_every: Duration,
+    hours: u64,
+) -> (u64, u64) {
+    let mut w = World::new(
+        PathConfig {
+            setting,
+            ..PathConfig::default()
+        },
+        42,
+    );
+    w.feed(I::Start);
+    w.feed(avail());
+    let end = S(3600 * hours);
+    let mut next_hint = hint_every;
+    let mut pipe_fails_at: Option<Duration> = None;
+    let mut dial_fails_at: Option<Duration> = None;
+    let (mut runs_seen, mut dials_seen) = (0, 0);
+    let track = |w: &World,
+                 runs_seen: &mut u64,
+                 dials_seen: &mut u64,
+                 pf: &mut Option<Duration>,
+                 df: &mut Option<Duration>| {
+        if w.runs != *runs_seen {
+            *runs_seen = w.runs;
+            *pf = Some(w.t.at + fail_after);
+        }
+        if !w.pipe_running {
+            *pf = None;
+        }
+        if w.dials != *dials_seen {
+            *dials_seen = w.dials;
+            *df = Some(w.t.at + S(2));
+        }
+        if !w.dialing {
+            *df = None;
+        }
+    };
+    track(
+        &w,
+        &mut runs_seen,
+        &mut dials_seen,
+        &mut pipe_fails_at,
+        &mut dial_fails_at,
+    );
+    while w.t.at < end {
+        let timer = w.timers.iter().next().copied();
+        let mut next = next_hint;
+        let mut which = 0; // 0 hint, 1 timer, 2 pipe failure, 3 dial failure
+        if let Some((due, _)) = timer {
+            if due < next {
+                next = due;
+                which = 1;
+            }
+        }
+        if let Some(t) = pipe_fails_at {
+            if t < next {
+                next = t;
+                which = 2;
+            }
+        }
+        if let Some(t) = dial_fails_at {
+            if t < next {
+                next = t;
+                which = 3;
+            }
+        }
+        if next > w.t.at {
+            w.t.at = next;
+        }
+        match which {
+            0 => {
+                next_hint += hint_every;
+                w.feed(I::NetworkChanged);
+            }
+            1 => {
+                let (due, i) = timer.unwrap();
+                w.timers.remove(&(due, i));
+                w.feed(I::Timer(TIMERS[i as usize]));
+            }
+            2 => {
+                w.pipe_running = false;
+                w.feed(I::PipeDown(DownReason::Io("timed out".into())));
+            }
+            _ => {
+                w.dialing = false;
+                w.feed(I::DirectDialFailed(refused()));
+            }
+        }
+        track(
+            &w,
+            &mut runs_seen,
+            &mut dials_seen,
+            &mut pipe_fails_at,
+            &mut dial_fails_at,
+        );
+    }
+    (w.runs, w.dials)
+}
+
+use TransportSetting::{Auto, Direct, Pipe};
+
+/// (setting, ssh fails after ms, a hint every ms, ssh runs and direct dials in an hour on main
+/// at 7c5f93a, measured with this same simulation).
+const MAIN_SLOW_STORM: &[(TransportSetting, u64, u64, (u64, u64))] = &[
+    (Auto, 10_000, 1_000, (190, 471)),
+    (Auto, 300, 15_000, (542, 767)),
+    (Auto, 3_000, 3_000, (343, 517)),
+    (Direct, 10_000, 1_000, (237, 471)),
+    (Pipe, 2_000, 15_000, (502, 0)),
+    (Pipe, 300, 15_000, (734, 0)),
+    (Pipe, 4_500, 3_000, (346, 0)),
+    (Pipe, 10_000, 1_000, (225, 0)),
+    (Pipe, 1_000, 500, (359, 0)),
+];
+
+#[test]
+fn hints_during_slow_failing_pipe_runs_cost_no_more_than_before() {
+    // (setting, ssh fails after, a hint every, ssh runs an hour on main). The runs are slow to
+    // fail, so hints land mid-run; a hint ends the wait it finds (or the next one) but does not
+    // reset the backoff, so each is worth about one run.
+    for (setting, fail_ms, hint_ms, (main_runs, main_dials)) in MAIN_SLOW_STORM {
+        let (runs, dials) = storm_slow(
+            *setting,
+            Duration::from_millis(*fail_ms),
+            Duration::from_millis(*hint_ms),
+            1,
+        );
+        eprintln!(
+            "{setting:?} fail {fail_ms} ms hint {hint_ms} ms: {runs} runs {dials} dials (main {main_runs})"
+        );
+        assert!(
+            runs <= *main_runs,
+            "{setting:?}: {runs} ssh runs, main had {main_runs}"
+        );
+    }
 }
 
 #[test]

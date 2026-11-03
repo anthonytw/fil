@@ -56,17 +56,18 @@
 //! - **The pipe is closed only after the switch.** `ClosePipe` follows `Switched(Direct)`, not
 //!   `DirectUp`, so a direct link that comes up but cannot resume the session never costs the
 //!   working pipe.
-//! - **A network-change hint is a nudge, not a command.** It clears the backoff and tries direct
-//!   at once, but at most once per [`PathConfig::hint_cooldown`] (hints inside the window are
-//!   coalesced into one timer), and only [`PathConfig::hint_budget`] hints are
-//!   honoured per [`PathConfig::hint_window`]. A network that reports a change every second for
-//!   an hour therefore costs a few attempts a minute, not a few a second. A hint restarts a
-//!   waiting pipe at once if the last pipe run began at least [`PathConfig::hint_pipe_gap`] ago,
-//!   and otherwise when that gap is over (deferred, not dropped: the pipe must not sit in a 30 s
+//! - **A network-change hint is a nudge, not a command.** It clears the direct backoff and tries
+//!   direct at once, but at most once per [`PathConfig::hint_cooldown`] (hints inside the window
+//!   are coalesced into one timer), and only [`PathConfig::hint_budget`] hints are honoured per
+//!   [`PathConfig::hint_window`]. A network that reports a change every second for an hour
+//!   therefore costs a few attempts a minute, not a few a second.
+//! - **For the pipe a hint ends the current wait, once.** It does not reset the failure count, so
+//!   each hint is worth about one run and the backoff keeps growing while runs fail. The pipe
+//!   restarts at once if the last pipe run began at least [`PathConfig::hint_pipe_gap`] ago,
+//!   otherwise when that gap is over (deferred, not dropped: the pipe must not sit in a 30 s
 //!   backoff after the network is back). A hint that arrives while a pipe run is in flight (ssh
-//!   waiting on its connect timeout, say) is remembered: if that run fails, the pipe is treated
-//!   as if the hint had found it waiting, so the next run follows the same rule instead of the
-//!   backoff.
+//!   waiting on its connect timeout, say) is remembered for that run: if it fails, the pipe is
+//!   treated as if the hint had found it waiting. This holds in every setting.
 //! - **Direct goes first after a loss, the pipe second.** When direct was healthy until it died,
 //!   the manager redials at once and gives it `fallback_after` before starting an ssh login. When
 //!   direct has been failing, the pipe starts at once: waiting would only delay a session that
@@ -545,6 +546,7 @@ impl PathManager {
         if kind == LinkKind::Direct {
             self.cancel(PathTimer::PipeRetry, out);
             self.cancel(PathTimer::PipeFallback, out);
+            self.cancel(PathTimer::PipeHint, out);
         }
     }
 
@@ -605,11 +607,12 @@ impl PathManager {
         self.restart_waiting_pipe(now, out);
     }
 
-    /// A hint found (or a deferred hint finds) the pipe waiting out its backoff: forget the
-    /// backoff so the pipe starts now, unless the last run began less than `hint_pipe_gap` ago.
-    /// Then the restart is deferred to the end of that gap, not dropped: the hint is often the
-    /// network coming back, and dropping it would leave the pipe in a backoff of up to
-    /// `pipe_retry_max`. The gap still bounds ssh logins to one per `hint_pipe_gap`.
+    /// A hint found (or a deferred hint finds) the pipe waiting out its backoff: end the wait so
+    /// the pipe starts now, unless the last run began less than `hint_pipe_gap` ago. Then the
+    /// restart is deferred to the end of that gap, not dropped: the hint is often the network
+    /// coming back, and dropping it would leave the pipe in a backoff of up to `pipe_retry_max`.
+    /// The failure count is kept, so a hint is worth one run and the backoff still grows if that
+    /// run fails; only a link that stays up resets it.
     fn restart_waiting_pipe(&mut self, now: Instant, out: &mut Vec<PathAction>) {
         if self.pipe != Lane::Waiting {
             return;
@@ -621,7 +624,8 @@ impl PathManager {
         });
         match wait {
             None => {
-                self.pipe_failures = 0;
+                // The wait is over, but the failures still count: the next failure waits
+                // longer. A hint is worth one run, not a restart of the whole backoff.
                 self.pipe = Lane::Idle;
                 self.cancel(PathTimer::PipeRetry, out);
                 self.cancel(PathTimer::PipeHint, out);

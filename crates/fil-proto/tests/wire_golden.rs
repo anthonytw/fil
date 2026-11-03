@@ -4,9 +4,10 @@
 //! `tests/golden/wire.txt` records, with the `PROTOCOL_MAJOR` and `PROTOCOL_REVISION` they were
 //! made for:
 //!
-//! - `[frozen]`: the preamble, the hello (layout and decode limits), the frame layout and
-//!   `Error(VersionMismatch)`: what a peer of any other build must be able to read to say
-//!   "different version" and to exit cleanly on a refusal;
+//! - `[frozen]`: the preamble, the hello (layout and decode limits), the opening ping and pong,
+//!   the frame layout and `Error(VersionMismatch)`: what a peer of any other build must be able
+//!   to read to say "different version", to exit cleanly on a refusal, and (the relay) to route
+//!   a client by its hello. A line may be added with a new revision; none may change;
 //! - `[limits]`: every constant that bounds a decoder or a peer, the QUIC stream cap and the
 //!   ALPN format;
 //! - `[revisioned]`: a canonical instance of every control message and of every variant of the
@@ -35,6 +36,7 @@ use fil_proto::frame::{ChannelId, DataSegment, Frame, FrameDecoder};
 use fil_proto::input::{InputRecord, RECORD_MARK, TerminalInput};
 use fil_proto::limits::*;
 use fil_proto::msg::*;
+use fil_proto::opening;
 use fil_proto::preamble;
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire.txt");
@@ -700,6 +702,28 @@ fn frozen() -> Entries {
                 .unwrap(),
         ),
         num("limit/MAX_AGENT", MAX_AGENT),
+        // The opening of a pipe connection: the ping and the pong are fixed bytes, not control
+        // messages, so that no change to `ControlMsg` can move them, and the relay can route a
+        // client of any build (DESIGN.md section 8.5, "The opening").
+        bytes_entry("opening/ping", opening::PING),
+        bytes_entry("opening/pong", opening::PONG),
+        bytes_entry(
+            "frame/opening-ping",
+            &opening::frame_of(opening::PING).unwrap(),
+        ),
+        bytes_entry(
+            "frame/opening-pong",
+            &opening::frame_of(opening::PONG).unwrap(),
+        ),
+        // ... and neither is, or can become, a control message.
+        (
+            "decode/opening-ping-as-control".into(),
+            control_outcome(opening::PING),
+        ),
+        (
+            "decode/opening-pong-as-control".into(),
+            control_outcome(opening::PONG),
+        ),
     ];
     for ch in [0u32, 1, 2, 3, 16, 127, 128, 300, 70_000, u32::MAX] {
         e.push(bytes_entry(
@@ -715,6 +739,23 @@ fn frozen() -> Entries {
     let hello_wire = |major: u64, revision: u64, agent: Vec<u8>| {
         raw_msg(0, &[varint(major), varint(revision), agent])
     };
+    // The relay reads the hello without the control enum: both readings agree.
+    e.push((
+        "decode/hello-by-opening".into(),
+        match opening::hello_of(&hello.encode().unwrap()) {
+            Some(h) if ControlMsg::Hello(h.clone()) == hello => "ok".into(),
+            _ => "err".to_string(),
+        },
+    ));
+    let mut trailing = hello.encode().unwrap();
+    trailing.push(0);
+    e.push((
+        "decode/hello-by-opening-trailing-byte".into(),
+        match opening::hello_of(&trailing) {
+            Some(_) => "ok".into(),
+            None => "err".to_string(),
+        },
+    ));
     for n in [MAX_AGENT, MAX_AGENT + 1] {
         e.push((
             format!("decode/hello-agent-{n}"),
@@ -1024,6 +1065,15 @@ fn revisioned() -> Entries {
             )),
         ));
     }
+    // The list of other daemons is capped by the receiver as well as the sender.
+    for n in [MAX_OTHER_DAEMONS, MAX_OTHER_DAEMONS + 1] {
+        let mut fields = vec![vec![0, 0, 0], varint(n as u64)];
+        fields.extend((0..n).map(|_| vec![1, 1]));
+        e.push((
+            format!("decode/others-{n}"),
+            control_outcome(&raw_msg(response_index(), &fields)),
+        ));
+    }
     // How many variants each enum has: the first index past the end is refused.
     let past = |n: u8| vec![n];
     e.push(("decode/error-code-3".into(), outcome::<ErrorCode>(&past(3))));
@@ -1233,14 +1283,29 @@ fn history_problem(g: &Parsed, now: &Now) -> Option<String> {
 /// What is wrong with the golden against the current wire, if anything. Pure, so the tests of
 /// the rule below can drive it.
 fn problem(g: &Parsed, now: &Now) -> Option<String> {
+    // A frozen line may be added (with a new revision, like any change of the wire), never
+    // changed or removed: that breaks what a peer of another build reads.
+    let frozen_kept = g.frozen.iter().all(|l| now.frozen.contains(l));
     let frozen_same = g.frozen == now.frozen;
-    let wire_old: Vec<String> = g.limits.iter().chain(&g.revisioned).cloned().collect();
-    let wire_now: Vec<String> = now.limits.iter().chain(&now.revisioned).cloned().collect();
+    let wire_old: Vec<String> = g
+        .frozen
+        .iter()
+        .chain(&g.limits)
+        .chain(&g.revisioned)
+        .cloned()
+        .collect();
+    let wire_now: Vec<String> = now
+        .frozen
+        .iter()
+        .chain(&now.limits)
+        .chain(&now.revisioned)
+        .cloned()
+        .collect();
     let wire_same = wire_old == wire_now;
-    if !frozen_same && g.major == now.major {
+    if !frozen_kept && g.major == now.major {
         return Some(format!(
-            "a FROZEN encoding changed (preamble, hello, frame layout, Error(VersionMismatch)) without a new PROTOCOL_MAJOR ({}). \
-             A peer of another build must be able to read these to report a version mismatch. {}",
+            "a FROZEN encoding changed (preamble, hello, opening ping and pong, frame layout, Error(VersionMismatch)) without a new PROTOCOL_MAJOR ({}). \
+             A peer of another build must be able to read these to report a version mismatch and to route. {}",
             now.major,
             first_difference(&g.frozen, &now.frozen)
         ));
@@ -1306,9 +1371,11 @@ fn the_wire_matches_the_golden_for_this_revision() {
         if let Some(g) = &old {
             // Writing is allowed when the numbers moved, or when nothing changed. Changed bytes
             // under an unchanged number are exactly what this test exists to stop.
-            let wire_same = g.limits == now.limits && g.revisioned == now.revisioned;
+            let wire_same =
+                g.frozen == now.frozen && g.limits == now.limits && g.revisioned == now.revisioned;
+            let frozen_kept = g.frozen.iter().all(|l| now.frozen.contains(l));
             let refused = g.major == now.major
-                && (g.frozen != now.frozen || (g.revision == now.revision && !wire_same));
+                && (!frozen_kept || (g.revision == now.revision && !wire_same));
             assert!(
                 !refused,
                 "refusing to regenerate: the encoding changed but the version did not. Bump PROTOCOL_REVISION \
@@ -1412,6 +1479,33 @@ fn the_rule_catches_each_way_to_get_it_wrong() {
     // ...and is allowed (pending regeneration) under a new major.
     let p = problem(&g, &Now { major: 2, ..f }).expect("golden is stale");
     assert!(p.contains("just wire-golden"), "{p}");
+    // The opening ping or pong changed: the relay of any later revision could no longer route a
+    // client of this one.
+    for key in ["opening/ping = ", "opening/pong = "] {
+        let mut o = shipped(6);
+        let at = o
+            .frozen
+            .iter()
+            .position(|l| l.starts_with(key))
+            .expect("the opening is in the frozen section");
+        o.frozen[at].push_str("00");
+        let p = problem(&g, &o).expect("must fail");
+        assert!(p.contains("FROZEN"), "{key}: {p}");
+    }
+    // A frozen line removed is a change too.
+    let mut removed = shipped(6);
+    removed.frozen.pop();
+    let p = problem(&g, &removed).expect("must fail");
+    assert!(p.contains("FROZEN"), "{p}");
+    // A frozen line ADDED is a wire change like any other: it needs a new revision (and then
+    // the golden regenerated), but not a new major, because nothing a peer reads moved.
+    let mut added = shipped(5);
+    added.frozen.push("opening/new = 00".into());
+    let p = problem(&g, &added).expect("must fail");
+    assert!(p.contains("PROTOCOL_REVISION is still 5"), "{p}");
+    added.revision = 6;
+    let p = problem(&g, &added).expect("golden is stale");
+    assert!(p.contains("just wire-golden"), "{p}");
 
     // The history must end at this revision with this wire's hash: a hand-edited golden whose
     // numbers were bumped but whose history was not, or whose last line was altered, fails.
@@ -1480,6 +1574,8 @@ fn the_golden_covers_the_whole_wire() {
     );
     for want in [
         "error/version-mismatch = 0b00",
+        "opening/ping = ff7f00",
+        "opening/pong = ff7f01",
         "limit/MAX_AGENT = 64",
         "hello/widest",
         "decode/hello-agent-65 = err",

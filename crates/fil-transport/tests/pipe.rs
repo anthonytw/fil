@@ -7,6 +7,7 @@ use bytes::Bytes;
 use fil_netsim::stream::{StreamConfig, StreamControl, stream_pair};
 use fil_proto::frame::DataSegment;
 use fil_proto::limits::{MAX_FRAME_BODY, MAX_PREAMBLE_SKIP};
+use fil_proto::opening;
 use fil_proto::preamble;
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder};
 use fil_transport::link::{DownReason, Link, LinkParams, LinkState};
@@ -297,10 +298,7 @@ async fn heartbeat_timing_follows_the_spec() {
     let (link, mut raw) = client_vs_raw(cfg(), b"", ping(77)).await;
     let t0 = Instant::now();
     // The handshake ping, then the reply to the peer's ping at once.
-    assert_eq!(
-        ControlMsg::decode(&raw.frame().await.payload).unwrap(),
-        ping(0)
-    );
+    assert_eq!(raw.frame().await.payload, opening::PING);
     let reply = raw.frame().await;
     assert_eq!(
         ControlMsg::decode(&reply.payload).unwrap(),
@@ -487,8 +485,8 @@ async fn expect_reply(raw: &mut Raw, nonce: u32) {
     loop {
         let f = raw.frame().await;
         if f.channel == ChannelId::CONTROL
-            && ControlMsg::decode(&f.payload).unwrap()
-                == (ControlMsg::Heartbeat { nonce, reply: true })
+            && ControlMsg::decode(&f.payload)
+                .is_ok_and(|m| m == (ControlMsg::Heartbeat { nonce, reply: true }))
         {
             return;
         }
@@ -900,10 +898,7 @@ async fn the_daemon_side_has_no_preamble() {
     assert!(link.banner().is_empty());
     assert_eq!(link.peer_major(), None);
     // Its first frame to the peer is its own ping, then the reply.
-    assert_eq!(
-        ControlMsg::decode(&raw.frame().await.payload).unwrap(),
-        ping(0)
-    );
+    assert_eq!(raw.frame().await.payload, opening::PING);
     drop(link);
 }
 
@@ -1163,10 +1158,7 @@ async fn the_daemon_pings_on_its_own_only_after_a_heartbeat_and_a_half_of_silenc
     let t0 = Instant::now();
     let link = PipeLink::accept(a, cfg()).await.unwrap();
     // The handshake ping and the reply to the peer's, at once.
-    assert_eq!(
-        ControlMsg::decode(&raw.frame().await.payload).unwrap(),
-        ping(0)
-    );
+    assert_eq!(raw.frame().await.payload, opening::PING);
     assert_eq!(
         ControlMsg::decode(&raw.frame().await.payload).unwrap(),
         ControlMsg::Heartbeat {
@@ -1483,4 +1475,53 @@ async fn killing_an_own_group_command_kills_its_helpers_too() {
         tokio::time::sleep(MS(20)).await;
     }
     panic!("the helper {helper} outlived its command's group");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The opening ping and pong are fixed bytes (fil_proto::opening), not control messages
+
+/// A client's first frame is the frozen ping, whatever `ControlMsg` looks like in this build, and
+/// the frozen pong is an answer to it: the link comes up and measures its round trip from it.
+#[tokio::test(start_paused = true)]
+async fn the_clients_opening_is_the_frozen_ping_and_the_frozen_pong_answers_it() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put(&preamble::encode(1)).await;
+    let link = tokio::spawn(PipeLink::connect(a, cfg()));
+    let first = raw.frame().await;
+    assert_eq!(
+        (first.channel, &first.payload[..]),
+        (ChannelId::CONTROL, opening::PING)
+    );
+    // Not the control message that the golden's `heartbeat-ping` is, and not any other.
+    assert!(ControlMsg::decode(&first.payload).is_err());
+    sleep(MS(40)).await;
+    raw.put_frame(ChannelId::CONTROL, opening::PONG).await;
+    let link = link.await.unwrap().unwrap();
+    sleep(MS(1)).await;
+    assert_eq!(link.status().borrow().state, LinkState::Up);
+    let rtt = link
+        .status()
+        .borrow()
+        .rtt
+        .expect("the pong is a reply to the first ping");
+    assert!((MS(40)..=MS(45)).contains(&rtt), "{rtt:?}");
+}
+
+/// A link answers the frozen ping with the frozen pong (and does not hand either up).
+#[tokio::test(start_paused = true)]
+async fn a_link_answers_the_frozen_ping_with_the_frozen_pong() {
+    let (a, b) = duplex(1 << 20);
+    let mut raw = Raw::new(b);
+    raw.put_frame(ChannelId::CONTROL, opening::PING).await;
+    let link = PipeLink::accept(a, cfg()).await.unwrap();
+    assert_eq!(raw.frame().await.payload, opening::PING);
+    assert_eq!(raw.frame().await.payload, opening::PONG);
+    raw.put_frame(ChannelId::CONTROL, opening::PONG).await;
+    sleep(MS(10)).await;
+    assert!(
+        timeout(MS(50), link.recv()).await.is_err(),
+        "neither frame reaches the layer above"
+    );
+    assert_eq!(link.status().borrow().state, LinkState::Up);
 }

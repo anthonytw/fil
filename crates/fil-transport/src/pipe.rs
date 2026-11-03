@@ -35,7 +35,9 @@
 //!   or anything received (at most one per heartbeat), and from the *daemon* only after one and a
 //!   half heartbeats of either. Every ping is answered at once with `reply: true` and the same
 //!   nonce; the pair measures RTT (so the daemon's RTT is the one from its handshake ping,
-//!   refreshed only when it has had to ping). Heartbeats never reach `recv`. An idle link carries
+//!   refreshed only when it has had to ping). The first ping of a connection, sent in the
+//!   handshake, is the frozen opening ping (`fil_proto::opening`), answered with the opening pong,
+//!   so a relay can answer it without knowing the peer's wire. Heartbeats never reach `recv`. An idle link carries
 //!   one ping and one reply a second, not two of each. They are encoded ahead of everything when
 //!   the writer is free: at most one reply (the latest ping's nonce) and one ping of our own are
 //!   ever pending, so a peer that floods pings without reading costs one pending frame, and a
@@ -66,7 +68,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_proto::limits::{MAX_FRAME_BODY, MAX_PREAMBLE_SKIP, PROTOCOL_MAJOR};
 use fil_proto::preamble::{PreambleError, PreambleScanner, Scan};
-use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder, FrameError};
+use fil_proto::{ChannelId, Frame, FrameDecoder, FrameError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
@@ -133,7 +135,8 @@ pub enum PipeStderr {
     /// is worth showing in the status line and the log.
     Capture,
     /// Kept like [`Capture`](Self::Capture), and also copied to our own stderr as it arrives,
-    /// until [`PipeLink::stop_stderr_tee`] is called, a line at a time (a line left unfinished
+    /// until [`PipeLink::stop_stderr_tee`] is called (or the link fails or is closed before the
+    /// session starts), a line at a time (a line left unfinished
     /// for 200 ms, a prompt without a newline, is shown as it is). Right for the first attach: ssh's errors
     /// and warnings show while the user waits, and from the moment the session owns the terminal
     /// nothing the command prints later (`Connection to host closed.`) is written into the raw
@@ -328,8 +331,12 @@ impl Tee {
             return;
         }
         let clean = fil_proto::text::sanitize(text);
+        if clean.is_empty() {
+            // Nothing visible (an escape sequence alone): the cursor has not moved.
+            return;
+        }
         (self.sink)(&clean);
-        self.open = !text.ends_with(b"\n");
+        self.open = !clean.ends_with('\n');
     }
 
     /// Takes in what arrived: shows the complete lines, holds back the rest.
@@ -618,6 +625,10 @@ impl PipeLink {
                 }
                 if let Some(cap) = &stderr {
                     err.stderr = cap.finish(Duration::from_millis(200)).await;
+                    // The run failed, so whoever reads the error owns the terminal again: what
+                    // the command wrote is shown now and nothing after it. (It may still be
+                    // writing: a ProxyCommand grandchild keeps the stream open past the exit.)
+                    cap.stop_tee();
                 }
                 return Err(err);
             }
@@ -761,14 +772,11 @@ impl Handshake {
             leftover = rest;
         }
 
-        // Our heartbeat, and then the peer's first frame, within `dead_after`.
-        let ping = ControlMsg::Heartbeat {
-            nonce: 0,
-            reply: false,
-        }
-        .to_frame()
-        .and_then(|f| f.encode().map_err(|_| fil_proto::msg::MsgError::Malformed))
-        .map_err(|e| PipeErrorKind::Io(io::Error::other(e.to_string())))?;
+        // Our opening ping, and then the peer's first frame, within `dead_after`. The ping is the
+        // frozen one (`fil_proto::opening`), not a control message: the relay answers it before
+        // it knows which wire the client speaks.
+        let ping = fil_proto::opening::frame_of(fil_proto::opening::PING)
+            .map_err(|e| PipeErrorKind::Io(io::Error::other(e.to_string())))?;
         let sent_at = Instant::now();
         let deadline = sent_at + cfg.params.dead_after;
         let exchange = async {
@@ -944,6 +952,10 @@ impl Link for PipeLink {
     }
 
     fn close(&self) {
+        // A link that is closed before its session started (a refused attach, a failed hello)
+        // no longer has the terminal to write to: its command's stderr is shown up to now, and
+        // not after (a no-op once the session has stopped the tee).
+        self.stop_stderr_tee();
         self.shared.set_down(DownReason::Closed);
     }
 }
@@ -1129,5 +1141,97 @@ mod tests {
         shown.until("the first part", |t| t == "\u{FFFD}ab").await;
         stdin.write_all(b"go\n").await.unwrap();
         shown.until("the rest", |t| t == "\u{FFFD}ab\u{e9}\n").await;
+    }
+
+    /// A pipe run as `PipeLink::spawn` sets it up, with the tee going to a [`Shown`]. The script's
+    /// stdout is the pipe's.
+    async fn run_of(script: &str) -> (Result<PipeLink, PipeError>, Arc<StderrCapture>, Shown) {
+        let mut child = ChildGuard::new(
+            tokio::process::Command::new("sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+            false,
+        );
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let shown = Shown::default();
+        let cap = StderrCapture::start(child.stderr.take().unwrap(), true, shown.sink());
+        let mut cfg = PipeConfig::new(LinkParams::default());
+        cfg.stderr = PipeStderr::Tee;
+        let link = PipeLink::establish(
+            stdout,
+            stdin,
+            Role::Client,
+            cfg,
+            Some(child),
+            Some(cap.clone()),
+        )
+        .await;
+        (link, cap, shown)
+    }
+
+    async fn captured(cap: &StderrCapture, what: &str) {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while !String::from_utf8_lossy(&cap.bytes()).contains(what) {
+            assert!(std::time::Instant::now() < end, "the capture stalled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A pipe run that fails its handshake while something else still holds the command's stderr
+    /// open (a ProxyCommand's grandchild): what was written is shown, and what is written after
+    /// the error is captured and not echoed over the retry or the prompt that follows.
+    #[tokio::test]
+    async fn a_failed_handshake_stops_the_tee_though_the_stream_stays_open() {
+        let (link, cap, shown) =
+            run_of("echo boom >&2; (sleep 1; echo late >&2) >/dev/null & exit 0").await;
+        let err = link.err().expect("the command ended without a preamble");
+        assert!(
+            err.stderr_text().contains("boom"),
+            "{:?}",
+            err.stderr_text()
+        );
+        assert_eq!(shown.text(), "boom\n");
+        captured(&cap, "late").await;
+        assert_eq!(
+            shown.text(),
+            "boom\n",
+            "the late line was captured, not shown"
+        );
+    }
+
+    /// A link that came up and is closed or dropped before its session started (the attach was
+    /// refused, the hello failed) stops the tee too: the command is still writing, and the
+    /// terminal belongs to whatever comes next.
+    #[tokio::test]
+    async fn a_link_dropped_before_its_session_started_stops_the_tee() {
+        // The preamble, a frozen pong as the first frame, then stderr text and a later line.
+        let script = "printf '\\033FIL-CONNECT 1\\n\\000\\000\\000\\004\\000\\377\\177\\001'; \
+                      echo hi >&2; (sleep 1; echo late >&2) & exec sleep 30";
+        let (link, cap, shown) = run_of(script).await;
+        let link = link.expect("the link comes up");
+        shown.until("the first line", |t| t == "hi\n").await;
+        drop(link);
+        captured(&cap, "late").await;
+        assert_eq!(
+            shown.text(),
+            "hi\n",
+            "the late line was captured, not shown"
+        );
+    }
+
+    /// The tee's line state follows what was shown: text that is nothing once cleaned (a lone
+    /// carriage return) shows nothing and leaves no line open, so the stop adds no blank line.
+    #[tokio::test]
+    async fn the_tee_ends_no_line_it_did_not_open() {
+        let (cap, shown, _child, _stdin) = tee_of("printf 'ok\\n\\r' >&2; exec sleep 60");
+        shown.until("the line", |t| t == "ok\n").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cap.stop_tee();
+        assert_eq!(shown.text(), "ok\n");
     }
 }

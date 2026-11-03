@@ -21,11 +21,12 @@
 //!   a hung emulator) the way out is the terminal's, not ours. If that ever matters, the fix is a
 //!   dedicated writer thread with a bounded queue, not `block_in_place` (which has no worker to
 //!   hand off from the main thread). The writes at the end of a run are the exception: they go
-//!   through [`TermOutput::write_all_within`], on a thread of their own and with a deadline, after
-//!   the termios is back, so a terminal that stopped reading cannot hold the client in raw mode.
+//!   through [`TermOutput::write_all_within`] ([`write_within`]): after the termios is back, in whole
+//!   escape sequences, polled with a deadline on the calling thread, so a terminal that stopped
+//!   reading cannot hold the client in raw mode and nothing is left running behind the call.
 
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -333,10 +334,8 @@ impl TermInput for TtyInput {
     }
 }
 
-/// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`. With a `deadline`, a
-/// non-blocking descriptor that stays full past it fails with `TimedOut` (a blocking one is
-/// stuck inside the kernel, out of reach: see [`TtyOutput::write_all_within`]).
-fn write_fd(fd: &OwnedFd, mut bytes: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+/// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`.
+fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         match rustix::io::write(fd, bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -345,27 +344,141 @@ fn write_fd(fd: &OwnedFd, mut bytes: &[u8], deadline: Option<Instant>) -> io::Re
             Err(Errno::AGAIN) => {
                 // The terminal is full: wait for room (backpressure, see the module docs).
                 let mut fds = [PollFd::new(fd, PollFlags::OUT)];
-                match deadline {
-                    None => {
-                        let _ = poll(&mut fds, None);
-                    }
-                    Some(d) => {
-                        let left = d.saturating_duration_since(Instant::now());
-                        if left.is_zero() {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        let t = Timespec {
-                            tv_sec: left.as_secs() as _,
-                            tv_nsec: left.subsec_nanos() as _,
-                        };
-                        let _ = poll(&mut fds, Some(&t));
-                    }
-                }
+                let _ = poll(&mut fds, None);
             }
             Err(e) => return Err(errno(e)),
         }
     }
     Ok(())
+}
+
+/// Writes `bytes` to the terminal or pipe on `fd`, giving up with [`io::ErrorKind::TimedOut`]
+/// after `within`. For the end of a process, when a stuck write must not keep the user's shell
+/// from getting the terminal back; nothing is left running after it returns.
+///
+/// - **No thread, no shared flag.** A tty is reopened by name as a fresh open file description,
+///   with `O_NONBLOCK`, so the blocking mode of the descriptor the shell shares is not touched
+///   (any other `fd`, or a tty that cannot be reopened, gets `O_NONBLOCK` for the length of the
+///   call and its old flags back after). The deadline is kept by polling on the calling thread.
+/// - **Whole sequences.** `bytes` is written in pieces that each start at an escape sequence,
+///   and a piece is begun only once the terminal has room, so a terminal that stopped reading is
+///   usually noticed between two sequences and not in the middle of one. A synchronized update
+///   (`CSI ? 2026 h` ... `CSI ? 2026 l`) is one piece. A terminal that takes part of a piece and
+///   then stops can still be left with a cut sequence: giving up on a stuck terminal cannot be
+///   made free of it.
+pub fn write_within<Fd: AsFd>(fd: Fd, bytes: &[u8], within: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + within;
+    let fd = fd.as_fd();
+    let (w, restore) = match reopen_tty(fd) {
+        Some(w) => (w, None),
+        None => {
+            let w = rustix::io::dup(fd).map_err(errno)?;
+            let old = rustix::fs::fcntl_getfl(&w).map_err(errno)?;
+            if old.contains(rustix::fs::OFlags::NONBLOCK) {
+                (w, None)
+            } else {
+                rustix::fs::fcntl_setfl(&w, old | rustix::fs::OFlags::NONBLOCK).map_err(errno)?;
+                (w, Some(old))
+            }
+        }
+    };
+    let result = write_pieces(&w, bytes, deadline);
+    if let Some(old) = restore {
+        let _ = rustix::fs::fcntl_setfl(&w, old);
+    }
+    result
+}
+
+/// Writes `text` to this process's standard error, within `within` (see [`write_within`]): for
+/// what is printed after the terminal was handed back, such as the error that ended a run.
+/// Failures are ignored; there is nowhere else to say them.
+pub fn write_stderr_within(text: &str, within: Duration) {
+    let _ = write_within(rustix::stdio::stderr(), text.as_bytes(), within);
+}
+
+/// A new `O_NONBLOCK` open file description of the terminal behind `fd`, if it is one that can be
+/// opened again by name and is the same device.
+fn reopen_tty(fd: BorrowedFd<'_>) -> Option<OwnedFd> {
+    use rustix::fs::{Mode, OFlags, fstat, open};
+    if !rustix::termios::isatty(fd) {
+        return None;
+    }
+    let name = rustix::termios::ttyname(fd, Vec::new()).ok()?;
+    let w = open(
+        name.as_c_str(),
+        OFlags::WRONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    // The name could have been reused since: it must be the terminal we were given.
+    let (a, b) = (fstat(fd).ok()?, fstat(&w).ok()?);
+    (a.st_rdev == b.st_rdev && rustix::termios::isatty(&w)).then_some(w)
+}
+
+/// Splits `bytes` before each escape sequence, except that a synchronized update stays whole and
+/// the `ESC \\` that ends a string is not a start.
+fn pieces(bytes: &[u8]) -> Vec<&[u8]> {
+    const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+    const SYNC_END: &[u8] = b"\x1b[?2026l";
+    let mut out = Vec::new();
+    let (mut start, mut hold_until) = (0, 0);
+    for i in 0..bytes.len() {
+        if bytes[i] != 0x1b || i < hold_until || bytes.get(i + 1) == Some(&b'\\') {
+            continue;
+        }
+        if i > start {
+            out.push(&bytes[start..i]);
+            start = i;
+        }
+        if bytes[i..].starts_with(SYNC_BEGIN)
+            && let Some(end) = bytes[i..]
+                .windows(SYNC_END.len())
+                .position(|w| w == SYNC_END)
+        {
+            hold_until = i + end + SYNC_END.len();
+        }
+    }
+    if start < bytes.len() {
+        out.push(&bytes[start..]);
+    }
+    out
+}
+
+fn write_pieces(w: &OwnedFd, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    for piece in pieces(bytes) {
+        // Room first: a terminal that is full stops the write here, between two sequences.
+        wait_writable(w, deadline)?;
+        let mut rest = piece;
+        while !rest.is_empty() {
+            match rustix::io::write(w, rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) => wait_writable(w, deadline)?,
+                Err(e) => return Err(errno(e)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wait_writable(w: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let t = Timespec {
+            tv_sec: left.as_secs() as _,
+            tv_nsec: left.subsec_nanos() as _,
+        };
+        let mut fds = [PollFd::new(w, PollFlags::OUT)];
+        match poll(&mut fds, Some(&t)) {
+            Ok(n) if n > 0 => return Ok(()),
+            Ok(_) | Err(Errno::INTR) => {}
+            Err(e) => return Err(errno(e)),
+        }
+    }
 }
 
 impl TermOutput for TtyOutput {
@@ -374,26 +487,11 @@ impl TermOutput for TtyOutput {
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        write_fd(&self.fd, bytes, None)
+        write_fd(&self.fd, bytes)
     }
 
-    /// The write runs on a thread of its own, on a duplicate of the descriptor, and is waited
-    /// for up to `within`: the descriptor is usually blocking, and a write to a terminal that
-    /// has stopped reading never returns, so nothing on this thread could bound it. A write
-    /// that is still stuck at the deadline is left to the thread; the process is about to end.
     fn write_all_within(&mut self, bytes: &[u8], within: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + within;
-        let fd = rustix::io::dup(&self.fd).map_err(errno)?;
-        let bytes = bytes.to_vec();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("fil-tty-exit-write".into())
-            .spawn(move || {
-                let _ = done_tx.send(write_fd(&fd, &bytes, Some(deadline)));
-            })?;
-        done_rx
-            .recv_timeout(within)
-            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+        write_within(&self.fd, bytes, within)
     }
 
     fn set_raw(&mut self, raw: bool) -> io::Result<()> {
@@ -417,5 +515,74 @@ impl Drop for TtyOutput {
         self.shared.wake();
         // Dropping the guard restores the saved settings.
         self.raw = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{pieces, write_within};
+
+    #[test]
+    fn a_full_pipe_times_out_and_keeps_its_blocking_mode() {
+        let (rx, tx) = rustix::pipe::pipe().unwrap();
+        let before = rustix::fs::fcntl_getfl(&tx).unwrap();
+        // Fill it through a non-blocking duplicate of the writer.
+        let nb = rustix::io::dup(&tx).unwrap();
+        rustix::fs::fcntl_setfl(&nb, before | rustix::fs::OFlags::NONBLOCK).unwrap();
+        while rustix::io::write(&nb, &[0u8; 4096]).is_ok() {}
+        // (That flag is shared: put the writer back the way a caller has it.)
+        rustix::fs::fcntl_setfl(&tx, before).unwrap();
+        let started = std::time::Instant::now();
+        let err = write_within(&tx, b"fil: boom\n", Duration::from_millis(150)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            !rustix::fs::fcntl_getfl(&tx)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK),
+            "the writer was left non-blocking"
+        );
+        // With room it writes whole.
+        rustix::fs::fcntl_setfl(&rx, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut sink = [0u8; 65536];
+        while rustix::io::read(&rx, &mut sink).is_ok_and(|n| n == sink.len()) {}
+        write_within(&tx, b"fil: boom\n", Duration::from_secs(2)).unwrap();
+    }
+
+    fn joined(p: &[&[u8]]) -> Vec<u8> {
+        p.concat()
+    }
+
+    #[test]
+    fn exit_output_is_cut_only_between_sequences() {
+        let b = b"\x18\x1b[?1l\x1b>\x1b[0m\x1b]8;;\x1b\\\r\nbye\r\n";
+        let p = pieces(b);
+        assert_eq!(joined(&p), b);
+        assert_eq!(
+            p,
+            vec![
+                &b"\x18"[..],
+                b"\x1b[?1l",
+                b"\x1b>",
+                b"\x1b[0m",
+                b"\x1b]8;;\x1b\\\r\nbye\r\n"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_synchronized_update_is_one_piece() {
+        let b = b"\x1b[?2026h\x1b[3;4H\x1b[K\x1b[?2026l\x1b[?25h";
+        let p = pieces(b);
+        assert_eq!(joined(&p), b);
+        assert_eq!(
+            p,
+            vec![&b"\x1b[?2026h\x1b[3;4H\x1b[K\x1b[?2026l"[..], b"\x1b[?25h"]
+        );
+        // One that is never closed is cut like any other text.
+        assert_eq!(pieces(b"\x1b[?2026h\x1b[K").len(), 2);
+        assert!(pieces(b"").is_empty());
     }
 }

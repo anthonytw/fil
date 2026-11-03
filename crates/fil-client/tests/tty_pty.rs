@@ -241,7 +241,8 @@ async fn a_panic_puts_the_terminal_back_before_unwinding_reaches_anyone() {
 
 /// A terminal that has stopped reading (its queue is full and nobody drains the master) cannot
 /// hold the end of a run: the bounded write gives up at its deadline and the termios is restored
-/// anyway. The plain `write_all` on the same descriptor blocks for good.
+/// anyway, and nothing of the write is left behind to reach the terminal later. (A plain blocking
+/// write on the same descriptor never returns.)
 #[tokio::test]
 #[ignore = "on demand: just client-pty"]
 async fn a_terminal_that_stopped_reading_cannot_hold_the_exit_writes() {
@@ -286,8 +287,18 @@ async fn a_terminal_that_stopped_reading_cannot_hold_the_exit_writes() {
     term.output.set_raw(false).unwrap();
     assert_eq!(lflags(&p.slave), before.local_modes);
 
-    // When the terminal reads again, a bounded write goes through whole.
+    // When the terminal reads again, nothing of the abandoned write turns up late: it left no
+    // thread behind, and a terminal that never had room never got half a sequence.
     let sink = drain(&p.master);
+    std::thread::sleep(Duration::from_millis(300));
+    {
+        let seen = sink.lock().unwrap();
+        assert!(
+            !seen.contains(&0x1b) && !String::from_utf8_lossy(&seen).contains("detached"),
+            "part of the abandoned write reached the terminal"
+        );
+    }
+    // And a bounded write goes through whole.
     term.output
         .write_all_within(b"after\r\n", Duration::from_secs(5))
         .unwrap();

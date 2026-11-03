@@ -7,10 +7,19 @@
 //!   input for a prompt that does not echo. A file sink creates the file with mode 0600 and
 //!   refuses an existing file that other users can read or write. It is bounded in size (1 MiB)
 //!   and in age: the file in use is moved to `<path>.1` once its first entry is 7 days old, and
-//!   that file is deleted 7 days after its last write, so nothing typed stays on disk for more
-//!   than about 14 days, however little is logged and however often fil runs. The age comes from
-//!   a header line the file starts with. A command sink pipes the bytes to the command's stdin;
-//!   the command decides where they end up.
+//!   that file is deleted 7 days after its last write. The age comes from a header line the file
+//!   starts with.
+//!   - **What that guarantees.** Nothing typed stays on disk for more than about 14 days *while
+//!     fil is run*: the log is checked when it is opened, on every write and every hour while a
+//!     client has it open (idle or not), and [`tidy_file_log`] does the same for the default path
+//!     at the start of every run, also when the log is off. Nothing deletes files while no fil
+//!     runs at all, and a log at some other path that is then switched off keeps what it holds
+//!     until a client opens that path again.
+//!   - **Several clients on one path** share it safely: every step that reads or changes the
+//!     file's clock is done under a lock on its directory, after looking at the file again, so one
+//!     client's rotation is seen by the others and nothing is written to a rotated file.
+//!
+//!   A command sink pipes the bytes to the command's stdin; the command decides where they end up.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -205,6 +214,10 @@ const LOG_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// written (a client attached for weeks must not keep an old log because it was never written to).
 const LOG_MAINTAIN_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// How far ahead of the clock a time found on disk (a header, a file's last write) may be before
+/// it is not believed.
+const FUTURE_SLACK: Duration = Duration::from_secs(60);
+
 /// What a file log starts with. Its entries are raw keystrokes with no time stamps, so the age
 /// of the file is kept here, as Unix seconds; the daemon's logs take theirs from the first line
 /// the same way, because file birth times are not on every platform (musl).
@@ -217,6 +230,15 @@ const LOG_HEADER_PREFIX: &str = "# fil offline-input log, started ";
 struct LogDir {
     dir: std::fs::File,
     name: OsString,
+}
+
+/// The directory's lock, released on drop.
+struct DirLock(std::fs::File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 impl LogDir {
@@ -262,20 +284,43 @@ impl LogDir {
         n
     }
 
-    /// Deletes the rotated twin if its last write is older than [`LOG_KEEP_FOR`]. Only a regular
-    /// file, and never through a symlink.
+    /// Deletes the rotated twin if its last write is older than [`LOG_KEEP_FOR`], or is in the
+    /// future (a clock that was ahead when it was written, or a time set by hand: an age that
+    /// cannot be told is not a young one). Only a regular file, and never through a symlink.
     fn prune_twin(&self, now: SystemTime) {
         use rustix::fs::{AtFlags, FileType, statat, unlinkat};
         let name = self.rotated_name();
         let Ok(st) = statat(&self.dir, &name, AtFlags::SYMLINK_NOFOLLOW) else {
             return;
         };
-        let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let age = u64::try_from(now as i64 - st.st_mtime).unwrap_or(0);
-        if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
-            && age > LOG_KEEP_FOR.as_secs()
-        {
+        let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+        let expired = st.st_mtime > now + FUTURE_SLACK.as_secs() as i64
+            || now - st.st_mtime > LOG_KEEP_FOR.as_secs() as i64;
+        if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile && expired {
             let _ = unlinkat(&self.dir, &name, AtFlags::empty());
+        }
+    }
+
+    /// Holds the directory's lock until the guard is dropped. Every clock-keeping step of a log
+    /// (look at the file, rotate it, write to it) happens under it, so that two fil clients on
+    /// one log path cannot rotate it under each other or both start its clock. A lock on the
+    /// directory, not the file, because the file is replaced by a rotation.
+    fn lock(&self) -> Result<DirLock, String> {
+        use rustix::fs::{FlockOperation, flock};
+        // A duplicate shares the open file description the lock belongs to; it is the guard's, so
+        // that the guard does not borrow the directory while the file is replaced.
+        let held = self.dir.try_clone().map_err(|e| e.to_string())?;
+        loop {
+            match flock(&held, FlockOperation::LockExclusive) {
+                Ok(()) => return Ok(DirLock(held)),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "cannot lock its directory: {}",
+                        std::io::Error::from(e)
+                    ));
+                }
+            }
         }
     }
 
@@ -336,12 +381,19 @@ impl LogDir {
     }
 }
 
-/// A file log in use: the open file, how much it holds and when its first entry was written.
+/// A file log in use. It keeps no facts about the file between operations: with several fil
+/// clients on one path, the file can be rotated, replaced or written by another at any moment,
+/// so every operation looks at the file again, under the directory's lock.
 struct FileLog {
     dir: LogDir,
     f: std::fs::File,
-    written: u64,
-    /// When the first entry in the file was written; `None` while the file is empty.
+}
+
+/// What a file log holds, as found.
+struct Look {
+    len: u64,
+    /// When the first entry was written; `None` while the file is empty, and also when it is not
+    /// empty but has no header we can believe (which is a reason to rotate it).
     born: Option<SystemTime>,
 }
 
@@ -369,64 +421,79 @@ impl FileLog {
     /// old, or that does not start with our header (one from before the header, or not ours), is
     /// moved aside first; a rotated file past its age is deleted.
     fn open(dir: LogDir, now: SystemTime) -> Result<FileLog, String> {
-        let (f, written) = dir.open_file()?;
-        // A time in the future (a clock set back, or a header written by hand) is not trusted:
-        // an age that cannot be told is the file's worst case, not its best.
-        let born = read_started(&f).filter(|t| *t <= now + Duration::from_secs(60));
-        let mut log = FileLog {
-            dir,
-            f,
-            written,
-            born,
-        };
-        if written > 0 && (log.born.is_none() || log.too_old(now) || written >= LOG_MAX_BYTES) {
-            log.rotate()?;
-        }
-        log.dir.prune_twin(now);
+        let (f, _) = dir.open_file()?;
+        let mut log = FileLog { dir, f };
+        log.maintain(now)?;
         Ok(log)
     }
 
-    fn too_old(&self, now: SystemTime) -> bool {
-        self.born.is_some_and(|b| {
-            now.duration_since(b)
-                .is_ok_and(|age| age > LOG_ROTATE_AFTER)
-        })
+    /// Makes `self.f` the file at the path (another client may have rotated it, and then ours is
+    /// the rotated twin, which must not be written to; or it was deleted) and reports what it
+    /// holds. The directory must be locked.
+    fn look(&mut self, now: SystemTime) -> Result<Look, String> {
+        use rustix::fs::{AtFlags, fstat, statat};
+        let same = match (
+            fstat(&self.f),
+            statat(&self.dir.dir, &self.dir.name, AtFlags::SYMLINK_NOFOLLOW),
+        ) {
+            (Ok(mine), Ok(at_path)) => {
+                mine.st_dev == at_path.st_dev && mine.st_ino == at_path.st_ino
+            }
+            _ => false,
+        };
+        if !same {
+            (self.f, _) = self.dir.open_file()?;
+        }
+        let len = self.f.metadata().map_err(|e| e.to_string())?.len();
+        // A time in the future (a clock set back, or a header written by hand) is not trusted:
+        // an age that cannot be told is the file's worst case, not its best.
+        let born = if len > 0 {
+            read_started(&self.f).filter(|t| *t <= now + FUTURE_SLACK)
+        } else {
+            None
+        };
+        Ok(Look { len, born })
     }
 
-    /// Moves the file aside (replacing the older twin) and starts an empty one.
+    /// Moves the file aside (replacing the older twin) and starts an empty one. Locked.
     fn rotate(&mut self) -> Result<(), String> {
-        (self.f, self.written) = self.dir.rotate()?;
-        self.born = None;
+        (self.f, _) = self.dir.rotate()?;
         Ok(())
     }
 
     /// Appends one entry, first moving the file aside if it would outgrow its size or is too old.
     fn append(&mut self, bytes: &[u8], now: SystemTime) -> Result<(), String> {
-        if self.written > 0
-            && (self.written + bytes.len() as u64 > LOG_MAX_BYTES || self.too_old(now))
+        let _held = self.dir.lock()?;
+        let mut look = self.look(now)?;
+        if look.len > 0
+            && (look.born.is_none()
+                || too_old(look.born, now)
+                || look.len + bytes.len() as u64 > LOG_MAX_BYTES)
         {
             self.rotate()?;
             self.dir.prune_twin(now);
+            look = Look { len: 0, born: None };
         }
         let mut out = Vec::with_capacity(bytes.len() + 48);
-        if self.born.is_none() {
+        if look.len == 0 {
             // The first entry of a file starts its clock.
             out.extend_from_slice(header(now).as_bytes());
-            self.born = Some(now);
         }
         out.extend_from_slice(bytes);
         self.f
             .write_all(&out)
             .and_then(|_| self.f.flush())
-            .map_err(|e| e.to_string())?;
-        self.written += out.len() as u64;
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 
-    /// What a log does with no writes: the file in use is moved aside when it has grown old, and
-    /// a rotated file past its age is deleted.
+    /// What a log does with no writes: the file in use is moved aside when it has grown old (or
+    /// full, or has no clock), and a rotated file past its age is deleted.
     fn maintain(&mut self, now: SystemTime) -> Result<(), String> {
-        if self.too_old(now) {
+        let _held = self.dir.lock()?;
+        let look = self.look(now)?;
+        if look.len > 0
+            && (look.born.is_none() || too_old(look.born, now) || look.len >= LOG_MAX_BYTES)
+        {
             self.rotate()?;
         }
         self.dir.prune_twin(now);
@@ -434,10 +501,39 @@ impl FileLog {
     }
 }
 
+fn too_old(born: Option<SystemTime>, now: SystemTime) -> bool {
+    born.is_some_and(|b| {
+        now.duration_since(b)
+            .is_ok_and(|age| age > LOG_ROTATE_AFTER)
+    })
+}
+
+/// Applies the age and size rules to the file log at `path` without writing to it: the file in use
+/// is moved aside if it is old, and a rotated file past its age is deleted. It never creates the
+/// log. For a path that fil is not logging to (the log was turned off, or points elsewhere now):
+/// the bound on how long typed keystrokes stay on disk holds as long as fil runs, not only while
+/// the log is on. Best effort: a directory or file that fails the checks of [`LogSink::open`] is
+/// left alone.
+pub fn tidy_file_log(path: &Path) {
+    use rustix::fs::{AtFlags, statat};
+    let Ok(dir) = LogDir::open(path) else { return };
+    let now = SystemTime::now();
+    if statat(&dir.dir, &dir.name, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
+        let _ = FileLog::open(dir, now);
+    } else if let Ok(_held) = dir.lock() {
+        dir.prune_twin(now);
+    }
+}
+
 impl LogSink {
     /// Opens the log. A file is created with mode 0600 and appended to; an existing file is
     /// refused unless it is a regular file that only the owner can access.
     pub fn open(log: &OfflineLog) -> Result<LogSink, LogError> {
+        Self::open_every(log, LOG_MAINTAIN_EVERY)
+    }
+
+    /// [`LogSink::open`], looking at a file log's age every `maintain_every` while it is idle.
+    fn open_every(log: &OfflineLog, maintain_every: Duration) -> Result<LogSink, LogError> {
         match log {
             OfflineLog::File(path) => {
                 let p = path.display().to_string();
@@ -467,7 +563,7 @@ impl LogSink {
                 let ticker = tx.downgrade();
                 std::thread::spawn(move || {
                     loop {
-                        std::thread::sleep(LOG_MAINTAIN_EVERY);
+                        std::thread::sleep(maintain_every);
                         let Some(tx) = ticker.upgrade() else { return };
                         let _ = tx.try_send(Vec::new());
                     }
@@ -848,14 +944,23 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        // The header takes room from the first file: fifteen chunks fit, the sixteenth starts a
+        // new file, and so does the seventeenth's. Wait for the writer thread to get that far.
+        let body = |p: &Path| -> usize {
+            std::fs::read(p).map_or(0, |b| {
+                b.iter()
+                    .position(|c| *c == b'\n')
+                    .map_or(0, |i| b.len() - i - 1)
+            })
+        };
         for _ in 0..500 {
-            let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            // (Not just the new file's size: after the first chunk it is that size too.)
-            if len(&dir.join("log.1")) > 0 && len(&path) >= chunk.len() as u64 {
+            if body(&path) == 2 * chunk.len() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(body(&path), 2 * chunk.len());
+        assert_eq!(body(&dir.join("log.1")), 15 * chunk.len());
         let (a, b) = (
             std::fs::metadata(&path).unwrap(),
             std::fs::metadata(dir.join("log.1")).unwrap(),
@@ -864,6 +969,174 @@ mod tests {
         assert!(b.len() > 0, "the full log moved aside");
         assert_eq!(a.permissions().mode() & 0o777, 0o600);
         assert_eq!(b.permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ---- several clients on one log -----------------------------------------------------------
+
+    /// The header of a file that was started `ago` before `now`.
+    fn old_header(now: SystemTime, ago: Duration) -> String {
+        header(now - ago)
+    }
+
+    /// Client A opened the log while it was empty, and client B wrote to it. A must still age
+    /// B's entries out, and must not start a second clock in the middle of the file.
+    #[test]
+    fn a_log_another_client_started_is_aged_out_by_this_one() {
+        let dir = scratch("two-a");
+        let path = dir.join("log");
+        let t0 = SystemTime::now();
+        let mut a = open_log(&path, t0);
+        let mut b = open_log(&path, t0);
+        b.append(b"B-secret", t0).unwrap();
+        drop(b);
+        set_mtime(&path, t0);
+        a.maintain(t0 + 6 * DAY).unwrap();
+        assert!(everything_in(&dir).contains("B-secret"), "day 6");
+        for d in [8u32, 15] {
+            a.maintain(t0 + DAY * d).unwrap();
+        }
+        assert!(
+            !everything_in(&dir).contains("B-secret"),
+            "B's entry is still on disk at day 15"
+        );
+        a.append(b"A-later", t0 + 61 * DAY).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches(LOG_HEADER_PREFIX).count(), 1, "{text:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// B's file is rotated by A. B must write to the new file, not to the rotated one, or the
+    /// rotated file's last write moves on and the bound with it.
+    #[test]
+    fn a_client_whose_file_was_rotated_by_another_writes_to_the_new_file() {
+        let dir = scratch("two-b");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        let t0 = SystemTime::now();
+        let mut a = open_log(&path, t0);
+        let mut b = open_log(&path, t0);
+        a.append(b"A-day0 ", t0).unwrap();
+        b.append(b"B-day6 ", t0 + 6 * DAY).unwrap();
+        set_mtime(&path, t0 + 6 * DAY);
+        a.append(b"A-day8 ", t0 + 8 * DAY).unwrap(); // A rotates
+        set_mtime(&twin, t0 + 6 * DAY);
+        b.append(b"B-day12 ", t0 + 12 * DAY).unwrap();
+        let moved = std::fs::read_to_string(&twin).unwrap();
+        assert!(
+            !moved.contains("B-day12"),
+            "B wrote into the rotated file: {moved:?}"
+        );
+        let now_file = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            now_file.contains("A-day8") && now_file.contains("B-day12"),
+            "{now_file:?}"
+        );
+        assert_eq!(
+            now_file.matches(LOG_HEADER_PREFIX).count(),
+            1,
+            "{now_file:?}"
+        );
+        a.maintain(t0 + 15 * DAY).unwrap();
+        let all = everything_in(&dir);
+        assert!(
+            !all.contains("A-day0") && !all.contains("B-day6"),
+            "day 15: {all:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The size limit is the file's, not each writer's.
+    #[test]
+    fn the_size_limit_holds_for_the_file_whoever_wrote_to_it() {
+        let dir = scratch("two-size");
+        let path = dir.join("log");
+        let t0 = SystemTime::now();
+        let mut a = open_log(&path, t0);
+        let mut b = open_log(&path, t0);
+        let chunk = vec![b'x'; 300 * 1024];
+        for i in 0..8 {
+            let w = if i % 2 == 0 { &mut a } else { &mut b };
+            w.append(&chunk, t0).unwrap();
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(len <= LOG_MAX_BYTES, "write {i}: {len} bytes");
+        }
+        assert!(dir.join("log.1").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rotated_file_dated_in_the_future_is_not_kept() {
+        let dir = scratch("future-twin");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        std::fs::write(&twin, b"written with the clock ahead").unwrap();
+        let now = SystemTime::now();
+        set_mtime(&twin, now + 3 * DAY);
+        let log_dir = LogDir::open(&path).unwrap();
+        log_dir.prune_twin(now);
+        assert!(!twin.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The idle tick reaches `maintain`: a client that writes nothing still ages the file out.
+    /// (Another client wrote into it after this one opened it, here by hand.)
+    #[test]
+    fn the_idle_tick_ages_the_log_out_without_a_write() {
+        use std::io::Write as _;
+        let dir = scratch("tick");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        let sink = LogSink::open_every(&OfflineLog::File(path.clone()), Duration::from_millis(10))
+            .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let old = old_header(SystemTime::now(), 8 * DAY);
+        write!(f, "{old}typed eight days ago").unwrap();
+        drop(f);
+        for _ in 0..500 {
+            if twin.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::read_to_string(&twin).is_ok_and(|t| t.contains("eight days ago")),
+            "the tick did not rotate the old log"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        drop(sink);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With the log turned off nothing opens it, so the client tidies the path on start: old
+    /// content is moved aside and expired files go, and a path with no log is not created.
+    #[test]
+    fn tidying_a_log_that_is_off_ages_it_out_and_creates_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("tidy");
+        let path = dir.join("log");
+        let twin = dir.join("log.1");
+        tidy_file_log(&path);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "created something"
+        );
+        // A leftover twin expires with no main log.
+        std::fs::write(&twin, b"left behind").unwrap();
+        set_mtime(&twin, SystemTime::now() - 8 * DAY);
+        tidy_file_log(&path);
+        assert!(!twin.exists());
+        // An old main log is moved aside and, its last write long ago, deleted with it.
+        let old = old_header(SystemTime::now(), 20 * DAY);
+        std::fs::write(&path, format!("{old}typed last month")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&path, SystemTime::now() - 19 * DAY);
+        tidy_file_log(&path);
+        assert!(!everything_in(&dir).contains("last month"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

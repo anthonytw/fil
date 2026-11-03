@@ -36,10 +36,12 @@ pub trait TermOutput: Send + 'static {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     /// Like [`write_all`](Self::write_all), but gives up with [`io::ErrorKind::TimedOut`] once
-    /// `within` has passed, and the caller goes on without what was not written. For the writes
-    /// at the end of a run: a terminal that has stopped reading (XOFF, a hung emulator) must not
-    /// keep the client from giving the user's shell back. The default does not bound anything,
-    /// which is right for a terminal that cannot block.
+    /// `within` has passed, and the caller goes on without what was not written. **For the end of
+    /// a process** (the terminal restore and the closing message): a terminal that has stopped
+    /// reading (XOFF, a hung emulator) must not keep the client from giving the user's shell back.
+    /// An implementation may have written part of the bytes when it gives up, but must not leave
+    /// the rest to be written later. The default does not bound anything, which is right for a
+    /// terminal that cannot block.
     fn write_all_within(&mut self, bytes: &[u8], within: Duration) -> io::Result<()> {
         let _ = within;
         self.write_all(bytes)

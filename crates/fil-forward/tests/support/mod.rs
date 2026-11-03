@@ -533,6 +533,12 @@ pub fn raise_fd_limit() {
     });
 }
 
+/// Serializes the tests that open thousands of connections at once.
+pub async fn heavy() -> tokio::sync::MutexGuard<'static, ()> {
+    static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    HEAVY.lock().await
+}
+
 /// Descriptors this process holds now.
 pub fn open_fds() -> usize {
     std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())

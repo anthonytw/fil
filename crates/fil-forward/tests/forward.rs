@@ -189,6 +189,9 @@ async fn concurrent_connections(t: Transport) {
         "FIL_FORWARD_CONCURRENT",
         if t == Transport::Quic { 1000 } else { 300 },
     );
+    // One transport at a time: three bursts of a thousand loopback connections at once overflow
+    // the servers' listen queues (128 on macOS) beyond what a retried connect absorbs.
+    let _one_at_a_time = heavy().await;
     // The server answers nobody until `hold` connections reached it: that many channels are
     // then open at once (DESIGN.md section 15, M2: 200 concurrent forwarded connections).
     let hold = n.min(200) as usize;

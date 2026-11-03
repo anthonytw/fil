@@ -131,9 +131,13 @@ async fn f_agent_other_user_child() {
     // Root traverses the 0700 directories anyway; the socket's own 0600 does not stop root
     // either. What stops it is the peer-UID check.
     println!("SOCK {}", sock.display());
-    let mut line = String::new();
-    let stdin = std::io::stdin();
-    stdin.lock().read_line(&mut line).unwrap();
+    // Off the runtime's workers: they carry the session and the relay meanwhile.
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).unwrap();
+    })
+    .await
+    .unwrap();
     println!("CONNECTS {}", agent.connects());
     let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
     let ok = tokio::time::timeout(WAIT, request(&mut s, &[REQUEST_IDENTITIES]))

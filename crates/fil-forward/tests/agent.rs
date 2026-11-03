@@ -231,7 +231,10 @@ async fn confirm_times_out_as_no() {
     near.write_all(&framed(&sign_request(&[1, 2, 3], b"m")))
         .await
         .unwrap();
-    let got = read_answer(&mut near).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(60), read_answer(&mut near))
+        .await
+        .expect("refused by the timeout, not passed on")
+        .unwrap();
     assert_eq!(got, [FAILURE]);
     assert_eq!(never.withdrawn.load(Ordering::SeqCst), 1);
     drop(near);

@@ -385,6 +385,20 @@ mod tests {
         }
     }
 
+    /// The agent socket of the longest session name and uid still fits a socket path.
+    #[test]
+    fn the_agent_socket_path_fits() {
+        let p = Paths::in_dir(format!("/tmp/fil-{}", u32::MAX));
+        let name: fil_proto::msg::SessionName = "x".repeat(64).parse().unwrap();
+        let sock = p.agent_socket(&name);
+        assert_eq!(sock.parent().unwrap(), p.dir.join("agent"));
+        assert!(
+            sock.as_os_str().len() <= MAX_SOCKET_PATH,
+            "{}",
+            sock.display()
+        );
+    }
+
     /// `fil ls` probes other daemons' lock files; one that is a FIFO (or a link) must neither block
     /// it nor be followed.
     #[test]

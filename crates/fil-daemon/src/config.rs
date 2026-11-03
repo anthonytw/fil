@@ -261,6 +261,13 @@ mod tests {
         assert_eq!(c.scope, ScopeMode::Auto);
         assert_eq!(c.history_lines, 1000);
         assert_eq!(c.ports_probe, ProbeMode::Head);
+        assert!(c.agent_socket, "the stable SSH_AUTH_SOCK by default (OD-6)");
+        assert!(
+            !DaemonConfig::parse("agent_socket = false")
+                .unwrap()
+                .agent_socket
+        );
+        assert!(DaemonConfig::parse("agent_socket = \"no\"").is_err());
         assert_eq!(
             c.bind,
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),

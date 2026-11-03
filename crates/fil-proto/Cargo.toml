@@ -19,6 +19,9 @@ test-hooks = []
 
 [dev-dependencies]
 fil-netsim = { path = "../fil-netsim" }
+# For tests/wire_golden.rs only, which pins the QUIC stream layout (fil_transport::quic::pinned)
+# next to the messages. A dev-dependency cycle: fil-transport depends on this crate.
+fil-transport = { path = "../fil-transport" }
 rand = "0.10"
 tokio = { version = "1", features = ["rt", "test-util", "macros", "io-util", "time", "sync"] }
 

@@ -70,28 +70,45 @@ pub struct VersionMismatch {
 }
 
 impl VersionMismatch {
-    /// A sentence the user can act on. The peer's numbers are the only thing in it that came
-    /// from the wire, and they are numbers.
+    /// Whether the peer is the newer build. Majors and revisions only grow, so the order of the
+    /// pairs says which side to upgrade.
+    pub fn peer_is_newer(&self) -> bool {
+        (self.peer.major, self.peer.revision) > (self.ours.major, self.ours.revision)
+    }
+
+    /// A sentence the user can act on, with the direction: it says which side is newer and which
+    /// to upgrade. The peer's numbers are the only thing in it that came from the wire, and they
+    /// are numbers.
     pub fn explain(&self, peer: Peer) -> String {
         let who = match peer {
             Peer::RemoteHost => "the fil on the remote host",
             Peer::Daemon => "the fil daemon",
         };
         let (ours, theirs) = (self.ours, self.peer);
+        let newer = self.peer_is_newer();
+        let which = if newer { "newer" } else { "older" };
+        let fix = if newer {
+            "upgrade this fil to match"
+        } else {
+            match peer {
+                Peer::RemoteHost => "upgrade the fil on the remote host to match",
+                Peer::Daemon => "upgrade the fil that started the daemon, or stop it",
+            }
+        };
         if ours.major != theirs.major {
             return format!(
-                "{who} speaks protocol major {} and this fil speaks major {}: install the same fil version there",
+                "{who} is {which}: it speaks protocol major {}, this fil speaks major {}: {fix}",
                 theirs.major, ours.major
             );
         }
         if theirs.revision == 0 {
             return format!(
-                "{who} is an older version that predates wire revisions (this fil is wire rev {}): install the same fil version there",
+                "{who} is older: it predates wire revisions (this fil is wire rev {}): {fix}",
                 ours.revision
             );
         }
         format!(
-            "{who} is a different version (wire rev {}; this fil is wire rev {}): install the same fil version there",
+            "{who} is {which} (wire rev {}) than this fil (wire rev {}): {fix}",
             theirs.revision, ours.revision
         )
     }
@@ -116,14 +133,25 @@ mod tests {
 
     #[test]
     fn the_words_name_both_revisions_and_the_remedy() {
+        // The remote is older (3 < 5): the fix is on the remote.
         let m = mismatch(1, 3).explain(Peer::RemoteHost);
         assert!(m.contains("rev 3") && m.contains("rev 5"), "{m}");
-        assert!(m.contains("install the same fil version"), "{m}");
+        assert!(
+            m.contains("older") && m.contains("upgrade the fil on the remote host"),
+            "{m}"
+        );
+        // The remote is newer (9 > 5): the fix is here.
+        let m = mismatch(1, 9).explain(Peer::RemoteHost);
+        assert!(m.contains("newer") && m.contains("upgrade this fil"), "{m}");
+        assert!(!m.contains("remote host to match"), "{m}");
         let old = mismatch(1, 0).explain(Peer::RemoteHost);
-        assert!(old.contains("predates wire revisions"), "{old}");
+        assert!(
+            old.contains("predates wire revisions") && old.contains("older"),
+            "{old}"
+        );
         let major = mismatch(2, 5).explain(Peer::Daemon);
         assert!(
-            major.contains("major 2") && major.contains("daemon"),
+            major.contains("major 2") && major.contains("daemon") && major.contains("newer"),
             "{major}"
         );
     }

@@ -140,6 +140,17 @@ impl Paths {
         self.file("sock")
     }
 
+    /// The socket of the daemon of wire `major`/`revision` in this directory, whichever it is:
+    /// `fil-<major>-<rev>.sock`, or the pre-revision `fil-<major>.sock` for revision 0. Numbers
+    /// only, so a client's claim of a wire cannot name any other path.
+    pub fn socket_of(&self, major: u16, revision: u16) -> PathBuf {
+        if revision == 0 {
+            self.dir.join(format!("fil-{major}.sock"))
+        } else {
+            self.dir.join(format!("fil-{major}-{revision}.sock"))
+        }
+    }
+
     /// `fil-<major>-<rev>.lock`: held by the running daemon.
     pub fn lock(&self) -> PathBuf {
         self.file("lock")

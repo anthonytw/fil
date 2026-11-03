@@ -66,10 +66,10 @@ fn main() -> ExitCode {
                 daemon_args.push(r.to_string().into());
             }
             daemon_args.push("daemon".into());
-            run_relay(&RelayOptions {
+            run_relay(&RelayOptions::with_paths(
                 paths,
-                launcher: DaemonLauncher::new(&exe, daemon_args),
-            })
+                DaemonLauncher::new(&exe, daemon_args),
+            ))
         }
         other => {
             eprintln!("fil-daemon-dev: unknown command {other:?}");

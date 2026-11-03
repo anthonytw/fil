@@ -1,5 +1,6 @@
 //! The relay: the preamble first, then bytes in both directions exactly as they come, and
-//! nothing else.
+//! nothing else. (Routing by a client's `Hello` is in `revision.rs`; what does not open like a
+//! fil client goes to the relay's own daemon unchanged, which is what these tests send.)
 
 mod common;
 
@@ -12,10 +13,11 @@ use common::*;
 use fil_daemon::{DaemonLauncher, EnsureError, RelayEnd, RelayError, RelayOptions, relay};
 
 fn options(s: &Scratch, launcher: DaemonLauncher) -> RelayOptions {
-    RelayOptions {
-        paths: s.paths(),
-        launcher,
-    }
+    let mut opts = RelayOptions::with_paths(s.paths(), launcher);
+    // These tests' clients send raw bytes or nothing, not a fil client's opening: the relay
+    // gives up waiting for a hello soon and passes the stream to its own daemon.
+    opts.hello_wait = Duration::from_millis(300);
+    opts
 }
 
 fn never_started() -> DaemonLauncher {

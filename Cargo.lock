@@ -480,6 +480,7 @@ name = "fil-proto"
 version = "0.0.0"
 dependencies = [
  "fil-netsim",
+ "fil-transport",
  "postcard",
  "rand",
  "serde",

@@ -20,6 +20,23 @@ use fil_transport::path::TransportSetting;
 /// The session `fil HOST` attaches to when none is named.
 pub const DEFAULT_SESSION: &str = "main";
 
+/// What `fil --version` prints after the name: the package version and the wire this build
+/// speaks (`wire <major>.<revision>`, DESIGN.md section 8.5). Two builds with the same wire talk
+/// to each other whatever their package versions, and a "different version" error names wire
+/// revisions, so this is the number a user compares. Reproducible: nothing in it depends on when
+/// or where the build was made.
+pub fn version_string() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "{} (wire {}.{})",
+            env!("CARGO_PKG_VERSION"),
+            fil_proto::limits::PROTOCOL_MAJOR,
+            fil_proto::version::wire_revision()
+        )
+    });
+    VERSION.as_str()
+}
+
 const AFTER_HELP: &str = "\
 Examples:
   fil orin                 attach to (or create) session \"main\" on orin
@@ -42,7 +59,7 @@ fil was stopped by signal N;
 #[derive(Parser, Debug)]
 #[command(
     name = "fil",
-    version,
+    version = version_string(),
     about = "A remote shell that keeps your place: reconnect, detach and reattach",
     after_help = AFTER_HELP,
     subcommand_negates_reqs = true,
@@ -483,6 +500,16 @@ mod tests {
         assert_eq!(
             parse(&["--version"]).unwrap_err().kind(),
             ErrorKind::DisplayVersion
+        );
+        // The version line names the wire: `fil 0.0.0 (wire 1.1)`.
+        let shown = Cli::command().render_version();
+        assert!(
+            shown.starts_with("fil ") && shown.contains(&format!(
+                "(wire {}.{})",
+                fil_proto::limits::PROTOCOL_MAJOR,
+                fil_proto::version::wire_revision()
+            )),
+            "{shown}"
         );
         let help = Cli::command().render_long_help().to_string();
         for needle in ["ls", "kill", "detach", "--transport", "Exit status", "-L"] {

@@ -162,11 +162,22 @@ impl Running {
     }
 
     pub fn relay_options(&self) -> RelayOptions {
-        RelayOptions {
-            paths: self.paths.clone(),
+        RelayOptions::with_paths(
+            self.paths.clone(),
             // Never used: the daemon is already running.
-            launcher: DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
-        }
+            DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+        )
+    }
+
+    /// A pipe link straight to the daemon's socket, with no relay in between (so no routing by
+    /// the client's hello): the daemon's own checks are all that stand between a client and it.
+    pub async fn direct_link(&self) -> PipeLink {
+        let sock = tokio::net::UnixStream::connect(self.paths.socket())
+            .await
+            .unwrap();
+        PipeLink::accept(sock, PipeConfig::default())
+            .await
+            .expect("pipe link to the daemon socket")
     }
 
     /// A pipe link to the daemon through a real relay (`fil_daemon::relay`), exactly as the

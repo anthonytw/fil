@@ -272,10 +272,9 @@ const TEE_STOP_WAIT: Duration = Duration::from_millis(100);
 
 /// Writes one chunk of the command's stderr to ours: control characters, escape sequences
 /// included, are removed (the text can come from a remote host's rc files or banner).
-// TODO(S2): use the shared text sanitizer (`fil_proto::text`) once it has landed.
 fn show_on_terminal(text: &[u8]) {
     use std::io::Write;
-    let clean = sanitize_banner(text);
+    let clean = fil_proto::text::sanitize(text);
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(clean.as_bytes()).and_then(|()| err.flush());
 }

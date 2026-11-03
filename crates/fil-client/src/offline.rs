@@ -516,7 +516,8 @@ mod tests {
         }
         for _ in 0..500 {
             let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            if len(&path) == chunk.len() as u64 {
+            // (Not just the new file's size: after the first chunk it is that size too.)
+            if len(&dir.join("log.1")) > 0 && len(&path) == chunk.len() as u64 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));

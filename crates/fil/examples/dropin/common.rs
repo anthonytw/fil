@@ -163,6 +163,18 @@ pub fn finish(mut c: Client) -> Result<(), String> {
     c.detach().map(|_| ())
 }
 
+/// Ctrl-C, then waits until the shell has drawn its next prompt: a character typed before that is
+/// lost by readline (over ssh too). Returns how long the prompt took.
+pub fn ctrl_c_to_prompt(c: &mut Client) -> Result<Duration, String> {
+    let from = c.len();
+    let t = Instant::now();
+    c.send(CTRL_C);
+    c.after("fil$ ", from)?;
+    let back = t.elapsed();
+    thread::sleep(Duration::from_millis(150));
+    Ok(back)
+}
+
 /// Answers one of the client's yes/no prompts: the prompt ignores keys until typing has been
 /// quiet for 300 ms and takes only a chunk that is exactly the key, so wait, then send it alone,
 /// and type nothing for another 400 ms.

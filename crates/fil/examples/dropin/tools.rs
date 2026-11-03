@@ -309,7 +309,7 @@ pub fn history_completion(ctx: &Ctx, host: &str) -> Res {
     c.send(CTRL_C);
     // Typed ahead of a Ctrl-C at the prompt, bash's readline can drop a character (and ssh does
     // the same): wait as a person would.
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(800));
     c.roundtrip("AFTERSEARCH", CMD_TIMEOUT)?;
     // Completion: one match completes the word...
     ensure(!c.has_row("fil$ ls unique_file_name_xyz"), || {
@@ -351,13 +351,10 @@ pub fn ctrl_c_d(ctx: &Ctx, host: &str) -> Res {
     let from = c.len();
     c.send("(echo STARTED-$((6*7)); exec sleep 3001)\r");
     c.after("STARTED-42", from)?;
+    let back = ctrl_c_to_prompt(&mut c)?;
     let from = c.len();
-    let t = Instant::now();
-    c.send(CTRL_C);
-    thread::sleep(Duration::from_millis(100));
     c.send("echo RC-$?\r");
     c.after("RC-130", from)?;
-    let back = t.elapsed();
     let out = c.run(
         "if pgrep -f 'sleep 3001' > /dev/null; then echo STILL-$((6*7)); else echo GONE-$((6*7)); fi",
         CMD_TIMEOUT,
@@ -380,8 +377,7 @@ pub fn ctrl_c_d(ctx: &Ctx, host: &str) -> Res {
     })?;
     // Ctrl-C at the prompt only clears the line: it does not run it.
     c.send("echo HALF-$((6*7))");
-    c.send(CTRL_C);
-    thread::sleep(Duration::from_millis(300));
+    ctrl_c_to_prompt(&mut c)?;
     let from = c.len();
     c.roundtrip("PROMPTC", CMD_TIMEOUT)?;
     ensure(!c.text_from(from).contains("HALF-42"), || {

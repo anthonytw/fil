@@ -45,8 +45,8 @@ pub async fn watch_keys(
                 {
                     seen.insert(path.clone());
                     let key = PublicKey::from_spki_der(bytes);
+                    registry.register(key.clone());
                     on_register(&key, &file_name(&path));
-                    registry.register(key);
                     let _ = std::fs::write(path.with_extension("registered"), b"ok");
                 }
             }

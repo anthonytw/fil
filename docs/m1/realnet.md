@@ -184,12 +184,12 @@ Six stand-in scenarios were **removed in M1 S6b** because the real binary, or `c
 
 | Removed | Covered by |
 |---|---|
-| `s_pipelink_echo` (PipeLink at both ends through the jumps and the noisy login) | `f_proxyjump`, `f_noisy`, `f_attach_detach`; the `ServerAlive` options it checked are the unit test in `crates/fil-transport/src/pipe/command.rs` |
-| `s_pipelink_kill_ssh` | `f_kill_ssh`, which also checks the session resumes |
+| `s_pipelink_echo` (PipeLink at both ends through the jumps and the noisy login) | `f_proxyjump`, `f_noisy`, `f_attach_detach` (the clean-login zero-skip check now lives in `f_proxyjump` and `f_attach_detach`); the `ServerAlive` options it grepped for are now grepped in `s_pipelink_netdown_keepalive`, and are a unit test in `crates/fil-transport/src/pipe/command.rs` |
+| `s_pipelink_kill_ssh` | `f_kill_ssh`, which also checks the session resumes and now asserts the new ssh within 3 s |
 | `s_flood` (pipe-echo) | `s_pipelink_flood`: the same 100000 bytes through the real `PipeLink` (the preamble code is the same), plus the in-process test in `crates/fil-transport/tests/pipe.rs` |
 | `s_netdown_app_heartbeat` (pipe-echo) | `s_pipelink_netdown_heartbeat`: the same black hole with ssh's keepalive off, so only the heartbeat can notice |
 | `s_port_range` | `crates/fil-transport/tests/quic_udp.rs`: `QuicListener::bind` scans the range on real UDP. The scenario only exercised quic-echo's own copy of the scan |
-| `s_quiclink_rebind` | `f_nat_rebind` (the same three NAT moves under the real client and daemon); the Retry and the `path_generation` count are in `crates/fil-transport/tests/quic_link.rs` |
+| `s_quiclink_rebind` | `f_nat_rebind` (the same three NAT moves under the real client and daemon; it now also asserts the status line never said "no reply", the client's sign of a Degraded link); the Retry and the `path_generation` count are in `crates/fil-transport/tests/quic_link.rs` |
 
 `s_netdown_ssh_keepalive` stays although `s_pipelink_netdown_keepalive` looks alike: it is the only run in which ssh's own keepalive is the sole detector, which proves the backstop works when fil's heartbeat is off. The rest stay too: they measure what the real binary does not print (raw quinn, netem, the bare pipe's detection times, the QuicLink state changes).
 
@@ -219,7 +219,7 @@ Notes on the ssh results:
 - **Clean closes are instant.** A killed ssh client or a killed sshd is a FIN or reset, and the client sees EOF within milliseconds, at every hop of the jump chain.
 - **A silent black hole is not detected by ssh unless it is told to.** With no keepalive the stream just stops, with no error, for as long as the TCP connection lives (Linux's default TCP retry limit is about 15 minutes). fil's own heartbeat (`DEAD_AFTER` 5 s, over the pipe) found the break in 4.9 s without any ssh option. ssh's keepalive found it at interval times (count + 1), about 8 s, and also tears the ssh process down. Both are needed in production: the heartbeat for the fast answer, `ServerAliveInterval` so a dead ssh process does not linger.
 - **fil's heartbeat finds the black hole by itself.** `s_pipelink_netdown_heartbeat` runs the real `PipeLink` with the ssh keepalive off: the link reports `Degraded` and then `Down(Dead)` at 4.9 s, the same time the pipe-echo driver measured (the removed `s_netdown_app_heartbeat`), and kills the ssh process rather than leaving it behind. With the keepalive on (the default) fil still wins, because the options it adds make ssh give up no earlier than `interval x count`, which is at least `dead_after` (6 to 8 s by default).
-- The banner is a pre-authentication message: sshd sends it on stderr, never on the stream. Every real-binary scenario over a clean login depends on the preamble being the first thing on stdout.
+- The banner is a pre-authentication message: sshd sends it on stderr, never on the stream. `f_proxyjump` and `f_attach_detach` check that a clean login skips zero bytes: the client's output never holds the "your shell printed this before fil started" warning.
 - Through two jumps, the handshake costs about 490 ms to the first byte, against 190 ms direct. A ControlMaster session starts in 11 ms.
 
 ### Direct QUIC over NAT and netem

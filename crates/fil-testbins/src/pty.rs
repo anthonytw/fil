@@ -62,6 +62,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl<T: Tap> PtyProc<T> {
     /// Starts `cmd` on a new PTY of `rows` x `cols`. `tap` sees the output.
     pub fn spawn(cmd: CommandBuilder, rows: u16, cols: u16, tap: T) -> Result<Self, String> {
+        // Before anything is started: a zero size must not leave a child behind.
+        let (nz_rows, nz_cols) = (nz(rows)?, nz(cols)?);
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -87,7 +89,7 @@ impl<T: Tap> PtyProc<T> {
             .map_err(|e| format!("writer: {e}"))?;
         let state = Arc::new(Mutex::new(PtyState {
             raw: Vec::new(),
-            parser: vt100::Parser::new(nz(rows)?, nz(cols)?, 0),
+            parser: vt100::Parser::new(nz_rows, nz_cols, 0),
             tap,
             exit: None,
             exit_at: None,

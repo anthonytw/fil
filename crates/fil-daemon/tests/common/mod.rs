@@ -313,9 +313,10 @@ impl<L: Link> Client<L> {
 
     /// A client that has sent nothing yet.
     pub fn new(link: L, size: TermSize) -> Self {
-        Client {
-            inner: fil_testkit::Client::new(link, size),
-        }
+        let mut inner = fil_testkit::Client::new(link, size);
+        // The daemon says Hello first.
+        inner.hello_expected = true;
+        Client { inner }
     }
 }
 

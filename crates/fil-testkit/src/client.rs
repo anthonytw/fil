@@ -27,6 +27,9 @@ const HISTORY: usize = 5000;
 pub struct Client<L: Link> {
     pub link: L,
     pub hello: Option<Hello>,
+    /// Whether a `Hello` from the far end is expected: the daemon sends one first, a bare session
+    /// does not (a `Hello` there is a bug, and panics like any other unexpected message).
+    pub hello_expected: bool,
     pub reply: Option<AttachReply>,
     pub refused: Option<AttachRefusal>,
     pub taken_over: Option<TakenOver>,
@@ -66,7 +69,8 @@ pub struct Client<L: Link> {
 }
 
 impl<L: Link> Client<L> {
-    /// A client over `link` with a window of `size`. Nothing is sent.
+    /// A client over `link` with a window of `size`. Nothing is sent. Set `hello_expected` if the
+    /// far end opens with a `Hello`.
     pub fn new(link: L, size: TermSize) -> Self {
         let emu = fil_term::create(
             "alacritty",
@@ -80,6 +84,7 @@ impl<L: Link> Client<L> {
         Client {
             link,
             hello: None,
+            hello_expected: false,
             reply: None,
             refused: None,
             taken_over: None,
@@ -325,7 +330,10 @@ impl<L: Link> Client<L> {
 
     async fn apply_ctl(&mut self, msg: ControlMsg) {
         match msg {
-            ControlMsg::Hello(h) => self.hello = Some(h),
+            ControlMsg::Hello(h) => {
+                assert!(self.hello_expected, "unexpected Hello {h:?}");
+                self.hello = Some(h);
+            }
             ControlMsg::AttachReply(r) => {
                 match r.start {
                     StartPoint::Resume { from } => {

@@ -26,7 +26,7 @@
 //! - `raw`: every byte received from the program so far.
 //! - `status`: `running pid=N` or `exited code=N [signal=S]`.
 //! - `wait-exit [--timeout S]`: wait for the program to end, print `status`.
-//! - `resize ROWS COLS`.
+//! - `resize ROWS COLS`: both at least 1 (a 0 is refused and nothing is resized).
 //! - `quit`: kill the program if it is running and stop the server.
 
 use std::io::{Read, Write};

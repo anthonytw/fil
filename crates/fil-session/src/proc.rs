@@ -392,15 +392,28 @@ static SHARED_TABLE: TableSlot = Mutex::new(None);
 /// The table in `slot` if it is no older than `max_age` at `now`; otherwise `scan()`'s result,
 /// which is stored. The slot stays locked during the scan, so concurrent callers wait for it and
 /// share its result instead of each scanning.
+#[cfg(test)]
 fn table_from(
     slot: &TableSlot,
     max_age: Duration,
     now: Instant,
     scan: impl FnOnce() -> Vec<ProcRow>,
 ) -> std::sync::Arc<Vec<ProcRow>> {
+    table_from_since(slot, max_age, None, now, scan)
+}
+
+/// [`table_from`], but a stored table taken before `not_before` is not good enough.
+fn table_from_since(
+    slot: &TableSlot,
+    max_age: Duration,
+    not_before: Option<Instant>,
+    now: Instant,
+    scan: impl FnOnce() -> Vec<ProcRow>,
+) -> std::sync::Arc<Vec<ProcRow>> {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, rows)) = slot.as_ref()
         && now.saturating_duration_since(*at) <= max_age
+        && not_before.is_none_or(|t| *at >= t)
     {
         return rows.clone();
     }
@@ -414,9 +427,18 @@ fn table_from(
 ///
 /// Use [`scan_processes`] where the table must be current (teardown).
 pub fn list_processes() -> Vec<ProcRow> {
-    table_from(
+    list_processes_since(None)
+}
+
+/// [`list_processes`], but never a table taken before `not_before`. A session's first recording
+/// passes the instant it was spawned: a shared table from before that cannot hold the session's
+/// processes, and a job that leaves the tree before the next recording (5 s) would then escape a
+/// kill.
+pub fn list_processes_since(not_before: Option<Instant>) -> Vec<ProcRow> {
+    table_from_since(
         &SHARED_TABLE,
         SHARED_TABLE_MAX_AGE,
+        not_before,
         Instant::now(),
         scan_processes,
     )
@@ -838,6 +860,29 @@ mod tests {
         assert_eq!(ask(t0 + Duration::from_millis(2200)), 2);
         // A caller whose clock reading predates the stored scan (it waited on the lock) shares.
         assert_eq!(ask(t0), 2);
+    }
+
+    #[test]
+    fn a_table_from_before_the_session_is_not_shared_with_its_first_recording() {
+        let slot: TableSlot = Mutex::new(None);
+        let age = Duration::from_secs(2);
+        let t0 = Instant::now();
+        // Another session scanned at t0; this session was spawned 500 ms later.
+        let first = table_from(&slot, age, t0, || table(1));
+        assert_eq!(first[0].pid, 1);
+        let spawned = t0 + Duration::from_millis(500);
+        let now = t0 + Duration::from_millis(600);
+        let got = table_from_since(&slot, age, Some(spawned), now, || table(2));
+        assert_eq!(
+            got[0].pid, 2,
+            "the old table predates the session: scan again"
+        );
+        // That scan is after the spawn, so a second session spawned before it may share it.
+        let again = table_from_since(&slot, age, Some(spawned), now, || table(3));
+        assert_eq!(again[0].pid, 2);
+        // Without a floor the old behavior stands.
+        let plain = table_from(&slot, age, now, || table(4));
+        assert_eq!(plain[0].pid, 2);
     }
 
     #[test]

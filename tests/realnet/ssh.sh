@@ -552,6 +552,8 @@ s_pipelink_netdown_keepalive() {
   # kills ssh at once, and the backstop never has to fire.
   netdown_probe ka "--dead-after 5" -T viajumps pipe-probe -- 25
   assert "detected, not hung" test "$HUNG" -eq 0
+  assert "ssh was given its keepalive options" \
+    grep -q 'ServerAliveInterval=2,-o,ServerAliveCountMax=3' "$STREAM_OUT"
   assert "by fil's liveness clock, before ssh's (got $FAIL_REASON)" test "$FAIL_REASON" = dead
   assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
   assert_num "and before ssh's earliest give-up, 6 s (ms)" "$DETECT_MS" -le 6000
@@ -611,6 +613,7 @@ f_attach_detach() {
   fc_start a -- direct ad
   fc_ready a
   note "attach_to_shell_ms=$(($(now_ms) - t0))"
+  fc_not_raw a 'your shell printed this before fil started'
   fc_line a 'echo FIL-$((40+2))'
   fc_wait a FIL-42
   fc_show_pid a
@@ -786,7 +789,9 @@ f_kill_ssh() {
     sleep 0.1
   done
   [[ -n $ssh2 ]] || fail "fil did not start a new ssh: $(fc_screen a)"
-  note "new_ssh_ms=$(($(now_ms) - t0))"
+  local new_ssh_ms=$(($(now_ms) - t0))
+  note "new_ssh_ms=$new_ssh_ms"
+  assert_num "the dead ssh was noticed and a new one started within 3 s (ms)" "$new_ssh_ms" -lt 3000
   fc_wait a TICK-60 40
   fc_seq_ok a TICK 1 60 || fail "output was lost or repeated across the ssh kill: $(fc_screen a)"
   ok "TICK-1 to TICK-60 each once, in order"
@@ -861,6 +866,9 @@ f_proxyjump() {
   ps=$(cx ps -eo args | grep -F 'fil server --stdio' | grep -F viajumps || true)
   [[ -n $ps ]] || fail "no ssh to viajumps running 'fil server --stdio': $(cx ps -ef)"
   ok "ssh viajumps ... fil server --stdio is the pipe command"
+  # A clean login skips zero bytes: the preamble is the first thing on stdout, the sshd Banner went to
+  # stderr. A byte before it would make the client warn about the shell's output on every attach.
+  fc_not_raw a 'your shell printed this before fil started'
   fc_detach a
   fk viajumps pj
 }
@@ -963,10 +971,11 @@ f_other_user() {
 }
 
 # Removed in M1 S6b because something else covers them (docs/m1/realnet.md, "Results"):
-#   s_pipelink_echo           -> f_proxyjump, f_noisy, f_attach_detach (PipeLink at both ends, through
-#                                both jumps and the noisy login); the ssh keepalive options are a
-#                                unit test in fil-transport's pipe/command.rs
-#   s_pipelink_kill_ssh       -> f_kill_ssh (the same kill, and the session resumes)
+#   s_pipelink_echo           -> f_proxyjump, f_noisy, f_attach_detach (the real client through both
+#                                jumps and the noisy login; the clean-login zero-skip check moved into
+#                                f_proxyjump and f_attach_detach); the ssh keepalive options are
+#                                checked in s_pipelink_netdown_keepalive
+#   s_pipelink_kill_ssh       -> f_kill_ssh (the same kill, the 3 s bound moved there, and the session resumes)
 #   s_flood                   -> s_pipelink_flood (the same flood through the real PipeLink)
 #   s_netdown_app_heartbeat   -> s_pipelink_netdown_heartbeat (the same black hole, the real heartbeat)
 ALL_SCENARIOS=(

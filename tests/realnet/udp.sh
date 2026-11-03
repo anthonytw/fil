@@ -865,6 +865,8 @@ f_nat_rebind() {
   fc_seq_ok a TICK 1 90 || fail "output lost or repeated across the NAT moves: $(fc_screen a)"
   ok "TICK-1 to TICK-90 each once, in order, across three NAT moves"
   [[ $(fc_count_log a 'Switched(') -eq 2 ]] || fail "the client switched transports again: $(fc_log a | grep -F 'Switched(')"
+  # The client log has no line for a link going quiet (Degraded); the status line says so on the screen.
+  fc_not_raw a 'no reply for'
   [[ -z $(pipe_ssh "$FIL_PID") ]] || fail "the client fell back to an ssh pipe"
   ok "still on direct: no switch after the upgrade, no ssh"
   if fc_has a 'skipped'; then fail "a gap marker on the screen"; fi

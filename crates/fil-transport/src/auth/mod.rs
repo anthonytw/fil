@@ -30,8 +30,18 @@ pub use identity::{ClientKey, DaemonIdentity, Fingerprint, PublicKey};
 pub use registry::KeyRegistry;
 pub use verify::{PinnedServerVerifier, RegisteredClientVerifier};
 
-/// The ALPN protocol both sides must agree on.
-pub const ALPN: &[u8] = b"fil/1";
+/// The ALPN protocol both sides must agree on: `fil/<major>.<revision>`, the wire this process
+/// speaks. A daemon and a client of different wire revisions fail the TLS handshake itself, before
+/// a single message is decoded (DESIGN.md section 8.5, "Versioning"); the hello then repeats the
+/// check with words for the user.
+pub fn alpn() -> Vec<u8> {
+    alpn_for(fil_proto::version::wire_revision())
+}
+
+/// [`alpn`] for wire revision `revision`.
+pub fn alpn_for(revision: u16) -> Vec<u8> {
+    format!("fil/{}.{revision}", fil_proto::limits::PROTOCOL_MAJOR).into_bytes()
+}
 
 /// The name the client passes to `Endpoint::connect`. It is sent as SNI and never checked, so the
 /// real host name does not leak into the handshake. Any valid DNS name works.
@@ -138,7 +148,7 @@ pub fn server_tls(
             .map_err(AuthError::Tls)?
             .with_client_cert_verifier(client_verifier)
             .with_cert_resolver(Arc::new(resolver));
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = vec![alpn()];
     tls.session_storage = Arc::new(NoServerSessionStorage {});
     tls.send_tls13_tickets = 0;
     Ok(tls)
@@ -182,7 +192,7 @@ pub fn client_tls(
         )),
         None => builder.with_no_client_auth(),
     };
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = vec![alpn()];
     tls.resumption = Resumption::disabled();
     tls.enable_early_data = false;
     Ok(tls)

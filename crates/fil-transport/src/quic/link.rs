@@ -262,7 +262,7 @@ impl QuicLink {
                 .map_err(|e| refused(format!("cannot connect: {e}")))?;
             let conn = connecting
                 .await
-                .map_err(|e| refused(format!("handshake failed: {e}")))?;
+                .map_err(|e| refused(handshake_failure(&e)))?;
             let link = Self::start(conn, Some(endpoint.clone()), Role::Client, params);
             // In TLS 1.3 the client finishes first: this connection may still be one the daemon
             // is about to reject. Only a frame from the daemon says it was accepted.
@@ -658,6 +658,22 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             return;
         }
     }
+}
+
+/// TLS alert `no_application_protocol` (120) as a QUIC transport error code (RFC 9001: 0x100 plus
+/// the alert).
+const CRYPTO_NO_APPLICATION_PROTOCOL: u64 = 0x100 + 120;
+
+/// Why a handshake failed, for the user. The ALPN names the wire revision (`auth::alpn`), so the
+/// daemon refusing every protocol the client offered means it speaks another revision.
+fn handshake_failure(err: &ConnectionError) -> String {
+    // The daemon's alert arrives as a close from the peer (`tests/quic_auth.rs` pins the shape).
+    if let ConnectionError::ConnectionClosed(close) = err
+        && u64::from(close.error_code) == CRYPTO_NO_APPLICATION_PROTOCOL
+    {
+        return "handshake failed: the daemon speaks a different wire revision of fil than this one; install the same fil version there".to_string();
+    }
+    format!("handshake failed: {err}")
 }
 
 fn reason_of(err: &ConnectionError) -> DownReason {

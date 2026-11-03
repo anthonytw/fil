@@ -436,6 +436,7 @@ name = "fil-daemon"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "fil-daemon",
  "fil-proto",
  "fil-session",
  "fil-term",

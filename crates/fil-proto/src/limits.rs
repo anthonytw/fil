@@ -2,11 +2,21 @@
 
 use std::time::Duration;
 
-/// Protocol major version. Incompatible changes bump it. It travels in the hello and is part of
-/// the daemon's socket path (DESIGN.md section 5.3).
+/// Protocol major version. It travels in the preamble and the hello and is part of the daemon's
+/// socket path (DESIGN.md section 5.3). It changes only when the preamble, the hello or the frame
+/// layout does: the things a peer must read to say "different version" at all.
 pub const PROTOCOL_MAJOR: u16 = 1;
-/// Protocol minor version. Additive changes (new trailing enum variants) bump it.
-pub const PROTOCOL_MINOR: u16 = 0;
+/// The wire revision: **it must change whenever any message's encoding changes** (a field, a
+/// variant, the order of either, a limit that a decoder enforces), before 1.0 as after. Two builds
+/// talk only when their revisions are equal; otherwise they say so at once (the hello, DESIGN.md
+/// section 8.5) instead of failing to decode something later. It is also part of the daemon's
+/// socket path, so daemons of different revisions run side by side.
+///
+/// `tests/wire_golden.rs` holds a committed encoding of every message and fails if the encoding
+/// changes without this number changing. Regenerate with `just wire-golden`. 0 is reserved for
+/// builds from before revisions existed (their hello said `minor: 0`).
+pub const PROTOCOL_REVISION: u16 = 1;
+const _: () = assert!(PROTOCOL_REVISION >= 1);
 
 /// Most data bytes in one data frame. DESIGN.md section 8.2 caps forward frames at this size so a
 /// large transfer cannot delay keystrokes; terminal frames use the same cap for simplicity.

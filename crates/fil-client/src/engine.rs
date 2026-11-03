@@ -485,7 +485,10 @@ fn candidate_step(m: Option<Result<(ChannelId, Bytes), LinkError>>) -> CandStep 
                     let ours = Hello::ours(Agent::new("fil-client").expect("valid"));
                     match ours.check(&h) {
                         Ok(()) => CandStep::Keep,
-                        Err(e) => CandStep::Fail(SwapError::LinkFailed(e.to_string())),
+                        // A direct link to a daemon of another wire: the pipe is not affected.
+                        Err(e) => CandStep::Fail(SwapError::LinkFailed(
+                            e.explain(fil_proto::version::Peer::RemoteHost),
+                        )),
                     }
                 }
                 Ok(ControlMsg::AttachReply(r)) => CandStep::Promote(r),
@@ -1339,10 +1342,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         match msg {
             ControlMsg::Hello(h) => {
                 let ours = Hello::ours(Agent::new("fil-client").expect("valid"));
-                ours.check(&h).map_err(|e| ClientError::VersionMismatch {
-                    ours: e.ours,
-                    peer: e.peer,
-                })?;
+                ours.check(&h).map_err(ClientError::VersionMismatch)?;
             }
             ControlMsg::AttachReply(r) => {
                 if !conn.awaiting_reply {
@@ -1383,10 +1383,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             ControlMsg::EchoAck { .. } => {}
             ControlMsg::Error(code) => {
                 return Err(match code {
-                    fil_proto::msg::ErrorCode::VersionMismatch => ClientError::VersionMismatch {
-                        ours: fil_proto::limits::PROTOCOL_MAJOR,
-                        peer: 0,
-                    },
+                    fil_proto::msg::ErrorCode::VersionMismatch => ClientError::VersionRefused,
                     fil_proto::msg::ErrorCode::SessionStartFailed => {
                         ClientError::SessionStartFailed(self.cfg.session.to_string())
                     }

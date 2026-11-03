@@ -9,7 +9,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_client::text::sanitize_inline;
 use fil_proto::ChannelId;
-use fil_proto::msg::{Agent, ControlMsg, Hello, Request, Response, SessionSummary};
+use fil_proto::msg::{
+    Agent, ControlMsg, ErrorCode, Hello, OtherDaemon, Request, Response, SessionSummary,
+};
+use fil_proto::version::{Peer, VersionMismatch};
 use fil_transport::{Link, LinkError};
 
 /// How long to wait for the daemon's answer once the pipe is up.
@@ -23,8 +26,14 @@ pub enum MgmtError {
     Lost(LinkError),
     #[error("the daemon did not answer within {0:?}")]
     Timeout(Duration),
-    #[error("protocol version mismatch: this fil speaks major {ours}, the daemon speaks {peer}")]
-    Version { ours: u16, peer: u16 },
+    /// The daemon's `Hello` states another major or wire revision: said at once, before the
+    /// request could be misread (DESIGN.md section 8.5, "Versioning").
+    #[error("{}", .0.explain(Peer::RemoteHost))]
+    Version(VersionMismatch),
+    #[error(
+        "the fil on the remote host refused this fil's version (a different wire revision): install the same fil version there"
+    )]
+    VersionRefused,
     #[error("the daemon refused the request: {0}")]
     Refused(String),
     #[error("unexpected message from the daemon: {0}")]
@@ -60,13 +69,11 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Response, MgmtE
         }
         match ControlMsg::decode(&payload).map_err(|e| MgmtError::Protocol(e.to_string()))? {
             ControlMsg::Hello(peer) => {
-                ours.check(&peer).map_err(|m| MgmtError::Version {
-                    ours: m.ours,
-                    peer: m.peer,
-                })?;
+                ours.check(&peer).map_err(MgmtError::Version)?;
             }
             ControlMsg::Response(r) => return Ok(r),
             ControlMsg::AttachRefused(r) => return Err(MgmtError::Refused(format!("{r:?}"))),
+            ControlMsg::Error(ErrorCode::VersionMismatch) => return Err(MgmtError::VersionRefused),
             ControlMsg::Error(code) => return Err(MgmtError::Refused(format!("{code:?}"))),
             _ => {}
         }
@@ -81,8 +88,17 @@ pub fn render(
     now_unix_ms: u64,
 ) -> Result<String, String> {
     match (request, response) {
-        (Request::ListSessions, Response::Sessions { list, truncated }) => {
-            Ok(format_sessions(list, *truncated, now_unix_ms))
+        (
+            Request::ListSessions,
+            Response::Sessions {
+                list,
+                truncated,
+                others,
+            },
+        ) => {
+            let mut out = format_sessions(list, *truncated, now_unix_ms);
+            out.push_str(&other_daemons_note(others));
+            Ok(out)
         }
         (Request::KillSession { name }, Response::Done) => {
             Ok(format!("killed session \"{name}\"\n"))
@@ -99,6 +115,26 @@ pub fn render(
         )),
         (_, other) => Err(format!("unexpected answer from the daemon: {other:?}")),
     }
+}
+
+/// What `fil ls` says about daemons of other wire revisions running beside the one it asked: it
+/// cannot list their sessions, and the user should know they exist and how to reach them. Empty
+/// when there are none. Numbers only.
+pub fn other_daemons_note(others: &[OtherDaemon]) -> String {
+    let mut out = String::new();
+    for d in others {
+        if d.revision == 0 {
+            out.push_str(
+                "also running: a daemon from an older fil (before wire revisions); use that fil version for its sessions\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "also running: a daemon of wire rev {}; use that fil version for its sessions\n",
+                d.revision
+            ));
+        }
+    }
+    out
 }
 
 /// `fil ls`: one line per session. Times are relative to now, so no time zone is involved.
@@ -276,7 +312,8 @@ mod tests {
                 &kill,
                 &Response::Sessions {
                     list: vec![],
-                    truncated: false
+                    truncated: false,
+                    others: vec![]
                 },
                 "orin",
                 NOW
@@ -319,6 +356,7 @@ mod tests {
         let reply = ControlMsg::Response(Response::Sessions {
             list: list.clone(),
             truncated: false,
+            others: vec![],
         });
         let d = tokio::spawn(daemon_answers(daemon, Some(reply)));
         let got = ask(&client, Request::ListSessions).await.unwrap();
@@ -326,7 +364,8 @@ mod tests {
             got,
             Response::Sessions {
                 list,
-                truncated: false
+                truncated: false,
+                others: vec![]
             }
         );
         d.await.unwrap();
@@ -350,9 +389,90 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let err = ask(&client, Request::ListSessions).await.unwrap_err();
-        assert!(matches!(err, MgmtError::Version { .. }), "{err}");
+        assert!(matches!(err, MgmtError::Version(_)), "{err}");
         assert!(err.to_string().contains("major"));
         d.abort();
+    }
+
+    /// The same major, another wire revision: the `Hello` alone ends the request, with both
+    /// revisions in the words.
+    #[tokio::test]
+    async fn a_daemon_of_another_wire_revision_is_a_version_error_at_the_hello() {
+        let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
+        let d = tokio::spawn(async move {
+            let _ = daemon.recv().await;
+            let _ = daemon.recv().await;
+            let hello = Hello::with_revision(
+                Agent::new("other").unwrap(),
+                fil_proto::version::wire_revision() + 3,
+            );
+            let _ = daemon
+                .send(
+                    ChannelId::CONTROL,
+                    Bytes::from(ControlMsg::Hello(hello).encode().unwrap()),
+                )
+                .await;
+            // Keep the link open: the client must stop on the hello alone.
+            std::future::pending::<()>().await;
+        });
+        let err = ask(&client, Request::ListSessions).await.unwrap_err();
+        assert!(matches!(err, MgmtError::Version(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("wire rev") && text.contains("install the same fil"),
+            "{text}"
+        );
+        d.abort();
+    }
+
+    #[test]
+    fn ls_notes_daemons_of_other_wire_revisions() {
+        let others = vec![
+            OtherDaemon {
+                major: 1,
+                revision: 0,
+            },
+            OtherDaemon {
+                major: 1,
+                revision: 4,
+            },
+        ];
+        let reply = Response::Sessions {
+            list: vec![summary("main", None, 0, NOW)],
+            truncated: false,
+            others,
+        };
+        let out = render(&Request::ListSessions, &reply, "orin", NOW).unwrap();
+        assert!(
+            out.contains("also running: a daemon of wire rev 4"),
+            "{out}"
+        );
+        assert!(out.contains("older fil (before wire revisions)"), "{out}");
+        assert!(out.starts_with("NAME"), "the table comes first: {out}");
+        // With none, nothing is added.
+        let none = Response::Sessions {
+            list: vec![],
+            truncated: false,
+            others: vec![],
+        };
+        assert_eq!(
+            render(&Request::ListSessions, &none, "orin", NOW).unwrap(),
+            "no sessions\n"
+        );
+        // An empty list still says where the other sessions are.
+        let only = Response::Sessions {
+            list: vec![],
+            truncated: false,
+            others: vec![OtherDaemon {
+                major: 1,
+                revision: 2,
+            }],
+        };
+        let out = render(&Request::ListSessions, &only, "orin", NOW).unwrap();
+        assert!(
+            out.starts_with("no sessions\n") && out.contains("wire rev 2"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

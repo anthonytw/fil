@@ -7,7 +7,7 @@
 //!
 //! # Lifecycle
 //!
-//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>.lock` for its
+//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>-<rev>.lock` for its
 //!   whole life (its pid is written there). A second daemon for the same major waits briefly,
 //!   for one on its way out, then reports [`StartError::AlreadyRunning`] and exits cleanly. The
 //!   lock dies with the process, so a socket file that exists while the lock is free is stale
@@ -189,6 +189,9 @@ pub(crate) enum Lookup {
 
 pub(crate) struct Inner {
     pub(crate) cfg: DaemonConfig,
+    /// Where this daemon lives: its wire revision (the one its `Hello` states) and the directory
+    /// `fil ls` looks in for daemons of other revisions.
+    pub(crate) paths: Paths,
     pub(crate) registry: KeyRegistry,
     pub(crate) host: Arc<Host>,
     state: Mutex<State>,
@@ -553,6 +556,7 @@ impl Daemon {
         let (busy, _) = watch::channel(0);
         let inner = Arc::new(Inner {
             cfg,
+            paths: paths.clone(),
             registry,
             host,
             state: Mutex::default(),

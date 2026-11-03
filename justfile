@@ -30,9 +30,21 @@ release-deps:
     set -euo pipefail
     out=$(cargo tree -q -p fil -e normal,build --target all -i vt100)
     test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
+    # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
+    # production fil must never honor an environment variable that changes what wire it speaks.
+    for c in fil-proto fil-daemon fil-transport fil-session; do
+      hooks=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" | grep -E 'feature "test-hooks"' || true)
+      test -z "$hooks" || { echo "release-deps: $c has its test-hooks feature in the release build of fil" >&2; exit 1; }
+    done
 
 test:
     cargo test --workspace --all-features
+
+# Regenerate the wire golden (crates/fil-proto/tests/golden/wire.txt) after a deliberate wire
+# change. Bump PROTOCOL_REVISION in crates/fil-proto/src/limits.rs FIRST: this refuses to write
+# changed bytes under an unchanged revision (CLAUDE.md § The wire).
+wire-golden:
+    FIL_UPDATE_GOLDEN=1 cargo test -p fil-proto --test wire_golden the_wire_matches_the_golden_for_this_revision
 
 # Fetches the RustSec advisory database, so it needs network access.
 # License, source and ban policy, RustSec advisories and yanked crates (deny.toml).

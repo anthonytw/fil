@@ -121,6 +121,25 @@ mod tests {
         assert_eq!(enc(u32::MAX).len(), MAX_VARINT_LEN);
     }
 
+    /// The QUIC stream layout is part of the wire (`PROTOCOL_REVISION`, with the golden in
+    /// `fil-proto/tests/golden/wire.txt`, which holds the rest): a stream starts with the channel
+    /// id as a varint, then payloads each behind a big-endian `u32` length, and a flush marker is
+    /// length 0 and a big-endian `u32` id. Changing any of this needs a new revision.
+    #[test]
+    fn the_stream_layout_is_pinned() {
+        assert_eq!(enc(0), [0x00]);
+        assert_eq!(enc(16), [0x10]);
+        assert_eq!(enc(300), [0xAC, 0x02]);
+        assert_eq!(flush_marker(0x0102_0304), [0, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(parse_prefix([0, 0, 0, 0]), Some(Frame::Flush));
+        assert_eq!(parse_prefix([0, 0, 0, 5]), Some(Frame::Payload(5)));
+        assert_eq!(
+            parse_prefix([0, 0, 0x40, 0x21]),
+            None,
+            "one byte over MAX_FRAME_BODY is refused"
+        );
+    }
+
     #[test]
     fn bad_varints_are_refused() {
         // Six bytes, a fifth byte with bits beyond 32, and a non-minimal encoding.

@@ -4,14 +4,14 @@
 //! # How the daemon is started
 //!
 //! [`ensure_daemon`] tries to connect to the socket. If nobody answers, it takes the **start
-//! lock** (`fil-<major>.start`, an `flock` held only while starting), tries once more, and then
+//! lock** (`fil-<major>-<rev>.start`, an `flock` held only while starting), tries once more, and then
 //! runs the launcher: the same binary with a subcommand that calls
 //! [`run_daemon`](crate::run_daemon), with null stdio, in `/`, and without the SSH login's
 //! variables. It then polls the socket until it answers.
 //!
 //! Two relays that start together serialize on the start lock, so the second finds the first's
 //! daemon and **exactly one daemon is started**. If the lock is bypassed (a daemon started by
-//! hand, say), the daemon takes its own lock (`fil-<major>.lock`, held for its whole life), so a
+//! hand, say), the daemon takes its own lock (`fil-<major>-<rev>.lock`, held for its whole life), so a
 //! second daemon exits at once. The lock is released when the process dies, however it dies, so
 //! a socket file left behind by a crash is known to be stale: only the lock holder removes it.
 //!
@@ -398,7 +398,7 @@ pub(crate) fn is_current(file: &std::fs::File, path: &Path) -> bool {
     }
 }
 
-/// A daemon that is exiting removes `fil-<major>.lock` and `fil-<major>.start`, so nothing of a
+/// A daemon that is exiting removes `fil-<major>-<rev>.lock` and `fil-<major>-<rev>.start`, so nothing of a
 /// finished daemon (its pid, the time it last started) stays in `/tmp` (DESIGN.md section 11.1,
 /// principle 5). A crashed daemon leaves them; the next one reuses them.
 ///

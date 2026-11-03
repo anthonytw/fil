@@ -201,7 +201,17 @@ pub async fn send_ctl<L: Link>(link: &L, msg: &ControlMsg) {
 
 /// Sends `Hello` and `Request` and returns the response, skipping the daemon's `Hello`.
 pub async fn request<L: Link>(link: &L, req: Request) -> Response {
-    send_ctl(link, &hello()).await;
+    request_rev(link, req, fil_proto::version::wire_revision()).await
+}
+
+/// [`request`], with a `Hello` that states wire revision `revision` (a daemon of another revision
+/// refuses any other).
+pub async fn request_rev<L: Link>(link: &L, req: Request, revision: u16) -> Response {
+    send_ctl(
+        link,
+        &ControlMsg::Hello(Hello::with_revision(Agent::new("test").unwrap(), revision)),
+    )
+    .await;
     send_ctl(link, &ControlMsg::Request(req)).await;
     loop {
         let (chan, payload) = tokio::time::timeout(WAIT, link.recv())
@@ -219,7 +229,7 @@ pub async fn request<L: Link>(link: &L, req: Request) -> Response {
 
 pub async fn ask(d: &Running, req: Request) -> Response {
     let link = d.pipe().await;
-    let r = request(&link, req).await;
+    let r = request_rev(&link, req, d.paths.revision).await;
     link.close();
     r
 }

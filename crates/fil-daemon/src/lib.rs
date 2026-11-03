@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `fil server --stdio` | [`run_relay`]`(&`[`RelayOptions::new`]`(`[`DaemonLauncher::fil`]`(current_exe)))` |
 //! | `fil server --daemon` | [`run_daemon`]`(&`[`Paths::for_current_user`]`())` |
-//! | `fil ls`, `kill`, `detach` (local pipe command) | the client side is `fil-transport`'s `PipeLink` talking to the relay; [`list_sockets`] finds the daemons of other majors |
+//! | `fil ls`, `kill`, `detach` (local pipe command) | the client side is `fil-transport`'s `PipeLink` talking to the relay; [`other_daemons`] finds the daemons of other wire revisions, which `fil ls` mentions |
 //!
 //! Both functions take over the process: call them from `main` and exit with the result. The
 //! launcher's arguments are what makes the same binary start as a daemon; `server --daemon` is
@@ -44,6 +44,8 @@ pub use config::{ConfigError, DaemonConfig, SessionDefaults};
 pub use daemon::{
     Daemon, DaemonHandle, Exit, StartError, peer_allowed, run_daemon, run_daemon_with,
 };
-pub use paths::{DirError, Paths, current_uid, ensure_socket_dir, list_sockets};
+pub use paths::{
+    DaemonSocket, DirError, Paths, current_uid, ensure_socket_dir, list_sockets, other_daemons,
+};
 pub use relay::{RelayEnd, RelayError, RelayOptions, relay, run_relay};
 pub use start::{DaemonLauncher, EnsureError, Ensured, ensure_daemon};

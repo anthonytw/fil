@@ -26,7 +26,10 @@ check-default:
 # §6.5). `cargo tree -i` exits 0 even when it prints "nothing to print" to stderr, so test its
 # output: it lists vt100's dependents on stdout when vt100 is in the graph.
 release-deps:
-    test -z "$(cargo tree -q -p fil -e normal,build --target all -i vt100 2>/dev/null)" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$(cargo tree -q -p fil -e normal,build --target all -i vt100)
+    test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
 
 test:
     cargo test --workspace --all-features

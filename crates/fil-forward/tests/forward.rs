@@ -1242,3 +1242,122 @@ async fn a_new_epoch_drops_the_old_epochs_events() {
     );
     assert!(rx.try_recv().is_err());
 }
+
+// ---- follow-ups from the F1 re-check --------------------------------------------------------
+
+/// A flood of SOCKS clients that never send their request holds at most `MAX_HANDSHAKES` places:
+/// an `-L` connection on the same endpoint goes through at once (it waited 9.6 s behind 1,100
+/// silent clients when handshakes shared the whole queue).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_socks_flood_does_not_stall_the_other_forwards() {
+    let _one_at_a_time = heavy().await;
+    let server = echo_server().await;
+    let w = World::new(Transport::Mem, mux_config()).await;
+    let lport = w.local_forward(1, server.port);
+    let dport = w
+        .client
+        .ep
+        .listen(ForwardId(9), ForwardKind::Dynamic, BindAddr::Loopback, 0)
+        .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..1100 {
+        match timeout(
+            Duration::from_millis(300),
+            tokio::net::TcpStream::connect(("127.0.0.1", dport)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => held.push(s),
+            _ => break,
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Two in a row: the listener was already waiting in its accept when the flood began, so the
+    // first gets in either way; the second is accepted only if the bound leaves room for it.
+    for i in 0..2 {
+        let t0 = std::time::Instant::now();
+        timeout(Duration::from_secs(20), echo_once(lport, 10, i))
+            .await
+            .expect("the -L connection went through");
+        let took = t0.elapsed();
+        eprintln!(
+            "-L connection {i} beside {} silent SOCKS clients took {took:?}",
+            held.len()
+        );
+        assert!(took < Duration::from_secs(2), "connection {i}: {took:?}");
+    }
+    drop(held);
+}
+
+/// The hold on the MUX stream is bounded by stream offset, not by payload bytes: an honest peer
+/// sending one tiny segment at a time up to its whole MUX buffer is held without complaint (the
+/// old byte count put such a peer at about 1.8 times its limit), and a segment past that is a
+/// protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mux_hold_is_bounded_by_stream_offset() {
+    use fil_proto::frame::DataSegment;
+    use fil_proto::mux::{MuxMsg, encode_record};
+    let cfg = mux_config();
+    let end = End::new_with(fil_proto::mux::Side::Client, cfg.clone(), true);
+    // Enough table records to fill the owner's channel and leave some waiting: from now on the
+    // endpoint holds the MUX stream.
+    let mut first = Vec::new();
+    for i in 0..(fil_forward::EVENT_QUEUE as u32 + 8) {
+        first.extend(encode_record(&MuxMsg::ForwardGone { id: ForwardId(i) }).unwrap());
+    }
+    let fed = first.len() as u64;
+    end.ep
+        .on_payload(
+            fil_proto::ChannelId::MUX,
+            DataSegment::encode(0, &first).unwrap().into(),
+        )
+        .unwrap();
+    assert!(end.ep.snapshot().undelivered_events > 0);
+    // One-byte segments, contiguous, up to exactly what an honest peer may leave unacknowledged:
+    // all held, whatever their headers cost.
+    let rec = encode_record(&MuxMsg::ForwardGone { id: ForwardId(7) }).unwrap();
+    let n = cfg.mux_buffer as u64;
+    for off in 0..n {
+        let b = rec[(off as usize) % rec.len()];
+        end.ep
+            .on_payload(
+                fil_proto::ChannelId::MUX,
+                DataSegment::encode(fed + off, &[b]).unwrap().into(),
+            )
+            .unwrap_or_else(|e| panic!("held segment at {off}: {e}"));
+    }
+    let s = end.ep.snapshot();
+    assert!(s.held_mux_bytes > cfg.mux_buffer, "{s:?}");
+    // One byte past it: not an honest peer.
+    assert!(
+        end.ep
+            .on_payload(
+                fil_proto::ChannelId::MUX,
+                DataSegment::encode(fed + n, &[0]).unwrap().into(),
+            )
+            .is_err()
+    );
+}
+
+/// Rekeying onto an id that still has stats from an earlier forward gives it the listener's
+/// stats, not the sum of both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rekeying_onto_an_id_with_old_stats_resets_them() {
+    let server = echo_server().await;
+    let w = World::new(Transport::Mem, mux_config()).await;
+    // Forward 2 carried a connection, then went away; its stats were not forgotten.
+    let old = w.local_forward(2, server.port);
+    echo_once(old, 100, 1).await;
+    w.settled().await;
+    assert!(w.client.ep.unlisten(ForwardId(2)));
+    assert_eq!(w.client.ep.stats(ForwardId(2)).unwrap().total, 1);
+    // Forward 1 carries two, then moves to id 2.
+    let port = w.local_forward(1, server.port);
+    echo_once(port, 10, 2).await;
+    echo_once(port, 10, 3).await;
+    w.settled().await;
+    let mine = w.client.ep.stats(ForwardId(1)).unwrap();
+    assert!(w.client.ep.rekey_listener(ForwardId(1), ForwardId(2)));
+    assert_eq!(w.client.ep.stats(ForwardId(2)), Some(mine));
+    assert!(w.client.ep.stats(ForwardId(1)).is_none());
+}

@@ -17,6 +17,15 @@ fn dialer(fake: &Fake, setting: TransportSetting) -> PathDialer<Fake> {
     PathDialer::new(fake.clone(), cfg).unwrap()
 }
 
+/// Like [`dialer`], but also says whether the real network watcher would be running for this
+/// setting. The tests send the watcher's hint themselves (a test machine's network does not
+/// change on cue), and only if the watcher would have.
+fn dialer_and_watched(fake: &Fake, setting: TransportSetting) -> (PathDialer<Fake>, bool) {
+    let mut cfg = DialerConfig::new(setting);
+    let watched = std::mem::replace(&mut cfg.watch_network, false);
+    (PathDialer::new(fake.clone(), cfg).unwrap(), watched)
+}
+
 fn auto(fake: &Fake) -> PathDialer<Fake> {
     dialer(fake, TransportSetting::Auto)
 }
@@ -852,13 +861,101 @@ async fn the_connector_is_told_when_a_session_starts_over_the_pipe() {
     assert_eq!(fake.sessions_started(), [LinkKind::Pipe]);
 }
 
-/// efficiency #14: the network watcher is a hint for upgrading and redialing; with the pipe only
-/// there is nothing to hint, and it would wake twice a second for nothing.
+/// The network watcher runs for every setting. On the pipe only it is what ends the pipe's
+/// backoff when the network comes back (this reverses M1 sweep efficiency #14, which turned it off
+/// there on the premise that there was nothing to hint).
 #[test]
-fn the_network_watcher_runs_only_when_direct_might_be_used() {
-    assert!(!DialerConfig::new(TransportSetting::Pipe).watch_network);
-    assert!(DialerConfig::new(TransportSetting::Auto).watch_network);
-    assert!(DialerConfig::new(TransportSetting::Direct).watch_network);
+fn the_network_watcher_runs_for_every_transport_setting() {
+    for setting in [
+        TransportSetting::Pipe,
+        TransportSetting::Auto,
+        TransportSetting::Direct,
+    ] {
+        assert!(DialerConfig::new(setting).watch_network, "{setting:?}");
+    }
+}
+
+/// Fails ssh for ten minutes (the backoff reaches its cap), then steps in small slices until a
+/// run has just failed, so the pipe is waiting and the last run is seconds old at most.
+async fn pipe_only_in_deep_backoff(fake: &Fake, d: &mut PathDialer<Fake>) {
+    fake.set_pipe_default(Script::fail("ssh: connect: network unreachable"));
+    let (link, _) = dial_for(secs(600), d, DialPurpose::Resume).await;
+    assert!(link.is_none());
+    let n = fake.pipe_runs();
+    while fake.pipe_runs() == n {
+        let _ = dial_for(ms(200), d, DialPurpose::Resume).await;
+    }
+    // The run that just failed was followed by a wait of about 30 s.
+    let runs = fake.runs(LinkKind::Pipe);
+    let last = runs.len() - 1;
+    assert!(
+        runs[last].at - runs[last - 1].at >= secs(20),
+        "deep backoff: {:?}",
+        runs[last].at - runs[last - 1].at
+    );
+}
+
+/// The network coming back during the pipe's 30 s backoff starts ssh at once, not when the
+/// backoff ends.
+#[tokio::test(start_paused = true)]
+async fn on_the_pipe_only_a_network_change_ends_the_backoff() {
+    let fake = Fake::new();
+    let (mut d, watched) = dialer_and_watched(&fake, TransportSetting::Pipe);
+    pipe_only_in_deep_backoff(&fake, &mut d).await;
+    // Let the last run age past the pipe gap, still far from the end of the wait.
+    let last = fake.runs(LinkKind::Pipe).last().unwrap().at;
+    while Instant::now() - last < secs(6) {
+        let _ = dial_for(ms(500), &mut d, DialPurpose::Resume).await;
+    }
+    assert!(Instant::now() - last < secs(14));
+    let n = fake.pipe_runs();
+    // The network is back: the next ssh works.
+    fake.set_pipe_default(Script::ok());
+    if watched {
+        d.network_changed(); // what the watcher sends
+    }
+    let t0 = Instant::now();
+    let link = within(secs(2), &mut d, DialPurpose::Resume)
+        .await
+        .expect("a link without waiting out the backoff")
+        .expect("no error");
+    assert_eq!(link.link.kind(), LinkKind::Pipe);
+    assert!(t0.elapsed() < secs(1), "{:?}", t0.elapsed());
+    assert_eq!(fake.pipe_runs(), n + 1);
+}
+
+/// A hint right after a run is deferred until the pipe gap (5 s) has passed, not dropped and not
+/// honoured at once: a flapping network cannot make ssh run in a tight loop.
+#[tokio::test(start_paused = true)]
+async fn on_the_pipe_only_a_hint_just_after_a_run_waits_for_the_gap() {
+    let fake = Fake::new();
+    let (mut d, watched) = dialer_and_watched(&fake, TransportSetting::Pipe);
+    assert!(watched);
+    pipe_only_in_deep_backoff(&fake, &mut d).await;
+    let last = fake.runs(LinkKind::Pipe).last().unwrap().at;
+    assert!(Instant::now() - last < secs(1));
+    let n = fake.pipe_runs();
+    // A flapping network: a hint every half second for a while.
+    for _ in 0..14 {
+        d.network_changed();
+        let _ = dial_for(ms(500), &mut d, DialPurpose::Resume).await;
+    }
+    let runs = fake.runs(LinkKind::Pipe);
+    assert!(runs.len() > n, "the hint was dropped, not deferred");
+    let next = runs[n].at;
+    assert!(
+        next - last >= secs(5),
+        "ssh ran only {:?} after the last run",
+        next - last
+    );
+    assert!(next - last < secs(6), "{:?}", next - last);
+    // Only the restart a hint causes is held to the gap; after it the backoff starts over
+    // (about a second), so the later runs are bounded by the hint budget instead.
+    assert!(
+        runs.len() <= n + 6,
+        "{} runs in 7 s of hints",
+        runs.len() - n
+    );
 }
 
 /// A change of network reaches the connector, which drops what it remembered about names.

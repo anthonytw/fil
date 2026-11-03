@@ -588,21 +588,72 @@ fn hints_are_budgeted() {
     assert!(dials >= 30, "{dials}");
 }
 
-#[test]
-fn a_hint_restarts_a_waiting_pipe_only_if_the_last_run_was_not_recent() {
+/// A pipe that has failed repeatedly: waiting out a 30 s backoff, the last run a few seconds
+/// ago. The network is down; `Start` was at t=0 and the manager has seen `failures` failed runs.
+fn pipe_in_deep_backoff() -> T {
     let mut t = T::new(TransportSetting::Pipe);
     t.feed(I::Start);
-    let a = t.after(
-        Duration::from_millis(500),
+    let mut a = t.after(
+        Duration::from_millis(300),
         I::PipeDown(DownReason::Io("net down".into())),
     );
-    assert!(delay_of(&a, PathTimer::PipeRetry).is_some());
-    // 1 s after the run began: too soon.
-    assert_eq!(t.after(Duration::from_millis(500), I::NetworkChanged), []);
+    for _ in 0..12 {
+        let wait = delay_of(&a, PathTimer::PipeRetry).expect("waiting");
+        t.advance(wait);
+        assert!(t.feed(I::Timer(PathTimer::PipeRetry)).contains(&RunPipe));
+        a = t.after(
+            Duration::from_millis(300),
+            I::PipeDown(DownReason::Io("net down".into())),
+        );
+    }
+    assert!(
+        delay_of(&a, PathTimer::PipeRetry).unwrap() >= S(24),
+        "{a:?}"
+    );
     assert_eq!(t.view().pipe, Lane::Waiting);
-    // 6 s after: go.
-    let a = t.after(S(5), I::NetworkChanged);
+    t
+}
+
+#[test]
+fn a_hint_restarts_a_waiting_pipe_that_last_ran_a_while_ago() {
+    let mut t = pipe_in_deep_backoff();
+    // 6 s after the last run began, far from the end of its 30 s wait.
+    let a = t.after(S(6), I::NetworkChanged);
     assert!(a.contains(&RunPipe), "{a:?}");
+    assert!(a.contains(&CancelTimer(PathTimer::PipeRetry)), "{a:?}");
+}
+
+#[test]
+fn a_hint_just_after_a_pipe_run_is_deferred_not_dropped() {
+    let mut t = pipe_in_deep_backoff();
+    // 1 s after the last run began (it failed at 0.3 s): too soon, so the restart is scheduled
+    // for the end of the 5 s gap and the backoff is left alone.
+    let a = t.after(Duration::from_millis(700), I::NetworkChanged);
+    assert_eq!(a, [ScheduleRetry(PathTimer::PipeHint, S(4))]);
+    assert_eq!(t.view().pipe, Lane::Waiting);
+    // A second hint meanwhile (after the cooldown) does not stack another timer.
+    let a = t.after(S(2), I::NetworkChanged);
+    assert!(
+        !a.iter()
+            .any(|x| matches!(x, ScheduleRetry(PathTimer::PipeHint, _))),
+        "{a:?}"
+    );
+    assert!(!a.contains(&RunPipe), "{a:?}");
+    // The gap ends: ssh runs.
+    let a = t.after(S(2), I::Timer(PathTimer::PipeHint));
+    assert!(a.contains(&RunPipe), "{a:?}");
+}
+
+#[test]
+fn a_deferred_pipe_hint_does_nothing_if_the_pipe_is_no_longer_waiting() {
+    let mut t = pipe_in_deep_backoff();
+    t.after(Duration::from_millis(700), I::NetworkChanged);
+    // The pipe's own retry ran it meanwhile, and it is up.
+    t.advance(S(1));
+    t.feed(I::Timer(PathTimer::PipeRetry));
+    t.feed(I::PipeUp);
+    t.feed(I::Switched(LinkKind::Pipe));
+    assert_eq!(t.after(S(3), I::Timer(PathTimer::PipeHint)), []);
 }
 
 #[test]
@@ -667,11 +718,12 @@ struct World {
     cfg: PathConfig,
 }
 
-const TIMERS: [PathTimer; 4] = [
+const TIMERS: [PathTimer; 5] = [
     PathTimer::DirectRetry,
     PathTimer::PipeRetry,
     PathTimer::PipeFallback,
     PathTimer::Hint,
+    PathTimer::PipeHint,
 ];
 
 fn timer_index(t: PathTimer) -> u8 {

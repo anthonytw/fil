@@ -184,3 +184,52 @@ async fn forward_requests_and_the_ports_answer() {
     drop(a);
     d.stop().await;
 }
+
+/// The real daemon process (`fil-daemon-dev`, started as the relay starts it) raises its own
+/// descriptor limit and starts the session's shell through its trampoline, with the limit the
+/// daemon was started with (`fil_session::nofile`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_process_gives_its_sessions_the_limit_it_was_started_with() {
+    use fil_transport::pipe::{PipeCommand, PipeConfig, PipeLink};
+    const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
+    let mine = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let soft = mine.current.expect("a finite soft limit");
+    let s = Scratch::new();
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    std::fs::write(s.paths().config, "direct = false\n").unwrap();
+    let dir = s.dir.display().to_string();
+    let launcher = fil_daemon::DaemonLauncher::new(
+        BIN,
+        vec![
+            "--dir".to_string(),
+            dir.clone(),
+            "daemon".into(),
+            "--command".into(),
+            "echo \"limit=$(ulimit -Sn).\"; exec cat".into(),
+        ],
+    );
+    drop(fil_daemon::ensure_daemon(&s.paths(), &launcher).unwrap());
+    let relay = PipeCommand::custom([BIN, "--dir", &dir, "relay"]).unwrap();
+    let link = PipeLink::spawn(&relay, PipeConfig::default())
+        .await
+        .unwrap();
+    let mut a = Client::attach(link, Connect::new("main", key(1))).await;
+    a.wait_out(&format!("limit={soft}.")).await;
+    // And the daemon itself runs with more, when the hard limit allows it.
+    let pid = s.daemon_pid().expect("the daemon's pid");
+    if mine.maximum.is_none_or(|h| h > soft) && cfg!(target_os = "linux") {
+        // `/proc/<pid>/limits` stays readable for a process that is not dumpable.
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max open files"))
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            line.split_whitespace().nth(3),
+            Some(soft.to_string().as_str()),
+            "the daemon's limit was not raised: {line:?}"
+        );
+    }
+    // The scratch directory's drop ends the daemon.
+}

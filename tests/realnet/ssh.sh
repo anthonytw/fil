@@ -596,7 +596,7 @@ s_pipelink_netdown_keepalive() {
   assert "detected, not hung" test "$HUNG" -eq 0
   assert "by fil's liveness clock, before ssh's (got $FAIL_REASON)" test "$FAIL_REASON" = dead
   assert_num "after about dead_after (ms)" "$DETECT_MS" -ge 3500
-  assert_num "and before ssh's own give-up, 6 to 8 s (ms)" "$DETECT_MS" -le 7500
+  assert_num "and before ssh's earliest give-up, 6 s (ms)" "$DETECT_MS" -le 6000
   assert "the dead link's ssh ($CHILD_PID) was killed, not left behind" \
     wait_pid_gone rn-client "$CHILD_PID" 5
   note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2s"

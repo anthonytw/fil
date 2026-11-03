@@ -81,8 +81,8 @@ pub struct PipeConfig {
     pub forward_queue: usize,
     /// One forward frame after this many interactive frames while forwards wait. Default 8.
     pub forward_share: u32,
-    /// Bytes of received payload that may wait for `recv` before the driver stops reading and
-    /// reports `Degraded`. Default 2 MiB.
+    /// Received payload that may wait for `recv` before the driver stops reading and reports
+    /// `Degraded`, counted in bytes plus 64 per payload (so empty frames count too). Default 2 MiB.
     pub inbound_budget: usize,
     /// How long a command that was asked to finish (its stdin closed) may take before it is
     /// killed. Default 1 s.

@@ -575,6 +575,37 @@ async fn past_the_budget_the_link_stops_reading_reports_degraded_and_recovers() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_flood_of_empty_frames_reaches_the_budget_too() {
+    let (link, mut raw) = client_vs_raw(cfg(), b"", ControlMsg::Detach).await;
+    let one = Frame::new(ChannelId::TERMINAL, Vec::new())
+        .encode()
+        .unwrap();
+    let batch: Vec<u8> = one.iter().copied().cycle().take(one.len() * 1000).collect();
+    // A million empty frames, with nobody calling `recv`.
+    let flood = tokio::spawn(async move {
+        for _ in 0..1000 {
+            raw.put(&batch).await;
+        }
+        raw
+    });
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(link.status().borrow().state, LinkState::Degraded);
+    assert!(!flood.is_finished(), "the link kept reading");
+    // How many entries the link holds: bounded by the 2 MiB budget at 64 per entry plus one
+    // read's worth of tiny frames, not by the million sent. (Each recv completes without
+    // yielding, so the driver does not run while this counts.)
+    let mut held = 0;
+    while timeout(Duration::ZERO, link.recv()).await.is_ok() {
+        held += 1;
+    }
+    assert!(
+        (30_000..50_000).contains(&held),
+        "{held} entries held for a flood of 1000000"
+    );
+    flood.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_ping_flood_from_a_peer_that_never_reads_costs_one_pending_reply() {
     let (a, b) = duplex(4096);
     let mut raw = Raw::new(b);

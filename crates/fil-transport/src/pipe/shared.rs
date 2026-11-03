@@ -28,6 +28,10 @@ struct Inbound {
     ended: bool,
 }
 
+/// What one waiting payload counts against the inbound budget besides its bytes: an entry costs
+/// memory even when it is empty, so a flood of empty frames reaches the budget too.
+pub(super) const INBOUND_ENTRY_COST: usize = 64;
+
 /// What `recv` found.
 pub(super) enum Pop {
     Item(ChannelId, Bytes),
@@ -103,13 +107,13 @@ impl Shared {
 
     pub fn push_inbound(&self, channel: ChannelId, payload: Bytes) {
         let mut inb = self.inbound();
-        inb.bytes += payload.len();
+        inb.bytes += payload.len() + INBOUND_ENTRY_COST;
         inb.q.push_back((channel, payload));
         drop(inb);
         self.inbound_ready.notify_waiters();
     }
 
-    /// Bytes of payload waiting for `recv`.
+    /// Budget units waiting for `recv`: payload bytes plus a fixed cost per entry.
     pub fn inbound_bytes(&self) -> usize {
         self.inbound().bytes
     }
@@ -118,7 +122,7 @@ impl Shared {
         let mut inb = self.inbound();
         match inb.q.pop_front() {
             Some((channel, payload)) => {
-                inb.bytes = inb.bytes.saturating_sub(payload.len());
+                inb.bytes = inb.bytes.saturating_sub(payload.len() + INBOUND_ENTRY_COST);
                 drop(inb);
                 self.inbound_room.notify_one();
                 Pop::Item(channel, payload)

@@ -373,7 +373,8 @@ where
             } else {
                 self.grace
             };
-            let _ = reap(&mut child, grace).await;
+            let how = reap(&mut child, grace).await;
+            tracing::debug!(%how, "pipe command reaped");
         }
         let _ = self.finished.send(true);
     }

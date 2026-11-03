@@ -1903,14 +1903,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(())
     }
 
+    /// The only place `size` is written: a change of the clamped size is a new generation.
+    fn set_size(&mut self, size: (u16, u16)) {
+        if term_size(self.size) != term_size(size) {
+            self.size_gen += 1;
+        }
+        self.size = size;
+    }
+
     fn on_resize(&mut self, cols: u16, rows: u16) -> Result<(), ClientError> {
         if cols == 0 || rows == 0 || self.size == (cols, rows) {
             return Ok(());
         }
-        if term_size(self.size) != term_size((cols, rows)) {
-            self.size_gen += 1;
-        }
-        self.size = (cols, rows);
+        self.set_size((cols, rows));
         if let Some(d) = self.display.as_mut() {
             let (bytes, damaged) = d.resize(cols, rows);
             self.write(&bytes)?;
@@ -2125,7 +2130,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn enter_session_screen(&mut self) -> Result<(), ClientError> {
         self.out.set_raw(true)?;
         self.raw = true;
-        self.size = self.out.size().unwrap_or(self.size);
+        // The window may have changed since the client started: a new size has a new generation,
+        // and the daemon is told when the screen is current (`link_became_ready`).
+        let now = self.out.size().unwrap_or(self.size);
+        self.set_size(now);
         let mut text = String::new();
         self.add_banner_warning(&mut text);
         self.add_term_warning(&mut text);

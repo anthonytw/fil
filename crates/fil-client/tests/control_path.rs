@@ -17,7 +17,7 @@ use fil_transport::{Link, LinkError, LinkKind, LinkStatus};
 use tokio::sync::watch;
 
 /// A link whose terminal channel can be jammed, as a full QUIC stream queue behind a big paste
-/// is: a `send` on it waits forever, while the other channels carry on.
+/// is: a `send` on it waits (until the test releases it), while the other channels carry on.
 struct JammedData {
     inner: MemLink,
     jam: Arc<AtomicBool>,
@@ -29,8 +29,10 @@ impl Link for JammedData {
     }
 
     async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<(), LinkError> {
-        if channel == ChannelId::TERMINAL && self.jam.load(Ordering::SeqCst) {
-            return std::future::pending().await;
+        // Jammed: this send waits, and so does everything queued behind it on the channel's
+        // writer, until the jam is released.
+        while channel == ChannelId::TERMINAL && self.jam.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.inner.send(channel, payload).await
     }
@@ -97,6 +99,36 @@ async fn a_jammed_data_channel_does_not_hold_back_control() {
     daemon.output(&lines(0..40)).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(daemon.acked().await, lines(0..40).len() as u64);
+
+    // The window changes and more is typed while the channel is jammed. Both wait behind the
+    // paste, in order, as they would over ssh: once the jam is released the paste arrives, then
+    // the resize record, then the keys typed after the resize, which run at the new size.
+    term.resize(100, 30);
+    term.type_bytes(b"ls\n");
+    settle().await;
+    assert!(
+        daemon.term_log().await.is_empty(),
+        "nothing got past the jam"
+    );
+    jam.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let key = |at, bytes: &[u8], size| common::daemon::TermLog::Keys {
+        at,
+        bytes: bytes.to_vec(),
+        size,
+    };
+    assert_eq!(
+        daemon.term_log().await,
+        vec![
+            key(0, b"pasted text", (80, 24)),
+            common::daemon::TermLog::Resize {
+                at: 11,
+                size_gen: 1,
+                size: (100, 30)
+            },
+            key(11, b"ls\n", (100, 30)),
+        ]
+    );
     client.abort();
 }
 

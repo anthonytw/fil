@@ -1023,6 +1023,11 @@ impl Core {
     /// A resize record arrived between the input bytes before `at` and the ones from `at` on. It
     /// is applied here, before any later input is handed to the PTY, which is the whole point of
     /// sending it in band.
+    ///
+    /// The liveness check is load-bearing, not a formality: the serve task checks that it was not
+    /// kicked, then queues this command, and a takeover can be handled in between (a full queue).
+    /// Without it the old subscriber's late record would resize the new subscriber's PTY and
+    /// leave a stale generation in force (pinned by the `gate_resize` test hook).
     fn on_resize_record(&mut self, conn: ConnId, at: u64, size_gen: u64, size: TermSize) {
         if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
             return;

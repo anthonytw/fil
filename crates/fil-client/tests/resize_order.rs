@@ -355,3 +355,26 @@ async fn a_resize_with_a_full_send_window_goes_out_at_the_next_offset() {
         b"0123456789abcdef0123456789abcdef"
     );
 }
+
+/// The window changes while the first attach's snapshot is arriving, and its event has not been
+/// handled yet: the client draws at the new size when the snapshot lands, and the daemon must be
+/// told as well (the size is re-read there, so that is where the generation has to move).
+#[tokio::test(start_paused = true)]
+async fn a_resize_during_the_first_snapshot_reaches_the_daemon() {
+    let rig = start(config());
+    rig.daemon
+        .set_snapshot_delay(Some(Duration::from_millis(500)))
+        .await;
+    settle().await;
+    rig.term.resize_quietly(100, 30);
+    rig.attached().await;
+    rig.term.resize_event(100, 30);
+    rig.type_str("ls\n");
+    settle().await;
+    assert_eq!(rig.daemon.pty_size().await, ((100, 30), 1));
+    let log = rig.daemon.term_log().await;
+    assert_eq!(
+        log,
+        vec![resize(0, 1, (100, 30)), keys(0, b"ls\n", (100, 30))]
+    );
+}

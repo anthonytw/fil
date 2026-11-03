@@ -213,3 +213,45 @@ async fn a_takeover_sets_the_size_and_the_snapshot_has_it() {
     .await;
     let _ = h.kill(Duration::from_secs(5)).await;
 }
+
+/// B3, the race: the old subscriber's record has been read and is on its way to the core when a
+/// takeover is handled. The core must drop it (it is no longer the live connection's), or the
+/// new subscriber's PTY takes the old one's size, and the old generation then outranks the new
+/// subscriber's own resizes. The gate parks the old connection's `Cmd::Resize` until the
+/// takeover has been handled, as a full command queue would.
+#[tokio::test]
+async fn a_record_that_reaches_the_core_after_a_takeover_is_dropped() {
+    let sc = Scratch::new();
+    let h = spawn_plain(sh_config(&sc, "main", STTY_SIZE)).await;
+    let gate = h.gate_resize();
+    let mut old = Client::attach(&h, Connect::new(&h, key(1))).await;
+    // Generations 1 to 6 are applied in order; the last one is held at the gate.
+    for g in 1..=7u64 {
+        old.resize_record(0, g, size(60 + g as u16, 20)).await;
+        tokio::time::timeout(WAIT, gate.arrived.notified())
+            .await
+            .expect("the record reached the gate");
+        if g < 7 {
+            gate.proceed.notify_one();
+        }
+    }
+    // The takeover is handled while the record waits.
+    let mut new = Client::attach(
+        &h,
+        Connect::new(&h, key(2)).host("desktop").size(size(100, 30)),
+    )
+    .await;
+    gate.proceed.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    new.type_bytes(b"\n").await;
+    assert_eq!(nth_line(&mut new, 0).await, "30 100");
+    // And the new subscriber's own first resize is not outranked by the old generation.
+    new.resize(size(90, 25)).await;
+    tokio::time::timeout(WAIT, gate.arrived.notified())
+        .await
+        .expect("its record reached the gate too");
+    gate.proceed.notify_one();
+    new.type_bytes(b"\n").await;
+    assert_eq!(nth_line(&mut new, 1).await, "25 90");
+    let _ = h.kill(Duration::from_secs(5)).await;
+}

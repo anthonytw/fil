@@ -2,12 +2,23 @@
 //! machine, the output log, the resume-or-snapshot decision, and fil-term's emulator and snapshot
 //! writer. It talks over `link::mem`. It is not P3's session; it is just faithful enough to the
 //! protocol (section 8.5) to exercise the client.
+//!
+//! Its forwards ([`FakeFwd`]) are a real daemon-side `fil_forward::Endpoint` with a table of
+//! `fil_proto::mux::ForwardTable`, real loopback TCP to the targets, and `-R` listeners. It is
+//! also **hostile on demand**: it can announce entries the table would refuse, answer an
+//! `AddForward` with another target than the one asked for, and open channels the client never
+//! agreed to. The client must refuse all of that.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use fil_forward::connect::connect_tcp;
+use fil_forward::{
+    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, Policy,
+};
 use fil_proto::ChannelId;
 use fil_proto::chan::RecvChannel;
 use fil_proto::epoch::{AttachInput, AttachMode, AttachOutcome, Effect, SessionEpoch};
@@ -18,6 +29,10 @@ use fil_proto::log::{CatchUpParams, OutputLog, StartDecision, decide_start};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, SnapshotInfo, StartPoint,
     TermName,
+};
+use fil_proto::mux::{
+    ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable, ListenState, MuxConfig,
+    MuxMsg, OpenFailure, OpenKind, Origin, Side,
 };
 use fil_term::{Emulator, Size};
 use fil_transport::link::mem::{MemControl, MemLink};
@@ -157,6 +172,7 @@ impl DState {
 
 pub struct FakeDaemon {
     st: Mutex<DState>,
+    pub fwd: Arc<FakeFwd>,
 }
 
 fn emu(size: Size) -> Box<dyn Emulator> {
@@ -166,6 +182,7 @@ fn emu(size: Size) -> Box<dyn Emulator> {
 impl FakeDaemon {
     pub fn new(log_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
+            fwd: FakeFwd::start(),
             st: Mutex::new(DState {
                 epoch: SessionEpoch::new(0xAB_CDEF),
                 log: OutputLog::new(log_capacity),
@@ -226,7 +243,10 @@ impl FakeDaemon {
                     biased;
                     r = link.recv() => match r {
                         Ok(m) => m,
-                        Err(_) => return,
+                        Err(_) => {
+                            me.fwd.link_ended(&link);
+                            return;
+                        }
                     },
                     _ = std::future::ready(()), if pump_due => {
                         pump_due = false;
@@ -244,6 +264,27 @@ impl FakeDaemon {
                     if let Some(d) = delay {
                         tokio::time::sleep(d).await;
                     }
+                }
+                // The forwards' traffic goes to the endpoint, never waiting, and only from the
+                // link it is on (an old link's late segments would be gaps on the new one).
+                if Endpoint::<MemLink>::handles(chan) {
+                    me.fwd.feed(&link, |ep| {
+                        let _ = ep.on_payload(chan, payload);
+                    });
+                    continue;
+                }
+                if chan == ChannelId::CONTROL
+                    && let Ok(msg) = ControlMsg::decode(&payload)
+                    && matches!(
+                        msg,
+                        ControlMsg::Ack { channel, .. } | ControlMsg::Resume { channel, .. }
+                            if Endpoint::<MemLink>::handles(channel)
+                    )
+                {
+                    me.fwd.feed(&link, |ep| {
+                        let _ = ep.on_control(&msg);
+                    });
+                    continue;
                 }
                 let mut st = me.st.lock().await;
                 if chan == ChannelId::CONTROL {
@@ -278,6 +319,8 @@ impl FakeDaemon {
                             let e = st.epoch.epoch();
                             let _ = st.epoch.detach(e);
                             st.current = None;
+                            // The subscriber is gone: its channels with it.
+                            me.fwd.ep.new_epoch();
                             // The session hangs up once it has handled a `Detach`; the client
                             // waits for that before it closes its own side.
                             link.close();
@@ -561,6 +604,10 @@ impl FakeDaemon {
             )
             .await;
         }
+        // The forwards move to this link (section 8.5: after the reply and the terminal's
+        // `Resume`); a fresh attach is a new mux epoch, and is sent the table.
+        self.fwd
+            .attach(&link, matches!(mode, AttachMode::Resumed(_)));
         true
     }
 
@@ -727,6 +774,9 @@ impl FakeDaemon {
             }
         }
         st.current = None;
+        // Another client's attach: a new mux epoch (it does not speak MUX here).
+        self.fwd.ep.new_epoch();
+        *self.fwd.on_link.lock().unwrap() = None;
     }
 
     /// Takes the session over silently: no notice, the old transport just dies. The client
@@ -1110,4 +1160,298 @@ impl FakeDaemon {
 async fn send(link: &MemLink, msg: &ControlMsg) -> Result<(), fil_transport::LinkError> {
     link.send(ChannelId::CONTROL, Bytes::from(msg.encode().unwrap()))
         .await
+}
+
+// ---- forwards ----------------------------------------------------------------------------------
+
+/// What the fake daemon's forwards saw and hold.
+#[derive(Default)]
+pub struct FwdState {
+    pub table: ForwardTable,
+    /// `AddForward`s from the client, as received.
+    pub added: Vec<(u32, ForwardSpec)>,
+    /// `Consent`s from the client, in order.
+    pub consents: Vec<(ForwardId, bool)>,
+    /// `Listening` reports from the client.
+    pub listening: Vec<(ForwardId, ListenState)>,
+    pub removed: Vec<ForwardId>,
+    /// The ports the daemon's `-R` listeners got.
+    pub remote_ports: HashMap<ForwardId, u16>,
+    /// Hostile: the next `AddForward` is entered (and announced) with this spec instead.
+    pub lie_next: Option<ForwardSpec>,
+    /// The next `AddForward` is refused with this.
+    pub refuse_next: Option<ForwardRefusal>,
+    /// The next `-R` the daemon binds reports this failure instead.
+    pub fail_listen_next: Option<fil_proto::mux::BindFailure>,
+    /// Channels the daemon was asked to open by the client, by kind.
+    pub incoming: Vec<OpenKind>,
+}
+
+pub struct FakeFwd {
+    pub ep: Endpoint<MemLink>,
+    pub st: Arc<std::sync::Mutex<FwdState>>,
+    /// The link the endpoint is on.
+    on_link: std::sync::Mutex<Option<usize>>,
+}
+
+struct DaemonPolicy(Arc<std::sync::Mutex<FwdState>>);
+
+impl Policy for DaemonPolicy {
+    fn check_incoming(&self, kind: &OpenKind) -> Result<(), OpenFailure> {
+        let mut st = self.0.lock().unwrap();
+        st.incoming.push(kind.clone());
+        let (forward, want) = match kind {
+            OpenKind::Local { forward } => (forward, ForwardKind::Local),
+            OpenKind::Dynamic { forward, .. } => (forward, ForwardKind::Dynamic),
+            _ => return Err(OpenFailure::NotPermitted),
+        };
+        match st.table.get(*forward) {
+            Some(e) if e.spec.kind() == want => Ok(()),
+            _ => Err(OpenFailure::NoSuchForward),
+        }
+    }
+    // The fake opens whatever a test asks it to: the client's checks are what is under test.
+    fn check_outgoing(&self, _: &OpenKind) -> Result<(), OpenFailure> {
+        Ok(())
+    }
+    fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
+        Ok(())
+    }
+}
+
+struct DaemonConnector(Arc<std::sync::Mutex<FwdState>>);
+
+impl Connector for DaemonConnector {
+    fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
+        let target = match kind {
+            OpenKind::Local { forward } => self
+                .0
+                .lock()
+                .unwrap()
+                .table
+                .get(*forward)
+                .and_then(|e| e.spec.target().cloned()),
+            OpenKind::Dynamic { target, .. } => Some(target.clone()),
+            _ => None,
+        };
+        Box::pin(async move {
+            let t = target.ok_or(OpenFailure::NoSuchForward)?;
+            let s = connect_tcp(&t, &check).await?;
+            Ok(Box::new(s) as BoxStream)
+        })
+    }
+}
+
+fn link_key(link: &Arc<MemLink>) -> usize {
+    Arc::as_ptr(link) as usize
+}
+
+impl FakeFwd {
+    fn start() -> Arc<Self> {
+        let st = Arc::new(std::sync::Mutex::new(FwdState::default()));
+        let (ep, events) = Endpoint::new(
+            Side::Daemon,
+            MuxConfig::default(),
+            Arc::new(DaemonConnector(st.clone())),
+            Arc::new(DaemonPolicy(st.clone())),
+        );
+        let me = Arc::new(Self {
+            ep,
+            st,
+            on_link: std::sync::Mutex::new(None),
+        });
+        tokio::spawn(Self::serve(Arc::downgrade(&me), events));
+        me
+    }
+
+    async fn serve(
+        me: std::sync::Weak<Self>,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<EndpointEvent>,
+    ) {
+        while let Some(ev) = events.recv().await {
+            let Some(me) = me.upgrade() else { return };
+            if let EndpointEvent::Table(m) = ev {
+                me.table(m);
+            }
+        }
+    }
+
+    fn attach(&self, link: &Arc<MemLink>, resumed: bool) {
+        if !resumed {
+            self.ep.new_epoch();
+        }
+        // Under the lock: an old link's reader that ends meanwhile must not detach this one.
+        let mut on = self.on_link.lock().unwrap();
+        self.ep.attach_link(link.clone(), resumed);
+        *on = Some(link_key(link));
+        drop(on);
+        if !resumed {
+            let entries: Vec<_> = self.st.lock().unwrap().table.iter().cloned().collect();
+            for e in entries {
+                let _ = self.ep.send_table(MuxMsg::Forward {
+                    id: e.id,
+                    spec: e.spec,
+                    origin: e.origin,
+                    req: None,
+                });
+            }
+        }
+    }
+
+    fn feed(&self, link: &Arc<MemLink>, f: impl FnOnce(&Endpoint<MemLink>)) {
+        let on = self.on_link.lock().unwrap();
+        if *on == Some(link_key(link)) {
+            f(&self.ep);
+        }
+    }
+
+    fn link_ended(&self, link: &Arc<MemLink>) {
+        let mut on = self.on_link.lock().unwrap();
+        if *on == Some(link_key(link)) {
+            self.ep.detach_link();
+            *on = None;
+        }
+    }
+
+    fn table(&self, m: MuxMsg) {
+        match m {
+            MuxMsg::AddForward { req, spec } => {
+                let (wire, refuse) = {
+                    let mut st = self.st.lock().unwrap();
+                    st.added.push((req, spec.clone()));
+                    (st.lie_next.take().unwrap_or(spec), st.refuse_next.take())
+                };
+                if let Some(why) = refuse {
+                    let _ = self.ep.send_table(MuxMsg::ForwardRefused { req, why });
+                    return;
+                }
+                let added = self
+                    .st
+                    .lock()
+                    .unwrap()
+                    .table
+                    .add(wire.clone(), Origin::Client);
+                match added {
+                    Ok(a) => {
+                        let id = a.id();
+                        let _ = self.ep.send_table(MuxMsg::Forward {
+                            id,
+                            spec: wire.clone(),
+                            origin: Origin::Client,
+                            req: Some(req),
+                        });
+                        if wire.kind() == ForwardKind::Remote {
+                            self.listen_remote(id, &wire);
+                        }
+                    }
+                    Err(why) => {
+                        let _ = self.ep.send_table(MuxMsg::ForwardRefused { req, why });
+                    }
+                }
+            }
+            MuxMsg::Consent { id, accepted } => {
+                self.st.lock().unwrap().consents.push((id, accepted));
+            }
+            MuxMsg::Listening { id, state } => {
+                self.st.lock().unwrap().listening.push((id, state));
+            }
+            MuxMsg::RemoveForward { id } => {
+                let mut st = self.st.lock().unwrap();
+                st.removed.push(id);
+                st.table.remove(id);
+            }
+            _ => {}
+        }
+    }
+
+    fn listen_remote(&self, id: ForwardId, spec: &ForwardSpec) {
+        let fail = self.st.lock().unwrap().fail_listen_next.take();
+        let state = match fail {
+            Some(f) => ListenState::Failed(f),
+            None => match self
+                .ep
+                .listen(id, ForwardKind::Remote, spec.bind(), spec.port())
+            {
+                Ok(port) => {
+                    self.st.lock().unwrap().remote_ports.insert(id, port);
+                    ListenState::Listening {
+                        port: std::num::NonZeroU16::new(port).unwrap(),
+                    }
+                }
+                Err(f) => ListenState::Failed(f),
+            },
+        };
+        let _ = self.ep.send_table(MuxMsg::Listening { id, state });
+    }
+
+    /// A management request (`fil forward` on the host): entered with `Origin::Request` and
+    /// announced to the client, as the real daemon does. Panics if the table refuses it.
+    pub fn request(&self, spec: ForwardSpec) -> ForwardId {
+        let id = self
+            .st
+            .lock()
+            .unwrap()
+            .table
+            .add(spec.clone(), Origin::Request)
+            .expect("the table takes it")
+            .id();
+        let _ = self.ep.send_table(MuxMsg::Forward {
+            id,
+            spec: spec.clone(),
+            origin: Origin::Request,
+            req: None,
+        });
+        if spec.kind() == ForwardKind::Remote {
+            self.listen_remote(id, &spec);
+        }
+        id
+    }
+
+    /// Hostile: announces an entry the table never held (any spec, any id).
+    pub fn announce(&self, id: ForwardId, spec: ForwardSpec, origin: Origin) {
+        let _ = self.ep.send_table(MuxMsg::Forward {
+            id,
+            spec,
+            origin,
+            req: None,
+        });
+    }
+
+    /// Removes an entry, as `fil forward --rm` does.
+    pub fn remove(&self, id: ForwardId) {
+        self.st.lock().unwrap().table.remove(id);
+        self.ep.unlisten(id);
+        let _ = self.ep.send_table(MuxMsg::ForwardGone { id });
+    }
+
+    /// Hostile: opens a channel of `kind` to the client for a local stream; returns the
+    /// application's end of that stream. A refusal resets it.
+    pub async fn open(&self, kind: OpenKind) -> tokio::net::TcpStream {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (ours, _) = l.accept().await.unwrap();
+        // A refusal here (the daemon's own policy) never happens: it allows everything.
+        let _ = self.ep.open_stream(kind, Box::new(ours));
+        app
+    }
+
+    pub fn consents(&self) -> Vec<(ForwardId, bool)> {
+        self.st.lock().unwrap().consents.clone()
+    }
+
+    pub fn remote_port(&self, id: ForwardId) -> Option<u16> {
+        self.st.lock().unwrap().remote_ports.get(&id).copied()
+    }
+
+    pub fn ids(&self) -> Vec<(ForwardId, ForwardSpec, Origin)> {
+        self.st
+            .lock()
+            .unwrap()
+            .table
+            .iter()
+            .map(|e| (e.id, e.spec.clone(), e.origin))
+            .collect()
+    }
 }

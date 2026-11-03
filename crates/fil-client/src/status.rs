@@ -111,6 +111,7 @@ pub fn help_lines() -> Vec<String> {
     vec![
         "fil escapes, typed after Enter:".into(),
         "~.  detach".into(),
+        "~#  the forwards".into(),
         "~~  a literal ~".into(),
         "~?  this help".into(),
     ]

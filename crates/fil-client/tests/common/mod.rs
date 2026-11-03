@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod daemon;
+pub mod fwd;
 pub mod term;
 
 use std::collections::VecDeque;

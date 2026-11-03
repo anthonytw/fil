@@ -72,6 +72,9 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// A yes/no question ignores the keyboard until the user has paused this long: it is only
+/// answered by someone who has seen it.
+const PROMPT_QUIET: Duration = Duration::from_millis(300);
 /// After `~.`, how long the client waits for the daemon to acknowledge the input typed before it,
 /// so the `Detach` does not overtake it. Past this the `Detach` goes anyway: it matters more than
 /// the typed-ahead input, and acks that do not come (a slow path, a daemon that dropped the link)
@@ -106,6 +109,11 @@ struct Session {
     input: SendChannel,
     /// The daemon has said where to continue the input stream on this link.
     input_ready: bool,
+    /// The screen no longer matches the byte position (the window narrowed under something we
+    /// had drawn, and the terminal re-wrapped it): the next resume asks the daemon for a
+    /// snapshot instead of a replay from `recv`. Epoch, key and input stream are kept, so it is
+    /// still a resume, and a swap or a reconnect over QUIC needs no ssh login.
+    want_snapshot: bool,
     /// `PtyMode` reports waiting for the output to reach their offset: (at, canonical, echo).
     modes: VecDeque<(u64, bool, bool)>,
     /// The daemon said the shell exited: `(code, signal, when to stop waiting for the link to
@@ -126,6 +134,7 @@ impl Session {
             acking: false,
             input: SendChannel::new(window),
             input_ready: false,
+            want_snapshot: false,
             modes: VecDeque::new(),
             exited: None,
         }
@@ -184,7 +193,7 @@ impl Session {
             incarnation: self.incarnation,
             epoch: self.epoch,
             seq: self.recv.received(),
-            want_snapshot: false,
+            want_snapshot: self.want_snapshot,
         })
     }
 }
@@ -248,7 +257,28 @@ enum Confirm {
     Typed { secs: u64 },
 }
 
-type Outbox = mpsc::UnboundedSender<(ChannelId, Bytes)>;
+/// The queues to a link's two writer tasks. Control and data have a writer each: a `send` blocked
+/// on a full terminal channel (a big paste on a slow path) must not hold back an ack, a
+/// `Resize` or a `Detach` queued after it (DESIGN.md section 8.1: a full channel never delays
+/// control).
+#[derive(Clone)]
+struct Outbox {
+    control: mpsc::UnboundedSender<Bytes>,
+    data: mpsc::UnboundedSender<(ChannelId, Bytes)>,
+}
+
+impl Outbox {
+    fn control(&self, msg: &ControlMsg) {
+        if let Ok(bytes) = msg.encode() {
+            let _ = self.control.send(Bytes::from(bytes));
+        }
+    }
+
+    fn data(&self, channel: ChannelId, payload: Vec<u8>) {
+        let _ = self.data.send((channel, Bytes::from(payload)));
+    }
+}
+
 type Inbox = mpsc::Receiver<Result<(ChannelId, Bytes), LinkError>>;
 
 /// One link and the tasks that move its payloads.
@@ -258,7 +288,7 @@ struct LinkCtx<L> {
     tx: Outbox,
     rrx: Inbox,
     status: watch::Receiver<LinkStatus>,
-    writer: JoinHandle<()>,
+    writers: [JoinHandle<()>; 2],
     reader: JoinHandle<()>,
     conn: Conn,
     /// The link said `Down`; what it queued before is still being read out.
@@ -273,11 +303,22 @@ impl<L: Link> LinkCtx<L> {
     fn open(link: L, resumed: bool) -> Self {
         let kind = link.kind();
         let link = Arc::new(link);
-        let (tx, mut wrx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
-        let writer = {
+        let (control, mut crx) = mpsc::unbounded_channel::<Bytes>();
+        let (data, mut drx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
+        let control_writer = {
             let link = link.clone();
             tokio::spawn(async move {
-                while let Some((c, p)) = wrx.recv().await {
+                while let Some(p) = crx.recv().await {
+                    if link.send(ChannelId::CONTROL, p).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let data_writer = {
+            let link = link.clone();
+            tokio::spawn(async move {
+                while let Some((c, p)) = drx.recv().await {
                     if link.send(c, p).await.is_err() {
                         break;
                     }
@@ -301,10 +342,10 @@ impl<L: Link> LinkCtx<L> {
         Self {
             link,
             kind,
-            tx,
+            tx: Outbox { control, data },
             rrx,
             status,
-            writer,
+            writers: [control_writer, data_writer],
             reader,
             conn: Conn::new(kind, resumed),
             down: false,
@@ -315,7 +356,9 @@ impl<L: Link> LinkCtx<L> {
 
     fn close(self) {
         self.reader.abort();
-        self.writer.abort();
+        for w in &self.writers {
+            w.abort();
+        }
         self.link.close();
     }
 }
@@ -826,17 +869,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             }
                             CandStep::Refused(r) => {
                                 dialer.swapped(Err(SwapError::Refused(format!("{r:?}"))));
+                                tracing::debug!(?r, "the candidate link was refused");
                                 if let Some(c) = cand.take() {
                                     c.close();
                                 }
-                                ended = match r {
-                                    // Nothing wrong with the session: stay on the old link.
-                                    AttachRefusal::WrongKey | AttachRefusal::BadResume => None,
-                                    other => match self.on_refusal(other)? {
-                                        Flow::End(s) => Some(s),
-                                        Flow::Continue => None,
-                                    },
-                                };
+                                // Whatever the candidate was told, the old link is still the
+                                // session and is still delivering: if the session is gone, taken
+                                // over or replaced, it carries the real ending (`SessionExited`,
+                                // `TakenOver`) and then closes, and the reconnect that follows
+                                // hears the refusal again. Ending the run here would cut the tail
+                                // of the output off and make up an exit status.
                             }
                         }
                     }
@@ -1214,6 +1256,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         ours: fil_proto::limits::PROTOCOL_MAJOR,
                         peer: 0,
                     },
+                    fil_proto::msg::ErrorCode::SessionStartFailed => {
+                        ClientError::SessionStartFailed(self.cfg.session.to_string())
+                    }
                     other => ClientError::Protocol(format!("the daemon reported {other:?}")),
                 });
             }
@@ -1322,6 +1367,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
                 self.sess.start_acks(info.at);
+                // This is the repaint that was asked for (or a fresh screen anyway).
+                self.sess.want_snapshot = false;
                 return self.begin_snapshot(conn, info);
             }
         }
@@ -1644,7 +1691,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         while let Some(seg) = self.sess.input.next_segment() {
             if let Some(tx) = &self.tx {
-                let _ = tx.send((ChannelId::TERMINAL, Bytes::from(seg.payload())));
+                tx.data(ChannelId::TERMINAL, seg.payload());
             }
         }
     }
@@ -1673,9 +1720,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(&bytes)?;
             if damaged {
                 // The window narrowed under something we had drawn; the terminal re-wrapped it
-                // and the erase cannot undo that. The next attach starts from a snapshot.
-                tracing::warn!("window narrowed under the overlay; the next attach is fresh");
-                self.sess.established = false;
+                // and the erase cannot undo that. The next resume repaints from a snapshot.
+                tracing::debug!("window narrowed under the overlay; the next resume repaints");
+                self.sess.want_snapshot = true;
             }
         }
         if self.link_ok && self.tx.is_some() {
@@ -1812,12 +1859,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(text.as_bytes())?;
             self.prompt_plain = true;
         }
+        // Typing that was still going on when the question appeared answers nothing: what is
+        // already queued is read and dropped, and so is anything that follows until the user has
+        // paused for `PROMPT_QUIET`. (A `y` in `python` is not a decision.)
+        let mut armed_at = Instant::now() + PROMPT_QUIET;
         let answer = loop {
             let wake = self.next_wake();
             tokio::select! {
                 ev = self.input.next() => match ev {
                     TermEvent::Input(bytes) => {
-                        if let Some(yes) = prompt_answer(&bytes) {
+                        if Instant::now() < armed_at {
+                            armed_at = Instant::now() + PROMPT_QUIET;
+                        } else if let Some(yes) = prompt_answer(&bytes) {
                             break if yes { Ok(()) } else { Err(no) };
                         }
                     }
@@ -2089,15 +2142,21 @@ fn term_size(s: (u16, u16)) -> TermSize {
     TermSize::clamped(s.0, s.1)
 }
 
+/// The answer a chunk of typed bytes gives to a yes/no question: only a chunk that is exactly the
+/// key (optionally with the Enter after it). A `y` somewhere in a word that was still being typed
+/// when the question appeared (`python`, `yes`), or an escape sequence that starts with ESC, is
+/// not an answer. Taking a session back is a decision, and a stray key must not make it.
 fn prompt_answer(bytes: &[u8]) -> Option<bool> {
-    for &b in bytes {
-        match b {
-            b'y' | b'Y' => return Some(true),
-            b'n' | b'N' | b'q' | 0x1b | 0x03 => return Some(false),
-            _ => {}
-        }
+    let key = match bytes {
+        [k, b'\r' | b'\n'] => *k,
+        [k] => *k,
+        _ => return None,
+    };
+    match key {
+        b'y' | b'Y' => Some(true),
+        b'n' | b'N' | b'q' | 0x1b | 0x03 => Some(false),
+        _ => None,
     }
-    None
 }
 
 async fn at(t: Option<Instant>) {
@@ -2133,7 +2192,5 @@ fn refused(chan: ChannelId, payload: &[u8]) -> bool {
 }
 
 fn send_on(tx: &Outbox, msg: &ControlMsg) {
-    if let Ok(bytes) = msg.encode() {
-        let _ = tx.send((ChannelId::CONTROL, Bytes::from(bytes)));
-    }
+    tx.control(msg);
 }

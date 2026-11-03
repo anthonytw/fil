@@ -50,6 +50,8 @@ pub struct DState {
     pub snapshots: u32,
     gone: bool,
     refuse_next: Option<AttachRefusal>,
+    /// The next attach is answered with this error instead.
+    error_next: Option<fil_proto::msg::ErrorCode>,
     catch_up: CatchUpParams,
     incarnation: u128,
     epoch_no: u64,
@@ -130,6 +132,7 @@ impl FakeDaemon {
                 snapshots: 0,
                 gone: false,
                 refuse_next: None,
+                error_next: None,
                 catch_up: CatchUpParams::default(),
                 incarnation: 0xAB_CDEF,
                 epoch_no: 0,
@@ -271,6 +274,10 @@ impl FakeDaemon {
             let _ = send(&link, &ControlMsg::AttachRefused(r)).await;
             return false;
         }
+        if let Some(code) = st.error_next.take() {
+            let _ = send(&link, &ControlMsg::Error(code)).await;
+            return false;
+        }
         let now = st.now_ms;
         let outcome = st.epoch.attach(AttachInput {
             key: a.key.clone(),
@@ -329,7 +336,17 @@ impl FakeDaemon {
             AttachMode::Fresh => None,
             AttachMode::Resumed(r) => Some(r.seq),
         };
-        let start = decide_start(&st.log, resume_seq, &st.catch_up);
+        // A resume that asks for a snapshot (its screen no longer matches its position) keeps
+        // the key, epoch and input stream but repaints.
+        let start = if resume_seq.is_some() && a.resume.is_some_and(|r| r.want_snapshot) {
+            StartDecision::Snapshot {
+                at: st.log.end(),
+                skipped: 0,
+                reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            }
+        } else {
+            decide_start(&st.log, resume_seq, &st.catch_up)
+        };
         let mut snapshot_bytes = None;
         let start_point = match start {
             StartDecision::Resume { from } => {
@@ -649,6 +666,11 @@ impl FakeDaemon {
     }
 
     /// The next attach is refused with this, whatever it says.
+    /// The next attach is answered with this error (`SessionStartFailed`, say).
+    pub async fn error_next(&self, code: fil_proto::msg::ErrorCode) {
+        self.st.lock().await.error_next = Some(code);
+    }
+
     pub async fn refuse_next(&self, r: AttachRefusal) {
         self.st.lock().await.refuse_next = Some(r);
     }

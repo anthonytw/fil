@@ -221,12 +221,22 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     let got = rig.term.state();
     assert_eq!(got.screen_text(), want.screen_text(), "screen differs");
     // The window narrowed under the overlay, so the client did not trust the screen and took a
-    // snapshot (a fresh attach). The terminal had already re-wrapped the overlay's rows into
-    // its scrollback by then, which nothing can undo: the history keeps those fragments and
-    // gains the snapshot's lines, but loses nothing.
+    // snapshot. That is still a resume (same key, same epoch, no new ssh login, input kept) that
+    // asks to be repainted. The terminal had already re-wrapped the overlay's rows into its
+    // scrollback by then, which nothing can undo: the history keeps those fragments and gains
+    // the snapshot's lines, but loses nothing.
     assert!(
-        attaches[1].resume.is_none(),
-        "narrowing under the overlay forces a snapshot"
+        attaches[1].resume.is_some_and(|r| r.want_snapshot),
+        "narrowing under the overlay asks for a snapshot: {:?}",
+        attaches[1].resume
+    );
+    assert_eq!(attaches[0].key, attaches[1].key, "the key is kept");
+    assert_eq!(
+        rig.dial.purposes(),
+        vec![
+            fil_client::DialPurpose::Attach,
+            fil_client::DialPurpose::Resume
+        ]
     );
     let wh: Vec<_> = want
         .history

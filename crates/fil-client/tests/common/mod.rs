@@ -304,6 +304,13 @@ impl Rig {
     pub fn type_str(&self, s: &str) {
         self.term.type_bytes(s.as_bytes());
     }
+
+    /// Answers a yes/no question the client has put on the screen: after the pause a person
+    /// who has read it takes (a question ignores the keyboard until the typing has stopped).
+    pub async fn answer(&self, s: &str) {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        self.type_str(s);
+    }
 }
 
 /// A line of numbered output, to check for duplicated or missing bytes.

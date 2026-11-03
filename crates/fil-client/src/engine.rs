@@ -43,6 +43,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
 use fil_proto::frame::DataSegment;
+use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
@@ -353,9 +354,10 @@ impl Answer {
 }
 
 /// The queues to a link's two writer tasks. Control and data have a writer each: a `send` blocked
-/// on a full terminal channel (a big paste on a slow path) must not hold back an ack, a
-/// `Resize` or a `Detach` queued after it (DESIGN.md section 8.1: a full channel never delays
-/// control).
+/// on a full terminal channel (a big paste on a slow path) must not hold back an ack or a
+/// `Detach` queued after it (DESIGN.md section 8.1: a full channel never delays
+/// control). The window size is not control: it is a record on the terminal channel, sent with
+/// `data`, so it stays in order with the keystrokes (DESIGN.md section 8.5).
 #[derive(Clone)]
 struct Outbox {
     control: mpsc::UnboundedSender<Bytes>,
@@ -392,6 +394,9 @@ struct LinkCtx<L> {
     /// it): replayed in order once the reply is in.
     pre: Vec<(ChannelId, Bytes)>,
     pre_bytes: usize,
+    /// The size generation this link's `Attach` carried: what its daemon knows once it has
+    /// taken the attach, whatever the old link was told since.
+    attach_gen: u64,
 }
 
 impl<L: Link> LinkCtx<L> {
@@ -446,6 +451,7 @@ impl<L: Link> LinkCtx<L> {
             down: false,
             pre: Vec::new(),
             pre_bytes: 0,
+            attach_gen: 0,
         }
     }
 
@@ -549,8 +555,12 @@ pub(crate) struct Core<I, O> {
     out: O,
     local_term: Option<String>,
     size: (u16, u16),
-    /// The size the daemon was last told.
-    sent_size: (u16, u16),
+    /// The generation of `size` (DESIGN.md section 8.5): up by one whenever the clamped size
+    /// changes, never reset.
+    size_gen: u64,
+    /// The generation of the size the daemon on the current link has been told, by the `Attach`
+    /// or a resize record. A new link starts from its own attach's.
+    told_gen: u64,
     raw: bool,
     display: Option<Display>,
     make_predictor: Option<PredictorFactory>,
@@ -616,7 +626,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             out,
             local_term: term.local_term,
             size,
-            sent_size: size,
+            size_gen: 0,
+            told_gen: 0,
             raw: false,
             display: None,
             make_predictor,
@@ -901,7 +912,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.ack_due = None;
         self.quiet = false;
         self.tx = Some(primary.tx.clone());
-        self.begin_attach(&primary.tx, resume, dialer.public_key(), true);
+        primary.attach_gen = self.begin_attach(&primary.tx, resume, dialer.public_key());
+        self.told_gen = primary.attach_gen;
         // A candidate being tried, and the kind of a candidate that has taken over but whose
         // resume is not complete yet.
         let mut cand: Option<LinkCtx<D::Link>> = None;
@@ -1028,9 +1040,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         }
                     }
                     swap = dialer.next_swap(), if can_swap => {
-                        let candidate = LinkCtx::open(swap.link, true);
+                        let mut candidate = LinkCtx::open(swap.link, true);
                         let resume = self.sess.resume_request();
-                        self.begin_attach(&candidate.tx, resume, dialer.public_key(), false);
+                        candidate.attach_gen =
+                            self.begin_attach(&candidate.tx, resume, dialer.public_key());
                         cand = Some(candidate);
                     }
                     _ = at(wake) => {
@@ -1233,6 +1246,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn take_over_tx<L: Link>(&mut self, primary: &LinkCtx<L>) {
         self.tx = Some(primary.tx.clone());
         self.last_kind = Some(primary.kind);
+        // What the new link's daemon knows of our size is what its own attach said; a resize
+        // since (told to the old link only) goes to it after its `Resume`.
+        self.told_gen = primary.attach_gen;
         // The new link's daemon tells us where its input stream stands, and its reply where its
         // output flow starts: an ack that fell due for the old link means nothing to it.
         self.sess.input_ready = false;
@@ -1257,18 +1273,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(None)
     }
 
-    /// `primary`: this is the link the session runs on; only then does the attach count as
-    /// having told the daemon our size (a candidate may still fail).
-    fn begin_attach(
-        &mut self,
-        tx: &Outbox,
-        resume: Option<ResumeRequest>,
-        key: PublicKey,
-        primary: bool,
-    ) {
-        if primary {
-            self.sent_size = self.size;
-        }
+    /// Sends `Hello` and `Attach` on a new link. Returns the size generation the attach carries,
+    /// which is what that link's daemon knows of our size (a candidate may still fail, or be
+    /// overtaken by a resize, so the caller keeps it with the link).
+    fn begin_attach(&mut self, tx: &Outbox, resume: Option<ResumeRequest>, key: PublicKey) -> u64 {
         let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
             .expect("agent string is valid");
         send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
@@ -1277,6 +1285,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             &ControlMsg::Attach(Attach {
                 name: self.cfg.session.clone(),
                 size: term_size(self.size),
+                size_gen: self.size_gen,
                 term: self.local_term_name(),
                 host: self.cfg.host_label.clone(),
                 key,
@@ -1284,6 +1293,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 resume,
             }),
         );
+        self.size_gen
     }
 
     fn local_term_name(&self) -> TermName {
@@ -1418,8 +1428,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }
-            | ControlMsg::Attach(_)
-            | ControlMsg::Resize(_) => {}
+            | ControlMsg::Attach(_) => {}
         }
         Ok(Flow::Continue)
     }
@@ -1781,11 +1790,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.link_ok = true;
         self.ready_since.get_or_insert_with(Instant::now);
         // The window may have changed size while the daemon could not be told (a quiet link,
-        // a snapshot on its way).
-        if self.size != self.sent_size {
-            self.sent_size = self.size;
-            self.send_ctl(&ControlMsg::Resize(term_size(self.size)));
-        }
+        // a snapshot on its way, a swap). The record goes before anything held back is released.
+        self.send_size();
         if self.sess.input_ready {
             self.flush_offline();
         }
@@ -1824,6 +1830,31 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.pending.extend_from_slice(&all);
     }
 
+    /// Tells the daemon the window size if it has not been told this generation: a record in the
+    /// terminal channel's keystroke stream, at the offset of the next byte this link will carry,
+    /// so every key typed after the change follows it (DESIGN.md section 8.5). It goes with the
+    /// data, never the control writer, which is a different queue and on QUIC a different stream.
+    /// Only where keystrokes may go: after the daemon's `Resume`, which says where its stream
+    /// stands. Until then the attach (or the next record) carries the size.
+    fn send_size(&mut self) {
+        if self.told_gen >= self.size_gen
+            || self.tx.is_none()
+            || !self.sess.input_ready
+            || !self.link_ok
+        {
+            return;
+        }
+        let record = InputRecord::Resize {
+            at: self.sess.input.next_seq(),
+            size_gen: self.size_gen,
+            size: term_size(self.size),
+        };
+        if let (Some(tx), Ok(payload)) = (&self.tx, record.encode()) {
+            tx.data(ChannelId::TERMINAL, payload);
+            self.told_gen = self.size_gen;
+        }
+    }
+
     /// Moves queued keystrokes into the send window and sends what it releases.
     fn pump_input(&mut self) {
         if self.tx.is_none() || !self.sess.input_ready || !self.link_ok {
@@ -1844,8 +1875,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn on_event(&mut self, ev: TermEvent) -> Result<Ev, ClientError> {
         match ev {
-            TermEvent::Input(bytes) => self.on_keys(&bytes),
+            TermEvent::Input(bytes) => {
+                // The window as it is now, before these keys go anywhere: a resize that came
+                // before them in time (the terminal set the size, then wrote the keys) is
+                // seen even if its SIGWINCH is still waiting in the queue.
+                self.sample_size()?;
+                self.on_keys(&bytes)
+            }
             TermEvent::Resize { cols, rows } => {
+                // The event says the size changed, not what it is now: it may have been queued
+                // behind later changes. Read the window, so a stale one cannot overwrite a
+                // newer one that keys already saw.
+                let (cols, rows) = self.out.size().unwrap_or((cols, rows));
                 self.on_resize(cols, rows)?;
                 Ok(Ev::Continue)
             }
@@ -1854,11 +1895,27 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
+    /// Notices a change of window size that has no event yet (or whose event is still queued).
+    fn sample_size(&mut self) -> Result<(), ClientError> {
+        if let Ok((cols, rows)) = self.out.size() {
+            self.on_resize(cols, rows)?;
+        }
+        Ok(())
+    }
+
+    /// The only place `size` is written: a change of the clamped size is a new generation.
+    fn set_size(&mut self, size: (u16, u16)) {
+        if term_size(self.size) != term_size(size) {
+            self.size_gen += 1;
+        }
+        self.size = size;
+    }
+
     fn on_resize(&mut self, cols: u16, rows: u16) -> Result<(), ClientError> {
         if cols == 0 || rows == 0 || self.size == (cols, rows) {
             return Ok(());
         }
-        self.size = (cols, rows);
+        self.set_size((cols, rows));
         if let Some(d) = self.display.as_mut() {
             let (bytes, damaged) = d.resize(cols, rows);
             self.write(&bytes)?;
@@ -1869,10 +1926,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.sess.want_snapshot = true;
             }
         }
-        if self.link_ok && self.tx.is_some() {
-            self.sent_size = self.size;
-            self.send_ctl(&ControlMsg::Resize(term_size(self.size)));
-        }
+        self.send_size();
         self.refresh_display()
     }
 
@@ -2016,7 +2070,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             break if yes { Ok(()) } else { Err(no) };
                         }
                     }
-                    TermEvent::Resize { cols, rows } => self.on_resize(cols, rows)?,
+                    TermEvent::Resize { cols, rows } => {
+                        let (cols, rows) = self.out.size().unwrap_or((cols, rows));
+                        self.on_resize(cols, rows)?;
+                    }
                     TermEvent::Signal(n) => break Err(Outcome::Signalled(n)),
                     TermEvent::Eof => break Err(Outcome::InputClosed),
                 },
@@ -2073,7 +2130,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn enter_session_screen(&mut self) -> Result<(), ClientError> {
         self.out.set_raw(true)?;
         self.raw = true;
-        self.size = self.out.size().unwrap_or(self.size);
+        // The window may have changed since the client started: a new size has a new generation,
+        // and the daemon is told when the screen is current (`link_became_ready`).
+        let now = self.out.size().unwrap_or(self.size);
+        self.set_size(now);
         let mut text = String::new();
         self.add_banner_warning(&mut text);
         self.add_term_warning(&mut text);

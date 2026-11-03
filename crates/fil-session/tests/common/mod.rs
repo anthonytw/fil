@@ -14,6 +14,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::RecvChannel;
 use fil_proto::frame::DataSegment;
+use fil_proto::input::InputRecord;
 use fil_proto::msg::{
     Attach, AttachRefusal, AttachReply, ControlMsg, ErrorCode, PublicKey, ResumeRequest,
     SessionName, SnapshotInfo, StartPoint, TakenOver, TermSize,
@@ -189,6 +190,11 @@ pub struct Client {
     input_sent: u64,
     pub auto_ack: bool,
     pub emu: Box<dyn Emulator>,
+    /// The size generation of this client's window: up by one with every `resize`.
+    pub size_gen: u64,
+    /// While `Some`, control messages are queued here instead of sent: a control stream whose
+    /// packet was lost, while the terminal stream goes on (DESIGN.md section 8.1).
+    held: Option<Vec<ControlMsg>>,
 }
 
 pub struct Connect {
@@ -199,6 +205,8 @@ pub struct Connect {
     pub resume: Option<ResumeRequest>,
     /// Ask for `EchoAck`s (`Attach::echo_ack`).
     pub echo_ack: bool,
+    /// The generation of `size` (`Attach::size_gen`).
+    pub size_gen: u64,
 }
 
 impl Connect {
@@ -210,7 +218,12 @@ impl Connect {
             size: size(80, 24),
             resume: None,
             echo_ack: false,
+            size_gen: 0,
         }
+    }
+    pub fn size_gen(mut self, g: u64) -> Self {
+        self.size_gen = g;
+        self
     }
     pub fn echo_ack(mut self) -> Self {
         self.echo_ack = true;
@@ -258,6 +271,7 @@ impl Client {
         let attach = Attach {
             name: c.name,
             size: c.size,
+            size_gen: c.size_gen,
             term: "xterm-256color".parse().unwrap(),
             host: c.host.parse().unwrap(),
             key: c.key,
@@ -299,6 +313,8 @@ impl Client {
             input_sent: 0,
             auto_ack: true,
             emu,
+            size_gen: c.size_gen,
+            held: None,
         }
     }
 
@@ -339,7 +355,11 @@ impl Client {
         String::from_utf8_lossy(&self.out).into_owned()
     }
 
-    pub async fn send_ctl(&self, msg: ControlMsg) {
+    pub async fn send_ctl(&mut self, msg: ControlMsg) {
+        if let Some(held) = &mut self.held {
+            held.push(msg);
+            return;
+        }
         self.link
             .send(ChannelId::CONTROL, Bytes::from(msg.encode().unwrap()))
             .await
@@ -356,12 +376,44 @@ impl Client {
             .unwrap();
     }
 
+    /// The window changed: a record on the terminal channel, in order with `type_bytes`.
     pub async fn resize(&mut self, s: TermSize) {
+        self.size_gen += 1;
+        let g = self.size_gen;
+        self.resize_record(self.input_sent, g, s).await;
+    }
+
+    /// A resize record exactly as given, for the cases that need a record the client would not
+    /// send (a stale generation, an offset beyond the input).
+    pub async fn resize_record(&mut self, at: u64, size_gen: u64, s: TermSize) {
         self.emu.resize(Size {
             cols: s.cols(),
             rows: s.rows(),
         });
-        self.send_ctl(ControlMsg::Resize(s)).await;
+        let payload = InputRecord::Resize {
+            at,
+            size_gen,
+            size: s,
+        }
+        .encode()
+        .unwrap();
+        self.link
+            .send(ChannelId::TERMINAL, Bytes::from(payload))
+            .await
+            .unwrap();
+    }
+
+    /// From now on control messages (acks, a detach) are held back, as if the control stream
+    /// had lost a packet; the terminal channel is not affected.
+    pub fn hold_control(&mut self) {
+        self.held.get_or_insert_with(Vec::new);
+    }
+
+    /// Sends what was held, in order.
+    pub async fn release_control(&mut self) {
+        for m in self.held.take().unwrap_or_default() {
+            self.send_ctl(m).await;
+        }
     }
 
     pub async fn detach(&mut self) {
@@ -513,7 +565,11 @@ impl Client {
             ControlMsg::Resume {
                 channel: ChannelId::TERMINAL,
                 received,
-            } => self.input_resume = Some(received),
+            } => {
+                // The input stream continues where the daemon says.
+                self.input_resume = Some(received);
+                self.input_sent = self.input_sent.max(received);
+            }
             ControlMsg::Error(code) => self.errors.push(code),
             ControlMsg::SessionExited { code, signal } => self.exited = Some((code, signal)),
             other => panic!("unexpected control message {other:?}"),

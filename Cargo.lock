@@ -404,6 +404,7 @@ dependencies = [
  "fil-client",
  "fil-daemon",
  "fil-proto",
+ "fil-session",
  "fil-term",
  "fil-transport",
  "nix",

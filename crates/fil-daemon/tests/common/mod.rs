@@ -258,6 +258,7 @@ impl Connect {
             host: self.host.parse().unwrap(),
             key: self.key.clone(),
             echo_ack: false,
+            size_gen: 0,
             resume: self.resume,
         }
     }

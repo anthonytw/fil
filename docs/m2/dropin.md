@@ -77,6 +77,32 @@ Not here yet: `fwd_takeover`. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) i
 
 ## Results
 
+### After the review (the record)
+
+Run on 2026-11-03 from 17:40 ET, pi1 then pi2, with the client from this PR's tree (main at `7c5f93a`, A1, merged) and the Pi binary of the same tree from the `aarch64` job ([run 41721410062](https://github.com/anthonytw/fil/actions/runs/41721410062), `fil` sha256 `5ba2e891…`). Misses now fail a scenario. **The M2 set (25 scenarios: `tools`, the 14 forward ones, the 4 management ones and the 6 agent ones) passed on both Pis: 0 failed, 0 skipped, no miss and no finding.** After each run no daemon or socket was left. Another agent's fil daemon held one UDP port of the range on this Mac throughout; the relay took the other 1,000, and in every relay scenario the daemon's announced port was among them.
+
+| Scenario | pi1 | pi2 |
+|---|---|---|
+| `fwd_cable_pull` | auto and pipe: both transfers byte-exact, one accept each, across 30 s and 5 min; shell back 6.9 / 10.8 s (auto) and 6.2 / 21.2 s (pipe) after the plug | the same; 0.3 / 16.6 s and 2.1 / 13.4 s |
+| `fwd_reconnect`, `fwd_swap`, `fwd_sleep` | exact, one accept each, daemon the same | the same |
+| `fwd_many_short` | 10,000 sequential, all echoed, 160/s, no link down | all, 157/s |
+| `fwd_parallel`, `fwd_halfclose`, `fwd_rst`, `fwd_dynamic`, `fwd_local_http` | pass | pass |
+| `fwd_remote` | 16 MiB exact; a connection opened during an outage went through 11.6 s after it was opened | pass |
+| `fwd_remote_detached` | five connects reset at once; the server here accepted 0 | the same |
+| `fwd_bulk_typing` | p50 10 ms idle, 21 (auto) and 30 (pipe) ms loaded; under H1's rule | 13 and 14 ms idle, 26 and 30 ms loaded |
+| `fwd_churn` | 2 x 20,000 each transport, all echoed; daemon RSS +2.7 MB, then +32 KiB (auto) and +0 (pipe); FDSize 64 throughout | +2.7 MB, then +0 and -32 KiB; 64 |
+| `fwd_inside_add_rm` | asked; `n` binds nothing and leaves the entry unconsented; `y` binds, 1 MB exact, consented; `--rm` closes it | the same |
+| `fwd_hostile_remote` | refused with the daemon's NotPermitted, no question, canary untouched | the same |
+| `fwd_ports_view`, `detach_inside` | pass | pass |
+| `agent_list_sign` | the key listed; a signature made in the session verifies here | the same |
+| `agent_reconnect` | three signatures (before, after a killed ssh, after a 15 s sleep) verify; the same `SSH_AUTH_SOCK` throughout | the same |
+| `agent_off_default` | the stable path set, no socket, `ssh-add -l` exits 2 | the same |
+| `agent_detached` | after `~.` `ssh-add -l` exits 2 in 5 ms | the same |
+| `agent_filter` | `ssh-add -D` and `-x` refused; the key still held and signing | the same |
+| `agent_confirm` | asked twice; `n` refused (exit 255), `y` signed and verified | the same |
+
+### The first run
+
 Run on 2026-11-03 (ET) from this Mac, one Pi at a time. The client is this Mac's, built from `m2-v1` with main at `a6bd109` (F4 part 2) merged; the Pi binary is the `aarch64` job's build of the same tree ([run 41700108978](https://github.com/anthonytw/fil/actions/runs/41700108978), `fil` sha256 `e498399a…`, `fwdprobe` `341b7fcd…`), installed through the gate's `install` verb. Single runs over the LAN (about 6 ms round trip), so times are indicative. After each run no daemon or socket was left on either Pi. An earlier run of the transfer scenarios on pi1 with the pre-F4b build (main at `9988fdd`) gave the same results.
 
 **Every forward scenario passes on both Pis, with no finding in fil**, after three fixes to the scenarios themselves (below, "Corrections").

@@ -59,7 +59,7 @@ Four runs of the part on `m2-v1` (nothing in this package changes fil), all with
 
 `f_fwd_ending_stress` failed in the two earlier runs on a harness bug (a counter's `grep -c`), fixed before the later two; every other scenario passed in all four. Single runs; read differences under a few percent, or a few hundred ms in a reconnect, as noise. The tables give the earlier GitHub and VM runs; the later ones agree with them (the differences are noted where they matter).
 
-**After the review** (misses fail, goodput, the `sshno` baseline, the agent part; main at `7c5f93a`, A1 merged): GitHub [run 41723172416](https://github.com/anthonytw/fil/actions/runs/41723172416) (16:35 ET) passed all six jobs, `ssh`, `udp`, `sysd`, `fwd-cable`, `fwd-rest` (with `FWD_STRESS_COUNT=4000`) and `agent`, with no miss and no finding; the VM ran the `agent` part (pass) and the `fwd` part (below). Its numbers agree with the earlier runs; the H1 table is from it.
+**After the review** (misses fail, goodput, the `sshno` baseline, the agent part; main at `7c5f93a`, A1 merged): GitHub [run 41723172416](https://github.com/anthonytw/fil/actions/runs/41723172416) (16:35 ET) passed all six jobs, `ssh`, `udp`, `sysd`, `fwd-cable`, `fwd-rest` (with `FWD_STRESS_COUNT=4000`) and `agent`, with no miss and no finding (its pipe recovery happened to fall under the bound). The VM (16:38 and 17:11 ET) passed the `agent` part and the `fwd` part with no miss; `f_fwd_cable_pull` was `PASS*`, the named pipe finding (5.4 s and 24.9 s after the plug). The numbers agree with the earlier runs; the H1 table is from GitHub.
 
 ### The done-when: a pulled cable (`f_fwd_cable_pull`)
 
@@ -75,6 +75,8 @@ Four runs of the part on `m2-v1` (nothing in this package changes fil), all with
 | pipe | VM, final run | 7.8 s | **28.1 s** | |
 | auto | GitHub, after the review | 0.8 s | 1.0 s | |
 | pipe | GitHub, after the review | 4.8 s | 1.3 s | |
+| auto | VM, after the review | 1.7 s | 2.3 s | |
+| pipe | VM, after the review | **5.4 s** | **24.9 s** | |
 
 **Finding (named; fixed by PR #77): on `--transport pipe` the client comes back up to 30 s after the network does.** The scenario records the wait on every run and checks it against 5 s (auto's 0.6 to 1.9 s and a margin): on auto a slower return is a miss; on the pipe it is this named finding until PR #77, which runs the watcher for the pipe too, makes it strict. The client log of the VM run shows why: the path manager's pipe retry backs off to its cap of 30 s during the outage (`ScheduleRetry(PipeRetry, 30s)` every 30 s from a minute in), and nothing cuts the wait short when the cable is back, because the network watcher that would (`NetworkChanged`) runs only when the setting is not `pipe` (`crates/fil/src/dialer.rs`, `watch_network: setting != TransportSetting::Pipe`: "with the pipe only there is nothing to upgrade to and nobody to hint"). The log has no `NetworkChanged` input at all. On `auto` the watcher sees the default route return and the client is back within 2 s (1.1 to 1.9 s in all four runs). No byte is lost either way; it is a wait, and how long depends on where the retry timer stands when the network returns: 8.0, 18.3, 23.3 and 28.1 s after the 5 min pull in the four runs. Under the 5 s bound the finding shows in most runs; the run after the review happened to catch the retry early (4.8 and 1.3 s), which is the timer's luck, not a fix.
 
@@ -120,7 +122,7 @@ On GitHub x86_64 and in the VM: from the session, a real `ssh rnfil@server` auth
 | lossy and slow: `loss 3% rate 5mbit` | 20,000 each way | 125 | 118 | 0 | 0 / 0 |
 | harsh: `delay 40ms 10ms loss 8% rate 2mbit` | 5,000 each way | 29 | 27 | 0 | 0 / 0 |
 
-The final GitHub run (x86_64, the same cells) agrees: no trip in any cell; lossy 150 and 144 a second, slow 423 and 417, lossy and slow 119 and 120, harsh 29 and 27; nothing failed; ssh -L on the lossy path 143 a second. The run after the review (4,000 connections a cell, as CI now runs it): no trip, no failure, no link down or move to the pipe in any cell, with the cell now failing on any of them.
+The final GitHub run (x86_64, the same cells) agrees: no trip in any cell; lossy 150 and 144 a second, slow 423 and 417, lossy and slow 119 and 120, harsh 29 and 27; nothing failed; ssh -L on the lossy path 143 a second. After the review, with a cell failing on any trip, failure, link down or move to the pipe: GitHub (4,000 connections a cell, as CI now runs it) and the VM (20,000; lossy 131 and 129 a second, slow 423 and 419, lossy and slow 119 and 114, harsh 31 and 26, ssh -L 135) both passed every cell.
 
 What the numbers say about the concern (C3's review: marker answers ride the control channel while stream credit returns in QUIC frames): at most 200 connections are open at a time, and each one's end marker is answered within a round trip or two of its stream end. Even at 420 connections a second, with every answer delayed by a full second of loss recovery, about 420 ends would be waiting, a fifth of the 2,048 limit. The limit would need an answer delay of about five seconds at that rate, or ten times the concurrency the opener allows (`MAX_OPEN_CHANNELS` is 256). A lossy path makes the rate fall faster than the delay grows: at 3 % loss the connection rate drops to a third, so the product (the ends waiting) goes down, not up.
 

@@ -72,8 +72,14 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
-/// After a `Detach`, how long the client waits for the daemon to hang up (which it does once it
-/// has handled the `Detach`) before it closes the link and exits regardless.
+/// After `~.`, how long the client waits for the daemon to acknowledge the input typed before it,
+/// so the `Detach` does not overtake it. Past this the `Detach` goes anyway: it matters more than
+/// the typed-ahead input, and acks that do not come (a slow path, a daemon that dropped the link)
+/// must not hold it back.
+const DETACH_ACK_WAIT: Duration = Duration::from_secs(1);
+/// After the `Detach` is sent, how long the client waits for the daemon to hang up (which it does
+/// once it has handled the `Detach`) before it closes the link and exits regardless. With
+/// [`DETACH_ACK_WAIT`] the client lingers 3 s at most; the terminal is the user's again meanwhile.
 const DETACH_DELIVERY_WAIT: Duration = Duration::from_secs(2);
 
 /// Everything about the session that must survive a link.
@@ -886,29 +892,37 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// what the link still queues and lets the process exit under an ssh that has not forwarded
     /// them. (A QUIC close likewise throws away unsent stream data.) So `flush` plays no part.
     ///
-    /// The `Detach` goes out only once the daemon has acknowledged all the input typed before it,
+    /// The `Detach` goes out once the daemon has acknowledged all the input typed before it,
     /// including what the send window held back: the links send control ahead of data, and a
-    /// `Detach` that overtook `make deploy` would lose the command. While a swap is under way the
-    /// candidate is told too: the daemon may already have moved the session to it and dropped
-    /// the old link, with the `Detach` on it.
+    /// `Detach` that overtook `make deploy` would lose the command. Acks that do not come within
+    /// [`DETACH_ACK_WAIT`] do not hold it back: delivering the detach matters more. The hang-up
+    /// wait runs from the moment the `Detach` is sent. While a swap is under way the candidate is
+    /// told too, and at once if the old link goes down first: the daemon may already have moved
+    /// the session to the candidate and dropped the old link (before acking), with the `Detach`
+    /// on it.
     async fn detach_and_wait<L: Link>(
         &mut self,
         primary: &mut LinkCtx<L>,
         cand: &mut Option<LinkCtx<L>>,
     ) -> Option<Outcome> {
-        let deadline = Instant::now() + DETACH_DELIVERY_WAIT;
-        let (mut sent, mut p_down, mut c_down) = (false, false, false);
+        let ack_by = Instant::now() + DETACH_ACK_WAIT;
+        let (mut sent_at, mut p_down, mut c_down) = (None, false, false);
         loop {
-            if !sent && self.input_delivered() {
-                send_on(&primary.tx, &ControlMsg::Detach);
-                if let Some(c) = cand.as_ref() {
+            // The input is acknowledged, or it is not going to be in time, or the old link is
+            // gone (the daemon dropped it for the candidate before acking): send.
+            if sent_at.is_none() && (p_down || self.input_delivered() || Instant::now() >= ack_by) {
+                if !p_down {
+                    send_on(&primary.tx, &ControlMsg::Detach);
+                }
+                if let Some(c) = cand.as_ref().filter(|_| !c_down) {
                     send_on(&c.tx, &ControlMsg::Detach);
                 }
-                sent = true;
+                sent_at = Some(Instant::now());
             }
             if p_down && (cand.is_none() || c_down) {
                 break;
             }
+            let wake = sent_at.map_or(ack_by, |t| t + DETACH_DELIVERY_WAIT);
             tokio::select! {
                 m = primary.rrx.recv(), if !p_down => match m {
                     Some(Ok((chan, payload))) => self.while_detaching(chan, &payload, true),
@@ -926,15 +940,27 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     }
                     _ => c_down = true,
                 },
-                () = sleep_until(deadline) => {
-                    tracing::debug!("the daemon did not hang up after the detach; closing anyway");
-                    break;
+                () = sleep_until(wake) => {
+                    // Before the `Detach` is sent this only wakes the loop to send it.
+                    if sent_at.is_some() {
+                        tracing::debug!(
+                            "the daemon did not hang up after the detach; closing anyway"
+                        );
+                        break;
+                    }
                 }
             }
         }
-        self.sess
+        let ended = self
+            .sess
             .exited
-            .map(|(code, signal, _)| Outcome::SessionEnded { code, signal })
+            .map(|(code, signal, _)| Outcome::SessionEnded { code, signal });
+        if let Some(o) = &ended {
+            // "Detached" is already on the screen: say why the exit status is the shell's.
+            let m = o.message(self.cfg.session.as_str(), self.cfg.time_format);
+            let _ = self.out.write_all(format!("{m}\r\n").as_bytes());
+        }
+        ended
     }
 
     /// Everything typed has reached the daemon (or cannot, on this link, so waiting is no use).

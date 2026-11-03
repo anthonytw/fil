@@ -239,8 +239,55 @@ async fn the_client_waits_for_the_daemon_only_so_long() {
     let (out, took) = run.finish().await;
     assert_eq!(out, Outcome::Detached);
     assert_eq!(daemon.detaches().await, 0);
+    // No input in flight: the `Detach` goes at once and the daemon gets 2 s to hang up.
     assert!(
-        took >= Duration::from_secs(1) && took < Duration::from_secs(3),
+        took >= Duration::from_millis(1900) && took < Duration::from_millis(2500),
+        "waited {took:?}"
+    );
+}
+
+/// With input in flight the whole lingering is capped: 1 s for acks, then 2 s for the hang-up.
+#[tokio::test(start_paused = true)]
+async fn the_whole_wait_is_capped_at_three_seconds() {
+    let run = attached(config()).await;
+    run.slow(30_000);
+    run.term.type_bytes(b"ls\r~.");
+    let (out, took) = run.finish().await;
+    assert_eq!(out, Outcome::Detached);
+    assert!(
+        took >= Duration::from_millis(2900) && took < Duration::from_millis(3500),
+        "waited {took:?}"
+    );
+}
+
+/// The ack of typed-ahead input comes late, past the ack wait. The `Detach` must go anyway (it
+/// may then overtake the input, which is the lesser loss) and be heard, whatever the latency.
+#[tokio::test(start_paused = true)]
+async fn a_late_ack_does_not_hold_the_detach_back() {
+    for ms in [1100u64, 1300, 1600] {
+        let run = attached(config()).await;
+        run.slow(ms);
+        run.term.type_bytes(b"ls\r~.");
+        let daemon = run.daemon.clone();
+        let (out, took) = run.finish().await;
+        assert_eq!(out, Outcome::Detached, "delay {ms} ms");
+        assert_eq!(daemon.detaches().await, 1, "no Detach at {ms} ms");
+        assert!(took <= Duration::from_millis(3100), "waited {took:?}");
+    }
+}
+
+/// A daemon that never acknowledges input: the `Detach` goes after the ack wait.
+#[tokio::test(start_paused = true)]
+async fn a_daemon_that_stops_acking_does_not_hold_the_detach_back() {
+    let run = attached(config()).await;
+    run.daemon.lose_input(true).await;
+    run.term.type_bytes(b"ls\r~.");
+    let daemon = run.daemon.clone();
+    let (out, took) = run.finish().await;
+    assert_eq!(out, Outcome::Detached);
+    assert_eq!(daemon.detaches().await, 1);
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_millis(1500),
         "waited {took:?}"
     );
 }
@@ -302,7 +349,14 @@ async fn a_session_that_ends_during_the_wait_reports_its_status() {
     run.term.type_bytes(b"~.");
     tokio::time::sleep(Duration::from_millis(100)).await;
     run.daemon.send_status_only(Some(3), None).await;
+    let term = run.term.clone();
     let (out, _) = run.finish().await;
+    assert!(
+        term.text().contains("detached from session")
+            && term.text().contains("session \"main\" exited 3"),
+        "{}",
+        term.text()
+    );
     assert_eq!(
         out,
         Outcome::SessionEnded {
@@ -321,6 +375,26 @@ async fn a_detach_during_a_swap_reaches_the_daemon_through_the_candidate() {
     run.offers.offer(delay_of(300));
     tokio::time::sleep(Duration::from_millis(50)).await;
     run.term.type_bytes(b"~.");
+    let daemon = run.daemon.clone();
+    let (out, took) = run.finish().await;
+    assert_eq!(out, Outcome::Detached);
+    assert!(
+        daemon.detaches().await >= 1,
+        "the daemon never saw the Detach"
+    );
+    assert!(took < Duration::from_secs(1), "waited {took:?}");
+}
+
+/// The same with typed-ahead input in flight: the daemon takes the candidate's resume and drops
+/// the old link before it has acked the input. The old link going down must not leave the
+/// `Detach` waiting for an ack that cannot come; it goes to the candidate at once.
+#[tokio::test(start_paused = true)]
+async fn a_detach_during_a_swap_with_input_in_flight_goes_to_the_candidate() {
+    let run = attached(config()).await;
+    run.slow(300);
+    run.offers.offer(delay_of(300));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    run.term.type_bytes(b"ls\r~.");
     let daemon = run.daemon.clone();
     let (out, took) = run.finish().await;
     assert_eq!(out, Outcome::Detached);

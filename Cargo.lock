@@ -345,6 +345,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fil-session"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fil-proto",
+ "fil-term",
+ "fil-transport",
+ "nix",
+ "portable-pty",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "vte",
+]
+
+[[package]]
 name = "fil-term"
 version = "0.0.0"
 dependencies = [

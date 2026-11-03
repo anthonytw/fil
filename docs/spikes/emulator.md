@@ -125,6 +125,9 @@ fil writes, about 30 lines for these five. alacritty's `ColorRequest` (OSC 10/11
 `vim_edit`) and `TextAreaSizeRequest` events arrive as closures that need the host's answer; the backend ignores
 them today, so they are **not** answered. M1 must answer them or programs that ask will wait.
 
+*Update (M1, `fil-session`):* the session answers them itself while detached (`fil-session/src/queries.rs`), from
+the colors the last attached terminal reported or dark-theme defaults.
+
 ### Performance and memory
 
 Release build, one thread. The stream is 16.8 MB of synthetic mixed text, SGR changes and erases, so only the
@@ -234,6 +237,13 @@ model; I did not evaluate its restore quality.
   exposes parser state. The daemon should snapshot at a sequence boundary or retain the unparsed tail.
 - Not restored by the writer: tab stops, charset designations (G0-G3, shifts), the primary cursor's pending wrap
   behind the alternate screen. The probe shows all three.
+
+*Update (M1, `fil-session`):* the session holds back the unfinished end of the output so a snapshot is always taken
+at a sequence boundary (`fil-session/src/boundary.rs`). `fil-term` now carries tab stops and charsets (G0-G3, the
+invoked set, and the ones DECSC saved) in `TermState` and the writer, for alacritty; the probe passes for it
+(`just fidelity`: alacritty 899/0/29). vt100 does not report them (`Capabilities::tab_stops` and `charsets` are
+false). alacritty keeps a program's synchronized-update batch (`?2026`) until it ends, so `Emulator::apply_pending`
+applies it before a snapshot is rendered. The primary cursor's pending wrap is still not restored.
 - Not run: fuzzing, chunk-split feeding (a single `feed` per fixture), non-UTF-8 input, sixel/kitty graphics, a
   Linux host. Real recordings are macOS programs.
 - Perf and memory are one machine, one synthetic stream. RSS per session is a delta over 40 sessions and includes

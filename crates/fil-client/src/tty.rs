@@ -40,6 +40,13 @@ fn errno(e: Errno) -> io::Error {
     io::Error::from_raw_os_error(e.raw_os_error())
 }
 
+/// Written by the panic hook after the termios is back: cancel a half-written sequence, end a
+/// synchronized update, mouse reporting (every mode and encoding), focus events, bracketed paste,
+/// application cursor keys and keypad, show the cursor, reset the pen. Each is a no-op on a
+/// terminal where the mode is already off.
+const PANIC_RESET: &[u8] = b"\x18\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\
+\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[0m";
+
 /// What a panic needs to put the terminal back.
 static PANIC_RESTORE: Mutex<Option<(OwnedFd, Termios)>> = Mutex::new(None);
 static HOOK: Once = Once::new();
@@ -53,6 +60,17 @@ fn install_panic_hook() {
                 && let Some((fd, saved)) = guard.as_ref()
             {
                 let _ = tcsetattr(fd, OptionalActions::Now, saved);
+                // The program's modes cannot be read here (the shadow screen is not reachable
+                // from a hook), so write the part of the exit restore that does nothing visible
+                // when the modes are already off. It does not leave the alternate screen or pop
+                // the kitty keyboard stack: both need the shadow's state (`?1049l` on the primary
+                // screen makes some terminals jump the cursor), so a panic in a full-screen
+                // program still leaves those; `reset` clears them.
+                // One plain write, not `write_fd`'s retry loop. The fd is blocking, so a terminal
+                // that has stopped reading (XOFF, a stuck emulator) with a full queue can still
+                // make this one wait, but the sequence is short (about a hundred bytes), so only a
+                // terminal whose queue is already full does.
+                let _ = rustix::io::write(fd, PANIC_RESET);
             }
             previous(info);
         }));

@@ -355,6 +355,11 @@ fwd_cable_case() {
     note "$tr.pull$k.down_ms=$((t - pull))"
     fwd_wait_resumed "$t" 120
     note "$tr.pull$k.l_resumed_after_plug_ms=$FWD_RESUMED_L $tr.pull$k.r_resumed_after_plug_ms=$FWD_RESUMED_R"
+    # The network is back: the client should be too, within seconds, as on auto (its network
+    # watcher sees the route come back). The pipe's retry backoff is capped at 30 s.
+    if [[ $FWD_RESUMED_L -gt 10000 || $FWD_RESUMED_R -gt 10000 ]]; then
+      known_bug "$tr: after a ${secs} s cable pull the forwards moved again only $FWD_RESUMED_L ms after the cable was back (the client reconnects at its next pipe retry; with --transport pipe it does not watch the network)"
+    fi
     [[ $(link_downs "$name") -gt $downs0 ]] || fail "$tr: the client never logged its link down during pull $k: it was not a disconnect"
     downs0=$(link_downs "$name")
     # Some data between the two pulls, so the second lands on a running transfer too.
@@ -530,6 +535,9 @@ fwd_burst() {
 f_fwd_many_short() {
   local name=m dir downs0 failed=0
   FWD_SESSION=fwdmany
+  # 20,000 channels write about 4 MiB of per-channel debug lines, the client log's rotation size:
+  # keep those at info, so the link's own lines (link down, path moves, a violation) stay in it.
+  FC_ENV=("FIL_LOG=fil=debug,fil_forward=info")
   reset_net
   fwd_attach "$name" "$FWD_SESSION" auto
   downs0=$(link_downs "$name")
@@ -551,6 +559,13 @@ f_fwd_many_short() {
   cx_fk "$FWD_SESSION"
 }
 
+# How often the daemon's log says a link ended on unanswered stream ends (grep -c prints 0 on none).
+fwd_daemon_trips() {
+  local n
+  n=$(as_root grep -c 'does not answer stream ends' /home/rnfil/.local/state/fil/daemon.log 2> /dev/null || true)
+  printf '%s' "${n:-0}"
+}
+
 # The QUIC link ends itself when more than MAX_ENDING (2,048) finished channels wait for the peer's
 # answer to their end marker (crates/fil-transport/src/quic.rs). The answers travel on the control
 # channel while stream credit comes back in QUIC frames, so an honest burst of short connections on
@@ -559,13 +574,23 @@ f_fwd_many_short() {
 f_fwd_ending_stress() {
   local name=s cell net dir v0c v0d vc vd downs0 to_pipe0 trips=0
   FWD_SESSION=fwdstress
+  # 20,000 channels write about 4 MiB of per-channel debug lines, the client log's rotation size:
+  # keep those at info, so the link's own lines (link down, path moves, a violation) stay in it.
+  FC_ENV=("FIL_LOG=fil=debug,fil_forward=info")
   reset_net
   fwd_attach "$name" "$FWD_SESSION" auto
-  for cell in lossy slow lossyslow; do
+  local count
+  for cell in lossy slow lossyslow harsh; do
+    count=$FWD_STRESS_COUNT
     case $cell in
       lossy) net="delay 20ms 5ms loss 3% rate 1gbit" ;;
       slow) net="delay 20ms 5ms rate 5mbit" ;;
       lossyslow) net="delay 20ms 5ms loss 3% rate 5mbit" ;;
+      # Past what a user would call working, to look for the edge (fewer connections: it is slow).
+      harsh)
+        net="delay 40ms 10ms loss 8% rate 2mbit"
+        count=$((FWD_STRESS_COUNT / 4))
+        ;;
     esac
     netem_clear
     local d
@@ -584,23 +609,38 @@ f_fwd_ending_stress() {
     note "$cell.starts_on=$([[ -z $(pipe_ssh "$FIL_PID") ]] && echo quic || echo pipe)"
     for dir in L R; do
       v0c=$(fc_count_log "$name" 'does not answer stream ends')
-      v0d=$(as_root grep -c 'does not answer stream ends' /home/rnfil/.local/state/fil/daemon.log 2> /dev/null || true)
+      v0d=$(fwd_daemon_trips)
       downs0=$(link_downs "$name")
       to_pipe0=$(fc_count_log "$name" 'Switched(Pipe)')
-      fwd_burst "$cell$dir" "$dir" "$FWD_STRESS_COUNT" "$FWD_STRESS_PAR"
+      fwd_burst "$cell$dir" "$dir" "$count" "$FWD_STRESS_PAR"
       vc=$(($(fc_count_log "$name" 'does not answer stream ends') - v0c))
-      vd=$(($(as_root grep -c 'does not answer stream ends' /home/rnfil/.local/state/fil/daemon.log 2> /dev/null || echo 0) - ${v0d:-0}))
+      vd=$(($(fwd_daemon_trips) - v0d))
       local rate=n/a
       [[ ${BURST_MS:-0} -gt 0 ]] && rate=$(awk -v n="${BURST_OK:-0}" -v ms="$BURST_MS" 'BEGIN { printf "%.0f", n * 1000 / ms }')
-      note "$cell$dir: net='$net' conns=$FWD_STRESS_COUNT parallel=$FWD_STRESS_PAR ok=$BURST_OK failed=$BURST_FAILED ms=$BURST_MS conns_per_s=$rate ending_trips_client=$vc ending_trips_daemon=$vd link_downs=$(($(link_downs "$name") - downs0)) to_pipe=$(($(fc_count_log "$name" 'Switched(Pipe)') - to_pipe0))"
+      note "$cell$dir: net='$net' conns=$count parallel=$FWD_STRESS_PAR ok=$BURST_OK failed=$BURST_FAILED ms=$BURST_MS conns_per_s=$rate ending_trips_client=$vc ending_trips_daemon=$vd link_downs=$(($(link_downs "$name") - downs0)) to_pipe=$(($(fc_count_log "$name" 'Switched(Pipe)') - to_pipe0))"
       if [[ $vc -gt 0 || $vd -gt 0 ]]; then
         trips=$((trips + 1))
-        known_bug "MAX_ENDING tripped on an honest link: $FWD_STRESS_COUNT -$dir connections, $FWD_STRESS_PAR at a time, over '$net': the link ended as 'the peer does not answer stream ends' $vc time(s) on the client and $vd on the daemon ($BURST_OK of $FWD_STRESS_COUNT connections echoed, $BURST_FAILED failed, at $rate per second)"
+        known_bug "MAX_ENDING tripped on an honest link: $count -$dir connections, $FWD_STRESS_PAR at a time, over '$net': the link ended as 'the peer does not answer stream ends' $vc time(s) on the client and $vd on the daemon ($BURST_OK of $count connections echoed, $BURST_FAILED failed, at $rate per second)"
       fi
-      [[ ${BURST_FAILED:-x} == 0 ]] || known_bug "$cell$dir: $BURST_FAILED of $FWD_STRESS_COUNT short -$dir connections failed over '$net' ($(fpv "$OUT/run/$SCENARIO/$cell$dir.burst" FIRST_ERROR))"
+      [[ ${BURST_FAILED:-x} == 0 ]] || known_bug "$cell$dir: $BURST_FAILED of $count short -$dir connections failed over '$net' ($(fpv "$OUT/run/$SCENARIO/$cell$dir.burst" FIRST_ERROR))"
     done
   done
   note "max_ending_trips=$trips"
+  # For scale: the same burst through ssh -L on the lossy path (one TCP connection, so a lost
+  # packet holds every connection up, as fil's MUX channel does).
+  netem_clear
+  for d in "${NETEM_DEVS[@]}"; do
+    nsx "$NS_R" tc qdisc replace dev "$d" root netem delay 20ms 5ms loss 3% rate 1gbit limit 500
+  done
+  srv_fp serve "127.0.0.1:$FWD_SSH_TARGET" echo > "$OUT/run/$SCENARIO/ssh-echo.out" 2>&1 &
+  lat_wait_listen "$NS_S" "$FWD_SSH_TARGET"
+  client_exec_on x ssh -N -L "127.0.0.1:$FWD_SSH_PORT:127.0.0.1:$FWD_SSH_TARGET" srv > /dev/null 2>&1 &
+  lat_wait_listen "$NS_C" "$FWD_SSH_PORT"
+  local so=$OUT/run/$SCENARIO/sshL.burst
+  client_exec_on x timeout 1200 fwdprobe connect "127.0.0.1:$FWD_SSH_PORT" burst --count "$FWD_STRESS_COUNT" --parallel "$FWD_STRESS_PAR" > "$so" 2>&1 || true
+  note "ssh_L_lossy_reference: conns=$FWD_STRESS_COUNT parallel=$FWD_STRESS_PAR ok=$(fpv "$so" OK) failed=$(fpv "$so" FAILED) ms=$(fpv "$so" MS) conns_per_s=$(awk -v n="$(fpv "$so" OK)" -v ms="$(fpv "$so" MS)" 'BEGIN { if (ms > 0) printf "%.0f", n * 1000 / ms; else print "n/a" }')"
+  lat_stop_listener "$NS_C" "$FWD_SSH_PORT"
+  lat_stop_listener "$NS_S" "$FWD_SSH_TARGET"
   netem_clear
   fwd_after_checks "$name" stress
   fc_detach "$name"

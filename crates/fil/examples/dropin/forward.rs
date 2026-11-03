@@ -251,12 +251,14 @@ fn sess_wait(c: &mut Client, out: &str, timeout: Duration) -> Result<(), String>
     Ok(())
 }
 
-/// The daemon's pid, its resident set (KiB) and its open descriptors, read in the session (the
-/// shell is the daemon's user, so `/proc/PID/fd` is readable). On a host without `/proc` (macOS on
-/// `--local`) the descriptor count is `-1`.
+/// The daemon's pid, its resident set (KiB) and the size of its descriptor table, read in the
+/// session. The daemon is not dumpable (`hardening.rs`), which makes `/proc/PID/fd` root's, so the
+/// count is `FDSize` from `/proc/PID/status`: the table's size, which the kernel grows (in powers
+/// of two) as descriptors are opened and never shrinks, so a leak shows as growth. On a host
+/// without `/proc` (macOS on `--local`) it is `-1`.
 fn daemon_stats(c: &mut Client) -> Result<(u32, u64, i64), String> {
     let out = c.run(
-        "p=$(pgrep -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(if [ -d /proc/$p/fd ]; then ls /proc/$p/fd | wc -l | tr -d ' '; else echo -1; fi)\"",
+        "p=$(pgrep -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(awk '/^FDSize:/ { print $2 }' /proc/$p/status 2>/dev/null || echo -1)\"",
         CMD_TIMEOUT,
     )?;
     let line = out
@@ -1370,12 +1372,30 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
         let (_, rss1, fds1) = daemon_stats(&mut c)?;
         let crss1 = client_rss(&c);
         let grew = rss1 as i64 - rss0 as i64;
+        // A second round: growth that repeats is per connection (a leak); growth that flattens
+        // is the allocator's high-water mark.
+        let (ok2, failed2, _, first2) = burst(ctx, host, &mut c, &p, false, 20_000, 1)?;
+        thread::sleep(Duration::from_secs(2));
+        let (_, rss2, fds2) = daemon_stats(&mut c)?;
+        let crss2 = client_rss(&c);
+        let grew2 = rss2 as i64 - rss1 as i64;
         notes.push(format!(
-            "{}: 20000 sequential -L connections: {ok} echoed, {failed} failed, {:.0}/s; daemon RSS {rss0} -> {rss1} KiB ({grew:+}), fds {fds0} -> {fds1}; client RSS {crss0} -> {crss1} KiB; link downs {}",
+            "{}: 2 x 20000 sequential -L connections: {} echoed, {} failed, {:.0}/s; daemon RSS {rss0} -> {rss1} -> {rss2} KiB ({grew:+}, then {grew2:+}), descriptor table (FDSize) {fds0} -> {fds1} -> {fds2}; client RSS {crss0} -> {crss1} -> {crss2} KiB; link downs {}",
             v.tag(),
+            ok + ok2,
+            failed + failed2,
             ok as f64 * 1000.0 / t.max(1) as f64,
             link_downs(&c) - downs
         ));
+        if grew2 > 1024 && grew2 * 10 >= grew * 8 {
+            notes.push(format!(
+                "{KB}{}: the daemon's RSS grew {grew} KiB over the first 20000 connections and {grew2} KiB over the next: it grows with the connections",
+                v.tag()
+            ));
+        }
+        let (fds1, crss1) = (fds2.max(fds1), crss2.max(crss1));
+        let first = format!("{first}{first2}");
+        let (ok, failed) = (ok.min(ok2), failed + failed2);
         if ok != 20_000 || failed != 0 || ok0 != 2000 || failed0 != 0 {
             notes.push(format!(
                 "{KB}{}: churn: {ok} ok, {failed} failed ({first}{first0})",
@@ -1383,16 +1403,16 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
             ));
         }
         // Bounds: 16 MiB of growth over 20,000 connections (the forward budget per side is 64 MiB,
-        // but an idle session after the burst holds nothing), and the descriptors back where
-        // they were (a few for timing).
+        // but an idle session after the burst holds nothing), and the descriptor table no larger
+        // than it was (it doubles past each power of two, so a leak of even a few hundred shows).
         if grew > 16 * 1024 {
             notes.push(format!(
                 "{KB}{}: the daemon's RSS grew {grew} KiB over 20000 connections",
                 v.tag()
             ));
         }
-        if fds0 >= 0 && fds1 > fds0 + 4 {
-            notes.push(format!("{KB}{}: the daemon's descriptors went from {fds0} to {fds1} over 20000 connections", v.tag()));
+        if fds0 >= 0 && fds1 > fds0 {
+            notes.push(format!("{KB}{}: the daemon's descriptor table grew from {fds0} to {fds1} over 20000 connections", v.tag()));
         }
         if (crss1 as i64 - crss0 as i64) > 16 * 1024 {
             notes.push(format!(

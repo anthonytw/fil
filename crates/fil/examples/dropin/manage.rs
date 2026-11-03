@@ -67,6 +67,11 @@ fn sess_status(c: &mut Client, cmd: &str) -> Result<(String, i32), String> {
 /// `fil forward -L` from inside the session: the client asks; `n` binds nothing; `y` binds, the
 /// forward carries data and `fil ports` shows it as a request the user allowed; `--rm` closes it.
 pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
+    if Ctx::is_local(host) {
+        return skip(
+            "`fil` in the session reaches the daemon of /tmp/fil-$UID, not --local's private one",
+        );
+    }
     let p = mac_ports();
     let port = p.l + 3;
     let mut c = ctx.shell(host, Variant::Auto, "fia")?;
@@ -108,6 +113,21 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
             "{KB}a forward the user refused listens on this machine"
         ));
     }
+    // The refused entry stays in the table, unconsented, and an equal add returns it without a
+    // second question (the client asks once per entry): the yes goes to a spec of its own.
+    let v = ctx.ports_json(host, "dp-fia")?;
+    let refused_row = session_of(&v, "dp-fia")
+        .and_then(|s| s["forwards"].as_array())
+        .and_then(|f| f.iter().find(|f| f["port"] == port).cloned());
+    notes.push(format!(
+        "after `n`, `fil ports --json` shows the entry as consented = {:?}",
+        refused_row.as_ref().map(|r| r["consented"].clone())
+    ));
+    let port = port + 1;
+    let spec = format!("{port}:127.0.0.1:{PL}");
+    ensure(!listening_here(port), || {
+        format!("port {port} is taken on this machine")
+    })?;
     // 2. Allowed.
     let from = c.len();
     c.send(&format!(
@@ -186,6 +206,11 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
 /// daemon refuses it (`NotPermitted`), the client asks nothing, and nothing connects to a canary
 /// listening there.
 pub fn fwd_hostile_remote(ctx: &Ctx, host: &str) -> Res {
+    if Ctx::is_local(host) {
+        return skip(
+            "`fil` in the session reaches the daemon of /tmp/fil-$UID, not --local's private one",
+        );
+    }
     // This machine's address on its network (never printed: notes say `<ip>`).
     let lan = Command::new("ipconfig")
         .args(["getifaddr", "en0"])
@@ -243,6 +268,11 @@ pub fn fwd_hostile_remote(ctx: &Ctx, host: &str) -> Res {
 /// session's shell, are attributed to the session with their pids; the wide one is flagged; the
 /// JSON parses. With python3 on the host, an HTTP server's title is the probe's label.
 pub fn fwd_ports_view(ctx: &Ctx, host: &str) -> Res {
+    if Ctx::is_local(host) {
+        return skip(
+            "`fil` in the session reaches the daemon of /tmp/fil-$UID, not --local's private one",
+        );
+    }
     let mut c = ctx.shell(host, Variant::Auto, "fpv")?;
     let fp = ctx.fp(host);
     let fil = ctx.fil_in(host);
@@ -264,7 +294,7 @@ pub fn fwd_ports_view(ctx: &Ctx, host: &str) -> Res {
     let have_py = c.have("python3")?;
     if have_py {
         c.run(
-            &format!("mkdir -p \"$D/w\" && printf '<html><head><title>dp-probe-page</title></head></html>' > \"$D/w/index.html\" && (cd \"$D/w\" && python3 -m http.server --bind 127.0.0.1 {web} > /dev/null 2>&1 &) ; sleep 1"),
+            &format!("mkdir -p \"$D/w\" && (cd \"$D/w\" && python3 -m http.server --bind 127.0.0.1 {web} > /dev/null 2>&1 &) ; sleep 1"),
             CMD_TIMEOUT,
         )?;
     }
@@ -297,13 +327,19 @@ pub fn fwd_ports_view(ctx: &Ctx, host: &str) -> Res {
         "`fil ports --json` in the session parses; 0.0.0.0:{wide} is the session's with its pid and exposed (asserted: {ok_w}); 127.0.0.1:{narrow} the session's with its pid, not exposed (asserted: {ok_n}); the text view warns about the wide one (asserted: {warned})"
     )];
     if have_py {
+        // The default probe is a HEAD: the label is the Server header (the page title needs
+        // `ports.probe = "full"`, crates/fil-daemon/src/ports/probe.rs).
         let label = find(web).and_then(|l| l["probe"]["label"].as_str().map(String::from));
         let kind = find(web).and_then(|l| l["probe"]["kind"].as_str().map(String::from));
+        let status = find(web).and_then(|l| l["probe"]["http_status"].as_u64());
         notes.push(format!(
-            "python3 http.server: probe kind {kind:?}, label {label:?}"
+            "python3 http.server: probe kind {kind:?}, status {status:?}, label {label:?} (the Server header: the default probe is a HEAD)"
         ));
-        if label.as_deref() != Some("dp-probe-page") {
-            notes.push(format!("{KB}the HTTP probe did not label the session's web server with its title (kind {kind:?}, label {label:?})"));
+        if kind.as_deref() != Some("http")
+            || status != Some(200)
+            || !label.as_deref().is_some_and(|l| l.contains("SimpleHTTP"))
+        {
+            notes.push(format!("{KB}the HTTP probe did not identify the session's web server (kind {kind:?}, status {status:?}, label {label:?})"));
         }
     } else {
         notes.push("no python3 on the host: the HTTP label is not checked here (the realnet and unit tests cover the probe)".into());
@@ -321,6 +357,11 @@ pub fn fwd_ports_view(ctx: &Ctx, host: &str) -> Res {
 /// `fil detach` with no arguments, inside the session: the attached client is told and exits 1;
 /// the session lives on.
 pub fn detach_inside(ctx: &Ctx, host: &str) -> Res {
+    if Ctx::is_local(host) {
+        return skip(
+            "`fil` in the session reaches the daemon of /tmp/fil-$UID, not --local's private one",
+        );
+    }
     let mut c = ctx.shell(host, Variant::Auto, "din")?;
     let fil = ctx.fil_in(host);
     c.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;

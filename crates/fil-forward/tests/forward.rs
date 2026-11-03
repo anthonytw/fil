@@ -179,7 +179,33 @@ async fn reset_propagates(t: Transport) {
 /// accepted and wait for a channel (within `open_wait`), oldest first.
 async fn concurrent_connections(t: Transport) {
     let n = env_or("FIL_FORWARD_CONCURRENT", 1000);
-    let server = echo_server().await;
+    // The server answers nobody until `hold` connections reached it: that many channels are
+    // then open at once (DESIGN.md section 15, M2: 200 concurrent forwarded connections).
+    let hold = n.min(200) as usize;
+    let (reached_tx, reached) = tokio::sync::watch::channel(0usize);
+    let reached_tx = Arc::new(reached_tx);
+    // Connections the server holds at once (through the forward, so each is a channel).
+    let live = Arc::new(AtomicUsize::new(0));
+    let live_peak = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let (live, live_peak) = (live.clone(), live_peak.clone());
+        serve(move |mut s| {
+            let reached_tx = reached_tx.clone();
+            let mut reached = reached.clone();
+            let (live, live_peak) = (live.clone(), live_peak.clone());
+            async move {
+                live_peak.fetch_max(live.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                reached_tx.send_modify(|r| *r += 1);
+                let mut req = Vec::new();
+                if s.read_to_end(&mut req).await.is_ok() {
+                    let _ = reached.wait_for(|r| *r >= hold).await;
+                    let _ = s.write_all(&req).await;
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .await
+    };
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
     let peak = Arc::new(AtomicUsize::new(0));
@@ -225,11 +251,15 @@ async fn concurrent_connections(t: Transport) {
     sampler.abort();
     let peak = peak.load(Ordering::Relaxed);
     eprintln!(
-        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once",
+        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once (sampled)",
         t0.elapsed()
     );
     assert!(peak <= fil_proto::limits::MAX_OPEN_CHANNELS, "{peak}");
-    assert!(peak > 1, "the connections never overlapped");
+    let live_peak = live_peak.load(Ordering::SeqCst);
+    assert!(
+        live_peak >= hold,
+        "{live_peak} connections at once, wanted {hold}"
+    );
     w.settled().await;
     assert_eq!(server.accepted.load(Ordering::SeqCst), n as usize);
 }

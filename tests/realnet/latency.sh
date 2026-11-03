@@ -119,8 +119,10 @@ l_nodelay() {
   as_root rm -f "$sshd_trace"
   nsx "$NS_S" strace -f -e trace=setsockopt -o "$sshd_trace" \
     /usr/sbin/sshd -D -E "$OUT/logs/sshd-trace.log" -f "$cfg" &
-  local srv=$! i
-  trap 'lat_stop_listener "$NS_S" "$SSHD_TRACE_PORT"; wait "$srv" 2> /dev/null' EXIT
+  # Global, not local: the EXIT trap runs after this function has returned.
+  LAT_SSHD_PID=$!
+  local i
+  trap 'lat_stop_listener "$NS_S" "$SSHD_TRACE_PORT"; wait "$LAT_SSHD_PID" 2> /dev/null' EXIT
   for ((i = 0; i < 100; i++)); do
     client_exec_on x ssh -T -p "$SSHD_TRACE_PORT" srv true > /dev/null 2>&1 && break
     sleep 0.2
@@ -236,13 +238,14 @@ lat_cell() {
   local kind=$1 rate=$2 load=$3 tag settle=500 cmd
   case $kind in
     ssh) tag=s$load$rate cmd=(ssh -tt srv) ;;
+    sshno) tag=n$load$rate cmd=(ssh -tt -o ObscureKeystrokeTiming=no srv) ;;
     pipe) tag=p$load$rate cmd=(fil --transport pipe srv "latp$load$rate") ;;
     quic) tag=q$load$rate cmd=(fil --transport direct srv "latq$load$rate") settle=3000 ;;
   esac
   log "=== cell $tag: $kind at $rate keys/s ($load)"
   lat_kp "$tag" "$rate" "$settle" -- "${cmd[@]}" || fail "$tag: keyprobe failed: $(cat "$OUT/run/$SCENARIO-$tag.err" "$OUT/run/$SCENARIO-$tag.keyprobe" 2> /dev/null | tail -n 5)"
   lat_finish "$kind" "$tag" "$load" "$rate"
-  if [[ $kind != ssh ]]; then
+  if [[ $kind == pipe || $kind == quic ]]; then
     lat_check_path "$tag" "$kind" "$(kv "$(last_line "$OUT/run/$SCENARIO-$tag.keyprobe" KEYPROBE)" first_key_ms)"
     cx_fk "${cmd[-1]}"
   fi
@@ -257,14 +260,19 @@ l_keys_idle() {
   for kind in ssh pipe quic; do
     for rate in "${LAT_RATES[@]}"; do lat_cell "$kind" "$rate" rtt; done
   done
+  # ssh 9.5 and later send keystrokes of an interactive session at 20 ms intervals
+  # (ObscureKeystrokeTiming). One more path with that off, to see what it costs.
+  lat_cell sshno 20 rtt
   lat_net clean
-  for kind in ssh pipe quic; do lat_cell "$kind" 20 local; done
+  for kind in ssh sshno pipe quic; do lat_cell "$kind" 20 local; done
   lat_compare 20
 }
 
 # lat_compare RATE: fil's p50 and p99 minus ssh -tt's at RATE keys/s on the 40 ms network.
 lat_compare() {
   local r=$1 kind f
+  note "ssh_minus_sshno.p50_ms_at_$r=$(awk -v a="$(lat_cell_field "$(lat_tag_of ssh rtt "$r")" p50_ms)" \
+    -v b="$(lat_cell_field "$(lat_tag_of sshno rtt "$r")" p50_ms)" 'BEGIN { printf "%+.1f", a - b }')"
   for kind in pipe quic; do
     for f in p50_ms p99_ms; do
       note "${kind}_minus_ssh.${f}_at_$r=$(awk -v a="$(lat_cell_field "$(lat_tag_of "$kind" rtt "$r")" "$f")" \
@@ -276,6 +284,7 @@ lat_compare() {
 lat_tag_of() {
   case $1 in
     ssh) printf 's%s%s' "$2" "$3" ;;
+    sshno) printf 'n%s%s' "$2" "$3" ;;
     pipe) printf 'p%s%s' "$2" "$3" ;;
     quic) printf 'q%s%s' "$2" "$3" ;;
   esac
@@ -400,6 +409,15 @@ l_keys_bulk() {
 # ---------------------------------------------------------------------------------------------
 # 4. Catch-up
 
+# lat_drain_field FILE KEY: KEY of each DRAIN run line, one per line.
+lat_drain_field() {
+  local l
+  grep -a '^DRAIN run=' "$1" | while read -r l; do
+    kv "$l" "$2"
+    echo
+  done
+}
+
 # l_catchup: a 4 MB `cat` (50000 lines) read by a consumer that parses nothing and throws
 # everything away (keyprobe drain), LAT_CATCH_RUNS times per cell: how many runs make the daemon
 # jump to a snapshot (the `fil: skipped` marker). `ssh -tt` is the control: it must deliver
@@ -407,7 +425,8 @@ l_keys_bulk() {
 l_catchup() {
   client_exec_on x mkdir -p "$PD"
   local net kind tag big=/tmp/rn-lat-big.txt cmd line sum
-  trap 'rm -f "$big"' EXIT
+  # The file is made by the server-side user in a sticky /tmp.
+  trap 'as_root rm -f "$big"' EXIT
   for net in clean rtt; do
     lat_net "$net"
     for kind in ssh pipe quic; do
@@ -431,10 +450,10 @@ l_catchup() {
       cat "$OUT/run/$SCENARIO-$tag.drain" >&2
       sum=$(last_line "$OUT/run/$SCENARIO-$tag.drain" DRAIN-SUMMARY)
       printf -v "FC_WHERE_$tag" x
-      note "catchup.$kind.$net=$(kv "$sum" runs_with_marks)/$(kv "$sum" runs) marks=$(kv "$sum" marks) ms=$(grep -a '^DRAIN run=' "$OUT/run/$SCENARIO-$tag.drain" | while read -r line; do kv "$line" ms; done | paste -sd, -)"
+      note "catchup.$kind.$net=$(kv "$sum" runs_with_marks)/$(kv "$sum" runs) marks=$(kv "$sum" marks) ms=$(lat_drain_field "$OUT/run/$SCENARIO-$tag.drain" ms | paste -sd, -)"
       if [[ $kind == ssh ]]; then
         # The control: every one of the 50000 lines reached the consumer, in every run.
-        for line in $(grep -a '^DRAIN run=' "$OUT/run/$SCENARIO-$tag.drain" | while read -r l; do kv "$l" tally; done); do
+        for line in $(lat_drain_field "$OUT/run/$SCENARIO-$tag.drain" tally); do
           [[ $line -eq 50000 ]] || fail "$tag: the consumer saw $line of 50000 lines through ssh: it is not a fast consumer"
         done
       else

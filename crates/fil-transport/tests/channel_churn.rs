@@ -31,7 +31,21 @@ const WINDOW: u32 = 16;
 /// What either side may hold per channel at any moment: the channels in flight, the ones whose
 /// stream end is still on its way, and the fixed channels. The churns carry thousands of times
 /// more channels than this over their life.
+///
+/// "On its way" is the one term the window does not bound: the client opens the next channel
+/// when a reply has arrived, not when the peer has answered the end marker of an earlier one
+/// (that answer travels on the control channel, behind other work). With the clock virtual
+/// (the pipe and netsim churns) the answers keep step and this bound holds exactly. With a real
+/// clock on a loaded machine the answers can fall behind by hundreds (364 seen, with 28 busy
+/// loops on 14 cores): see [`HELD_BOUND_REAL_CLOCK`].
 const HELD_BOUND: usize = 2 * WINDOW as usize + 4;
+
+/// What the real-clock churn may hold per side: [`HELD_BOUND`], plus the unanswered stream ends
+/// an honest peer may leave outstanding, which is the stream credit it was granted
+/// (`quic::pinned::MAX_STREAMS`; `MAX_ENDING` in `quic.rs`). That is the link's own limit, not a
+/// tuned number, and it is still far below the 20,000 channels carried, so a leak that grows
+/// with the channels is caught here, and any leak at all by `assert_quic_idle`.
+const HELD_BOUND_REAL_CLOCK: usize = quic::pinned::MAX_STREAMS as usize + HELD_BOUND;
 
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -170,13 +184,13 @@ async fn assert_quic_idle(client: &QuicLink, daemon: &QuicLink) {
 /// carried. This is a backstop for leaks the size of a task (a writer task or a quinn stream per
 /// channel): its limit would let about 230 bytes a channel through, so the proof that no map entry
 /// is kept per channel is the `channel_state` bound, not this.
-fn assert_rss_flat(what: &str, c: &Churn) {
+fn assert_rss_flat(what: &str, c: &Churn, bound: usize) {
     let grew = c.rss_end.saturating_sub(c.rss_early);
     eprintln!(
         "{what}: held at most {} per side, RSS {} KiB after 2,000 channels, {} KiB at the end (+{grew} KiB)",
         c.held_max, c.rss_early, c.rss_end
     );
-    assert!(c.held_max <= HELD_BOUND, "{what}: {c:?}");
+    assert!(c.held_max <= bound, "{what}: bound {bound}: {c:?}");
     assert!(grew <= 4 * 1024, "{what}: RSS grew by {grew} KiB: {c:?}");
 }
 
@@ -211,7 +225,7 @@ async fn twenty_thousand_sequential_channels_on_one_quic_link_over_loopback() {
     let (client, daemon) = (Arc::new(client), Arc::new(daemon));
     let c = churn(client.clone(), daemon.clone(), 20_000, 2_000, quic_held).await;
     assert_quic_idle(&client, &daemon).await;
-    assert_rss_flat("QUIC over loopback", &c);
+    assert_rss_flat("QUIC over loopback", &c, HELD_BOUND_REAL_CLOCK);
 }
 
 #[tokio::test(start_paused = true)]
@@ -249,7 +263,7 @@ async fn twenty_thousand_sequential_channels_on_one_quic_link_over_netsim() {
     let (client, daemon) = (Arc::new(client), Arc::new(daemon));
     let c = churn(client.clone(), daemon.clone(), 20_000, 2_000, quic_held).await;
     assert_quic_idle(&client, &daemon).await;
-    assert_rss_flat("QUIC over fil-netsim", &c);
+    assert_rss_flat("QUIC over fil-netsim", &c, HELD_BOUND);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -60,16 +60,16 @@ Do not run two copies at once. `reset` kills everything the account runs.
 
 ## Results
 
-Run on 2026-11-02 (ET), binary sha256 `c2bd1214…`, client built from this branch on macOS aarch64. The Mac is on a different subnet from the Pis, across the home router. All scenarios passed on both Pis. Times are single runs from this network; the two Pis agree within noise.
+Run on 2026-11-02 (ET) on main at a472d35 plus this branch: Pi binary sha256 `ced51e9d…` (from the `aarch64` job, run 41569420955), client built from the same tree on macOS aarch64. An earlier run on the tree before #25 to #27 gave the same results. The Mac is on a different subnet from the Pis, across the home router. All scenarios passed on both Pis. Times are single runs from this network; the two Pis agree within noise.
 
 | Scenario | What the driver checks | mars | venus |
 |---|---|---|---|
-| attach and detach | attach, run a command, `~.` | first prompt 496 ms (ssh login about 400 ms of it); round trip 7 ms; client gone 6 ms after `~.` | 811 ms; 15 ms; 7 ms |
-| reattach | a second client sees the earlier output and the same shell (a shell variable) | earlier output on screen after 163 ms | 280 ms |
-| `fil ls`, `detach`, `kill` | `ls` lists the session; `detach` tells the attached client, which exits 1 when it declines to reattach; `kill` ends the client and the session | `ls` 187 ms; detach told after 1.4 s; kill: client exit 129 | 183 ms; 1.0 s; 129 |
-| takeover | a second client takes the session; the first is told | second client sees the session in 232 ms; first told 240 ms after the second started, exits 1 | 174 ms; 196 ms; exits 1 |
-| killed ssh | `kill -9` the local ssh child mid-session, with input typed right after | same shell back, the typed command ran: 1253 ms; second kill 2191 ms | 1136 ms; 2210 ms |
-| daemon restart | client offline, gate `reset`, client may log in again | "is a different session now" prompt 4.6 s after it could log in; after `y` a fresh shell (the old variable gone) | 3.6 s; same |
+| attach and detach | attach, run a command, `~.` | first prompt 806 ms (the ssh login is about 400 ms of it); round trip 7 ms; client gone 7 ms after `~.` | 560 ms; 5 ms; 6 ms |
+| reattach | a second client sees the earlier output and the same shell (a shell variable) | earlier output on screen after 229 ms | 175 ms |
+| `fil ls`, `detach`, `kill` | `ls` lists the session; `detach` tells the attached client, which exits 1 when it declines to reattach; `kill` ends the client and the session | `ls` 173 ms; detach told after 1.3 s; kill: client exit 129 | 192 ms; 1.1 s; 129 |
+| takeover | a second client takes the session; the first is told | second client sees the session in 188 ms; first told 216 ms after the second started, exits 1 | 165 ms; 195 ms; exits 1 |
+| killed ssh | `kill -9` the local ssh child mid-session, with input typed right after | same shell back, the typed command ran: 1336 ms; second kill 2556 ms | 1010 ms; 2381 ms |
+| daemon restart | client offline, gate `reset`, client may log in again | "is a different session now" prompt 3.8 s after it could log in; after `y` a fresh shell (the old variable gone) | 4.7 s; same |
 | lingering | detach, wait 40 s with no login, the shell kept running and its output waited in the session | yes; the shell ran in a `fil session` systemd scope | yes; same |
 | direct mode | does it move to QUIC? | **no**: stayed on the pipe | **no**: stayed on the pipe |
 
@@ -84,6 +84,8 @@ Why it fails: a UDP probe to mars on ports 9, 40000, 60001, 60500, 60999 and 610
 - **`reset` can take 90 seconds.** It stops the daemon's systemd scope with SIGTERM; an interactive bash ignores SIGTERM, so with a live shell it waits for the unit's 90 s stop timeout, then SIGKILLs. A client attached at the time sees "session killed by signal 9" after about 91 s (observed on mars). End sessions with `fil kill` first, as the driver does, or replace the shell with `exec sleep N`.
 - **`reset` restarts the whole systemd user manager** (it kills every process of the account, `systemd --user` included, and lingering starts it again). That is harmless for fil.
 - **The `logs` verb shows the user journal**, which has the `Started fil-SESSION-….scope` line for each session (it proves the process-scope path). fil keeps no daemon log file there.
+
+Runs: the `aarch64` job builds, [run 41565928944](https://github.com/anthonytw/fil/actions/runs/41565928944) (first tree) and [run 41569420955](https://github.com/anthonytw/fil/actions/runs/41569420955) (merged tree).
 
 ## Findings
 

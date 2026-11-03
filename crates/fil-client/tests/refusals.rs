@@ -182,12 +182,14 @@ async fn a_session_detached_from_elsewhere_offers_to_attach_again() {
         rig.term.text().contains("detached from elsewhere")
     })
     .await;
+    // The daemon told the client: it did not reconnect to find out.
+    assert_eq!(rig.daemon.attaches().await.len(), 1);
     rig.type_str("y");
     until_async("the fresh attach", 30, || async {
-        rig.daemon.attaches().await.len() == 3
+        rig.daemon.attaches().await.len() == 2
     })
     .await;
-    assert!(rig.daemon.attaches().await[2].resume.is_none());
+    assert!(rig.daemon.attaches().await[1].resume.is_none());
 }
 
 #[tokio::test(start_paused = true)]

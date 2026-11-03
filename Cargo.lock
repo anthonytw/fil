@@ -406,6 +406,7 @@ dependencies = [
  "fil-proto",
  "fil-term",
  "fil-transport",
+ "portable-pty",
  "rustix",
  "serde",
  "thiserror 2.0.21",
@@ -413,6 +414,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vt100",
 ]
 
 [[package]]

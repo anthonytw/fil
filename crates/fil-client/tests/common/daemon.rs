@@ -556,7 +556,8 @@ impl FakeDaemon {
         self.st.lock().await.refuse_next = Some(r);
     }
 
-    /// Another terminal ran `fil detach`.
+    /// Another terminal ran `fil detach`. Like the real daemon: the attached client is sent
+    /// `Detach`, the link is flushed (bounded) so the message arrives, and then it is closed.
     pub async fn detach_elsewhere(&self) {
         let mut st = self.st.lock().await;
         let e = st.epoch.epoch();
@@ -564,6 +565,8 @@ impl FakeDaemon {
         if let Some(id) = st.current.take()
             && let Some(c) = st.conns.remove(&id)
         {
+            let _ = send(&c.link, &ControlMsg::Detach).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), c.link.flush()).await;
             c.control.kill(DownReason::Closed);
         }
     }

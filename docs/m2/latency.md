@@ -34,19 +34,20 @@ It cannot run on macOS or without root (network namespaces, `tc netem`). The sce
 | `results-latency-cells.tsv` | one row per keystroke cell: transport, load, keys/s, sent, echoed, lost, min, p50, p90, p99, max (ms) |
 | `run/l_nodelay-*`, `run/lat-strace-*.txt` | the raw `strace` output of both ssh ends and of the real fil pipe |
 | `run/SCENARIO-TAG.keyprobe`, `.drain` | each `keyprobe` result line |
-| `logs/` | the per-scenario logs (the fil client's debug log of each cell stays in its state directory on the runner; the path check reads it while the cell runs) |
+| `run/SCENARIO-TAG.clientlog` | the fil client's debug log of each fil cell (what the path check read) |
+| `logs/` | the per-scenario logs |
 
 ## The topology
 
 The `udp` part's, unchanged (`docs/m1/realnet.md`, "Direct: network namespaces"): client, router and server namespaces, NAT on the router, `tc netem` on its three egress interfaces so every packet crosses exactly one instance, and the runner's own `sshd` in the server namespace. The client is a throwaway user (`rnclient`), the server account `rnfil`, both made for the run and removed at its end. `latency.sh` sources `udp.sh` for all of it.
 
-The network of a cell, unless it says otherwise: **one-way delay 20 ms with 5 ms of jitter, so a round trip of 40 ms, +-5 ms per direction** (`LAT_DELAY_MS`, `LAT_JITTER_MS`), at `rate 1gbit`. The `rate` keyword is what keeps netem's jitter from reordering packets (`s_netem_reorder_probe` shows that plain jitter does reorder, and a reordering network would measure TCP's reaction to reordering, not Nagle). The bulk scenario replaces the rate with a bottleneck, described below.
+The network of a cell, unless it says otherwise: **one-way delay 20 ms with 5 ms of jitter, so a round trip of 40 ms with up to +-10 ms of spread (+-5 ms in each direction)** (`LAT_DELAY_MS`, `LAT_JITTER_MS`), at `rate 1gbit`. The `rate` keyword is what keeps netem's jitter from reordering packets (`s_netem_reorder_probe` shows that plain jitter does reorder, and a reordering network would measure TCP's reaction to reordering, not Nagle). The bulk scenario replaces the rate with a bottleneck, described below.
 
 ## The tool: `keyprobe`
 
 `crates/fil-testbins/src/bin/keyprobe.rs`, a static test program like the rest of `fil-testbins`. It runs a command on a pty (30 rows by 100 columns) and has two modes.
 
-**`keyprobe keys`** types one key every 1/rate seconds, on a fixed schedule: the n-th key is due at start + n/rate however late the previous echo was, so a slow path cannot slow the typing down (it would hide the queueing it is meant to show). Each key is timestamped just before it is written to the pty. A reader thread timestamps every chunk of output as soon as the read returns. The keys are `a` to `z` in turn; the i-th byte read that equals the i-th key sent is its echo. Any other byte is counted (`unexpected`) and skipped; a key that never comes back is `lost`. The first 10 keys are warm-up and left out.
+**`keyprobe keys`** types one key every 1/rate seconds, on a fixed schedule: the n-th key is due at start + n/rate however late the previous echo was, so a slow path cannot slow the typing down (it would hide the queueing it is meant to show). Each key is timestamped just before it is written to the pty. A reader thread timestamps every chunk of output as soon as the read returns. The keys are 62 symbols in turn (`a`-`z`, `A`-`Z`, `0`-`9`). Echoes come back in order, so a byte that equals the next expected key is its echo; a byte that equals a later key's symbol means the keys in between got no echo, and they are `lost` (one lost echo costs one key, not the rest of the run); any other byte is counted (`unexpected`) and skipped. Percentiles are over the keys that came back, so they are optimistic when `lost` is not 0; `lost` is always printed next to them. The first 10 keys are warm-up and left out.
 
 With `--shell`, the command is an interactive shell (`ssh -tt srv`, `fil srv name`), and `keyprobe` types
 
@@ -80,7 +81,8 @@ Three paths, three typing rates, the 40 ms network:
 
 | Path | Command |
 |---|---|
-| `ssh` | `ssh -tt srv`: the raw baseline, a terminal session of plain OpenSSH with `TCP_NODELAY` set |
+| `ssh` | `ssh -tt srv`: the raw baseline, a terminal session of plain OpenSSH |
+| `sshno` | the same with `-o ObscureKeystrokeTiming=no` (20 and no-netem cells only; see the results) |
 | `pipe` | `fil --transport pipe srv NAME`: fil over `ssh -T` |
 | `quic` | `fil --transport direct srv NAME`: fil over QUIC, after the move from the pipe |
 
@@ -104,7 +106,7 @@ For each load the scenario notes `p50_vs_idle` and applies H1's rule, `h1_rule_e
 
 ## Measurement 4: how often catch-up fires (`l_catchup`, and the Pis)
 
-A 4 MB file (50000 lines of 79 bytes, `LINE-000001 ...`) is `cat`ted in the session, `LAT_CATCH_RUNS` (5) times per cell, by `keyprobe drain`: the consumer reads at full speed and discards. A run counts as a catch-up run if the output contained the daemon's `fil: skipped` marker (DESIGN.md section 6.2: the subscriber fell more than 1 MiB or 2 s behind, so the daemon jumped to a snapshot). Cells: `ssh -tt` as the control (it must deliver all 50000 `LINE-` tokens in every run; if it does not, the consumer is not fast and the scenario fails), fil on the pipe, fil on QUIC; each on the clean network and on the 40 ms one. The note `catchup.KIND.NET=W/R marks=M ms=...` gives the runs with a marker out of R, the marker total and the time of each run.
+A 4.0 MB file (55000 lines of 73 bytes, `LINE-000001 ...`) is `cat`ted in the session, `LAT_CATCH_RUNS` (5) times per cell, by `keyprobe drain`: the consumer reads at full speed and discards. A run counts as a catch-up run if the output contained the daemon's `fil: skipped` marker (DESIGN.md section 6.2: the subscriber fell more than 1 MiB or 2 s behind, so the daemon jumped to a snapshot). Cells: `ssh -tt` as the control (it must deliver all 55000 `LINE-` tokens in every run; if it does not, the consumer is not fast and the scenario fails), fil on the pipe, fil on QUIC; each on the clean network and on the 40 ms one. The note `catchup.KIND.NET=W/R marks=M ms=...` gives the runs with a marker out of R, the marker total and the time of each run.
 
 Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-` tally of a fil run can exceed the lines "kept" (the Pi suite counts lines on the screen instead). And the consumer is a pty reader that parses nothing: a real terminal emulator is slower, so this is the lower bound on how often catch-up fires on real use.
 
@@ -134,7 +136,7 @@ Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-
    ```bash
    XDG_STATE_HOME=$(mktemp -d) FIL_LOG=debug target/release/keyprobe drain \
      --settle-ms 3000 --repeat 20 --timeout 150 \
-     --setup "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 50000 > /tmp/big.txt; echo KP-READY-\$((6*7))" \
+     --setup "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 55000 > /tmp/big.txt; echo KP-READY-\$((6*7))" \
      --ready KP-READY-42 --run 'cat /tmp/big.txt; echo CATEND-$((6*7))' --end CATEND-42 --tally LINE- \
      -- target/release/fil --config pi.toml pi1 latcatch
    ```

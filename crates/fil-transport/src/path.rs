@@ -56,12 +56,18 @@
 //! - **The pipe is closed only after the switch.** `ClosePipe` follows `Switched(Direct)`, not
 //!   `DirectUp`, so a direct link that comes up but cannot resume the session never costs the
 //!   working pipe.
-//! - **A network-change hint is a nudge, not a command.** It clears the backoff and tries direct
-//!   at once, but at most once per [`PathConfig::hint_cooldown`] (hints inside the window are
-//!   coalesced into one timer), it restarts a waiting pipe only if the last pipe run began at
-//!   least [`PathConfig::hint_pipe_gap`] ago, and only [`PathConfig::hint_budget`] hints are
-//!   honoured per [`PathConfig::hint_window`]. A network that reports a change every second for
-//!   an hour therefore costs a few attempts a minute, not a few a second.
+//! - **A network-change hint is a nudge, not a command.** It clears the direct backoff and tries
+//!   direct at once, but at most once per [`PathConfig::hint_cooldown`] (hints inside the window
+//!   are coalesced into one timer), and only [`PathConfig::hint_budget`] hints are honoured per
+//!   [`PathConfig::hint_window`]. A network that reports a change every second for an hour
+//!   therefore costs a few attempts a minute, not a few a second.
+//! - **For the pipe a hint ends the current wait, once.** It does not reset the failure count, so
+//!   each hint is worth about one run and the backoff keeps growing while runs fail. The pipe
+//!   restarts at once if the last pipe run began at least [`PathConfig::hint_pipe_gap`] ago,
+//!   otherwise when that gap is over (deferred, not dropped: the pipe must not sit in a 30 s
+//!   backoff after the network is back). A hint that arrives while a pipe run is in flight (ssh
+//!   waiting on its connect timeout, say) is remembered for that run: if it fails, the pipe is
+//!   treated as if the hint had found it waiting. This holds in every setting.
 //! - **Direct goes first after a loss, the pipe second.** When direct was healthy until it died,
 //!   the manager redials at once and gives it `fallback_after` before starting an ssh login. When
 //!   direct has been failing, the pipe starts at once: waiting would only delay a session that
@@ -101,7 +107,8 @@ pub struct PathConfig {
     pub stable_after: Duration,
     /// Network-change hints closer together than this are merged.
     pub hint_cooldown: Duration,
-    /// A hint restarts a waiting pipe only if the last pipe run started this long ago.
+    /// A hint restarts a waiting pipe at once only if the last pipe run started this long ago;
+    /// otherwise the restart waits until it did.
     pub hint_pipe_gap: Duration,
     /// At most this many hints are honoured in any `hint_window`; the rest are ignored. It
     /// bounds the work a network that keeps flapping can cause.
@@ -192,6 +199,9 @@ pub enum PathTimer {
     PipeFallback,
     /// A network-change hint that arrived inside the cooldown.
     Hint,
+    /// A hint that found the pipe waiting but the last pipe run too recent: restart the pipe
+    /// when [`PathConfig::hint_pipe_gap`] has passed.
+    PipeHint,
 }
 
 /// What the client should do. Actions are returned in order.
@@ -243,6 +253,7 @@ struct Pending {
     pipe_retry: bool,
     pipe_fallback: bool,
     hint: bool,
+    pipe_hint: bool,
 }
 
 impl Pending {
@@ -252,6 +263,7 @@ impl Pending {
             PathTimer::PipeRetry => &mut self.pipe_retry,
             PathTimer::PipeFallback => &mut self.pipe_fallback,
             PathTimer::Hint => &mut self.hint,
+            PathTimer::PipeHint => &mut self.pipe_hint,
         }
     }
 }
@@ -289,6 +301,10 @@ pub struct PathManager {
     pending: Pending,
     hints: VecDeque<Instant>,
     last_pipe_start: Option<Instant>,
+    /// A hint was honoured while the current pipe run was in flight. If that run fails, the
+    /// network may have come back during the attempt: the pipe restarts as for a hint that
+    /// found it waiting (after the gap), not after the backoff.
+    hint_during_pipe_run: bool,
     last_direct_error: Option<DownReason>,
     rng: u64,
 }
@@ -311,6 +327,7 @@ impl PathManager {
             pending: Pending::default(),
             hints: VecDeque::new(),
             last_pipe_start: None,
+            hint_during_pipe_run: false,
             last_direct_error: None,
             rng: cfg.jitter_seed | 1,
         }
@@ -394,6 +411,7 @@ impl PathManager {
             return; // a duplicate report
         }
         self.pipe = Lane::Up;
+        self.hint_during_pipe_run = false;
         self.pipe_up_at = Some(now);
         self.cancel(PathTimer::PipeRetry, out);
         self.cancel(PathTimer::PipeFallback, out);
@@ -417,7 +435,11 @@ impl PathManager {
             _ => None, // stale: nothing of ours is running
         };
         let Some(lived) = lived else { return };
+        let hinted_during_run = std::mem::take(&mut self.hint_during_pipe_run);
         self.pipe_gone(lived, out);
+        if hinted_during_run && self.pipe == Lane::Waiting {
+            self.restart_waiting_pipe(now, out);
+        }
     }
 
     /// The pipe run failed or the pipe link is gone, after `lived` of being up.
@@ -524,6 +546,7 @@ impl PathManager {
         if kind == LinkKind::Direct {
             self.cancel(PathTimer::PipeRetry, out);
             self.cancel(PathTimer::PipeFallback, out);
+            self.cancel(PathTimer::PipeHint, out);
         }
     }
 
@@ -578,13 +601,40 @@ impl PathManager {
             self.direct = Lane::Idle;
             self.cancel(PathTimer::DirectRetry, out);
         }
-        let pipe_gap_ok = self
-            .last_pipe_start
-            .is_none_or(|t| now.duration_since(t) >= self.cfg.hint_pipe_gap);
-        if self.pipe == Lane::Waiting && pipe_gap_ok {
-            self.pipe_failures = 0;
-            self.pipe = Lane::Idle;
-            self.cancel(PathTimer::PipeRetry, out);
+        if self.pipe == Lane::Busy {
+            self.hint_during_pipe_run = true;
+        }
+        self.restart_waiting_pipe(now, out);
+    }
+
+    /// A hint found (or a deferred hint finds) the pipe waiting out its backoff: end the wait so
+    /// the pipe starts now, unless the last run began less than `hint_pipe_gap` ago. Then the
+    /// restart is deferred to the end of that gap, not dropped: the hint is often the network
+    /// coming back, and dropping it would leave the pipe in a backoff of up to `pipe_retry_max`.
+    /// The failure count is kept, so a hint is worth one run and the backoff still grows if that
+    /// run fails; only a link that stays up resets it.
+    fn restart_waiting_pipe(&mut self, now: Instant, out: &mut Vec<PathAction>) {
+        if self.pipe != Lane::Waiting {
+            return;
+        }
+        let wait = self.last_pipe_start.and_then(|t| {
+            (self.cfg.hint_pipe_gap)
+                .checked_sub(now.duration_since(t))
+                .filter(|d| !d.is_zero())
+        });
+        match wait {
+            None => {
+                // The wait is over, but the failures still count: the next failure waits
+                // longer. A hint is worth one run, not a restart of the whole backoff.
+                self.pipe = Lane::Idle;
+                self.cancel(PathTimer::PipeRetry, out);
+                self.cancel(PathTimer::PipeHint, out);
+            }
+            Some(wait) => {
+                if !self.pending.pipe_hint {
+                    self.schedule(PathTimer::PipeHint, wait, out);
+                }
+            }
         }
     }
 
@@ -610,6 +660,7 @@ impl PathManager {
                 }
             }
             PathTimer::Hint => self.apply_hint(now, out),
+            PathTimer::PipeHint => self.restart_waiting_pipe(now, out),
         }
     }
 
@@ -679,8 +730,10 @@ impl PathManager {
     fn start_pipe(&mut self, now: Instant, out: &mut Vec<PathAction>) {
         self.pipe = Lane::Busy;
         self.last_pipe_start = Some(now);
+        self.hint_during_pipe_run = false;
         self.cancel(PathTimer::PipeRetry, out);
         self.cancel(PathTimer::PipeFallback, out);
+        self.cancel(PathTimer::PipeHint, out);
         out.push(PathAction::RunPipe);
     }
 

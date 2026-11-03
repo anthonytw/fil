@@ -403,6 +403,7 @@ dependencies = [
  "clap",
  "fil-client",
  "fil-daemon",
+ "fil-forward",
  "fil-proto",
  "fil-session",
  "fil-term",
@@ -425,6 +426,7 @@ name = "fil-client"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "fil-forward",
  "fil-predict",
  "fil-proto",
  "fil-term",

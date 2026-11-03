@@ -58,11 +58,26 @@ fn the_first_run_shows_the_pipe_commands_stderr() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Until the forwards are connected to the engine (M2 in progress), a forward on the command line
-/// is refused before anything is dialed: never accepted and silently dropped. A bad spec is a
-/// usage error.
+/// A port nothing listens on right now, in both loopback families (a `-L` binds both).
+fn free_port() -> u16 {
+    loop {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        match std::net::TcpListener::bind(("::1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            _ => return port,
+        }
+    }
+}
+
+/// What a run without a terminal says once it is past the forwards (it would attach next).
+const PAST_FORWARDS: &str = "needs a terminal";
+
+/// Forwards on the command line are carried to the attach; `-A` is refused before
+/// anything is dialed until the agent relay is connected: never accepted and silently dropped.
+/// A bad spec is a usage error.
 #[test]
-fn forward_flags_are_refused_until_they_are_connected_and_bad_ones_are_usage_errors() {
+fn forward_flags_reach_the_attach_the_agent_is_refused_and_bad_ones_are_usage_errors() {
     let home = home_with_pipe("fwd", "echo dialed >&2; exit 1");
     let run = |args: &[&str]| {
         Command::new(FIL)
@@ -73,18 +88,22 @@ fn forward_flags_are_refused_until_they_are_connected_and_bad_ones_are_usage_err
             .output()
             .unwrap()
     };
+    let (l, d) = (free_port().to_string(), free_port().to_string());
     for args in [
-        &["-L", "5173", "probe"][..],
+        &["-L", l.as_str(), "probe"][..],
         &["-R", "9000:localhost:9000", "probe"][..],
-        &["-D", "1080", "probe"][..],
-        &["-A", "probe"][..],
+        &["-D", d.as_str(), "probe"][..],
     ] {
         let out = run(args);
         let err = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
-        assert!(err.contains("not connected yet"), "{args:?}: {err}");
-        assert!(!err.contains("dialed"), "{args:?} dialed: {err}");
+        assert!(!err.contains("not connected yet"), "{args:?}: {err}");
+        assert!(err.contains(PAST_FORWARDS), "{args:?} stopped early: {err}");
     }
+    let out = run(&["-A", "probe"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("not connected yet"), "{err}");
+    assert!(!err.contains("dialed"), "-A dialed: {err}");
     for args in [
         &["-L", "0:h:80", "probe"][..],
         &["-R", "*:9000:h:80", "probe"][..],
@@ -145,14 +164,16 @@ fn a_refused_forward_spec_is_not_echoed_raw_on_a_terminal() {
     }
 }
 
-/// A config that asks for forwards while the connection to them cannot be made yet: with
-/// `forward_failure = "exit"` the attach is refused before dialing (the user said a missing
-/// forward must not leave a session running); with the default it warns and goes on.
+/// A `-L` whose port is taken: it is said before the attach, and with `forward_failure = "exit"`
+/// nothing is dialed and the status is 255 (ssh's `ExitOnForwardFailure`); with the default it
+/// warns and goes on.
 #[test]
-fn config_forwards_with_forward_failure_exit_refuse_the_attach_until_they_are_connected() {
+fn a_taken_forward_port_exits_255_with_forward_failure_exit_and_warns_otherwise() {
     let home = std::env::temp_dir().join(format!("fil-bin-test-cfwd-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join(".config/fil")).unwrap();
+    let squat = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squat.local_addr().unwrap().port();
     let run = |failure: &str, forward: &str| {
         let toml = format!(
             "[host.probe]\npipe = [\"sh\", \"-c\", \"echo dialed >&2; exit 1\"]\nforward = [{forward}]\nforward_failure = \"{failure}\"\n"
@@ -170,23 +191,29 @@ fn config_forwards_with_forward_failure_exit_refuse_the_attach_until_they_are_co
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
-    let (code, err) = run("exit", "\"-L 5173\"");
-    assert_eq!(code, Some(1), "{err}");
+    let in_use = format!("\"-L {taken}\"");
+    let (code, err) = run("exit", &in_use);
+    assert_eq!(code, Some(255), "{err}");
     assert!(
-        err.contains("forward_failure") && err.contains("not attaching"),
+        err.contains("cannot listen") && err.contains("not attaching"),
         "{err}"
     );
     assert!(!err.contains("dialed"), "{err}");
 
-    let (_, err) = run("warn", "\"-L 5173\"");
-    assert!(err.contains("ignored"), "{err}");
-    assert!(!err.contains("not attaching"), "{err}");
-
-    // Nothing to fail: no forwards, no refusal and no warning about them.
-    let (_, err) = run("exit", "");
+    let (_, err) = run("warn", &in_use);
     assert!(
-        !err.contains("not attaching") && !err.contains("ignored"),
+        err.contains("warning") && err.contains("cannot listen"),
         "{err}"
     );
+    assert!(err.contains(PAST_FORWARDS), "{err}");
+
+    // A free port: nothing to fail.
+    let free = format!("\"-L {}\"", free_port());
+    let (_, err) = run("exit", &free);
+    assert!(
+        !err.contains("not attaching") && err.contains(PAST_FORWARDS),
+        "{err}"
+    );
+    drop(squat);
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -59,6 +59,7 @@ use crate::config::{Backoff, ClientConfig, ClientError, Outcome};
 use crate::dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 use crate::display::{Display, PredictorFactory};
 use crate::escape::{Action, EscapeFilter};
+use crate::forward::{Asks, ForwardHandle, Forwards, Inbox, Note, Question, Router};
 use crate::offline::{LogSink, OfflineBuffer};
 use crate::status::{self, Connection};
 use crate::terminal::{TermEvent, TermInput, TermOutput, Terminal};
@@ -93,6 +94,9 @@ const DETACH_ACK_WAIT: Duration = Duration::from_secs(1);
 /// once it has handled the `Detach`) before it closes the link and exits regardless. With
 /// [`DETACH_ACK_WAIT`] the client lingers 3 s at most; the terminal is the user's again meanwhile.
 const DETACH_DELIVERY_WAIT: Duration = Duration::from_secs(2);
+/// A question about a forward the host asked for is refused when it goes unanswered this long,
+/// so a question nobody saw does not keep the keyboard.
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything about the session that must survive a link.
 struct Session {
@@ -257,6 +261,9 @@ enum Prompt {
 enum Served {
     /// The link is gone: dial again.
     Reconnect,
+    /// The daemon will not resume this attach (`BadResume`: our position is impossible, or the
+    /// session's forwards failed and only a new mux epoch repairs them): attach afresh, at once.
+    Fresh,
     Refused(Prompt),
     Done(Outcome),
 }
@@ -380,10 +387,8 @@ impl Outbox {
     }
 }
 
-type Inbox = mpsc::Receiver<Result<(ChannelId, Bytes), LinkError>>;
-
 /// One link and the tasks that move its payloads.
-struct LinkCtx<L> {
+struct LinkCtx<L: Link> {
     link: Arc<L>,
     kind: LinkKind,
     tx: Outbox,
@@ -391,6 +396,8 @@ struct LinkCtx<L> {
     status: watch::Receiver<LinkStatus>,
     writers: [JoinHandle<()>; 2],
     reader: JoinHandle<()>,
+    /// Moves the forwards' endpoint to this link at its `AttachReply` (see [`crate::forward`]).
+    router: Router<L>,
     conn: Conn,
     /// The link said `Down`; what it queued before is still being read out.
     down: bool,
@@ -404,7 +411,8 @@ struct LinkCtx<L> {
 }
 
 impl<L: Link> LinkCtx<L> {
-    fn open(link: L, resumed: bool) -> Self {
+    /// `resumed`: the attach this link will carry is a resume.
+    fn open(link: L, resumed: bool, router: Router<L>) -> Self {
         let kind = link.kind();
         let link = Arc::new(link);
         let (control, mut crx) = mpsc::unbounded_channel::<Bytes>();
@@ -429,19 +437,9 @@ impl<L: Link> LinkCtx<L> {
                 }
             })
         };
-        let (rtx, rrx) = mpsc::channel(256);
-        let reader = {
-            let link = link.clone();
-            tokio::spawn(async move {
-                loop {
-                    let m = link.recv().await;
-                    let end = m.is_err();
-                    if rtx.send(m).await.is_err() || end {
-                        break;
-                    }
-                }
-            })
-        };
+        // The reader hands the forwards' traffic to their endpoint itself, so a loop stuck on a
+        // terminal write does not hold forwarded connections up (see `crate::forward`).
+        let (rrx, reader) = crate::forward::spawn_reader(link.clone(), router.clone(), resumed);
         let status = link.status();
         Self {
             link,
@@ -451,6 +449,7 @@ impl<L: Link> LinkCtx<L> {
             status,
             writers: [control_writer, data_writer],
             reader,
+            router,
             conn: Conn::new(kind, resumed),
             down: false,
             pre: Vec::new(),
@@ -464,6 +463,7 @@ impl<L: Link> LinkCtx<L> {
         for w in &self.writers {
             w.abort();
         }
+        self.router.ended(&self.link);
         self.link.close();
     }
 }
@@ -614,6 +614,23 @@ pub(crate) struct Core<I, O> {
     term_mismatch: Option<(String, String)>,
     banner: Option<Vec<u8>>,
     banner_shown: bool,
+    /// The forwards: answers and the `~#` summary. Set for the run in [`Core::run`].
+    fwd: Option<ForwardHandle>,
+    fwd_notes: Option<mpsc::UnboundedReceiver<Note>>,
+    /// Questions about forwards the host asked for, waiting to be shown (one at a time, while
+    /// the session is live and no other question is up).
+    fwd_asks: Asks,
+    fwd_confirm: Option<FwdConfirm>,
+    /// The `~#` summary, until the next key.
+    ports: Option<Vec<String>>,
+}
+
+/// A question about a forward on the screen.
+struct FwdConfirm {
+    q: Question,
+    answer: Answer,
+    /// Refused when it is still unanswered by then.
+    until: Instant,
 }
 
 impl<I: TermInput, O: TermOutput> Core<I, O> {
@@ -668,6 +685,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             term_mismatch: None,
             banner: None,
             banner_shown: false,
+            fwd: None,
+            fwd_notes: None,
+            fwd_asks: Asks::default(),
+            fwd_confirm: None,
+            ports: None,
         })
     }
 
@@ -705,11 +727,23 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     // ---- the top-level loop ------------------------------------------------------------
 
     pub(crate) async fn run<D: Dialer>(&mut self, dialer: &mut D) -> Result<Outcome, ClientError> {
-        let result = self.main(dialer).await;
+        // The forwards live for the run, beside the loop: their IO never waits on it.
+        let set = std::mem::take(&mut self.cfg.forwards);
+        let (fwd, handle, notes) = Forwards::<D::Link>::start(set);
+        self.fwd = Some(handle);
+        self.fwd_notes = Some(notes);
+        let result = self.main(dialer, &fwd).await;
+        // Listeners close and local sockets are reset; the daemon closes its side of the
+        // channels when the subscriber goes.
+        fwd.shutdown();
         self.finish(result)
     }
 
-    async fn main<D: Dialer>(&mut self, dialer: &mut D) -> Result<Outcome, ClientError> {
+    async fn main<D: Dialer>(
+        &mut self,
+        dialer: &mut D,
+        fwd: &Forwards<D::Link>,
+    ) -> Result<Outcome, ClientError> {
         let mut purpose = DialPurpose::Attach;
         let mut failures = 0u32;
         let mut backoff = BackoffState::new(self.cfg.reconnect.backoff);
@@ -723,7 +757,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             };
             self.note_banner(&dialed.skipped);
             self.ready_since = None;
-            match self.serve(dialer, dialed).await? {
+            match self.serve(dialer, dialed, fwd).await? {
                 Served::Reconnect => {
                     self.mark_disconnected();
                     purpose = self.purpose();
@@ -764,6 +798,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         }
                         Err(outcome) => return Ok(outcome),
                     }
+                }
+                Served::Fresh => {
+                    self.mark_disconnected();
+                    // As after a take-back: new session state, and the dialer installs a new key.
+                    self.sess.forget(self.cfg.input_window);
+                    self.pending.clear();
+                    purpose = DialPurpose::Attach;
                 }
                 Served::Done(outcome) => return Ok(outcome),
             }
@@ -929,9 +970,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         &mut self,
         dialer: &mut D,
         dialed: Dialed<D::Link>,
+        fwd: &Forwards<D::Link>,
     ) -> Result<Served, ClientError> {
         let resume = self.sess.resume_request();
-        let mut primary = LinkCtx::open(dialed.link, resume.is_some());
+        let mut primary = LinkCtx::open(dialed.link, resume.is_some(), fwd.router());
         self.last_kind = Some(primary.kind);
         self.sess.input_ready = false;
         self.sess.link_changed();
@@ -945,6 +987,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // resume is not complete yet.
         let mut cand: Option<LinkCtx<D::Link>> = None;
         let mut promoted: Option<LinkKind> = None;
+        // Read here, beside the user's input (both borrow the loop).
+        let mut notes = self.fwd_notes.take();
 
         let result: Result<Served, ClientError> = async {
             Ok(loop {
@@ -1066,8 +1110,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             Ev::End(o) => ended = Some(Served::Done(o)),
                         }
                     }
+                    note = next_note(&mut notes) => self.on_note(note)?,
                     swap = dialer.next_swap(), if can_swap => {
-                        let mut candidate = LinkCtx::open(swap.link, true);
+                        let mut candidate = LinkCtx::open(swap.link, true, fwd.router());
                         let resume = self.sess.resume_request();
                         candidate.attach_gen =
                             self.begin_attach(&candidate.tx, resume, dialer.public_key());
@@ -1133,6 +1178,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             })
         }
         .await;
+        self.fwd_notes = notes;
 
         // `~.`: the terminal is given back at once, then the daemon is given time to hear it.
         let mut result = result;
@@ -1360,11 +1406,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.on_snapshot_data(conn, seg.seq, seg.data)
             };
         }
-        // Agent relay, forwards: M2.
-        tracing::debug!(
-            channel = chan.0,
-            "ignoring data on a channel M1 does not use"
-        );
+        // The forwards' channels go to their endpoint in the link's reader (`crate::forward`);
+        // anything else is a channel nobody uses.
+        tracing::debug!(channel = chan.0, "ignoring data on an unused channel");
         Ok(Flow::Continue)
     }
 
@@ -1465,7 +1509,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 })))
             }
             AttachRefusal::WrongKey => Err(ClientError::WrongKey(name)),
-            AttachRefusal::BadResume => Err(ClientError::BadResume(name)),
+            // Not an end: a fresh attach (a new epoch, a snapshot) carries on.
+            AttachRefusal::BadResume => {
+                tracing::debug!("the daemon refused the resume; attaching afresh");
+                Ok(Flow::End(Served::Fresh))
+            }
         }
     }
 
@@ -1771,6 +1819,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.link_ok = false;
         self.quiet = false;
         self.confirm = None;
+        self.requeue_fwd_confirm();
         self.confirm_pending = None;
         if self.disconnected_since.is_none() {
             self.disconnected_since = Some(Instant::now());
@@ -1784,6 +1833,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.quiet = true;
         self.link_ok = false;
         self.confirm = None;
+        self.requeue_fwd_confirm();
         self.confirm_pending = None;
         if self.disconnected_since.is_none() {
             self.disconnected_since = Some(Instant::now());
@@ -1975,10 +2025,42 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if self.confirm_pending.is_some() {
             self.refresh_display()?;
         }
+        // The `~#` summary goes with the next key (which is not eaten).
+        self.ports = None;
         if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm {
             if let Some(yes) = answer.input(bytes) {
                 let enter_seen = answer.enter_seen;
                 self.confirmed(yes, enter_seen);
+            }
+            self.refresh_display()?;
+            self.pump_input();
+            return Ok(Ev::Continue);
+        }
+        if self.fwd_confirm.is_some() {
+            // The host asked this question, not the user: the escapes still work (`~.` detaches),
+            // and only what would have been typed into the session goes to the answer.
+            for action in self.esc.feed(bytes) {
+                match action {
+                    Action::Send(b) => {
+                        if let Some(c) = &mut self.fwd_confirm
+                            && let Some(yes) = c.answer.input(&b)
+                        {
+                            let enter_seen = c.answer.enter_seen;
+                            self.fwd_answered(yes, enter_seen);
+                        }
+                    }
+                    Action::Help => {
+                        self.notice = status::help_lines();
+                        self.notice_until = Some(Instant::now() + self.cfg.notice_for);
+                    }
+                    Action::Ports => {
+                        self.ports = self.fwd.as_ref().map(ForwardHandle::summary);
+                    }
+                    Action::Detach => {
+                        self.pump_input();
+                        return Ok(Ev::Detach);
+                    }
+                }
             }
             self.refresh_display()?;
             self.pump_input();
@@ -1990,6 +2072,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 Action::Help => {
                     self.notice = status::help_lines();
                     self.notice_until = Some(Instant::now() + self.cfg.notice_for);
+                }
+                Action::Ports => {
+                    self.ports = self.fwd.as_ref().map(ForwardHandle::summary);
                 }
                 Action::Detach => {
                     // What was typed before the escape still goes out.
@@ -2042,6 +2127,56 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
+    // ---- forwards ----------------------------------------------------------------------
+
+    /// The user answered the question about a forward (or it timed out: `no`).
+    fn fwd_answered(&mut self, yes: bool, enter_seen: bool) {
+        let Some(c) = self.fwd_confirm.take() else {
+            return;
+        };
+        if let Some(h) = &self.fwd {
+            h.answer(&c.q, yes);
+        }
+        if !enter_seen {
+            self.swallow_enter = Some(Instant::now() + ANSWER_ENTER_WINDOW);
+        }
+    }
+
+    /// A question on the screen goes back to the queue (the link went away under it): it is
+    /// asked again, from the start, when the session is live again.
+    fn requeue_fwd_confirm(&mut self) {
+        if let Some(c) = self.fwd_confirm.take() {
+            self.fwd_asks.push_front(c.q);
+        }
+    }
+
+    fn on_note(&mut self, note: Note) -> Result<(), ClientError> {
+        match note {
+            Note::Ask(q) => self.fwd_asks.push(q),
+            Note::Cancel { token } => {
+                self.fwd_asks.remove(token);
+                if self
+                    .fwd_confirm
+                    .as_ref()
+                    .is_some_and(|c| c.q.token == token)
+                {
+                    self.fwd_confirm = None;
+                }
+            }
+            Note::CancelAll => {
+                self.fwd_asks.clear();
+                self.fwd_confirm = None;
+            }
+            Note::Notice(lines) => {
+                self.notice = lines;
+                self.notice_until = Some(Instant::now() + self.cfg.notice_for);
+            }
+            Note::Exit(text) => return Err(ClientError::ForwardFailed(text)),
+            Note::Failed(text) => return Err(ClientError::Protocol(text)),
+        }
+        self.refresh_display()
+    }
+
     // ---- prompts after a refusal -------------------------------------------------------
 
     /// Asks the user, on the overlay, with the link gone. `Ok(Ok(()))` is yes.
@@ -2070,6 +2205,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         };
         self.link_ok = false;
         self.confirm = None;
+        self.requeue_fwd_confirm();
         if matches!(prompt, Prompt::Replaced) {
             // Typed for the old session; it must not land in the new one.
             self.buf.reset();
@@ -2242,9 +2378,28 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             return Ok(());
         }
+        // A question about a forward, once the session is live and nothing else is asked. Entered
+        // only once it is on the screen: an unseen question must not eat keystrokes.
+        if self.confirm.is_none()
+            && self.fwd_confirm.is_none()
+            && self.link_ok
+            && let Some(q) = self.fwd_asks.pop()
+        {
+            if self.show_or_open(q.lines.clone(), false)? {
+                self.fwd_confirm = Some(FwdConfirm {
+                    q,
+                    answer: Answer::new(),
+                    until: Instant::now() + CONSENT_TIMEOUT,
+                });
+                return Ok(());
+            }
+            self.fwd_asks.push_front(q);
+        }
         let mut lines = Vec::new();
         if let Some(Confirm::Typed { secs, .. }) = &self.confirm {
             lines = self.confirm_text(*secs);
+        } else if let Some(c) = &self.fwd_confirm {
+            lines = c.q.lines.clone();
         } else if let (false, Some(since)) = (self.link_ok, self.disconnected_since) {
             let secs = since.elapsed().as_secs();
             lines.extend(status::connection_lines(&Connection {
@@ -2267,6 +2422,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 lines.extend(self.notice.iter().cloned());
             }
         }
+        if let Some(p) = &self.ports {
+            lines.extend(p.iter().cloned());
+        }
         self.show_lines(lines)
     }
 
@@ -2284,6 +2442,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         min(self.sess.exited.map(|e| e.2));
         if let Some(Confirm::Typed { answer, .. }) = &self.confirm {
             min(answer.deadline());
+        }
+        if let Some(c) = &self.fwd_confirm {
+            min(c.answer.deadline());
+            min(Some(c.until));
         }
         if self.display.is_some()
             && ((!self.link_ok && self.disconnected_since.is_some())
@@ -2318,6 +2480,25 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let enter_seen = answer.enter_seen;
             self.confirmed(yes, enter_seen);
             self.pump_input();
+        }
+        let due = self.fwd_confirm.as_ref().is_some_and(|c| c.answer.due());
+        if due
+            && !self.input_waiting()
+            && let Some(c) = &mut self.fwd_confirm
+            && let Some(yes) = c.answer.tick()
+        {
+            let enter_seen = c.answer.enter_seen;
+            self.fwd_answered(yes, enter_seen);
+        }
+        if self
+            .fwd_confirm
+            .as_ref()
+            .is_some_and(|c| Instant::now() >= c.until)
+        {
+            // Nobody answered: refused, and the keyboard is the session's again.
+            self.fwd_answered(false, true);
+            self.notice = vec!["fil: no answer; the forward is refused".to_string()];
+            self.notice_until = Some(Instant::now() + self.cfg.notice_for);
         }
         self.refresh_display()
     }
@@ -2496,6 +2677,17 @@ fn csi_key(rest: &[u8]) -> Option<(Tok, usize)> {
         _ => return None,
     };
     Some((tok, used))
+}
+
+/// The next note from the forwards, or never.
+async fn next_note(rx: &mut Option<mpsc::UnboundedReceiver<Note>>) -> Note {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Some(n) => n,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 async fn at(t: Option<Instant>) {

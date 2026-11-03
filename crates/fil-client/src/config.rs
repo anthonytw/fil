@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use fil_predict::Placement;
 use fil_proto::msg::{HostLabel, SessionName};
+use fil_proto::mux::{ForwardSpec, MuxConfig};
 
+use crate::forward::Prebound;
 use crate::offline::OfflineInput;
 use crate::text::format_utc;
 
@@ -69,6 +71,63 @@ pub struct ClientConfig {
     /// How much terminal output may wait behind an incomplete snapshot (QUIC channels are
     /// independent, so output can overtake it).
     pub max_held_output: usize,
+    /// Port forwards: this run's own specs and the rules for the rest (DESIGN.md section 7).
+    pub forwards: ForwardSet,
+}
+
+/// What the client does with a forward that a process on the host asked for (`fil forward`), or
+/// that another client left in the session's table (DESIGN.md section 7.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteRequests {
+    /// Ask the user once per entry, on the overlay.
+    #[default]
+    Ask,
+    /// Refuse them all without asking.
+    Deny,
+}
+
+/// What a forward of this run's own that cannot be set up does to the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardFailure {
+    /// Say so and carry on.
+    #[default]
+    Warn,
+    /// End the run with [`ClientError::ForwardFailed`] (exit status 255, as ssh's
+    /// `ExitOnForwardFailure`).
+    Exit,
+}
+
+/// The forwards of one run (DESIGN.md section 7, `docs/m2/plan.md` F3).
+///
+/// - `specs` are this run's own (its command line and config): the only forwards the client
+///   sets up without asking, and the only ones that may bind beyond loopback or aim `-R` beyond
+///   loopback (DESIGN.md section 7.2, "The rule for every connection").
+/// - Everything else in the session's table is asked about (`remote_requests`).
+///
+/// [`ForwardSet::bind_local`] binds the `-L` and `-D` listeners before the attach, so the caller
+/// can report a failure before the terminal goes raw (and stop, with `ForwardFailure::Exit`).
+#[derive(Debug, Default)]
+pub struct ForwardSet {
+    pub specs: Vec<ForwardSpec>,
+    pub remote_requests: RemoteRequests,
+    pub failure: ForwardFailure,
+    /// The agent relay is on for this run (`-A`, DESIGN.md section 10). Off by default; until
+    /// the relay exists (A1) an agent channel is refused even when this is on.
+    pub agent: bool,
+    /// Windows, buffers and timers of the forwarded connections (`[defaults.forward]`).
+    pub mux: MuxConfig,
+    /// The listeners [`ForwardSet::bind_local`] bound, by index into `specs`.
+    pub(crate) prebound: Prebound,
+}
+
+impl ForwardSet {
+    /// This run's own specs, with the default rules (ask, warn, no agent).
+    pub fn new(specs: Vec<ForwardSpec>) -> Self {
+        Self {
+            specs,
+            ..Self::default()
+        }
+    }
 }
 
 impl ClientConfig {
@@ -85,6 +144,7 @@ impl ClientConfig {
             time_format: format_utc,
             input_window: 256 * 1024,
             max_held_output: 4 * 1024 * 1024,
+            forwards: ForwardSet::default(),
         }
     }
 }
@@ -198,10 +258,6 @@ pub enum ClientError {
     )]
     WrongKey(String),
     #[error(
-        "the daemon rejected our resume point for session \"{0}\" as impossible (a bug in fil); attach again"
-    )]
-    BadResume(String),
-    #[error(
         "the daemon could not start session \"{0}\"; the reason is in the fil daemon log on the remote host (daemon.log under $XDG_STATE_HOME/fil, default ~/.local/state/fil)"
     )]
     SessionStartFailed(String),
@@ -209,6 +265,10 @@ pub enum ClientError {
     Protocol(String),
     #[error("terminal error: {0}")]
     Terminal(#[from] std::io::Error),
+    /// A forward of this run's own could not be set up and `forward_failure` is `Exit`: the
+    /// `fil` binary exits with 255, as ssh's `ExitOnForwardFailure`.
+    #[error("{0}")]
+    ForwardFailed(String),
     #[error(transparent)]
     OfflineLog(#[from] crate::offline::LogError),
 }

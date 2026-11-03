@@ -2,7 +2,8 @@
 //! terminal and is the screen oracle.
 
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use fil_client::{TermEvent, TermInput, TermOutput, Terminal};
@@ -27,12 +28,23 @@ pub struct TermShared {
 }
 
 pub struct FakeIn(mpsc::UnboundedReceiver<TermEvent>);
-pub struct FakeOut(Arc<Mutex<TermShared>>);
+pub struct FakeOut(Arc<Mutex<TermShared>>, Arc<Gate>);
+
+/// Holds the terminal's writes: a terminal that has stopped reading (XOFF, a hung emulator).
+/// `write_all` then blocks the thread that calls it, as the real one does.
+#[derive(Default)]
+pub struct Gate {
+    closed: Mutex<bool>,
+    cv: Condvar,
+    /// A write is held at the gate now.
+    pub held: AtomicBool,
+}
 
 #[derive(Clone)]
 pub struct TermHandle {
     tx: mpsc::UnboundedSender<TermEvent>,
     shared: Arc<Mutex<TermShared>>,
+    gate: Arc<Gate>,
 }
 
 pub fn fake_terminal(
@@ -52,12 +64,13 @@ pub fn fake_terminal(
         stalled: false,
         size_unreadable: false,
     }));
+    let gate = Arc::new(Gate::default());
     let term = Terminal {
         input: FakeIn(rx),
-        output: FakeOut(shared.clone()),
+        output: FakeOut(shared.clone(), gate.clone()),
         local_term: Some(local_term.to_string()),
     };
-    (term, TermHandle { tx, shared })
+    (term, TermHandle { tx, shared, gate })
 }
 
 impl TermInput for FakeIn {
@@ -75,6 +88,14 @@ impl TermOutput for FakeOut {
         Ok(s.size)
     }
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        {
+            let mut closed = self.1.closed.lock().unwrap();
+            while *closed {
+                self.1.held.store(true, Ordering::SeqCst);
+                closed = self.1.cv.wait(closed).unwrap();
+            }
+            self.1.held.store(false, Ordering::SeqCst);
+        }
         let mut s = self.0.lock().unwrap();
         s.emu.feed(bytes);
         s.written.extend_from_slice(bytes);
@@ -152,6 +173,17 @@ impl TermHandle {
     /// Reading the window size fails from now on (`false`: it works again).
     pub fn size_unreadable(&self, on: bool) {
         self.shared.lock().unwrap().size_unreadable = on;
+    }
+
+    /// Every write blocks from now on (`false`: they go through again).
+    pub fn hold_writes(&self, on: bool) {
+        *self.gate.closed.lock().unwrap() = on;
+        self.gate.cv.notify_all();
+    }
+
+    /// A write is blocked at the gate now.
+    pub fn write_held(&self) -> bool {
+        self.gate.held.load(Ordering::SeqCst)
     }
 
     /// The terminal stops taking the writes at the end of the run (they time out).

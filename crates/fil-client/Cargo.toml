@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bytes = "1"
+fil-forward = { path = "../fil-forward" }
 fil-predict = { path = "../fil-predict" }
 fil-proto = { path = "../fil-proto" }
 fil-term = { path = "../fil-term", default-features = false, features = ["alacritty"] }
@@ -21,7 +22,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "pty", "process"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "signal", "process", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "signal", "process", "io-util", "net"] }
 
 [lints]
 workspace = true

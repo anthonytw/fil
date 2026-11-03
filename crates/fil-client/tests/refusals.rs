@@ -217,15 +217,34 @@ async fn a_wrong_key_is_an_error_not_a_prompt() {
     assert!(!term.is_raw());
 }
 
+/// `BadResume`: the daemon will not resume this attach (an impossible position, or the session's
+/// forwards failed and need a new mux epoch). The client attaches afresh, without asking, and the
+/// session goes on.
 #[tokio::test(start_paused = true)]
-async fn a_bad_resume_is_an_error() {
+async fn a_bad_resume_attaches_afresh() {
     let rig = with_output().await;
     rig.daemon.refuse_next(AttachRefusal::BadResume).await;
     rig.daemon.kill_link(DownReason::Dead).await;
-    match rig.finish().await {
-        Err(ClientError::BadResume(s)) => assert_eq!(s, "main"),
-        other => panic!("{other:?}"),
-    }
+    common::until_async("the fresh attach", 10, || {
+        let d = rig.daemon.clone();
+        async move { d.attaches().await.len() >= 3 }
+    })
+    .await;
+    let attaches = rig.daemon.attaches().await;
+    assert!(attaches[1].resume.is_some(), "the refused one was a resume");
+    assert!(attaches[2].resume.is_none(), "then a fresh attach");
+    assert_eq!(
+        rig.dial.purposes().last(),
+        Some(&fil_client::DialPurpose::Attach)
+    );
+    settle().await;
+    rig.daemon.output(b"after the fresh attach\r\n").await;
+    until("the session goes on", 5, || {
+        rig.term.text().contains("after the fresh attach")
+    })
+    .await;
+    assert!(!rig.is_finished());
+    assert!(!rig.term.text().contains("Take it back?"), "no question");
 }
 
 #[tokio::test(start_paused = true)]

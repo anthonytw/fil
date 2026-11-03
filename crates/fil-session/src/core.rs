@@ -1614,6 +1614,7 @@ mod tests {
             key: PublicKey::new(vec![n; 32]).unwrap(),
             resume: None,
             echo_ack: false,
+            size_gen: 0,
         };
         let accepted = |answer: AttachAnswer| match answer {
             AttachAnswer::Accepted(a) => a,

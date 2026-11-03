@@ -163,6 +163,11 @@ async fn ends(s: &mut TcpStream) {
     }
 }
 
+/// The local peer of a stream handed to the endpoint directly (it came from no listener).
+fn peer() -> fil_forward::LocalPeer {
+    fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap())
+}
+
 /// A connected pair: what the application holds, and what the endpoint is handed.
 async fn socket_pair() -> (TcpStream, TcpStream) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -274,11 +279,13 @@ async fn no_open_remote_before_consent() {
         }),
         ForwardResult::Removed(id)
     );
+    // Closed before the answer. (Not checked by connecting: under load another process may bind
+    // the freed ephemeral port at once.)
+    assert_eq!(h.forward_snapshot().listeners, 0);
     c.wait_table("ForwardGone", |m| {
         matches!(m, MuxMsg::ForwardGone { id: i } if *i == id).then_some(())
     })
     .await;
-    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     assert_eq!(
         h.forward(ForwardOp::Remove { kind: None, port }),
         ForwardResult::Refused(ForwardRefusal::NoSuchForward)
@@ -434,7 +441,7 @@ async fn forwards_survive_a_reconnect() {
     // -L: the client's application talks to `target` on the remote through a channel.
     let lid = add(&mut c, local(40001, target.port())).await;
     let (mut app, inner) = socket_pair().await;
-    c.ep.open_stream(OpenKind::Local { forward: lid }, Box::new(inner))
+    c.ep.open_stream(OpenKind::Local { forward: lid }, Box::new(inner), peer())
         .unwrap();
     let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let (mut rd, mut wr) = app.split();
@@ -533,6 +540,14 @@ async fn takeover_and_take_back() {
     a.side.targets.lock().unwrap().insert(id, at.addr);
     let mut held = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     assert_eq!(exchange(&mut held, b"x", 2).await.unwrap(), b"Ax");
+    // A busy one too, writing for as long as it lives: none of its bytes may reach a channel of
+    // the next epoch, which reuses the same channel ids (F1 review, B1).
+    let mut busy = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert_eq!(exchange(&mut busy, b"z", 2).await.unwrap(), b"Az");
+    let writer = tokio::spawn(async move {
+        let junk = vec![b'Z'; 16 * 1024];
+        while busy.write_all(&junk).await.is_ok() {}
+    });
 
     // B takes over.
     let mut b = FwdClient::attach(&h, key(2), "desk").await;
@@ -560,6 +575,13 @@ async fn takeover_and_take_back() {
     // target for it.
     assert_eq!(add(&mut b, spec.clone()).await, id);
     assert_eq!(round_trip_eventually(port, b"y", 2).await, b"By");
+    for _ in 0..20 {
+        assert_eq!(round_trip(port, b"w", 2).await.as_deref(), Some(&b"Bw"[..]));
+    }
+    tokio::time::timeout(WAIT, writer)
+        .await
+        .expect("the old connection was reset")
+        .unwrap();
 
     // A takes it back: a fresh attach of its own, a new epoch again.
     a.take_back(&h).await;
@@ -568,8 +590,8 @@ async fn takeover_and_take_back() {
     assert_eq!(round_trip_eventually(port, b"z", 2).await, b"Az");
     assert_eq!(
         b.side.opens.load(Ordering::SeqCst),
-        1,
-        "B was opened once, before"
+        21,
+        "B was opened only while it held the session"
     );
 }
 
@@ -605,6 +627,75 @@ async fn a_client_spec_replaces_an_entry() {
     assert_eq!(h.forward_count(), 1);
 }
 
+/// An `-R` connection whose consent check passed while A held the session, and whose channel is
+/// opened only after B took the session over (or after a detach), must not be opened toward B:
+/// B never consented. The check and the open are separate steps under separate locks, so the
+/// gate holds the connection between them while the takeover happens (PR #68 review, B2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_checked_before_a_takeover_does_not_open_toward_the_new_client() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "toctou")).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let at = tagged_echo(b"A").await;
+    let bt = tagged_echo(b"B").await;
+    let id = add(&mut a, remote(0, at.port())).await;
+    let port = bound_port(&a, id, 0).await;
+    a.side.targets.lock().unwrap().insert(id, at.addr);
+    assert_eq!(round_trip_eventually(port, b"x", 2).await, b"Ax");
+
+    let gate = h.gate_check_outgoing();
+    let mut app = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    eventually("the accept to pass its check", || async { gate.arrived() }).await;
+    let b = FwdClient::attach(&h, key(2), "desk").await;
+    b.side.targets.lock().unwrap().insert(id, bt.addr);
+    gate.open();
+    ends(&mut app).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        b.side.opens.load(Ordering::SeqCst),
+        0,
+        "B got an Open Remote it never consented to"
+    );
+    assert_eq!(bt.accepts.load(Ordering::SeqCst), 0);
+}
+
+/// The same race against a detach: the connection is refused at once, not left to wait for a
+/// link that no subscriber will bring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_checked_before_a_detach_is_refused_at_once() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "toctou-detach")).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let at = echo().await;
+    let id = add(&mut a, remote(0, at.port())).await;
+    let port = bound_port(&a, id, 0).await;
+    a.side.targets.lock().unwrap().insert(id, at.addr);
+    assert_eq!(round_trip_eventually(port, b"x", 1).await, b"x");
+
+    let gate = h.gate_check_outgoing();
+    let mut app = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    eventually("the accept to pass its check", || async { gate.arrived() }).await;
+    a.detach().await;
+    assert_eq!(a.serve_end().await, ServeEnd::Detached);
+    eventually("the core to handle the detach", || async {
+        h.info().await.is_some_and(|i| i.subscriber.is_none())
+    })
+    .await;
+    let t = Instant::now();
+    gate.open();
+    ends(&mut app).await;
+    // `open_wait` here is 5 s: a connection left waiting for a link would take that long.
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "refused after {:?}",
+        t.elapsed()
+    );
+    eventually("nothing left in the endpoint", || async {
+        h.forward_snapshot().channels == 0
+    })
+    .await;
+}
+
 // ---- the checks on incoming opens ---------------------------------------------------------------
 
 /// The daemon accepts `Open Local` and `Open Dynamic` only for a table entry of that kind; any
@@ -634,7 +725,7 @@ async fn opens_are_checked_against_the_table() {
     ];
     for kind in bad {
         let (mut app, inner) = socket_pair().await;
-        c.ep.open_stream(kind, Box::new(inner)).unwrap();
+        c.ep.open_stream(kind, Box::new(inner), peer()).unwrap();
         ends(&mut app).await;
     }
     assert_eq!(canary.accepts.load(Ordering::SeqCst), 0);
@@ -648,7 +739,7 @@ async fn opens_are_checked_against_the_table() {
         },
     ] {
         let (mut app, inner) = socket_pair().await;
-        c.ep.open_stream(kind, Box::new(inner)).unwrap();
+        c.ep.open_stream(kind, Box::new(inner), peer()).unwrap();
         assert_eq!(exchange(&mut app, b"ok", 2).await.unwrap(), b"ok");
     }
     assert_eq!(target.accepts.load(Ordering::SeqCst), 2);
@@ -686,10 +777,9 @@ async fn exit_closes_forwards_and_a_resume_gets_the_status() {
     assert_eq!(c.seen.lock().unwrap().exited, Some((Some(7), None)));
     ends(&mut held).await;
     eventually("the -R listener to close", || async {
-        TcpStream::connect(("127.0.0.1", port)).await.is_err()
+        h.forward_snapshot().listeners == 0
     })
     .await;
-    assert_eq!(h.forward_snapshot().listeners, 0);
 
     // A client that missed `SessionExited` resumes and hears how it ended.
     c.drop_link().await;
@@ -744,7 +834,7 @@ async fn forward_floods_do_not_slow_the_terminal() {
     for (forward, n) in [(to_sink, 3), (from_source, 3), (to_stuck, 2)] {
         for _ in 0..n {
             let (app, inner) = socket_pair().await;
-            c.ep.open_stream(OpenKind::Local { forward }, Box::new(inner))
+            c.ep.open_stream(OpenKind::Local { forward }, Box::new(inner), peer())
                 .unwrap();
             let reads = forward == from_source;
             apps.push(tokio::spawn(async move {

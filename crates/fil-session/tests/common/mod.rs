@@ -356,7 +356,9 @@ mod fwd {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
 
-    use fil_forward::{AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, Policy};
+    use fil_forward::{
+        AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
+    };
     use fil_proto::chan::RecvChannel;
     use fil_proto::frame::DataSegment;
     use fil_proto::msg::{
@@ -387,7 +389,7 @@ mod fwd {
                 _ => Err(OpenFailure::NotPermitted),
             }
         }
-        fn check_outgoing(&self, _: &OpenKind) -> Result<(), OpenFailure> {
+        fn check_outgoing(&self, _: &OpenKind, _: &LocalPeer) -> Result<(), OpenFailure> {
             Ok(())
         }
         fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
@@ -478,6 +480,7 @@ mod fwd {
                     match e {
                         EndpointEvent::Table(m) => s.table.push(m),
                         EndpointEvent::Failed(e) => s.mux_failed.push(e.to_string()),
+                        EndpointEvent::LinkFailed => s.mux_failed.push("link failed".into()),
                     }
                 }
             });

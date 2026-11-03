@@ -54,6 +54,44 @@ pub struct CatchUpGate {
     pub proceed: tokio::sync::Notify,
 }
 
+/// A gate for a thread that cannot await (the forwards' policy runs inside the endpoint, on a
+/// runtime worker): [`SyncGate::pass`] blocks the caller until the test lets it through. Only
+/// with the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+pub struct SyncGate {
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(feature = "test-hooks")]
+impl SyncGate {
+    /// Arrives, and waits (at most 30 s) to be let through. The caller is a runtime worker (a
+    /// test's multi-threaded one): its other tasks move to another worker meanwhile.
+    pub(crate) fn pass(&self) {
+        tokio::task::block_in_place(|| {
+            let mut st = self.state.lock().unwrap();
+            st.0 = true;
+            self.changed.notify_all();
+            let _ = self
+                .changed
+                .wait_timeout_while(st, Duration::from_secs(30), |s| !s.1)
+                .unwrap();
+        });
+    }
+
+    /// Whether something has arrived.
+    pub fn arrived(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
+    /// Lets everything through, from now on.
+    pub fn open(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+}
+
 /// One running session. Cheap to clone; every clone refers to the same session.
 ///
 /// The session lives until its shell exits or [`SessionHandle::kill`] ends it, whether or not
@@ -266,6 +304,14 @@ impl SessionHandle {
         let gate = Arc::new(CatchUpGate::default());
         *self.inner.resize_gate.lock().unwrap() = Some(gate.clone());
         gate
+    }
+
+    /// Test hook: from now on an `-R` connection whose consent check passed waits at the returned
+    /// gate before its channel is opened, so a test can take the session over in between. Only
+    /// with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn gate_check_outgoing(&self) -> Arc<SyncGate> {
+        self.inner.forwards.gate_outgoing()
     }
 
     /// Test hook: records the session's process tree now, from a fresh scan, and returns once the

@@ -42,7 +42,9 @@ use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use fil_forward::{AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, Policy};
+use fil_forward::{
+    AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
+};
 use fil_proto::ChannelId;
 use fil_proto::msg::{ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, SessionName};
 use fil_proto::mux::{
@@ -195,10 +197,10 @@ pub(crate) struct Forwards {
     ep: Endpoint<SessionLink>,
     st: Shared,
     task: Mutex<Option<JoinHandle<()>>>,
-    /// For the tasks it starts (a rebind that waits for the replaced listener to let go).
-    me: std::sync::Weak<Forwards>,
     /// Where the MUX send buffer stops taking table records (three quarters of it).
     table_room: usize,
+    #[cfg(feature = "test-hooks")]
+    gate: Arc<Mutex<Option<Arc<crate::handle::SyncGate>>>>,
 }
 
 /// Counts only.
@@ -227,18 +229,25 @@ impl Forwards {
             events: placeholder,
             ended: false,
         }));
-        let policy = Arc::new(SessionPolicy { st: st.clone() });
+        #[cfg(feature = "test-hooks")]
+        let gate = Arc::new(Mutex::new(None));
+        let policy = Arc::new(SessionPolicy {
+            st: st.clone(),
+            #[cfg(feature = "test-hooks")]
+            gate: gate.clone(),
+        });
         let connector = Arc::new(SessionConnector { st: st.clone() });
         let table_room = cfg.mux_buffer / 4 * 3;
         let (ep, events) = Endpoint::new(Side::Daemon, cfg, connector, policy);
         lock(&st).events = events;
-        let fw = Arc::new_cyclic(|me| Forwards {
+        let fw = Arc::new(Forwards {
             name,
             ep,
             st,
             task: Mutex::new(None),
-            me: me.clone(),
             table_room,
+            #[cfg(feature = "test-hooks")]
+            gate,
         });
         let task = tokio::spawn(fw.clone().drain_events());
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -525,11 +534,19 @@ impl Forwards {
     /// (`req` answers its `AddForward`) and, for `-R`, the bind.
     fn install(&self, st: &mut State, added: Added, req: Option<u32>) {
         let id = added.id();
+        // A replaced `-R` hands its listener over: the same bind and port (a replace keeps the
+        // identity), so the socket and its backlog stay and nothing is rebound.
+        let mut handed_over = false;
         if let Added::Replaced { old, .. } = added {
-            self.ep.unlisten(old);
-            st.listen.remove(&old);
+            let state = st.listen.remove(&old);
+            if let Some(state) = state.filter(|_| self.ep.rekey_listener(old, id)) {
+                st.listen.insert(id, state);
+                handed_over = true;
+            } else {
+                self.ep.unlisten(old);
+                self.ep.forget_stats(old);
+            }
             st.consented.remove(&old);
-            self.ep.forget_stats(old);
             self.tell(st, MuxMsg::ForwardGone { id: old });
         }
         let e = st.table.get(id).cloned().expect("just added");
@@ -540,7 +557,9 @@ impl Forwards {
             }
             Added::Replaced { .. } => {
                 debug!(kind = ?e.spec.kind(), "forward replaced");
-                self.bind_replacing(st, id, &e.spec);
+                if !handed_over {
+                    self.bind_remote(st, id, &e.spec);
+                }
             }
             Added::Existing(_) => {}
         }
@@ -607,44 +626,6 @@ impl Forwards {
         }
     }
 
-    /// Binds the `-R` entry that replaced another with the same bind and port. The replaced
-    /// listener's sockets close when its accept tasks are dropped, which happens on the runtime
-    /// shortly after `unlisten`, not inside it: a bind that finds the port still taken is tried
-    /// again for a moment, on a task, and reported when it is settled.
-    fn bind_replacing(&self, st: &mut State, id: ForwardId, spec: &ForwardSpec) {
-        const TRIES: u32 = 25;
-        const EVERY: std::time::Duration = std::time::Duration::from_millis(20);
-        if spec.kind() != ForwardKind::Remote {
-            return;
-        }
-        let state = self.try_bind(id, spec);
-        if state != ListenState::Failed(BindFailure::AddrInUse) {
-            st.listen.insert(id, state);
-            return;
-        }
-        let Some(me) = self.me.upgrade() else { return };
-        let spec = spec.clone();
-        tokio::spawn(async move {
-            for n in 1..=TRIES {
-                tokio::time::sleep(EVERY).await;
-                let mut st = me.lock();
-                if st.ended || st.table.get(id).is_none() {
-                    return;
-                }
-                let state = me.try_bind(id, &spec);
-                if state == ListenState::Failed(BindFailure::AddrInUse) && n < TRIES {
-                    continue;
-                }
-                if let ListenState::Failed(why) = state {
-                    debug!(why = ?why, "remote forward bind failed");
-                }
-                st.listen.insert(id, state);
-                me.tell(&st, MuxMsg::Listening { id, state });
-                return;
-            }
-        });
-    }
-
     fn remove(&self, st: &mut State, id: ForwardId) {
         let Some(e) = st.table.remove(id) else {
             return;
@@ -676,6 +657,15 @@ impl Forwards {
     fn on_event(&self, st: &mut State, ev: EndpointEvent) {
         match ev {
             EndpointEvent::Table(msg) => self.on_table(st, msg),
+            // A payload the link refused while it stays up: the endpoint has let go of the link,
+            // which can no longer carry the channels whole. The connection ends quietly and the
+            // client resumes on a new link, where the channels are restated.
+            EndpointEvent::LinkFailed => {
+                debug!("a forward send failed on a live link");
+                if let Some(tx) = &st.fatal {
+                    let _ = tx.send(ConnEvent::Drop);
+                }
+            }
             EndpointEvent::Failed(e) => {
                 debug!(error = %e, "the forward mux failed");
                 if let Some(tx) = &st.fatal {
@@ -742,6 +732,15 @@ impl Forwards {
         }
     }
 
+    /// Test hook: from now on an `-R` accept whose check passed waits at the returned gate before
+    /// the endpoint opens its channel.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn gate_outgoing(&self) -> Arc<crate::handle::SyncGate> {
+        let g = Arc::new(crate::handle::SyncGate::default());
+        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(g.clone());
+        g
+    }
+
     /// Test and status view of the endpoint (counts only).
     pub(crate) fn snapshot(&self) -> fil_forward::Snapshot {
         self.ep.snapshot()
@@ -777,6 +776,10 @@ fn find_port(
 /// The daemon's checks (see the module docs).
 struct SessionPolicy {
     st: Shared,
+    /// Test hook: holds an `-R` accept right after its check passed (see
+    /// [`Forwards::gate_outgoing`]).
+    #[cfg(feature = "test-hooks")]
+    gate: Arc<Mutex<Option<Arc<crate::handle::SyncGate>>>>,
 }
 
 impl Policy for SessionPolicy {
@@ -794,7 +797,9 @@ impl Policy for SessionPolicy {
         }
     }
 
-    fn check_outgoing(&self, kind: &OpenKind) -> Result<(), OpenFailure> {
+    /// `peer` is who connected: the seam for OD-9's `forward.remote_peers = "same-user"` (the
+    /// peer socket's owner, from `/proc/net/tcp`). The default, `any`, is ssh's: not checked.
+    fn check_outgoing(&self, kind: &OpenKind, _peer: &LocalPeer) -> Result<(), OpenFailure> {
         let st = lock(&self.st);
         let OpenKind::Remote { forward } = kind else {
             // The agent relay (A1) is not here yet.
@@ -808,6 +813,14 @@ impl Policy for SessionPolicy {
         }
         if !st.consented.contains(forward) {
             return Err(OpenFailure::NotPermitted);
+        }
+        drop(st);
+        #[cfg(feature = "test-hooks")]
+        {
+            let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(g) = gate {
+                g.pass();
+            }
         }
         Ok(())
     }

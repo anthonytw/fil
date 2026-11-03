@@ -134,7 +134,7 @@ impl KeyUses {
         self.lock().total.clone()
     }
 
-    fn entry<'a>(u: &'a mut Uses, info: KeyInfo) -> Option<&'a mut KeyUse> {
+    fn entry(u: &mut Uses, info: KeyInfo) -> Option<&mut KeyUse> {
         let i = match u.by_fp.get(&info.fingerprint) {
             Some(&i) => {
                 // The newest comment the agent gave wins (a key without one keeps its last).

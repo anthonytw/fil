@@ -75,7 +75,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
 `ForwardPlan::resolve(&HostSettings, &CliForwards)` is what a run carries: the specs (config, then `-L`, `-R`, `-D`), the resolved agent mode, and the other settings. `Action::Attach` carries the parsed flags. `app.rs` turns the plan into the client's `ForwardSet` (F3) and binds its `-L` and `-D` listeners before the attach:
 
 - a port that cannot be bound is printed before the terminal goes raw; with `forward_failure = "exit"` nothing is attached and the status is 255 (ssh's `ExitOnForwardFailure`), otherwise it is a warning and the forward is still added to the session (reported as not listening, tried again at every fresh attach). A forward of the run's own that fails later (the host refuses it, or cannot bind a `-R`) ends the run with 255 under `"exit"` and is a notice otherwise;
-- until the agent relay is connected (A1), `-A` is **refused** before anything is dialed (exit 1, "not connected yet") and a config `agent` gets a warning that it is ignored;
+- the agent (A1): `-A` or a config `agent` of `on` or `confirm` relays the local agent at `SSH_AUTH_SOCK` as it is when `fil` starts (never a path from the host), with `agent_keys` and `confirm` carried into the client's `ForwardSet::agent`; with no `SSH_AUTH_SOCK` it warns and carries on (the session's socket then refuses, as `ssh -A` without an agent);
 - a bad spec is a usage error (exit 2), including `-R` beyond loopback (OD-7); two forwards that would take one port are an error (exit 1) when the plan is made.
 
 ### `fil ports` rendering (`src/ports_view.rs`)
@@ -97,7 +97,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
 
 - `tests/forward_spec.rs`: the grammar table, the loopback default (`a_bare_port_binds_loopback_never_wide`), hostile input (a flag as a spec, control characters, overlong names, port 0 on `-L`, out-of-range ports, unbalanced brackets, Unix sockets), a round trip through the formatter, random-input no-panic, OD-7, the plan's precedence and the agent flags.
 - `tests/ports_view.rs`: the text golden (`tests/golden/ports.txt`) and JSON golden for a fixed answer (IPv6 targets, binds and listeners included), the JSON key set, an escape sequence in a process name, path, probe label and host label rendered inert, multi-part assembly, truncation.
-- `tests/binary.rs`: the forward flags reach the attach and `-A` is refused before dialing, bad specs are usage errors, a refused spec is not echoed raw on a pty (clap styles its output there), and a `-L` on a port in use exits 255 under `forward_failure = "exit"` and warns otherwise.
+- `tests/binary.rs`: the forward flags and `-A` reach the attach, bad specs are usage errors, a refused spec is not echoed raw on a pty (clap styles its output there), and a `-L` on a port in use exits 255 under `forward_failure = "exit"` and warns otherwise.
 - Unit tests in `config.rs`, `cli.rs` and `mgmt.rs`.
 
 Mutations, applied by hand and reverted: the no-BIND default changed to `Any` fails `a_bare_port_binds_loopback_never_wide`, the grammar table and four more; `ports_view::clean` made the identity fails `escape_sequences_from_the_host_are_rendered_inert` and `a_name_that_is_only_escapes_still_shows_a_row`.
@@ -107,5 +107,4 @@ Mutations, applied by hand and reverted: the no-BIND default changed to `Any` fa
 - `fil forward` (laptop and in-session), `--rm`, the ambiguity error, `$FIL_SESSION` and the daemon socket of the right revision.
 - `fil ports [HOST [SESSION]] [--json]` as a command: send `Request::Ports`, collect every `Response::Ports` part (today `mgmt::ask` reads one response), choose the host's local time zone for `utc_offset_secs`, and print with `render_text`/`render_json`.
 - `fil detach` with no arguments (it needs the in-session daemon socket).
-- The agent (A1): the "not connected yet" refusal of `-A` in `app.rs` goes then.
 - The hint under an unforwarded listener says `fil forward -L PORT`; it may need a host and session when run from the laptop.

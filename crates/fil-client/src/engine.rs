@@ -1363,8 +1363,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 host: self.cfg.host_label.clone(),
                 key,
                 echo_ack: false,
-                // The agent relay comes with M2's A1.
-                agent: false,
+                // The session's agent socket exists while this subscriber relays (section 10).
+                agent: self.fwd.as_ref().is_some_and(ForwardHandle::agent_on),
                 resume,
             }),
         );
@@ -2496,8 +2496,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             .is_some_and(|c| Instant::now() >= c.until)
         {
             // Nobody answered: refused, and the keyboard is the session's again.
+            let agent = self.fwd_confirm.as_ref().is_some_and(|c| c.q.agent);
             self.fwd_answered(false, true);
-            self.notice = vec!["fil: no answer; the forward is refused".to_string()];
+            self.notice = vec![if agent {
+                "fil: no answer; the signature is refused".to_string()
+            } else {
+                "fil: no answer; the forward is refused".to_string()
+            }];
             self.notice_until = Some(Instant::now() + self.cfg.notice_for);
         }
         self.refresh_display()

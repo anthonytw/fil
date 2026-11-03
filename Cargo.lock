@@ -430,6 +430,7 @@ dependencies = [
  "fil-predict",
  "fil-proto",
  "fil-term",
+ "fil-testkit",
  "fil-transport",
  "rustix",
  "thiserror 2.0.21",

@@ -649,10 +649,17 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 ## 10. Agent forwarding (opt-in)
 
-- **Stable path:** the session's `SSH_AUTH_SOCK` is `/tmp/fil-$UID/agent/<session>.sock`.
-- **Relaying:** connections to that socket go over the agent channel to the current subscriber's local agent. While detached, they are refused immediately rather than left hanging.
-- **What it fixes:** the socket survives reconnects and takeovers. This is the tmux-era problem where `git push` fails after you reattach.
-- **Risk:** the same as `ssh -A`. While you're attached, root or your own UID on the remote can use your agent. Keys that require confirmation per use (Secure Enclave or Touch ID) prompt for every signature. Plain keys don't.
+- **Off by default.** `-A`, or `agent = "on"` or `"confirm"` for the host, turns it on for a run; `-a` turns it off. The client relays the agent at `SSH_AUTH_SOCK` as it was when `fil` started, never a path from the host.
+- **Stable path:** every session's `SSH_AUTH_SOCK` is `/tmp/fil-$UID/agent/<session>.sock`, whether or not a client relays (OD-6; `daemon.toml` `agent_socket = false` drops it). `agent/` is created with mode 0700 and checked with `lstat` like the socket directory (a real directory, ours, mode exactly 0700); anything else leaves the relay off.
+- **Relaying:** the socket (mode 0600) exists only while the subscriber holding the session relays its agent (`Attach.agent`). Every connection's peer uid is checked by the kernel's credentials (ours only). It then becomes an `Agent` channel to the client: at once while the link is up, after at most 10 s (`agent_wait`) while the client is between links, and never while detached. Detached, or held by a client that does not relay, the socket is removed, so a connection is refused at once.
+- **The filter (decided, OD-3), on the client:** only `REQUEST_IDENTITIES` (11), `SIGN_REQUEST` (13) and `EXTENSION` (27) for `session-bind@openssh.com` and `query` reach the agent. Every other message, among them add, remove, remove-all, lock, unlock and the smartcard and constrained adds, is answered with `SSH_AGENT_FAILURE`. A request must parse exactly, a message is at most 256 KiB, and the agent's answers are checked too (an answer of the wrong type becomes a failure). There is no switch to turn the filter off. The daemon does not read the messages; it counts them for `fil ports`.
+- **`agent_keys`:** SHA256 fingerprints. The list answer is rebuilt with only those keys, and a signature with any other is refused without asking the agent.
+- **`confirm` mode:** a question on the overlay before every signature, with the key's type, fingerprint and comment (sanitized, as all host-reachable text). It follows the forward questions' rules (one at a time, only on a live session, a lone key answers after a quiet moment) and is refused after 30 s. It is asked from the relay task of that connection, so it never holds up forwards or other agent connections.
+- **Key use is shown, not logged:** counts and last use per key are in `~#` on the client; `fil ports` shows the relay's open connections, requests and last use (counts only: fingerprints live on the client). Logs carry counts only, at debug.
+- **What it fixes:** the socket survives reconnects, swaps and takeovers. This is the tmux-era problem where `git push` fails after you reattach.
+- **Risk:** the same as `ssh -A` while you are attached. Root or your own UID on the remote can ask for signatures (not add or remove keys). Keys that require confirmation per use (Secure Enclave or Touch ID) prompt for every signature, and `confirm` does it for every key.
+- **Destination-constrained keys (OD-5, owner decision open):** OpenSSH 8.9+ constraints (`ssh-add -h`) assume the agent sees ssh's own `session-bind` for the laptop-to-remote hop. fil's relay is an ordinary local agent client, so a key constrained to "only from this laptop" becomes usable from the remote, and a key constrained to `remote>github.com` fails. This is true of any relay that is not ssh. Use `agent_keys` to keep such keys out.
+- **sshd's `AllowAgentForwarding` is bypassed (OD-8):** fil runs as the user, as any user-level relay would. A read-only policy file is a candidate for M4.
 
 ## 11. Security model
 
@@ -671,7 +678,8 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 | Other users on the remote host | the socket directory | 0700 and owned by you; the daemon refuses a directory created by someone else; every connection's peer UID is checked by the kernel. |
 | Other users on the remote host | `-R` ports on 127.0.0.1 | Reachable by every user on that host, the same as `ssh -R`. Documented. |
 | Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |
-| The remote host using your agent | signatures | Opt-in. The agent is relayed only while you're attached. Per-use confirmation keys prompt. |
+| The remote host using your agent | signatures | Opt-in and off by default. Relayed only while a client that asked for it is attached; the socket does not exist otherwise. The client's filter refuses everything but list, sign and two extensions; `agent_keys` limits the keys, and `confirm` asks per signature (§10). |
+| Other users on the remote host | the agent socket | Inside the 0700 socket directory, in a 0700 `agent/` checked like it; mode 0600; every connection's peer UID is checked by the kernel. |
 | A laptop waking up later | the session | Epoch fencing (§5.2). |
 | A stolen laptop disk | the opt-in offline-input log, if enabled | No tokens or keys are stored. The offline-input log (§4.3) is off by default, and when enabled it can contain typed passwords. |
 

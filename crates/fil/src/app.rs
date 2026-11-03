@@ -22,9 +22,6 @@ const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Exit status of a normal end.
 const OK: u8 = 0;
-/// Why the agent does nothing yet.
-const AGENT_NOT_WIRED: &str =
-    "agent relaying is parsed but not connected yet (milestone 2 is in progress)";
 /// Exit status when a forward cannot be set up and `forward_failure = "exit"`, as ssh's
 /// `ExitOnForwardFailure`.
 const FORWARD_FAILED: u8 = 255;
@@ -122,20 +119,17 @@ async fn attach(
             return FAILED;
         }
     };
-    // The agent relay is A1's: `-A` is refused (never dropped silently), the config's `agent`
-    // is warned about.
-    if forwards.agent == Some(crate::forward_spec::AgentFlag::On) {
-        eprintln!("fil: {AGENT_NOT_WIRED}. Attach without -A, or use ssh -A for now");
-        return FAILED;
-    }
-    if plan.agent != crate::config::AgentMode::Off {
-        eprintln!("fil: warning: `agent` in the config is ignored: {AGENT_NOT_WIRED}");
+    // The agent relay (DESIGN.md section 10): the local agent as it is now, never a path the
+    // host names. Without one the session's socket still exists and refuses, as ssh -A does.
+    let agent_socket = local_agent_socket();
+    if plan.agent != crate::config::AgentMode::Off && agent_socket.is_none() {
+        eprintln!("fil: warning: no local agent (SSH_AUTH_SOCK is not set): nothing to relay");
     }
     // Many sockets with forwards; children keep the original limit (`fil_transport::fdlimit`).
     let _ = fil_transport::fdlimit::raise();
     // `-L` and `-D` listen from now on, before the attach and before the terminal is raw: a port
     // that is taken is said here, and with `forward_failure = "exit"` nothing is attached.
-    let mut forward_set = forward_set(&plan);
+    let mut forward_set = forward_set(&plan, agent_socket);
     let failed = forward_set.bind_local();
     for f in &failed {
         match plan.forward_failure {
@@ -206,8 +200,26 @@ async fn attach(
 }
 
 /// The client's forwards from the resolved plan.
-fn forward_set(plan: &ForwardPlan) -> fil_client::ForwardSet {
+/// `SSH_AUTH_SOCK` at start, when it is an absolute path.
+fn local_agent_socket() -> Option<std::path::PathBuf> {
+    std::env::var_os("SSH_AUTH_SOCK")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+fn forward_set(
+    plan: &ForwardPlan,
+    agent_socket: Option<std::path::PathBuf>,
+) -> fil_client::ForwardSet {
     let mut set = fil_client::ForwardSet::new(plan.specs.clone());
+    set.agent = match plan.agent {
+        crate::config::AgentMode::Off => None,
+        mode => Some(fil_client::AgentRelay {
+            socket: agent_socket,
+            keys: plan.agent_keys.clone(),
+            confirm: mode == crate::config::AgentMode::Confirm,
+        }),
+    };
     set.remote_requests = match plan.remote_requests {
         crate::config::RemoteRequests::Ask => fil_client::RemoteRequests::Ask,
         crate::config::RemoteRequests::Deny => fil_client::RemoteRequests::Deny,

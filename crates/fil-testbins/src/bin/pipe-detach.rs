@@ -53,9 +53,13 @@ async fn daemon(args: &[String]) -> ExitCode {
     let _ = out.write_all(&preamble::encode(PROTOCOL_MAJOR));
     let _ = out.flush();
     let cfg = PipeConfig::new(LinkParams::default());
-    let Ok(link) = PipeLink::accept_halves(tokio::io::stdin(), tokio::io::stdout(), cfg).await
-    else {
-        return ExitCode::from(1);
+    let link = match PipeLink::accept_halves(tokio::io::stdin(), tokio::io::stdout(), cfg).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Say so: a test that finds no verdict could not tell this from a lost `Detach`.
+            let _ = std::fs::write(seen, format!("handshake failed: {e}"));
+            return ExitCode::from(1);
+        }
     };
     let verdict = loop {
         match link.recv().await {

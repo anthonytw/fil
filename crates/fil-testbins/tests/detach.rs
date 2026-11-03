@@ -4,6 +4,10 @@
 //! may not have forwarded them yet. A client that closes then loses the `Detach` once the
 //! command is killed after `close_grace`. A client that waits for the daemon to hang up (what
 //! `fil-client` does after a `Detach`) does not. The slow command is `pipe-detach slow`.
+//!
+//! This characterizes `PipeLink` against a real child process; it does **not** run `fil-client`
+//! (a daemon that speaks the attach protocol is beyond a test program), so reverting the engine
+//! leaves it green. The regression tests for the engine are `fil-client/tests/detach_delivery.rs`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -73,7 +77,14 @@ async fn detach(tag: &str, wait_for_hangup: bool) -> String {
     cfg.close_grace = Duration::from_millis(300);
     let link = PipeLink::spawn(&command, cfg).await.expect("link up");
 
-    // The link is up: from here on the command holds what it is given.
+    // `spawn` returns on the daemon's first frame, which says nothing of whether the daemon has
+    // ours: the slow command may still hold our handshake. The daemon answering our first ping
+    // proves it has read it, and only then does the command start holding bytes back.
+    let mut status = link.status();
+    timeout(Duration::from_secs(5), status.wait_for(|s| s.rtt.is_some()))
+        .await
+        .expect("the daemon answered our handshake")
+        .expect("the link is alive");
     std::fs::write(&delay, HOLD).unwrap();
     let detach = ControlMsg::Detach.encode().unwrap();
     link.send(ChannelId::CONTROL, detach.into()).await.unwrap();

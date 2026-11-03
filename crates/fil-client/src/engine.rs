@@ -253,41 +253,6 @@ impl<L: Link> LinkCtx<L> {
         self.writer.abort();
         self.link.close();
     }
-
-    /// Lets what was queued (a `Detach`) reach the daemon, then closes.
-    ///
-    /// "Reached" means the daemon saw it, and only the daemon can say so. `Link::flush` promises
-    /// no more than that the bytes left this side (written into ssh's stdin, on the pipe), and
-    /// closing then discards whatever the link still queues and lets the process exit under
-    /// ssh, which dies with its undelivered bytes. The session closes the link once it has
-    /// handled a `Detach`, so this waits for the link to go down, for at most
-    /// [`DETACH_DELIVERY_WAIT`], and only then closes its own side.
-    async fn close_after_flush(self) {
-        let Self {
-            link,
-            tx,
-            writer,
-            mut rrx,
-            reader,
-            ..
-        } = self;
-        drop(tx);
-        let delivered = tokio::time::timeout(DETACH_DELIVERY_WAIT, async {
-            // The writer has handed everything to the link (it stops when the link is down) ...
-            let _ = writer.await;
-            // ... the link has written it out ...
-            let _ = link.flush().await;
-            // ... and the daemon, done with the `Detach`, has hung up. Anything it sent before
-            // that is of no interest.
-            while let Some(Ok(_)) = rrx.recv().await {}
-        })
-        .await;
-        if delivered.is_err() {
-            tracing::debug!("the daemon did not hang up after the detach; closing anyway");
-        }
-        reader.abort();
-        link.close();
-    }
 }
 
 /// The next payload of the candidate link, or never when there is none.
@@ -418,6 +383,9 @@ pub(crate) struct Core<I, O> {
     notice_until: Option<Instant>,
     ack_due: Option<Instant>,
     first_attached: bool,
+    /// The screen has been given back (overlay gone, cooked mode, the ending shown). A detach does
+    /// it before it waits for the daemon.
+    screen_left: bool,
     term_warned: bool,
     term_mismatch: Option<(String, String)>,
     banner: Option<Vec<u8>>,
@@ -468,6 +436,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             notice_until: None,
             ack_due: None,
             first_attached: false,
+            screen_left: false,
             term_warned: false,
             term_mismatch: None,
             banner: None,
@@ -553,6 +522,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// Restores the terminal and shows the result.
     fn finish(&mut self, result: Result<Outcome, ClientError>) -> Result<Outcome, ClientError> {
+        self.leave_screen(&result);
+        result
+    }
+
+    /// Gives the screen back, once: the overlay comes off, the ending is shown, the terminal is
+    /// cooked again.
+    fn leave_screen(&mut self, result: &Result<Outcome, ClientError>) {
+        if std::mem::replace(&mut self.screen_left, true) {
+            return;
+        }
         // Take our drawing off the screen first; the screen is the user's again.
         if let Some(d) = self.display.as_mut() {
             let bytes = d.set_lines(Vec::new());
@@ -562,7 +541,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if !self.first_attached {
             self.add_banner_warning(&mut text);
         }
-        match &result {
+        match result {
             Ok(o) => {
                 let m = o.message(self.cfg.session.as_str(), self.cfg.time_format);
                 text.push_str(&format!("\r\n{m}\r\n"));
@@ -574,7 +553,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let _ = self.out.set_raw(false);
             self.raw = false;
         }
-        result
     }
 
     // ---- dialing -----------------------------------------------------------------------
@@ -799,10 +777,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     ev = self.input.next(), if self.pending.len() < MAX_PENDING_INPUT => {
                         match self.on_event(ev)? {
                             Ev::Continue => {}
-                            Ev::Detach => {
-                                self.send_ctl(&ControlMsg::Detach);
-                                ended = Some(Served::Done(Outcome::Detached));
-                            }
+                            // The `Detach` itself is sent by `detach_and_wait`, once the input
+                            // typed before it has reached the daemon.
+                            Ev::Detach => ended = Some(Served::Done(Outcome::Detached)),
                             Ev::End(o) => ended = Some(Served::Done(o)),
                         }
                     }
@@ -873,6 +850,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         .await;
 
+        // `~.`: the terminal is given back at once, then the daemon is given time to hear it.
+        let mut result = result;
+        if matches!(result, Ok(Served::Done(Outcome::Detached))) {
+            self.leave_screen(&Ok(Outcome::Detached));
+            if let Some(o) = self.detach_and_wait(&mut primary, &mut cand).await {
+                result = Ok(Served::Done(o));
+            }
+        }
+
         // Leave the links tidy, also when the loop failed: the daemon should see them close.
         self.tx = None;
         if primary.conn.snap.is_some() {
@@ -887,12 +873,96 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             dialer.swapped(Err(SwapError::LinkFailed("the session ended first".into())));
             c.close();
         }
-        if matches!(result, Ok(Served::Done(Outcome::Detached))) {
-            primary.close_after_flush().await;
-        } else {
-            primary.close();
-        }
+        primary.close();
         result
+    }
+
+    /// After `~.`: tells the daemon, and waits until it has heard. Returns a different ending if
+    /// one turned up meanwhile (the shell exited).
+    ///
+    /// Only the daemon can say it heard, so this waits for it to hang up (the session closes the
+    /// link once it has handled a `Detach`), for at most [`DETACH_DELIVERY_WAIT`]. `Link::flush`
+    /// would not do: on the pipe it means the bytes are in ssh's stdin, and closing then discards
+    /// what the link still queues and lets the process exit under an ssh that has not forwarded
+    /// them. (A QUIC close likewise throws away unsent stream data.) So `flush` plays no part.
+    ///
+    /// The `Detach` goes out only once the daemon has acknowledged all the input typed before it,
+    /// including what the send window held back: the links send control ahead of data, and a
+    /// `Detach` that overtook `make deploy` would lose the command. While a swap is under way the
+    /// candidate is told too: the daemon may already have moved the session to it and dropped
+    /// the old link, with the `Detach` on it.
+    async fn detach_and_wait<L: Link>(
+        &mut self,
+        primary: &mut LinkCtx<L>,
+        cand: &mut Option<LinkCtx<L>>,
+    ) -> Option<Outcome> {
+        let deadline = Instant::now() + DETACH_DELIVERY_WAIT;
+        let (mut sent, mut p_down, mut c_down) = (false, false, false);
+        loop {
+            if !sent && self.input_delivered() {
+                send_on(&primary.tx, &ControlMsg::Detach);
+                if let Some(c) = cand.as_ref() {
+                    send_on(&c.tx, &ControlMsg::Detach);
+                }
+                sent = true;
+            }
+            if p_down && (cand.is_none() || c_down) {
+                break;
+            }
+            tokio::select! {
+                m = primary.rrx.recv(), if !p_down => match m {
+                    Some(Ok((chan, payload))) => self.while_detaching(chan, &payload, true),
+                    // The link went down, which is what the daemon does once it has heard.
+                    _ => p_down = true,
+                },
+                m = cand_recv(cand), if cand.is_some() && !c_down => match m {
+                    Some(Ok((chan, payload))) => {
+                        // Refused: the key is already revoked, so the session is detached.
+                        if refused(chan, &payload) {
+                            c_down = true;
+                        } else {
+                            self.while_detaching(chan, &payload, false);
+                        }
+                    }
+                    _ => c_down = true,
+                },
+                () = sleep_until(deadline) => {
+                    tracing::debug!("the daemon did not hang up after the detach; closing anyway");
+                    break;
+                }
+            }
+        }
+        self.sess
+            .exited
+            .map(|(code, signal, _)| Outcome::SessionEnded { code, signal })
+    }
+
+    /// Everything typed has reached the daemon (or cannot, on this link, so waiting is no use).
+    fn input_delivered(&self) -> bool {
+        let flowing = self.tx.is_some() && self.link_ok && self.sess.input_ready;
+        !flowing || (self.pending.is_empty() && self.sess.input.buffered() == 0)
+    }
+
+    /// A message from the daemon while the detach is under way. Output is of no interest (the
+    /// screen is the user's); acks free the send window, and a `SessionExited` changes how the
+    /// run ends.
+    fn while_detaching(&mut self, chan: ChannelId, payload: &[u8], primary: bool) {
+        if chan != ChannelId::CONTROL {
+            return;
+        }
+        match ControlMsg::decode(payload) {
+            Ok(ControlMsg::Ack { channel, upto }) if primary && channel == ChannelId::TERMINAL => {
+                if self.sess.input.ack(upto).is_ok() {
+                    self.pump_input();
+                }
+            }
+            Ok(ControlMsg::SessionExited { code, signal }) => {
+                self.sess
+                    .exited
+                    .get_or_insert((code, signal, Instant::now()));
+            }
+            _ => {}
+        }
     }
 
     /// `primary` (a candidate that took over) is now the link keystrokes and acks go to.
@@ -1960,6 +2030,15 @@ enum Ev {
 enum Flow {
     Continue,
     End(Served),
+}
+
+/// Whether a payload is the daemon refusing an attach.
+fn refused(chan: ChannelId, payload: &[u8]) -> bool {
+    chan == ChannelId::CONTROL
+        && matches!(
+            ControlMsg::decode(payload),
+            Ok(ControlMsg::AttachRefused(_))
+        )
 }
 
 fn send_on(tx: &Outbox, msg: &ControlMsg) {

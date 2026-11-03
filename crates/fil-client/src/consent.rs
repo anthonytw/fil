@@ -19,8 +19,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use fil_proto::mux::{
-    BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Origin, Target,
-    TargetHost,
+    BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Target, TargetHost,
 };
 
 use crate::config::RemoteRequests;
@@ -236,7 +235,7 @@ pub fn flag(kind: ForwardKind) -> &'static str {
 /// decode (addresses, LDH names, ports), so this is plain ASCII with nothing to escape.
 pub fn describe(spec: &ForwardSpec) -> String {
     let listen = format!("{}:{}", bind_text(spec.bind()), spec.port());
-    match spec.target() {
+    let text = match spec.target() {
         Some(t) => format!(
             "{} {listen} -> {}:{}",
             flag(spec.kind()),
@@ -244,15 +243,19 @@ pub fn describe(spec: &ForwardSpec) -> String {
             t.port
         ),
         None => format!("{} {listen}", flag(spec.kind())),
-    }
+    };
+    debug_assert!(
+        text.is_ascii() && !text.bytes().any(|b| b.is_ascii_control()),
+        "a spec is plain ASCII"
+    );
+    text
 }
 
-/// The question about a forward the client did not name, in lines of at most 40 columns.
-pub fn prompt_lines(spec: &ForwardSpec, origin: Origin) -> Vec<String> {
-    let mut v = vec![match origin {
-        Origin::Request => "fil: the host asks to forward".to_string(),
-        Origin::Client => "fil: the session has a forward".to_string(),
-    }];
+/// The question about a forward the client did not name, in lines of at most 40 columns. One
+/// wording whatever origin the daemon claims: the claim is the host's, and a softer wording would
+/// make a hostile request look more legitimate.
+pub fn prompt_lines(spec: &ForwardSpec) -> Vec<String> {
+    let mut v = vec!["fil: the host asks to forward".to_string()];
     v.extend(crate::text::wrap(&describe(spec), 38));
     v.push(
         match spec.kind() {
@@ -458,11 +461,21 @@ mod tests {
             g.address(&open(theirs), at("[::ffff:127.0.0.1]:22")),
             Ok(())
         );
-        // `localhost` that resolves somewhere else is not this machine.
-        assert_eq!(
-            g.address(&open(theirs), at("192.0.2.8:22")),
-            Err(OpenFailure::NotPermitted)
-        );
+        // `localhost` that resolves somewhere else is not this machine; nor is the unspecified
+        // address (a connect to it reaches this host on Linux and macOS, but it is not an
+        // address the rule allows, and nothing honest resolves to it).
+        for bad in [
+            "192.0.2.8:22",
+            "0.0.0.0:22",
+            "[::]:22",
+            "[::ffff:0.0.0.0]:22",
+        ] {
+            assert_eq!(
+                g.address(&open(theirs), at(bad)),
+                Err(OpenFailure::NotPermitted),
+                "{bad}"
+            );
+        }
         // The user's own spec reaches what the user named.
         assert_eq!(g.address(&open(ours), at("192.0.2.8:22")), Ok(()));
         assert_eq!(
@@ -486,7 +499,7 @@ mod tests {
             65535,
             Some(target(&long, 65535)),
         );
-        let lines = prompt_lines(&s, Origin::Request);
+        let lines = prompt_lines(&s);
         assert!(
             lines
                 .iter()

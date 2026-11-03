@@ -356,3 +356,86 @@ async fn tilde_hash_shows_the_forwards_until_the_next_key() -> Test {
     until_async("the key reaches the session", 5, || typed(&rig, "\rx")).await;
     Ok(())
 }
+
+/// While a session's forwards are failed the daemon refuses resumes with `BadResume` (F2); the
+/// client attaches afresh, a new mux epoch, and its own forwards come back with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_resume_starts_a_new_epoch_and_the_forwards_come_back() -> Test {
+    let server = echo_server().await;
+    let port = free_port();
+    let rig = attached(vec![local(port, server.port)], Rules::default()).await;
+    eventually("the own -L is in the table", 5, || {
+        own_id(&rig, ForwardKind::Local).is_some()
+    })
+    .await;
+    let added = rig.daemon.fwd.st.lock().unwrap().added.len();
+    rig.daemon
+        .refuse_next(fil_proto::msg::AttachRefusal::BadResume)
+        .await;
+    rig.daemon.kill_link(DownReason::Dead).await;
+    // The fresh attach adds the own spec again (a new epoch).
+    eventually("the own spec added again", 10, || {
+        rig.daemon.fwd.st.lock().unwrap().added.len() > added
+    })
+    .await;
+    let attaches = rig.daemon.attaches().await;
+    assert!(attaches.last().unwrap().resume.is_none(), "a fresh attach");
+    eventually("listening again", 5, || {
+        let st = rig.daemon.fwd.st.lock().unwrap();
+        st.listening.len() >= 2
+    })
+    .await;
+    let mut app = connect(port).await.expect("the own -L");
+    assert!(round_trip(&mut app, b"after the fresh attach").await);
+    assert!(!rig.is_finished());
+    Ok(())
+}
+
+/// A take-back where the own `-L` comes back under a new id (the entry was removed or replaced
+/// meanwhile, or the session is another one): its listener moves to the new id and keeps the
+/// port. Under `forward_failure = "exit"`, so a failed rebind would end the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_take_back_under_a_new_id_keeps_listening() -> Test {
+    let server = echo_server().await;
+    let mine = free_port();
+    let rig = attached(
+        vec![local(mine, server.port)],
+        Rules {
+            failure: ForwardFailure::Exit,
+            ..Rules::default()
+        },
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    for round in 0..4 {
+        eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+        let id = fwd.ids()[0].0;
+        rig.daemon.take_over("other").await;
+        // While the other client has it, the entry goes.
+        fwd.st.lock().unwrap().table.remove(id);
+        until("take back?", 5, || {
+            rig.term.text().contains("Take it back?")
+        })
+        .await;
+        rig.answer("y").await;
+        eventually("a new id", 5, || {
+            fwd.ids().first().is_some_and(|e| e.0 != id)
+        })
+        .await;
+        let new = fwd.ids()[0].0;
+        eventually("listening under the new id", 5, || {
+            fwd.st
+                .lock()
+                .unwrap()
+                .listening
+                .iter()
+                .any(|(i, s)| *i == new && matches!(s, ListenState::Listening { .. }))
+        })
+        .await;
+        let mut c = connect(mine).await.expect("the own -L listens");
+        assert!(round_trip(&mut c, b"x").await, "round {round}");
+        assert!(!rig.is_finished(), "round {round}: the run ended");
+        assert!(!rig.term.text().contains("cannot listen"), "round {round}");
+    }
+    Ok(())
+}

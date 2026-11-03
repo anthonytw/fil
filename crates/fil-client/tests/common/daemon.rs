@@ -1185,6 +1185,10 @@ pub struct FwdState {
     pub fail_listen_next: Option<fil_proto::mux::BindFailure>,
     /// Channels the daemon was asked to open by the client, by kind.
     pub incoming: Vec<OpenKind>,
+    /// Hostile: `AddForward`s are recorded and not answered (a test answers them by hand).
+    pub hold_adds: bool,
+    /// Every `Consent` received (`consents` keeps the first 5,000).
+    pub nconsents: usize,
 }
 
 pub struct FakeFwd {
@@ -1319,6 +1323,9 @@ impl FakeFwd {
                 let (wire, refuse) = {
                     let mut st = self.st.lock().unwrap();
                     st.added.push((req, spec.clone()));
+                    if st.hold_adds {
+                        return;
+                    }
                     (st.lie_next.take().unwrap_or(spec), st.refuse_next.take())
                 };
                 if let Some(why) = refuse {
@@ -1350,7 +1357,13 @@ impl FakeFwd {
                 }
             }
             MuxMsg::Consent { id, accepted } => {
-                self.st.lock().unwrap().consents.push((id, accepted));
+                let mut st = self.st.lock().unwrap();
+                st.nconsents += 1;
+                // The first ones are kept; a flood is only counted (the flood test measures
+                // the client's memory, not this record's).
+                if st.consents.len() < 5000 {
+                    st.consents.push((id, accepted));
+                }
             }
             MuxMsg::Listening { id, state } => {
                 self.st.lock().unwrap().listening.push((id, state));
@@ -1435,6 +1448,13 @@ impl FakeFwd {
         // A refusal here (the daemon's own policy) never happens: it allows everything.
         let _ = self.ep.open_stream(kind, Box::new(ours));
         app
+    }
+
+    /// Hostile: sends any table message, waiting while the MUX buffer is full.
+    pub async fn send(&self, msg: MuxMsg) {
+        while self.ep.send_table(msg.clone()).is_err() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     pub fn consents(&self) -> Vec<(ForwardId, bool)> {

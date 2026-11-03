@@ -27,7 +27,7 @@ fil-client = { path = "../fil-client" }
 fil-daemon = { path = "../fil-daemon" }
 fil-proto = { path = "../fil-proto" }
 fil-transport = { path = "../fil-transport" }
-rustix = { version = "1", features = ["system", "fs", "process"] }
+rustix = { version = "1", features = ["system", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

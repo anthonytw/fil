@@ -622,14 +622,15 @@ impl LogSink {
                 let (prog, args) = argv
                     .split_first()
                     .ok_or_else(|| err("empty command".into()))?;
-                let mut child = tokio::process::Command::new(prog)
-                    .args(args)
+                let mut cmd = tokio::process::Command::new(prog);
+                cmd.args(args)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .kill_on_drop(false)
-                    .spawn()
-                    .map_err(|e| err(e.to_string()))?;
+                    .kill_on_drop(false);
+                // Not the raised limit on open files (`fil_transport::fdlimit`).
+                fil_transport::fdlimit::keep_for_child(&mut cmd);
+                let mut child = cmd.spawn().map_err(|e| err(e.to_string()))?;
                 let mut stdin = child.stdin.take().ok_or_else(|| err("no stdin".into()))?;
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
                 tokio::spawn(async move {

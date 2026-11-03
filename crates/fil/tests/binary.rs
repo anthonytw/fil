@@ -58,13 +58,16 @@ fn the_first_run_shows_the_pipe_commands_stderr() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A port nothing listens on right now.
+/// A port nothing listens on right now, in both loopback families (a `-L` binds both).
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    loop {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        match std::net::TcpListener::bind(("::1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            _ => return port,
+        }
+    }
 }
 
 /// What a run without a terminal says once it is past the forwards (it would attach next).

@@ -246,3 +246,291 @@ fn a_local_forward_keeps_going_while_the_terminal_is_stuck() -> Test {
     });
     Ok(())
 }
+
+/// The review's swap (B1): a question shows a benign `-R`; the host answers the run's own
+/// `AddForward` with the question's id, sends `ForwardGone` for it and announces that id again
+/// with another target. The user's `y` was to what was shown: nothing else may be granted. The
+/// client takes an own answer with an id in use as the protocol break it is and ends the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_yes_is_never_applied_to_an_entry_swapped_in_behind_the_question() -> Test {
+    use fil_proto::mux::MuxMsg;
+    let benign = echo_server().await;
+    let bait = canary().await;
+    let server = echo_server().await;
+    let own = local(free_port(), server.port);
+    let daemon = common::FakeDaemon::new(8 * 1024 * 1024);
+    daemon.fwd.st.lock().unwrap().hold_adds = true;
+    let (cfg, _) = common::fwd::config_with(vec![own.clone()], Rules::default());
+    let rig = common::start_with(daemon, cfg, 80, 24, "xterm-256color");
+    rig.attached().await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own AddForward", 5, || {
+        !fwd.st.lock().unwrap().added.is_empty()
+    })
+    .await;
+    let req = fwd.st.lock().unwrap().added[0].0;
+    let x = ForwardId(500);
+    fwd.announce(x, remote(0, benign.port), Origin::Request);
+    until("the question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    fwd.send(MuxMsg::Forward {
+        id: x,
+        spec: own.clone(),
+        origin: Origin::Client,
+        req: Some(req),
+    })
+    .await;
+    fwd.send(MuxMsg::ForwardGone { id: x }).await;
+    fwd.send(MuxMsg::Forward {
+        id: x,
+        spec: remote(0, bait.port),
+        origin: Origin::Request,
+        req: None,
+    })
+    .await;
+    rig.answer("y").await;
+    let r = rig.finish().await;
+    assert!(
+        matches!(r, Err(fil_client::ClientError::Protocol(_))),
+        "{r:?}"
+    );
+    assert!(!fwd.consents().iter().any(|c| c.1), "{:?}", fwd.consents());
+    let mut s = fwd.open(OpenKind::Remote { forward: x }).await;
+    let _ = ends_without_data(&mut s, Duration::from_millis(500)).await;
+    assert_eq!(bait.accepts(), 0, "the swapped-in target was reached");
+    assert_eq!(benign.accepts(), 0);
+    Ok(())
+}
+
+/// Without an own forward: `ForwardGone` takes the question away, and the id announced again
+/// (with another target) is refused without asking, whatever the user types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gone_id_announced_again_is_refused() -> Test {
+    use fil_proto::mux::MuxMsg;
+    let benign = echo_server().await;
+    let bait = canary().await;
+    let rig = attached(vec![], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    let x = ForwardId(600);
+    fwd.announce(x, remote(0, benign.port), Origin::Request);
+    until("the question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    fwd.send(MuxMsg::ForwardGone { id: x }).await;
+    fwd.send(MuxMsg::Forward {
+        id: x,
+        spec: remote(0, bait.port),
+        origin: Origin::Request,
+        req: None,
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the refusal", 5, || fwd.consents().contains(&(x, false))).await;
+    assert!(!fwd.consents().iter().any(|c| c.1), "{:?}", fwd.consents());
+    let mut s = fwd.open(OpenKind::Remote { forward: x }).await;
+    assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    assert_eq!(bait.accepts(), 0);
+    Ok(())
+}
+
+/// Ten entries at once (B2): at most [`fil_client::forward::MAX_QUESTIONS`] are asked, the
+/// refusals that follow trip the 3-refusal rule, and that refuses the questions still waiting.
+/// Nothing holds the keyboard, and no answer was needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_requests_is_refused_and_does_not_hold_the_keyboard() -> Test {
+    let bait = canary().await;
+    let rig = attached(vec![], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    for i in 0..10u32 {
+        fwd.announce(ForwardId(100 + i), remote(0, bait.port), Origin::Request);
+    }
+    eventually("all refused", 5, || fwd.consents().len() == 10).await;
+    assert!(fwd.consents().iter().all(|c| !c.1), "{:?}", fwd.consents());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rig.term.text().contains("asks to forward"),
+        "a question is still up"
+    );
+    // The keyboard is the session's.
+    rig.type_str("ls\r");
+    common::until_async("typing reaches the session", 5, || {
+        let d = rig.daemon.clone();
+        async move { String::from_utf8_lossy(&d.input().await).contains("ls\r") }
+    })
+    .await;
+    for i in 0..10u32 {
+        let mut s = fwd
+            .open(OpenKind::Remote {
+                forward: ForwardId(100 + i),
+            })
+            .await;
+        assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    }
+    assert_eq!(bait.accepts(), 0);
+    Ok(())
+}
+
+/// `~.` detaches while a question from the host is on the screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tilde_dot_detaches_during_a_question() -> Test {
+    let bait = canary().await;
+    let rig = attached(vec![], Rules::default()).await;
+    rig.daemon.fwd.request(remote(0, bait.port));
+    until("the question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rig.type_str("\r~.");
+    let r = rig.finish().await;
+    assert!(matches!(r, Ok(fil_client::Outcome::Detached)), "{r:?}");
+    Ok(())
+}
+
+/// 200,000 entries announced (B2): the client keeps a bounded number, so its memory does not
+/// grow with what the host sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_flood_stays_bounded_in_memory() -> Test {
+    use fil_proto::mux::MuxMsg;
+    let rig = attached(vec![], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    let rss_kib = || {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+    };
+    const N: u32 = 200_000;
+    let flood = |first: u32| {
+        let fwd = fwd.clone();
+        async move {
+            for i in 0..N {
+                fwd.send(MuxMsg::Forward {
+                    id: ForwardId(first + i),
+                    spec: remote(0, 22),
+                    origin: Origin::Request,
+                    req: None,
+                })
+                .await;
+            }
+        }
+    };
+    let answered = |n: usize| {
+        let fwd = fwd.clone();
+        move || fwd.st.lock().unwrap().nconsents >= n
+    };
+    // A first flood brings every pool and buffer on the way to its working size; a second one
+    // of the same size must then add nothing that grows with it.
+    flood(10_000).await;
+    eventually("the first flood answered", 120, answered(N as usize)).await;
+    let before = rss_kib();
+    flood(10_000 + N).await;
+    eventually("the second flood answered", 120, answered(2 * N as usize)).await;
+    let grew = rss_kib().saturating_sub(before);
+    // Unbounded, the client kept about 150 bytes per entry: about 29 MiB per flood.
+    assert!(grew < 4 * 1024, "grew by {grew} KiB over the second flood");
+    assert!(!rig.is_finished());
+    Ok(())
+}
+
+/// An entry the own spec supersedes (another client's `-R` on that port, with another target)
+/// is never granted; the own one reaches the own target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_entry_is_not_granted() -> Test {
+    let wanted = echo_server().await;
+    let bait = canary().await;
+    let port = free_port();
+    let rig = attached(vec![remote(port, wanted.port)], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("own -R", 5, || !fwd.ids().is_empty()).await;
+    rig.daemon.take_over("other").await;
+    {
+        let mut st = fwd.st.lock().unwrap();
+        let id = st.table.iter().next().unwrap().id;
+        st.table.remove(id);
+        st.table
+            .add(remote(port, bait.port), Origin::Client)
+            .unwrap();
+    }
+    let lied = fwd.ids()[0].0;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("replaced", 5, || fwd.ids().iter().any(|e| e.0 != lied)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.term.text().contains("asks to forward"));
+    let mut s = fwd.open(OpenKind::Remote { forward: lied }).await;
+    assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    let own = fwd.ids().iter().find(|e| e.0 != lied).unwrap().0;
+    let mut s = fwd.open(OpenKind::Remote { forward: own }).await;
+    assert!(round_trip(&mut s, b"own").await);
+    assert_eq!(bait.accepts(), 0);
+    Ok(())
+}
+
+/// An own `-R` removed on the host (`ForwardGone`) is not served any more, nor when its id is
+/// announced again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_remote_forward_is_not_served_after_it_went() -> Test {
+    let bait = canary().await;
+    let rig = attached(vec![remote(free_port(), bait.port)], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("own -R", 5, || !fwd.ids().is_empty()).await;
+    let (id, spec, _) = fwd.ids()[0].clone();
+    fwd.remove(id);
+    until("the notice", 5, || rig.term.text().contains("was removed")).await;
+    let mut s = fwd.open(OpenKind::Remote { forward: id }).await;
+    assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    fwd.announce(id, spec, Origin::Client);
+    eventually("the re-announcement refused", 5, || {
+        fwd.consents().contains(&(id, false))
+    })
+    .await;
+    let mut s = fwd.open(OpenKind::Remote { forward: id }).await;
+    assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    assert_eq!(bait.accepts(), 0);
+    Ok(())
+}
+
+/// A management `-R` granted in one epoch is not granted in the next: after a take-back it is
+/// asked about again, and opened before the answer it reaches nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_does_not_survive_a_take_back() -> Test {
+    let target = echo_server().await;
+    let rig = attached(vec![], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    let id = fwd.request(remote(0, target.port));
+    until("the question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the consent", 5, || fwd.consents() == vec![(id, true)]).await;
+    let mut s = fwd.open(OpenKind::Remote { forward: id }).await;
+    assert!(round_trip(&mut s, b"granted").await);
+    assert_eq!(target.accepts(), 1);
+
+    rig.daemon.take_over("other").await;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    until("the question again", 10, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    let mut s = fwd.open(OpenKind::Remote { forward: id }).await;
+    assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
+    assert_eq!(target.accepts(), 1, "an old grant was used");
+    Ok(())
+}

@@ -42,7 +42,7 @@
 //! Specs, ports, targets and addresses are user data (DESIGN.md section 11.1): logged at debug at
 //! most, never above. Info lines are counts and kinds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -157,13 +157,23 @@ impl ForwardSet {
 
 // ---- what the client loop sees --------------------------------------------------------------
 
+/// A question about one entry. The answer names the question by its `token`, not by the
+/// entry's id alone: the host could otherwise point the id at another spec while the question is
+/// on the screen, and the user's `y` to what was shown would grant what was not.
+#[derive(Clone, Debug)]
+pub(crate) struct Question {
+    pub(crate) id: ForwardId,
+    pub(crate) token: u64,
+    pub(crate) lines: Vec<String>,
+}
+
 /// What the forwards tell the client loop.
 #[derive(Debug)]
 pub(crate) enum Note {
-    /// Ask the user about entry `id`; answer with [`ForwardHandle::answer`].
-    Ask { id: ForwardId, lines: Vec<String> },
-    /// The entry is gone: drop its question if it is still waiting.
-    Cancel { id: ForwardId },
+    /// Ask the user; answer with [`ForwardHandle::answer`].
+    Ask(Question),
+    /// The question is moot (its entry is gone, or refused): drop it if it is still waiting.
+    Cancel { token: u64 },
     /// A fresh attach: every question still waiting is moot.
     CancelAll,
     /// Something to show for a while.
@@ -181,8 +191,12 @@ pub(crate) struct ForwardHandle {
 }
 
 impl ForwardHandle {
-    pub(crate) fn answer(&self, id: ForwardId, yes: bool) {
-        let _ = self.to_manager.send(ToManager::Answer { id, yes });
+    pub(crate) fn answer(&self, q: &Question, yes: bool) {
+        let _ = self.to_manager.send(ToManager::Answer {
+            id: q.id,
+            token: q.token,
+            yes,
+        });
     }
 
     /// Two lines of at most 40 columns for `~#`.
@@ -196,6 +210,7 @@ enum ToManager {
     Fresh(oneshot::Sender<()>),
     Answer {
         id: ForwardId,
+        token: u64,
         yes: bool,
     },
 }
@@ -298,6 +313,11 @@ impl<L: Link> Forwards<L> {
             rules: set.remote_requests,
             failure: set.failure,
             denials: 0,
+            refusals: 0,
+            next_token: 0,
+            gone_ids: HashSet::new(),
+            failed: false,
+            dirty: true,
             view: view.clone(),
         };
         let manager = tokio::spawn(mgr.run(from_router, events));
@@ -565,7 +585,37 @@ struct Other {
     spec: ForwardSpec,
     state: State,
     port: Option<u16>,
+    /// The question asked about it (`Asking`): only an answer to this one counts.
+    token: u64,
 }
+
+impl Other {
+    fn new(spec: ForwardSpec, state: State) -> Self {
+        Self {
+            spec,
+            state,
+            port: None,
+            token: 0,
+        }
+    }
+}
+
+/// Most questions about forwards waiting for the user at once. Entries past it are refused
+/// without asking and count as refusals, so a host cannot queue questions without end.
+pub const MAX_QUESTIONS: usize = 4;
+/// Most entries the client keeps of those it did not name. An honest daemon has at most
+/// [`fil_proto::limits::MAX_FORWARDS`] in all; past this every further one is refused without
+/// being kept.
+pub const MAX_OTHERS: usize = 2 * fil_proto::limits::MAX_FORWARDS;
+/// Most ids remembered as gone in one epoch (an id never comes back: section 2.4). A host that
+/// goes past it ends the run with a protocol error.
+const MAX_GONE: usize = 4096;
+/// After the listener of an own forward moved to another id: how long to wait for the old
+/// sockets to close before the bind under the new id.
+const REBIND_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+const REBIND_TRIES: usize = 200;
+/// Refusals logged at info and shown as a notice; after that only at debug.
+const LOUD_REFUSALS: u32 = 8;
 
 /// For `~#`.
 #[derive(Clone, Debug, Default)]
@@ -585,8 +635,19 @@ struct Manager<L: Link> {
     notes: mpsc::UnboundedSender<Note>,
     rules: RemoteRequests,
     failure: ForwardFailure,
+    /// Refusals and unanswered questions in a row (an allowed one resets it).
     denials: u32,
+    /// Refusals without asking in this run, for the log and notices.
+    refusals: u32,
+    next_token: u64,
+    /// Ids that went (`ForwardGone`) in this epoch: never taken again.
+    gone_ids: HashSet<ForwardId>,
+    /// The run is over for the forwards (the host broke the rules): nothing more is done.
+    failed: bool,
     view: Arc<Mutex<View>>,
+    /// The view needs redoing: something it shows changed. A message that only gets an entry
+    /// refused and forgotten does not set it, so a flood costs no more than its refusals.
+    dirty: bool,
 }
 
 impl<L: Link> Manager<L> {
@@ -604,26 +665,41 @@ impl<L: Link> Manager<L> {
                     None => return,
                     Some(ToManager::Fresh(done)) => {
                         while events.try_recv().is_ok() {}
+                        self.dirty = true;
                         self.fresh();
                         let _ = done.send(());
                     }
-                    Some(ToManager::Answer { id, yes }) => self.answer(id, yes),
+                    Some(ToManager::Answer { id, token, yes }) => {
+                        self.dirty = true;
+                        self.answer(id, token, yes);
+                    }
                 },
                 ev = events.recv() => match ev {
                     None => return,
-                    Some(EndpointEvent::Table(m)) => self.table(m),
+                    Some(EndpointEvent::Table(m)) => self.table(m).await,
                     Some(EndpointEvent::Failed(e)) => {
                         debug!(error = %e, "forward protocol failed");
-                        self.note(Note::Failed(format!("the host broke the forward protocol: {e}")));
+                        self.broken(format!("the host broke the forward protocol: {e}"));
                     }
                 },
             }
-            self.refresh_view();
+            if std::mem::take(&mut self.dirty) {
+                self.refresh_view();
+            }
         }
     }
 
     fn note(&self, n: Note) {
         let _ = self.notes.send(n);
+    }
+
+    /// The host broke the rules: the run ends with a protocol error, and nothing more is acted
+    /// on meanwhile.
+    fn broken(&mut self, why: impl Into<String>) {
+        if !std::mem::replace(&mut self.failed, true) {
+            lock(&self.grants).clear();
+            self.note(Note::Failed(why.into()));
+        }
     }
 
     fn send(&self, msg: MuxMsg) {
@@ -641,6 +717,7 @@ impl<L: Link> Manager<L> {
             }
         }
         self.note(Note::CancelAll);
+        self.gone_ids.clear();
         for i in 0..self.own.len() {
             let req = self.next_req;
             self.next_req = self.next_req.wrapping_add(1);
@@ -656,7 +733,14 @@ impl<L: Link> Manager<L> {
         self.own.iter().position(|o| o.id == Some(id))
     }
 
-    fn table(&mut self, msg: MuxMsg) {
+    async fn table(&mut self, msg: MuxMsg) {
+        if self.failed {
+            return;
+        }
+        // Only an announcement can be refused and forgotten; `other` says when it keeps one.
+        if !matches!(msg, MuxMsg::Forward { req: None, .. }) {
+            self.dirty = true;
+        }
         match msg {
             MuxMsg::Forward {
                 id,
@@ -666,7 +750,7 @@ impl<L: Link> Manager<L> {
             } => {
                 let _ = origin;
                 match self.own.iter().position(|o| o.req == Some(req)) {
-                    Some(i) => self.own_answer(i, id, &spec),
+                    Some(i) => self.own_answer(i, id, &spec).await,
                     None => debug!("an answer to no request of ours"),
                 }
             }
@@ -697,9 +781,26 @@ impl<L: Link> Manager<L> {
 
     /// The daemon's answer to an own `AddForward`: entry `id`. What it said the spec is
     /// (`_wire`) is not used: the run's own copy is what the forward does.
-    fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
+    async fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
         if *_wire != self.own[i].spec {
             debug!("the host's entry differs from the spec asked for; the own copy is used");
+        }
+        // An honest daemon answers with a new id or with an entry of this spec's identity (which
+        // the client holds as `Superseded`). Anything else would take an id the client already
+        // acts on: a question on the screen, a grant, another own forward, a gone one.
+        let in_use = self
+            .entries
+            .get(&id)
+            .is_some_and(|o| o.state != State::Superseded)
+            || self
+                .own
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != i && o.id == Some(id))
+            || self.gone_ids.contains(&id);
+        if in_use {
+            self.broken("the host answered a forward with an id already in use");
+            return;
         }
         let o = &mut self.own[i];
         o.req = None;
@@ -718,13 +819,13 @@ impl<L: Link> Manager<L> {
             }
             kind @ (ForwardKind::Local | ForwardKind::Dynamic) => {
                 lock(&self.grants).grant_local(id, kind);
-                self.listen_own(i, id);
+                self.listen_own(i, id).await;
             }
         }
     }
 
     /// Listens for own `-L` or `-D` entry `id` and reports it.
-    fn listen_own(&mut self, i: usize, id: ForwardId) {
+    async fn listen_own(&mut self, i: usize, id: ForwardId) {
         let spec = self.own[i].spec.clone();
         match std::mem::replace(&mut self.own[i].listener, Listener::None) {
             Listener::On(old) if old == id => {
@@ -739,6 +840,14 @@ impl<L: Link> Manager<L> {
             }
             Listener::On(old) => {
                 self.ep.unlisten(old);
+                // `unlisten` stops the accept tasks; their sockets close when the runtime next
+                // drops them, so the same port can be taken a moment later only.
+                for _ in 0..REBIND_TRIES {
+                    tokio::time::sleep(REBIND_PAUSE).await;
+                    if listen::bind(spec.bind(), spec.port()).is_ok() {
+                        break;
+                    }
+                }
             }
             // The endpoint binds the address itself: the early socket goes first.
             Listener::Prebound(b) => drop(b),
@@ -772,8 +881,23 @@ impl<L: Link> Manager<L> {
 
     /// An entry the run did not name: a management request, or one left by another client.
     fn other(&mut self, id: ForwardId, spec: ForwardSpec, origin: Origin) {
+        let _ = origin;
         if self.entries.contains_key(&id) || self.own_index(id).is_some() {
             // Ids are never reused: a restatement, not a new entry.
+            return;
+        }
+        if self.gone_ids.contains(&id) {
+            // A gone id never names anything again (section 2.4).
+            debug!("an id announced again after it went; refused");
+            self.send(MuxMsg::Consent {
+                id,
+                accepted: false,
+            });
+            return;
+        }
+        if self.entries.len() >= MAX_OTHERS {
+            // More than an honest daemon ever has: refused, and not kept.
+            self.refuse(id, &spec, consent::Refusal::TooMany);
             return;
         }
         // The identity of an own spec whose answer is still on its way: that answer names this
@@ -783,71 +907,103 @@ impl<L: Link> Manager<L> {
                 .own
                 .iter()
                 .any(|o| o.id.is_none() && o.spec.identity() == spec.identity());
+        self.dirty = true;
         if mine {
-            self.entries.insert(
-                id,
-                Other {
-                    spec,
-                    state: State::Superseded,
-                    port: None,
-                },
-            );
+            self.entries.insert(id, Other::new(spec, State::Superseded));
             return;
         }
-        match consent::decide(&spec, self.rules, self.denials) {
+        let asking = self
+            .entries
+            .values()
+            .filter(|o| o.state == State::Asking)
+            .count();
+        let decision = match consent::decide(&spec, self.rules, self.denials) {
+            // Questions enough are waiting: this one is refused, and counts as a refusal.
+            Decision::Ask if asking >= MAX_QUESTIONS => Decision::Refuse(consent::Refusal::TooMany),
+            d => d,
+        };
+        match decision {
             Decision::Ask => {
-                let lines = consent::prompt_lines(&spec, origin);
+                let token = self.next_token;
+                self.next_token += 1;
+                let lines = consent::prompt_lines(&spec);
                 debug!(kind = ?spec.kind(), "asking about a forward from the host");
-                self.entries.insert(
-                    id,
-                    Other {
-                        spec,
-                        state: State::Asking,
-                        port: None,
-                    },
-                );
-                self.note(Note::Ask { id, lines });
+                let mut o = Other::new(spec, State::Asking);
+                o.token = token;
+                self.entries.insert(id, o);
+                self.note(Note::Ask(Question { id, token, lines }));
             }
             Decision::Refuse(why) => {
-                tracing::info!(kind = ?spec.kind(), why = ?why, "forward from the host refused");
-                self.send(MuxMsg::Consent {
-                    id,
-                    accepted: false,
-                });
-                // Said once when the run starts refusing everything, not for each.
-                if why != consent::Refusal::TooMany || self.denials == consent::MAX_DENIALS {
-                    self.note(Note::Notice(consent::refusal_lines(&spec, why)));
-                }
-                if why == consent::Refusal::TooMany {
-                    self.denials = self.denials.saturating_add(1);
-                }
-                self.entries.insert(
-                    id,
-                    Other {
-                        spec,
-                        state: State::Refused,
-                        port: None,
-                    },
-                );
+                self.refuse(id, &spec, why);
+                self.entries.insert(id, Other::new(spec, State::Refused));
             }
         }
     }
 
-    /// The user answered the question about `id` (or let it time out: `no`).
-    fn answer(&mut self, id: ForwardId, yes: bool) {
-        let Some(o) = self.entries.get_mut(&id) else {
-            return;
-        };
-        if o.state != State::Asking {
+    /// Refuses an entry without asking.
+    fn refuse(&mut self, id: ForwardId, spec: &ForwardSpec, why: consent::Refusal) {
+        self.send(MuxMsg::Consent {
+            id,
+            accepted: false,
+        });
+        self.refusals = self.refusals.saturating_add(1);
+        if self.refusals <= LOUD_REFUSALS {
+            tracing::info!(kind = ?spec.kind(), why = ?why, "forward from the host refused");
+            self.note(Note::Notice(consent::refusal_lines(spec, why)));
+        } else {
+            debug!(kind = ?spec.kind(), why = ?why, "forward from the host refused");
+        }
+        if why == consent::Refusal::TooMany {
+            self.denied();
+        }
+    }
+
+    /// One more refusal in a row. At [`consent::MAX_DENIALS`] every question still waiting is
+    /// refused too: the rule is for the queue, not only for what comes next.
+    fn denied(&mut self) {
+        self.denials = self.denials.saturating_add(1);
+        // Only when the rule trips: no question is asked once it has.
+        if self.denials != consent::MAX_DENIALS {
             return;
         }
-        if !yes {
-            o.state = State::Refused;
-            self.denials = self.denials.saturating_add(1);
+        let waiting: Vec<(ForwardId, u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, o)| o.state == State::Asking)
+            .map(|(id, o)| (*id, o.token))
+            .collect();
+        for (id, token) in waiting {
+            if let Some(o) = self.entries.get_mut(&id) {
+                o.state = State::Refused;
+            }
             self.send(MuxMsg::Consent {
                 id,
                 accepted: false,
             });
+            self.note(Note::Cancel { token });
+        }
+    }
+
+    /// The user answered question `token` about `id` (or let it time out: `no`). An answer to
+    /// any other question than the one the entry is asked with now does nothing.
+    fn answer(&mut self, id: ForwardId, token: u64, yes: bool) {
+        if self.failed {
+            return;
+        }
+        let Some(o) = self.entries.get_mut(&id) else {
+            return;
+        };
+        if o.state != State::Asking || o.token != token {
+            debug!("an answer to a question that is not asked any more");
+            return;
+        }
+        if !yes {
+            o.state = State::Refused;
+            self.send(MuxMsg::Consent {
+                id,
+                accepted: false,
+            });
+            self.denied();
             return;
         }
         o.state = State::Granted;
@@ -885,6 +1041,15 @@ impl<L: Link> Manager<L> {
     }
 
     fn gone(&mut self, id: ForwardId) {
+        let known = self.own_index(id).is_some() || self.entries.contains_key(&id);
+        if !known {
+            return;
+        }
+        if self.gone_ids.len() >= MAX_GONE {
+            self.broken("the host went through too many forwards");
+            return;
+        }
+        self.gone_ids.insert(id);
         lock(&self.grants).revoke(id);
         self.ep.forget_stats(id);
         if let Some(i) = self.own_index(id) {
@@ -900,7 +1065,7 @@ impl<L: Link> Manager<L> {
         }
         if let Some(o) = self.entries.remove(&id) {
             match o.state {
-                State::Asking => self.note(Note::Cancel { id }),
+                State::Asking => self.note(Note::Cancel { token: o.token }),
                 State::Granted if o.spec.kind() != ForwardKind::Remote => {
                     self.ep.unlisten(id);
                 }
@@ -1045,20 +1210,20 @@ fn summary_lines<L: Link>(v: &View, ep: &Endpoint<L>) -> Vec<String> {
 
 /// Waiting questions about forwards, for the client loop (one shown at a time).
 #[derive(Debug, Default)]
-pub(crate) struct Asks(VecDeque<(ForwardId, Vec<String>)>);
+pub(crate) struct Asks(VecDeque<Question>);
 
 impl Asks {
-    pub(crate) fn push(&mut self, id: ForwardId, lines: Vec<String>) {
-        self.0.push_back((id, lines));
+    pub(crate) fn push(&mut self, q: Question) {
+        self.0.push_back(q);
     }
-    pub(crate) fn push_front(&mut self, id: ForwardId, lines: Vec<String>) {
-        self.0.push_front((id, lines));
+    pub(crate) fn push_front(&mut self, q: Question) {
+        self.0.push_front(q);
     }
-    pub(crate) fn pop(&mut self) -> Option<(ForwardId, Vec<String>)> {
+    pub(crate) fn pop(&mut self) -> Option<Question> {
         self.0.pop_front()
     }
-    pub(crate) fn remove(&mut self, id: ForwardId) {
-        self.0.retain(|(i, _)| *i != id);
+    pub(crate) fn remove(&mut self, token: u64) {
+        self.0.retain(|q| q.token != token);
     }
     pub(crate) fn clear(&mut self) {
         self.0.clear();
@@ -1068,6 +1233,115 @@ impl Asks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use fil_proto::mux::{BindAddr, Target, TargetHost};
+    use fil_transport::link::mem::MemLink;
+
+    /// A manager with no own forwards, not running: the tests call its handlers.
+    fn manager() -> (Manager<MemLink>, mpsc::UnboundedReceiver<Note>) {
+        let grants = Arc::new(Mutex::new(Grants::default()));
+        let (ep, _events) = Endpoint::<MemLink>::new(
+            Side::Client,
+            Default::default(),
+            Arc::new(ClientConnector(grants.clone())),
+            Arc::new(ClientPolicy(grants.clone())),
+        );
+        let (notes, rx) = mpsc::unbounded_channel();
+        let m = Manager {
+            ep,
+            grants,
+            own: Vec::new(),
+            entries: HashMap::new(),
+            next_req: 0,
+            notes,
+            rules: RemoteRequests::Ask,
+            failure: ForwardFailure::Warn,
+            denials: 0,
+            refusals: 0,
+            next_token: 0,
+            gone_ids: HashSet::new(),
+            failed: false,
+            dirty: true,
+            view: Arc::new(Mutex::new(View::default())),
+        };
+        (m, rx)
+    }
+
+    fn rspec(port: u16) -> ForwardSpec {
+        ForwardSpec::new(
+            ForwardKind::Remote,
+            BindAddr::Loopback,
+            0,
+            Some(Target {
+                host: TargetHost::Ip("127.0.0.1".parse().unwrap()),
+                port: std::num::NonZeroU16::new(port).unwrap(),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn asked(rx: &mut mpsc::UnboundedReceiver<Note>) -> Vec<Question> {
+        let mut v = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            if let Note::Ask(q) = n {
+                v.push(q);
+            }
+        }
+        v
+    }
+
+    /// An answer counts only for the question it answers: one given to an earlier question
+    /// about the same id grants nothing, even if that id is being asked about again now.
+    #[tokio::test]
+    async fn an_answer_to_an_older_question_grants_nothing() {
+        let (mut m, mut rx) = manager();
+        let x = ForwardId(7);
+        m.other(x, rspec(8000), Origin::Request);
+        let first = asked(&mut rx).pop().expect("asked");
+        // The entry is asked about again under a new question (whatever the host did to get
+        // there), with another target.
+        let o = m.entries.get_mut(&x).unwrap();
+        o.spec = rspec(22);
+        o.token = 99;
+        m.answer(x, first.token, true);
+        assert_eq!(m.entries[&x].state, State::Asking);
+        assert_eq!(lock(&m.grants).target(x), None);
+        m.answer(x, 99, true);
+        assert!(lock(&m.grants).target(x).is_some());
+    }
+
+    /// The 3-refusal rule refuses the questions already waiting, and the cap on questions holds.
+    #[tokio::test]
+    async fn refusals_close_the_queue() {
+        let (mut m, mut rx) = manager();
+        for i in 0..MAX_QUESTIONS as u32 {
+            m.other(ForwardId(i), rspec(8000), Origin::Request);
+        }
+        let qs = asked(&mut rx);
+        assert_eq!(qs.len(), MAX_QUESTIONS);
+        for q in &qs[..consent::MAX_DENIALS as usize] {
+            m.answer(q.id, q.token, false);
+        }
+        assert!(
+            m.entries.values().all(|o| o.state == State::Refused),
+            "a question outlived the rule"
+        );
+        m.other(ForwardId(100), rspec(8000), Origin::Request);
+        assert!(asked(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_entries_kept_are_bounded() {
+        let (mut m, _rx) = manager();
+        for i in 0..10 * MAX_OTHERS as u32 {
+            m.other(ForwardId(i), rspec(8000), Origin::Request);
+        }
+        assert!(m.entries.len() <= MAX_OTHERS);
+        for i in 0..10 * MAX_OTHERS as u32 {
+            m.gone(ForwardId(i));
+        }
+        assert!(m.gone_ids.len() <= MAX_OTHERS);
+    }
 
     #[test]
     fn the_summary_fits() {

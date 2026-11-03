@@ -131,7 +131,8 @@ async fn attach(
     if plan.agent != crate::config::AgentMode::Off {
         eprintln!("fil: warning: `agent` in the config is ignored: {AGENT_NOT_WIRED}");
     }
-    raise_fd_limit();
+    // Many sockets with forwards; children keep the original limit (`fil_transport::fdlimit`).
+    fil_transport::fdlimit::raise();
     // `-L` and `-D` listen from now on, before the attach and before the terminal is raw: a port
     // that is taken is said here, and with `forward_failure = "exit"` nothing is attached.
     let mut forward_set = forward_set(&plan);
@@ -202,30 +203,6 @@ async fn attach(
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
     exit_code(&result)
-}
-
-/// Forwarded connections hold sockets: an endpoint may have up to 256 channels open per opener
-/// plus up to 1,024 accepted connections waiting, and the listeners (fil-forward). That is more
-/// than the usual soft limit on open files (256 on macOS, 1,024 on Linux), and running out would
-/// also stop the reconnect (no socket for QUIC, no pipe for ssh). The soft limit goes up to the
-/// hard one (on macOS at most `OPEN_MAX`, which `setrlimit` insists on). Best effort.
-fn raise_fd_limit() {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    let lim = getrlimit(Resource::Nofile);
-    let mut want = lim.maximum.unwrap_or(u64::MAX);
-    if cfg!(target_os = "macos") {
-        want = want.min(10_240);
-    }
-    if lim.current.is_some_and(|c| c >= want) {
-        return;
-    }
-    let _ = setrlimit(
-        Resource::Nofile,
-        Rlimit {
-            current: Some(want),
-            maximum: lim.maximum,
-        },
-    );
 }
 
 /// The client's forwards from the resolved plan.

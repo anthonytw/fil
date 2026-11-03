@@ -36,8 +36,13 @@ release-deps:
     test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
     # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
     # production fil must never honor an environment variable that changes what wire it speaks.
-    for c in fil-proto fil-daemon fil-transport fil-session; do
-      hooks=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" | grep -E 'feature "test-hooks"' || true)
+    # fil-forward is checked once fil depends on it (until then `cargo tree -i` finds no such package).
+    for c in fil-proto fil-daemon fil-transport fil-session fil-forward; do
+      if ! tree=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" 2>&1); then
+        case "$tree" in *"did not match any packages"*) continue ;; esac
+        echo "$tree" >&2; exit 1
+      fi
+      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
       test -z "$hooks" || { echo "release-deps: $c has its test-hooks feature in the release build of fil" >&2; exit 1; }
     done
 

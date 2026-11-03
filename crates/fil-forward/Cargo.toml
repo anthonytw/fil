@@ -15,7 +15,13 @@ rustix = { version = "1", features = ["net"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tracing = "0.1"
 
+[features]
+# Hooks for tests of races (`Endpoint::set_after_check_hook`). Only the test targets enable it.
+test-hooks = []
+
 [dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-forward = { path = ".", features = ["test-hooks"] }
 # `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.
 fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
 fil-netsim = { path = "../fil-netsim" }

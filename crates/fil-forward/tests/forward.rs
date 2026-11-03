@@ -1074,3 +1074,50 @@ async fn a_paused_listener_rekeys_without_rebinding() {
     assert_eq!(echo.accepted.load(Ordering::SeqCst), 3);
     w.settled().await;
 }
+
+/// A fresh attach between the policy's check of a local connection and its open: the check was
+/// for the previous subscriber (its consent, its attachment), so the connection is refused and
+/// nothing is opened in the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_checked_in_one_epoch_never_goes_out_in_the_next() {
+    let canary = echo_server().await;
+    let mut w = World::new(Transport::Mem, mux_config()).await;
+    w.client.targets.set(ForwardId(3), canary.port);
+    let port = w
+        .daemon
+        .ep
+        .listen(ForwardId(3), ForwardKind::Remote, BindAddr::Loopback, 0)
+        .unwrap();
+    // The window, made wide: the daemon's owner starts a new epoch right after the check.
+    let ep = w.daemon.ep.clone();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f = fired.clone();
+    w.daemon.ep.set_after_check_hook(Some(Arc::new(move || {
+        if !f.swap(true, Ordering::SeqCst) {
+            ep.new_epoch();
+        }
+    })));
+    w.daemon.detach();
+    expect_reset(port).await;
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(w.daemon.ep.snapshot().channels, 0, "an open went out");
+    assert_eq!(
+        w.daemon.ep.snapshot().mux_buffered,
+        0,
+        "an Open record is queued"
+    );
+    // The new epoch, attached: still nothing reaches the client's target.
+    w.daemon.ep.set_after_check_hook(None);
+    let pair = w.factory.pair(Transport::Mem).await;
+    w.client.detach();
+    w.client.ep.new_epoch();
+    w.daemon.attach(pair.daemon.clone(), false);
+    w.client.attach(pair.client.clone(), false);
+    w.link = Some(pair);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(w.client.targets.asked.load(Ordering::SeqCst), 0);
+    assert_eq!(canary.accepted.load(Ordering::SeqCst), 0);
+    // And a connection checked in the new epoch goes through.
+    echo_once(port, 10, 4).await;
+    w.settled().await;
+}

@@ -438,6 +438,8 @@ struct State<L> {
     /// Changes with every attach and detach: what was taken from the mux for one link is never
     /// sent on another (its offsets would not match the peer's restated ones).
     generation: u64,
+    /// The mux epoch, counted: a policy answer given in one epoch is not used in another.
+    epoch: u64,
     ctl_out: VecDeque<(ChannelId, Bytes)>,
     data_out: VecDeque<Out>,
     data_out_bytes: usize,
@@ -637,6 +639,26 @@ struct Inner<L> {
     policy: Arc<dyn Policy>,
     connect_timeout: Duration,
     runtime: tokio::runtime::Handle,
+    #[cfg(feature = "test-hooks")]
+    hooks: TestHooks,
+}
+
+/// Hooks for tests of races (feature `test-hooks`; never in a released binary).
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct TestHooks {
+    /// Runs in `open_local` between the policy check and the open, without the lock.
+    after_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl TestHooks {
+    fn after_check(&self) {
+        let hook = lock(&self.after_check).clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
 }
 
 /// The endpoint of one session and side. Cheap to clone; when the last clone is dropped every
@@ -690,6 +712,7 @@ impl<L: Link> Endpoint<L> {
                 mux: Mux::new(side, cfg),
                 link: None,
                 generation: 0,
+                epoch: 0,
                 ctl_out: VecDeque::new(),
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
@@ -717,6 +740,8 @@ impl<L: Link> Endpoint<L> {
             policy,
             connect_timeout,
             runtime: tokio::runtime::Handle::current(),
+            #[cfg(feature = "test-hooks")]
+            hooks: TestHooks::default(),
         });
         {
             let mut st = lock(&inner.state);
@@ -736,6 +761,13 @@ impl<L: Link> Endpoint<L> {
 
     fn inner(&self) -> &Arc<Inner<L>> {
         &self.handle.0
+    }
+
+    /// Runs `hook` in every local open between the policy check and the open (feature
+    /// `test-hooks`, for tests of that window).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_after_check_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *lock(&self.inner().hooks.after_check) = hook;
     }
 
     pub fn side(&self) -> Side {
@@ -803,6 +835,7 @@ impl<L: Link> Endpoint<L> {
     pub fn new_epoch(&self) {
         let inner = self.inner();
         let mut st = lock(&inner.state);
+        st.epoch += 1;
         for ch in st.mux.new_epoch() {
             st.end_slot(ch, CloseReason::Reset);
         }
@@ -1373,14 +1406,24 @@ impl<L: Link> Inner<L> {
         socks: Option<socks::Version>,
         early: &[u8],
     ) -> Result<ChannelId, (OpenFailure, BoxStream)> {
+        // The policy answers for this epoch (consent, attachment); the open must go out in it.
+        let epoch = lock(&self.state).epoch;
         if let Err(why) = self.policy.check_outgoing(&kind, &peer) {
             debug!(why = ?why, "local connection refused");
             return Err((why, stream));
         }
+        #[cfg(feature = "test-hooks")]
+        self.hooks.after_check();
         let key = stats_key(&kind);
         let mut st = lock(&self.state);
         if st.closed {
             return Err((OpenFailure::Other, stream));
+        }
+        if st.epoch != epoch {
+            // A fresh attach came between the check and the open: what the check allowed was
+            // for the previous subscriber.
+            debug!("local connection refused: a new epoch began during its check");
+            return Err((OpenFailure::Detached, stream));
         }
         let t = now();
         // The mux stamps the open with the time of its last tick: make that now.

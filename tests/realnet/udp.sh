@@ -882,7 +882,7 @@ f_upgrade() {
   reset_net
   netem_apply delay 20ms
   fil_attach_direct a up
-  # DESIGN: "moves to QUIC within a second". The runner measures 0.1 s after the reply (0.9 s after
+  # DESIGN: "moves to QUIC within a second". The runner measures 0.17 s after the reply (0.9 s after
   # the process start, most of it the ssh login); 1.5 s is the margin for a noisy VM.
   assert_num "moved to direct within 1.5 s of the attach reply (ms)" "$UP_MS" -lt 1500
   fc_line a 'echo UP-$((6*7))'

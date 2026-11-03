@@ -809,13 +809,15 @@ f_takeover_back() {
   fc_wait a 'Take it back' 20
   fc_type a y
   fc_wait b 'was taken over' 20
-  fc_wait b 'by client at' 5
+  # The prompt has "by NAME" on a line of its own, so \n tells client from client2.
+  fc_wait b 'by client\n' 5
   fc_wait a SECOND-25 30
   fc_has a FIRST-42 || fail "the first client lost the earlier output after taking the session back: $(fc_screen a)"
   fc_line a 'echo BACK-$((2*8))'
   fc_wait a BACK-16 20
   fc_type b n
   fc_expect_exit b 1
+  fc_has b 'taken over by client at' || fail "no final message on the second client: $(fc_screen b)"
   fc_detach a
   fk viajumps tb
 }

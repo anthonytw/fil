@@ -66,7 +66,10 @@ fn install_panic_hook() {
                 // the kitty keyboard stack: both need the shadow's state (`?1049l` on the primary
                 // screen makes some terminals jump the cursor), so a panic in a full-screen
                 // program still leaves those; `reset` clears them.
-                // One write, not `write_fd`: a hook must not wait on a terminal that is stuck.
+                // One plain write, not `write_fd`'s retry loop. The fd is blocking, so a terminal
+                // that has stopped reading (XOFF, a stuck emulator) with a full queue can still
+                // make this one wait, but the sequence is short (about a hundred bytes), so only a
+                // terminal whose queue is already full does.
                 let _ = rustix::io::write(fd, PANIC_RESET);
             }
             previous(info);

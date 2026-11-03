@@ -253,3 +253,40 @@ async fn the_restore_includes_the_modes_the_emulator_cannot_show() {
         assert!(written.contains(want), "{want:?} not written: {written:?}");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_in_the_middle_of_a_program_keeps_the_modes_it_cannot_restore() {
+    // vim keeps running with modifyOtherKeys and color-scheme reports on. A snapshot (here a
+    // take-back after a takeover, with vim still running on the daemon's screen) must not reset
+    // them: it could not turn them back on. Only the exit may.
+    let rig = in_a_program().await;
+    rig.daemon.output(b"\x1b[>4;2m\x1b[?2031h").await;
+    settle().await;
+    rig.daemon.take_over("desktop").await;
+    until("the prompt", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    let before = rig.term.written().len();
+    rig.answer("y").await;
+    until_async("the new attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    let during = String::from_utf8_lossy(&rig.term.written()[before..]).into_owned();
+    for bad in ["\x1b[>4m", "?2031l", "?2048l"] {
+        assert!(
+            !during.contains(bad),
+            "{bad:?} written before the snapshot: {during:?}"
+        );
+    }
+    // The snapshot is not preceded by a cursor flash: the cursor is shown only by the snapshot
+    // itself, if the screen says so (vim hid it).
+    assert!(!during.contains("?25h"), "{during:?}");
+    rig.type_str("\r~.");
+    let term = rig.term.clone();
+    assert_eq!(rig.finish().await.unwrap(), Outcome::Detached);
+    let all = String::from_utf8_lossy(&term.written()).into_owned();
+    assert!(all.contains("?2031l"), "the exit still resets it");
+}

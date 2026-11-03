@@ -127,8 +127,9 @@ impl Display {
     /// What to write to give the user's terminal back, after the overlay is off: undo everything
     /// the session's programs can have turned on, so a shell that was started before `fil` finds
     /// its terminal as it left it (mosh does the same on exit; ssh does not). Also written before
-    /// a snapshot onto a terminal that has been showing the session: the snapshot writer turns
-    /// modes on but never off, so the terminal must start from all-off, as the fresh shadow does.
+    /// a snapshot onto a terminal that has been showing the session ([`Display::snapshot_prefix`]):
+    /// the snapshot writer turns modes on but never off, so the terminal must start from all-off,
+    /// as the fresh shadow does.
     ///
     /// It is built from the shadow screen, which has seen every byte the terminal has (a snapshot
     /// is preceded by this very reset, so the shadow and the terminal start the same), so only
@@ -137,36 +138,45 @@ impl Display {
     /// It never sends `RIS`, which would wipe the scrollback, and it leaves the window title
     /// alone (as ssh does: there is no way to read the old one back). See [`restore_sequence`].
     pub fn restore_bytes(&self) -> Vec<u8> {
-        restore_sequence(&self.overlay.view(0).shadow, self.kitty_used)
+        restore_sequence(&self.overlay.view(0).shadow, self.kitty_used, Restore::Exit)
+    }
+
+    /// What to write before a snapshot onto a terminal that has been showing the session: the
+    /// same reset, without what the snapshot cannot turn back on. The shadow does not track
+    /// `modifyOtherKeys`, `?2031`, `?2048` and (for the shadow, unless it saw them) `?9`, `?1015`
+    /// and `?1016`, so a program that keeps running would lose them for good; and the cursor is
+    /// not shown, because the snapshot hides it again at once (a flash).
+    pub fn snapshot_prefix(&self) -> Vec<u8> {
+        restore_sequence(
+            &self.overlay.view(0).shadow,
+            self.kitty_used,
+            Restore::Snapshot,
+        )
     }
 
     /// Notes whether the stream pushed or set the kitty keyboard protocol (`CSI > flags u`,
-    /// `CSI = flags ; mode u`), looking across the boundary with the previous bytes.
+    /// `CSI = flags ; mode u`), looking across the boundary with the previous bytes. Only the
+    /// last few bytes are carried over, not the chunks.
     fn note_kitty(&mut self, bytes: &[u8]) {
         if self.kitty_used {
             return;
         }
-        let mut seen = std::mem::take(&mut self.kitty_tail);
-        seen.extend_from_slice(bytes);
-        let mut i = 0;
-        while let Some(at) = seen[i..]
-            .windows(3)
-            .position(|w| w[0] == 0x1b && w[1] == b'[' && (w[2] == b'>' || w[2] == b'='))
-        {
-            let rest = &seen[i + at + 3..];
-            let n = rest
-                .iter()
-                .take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':')
-                .count();
-            if rest.get(n) == Some(&b'u') {
-                self.kitty_used = true;
-                return;
-            }
-            i += at + 3;
+        let head = bytes.len().min(KITTY_CARRY);
+        let mut edge = std::mem::take(&mut self.kitty_tail);
+        edge.extend_from_slice(&bytes[..head]);
+        if sets_kitty(&edge) || sets_kitty(bytes) {
+            self.kitty_used = true;
+            return;
         }
-        // Keep the end: a sequence may be cut anywhere in its (short) parameters.
-        let keep = seen.len().min(24);
-        self.kitty_tail = seen[seen.len() - keep..].to_vec();
+        // The end of what was seen, for a sequence cut at the next boundary.
+        if bytes.len() >= KITTY_CARRY {
+            edge.clear();
+            edge.extend_from_slice(&bytes[bytes.len() - KITTY_CARRY..]);
+        } else {
+            let from = edge.len().saturating_sub(KITTY_CARRY);
+            edge.drain(..from);
+        }
+        self.kitty_tail = edge;
     }
 
     /// Writes what it takes to open the overlay's gates, through the shadow so both stay in step:
@@ -260,6 +270,38 @@ impl Display {
     }
 }
 
+/// How much of the stream's end is kept to find a kitty sequence cut between two reads.
+const KITTY_CARRY: usize = 24;
+
+/// Whether `bytes` holds `CSI > params u` or `CSI = params u` (push or set).
+fn sets_kitty(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(at) = bytes[i..]
+        .windows(3)
+        .position(|w| w[0] == 0x1b && w[1] == b'[' && (w[2] == b'>' || w[2] == b'='))
+    {
+        let rest = &bytes[i + at + 3..];
+        let n = rest
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':')
+            .count();
+        if rest.get(n) == Some(&b'u') {
+            return true;
+        }
+        i += at + 3;
+    }
+    false
+}
+
+/// Which reset [`restore_sequence`] makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restore {
+    /// The client gives the terminal back: everything, tracked or not.
+    Exit,
+    /// Before a snapshot: only what the snapshot writer sets again, and nothing visible.
+    Snapshot,
+}
+
 /// The bytes that put a terminal in the state `st` back to its defaults (see
 /// [`Display::restore_bytes`]). `kitty_used` is whether the stream ever used the kitty keyboard
 /// protocol: the state knows the flags of the current screen only, and the other screen's stack
@@ -268,20 +310,33 @@ impl Display {
 /// Order matters: input modes first, then the alternate screen (the kitty keyboard stacks are
 /// per screen, so both are popped), then the margins and origin mode (resetting either homes the
 /// cursor, so the cursor is put back afterwards), then the cursor, the pen and the character sets.
-pub fn restore_sequence(st: &TermState, kitty_used: bool) -> Vec<u8> {
+pub fn restore_sequence(st: &TermState, kitty_used: bool, kind: Restore) -> Vec<u8> {
     let m = &st.modes;
+    let exit = kind == Restore::Exit;
     let mut s = String::new();
     // Cancel a half-written escape sequence (the link can drop mid-sequence), then end a
     // synchronized update the program left open: it would hold everything below back.
     s.push_str("\x18\x1b[?2026l");
-    // Modes the shadow cannot see (its parser has no X10 mouse, colour-scheme reports `?2031` or
-    // in-band resize reports `?2048`): reset always. No local shell sets them.
-    s.push_str("\x1b[?9l\x1b[?2031l\x1b[?2048l");
+    if exit {
+        // Modes the shadow cannot see (its parser has no X10 mouse, color-scheme reports
+        // `?2031` or in-band resize reports `?2048`): reset always. No local shell sets them.
+        // Not before a snapshot, which cannot turn them back on.
+        s.push_str("\x1b[?9l\x1b[?2031l\x1b[?2048l");
+    }
     if m.mouse_tracking != MouseTracking::Off || m.mouse_encoding != MouseEncoding::Default {
         // Every tracking mode and every encoding: a program may have used several, and the
-        // shadow keeps only the last.
-        s.push_str("\x1b[?1000l\x1b[?1002l\x1b[?1003l");
-        s.push_str("\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l");
+        // shadow keeps only the last. (Before a snapshot, the encodings and `?9` the shadow
+        // tracks and so the snapshot restores are the only ones that need it.)
+        s.push_str("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+        if !exit && m.mouse_tracking == MouseTracking::X10 {
+            s.push_str("\x1b[?9l");
+        }
+        if exit || m.mouse_encoding == MouseEncoding::Urxvt {
+            s.push_str("\x1b[?1015l");
+        }
+        if exit || m.mouse_encoding == MouseEncoding::SgrPixels {
+            s.push_str("\x1b[?1016l");
+        }
     }
     if m.focus_events {
         s.push_str("\x1b[?1004l");
@@ -304,7 +359,9 @@ pub fn restore_sequence(st: &TermState, kitty_used: bool) -> Vec<u8> {
     if kitty {
         s.push_str("\x1b[<99u");
     }
-    s.push_str("\x1b[>4m");
+    if exit {
+        s.push_str("\x1b[>4m");
+    }
     // Where the cursor will be once the alternate screen is gone.
     let cursor = match (&st.primary_behind_alt, m.alt_screen) {
         (Some(p), true) => p.cursor,
@@ -332,7 +389,9 @@ pub fn restore_sequence(st: &TermState, kitty_used: bool) -> Vec<u8> {
         // Both home the cursor: put it back where the content ends.
         s.push_str(&format!("\x1b[{};{}H", cursor.row + 1, cursor.col + 1));
     }
-    s.push_str("\x1b[?25h");
+    if exit {
+        s.push_str("\x1b[?25h");
+    }
     if st.cursor.shape != CursorShape::Default || st.cursor.blinking {
         s.push_str("\x1b[0 q");
     }
@@ -433,6 +492,29 @@ mod tests {
         assert!(String::from_utf8_lossy(&seq).contains("\x1b[<99u"));
         let (_, seq) = after(b"\x1b[>4;2m\x1b[1;5H");
         assert!(!String::from_utf8_lossy(&seq).contains("\x1b[<99u"));
+    }
+
+    #[test]
+    fn a_snapshot_prefix_keeps_what_the_snapshot_cannot_restore() {
+        // A catch-up in the middle of vim: modifyOtherKeys and color-scheme reports are on, the
+        // mouse and the alternate screen too. The prefix resets what the snapshot sets again,
+        // and neither the untracked modes nor the cursor.
+        let mut d = display();
+        d.server(b"$ vim\r\n\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[>4;2m\x1b[?2031h\x1b[?25l");
+        let text = String::from_utf8_lossy(&d.snapshot_prefix()).into_owned();
+        for bad in [
+            "\x1b[>4m", "?2031l", "?2048l", "?9l", "?1015l", "?1016l", "?25h",
+        ] {
+            assert!(!text.contains(bad), "{bad:?} in {text:?}");
+        }
+        for want in ["?1000l", "?1006l", "?1049l"] {
+            assert!(text.contains(want), "{want:?} missing from {text:?}");
+        }
+        // The exit form does send them.
+        let text = String::from_utf8_lossy(&d.restore_bytes()).into_owned();
+        for want in ["\x1b[>4m", "?2031l", "?2048l", "?9l", "?25h"] {
+            assert!(text.contains(want), "{want:?} missing from {text:?}");
+        }
     }
 
     #[test]

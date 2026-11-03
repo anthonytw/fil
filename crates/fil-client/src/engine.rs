@@ -1625,7 +1625,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             // mouse reporting or a character set or a pen the fresh shadow does not assume. The
             // snapshot writer turns modes on and never off, so start from all-off (also what
             // the exit restore relies on: the shadow and the terminal must agree).
-            let prefix = d.restore_bytes();
+            let prefix = d.snapshot_prefix();
             self.write(&prefix)?;
         }
         // The snapshot begins by clearing the screen, so a fresh shadow matches the terminal

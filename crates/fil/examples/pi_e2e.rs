@@ -775,6 +775,26 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
     c.send("(sleep 25; echo BG-$((6*7))) &\r");
     thread::sleep(Duration::from_millis(500));
     c.roundtrip("LN1", ATTACH_TIMEOUT)?;
+    // The scope this shell runs in, from inside it: `fil-<32 hex>.scope` (the session name is not
+    // in it). The typed command holds `-$((6*7))`, never the `-42` that ends its output.
+    let from = c.len();
+    c.send("echo CG-$(sed -n 's/.*\\(fil-[0-9a-f]*\\.scope\\).*/\\1/p' /proc/$$/cgroup | head -n 1)-$((6*7))\r");
+    c.expect_from("-42", from, ATTACH_TIMEOUT)
+        .ok_or_else(|| format!("no cgroup line from the shell\n{}", c.tail()))?;
+    let text = c.text();
+    let scope = text
+        .rfind("CG-")
+        .and_then(|i| text[i + 3..].split("-42").next())
+        .unwrap_or("")
+        .to_string();
+    let hex = scope
+        .strip_prefix("fil-")
+        .and_then(|s| s.strip_suffix(".scope"))
+        .unwrap_or("");
+    ensure(
+        hex.len() == 32 && hex.chars().all(|ch| ch.is_ascii_hexdigit()),
+        || format!("the shell is not in a `fil-<hex>.scope` (cgroup says {scope:?})"),
+    )?;
     c.detach()?;
     drop(c);
     let t0 = Instant::now();
@@ -788,9 +808,8 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
         format!("daemon gone after the login ended\n{late}")
     })?;
     let journal = ctx.gate(host, "logs 800");
-    ensure(journal.contains("fil session e2e-ln"), || {
-        "no `fil session e2e-ln` systemd scope in the user journal: the shell did not run in a scope"
-            .to_string()
+    ensure(journal.contains(&format!("{scope} - fil session")), || {
+        format!("no `{scope} - fil session` line in the user journal")
     })?;
     let mut c2 = Client::spawn(ctx, host, Variant::Pipe, "e2e-ln");
     c2.expect("BG-42", ATTACH_TIMEOUT).ok_or_else(|| {
@@ -806,7 +825,8 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
             "daemon and shell alive {} after the last login ended; background job's output waited in the session",
             ms(away)
         ),
-        "the shell ran in a systemd scope (`fil session e2e-ln` in the user journal)".to_string(),
+        "the shell ran in a systemd scope (`fil-<hex>.scope - fil session` in the user journal)"
+            .to_string(),
     ])
 }
 

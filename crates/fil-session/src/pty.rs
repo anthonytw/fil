@@ -11,7 +11,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use fil_proto::msg::TermSize;
 
 use crate::config::SessionConfig;
-use crate::proc::{Scope, systemd_run_argv};
+use crate::env::{SESSION_ONLY_DROPPED_VARS, login_session_vars_in_env};
+use crate::proc::{SCOPE_DESCRIPTION, Scope, systemd_run_argv};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -52,15 +53,19 @@ fn size_of(s: TermSize) -> PtySize {
     }
 }
 
-/// The variables that describe the SSH login which happened to start the daemon, not the
-/// session's user.
-const STALE_SSH_VARS: [&str; 5] = [
-    "SSH_TTY",
-    "SSH_CONNECTION",
-    "SSH_CLIENT",
-    "SSH_ORIGINAL_COMMAND",
-    "SSH_USER_AUTH",
-];
+/// Removes what describes the login that started the daemon ([`crate::env`]) from the inherited
+/// environment. What the configuration sets afterwards is the caller's choice and stays.
+///
+/// The names come from the process's real environment (`CommandBuilder` starts from it), not
+/// from the builder's `*_as_str` iterators, which skip any entry whose value is not UTF-8.
+fn drop_login_vars(cmd: &mut CommandBuilder) {
+    for k in login_session_vars_in_env() {
+        cmd.env_remove(k);
+    }
+    for k in SESSION_ONLY_DROPPED_VARS {
+        cmd.env_remove(k);
+    }
+}
 
 fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, SpawnError> {
     if cfg.command.as_ref().is_some_and(|c| c.is_empty()) {
@@ -78,9 +83,8 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
                 // `systemd-run` cannot set argv[0], so ask for a login shell with `-l`.
                 None => vec![CommandBuilder::new_default_prog().get_shell(), "-l".into()],
             };
-            let description = format!("fil session {}", cfg.name);
             CommandBuilder::from_argv(
-                systemd_run_argv(unit, &description, &inner)
+                systemd_run_argv(unit, SCOPE_DESCRIPTION, &inner)
                     .into_iter()
                     .map(OsString::from)
                     .collect(),
@@ -101,9 +105,7 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
     for (k, v) in keep {
         cmd.env(k, v);
     }
-    for k in STALE_SSH_VARS {
-        cmd.env_remove(k);
-    }
+    drop_login_vars(&mut cmd);
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
@@ -219,5 +221,101 @@ impl Pty {
             t.local_flags.contains(LocalFlags::ICANON),
             t.local_flags.contains(LocalFlags::ECHO),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    /// The variables the test process is started with, by the parent half of
+    /// `the_login_environment_is_dropped_even_when_a_value_is_not_utf8`. The values of the first
+    /// two are Latin-1 bytes, which are not UTF-8.
+    fn login_environment() -> Vec<(&'static str, std::ffi::OsString)> {
+        use std::os::unix::ffi::OsStrExt;
+        let latin1 = |b: &[u8]| std::ffi::OsString::from(OsStr::from_bytes(b));
+        vec![
+            ("SSH_ORIGINAL_COMMAND", latin1(b"caf\xe9 \xff")),
+            ("LC_TERMINAL", latin1(b"iTerm\xe9")),
+            ("DISPLAY", "localhost:10.0".into()),
+            ("XDG_SESSION_ID", "42".into()),
+            ("XDG_SESSION_TYPE", "tty".into()),
+            ("SSH_CONNECTION", "a b c d".into()),
+            ("TMUX", "/tmp/tmux-1000/default,1,0".into()),
+            ("FIL_LOG", "trace".into()),
+        ]
+    }
+
+    /// The process environment is global, so the checks run in a child copy of the test binary
+    /// that is started with the login's variables set. The parent half starts it.
+    #[test]
+    fn the_login_environment_is_dropped_even_when_a_value_is_not_utf8() {
+        const CHILD: &str = "FIL_TEST_LOGIN_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut cmd = CommandBuilder::new("true");
+            for (k, _) in login_environment() {
+                assert!(cmd.get_env(k).is_some(), "{k} was not inherited: bad setup");
+            }
+            drop_login_vars(&mut cmd);
+            for (k, _) in login_environment() {
+                assert_eq!(cmd.get_env(k), None, "{k} must be dropped");
+            }
+            assert_eq!(
+                cmd.get_env("XDG_RUNTIME_DIR"),
+                Some(OsStr::new("/run/user/1000"))
+            );
+            assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("C")));
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "pty::tests::the_login_environment_is_dropped_even_when_a_value_is_not_utf8",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("LANG", "C");
+        for (k, v) in login_environment() {
+            child.env(k, v);
+        }
+        let out = child.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains("1 passed"),
+            "the child test did not run:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_systemd_scope_names_the_session_neither_in_its_unit_nor_in_its_description() {
+        let mut cfg = SessionConfig::new(
+            "acme-incident".parse().unwrap(),
+            "xterm-256color".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            0x1234_5678_9abc_def0_1111_2222_3333_4444,
+        );
+        cfg.command = Some(vec!["/bin/true".into()]);
+        let unit = crate::proc::unit_name(cfg.incarnation);
+        let cmd = build_command(&cfg, &Scope::Systemd { unit }).unwrap();
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.iter().any(|a| a.starts_with("--unit=fil-")),
+            "{argv:?}"
+        );
+        assert!(
+            argv.iter().all(|a| !a.contains("acme")),
+            "the session name is in the command line systemd records: {argv:?}"
+        );
+        assert!(argv.contains(&format!("--description={SCOPE_DESCRIPTION}")));
     }
 }

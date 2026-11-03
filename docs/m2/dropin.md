@@ -64,4 +64,39 @@ Not here yet: `agent_*` (A1, PR #74, still open) and `fwd_takeover`. The M1 "Pla
 
 ## Results
 
-(Filled in from the runs below.)
+Run on 2026-11-03 (ET) from this Mac, one Pi at a time. The client is this Mac's, built from `m2-v1` with main at `a6bd109` (F4 part 2) merged; the Pi binary is the `aarch64` job's build of the same tree ([run 41700108978](https://github.com/anthonytw/fil/actions/runs/41700108978), `fil` sha256 `e498399a…`, `fwdprobe` `341b7fcd…`), installed through the gate's `install` verb. Single runs over the LAN (about 6 ms round trip), so times are indicative. After each run no daemon or socket was left on either Pi. An earlier run of the transfer scenarios on pi1 with the pre-F4b build (main at `9988fdd`) gave the same results.
+
+**Every forward scenario passes on both Pis, with no finding in fil**, after three fixes to the scenarios themselves (below, "Corrections").
+
+| Scenario | pi1 | pi2 |
+|---|---|---|
+| `fwd_cable_pull` auto | **byte-exact both ways, 1 accept each**, across 30 s and 5 min; shell back 0.6 s and 17.6 s after the plug; 2 link downs | **the same**; 13.4 s and 13.3 s |
+| `fwd_cable_pull` pipe | **byte-exact both ways, 1 accept each**; shell back 8.2 s and 24.8 s after the plug | **the same**; 4.8 s and 19.7 s |
+| `fwd_reconnect` | exact, 1 accept each: auto (6 s cut) shell back 2.0 s after; pipe (ssh killed) 1.0 s | exact; 2.0 s, 1.3 s |
+| `fwd_swap` | exact; on the pipe 8.2 s after UDP went, back on QUIC 12.0 s after | exact; 8.2 s, 12.4 s |
+| `fwd_sleep` | exact; 12 s (auto) and 45 s (pipe), the shell answered at once after the wake | exact; the same |
+| `fwd_local_http` | 64 MiB exact, 1 accept, 44 MB/s; `fil ports` shows 67108864 bytes down | exact, 49 MB/s; the same |
+| `fwd_many_short` | 10,000 sequential, all echoed, 153/s, no link down | all, 141/s, no link down |
+| `fwd_parallel` | 200 concurrent each way, all exact (87 ms, 62 ms) | all exact (58, 47 ms) |
+| `fwd_halfclose`, `fwd_rst` | both directions: EOF after the exact request and the response exact; a reset seen as a reset | the same |
+| `fwd_remote` | 16 MiB exact, 1 accept; a connection opened 8 s into a 15 s outage went through 13.1 s after it was opened, exact | exact; 12.8 s |
+| `fwd_remote_detached` | five connects after `~.`: each reset at once (0 ms) | the same |
+| `fwd_dynamic` | curl through SOCKS to the host's `localhost`: 4 MB exact, 1 accept | the same |
+| `fwd_bulk_typing` | vim echo p50 11 ms idle, 23 ms (auto) and 26 ms (pipe) under an unpaced bulk download; H1's rule not exceeded | 12 and 13 ms idle, 26 and 33 ms loaded; not exceeded |
+| `fwd_churn` | 2 x 20,000 on each transport, all echoed, 117 and 123/s; daemon RSS +2.8 MB over the first round, then +16 KiB on each: a high-water mark, not a leak; descriptor table 64 throughout; client RSS flat | 2 x 20,000 on each transport, all echoed, 118 and 120/s; daemon RSS +2.7 MB over the first round, then +32 KiB (auto) and +0 (pipe): a high-water mark, not a leak; descriptor table 64 throughout; client RSS flat |
+| `fwd_inside_add_rm` | asked; `n`: nothing listens here, the entry unconsented; `y`: listening 0.8 s later, 1 MB exact, `origin: request`, consented; `--rm` closed it | asked; `n`: nothing listens here, `fil ports` shows the entry unconsented; `y` (another spec): listening 0.8 s later, 1 MB exact, `origin: request`, consented; `--rm` closed it |
+| `fwd_hostile_remote` | refused (exit 1, the same message), no question, canary untouched | refused (exit 1, "a forward added with `fil forward` may not ... connect to a non-loopback target from it (-R)"), no question, canary untouched |
+| `fwd_ports_view` | the same as pi2 | both listeners the session's with their pids, the 0.0.0.0 one exposed and warned about; python's server probed as `http` 200, label its `Server` header |
+| `detach_inside` | told after 1.1 s, exit 1, the session listed as detached | told after 1.1 s, exit 1, the session listed as detached |
+
+What the Pis add to realnet:
+
+- **The done-when holds on real hardware**: an `-L` download and an `-R` upload, 200 MB each, through a 30 s and a 5 min outage of both paths, byte-exact with one accept each, on both transports and both Pis.
+- **Recovery after a long outage is slow on both transports here**, 13 to 25 s after the cable was back. On the Pis the relay keeps this Mac's address, so the client's network watcher sees no change and the client waits for its next retry (backoff up to 30 s) on `auto` too; realnet's `auto`, where the route really disappears and returns, recovers in under 2 s. Realnet's pipe case (no watcher) records it as a finding (`docs/m2/realnet.md`).
+- **Typing under a bulk forward on the LAN is fine** (p50 23 to 33 ms against 11 to 13 ms idle, under H1's rule): the LAN has no slow bottleneck for a queue to build in. The realnet numbers are the ones that decide H1.
+
+### Corrections made to the scenarios after the first run
+
+- `fwd_inside_add_rm` first answered `n` and then `y` to the same spec. The refused entry stays in the table, unconsented, and an equal add returns it without asking again (the client asks once per entry, DESIGN §7.3), so the second question never came. The `y` now goes to a spec of its own. Not a bug in fil.
+- `fwd_ports_view` first expected the page title as the HTTP label. The default probe is a `HEAD`, which labels with the `Server` header; the title needs `ports.probe = "full"` (`crates/fil-daemon/src/ports/probe.rs`). Not a bug in fil.
+- `fwd_churn` first counted `/proc/PID/fd` entries and read 0: the daemon is not dumpable (`hardening.rs`), so the directory is root's. It now reads `FDSize`, and runs a second round to tell growth per connection from the allocator's high-water mark.

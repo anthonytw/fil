@@ -37,7 +37,7 @@ Every forwarded byte stream is `fwdprobe` (`docs/m2/pi.md`) at both ends: a seed
 | `f_fwd_sleep` | the pair across a client sleep: its process group stopped 12 s on `auto`, 45 s on the pipe | as above; the link went down (asserted) |
 | `f_fwd_roam` | the pair across three NAT moves (a new port, another, a new address; conntrack proves each) | as above, and no link down, no transport switch, no ssh. Measured: the largest stall |
 | `f_fwd_many_short` | 10,000 sequential and 200 concurrent short connections (1000 bytes echoed each) through the `-L` and through the `-R`, on one QUIC link (clean network) | all echoed; no link down; no switch (M1's link died at the 1,025th stream) |
-| `f_fwd_ending_stress` | **the `MAX_ENDING` stress.** 20,000 short connections, 200 at a time, through the `-L` and through the `-R`, on three paths: lossy (`delay 20ms 5ms loss 3%`), slow (`delay 20ms 5ms rate 5mbit`), both | measured: connections a second, failures, link downs, moves to the pipe, and how often a side ended the link as "the peer does not answer stream ends" (client log and daemon log). A trip is a finding, with its numbers |
+| `f_fwd_ending_stress` | **the `MAX_ENDING` stress.** 20,000 short connections, 200 at a time, through the `-L` and through the `-R`, on three paths: lossy (`delay 20ms 5ms loss 3%`), slow (`delay 20ms 5ms rate 5mbit`), both; then 5,000 each way on a harsh one (`delay 40ms 10ms loss 8% rate 2mbit`); then the lossy burst through `ssh -N -L`, for scale. The client logs at `fil=debug,fil_forward=info` here, so 20,000 channels' debug lines do not rotate the link's own lines out of its 4 MiB log | measured: connections a second, failures, link downs, moves to the pipe, and how often a side ended the link as "the peer does not answer stream ends" (client log and daemon log). A trip is a finding, with its numbers |
 | `f_fwd_other_user` | another user of the host connects to the session's loopback `-R` port, then to the daemon's socket | the `-R` port answers (documented, as with ssh: a loopback port is open to every local user); the daemon socket refuses (`EACCES`, asserted) |
 | `f_fwd_vs_ssh` | **H1's data.** Keystrokes at 20 keys/s (`keyprobe --shell`) under a bulk transfer through the same client's `-L`, idle, upload and download, on `delay 20ms 5ms rate 20mbit limit 500` each way: `ssh -tt -L` (again, on this machine), fil on the pipe, fil on QUIC | the link was loaded (at least 2 Mbit/s of bulk, asserted per cell); the QUIC cells were on QUIC before the first measured key, the pipe cells never (asserted). Measured: p50, p99, bulk Mbit/s; H1's rule; the plan's target against ssh |
 
@@ -47,7 +47,12 @@ Not here yet, waiting for their packages: `f_agent_ssh_hop` and the agent half o
 
 ## Results
 
-Two runs of the part on `m2-v1` (main at `9988fdd`, F3; nothing in this package changes fil): GitHub `ubuntu-24.04` x86_64 ([run 41699600128](https://github.com/anthonytw/fil/actions/runs/41699600128), 2026-11-03 14:03 ET) and the Lima VM on aarch64 (`just vm-realnet fwd`, 13:50 ET). Both ran OpenSSH 9.6p1. Single runs; read differences under a few percent, or a few hundred ms in a reconnect, as noise. `f_fwd_ending_stress` failed in both of those runs on a harness bug (a counter's `grep -c`), since fixed; its numbers are from the VM reruns listed under it.
+Four runs of the part on `m2-v1` (nothing in this package changes fil), all with OpenSSH 9.6p1, all passing:
+
+- GitHub `ubuntu-24.04` x86_64: [run 41699600128](https://github.com/anthonytw/fil/actions/runs/41699600128) (14:03 ET, main at `9988fdd`) and **[run 41707448932](https://github.com/anthonytw/fil/actions/runs/41707448932) (14:53 ET, main at `a6bd109`, this PR's tree: all four realnet parts passed)**;
+- the Lima VM on aarch64 (`just vm-realnet fwd`): 13:50 ET (main at `9988fdd`) and 14:48 ET (this PR's tree).
+
+`f_fwd_ending_stress` failed in the two earlier runs on a harness bug (a counter's `grep -c`), fixed before the later two; every other scenario passed in all four. Single runs; read differences under a few percent, or a few hundred ms in a reconnect, as noise. The tables give the earlier GitHub and VM runs; the later ones agree with them (the differences are noted where they matter).
 
 ### The done-when: a pulled cable (`f_fwd_cable_pull`)
 
@@ -59,8 +64,10 @@ Two runs of the part on `m2-v1` (main at `9988fdd`, F3; nothing in this package 
 | auto (QUIC) | VM aarch64 | 1.9 s | 0.6 s | 391 s |
 | pipe | GitHub x86_64 | 9.8 s | **18.3 s** | 383 s |
 | pipe | VM aarch64 | 8.0 s | **23.3 s** | 385 s |
+| pipe | GitHub, final run | 9.9 s | 8.0 s | |
+| pipe | VM, final run | 7.8 s | **28.1 s** | |
 
-**Finding (recorded by the scenario from now on, as a KNOWN-BUG above 10 s): on `--transport pipe` the client comes back up to 30 s after the network does.** The client log of the VM run shows why: the path manager's pipe retry backs off to its cap of 30 s during the outage (`ScheduleRetry(PipeRetry, 30s)` every 30 s from a minute in), and nothing cuts the wait short when the cable is back, because the network watcher that would (`NetworkChanged`) runs only when the setting is not `pipe` (`crates/fil/src/dialer.rs`, `watch_network: setting != TransportSetting::Pipe`: "with the pipe only there is nothing to upgrade to and nobody to hint"). The log has no `NetworkChanged` input at all. On `auto` the watcher sees the default route return and the client is back within 2 s. No byte is lost either way; it is a wait.
+**Finding (recorded by the scenario from now on, as a KNOWN-BUG above 10 s): on `--transport pipe` the client comes back up to 30 s after the network does.** The client log of the VM run shows why: the path manager's pipe retry backs off to its cap of 30 s during the outage (`ScheduleRetry(PipeRetry, 30s)` every 30 s from a minute in), and nothing cuts the wait short when the cable is back, because the network watcher that would (`NetworkChanged`) runs only when the setting is not `pipe` (`crates/fil/src/dialer.rs`, `watch_network: setting != TransportSetting::Pipe`: "with the pipe only there is nothing to upgrade to and nobody to hint"). The log has no `NetworkChanged` input at all. On `auto` the watcher sees the default route return and the client is back within 2 s (1.1 to 1.9 s in all four runs). No byte is lost either way; it is a wait, and how long depends on where the retry timer stands when the network returns: 8.0, 18.3, 23.3 and 28.1 s after the 5 min pull in the four runs. The final GitHub run's 8.0 s was under the scenario's 10 s line, so that run records no finding; the final VM run's 28.1 s does.
 
 **ssh -L, alongside on `auto`'s run: byte-exact, one accept, ssh still running, on both machines (355 s and 354 s).** The kernel kept ssh's TCP connection through 5 min with no route (TCP gives up after about 15 minutes of retransmissions) and the address did not change, so the connection resumed when its next retransmission got through. A cable pull that comes back with the same address and no NAT in between is the case ssh survives; `f_fwd_roam` and the udp part's `f_nat_rebind` are the cases it does not (a new mapping ends ssh's connection, and fil's QUIC link moves). This contradicts the plan's expectation ("ssh is expected to fail") for this exact case, so it is recorded as it is.
 
@@ -91,7 +98,7 @@ One QUIC link throughout: no link down, no switch. Another user (`rnmallory`) re
 
 ### The `MAX_ENDING` stress (`f_fwd_ending_stress`)
 
-**It did not trip.** In no cell, either way, did either side end the link as "the peer does not answer stream ends", and no link went down or moved to the pipe. Every connection was echoed. The VM, aarch64 (`just vm-realnet fwd f_fwd_many_short f_fwd_ending_stress`, 14:29 ET), 200 connections at a time, 1000 bytes echoed each:
+**It did not trip.** In no cell, either way, did either side end the link as "the peer does not answer stream ends", and no link went down or moved to the pipe. Every connection was echoed. The VM, aarch64 (`just vm-realnet fwd f_fwd_many_short f_fwd_ending_stress`, 14:29 ET; the final VM run agreed within 10 %), 200 connections at a time, 1000 bytes echoed each:
 
 | Path (`tc netem` each way) | Connections | -L: per second | -R: per second | Failed | Trips (client / daemon) |
 |---|---|---|---|---|---|
@@ -100,16 +107,16 @@ One QUIC link throughout: no link down, no switch. Another user (`rnmallory`) re
 | lossy and slow: `loss 3% rate 5mbit` | 20,000 each way | 125 | 118 | 0 | 0 / 0 |
 | harsh: `delay 40ms 10ms loss 8% rate 2mbit` | 5,000 each way | 29 | 27 | 0 | 0 / 0 |
 
-GITHUB_STRESS
+The final GitHub run (x86_64, the same cells) agrees: no trip in any cell; lossy 150 and 144 a second, slow 423 and 417, lossy and slow 119 and 120, harsh 29 and 27; nothing failed; ssh -L on the lossy path 143 a second.
 
 What the numbers say about the concern (C3's review: marker answers ride the control channel while stream credit returns in QUIC frames): at most 200 connections are open at a time, and each one's end marker is answered within a round trip or two of its stream end. Even at 420 connections a second, with every answer delayed by a full second of loss recovery, about 420 ends would be waiting, a fifth of the 2,048 limit. The limit would need an answer delay of about five seconds at that rate, or ten times the concurrency the opener allows (`MAX_OPEN_CHANNELS` is 256). A lossy path makes the rate fall faster than the delay grows: at 3 % loss the connection rate drops to a third, so the product (the ends waiting) goes down, not up.
 
-**A slower measurement worth having (not a bug): a lossy path cuts the connection rate to a third.** On the clean network 200 concurrent connections finish in about 30 ms (`f_fwd_many_short`); on the 3 % lossy path the same burst sustains 135 a second, about 1.5 s per connection with 200 open. Every channel's open, acknowledgement and close travels on the one MUX channel (§8.5), one QUIC stream, so a lost packet there holds up every connection's bookkeeping until it is retransmitted. The ssh -L reference row (added after these runs; one TCP connection, the same head-of-line effect) puts it in scale.
+**A slower measurement worth having (not a bug): a lossy path cuts the connection rate to a third.** On the clean network 200 concurrent connections finish in about 30 ms (`f_fwd_many_short`); on the 3 % lossy path the same burst sustains 135 a second, about 1.5 s per connection with 200 open. Every channel's open, acknowledgement and close travels on the one MUX channel (§8.5), one QUIC stream, so a lost packet there holds up every connection's bookkeeping until it is retransmitted. ssh -L puts it in scale: the same 20,000-connection burst through `ssh -N -L` on the same lossy path ran at **129 a second** in the VM and 143 on GitHub, against fil's 133 to 150. One TCP connection carries all of ssh's channels, so a lost packet holds them all up in the same way; fil is no worse.
 
 
 ### H1's data (`f_fwd_vs_ssh`)
 
-Keystroke-to-echo at 20 keys/s, `delay 20ms 5ms rate 20mbit limit 500` each way, the bulk transfer through the same client's `-L`, every loaded cell at 20.0 Mbit/s of bulk (the link's whole rate). ms; GitHub x86_64 first, the VM in brackets:
+Keystroke-to-echo at 20 keys/s, `delay 20ms 5ms rate 20mbit limit 500` each way, the bulk transfer through the same client's `-L`, every loaded cell at 20.0 Mbit/s of bulk (the link's whole rate). ms; GitHub x86_64 first (run 41699600128), the VM in brackets. The final GitHub run gave the same to within 1 % in every loaded cell (pipe 432.8 / 702.9 up, 432.3 / 674.0 down; QUIC 272.6 / 320.5 up, 273.1 / 321.2 down; ssh -L 854.8 / 1092.7 up, 849.4 / 1103.9 down):
 
 | Path | idle p50 / p99 | H1 trigger (2x idle + 10) | upload p50 / p99 | download p50 / p99 | H1 rule |
 |---|---|---|---|---|---|

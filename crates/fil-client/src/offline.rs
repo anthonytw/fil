@@ -271,19 +271,35 @@ impl LogDir {
         use rustix::fs::{Mode, OFlags, openat};
         // Never follow a symlink at the name (another local user could plant one at a
         // predictable location such as /tmp to have our keystrokes appended to one of our own
-        // files), and check what was actually opened.
+        // files), and check what was actually opened. The open does not block (a FIFO planted
+        // at the path would otherwise hang the start of the session until something opens its
+        // other end; without a reader the open fails at once) and does not make a terminal
+        // device our controlling terminal; blocking mode is restored once it is known to be a
+        // regular file.
         let fd = openat(
             &self.dir,
             &self.name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::APPEND
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::NOCTTY
+                | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
-        .map_err(|e| std::io::Error::from(e).to_string())?;
+        .map_err(|e| match e {
+            rustix::io::Errno::NXIO => "not a regular file (a FIFO nobody reads?)".to_string(),
+            e => std::io::Error::from(e).to_string(),
+        })?;
         let f = std::fs::File::from(fd);
         let md = f.metadata().map_err(|e| e.to_string())?;
         if !md.is_file() {
             return Err("not a regular file".into());
         }
+        let flags = rustix::fs::fcntl_getfl(&f).map_err(|e| std::io::Error::from(e).to_string())?;
+        rustix::fs::fcntl_setfl(&f, flags - OFlags::NONBLOCK)
+            .map_err(|e| std::io::Error::from(e).to_string())?;
         if md.uid() != rustix::process::geteuid().as_raw() {
             return Err("not owned by you".into());
         }
@@ -466,6 +482,46 @@ mod tests {
         assert!(LogDir::open(&path).is_ok());
         set(0o700);
         assert!(LogDir::open(&dir.join("missing/log")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_fifo_at_the_log_path_does_not_hang_the_start() {
+        let dir = scratch("fifo");
+        let path = dir.join("log");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        // Opening a FIFO for writing blocks until a reader turns up: run it on a thread, so a
+        // regression fails this test instead of hanging the run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                LogSink::open(&OfflineLog::File(p))
+                    .err()
+                    .map(|e| e.to_string()),
+            );
+        });
+        let why = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening the log hung on a FIFO");
+        assert!(
+            why.as_deref()
+                .expect("a FIFO is refused")
+                .contains("not a regular file"),
+            "{why:?}"
+        );
+        // With a reader on the other end the open succeeds, and is still refused.
+        let _reader = std::fs::File::options()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(&path)
+            .unwrap();
+        let err = LogSink::open(&OfflineLog::File(path)).expect_err("refused");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

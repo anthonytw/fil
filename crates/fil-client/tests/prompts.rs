@@ -90,6 +90,89 @@ async fn the_first_letter_of_a_word_typed_after_a_pause_is_not_an_answer() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_late_deadline_does_not_commit_a_key_over_the_one_that_follows_it() {
+    let rig = taken_over().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("y");
+    settle().await;
+    // The loop is late: the candidate's 300 ms are up when it next looks, and the `o` of "you"
+    // is already waiting. The letter that follows cancels the candidate; the clock does not
+    // get to commit it first.
+    rig.type_str("o");
+    tokio::time::advance(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!rig.is_finished());
+    assert_eq!(
+        rig.daemon.attaches().await.len(),
+        1,
+        "\"yo\" took the session back"
+    );
+}
+
+/// The keys a terminal reports once the program in it (or an earlier fil) has switched on the
+/// kitty keyboard protocol or xterm's modifyOtherKeys.
+#[tokio::test(start_paused = true)]
+async fn the_answer_keys_work_as_reported_by_enhanced_keyboard_modes() {
+    // (what arrives, whether it is a yes)
+    let cases: &[(&str, bool)] = &[
+        ("\x1b[121u", true),         // kitty y
+        ("\x1b[121;1u", true),       // kitty y with explicit modifiers
+        ("\x1b[121;2u", true),       // kitty shift-y
+        ("\x1b[121;65u", true),      // kitty y with caps lock
+        ("\x1b[121;1:1u", true),     // with the event type (press)
+        ("\x1b[121u\x1b[13u", true), // y, then Enter, in one read
+        ("\x1b[110u", false),        // kitty n
+        ("\x1b[113u", false),        // kitty q
+        ("\x1b[27u", false),         // kitty ESC
+        ("\x1b[99;5u", false),       // kitty ctrl-c
+        ("\x1b[27;5;99~", false),    // modifyOtherKeys ctrl-c
+        ("\x1b[27;1;121~", true),    // modifyOtherKeys y
+    ];
+    for (keys, yes) in cases {
+        let rig = taken_over().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.type_str(keys);
+        // A release event after the press is not typing and does not cancel it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.type_str("\x1b[121;1:3u");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if *yes {
+            assert_eq!(
+                rig.daemon.attaches().await.len(),
+                2,
+                "{keys:?} was not a yes"
+            );
+        } else {
+            let out = rig.finish().await.unwrap();
+            assert!(
+                matches!(out, Outcome::TakenOver { .. }),
+                "{keys:?}: {out:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_sequences_are_still_not_answers() {
+    let rig = taken_over().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for seq in [
+        "\x1b[121;5u",    // ctrl-y
+        "\x1b[120u",      // kitty x
+        "\x1b[13;2u",     // shift-Enter
+        "\x1b[27;5;121~", // modifyOtherKeys ctrl-y
+        "\x1b[A",
+        "\x1b[121u\x1b[121u",
+        "\x1b[121", // not finished
+    ] {
+        rig.type_str(seq);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(!rig.is_finished());
+    assert_eq!(rig.daemon.attaches().await.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_enter_after_y_is_not_typed_into_the_session() {
     // Enter as its own keystroke, after the quiet period has already made `y` the answer.
     let rig = taken_over().await;

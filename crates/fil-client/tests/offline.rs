@@ -409,6 +409,48 @@ async fn a_key_that_starts_a_word_after_a_pause_is_not_an_answer() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_late_deadline_does_not_commit_a_key_over_the_one_that_follows_it() {
+    // The loop picks between its timer and the keyboard at random when both are ready, so the
+    // late-timer case is repeated until a wrong choice would have shown.
+    for _ in 0..20 {
+        let rig = confirming_rig().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.type_str("y");
+        settle().await;
+        rig.type_str("o"); // already waiting when the 300 ms are up
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            rig.daemon.input().await,
+            b"",
+            "\"yo\" released the held keys"
+        );
+        assert!(rig.term.text().contains("Send it?"), "still asking");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_confirmation_takes_enhanced_keyboard_reports_too() {
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Ctrl-C as kitty reports it, and an arrow key: only the first answers (no).
+    rig.type_str("\x1b[A");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(rig.term.text().contains("Send it?"));
+    rig.type_str("\x1b[99;5u");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!rig.term.text().contains("Send it?"));
+    assert_eq!(rig.daemon.input().await, b"");
+    let rig = confirming_rig().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("\x1b[121u"); // y
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.type_str("\x1b[13u"); // Enter
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"ls\r");
+}
+
+#[tokio::test(start_paused = true)]
 async fn arrow_keys_and_escape_sequences_do_not_discard_the_buffer() {
     let rig = confirming_rig().await;
     tokio::time::sleep(Duration::from_secs(2)).await;

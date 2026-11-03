@@ -293,7 +293,14 @@ impl Answer {
         self.candidate.map(|c| c.1)
     }
 
-    /// The candidate's quiet time is up: it is the answer.
+    /// The candidate's quiet time is up.
+    fn due(&self) -> bool {
+        self.candidate.is_some_and(|(_, at)| Instant::now() >= at)
+    }
+
+    /// The candidate's quiet time is up: it is the answer. **Only the deadline timer may call
+    /// this**, and only after looking for input that is already waiting: if the loop was blocked
+    /// past the deadline, a key that follows the candidate in the queue cancels it.
     fn tick(&mut self) -> Option<bool> {
         match self.candidate {
             Some((yes, at)) if Instant::now() >= at => {
@@ -304,14 +311,17 @@ impl Answer {
         }
     }
 
-    /// A read from the keyboard. `Some` is the answer.
+    /// A read from the keyboard. `Some` is the answer. Input never commits a lone key by the
+    /// clock: whatever arrives after a candidate cancels it, however late the timer is.
     fn input(&mut self, bytes: &[u8]) -> Option<bool> {
-        if let Some(yes) = self.tick() {
-            return Some(yes);
+        let chunk = classify(bytes);
+        // The release of a key (kitty's event types) is not typing.
+        if matches!(chunk, Chunk::Release) {
+            return None;
         }
         let now = Instant::now();
         if let Some((yes, _)) = self.candidate {
-            if matches!(bytes, [b'\r'] | [b'\n']) {
+            if matches!(chunk, Chunk::Enter) {
                 self.candidate = None;
                 self.enter_seen = true;
                 return Some(yes);
@@ -325,16 +335,16 @@ impl Answer {
             self.armed_at = now + PROMPT_QUIET;
             return None;
         }
-        match prompt_answer(bytes) {
-            Some((yes, true)) => {
+        match chunk {
+            Chunk::Key { yes, enter: true } => {
                 self.enter_seen = true;
                 Some(yes)
             }
-            Some((yes, false)) => {
+            Chunk::Key { yes, enter: false } => {
                 self.candidate = Some((yes, now + PROMPT_QUIET));
                 None
             }
-            None => {
+            _ => {
                 self.armed_at = now + PROMPT_QUIET;
                 None
             }
@@ -548,6 +558,8 @@ pub(crate) struct Core<I, O> {
     buf: OfflineBuffer,
     log: Option<LogSink>,
     confirm: Option<Confirm>,
+    /// Events read ahead by [`Core::input_waiting`], delivered before any new one.
+    stashed: VecDeque<TermEvent>,
     /// An answer was just given without its Enter: a lone Enter before this is swallowed.
     swallow_enter: Option<Instant>,
     /// The confirmation is due but could not be drawn yet; nothing is sent until it is shown
@@ -612,6 +624,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             buf,
             log,
             confirm: None,
+            stashed: VecDeque::new(),
             swallow_enter: None,
             confirm_pending: None,
             prompt: None,
@@ -638,6 +651,37 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             banner: None,
             banner_shown: false,
         })
+    }
+
+    /// The next event from the user. Cancel-safe, like the terminal's own.
+    async fn next_input(&mut self) -> TermEvent {
+        if let Some(ev) = self.stashed.pop_front() {
+            return ev;
+        }
+        self.input.next().await
+    }
+
+    /// Whether an event is already waiting. It is read ahead (once) and kept for
+    /// [`Core::next_input`]: nothing is lost.
+    fn input_waiting(&mut self) -> bool {
+        if !self.stashed.is_empty() {
+            return true;
+        }
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let ev = {
+            let fut = std::pin::pin!(self.input.next());
+            match std::future::Future::poll(fut, &mut cx) {
+                std::task::Poll::Ready(ev) => Some(ev),
+                std::task::Poll::Pending => None,
+            }
+        };
+        match ev {
+            Some(ev) => {
+                self.stashed.push_back(ev);
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- the top-level loop ------------------------------------------------------------
@@ -823,7 +867,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let wake = self.next_wake();
             tokio::select! {
                 out = &mut fut => return Ok(Pumped::Ready(out)),
-                ev = self.input.next() => {
+                ev = self.next_input() => {
                     match self.on_event(ev)? {
                         Ev::Continue => {}
                         Ev::Detach => return Ok(Pumped::Done(Outcome::Detached)),
@@ -974,7 +1018,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             }
                         }
                     }
-                    ev = self.input.next(), if self.pending.len() < MAX_PENDING_INPUT => {
+                    ev = self.next_input(), if self.pending.len() < MAX_PENDING_INPUT => {
                         match self.on_event(ev)? {
                             Ev::Continue => {}
                             // The `Detach` itself is sent by `detach_and_wait`, once the input
@@ -1829,7 +1873,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // client left half-typed on the shell's line.
         if let Some(until) = self.swallow_enter.take()
             && Instant::now() < until
-            && matches!(bytes, [b'\r'] | [b'\n'])
+            && classify(bytes) == Chunk::Enter
         {
             return Ok(Ev::Continue);
         }
@@ -1954,8 +1998,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let mut keys = Answer::new();
         let answer = loop {
             let wake = self.next_wake();
+            // Input first: a candidate's deadline that passed while the loop was blocked does
+            // not commit it over a key that is already waiting.
             tokio::select! {
-                ev = self.input.next() => match ev {
+                biased;
+                ev = self.next_input() => match ev {
                     TermEvent::Input(bytes) => {
                         if let Some(yes) = keys.input(&bytes) {
                             break if yes { Ok(()) } else { Err(no) };
@@ -2161,7 +2208,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 });
             }
         }
-        if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm
+        // A candidate whose time is up becomes the answer, unless the loop was late and a key
+        // is already waiting: that key cancels it, so it is left for the input branch.
+        let due = matches!(&self.confirm, Some(Confirm::Typed { answer, .. }) if answer.due());
+        if due
+            && !self.input_waiting()
+            && let Some(Confirm::Typed { answer, .. }) = &mut self.confirm
             && let Some(yes) = answer.tick()
         {
             let enter_seen = answer.enter_seen;
@@ -2250,21 +2302,101 @@ fn term_size(s: (u16, u16)) -> TermSize {
     TermSize::clamped(s.0, s.1)
 }
 
-/// What a chunk of typed bytes says to a yes/no question: `(yes, with_enter)`. Only a chunk that
-/// is exactly the key counts, optionally with the Enter after it. A `y` somewhere in a word
-/// (`python`, `yes`), or an escape sequence that starts with ESC (an arrow key), is not an
-/// answer. Taking a session back is a decision, and a stray key must not make it.
-fn prompt_answer(bytes: &[u8]) -> Option<(bool, bool)> {
-    let (key, enter) = match bytes {
-        [k, b'\r' | b'\n'] => (*k, true),
-        [k] => (*k, false),
-        _ => return None,
+/// What a read from the keyboard says to a yes/no question.
+#[derive(Debug, PartialEq, Eq)]
+enum Chunk {
+    /// Exactly an answer key, optionally with its Enter in the same read.
+    Key { yes: bool, enter: bool },
+    /// Exactly an Enter.
+    Enter,
+    /// The release of a key (the kitty protocol's event types): not typing.
+    Release,
+    /// Anything else: other keys, a word, an arrow key (it starts with ESC), a paste.
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Yes,
+    No,
+    Enter,
+    Release,
+}
+
+/// Classifies a read. Only a chunk that is exactly the key counts, so a `y` somewhere in a word
+/// (`python`) or an escape sequence that merely starts with ESC is not an answer: taking a
+/// session back is a decision, and a stray key must not make it. The key may also arrive the
+/// way a terminal with an enhanced keyboard mode reports it (the remote program may have
+/// switched one on and our own terminal still be in it): kitty's `CSI 121 u` style (`y`, `n`,
+/// `q`, Enter `CSI 13 u`, ESC `CSI 27 u`, ^C `CSI 99;5 u`) and xterm's `modifyOtherKeys`
+/// (`CSI 27;5;99 ~`). Nothing is sent to the terminal to leave those modes.
+fn classify(bytes: &[u8]) -> Chunk {
+    let Some((first, n)) = token(bytes) else {
+        return Chunk::Other;
     };
-    match key {
-        b'y' | b'Y' => Some((true, enter)),
-        b'n' | b'N' | b'q' | 0x1b | 0x03 => Some((false, enter)),
+    match (first, token(&bytes[n..])) {
+        (Tok::Release, None) if n == bytes.len() => Chunk::Release,
+        (Tok::Enter, None) if n == bytes.len() => Chunk::Enter,
+        (Tok::Yes | Tok::No, None) if n == bytes.len() => Chunk::Key {
+            yes: first == Tok::Yes,
+            enter: false,
+        },
+        (Tok::Yes | Tok::No, Some((Tok::Enter, m))) if n + m == bytes.len() => Chunk::Key {
+            yes: first == Tok::Yes,
+            enter: true,
+        },
+        _ => Chunk::Other,
+    }
+}
+
+/// The first key in `bytes`, and how many bytes it takes.
+fn token(bytes: &[u8]) -> Option<(Tok, usize)> {
+    match bytes {
+        [b'y' | b'Y', ..] => Some((Tok::Yes, 1)),
+        [b'n' | b'N' | b'q' | 0x03, ..] => Some((Tok::No, 1)),
+        [b'\r' | b'\n', ..] => Some((Tok::Enter, 1)),
+        [0x1b, b'[', rest @ ..] => csi_key(rest).map(|(t, n)| (t, n + 2)),
+        // A bare ESC (anything after it that is not a key makes the chunk `Other`).
+        [0x1b, ..] => Some((Tok::No, 1)),
         _ => None,
     }
+}
+
+/// A key reported as a CSI sequence; `rest` follows `ESC [`.
+fn csi_key(rest: &[u8]) -> Option<(Tok, usize)> {
+    let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+    let (params, fin) = (std::str::from_utf8(&rest[..end]).ok()?, rest[end]);
+    let num = |s: &str| s.split(':').next().and_then(|n| n.parse::<u32>().ok());
+    let fields: Vec<&str> = params.split(';').collect();
+    // (key code, modifier field)
+    let (code, mods) = match (fin, fields.as_slice()) {
+        // kitty: CSI code[:alternates] ; modifiers[:event] u
+        (b'u', [code]) => (num(code)?, "1"),
+        (b'u', [code, mods]) => (num(code)?, *mods),
+        // xterm modifyOtherKeys: CSI 27 ; modifiers ; code ~
+        (b'~', [marker, mods, code]) if *marker == "27" => (num(code)?, *mods),
+        _ => return None,
+    };
+    let event = mods
+        .split(':')
+        .nth(1)
+        .and_then(|e| e.parse::<u32>().ok())
+        .unwrap_or(1);
+    let used = end + 1;
+    if event == 3 {
+        return Some((Tok::Release, used));
+    }
+    // Shift is part of Y/N; Caps Lock and Num Lock (bits 64 and 128) change nothing.
+    let bits = num(mods)?.saturating_sub(1) & !(64 | 128);
+    let tok = match (code, bits) {
+        (121 | 89, 0 | 1) => Tok::Yes,
+        (110 | 78 | 113 | 81, 0 | 1) => Tok::No,
+        (13, 0) => Tok::Enter,
+        (27, 0) => Tok::No,
+        (99, 4) => Tok::No, // Ctrl-C
+        _ => return None,
+    };
+    Some((tok, used))
 }
 
 async fn at(t: Option<Instant>) {
@@ -2301,4 +2433,103 @@ fn refused(chan: ChannelId, payload: &[u8]) -> bool {
 
 fn send_on(tx: &Outbox, msg: &ControlMsg) {
     tx.control(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Keys(mpsc::UnboundedReceiver<TermEvent>);
+
+    impl TermInput for Keys {
+        async fn next(&mut self) -> TermEvent {
+            self.0.recv().await.unwrap_or(TermEvent::Eof)
+        }
+    }
+
+    struct Screen;
+
+    impl TermOutput for Screen {
+        fn size(&mut self) -> std::io::Result<(u16, u16)> {
+            Ok((80, 24))
+        }
+        fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn set_raw(&mut self, _: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn core() -> (Core<Keys, Screen>, mpsc::UnboundedSender<TermEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let term = Terminal {
+            input: Keys(rx),
+            output: Screen,
+            local_term: None,
+        };
+        let cfg = ClientConfig::new("main".parse().unwrap(), "host".parse().unwrap());
+        (Core::new(term, cfg, None).expect("core"), tx)
+    }
+
+    /// A confirmation whose lone `y` has waited out its 300 ms.
+    fn due_confirmation() -> Confirm {
+        let now = Instant::now();
+        Confirm::Typed {
+            secs: 0,
+            answer: Answer {
+                armed_at: now,
+                candidate: Some((true, now)),
+                enter_seen: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_due_candidate_waits_for_a_key_that_is_already_queued() {
+        let (mut core, keys) = core();
+        core.buf.push(b"ls\r");
+        core.confirm = Some(due_confirmation());
+        // The timer fires late and the next letter is already waiting: the tick leaves the
+        // candidate alone (the letter will cancel it), and loses nothing.
+        keys.send(TermEvent::Input(b"o".to_vec())).unwrap();
+        core.on_tick().unwrap();
+        assert!(core.confirm.is_some(), "the clock committed the key");
+        assert_eq!(core.stashed.len(), 1, "the waiting key was read ahead");
+        assert!(matches!(core.next_input().await, TermEvent::Input(b) if b == b"o"));
+        // With nothing waiting, the same tick commits it.
+        core.on_tick().unwrap();
+        assert!(core.confirm.is_none());
+        assert_eq!(core.pending, b"ls\r");
+    }
+
+    #[test]
+    fn answer_keys_are_classified_exactly() {
+        use Chunk::*;
+        let key = |yes, enter| Key { yes, enter };
+        assert_eq!(classify(b"y"), key(true, false));
+        assert_eq!(classify(b"Y\r"), key(true, true));
+        assert_eq!(classify(b"n\n"), key(false, true));
+        assert_eq!(classify(b"\x1b"), key(false, false));
+        assert_eq!(classify(b"\x03"), key(false, false));
+        assert_eq!(classify(b"\r"), Enter);
+        assert_eq!(classify(b"\x1b[121u"), key(true, false));
+        assert_eq!(classify(b"\x1b[121;1:1u"), key(true, false));
+        assert_eq!(classify(b"\x1b[121;1:3u"), Release);
+        assert_eq!(classify(b"\x1b[27;5;99~"), key(false, false));
+        assert_eq!(classify(b"\x1b[13u"), Enter);
+        for other in [
+            &b"yes"[..],
+            b"",
+            b"\x1b[A",
+            b"\x1bOP",
+            b"yy",
+            b"\x1b[121;5u",
+            b"\x1b[121",
+            b"y\r\r",
+            b"\x1b[121u\x1b[121u",
+        ] {
+            assert_eq!(classify(other), Other, "{other:?}");
+        }
+    }
 }

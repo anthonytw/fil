@@ -45,6 +45,25 @@ pub const LOCAL: &str = "local";
 /// the entry gets removed with the fix. See docs/m1/dropin.md, finding 1.
 const XFAIL: &[&str] = &["resize_order", "terminal_sane_after_detach"];
 
+/// Whether an error is *the* expected failure of a known-failing scenario, and not some other
+/// error that happens in the same scenario (a timeout, a wrong first size, a missing tool...).
+/// Every part of the message must carry the signature.
+fn is_expected_failure(name: &str, err: &str) -> bool {
+    match name {
+        // "auto: 6 of 200 commands typed right after a resize saw the old size (...) | pipe: ..."
+        "resize_order" => err
+            .split(" | ")
+            .all(|part| part.contains(" commands typed right after a resize saw the old size (")),
+        // "terminal modes after `~.` are Modes {..}, wanted Modes {..}; the terminal is not in
+        // cooked mode (...)": the modes left set, or the termios not restored.
+        "terminal_sane_after_detach" => err.split("; ").all(|part| {
+            part.starts_with("terminal modes after `~.` are ")
+                || part.starts_with("the terminal is not in cooked mode")
+        }),
+        _ => false,
+    }
+}
+
 /// The tools every host must have. A host without one fails the run (finding: a reimaged Pi must
 /// not turn the gate green by dropping the vim scenarios).
 const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git"];
@@ -229,17 +248,61 @@ impl Local {
         Local { dev, dir }
     }
 
-    /// Stops the private daemon (the one whose command line names this directory) and removes it.
-    fn stop(&self) {
-        let pat = format!("--dir {} daemon", self.dir.display());
-        let out = Command::new("pgrep").args(["-f", &pat]).output();
-        if let Ok(o) = out {
-            for pid in String::from_utf8_lossy(&o.stdout).split_whitespace() {
-                let _ = Command::new("kill").arg(pid).status();
+    /// The pids of the daemons of this directory: each `fil-<major>.lock` holds its daemon's pid
+    /// for the daemon's whole life.
+    fn daemon_pids(&self) -> Vec<u32> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        rd.filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".lock"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| t.trim().parse().ok())
+            .collect()
+    }
+
+    /// Whether the process is alive and is a daemon of this directory (a pid in a stale lock
+    /// file may belong to something else by now: that one is never touched).
+    fn is_ours(&self, pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output();
+        out.is_ok_and(|o| {
+            let cmd = String::from_utf8_lossy(&o.stdout);
+            cmd.contains(&self.dir.display().to_string()) && cmd.contains("daemon")
+        })
+    }
+
+    /// Stops the private daemon by the pid it wrote, waits for it to exit, and only then removes
+    /// the directory. No pattern kills. Fails if a daemon of this directory is still alive.
+    fn stop(&self) -> Result<(), String> {
+        let pids = self.daemon_pids();
+        for pid in &pids {
+            if self.is_ours(*pid) {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let t0 = Instant::now();
+        while pids.iter().any(|p| self.is_ours(*p))
+            && t0.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        for pid in &pids {
+            if self.is_ours(*pid) {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let left: Vec<u32> = pids.iter().copied().filter(|p| self.is_ours(*p)).collect();
         let _ = std::fs::remove_dir_all(&self.dir);
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the private daemon (pid {left:?}) is still running after the local run"
+            ))
+        }
     }
 }
 
@@ -517,7 +580,16 @@ fn main() {
         }
     }
     if let Some(l) = &ctx.local {
-        l.stop();
+        match l.stop() {
+            Ok(()) => println!("   after the local run: no private daemon left"),
+            Err(e) => {
+                failures += 1;
+                println!("FAIL local: {e}");
+                table.push(
+                    "| local | cleanup | FAIL | the private daemon is still running |".into(),
+                );
+            }
+        }
     }
     println!("\n| host | scenario | result | details |\n|---|---|---|---|");
     for l in table {
@@ -584,7 +656,40 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
             }
             End::Pass(notes)
         }
-        Err(e) if xfail => End::Xfail(e),
+        Err(e) if xfail && is_expected_failure(name, &e) => End::Xfail(e),
+        Err(e) if xfail => End::Fail(format!(
+            "`{name}` is a known failure, but this is not the expected one: {e}"
+        )),
         Err(e) => End::Fail(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expected_failure as exp;
+
+    #[test]
+    fn only_the_expected_error_counts_as_the_known_failure() {
+        let old = "auto: 6 of 200 commands typed right after a resize saw the old size (38x100 then `stty size` said RO7-37x100) | pipe: 1 of 100 commands typed right after a resize saw the old size (57x100 then `stty size` said RO26-56x100)";
+        assert!(exp("resize_order", old));
+        assert!(!exp("resize_order", "no \"RDY-42\" within 25s"));
+        assert!(!exp("resize_order", &format!("{old} | something else")));
+        let modes =
+            "terminal modes after `~.` are Modes { alt: true }, wanted Modes { alt: false }";
+        assert!(exp("terminal_sane_after_detach", modes));
+        assert!(exp(
+            "terminal_sane_after_detach",
+            &format!("{modes}; the terminal is not in cooked mode (termios: Some(false))")
+        ));
+        // A different error in the same scenario is a real failure.
+        assert!(!exp(
+            "terminal_sane_after_detach",
+            "while the program holds them: terminal modes are Modes { alt: false }, wanted"
+        ));
+        assert!(!exp(
+            "terminal_sane_after_detach",
+            "no \"RDY-42\" within 25s"
+        ));
+        assert!(!exp("vim_edit", old));
     }
 }

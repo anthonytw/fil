@@ -647,14 +647,16 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
     if ctx.verbose {
         eprintln!("--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}");
     }
+    // This client's attach only: the journal keeps earlier scenarios' lines too, and the daemon's
+    // log no longer names the session (privacy, S4), so go by time: a direct attach after this
+    // client started (a second of slack for the clocks).
     ensure(
         pi_logs.lines().any(|l| {
-            // This session's attach only: the journal keeps earlier scenarios' lines too.
             l.contains("\"message\":\"attach\"")
                 && l.contains("\"direct\":true")
-                && l.contains("\"session\":\"e2e-dm\"")
+                && log_seconds(l).is_some_and(|t| t >= start - 1.0)
         }),
-        || "the Pi's daemon log has no direct attach".to_string(),
+        || "the Pi's daemon log has no direct attach after this client started".to_string(),
     )?;
     notes.push(format!(
         "UPGRADED to QUIC: attach reply {} after start (the ssh login is most of it), QUIC up {} later, switched {} after that; {} from start to carrying the session; pipe closed; round trip over QUIC {}; the Pi's log shows the direct attach (first prompt {})",

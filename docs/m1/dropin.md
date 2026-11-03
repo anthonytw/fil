@@ -10,7 +10,7 @@ It is on demand and never part of `just ci`. (Its unit tests, which pin the exac
 |---|---|---|
 | The lab Raspberry Pis (aarch64, Debian 13) | 30 scenarios, this Mac's client against `fil server --stdio` on each Pi through the `fil-test` gate | `crates/fil/examples/dropin/`, `just dropin` |
 | The real-network harness (`udp` part, a Linux runner) | vim while the NAT mapping moves and while UDP is lossy and dead; the same everyday battery through `ssh -tt` and through fil, side by side | `tests/realnet/udp.sh` (`f_dropin_*`), helpers in `tests/realnet/dropin.sh` |
-| This machine (`--local`) | a development aid, not a result: the scenarios against a **private** daemon (`fil-daemon-dev --dir`), never `/tmp/fil-$UID`, so a stale daemon of another tree cannot answer | `just dropin --local` |
+| This machine (`--local`) | a development aid, not a result: the scenarios against a **private** daemon (`fil-daemon-dev --dir`), never `/tmp/fil-$UID`, so a stale daemon of another tree cannot answer; it is stopped at the end by the pid in its lock file (never by a pattern) and the run fails if it is still alive | `just dropin --local` |
 
 Every tool runs inside the fil session's shell, which is what a user does. The gate (`fil server --stdio`, `install`, `run`, `status`, `logs`, `reset`) offers no shell, so **plain `ssh -t` cannot be run on the Pis**. The like-for-like comparison with ssh therefore runs in realnet, where the "server" is a real sshd with a real login shell.
 
@@ -33,7 +33,7 @@ The run is strict by default. It **fails** when:
 - a scenario is skipped on a lab host (`--allow-skip` to accept it);
 - a required tool is missing (`--require vim,less,top,htop,git` is the default list; `--allow-missing` to accept it): a reimaged Pi must not turn the gate green by quietly dropping the vim scenarios;
 - a gate verb cannot run or exits non-zero, including the final `status` (silence is not "clean");
-- a known failure starts to pass (XPASS), so its entry is removed with the fix.
+- a known failure starts to pass (XPASS), so its entry is removed with the fix; and a known-failing scenario that fails in any *other* way than its signature (the old size seen; the modes left set) is a failure too.
 
 The summary prints the number of scenarios run, failed, skipped (with their names) and expected failures. Every message the driver prints goes through a scrubber that swaps the real host names for `pi1`/`pi2`, and the shells use a neutral prompt (`fil$ `).
 

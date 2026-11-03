@@ -708,9 +708,11 @@ UC_HOME=/home/rnclient
 FIL_BINS=(fil ptydrive sockprobe)
 PD=/tmp/rn-pd-udp
 # The programs live in a directory of their own, put first on the PATH of the client and (through
-# sshd's SetEnv) of the sessions sshd starts. Nothing is installed into /usr/local/bin.
-UDP_BIN=/tmp/rn-udp-bin
-UDP_PATH=$UDP_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# sshd's SetEnv) of the sessions sshd starts. Nothing is installed into /usr/local/bin. The
+# directory is made fresh by `mktemp -d` in udp_fil_setup, so nobody can plant one at a fixed path
+# first on a shared machine.
+UDP_BIN=""
+UDP_PATH=""
 
 client_exec_on() {
   shift
@@ -730,6 +732,12 @@ udp_fil_setup() {
   done
   rm -rf "$k"
   mkdir -p "$k"
+  UDP_BIN=$(as_root mktemp -d /tmp/rn-udp-bin.XXXXXX)
+  as_root chmod 755 "$UDP_BIN"
+  UDP_PATH=$UDP_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  # Each scenario runs in a fresh process that sources this file (part_main --one), so the
+  # per-run directory must be written down here, as ssh.sh and sysd.sh do with their state.
+  printf 'UDP_BIN=%q\nUDP_PATH=%q\n' "$UDP_BIN" "$UDP_PATH" > "$OUT/udp.env"
   ssh-keygen -q -t ed25519 -N '' -C realnet-udp-user -f "$k/id"
   ssh-keygen -q -t ed25519 -N '' -C realnet-udp-host -f "$k/host"
   cat > "$k/sshd_config" << EOF
@@ -774,7 +782,6 @@ EOF
   as_root install -d -o rnfil -g rnfil -m 700 /home/rnfil/.config /home/rnfil/.config/fil
   printf 'idle_exit_secs = 0\n' | as_root tee /home/rnfil/.config/fil/daemon.toml > /dev/null
   as_root chown rnfil:rnfil /home/rnfil/.config/fil/daemon.toml
-  as_root install -d -m 755 "$UDP_BIN"
   for c in "${FIL_BINS[@]}"; do as_root install -m 755 "$BIN_DIR/$c" "$UDP_BIN/$c"; done
   nsx "$NS_S" /usr/sbin/sshd -D -E "$OUT/logs/sshd-udp.log" -f /etc/fil-realnet-udp/sshd_config &
   local i
@@ -794,7 +801,8 @@ udp_fil_teardown() {
   for c in rnclient rnfil; do
     as_root userdel -r -f "$c" > /dev/null 2>&1 || true
   done
-  as_root rm -rf "$UDP_BIN" /etc/fil-realnet-udp "$PD" "$OUT/run/udp-keys"
+  [[ -z $UDP_BIN ]] || as_root rm -rf "$UDP_BIN"
+  as_root rm -rf /etc/fil-realnet-udp "$PD" "$OUT/run/udp-keys"
 }
 
 # wait_log NAME TEXT SECONDS [MIN]: the client's log must have at least MIN (default 1) lines

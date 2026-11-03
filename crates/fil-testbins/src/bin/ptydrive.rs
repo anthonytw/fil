@@ -336,9 +336,11 @@ fn serve(args: &[String]) -> Result<(), Fail> {
         }
         let pid = lock(&state).pid;
         if let (true, Some(pid)) = (lock(&state).exit.is_none(), pid) {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            // The system call itself, not the `kill` program, so PATH cannot matter.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
     }
     let _ = std::fs::remove_file(&sock);

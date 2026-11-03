@@ -958,6 +958,44 @@ async fn on_the_pipe_only_a_hint_just_after_a_run_waits_for_the_gap() {
     );
 }
 
+/// The network comes back while an ssh attempt is in flight (waiting on its connect timeout,
+/// `attempt_secs` long). The attempt fails; the next one follows the hint, not the 30 s backoff.
+/// Returns the start of the attempt and of the next one.
+async fn hint_during_a_failing_pipe_run(attempt_secs: u64) -> (Instant, Instant) {
+    let fake = Fake::new();
+    let (mut d, watched) = dialer_and_watched(&fake, TransportSetting::Pipe);
+    pipe_only_in_deep_backoff(&fake, &mut d).await;
+    // The attempts now take a while to fail.
+    fake.set_pipe_default(Script::Fail(secs(attempt_secs), "ssh: timed out".into()));
+    let n = fake.pipe_runs();
+    while fake.pipe_runs() == n {
+        let _ = dial_for(ms(200), &mut d, DialPurpose::Resume).await;
+    }
+    let started = fake.runs(LinkKind::Pipe)[n].at;
+    assert!(Instant::now() - started < secs(1));
+    if watched {
+        d.network_changed(); // what the watcher sends
+    }
+    let _ = dial_for(secs(attempt_secs + 6), &mut d, DialPurpose::Resume).await;
+    let runs = fake.runs(LinkKind::Pipe);
+    assert!(runs.len() > n + 1, "no run followed the failed one");
+    (started, runs[n + 1].at)
+}
+
+#[tokio::test(start_paused = true)]
+async fn on_the_pipe_only_a_hint_during_a_run_that_fails_soon_restarts_after_the_gap() {
+    let (started, next) = hint_during_a_failing_pipe_run(2).await;
+    assert!(next - started >= secs(5), "{:?}", next - started);
+    assert!(next - started < secs(6), "{:?}", next - started);
+}
+
+#[tokio::test(start_paused = true)]
+async fn on_the_pipe_only_a_hint_during_a_run_that_fails_late_restarts_at_once() {
+    let (started, next) = hint_during_a_failing_pipe_run(8).await;
+    assert!(next - started >= secs(8), "{:?}", next - started);
+    assert!(next - started < secs(9), "{:?}", next - started);
+}
+
 /// A change of network reaches the connector, which drops what it remembered about names.
 #[tokio::test(start_paused = true)]
 async fn the_connector_hears_of_a_network_change() {

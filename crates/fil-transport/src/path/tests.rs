@@ -644,6 +644,51 @@ fn a_hint_just_after_a_pipe_run_is_deferred_not_dropped() {
     assert!(a.contains(&RunPipe), "{a:?}");
 }
 
+/// The pipe in deep backoff whose retry timer has just fired: a run is in flight (since t).
+fn pipe_run_in_flight_after_deep_backoff() -> T {
+    let mut t = pipe_in_deep_backoff();
+    t.advance(S(25));
+    assert!(t.feed(I::Timer(PathTimer::PipeRetry)).contains(&RunPipe));
+    t
+}
+
+#[test]
+fn a_hint_during_a_pipe_run_that_then_fails_restarts_the_pipe_after_the_gap() {
+    let mut t = pipe_run_in_flight_after_deep_backoff();
+    // The network comes back one second into the attempt: nothing to restart yet.
+    assert_eq!(t.after(S(1), I::NetworkChanged), []);
+    // The attempt (which started before the network was back) fails at 2 s: the next run is
+    // due at the end of the 5 s gap, not after the 30 s backoff.
+    let a = t.after(S(1), I::PipeDown(DownReason::Io("timed out".into())));
+    assert_eq!(delay_of(&a, PathTimer::PipeHint), Some(S(3)), "{a:?}");
+    assert!(!a.contains(&RunPipe), "{a:?}");
+    // The backoff timer is still there; the restart cancels it.
+    let a = t.after(S(3), I::Timer(PathTimer::PipeHint));
+    assert!(a.contains(&RunPipe), "{a:?}");
+    assert!(a.contains(&CancelTimer(PathTimer::PipeRetry)), "{a:?}");
+}
+
+#[test]
+fn a_hint_during_a_long_pipe_run_that_then_fails_restarts_the_pipe_at_once() {
+    let mut t = pipe_run_in_flight_after_deep_backoff();
+    assert_eq!(t.after(S(1), I::NetworkChanged), []);
+    // ssh gave up on its connect timeout 10 s in: the gap is long over.
+    let a = t.after(S(9), I::PipeDown(DownReason::Io("timed out".into())));
+    assert!(a.contains(&RunPipe), "{a:?}");
+}
+
+#[test]
+fn a_hint_before_a_pipe_run_does_not_shorten_the_backoff_after_the_next_failure() {
+    // The memory is of a hint during *this* run, not of every hint ever.
+    let mut t = pipe_run_in_flight_after_deep_backoff();
+    let a = t.after(S(9), I::PipeDown(DownReason::Io("timed out".into())));
+    assert!(
+        delay_of(&a, PathTimer::PipeRetry).unwrap() >= S(24),
+        "{a:?}"
+    );
+    assert!(!a.contains(&RunPipe), "{a:?}");
+}
+
 #[test]
 fn a_deferred_pipe_hint_does_nothing_if_the_pipe_is_no_longer_waiting() {
     let mut t = pipe_in_deep_backoff();

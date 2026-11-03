@@ -58,11 +58,15 @@
 //!   working pipe.
 //! - **A network-change hint is a nudge, not a command.** It clears the backoff and tries direct
 //!   at once, but at most once per [`PathConfig::hint_cooldown`] (hints inside the window are
-//!   coalesced into one timer), it restarts a waiting pipe at once if the last pipe run began at
-//!   least [`PathConfig::hint_pipe_gap`] ago and otherwise when that gap is over (deferred, not
-//!   dropped: the pipe must not sit in a 30 s backoff after the network is back), and only [`PathConfig::hint_budget`] hints are
+//!   coalesced into one timer), and only [`PathConfig::hint_budget`] hints are
 //!   honoured per [`PathConfig::hint_window`]. A network that reports a change every second for
-//!   an hour therefore costs a few attempts a minute, not a few a second.
+//!   an hour therefore costs a few attempts a minute, not a few a second. A hint restarts a
+//!   waiting pipe at once if the last pipe run began at least [`PathConfig::hint_pipe_gap`] ago,
+//!   and otherwise when that gap is over (deferred, not dropped: the pipe must not sit in a 30 s
+//!   backoff after the network is back). A hint that arrives while a pipe run is in flight (ssh
+//!   waiting on its connect timeout, say) is remembered: if that run fails, the pipe is treated
+//!   as if the hint had found it waiting, so the next run follows the same rule instead of the
+//!   backoff.
 //! - **Direct goes first after a loss, the pipe second.** When direct was healthy until it died,
 //!   the manager redials at once and gives it `fallback_after` before starting an ssh login. When
 //!   direct has been failing, the pipe starts at once: waiting would only delay a session that
@@ -296,6 +300,10 @@ pub struct PathManager {
     pending: Pending,
     hints: VecDeque<Instant>,
     last_pipe_start: Option<Instant>,
+    /// A hint was honoured while the current pipe run was in flight. If that run fails, the
+    /// network may have come back during the attempt: the pipe restarts as for a hint that
+    /// found it waiting (after the gap), not after the backoff.
+    hint_during_pipe_run: bool,
     last_direct_error: Option<DownReason>,
     rng: u64,
 }
@@ -318,6 +326,7 @@ impl PathManager {
             pending: Pending::default(),
             hints: VecDeque::new(),
             last_pipe_start: None,
+            hint_during_pipe_run: false,
             last_direct_error: None,
             rng: cfg.jitter_seed | 1,
         }
@@ -401,6 +410,7 @@ impl PathManager {
             return; // a duplicate report
         }
         self.pipe = Lane::Up;
+        self.hint_during_pipe_run = false;
         self.pipe_up_at = Some(now);
         self.cancel(PathTimer::PipeRetry, out);
         self.cancel(PathTimer::PipeFallback, out);
@@ -424,7 +434,11 @@ impl PathManager {
             _ => None, // stale: nothing of ours is running
         };
         let Some(lived) = lived else { return };
+        let hinted_during_run = std::mem::take(&mut self.hint_during_pipe_run);
         self.pipe_gone(lived, out);
+        if hinted_during_run && self.pipe == Lane::Waiting {
+            self.restart_waiting_pipe(now, out);
+        }
     }
 
     /// The pipe run failed or the pipe link is gone, after `lived` of being up.
@@ -585,6 +599,9 @@ impl PathManager {
             self.direct = Lane::Idle;
             self.cancel(PathTimer::DirectRetry, out);
         }
+        if self.pipe == Lane::Busy {
+            self.hint_during_pipe_run = true;
+        }
         self.restart_waiting_pipe(now, out);
     }
 
@@ -709,6 +726,7 @@ impl PathManager {
     fn start_pipe(&mut self, now: Instant, out: &mut Vec<PathAction>) {
         self.pipe = Lane::Busy;
         self.last_pipe_start = Some(now);
+        self.hint_during_pipe_run = false;
         self.cancel(PathTimer::PipeRetry, out);
         self.cancel(PathTimer::PipeFallback, out);
         self.cancel(PathTimer::PipeHint, out);

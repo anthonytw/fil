@@ -3,7 +3,7 @@
 //! user data, DESIGN.md section 11.1).
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -19,12 +19,34 @@ use crate::AddressCheck;
 /// "connection attempt delay").
 pub const STAGGER: Duration = Duration::from_millis(250);
 
-/// Connects to `target`. A host name is resolved by the system resolver (on tokio's blocking
-/// pool, so no worker waits on it). **Every resolved address then goes through `check`**
-/// ([`crate::Policy::check_address`]); only those it allows are tried, so an address rule cannot
-/// be dodged by a name (`localhost`, `foo.localhost`, `0x7f.0x1` or a DNS record pointing at
-/// loopback). If it allows none, the open fails with its first refusal and nothing is
-/// connected. The survivors are tried in turn, alternating families from the first one the
+/// Name resolutions that may run at once, process-wide. `getaddrinfo` cannot be cancelled: a
+/// resolver that never answers holds a blocking thread until it gives up by itself, so without
+/// a bound a peer opening channels to such names could fill tokio's blocking pool, which the
+/// daemon also needs to start sessions.
+pub const MAX_RESOLVING: usize = 32;
+
+/// Most addresses of one name that are tried (after the checks): each attempt is a socket.
+pub const MAX_ADDRESSES: usize = 16;
+
+static RESOLVERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RESOLVING);
+
+/// Connects to `target`. A host name is resolved by the system resolver on tokio's blocking pool
+/// (so no worker waits on it), at most [`MAX_RESOLVING`] at a time; the wait for a turn counts
+/// against the caller's timeout.
+///
+/// **Every resolved address is then made canonical and checked** before anything is tried:
+///
+/// - an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) becomes the IPv4 address it is, for the
+///   check and for the connect;
+/// - destinations that are no single remote host are refused whatever the policy says
+///   (`NotPermitted`): the unspecified address and the rest of `0.0.0.0/8` (a connect to
+///   `0.0.0.0` reaches the local host), multicast, and the IPv4 broadcast address;
+/// - every other address goes through `check` ([`crate::Policy::check_address`]).
+///
+/// So an address rule cannot be dodged by a name (`localhost`, `foo.localhost`, `0x7f.0x1`,
+/// `0x0`, a DNS record pointing at loopback) or by another spelling of an address. If nothing is
+/// allowed, the open fails with the first refusal and nothing is connected. The survivors (at
+/// most [`MAX_ADDRESSES`]) are tried in turn, alternating families from the first one the
 /// resolver gave, each [`STAGGER`] after the one before or at once when every attempt so far has
 /// failed. The first to connect wins and the others are dropped.
 ///
@@ -35,18 +57,44 @@ pub async fn connect_tcp(target: &Target, check: &AddressCheck) -> Result<TcpStr
     let port = target.port.get();
     let addrs: Vec<SocketAddr> = match &target.host {
         TargetHost::Ip(ip) => vec![SocketAddr::new(*ip, port)],
-        TargetHost::Name(name) => tokio::net::lookup_host((name.as_str(), port))
-            .await
-            .map_err(|_| OpenFailure::NameNotFound)?
-            .collect(),
+        TargetHost::Name(name) => resolve(name.as_str(), port).await?,
     };
-    let allowed = allowed(addrs, |a| check.check(a))?;
+    let mut allowed = allowed(addrs, |a| check.check(a))?;
+    allowed.truncate(MAX_ADDRESSES);
     let stream = race(interleave(allowed), STAGGER).await?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
 
-/// The addresses `check` allows, in order; `Err` with the first refusal if it allows none (or
+async fn resolve(name: &str, port: u16) -> Result<Vec<SocketAddr>, OpenFailure> {
+    let permit = RESOLVERS.acquire().await.map_err(|_| OpenFailure::Other)?;
+    let name = name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // Held until getaddrinfo really returns, even if the caller gave up on it.
+        let _permit = permit;
+        std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port))
+            .map(Iterator::collect::<Vec<_>>)
+    })
+    .await
+    .map_err(|_| OpenFailure::Other)?
+    .map_err(|_| OpenFailure::NameNotFound)
+}
+
+/// The address a connect to `a` really goes to, or `Err` if it is no single remote host.
+pub fn destination(a: SocketAddr) -> Result<SocketAddr, OpenFailure> {
+    let ip = a.ip().to_canonical();
+    let refused = match ip {
+        IpAddr::V4(v4) => v4.octets()[0] == 0 || v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast(),
+    };
+    if refused {
+        return Err(OpenFailure::NotPermitted);
+    }
+    Ok(SocketAddr::new(ip, a.port()))
+}
+
+/// The canonical addresses that are single remote hosts and that `check` allows, in order
+/// (duplicates after canonicalization dropped); `Err` with the first refusal if none is left (or
 /// `NameNotFound` if there were none).
 fn allowed(
     addrs: Vec<SocketAddr>,
@@ -55,8 +103,9 @@ fn allowed(
     let mut refusal = None;
     let mut out = Vec::with_capacity(addrs.len());
     for a in addrs {
-        match check(a) {
-            Ok(()) => out.push(a),
+        match destination(a).and_then(|a| check(a).map(|()| a)) {
+            Ok(a) if !out.contains(&a) => out.push(a),
+            Ok(_) => {}
             Err(why) => {
                 refusal.get_or_insert(why);
             }
@@ -87,6 +136,27 @@ pub fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     }
 }
 
+/// Connect attempts to one address. A connect reset during the handshake is what a BSD kernel
+/// does when the target's listen queue is full (macOS caps it at 128): a burst of opens to one
+/// local server (a queue of forwarded connections opening at once) is common, so such a
+/// refusal is tried again after a short backoff, a few times, within the caller's timeout.
+async fn attempt(addr: SocketAddr) -> io::Result<TcpStream> {
+    let mut backoff = Duration::from_millis(20);
+    for _ in 0..RESET_RETRIES {
+        match TcpStream::connect(addr).await {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            r => return r,
+        }
+    }
+    TcpStream::connect(addr).await
+}
+
+/// How often a connect reset by a full listen queue is tried again (20, 40, 80, 160 ms apart).
+const RESET_RETRIES: usize = 4;
+
 async fn race(addrs: Vec<SocketAddr>, stagger: Duration) -> Result<TcpStream, OpenFailure> {
     let mut attempts = JoinSet::new();
     let mut next = 0;
@@ -95,7 +165,7 @@ async fn race(addrs: Vec<SocketAddr>, stagger: Duration) -> Result<TcpStream, Op
     loop {
         if next < addrs.len() && (attempts.is_empty() || Instant::now() >= next_at) {
             let addr = addrs[next];
-            attempts.spawn(TcpStream::connect(addr));
+            attempts.spawn(attempt(addr));
             next += 1;
             next_at = Instant::now() + stagger;
         }
@@ -195,7 +265,7 @@ mod tests {
         fn check_incoming(&self, _: &OpenKind) -> Result<(), OpenFailure> {
             Ok(())
         }
-        fn check_outgoing(&self, _: &OpenKind) -> Result<(), OpenFailure> {
+        fn check_outgoing(&self, _: &OpenKind, _: &crate::LocalPeer) -> Result<(), OpenFailure> {
             Ok(())
         }
         fn check_address(&self, _: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure> {
@@ -286,6 +356,8 @@ mod tests {
             name_target("LocalHost", c.port),
             ip_target("127.0.0.1", c.port),
             ip_target("::1", c.port),
+            // Loopback in another spelling: checked as the address it is.
+            ip_target("::ffff:127.0.0.1", c.port),
         ] {
             assert_eq!(
                 connect_tcp(&t, &check(true)).await.unwrap_err(),
@@ -310,11 +382,75 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits(), 0, "a name resolving to loopback was connected");
+        // Destinations that reach the local host (or no single host) are refused even by a
+        // policy that allows everything: `0.0.0.0` and `::` connect to this host, and `0x0` is a
+        // valid DnsName that resolvers read as 0.0.0.0.
+        for t in [
+            ip_target("0.0.0.0", c.port),
+            ip_target("0.1.2.3", c.port),
+            ip_target("::", c.port),
+            ip_target("::ffff:0.0.0.0", c.port),
+            ip_target("224.0.0.1", c.port),
+            ip_target("255.255.255.255", c.port),
+            ip_target("ff02::1", c.port),
+        ] {
+            assert_eq!(
+                connect_tcp(&t, &check(false)).await.unwrap_err(),
+                OpenFailure::NotPermitted,
+                "{t:?}"
+            );
+        }
+        for name in ["0x0", "0"] {
+            let Ok(n) = fil_proto::mux::DnsName::new(name) else {
+                continue;
+            };
+            let t = Target {
+                host: TargetHost::Name(n),
+                port: std::num::NonZeroU16::new(c.port).unwrap(),
+            };
+            let r = connect_tcp(&t, &check(false)).await;
+            assert!(
+                matches!(
+                    r,
+                    Err(OpenFailure::NotPermitted | OpenFailure::NameNotFound)
+                ),
+                "{name}: {r:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hits(),
+            0,
+            "a destination reaching the local host was connected"
+        );
         connect_tcp(&name_target("localhost", c.port), &check(false))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits(), 1);
+    }
+
+    /// The policy sees canonical addresses only.
+    #[test]
+    fn the_check_gets_canonical_addresses() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let only = allowed(
+            vec![
+                a("[::ffff:192.0.2.1]:1"),
+                a("192.0.2.1:1"),
+                a("[::ffff:192.0.2.2]:2"),
+            ],
+            |x| {
+                seen.lock().unwrap().push(x);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(only, vec![a("192.0.2.1:1"), a("192.0.2.2:2")]);
+        assert!(seen.lock().unwrap().iter().all(|x| x.is_ipv4()));
+        assert_eq!(destination(a("[::ffff:127.0.0.1]:5")), Ok(a("127.0.0.1:5")));
+        assert_eq!(destination(a("0.0.0.0:5")), Err(OpenFailure::NotPermitted));
+        assert_eq!(destination(a("[::]:5")), Err(OpenFailure::NotPermitted));
     }
 
     #[test]

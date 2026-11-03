@@ -36,8 +36,13 @@ release-deps:
     test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
     # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
     # production fil must never honor an environment variable that changes what wire it speaks.
-    for c in fil-proto fil-daemon fil-transport fil-session; do
-      hooks=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" | grep -E 'feature "test-hooks"' || true)
+    # fil-forward is checked once fil depends on it (until then `cargo tree -i` finds no such package).
+    for c in fil-proto fil-daemon fil-transport fil-session fil-forward; do
+      if ! tree=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" 2>&1); then
+        case "$tree" in *"did not match any packages"*) continue ;; esac
+        echo "$tree" >&2; exit 1
+      fi
+      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
       test -z "$hooks" || { echo "release-deps: $c has its test-hooks feature in the release build of fil" >&2; exit 1; }
     done
 
@@ -66,9 +71,11 @@ mux-soak seeds="5000":
 
 # The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
 # forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
-# tests at 8 MiB and 2,000. Release build. Also runs the SOCKS fuzz table with more seeds.
+# tests at 8 MiB and 2,000 (and 300 concurrent off QUIC). Release build. Also runs the SOCKS fuzz
+# table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
+# tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports.
 forward-soak mib="256" seq="20000":
-    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture
+    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:

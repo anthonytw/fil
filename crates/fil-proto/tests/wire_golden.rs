@@ -770,6 +770,24 @@ fn ports_rows() -> Vec<PortsRow> {
             last_unix_ms: 1_700_000_000_000,
             owner: Some(process(4, 5)),
             probe: Some(probes()[1].clone()),
+            target_other_user: false,
+        }),
+        // A `-L` whose target another user's listener takes: no owner, no probe.
+        PortsRow::Forward(ForwardRow {
+            session: name("main"),
+            id: ForwardId(2),
+            spec: spec_local(),
+            origin: Origin::Client,
+            listen: None,
+            consented: true,
+            conns: 0,
+            waiting: 0,
+            bytes_down: 0,
+            bytes_up: 0,
+            last_unix_ms: 0,
+            owner: None,
+            probe: None,
+            target_other_user: true,
         }),
         PortsRow::Agent(AgentRow {
             session: name("main"),
@@ -844,7 +862,27 @@ fn widest_forward_row() -> PortsRow {
             kind: ProbeKind::Http { status: u16::MAX },
             label: Some(ProbeLabel::new("l".repeat(MAX_PROBE_LABEL)).unwrap()),
         }),
+        target_other_user: true,
     })
+}
+
+/// Every reason a `fil ports` answer can be incomplete.
+fn ports_incomplete() -> Vec<PortsIncomplete> {
+    let all = vec![
+        PortsIncomplete::NoSocketTable,
+        PortsIncomplete::Bounded,
+        PortsIncomplete::TimedOut,
+        PortsIncomplete::Unsupported,
+    ];
+    for i in &all {
+        match i {
+            PortsIncomplete::NoSocketTable
+            | PortsIncomplete::Bounded
+            | PortsIncomplete::TimedOut
+            | PortsIncomplete::Unsupported => {}
+        }
+    }
+    all
 }
 
 fn summary() -> SessionSummary {
@@ -895,13 +933,25 @@ fn responses() -> Vec<Response> {
             .map(|r| Response::Forward(ForwardResult::Refused(r))),
     );
     all.push(Response::Ports {
-        part: PortsPart { rows: ports_rows() },
+        part: PortsPart {
+            rows: ports_rows(),
+            incomplete: None,
+        },
         more: false,
     });
     all.push(Response::Ports {
         part: PortsPart::default(),
         more: true,
     });
+    for i in ports_incomplete() {
+        all.push(Response::Ports {
+            part: PortsPart {
+                rows: Vec::new(),
+                incomplete: Some(i),
+            },
+            more: false,
+        });
+    }
     for c in &all {
         match c {
             Response::Sessions { .. }
@@ -1222,6 +1272,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         ControlMsg::Response(Response::Ports {
             part: PortsPart {
                 rows: vec![widest_forward_row(); 4],
+                incomplete: Some(PortsIncomplete::Unsupported),
             },
             more: true,
         }),
@@ -2044,7 +2095,7 @@ fn forward_probes() -> Entries {
     }
     // The enums with fields: their last variant, and the first index past it.
     type EnumProbe = (&'static str, Vec<u8>, Vec<u8>, fn(&[u8]) -> String);
-    let last_and_past: [EnumProbe; 7] = [
+    let last_and_past: [EnumProbe; 9] = [
         (
             "listen-state",
             vec![1, 0],
@@ -2077,6 +2128,19 @@ fn forward_probes() -> Entries {
         ),
         ("listener-owner", vec![2], vec![3], outcome::<ListenerOwner>),
         ("probe-kind", vec![4], vec![5], outcome::<ProbeKind>),
+        (
+            "ports-incomplete",
+            vec![3],
+            vec![4],
+            outcome::<PortsIncomplete>,
+        ),
+        // A part with no rows and `incomplete: Some(last)`, then one past it.
+        (
+            "ports-part-incomplete",
+            vec![0, 1, 3],
+            vec![0, 1, 4],
+            outcome::<PortsPart>,
+        ),
     ];
     for (what, last, past, r) in last_and_past {
         e.push((format!("decode/{what}-last"), r(&last)));
@@ -2185,6 +2249,7 @@ fn forward_probes() -> Entries {
         for _ in 0..n {
             v.extend([3u8, 1, b'a', 0, 0, 0]);
         }
+        v.push(0); // incomplete: None
         e.push((format!("decode/ports-rows-{n}"), outcome::<PortsPart>(&v)));
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
@@ -2225,7 +2290,22 @@ fn forward_probes() -> Entries {
         ));
     }
     // The chunker keeps a full answer within the limits.
-    let parts = Response::ports(vec![widest_forward_row(); MAX_PORTS_ROWS + 10]);
+    let parts = Response::ports_with(
+        vec![widest_forward_row(); MAX_PORTS_ROWS + 10],
+        Some(PortsIncomplete::Unsupported),
+    );
+    let marked = parts.iter().all(|r| {
+        matches!(
+            r,
+            Response::Ports {
+                part: PortsPart {
+                    incomplete: Some(PortsIncomplete::Unsupported),
+                    ..
+                },
+                ..
+            }
+        )
+    });
     let rows: usize = parts
         .iter()
         .map(|r| match r {
@@ -2245,7 +2325,7 @@ fn forward_probes() -> Entries {
     e.push((
         "ports/chunked-widest".into(),
         format!(
-            "parts {} rows {rows} fit {fits} more-on-all-but-last {last_only}",
+            "parts {} rows {rows} fit {fits} more-on-all-but-last {last_only} incomplete-on-all {marked}",
             parts.len()
         ),
     ));

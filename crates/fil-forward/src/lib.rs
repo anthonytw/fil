@@ -19,7 +19,7 @@ pub mod socks;
 pub mod stream;
 
 pub use endpoint::{
-    AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, ForwardStats, Policy,
-    SOCKS_TIMEOUT, Snapshot,
+    AddressCheck, ConnectFuture, Connector, DATA_AHEAD_MAX, EVENT_QUEUE, Endpoint, EndpointEvent,
+    ForwardStats, LocalPeer, MAX_PENDING, PeerCred, Policy, SOCKS_TIMEOUT, Snapshot,
 };
 pub use stream::{BoxStream, ForwardStream};

@@ -209,11 +209,40 @@ impl Ctx {
     /// The row of `fil ls` for a session: (attached column, whole row).
     pub fn ls_row(&self, host: &str, session: &str) -> Option<(String, String)> {
         let (_, ls) = self.fil_cmd(host, Variant::Auto, &["ls", host]);
-        ls.lines().find_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            (f.first() == Some(&session)).then(|| (f.get(2).unwrap_or(&"?").to_string(), l.into()))
-        })
+        ls_row_of(&ls, session)
     }
+}
+
+/// The row for `session` in the text of `fil ls`: the first word of its ATTACHED cell (`-` when
+/// nobody is attached, else the client's host label), and the whole row. The columns are found
+/// by the header's names, never by counting words: a column added to the table (FORWARDS, M2)
+/// would otherwise shift the one read here. A header without ATTACHED yields `?` for it.
+fn ls_row_of(ls: &str, session: &str) -> Option<(String, String)> {
+    let mut lines = ls.lines().skip_while(|l| !l.starts_with("NAME  "));
+    let head = lines.next()?;
+    // Column starts: a name is words joined by one space, columns are two or more apart.
+    let mut starts: Vec<(usize, &str)> = Vec::new();
+    let mut at = 0;
+    while let Some(i) = head[at..].find(|c| c != ' ') {
+        let start = at + i;
+        let end = head[start..].find("  ").map_or(head.len(), |e| start + e);
+        starts.push((start, &head[start..end]));
+        at = end;
+    }
+    let cell = |l: &str, col: usize| -> String {
+        let from = starts[col].0.min(l.len());
+        let to = starts.get(col + 1).map_or(l.len(), |n| n.0.min(l.len()));
+        l[from..to].trim().to_string()
+    };
+    let attached = starts.iter().position(|(_, n)| *n == "ATTACHED");
+    lines.find_map(|l| {
+        (cell(l, 0) == session).then(|| {
+            let a = attached
+                .and_then(|c| cell(l, c).split_whitespace().next().map(String::from))
+                .unwrap_or_else(|| "?".into());
+            (a, l.into())
+        })
+    })
 }
 
 impl Local {
@@ -679,6 +708,37 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
 #[cfg(test)]
 mod tests {
     use super::is_expected_failure as exp;
+    use super::ls_row_of;
+
+    #[test]
+    fn the_attached_cell_is_found_by_its_header_in_the_real_table() {
+        use fil_proto::msg::{SessionName, SessionSummary, SubscriberSummary, TermName};
+        let now = 10_000_000u64;
+        let row = |name: &str, attached: Option<&str>, forwards: u16, agent: bool| SessionSummary {
+            name: SessionName::new(name).unwrap(),
+            term: TermName::new("xterm-256color").unwrap(),
+            created_unix_ms: now - 5_000,
+            last_output_unix_ms: 0,
+            attached: attached.map(|h| SubscriberSummary {
+                host: h.parse().unwrap(),
+                since_unix_ms: now - 3_000,
+            }),
+            forwards,
+            agent,
+        };
+        let table = fil::mgmt::format_sessions(
+            &[
+                row("idle", None, 0, false),
+                row("busy", Some("client2"), 3, true),
+            ],
+            false,
+            now,
+        );
+        assert_eq!(ls_row_of(&table, "idle").unwrap().0, "-");
+        assert_eq!(ls_row_of(&table, "busy").unwrap().0, "client2");
+        assert!(ls_row_of(&table, "gone").is_none());
+        assert!(ls_row_of("no sessions\n", "idle").is_none());
+    }
 
     #[test]
     fn only_the_expected_error_counts_as_the_known_failure() {

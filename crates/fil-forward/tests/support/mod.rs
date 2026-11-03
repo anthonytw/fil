@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fil_forward::connect::connect_tcp;
-use fil_forward::{AddressCheck, ConnectFuture, Connector, Endpoint, Policy};
+use fil_forward::{AddressCheck, ConnectFuture, Connector, Endpoint, LocalPeer, Policy};
 use fil_netsim::stream::{StreamConfig, StreamControl, stream_pair};
 use fil_netsim::{Net, SimSocket};
 use fil_proto::frame::DataSegment;
@@ -292,6 +292,10 @@ impl Targets {
     pub fn set(&self, id: ForwardId, port: u16) {
         self.map.lock().unwrap().insert(id, loopback(port));
     }
+
+    pub fn remove(&self, id: ForwardId) {
+        self.map.lock().unwrap().remove(&id);
+    }
 }
 
 pub fn loopback(port: u16) -> Target {
@@ -319,19 +323,23 @@ impl Connector for Targets {
     }
 }
 
-/// Allows everything unless told otherwise.
+/// Allows everything unless told otherwise; counts the outgoing checks and keeps the last peer.
 #[derive(Default)]
 pub struct TestPolicy {
     pub refuse_incoming: Mutex<Option<OpenFailure>>,
     pub refuse_outgoing: Mutex<Option<OpenFailure>>,
     pub refuse_loopback: std::sync::atomic::AtomicBool,
+    pub outgoing_checks: AtomicUsize,
+    pub last_peer: Mutex<Option<LocalPeer>>,
 }
 
 impl Policy for TestPolicy {
     fn check_incoming(&self, _: &OpenKind) -> Result<(), OpenFailure> {
         self.refuse_incoming.lock().unwrap().map_or(Ok(()), Err)
     }
-    fn check_outgoing(&self, _: &OpenKind) -> Result<(), OpenFailure> {
+    fn check_outgoing(&self, _: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure> {
+        self.outgoing_checks.fetch_add(1, Ordering::SeqCst);
+        *self.last_peer.lock().unwrap() = Some(*peer);
         self.refuse_outgoing.lock().unwrap().map_or(Ok(()), Err)
     }
     fn check_address(&self, _: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure> {
@@ -350,25 +358,51 @@ pub struct End {
     pub targets: Arc<Targets>,
     pub policy: Arc<TestPolicy>,
     pub errors: Arc<Mutex<Vec<String>>>,
+    /// `EndpointEvent::LinkFailed`s seen.
+    pub link_failed: Arc<AtomicUsize>,
     recv: Option<JoinHandle<()>>,
+    /// Open while the receive loop may feed the endpoint; held while it does.
+    gate: Arc<Mutex<bool>>,
     /// Probes on the terminal channel: the daemon echoes them, the client hands them here.
     echo: bool,
     probes: mpsc::UnboundedSender<Bytes>,
     pub probes_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
     events: Option<JoinHandle<()>>,
+    /// The endpoint's events, when the test drains them itself ([`End::new_with`]).
+    pub events_rx: Option<mpsc::Receiver<fil_forward::EndpointEvent>>,
 }
 
 impl End {
     pub fn new(side: Side, cfg: MuxConfig) -> Self {
+        Self::new_with(side, cfg, false)
+    }
+
+    /// `hold_events`: the test takes the event receiver (`events_rx`) and drains it itself.
+    pub fn new_with(side: Side, cfg: MuxConfig, hold_events: bool) -> Self {
         let targets = Arc::new(Targets::default());
         let policy = Arc::new(TestPolicy::default());
-        let (ep, mut events) = Endpoint::new(side, cfg, targets.clone(), policy.clone());
+        let (ep, events) = Endpoint::new(side, cfg, targets.clone(), policy.clone());
+        let (events, events_rx) = if hold_events {
+            let (_, dummy) = mpsc::channel(1);
+            (dummy, Some(events))
+        } else {
+            (events, None)
+        };
+        let mut events = events;
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errs = errors.clone();
+        let link_failed = Arc::new(AtomicUsize::new(0));
+        let lf = link_failed.clone();
         let events = tokio::spawn(async move {
             while let Some(e) = events.recv().await {
-                if let fil_forward::EndpointEvent::Failed(e) = e {
-                    errs.lock().unwrap().push(format!("mux failed: {e}"));
+                match e {
+                    fil_forward::EndpointEvent::Failed(e) => {
+                        errs.lock().unwrap().push(format!("mux failed: {e}"));
+                    }
+                    fil_forward::EndpointEvent::LinkFailed => {
+                        lf.fetch_add(1, Ordering::SeqCst);
+                    }
+                    fil_forward::EndpointEvent::Table(_) => {}
                 }
             }
         });
@@ -378,11 +412,14 @@ impl End {
             targets,
             policy,
             errors,
+            link_failed,
             recv: None,
+            gate: Arc::new(Mutex::new(false)),
             echo: side == Side::Daemon,
             probes,
             probes_rx: Some(probes_rx),
             events: Some(events),
+            events_rx,
         }
     }
 
@@ -391,8 +428,11 @@ impl End {
     pub fn attach(&mut self, link: Arc<TestLink>, resumed: bool) {
         self.stop_recv();
         self.ep.attach_link(link.clone(), resumed);
+        let gate = Arc::new(Mutex::new(true));
+        self.gate = gate.clone();
         self.recv = Some(tokio::spawn(recv_loop(
             link,
+            gate,
             self.ep.clone(),
             self.errors.clone(),
             self.echo,
@@ -405,7 +445,10 @@ impl End {
         self.ep.detach_link();
     }
 
+    /// Stops feeding the endpoint from the current link. When this returns, no payload of that
+    /// link is being fed and none will be (the abort of the task alone takes effect later).
     fn stop_recv(&mut self) {
+        *self.gate.lock().unwrap() = false;
         if let Some(t) = self.recv.take() {
             t.abort();
         }
@@ -431,12 +474,17 @@ impl Drop for End {
 /// return at once), so the terminal channel's probes are answered however the forwards fare.
 async fn recv_loop(
     link: Arc<TestLink>,
+    gate: Arc<Mutex<bool>>,
     ep: Endpoint<TestLink>,
     errors: Arc<Mutex<Vec<String>>>,
     echo: bool,
     probes: mpsc::UnboundedSender<Bytes>,
 ) {
     while let Ok((ch, p)) = link.recv().await {
+        let open = gate.lock().unwrap();
+        if !*open {
+            return;
+        }
         if ch == ChannelId::CONTROL {
             if let Ok(msg) = ControlMsg::decode(&p)
                 && let Some(Err(e)) = ep.on_control(&msg)
@@ -472,12 +520,57 @@ pub struct World {
     pub link: Option<LinkPair>,
 }
 
+/// Raises this process's soft `RLIMIT_NOFILE` toward its hard limit, once: a test holds
+/// thousands of loopback sockets (both ends of every connection live in this process), more than
+/// the default soft limits (256 on macOS, 1,024 on Linux) allow.
+pub fn raise_fd_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let cur = getrlimit(Resource::Nofile);
+        // macOS refuses a soft limit above OPEN_MAX (10,240) even when the hard one is unlimited.
+        for want in [cur.maximum, Some(65_536), Some(10_240), Some(4_096)] {
+            let want = match (want, cur.maximum) {
+                (Some(w), Some(max)) => Some(w.min(max)),
+                (w, _) => w,
+            };
+            if want.is_some_and(|w| cur.current.is_some_and(|c| c >= w)) {
+                return;
+            }
+            let lim = Rlimit {
+                current: want,
+                maximum: cur.maximum,
+            };
+            if setrlimit(Resource::Nofile, lim).is_ok() {
+                return;
+            }
+        }
+    });
+}
+
+/// Serializes the tests that open thousands of connections at once.
+pub async fn heavy() -> tokio::sync::MutexGuard<'static, ()> {
+    static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    HEAVY.lock().await
+}
+
+/// Descriptors this process holds now.
+pub fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
+}
+
 impl World {
     pub async fn new(t: Transport, cfg: MuxConfig) -> Self {
+        Self::new_with(t, cfg, false).await
+    }
+
+    /// `hold_client_events`: the client's events are left for the test (`client.events_rx`).
+    pub async fn new_with(t: Transport, cfg: MuxConfig, hold_client_events: bool) -> Self {
+        raise_fd_limit();
         let mut w = Self {
             t,
             factory: Factory::new(),
-            client: End::new(Side::Client, cfg.clone()),
+            client: End::new_with(Side::Client, cfg.clone(), hold_client_events),
             daemon: End::new(Side::Daemon, cfg),
             link: None,
         };
@@ -688,8 +781,20 @@ pub async fn oneshot_echo_server(n: usize) -> Server {
     .await
 }
 
-/// A connection through a forward, as an application makes one.
+/// A connection through a forward, as an application makes one. A connect reset before fil
+/// accepts it is the kernel's listen queue overflowing (128 on macOS, on a machine busy with
+/// other work), not fil's answer: tried again, as a client library would.
 pub async fn connect(port: u16) -> TcpStream {
+    let mut backoff = Duration::from_millis(20);
+    for _ in 0..6 {
+        match TcpStream::connect(("127.0.0.1", port)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            r => return r.unwrap(),
+        }
+    }
     TcpStream::connect(("127.0.0.1", port)).await.unwrap()
 }
 

@@ -28,6 +28,7 @@
 //! - [`hardening`] switches core dumps off.
 //! - [`config`] reads `~/.config/fil/daemon.toml`.
 //! - [`linger`] is the warning for hosts that kill your processes at logout.
+//! - [`ports`] answers `fil ports`: the listeners, whose they are, and the probe.
 
 pub mod config;
 pub mod daemon;
@@ -35,6 +36,7 @@ pub mod hardening;
 pub mod linger;
 pub mod logging;
 pub mod paths;
+pub mod ports;
 pub mod relay;
 pub mod start;
 

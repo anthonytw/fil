@@ -539,7 +539,7 @@ confirm = "after 30s"
 transport = "pipe"
 offline_input.buffer = 0
 [host.a.direct]
-address = "10.1.2.3"
+address = "198.51.100.3"
 "#,
         )
         .unwrap();
@@ -548,7 +548,7 @@ address = "10.1.2.3"
         assert_eq!(a.offline.buffer, 0);
         // Not overridden: comes from [defaults].
         assert_eq!(a.offline.confirm_after, Some(Duration::from_secs(30)));
-        assert_eq!(a.direct_address.as_deref(), Some("10.1.2.3"));
+        assert_eq!(a.direct_address.as_deref(), Some("198.51.100.3"));
         let other = cfg.for_host("b");
         assert_eq!(other.transport, TransportSetting::Direct);
         assert_eq!(other.offline.buffer, 8192);

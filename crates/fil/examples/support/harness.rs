@@ -721,9 +721,9 @@ mod tests {
 
     #[test]
     fn addresses_are_scrubbed_but_a_target_that_is_one_keeps_its_numbers() {
-        let t = Targets::parse("pi1=fil-test@192.168.7.9", &[]).unwrap();
+        let t = Targets::parse("pi1=fil-test@192.0.2.9", &[]).unwrap();
         let s = t.scrub(
-            "ok in 1923 ms, peer 10.1.2.3:4433 via fe80::1a2b, lo 127.0.0.1 [::1], to 192.168.7.9.",
+            "ok in 1923 ms, peer 198.51.100.3:4433 via fe80::1a2b, lo 127.0.0.1 [::1], to 192.0.2.9.",
         );
         assert_eq!(
             s,

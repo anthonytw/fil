@@ -49,6 +49,12 @@ async fn session(dir: &Short) -> (Scratch, fil_session::SessionHandle) {
     (scratch, h)
 }
 
+/// Ends the session before the test's directory goes: a link change of a session still alive
+/// would try the socket again (and create its directory anew).
+async fn end(h: &fil_session::SessionHandle) {
+    h.kill(WAIT).await;
+}
+
 async fn wait_for(what: &str, f: impl Fn() -> bool) {
     let end = Instant::now() + WAIT;
     while !f() {
@@ -109,6 +115,7 @@ async fn list_and_sign_across_a_reconnect() {
     assert!(row.last_unix_ms > 0);
     // One connection per `UnixStream` above, through the mini agent.
     assert_eq!(agent.connects(), 3);
+    end(&h).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -125,6 +132,7 @@ async fn socket_permissions() {
     assert!(s.file_type().is_socket());
     assert_eq!(s.mode() & 0o777, 0o600);
     assert_eq!(s.uid(), d.uid());
+    end(&h).await;
 }
 
 /// A directory with the wrong mode, or a symbolic link in its place, is refused: no socket.
@@ -155,6 +163,8 @@ async fn a_bad_directory_is_refused() {
         assert!(!dir.socket().exists(), "{bad}: no socket");
         assert!(!h.agent_relayed());
         assert!(h.agent_row().is_none());
+        drop(c);
+        end(&h).await;
     }
 }
 
@@ -190,6 +200,7 @@ async fn refused_at_once_while_detached() {
     refused_fast("taken over by a client that does not relay").await;
     drop(c2);
     assert_eq!(agent.connects(), 0);
+    end(&h).await;
 }
 
 /// The peer-UID check, on a real connection: the session is made to expect another uid (a test
@@ -216,4 +227,5 @@ async fn another_users_connection_is_refused() {
     // Our own uid again: it works.
     h.set_agent_uid(ours);
     list_and_sign(&dir.socket(), &agent, b"ok").await;
+    end(&h).await;
 }

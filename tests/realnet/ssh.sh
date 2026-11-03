@@ -4,13 +4,15 @@
 #   client --rn-c-- jump1 --rn-1-- jump2 --rn-2-- target
 #
 # Three internal Docker networks, so the target is reachable only through the jumps. All four are
-# the same image (OpenSSH server and client, pipe-echo, quic-echo). Run: ssh.sh [SCENARIO...]
+# the same image (OpenSSH server and client, the real fil, the stand-ins). Run: ssh.sh [SCENARIO...]
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=fil.sh
+source "$(dirname "${BASH_SOURCE[0]}")/fil.sh"
 
 IMAGE=fil-realnet
-HOSTS=(client jump1 jump2 target)
+HOSTS=(client client2 jump1 jump2 target)
 NETWORKS=(rn-c rn-1 rn-2)
 TSSH=/home/tester/.ssh
 MIB=$((1 << 20))
@@ -29,13 +31,15 @@ ssh_setup() {
   rm -rf "$ctx"
   mkdir -p "$ctx/bin"
   cp "$REALNET_DIR"/docker/* "$ctx/"
-  cp "$BIN_DIR/pipe-echo" "$BIN_DIR/pipe-probe" "$BIN_DIR/quic-echo" "$ctx/bin/"
+  cp "$BIN_DIR/pipe-echo" "$BIN_DIR/pipe-probe" "$BIN_DIR/quic-echo" \
+    "$BIN_DIR/fil" "$BIN_DIR/ptydrive" "$BIN_DIR/sockprobe" "$ctx/bin/"
   docker build -q -t "$IMAGE" "$ctx" > /dev/null
 
   make_keys
   local n
   for n in "${NETWORKS[@]}"; do docker network create --internal "$n" > /dev/null; done
   start_host client rn-c
+  start_host client2 rn-c
   start_host jump1 rn-c rn-1
   start_host jump2 rn-1 rn-2
   start_host target rn-2
@@ -45,12 +49,16 @@ ssh_setup() {
     docker cp "$SSH_KEYS/authorized_keys" "rn-$h:/etc/fil-realnet/authorized_keys"
     docker cp "$SSH_KEYS/ca.pub" "rn-$h:/etc/fil-realnet/ca.pub"
   done
-  for f in id_user id_cert cert-valid.pub cert-expired.pub cert-wrongprincipal.pub \
-    config config-ka config-cert-valid config-cert-nocert config-cert-expired \
-    config-cert-wrongprincipal; do
-    docker cp "$SSH_KEYS/$f" "rn-client:$TSSH/$f"
+  # client2 is a second machine for the takeover scenarios: the same user and the same keys.
+  local c
+  for c in client client2; do
+    for f in id_user id_cert cert-valid.pub cert-expired.pub cert-wrongprincipal.pub \
+      config config-ka config-cert-valid config-cert-nocert config-cert-expired \
+      config-cert-wrongprincipal; do
+      docker cp "$SSH_KEYS/$f" "rn-$c:$TSSH/$f"
+    done
+    docker exec -u root "rn-$c" sh -c "chown -R tester:tester $TSSH && chmod 600 $TSSH/*"
   done
-  docker exec -u root rn-client sh -c "chown -R tester:tester $TSSH && chmod 600 $TSSH/*"
 
   printf 'SSH_KEYS=%q\n' "$SSH_KEYS" > "$OUT/ssh.env"
 
@@ -67,8 +75,13 @@ ssh_setup() {
 ssh_teardown() {
   local h
   if [[ ${1:-} != quiet ]]; then
+    local u
     for h in "${HOSTS[@]}"; do
       docker cp "rn-$h:/var/log/sshd.log" "$OUT/logs/sshd-$h.log" > /dev/null 2>&1 || true
+      # The real daemons' logs (the users that ran fil on each host).
+      for u in fil noisy mallory; do
+        docker cp "rn-$h:/home/$u/.local/state/fil/daemon.log" "$OUT/logs/fil-daemon-$h-$u.log" > /dev/null 2>&1 || true
+      done
     done
   fi
   for h in "${HOSTS[@]}"; do docker rm -f "rn-$h" > /dev/null 2>&1 || true; done
@@ -80,7 +93,7 @@ ssh_teardown() {
 start_host() {
   local name=$1 first=$2
   shift 2
-  docker run -d --name "rn-$name" --network "$first" --network-alias "$name" "$IMAGE" > /dev/null
+  docker run -d --init --name "rn-$name" --hostname "$name" --network "$first" --network-alias "$name" "$IMAGE" > /dev/null
   local net
   for net in "$@"; do docker network connect --alias "$name" "$net" "rn-$name"; done
 }
@@ -137,6 +150,9 @@ Host direct-loud
 Host direct-flood
   HostName jump1
   User flood
+Host direct-other
+  HostName jump1
+  User mallory
 Host viajumps
   HostName target
   ProxyJump jump1,jump2
@@ -602,12 +618,417 @@ s_pipelink_netdown_keepalive() {
   note "detect_ms=$DETECT_MS" "dead_after=5s" "ssh_keepalive=2s"
 }
 
+# ---------------------------------------------------------------------------------------------
+# The real `fil` (client, relay, daemon) over the same real OpenSSH. The client runs on a PTY
+# under ptydrive (fil.sh); the daemon is started by the first relay on each host, as in life.
+# Session names are unique per scenario, and each scenario kills its sessions.
+
+# fil.sh wants these: run as the client user in container HOST (client or client2).
+client_exec_on() {
+  local h=$1
+  shift
+  docker exec -u tester "rn-$h" "$@"
+}
+client_bg_on() {
+  local h=$1
+  shift
+  docker exec -d -u tester "rn-$h" "$@"
+}
+
+# fk HOST SESSION: kill a session, whatever state it is in.
+fk() { cx fil kill "$1" "$2" > /dev/null 2>&1 || true; }
+
+# Of the ten clean detaches (`~.`) in f_detach_delivery, how many may be lost before the scenario
+# fails. A lost detach is a known defect in fil (see "Real binary: findings" in
+# docs/m1/realnet.md) and is recorded as KNOWN-BUG up to this number. When the fix lands, set it
+# to 0 (or run with REALNET_STRICT=1, which fails on any known finding).
+DETACH_LOST_MAX=${DETACH_LOST_MAX:-7}
+
+# ls_detached HOST SESSION [MS]: polls `fil ls HOST` until SESSION is listed as not attached (the
+# ATTACHED column is "-"), for at most MS milliseconds (default 5000). Returns 0 once it is, 1 if
+# it is still listed as attached at the deadline. The session not being listed at all is a failure
+# of the scenario (the daemon lost it), never a "lost detach". Sets LS_OUT.
+ls_detached() {
+  local host=$1 session=$2 limit=${3:-5000} deadline
+  deadline=$(($(now_ms) + limit))
+  while :; do
+    LS_OUT=$(cx fil ls "$host")
+    awk -v s="$session" '$1 == s { f = 1 } END { exit !f }' <<< "$LS_OUT" \
+      || fail "fil ls does not list the session $session at all: $LS_OUT"
+    if awk -v s="$session" '$1 == s && $3 == "-" { f = 1 } END { exit !f }' <<< "$LS_OUT"; then return 0; fi
+    [[ $(now_ms) -lt $deadline ]] || return 1
+    sleep 0.1
+  done
+}
+
+# Attach, run something, detach with ~. ; list; reattach and see the earlier output, in the same
+# shell; the exit status and the messages of each step.
+f_attach_detach() {
+  local t0
+  t0=$(now_ms)
+  fc_start a -- direct ad
+  fc_ready a
+  note "attach_to_shell_ms=$(($(now_ms) - t0))"
+  fc_line a 'echo FIL-$((40+2))'
+  fc_wait a FIL-42
+  fc_show_pid a
+  local pid1
+  pid1=$(shell_pid a)
+  [[ -n $pid1 ]] || fail "no shell pid on the screen: $(fc_screen a)"
+  fc_detach a
+
+  # The daemon notices the closed link a moment after the client has gone; allow it a few seconds.
+  local t1
+  t1=$(now_ms)
+  if ls_detached direct ad 5000; then
+    note "listed_as_detached_after_ms=$(($(now_ms) - t1))"
+    ok "fil ls lists the session as detached"
+  else
+    log "fil ls, 5 s after ~. : $LS_OUT"
+    known_bug "after ~. over ssh, fil ls still lists the client as attached (the daemon logs LinkDown, not a detach)"
+  fi
+
+  fc_start b -- direct ad
+  fc_wait b FIL-42 20
+  fc_has b "PID-$pid1" || fail "the earlier output (the shell pid) is not on the second screen"
+  fc_show_pid b
+  [[ $(shell_pid b) == "$pid1" ]] || fail "the reattached shell is a different process: $(shell_pid b) vs $pid1"
+  ok "reattached: earlier output visible, same shell (pid $pid1)"
+  fc_detach b
+  fk direct ad
+}
+
+# Does `~.` always reach the daemon? Ten attach/detach cycles over ssh to the same session; after
+# each, `fil ls` must stop listing the client as attached within 5 s. A detach that is lost leaves
+# the daemon holding a client that has gone: it shows as attached until somebody takes the session
+# over. Every cycle must find the same shell (the session survived), and the session must be
+# listed (a missing one fails the scenario). Up to DETACH_LOST_MAX lost detaches are recorded as a
+# known finding; more fail.
+f_detach_delivery() {
+  local n lost=0 pid0='' pid
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    fc_start "d$n" -- direct dd
+    fc_ready "d$n"
+    fc_show_pid "d$n"
+    pid=$(shell_pid "d$n")
+    [[ -n $pid ]] || fail "cycle $n: no shell pid on the screen: $(fc_screen "d$n")"
+    if [[ -z $pid0 ]]; then
+      pid0=$pid
+    elif [[ $pid != "$pid0" ]]; then
+      fail "cycle $n: the session's shell is pid $pid, it was $pid0: the session was lost between cycles"
+    fi
+    fc_detach "d$n"
+    if ! ls_detached direct dd 5000; then
+      lost=$((lost + 1))
+      log "cycle $n: the detach did not reach the daemon: $LS_OUT"
+    fi
+  done
+  note "detach_not_seen_by_daemon=$lost/10 (allowed: $DETACH_LOST_MAX)"
+  if [[ $lost -gt $DETACH_LOST_MAX ]]; then
+    fail "$lost of 10 detaches were lost, more than the $DETACH_LOST_MAX allowed"
+  fi
+  if [[ $lost -gt 0 ]]; then
+    known_bug "$lost of 10 clean detaches (~.) over ssh never reached the daemon: fil ls kept listing the client as attached"
+  fi
+  fk direct dd
+}
+
+# fil ls, fil detach (the attached client is told), fil kill (of an attached session; the client
+# reports how it ended), and the errors for a session that is gone.
+f_ls_kill_detach() {
+  fc_start a -- direct lkd
+  fc_ready a
+  local out
+  out=$(cx fil ls direct)
+  awk '$1 == "lkd" && $3 == "client" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls: 'lkd' should show the attached client: $out"
+  ok "fil ls shows who is attached"
+
+  out=$(cx fil detach direct lkd)
+  [[ $out == *'detached session "lkd"'* ]] || fail "fil detach said: $out"
+  fc_wait a 'was detached from elsewhere' 20
+  fc_type a n
+  fc_expect_exit a 1
+  out=$(cx fil ls direct)
+  awk '$1 == "lkd" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls after detach: $out"
+  ok "after fil detach the session is listed as detached, and it kept running"
+
+  fc_start b -- direct lkd
+  fc_ready b
+  out=$(cx fil kill direct lkd)
+  [[ $out == *'killed session "lkd"'* ]] || fail "fil kill said: $out"
+  fc_wait_exit b 20
+  note "exit_after_kill=$FC_CODE"
+  [[ $FC_CODE -ge 128 ]] || fail "the client of a killed session exited $FC_CODE, wanted 128+signal: $(fc_screen b)"
+  fc_has b 'killed by signal' || fail "the client did not say the session was killed by a signal: $(fc_screen b)"
+  out=$(cx fil ls direct)
+  if grep -q '^lkd ' <<< "$out"; then fail "the killed session is still listed: $out"; fi
+  local rc=0
+  out=$(cx fil kill direct lkd 2>&1) || rc=$?
+  [[ $rc -ne 0 && $out == *'no session "lkd"'* ]] || fail "killing it again: rc=$rc $out"
+  ok "killing a session that is gone fails with a clear message"
+}
+
+# A second machine attaches: it gets the earlier output, and the first client is told, by whom.
+f_takeover() {
+  fc_on client
+  fc_start a -- viajumps tk
+  fc_ready a
+  fc_line a 'echo TAKEN-$((6*7))'
+  fc_wait a TAKEN-42
+  fc_on client2
+  fc_start b -- viajumps tk
+  fc_wait b TAKEN-42 30
+  fc_wait a 'was taken over' 20
+  fc_wait a 'by client2' 5
+  local out
+  out=$(cx fil ls viajumps)
+  awk '$1 == "tk" && $3 == "client2" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls should show client2 as attached: $out"
+  fc_type a n
+  fc_expect_exit a 1
+  fc_has a 'taken over by client2' || fail "no final message on the first client: $(fc_screen a)"
+  fc_line b 'echo OWNER-$((3+4))'
+  fc_wait b OWNER-7
+  fc_detach b
+  fk viajumps tk
+}
+
+# ... and the first client takes it back: the second one is told in turn.
+f_takeover_back() {
+  fc_on client
+  fc_start a -- viajumps tb
+  fc_ready a
+  fc_line a 'echo FIRST-$((6*7))'
+  fc_wait a FIRST-42
+  fc_on client2
+  fc_start b -- viajumps tb
+  fc_wait b FIRST-42 30
+  # Output produced while the second client holds the session: the first client has not seen it,
+  # so it can only appear on its screen if the take-back really restores the session.
+  fc_line b 'echo SECOND-$((5*5))'
+  fc_wait b SECOND-25
+  fc_wait a 'Take it back' 20
+  fc_type a y
+  fc_wait b 'was taken over' 20
+  # The prompt has "by NAME" on a line of its own, so \n tells client from client2.
+  fc_wait b 'by client\n' 5
+  fc_wait a SECOND-25 30
+  fc_has a FIRST-42 || fail "the first client lost the earlier output after taking the session back: $(fc_screen a)"
+  fc_line a 'echo BACK-$((2*8))'
+  fc_wait a BACK-16 20
+  fc_type b n
+  fc_expect_exit b 1
+  fc_has b 'taken over by client at' || fail "no final message on the second client: $(fc_screen b)"
+  fc_detach a
+  fk viajumps tb
+}
+
+# kill -9 the client's ssh in the middle of output: the session resumes with nothing lost.
+f_kill_ssh() {
+  fc_start a -- viajumps ks
+  fc_ready a
+  fc_line a 'for i in $(seq 1 60); do echo TICK-$i; sleep 0.25; done'
+  fc_wait a TICK-8 20
+  local pid ssh1 ssh2 t0 i
+  pid=$(fc_pid a)
+  ssh1=$(cx pgrep -P "$pid" -x ssh | head -n 1 || true)
+  [[ -n $ssh1 ]] || fail "fil ($pid) has no ssh child: $(cx ps -ef)"
+  t0=$(now_ms)
+  cx kill -9 "$ssh1"
+  ssh2=
+  for ((i = 0; i < 300; i++)); do
+    ssh2=$(cx pgrep -P "$pid" -x ssh | head -n 1 || true)
+    [[ -n $ssh2 && $ssh2 != "$ssh1" ]] && break
+    ssh2=
+    sleep 0.1
+  done
+  [[ -n $ssh2 ]] || fail "fil did not start a new ssh: $(fc_screen a)"
+  note "new_ssh_ms=$(($(now_ms) - t0))"
+  fc_wait a TICK-60 40
+  fc_seq_ok a TICK 1 60 || fail "output was lost or repeated across the ssh kill: $(fc_screen a)"
+  ok "TICK-1 to TICK-60 each once, in order"
+  if fc_has a 'skipped'; then fail "a gap marker: the resume was a snapshot, not a resume: $(fc_screen a)"; fi
+  ok "no gap marker"
+  fc_detach a
+  fk viajumps ks
+}
+
+# kill -9 the daemon: the next resume says the session was replaced, and a fresh attach works.
+f_daemon_restart() {
+  fc_start a -- viajumps dr1
+  fc_ready a
+  fc_show_pid a
+  local old dpid t0
+  old=$(shell_pid a)
+  dpid=$(docker exec rn-target pgrep -u fil -f 'fil server --daemon' | head -n 1 || true)
+  [[ -n $dpid ]] || fail "no daemon on the target"
+  t0=$(now_ms)
+  docker exec rn-target kill -9 "$dpid"
+  fc_wait a 'is a different session now' 60
+  note "replaced_message_ms=$(($(now_ms) - t0))"
+  fc_type a n
+  fc_expect_exit a 1
+  fc_has a 'daemon restarted' || fail "no final message: $(fc_screen a)"
+
+  # And the other answer: a fresh attach, a new shell.
+  fc_start c -- viajumps dr2
+  fc_ready c
+  fc_show_pid c
+  dpid=$(docker exec rn-target pgrep -u fil -f 'fil server --daemon' | head -n 1 || true)
+  docker exec rn-target kill -9 "$dpid"
+  fc_wait c 'Start a fresh attach' 60
+  fc_type c y
+  fc_show_pid c
+  local new
+  new=$(shell_pid c)
+  [[ -n $new ]] || fail "no shell after the fresh attach: $(fc_screen c)"
+  fc_line c 'echo FRESH-$((6*7))'
+  fc_wait c FRESH-42
+  ok "a fresh attach after the daemon restart gives a working shell (pid $new; the first session's was $old)"
+  fc_detach c
+  fk viajumps dr2
+}
+
+# A login shell that prints at startup: the banner warning is shown, and the session works.
+f_noisy() {
+  fc_start a -- direct-noisy nz
+  # The warning is written before the session's screen is drawn, and the first snapshot pushes it
+  # into the scrollback, so look at everything the client printed rather than at the screen.
+  fc_wait_raw a 'your shell printed this before fil started' 30
+  fc_wait_raw a 'fil:   | NOISY-BASHRC: welcome back' 5
+  fc_ready a
+  local err
+  err=$(cx fil ls direct-noisy 2>&1 > /dev/null)
+  [[ $err == *'the remote shell printed this before fil started'* && $err == *NOISY-BASHRC* ]] || fail "fil ls did not show the banner: $err"
+  ok "fil ls shows the banner too"
+  fc_detach a
+  fk direct-noisy nz
+}
+
+# Through both jumps, for real: the shell is on the target, and the target's sshd saw jump2.
+f_proxyjump() {
+  local before
+  before=$(accepted_count target)
+  fc_start a -- viajumps pj
+  fc_ready a
+  fc_line a 'echo ON-$(hostname)'
+  fc_wait a ON-target
+  [[ $(accepted_count target) -gt $before ]] || fail "the target's sshd saw no new login"
+  local ps
+  ps=$(cx ps -eo args | grep -F 'fil server --stdio' | grep -F viajumps || true)
+  [[ -n $ps ]] || fail "no ssh to viajumps running 'fil server --stdio': $(cx ps -ef)"
+  ok "ssh viajumps ... fil server --stdio is the pipe command"
+  fc_detach a
+  fk viajumps pj
+}
+
+# Sessions end with their processes: no systemd here, so this is the process-tree fallback.
+f_tree_scope() {
+  fc_start a -- viajumps tr
+  fc_ready a
+  fc_line a 'sleep 777 & echo BG-$! DONE-$((1+1))'
+  fc_wait a DONE-2
+  local bg
+  bg=$(fc_screen a | grep -o 'BG-[0-9][0-9]*' | tail -n 1 | cut -d- -f2)
+  [[ -n $bg ]] || fail "no background pid: $(fc_screen a)"
+  docker exec rn-target kill -0 "$bg" || fail "the background job is not running"
+  if docker exec rn-target cat "/proc/$bg/cgroup" | grep -q 'fil-tr-'; then fail "a systemd scope was used where there is no systemd"; fi
+  ok "no systemd scope (the process tree is used)"
+  cx fil kill viajumps tr > /dev/null
+  fc_wait_exit a 20
+  wait_pid_gone rn-target "$bg" 10 || fail "the background job ($bg) survived fil kill"
+  ok "fil kill ended the shell and its background job"
+}
+
+# Another Unix user cannot reach the first user's daemon: the directory refuses it, and when the
+# directory is opened up by hand the daemon's own peer-UID check does. Each user has a daemon of
+# its own. A directory somebody else prepared makes fil refuse to start.
+f_other_user() {
+  local out u
+  scenario_cleanup() {
+    [[ -n ${FUID:-} ]] || return 0
+    docker exec rn-target sh -c "chmod 700 /tmp/fil-$FUID; chmod 600 /tmp/fil-$FUID/*.sock" > /dev/null 2>&1 || true
+  }
+  trap scenario_cleanup EXIT
+  cx fil ls viajumps > /dev/null || fail "could not start fil's daemon on the target"
+  FUID=$(docker exec rn-target id -u fil)
+  local muid sock probe
+  muid=$(docker exec rn-target id -u mallory)
+  sock=$(docker exec rn-target sh -c "ls /tmp/fil-$FUID/*.sock" | head -n 1)
+  [[ -n $sock ]] || fail "no socket in /tmp/fil-$FUID"
+  [[ $(docker exec rn-target stat -c '%a %U' "/tmp/fil-$FUID") == '700 fil' ]] || fail "the socket directory is not 0700 fil"
+  [[ $(docker exec rn-target stat -c '%a %U' "$sock") == '600 fil' ]] || fail "the socket is not 0600 fil"
+  ok "the socket directory is 0700 and the socket 0600, both fil's"
+
+  if docker exec -u mallory rn-target ls "/tmp/fil-$FUID" > /dev/null 2>&1; then fail "mallory can list fil's socket directory"; fi
+  probe=$(docker exec -u mallory rn-target sockprobe "$sock")
+  [[ $probe == 'REFUSED errno=13'* ]] || fail "mallory's connect: $probe"
+  ok "mallory is stopped at the directory: $probe"
+
+  # Open the directory and the socket by hand (as root) so only the daemon's own check is left.
+  docker exec rn-target sh -c "chmod 711 /tmp/fil-$FUID; chmod 666 $sock"
+  probe=$(docker exec -u fil rn-target sockprobe "$sock")
+  [[ $probe == DATA* ]] || fail "control: fil's own connection got: $probe"
+  probe=$(docker exec -u mallory rn-target sockprobe "$sock")
+  [[ $probe == CLOSED* ]] || fail "mallory with the door open got: $probe"
+  ok "with the directory and socket opened, the daemon hangs up on mallory (fil itself is let in and greeted)"
+  local i
+  for ((i = 0; i < 20; i++)); do
+    docker exec rn-target grep -q "\"peer_uid\":$muid" /home/fil/.local/state/fil/daemon.log && break
+    sleep 0.2
+  done
+  docker exec rn-target grep "\"peer_uid\":$muid" /home/fil/.local/state/fil/daemon.log | grep -q 'refused a connection from another user' \
+    || fail "the daemon's log has no refusal for uid $muid"
+  ok "the daemon logged the refusal (uid $muid)"
+  scenario_cleanup
+  cx fil ls viajumps > /dev/null || fail "the daemon stopped serving fil after the probes"
+
+  # A directory somebody else made, with the wrong mode, or a symbolic link: fil refuses to start.
+  local vuid v2uid v3uid err rc
+  vuid=$(docker exec rn-target id -u victim)
+  v2uid=$(docker exec rn-target id -u victim2)
+  v3uid=$(docker exec rn-target id -u victim3)
+  docker exec -u mallory rn-target mkdir -m 700 "/tmp/fil-$vuid"
+  rc=0
+  err=$(docker exec -u victim rn-target fil server --stdio 2>&1 > /dev/null) || rc=$?
+  [[ $rc -ne 0 && $err == *"owned by uid $muid, not by uid $vuid"* ]] || fail "directory made by another user: rc=$rc $err"
+  ok "a directory made by another user is refused: $err"
+  docker exec rn-target install -d -o victim2 -g victim2 -m 755 "/tmp/fil-$v2uid"
+  rc=0
+  err=$(docker exec -u victim2 rn-target fil server --stdio 2>&1 > /dev/null) || rc=$?
+  [[ $rc -ne 0 && $err == *'has mode 0755, not 0700'* ]] || fail "directory with the wrong mode: rc=$rc $err"
+  ok "a directory with the wrong mode is refused: $err"
+  docker exec rn-target ln -s /tmp "/tmp/fil-$v3uid"
+  rc=0
+  err=$(docker exec -u victim3 rn-target fil server --stdio 2>&1 > /dev/null) || rc=$?
+  [[ $rc -ne 0 && $err == *'symbolic link'* ]] || fail "symbolic link in place of the directory: rc=$rc $err"
+  ok "a symbolic link in place of the directory is refused: $err"
+  for u in victim victim2 victim3; do
+    if docker exec rn-target pgrep -u "$u" fil > /dev/null; then fail "a fil process runs as $u"; fi
+  done
+
+  # Two users on one host: two daemons, two directories, sessions not shared.
+  fc_start a -- direct iso
+  fc_ready a
+  fc_detach a
+  out=$(cx fil ls direct-other)
+  [[ $out == 'no sessions' ]] || fail "mallory's fil ls on the host where fil has a session: $out"
+  out=$(docker exec rn-jump1 sh -c 'stat -c "%U:%a" /tmp/fil-*' | tr '\n' ' ')
+  [[ $out == *'fil:700'* && $out == *'mallory:700'* ]] || fail "socket directories on jump1: $out"
+  ok "each user has a daemon and a directory of its own; mallory does not see fil's session"
+  fk direct iso
+}
+
+# Retired from the default run (still runnable by name): the real fil now covers them.
+#   s_pipelink_echo      -> f_proxyjump, f_noisy, f_attach_detach (PipeLink at both ends, through
+#                           both jumps and the noisy login)
+#   s_pipelink_kill_ssh  -> f_kill_ssh (the same kill, and the session resumes)
 ALL_SCENARIOS=(
   s_topology s_direct s_jumps s_controlmaster s_certs s_noisy s_flood s_hostile_names
   s_kill_ssh_client s_kill_sshd_child
   s_netdown_app_heartbeat s_netdown_ssh_keepalive s_netdown_no_detection
-  s_pipelink_echo s_pipelink_flood s_pipelink_kill_ssh s_pipelink_netdown_heartbeat
-  s_pipelink_netdown_keepalive
+  s_pipelink_flood s_pipelink_netdown_heartbeat s_pipelink_netdown_keepalive
+  f_attach_detach f_detach_delivery f_ls_kill_detach f_takeover f_takeover_back f_kill_ssh f_daemon_restart
+  f_noisy f_proxyjump f_tree_scope f_other_user
 )
 
 part_main ssh ssh_setup ssh_teardown "${ALL_SCENARIOS[@]}" -- "$@"

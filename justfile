@@ -68,7 +68,7 @@ client-pty:
 
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
-# `just realnet` runs everything; `just realnet ssh` or `udp`; add scenario names to narrow.
+# `just realnet` runs everything; `just realnet ssh`, `udp` or `sysd`; add scenario names to narrow.
 realnet *args:
     tests/realnet/run.sh {{args}}
 

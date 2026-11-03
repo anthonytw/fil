@@ -1,6 +1,6 @@
 # fil — design
 
-> **Status: draft for discussion, 2026-11-02.** Nothing is implemented yet.
+> **Status: draft for discussion, 2026-11-03.** M0 and M1 are built and the M1 sweep is under way (§15); M2 onward is not started.
 > Items marked **(decided)** are the owner's decisions. Everything else is a proposal.
 
 *fil* is French for thread or wire. *Reprendre le fil*: to pick up the thread where you left off.
@@ -97,7 +97,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
 
 ### 4.1 Attach
 
-1. The client runs the pipe command (by default `ssh -T HOST fil server --stdio`). This is the one SSH login per attach, and the only Touch ID prompt for keys guarded by Touch ID.
+1. The client runs the pipe command (by default `ssh -T -- HOST fil server --stdio`). This is the one SSH login per attach, and the only Touch ID prompt for keys guarded by Touch ID.
 2. The relay connects to the daemon, starting it if needed, and the two sides compare versions.
 3. The client sends:
    - the session name
@@ -119,7 +119,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
   - A path change, such as Wi-Fi to cellular or a new IP address, is absorbed by QUIC connection migration with no new handshake.
   - If the connection itself is gone (for example the laptop slept past the idle timeout), the client performs a new QUIC handshake with the same in-memory key. **No SSH is involved.**
 - **Fallback:** if QUIC can't be re-established within a few seconds, the client re-runs the pipe, which means a new SSH login.
-- **Which transport, when:** the choice is `fil_transport::path::PathManager`, a state machine with no IO (`docs/m1/quic-link.md`). Direct retries back off from 1 s to 2 min and the pipe's from 1 s to 30 s, with jitter. A link that dies within 10 s counts as a failure, so a flapping one slows down instead of cycling. A network-change hint tries direct at once, at most four times a minute. The pipe is closed only after the session has been moved to QUIC.
+- **Which transport, when:** the choice is `fil_transport::path::PathManager`, a state machine with no IO (`docs/m1/quic-link.md`). Retries back off with jitter, a link that dies soon after coming up counts as a failure so a flapping one slows down instead of cycling, and a network-change hint tries direct at once at a bounded rate; the timings are in `docs/m1/quic-link.md` § The path manager (`PathConfig` is the source). The pipe is closed only after the session has been moved to QUIC.
 - **Resume:** either way, the client sends "resume session S, epoch E, from byte N", and the daemon continues from byte N (§6.2).
 - **While disconnected:**
   - The client paints a status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect, leaving the screen and the scrollback exactly as they were.
@@ -242,10 +242,10 @@ fil runs a headless emulator (no rendering) in two places: in the daemon, to ans
 
 A session picks its backend when it is created and keeps it.
 
-**The default backend is `alacritty_terminal` (decided).** The M0 restore-fidelity comparison (`docs/spikes/emulator.md`) chose it. Two backends are built in:
+**The default backend is `alacritty_terminal` (decided).** The M0 restore-fidelity comparison (`docs/spikes/emulator.md`) chose it. Two backends exist. `fil-term` builds both by default, but `fil-session` and `fil-client` ask only for `alacritty`, so the shipped binary contains just that one; `vt100` is built for the fidelity suite and the tests:
 
 - `alacritty_terminal` (Apache-2.0), the default. It is the only candidate with reflow, OSC 8 hyperlinks, underline styles and replies to terminal queries, and it parses about 1.9x faster than `vt100`. The costs are about 30% more memory per session and glue around an API that wasn't built for this use, so every upgrade re-runs `just fidelity`.
-- `vt100` (MIT), the light alternative. It tracks fewer fields: no reflow, no query replies, and no saved cursor or origin mode.
+- `vt100` (MIT), the light alternative, kept as a second opinion for the fidelity suite and the tests. It tracks fewer fields: no reflow, no query replies, and no saved cursor or origin mode.
 
 libghostty-vt (C ABI, used by zmx) was not evaluated: it needs a Zig toolchain, and the default already meets the bar. It can be added later behind its own feature.
 
@@ -361,14 +361,14 @@ The trait is not object-safe. A client that switches between the pipe and QUIC h
 
 ### 8.2 Pipe (ssh by default)
 
-- **What it runs:** a command whose stdin and stdout reach `fil server --stdio` on the remote. The default is `ssh -T HOST fil server --stdio`. Using the system `ssh` means everything in `~/.ssh/config` applies: ProxyJump, certificates, agents and ControlMaster.
+- **What it runs:** a command whose stdin and stdout reach `fil server --stdio` on the remote. The default is `ssh -T -- HOST fil server --stdio`. Using the system `ssh` means everything in `~/.ssh/config` applies: ProxyJump, certificates, agents and ControlMaster.
 - **Fixed remote command:** the remote command is always exactly `fil server --stdio`. It is never assembled from user input, because ssh hands its command line to the remote shell as a string. Session names and everything else travel inside the protocol.
 - **Configurable per host:** for example `kubectl exec -i`, `docker exec -i`, `aws ssm start-session` or `tailscale ssh`. This is fil's runtime extension point (§8.4).
 - **Multiplexing:** all channels share one byte stream with fil's own framing.
   - The scheduler sends terminal and control frames ahead of forward data.
   - Forward frames are capped at 16 KiB, so a large transfer through a forward can't delay keystrokes.
 - **Keepalive backstop:** when the program is `ssh`, fil adds `-o ServerAliveInterval=N -o ServerAliveCountMax=3`, unless the command line already sets them. `N` is `dead_after / 3` rounded up to whole seconds (2 s by default), so ssh gives up after between `N x 3` and `N x 4` of silence (6 to 8 s by default; measured 7.5 s) and never before `dead_after`. fil's heartbeat (§8.5) is the fast detector and kills the ssh process the moment it declares the link dead; the backstop is for a fil process that is gone while a black-holed ssh would linger for the TCP retry limit. A command that is not `ssh` runs untouched.
-- **Process handling:** ssh's stderr stays attached to the user's terminal, so Touch ID and password prompts and errors remain visible. When the command exits, the link reports `Down(Io)` with its exit status. Closing the link closes the command's stdin, gives it a second to exit, then kills and reaps it. The default command is `ssh -T -- HOST fil server --stdio`; the host name is checked against an allowlist (letters, digits and `. _ @ : % [ ] -`, not starting with `-`) before it reaches the command line, because `~/.ssh/config` may expand it in `ProxyCommand` or `Match exec`.
+- **Process handling:** ssh's stderr stays attached to the user's terminal, so Touch ID and password prompts and errors remain visible. When the command exits, the link reports `Down(Io)` with its exit status. Closing the link closes the command's stdin, gives it a second to exit, then kills and reaps it. The host name is checked against an allowlist (letters, digits and `. _ @ : % [ ] -`, not starting with `-`) before it reaches the command line, because `~/.ssh/config` may expand it in `ProxyCommand` or `Match exec`.
 - **Reconnect:** re-run the command.
 
 ### 8.3 Direct: QUIC over UDP
@@ -387,7 +387,7 @@ Direct mode is first-class **(decided)**.
 - **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods:
   - **Retry:** the first packet from an address that has not been validated gets a stateless Retry and nothing else. No handshake state is kept and no crypto is done until the client answers it, so forged source addresses cost one small packet each.
   - **Rate limits:** only validated addresses are counted, so a spoofed flood cannot spend a real client's allowance. Each source address has a token bucket (default burst 8, one a second) and the port has one (burst 100, 50 a second). Over the source limit the handshake is refused with a short close; over the global limit the packet is dropped silently. At most 128 handshakes are in progress at once.
-  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke` closes at once). Removing a key from the registry blocks new handshakes at once and closes its live connections after a 2 s backstop (`revoke_backstop`), so the layer above can send its last message first; this is safe because a session that lost its subscriber neither reads from nor writes to the old connection.
+  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake. Timing and mechanism: §8.5 "Revocation timing" and `docs/m1/quic-link.md` § Revocation.
 
 ### 8.4 Extensibility is compile-time, not runtime
 
@@ -477,7 +477,7 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 The binding and the key end with the subscriber's hold on the session: on takeover and detach (the session's `RevokeKey`), when the session ends or is killed, and when the attach is refused (a key that attach newly registered is revoked again). The registry therefore holds at most one key per live session.
 
-**Revocation timing.** Removing a key from the registry blocks new handshakes with it at once. Its live QUIC connections are closed by the listener 2 s later (`revoke_backstop`) unless something closes them first, which the session does: it sends `TakenOver`, waits for it to be read, and closes the link, so the old client is told. This is safe because a session whose subscriber lost it neither reads from nor writes to the old connection; the delay is only a backstop for a serve task that is stuck.
+**Revocation timing.** Removing a key from the registry blocks new handshakes with it at once. Its live QUIC connections are closed by the listener 2 s later (`revoke_backstop`) unless something closes them first, which the session does: it sends `TakenOver`, waits for it to be read, and closes the link, so the old client is told. The delay is only a backstop for a serve task that is stuck. The listener side (`QuicListener::revoke`, the sweep, why the delay is safe) is in `docs/m1/quic-link.md` § Revocation.
 
 - Terminal sizes are capped: at most 2000 columns, 1000 rows and 1,000,000 cells. Larger sizes are refused when decoded, because the emulator allocates the grid and an unbounded size would let one peer take down every session (M1 security sweep). The client clamps its real size.
 - `Attach.echo_ack`: only a predicting client asks for `EchoAck`, so other clients don't pay for them.
@@ -613,10 +613,12 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
   - `fil-transport`: the trait, pipe and QUIC
   - `fil-term`: the emulator trait, its backends and snapshots
   - `fil-session`: one session (PTY, log, emulator, the subscriber protocol over any `Link`)
-  - `fil-predict`: the trait and the default predictor
+  - `fil-client`: the client engine (raw terminal, the attach, resume and reconnect loop, input while disconnected, the status line), independent of the transport
+  - `fil-predict`: the trait, the default predictor and the overlay
   - `fil-netsim`: the in-process link simulator (§12), used only by tests
   - `fil-daemon`: the daemon, its socket and lifecycle, and the stdio relay (`fil server --stdio`)
   - `fil`: the CLI
+  - `fil-testbins`: test programs for the real-network harness, used only by tests
 
 ## 14. CLI and configuration (sketch)
 
@@ -664,7 +666,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison across the modular backends (§6.5) | the default emulator is chosen, and the overlay never corrupts the screen in the harness |
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed |
-| **M3: prediction** | the trait, the default predictor and the status overlay; then the M3 sweep | no visible mispredictions in the harness, and the sweep is closed |
+| **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, and the sweep is closed |
 | **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-public sweep; go public; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners, which are free once the repo is public | the pre-public sweep is closed before the repo goes public |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.

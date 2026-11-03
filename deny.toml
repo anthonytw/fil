@@ -23,8 +23,19 @@ confidence-threshold = 0.9
 # The list is policy, not inventory: entries no current dependency uses are fine.
 unused-allowed-license = "allow"
 
+[advisories]
+# Part of `just ci` (the `deny` recipe). The advisory database is fetched on each run, so this
+# needs network access. A yanked crate fails the gate like a RustSec advisory does.
+yanked = "deny"
+# A new RustSec advisory in a dependency fails `just ci` on any PR, by design. If it cannot be fixed
+# by an update yet, acknowledge it here with a reason and a follow-up, never silently:
+#   ignore = [{ id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply, and what removes the entry" }]
+
 [bans]
 multiple-versions = "allow"
+# `*` version requirements would let a dependency float; workspace path dependencies are exempt.
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

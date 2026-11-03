@@ -720,12 +720,15 @@ async fn no_link_no_failure_while_an_answer_is_awaited() -> Test {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let reports = fwd.st.lock().unwrap().listening.len();
     fwd.release_adds();
     eventually("listening again", 5, || {
         let st = fwd.st.lock().unwrap();
-        st.listening
-            .last()
-            .is_some_and(|(_, s)| matches!(s, ListenState::Listening { .. }))
+        st.listening.len() > reports
+            && st
+                .listening
+                .last()
+                .is_some_and(|(_, s)| matches!(s, ListenState::Listening { .. }))
     })
     .await;
     let mut app = connect(mine).await.expect("the own -L listens");

@@ -1,7 +1,8 @@
 //! The command line (DESIGN.md section 14).
 //!
 //! ```text
-//! fil HOST [SESSION] [-L SPEC]... [-R SPEC]...   attach (default session: main)
+//! fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
+//!                                                attach (default session: main)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
 //! fil detach HOST SESSION                        detach whoever is attached
@@ -15,7 +16,10 @@ use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use fil_proto::msg::SessionName;
+use fil_proto::mux::{ForwardKind, ForwardSpec};
 use fil_transport::path::TransportSetting;
+
+use crate::forward_spec::{self, AgentFlag, CliForwards};
 
 /// The session `fil HOST` attaches to when none is named.
 pub const DEFAULT_SESSION: &str = "main";
@@ -88,13 +92,30 @@ pub struct AttachArgs {
     #[arg(value_name = "SESSION", value_parser = parse_session)]
     pub session: Option<SessionName>,
 
-    /// Forward a local port to the host (not available yet)
-    #[arg(short = 'L', value_name = "SPEC")]
-    pub local: Vec<String>,
+    /// Listen here, connect from the host: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same port
+    /// on the host's localhost. A bare port binds loopback; * or an empty BIND is every
+    /// interface. Repeatable
+    #[arg(short = 'L', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Local))]
+    pub local: Vec<ForwardSpec>,
 
-    /// Forward a port on the host to here (not available yet)
-    #[arg(short = 'R', value_name = "SPEC")]
-    pub remote: Vec<String>,
+    /// Listen on the host, connect from here: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same
+    /// port on this machine's localhost (not ssh's reverse SOCKS proxy). PORT 0 asks the host for a free
+    /// port. Repeatable
+    #[arg(short = 'R', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Remote))]
+    pub remote: Vec<ForwardSpec>,
+
+    /// A SOCKS proxy here that connects from the host: [BIND:]PORT. Repeatable
+    #[arg(short = 'D', value_name = "SPEC", value_parser = SpecParser(ForwardKind::Dynamic))]
+    pub dynamic: Vec<ForwardSpec>,
+
+    /// Relay your ssh-agent to the session while you are attached (the config's agent = "confirm"
+    /// stays "confirm")
+    #[arg(short = 'A', overrides_with = "no_agent")]
+    pub agent: bool,
+
+    /// Do not relay the agent, whatever the config says (the last of -A and -a wins, as in ssh)
+    #[arg(short = 'a', overrides_with = "agent")]
+    pub no_agent: bool,
 
     /// How to reach the host: auto (the pipe first, then QUIC), pipe (ssh only) or direct (QUIC
     /// once attached)
@@ -156,6 +177,60 @@ pub struct ServerArgs {
     pub daemon: bool,
 }
 
+fn parse_forward(kind: ForwardKind, s: &str) -> Result<ForwardSpec, String> {
+    let spec = forward_spec::parse(kind, s).map_err(|e| e.to_string())?;
+    forward_spec::check_policy(&spec).map_err(|e| e.to_string())?;
+    Ok(spec)
+}
+
+/// The value parser of `-L`, `-R` and `-D`. A bad value is reported by this parser's own words,
+/// the value quoted ASCII-escaped: clap's `ValueValidation` message would repeat the raw value,
+/// and on a terminal that is an escape sequence the user's script may have passed through.
+#[derive(Clone, Copy)]
+struct SpecParser(ForwardKind);
+
+impl clap::builder::TypedValueParser for SpecParser {
+    type Value = ForwardSpec;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<ForwardSpec, clap::Error> {
+        let raw = value.to_string_lossy();
+        parse_forward(self.0, &raw).map_err(|why| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "invalid {} spec {}: {why}\n",
+                    forward_spec::flag(self.0),
+                    forward_spec::quote(&raw)
+                ),
+            )
+            .with_cmd(cmd)
+        })
+    }
+}
+
+impl AttachArgs {
+    /// The forward flags, parsed.
+    pub fn forwards(&self) -> CliForwards {
+        CliForwards {
+            specs: [&self.local, &self.remote, &self.dynamic]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            agent: match (self.agent, self.no_agent) {
+                (true, _) => Some(AgentFlag::On),
+                (_, true) => Some(AgentFlag::Off),
+                _ => None,
+            },
+        }
+    }
+}
+
 fn parse_session(s: &str) -> Result<SessionName, String> {
     SessionName::new(s).map_err(|e| e.to_string())
 }
@@ -167,6 +242,8 @@ pub enum Action {
         host: String,
         session: SessionName,
         transport: Option<TransportSetting>,
+        /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked. Carried; not connected yet.
+        forwards: CliForwards,
     },
     List {
         host: String,
@@ -186,10 +263,6 @@ pub enum Action {
 /// A request clap accepted that fil still cannot honor.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Unsupported {
-    #[error(
-        "port forwards (-L, -R) are not available yet: they arrive in milestone 2. Attach without them, or use ssh -L for now"
-    )]
-    Forwards,
     #[error(
         "`fil detach` without a host works only inside a session, which needs port-forward control (milestone 2). Type ~. after a newline to detach, or run `fil detach HOST SESSION`"
     )]
@@ -212,11 +285,16 @@ impl Cli {
         if let Some(s) = &a.session {
             stray.push(format!("the session `{s}`"));
         }
-        if !a.local.is_empty() {
-            stray.push("-L".to_string());
-        }
-        if !a.remote.is_empty() {
-            stray.push("-R".to_string());
+        for (given, flag) in [
+            (!a.local.is_empty(), "-L"),
+            (!a.remote.is_empty(), "-R"),
+            (!a.dynamic.is_empty(), "-D"),
+            (a.agent, "-A"),
+            (a.no_agent, "-a"),
+        ] {
+            if given {
+                stray.push(flag.to_string());
+            }
         }
         if a.transport.is_some() {
             stray.push("--transport".to_string());
@@ -254,9 +332,7 @@ impl Cli {
             }),
             None => {
                 let a = self.attach;
-                if !a.local.is_empty() || !a.remote.is_empty() {
-                    return Err(Unsupported::Forwards);
-                }
+                let forwards = a.forwards();
                 Ok(Action::Attach {
                     host: a
                         .host
@@ -265,6 +341,7 @@ impl Cli {
                         .session
                         .unwrap_or_else(|| SessionName::new(DEFAULT_SESSION).expect("valid")),
                     transport: a.transport.map(Into::into),
+                    forwards,
                 })
             }
         }
@@ -301,7 +378,8 @@ mod tests {
             Action::Attach {
                 host: "orin".into(),
                 session: name("main"),
-                transport: None
+                transport: None,
+                forwards: Default::default()
             }
         );
         assert_eq!(
@@ -309,7 +387,8 @@ mod tests {
             Action::Attach {
                 host: "me@orin".into(),
                 session: name("build"),
-                transport: None
+                transport: None,
+                forwards: Default::default()
             }
         );
     }
@@ -326,7 +405,8 @@ mod tests {
                 Action::Attach {
                     host: "orin".into(),
                     session: name("main"),
-                    transport: Some(want)
+                    transport: Some(want),
+                    forwards: Default::default()
                 }
             );
         }
@@ -371,16 +451,87 @@ mod tests {
         assert!(parse(&["detach", "--help"]).is_err());
     }
 
+    fn forwards(args: &[&str]) -> CliForwards {
+        match action(args) {
+            Action::Attach { forwards, .. } => forwards,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn flags(f: &CliForwards) -> Vec<String> {
+        f.specs.iter().map(forward_spec::format_flag).collect()
+    }
+
     #[test]
-    fn forwards_are_a_clear_not_yet() {
-        for args in [
-            &["-L", "5173", "orin"][..],
-            &["orin", "-R", "9000:localhost:9000"][..],
-            &["-L5173", "orin", "main"][..],
+    fn forward_flags_are_parsed_into_the_run() {
+        let f = forwards(&[
+            "-L5173",
+            "orin",
+            "-R",
+            "9000:db:5432",
+            "-D",
+            "localhost:1080",
+            "-L",
+            "*:8080:web:80",
+            "main",
+            "-R",
+            "0:localhost:22",
+        ]);
+        // Repeatable; -L, then -R, then -D, each in the order given.
+        assert_eq!(
+            flags(&f),
+            [
+                "-L 5173:localhost:5173",
+                "-L *:8080:web:80",
+                "-R 9000:db:5432",
+                "-R 0:localhost:22",
+                "-D 1080"
+            ]
+        );
+        assert_eq!(f.agent, None);
+        assert_eq!(forwards(&["orin"]), CliForwards::default());
+    }
+
+    #[test]
+    fn agent_flags_last_one_wins_as_in_ssh() {
+        assert_eq!(forwards(&["-A", "orin"]).agent, Some(AgentFlag::On));
+        assert_eq!(forwards(&["-a", "orin"]).agent, Some(AgentFlag::Off));
+        assert_eq!(forwards(&["-A", "-a", "orin"]).agent, Some(AgentFlag::Off));
+        assert_eq!(forwards(&["-a", "-A", "orin"]).agent, Some(AgentFlag::On));
+    }
+
+    #[test]
+    fn a_bad_forward_spec_is_a_usage_error_that_says_why() {
+        for (args, why) in [
+            (&["-L", "0:h:80", "orin"][..], "cannot be 0"),
+            (&["-D", "0", "orin"][..], "cannot be 0"),
+            (&["-L", "80:h:99999", "orin"][..], "not a port"),
+            (&["-L", "[::1:80:h:80", "orin"][..], "bracket"),
+            (&["-L", "8080:h:80\x1b[2J", "orin"][..], "outside"),
+            (&["-R", "*:80:h:80", "orin"][..], "OD-7"),
         ] {
-            let err = parse(args).unwrap().action().unwrap_err();
-            assert_eq!(err, Unsupported::Forwards, "{args:?}");
-            assert!(err.to_string().contains("milestone 2"));
+            let e = parse(args).expect_err(&format!("{args:?}"));
+            assert_eq!(e.kind(), ErrorKind::ValueValidation, "{args:?}: {e}");
+            assert!(e.to_string().contains(why), "{args:?}: {e}");
+            // Nothing of the refused text comes back raw, however the error is drawn.
+            for shown in [e.to_string(), e.render().ansi().to_string()] {
+                assert!(
+                    !shown.contains("[2J") || shown.contains("\\u{1b}[2J"),
+                    "{shown:?}"
+                );
+                assert!(!shown.contains('\u{202e}') && !shown.contains("8080:h:80\x1b"));
+            }
+        }
+        // A flag in the place of a spec is not taken for the spec: clap reads it as an option,
+        // and nothing runs. Joined to the flag it reaches the parser, which refuses it.
+        for args in [
+            &["-L", "-oProxyCommand=sh", "orin"][..],
+            &["-D", "-oProxyCommand=sh", "orin"][..],
+            &["-R", "-oProxyCommand=sh", "orin"][..],
+            &["-L-oProxyCommand=sh", "orin"][..],
+            &["-Doproxy", "orin"][..],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 
@@ -428,6 +579,9 @@ mod tests {
             &["orin", "ls", "box"][..],
             &["-L", "5173", "ls", "box"][..],
             &["-R", "9000", "kill", "box", "main"][..],
+            &["-D", "1080", "ls", "box"][..],
+            &["-A", "ls", "box"][..],
+            &["-a", "detach", "box", "main"][..],
             &["--transport", "pipe", "ls", "box"][..],
             &["--transport", "pipe", "detach", "box", "main"][..],
         ] {
@@ -460,7 +614,8 @@ mod tests {
             Action::Attach {
                 host: "orin".into(),
                 session: name("ls"),
-                transport: None
+                transport: None,
+                forwards: Default::default()
             }
         );
     }
@@ -472,7 +627,8 @@ mod tests {
             Action::Attach {
                 host: "ls".into(),
                 session: name("main"),
-                transport: None
+                transport: None,
+                forwards: Default::default()
             }
         );
     }

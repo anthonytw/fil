@@ -136,7 +136,7 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
     if list.is_empty() {
         return "no sessions\n".to_string();
     }
-    let rows: Vec<[String; 5]> = list
+    let rows: Vec<[String; 6]> = list
         .iter()
         .map(|s| {
             let attached = match &s.attached {
@@ -155,20 +155,28 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
             [
                 s.name.as_str().to_string(),
                 s.term.as_str().to_string(),
+                forwards_cell(s),
                 attached,
                 last,
                 format!("{} ago", age(now_unix_ms, s.created_unix_ms)),
             ]
         })
         .collect();
-    let head = ["NAME", "TERM", "ATTACHED", "LAST OUTPUT", "CREATED"];
+    let head = [
+        "NAME",
+        "TERM",
+        "FORWARDS",
+        "ATTACHED",
+        "LAST OUTPUT",
+        "CREATED",
+    ];
     let mut widths = head.map(str::len);
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; 5]| {
+    let line = |cells: [&str; 6]| {
         let mut out = String::new();
         for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
             if i + 1 == cells.len() {
@@ -182,12 +190,25 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
     };
     let mut out = line(head);
     for row in &rows {
-        out.push_str(&line([&row[0], &row[1], &row[2], &row[3], &row[4]]));
+        out.push_str(&line([
+            &row[0], &row[1], &row[2], &row[3], &row[4], &row[5],
+        ]));
     }
     if truncated {
         out.push_str("(the list is cut short: the host has more sessions than fit in one reply)\n");
     }
     out
+}
+
+/// The FORWARDS column: how many forwards the session's table holds, and whether its agent relay
+/// is on; `-` for neither.
+fn forwards_cell(s: &SessionSummary) -> String {
+    match (s.forwards, s.agent) {
+        (0, false) => "-".to_string(),
+        (n, false) => n.to_string(),
+        (0, true) => "agent".to_string(),
+        (n, true) => format!("{n}, agent"),
+    }
 }
 
 /// `90` s as `1m`, `7300` s as `2h`, a clock that is ahead as `0s`. One unit, rounded down.
@@ -258,6 +279,36 @@ mod tests {
         let col = lines[0].find("ATTACHED").unwrap();
         assert_eq!(&lines[1][col..col + 6], "laptop");
         assert!(!out.contains("cut short"));
+    }
+
+    #[test]
+    fn ls_shows_the_forwards_and_the_agent() {
+        let mut busy = summary("busy", None, 0, NOW);
+        busy.forwards = 3;
+        let mut both = summary("both", None, 0, NOW);
+        both.forwards = 2;
+        both.agent = true;
+        let mut agent = summary("agent", None, 0, NOW);
+        agent.agent = true;
+        let out = format_sessions(
+            &[summary("none", None, 0, NOW), busy, both, agent],
+            false,
+            NOW,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let col = lines[0].find("FORWARDS").unwrap();
+        let cell = |i: usize| {
+            lines[i][col..]
+                .split("  ")
+                .next()
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            (cell(1), cell(2), cell(3), cell(4)),
+            ("-".into(), "3".into(), "2, agent".into(), "agent".into())
+        );
     }
 
     #[test]

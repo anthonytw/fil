@@ -7,7 +7,18 @@
 //! host_label = "laptop"      # what other clients are shown when you take a session over;
 //!                             # default: this machine's short host name
 //! predict = "adaptive"        # off | adaptive | always; accepted, used from M3
-//! forward = ["-L 5173"]       # accepted, used from M2
+//! forward = ["-L 5173", "-R 9000", "-D 1080"]   # forwards for every attach (section 7.1)
+//! agent = "off"               # off | on | confirm: relay the local ssh-agent (section 10)
+//! agent_keys = []             # SHA256 fingerprints the relay answers for; empty is every key
+//! remote_requests = "ask"     # ask | deny: `fil forward` run on the host (section 7.3)
+//! forward_failure = "warn"    # warn | exit: a forward that cannot bind (ssh ExitOnForwardFailure)
+//!
+//! [defaults.forward]          # instead of the list above, when tunables are set:
+//! # specs = ["-L 5173"]       #   the same list
+//! # window = "1MiB"           #   16KiB to 4MiB
+//! # buffer = "1MiB"           #   16KiB to 16MiB
+//! # open_wait = "30s"         #   0 to 1h; how long a connection waits for a link
+//! # linger = "10m"            #   0 to 24h; how long open connections outlive a disconnect
 //!
 //! [defaults.offline_input]    # keystrokes typed while disconnected (section 4.3)
 //! buffer = "4KiB"             # 0 drops them
@@ -23,8 +34,9 @@
 //! pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 //! ```
 //!
-//! A `[host.NAME]` section overrides `[defaults]` field by field (`offline_input` and `direct`
-//! too). A missing file means the defaults. Unknown keys are errors, so a typo does not silently
+//! A `[host.NAME]` section overrides `[defaults]` field by field (`offline_input`, `direct` and
+//! `forward` too; a list replaces the list under it). The command line is over both: `-L`, `-R`
+//! and `-D` add to `forward`, `-A` and `-a` set `agent` (see `forward_spec::ForwardPlan`). A missing file means the defaults. Unknown keys are errors, so a typo does not silently
 //! do nothing; every section is checked when the file is read, and the error names the file, the
 //! section and the key.
 //!
@@ -35,22 +47,67 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use fil_client::{OfflineInput, OfflineLog, parse_byte_size, parse_confirm};
-use fil_proto::limits::MAX_HOST_LABEL;
+use fil_proto::limits::{
+    DEFAULT_FORWARD_BUFFER, FORWARD_BUDGET, LINGER, MAX_FORWARDS, MAX_HOST_LABEL, MIN_WINDOW,
+    OPEN_WAIT,
+};
+use fil_proto::mux::{ForwardSpec, MuxConfig, Window};
 use fil_transport::path::TransportSetting;
 use serde::Deserialize;
 
+use crate::forward_spec;
+
 pub use fil_daemon::paths::{base_dir, home_dir};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{origin}: {message}")]
-    Invalid { origin: String, message: String },
+    Invalid {
+        origin: String,
+        message: String,
+    },
+}
+
+/// `text` with every control and invisible character written out (`\u{1b}`), newlines kept. Serde
+/// and toml quote the file's own values in their messages (an unknown variant, say), and a value
+/// can hold a terminal escape: errors are shown only like this.
+pub fn escape_unprintable(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c != '\n' && (c.is_control() || fil_proto::text::is_invisible(c)) {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let raw = match self {
+            ConfigError::Read { path, source } => {
+                format!("cannot read {}: {source}", path.display())
+            }
+            ConfigError::Invalid { origin, message } => format!("{origin}: {message}"),
+        };
+        f.write_str(&escape_unprintable(&raw))
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::Read { source, .. } => Some(source),
+            ConfigError::Invalid { .. } => None,
+        }
+    }
 }
 
 fn invalid(origin: &str, message: impl fmt::Display) -> ConfigError {
@@ -84,6 +141,193 @@ impl From<Transport> for TransportSetting {
             Transport::Pipe => TransportSetting::Pipe,
             Transport::Direct => TransportSetting::Direct,
         }
+    }
+}
+
+/// Whether and how the local ssh-agent is relayed (DESIGN.md section 10). Off unless asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    Off,
+    On,
+    /// Ask on screen before every signature.
+    Confirm,
+}
+
+/// What the client does with a forward that a process on the host asked for with `fil forward`
+/// (DESIGN.md section 7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteRequests {
+    /// Ask once per entry.
+    Ask,
+    Deny,
+}
+
+/// What a forward that cannot be set up does to the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardFailure {
+    /// Say so and carry on.
+    Warn,
+    /// End the run with status 255, as ssh's `ExitOnForwardFailure`.
+    Exit,
+}
+
+/// The `[defaults.forward]` tunables (`docs/m2/plan.md` section 2.9), checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardTunables {
+    pub window: Window,
+    pub buffer: usize,
+    pub open_wait: Duration,
+    pub linger: Duration,
+}
+
+impl Default for ForwardTunables {
+    fn default() -> Self {
+        Self {
+            window: Window::DEFAULT,
+            buffer: DEFAULT_FORWARD_BUFFER,
+            open_wait: OPEN_WAIT,
+            linger: LINGER,
+        }
+    }
+}
+
+impl ForwardTunables {
+    /// The MUX configuration with these tunables over the defaults.
+    pub fn mux_config(&self) -> MuxConfig {
+        MuxConfig {
+            window: self.window,
+            buffer: self.buffer,
+            open_wait: self.open_wait,
+            linger: self.linger,
+            ..MuxConfig::default()
+        }
+    }
+}
+
+/// `forward` as written: a list of specs, or a table that has the list as `specs` next to the
+/// tunables (a key cannot be both a list and a table).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawForward {
+    specs: Option<Vec<String>>,
+    window: Option<SizeValue>,
+    buffer: Option<SizeValue>,
+    open_wait: Option<DurationValue>,
+    linger: Option<DurationValue>,
+}
+
+#[derive(Clone, Debug)]
+enum ForwardValue {
+    List(Vec<String>),
+    Table(RawForward),
+}
+
+// By hand, not `untagged`: that would answer every mistake in the table with "did not match any
+// variant", and the unknown key it found is what the user needs to read.
+impl<'de> Deserialize<'de> for ForwardValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ForwardValue;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of specs, or a table with specs and tunables")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                a: A,
+            ) -> Result<Self::Value, A::Error> {
+                Vec::deserialize(SeqAccessDeserializer::new(a)).map(ForwardValue::List)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                a: A,
+            ) -> Result<Self::Value, A::Error> {
+                RawForward::deserialize(MapAccessDeserializer::new(a)).map(ForwardValue::Table)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl ForwardValue {
+    fn into_table(self) -> RawForward {
+        match self {
+            ForwardValue::List(specs) => RawForward {
+                specs: Some(specs),
+                ..RawForward::default()
+            },
+            ForwardValue::Table(t) => t,
+        }
+    }
+}
+
+/// A duration written as seconds (`open_wait = 30`) or text (`"30s"`, `"10m"`, `"1500ms"`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum DurationValue {
+    Secs(u64),
+    Text(String),
+}
+
+fn parse_duration(v: &DurationValue) -> Result<Duration, String> {
+    let text = match v {
+        DurationValue::Secs(n) => return Ok(Duration::from_secs(*n)),
+        DurationValue::Text(t) => t.trim(),
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (num, unit) = text.split_at(split);
+    let n: u64 = num.parse().map_err(|_| {
+        format!("not a duration: {text:?} (whole numbers; examples: \"30s\", \"10m\")")
+    })?;
+    let secs = |mult: u64| {
+        n.checked_mul(mult)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("duration too large: {text:?}"))
+    };
+    match unit.trim() {
+        "ms" => Ok(Duration::from_millis(n)),
+        "s" | "" => secs(1),
+        "m" => secs(60),
+        "h" => secs(3600),
+        _ => Err(format!(
+            "unknown duration unit in {text:?} (use ms, s, m or h)"
+        )),
+    }
+}
+
+fn size_value(key: &str, v: &SizeValue) -> Result<usize, String> {
+    match v {
+        SizeValue::Int(n) => {
+            usize::try_from(*n).map_err(|_| format!("forward.{key} = {n}: too large"))
+        }
+        SizeValue::Text(t) => parse_byte_size(t)
+            .map_err(|e| format!("forward.{key}: {e} (examples: \"1MiB\", \"64KiB\")")),
+    }
+}
+
+/// The most fingerprints `agent_keys` may list.
+pub const MAX_AGENT_KEYS: usize = 64;
+
+/// An ssh fingerprint, `SHA256:` and 43 base64 characters.
+fn check_fingerprint(f: &str) -> Result<String, String> {
+    let ok = f.strip_prefix("SHA256:").is_some_and(|b| {
+        b.len() == 43
+            && b.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
+    });
+    if ok {
+        Ok(f.to_string())
+    } else {
+        Err(format!(
+            "agent_keys: {}: expected an ssh fingerprint such as SHA256:... (ssh-keygen -lf KEY.pub)",
+            forward_spec::quote(f)
+        ))
     }
 }
 
@@ -130,7 +374,11 @@ struct RawSection {
     history_lines: Option<toml::Value>,
     host_label: Option<String>,
     predict: Option<Predict>,
-    forward: Option<Vec<String>>,
+    forward: Option<ForwardValue>,
+    agent: Option<AgentMode>,
+    agent_keys: Option<Vec<String>>,
+    remote_requests: Option<RemoteRequests>,
+    forward_failure: Option<ForwardFailure>,
     offline_input: Option<RawOffline>,
     direct: Option<RawDirect>,
 }
@@ -168,7 +416,24 @@ impl RawSection {
                 .or_else(|| base.history_lines.clone()),
             host_label: self.host_label.clone().or_else(|| base.host_label.clone()),
             predict: self.predict.or(base.predict),
-            forward: self.forward.clone().or_else(|| base.forward.clone()),
+            forward: match (&self.forward, &base.forward) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = (a.clone().into_table(), b.clone().into_table());
+                    Some(ForwardValue::Table(RawForward {
+                        specs: a.specs.or(b.specs),
+                        window: a.window.or(b.window),
+                        buffer: a.buffer.or(b.buffer),
+                        open_wait: a.open_wait.or(b.open_wait),
+                        linger: a.linger.or(b.linger),
+                    }))
+                }
+                (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+                (None, None) => None,
+            },
+            agent: self.agent.or(base.agent),
+            agent_keys: self.agent_keys.clone().or_else(|| base.agent_keys.clone()),
+            remote_requests: self.remote_requests.or(base.remote_requests),
+            forward_failure: self.forward_failure.or(base.forward_failure),
             offline_input: nested(
                 &self.offline_input,
                 &base.offline_input,
@@ -201,8 +466,15 @@ pub struct HostSettings {
     /// What other clients are shown for this machine; `None` is the short host name.
     pub host_label: Option<String>,
     pub predict: Predict,
-    /// `-L`/`-R` specs from the file. Forwards arrive in M2; the client warns and ignores them.
-    pub forward: Vec<String>,
+    /// The file's `forward` specs, parsed and checked (`-L`, `-R` and `-D`; the command line
+    /// adds to them, see `forward_spec::ForwardPlan`).
+    pub forward: Vec<ForwardSpec>,
+    pub agent: AgentMode,
+    /// SHA256 fingerprints the agent relay answers for; empty is every key.
+    pub agent_keys: Vec<String>,
+    pub remote_requests: RemoteRequests,
+    pub forward_failure: ForwardFailure,
+    pub forward_tunables: ForwardTunables,
     pub offline: OfflineInput,
     /// Where to dial UDP when it is not the host name (an ssh alias, a different interface).
     pub direct_address: Option<String>,
@@ -216,6 +488,11 @@ impl Default for HostSettings {
             host_label: None,
             predict: Predict::Adaptive,
             forward: Vec::new(),
+            agent: AgentMode::Off,
+            agent_keys: Vec::new(),
+            remote_requests: RemoteRequests::Ask,
+            forward_failure: ForwardFailure::Warn,
+            forward_tunables: ForwardTunables::default(),
             offline: OfflineInput::default(),
             direct_address: None,
         }
@@ -342,7 +619,25 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
         out.predict = p;
     }
     if let Some(f) = &s.forward {
-        out.forward = f.clone();
+        resolve_forward(&f.clone().into_table(), &mut out)?;
+    }
+    if let Some(a) = s.agent {
+        out.agent = a;
+    }
+    if let Some(keys) = &s.agent_keys {
+        if keys.len() > MAX_AGENT_KEYS {
+            return Err(format!("agent_keys: more than {MAX_AGENT_KEYS} entries"));
+        }
+        out.agent_keys = keys
+            .iter()
+            .map(|k| check_fingerprint(k))
+            .collect::<Result<_, _>>()?;
+    }
+    if let Some(r) = s.remote_requests {
+        out.remote_requests = r;
+    }
+    if let Some(f) = s.forward_failure {
+        out.forward_failure = f;
     }
     if let Some(o) = &s.offline_input {
         if let Some(b) = &o.buffer {
@@ -377,6 +672,52 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
         }
     }
     Ok(out)
+}
+
+fn resolve_forward(f: &RawForward, out: &mut HostSettings) -> Result<(), String> {
+    if let Some(list) = &f.specs {
+        if list.len() > MAX_FORWARDS {
+            return Err(format!("forward: more than {MAX_FORWARDS} entries"));
+        }
+        for (i, text) in list.iter().enumerate() {
+            let spec = forward_spec::parse_flag(text)
+                .map_err(|e| format!("forward[{i}] = {}: {e}", forward_spec::quote(text)))?;
+            forward_spec::check_policy(&spec)
+                .map_err(|e| format!("forward[{i}] = {}: {e}", forward_spec::quote(text)))?;
+            forward_spec::add_spec(&mut out.forward, spec);
+        }
+    }
+    let t = &mut out.forward_tunables;
+    if let Some(v) = &f.window {
+        let n = size_value("window", v)?;
+        t.window = u32::try_from(n)
+            .ok()
+            .and_then(|n| Window::new(n).ok())
+            .ok_or_else(|| format!("forward.window = {n}: expected 16KiB to 4MiB"))?;
+    }
+    if let Some(v) = &f.buffer {
+        let n = size_value("buffer", v)?;
+        let (lo, hi) = (MIN_WINDOW as usize, FORWARD_BUDGET / 4);
+        if !(lo..=hi).contains(&n) {
+            return Err(format!("forward.buffer = {n}: expected 16KiB to 16MiB"));
+        }
+        t.buffer = n;
+    }
+    if let Some(v) = &f.open_wait {
+        let d = parse_duration(v).map_err(|e| format!("forward.open_wait: {e}"))?;
+        if d > Duration::from_secs(3600) {
+            return Err("forward.open_wait: expected 0 to 1h".to_string());
+        }
+        t.open_wait = d;
+    }
+    if let Some(v) = &f.linger {
+        let d = parse_duration(v).map_err(|e| format!("forward.linger: {e}"))?;
+        if d > Duration::from_secs(24 * 3600) {
+            return Err("forward.linger: expected 0 to 24h".to_string());
+        }
+        t.linger = d;
+    }
+    Ok(())
 }
 
 fn check_argv(key: &str, argv: &[String]) -> Result<Vec<String>, String> {
@@ -516,7 +857,8 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
         )
         .unwrap();
         let orin = cfg.for_host("orin");
-        assert_eq!(orin.forward, ["-L 5173", "-R 9000"]);
+        let flags: Vec<String> = orin.forward.iter().map(forward_spec::format_flag).collect();
+        assert_eq!(flags, ["-L 5173:localhost:5173", "-R 9000:localhost:9000"]);
         assert_eq!(orin.transport, TransportSetting::Auto);
         assert_eq!(orin.host_label.as_deref(), Some("laptop"));
         assert_eq!(orin.direct_address.as_deref(), Some("orin.example.net"));
@@ -676,5 +1018,201 @@ offline_input.log = ["logger", "-t", "fil"]
     fn a_numeric_buffer_works() {
         let cfg = parse("[defaults.offline_input]\nbuffer = 0").unwrap();
         assert_eq!(cfg.defaults().offline.buffer, 0);
+    }
+
+    fn flags(s: &HostSettings) -> Vec<String> {
+        s.forward.iter().map(forward_spec::format_flag).collect()
+    }
+
+    #[test]
+    fn forward_settings_default_to_nothing_and_to_the_safe_choice() {
+        let d = Config::default().for_host("x");
+        assert!(d.forward.is_empty() && d.agent_keys.is_empty());
+        assert_eq!(d.agent, AgentMode::Off);
+        assert_eq!(d.remote_requests, RemoteRequests::Ask);
+        assert_eq!(d.forward_failure, ForwardFailure::Warn);
+        assert_eq!(d.forward_tunables, ForwardTunables::default());
+        let mux = d.forward_tunables.mux_config();
+        assert_eq!(mux.window, Window::DEFAULT);
+        assert_eq!(mux.linger, LINGER);
+    }
+
+    #[test]
+    fn forward_keys_parse_and_layer_host_over_defaults() {
+        let fp = "SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8";
+        let cfg = parse(&format!(
+            r#"
+[defaults]
+forward = ["-D 1080"]
+agent = "confirm"
+agent_keys = ["{fp}"]
+remote_requests = "deny"
+forward_failure = "exit"
+[host.a]
+forward = ["-L 5173", "-R 9000:db:5432", "-L 192.0.2.1:8080:web:80"]
+agent = "on"
+[host.b]
+remote_requests = "ask"
+"#
+        ))
+        .unwrap();
+        let a = cfg.for_host("a");
+        // A host's list replaces the default list.
+        assert_eq!(
+            flags(&a),
+            [
+                "-L 5173:localhost:5173",
+                "-R 9000:db:5432",
+                "-L 192.0.2.1:8080:web:80"
+            ]
+        );
+        assert_eq!(a.agent, AgentMode::On);
+        assert_eq!(a.agent_keys, [fp]);
+        assert_eq!(a.remote_requests, RemoteRequests::Deny);
+        assert_eq!(a.forward_failure, ForwardFailure::Exit);
+        let b = cfg.for_host("b");
+        assert_eq!(flags(&b), ["-D 1080"]);
+        assert_eq!(b.agent, AgentMode::Confirm);
+        assert_eq!(b.remote_requests, RemoteRequests::Ask);
+    }
+
+    #[test]
+    fn forward_as_a_table_carries_specs_and_tunables_and_merges_by_field() {
+        let cfg = parse(
+            r#"
+[defaults.forward]
+window = "256KiB"
+buffer = "2MiB"
+open_wait = "5s"
+linger = "2m"
+specs = ["-L 80:web:80"]
+[host.a]
+forward = ["-R 9000"]
+[host.b.forward]
+linger = 30
+"#,
+        )
+        .unwrap();
+        let a = cfg.for_host("a");
+        assert_eq!(flags(&a), ["-R 9000:localhost:9000"]);
+        assert_eq!(a.forward_tunables.window.get(), 256 * 1024);
+        assert_eq!(a.forward_tunables.buffer, 2 * 1024 * 1024);
+        assert_eq!(a.forward_tunables.open_wait, Duration::from_secs(5));
+        assert_eq!(a.forward_tunables.linger, Duration::from_secs(120));
+        let b = cfg.for_host("b");
+        assert_eq!(flags(&b), ["-L 80:web:80"]);
+        assert_eq!(b.forward_tunables.linger, Duration::from_secs(30));
+        assert_eq!(b.forward_tunables.window.get(), 256 * 1024);
+    }
+
+    #[test]
+    fn bad_forward_settings_name_the_key_and_never_echo_raw_control_characters() {
+        for (text, needles) in [
+            (
+                r#"[defaults]
+forward = ["-L 5173", "-L 0:h:80"]"#,
+                vec!["[defaults]", "forward[1]", "cannot be 0"],
+            ),
+            (
+                r#"[host.x]
+forward = ["-oProxyCommand=sh"]"#,
+                vec!["[host.x]", "forward[0]", "-L, -R or -D"],
+            ),
+            (
+                r#"[defaults]
+forward = ["-L 1:h:2\u001b[2J"]"#,
+                vec!["forward[0]", "\\u{1b}"],
+            ),
+            (
+                r#"[defaults]
+forward = ["-R *:8080:h:80"]"#,
+                vec!["forward[0]", "OD-7"],
+            ),
+            (
+                "[defaults]\nagent = \"yes\"",
+                vec!["unknown variant", "confirm"],
+            ),
+            (
+                "[defaults]\nagent_keys = [\"MD5:aa:bb\"]",
+                vec!["agent_keys", "SHA256"],
+            ),
+            (
+                "[defaults]\nremote_requests = \"allow\"",
+                vec!["unknown variant", "ask"],
+            ),
+            (
+                "[defaults]\nforward_failure = \"die\"",
+                vec!["unknown variant"],
+            ),
+            (
+                "[defaults.forward]\nwindow = \"1KiB\"",
+                vec!["forward.window", "16KiB"],
+            ),
+            (
+                "[defaults.forward]\nbuffer = \"1GiB\"",
+                vec!["forward.buffer"],
+            ),
+            (
+                "[defaults.forward]\nopen_wait = \"2d\"",
+                vec!["forward.open_wait", "unit"],
+            ),
+            (
+                "[defaults.forward]\nlinger = \"48h\"",
+                vec!["forward.linger"],
+            ),
+            (
+                "[defaults.forward]\nbogus = 1",
+                vec!["unknown field", "bogus"],
+            ),
+        ] {
+            let err = parse(text).expect_err(text);
+            for n in needles {
+                assert!(err.contains(n), "{text:?}: {err:?} lacks {n:?}");
+            }
+            assert!(!err.contains('\u{1b}'), "{err:?}");
+        }
+        let keys = format!(
+            "[defaults]\nagent_keys = [{}]",
+            (0..65)
+                .map(|_| "\"SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8\"")
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse(&keys).unwrap_err().contains("more than 64"));
+        let many = format!(
+            "[defaults]\nforward = [{}]",
+            (1..=65)
+                .map(|p| format!("\"-L {p}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse(&many).unwrap_err().contains("more than 64"));
+    }
+
+    #[test]
+    fn errors_never_carry_a_terminal_escape_whatever_key_they_come_from() {
+        // Serde quotes the file's value in its own words: a title-setting escape, a bidi
+        // override. `predict` is an old key, the others are new.
+        for key in [
+            "predict",
+            "agent",
+            "remote_requests",
+            "forward_failure",
+            "transport",
+        ] {
+            let text = format!("[defaults]\n{key} = \"x\\u001b]0;pwned\\u0007\\u202e\"");
+            let err = parse(&text).expect_err(&text);
+            assert!(
+                err.contains("pwned") && err.contains("\\u{1b}"),
+                "{key}: {err:?}"
+            );
+            assert!(
+                !err.chars().any(|c| c.is_control() && c != '\n') && !err.contains('\u{202e}'),
+                "{key}: {err:?}"
+            );
+        }
+        // A path with an escape in it, too.
+        let e = Config::load(Path::new("/nonexistent/\x1b[2J/c.toml"), true).unwrap_err();
+        assert!(!e.to_string().contains('\x1b'), "{e}");
     }
 }

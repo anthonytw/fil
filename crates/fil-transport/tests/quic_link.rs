@@ -1055,6 +1055,113 @@ async fn the_global_limit_drops_handshakes_from_many_sources() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Finishing channels (`Link::finish`)
+
+#[tokio::test(start_paused = true)]
+async fn finish_delivers_what_was_sent_then_forgets_the_channel() {
+    let mut w = World::new(50);
+    let (client, daemon, _) = w.pair().await;
+    for n in 0..3 {
+        client.send(FWD, seq_payload(n, 100)).await.unwrap();
+    }
+    client.finish(FWD);
+    client.finish(FWD); // idempotent
+    // While the stream is ending, the channel refuses more.
+    let err = client.send(FWD, seq_payload(9, 10)).await.unwrap_err();
+    assert!(
+        matches!(err.0, DownReason::Io(ref m) if m.contains("finished")),
+        "{err:?}"
+    );
+    for n in 0..3 {
+        let (ch, p) = daemon.recv().await.unwrap();
+        assert_eq!((ch, seq_of(&p)), (FWD, n));
+    }
+    sleep(Duration::from_millis(300)).await;
+    // Both ends have let go of it (the client's only writer was the channel).
+    assert_eq!(client.channel_state().writers, 0);
+    assert_eq!(client.channel_state().flush_pending, 0);
+    assert_eq!(daemon.channel_state().inbox_channels, 0);
+    // Fixed channels are never finished.
+    client.finish(TERM);
+    client.send(TERM, seq_payload(1, 10)).await.unwrap();
+    assert_eq!(daemon.recv().await.unwrap().0, TERM);
+    // Once forgotten, a send opens the channel afresh: the peer's link hands it up (the layer
+    // above drops it as a closed channel).
+    client.send(FWD, seq_payload(7, 10)).await.unwrap();
+    let (ch, p) = daemon.recv().await.unwrap();
+    assert_eq!((ch, seq_of(&p)), (FWD, 7));
+    assert!(matches!(client.status().borrow().state, LinkState::Up));
+}
+
+/// A flush covers a channel that was finished and whose stream end the peer has not read yet: it
+/// waits for the marker that ends the stream.
+#[tokio::test(start_paused = true)]
+async fn a_flush_waits_for_a_finished_channels_stream_end() {
+    let mut w = World::new(51);
+    let (client, daemon, _) = w.pair().await;
+    // More than the daemon's per-channel budget, so its reader stops before the stream's end.
+    for n in 0..20 {
+        client.send(FWD, seq_payload(n, 16 * 1024)).await.unwrap();
+    }
+    client.finish(FWD);
+    let flushed = timeout(Duration::from_secs(5), client.flush()).await;
+    assert!(
+        flushed.is_err(),
+        "the flush did not wait for the stream end"
+    );
+    let flush = tokio::spawn({
+        let client = Arc::new(client);
+        let c = client.clone();
+        async move { (c.flush().await, client) }
+    });
+    for n in 0..20 {
+        let (ch, p) = daemon.recv().await.unwrap();
+        assert_eq!((ch, seq_of(&p)), (FWD, n));
+    }
+    let (res, client) = timeout(Duration::from_secs(5), flush)
+        .await
+        .unwrap()
+        .unwrap();
+    res.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(client.channel_state().writers, 0);
+}
+
+/// `flush` puts a marker on the channels that are live now, however many the link has carried.
+#[tokio::test(start_paused = true)]
+async fn flush_cost_does_not_grow_with_the_channels_a_link_has_carried() {
+    let mut w = World::new(52);
+    let (client, daemon, _) = w.pair().await;
+    let reader = tokio::spawn(async move {
+        loop {
+            if daemon.recv().await.is_err() {
+                break;
+            }
+        }
+    });
+    for ch in 0..2000u32 {
+        let ch = ChannelId(1000 + ch);
+        client.send(ch, seq_payload(ch.0, 10)).await.unwrap();
+        client.finish(ch);
+    }
+    for ch in [TERM, FWD, FWD2] {
+        client.send(ch, seq_payload(0, 10)).await.unwrap();
+    }
+    sleep(Duration::from_secs(1)).await;
+    let before = client.channel_state();
+    assert_eq!(before.writers, 3, "{before:?}");
+    timeout(Duration::from_secs(5), client.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    let after = client.channel_state();
+    assert_eq!(after.markers_sent - before.markers_sent, 3, "{after:?}");
+    assert_eq!(after.flush_pending, 0);
+    drop(client);
+    reader.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
 // What the daemon does with a misbehaving (but authenticated) peer
 
 /// An authenticated raw QUIC connection that speaks the stream rules badly.
@@ -1084,62 +1191,105 @@ async fn an_oversized_frame_ends_the_link() {
     assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("protocol violation")));
 }
 
+/// A later stream for a channel is read only once the earlier one has ended and its payloads
+/// were handed up, so the channel's payloads stay in order. A peer that opens two at once stalls
+/// only its own second stream.
 #[tokio::test(start_paused = true)]
-async fn a_second_stream_for_one_channel_ends_the_link() {
+async fn a_later_stream_for_a_channel_is_read_after_the_earlier_one() {
     let mut w = World::new(19);
     let (conn, daemon) = raw_peer(&mut w).await;
-    for _ in 0..2 {
-        let mut s = conn.open_uni().await.unwrap();
-        s.write_all(&[1, 0, 0, 0, 1, 42]).await.unwrap(); // channel 1, one 1-byte frame
-        sleep(Duration::from_millis(100)).await;
-    }
-    let mut ds = daemon.status();
-    let st = wait_for(&mut ds, "daemon Down", is_down).await;
-    assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("second stream")));
+    let mut first = conn.open_uni().await.unwrap();
+    first.write_all(&[16, 0, 0, 0, 1, 42]).await.unwrap(); // channel 16, one 1-byte frame
+    sleep(Duration::from_millis(100)).await;
+    let mut second = conn.open_uni().await.unwrap();
+    second.write_all(&[16, 0, 0, 0, 1, 43]).await.unwrap();
+    second.finish().unwrap();
+    assert_eq!(
+        daemon.recv().await.unwrap(),
+        (FWD, Bytes::from_static(&[42]))
+    );
+    // The second stream waits while the first is open.
+    assert!(
+        timeout(Duration::from_secs(2), daemon.recv())
+            .await
+            .is_err()
+    );
+    first.finish().unwrap();
+    let got = timeout(Duration::from_secs(2), daemon.recv())
+        .await
+        .unwrap();
+    assert_eq!(got.unwrap(), (FWD, Bytes::from_static(&[43])));
+    assert!(matches!(daemon.status().borrow().state, LinkState::Up));
 }
 
-/// Security sweep #3: quinn grants new stream credit as finished streams are freed, so the
-/// concurrent limit alone is no lifetime cap. A peer that finishes its streams used to register
-/// an unbounded number of channels (5,000 in the proof of concept). Now the 1,025th stream of one
-/// link ends it.
+/// The channel id varint of a stream header.
+fn varint(mut v: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    while v >= 0x80 {
+        b.push((v & 0x7f) as u8 | 0x80);
+        v >>= 7;
+    }
+    b.push(v as u8);
+    b
+}
+
+/// Security sweep #3: quinn grants new stream credit as soon as a stream's end has been read, so
+/// a peer that finishes its streams faster than the consumer reads them used to register an
+/// unbounded number of channels (5,000 in the proof of concept); M1 capped streams over the link's
+/// life instead. Now a channel holds its place until `recv` has handed up its payloads: with a
+/// consumer that does not read, the peer runs out of credit, and the daemon holds at most 1,024
+/// channels. Once the consumer reads, everything arrives and the channels go.
 #[tokio::test(start_paused = true)]
-async fn a_peer_that_finishes_its_streams_still_hits_the_lifetime_cap() {
+async fn a_peer_that_finishes_streams_faster_than_they_are_read_waits_for_credit() {
     let mut w = World::new(77);
     let (conn, daemon) = raw_peer(&mut w).await;
-    let mut ds = daemon.status();
-    let mut opened = 0u32;
-    for ch in 0..5000u32 {
-        // Forward channels, never the same id twice; one 1-byte frame each, then finish.
-        let id = 100_000 + ch;
-        let Ok(mut s) = conn.open_uni().await else {
-            break; // the daemon has closed the connection
-        };
-        let mut b = Vec::new();
-        let mut v = id;
-        while v >= 0x80 {
-            b.push((v & 0x7f) as u8 | 0x80);
-            v >>= 7;
+    let opener = tokio::spawn(async move {
+        let mut opened = 0u32;
+        for ch in 0..5000u32 {
+            // Forward channels, never the same id twice; one 1-byte frame each, then finish.
+            let Ok(Ok(mut s)) = timeout(Duration::from_secs(3), conn.open_uni()).await else {
+                break; // no credit
+            };
+            let mut b = varint(100_000 + ch);
+            b.extend_from_slice(&[0, 0, 0, 1, 42]);
+            s.write_all(&b).await.unwrap();
+            s.finish().unwrap();
+            opened += 1;
         }
-        b.push(v as u8);
+        (opened, conn)
+    });
+    let (opened, conn) = opener.await.unwrap();
+    let held = daemon.channel_state().inbox_channels;
+    eprintln!("opened {opened} streams with nothing read; {held} channels registered");
+    assert!(held <= 1024, "{held} channels registered");
+    assert!(
+        (1024..=2048).contains(&opened),
+        "the peer opened {opened} streams with nothing read"
+    );
+    assert!(matches!(daemon.status().borrow().state, LinkState::Up));
+
+    // Reading frees the places: the rest can be opened and all of it arrives.
+    let reader = tokio::spawn(async move {
+        let mut n = 0u32;
+        while n < 5000 {
+            daemon.recv().await.unwrap();
+            n += 1;
+        }
+        daemon
+    });
+    for ch in opened..5000 {
+        let mut s = conn.open_uni().await.unwrap();
+        let mut b = varint(100_000 + ch);
         b.extend_from_slice(&[0, 0, 0, 1, 42]);
-        if s.write_all(&b).await.is_err() || s.finish().is_err() {
-            break;
-        }
-        opened += 1;
-        // Let the daemon take the stream, which is what returns the credit.
-        if opened.is_multiple_of(64) {
-            sleep(Duration::from_millis(100)).await;
-        }
+        s.write_all(&b).await.unwrap();
+        s.finish().unwrap();
     }
-    let st = wait_for(&mut ds, "daemon Down", is_down).await;
-    assert!(
-        matches!(down_reason(&st), DownReason::Io(m) if m.contains("too many streams")),
-        "{st:?}"
-    );
-    assert!(
-        opened <= 1100,
-        "the peer opened {opened} streams before the daemon closed the link"
-    );
+    let daemon = timeout(Duration::from_secs(60), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(daemon.channel_state().inbox_channels, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1187,11 +1337,15 @@ async fn dropping_links_ends_their_tasks() {
     );
 }
 
+/// The case M1 ended the link for (the 1,025th stream over its life) is gone; what is left is
+/// quinn's limit on streams open at once. A side that opens 1,025 channels and finishes none of
+/// them gets no stream for the last: its link goes `Down(Io)` within `dead_after`, and what `send`
+/// accepted for that channel is not reported as delivered by a flush.
 #[tokio::test(start_paused = true)]
-async fn send_fails_instead_of_hanging_when_the_stream_limit_is_spent() {
+async fn a_peer_that_opens_1025_streams_at_once_hits_quinns_limit() {
     let mut w = World::new(41);
     let (client, daemon, _) = w.pair().await;
-    // The peer grants 1,024 streams over the link's life; one tiny payload on each channel.
+    // The daemon grants 1,024 streams at once; one tiny payload on each channel, none finished.
     for ch in 100..100 + 1024u32 {
         client
             .send(ChannelId(ch), Bytes::from_static(b"x"))
@@ -1199,45 +1353,84 @@ async fn send_fails_instead_of_hanging_when_the_stream_limit_is_spent() {
             .unwrap();
     }
     sleep(Duration::from_millis(500)).await;
-    // The next new channel cannot get a stream. Its first sends queue; then `send` reports it.
     let t0 = Instant::now();
-    let mut failed = None;
-    for _ in 0..40 {
-        match timeout(
-            Duration::from_secs(20),
-            client.send(ChannelId(5000), Bytes::from_static(b"y")),
-        )
+    // The next channel's send is accepted (its queue has room), but it gets no stream.
+    client
+        .send(ChannelId(5000), Bytes::from_static(b"y"))
         .await
-        .expect("send must not hang")
-        {
-            Ok(()) => {}
-            Err(e) => {
-                failed = Some(e);
-                break;
-            }
-        }
-    }
-    let err = failed.expect("an error once the queue in front of the stuck channel filled");
+        .unwrap();
+    let flushed = timeout(Duration::from_secs(20), client.flush())
+        .await
+        .expect("flush must not hang");
     assert!(
-        matches!(err.0, DownReason::Io(ref m) if m.contains("channel 5000")),
-        "{err:?}"
+        flushed.is_err(),
+        "a flush reported the stuck payload as sent"
+    );
+    let mut cs = client.status();
+    let st = wait_for(&mut cs, "client Down", is_down).await;
+    assert!(
+        matches!(down_reason(&st), DownReason::Io(ref m) if m.contains("no stream credit")),
+        "{st:?}"
     );
     assert!(
-        t0.elapsed() <= Duration::from_secs(10),
+        t0.elapsed() <= w.params.dead_after + Duration::from_secs(1),
         "{:?}",
         t0.elapsed()
     );
-    // The link itself is fine, and the channels that did get a stream still work.
-    assert!(matches!(client.status().borrow().state, LinkState::Up));
-    client
-        .send(ChannelId(100), Bytes::from_static(b"z"))
-        .await
-        .unwrap();
+    // The daemon still hands up what reached it, and then sees the close.
     let mut n = 0;
-    while n < 1025 {
-        daemon.recv().await.unwrap();
+    while daemon.recv().await.is_ok() {
         n += 1;
     }
+    assert_eq!(n, 1024);
+}
+
+/// A side whose peer grants it few streams (a quinn config from the test hooks) and that runs out
+/// of credit goes `Down`: it never answers `Ok` for a payload it then drops.
+#[tokio::test(start_paused = true)]
+async fn starved_stream_credit_takes_the_link_down_instead_of_dropping_payloads() {
+    let mut w = World::new(43);
+    let ep = w.client_endpoint();
+    let key = ClientKey::generate().unwrap();
+    w.registry.register(key.public_key().clone());
+    // The raw client grants the daemon 4 streams at once and reads none of them.
+    let cfg = quic::client_config_with_stream_limit(w.pin(), &key, &w.params, 4).unwrap();
+    let conn = ep
+        .connect_with(cfg, w.server, fil_transport::auth::SERVER_NAME)
+        .unwrap()
+        .await
+        .unwrap();
+    let daemon = w.listener.accept().await.unwrap();
+    // Control (the accept proof) holds one stream; three more channels get theirs.
+    for ch in [TERM, FWD, FWD2] {
+        daemon.send(ch, Bytes::from_static(b"x")).await.unwrap();
+    }
+    let t0 = Instant::now();
+    // The fifth stream gets no credit. The send is accepted...
+    daemon
+        .send(ChannelId(18), Bytes::from_static(b"lost?"))
+        .await
+        .unwrap();
+    // ...and the link goes down instead of keeping quiet about it.
+    let mut ds = daemon.status();
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(
+        matches!(down_reason(&st), DownReason::Io(ref m) if m.contains("no stream credit")),
+        "{st:?}"
+    );
+    assert!(
+        t0.elapsed() <= w.params.dead_after + Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert!(daemon.flush().await.is_err());
+    assert!(
+        daemon
+            .send(ChannelId(18), Bytes::from_static(b"z"))
+            .await
+            .is_err()
+    );
+    drop(conn);
 }
 
 /// The stream bytes of one channel carrying `frames` frames of 16 KiB.
@@ -1591,18 +1784,18 @@ async fn flush_fails_when_a_channels_writer_gave_up_on_payloads_it_had_accepted(
         .await
         .unwrap();
     // The flush must not report that the stuck payload left, and must not sit there until the
-    // caller gives up: it ends when the writer does (after `dead_after`).
+    // caller gives up: the writer takes the link down after `dead_after` without a stream.
     let t0 = Instant::now();
     let err = timeout(Duration::from_secs(60), client.flush())
         .await
         .expect("the flush ended on its own")
         .unwrap_err();
     assert!(
-        matches!(err.0, DownReason::Io(ref m) if m.contains("lost")),
+        matches!(err.0, DownReason::Io(ref m) if m.contains("no stream credit")),
         "{err:?}"
     );
     assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
-    // From then on a flush fails at once.
+    // The link is down, so a flush fails at once.
     assert!(client.flush().await.is_err());
 }
 

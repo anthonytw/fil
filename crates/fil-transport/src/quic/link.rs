@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -10,10 +10,9 @@ use bytes::Bytes;
 use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::{ChannelClass, ChannelId, ControlMsg};
 use quinn::{Connection, ConnectionError, Endpoint, RecvStream, WriteError};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc, watch};
 use tokio::time::Instant;
 
-use super::MAX_STREAMS;
 use super::inbox::{Closed, Inbox};
 use super::wire::{
     self, Chunks, Frame, MAX_VARINT_LEN, READ_MAX, VarintReader, parse_prefix, put_varint,
@@ -37,6 +36,16 @@ const WRITE_QUEUE: usize = 8;
 /// Payloads up to this size are copied into one buffer with their length prefix before they are
 /// written; larger ones are handed to quinn as they are.
 const COPY_BELOW: usize = 2048;
+
+/// A channel's place in [`Io::writers`].
+enum Writer {
+    /// The queue in front of the channel's stream.
+    Live(mpsc::Sender<Item>),
+    /// [`Link::finish`] was called. The writer is sending what was queued, then the flush marker
+    /// with this id and the stream's end, and it removes this entry once the peer has read the
+    /// marker. Until then `send` on the channel fails.
+    Finishing(u32),
+}
 
 /// What waits in front of a channel's stream.
 enum Item {
@@ -109,16 +118,14 @@ struct Io {
     /// How long opening a stream may wait for stream credit before `send` gives up.
     open_timeout: Duration,
     inbox: Inbox,
-    writers: Mutex<HashMap<ChannelId, mpsc::Sender<Item>>>,
+    /// The channels this side sends on and has not finished, and the finished ones whose stream
+    /// end the peer has not read yet. Nothing else: a finished channel is forgotten.
+    writers: Mutex<HashMap<ChannelId, Writer>>,
     /// Flush markers sent and not yet acknowledged by the peer.
     flush_pending: Mutex<HashSet<u32>>,
     /// Signalled when an acknowledgement arrives.
     flush_acked: Notify,
     next_flush: AtomicU32,
-    /// Set when a channel's writer gave up with payloads `send` had accepted (no stream could be
-    /// opened). The payloads are lost, so no flush can honestly say everything left: from then
-    /// on every flush fails.
-    lost_payloads: AtomicBool,
     /// True once any frame from the peer has arrived.
     got_frame: watch::Sender<bool>,
     /// The text of the error that ended the connection, for `Refused` messages.
@@ -141,25 +148,57 @@ impl Io {
         self.conn.close(code::PROTOCOL, what.as_bytes());
     }
 
-    /// The queue in front of `channel`'s stream; starts the stream's writer on first use.
+    fn writers(&self) -> std::sync::MutexGuard<'_, HashMap<ChannelId, Writer>> {
+        self.writers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The queue in front of `channel`'s stream; starts the stream's writer on first use. Fails
+    /// while a finished channel's stream is still ending.
     fn writer_for(self: &Arc<Self>, channel: ChannelId) -> Result<mpsc::Sender<Item>, LinkError> {
         if self.inbox.down_reason().is_some() {
             return Err(self.down_error());
         }
-        let mut writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tx) = writers.get(&channel) {
-            return Ok(tx.clone());
+        let mut writers = self.writers();
+        match writers.get(&channel) {
+            Some(Writer::Live(tx)) => return Ok(tx.clone()),
+            Some(Writer::Finishing(_)) => {
+                return Err(LinkError(DownReason::Io(format!(
+                    "channel {} was finished",
+                    channel.0
+                ))));
+            }
+            None => {}
         }
         let (tx, rx) = mpsc::channel(WRITE_QUEUE);
         tokio::spawn(write_stream(self.clone(), channel, rx));
-        writers.insert(channel, tx.clone());
+        writers.insert(channel, Writer::Live(tx.clone()));
         Ok(tx)
     }
 
-    fn lost_error(&self) -> LinkError {
-        LinkError(DownReason::Io(
-            "payloads were lost: a channel's stream could not be opened".into(),
-        ))
+    /// A new flush marker id, registered as waiting for its acknowledgement. Never 0 (the accept
+    /// proof's nonce), also after the counter wraps.
+    fn new_marker(&self) -> u32 {
+        let id = loop {
+            let id = self.next_flush.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                break id;
+            }
+        };
+        self.pending().insert(id);
+        id
+    }
+
+    /// No stream could be opened within `open_timeout`: the peer is not granting stream credit.
+    /// What `send` accepted on the channel cannot leave, so the link goes down rather than drop
+    /// it; the layer above resends it on the next link.
+    fn no_stream_credit(&self, channel: ChannelId) {
+        tracing::warn!(
+            channel = channel.0,
+            "QUIC link: no stream credit from the peer"
+        );
+        self.inbox
+            .close(DownReason::Io("no stream credit".to_string()));
+        self.conn.close(code::CLOSED, b"no stream credit");
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
@@ -182,9 +221,6 @@ impl Io {
             }
             if self.inbox.down_reason().is_some() {
                 return Err(self.down_error());
-            }
-            if self.lost_payloads.load(Ordering::SeqCst) {
-                return Err(self.lost_error());
             }
             tokio::select! {
                 () = &mut acked => {}
@@ -299,7 +335,6 @@ impl QuicLink {
             flush_pending: Mutex::new(HashSet::new()),
             flush_acked: Notify::new(),
             next_flush: AtomicU32::new(1),
-            lost_payloads: AtomicBool::new(false),
             got_frame: watch::Sender::new(false),
             last_error: OnceLock::new(),
             ticks: std::sync::atomic::AtomicU64::new(0),
@@ -364,6 +399,18 @@ impl QuicLink {
         self.io.ticks.load(Ordering::Relaxed)
     }
 
+    /// What the link holds per channel (feature `test-hooks`), which tests of channel churn keep
+    /// bounded by the channels that are open.
+    #[cfg(feature = "test-hooks")]
+    pub fn channel_state(&self) -> super::ChannelState {
+        super::ChannelState {
+            writers: self.io.writers().len(),
+            inbox_channels: self.io.inbox.channels(),
+            flush_pending: self.io.pending().len(),
+            markers_sent: self.io.next_flush.load(Ordering::Relaxed).wrapping_sub(1),
+        }
+    }
+
     /// Closes the link because the client's key was revoked. The client sees `Down(Closed)`.
     pub(super) fn close_revoked(conn: &Connection) {
         conn.close(code::REVOKED, b"key revoked");
@@ -391,18 +438,11 @@ impl Link for QuicLink {
             ))));
         }
         let tx = self.io.writer_for(channel)?;
-        tx.send(Item::Payload(payload)).await.map_err(|_| {
-            if self.io.inbox.down_reason().is_some() {
-                self.io.down_error()
-            } else {
-                // The writer gave up because no stream could be opened (the peer's limit on
-                // streams is spent, see `MAX_STREAMS`). The link itself is fine.
-                LinkError(DownReason::Io(format!(
-                    "cannot open a stream for channel {}",
-                    channel.0
-                )))
-            }
-        })
+        // The writer ends only with the connection (or after a `finish`, which has dropped the
+        // queue's sender, so a send that got it before then still has its payload delivered).
+        tx.send(Item::Payload(payload))
+            .await
+            .map_err(|_| self.io.down_error())
     }
 
     async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError> {
@@ -420,44 +460,51 @@ impl Link for QuicLink {
         if self.io.inbox.down_reason().is_some() {
             return Err(self.io.down_error());
         }
-        if self.io.lost_payloads.load(Ordering::SeqCst) {
-            return Err(self.io.lost_error());
+        // Markers go to the channels that have a writer, not to every channel ever used. A
+        // finished channel's stream already ends in a marker of its own: wait for that one.
+        let mut live = Vec::new();
+        let mut ending = Vec::new();
+        for w in self.io.writers().values() {
+            match w {
+                Writer::Live(tx) => live.push(tx.clone()),
+                Writer::Finishing(id) => ending.push(*id),
+            }
         }
-        let writers: Vec<mpsc::Sender<Item>> = self
-            .io
-            .writers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        let mut ids = PendingIds(&self.io, Vec::new());
+        let mut ids = PendingIds(&self.io, Vec::with_capacity(live.len()));
         let mut down = self.io.inbox.subscribe_down();
-        for tx in writers {
-            // Ids are never 0 (the accept proof's nonce), also after the counter wraps.
-            let id = loop {
-                let id = self.io.next_flush.fetch_add(1, Ordering::Relaxed);
-                if id != 0 {
-                    break id;
-                }
-            };
-            self.io.pending().insert(id);
+        for tx in live {
+            let id = self.io.new_marker();
             ids.1.push(id);
             let queued = tokio::select! {
                 sent = tx.send(Item::Flush(id)) => sent.is_ok(),
                 _ = down.wait_for(|d| *d) => false,
             };
             if !queued {
-                return Err(if self.io.inbox.down_reason().is_some() {
-                    self.io.down_error()
-                } else {
-                    // The channel's writer is gone (it gave up opening a stream): what was sent
-                    // on it is lost, which a flush must not report as done.
-                    self.io.lost_error()
-                });
+                // A writer's queue closes only with the connection.
+                return Err(self.io.down_error());
             }
         }
-        self.io.wait_acked(&ids.1).await
+        // The finishing writers own their markers' entries; this flush only waits for them.
+        let mut all = ids.1.clone();
+        all.extend(ending);
+        self.io.wait_acked(&all).await
+    }
+
+    /// Drops the channel's queue: the writer sends what is in it, a flush marker and the stream's
+    /// end, and forgets the channel once the peer has read the marker. quinn then gives the peer
+    /// back the stream, so a link carries any number of channels over its life.
+    fn finish(&self, channel: ChannelId) {
+        if channel.0 < ChannelId::FORWARD_BASE {
+            return;
+        }
+        let mut writers = self.io.writers();
+        if let Some(w) = writers.get_mut(&channel)
+            && matches!(w, Writer::Live(_))
+        {
+            // Replacing the entry drops the map's sender. The writer sees its queue end once the
+            // sends already holding a sender have queued their payloads.
+            *w = Writer::Finishing(self.io.new_marker());
+        }
     }
 
     fn status(&self) -> watch::Receiver<LinkStatus> {
@@ -475,7 +522,11 @@ impl Link for QuicLink {
 
 /// One channel's outgoing stream: opened with the first payload, then a stream of length-prefixed
 /// payloads. Ends when the connection does (a link that is dropped or dies must not leave its
-/// writers behind), and when no stream can be opened.
+/// writers behind), or after a [`Link::finish`]: then it writes what was queued, a flush marker
+/// and the stream's end, waits for the peer to read the marker, and removes its entry.
+///
+/// A stream that cannot be opened within `open_timeout` (the peer grants no stream credit) takes
+/// the link down: payloads `send` accepted are never dropped on a link that stays up.
 async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<Item>) {
     /// The next payload to write, or `None` when the queue's senders are gone or the connection
     /// has ended.
@@ -487,23 +538,18 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
     }
 
     let Some(first) = next(&io, &mut rx).await else {
+        // Finished before anything was queued (or the connection ended): no stream to end.
+        forget_writer(&io, channel);
         return;
     };
     let opened = tokio::select! {
         r = tokio::time::timeout(io.open_timeout, io.conn.open_uni()) => r,
         _ = io.conn.closed() => return, // `supervise` reports why
     };
-    let Ok(Ok(mut stream)) = opened else {
-        // The peer's stream limit is spent (or the connection just ended). Forget this writer,
-        // which fails the senders waiting on it; the link stays up. What `send` accepted on this
-        // channel is lost: flushes fail from now on, and the ones waiting are woken.
-        io.lost_payloads.store(true, Ordering::SeqCst);
-        io.flush_acked.notify_waiters();
-        io.writers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&channel);
-        return;
+    let mut stream = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) => return, // the connection ended; `supervise` reports why
+        Err(_) => return io.no_stream_credit(channel),
     };
     let _ = stream.set_priority(priority(channel));
     let mut header = Vec::with_capacity(MAX_VARINT_LEN);
@@ -515,7 +561,9 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
             Some(p) => p,
             None => match next(&io, &mut rx).await {
                 Some(p) => p,
-                None => return,
+                None if io.conn.close_reason().is_some() => return,
+                // Every sender is gone: the channel was finished.
+                None => break,
             },
         };
         let res = match item {
@@ -538,40 +586,80 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
                     None => stream.write_all_chunks(&mut [prefix, payload]).await,
                 }
             }
-            Item::Flush(id) => {
-                let marker = Bytes::copy_from_slice(&wire::flush_marker(id));
-                match header.take() {
-                    Some(h) => stream.write_all_chunks(&mut [h, marker]).await,
-                    None => stream.write_all_chunks(&mut [marker]).await,
-                }
-            }
+            Item::Flush(id) => write_marker(&mut stream, &mut header, id).await,
         };
-        match res {
-            Ok(()) => {}
-            Err(WriteError::Stopped(_)) => {
-                io.violation("peer stopped a stream we write");
-                return;
-            }
-            Err(_) => return,
+        if !wrote(&io, res) {
+            return;
         }
+    }
+
+    // Finished. The stream ends with a marker, so this side knows when the peer's link has read
+    // everything on it (quinn would only say that its QUIC stack acknowledged it), and only then
+    // forgets the channel: a `flush` meanwhile waits for the same marker.
+    let marker = match io.writers().get(&channel) {
+        Some(Writer::Finishing(id)) => *id,
+        _ => return, // cannot happen: only `finish` drops the map's sender
+    };
+    let res = write_marker(&mut stream, &mut header, marker).await;
+    if !wrote(&io, res) {
+        return;
+    }
+    let _ = stream.finish();
+    drop(stream);
+    let _ = io.wait_acked(&[marker]).await;
+    forget_writer(&io, channel);
+}
+
+/// Writes flush marker `id`, behind the stream header if nothing was written yet.
+async fn write_marker(
+    stream: &mut quinn::SendStream,
+    header: &mut Option<Bytes>,
+    id: u32,
+) -> Result<(), WriteError> {
+    let marker = Bytes::copy_from_slice(&wire::flush_marker(id));
+    match header.take() {
+        Some(h) => stream.write_all_chunks(&mut [h, marker]).await,
+        None => stream.write_all_chunks(&mut [marker]).await,
+    }
+}
+
+/// Whether a write went through; a peer that stops a stream we write breaks the stream rules.
+fn wrote(io: &Io, res: Result<(), WriteError>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(WriteError::Stopped(_)) => {
+            io.violation("peer stopped a stream we write");
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Removes a finished channel's writer and its marker (a marker the peer never answered, when the
+/// link went down first, would otherwise stay pending).
+fn forget_writer(io: &Io, channel: ChannelId) {
+    let mut writers = io.writers();
+    if let Some(Writer::Finishing(id)) = writers.get(&channel) {
+        io.pending().remove(id);
+        writers.remove(&channel);
+        // A flush waiting for the marker is done with it either way.
+        io.flush_acked.notify_waiters();
     }
 }
 
 /// Accepts the peer's streams and starts a reader for each.
 ///
-/// A peer may open [`MAX_STREAMS`] streams over the life of the link. quinn only limits how many
-/// are open at once and hands out new credit as streams finish, so the lifetime cap is counted
-/// here: a peer that finishes its streams would otherwise register an unbounded number of
-/// channels in the inbox (security sweep #3).
+/// quinn limits the streams open at once (`MAX_STREAMS`) and grants the peer a new one as soon as
+/// a reader has read a stream's end. A stream is accepted only once the inbox has a place for its
+/// channel, and that place is given back when `recv` has handed up the channel's last payload, so
+/// a peer that finishes streams faster than the consumer reads them waits for credit instead of
+/// registering channels without bound (security sweep #3).
 async fn accept_streams(io: Arc<Io>) {
-    let mut accepted: u32 = 0;
-    while let Ok(stream) = io.conn.accept_uni().await {
-        accepted += 1;
-        if accepted > MAX_STREAMS {
-            io.violation("too many streams");
+    while let Some(slot) = io.inbox.slot().await {
+        let Ok(stream) = io.conn.accept_uni().await else {
             return;
-        }
-        tokio::spawn(read_stream(io.clone(), stream));
+        };
+        tokio::spawn(read_stream(io.clone(), stream, slot));
     }
 }
 
@@ -615,7 +703,7 @@ async fn payload(stream: &mut RecvStream, chunks: &mut Chunks, len: usize) -> Re
     }
 }
 
-async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
+async fn read_stream(io: Arc<Io>, mut stream: RecvStream, slot: OwnedSemaphorePermit) {
     let mut chunks = Chunks::default();
     // The channel id.
     let mut varint = VarintReader::default();
@@ -630,12 +718,12 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             Err(_) => return io.violation("bad channel id"),
         }
     };
-    let Some(wake) = io.inbox.register(channel) else {
-        if io.inbox.down_reason().is_none() {
-            io.violation("second stream for one channel");
-        }
-        return;
+    let Some(wake) = io.inbox.register(channel, slot).await else {
+        return; // the link is down
     };
+    // However the stream ends, the channel is deregistered once its payloads are handed up. A
+    // reset stream leaves a hole in the channel, which the layer above finds by its offsets.
+    let _end = EndOnDrop(&io.inbox, channel);
     // Only a client expects the daemon's accept frame; a daemon passes up whatever the client's
     // first control frame is.
     let mut proof_pending = io.role == Role::Client && channel == ChannelId::CONTROL;
@@ -643,7 +731,7 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
         let mut prefix = [0u8; 4];
         match fill(&mut stream, &mut chunks, &mut prefix).await {
             Ok(()) => {}
-            Err(Short::Finished(0)) => return, // the peer finished this channel
+            Err(Short::Finished(0)) => return, // the peer finished this channel (`_end`)
             Err(Short::Finished(_)) => return io.violation("truncated frame"),
             Err(Short::Error) => return,
         }
@@ -699,6 +787,15 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
         {
             return;
         }
+    }
+}
+
+/// Ends a reader's channel in the inbox when the reader returns.
+struct EndOnDrop<'a>(&'a Inbox, ChannelId);
+
+impl Drop for EndOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.end(self.1);
     }
 }
 

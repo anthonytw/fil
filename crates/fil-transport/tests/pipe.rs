@@ -243,6 +243,57 @@ async fn a_full_forward_channel_never_blocks_terminal_or_control() {
     assert_eq!(forward_offsets, want);
 }
 
+/// `finish` on the pipe: what was accepted still goes out in order, the channel refuses more
+/// until it has, and then its counters are gone; a flush is not held back by it.
+#[tokio::test(start_paused = true)]
+async fn finish_sends_what_was_accepted_then_forgets_the_channel() {
+    let forever = LinkParams {
+        degraded_after: Duration::from_secs(3600),
+        dead_after: Duration::from_secs(7200),
+        ..LinkParams::default()
+    };
+    let mk = || PipeConfig::new(forever);
+    let (a, b, ctl) = pair(StreamConfig::default(), mk(), mk()).await;
+    let fwd = ChannelId(16);
+    ctl.stall();
+    // Enough that some of it is still queued while the stream is stalled.
+    for i in 0..12u64 {
+        a.send(fwd, data(i * 16384, 7, 16384)).await.unwrap();
+    }
+    a.finish(fwd);
+    a.finish(fwd); // idempotent
+    let err = a.send(fwd, data(0, 1, 1)).await.unwrap_err();
+    assert!(
+        matches!(err.0, DownReason::Io(ref m) if m.contains("finished")),
+        "{err:?}"
+    );
+    // Fixed channels are never finished.
+    a.finish(ChannelId::TERMINAL);
+    a.send(ChannelId::TERMINAL, data(0, 2, 1)).await.unwrap();
+    assert_eq!(a.channel_state().counted, 2);
+    ctl.release();
+    timeout(Duration::from_secs(5), a.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    // All 12 arrive in order (the terminal frame among them, wherever the scheduler put it).
+    let mut seen = 0u64;
+    while seen < 12 {
+        let (ch, p) = b.recv().await.unwrap();
+        if ch == fwd {
+            assert_eq!(DataSegment::parse(&p).unwrap().seq, seen * 16384);
+            seen += 1;
+        }
+    }
+    // Only the terminal is counted now; once forgotten, the channel can be sent on afresh.
+    assert_eq!(a.channel_state().counted, 1);
+    a.send(fwd, data(0, 3, 1)).await.unwrap();
+    // A channel finished with everything written goes at once.
+    a.flush().await.unwrap();
+    a.finish(fwd);
+    assert_eq!(a.channel_state().counted, 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn oversize_payloads_take_the_link_down() {
     let (a, b, _) = pair(StreamConfig::default(), cfg(), cfg()).await;

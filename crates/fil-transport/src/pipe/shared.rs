@@ -22,17 +22,56 @@ struct Queues {
     held: Option<Frame>,
     /// Frames queued per channel (user frames and internal heartbeats alike), for the bound.
     queued: HashMap<ChannelId, usize>,
-    /// Per channel: frames accepted by `try_enqueue`, frames taken by the driver, and frames the
-    /// driver knows have been written and flushed. A channel's frames leave in the order they
-    /// were accepted, so comparing counts per channel is exact even though the scheduler mixes
-    /// channels.
-    sent: HashMap<ChannelId, u64>,
-    popped: HashMap<ChannelId, u64>,
-    written: HashMap<ChannelId, u64>,
+    /// Per channel: what `flush` compares. Holds the channels in use and the finished ones whose
+    /// frames have not all been written; a finished channel is forgotten once they have.
+    counts: HashMap<ChannelId, Counts>,
+    /// The channels with frames taken since the last `mark_written`, so that marking costs what
+    /// was written, not every channel in `counts`.
+    dirty: Vec<ChannelId>,
+    /// The next [`Counts::life`].
+    next_life: u64,
+    /// Entries `mark_written` has looked at, over the link's life (a cost a test bounds).
+    marked: u64,
 }
 
-/// What a `flush` waits for: per channel, how many frames must have been written.
-pub(super) struct FlushTarget(Vec<(ChannelId, u64)>);
+/// One channel's frame counts: accepted by `try_enqueue`, taken by the driver, and known to be
+/// written and flushed. A channel's frames leave in the order they were accepted, so comparing
+/// counts per channel is exact even though the scheduler mixes channels.
+struct Counts {
+    /// Tells this use of the channel from one after it was forgotten, whose counts start again
+    /// at 0: a flush target taken before is met (everything of the old use was written).
+    life: u64,
+    sent: u64,
+    popped: u64,
+    written: u64,
+    /// `finish` was called: new frames are refused, and the entry goes once all are written.
+    finished: bool,
+}
+
+/// What a `flush` waits for: per channel (and use of it), how many frames must have been written.
+pub(super) struct FlushTarget(Vec<(ChannelId, u64, u64)>);
+
+/// Why `try_enqueue` did not take a frame.
+pub(super) enum Refused {
+    /// The channel's queue is full; here is the frame back.
+    Full(Frame),
+    /// The channel was finished and its frames are still being written.
+    Finished,
+}
+
+/// What a pipe link holds per channel (feature `test-hooks`; `PipeLink::channel_state`).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelState {
+    /// Channels with frame counts (in use, or finished with frames not yet written).
+    pub counted: usize,
+    /// Channels with frames queued.
+    pub queued: usize,
+    /// Channels taken from since the last write was marked.
+    pub dirty: usize,
+    /// Channel entries looked at by marking writes, over the link's life.
+    pub marked: u64,
+}
 
 /// Payloads received and not yet taken by `recv`.
 #[derive(Default)]
@@ -80,9 +119,10 @@ impl Shared {
                 sched: Scheduler::with_forward_share(cfg.forward_share),
                 held: None,
                 queued: HashMap::new(),
-                sent: HashMap::new(),
-                popped: HashMap::new(),
-                written: HashMap::new(),
+                counts: HashMap::new(),
+                dirty: Vec::new(),
+                next_life: 0,
+                marked: 0,
             }),
             inbound: Mutex::new(Inbound::default()),
             inbound_ready: Notify::new(),
@@ -112,19 +152,51 @@ impl Shared {
         }
     }
 
-    /// Queues `frame` if its channel's queue has room. Returns the frame back when it is full.
-    pub fn try_enqueue(&self, frame: Frame) -> Result<(), Frame> {
+    /// Queues `frame` if its channel's queue has room and the channel is not being finished.
+    pub fn try_enqueue(&self, frame: Frame) -> Result<(), Refused> {
         let mut q = self.queues();
+        let q = &mut *q;
+        if q.counts.get(&frame.channel).is_some_and(|c| c.finished) {
+            return Err(Refused::Finished);
+        }
         let n = q.queued.entry(frame.channel).or_insert(0);
         if *n >= self.limit(frame.channel) {
-            return Err(frame);
+            return Err(Refused::Full(frame));
         }
         *n += 1;
-        *q.sent.entry(frame.channel).or_insert(0) += 1;
+        let life = &mut q.next_life;
+        q.counts
+            .entry(frame.channel)
+            .or_insert_with(|| {
+                *life += 1;
+                Counts {
+                    life: *life,
+                    sent: 0,
+                    popped: 0,
+                    written: 0,
+                    finished: false,
+                }
+            })
+            .sent += 1;
         q.sched.push(frame);
-        drop(q);
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// `Link::finish`: refuses new frames on `channel` and forgets it once its frames are
+    /// written (at once if they are). Fixed channels are never finished.
+    pub fn finish(&self, channel: ChannelId) {
+        if channel.0 < ChannelId::FORWARD_BASE {
+            return;
+        }
+        let mut q = self.queues();
+        if let Some(c) = q.counts.get_mut(&channel) {
+            if c.written == c.sent {
+                q.counts.remove(&channel);
+            } else {
+                c.finished = true;
+            }
+        }
     }
 
     fn inbound(&self) -> MutexGuard<'_, Inbound> {
@@ -170,7 +242,8 @@ impl Shared {
     /// the writer allows, however large the scheduler's next frame is. Control frames are small
     /// and always fit.
     pub fn pop_fit(&self, room: Option<usize>) -> Option<Frame> {
-        let mut q = self.queues();
+        let mut guard = self.queues();
+        let q = &mut *guard;
         let control_waits = q.queued.get(&ChannelId::CONTROL).is_some_and(|n| *n > 0);
         // A control frame goes first even if another frame is being held back (the scheduler
         // returns it first); otherwise the held frame is next.
@@ -190,24 +263,40 @@ impl Shared {
             q.held = Some(frame);
             return None;
         }
-        *q.popped.entry(frame.channel).or_insert(0) += 1;
+        if let Some(c) = q.counts.get_mut(&frame.channel) {
+            // The first frame taken since the last mark makes the channel dirty.
+            if c.popped == c.written {
+                q.dirty.push(frame.channel);
+            }
+            c.popped += 1;
+        }
         if let Some(n) = q.queued.get_mut(&frame.channel) {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 q.queued.remove(&frame.channel);
             }
         }
-        drop(q);
+        drop(guard);
         self.space.notify_waiters();
         Some(frame)
     }
 
-    /// The driver has written and flushed everything it has taken from the queues so far.
+    /// The driver has written and flushed everything it has taken from the queues so far. Looks
+    /// only at the channels taken from since the last call, and forgets the finished ones whose
+    /// frames are now all written.
     pub fn mark_written(&self) {
         let mut q = self.queues();
-        let popped = q.popped.clone();
-        q.written = popped;
-        drop(q);
+        let q = &mut *q;
+        q.marked += q.dirty.len() as u64;
+        for channel in q.dirty.drain(..) {
+            let Some(c) = q.counts.get_mut(&channel) else {
+                continue;
+            };
+            c.written = c.popped;
+            if c.finished && c.written == c.sent {
+                q.counts.remove(&channel);
+            }
+        }
         self.flushed.notify_waiters();
     }
 
@@ -215,21 +304,34 @@ impl Shared {
     pub fn flush_target(&self) -> FlushTarget {
         let q = self.queues();
         FlushTarget(
-            q.sent
+            q.counts
                 .iter()
-                .filter(|(c, n)| q.written.get(c).copied().unwrap_or(0) < **n)
-                .map(|(c, n)| (*c, *n))
+                .filter(|(_, c)| c.written < c.sent)
+                .map(|(ch, c)| (*ch, c.life, c.sent))
                 .collect(),
         )
     }
 
-    /// Whether every frame in `target` has been written.
+    /// Whether every frame in `target` has been written. A channel forgotten since (or
+    /// forgotten and used again) had all of them written.
     pub fn is_written(&self, target: &FlushTarget) -> bool {
         let q = self.queues();
-        target
-            .0
-            .iter()
-            .all(|(c, n)| q.written.get(c).copied().unwrap_or(0) >= *n)
+        target.0.iter().all(|(ch, life, n)| match q.counts.get(ch) {
+            Some(c) if c.life == *life => c.written >= *n,
+            _ => true,
+        })
+    }
+
+    /// What the link holds per channel (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn channel_state(&self) -> ChannelState {
+        let q = self.queues();
+        ChannelState {
+            counted: q.counts.len(),
+            queued: q.queued.len(),
+            dirty: q.dirty.len(),
+            marked: q.marked,
+        }
     }
 
     /// Registers a `flush` for as long as the guard lives, and wakes the driver.

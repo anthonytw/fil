@@ -21,17 +21,21 @@
 //!   stream's flow control, and on the receiving side a channel with `inbox::CHANNEL_BUDGET`
 //!   unread bytes stops being read, which stops only that stream. Unread data is also capped for
 //!   the connection as a whole (`inbox::CONNECTION_BUDGET`).
-//! - **Streams are one-shot:** a channel's stream lives as long as the link. A peer may open
-//!   [`MAX_STREAMS`] of them (1,024) over the link's whole life; after that `send` on a new
-//!   channel fails with an `Io` error after `dead_after` instead of hanging. Channel close
-//!   (finishing a stream and freeing its slot) belongs to M2, with forwarded connections.
-//!   (M2 note: up to 8 payloads `send` already accepted on such a channel are dropped when its
-//!   writer gives up.)
+//! - **Streams end with their channel:** [`Link::finish`](crate::Link::finish) makes the
+//!   channel's writer send what is queued, a flush marker and the stream's end; it forgets the
+//!   channel once the peer's reader has read the marker. The peer's reader, at the stream's end,
+//!   has its channel deregistered once `recv` has handed up its payloads, and a later stream for
+//!   the same channel is read after that. quinn gives a stream back as it ends, so a link
+//!   carries any number of channels over its life; at most [`MAX_STREAMS`] (1,024) are open at
+//!   once in each direction, and the inbox registers no more channels than that. A stream that
+//!   gets no credit within `dead_after` takes the link `Down(Io)`: what `send` accepted is never
+//!   dropped on a link that stays up, and the layer above resends it on the next link.
 //! - **Flush:** [`Link::flush`] puts a marker (a zero-length frame and an id) behind everything
-//!   sent on each channel's stream. The peer's reader answers each marker, on the control
-//!   channel, once it has read everything before it, and the flush resolves when all are
-//!   answered. quinn reports a stream's acknowledgements only when the stream is finished, and
-//!   these streams live as long as the link.
+//!   sent on each live channel's stream (a finished channel's stream already ends in one, which
+//!   the flush waits for). The peer's reader answers each marker, on the control channel, once
+//!   it has read everything before it, and the flush resolves when all are answered. quinn
+//!   reports a stream's acknowledgements only when the stream is finished, and only from its
+//!   own stack: a marker says the peer's link has the payloads.
 //! - **Order across channels:** none from QUIC. `recv` hands out control first, then interactive
 //!   payloads in arrival order, with forwards guaranteed a share of what has already arrived.
 //!   On the wire forwards and interactive channels take turns per packet (see above), so the exact
@@ -91,8 +95,8 @@ pub use listener::{
 pub mod pinned {
     use super::wire;
 
-    /// Most channels a peer may have open in one direction over a link's life: the peer that
-    /// opens one more has its link ended.
+    /// Most streams a peer may have open at once in one direction (quinn's limit). (M1 counted
+    /// them over the link's life instead.)
     pub const MAX_STREAMS: u32 = super::MAX_STREAMS;
     /// The longest channel-id varint on a stream.
     pub const MAX_VARINT_LEN: usize = wire::MAX_VARINT_LEN;
@@ -137,9 +141,25 @@ pub mod chunks {
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).
 pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
 
-/// Most channels (streams) a peer may have open in one direction. A forwarded connection is a
-/// channel (M2); the bound keeps a misbehaving peer's cost finite.
+/// Most channels (streams) a peer may have open at once in one direction. A forwarded connection
+/// is a channel (M2), and quinn gives a stream back when it ends, so this bounds what is open,
+/// not what a link carries over its life. The bound keeps a misbehaving peer's cost finite; the
+/// inbox registers at most this many channels (`inbox::MAX_CHANNELS`).
 const MAX_STREAMS: u32 = 1024;
+
+/// What a [`QuicLink`] holds per channel (feature `test-hooks`; [`QuicLink::channel_state`]).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelState {
+    /// Writers: channels this side sends on, live or ending.
+    pub writers: usize,
+    /// Channels registered in the inbox: streams being read, and ended ones with payloads waiting.
+    pub inbox_channels: usize,
+    /// Flush markers waiting for the peer's answer.
+    pub flush_pending: usize,
+    /// Flush markers sent over the link's life (flushes and stream ends).
+    pub markers_sent: u32,
+}
 
 /// quinn's receive window for the whole connection: how much the peer may have in flight that
 /// quinn has not yet delivered to our reader tasks. (Data our readers have taken is bounded
@@ -158,6 +178,7 @@ const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 fn transport_config(
     params: &LinkParams,
     keep_alive: Duration,
+    streams: u32,
 ) -> Result<Arc<TransportConfig>, AuthError> {
     let idle = quinn::IdleTimeout::try_from(params.dead_after)
         .map_err(|e| AuthError::Config(format!("dead_after: {e}")))?;
@@ -166,7 +187,7 @@ fn transport_config(
     t.keep_alive_interval(Some(keep_alive));
     // Only unidirectional streams, and no datagrams: less to defend, and nothing to leak.
     t.max_concurrent_bidi_streams(0u32.into());
-    t.max_concurrent_uni_streams(MAX_STREAMS.into());
+    t.max_concurrent_uni_streams(streams.into());
     t.datagram_receive_buffer_size(None);
     t.receive_window(CONNECTION_WINDOW.into());
     // quinn assumes 333 ms until it has a sample, which makes the first retransmission of a lost
@@ -183,7 +204,11 @@ pub fn server_config(
     params: &LinkParams,
 ) -> Result<quinn::ServerConfig, AuthError> {
     let mut cfg = auth::server_config(identity, registry, params.into())?;
-    cfg.transport_config(transport_config(params, params.heartbeat * 3 / 2)?);
+    cfg.transport_config(transport_config(
+        params,
+        params.heartbeat * 3 / 2,
+        MAX_STREAMS,
+    )?);
     cfg.max_incoming(1024);
     cfg.incoming_buffer_size(64 * 1024);
     cfg.incoming_buffer_size_total(4 * 1024 * 1024);
@@ -197,6 +222,21 @@ pub fn client_config(
     params: &LinkParams,
 ) -> Result<quinn::ClientConfig, AuthError> {
     let mut cfg = auth::client_config(pin, key, params.into())?;
-    cfg.transport_config(transport_config(params, params.heartbeat)?);
+    cfg.transport_config(transport_config(params, params.heartbeat, MAX_STREAMS)?);
+    Ok(cfg)
+}
+
+/// [`client_config`] granting the daemon only `streams` streams open at once instead of
+/// [`MAX_STREAMS`] (feature `test-hooks`): a test starves the daemon's link of stream credit
+/// with it. Not for daemon or client code.
+#[cfg(feature = "test-hooks")]
+pub fn client_config_with_stream_limit(
+    pin: Fingerprint,
+    key: &ClientKey,
+    params: &LinkParams,
+    streams: u32,
+) -> Result<quinn::ClientConfig, AuthError> {
+    let mut cfg = auth::client_config(pin, key, params.into())?;
+    cfg.transport_config(transport_config(params, params.heartbeat, streams)?);
     Ok(cfg)
 }

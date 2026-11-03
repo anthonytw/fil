@@ -45,6 +45,10 @@ impl<L: Link> Link for Shared<L> {
         self.0.status()
     }
 
+    fn finish(&self, channel: ChannelId) {
+        self.0.finish(channel);
+    }
+
     fn close(&self) {
         self.0.close();
     }
@@ -89,6 +93,13 @@ impl Link for AnyLink {
         match self {
             AnyLink::Pipe(l) => l.status(),
             AnyLink::Direct(l) => l.status(),
+        }
+    }
+
+    fn finish(&self, channel: ChannelId) {
+        match self {
+            AnyLink::Pipe(l) => l.finish(channel),
+            AnyLink::Direct(l) => l.finish(channel),
         }
     }
 

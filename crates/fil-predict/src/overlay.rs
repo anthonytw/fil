@@ -534,11 +534,6 @@ impl Overlay {
         self.flush_paint(&st)
     }
 
-    /// True while a [`Status`] is set (it may not be drawn: see [`Status`]).
-    pub fn has_status(&self) -> bool {
-        self.status.is_some()
-    }
-
     /// The user's terminal changed size. Best effort: the erase runs against the old
     /// geometry, which is only right if the terminal has not reflowed yet (see the report).
     /// A pinned [`Status`] is redrawn at the new size.
@@ -824,10 +819,11 @@ impl Overlay {
     fn apply(&mut self, plan: Option<Plan>) -> Vec<u8> {
         let cur = self.on_screen.take();
         let g = self.cfg.guards;
+        let cols = self.size.cols;
         match (cur, plan) {
             (None, None) => Vec::new(),
             (Some(os), None) => {
-                let mut out = Out::begin(&os.ctx, &g);
+                let mut out = Out::begin(&os.ctx, &g, cols);
                 for (&(r, c), s) in &os.cells {
                     out.restore(r, c, &s.orig);
                 }
@@ -835,7 +831,7 @@ impl Overlay {
                 out.buf
             }
             (None, Some(p)) => {
-                let mut out = Out::begin(&p.ctx, &g);
+                let mut out = Out::begin(&p.ctx, &g, cols);
                 for (&(r, c), s) in &p.cells {
                     out.predicted(r, c, s, &p.ctx);
                 }
@@ -874,7 +870,7 @@ impl Overlay {
                     self.on_screen = Some(os);
                     return Vec::new();
                 }
-                let mut out = Out::begin(&os.ctx, &g);
+                let mut out = Out::begin(&os.ctx, &g, cols);
                 for pos in gone {
                     out.restore(pos.0, pos.1, &os.cells[&pos].orig);
                 }
@@ -910,17 +906,24 @@ struct Out {
     pen: Attrs,
     link: Option<Link>,
     origin_toggled: bool,
+    /// Where the terminal's cursor is after the last cell written, when that is known: the next
+    /// cell of the row, so a run of adjacent cells needs one cursor move, not one each. Unknown
+    /// after a wide cell or one in the last column (the cursor stays there, wrap pending).
+    at: Option<(u16, u16)>,
+    cols: u16,
 }
 
 impl Out {
     /// Starts a paint or erase: hide the cursor, and leave origin mode so that every cell
     /// can be addressed absolutely.
-    fn begin(ctx: &RestoreCtx, g: &Guards) -> Out {
+    fn begin(ctx: &RestoreCtx, g: &Guards, cols: u16) -> Out {
         let mut o = Out {
             buf: Vec::new(),
             pen: ctx.pen,
             link: ctx.link.clone(),
             origin_toggled: false,
+            at: None,
+            cols,
         };
         o.put("\x1b[?25l");
         if ctx.origin && g.origin {
@@ -934,12 +937,45 @@ impl Out {
         self.buf.extend_from_slice(s.as_bytes());
     }
 
+    /// Appends `n` in decimal.
+    fn num(&mut self, mut n: u32) {
+        let mut digits = [0u8; 10];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.buf.extend_from_slice(&digits[i..]);
+    }
+
+    /// An absolute cursor move (rows and columns are 0-based here).
     fn cup(&mut self, row: u16, col: u16) {
-        self.put(&format!(
-            "\x1b[{};{}H",
-            u32::from(row) + 1,
-            u32::from(col) + 1
-        ));
+        self.put("\x1b[");
+        self.num(u32::from(row) + 1);
+        self.put(";");
+        self.num(u32::from(col) + 1);
+        self.put("H");
+        self.at = Some((row, col));
+    }
+
+    /// Moves the cursor to a cell, unless it is there already.
+    fn goto(&mut self, row: u16, col: u16) {
+        if self.at != Some((row, col)) {
+            self.cup(row, col);
+        }
+    }
+
+    /// A single-width cell was written at the cursor, which moved one column on, except in the
+    /// last column.
+    fn wrote_one_cell(&mut self) {
+        self.at = match self.at {
+            Some((r, c)) if c + 1 < self.cols => Some((r, c + 1)),
+            _ => None,
+        };
     }
 
     fn set_pen(&mut self, a: Attrs) {
@@ -965,15 +1001,20 @@ impl Out {
 
     /// Writes a cell back as the shadow has it.
     fn restore(&mut self, row: u16, col: u16, r: &Restore) {
-        self.cup(row, col);
+        self.goto(row, col);
         self.set_link(r.link.as_ref());
         self.set_pen(r.attrs);
         let t = sanitize(&r.text);
         self.put(if t.is_empty() { " " } else { &t });
+        if t.is_empty() || unicode_width::UnicodeWidthStr::width(&*t) == 1 {
+            self.wrote_one_cell();
+        } else {
+            self.at = None;
+        }
     }
 
     fn predicted(&mut self, row: u16, col: u16, s: &Shown, ctx: &RestoreCtx) {
-        self.cup(row, col);
+        self.goto(row, col);
         self.set_link(None);
         let mut a = ctx.pen;
         match s.style {
@@ -984,6 +1025,8 @@ impl Out {
         self.set_pen(a);
         let mut b = [0u8; 4];
         self.put(s.ch.encode_utf8(&mut b));
+        // `predictable` and the status text are single-width.
+        self.wrote_one_cell();
     }
 
     /// Ends a paint or erase: cursor to `target`, pen, hyperlink and visibility as the
@@ -997,7 +1040,7 @@ impl Out {
                 u32::from(target.1) + 1
             ));
         } else {
-            self.cup(target.0, target.1);
+            self.goto(target.0, target.1);
         }
         if g.pen {
             self.set_pen(ctx.pen);

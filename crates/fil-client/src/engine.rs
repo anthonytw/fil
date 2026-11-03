@@ -1242,14 +1242,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // A report for an offset already written applies now.
                 self.apply_modes(self.sess.recv.received())?;
             }
-            ControlMsg::EchoAck {
-                input_upto,
-                output_at,
-            } => {
-                if let Some(d) = self.display.as_mut() {
-                    d.echo_ack(input_upto, output_at);
-                }
-            }
+            // Only sent to a client that asked (`Attach::echo_ack`, which M1 never does); the
+            // predictor will read it in M3.
+            ControlMsg::EchoAck { .. } => {}
             ControlMsg::Error(code) => {
                 return Err(match code {
                     fil_proto::msg::ErrorCode::VersionMismatch => ClientError::VersionMismatch {

@@ -446,6 +446,26 @@ fn review_print_origin_after_decrc() {
     }
 }
 
+/// A run of adjacent cells costs one cursor move, not one each (the old painter spent about 450
+/// bytes on a two-line status, mostly on `ESC [ r ; c H` before every cell).
+#[test]
+fn a_status_paint_moves_the_cursor_once_per_run_of_cells() {
+    each_backend(|r| {
+        r.server(b"$ ");
+        let status = lines(&[" fil: no reply for 3s ", " 12 bytes held "]);
+        let f = r.overlay.set_status(status);
+        let cups = f.paint.iter().filter(|&&b| b == b'H').count();
+        // One move to each of the two lines, one to put the cursor back: well under one per
+        // cell (about 40).
+        assert!(cups <= 4, "{cups} cursor moves in {:?}", f.paint);
+        assert!(f.paint.len() < 160, "{} bytes", f.paint.len());
+        r.user.write(&f.erase);
+        r.user.write(&f.paint);
+        r.check();
+        r.assert_clean();
+    });
+}
+
 #[test]
 fn review_resize_with_status_and_predictions_shown() {
     each_backend(|r| {

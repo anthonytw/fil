@@ -14,9 +14,9 @@ fil-proto = { path = "../fil-proto" }
 fil-term = { path = "../fil-term" }
 fil-transport = { path = "../fil-transport" }
 # Safe termios, poll and fd I/O for the real terminal (DESIGN.md section 13).
-rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "process"] }
+rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "process", "pipe"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "process", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal", "process", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

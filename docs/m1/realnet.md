@@ -124,14 +124,14 @@ The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `s
 
 ## Results: the real `fil` binary
 
-From [run 41571100070](https://github.com/anthonytw/fil/actions/runs/41571100070) (GitHub `ubuntu-24.04`, `fil` built for `x86_64-unknown-linux-musl`, static). All three parts passed; one scenario reports a known finding (below). The measurements come from that run unless a range is given; a range is over the runs in which the scenario worked. One shared runner VM: timings are indicative.
+From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104) (GitHub `ubuntu-24.04`, `fil` built for `x86_64-unknown-linux-musl`, static). All three parts passed; one scenario reports a known finding (below). The measurements come from that run unless a range is given; a range is over the runs in which the scenario worked. One shared runner VM: timings are indicative.
 
 ### ssh topology (client, two jumps, target; `fil` over the real OpenSSH pipe)
 
 | Scenario | What it checks | Result |
 |---|---|---|
 | `f_attach_detach` | attach to `direct`, run a command, `~.`; `fil ls`; attach again | pass: shell prompt 300 to 380 ms after the start; `~.` printed `detached from session` and exited 0; the second client saw the earlier output on its screen and the same shell (same pid) |
-| `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. Up to `DETACH_LOST_MAX` (7) lost detaches are recorded as a known finding; more fail | **finding 1**: 3 of 10 detaches never reached the daemon. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
+| `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. Up to `DETACH_LOST_MAX` (7) lost detaches are recorded as a known finding; more fail | **finding 1**: 3 of 10 detaches never reached the daemon (3 of 10 in each of the last three runs; the status shows `PASS*`). (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
 | `f_ls_kill_detach` | `fil ls` shows who is attached; `fil detach` tells the client; `fil kill` of an attached session; kill again | pass; the client of a killed session exits **129** (SIGHUP), see finding 2 |
 | `f_takeover` | a second machine (`client2`) attaches to a session held by `client` | pass: the first client was told `by client2` with the time, answered `n` and exited 1 with `was taken over by client2 ... (left alone)`; the second screen showed the earlier output; `fil ls` named `client2` |
 | `f_takeover_back` | the first client answers `y` (take it back) | pass: the second client is told in turn (`by client`, not `client2`); the first client's screen shows a line the second client printed while it held the session, so the take-back really carries the session's state; a working shell again |

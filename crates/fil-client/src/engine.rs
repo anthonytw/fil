@@ -666,8 +666,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     (a, b) => a.or(b),
                 };
                 // No swap before the reply and any snapshot are in, and none without a session
-                // to resume (a fresh attach would reuse the key).
+                // to resume (a fresh attach would reuse the key). None once the session has
+                // exited either: the new path would only hear `SessionGone` and lose the status.
                 let can_swap = self.sess.established
+                    && self.sess.exited.is_none()
                     && cand.is_none()
                     && promoted.is_none()
                     && !primary.conn.awaiting_reply

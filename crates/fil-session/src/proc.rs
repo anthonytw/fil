@@ -86,39 +86,51 @@ const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 /// process the probe left behind would otherwise keep them going.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
+type Kept = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
 /// Reads `r` to the end on its own thread, keeping the first `cap` bytes. Reading continues past
-/// the cap so that the writer never blocks on a full pipe.
+/// the cap so that the writer never blocks on a full pipe. Fails if the thread cannot start.
 fn drain<R: std::io::Read + Send + 'static>(
     mut r: R,
     cap: usize,
-) -> (
-    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    std::thread::JoinHandle<()>,
-) {
-    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+) -> std::io::Result<(Kept, std::thread::JoinHandle<()>)> {
+    let kept = Kept::default();
     let out = kept.clone();
-    let t = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match r.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut v = out.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = cap.saturating_sub(v.len());
-                    v.extend_from_slice(&buf[..n.min(room)]);
+    let t = std::thread::Builder::new()
+        .name("fil-probe-drain".into())
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut v = out.lock().unwrap_or_else(|e| e.into_inner());
+                        let room = cap.saturating_sub(v.len());
+                        v.extend_from_slice(&buf[..n.min(room)]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
             }
-        }
-    });
-    (kept, t)
+        })?;
+    Ok((kept, t))
+}
+
+/// Kills `child` and reaps it.
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Runs `cmd` with its output captured and kills it after `timeout`.
 ///
 /// Both output streams are drained while waiting, so a probe that prints more than a pipe holds
 /// is not mistaken for a hung one. At most [`PROBE_OUTPUT_CAP`] bytes of each are kept.
+///
+/// If a process the probe left behind still holds its pipes after the probe exited, the readers
+/// outlive this call by up to as long as that process lives (each keeps at most
+/// [`PROBE_OUTPUT_CAP`] bytes, so the memory they hold is bounded); what they have read by
+/// the end of the grace period is what is returned.
 fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -129,24 +141,40 @@ fn output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let (stdout, t_out) = drain(
-        child.stdout.take().expect("stdout was piped"),
-        PROBE_OUTPUT_CAP,
-    );
-    let (stderr, t_err) = drain(
-        child.stderr.take().expect("stderr was piped"),
-        PROBE_OUTPUT_CAP,
-    );
+    let readers = (|| {
+        let out = drain(
+            child.stdout.take().expect("stdout was piped"),
+            PROBE_OUTPUT_CAP,
+        )?;
+        let err = drain(
+            child.stderr.take().expect("stderr was piped"),
+            PROBE_OUTPUT_CAP,
+        )?;
+        Ok::<_, std::io::Error>((out, err))
+    })();
+    let ((stdout, t_out), (stderr, t_err)) = match readers {
+        Ok(r) => r,
+        Err(e) => {
+            // The pipes close with the child gone, which ends a reader that did start.
+            kill_and_reap(&mut child);
+            return Err(e);
+        }
+    };
     let end = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
+        let waited = match child.try_wait() {
+            Ok(w) => w,
+            Err(e) => {
+                kill_and_reap(&mut child);
+                return Err(e);
+            }
+        };
+        if let Some(status) = waited {
             let grace = Instant::now() + READER_GRACE;
             while !(t_out.is_finished() && t_err.is_finished()) && Instant::now() < grace {
                 std::thread::sleep(Duration::from_millis(2));
             }
-            let take = |m: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
-                std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
-            };
+            let take = |m: &Kept| std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()));
             return Ok(std::process::Output {
                 status,
                 stdout: take(&stdout),
@@ -154,8 +182,7 @@ fn output_with_timeout(
             });
         }
         if Instant::now() >= end {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("did not answer within {timeout:?}"),

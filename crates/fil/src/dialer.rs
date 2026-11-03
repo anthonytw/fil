@@ -257,8 +257,10 @@ pub struct PathDialer<C: Connector> {
     /// `dial(Attach)` returned an error and the next one continues instead of rotating the key
     /// again.
     retrying_attach: bool,
-    /// The next pipe run may use the terminal (ssh prompts).
-    interactive: bool,
+    /// A `dial(Attach)` is running. With `!ever_attached` this is the only time ssh may use the
+    /// terminal; it is decided in one place ([`PathDialer::interactive`]), at the moment a pipe
+    /// run starts, so no flag left over from an earlier call can make a later run interactive.
+    dialing_attach: bool,
     /// Why the last pipe attempt failed, for the status line.
     note: Option<String>,
     netwatch: Option<AbortHandle>,
@@ -302,10 +304,74 @@ impl<C: Connector> PathDialer<C> {
             started: false,
             ever_attached: false,
             retrying_attach: false,
-            interactive: true,
+            dialing_attach: false,
             note: None,
             netwatch,
         })
+    }
+
+    async fn dial_loop(
+        &mut self,
+        purpose: DialPurpose,
+    ) -> Result<Dialed<Shared<C::Link>>, DialError> {
+        // A fresh attach rotates the key, unless nothing has happened yet or the last one failed
+        // and this is its retry.
+        if purpose == DialPurpose::Attach && self.started && !self.retrying_attach {
+            self.rekey()
+                .map_err(|e| DialError::fatal(format!("cannot make a session key: {e}")))?;
+        }
+        self.handed_dial = None;
+        // A failure seen before this call belongs to an earlier dial; what `drain` finds is fresh.
+        self.pipe_error = None;
+        self.drain();
+        if !self.started {
+            self.started = true;
+            self.feed(Instant::now(), PathInput::Start);
+        }
+        let mut stalls = 0u32;
+        loop {
+            if let Some(d) = self.take_offer(Handed::Dial, purpose == DialPurpose::Attach) {
+                self.retrying_attach = false;
+                return Ok(d);
+            }
+            if let Some(e) = self.error_for(purpose) {
+                return Err(e);
+            }
+            if self.stalled() {
+                // Nothing will ever wake us. Ask for a pipe; if the manager is confused about
+                // what it is running, start it over (the bootstrap is kept).
+                stalls += 1;
+                if stalls >= 2 {
+                    tracing::warn!("path manager stalled; starting it over");
+                    self.mgr = PathManager::new(self.cfg.path);
+                    if let Some((port, pin)) = self.bootstrap {
+                        self.feed(
+                            Instant::now(),
+                            PathInput::DirectAvailable {
+                                port,
+                                fingerprint: pin.as_bytes().to_vec(),
+                                fresh_attach: false,
+                            },
+                        );
+                    }
+                }
+                self.feed(Instant::now(), PathInput::Start);
+                if self.stalled() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    self.drain();
+                    continue;
+                }
+            }
+            self.step().await;
+        }
+    }
+
+    /// May the pipe run that starts now use the terminal (ssh prompts)? Only while a fresh
+    /// attach is being dialed and the process's first attach has not been accepted yet: the user
+    /// is waiting for it. Every other run (an upgrade that failed young and falls back to ssh
+    /// from `next_swap`, the pipe a key rotation starts, every reconnect) is a background run.
+    fn interactive(&self) -> bool {
+        self.dialing_attach && !self.ever_attached
     }
 
     /// A hint from outside that the network changed (the built-in watcher sends the same).
@@ -440,7 +506,7 @@ impl<C: Connector> PathDialer<C> {
         self.serial += 1;
         let run = self.serial;
         self.pipe_run = Some(run);
-        let (c, tx, interactive) = (self.connector.clone(), self.tx.clone(), self.interactive);
+        let (c, tx, interactive) = (self.connector.clone(), self.tx.clone(), self.interactive());
         self.pipe_task = Some(
             tokio::spawn(async move {
                 let result = c.run_pipe(interactive).await;
@@ -626,6 +692,7 @@ impl<C: Connector> PathDialer<C> {
             self.offer = None;
             if let Some(h) = self.direct_link.take() {
                 h.close();
+                self.feed(Instant::now(), PathInput::DirectDown(DownReason::Closed));
             }
             return None;
         }
@@ -736,60 +803,11 @@ impl<C: Connector> Dialer for PathDialer<C> {
     }
 
     async fn dial(&mut self, purpose: DialPurpose) -> Result<Dialed<Self::Link>, DialError> {
-        // A fresh attach rotates the key, unless nothing has happened yet or the last one failed
-        // and this is its retry.
-        if purpose == DialPurpose::Attach && self.started && !self.retrying_attach {
-            self.rekey()
-                .map_err(|e| DialError::fatal(format!("cannot make a session key: {e}")))?;
-        }
-        self.handed_dial = None;
-        // ssh may use the terminal only while the user is waiting for the process's first
-        // attach. After that the terminal belongs to the session: a fresh attach (a take-back,
-        // a replaced session) runs ssh the background way too.
-        self.interactive = purpose == DialPurpose::Attach && !self.ever_attached;
-        // A failure seen before this call belongs to an earlier dial; what `drain` finds is fresh.
-        self.pipe_error = None;
-        self.drain();
-        if !self.started {
-            self.started = true;
-            self.feed(Instant::now(), PathInput::Start);
-        }
-        let mut stalls = 0u32;
-        loop {
-            if let Some(d) = self.take_offer(Handed::Dial, purpose == DialPurpose::Attach) {
-                self.retrying_attach = false;
-                return Ok(d);
-            }
-            if let Some(e) = self.error_for(purpose) {
-                return Err(e);
-            }
-            if self.stalled() {
-                // Nothing will ever wake us. Ask for a pipe; if the manager is confused about
-                // what it is running, start it over (the bootstrap is kept).
-                stalls += 1;
-                if stalls >= 2 {
-                    tracing::warn!("path manager stalled; starting it over");
-                    self.mgr = PathManager::new(self.cfg.path);
-                    if let Some((port, pin)) = self.bootstrap {
-                        self.feed(
-                            Instant::now(),
-                            PathInput::DirectAvailable {
-                                port,
-                                fingerprint: pin.as_bytes().to_vec(),
-                                fresh_attach: false,
-                            },
-                        );
-                    }
-                }
-                self.feed(Instant::now(), PathInput::Start);
-                if self.stalled() {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    self.drain();
-                    continue;
-                }
-            }
-            self.step().await;
-        }
+        // Set before anything can start a pipe (the rekey does), cleared on every way out.
+        self.dialing_attach = purpose == DialPurpose::Attach;
+        let result = self.dial_loop(purpose).await;
+        self.dialing_attach = false;
+        result
     }
 
     async fn next_swap(&mut self) -> Dialed<Self::Link> {

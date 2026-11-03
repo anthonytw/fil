@@ -770,3 +770,58 @@ async fn the_late_death_of_a_closed_pipe_is_not_taken_for_the_death_of_direct() 
         "and no ssh was started to replace the carrier"
     );
 }
+
+// ---- the stale interactive flag (re-check blocker) -----------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_pipe_started_from_next_swap_after_direct_dies_young_is_a_background_run() {
+    // Upgrade to QUIC, then QUIC dies within 10 s: the manager runs the pipe at once, from
+    // `next_swap`, before the loop calls `dial` again. That ssh must not use the terminal.
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    let _cand = swap_within(secs(5), &mut d).await.unwrap();
+    d.swapped(Ok(LinkKind::Direct));
+    tokio::time::sleep(secs(1)).await;
+    fake.kill_latest(LinkKind::Direct, DownReason::Dead);
+    let _ = swap_within(secs(5), &mut d).await;
+    let runs = fake.runs(LinkKind::Pipe);
+    assert_eq!(runs.len(), 2, "the manager started the pipe at once");
+    assert!(!runs[1].interactive, "ssh must not use the terminal here");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pipe_a_rekey_starts_at_once_is_a_background_run() {
+    // The old pipe was healthy for a long time, so the manager has no backoff and the rekey of
+    // the first fresh attach after the first attach starts the pipe immediately.
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let pipe = first_attach(&mut d).await;
+    tokio::time::sleep(secs(30)).await;
+    pipe.link.close();
+    let fresh = within(secs(5), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.link.kind(), LinkKind::Pipe);
+    let runs = fake.runs(LinkKind::Pipe);
+    assert_eq!(runs.len(), 2);
+    assert!(!runs[1].interactive, "ssh must not use the terminal here");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_direct_offer_on_a_fresh_attach_tells_the_manager() {
+    // Defensive branch: a direct link on offer when a fresh attach asks for a link is closed,
+    // and the manager hears that it is gone.
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    tokio::time::sleep(secs(3)).await;
+    let fresh = within(secs(5), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.link.kind(), LinkKind::Pipe);
+    let v = d.view();
+    assert_ne!(v.direct, fil_transport::path::Lane::Up, "{v:?}");
+}

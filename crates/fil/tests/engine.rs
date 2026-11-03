@@ -405,3 +405,47 @@ async fn a_background_ssh_that_needs_a_login_says_so_in_the_status_line() {
     );
     assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_fallback_pipe_after_direct_dies_young_is_a_background_run() {
+    // Upgrade, then QUIC dies a second later: the manager starts ssh at once. With the real
+    // client the terminal is raw and fil is reading keys, so that ssh must not prompt.
+    let rig = rig_with_direct(TransportSetting::Auto).await;
+    rig.wait_attaches(2).await;
+    rig.fake.kill_latest(LinkKind::Direct, DownReason::Dead);
+    rig.wait_attaches(3).await;
+    let pipes = rig.fake.runs(LinkKind::Pipe);
+    assert!(pipes.len() >= 2, "{}", pipes.len());
+    assert!(pipes[0].interactive);
+    assert!(
+        pipes[1..].iter().all(|r| !r.interactive),
+        "no later ssh may use the terminal: {pipes:?}"
+    );
+    rig.works("after the fallback").await;
+    assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_fresh_attach_pipe_after_a_long_healthy_pipe_is_a_background_run() {
+    // Pipe only, healthy for a minute, then the session is replaced and the user says yes: the
+    // new pipe starts at once (no backoff to wait out) while the terminal is the session's.
+    let rig = rig_with_direct(TransportSetting::Pipe).await;
+    rig.wait_attaches(1).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    rig.daemon.replace_session().await;
+    rig.fake.kill_latest(LinkKind::Pipe, DownReason::Dead);
+    until_async("the question", 60, || async {
+        rig.term.text().contains("is a different session now")
+    })
+    .await;
+    let before = rig.fake.pipe_runs();
+    rig.term.type_bytes(b"y");
+    until_async("the fresh run", 30, || async {
+        rig.fake.pipe_runs() > before
+    })
+    .await;
+    assert!(rig.term.is_raw());
+    let pipes = rig.fake.runs(LinkKind::Pipe);
+    assert!(pipes[before..].iter().all(|r| !r.interactive), "{pipes:?}");
+    assert!(matches!(rig.end().await, Ok(Outcome::Detached)));
+}

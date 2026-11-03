@@ -114,6 +114,11 @@ fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
     let s = Scratch::new();
     let (relay_in, _keep) = UnixStream::pair().unwrap();
     let (relay_out, mut from_relay) = UnixStream::pair().unwrap();
+    // Set the timeout while the pair is still connected: on macOS, setsockopt on a socket whose
+    // peer has already closed can fail with EINVAL, which made this test flaky under load.
+    from_relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let opts = options(&s, never_started());
     let err = relay(relay_in, relay_out, &opts).unwrap_err();
     assert!(
@@ -123,9 +128,6 @@ fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
     // The relay is gone (its output dropped), so reading ends; what it wrote is the preamble
     // and nothing else, so the client can tell fil started and why it failed (ssh's stderr).
     let mut got = Vec::new();
-    from_relay
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     from_relay.read_to_end(&mut got).unwrap();
     assert_eq!(
         got,

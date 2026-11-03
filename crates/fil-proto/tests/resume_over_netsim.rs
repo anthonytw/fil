@@ -21,7 +21,7 @@ use fil_proto::msg::Hello;
 use fil_proto::sched::Scheduler;
 use fil_proto::{ChannelId, ControlMsg};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 

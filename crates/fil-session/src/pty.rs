@@ -11,7 +11,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use fil_proto::msg::TermSize;
 
 use crate::config::SessionConfig;
-use crate::env::{SESSION_ONLY_DROPPED_VARS, is_login_session_var};
+use crate::env::{SESSION_ONLY_DROPPED_VARS, login_session_vars_in_env};
 use crate::proc::{SCOPE_DESCRIPTION, Scope, systemd_run_argv};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,14 +55,11 @@ fn size_of(s: TermSize) -> PtySize {
 
 /// Removes what describes the login that started the daemon ([`crate::env`]) from the inherited
 /// environment. What the configuration sets afterwards is the caller's choice and stays.
+///
+/// The names come from the process's real environment (`CommandBuilder` starts from it), not
+/// from the builder's `*_as_str` iterators, which skip any entry whose value is not UTF-8.
 fn drop_login_vars(cmd: &mut CommandBuilder) {
-    let names: Vec<String> = cmd
-        .iter_full_env_as_str()
-        .map(|(k, _)| k)
-        .filter(|k| is_login_session_var(k.as_ref()))
-        .map(str::to_string)
-        .collect();
-    for k in names {
+    for k in login_session_vars_in_env() {
         cmd.env_remove(k);
     }
     for k in SESSION_ONLY_DROPPED_VARS {
@@ -233,37 +230,66 @@ mod tests {
 
     use super::*;
 
+    /// The variables the test process is started with, by the parent half of
+    /// `the_login_environment_is_dropped_even_when_a_value_is_not_utf8`. The values of the first
+    /// two are Latin-1 bytes, which are not UTF-8.
+    fn login_environment() -> Vec<(&'static str, std::ffi::OsString)> {
+        use std::os::unix::ffi::OsStrExt;
+        let latin1 = |b: &[u8]| std::ffi::OsString::from(OsStr::from_bytes(b));
+        vec![
+            ("SSH_ORIGINAL_COMMAND", latin1(b"caf\xe9 \xff")),
+            ("LC_TERMINAL", latin1(b"iTerm\xe9")),
+            ("DISPLAY", "localhost:10.0".into()),
+            ("XDG_SESSION_ID", "42".into()),
+            ("XDG_SESSION_TYPE", "tty".into()),
+            ("SSH_CONNECTION", "a b c d".into()),
+            ("TMUX", "/tmp/tmux-1000/default,1,0".into()),
+            ("FIL_LOG", "trace".into()),
+        ]
+    }
+
+    /// The process environment is global, so the checks run in a child copy of the test binary
+    /// that is started with the login's variables set. The parent half starts it.
     #[test]
-    fn the_login_environment_is_dropped_and_the_rest_kept() {
-        let mut cmd = CommandBuilder::new("true");
-        for (k, v) in [
-            ("DISPLAY", "localhost:10.0"),
-            ("XDG_SESSION_ID", "42"),
-            ("XDG_SESSION_TYPE", "tty"),
-            ("SSH_CONNECTION", "a b c d"),
-            ("LC_TERMINAL", "iTerm2"),
-            ("FIL_LOG", "trace"),
-            ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("LANG", "C"),
-        ] {
-            cmd.env(k, v);
+    fn the_login_environment_is_dropped_even_when_a_value_is_not_utf8() {
+        const CHILD: &str = "FIL_TEST_LOGIN_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut cmd = CommandBuilder::new("true");
+            for (k, _) in login_environment() {
+                assert!(cmd.get_env(k).is_some(), "{k} was not inherited: bad setup");
+            }
+            drop_login_vars(&mut cmd);
+            for (k, _) in login_environment() {
+                assert_eq!(cmd.get_env(k), None, "{k} must be dropped");
+            }
+            assert_eq!(
+                cmd.get_env("XDG_RUNTIME_DIR"),
+                Some(OsStr::new("/run/user/1000"))
+            );
+            assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("C")));
+            return;
         }
-        drop_login_vars(&mut cmd);
-        for k in [
-            "DISPLAY",
-            "XDG_SESSION_ID",
-            "XDG_SESSION_TYPE",
-            "SSH_CONNECTION",
-            "LC_TERMINAL",
-            "FIL_LOG",
-        ] {
-            assert_eq!(cmd.get_env(k), None, "{k} must be dropped");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "pty::tests::the_login_environment_is_dropped_even_when_a_value_is_not_utf8",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("LANG", "C");
+        for (k, v) in login_environment() {
+            child.env(k, v);
         }
-        assert_eq!(
-            cmd.get_env("XDG_RUNTIME_DIR"),
-            Some(OsStr::new("/run/user/1000"))
+        let out = child.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains("1 passed"),
+            "the child test did not run:\n{text}"
         );
-        assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("C")));
     }
 
     #[test]

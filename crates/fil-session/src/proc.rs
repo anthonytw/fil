@@ -666,21 +666,113 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-systemctl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("systemctl");
-        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let marker = dir.join("ran");
+        // The fake records that it ran, then hangs. Without the marker a fake that could not be
+        // started (ETXTBSY from a concurrent fork, a noexec temp dir) would look like a pass.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\nexec sleep 30\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let t = Instant::now();
-        systemctl_kill(
-            fake.to_str().unwrap(),
-            "fil-x",
-            "SIGKILL",
-            Duration::from_millis(300),
-        );
-        let took = t.elapsed();
+        let mut took = Duration::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            systemctl_kill(
+                fake.to_str().unwrap(),
+                "fil-x",
+                "SIGKILL",
+                Duration::from_millis(300),
+            );
+            took = t.elapsed();
+            if marker.exists() {
+                break;
+            }
+        }
+        let args = std::fs::read_to_string(&marker);
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            args.expect("the fake systemctl never ran").trim(),
+            "--user kill --signal=SIGKILL fil-x.scope"
+        );
         assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    /// Spawns `sh` as a process group leader with a background `sleep` in a group of its own (job
+    /// control), the shape the tree fallback exists for. Returns the shell and the sleep's pid.
+    fn shell_with_a_job_in_its_own_group() -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut sh = Command::new("sh")
+            .args(["-c", "set -m; sleep 30 & echo $!; wait"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(sh.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let job: u32 = line.trim().parse().expect("the job's pid");
+        let pgid = |pid: u32| {
+            let out = Command::new("ps")
+                .args(["-o", "pgid=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_ne!(
+            pgid(job),
+            pgid(sh.id()),
+            "the job must be in a group of its own"
+        );
+        (sh, job)
+    }
+
+    /// Teardown must act on the table as it is now. A job that moved into a group of its own is
+    /// only found through the table; `killpg` of the shell's group does not reach it. The shared
+    /// table is poisoned with an empty one that is still "fresh", so a teardown that read it
+    /// (`list_processes`) would find nobody.
+    fn teardown_ignores_the_shared_table(teardown: impl Fn(u32)) {
+        let (mut sh, job) = shell_with_a_job_in_its_own_group();
+        *SHARED_TABLE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), std::sync::Arc::new(Vec::new())));
+        teardown(sh.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(job) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = alive(job);
+        let _ = kill(Pid::from_raw(job as i32), Signal::SIGKILL);
+        let _ = sh.kill();
+        let _ = sh.wait();
+        *SHARED_TABLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert!(!survived, "the job in its own group was not reached");
+    }
+
+    #[test]
+    fn hang_up_reads_a_fresh_process_table() {
+        teardown_ignores_the_shared_table(|root| {
+            hang_up(root, &Scope::Tree, &Tracker::default());
+        });
+    }
+
+    #[test]
+    fn kill_session_reads_a_fresh_process_table() {
+        teardown_ignores_the_shared_table(|root| {
+            kill_session(
+                root,
+                &Scope::Tree,
+                &Tracker::default(),
+                Duration::from_millis(200),
+            );
+        });
     }
 
     fn table(n: u32) -> Vec<ProcRow> {

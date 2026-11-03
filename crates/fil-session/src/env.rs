@@ -4,14 +4,17 @@
 //! The daemon is started by whichever SSH login came first, and its sessions are used later,
 //! from other machines and other logins. Whatever describes that first login (its connection,
 //! its terminal, its X11 forwarding, its agent, its logind session) must not be stamped onto
-//! every session and onto the programs in them. One list serves both places that scrub:
+//! every session and onto the programs in them. One list is meant to serve both places that
+//! scrub:
 //!
-//! - the daemon's launcher (`fil_daemon::start`) scrubs the environment of the daemon it starts;
-//! - the session's PTY child is scrubbed again here, because a daemon may be started by hand.
+//! - the session's PTY child is scrubbed with it today, whichever way the daemon was started;
+//! - the daemon's launcher (`fil_daemon::start`) will scrub the environment of the daemon it
+//!   starts with the same list (it still has its own shorter one until it switches over).
 //!
 //! The list is tmux's `update-environment` set (the variables tmux refreshes per client because
-//! they belong to a login) plus the other SSH connection variables, logind's `XDG_SESSION_*`
-//! and the terminal-identification variables that `SendEnv LC_*` carries.
+//! they belong to a login) plus the other SSH connection variables, logind's `XDG_SESSION_*`,
+//! the terminal-identification variables that `SendEnv LC_*` carries, and what a daemon started
+//! by hand inherits from a terminal multiplexer or a local login.
 //!
 //! `FIL_LOG` is deliberately *not* in the list: the daemon reads its own log level from it, so
 //! the daemon's launcher must keep it. Sessions drop it separately (see
@@ -41,6 +44,16 @@ pub const LOGIN_SESSION_VARS: &[&str] = &[
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
     "MOTD_SHOWN",
+    // What a daemon started by hand inherits from the terminal session of whoever started it: a
+    // multiplexer (a stale `TMUX` makes `tmux` inside a session refuse to start) or a local
+    // graphical or console login.
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    "XDG_SEAT",
+    "XDG_VTNR",
+    "WAYLAND_DISPLAY",
 ];
 
 /// Prefixes of variables that are dropped as a family: logind's `XDG_SESSION_ID`,
@@ -98,6 +111,13 @@ mod tests {
             "LC_TERMINAL",
             "LC_TERMINAL_VERSION",
             "MOTD_SHOWN",
+            "TMUX",
+            "TMUX_PANE",
+            "STY",
+            "WINDOW",
+            "XDG_SEAT",
+            "XDG_VTNR",
+            "WAYLAND_DISPLAY",
         ] {
             assert!(is(v), "{v} must be dropped");
         }

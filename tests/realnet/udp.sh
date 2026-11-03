@@ -43,7 +43,7 @@ udp_setup() {
   as_root true || { echo "realnet: root is required for network namespaces" >&2; exit 2; }
   udp_teardown quiet
   mkdir -p "$OUT/run" "$OUT/logs"
-  "$REALNET_DIR/build.sh"
+  "$REALNET_DIR/build.sh" || exit 1
 
   local ns
   for ns in "$NS_C" "$NS_R" "$NS_S"; do

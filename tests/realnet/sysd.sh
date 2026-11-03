@@ -44,7 +44,7 @@ sysd_setup() {
   docker info > /dev/null 2>&1 || { echo "realnet: the docker daemon is not reachable" >&2; exit 2; }
   sysd_teardown quiet
   mkdir -p "$OUT/run" "$OUT/logs" "$SD_DIR"
-  "$REALNET_DIR/build.sh"
+  "$REALNET_DIR/build.sh" || exit 1
   local ctx=$OUT/ctx-sysd
   rm -rf "$ctx"
   mkdir -p "$ctx/bin"

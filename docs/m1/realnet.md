@@ -111,7 +111,7 @@ just realnet sysd       # the systemd host only
 just realnet udp f_upgrade f_nat_rebind   # named scenarios
 ```
 
-On macOS (or without the tools) it refuses with a message and exits 2. From anywhere:
+On macOS (or without the tools) it refuses with a message and exits 2. On an Apple-silicon Mac, `just vm-realnet [PART]` runs it in a local Linux VM on aarch64 binaries ([docs/dev/vm.md](../dev/vm.md)). From anywhere:
 
 ```bash
 gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet

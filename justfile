@@ -104,6 +104,33 @@ client-pty:
 realnet *args:
     tests/realnet/run.sh {{args}}
 
+# Local Linux VM (docs/dev/vm.md): root-only tests without GitHub. The Lima instance `fil` (override
+# with FIL_VM) is Ubuntu aarch64 with Docker, netem and no access to this Mac; code reaches it by
+# rsync. GitHub's linux-check stays the x86_64 reference.
+
+# Once after creating the VM: conntrack, the pinned toolchain, just and cargo-deny.
+vm-setup:
+    tests/realnet/vm.sh setup
+
+# Copy this worktree (uncommitted work included) to ~/src/<worktree name> in the VM.
+vm-sync:
+    tests/realnet/vm.sh sync
+
+# Sync, then run a command in that directory in the VM, with the pinned toolchain: `just vm-run just ci`.
+[positional-arguments]
+vm-run +cmd:
+    tests/realnet/vm.sh run "$@"
+
+# Sync, then `just realnet PART` in the VM, one run at a time across the whole VM (a lock). Parts and
+# scenario names as for `realnet`; none runs everything. Killed after FIL_VM_TIMEOUT (default 60m).
+[positional-arguments]
+vm-realnet *args:
+    tests/realnet/vm.sh realnet "$@"
+
+# Remove this worktree's copy and build directory from the VM.
+vm-clean:
+    tests/realnet/vm.sh clean
+
 # A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
 # (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session "local-pipe"
 # over the pipe only; `just local auto` (session "local-auto") also lets it upgrade to QUIC on

@@ -4,6 +4,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use common::*;
 use fil_proto::msg::{self, ControlMsg, ErrorCode, Request, Response, StartPoint};
@@ -22,7 +23,18 @@ async fn dial(d: &Running, key: &ClientKey) -> Result<QuicLink, fil_transport::L
             .try_into()
             .unwrap(),
     );
-    QuicLink::connect(addr, pin, key, LinkParams::default()).await
+    QuicLink::connect(addr, pin, key, link_params()).await
+}
+
+/// The default `connect_timeout` (2 s) is the production bound for falling back to another path;
+/// a debug-build handshake on a loaded machine can exceed it, and a test that expects the
+/// handshake to succeed (or to be refused) would then fail on a timeout it is not about. A
+/// refusal is immediate, so the long timeout does not slow the tests that expect one.
+fn link_params() -> LinkParams {
+    LinkParams {
+        connect_timeout: Duration::from_secs(60),
+        ..LinkParams::default()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,7 +302,7 @@ async fn the_default_bind_is_reached_over_both_address_families() {
     }
     for addr in addrs {
         let t = std::time::Instant::now();
-        QuicLink::connect(addr, pin, &ck, LinkParams::default())
+        QuicLink::connect(addr, pin, &ck, link_params())
             .await
             .unwrap_or_else(|e| panic!("{addr}: {e}"));
         assert!(t.elapsed() < std::time::Duration::from_secs(10), "{addr}");

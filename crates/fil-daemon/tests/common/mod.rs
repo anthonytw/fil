@@ -66,6 +66,10 @@ impl Drop for Scratch {
                 .args(["-KILL", &pid.to_string()])
                 .status();
         }
+        // A test may leave a plain file or a symlink where the directory would be.
+        if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| !m.is_dir()) {
+            let _ = std::fs::remove_file(&self.dir);
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

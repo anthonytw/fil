@@ -42,7 +42,14 @@ const START_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPAWNS: u32 = 3;
 /// Environment variables of the SSH login that must not leak into the daemon and its sessions:
 /// they describe the login that happened to start the daemon, not the sessions.
-const LOGIN_VARS: [&str; 4] = ["SSH_AUTH_SOCK", "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"];
+const LOGIN_VARS: [&str; 6] = [
+    "SSH_AUTH_SOCK",
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "SSH_TTY",
+    "SSH_ORIGINAL_COMMAND",
+    "SSH_USER_AUTH",
+];
 
 /// How to start a daemon: the executable and the arguments that make it call
 /// [`run_daemon`](crate::run_daemon).
@@ -149,46 +156,53 @@ pub fn ensure_daemon(paths: &Paths, launcher: &DaemonLauncher) -> Result<Ensured
     }
     DaemonConfig::load(&paths.config)?;
 
+    let mut child = spawn(launcher)?;
+    let result = wait_for_daemon(paths, launcher, &sock, &mut child);
+    // Whatever happened, the last child is reaped when it exits (at once if it already has).
+    reap_in_background(child);
+    result
+}
+
+/// Polls the socket until the daemon `child` answers. A child that exits cleanly without
+/// answering is replaced (see [`MAX_RESPAWNS`]); `child` is left holding the last one spawned.
+fn wait_for_daemon(
+    paths: &Paths,
+    launcher: &DaemonLauncher,
+    sock: &Path,
+    child: &mut Child,
+) -> Result<Ensured, EnsureError> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut respawns = 0;
-    let mut child = spawn(launcher)?;
-    let first_pid = child.id();
     loop {
-        if let Some(stream) = try_connect(&sock)? {
-            reap_in_background(child);
+        if let Some(stream) = try_connect(sock)? {
             return Ok(Ensured {
                 stream,
                 started: true,
-                spawned_pid: Some(first_pid),
+                spawned_pid: Some(child.id()),
             });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // The daemon process ended without answering. A clean exit means it found
-                // another daemon holding the lock (one on its way out, or started by hand):
-                // look again, and start another if there is still none.
-                std::thread::sleep(Duration::from_millis(100));
-                if let Some(stream) = try_connect(&sock)? {
-                    return Ok(Ensured {
-                        stream,
-                        started: false,
-                        spawned_pid: None,
-                    });
-                }
-                if !status.success() || respawns >= MAX_RESPAWNS {
-                    return Err(EnsureError::DaemonExited {
-                        status: status.to_string(),
-                        log: paths.log.clone(),
-                    });
-                }
-                respawns += 1;
-                child = spawn(launcher)?;
+        if let Ok(Some(status)) = child.try_wait() {
+            // The daemon process ended without answering. A clean exit means it found another
+            // daemon holding the lock (one on its way out, or started by hand): look again,
+            // and start another if there is still none.
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(stream) = try_connect(sock)? {
+                return Ok(Ensured {
+                    stream,
+                    started: false,
+                    spawned_pid: None,
+                });
             }
-            Ok(None) => {}
-            Err(_) => {}
+            if !status.success() || respawns >= MAX_RESPAWNS {
+                return Err(EnsureError::DaemonExited {
+                    status: status.to_string(),
+                    log: paths.log.clone(),
+                });
+            }
+            respawns += 1;
+            *child = spawn(launcher)?;
         }
         if Instant::now() >= deadline {
-            reap_in_background(child);
             return Err(EnsureError::StartTimeout(STARTUP_TIMEOUT));
         }
         std::thread::sleep(Duration::from_millis(15));

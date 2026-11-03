@@ -371,7 +371,7 @@ Direct mode is first-class **(decided)**.
 - **Mutual authentication, set up during the bootstrap:**
   - **Daemon to client:** the daemon's certificate fingerprint arrives over the pipe and is pinned. Nothing is trusted on first use.
   - **Client to daemon:** the client generates a key pair in memory for each attach. Only the public half is sent, over the pipe, and the daemon accepts only that key.
-  - Keys are revoked on detach and on takeover, and nothing is written to disk.
+  - A key is bound to the one session its pipe attach was accepted for, and over QUIC it can only resume that session (§8.5). Keys are revoked on detach, on takeover, when the session ends and when the attach is refused, and nothing is written to disk.
 - **Port:** one UDP port per user, not per session. The default range is 60000–61000, the same range mosh uses, so hosts already opened for mosh work unchanged. Both the range and the bind address are configurable, for example to bind only to the LAN or tailnet interface.
 - **Address:** the client dials the same host name it used for the pipe, resolved locally, unless the host config sets `direct.address`. Hosts reached through a jump host usually aren't directly reachable, so they stay on the pipe.
 - **Roaming:** QUIC connection migration covers both client IP changes and NAT rebinding (a router changing the outside port).
@@ -379,7 +379,7 @@ Direct mode is first-class **(decided)**.
 - **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods:
   - **Retry:** the first packet from an address that has not been validated gets a stateless Retry and nothing else. No handshake state is kept and no crypto is done until the client answers it, so forged source addresses cost one small packet each.
   - **Rate limits:** only validated addresses are counted, so a spoofed flood cannot spend a real client's allowance. Each source address has a token bucket (default burst 8, one a second) and the port has one (burst 100, 50 a second). Over the source limit the handshake is refused with a short close; over the global limit the packet is dropped silently. At most 128 handshakes are in progress at once.
-  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke`; a sweep every 500 ms catches a registry change made directly).
+  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke` closes at once). Removing a key from the registry blocks new handshakes at once and closes its live connections after a 2 s backstop (`revoke_backstop`), so the layer above can send its last message first; this is safe because a session that lost its subscriber neither reads from nor writes to the old connection.
 
 ### 8.4 Extensibility is compile-time, not runtime
 
@@ -460,7 +460,17 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 **Session management.** `fil ls`, `fil kill` and `fil detach` reuse the fixed remote command. The client sends `Hello`, then one `Request` (`ListSessions`, `KillSession { name }` or `DetachSession { name }`) in place of an `Attach`. The daemon answers with one `Response`: `Sessions { list, truncated }`, `Done` or `NoSuchSession`. A session list is cut to fit one control message (4 KiB) and marked `truncated`.
 
-**What the daemon does with a connection** (`fil-daemon`). It sends its `Hello` at once and expects the client's `Hello` and then an `Attach` or a `Request`, all within 10 s. A different major gets `Error(VersionMismatch)`. A pipe `Attach` registers its key for QUIC (the bootstrap); if the attach is refused, a key it newly registered is revoked again. A QUIC `Attach` must carry the key the connection authenticated with (otherwise `Error(Protocol)`) and never registers one; a `Request` on QUIC is refused. A resume for a session the daemon does not have is refused with `SessionGone` if it ended recently (the daemon remembers the last 256 endings) and with `SessionReplaced` otherwise, and never creates a session. A revoked key stops being accepted at once; its live QUIC connections are closed one second later, so that `TakenOver` can reach the old client first (the session closes the link itself within about 300 ms of sending it).
+**What the daemon does with a connection** (`fil-daemon`). It sends its `Hello` at once and expects the client's `Hello` and then an `Attach` or a `Request`, all within 10 s. A different major gets `Error(VersionMismatch)`. A resume for a session the daemon does not have is refused with `SessionGone` if it ended recently (the daemon remembers the last 256 endings) and with `SessionReplaced` otherwise, and never creates a session.
+
+**A direct key is bound to its session.** A pipe `Attach` registers its key for QUIC (the bootstrap) and, once the session accepts the attach, binds the key to that session's name and incarnation. Over QUIC the key reaches that session and nothing else:
+
+- a QUIC `Attach` must be a **resume**; a fresh attach (a take-back included) always goes over the pipe, with a new key, so QUIC can neither create a session nor take one over;
+- it must carry the key the connection authenticated with, name the bound session and carry the bound incarnation, or it gets `Error(Protocol)`;
+- a QUIC `Attach` never registers a key, and a `Request` on QUIC is refused.
+
+The binding and the key end with the subscriber's hold on the session: on takeover and detach (the session's `RevokeKey`), when the session ends or is killed, and when the attach is refused (a key that attach newly registered is revoked again). The registry therefore holds at most one key per live session.
+
+**Revocation timing.** Removing a key from the registry blocks new handshakes with it at once. Its live QUIC connections are closed by the listener 2 s later (`revoke_backstop`) unless something closes them first, which the session does: it sends `TakenOver`, waits for it to be read, and closes the link, so the old client is told. This is safe because a session whose subscriber lost it neither reads from nor writes to the old connection; the delay is only a backstop for a serve task that is stuck.
 
 Before v1 these changes are made in place, with no compatibility kept.
 
@@ -533,7 +543,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 |---|---|---|
 | Anyone on the network | sshd; the UDP port when direct mode is on | OpenSSH as before. The QUIC handshake succeeds only with the per-attach client key that was registered over the pipe. Everything else is dropped. |
 | A man in the middle | the direct connection | The client pins the daemon's certificate fingerprint received over the pipe. Nothing is trusted on first use. |
-| Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, and is revoked on detach and takeover. |
+| Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, is bound to its one session (over QUIC it can only resume that session), and is revoked on detach, takeover and when the session ends. |
 | Other users on the remote host | the socket directory | 0700 and owned by you; the daemon refuses a directory created by someone else; every connection's peer UID is checked by the kernel. |
 | Other users on the remote host | `-R` ports on 127.0.0.1 | Reachable by every user on that host, the same as `ssh -R`. Documented. |
 | Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |

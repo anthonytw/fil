@@ -46,12 +46,21 @@ fn open(path: &Path) -> Option<std::fs::File> {
     if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_AT) {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
-        let _ = std::fs::rename(path, old);
+        let _ = std::fs::rename(path, &old);
+        private(Path::new(&old));
     }
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
-        .ok()
+        .ok()?;
+    private(path);
+    Some(file)
+}
+
+/// The mode of an existing file is not changed by `OpenOptions::mode`; make it 0600 anyway.
+fn private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }

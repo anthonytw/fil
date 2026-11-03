@@ -6,7 +6,7 @@ mod common;
 use std::net::SocketAddr;
 
 use common::*;
-use fil_proto::msg::{self, ControlMsg, ErrorCode, Request, StartPoint};
+use fil_proto::msg::{self, ControlMsg, ErrorCode, Request, Response, StartPoint};
 use fil_transport::LinkParams;
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::quic::QuicLink;
@@ -147,5 +147,122 @@ async fn takeover_closes_the_old_quic_connection_and_revokes_its_key() {
     );
     // The new subscriber's key does connect.
     assert!(dial(&d, &ck_b).await.is_ok());
+    d.stop().await;
+}
+
+/// A key reaches the one session it was registered for (DESIGN.md section 8.3): over QUIC it can
+/// resume that session at that incarnation and do nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_key_can_only_resume_its_own_session() {
+    let s = Scratch::new();
+    let d = start(&s, direct_config(CAT)).await;
+    let ck = ClientKey::generate().unwrap();
+    let pk = proto_key(&ck);
+    let a = Client::attach(d.pipe().await, Connect::new("main", pk.clone())).await;
+    let resume = a.resume_request();
+    let _other = Client::attach(
+        d.pipe().await,
+        Connect::new("other", proto_key(&ClientKey::generate().unwrap())),
+    )
+    .await;
+
+    // Every attach below is made over a connection the registered key authenticated.
+    let refused = |name: &'static str, resume: Option<msg::ResumeRequest>| {
+        let (d, ck, pk) = (&d, &ck, pk.clone());
+        async move {
+            let q = dial(d, ck).await.expect("the key is registered");
+            let mut c = Connect::new(name, pk);
+            c.resume = resume;
+            let cl = Client::attach(q, c).await;
+            assert!(cl.reply.is_none(), "{name}: attached");
+            cl.errors
+        }
+    };
+    // A fresh attach to its own session (this would be a takeover), and to a new name (this
+    // would create a session): refused.
+    assert_eq!(refused("main", None).await, [ErrorCode::Protocol]);
+    assert_eq!(
+        refused("created-over-quic", None).await,
+        [ErrorCode::Protocol]
+    );
+    // A resume of a session the key is not bound to.
+    assert_eq!(refused("other", Some(resume)).await, [ErrorCode::Protocol]);
+    // A resume of its own session at an incarnation it was not issued.
+    let wrong = msg::ResumeRequest {
+        incarnation: resume.incarnation ^ 1,
+        ..resume
+    };
+    assert_eq!(refused("main", Some(wrong)).await, [ErrorCode::Protocol]);
+    // Nothing was created or taken over by any of that.
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!();
+    };
+    let names: Vec<_> = list.iter().map(|s| s.name.as_str().to_string()).collect();
+    assert_eq!(names, ["main", "other"]);
+    assert_eq!(list[0].attached.as_ref().unwrap().host.as_str(), "laptop");
+
+    // The right resume still works.
+    let q = dial(&d, &ck).await.unwrap();
+    let ok = Client::attach(q, Connect::new("main", pk).resume(resume)).await;
+    assert!(ok.reply.is_some());
+    d.stop().await;
+}
+
+/// The reviewer's reproduction: the session ends, and the key goes with it. The registry does
+/// not collect keys of sessions that no longer exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_does_not_outlive_its_session() {
+    let s = Scratch::new();
+    let d = start(&s, direct_config(CAT)).await;
+    let ck = ClientKey::generate().unwrap();
+    let pk = proto_key(&ck);
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", pk.clone())).await;
+    a.wait_screen("ready").await;
+    let q = dial(&d, &ck).await.unwrap();
+    let mut live = Client::attach(
+        q,
+        Connect::new("main", pk.clone()).resume(a.resume_request()),
+    )
+    .await;
+    assert!(d.registry.contains(&transport_key(&pk)));
+
+    let kill = Request::KillSession {
+        name: "main".parse().unwrap(),
+    };
+    assert_eq!(ask(&d, kill).await, Response::Done);
+    live.wait_down().await;
+    eventually(|| async { !d.registry.contains(&transport_key(&pk)) }).await;
+    assert!(
+        d.registry.is_empty(),
+        "no key is left for a session that is gone"
+    );
+
+    // The key cannot connect at all any more, so it can neither create a session (fresh attach)
+    // nor resume one.
+    assert!(dial(&d, &ck).await.is_err());
+    assert!(d.sessions_is_empty().await);
+
+    // Same when the shell exits by itself, and when an attach is refused.
+    d.stop().await;
+    let s2 = Scratch::new();
+    let d = start(&s2, direct_config("echo bye; exit 0")).await;
+    let ck = ClientKey::generate().unwrap();
+    let c = Client::attach(d.pipe().await, Connect::new("main", proto_key(&ck))).await;
+    drop(c);
+    eventually(|| async { d.registry.is_empty() }).await;
+    assert!(dial(&d, &ck).await.is_err());
+    let stale = msg::ResumeRequest {
+        incarnation: 1,
+        epoch: 1,
+        seq: 0,
+    };
+    let ck2 = ClientKey::generate().unwrap();
+    let r = Client::attach(
+        d.pipe().await,
+        Connect::new("nothere", proto_key(&ck2)).resume(stale),
+    )
+    .await;
+    assert_eq!(r.refused, Some(msg::AttachRefusal::SessionReplaced));
+    eventually(|| async { d.registry.is_empty() }).await;
     d.stop().await;
 }

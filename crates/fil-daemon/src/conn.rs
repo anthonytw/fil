@@ -28,7 +28,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::msg::{
-    Agent, Attach, ControlMsg, ErrorCode, Hello, Request, Response, SessionSummary,
+    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, Hello, Request, Response, SessionSummary,
     SubscriberSummary,
 };
 use fil_session::ServeEnd;
@@ -36,7 +36,7 @@ use fil_transport::Link;
 use fil_transport::auth::PublicKey as TransportKey;
 use std::sync::Arc;
 
-use crate::daemon::{Inner, Lookup};
+use crate::daemon::{Binding, Inner, Lookup};
 
 /// How long `KillSession` waits for the session's processes to be gone.
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -148,55 +148,138 @@ impl Inner {
 
     async fn attach<L: Link>(self: &Arc<Self>, link: L, origin: Origin, attach: Attach) {
         let key_bytes = attach.key.clone();
+        let key = TransportKey::from_spki_der(attach.key.as_bytes());
         let session = attach.name.clone();
-        let resuming = attach.resume.is_some();
-        let mut newly_registered = false;
-        match &origin {
-            Origin::Direct { key } => {
-                if key.as_spki_der() != attach.key.as_bytes() {
-                    tracing::warn!(%session, "direct attach with a key the connection did not authenticate with");
-                    tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
+        let direct = matches!(origin, Origin::Direct { .. });
+        tracing::info!(%session, host = %attach.host, resuming = attach.resume.is_some(), direct, "attach");
+
+        // What the direct connection may do, decided before looking at any session.
+        let required = match &origin {
+            Origin::Direct { key: peer } => match self.check_direct(peer, &attach) {
+                Ok(b) => Some(b),
+                Err(Fail::Tell(code)) => {
+                    tell_and_close(&link, ControlMsg::Error(code)).await;
                     return;
                 }
-                if !self.registry.contains(key) {
-                    tracing::info!(%session, "direct attach with a revoked key");
+                Err(Fail::Drop(_)) => {
                     link.close();
                     return;
                 }
-            }
-            Origin::Pipe => {
-                newly_registered = self
-                    .registry
-                    .register(TransportKey::from_spki_der(attach.key.as_bytes()));
-            }
-        }
-        let direct = matches!(origin, Origin::Direct { .. });
-        tracing::info!(%session, host = %attach.host, resuming, direct, "attach");
+            },
+            Origin::Pipe => None,
+        };
 
+        // On the pipe (the bootstrap) the key is registered for QUIC. A key is for one attach,
+        // so for one session: one already bound to another session is not registered again.
+        let mut newly_registered = false;
+        if required.is_none() {
+            if self
+                .host
+                .binding(&key)
+                .is_some_and(|b| b.name != attach.name)
+            {
+                tracing::warn!(%session, "a key already bound to another session");
+                tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
+                return;
+            }
+            newly_registered = self.registry.register(key.clone());
+        }
+
+        let refuse = |why: ControlMsg| {
+            if newly_registered {
+                self.revoke_key(&key_bytes);
+            }
+            why
+        };
         let handle = match self.session_for(&attach).await {
             Ok(h) => h,
             Err(Lookup::Refuse(refusal)) => {
                 tracing::info!(%session, ?refusal, "attach refused");
-                if newly_registered {
-                    self.revoke_key(&key_bytes);
-                }
-                tell_and_close(&link, ControlMsg::AttachRefused(refusal)).await;
+                let msg = refuse(ControlMsg::AttachRefused(refusal));
+                tell_and_close(&link, msg).await;
                 return;
             }
             Err(Lookup::Failed(why)) => {
                 tracing::error!(%session, %why, "cannot serve an attach");
-                if newly_registered {
-                    self.revoke_key(&key_bytes);
-                }
                 // The wire has no better word for "the daemon failed" yet.
-                tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
+                let msg = refuse(ControlMsg::Error(ErrorCode::Protocol));
+                tell_and_close(&link, msg).await;
                 return;
             }
         };
+
+        match required {
+            // A direct attach resumes the session its key is bound to, at that incarnation,
+            // with that key. Checked again here, with no await before `serve`, so a revocation
+            // while the session was looked up cannot slip through. (The session also refuses a
+            // resume whose key is not its subscriber's.)
+            Some(bound) => {
+                let still = self.registry.contains(&key)
+                    && self.host.binding(&key).as_ref() == Some(&bound)
+                    && handle.incarnation() == bound.incarnation;
+                if !still {
+                    tracing::info!(%session, "direct attach whose key was revoked meanwhile");
+                    link.close();
+                    return;
+                }
+            }
+            // The pipe attach was accepted for this session: bind the key to it.
+            None => {
+                let bound = self.host.bind(
+                    &key,
+                    Binding {
+                        name: session.clone(),
+                        incarnation: handle.incarnation(),
+                    },
+                );
+                // A session that ended while we were binding has already been reaped, so
+                // nothing else would revoke the key.
+                if !bound || !handle.is_alive() {
+                    let msg = refuse(ControlMsg::AttachRefused(AttachRefusal::SessionGone));
+                    self.revoke_key(&key_bytes);
+                    tell_and_close(&link, msg).await;
+                    return;
+                }
+            }
+        }
+
         let end = handle.serve(link, attach).await;
         tracing::info!(%session, direct, end = ?end, "attach ended");
         if newly_registered && matches!(end, ServeEnd::Refused(_)) {
             self.revoke_key(&key_bytes);
+        }
+    }
+
+    /// The rules for a connection that authenticated with `peer` (DESIGN.md sections 8.3, 8.5):
+    ///
+    /// - the attach key is the connection's key;
+    /// - the attach is a **resume**: a fresh attach, take-back included, always goes over the
+    ///   pipe with a new key, so QUIC can never create a session or take one over;
+    /// - the key is bound to the session named, at the incarnation resumed.
+    fn check_direct(&self, peer: &TransportKey, attach: &Attach) -> Result<Binding, Fail> {
+        let session = &attach.name;
+        if peer.as_spki_der() != attach.key.as_bytes() {
+            tracing::warn!(%session, "direct attach with a key the connection did not authenticate with");
+            return Err(Fail::Tell(ErrorCode::Protocol));
+        }
+        let Some(resume) = &attach.resume else {
+            tracing::warn!(%session, "a fresh attach over a direct connection; refused");
+            return Err(Fail::Tell(ErrorCode::Protocol));
+        };
+        if !self.registry.contains(peer) {
+            tracing::info!(%session, "direct attach with a revoked key");
+            return Err(Fail::Drop("revoked key"));
+        }
+        match self.host.binding(peer) {
+            Some(b) if b.name == attach.name && b.incarnation == resume.incarnation => Ok(b),
+            Some(b) => {
+                tracing::warn!(%session, bound = %b.name, "direct attach for a session the key is not bound to");
+                Err(Fail::Tell(ErrorCode::Protocol))
+            }
+            None => {
+                tracing::warn!(%session, "direct attach with a key bound to no session");
+                Err(Fail::Tell(ErrorCode::Protocol))
+            }
         }
     }
 

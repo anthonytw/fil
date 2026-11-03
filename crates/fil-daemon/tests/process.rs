@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -93,15 +94,83 @@ fn concurrent_ensure_daemon_calls_start_exactly_one_daemon() {
     for e in &results {
         assert!(e.stream.peer_addr().is_ok());
     }
-    // The daemon detached itself: it is its own session leader, no longer in our group.
-    let ps = std::process::Command::new("ps")
-        .args(["-o", "pgid=,ppid=", "-p", &pid.to_string()])
+    // The daemon detached itself: it is the leader of a session of its own.
+    assert_eq!(session_of(pid), pid, "setsid made it a session leader");
+    assert_ne!(session_of(pid), session_of(std::process::id()));
+}
+
+fn session_of(pid: u32) -> u32 {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    rustix::process::getsid(Some(pid))
+        .unwrap()
+        .as_raw_nonzero()
+        .get() as u32
+}
+
+/// What detachment is for: the relay that started the daemon exits, and a hangup sent to the
+/// relay's process group (the login ending) does not reach the daemon.
+#[test]
+fn the_daemon_outlives_the_relay_that_started_it_and_a_hangup_of_its_group() {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let s = Scratch::new();
+    write_config(&s, "");
+    // A relay in a process group of its own, as sshd would run it.
+    let mut relay = Command::new(BIN)
+        .arg("--dir")
+        .arg(&s.dir)
+        .arg("relay")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let relay_pid = relay.id();
+    // Its first bytes are the preamble; the daemon is up once the lock holds its pid.
+    let mut first = [0u8; 1];
+    relay
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut first)
+        .unwrap();
+    wait_until("the daemon to be running", || {
+        s.daemon_pid().is_some() && lock_is_held(&s.paths())
+    });
+    let daemon = s.daemon_pid().unwrap();
+    assert_ne!(daemon, relay_pid);
+
+    // The login ends: the relay's stdin closes and it exits.
+    drop(relay.stdin.take());
+    relay.wait().unwrap();
+    // A hangup to the relay's old group (nobody is left in it) and one straight at the daemon.
+    let _ = Command::new("kill")
+        .args(["-HUP", "--", &format!("-{relay_pid}")])
+        .stderr(Stdio::null())
+        .status();
+    Command::new("kill")
+        .args(["-HUP", &daemon.to_string()])
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+
+    assert!(pid_alive(daemon), "the daemon survived the hangups");
+    assert!(lock_is_held(&s.paths()));
+    assert_eq!(session_of(daemon), daemon);
+    // It was adopted by init, not left as the relay's child.
+    let ppid = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &daemon.to_string()])
         .output()
         .unwrap();
-    let ps = String::from_utf8_lossy(&ps.stdout);
-    let mut cols = ps.split_whitespace();
-    let pgid: u32 = cols.next().unwrap().parse().unwrap();
-    assert_eq!(pgid, pid, "setsid made it a process group leader");
+    let ppid: u32 = String::from_utf8_lossy(&ppid.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(ppid, relay_pid);
+    // And it still answers.
+    assert!(UnixStream::connect(s.paths().socket()).is_ok());
 }
 
 #[test]
@@ -186,6 +255,19 @@ async fn relay_process_to_daemon_process_to_session_and_a_daemon_restart() {
     a.type_bytes(b"typed\n").await;
     a.wait("typed twice", |c| c.out_str().matches("typed").count() >= 2)
         .await;
+
+    // A second session, driven through `detach` and `kill` on real relays.
+    let two = PipeLink::spawn(&relay_cmd(), PipeConfig::default())
+        .await
+        .unwrap();
+    let mut b = Client::attach(two, Connect::new("second", key(2)).host("desktop")).await;
+    b.wait_screen("ready").await;
+    assert!(run_tool(&s, &["detach", "second"]).await.contains("done"));
+    b.wait_down().await;
+    let ls = run_tool(&s, &["ls"]).await;
+    assert!(ls.contains("second") && ls.contains("detached"), "{ls}");
+    assert!(run_tool(&s, &["kill", "second"]).await.contains("done"));
+    eventually(|| async { !run_tool(&s, &["ls"]).await.contains("second") }).await;
 
     // `ls` through a second real relay.
     let ls = run_tool(&s, &["ls"]).await;

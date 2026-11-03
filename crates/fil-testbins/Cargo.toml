@@ -1,6 +1,6 @@
 [package]
 name = "fil-testbins"
-description = "Test programs for the real-network harness (tests/realnet): the stand-ins (pipe-echo, pipe-probe, pipe-detach, quic-echo, quiclink-probe) and the drivers for the real fil binary (ptydrive, sockprobe) and fwdprobe, the TCP end for port-forward tests (serve/connect, seeded streams, sha256)"
+description = "Test programs for the real-network harness (tests/realnet): the stand-ins (pipe-echo, pipe-probe, pipe-detach, quic-echo, quiclink-probe) and the drivers for the real fil binary (ptydrive, sockprobe) and fwdprobe, the TCP end for port-forward tests (serve/connect, seeded streams, sha256), and keyprobe (keystroke-to-echo latency on a pty, and the catch-up drain)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

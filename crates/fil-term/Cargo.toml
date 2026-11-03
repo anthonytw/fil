@@ -9,7 +9,8 @@ publish.workspace = true
 
 [features]
 # One feature per emulator backend (DESIGN.md §6.5). alacritty is the default backend
-# (decided); vt100 stays built in as the light alternative.
+# (decided). vt100 is the light alternative, kept for the fidelity suite and the tests: the
+# consumers that ship in the binary (fil-session, fil-client, fil-predict) take only `alacritty`.
 default = ["alacritty", "vt100"]
 alacritty = ["dep:alacritty_terminal", "dep:vte"]
 vt100 = ["dep:vt100", "dep:vte"]

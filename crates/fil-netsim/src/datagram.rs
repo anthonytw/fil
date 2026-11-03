@@ -20,7 +20,7 @@ use std::time::Duration;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::time::{Instant, Sleep, sleep_until};
 
 /// Impairments applied to every datagram. All probabilities are in `[0, 1]`.

@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rand = "0.9"
+rand = "0.10"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "io-util"] }
 
 [dev-dependencies]

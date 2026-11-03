@@ -1,0 +1,38 @@
+[package]
+name = "fil-forward"
+description = "Port forwards and the agent relay above the link: the async endpoint that drives fil-proto's MUX state machine, per-connection pumps, listeners, connects and SOCKS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+fil-proto = { path = "../fil-proto" }
+fil-transport = { path = "../fil-transport" }
+rustix = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tracing = "0.1"
+
+[features]
+# Hooks for tests of races (`Endpoint::set_after_check_hook`). Only the test targets enable it.
+test-hooks = []
+
+[dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-forward = { path = ".", features = ["test-hooks"] }
+# `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.
+fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
+fil-netsim = { path = "../fil-netsim" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.10"
+# SHA-256 for the byte-exact checks (already in the tree through fil-transport; its digest is
+# optimized even in a debug build).
+ring = "0.17"
+# The tests raise their soft RLIMIT_NOFILE (thousands of loopback sockets in one process).
+rustix = { version = "1", features = ["net", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
+
+[lints]
+workspace = true

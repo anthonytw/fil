@@ -7,6 +7,10 @@ use tokio::time::Instant;
 
 use super::PublicKey;
 
+/// The longest any revocation is remembered, whoever prunes it. Far beyond any backstop the
+/// listener uses, it bounds `revoked_at` even when no listener runs (direct mode off).
+const REVOCATION_MEMORY: Duration = Duration::from_secs(600);
+
 /// The keys and the moments recent revocations happened.
 #[derive(Debug, Default)]
 struct State {
@@ -53,6 +57,7 @@ impl KeyRegistry {
         let mut st = self.lock();
         let was = st.keys.remove(key);
         if was {
+            st.revoked_at.retain(|_, t| t.elapsed() < REVOCATION_MEMORY);
             st.revoked_at.insert(key.clone(), Instant::now());
         }
         was
@@ -107,5 +112,20 @@ mod tests {
         assert!(reg.revoke(&k));
         reg.forget_revocations_older_than(Duration::ZERO);
         assert!(reg.revoked_ago(&k).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_revocations_are_forgotten_without_a_listener() {
+        let reg = KeyRegistry::new();
+        let old = PublicKey::from_spki_der(vec![1]);
+        reg.register(old.clone());
+        reg.revoke(&old);
+        tokio::time::advance(REVOCATION_MEMORY + Duration::from_secs(1)).await;
+        let new = PublicKey::from_spki_der(vec![2]);
+        reg.register(new.clone());
+        reg.revoke(&new);
+        assert_eq!(reg.revoked_ago(&old), None, "pruned by the next revoke");
+        assert!(reg.revoked_ago(&new).is_some());
+        assert_eq!(reg.lock().revoked_at.len(), 1);
     }
 }

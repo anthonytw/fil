@@ -7,6 +7,7 @@ use std::time::Duration;
 use fil_proto::limits::DEFAULT_LOG_CAPACITY;
 use fil_proto::log::CatchUpParams;
 use fil_proto::msg::{Fingerprint, PublicKey, SessionName, TermName, TermSize};
+use fil_proto::mux::MuxConfig;
 
 /// How the session's processes are grouped (DESIGN.md section 5.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,6 +85,9 @@ pub struct SessionConfig {
     /// cut with `Error(Protocol)`. Acknowledgements stop well before this (64 KiB), so a client
     /// that honors its send window never gets here.
     pub max_queued_input: usize,
+    /// The forwards' tunables on the daemon side (DESIGN.md section 8.5: the receive window, the
+    /// send buffer, the memory budget, `open_wait`, `linger`, the connect timeout).
+    pub forward: MuxConfig,
 }
 
 impl SessionConfig {
@@ -107,6 +111,7 @@ impl SessionConfig {
             mode_poll: Duration::from_millis(50),
             exit_drain: Duration::from_millis(300),
             max_queued_input: 4 * 1024 * 1024,
+            forward: MuxConfig::default(),
         }
     }
 }

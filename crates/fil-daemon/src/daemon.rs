@@ -174,13 +174,21 @@ impl SessionHost for Host {
 #[derive(Default)]
 struct State {
     live: std::collections::HashMap<SessionName, SessionHandle>,
-    /// `(name, incarnation)` of sessions that ended, oldest first.
-    ended: std::collections::VecDeque<(SessionName, u128)>,
+    /// Sessions that ended, oldest first: `(name, incarnation)` and how the shell ended, for a
+    /// client that missed `SessionExited` (`SessionGone { exit }`).
+    ended: std::collections::VecDeque<Tombstone>,
     /// Connections being served.
     conns: usize,
     /// Session creations that outlived their attach (it timed out) and are still running. Each
     /// kills what it produces, and keeps the daemon from idling out until it has.
     spawning: usize,
+}
+
+/// What the daemon remembers of a session that ended.
+struct Tombstone {
+    name: SessionName,
+    incarnation: u128,
+    exit: Option<msg::ExitStatus>,
 }
 
 /// Why a session could not be found or made for an attach.
@@ -331,18 +339,22 @@ impl Inner {
             return Ok(h.clone());
         }
         if let Some(r) = &attach.resume {
-            let gone = existing
+            // Ended and not reaped yet: its status is the handle's. Reaped: the tombstone's.
+            let gone = match existing
                 .as_ref()
-                .is_some_and(|dead| dead.incarnation() == r.incarnation)
-                || self
+                .filter(|dead| dead.incarnation() == r.incarnation)
+            {
+                Some(dead) => Some(dead.exit_status()),
+                None => self
                     .state()
                     .ended
                     .iter()
-                    .any(|(n, i)| *n == attach.name && *i == r.incarnation);
-            return Err(Lookup::Refuse(if gone {
-                msg::AttachRefusal::SessionGone { exit: None }
-            } else {
-                msg::AttachRefusal::SessionReplaced
+                    .find(|t| t.name == attach.name && t.incarnation == r.incarnation)
+                    .map(|t| t.exit),
+            };
+            return Err(Lookup::Refuse(match gone {
+                Some(exit) => msg::AttachRefusal::SessionGone { exit },
+                None => msg::AttachRefusal::SessionReplaced,
             }));
         }
 
@@ -403,7 +415,11 @@ impl Inner {
         {
             st.live.remove(h.name());
         }
-        st.ended.push_back((h.name().clone(), h.incarnation()));
+        st.ended.push_back(Tombstone {
+            name: h.name().clone(),
+            incarnation: h.incarnation(),
+            exit: h.exit_status(),
+        });
         while st.ended.len() > MAX_TOMBSTONES {
             st.ended.pop_front();
         }
@@ -832,6 +848,21 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
         pid = std::process::id(),
         "daemon process starting"
     );
+    // One daemon serves every session, and their forwards may hold many descriptors: the soft
+    // limit goes as high as it may, and every program the daemon starts gets the original back
+    // (`fil_session::nofile`).
+    // A session's child starts through this binary, which gives it the original limit back.
+    // Without one the limit is not raised at all: the shells would inherit it.
+    match fil_session::nofile::own_executable() {
+        Some(exe) => {
+            fil_session::nofile::set_trampoline(exe);
+            match fil_transport::fdlimit::raise() {
+                Some(r) => tracing::info!(from = r.from, to = r.to, "descriptor limit raised"),
+                None => tracing::debug!("descriptor limit left as it is"),
+            }
+        }
+        None => tracing::info!("own executable unknown: descriptor limit left as it is"),
+    }
     let cfg = match DaemonConfig::load(&paths.config) {
         Ok(mut c) => {
             adjust(&mut c);

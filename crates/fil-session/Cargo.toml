@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bytes = "1"
+fil-forward = { path = "../fil-forward" }
 fil-proto = { path = "../fil-proto" }
 fil-term = { path = "../fil-term", default-features = false, features = ["alacritty"] }
 fil-transport = { path = "../fil-transport" }
@@ -19,6 +20,11 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 vte = "0.15"
 
+[[bin]]
+# The descriptor-limit trampoline for this crate's tests (`nofile`); never built otherwise.
+name = "fil-session-exec"
+required-features = ["test-hooks"]
+
 [features]
 # Hooks for tests of races. Not for daemon code: only the test targets enable it.
 test-hooks = []
@@ -28,7 +34,8 @@ test-hooks = []
 fil-session = { path = ".", features = ["test-hooks"] }
 # The scripted protocol client, shared with the daemon's tests.
 fil-testkit = { path = "../fil-testkit" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+rustix = { version = "1", features = ["process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 
 [lints]
 workspace = true

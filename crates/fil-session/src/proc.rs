@@ -146,6 +146,7 @@ fn output_with_timeout(
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
+    fil_transport::fdlimit::keep_for_std_child(&mut cmd);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,10 +461,11 @@ pub fn scan_processes() -> Vec<ProcRow> {
             })
             .collect();
     }
-    Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
-        .env("LC_ALL", "C")
-        .output()
+    let mut ps = Command::new("ps");
+    ps.args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+        .env("LC_ALL", "C");
+    fil_transport::fdlimit::keep_for_std_child(&mut ps);
+    ps.output()
         .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }
@@ -505,6 +507,11 @@ impl Tracker {
         let live: HashMap<u32, &str> = rows.iter().map(|r| (r.pid, r.start.as_str())).collect();
         self.known
             .retain(|pid, start| live.get(pid).is_some_and(|s| s == start));
+    }
+
+    /// The recorded processes.
+    pub fn pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.known.keys().copied()
     }
 
     /// Every process to signal: the current descendants of `root`, plus the recorded ones that

@@ -46,6 +46,9 @@ pub use config::{ConfigError, DaemonConfig, SessionDefaults};
 pub use daemon::{
     Daemon, DaemonHandle, Exit, StartError, peer_allowed, run_daemon, run_daemon_with,
 };
+/// The descriptor-limit trampoline: every binary that runs the daemon calls it first in `main`
+/// (`fil_session::nofile`).
+pub use fil_session::nofile::run_trampoline_if_asked;
 pub use paths::{
     DaemonSocket, DirError, Paths, current_uid, ensure_socket_dir, list_sockets, other_daemons,
 };

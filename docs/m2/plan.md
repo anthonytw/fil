@@ -626,6 +626,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-10 | The NODELAY remedy, if L1 finds Nagle (for example `ssh -tt` with the relay setting raw mode before the preamble: a pty, utmp entries, stderr merged into the stream), and forward pacing (H1) | §8.2 (the pipe invocation; the remote command itself stays fixed) | Decide on L1's data; avoid `-tt` unless p50 improves by more than 20 ms. |
 | OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. **Decided 2026-11-03:** the owner made the repo public, so Actions minutes are no longer scarce; T1 skipped the local cross build (the CI `aarch64` job builds `fil` and `fwdprobe`), and a seat-owned Lima VM runs realnet locally. |
 | OD-12 | `-N` tunnel-only mode | §2 non-goal | Not in M2; consider it for M4 ("autossh replacement"). |
+| OD-13 | Fairness between one side's channels: one flooded `-R` port can hold all 256 of the daemon opener's channels (`MAX_OPEN_CHANNELS`) and its queue of accepted connections, starving the user's other `-R` forwards and the agent. With `remote_peers = any` the flooder can be another user on the remote (found in the F1 and F2 reviews). | §7.2, §8.5 ("Memory"), §10 | Interim: accept (ssh has the same shape). Per-forward channel caps, or a share reserved for the agent, are a candidate for V1. |
 
 **Decision status (coordinator, 2026-11-03).** The owner asked for M1 to M2 to run without waiting on them. They still decide access changes, router changes and anything that weakens a §11 invariant. So:
 
@@ -635,6 +636,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
   - **OD-7** (non-loopback `-R` bind). Interim: refused, with a message naming the decision, until the owner rules.
   - **OD-8** (bypassing sshd's forwarding and agent switches). Interim: documented in §11 as a known property; no policy file.
   - **OD-11** (infrastructure): decided, the repo is public (see the table).
+  - **OD-13** (channel fairness between forwards). Interim: accepted as is; per-forward caps are a candidate for V1.
 
 ## 5. Verification
 

@@ -535,7 +535,17 @@ pub enum AttachRefusal {
     /// The session no longer exists. `exit` is how it ended, if the daemon still remembers it
     /// (its tombstone), for a client that missed `SessionExited`.
     SessionGone { exit: Option<ExitStatus> },
-    /// The resume request makes no sense (an epoch from the future).
+    /// The resume cannot go on: it makes no sense (an epoch from the future), or it would be
+    /// accepted but the session's forwards have failed, so only a fresh attach can start them
+    /// over (DESIGN.md section 7.2).
+    ///
+    /// **Never sent to an honest client while another subscriber is current.** The failed-forwards
+    /// refusal goes only to the subscriber that holds the session (this incarnation, the current
+    /// epoch, its own key). The other case, an epoch from the future, is one no honest client
+    /// can present: its epoch comes from this incarnation's own attach replies, which never
+    /// run ahead of the session's. A resume from anyone else gets `TakenOver`, `WrongKey`,
+    /// `Detached` or `SessionReplaced` instead. So a client may attach fresh on `BadResume`
+    /// without asking: the session it takes is not someone else's.
     BadResume,
     /// The session was killed and recreated (or the daemon restarted) since the client attached.
     /// This is a different session of the same name: attach afresh.

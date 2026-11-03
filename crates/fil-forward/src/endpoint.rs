@@ -221,6 +221,19 @@ impl EventReceiver {
         }
     }
 
+    /// [`EventReceiver::recv`], with the epoch the event belongs to. An owner that acts on events
+    /// under a lock of its own, which [`Endpoint::new_epoch`] is also called under, compares it
+    /// there with [`Endpoint::epoch`]: an event handed out just before a new epoch can reach that
+    /// lock after it.
+    pub async fn recv_with_epoch(&mut self) -> Option<(u64, EndpointEvent)> {
+        loop {
+            let (epoch, ev) = self.rx.recv().await?;
+            if epoch == self.epoch.load(Ordering::SeqCst) {
+                return Some((epoch, ev));
+            }
+        }
+    }
+
     /// The next event of the current epoch, if one is waiting.
     pub fn try_recv(&mut self) -> Result<EndpointEvent, mpsc::error::TryRecvError> {
         loop {
@@ -961,6 +974,12 @@ impl<L: Link> Endpoint<L> {
         inner.drain(&mut st);
         drop(st);
         inner.kick();
+    }
+
+    /// The current mux epoch (incremented by [`Endpoint::new_epoch`]), as the events of
+    /// [`EventReceiver::recv_with_epoch`] are tagged.
+    pub fn epoch(&self) -> u64 {
+        lock(&self.inner().state).epoch
     }
 
     /// A fresh attach: a new mux epoch. Every channel is dropped (its local socket reset, no

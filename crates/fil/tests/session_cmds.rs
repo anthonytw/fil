@@ -738,11 +738,7 @@ fn an_answer_in_several_parts_is_one_listing() {
     let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
     assert_eq!(v["complete"], true, "{}", json.stdout);
     assert_eq!(v["truncated"], false);
-    let mine = v["other_listeners"]
-        .as_array()
-        .or_else(|| v["host_listeners"].as_array())
-        .or_else(|| v["mine"].as_array())
-        .unwrap_or_else(|| panic!("no listener list in {}", json.stdout));
+    let mine = v["host_listeners"].as_array().unwrap();
     assert_eq!(mine.len(), 200, "{}", json.stdout);
 
     // From the laptop, through the real relay: the same listing, and the host in the header.
@@ -932,4 +928,105 @@ fn times_are_shown_in_the_local_zone() {
             "TZ={tz}: shown {shown:?}, wanted one of {ok:?}"
         );
     }
+}
+
+/// A time from before a daylight-saving change is shown in the offset it had, not in today's:
+/// a summer instant is EDT even when the machine is now on EST (and the other way round).
+#[test]
+fn each_time_is_shown_in_the_offset_it_had() {
+    // 2023-07-15 12:00 UTC.
+    let summer = 1_689_422_400_000;
+    let (w, _fake) = fake_world(
+        "dst",
+        Response::ports(vec![session_row("main", "laptop", summer)]),
+    );
+    let out = Out::of(
+        w.command(ours())
+            .env("TZ", "EST5EDT,M3.2.0,M11.1.0")
+            .env("FIL_SESSION", "main")
+            .arg("ports")
+            .output()
+            .unwrap(),
+    );
+    assert!(out.ok, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("since 2023-07-15 08:00"),
+        "EDT is UTC-4: {}",
+        out.stdout
+    );
+}
+
+// ---- the socket checks -------------------------------------------------------------------------
+
+/// `fil ports` against a live fake daemon whose directory is `dir`; the fake's log shows whether
+/// anything connected.
+fn ports_via(w: &World, dir: &Path) -> Out {
+    Out::of(
+        w.command(ours())
+            .env("FIL_TEST_SOCKET_DIR", dir)
+            .arg("ports")
+            .output()
+            .unwrap(),
+    )
+}
+
+/// The socket directory is checked before any connect: a symbolic link to a good directory, and a
+/// directory that is not mode 0700, are refused although a daemon is listening there. (The same
+/// directory at 0700 is the control: it answers.)
+#[test]
+fn a_linked_or_open_socket_directory_is_refused_before_connecting() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (w, fake) = fake_world(
+        "dircheck",
+        Response::ports(vec![session_row("main", "laptop", now_ms())]),
+    );
+    let control = ports_via(&w, &w.socks);
+    assert!(control.ok, "{}", control.stderr);
+    assert_eq!(fake.asked.lock().unwrap().len(), 1);
+
+    let link = PathBuf::from(format!("{}-link", w.socks.display()));
+    let _ = std::fs::remove_file(&link);
+    symlink(&w.socks, &link).unwrap();
+    let out = ports_via(&w, &link);
+    let _ = std::fs::remove_file(&link);
+    assert_eq!(out.code, Some(1), "{}", out.stdout);
+    assert!(
+        out.stderr.contains("symbolic link") && out.stderr.contains("refusing"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert_eq!(fake.asked.lock().unwrap().len(), 1, "nothing connected");
+
+    std::fs::set_permissions(&w.socks, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = ports_via(&w, &w.socks);
+    assert_eq!(out.code, Some(1), "{}", out.stdout);
+    assert!(
+        out.stderr.contains("0755") && out.stderr.contains("refusing"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert_eq!(fake.asked.lock().unwrap().len(), 1, "nothing connected");
+    std::fs::set_permissions(&w.socks, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The connection's peer must be the user we expect: a live daemon running as someone else is
+/// refused (a real second uid needs root; the expected uid is the seam).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_of_another_uid_is_refused() {
+    let (w, fake) = fake_world("uidcheck", Response::ports(Vec::new()));
+    let paths = fil_daemon::Paths::in_dir(&w.socks);
+    let me = fil_daemon::current_uid();
+    let err = fil::cmds::connect_local_as(&paths, me.wrapping_add(1))
+        .await
+        .err()
+        .expect("a daemon of another uid is refused");
+    assert!(
+        matches!(err, fil::cmds::LocalError::WrongUser(u) if u == me),
+        "{err}"
+    );
+    assert!(fake.asked.lock().unwrap().is_empty(), "no request was sent");
+    let link = fil::cmds::connect_local_as(&paths, me).await.unwrap();
+    link.close();
 }

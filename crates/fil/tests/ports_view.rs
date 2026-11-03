@@ -32,6 +32,7 @@ fn opts(host: Option<&str>) -> ViewOptions<'_> {
         host,
         now_unix_ms: NOW,
         utc_offset_secs: 0,
+        zone: None,
         current_session: None,
     }
 }
@@ -433,6 +434,7 @@ fn the_json_is_the_same_whatever_the_clock_and_the_zone() {
             host: Some("orin"),
             now_unix_ms: 0,
             utc_offset_secs: -5 * 3600,
+            zone: None,
             current_session: None,
         },
     );
@@ -456,6 +458,7 @@ fn times_follow_the_zone_and_name_the_day_when_it_is_not_today() {
             host: None,
             now_unix_ms: NOW,
             utc_offset_secs: 3600,
+            zone: None,
             current_session: None,
         },
     );
@@ -767,6 +770,33 @@ fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
     let t = hint(Some("or in;$x\x1b[2J"), None);
     assert!(t.contains("fil forward 'or in;$x[2J' main -L 8000"), "{t}");
     assert!(!t.contains('\x1b'));
+    // A session named like an option is given after `--`, so the hint cannot become a removal.
+    for odd in ["--rm", "-x"] {
+        let rows = vec![
+            PortsRow::Session(summary(odd, None, 0, false)),
+            PortsRow::Listener(ListenerRow {
+                addr: ip("127.0.0.1"),
+                port: port(8000),
+                owner: ListenerOwner::Session {
+                    session: name(odd),
+                    process: proc(1, "python", None),
+                },
+                since_unix_ms: 0,
+                probe: None,
+            }),
+        ];
+        let t = render_text(&answer(rows.clone()), &opts(Some("orin")));
+        assert!(
+            t.contains(&format!("fil forward orin -L 8000 -- {odd}")),
+            "{t}"
+        );
+        // Inside that very session the hint needs no name, and it never starts with the name.
+        let o = ViewOptions {
+            current_session: Some(odd),
+            ..opts(None)
+        };
+        assert!(render_text(&answer(rows), &o).contains("→  fil forward -L 8000"));
+    }
     // Inside that session: neither. In another or none: the session through the environment.
     let t = hint(None, Some("main"));
     assert!(

@@ -267,6 +267,21 @@ impl ForwardArgs {
     }
 }
 
+/// A usage error that prints the usage line of subcommand `sub` (`Usage: fil forward ...`), as
+/// clap's own errors for that subcommand do, not the root command's.
+fn usage_error(
+    sub: &str,
+    kind: clap::error::ErrorKind,
+    message: impl std::fmt::Display,
+) -> clap::Error {
+    let mut cmd = Cli::command();
+    cmd.build();
+    match cmd.find_subcommand_mut(sub) {
+        Some(sub) => sub.error(kind, message),
+        None => cmd.error(kind, message),
+    }
+}
+
 fn default_session() -> SessionName {
     SessionName::new(DEFAULT_SESSION).expect("valid")
 }
@@ -443,7 +458,11 @@ impl Cli {
         if let Command::Forward(f) = command
             && let Err(why) = f.op()
         {
-            return Err(Cli::command().error(clap::error::ErrorKind::MissingRequiredArgument, why));
+            return Err(usage_error(
+                "forward",
+                clap::error::ErrorKind::MissingRequiredArgument,
+                why,
+            ));
         }
         let a = &self.attach;
         let mut stray = Vec::new();
@@ -478,7 +497,8 @@ impl Cli {
             Command::Ports(_) => "ports",
             Command::Server(_) => "server",
         };
-        Err(Cli::command().error(
+        Err(usage_error(
+            name,
             clap::error::ErrorKind::ArgumentConflict,
             format!(
                 "{} before the command `{name}` would be ignored; put the command first (`fil {name} HOST ...`), or use `--` if a host or session is named `{name}`",
@@ -495,14 +515,19 @@ impl Cli {
             Some(Command::Detach { host, session }) => match (host, session) {
                 (Some(host), Some(session)) => Ok(Action::Detach { host, session }),
                 (None, _) => Ok(Action::DetachHere),
-                (Some(_), None) => Err(Cli::command().error(
+                (Some(_), None) => Err(usage_error(
+                    "detach",
                     clap::error::ErrorKind::MissingRequiredArgument,
                     "`fil detach HOST` needs the session too: `fil detach HOST SESSION`; with no arguments it detaches the session it is run in",
                 )),
             },
             Some(Command::Forward(f)) => {
                 let op = f.op().map_err(|why| {
-                    Cli::command().error(clap::error::ErrorKind::MissingRequiredArgument, why)
+                    usage_error(
+                        "forward",
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        why,
+                    )
                 })?;
                 let target = match f.host {
                     Some(host) => Target::Host {
@@ -861,6 +886,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn usage_errors_show_the_usage_of_their_own_command() {
+        for (args, usage) in [
+            (&["forward", "orin"][..], "Usage: fil forward"),
+            (
+                &["forward", "--rm", "80", "-L", "80"][..],
+                "Usage: fil forward",
+            ),
+            (&["-L", "80", "ls", "box"][..], "Usage: fil ls"),
+        ] {
+            let e = parse(args)
+                .unwrap()
+                .validate()
+                .expect_err(&format!("{args:?}"));
+            assert!(e.to_string().contains(usage), "{args:?}: {e}");
+        }
+        let e = parse(&["detach", "orin"]).unwrap().action().unwrap_err();
+        assert!(e.to_string().contains("Usage: fil detach"), "{e}");
+    }
+
+    /// A session named like an option is given after `--` wherever a session can be given.
+    #[test]
+    fn a_session_named_like_an_option_is_given_after_the_double_dash() {
+        let s = name("--rm");
+        assert_eq!(
+            action(&["kill", "orin", "--", "--rm"]),
+            Action::Kill {
+                host: "orin".into(),
+                session: s.clone()
+            }
+        );
+        assert_eq!(
+            action(&["detach", "orin", "--", "--rm"]),
+            Action::Detach {
+                host: "orin".into(),
+                session: s.clone()
+            }
+        );
+        assert_eq!(
+            action(&["orin", "-L", "80", "--", "--rm"]),
+            Action::Attach {
+                host: "orin".into(),
+                session: s.clone(),
+                transport: None,
+                forwards: forwards(&["orin", "-L", "80"]),
+            }
+        );
+        assert_eq!(
+            action(&["ports", "orin", "--json", "--", "--rm"]),
+            Action::Ports {
+                target: Target::Host {
+                    host: "orin".into(),
+                    session: Some(s.clone())
+                },
+                json: true
+            }
+        );
+        // The form the forward hint prints.
+        let (t, op) = forward_op(&["forward", "orin", "-L", "8000", "--", "--rm"]);
+        assert_eq!(
+            t,
+            Target::Host {
+                host: "orin".into(),
+                session: Some(s)
+            }
+        );
+        assert_eq!(add_flag(&op), "-L 8000:localhost:8000");
     }
 
     #[test]

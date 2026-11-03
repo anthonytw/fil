@@ -95,6 +95,12 @@ fn no_daemon_words(others: &[OtherDaemon]) -> String {
 /// constructor, as the daemon's own tests use. Nothing here blocks a worker: the file checks are
 /// two `lstat`s, and the connect and the first frame are under [`LOCAL_CONNECT`].
 pub async fn connect_local(paths: &Paths) -> Result<PipeLink, LocalError> {
+    connect_local_as(paths, current_uid()).await
+}
+
+/// [`connect_local`] for a daemon that must run as `uid`. The seam for the peer check: a test
+/// names a uid the live daemon does not have.
+pub async fn connect_local_as(paths: &Paths, uid: u32) -> Result<PipeLink, LocalError> {
     paths
         .check_socket_len()
         .map_err(|e| LocalError::Unsafe(e.to_string()))?;
@@ -121,7 +127,7 @@ pub async fn connect_local(paths: &Paths) -> Result<PipeLink, LocalError> {
     // The directory is ours and 0700, so only we could have put a socket in it; the kernel says
     // who is listening all the same.
     match stream.peer_cred() {
-        Ok(c) if c.uid() == current_uid() => {}
+        Ok(c) if c.uid() == uid => {}
         Ok(c) => return Err(LocalError::WrongUser(c.uid())),
         Err(e) => return Err(LocalError::Io(e.kind().to_string())),
     }
@@ -433,7 +439,8 @@ pub async fn ports(target: Target, json: bool, config: &Config) -> u8 {
                     let opts = ViewOptions {
                         host: conn.host.as_deref(),
                         now_unix_ms: now,
-                        utc_offset_secs: localtime::utc_offset_secs((now / 1000) as i64),
+                        utc_offset_secs: 0,
+                        zone: Some(localtime::utc_offset_secs),
                         current_session: current.as_ref().map(SessionName::as_str),
                     };
                     let text = if json {

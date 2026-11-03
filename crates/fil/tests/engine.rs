@@ -293,7 +293,7 @@ async fn a_version_mismatch_ends_the_client_with_a_clear_message() {
         .expect_err("fatal");
     let text = err.to_string();
     assert!(
-        text.contains("version mismatch") && text.contains("same version"),
+        text.contains("newer") && text.contains("upgrade this fil"),
         "{text}"
     );
     assert_eq!(rig.fake.pipe_runs(), 1, "never retried");

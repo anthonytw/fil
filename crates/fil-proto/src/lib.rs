@@ -7,6 +7,7 @@
 //! - [`input`]: in-band records on the terminal channel (the resize that stays in order with the
 //!   keystrokes).
 //! - [`msg`]: the control messages and the validated types they carry.
+//! - [`opening`]: the pipe's opening ping and pong, fixed bytes of the frozen wire.
 //! - [`ring`], [`chan`], [`log`]: sequence-numbered reliable channels, the terminal output log and
 //!   the resume-or-snapshot decision.
 //! - [`epoch`]: the one-subscriber-with-takeover state machine for a session.
@@ -23,6 +24,7 @@ pub mod input;
 pub mod limits;
 pub mod log;
 pub mod msg;
+pub mod opening;
 pub mod preamble;
 pub mod ring;
 pub mod sched;

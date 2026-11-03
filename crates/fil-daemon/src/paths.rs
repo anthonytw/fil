@@ -331,8 +331,16 @@ fn parse_socket_name(name: &OsStr) -> Option<(u16, u16)> {
 /// meets the probe's instant of lock sees the file busy and tries again, as it does for any
 /// other daemon). No file, or a lock nobody holds, is no daemon.
 fn lock_is_held(lock: &Path) -> bool {
-    use rustix::fs::{FlockOperation, flock};
-    let Ok(file) = std::fs::File::open(lock) else {
+    use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+    // Not a way to hang or to read through a link: the directory is ours (0700), but a lock
+    // file that is a FIFO would block a plain open until someone opened the other end, and one
+    // that is a link would be followed.
+    let Ok(file) = openat(
+        CWD,
+        lock,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
         return false;
     };
     matches!(
@@ -367,6 +375,40 @@ mod tests {
             uid,
             mode,
         }
+    }
+
+    /// `fil ls` probes other daemons' lock files; one that is a FIFO (or a link) must neither block
+    /// it nor be followed.
+    #[test]
+    fn a_lock_file_that_is_a_fifo_or_a_link_is_no_daemon_and_costs_no_wait() {
+        let dir = std::env::temp_dir().join(format!("fil-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo.lock");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // A real lock held elsewhere, and a link to it.
+        let real = dir.join("real.lock");
+        let held = std::fs::File::create(&real).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(lock_is_held(&real));
+        let link = dir.join("link.lock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (f, l) = (fifo.clone(), link.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((lock_is_held(&f), lock_is_held(&l)));
+        });
+        let (fifo_held, link_held) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the probe of a FIFO did not block");
+        assert!(!fifo_held && !link_held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

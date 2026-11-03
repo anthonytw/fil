@@ -749,13 +749,8 @@ impl<C: Connector> PathDialer<C> {
             // asks again); the manager's timers decide when the next run happens.
             DialPurpose::Resume => f.severity == Severity::Version,
         };
-        let message = match f.severity {
-            Severity::Version => format!(
-                "{} (install the same version of fil on both ends)",
-                f.message
-            ),
-            _ => f.message,
-        };
+        // A version mismatch is worded with its remedy already (`VersionMismatch::explain`).
+        let message = f.message;
         self.retrying_attach = purpose == DialPurpose::Attach;
         Some(DialError {
             message,

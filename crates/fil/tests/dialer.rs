@@ -435,9 +435,9 @@ async fn a_version_mismatch_is_fatal_on_attach_and_in_a_running_session() {
             .err()
             .unwrap();
         assert!(e.fatal, "{purpose:?}");
-        assert!(e.message.contains("version"), "{}", e.message);
+        assert!(e.message.contains("newer"), "which side: {}", e.message);
         assert!(
-            e.message.contains("same version"),
+            e.message.contains("upgrade"),
             "says what to do: {}",
             e.message
         );

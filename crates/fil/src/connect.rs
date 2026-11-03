@@ -26,6 +26,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fil_proto::version::{Peer, VersionMismatch, WireVersion};
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::pipe::{
     PipeCommand, PipeConfig, PipeError, PipeErrorKind, PipeLink, PipeStderr,
@@ -368,11 +369,21 @@ pub fn failure(e: PipeError) -> PipeFailure {
 /// status note, which would show it twice.
 pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
     let (severity, message) = match &e.kind {
+        // The same words as every other version mismatch (direction and remedy); only the majors
+        // are known here, and with different majors they are all the words use.
         PipeErrorKind::Version { ours, theirs } => (
             Severity::Version,
-            format!(
-                "protocol version mismatch: this fil speaks major {ours}, the fil on the remote host speaks major {theirs}"
-            ),
+            VersionMismatch {
+                ours: WireVersion {
+                    major: *ours,
+                    revision: fil_proto::version::wire_revision(),
+                },
+                peer: WireVersion {
+                    major: *theirs,
+                    revision: 0,
+                },
+            }
+            .explain(Peer::RemoteHost),
         ),
         PipeErrorKind::NoPreamble { .. } => (
             Severity::Permanent,
@@ -611,6 +622,24 @@ mod tests {
         });
         assert_eq!(v.severity, Severity::Version);
         assert!(v.message.contains("major 1") && v.message.contains("major 2"));
+        // The one wording: which side is newer and what to do (a pipe peer of major 2 is newer).
+        assert!(
+            v.message.contains("newer") && v.message.contains("upgrade this fil"),
+            "{}",
+            v.message
+        );
+        let older = failure(PipeError {
+            kind: PipeErrorKind::Version { ours: 2, theirs: 1 },
+            skipped: Vec::new(),
+            exit: None,
+            stderr: Vec::new(),
+        });
+        assert!(
+            older.message.contains("older")
+                && older.message.contains("upgrade the fil on the remote host"),
+            "{}",
+            older.message
+        );
         let n = failure(PipeError {
             kind: PipeErrorKind::NoPreamble { limit: 65536 },
             skipped: b"bash: fil: command not found\n".to_vec(),

@@ -21,11 +21,24 @@
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.
 //!
-//! The client's first frame is a heartbeat ping, sent before it has heard from anyone; the relay
-//! answers it itself (with the reply a daemon would send) and does not forward it, because the
-//! client sends its `Hello` only once something has answered. Anything that is not a client's
-//! opening (no frames, no `Hello` within [`RelayOptions::hello_wait`]) is passed through to the
-//! relay's own daemon unchanged.
+//! # The opening is frozen
+//!
+//! The relay routes a client of **any** build, including ones whose control messages encode
+//! differently from this build's, so it reads the opening without [`ControlMsg`]. The client's
+//! first frame is the ping of [`fil_proto::opening`], sent before it has heard from anyone; the
+//! relay answers it itself with the pong (it is not forwarded, because the client sends its
+//! `Hello` only once something has answered) and reads the next frame, the `Hello`, whose layout
+//! and variant index are frozen too ([`fil_proto::opening::hello_of`]). Those fixed bytes are in
+//! the wire golden's `[frozen]` section, so no later revision can change them and strand an older
+//! client's session.
+//!
+//! Builds from before the opening was frozen (revision 0, the dev builds up to the wire revision
+//! change, and revisions 1 and 2) opened with a `Heartbeat` control message whose variant index
+//! had been 7 and became 6 when `Resize` was removed. Those two byte strings are known and
+//! recognised by value ([`LEGACY_PINGS`]), and answered in the form that client reads. Nothing
+//! more is guessed about old builds: any other first frame is not an opening, and goes with the
+//! rest of the stream to the relay's own daemon unchanged, as does a stream with no `Hello` within
+//! [`RelayOptions::hello_wait`].
 //!
 //! The relay is plain blocking `std` code on threads: stdin and stdout may be a terminal, a
 //! pipe or a socket, none of which tokio can wait on portably, and a thread stuck reading a
@@ -40,6 +53,7 @@ use std::time::{Duration, Instant};
 use fil_proto::frame::{Frame, FrameDecoder};
 use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::msg::{Agent, ControlMsg, ErrorCode, Hello};
+use fil_proto::opening;
 
 use crate::linger;
 use crate::paths::{Paths, ensure_socket_dir};
@@ -53,7 +67,7 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const BUF: usize = 64 * 1024;
 const _: () = assert!(BUF >= 2 * fil_proto::limits::MAX_FRAME_BODY);
 /// How long the relay waits for the client's `Hello`. A client sends it as soon as the relay has
-/// answered its first heartbeat, so this is for something that is not a fil client.
+/// answered its ping, so this is for something that is not a fil client.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
 
 /// What the relay needs: where the daemon is and how to start it.
@@ -132,6 +146,30 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
     }
 }
 
+/// How many chunks of the client's side wait for the relay to pass them on. The reader thread
+/// blocks when they do, so a daemon that is slow to take bytes pushes back on ssh instead of the
+/// relay buffering without bound (past the daemon's own input window it would otherwise grow).
+const CHUNKS_QUEUED: usize = 8;
+/// The most pings the relay answers before it wants a hello: one is what a client sends.
+const MAX_PINGS: usize = 4;
+/// The opening pings of builds from before it was frozen, each with the answer that build reads.
+/// Both are a `Heartbeat { nonce: 0, .. }` control message in the encoding of its time: variant
+/// index 7 up to the removal of `Resize` (the `ede9cb2` build and the dev builds until then), 6
+/// since (wire revisions 1 and 2). The first is the real bytes of an `ede9cb2` client's opening
+/// (`tests/opening.rs` carries them as captured).
+const LEGACY_PINGS: [(&[u8], &[u8]); 2] = [(&[7, 0, 0], &[7, 0, 1]), (&[6, 0, 0], &[6, 0, 1])];
+
+/// The payload to answer a client's opening ping with, if `payload` is one.
+fn pong_for(payload: &[u8]) -> Option<&'static [u8]> {
+    if payload == opening::PING {
+        return Some(opening::PONG);
+    }
+    LEGACY_PINGS
+        .iter()
+        .find(|(ping, _)| *ping == payload)
+        .map(|(_, pong)| *pong)
+}
+
 /// A chunk of the client's side of the pipe.
 enum Chunk {
     Data(Vec<u8>),
@@ -142,7 +180,7 @@ enum Chunk {
 /// Reads `input` on a thread of its own and hands the chunks over, so the relay can wait for
 /// them with a timeout and later pass them on.
 fn read_in_background<R: Read + Send + 'static>(mut input: R) -> mpsc::Receiver<Chunk> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(CHUNKS_QUEUED);
     std::thread::spawn(move || {
         let mut buf = vec![0u8; BUF];
         loop {
@@ -194,9 +232,9 @@ fn frame_at(buf: &[u8]) -> Result<Option<(Frame, usize)>, ()> {
     }
 }
 
-/// The client's opening: answers its first heartbeat ping, then reads its `Hello`. Returns the
-/// wire the hello names, and the bytes read that are still to be passed on (the hello and
-/// whatever came with it). `ended`: the client's side has ended.
+/// The client's opening: answers its ping, then reads its `Hello`. Returns the wire the hello
+/// names, and the bytes read that are still to be passed on (the hello and whatever came with
+/// it). `ended`: the client's side has ended.
 fn read_opening<W: Write>(
     rx: &mpsc::Receiver<Chunk>,
     output: &mut W,
@@ -204,43 +242,41 @@ fn read_opening<W: Write>(
 ) -> Result<(Want, Vec<u8>, bool), RelayError> {
     let deadline = Instant::now() + wait;
     let mut buf: Vec<u8> = Vec::new();
-    let mut answered = false;
+    let mut answered = 0;
     let mut ended = false;
     loop {
         match frame_at(&buf) {
             Ok(Some((frame, used))) => {
-                let msg = (frame.channel == fil_proto::ChannelId::CONTROL)
-                    .then(|| ControlMsg::decode(&frame.payload).ok())
-                    .flatten();
-                match msg {
-                    Some(ControlMsg::Heartbeat {
-                        nonce,
-                        reply: false,
-                    }) if !answered => {
-                        write_control(output, &ControlMsg::Heartbeat { nonce, reply: true })?;
-                        buf.drain(..used);
-                        answered = true;
-                        continue;
-                    }
-                    Some(ControlMsg::Hello(h)) => {
-                        return Ok((
+                let is_control = frame.channel == fil_proto::ChannelId::CONTROL;
+                if is_control
+                    && answered < MAX_PINGS
+                    && let Some(pong) = pong_for(&frame.payload)
+                {
+                    write_payload(output, pong)?;
+                    buf.drain(..used);
+                    answered += 1;
+                    continue;
+                }
+                return Ok(
+                    match opening::hello_of(&frame.payload).filter(|_| is_control) {
+                        Some(h) => (
                             Want::Wire {
                                 major: h.major,
                                 revision: h.revision,
                             },
                             buf,
                             ended,
-                        ));
-                    }
-                    // Not a client's opening: pass it on as it is.
-                    _ => return Ok((Want::Own, buf, ended)),
-                }
+                        ),
+                        // Not a client's opening: pass it on as it is.
+                        None => (Want::Own, buf, ended),
+                    },
+                );
             }
             Err(()) => return Ok((Want::Own, buf, ended)),
             Ok(None) => {}
         }
         if ended {
-            let want = if buf.is_empty() && !answered {
+            let want = if buf.is_empty() && answered == 0 {
                 Want::Gone
             } else {
                 Want::Own
@@ -256,15 +292,21 @@ fn read_opening<W: Write>(
     }
 }
 
-fn write_control<W: Write>(output: &mut W, msg: &ControlMsg) -> Result<(), RelayError> {
-    let frame = msg
-        .to_frame()
-        .and_then(|f| f.encode().map_err(|_| fil_proto::msg::MsgError::Malformed))
+/// A control frame holding `payload`, written to the client.
+fn write_payload<W: Write>(output: &mut W, payload: &[u8]) -> Result<(), RelayError> {
+    let frame = opening::frame_of(payload)
         .map_err(|e| RelayError::Io(std::io::Error::other(e.to_string())))?;
     output
         .write_all(&frame)
         .and_then(|()| output.flush())
         .map_err(RelayError::Output)
+}
+
+fn write_control<W: Write>(output: &mut W, msg: &ControlMsg) -> Result<(), RelayError> {
+    let payload = msg
+        .encode()
+        .map_err(|e| RelayError::Io(std::io::Error::other(e.to_string())))?;
+    write_payload(output, &payload)
 }
 
 /// The refusal for a client whose wire has no daemon here: this relay's `Hello` (so the client
@@ -277,6 +319,21 @@ fn refuse<W: Write>(output: &mut W, revision: u16) -> Result<(), RelayError> {
         &ControlMsg::Hello(Hello::with_revision(agent, revision)),
     )?;
     write_control(output, &ControlMsg::Error(ErrorCode::VersionMismatch))
+}
+
+/// What to tell the user when this relay has just started a daemon and daemons of other wires
+/// are running: their sessions are not in the new one. One line and no numbers: `fil ls` names
+/// the daemons (its "also running" lines), so the two do not say the same thing twice, and a
+/// plain `fil HOST` after an upgrade, which has no `fil ls` output, still hears it.
+fn others_note(paths: &Paths) -> Option<String> {
+    if crate::paths::other_daemons(paths).is_empty() {
+        return None;
+    }
+    Some(
+        "fil: note: started a new fil daemon; sessions of other fil versions stay in their own \
+         daemons (`fil ls` names them)\n"
+            .to_string(),
+    )
 }
 
 /// The relay over any input and output. Writes the preamble to `output` first, so the client
@@ -316,10 +373,15 @@ where
         }
         Want::Own | Want::Wire { .. } => {
             let ensured = ensure_daemon(&opts.paths, &opts.launcher)?;
-            if ensured.started
-                && let Some(w) = linger::check_host()
-            {
-                eprintln!("fil: warning: {w}");
+            if ensured.started {
+                if let Some(w) = linger::check_host() {
+                    eprintln!("fil: warning: {w}");
+                }
+                // A first connection after an upgrade starts a daemon with no sessions beside the
+                // old one that has them: say so now, or `main` silently becomes a second one.
+                if let Some(note) = others_note(&opts.paths) {
+                    eprint!("{note}");
+                }
             }
             ensured.stream
         }
@@ -400,5 +462,35 @@ where
             let _ = done.recv_timeout(HALF_CLOSE_GRACE);
             Ok(RelayEnd::PipeClosed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustix::fs::{FlockOperation, flock};
+
+    /// A first connection after an upgrade starts a daemon beside the old one: the relay says the
+    /// old one is there (numbers only), and says nothing when it is alone.
+    #[test]
+    fn a_new_daemon_beside_an_old_one_is_mentioned_and_alone_it_is_not() {
+        let dir = std::path::PathBuf::from(format!("/tmp/fil-rn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::paths::ensure_socket_dir(&dir).unwrap();
+        let paths = Paths::in_dir(&dir).with_revision(5);
+        assert_eq!(others_note(&paths), None);
+        // A running daemon of revision 4: its socket and its held lock.
+        let old = paths.socket_of(paths.major, 4);
+        drop(std::os::unix::net::UnixListener::bind(&old).unwrap());
+        let lock = std::fs::File::create(old.with_extension("lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let note = others_note(&paths).expect("an old daemon is running");
+        assert!(
+            note.contains("other fil versions") && note.ends_with('\n'),
+            "{note}"
+        );
+        assert_eq!(note.lines().count(), 1, "{note}");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -323,6 +323,23 @@ fn incomplete_tail(bytes: &[u8]) -> usize {
     0
 }
 
+/// Runs `f`, which may block for as long as the terminal does (a write to a flow-controlled
+/// stderr, or the tee lock that such a write holds), without stalling the runtime.
+///
+/// On a multi-threaded runtime's worker the worker hands its queue to another thread first
+/// ([`tokio::task::block_in_place`]). A plain blocking call is not enough there, though the
+/// other workers are free: the worker that took the tee task off the I/O driver was the only
+/// one polling the driver, the others sleep until a task is queued for them, and none is, so no
+/// timer fires and no I/O is noticed until the write returns. Anywhere else (a plain thread, a
+/// blocking-pool thread, a current-thread runtime, where `block_in_place` is not allowed) `f`
+/// runs as it is.
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// Writes to our own stderr.
 fn terminal_sink() -> Sink {
     Arc::new(|text: &str| {
@@ -347,7 +364,7 @@ impl Tee {
             // Nothing visible (an escape sequence alone): the cursor has not moved.
             return;
         }
-        (self.sink)(&clean);
+        blocking(|| (self.sink)(&clean));
         self.open = !clean.ends_with('\n');
     }
 
@@ -416,11 +433,11 @@ impl StderrCapture {
                 // The partial-line timer only runs while there is something to show (not for a
                 // lone first byte of a character, which waits for the rest of it).
                 let partial = {
-                    let t = task.tee.lock().unwrap_or_else(|e| e.into_inner());
+                    let t = task.lock_tee();
                     t.on && t.showable() > 0
                 };
                 let read = std::future::poll_fn(|cx| {
-                    let mut t = task.tee.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut t = task.lock_tee();
                     match task.pump(&mut t, cx) {
                         Poll::Ready(Some(())) => Poll::Ready(true),
                         Poll::Ready(None) => Poll::Ready(false),
@@ -430,14 +447,14 @@ impl StderrCapture {
                 tokio::select! {
                     more = read => if !more { break },
                     () = tokio::time::sleep(TEE_PARTIAL_AFTER), if partial => {
-                        let mut t = task.tee.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut t = task.lock_tee();
                         if t.on {
                             t.show_partial();
                         }
                     }
                 }
             }
-            task.tee.lock().unwrap_or_else(|e| e.into_inner()).finish();
+            task.lock_tee().finish();
             task.done.send_replace(true);
         });
         cap
@@ -464,6 +481,19 @@ impl StderrCapture {
         }
     }
 
+    /// The tee lock. Whoever holds it may be stuck in a write to a stopped terminal, so a wait
+    /// for it goes through [`blocking`]; the lock is free nearly always, and then nothing is
+    /// handed off.
+    fn lock_tee(&self) -> std::sync::MutexGuard<'_, Tee> {
+        match self.tee.try_lock() {
+            Ok(t) => t,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                blocking(|| self.tee.lock().unwrap_or_else(|e| e.into_inner()))
+            }
+        }
+    }
+
     fn keep(&self, bytes: &[u8]) {
         let mut b = self.buf.lock().unwrap_or_else(|e| e.into_inner());
         b.extend_from_slice(bytes);
@@ -481,9 +511,10 @@ impl StderrCapture {
     /// is the same from any thread or task, whichever runtime it is on. It does wait for the
     /// lock, which the task holds while it writes to the terminal, and it writes to the terminal
     /// itself: if our stderr is flow-controlled (Ctrl-S on a terminal, a paused pager), the
-    /// caller is held until the terminal takes the text.
+    /// caller is held until the terminal takes the text (the caller, not the runtime: see
+    /// [`blocking`]).
     fn stop_tee(&self) {
-        let mut t = self.tee.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self.lock_tee();
         if !t.on {
             return;
         }
@@ -1269,36 +1300,80 @@ mod tests {
         );
     }
 
+    /// A terminal that is stopped (Ctrl-S) for one line: the tee's write of `line` waits until
+    /// the test releases it. It gives up after a while, and says so, so that a test that goes
+    /// wrong fails with a message instead of holding a runtime worker, and the runtime's
+    /// shutdown, forever.
+    struct Stopped {
+        shown: Shown,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        gave_up: Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    /// How long a [`Stopped`] terminal waits to be released before it gives up.
+    const STOPPED_FOR_AT_MOST: Duration = Duration::from_secs(20);
+
+    impl Stopped {
+        fn new(line: &'static str) -> (Self, Sink) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = Mutex::new(released);
+            let stopped = Self {
+                shown: Shown::default(),
+                entered: Arc::new(AtomicBool::new(false)),
+                gave_up: Arc::new(AtomicBool::new(false)),
+                release,
+            };
+            let (entered, gave_up, record) = (
+                stopped.entered.clone(),
+                stopped.gave_up.clone(),
+                stopped.shown.sink(),
+            );
+            let sink: Sink = Arc::new(move |text: &str| {
+                if text == line {
+                    entered.store(true, Ordering::SeqCst);
+                    let waited = released.lock().unwrap().recv_timeout(STOPPED_FOR_AT_MOST);
+                    if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                        gave_up.store(true, Ordering::SeqCst);
+                    }
+                }
+                record(text);
+            });
+            (stopped, sink)
+        }
+
+        /// Waits until the tee is in the write that the terminal does not take.
+        async fn until_entered(&self) {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            while !self.entered.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < end, "the tee never wrote");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Lets the terminal go again, and fails if it had already given up waiting: something
+        /// the test needed to make progress did not, while the tee was in its write.
+        fn release(&self, what: &str) {
+            let _ = self.release.send(());
+            assert!(
+                !self.gave_up.load(std::sync::atomic::Ordering::SeqCst),
+                "{what}: nothing moved for {STOPPED_FOR_AT_MOST:?} while the tee was stuck in a write"
+            );
+        }
+    }
+
     /// Dropping a link must not wait for the terminal: with our stderr stopped (Ctrl-S), the tee
     /// task sits in a write holding its lock, and a drop that waited for the lock would hang the
     /// thread that drops (it may be a runtime worker). The text after the drop is not shown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn dropping_a_link_does_not_wait_for_a_terminal_that_has_stopped() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = Mutex::new(release_rx);
-        let entered = Arc::new(AtomicBool::new(false));
-        let shown = Shown::default();
-        let sink: Sink = {
-            let (entered, record) = (entered.clone(), shown.sink());
-            Arc::new(move |text: &str| {
-                if text == "hi\n" {
-                    entered.store(true, Ordering::SeqCst);
-                    // The terminal takes no text until released.
-                    let _ = release_rx.lock().unwrap().recv();
-                }
-                record(text);
-            })
-        };
+        let (stopped, sink) = Stopped::new("hi\n");
         let script = "printf '\\033FIL-CONNECT 1\\n\\000\\000\\000\\004\\000\\377\\177\\001'; \\
                       echo hi >&2; (sleep 1; echo late >&2) & exec sleep 30";
         let (link, cap) = run_with(script, sink).await;
         let link = link.expect("the link comes up");
-        let end = std::time::Instant::now() + Duration::from_secs(20);
-        while !entered.load(Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < end, "the tee never wrote");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        stopped.until_entered().await;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             drop(link);
@@ -1306,10 +1381,52 @@ mod tests {
         });
         let dropped = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         // Let the terminal go again whatever happened, so nothing is left stuck.
-        let _ = release_tx.send(());
+        stopped.release("the runtime stalled");
         assert!(dropped, "the drop waited for a stopped terminal");
         captured(&cap, "late").await;
-        assert_eq!(shown.text(), "hi\n", "nothing after the drop is shown");
+        assert_eq!(
+            stopped.shown.text(),
+            "hi\n",
+            "nothing after the drop is shown"
+        );
+    }
+
+    /// A tee stuck in a write to a stopped terminal holds its own task, not the runtime: timers
+    /// fire and I/O is noticed. The worker that took the tee task off the I/O driver was the only
+    /// one polling the driver, and the other workers sleep until a task is queued for them, so a
+    /// plain blocking write used to stop every timer and every read until the terminal took the
+    /// text. The line comes after a pause, so that the tee task is woken alone, from the driver,
+    /// with the rest of the runtime idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_tee_stuck_on_a_stopped_terminal_does_not_stall_the_runtime() {
+        let (stopped, sink) = Stopped::new("hi\n");
+        let mut child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 0.5; echo hi >&2; read x; echo out; exec sleep 60",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _cap = StderrCapture::start(child.stderr.take().unwrap(), true, sink);
+        stopped.until_entered().await;
+        // A timer, and a read that needs the I/O driver, while the tee is still in its write.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"go\n").await.unwrap();
+        let mut out = [0u8; 4];
+        let mut stdout = child.stdout.take().unwrap();
+        timeout(Duration::from_secs(10), stdout.read_exact(&mut out))
+            .await
+            .expect("the read was noticed")
+            .unwrap();
+        // Still in it: only the release, or its giving up (which fails the test), ends it.
+        stopped.release("the runtime stalled");
+        assert_eq!(&out, b"out\n");
+        stopped.shown.until("the line", |t| t == "hi\n").await;
     }
 
     /// The tee's line state follows what was shown: text that is nothing once cleaned (a lone

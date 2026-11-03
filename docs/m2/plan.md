@@ -129,6 +129,7 @@ pub enum MuxMsg {
     OpenFailed { channel: ChannelId, why: OpenFailure },
     Eof { channel: ChannelId, at: u64 },
     Close { channel: ChannelId, why: CloseReason },
+    Window { channel: ChannelId, window: u32 },      // raise-only receive window (C2 review: a channel that opened small grows when shares free up)
 }
 pub enum OpenKind {
     Local { forward: ForwardId },                   // C→D: the daemon connects to the target in its table
@@ -161,7 +162,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 
 ### 2.5 Forward table semantics
 
-- **Identity of a spec** is `(kind, bind, port)`.
+- **Identity of a spec** is `(kind, bind, port)`. Port 0 (an ephemeral `-R`) has no identity: every `-R 0` is its own listener and never clashes (C2 review). Equal specs still dedup.
 - **`AddForward` from the attached client:**
   - equal to an existing entry: answered with that entry;
   - conflicting (same identity, different target): the client's spec **replaces** it under a new id. The old entry's open channels run until they close.
@@ -219,7 +220,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 
 - **The pipe:** unchanged. MUX is interactive. Dynamic channels are in the forward class: 16 KiB frames, round-robin, one forward frame after every 8 interactive ones.
 - **QUIC:** dynamic channels share the interactive priority (§8.5). L1 and V1 measure keystroke latency under a bulk forward on both transports; H1 acts on the result (§3).
-- **Memory budget per side and session:** 64 MiB of buffered forward data. Past it, a side stops reading local sockets and refuses new opens with `Busy`.
+- **Memory budget per side and session:** 64 MiB of buffered forward data, a hard cap (C2 review). Each opener has half; a channel reserves its window and send buffer from its opener's half at open, full while the rest still covers the smallest share (16 KiB + 16 KiB) for every channel that opener may yet open, smaller down to that share otherwise, and `Busy` when not even that fits (DESIGN §8.5, "Memory").
 - **`ByteRing` gives memory back when drained** (C1), so an idle channel after a burst does not pin 1 MiB.
 - **A full forward never blocks the link's `recv` loop.** Payloads go into per-channel buffers that credit bounds, with no await on a socket write. This keeps §8.1's "the consumer must keep up" on the pipe.
 
@@ -623,7 +624,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. |
 | OD-9 | The `-R` peer check (`same-user`) | §11 table row "`-R` ports on 127.0.0.1" | Ship it as an option, default `any` (ssh parity). |
 | OD-10 | The NODELAY remedy, if L1 finds Nagle (for example `ssh -tt` with the relay setting raw mode before the preamble: a pty, utmp entries, stderr merged into the stream), and forward pacing (H1) | §8.2 (the pipe invocation; the remote command itself stays fixed) | Decide on L1's data; avoid `-tt` unless p50 improves by more than 20 ms. |
-| OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. |
+| OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. **Decided 2026-11-03:** the owner made the repo public, so Actions minutes are no longer scarce; T1 skipped the local cross build (the CI `aarch64` job builds `fil` and `fwdprobe`), and a seat-owned Lima VM runs realnet locally. |
 | OD-12 | `-N` tunnel-only mode | §2 non-goal | Not in M2; consider it for M4 ("autossh replacement"). |
 
 **Decision status (coordinator, 2026-11-03).** The owner asked for M1 to M2 to run without waiting on them. They still decide access changes, router changes and anything that weakens a §11 invariant. So:
@@ -633,7 +634,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
   - **OD-5** (destination-constrained keys through the relay). Interim: the agent stays off by default, and the limitation is documented. A1 must not turn the agent on anywhere by default.
   - **OD-7** (non-loopback `-R` bind). Interim: refused, with a message naming the decision, until the owner rules.
   - **OD-8** (bypassing sshd's forwarding and agent switches). Interim: documented in §11 as a known property; no policy file.
-  - **OD-11** (infrastructure: making the repo public, a self-hosted runner, local cross builds). Interim: local `just ci`, the Pis, and batched Actions runs inside the free minutes.
+  - **OD-11** (infrastructure): decided, the repo is public (see the table).
 
 ## 5. Verification
 
@@ -699,7 +700,7 @@ These rely on `ssh-add` and `ssh-keygen` being on the Pis; `tools` reports them,
 | B | after V1 | `all` (check, realnet three parts, aarch64) | 70 |
 | C | sweep close | `all` | 70 |
 
-- Pi binaries come from the local aarch64 build (OD-11). Otherwise each extra Pi round costs one `aarch64` job, about 4 min.
+- Pi binaries come from the CI `aarch64` artifact (OD-11 decided: the repo is public, so the minutes here no longer bind; batch runs anyway).
 - Pi runs are free, so they are the main end-to-end check:
   - after Wave 2: the forward subset;
   - after V1: the full M2 suite, both Pis;

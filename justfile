@@ -55,6 +55,11 @@ deny:
 netsim-soak:
     cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak
 
+# The MUX model (crates/fil-proto/tests/mux_model.rs: both ends over a reordering, dropping link)
+# over many seeds, in release. Not part of `ci`, which runs a few. MUX_SEED_BASE moves the range.
+mux-soak seeds="5000":
+    MUX_SEEDS={{seeds}} cargo test --release -p fil-proto --test mux_model -- --nocapture
+
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
     cargo run -q -p fil-term --example fixtures
@@ -101,6 +106,7 @@ client-pty:
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh`, `udp` or `sysd`; add scenario names to narrow.
+# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
 realnet *args:
     tests/realnet/run.sh {{args}}
 

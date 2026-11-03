@@ -1098,7 +1098,7 @@ impl Core {
 
     fn on_attach(&mut self, a: Attach) -> AttachAnswer {
         if self.exit.is_some() || a.name != self.name {
-            return AttachAnswer::Refused(AttachRefusal::SessionGone);
+            return AttachAnswer::Refused(AttachRefusal::SessionGone { exit: None });
         }
         self.sample_mode();
         let echo_ack = a.echo_ack;
@@ -1656,6 +1656,7 @@ mod tests {
             key: PublicKey::new(vec![n; 32]).unwrap(),
             resume: None,
             echo_ack: false,
+            agent: false,
             size_gen: 0,
         };
         let accepted = |answer: AttachAnswer| match answer {

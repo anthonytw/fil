@@ -222,6 +222,7 @@ impl Client {
             host: c.host.parse().unwrap(),
             key: c.key,
             echo_ack: c.echo_ack,
+            agent: false,
             resume: c.resume,
         };
         let h = h.clone();

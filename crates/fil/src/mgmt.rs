@@ -226,6 +226,8 @@ mod tests {
                 host: h.parse().unwrap(),
                 since_unix_ms: since,
             }),
+            forwards: 0,
+            agent: false,
         }
     }
 

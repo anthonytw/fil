@@ -1317,6 +1317,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 host: self.cfg.host_label.clone(),
                 key,
                 echo_ack: false,
+                // The agent relay comes with M2's A1.
+                agent: false,
                 resume,
             }),
         );
@@ -1424,13 +1426,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     other => ClientError::Protocol(format!("the daemon reported {other:?}")),
                 });
             }
-            ControlMsg::Reset { channel, code } => {
-                if channel == ChannelId::TERMINAL {
-                    return Err(ClientError::Protocol(format!(
-                        "the daemon reset the terminal channel ({code:?})"
-                    )));
-                }
-            }
+            ControlMsg::Retired(never) => match never {},
             // The daemon sends this after the output, then flushes and closes the link. The
             // output may still be on its way (control messages are handed up ahead of data on
             // QUIC), so the run goes on, reading and acknowledging terminal data, until the link
@@ -1462,10 +1458,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             AttachRefusal::TakenOver(t) => Ok(Flow::End(Served::Refused(Prompt::TakeBack(t)))),
             AttachRefusal::SessionReplaced => Ok(Flow::End(Served::Refused(Prompt::Replaced))),
             AttachRefusal::Detached => Ok(Flow::End(Served::Refused(Prompt::DetachedElsewhere))),
-            AttachRefusal::SessionGone => Ok(Flow::End(Served::Done(Outcome::SessionEnded {
-                code: None,
-                signal: None,
-            }))),
+            AttachRefusal::SessionGone { .. } => {
+                Ok(Flow::End(Served::Done(Outcome::SessionEnded {
+                    code: None,
+                    signal: None,
+                })))
+            }
             AttachRefusal::WrongKey => Err(ClientError::WrongKey(name)),
             AttachRefusal::BadResume => Err(ClientError::BadResume(name)),
         }

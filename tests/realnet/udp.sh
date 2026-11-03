@@ -1069,4 +1069,7 @@ ALL_SCENARIOS=(
   f_dropin_vim_nat f_dropin_vim_loss f_dropin_vs_ssh
 )
 
-part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"
+# Sourced by latency.sh for the topology and the helpers; run directly, it is the udp part.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"
+fi

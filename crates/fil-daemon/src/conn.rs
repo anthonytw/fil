@@ -31,10 +31,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::msg::{
-    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, ForwardResult, Hello, PortsRow, Request,
-    Response, SessionSummary, SubscriberSummary,
+    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, ForwardResult, Hello, Request, Response,
+    SessionSummary, SubscriberSummary,
 };
 use fil_session::{ServeEnd, SessionHandle};
+
+use crate::ports::{Membership, PortsQuery, SessionPorts};
 use fil_transport::Link;
 use fil_transport::auth::PublicKey as TransportKey;
 use std::sync::Arc;
@@ -395,29 +397,34 @@ impl Inner {
         }
     }
 
-    /// `fil ports [SESSION]`: each session's row, then its forwards.
-    ///
-    /// The seam for listener discovery (`docs/m2/plan.md`, P1): it adds, per session, the
-    /// listeners in it and on the host, the owner of each `-L` target and the probe. Until it is
-    /// wired the answer holds the sessions and their forward tables only.
-    async fn ports(
-        self: &Arc<Self>,
-        session: Option<fil_proto::msg::SessionName>,
-    ) -> Vec<Response> {
-        let handles = match &session {
-            Some(name) => match self.session(name) {
-                Some(h) => vec![h],
-                None => return vec![Response::NoSuchSession],
-            },
-            None => self.sessions(),
-        };
-        let mut rows = Vec::new();
-        for h in handles {
-            let Some(s) = summary(&h).await else { continue };
-            rows.push(PortsRow::Session(s));
-            rows.extend(h.forward_rows().into_iter().map(PortsRow::Forward));
+    /// `fil ports [SESSION]`: every session (the discovery needs all of them to tell whose a
+    /// listener is) with its forward rows, handed to the listener discovery and probe
+    /// ([`crate::ports`]), which answers in parts.
+    async fn ports(self: &Arc<Self>, focus: Option<fil_proto::msg::SessionName>) -> Vec<Response> {
+        if let Some(name) = &focus
+            && self.session(name).is_none()
+        {
+            return vec![Response::NoSuchSession];
         }
-        Response::ports(rows)
+        let mut sessions = Vec::new();
+        for h in self.sessions() {
+            let Some(summary) = summary(&h).await else {
+                continue;
+            };
+            let membership = match h.scope() {
+                fil_session::Scope::Systemd { unit } => Membership::Unit(unit.clone()),
+                fil_session::Scope::Tree => Membership::Pids(h.pids()),
+            };
+            sessions.push(SessionPorts {
+                summary,
+                membership,
+                forwards: h.forward_rows(),
+                // The agent relay arrives with M2's A1.
+                agent: None,
+            });
+        }
+        let q = PortsQuery::new(sessions, focus, self.cfg.ports_probe);
+        crate::ports::ports(q).await.into_responses()
     }
 }
 

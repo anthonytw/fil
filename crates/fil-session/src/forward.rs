@@ -507,6 +507,7 @@ impl Forwards {
                     last_unix_ms,
                     owner: None,
                     probe: None,
+                    target_other_user: false,
                 }
             })
             .collect()

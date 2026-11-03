@@ -44,8 +44,18 @@ async fn forward(d: &Running, session: &str, op: ForwardOp) -> Response {
     .await
 }
 
-/// Every part of a `Ports` answer, in order.
+/// The session and forward rows of a `Ports` answer, in order (the host's own listeners, which
+/// discovery adds on Linux, are not this test's).
 async fn ports(d: &Running, session: Option<&str>) -> Result<Vec<PortsRow>, Response> {
+    all_ports(d, session).await.map(|rows| {
+        rows.into_iter()
+            .filter(|r| matches!(r, PortsRow::Session(_) | PortsRow::Forward(_)))
+            .collect()
+    })
+}
+
+/// Every part of a `Ports` answer, in order.
+async fn all_ports(d: &Running, session: Option<&str>) -> Result<Vec<PortsRow>, Response> {
     let link = d.pipe().await;
     let first = request_rev(
         &link,
@@ -134,6 +144,13 @@ async fn forward_requests_and_the_ports_answer() {
         panic!("not bound: {:?}", f.listen);
     };
     assert_eq!(ports(&d, Some("main")).await.unwrap(), rows);
+    // The -R listener is the daemon's own: discovery never lists it as anyone's listener.
+    let all = all_ports(&d, None).await.unwrap();
+    assert!(
+        !all.iter()
+            .any(|r| matches!(r, PortsRow::Listener(l) if l.port == port)),
+        "{all:?}"
+    );
 
     // `fil forward --rm PORT` finds an -R 0 by the port it got.
     assert_eq!(

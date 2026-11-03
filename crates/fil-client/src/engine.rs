@@ -126,6 +126,7 @@ impl Session {
             incarnation: self.incarnation,
             epoch: self.epoch,
             seq: self.recv.received(),
+            want_snapshot: false,
         })
     }
 }
@@ -1039,6 +1040,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 term: self.local_term_name(),
                 host: self.cfg.host_label.clone(),
                 key,
+                echo_ack: false,
                 resume,
             }),
         );
@@ -2021,7 +2023,7 @@ fn ascii_note(s: &str) -> String {
 }
 
 fn term_size(s: (u16, u16)) -> TermSize {
-    TermSize::new(s.0.max(1), s.1.max(1)).expect("non-zero")
+    TermSize::clamped(s.0, s.1)
 }
 
 fn prompt_answer(bytes: &[u8]) -> Option<bool> {

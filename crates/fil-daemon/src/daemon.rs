@@ -113,6 +113,8 @@ pub(crate) struct Binding {
 pub(crate) struct Host {
     registry: KeyRegistry,
     direct: Option<DirectInfo>,
+    /// The host's server policy, shared by every session (DESIGN.md section 11.2).
+    pub(crate) policy: Arc<fil_session::policy::Policy>,
     bindings: Mutex<HashMap<TransportKey, Binding>>,
 }
 
@@ -165,8 +167,17 @@ impl SessionHost for Host {
         self.revoke(&TransportKey::from_spki_der(key.as_bytes()));
     }
 
+    /// Not offered where server policy refuses the direct transport (`direct = false`): the
+    /// client stays on the pipe, and `fil ports` says why.
     fn direct_info(&self) -> Option<DirectInfo> {
-        self.direct.clone()
+        let d = self.direct.clone()?;
+        match self.policy.direct() {
+            Ok(()) => Some(d),
+            Err(_) => {
+                tracing::debug!("direct mode not offered: server policy");
+                None
+            }
+        }
     }
 }
 
@@ -376,6 +387,7 @@ impl Inner {
             .cfg
             .agent_socket
             .then(|| self.paths.agent_socket(&attach.name));
+        sc.policy = self.host.policy.clone();
         let host = self.host.clone() as Arc<dyn SessionHost>;
         let delay = self.cfg.spawn_delay;
         let spawn = async move {
@@ -574,6 +586,7 @@ impl Daemon {
         let host = Arc::new(Host {
             registry: registry.clone(),
             direct,
+            policy: Arc::new(fil_session::policy::Policy::new(cfg.policy.clone())),
             bindings: Mutex::default(),
         });
         let (busy, _) = watch::channel(0);
@@ -1115,6 +1128,9 @@ mod tests {
         Host {
             registry: registry.clone(),
             direct,
+            policy: Arc::new(fil_session::policy::Policy::new(
+                fil_session::policy::PolicySources::none(),
+            )),
             bindings: Mutex::default(),
         }
     }

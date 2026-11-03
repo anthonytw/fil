@@ -256,7 +256,7 @@ async fn confirm_times_out_as_no() {
     let never = Arc::new(Never::default());
     let rules = Arc::new(Rules {
         confirm: Some(never.clone()),
-        bind: None,
+        bind: fil_forward::agent::Bind::Unbound,
         ..Rules::default()
     });
     let task = tokio::spawn(relay(far, script.end, rules, Arc::new(KeyUses::default())));
@@ -341,7 +341,7 @@ async fn a_signature_names_only_a_listed_blob() {
     let (mut near, far) = tokio::io::duplex(1 << 16);
     let uses = Arc::new(KeyUses::default());
     let rules = Arc::new(Rules {
-        bind: None,
+        bind: fil_forward::agent::Bind::Unbound,
         ..Rules::default()
     });
     tokio::spawn(relay(far, script.end, rules, uses.clone()));
@@ -425,7 +425,7 @@ async fn random_bytes_never_panic_the_relay() {
             far,
             agent_near,
             Arc::new(Rules {
-                bind: None,
+                bind: fil_forward::agent::Bind::Unbound,
                 ..Rules::default()
             }),
             Arc::new(KeyUses::default()),

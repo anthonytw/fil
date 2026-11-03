@@ -89,6 +89,9 @@ pub struct SessionConfig {
     /// The forwards' tunables on the daemon side (DESIGN.md section 8.5: the receive window, the
     /// send buffer, the memory budget, `open_wait`, `linger`, the connect timeout).
     pub forward: MuxConfig,
+    /// The host's server policy (DESIGN.md section 11.2): what forwards and agent relay it
+    /// allows. Default: everything ([`crate::policy::AllowAll`]); the daemon sets its mirror.
+    pub policy: Arc<dyn crate::policy::ServerPolicy>,
 }
 
 impl SessionConfig {
@@ -113,6 +116,7 @@ impl SessionConfig {
             exit_drain: Duration::from_millis(300),
             max_queued_input: 4 * 1024 * 1024,
             forward: MuxConfig::default(),
+            policy: crate::policy::AllowAll::arc(),
         }
     }
 }

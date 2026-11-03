@@ -682,8 +682,6 @@ fn resolve_forward(f: &RawForward, out: &mut HostSettings) -> Result<(), String>
         for (i, text) in list.iter().enumerate() {
             let spec = forward_spec::parse_flag(text)
                 .map_err(|e| format!("forward[{i}] = {}: {e}", forward_spec::quote(text)))?;
-            forward_spec::check_policy(&spec)
-                .map_err(|e| format!("forward[{i}] = {}: {e}", forward_spec::quote(text)))?;
             forward_spec::add_spec(&mut out.forward, spec);
         }
     }
@@ -1122,11 +1120,6 @@ forward = ["-oProxyCommand=sh"]"#,
                 r#"[defaults]
 forward = ["-L 1:h:2\u001b[2J"]"#,
                 vec!["forward[0]", "\\u{1b}"],
-            ),
-            (
-                r#"[defaults]
-forward = ["-R *:8080:h:80"]"#,
-                vec!["forward[0]", "OD-7"],
             ),
             (
                 "[defaults]\nagent = \"yes\"",

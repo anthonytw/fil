@@ -5,8 +5,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fil::config::{AgentMode, Config};
 use fil::forward_spec::{
-    self, AgentFlag, CliForwards, ForwardPlan, MAX_SPEC_LEN, PlanError, PolicyError, SpecError,
-    format_flag, parse, parse_flag,
+    self, AgentFlag, CliForwards, ForwardPlan, MAX_SPEC_LEN, PlanError, SpecError, format_flag,
+    parse, parse_flag,
 };
 use fil_proto::mux::{BindAddr, ForwardKind, ForwardSpec, TargetHost};
 
@@ -344,35 +344,19 @@ fn nothing_panics_on_random_bytes() {
 }
 
 #[test]
-fn a_remote_listener_beyond_loopback_is_refused_until_od7_is_decided() {
+fn a_remote_listener_beyond_loopback_is_the_host_s_call() {
+    // OD-7, settled by the owner: a wide -R from the command line or the config parses and is
+    // carried out where the host's server policy (GatewayPorts) allows it; the daemon decides.
     for text in [
         "*:9000:localhost:3000",
         ":9000:localhost:3000",
         "192.0.2.1:9000:h:1",
         "0.0.0.0:9000:h:1",
     ] {
-        // It parses (the grammar is ssh's) ...
         let spec = parse(Remote, text).unwrap();
-        // ... and policy says no, from the command line and the config alike.
-        assert_eq!(
-            forward_spec::check_policy(&spec),
-            Err(PolicyError::WideRemoteBind),
-            "{text}"
-        );
+        assert!(forward_spec::is_exposed(&spec), "{text}");
         let cfg = format!("[defaults]\nforward = [\"-R {text}\"]");
-        let err = Config::parse(&cfg, "t.toml").unwrap_err().to_string();
-        assert!(err.contains("OD-7"), "{err}");
-    }
-    // Wide on the laptop is allowed when written, and so is a loopback -R.
-    for (kind, text) in [
-        (Local, "*:8080:db:80"),
-        (Dynamic, "*:1080"),
-        (Remote, "127.0.0.1:9000:h:1"),
-    ] {
-        assert_eq!(
-            forward_spec::check_policy(&parse(kind, text).unwrap()),
-            Ok(())
-        );
+        assert!(Config::parse(&cfg, "t.toml").is_ok(), "{text}");
     }
 }
 
@@ -495,7 +479,6 @@ fn an_ipv4_mapped_loopback_bind_is_loopback() {
     ] {
         let spec = parse(kind, text).unwrap();
         assert!(!forward_spec::is_exposed(&spec), "{text}");
-        assert_eq!(forward_spec::check_policy(&spec), Ok(()), "{text}");
     }
     // The mapped wildcard is still wide.
     assert!(forward_spec::is_exposed(

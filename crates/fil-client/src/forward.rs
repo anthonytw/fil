@@ -112,17 +112,22 @@ pub fn bind_text(f: BindFailure) -> &'static str {
         BindFailure::PermissionDenied => "permission denied",
         BindFailure::AddrNotAvailable => "no such address here",
         BindFailure::Other => "the system refused",
+        BindFailure::Policy => "refused by server policy",
     }
 }
 
-fn refusal_text(why: ForwardRefusal) -> &'static str {
-    match why {
+/// Why the host refused a forward, after "SPEC: ". A server-policy refusal names the setting and
+/// its source (`AllowTcpForwarding no (/etc/ssh/sshd_config:42)`), sanitized.
+pub fn refusal_text(why: &ForwardRefusal) -> String {
+    let short = match why {
         ForwardRefusal::Conflict => "it conflicts with another forward",
         ForwardRefusal::TooMany => "the session has too many forwards",
         ForwardRefusal::BadSpec => "the host cannot do it",
         ForwardRefusal::NotPermitted => "not permitted",
         ForwardRefusal::NoSuchForward | ForwardRefusal::Ambiguous => "no such forward",
-    }
+        ForwardRefusal::Policy(r) => return format!("refused by server policy: {r}"),
+    };
+    format!("refused by the host ({short})")
 }
 
 impl ForwardSet {
@@ -317,12 +322,15 @@ impl<L: Link> Forwards<L> {
         mut set: ForwardSet,
     ) -> (Self, ForwardHandle, mpsc::UnboundedReceiver<Note>) {
         let grants = Arc::new(Mutex::new(Grants::default()));
-        lock(&grants).set_agent(set.agent.is_some());
         let (notes, notes_rx) = mpsc::unbounded_channel();
-        let agent = set
-            .agent
-            .take()
-            .map(|relay| ClientAgent::new(relay, notes.clone()));
+        // No key for the session-bind: the agent is refused for the run (an unbound relay would
+        // let the host use destination-constrained keys, OD-5), and `Attach.agent` says so.
+        let agent = crate::agent::for_run(
+            set.agent.take(),
+            &notes,
+            fil_forward::agent::BindKey::generate,
+        );
+        lock(&grants).set_agent(agent.is_some());
         let (ep, events) = Endpoint::<L>::new(
             Side::Client,
             set.mux.clone(),
@@ -1007,7 +1015,7 @@ impl<L: Link> Manager<L> {
             MuxMsg::ForwardRefused { req, why } => {
                 if let Some(i) = self.own.iter().position(|o| o.req == Some(req)) {
                     self.own[i].req = None;
-                    debug!(why = ?why, "an own forward was refused");
+                    debug!("an own forward was refused");
                     self.all_answered();
                     // Its listener (paused since the fresh attach) refuses what waits on it; the
                     // bind is tried again at the next fresh attach.
@@ -1016,11 +1024,7 @@ impl<L: Link> Manager<L> {
                     {
                         self.ep.unlisten(old);
                     }
-                    let text = format!(
-                        "{}: refused by the host ({})",
-                        describe(&self.own[i].spec),
-                        refusal_text(why)
-                    );
+                    let text = format!("{}: {}", describe(&self.own[i].spec), refusal_text(&why));
                     self.failed(text);
                 }
             }

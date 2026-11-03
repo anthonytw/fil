@@ -482,22 +482,11 @@ impl Event {
 /// announced. Unless the relay holds that port the scenario stops here, so no packet of the test
 /// reaches another process on this machine. The probe detaches; its session keeps the daemon (and
 /// so the port) until the cleanup after the scenario.
-pub fn relay_port_check(ctx: &Ctx, host: &str, cut: &Cut) -> Result<String, String> {
+pub fn relay_port_check(ctx: &Ctx, host: &str, cut: &Cut) -> Result<(u16, String), String> {
     let mut p = ctx.shell_with(host, Variant::Pipe, "fprb", &[], Some(cut))?;
     let port = p
-        .wait_for(Duration::from_secs(10), |c| {
-            c.log().contains("DirectAvailable { port: ")
-        })
-        .and_then(|_| {
-            let log = p.log();
-            let at = log.find("DirectAvailable { port: ")? + "DirectAvailable { port: ".len();
-            log[at..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u16>()
-                .ok()
-        })
+        .wait_for(Duration::from_secs(10), |c| announced_port(c).is_some())
+        .and_then(|_| announced_port(&p))
         .ok_or("the probe client never learnt the daemon's UDP port")?;
     p.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;
     p.detach()?;
@@ -507,10 +496,26 @@ pub fn relay_port_check(ctx: &Ctx, host: &str, cut: &Cut) -> Result<String, Stri
             cut.udp_bound
         )
     })?;
-    Ok(format!(
-        "relay: {} of the 1001 UDP ports bound, the daemon's (announced, {port}) among them",
-        cut.udp_bound
+    Ok((
+        port,
+        format!(
+            "relay: {} of the 1001 UDP ports bound, the daemon's (announced, {port}) among them",
+            cut.udp_bound
+        ),
     ))
+}
+
+/// The first UDP port the daemon announced to this client (its log's `DirectAvailable`).
+fn announced_port(c: &Client) -> Option<u16> {
+    let log = c.log();
+    let key = "DirectAvailable { port: ";
+    let at = log.find(key)? + key.len();
+    log[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 /// The pair across `events`, one after another, on one client: each must leave both transfers
@@ -538,10 +543,25 @@ fn pair_through(
         None
     };
     let mut notes = Vec::new();
+    let mut probed = None;
     if let Some(cut) = &cut {
-        notes.push(relay_port_check(ctx, host, cut)?);
+        let (port, note) = relay_port_check(ctx, host, cut)?;
+        probed = Some(port);
+        notes.push(note);
     }
     let mut c = ctx.fwd_shell(host, variant, name, &fwd_args(&p), cut.as_ref())?;
+    // The client's own port must be the probed one: a daemon that restarted in between would
+    // announce another, unchecked against the relay.
+    if let Some(port) = probed {
+        let own = c
+            .wait_for(Duration::from_secs(10), |c| announced_port(c).is_some())
+            .and_then(|_| announced_port(&c));
+        ensure(own == Some(port), || {
+            format!(
+                "the client was announced UDP port {own:?}, not the probed {port}: the daemon changed under the relay"
+            )
+        })?;
+    }
     if variant == Variant::Auto {
         c.wait_for(Duration::from_secs(15), |c| {
             c.log().contains("Switched(Direct)")

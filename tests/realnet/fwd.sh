@@ -56,7 +56,7 @@ FWD_MALLORY=rnmallory
 # forward that listens, another user reaching a socket. Each is recorded at once (a note and the
 # log) and collected, so every miss of a scenario is visible, and fwd_verdict fails the scenario at
 # its end if there was any. known_bug (fil.sh) is only for a named finding, which says which change
-# fixes it: today the pipe's slow return after a long outage (FWD_PIPE_RECOVERY_FIX).
+# fixes it; none is open here.
 FWD_MISSES=()
 fwd_miss() {
   FWD_MISSES+=("$1")
@@ -68,12 +68,11 @@ fwd_verdict() {
   ok "no misses"
 }
 
-# The named finding: on --transport pipe the network watcher is off, so after a long outage the
-# client returns only at its next pipe retry (backoff up to 30 s). The fix runs the watcher for the
-# pipe too (a separate PR); when it lands, this becomes a miss like any other.
-FWD_PIPE_RECOVERY_FIX="PR #77 (the network watcher for every transport), which makes this check strict"
-# How soon after the cable is back the forwards must move again. auto measured 0.6 to 1.9 s in four
-# runs (its watcher sees the route return); 5 s is that and margin.
+# The pipe's return after a long outage was a named finding (no network watcher on the pipe, so
+# the client waited for its next retry, up to 30 s); PR #77 runs the watcher for every transport,
+# so it is a miss like any other now. No named finding is open in this part.
+# How soon after the cable is back the forwards must move again, on either transport. auto measured
+# 0.6 to 2.3 s before PR #77 (its watcher sees the route return); 5 s is that and margin.
 FWD_RECOVERY_MS=5000
 
 # ---------------------------------------------------------------------------------------------
@@ -345,6 +344,7 @@ client_cont() {
 
 # The end of every scenario (fc_finish calls it): nothing stays stopped, unplugged or blocked.
 scenario_cleanup() {
+  fwd_door_restore
   client_cont
   fwd_sampler_stop
   cable_plug > /dev/null 2>&1
@@ -397,16 +397,11 @@ fwd_cable_case() {
     fwd_wait_resumed "$t" 120
     note "$tr.pull$k.l_resumed_after_plug_ms=$FWD_RESUMED_L $tr.pull$k.r_resumed_after_plug_ms=$FWD_RESUMED_R"
     # The network is back: the client must be too, within FWD_RECOVERY_MS (recorded above on every
-    # run). auto's network watcher sees the route return; the pipe's is off, which is the named
-    # finding (it then waits for its retry, up to 30 s).
+    # run), on both transports: the network watcher sees the route return (PR #77 for the pipe).
     local slow=$FWD_RESUMED_L
     [[ $FWD_RESUMED_R -le $slow ]] || slow=$FWD_RESUMED_R
     if [[ $slow -gt $FWD_RECOVERY_MS ]]; then
-      if [[ $tr == pipe ]]; then
-        known_bug "$tr: after a ${secs} s cable pull the forwards moved again only $slow ms after the cable was back, over the ${FWD_RECOVERY_MS} ms bound (no network watcher on the pipe; fixed by $FWD_PIPE_RECOVERY_FIX)"
-      else
-        fwd_miss "$tr: after a ${secs} s cable pull the forwards moved again only $slow ms after the cable was back (bound ${FWD_RECOVERY_MS} ms)"
-      fi
+      fwd_miss "$tr: after a ${secs} s cable pull the forwards moved again only $slow ms after the cable was back (bound ${FWD_RECOVERY_MS} ms)"
     fi
     [[ $(link_downs "$name") -gt $downs0 ]] || fail "$tr: the client never logged its link down during pull $k: it was not a disconnect"
     downs0=$(link_downs "$name")
@@ -718,22 +713,28 @@ f_fwd_ending_stress() {
 # restored at once), the owner's own peer-UID check must: the server hangs up on the stranger
 # (CLOSED) while the owner's connection is let in (CONTROL: DATA for the daemon, which greets its
 # user; WAITING for the agent socket, which waits for a request). A stranger let in is a miss.
+# The modes fwd_door_check opened, as "MODE PATH" lines, until it restores them; scenario_cleanup
+# restores whatever is left if the scenario stops in between.
+FWD_DOOR_MODES=()
+fwd_door_restore() {
+  local e
+  for e in ${FWD_DOOR_MODES[@]+"${FWD_DOOR_MODES[@]}"}; do as_root chmod "${e%% *}" "${e#* }" 2> /dev/null || true; done
+  FWD_DOOR_MODES=()
+}
+
 fwd_door_check() {
-  local what=$1 sock=$2 control=$3 p modes=() x
+  local what=$1 sock=$2 control=$3 p probe x
   shift 3
   probe=$(nsx "$NS_S" runuser -u "$FWD_MALLORY" -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
   note "$what.closed_door=$probe"
   [[ $probe == 'REFUSED errno=13'* ]] || fwd_miss "another user's connect to the $what socket, with the directories as fil left them: $probe"
-  for x in "$@" "$sock"; do modes+=("$(as_root stat -c %a "$x")"); done
+  # Paths have no spaces here (/tmp/fil-UID/...), so "MODE PATH" splits on the first space.
+  for x in "$@" "$sock"; do FWD_DOOR_MODES+=("$(as_root stat -c %a "$x") $x"); done
   for x in "$@"; do as_root chmod 711 "$x"; done
   as_root chmod 666 "$sock"
   p=$(nsx "$NS_S" runuser -u rnfil -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
   probe=$(nsx "$NS_S" runuser -u "$FWD_MALLORY" -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
-  local i=0
-  for x in "$@" "$sock"; do
-    as_root chmod "${modes[$i]}" "$x"
-    i=$((i + 1))
-  done
+  fwd_door_restore
   note "$what.open_door: owner=$p stranger=$probe"
   [[ $p == "$control"* ]] || fail "control: the owner's own connection to the $what socket got '$p', wanted $control"
   [[ $probe == CLOSED* ]] || fwd_miss "another user's connect to the $what socket with the door opened was not hung up on (the peer-UID check): $probe"

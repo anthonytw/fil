@@ -39,8 +39,9 @@ use fil_proto::input::{InputRecord, RECORD_MARK, TerminalInput};
 use fil_proto::limits::*;
 use fil_proto::msg::*;
 use fil_proto::mux::{
-    BindAddr, BindFailure, CloseReason, DnsName, ForwardId, ForwardKind, ForwardRefusal,
-    ForwardSpec, ListenState, MuxMsg, OpenFailure, OpenKind, Origin, Target, TargetHost, Window,
+    BindAddr, BindFailure, CloseReason, DnsName, FileFault, FileKey, ForwardId, ForwardKind,
+    ForwardRefusal, ForwardSpec, ListenState, MuxMsg, OpenFailure, OpenKind, Origin, Permit,
+    PolicyRefusal, PolicySetting, PolicySource, Target, TargetHost, TcpForwarding, Toggle, Window,
     encode_record,
 };
 use fil_proto::opening;
@@ -306,13 +307,15 @@ fn bind_failures() -> Vec<BindFailure> {
         BindFailure::PermissionDenied,
         BindFailure::AddrNotAvailable,
         BindFailure::Other,
+        BindFailure::Policy,
     ];
     for c in &all {
         match c {
             BindFailure::AddrInUse
             | BindFailure::PermissionDenied
             | BindFailure::AddrNotAvailable
-            | BindFailure::Other => {}
+            | BindFailure::Other
+            | BindFailure::Policy => {}
         }
     }
     all
@@ -329,8 +332,149 @@ fn listen_states() -> Vec<ListenState> {
     all
 }
 
-fn forward_refusals() -> Vec<ForwardRefusal> {
+fn policy_settings() -> Vec<PolicySetting> {
+    let mut all = vec![PolicySetting::DisableForwarding];
+    for v in [
+        TcpForwarding::No,
+        TcpForwarding::Local,
+        TcpForwarding::Remote,
+        TcpForwarding::Unrecognized,
+    ] {
+        match v {
+            TcpForwarding::No
+            | TcpForwarding::Local
+            | TcpForwarding::Remote
+            | TcpForwarding::Unrecognized => {}
+        }
+        all.push(PolicySetting::AllowTcpForwarding(v));
+    }
+    for t in [Toggle::No, Toggle::Unrecognized] {
+        match t {
+            Toggle::No | Toggle::Unrecognized => {}
+        }
+        all.push(PolicySetting::AllowAgentForwarding(t));
+        all.push(PolicySetting::GatewayPorts(t));
+    }
+    for p in [Permit::None, Permit::NotListed, Permit::Unrecognized] {
+        match p {
+            Permit::None | Permit::NotListed | Permit::Unrecognized => {}
+        }
+        all.push(PolicySetting::PermitOpen(p));
+        all.push(PolicySetting::PermitListen(p));
+    }
+    for k in [
+        FileKey::Local,
+        FileKey::Remote,
+        FileKey::Agent,
+        FileKey::Direct,
+        FileKey::PermitOpen,
+        FileKey::PermitListen,
+        FileKey::GatewayPorts,
+    ] {
+        match k {
+            FileKey::Local
+            | FileKey::Remote
+            | FileKey::Agent
+            | FileKey::Direct
+            | FileKey::PermitOpen
+            | FileKey::PermitListen
+            | FileKey::GatewayPorts => {}
+        }
+        all.push(PolicySetting::File(k));
+    }
+    for f in [
+        FileFault::NotRegular,
+        FileFault::NotRootOwned,
+        FileFault::Writable,
+        FileFault::DirectoryUnsafe,
+        FileFault::Unreadable,
+        FileFault::Unparsable,
+    ] {
+        match f {
+            FileFault::NotRegular
+            | FileFault::NotRootOwned
+            | FileFault::Writable
+            | FileFault::DirectoryUnsafe
+            | FileFault::Unreadable
+            | FileFault::Unparsable => {}
+        }
+        all.push(PolicySetting::FileUnsafe(f));
+    }
+    for c in &all {
+        match c {
+            PolicySetting::DisableForwarding
+            | PolicySetting::AllowTcpForwarding(_)
+            | PolicySetting::AllowAgentForwarding(_)
+            | PolicySetting::PermitOpen(_)
+            | PolicySetting::PermitListen(_)
+            | PolicySetting::GatewayPorts(_)
+            | PolicySetting::File(_)
+            | PolicySetting::FileUnsafe(_) => {}
+        }
+    }
+    all
+}
+
+fn policy_sources() -> Vec<PolicySource> {
     let all = vec![
+        PolicySource::Default,
+        PolicySource::Sshd {
+            file: PortsPath::new("/etc/ssh/sshd_config").unwrap(),
+            line: 42,
+            maybe: false,
+        },
+        PolicySource::Sshd {
+            file: PortsPath::new("/etc/ssh/sshd_config.d/10-dev.conf").unwrap(),
+            line: 3,
+            maybe: true,
+        },
+        PolicySource::File {
+            file: PortsPath::new("/etc/fil/policy.toml").unwrap(),
+        },
+    ];
+    for c in &all {
+        match c {
+            PolicySource::Default | PolicySource::Sshd { .. } | PolicySource::File { .. } => {}
+        }
+    }
+    all
+}
+
+/// Every setting (from the default source) and every source (with one setting).
+fn policy_refusals() -> Vec<PolicyRefusal> {
+    let mut all: Vec<PolicyRefusal> = policy_settings()
+        .into_iter()
+        .map(|setting| PolicyRefusal {
+            setting,
+            source: PolicySource::Default,
+        })
+        .collect();
+    all.extend(
+        policy_sources()
+            .into_iter()
+            .skip(1)
+            .map(|source| PolicyRefusal {
+                setting: PolicySetting::AllowTcpForwarding(TcpForwarding::No),
+                source,
+            }),
+    );
+    all
+}
+
+/// The widest refusal: the longest path, the largest line.
+fn widest_policy_refusal() -> PolicyRefusal {
+    PolicyRefusal {
+        setting: PolicySetting::AllowTcpForwarding(TcpForwarding::Unrecognized),
+        source: PolicySource::Sshd {
+            file: PortsPath::new("p".repeat(MAX_PORTS_PATH)).unwrap(),
+            line: u32::MAX,
+            maybe: true,
+        },
+    }
+}
+
+fn forward_refusals() -> Vec<ForwardRefusal> {
+    let mut all = vec![
         ForwardRefusal::Conflict,
         ForwardRefusal::TooMany,
         ForwardRefusal::BadSpec,
@@ -338,6 +482,7 @@ fn forward_refusals() -> Vec<ForwardRefusal> {
         ForwardRefusal::NoSuchForward,
         ForwardRefusal::Ambiguous,
     ];
+    all.extend(policy_refusals().into_iter().map(ForwardRefusal::Policy));
     for c in &all {
         match c {
             ForwardRefusal::Conflict
@@ -345,7 +490,8 @@ fn forward_refusals() -> Vec<ForwardRefusal> {
             | ForwardRefusal::BadSpec
             | ForwardRefusal::NotPermitted
             | ForwardRefusal::NoSuchForward
-            | ForwardRefusal::Ambiguous => {}
+            | ForwardRefusal::Ambiguous
+            | ForwardRefusal::Policy(_) => {}
         }
     }
     all
@@ -364,6 +510,7 @@ fn open_failures() -> Vec<OpenFailure> {
         OpenFailure::AgentUnavailable,
         OpenFailure::Detached,
         OpenFailure::Other,
+        OpenFailure::Policy,
     ];
     for c in &all {
         match c {
@@ -377,7 +524,8 @@ fn open_failures() -> Vec<OpenFailure> {
             | OpenFailure::Busy
             | OpenFailure::AgentUnavailable
             | OpenFailure::Detached
-            | OpenFailure::Other => {}
+            | OpenFailure::Other
+            | OpenFailure::Policy => {}
         }
     }
     all
@@ -614,7 +762,7 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
         "max/forward-refused".into(),
         MuxMsg::ForwardRefused {
             req: u32::MAX,
-            why: ForwardRefusal::Ambiguous,
+            why: ForwardRefusal::Policy(widest_policy_refusal()),
         },
     );
     add(
@@ -771,6 +919,7 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: Some(process(4, 5)),
             probe: Some(probes()[1].clone()),
             target_other_user: false,
+            policy: None,
         }),
         // A `-L` whose target another user's listener takes: no owner, no probe.
         PortsRow::Forward(ForwardRow {
@@ -788,6 +937,7 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: None,
             probe: None,
             target_other_user: true,
+            policy: Some(policy_refusals()[1].clone()),
         }),
         PortsRow::Agent(AgentRow {
             session: name("main"),
@@ -826,12 +976,53 @@ fn ports_rows() -> Vec<PortsRow> {
         since_unix_ms: 0,
         probe: Some(probes()[4].clone()),
     }));
+    let lines = vec![
+        PolicyLine::Unreadable {
+            file: PortsPath::new("/etc/ssh/sshd_config").unwrap(),
+        },
+        PolicyLine::Partial {
+            file: PortsPath::new("/etc/ssh/sshd_config.d/50-cloud-init.conf").unwrap(),
+            more: 2,
+        },
+        PolicyLine::DenyAll(PolicyRefusal {
+            setting: PolicySetting::FileUnsafe(FileFault::Writable),
+            source: policy_sources()[3].clone(),
+        }),
+        PolicyLine::Direct(PolicyRefusal {
+            setting: PolicySetting::File(FileKey::Direct),
+            source: policy_sources()[3].clone(),
+        }),
+    ];
+    for l in &lines {
+        match l {
+            PolicyLine::Unreadable { .. }
+            | PolicyLine::Partial { .. }
+            | PolicyLine::DenyAll(_)
+            | PolicyLine::Direct(_) => {}
+        }
+    }
+    rows.extend(lines.into_iter().map(PortsRow::Policy));
+    let what = vec![RefusedWhat::Forward(spec_local()), RefusedWhat::Agent];
+    for w in &what {
+        match w {
+            RefusedWhat::Forward(_) | RefusedWhat::Agent => {}
+        }
+    }
+    for w in what {
+        rows.push(PortsRow::Refused(RefusedRow {
+            session: name("main"),
+            what: w,
+            why: policy_refusals()[2].clone(),
+        }));
+    }
     for r in &rows {
         match r {
             PortsRow::Session(_)
             | PortsRow::Forward(_)
             | PortsRow::Listener(_)
-            | PortsRow::Agent(_) => {}
+            | PortsRow::Agent(_)
+            | PortsRow::Policy(_)
+            | PortsRow::Refused(_) => {}
         }
     }
     rows
@@ -863,6 +1054,7 @@ fn widest_forward_row() -> PortsRow {
             label: Some(ProbeLabel::new("l".repeat(MAX_PROBE_LABEL)).unwrap()),
         }),
         target_other_user: true,
+        policy: Some(widest_policy_refusal()),
     })
 }
 
@@ -1018,6 +1210,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                 udp_port: Some(60001),
                 fingerprint: Some(Fingerprint::new(vec![1; 32]).unwrap()),
                 term: term("xterm-256color"),
+                agent_refused: None,
             }),
         );
     }
@@ -1030,6 +1223,22 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             udp_port: None,
             fingerprint: None,
             term: term("xterm-ghostty"),
+            agent_refused: None,
+        }),
+    );
+    add(
+        "attach-reply-agent-refused",
+        ControlMsg::AttachReply(AttachReply {
+            incarnation: 1,
+            epoch: 2,
+            start: StartPoint::Resume { from: 0 },
+            udp_port: None,
+            fingerprint: None,
+            term: term("xterm-ghostty"),
+            agent_refused: Some(PolicyRefusal {
+                setting: PolicySetting::AllowAgentForwarding(Toggle::No),
+                source: policy_sources()[1].clone(),
+            }),
         }),
     );
     for (i, r) in refusals().into_iter().enumerate() {
@@ -1160,6 +1369,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             udp_port: Some(u16::MAX),
             fingerprint: Some(Fingerprint::new(vec![0xFF; MAX_FINGERPRINT]).unwrap()),
             term: term(&longest('t', MAX_TERM)),
+            agent_refused: Some(widest_policy_refusal()),
         }),
     );
     add(
@@ -1451,6 +1661,7 @@ fn attach_reply_index() -> u8 {
         udp_port: None,
         fingerprint: None,
         term: term("x"),
+        agent_refused: None,
     }))
 }
 
@@ -1873,7 +2084,8 @@ fn revisioned() -> Entries {
         ));
     }
     for port in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
-        // AttachReply { incarnation, epoch, start, udp_port: Option<u16>, fingerprint, term }.
+        // AttachReply { incarnation, epoch, start, udp_port: Option<u16>, fingerprint, term,
+        // agent_refused }.
         e.push((
             format!("decode/udp-port-{port}"),
             control_outcome(&raw_msg(
@@ -1886,6 +2098,7 @@ fn revisioned() -> Entries {
                     varint(port),
                     vec![0],
                     counted(1, b'x'),
+                    vec![0],
                 ],
             )),
         ));

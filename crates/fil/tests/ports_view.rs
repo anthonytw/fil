@@ -12,11 +12,22 @@ use fil::forward_spec::parse;
 use fil::ports_view::{JSON_SCHEMA, PortsAnswer, ViewError, ViewOptions, render_json, render_text};
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsPart, PortsPath,
-    PortsRow, Probe, ProbeKind, ProbeLabel, ProcessInfo, ProcessName, Response, SessionName,
-    SessionSummary, SubscriberSummary, TermName,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsPart,
+    PortsPath, PortsRow, Probe, ProbeKind, ProbeLabel, ProcessInfo, ProcessName, RefusedRow,
+    RefusedWhat, Response, SessionName, SessionSummary, SubscriberSummary, TermName,
 };
-use fil_proto::mux::{BindFailure, ForwardId, ForwardKind, ListenState, Origin};
+use fil_proto::mux::{
+    BindFailure, ForwardId, ForwardKind, ListenState, Origin, PolicyRefusal, PolicySetting,
+    PolicySource, TcpForwarding, Toggle,
+};
+
+fn sshd_line(line: u32) -> PolicySource {
+    PolicySource::Sshd {
+        file: PortsPath::new("/etc/ssh/sshd_config").unwrap(),
+        line,
+        maybe: false,
+    }
+}
 
 /// 2023-11-14 00:00:00 UTC.
 const DAY: u64 = 1_699_920_000;
@@ -100,6 +111,7 @@ fn fwd(
         owner: None,
         probe: None,
         target_other_user: false,
+        policy: None,
     }
 }
 
@@ -152,15 +164,20 @@ fn fixed_rows() -> Vec<PortsRow> {
         Origin::Client,
         true,
     );
-    let asked = fwd(
+    let mut asked = fwd(
         "main",
         4,
         ForwardKind::Remote,
         "0:localhost:22",
-        listening(41234),
+        Some(ListenState::Failed(BindFailure::Policy)),
         Origin::Request,
         false,
     );
+    // Server policy changed since it was added: its listener closed at the next attach.
+    asked.policy = Some(PolicyRefusal {
+        setting: PolicySetting::AllowTcpForwarding(TcpForwarding::Local),
+        source: sshd_line(3),
+    });
     let unbound = fwd(
         "main",
         5,
@@ -261,6 +278,22 @@ fn fixed_rows() -> Vec<PortsRow> {
             requests: 14,
             last_unix_ms: at(10, 40),
         }),
+        PortsRow::Refused(RefusedRow {
+            session: name("main"),
+            what: RefusedWhat::Forward(parse(ForwardKind::Remote, "*:8080:localhost:80").unwrap()),
+            why: PolicyRefusal {
+                setting: PolicySetting::GatewayPorts(Toggle::No),
+                source: PolicySource::Default,
+            },
+        }),
+        PortsRow::Refused(RefusedRow {
+            session: name("main"),
+            what: RefusedWhat::Agent,
+            why: PolicyRefusal {
+                setting: PolicySetting::AllowAgentForwarding(Toggle::No),
+                source: sshd_line(12),
+            },
+        }),
         PortsRow::Session(summary("build", None, 1, false)),
         PortsRow::Forward(squatted),
         PortsRow::Listener(ListenerRow {
@@ -283,6 +316,10 @@ fn fixed_rows() -> Vec<PortsRow> {
             owner: ListenerOwner::Other,
             since_unix_ms: 0,
             probe: None,
+        }),
+        PortsRow::Policy(PolicyLine::Partial {
+            file: PortsPath::new("/etc/ssh/sshd_config.d/50-cloud-init.conf").unwrap(),
+            more: 0,
         }),
     ]
 }
@@ -349,6 +386,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "host_listeners",
             "incomplete",
             "schema",
+            "server_policy",
             "sessions",
             "truncated"
         ]
@@ -356,7 +394,25 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     let main = &v["sessions"][0];
     assert_eq!(
         keys(main),
-        ["agent", "attached", "forwards", "listeners", "name", "term"]
+        [
+            "agent",
+            "attached",
+            "forwards",
+            "listeners",
+            "name",
+            "refused",
+            "term"
+        ]
+    );
+    assert_eq!(main["refused"][0]["what"], "-R *:8080:localhost:80");
+    assert_eq!(
+        main["refused"][0]["reason"],
+        "GatewayPorts no (OpenSSH's default)"
+    );
+    assert_eq!(main["refused"][1]["what"], "agent");
+    assert_eq!(
+        v["server_policy"][0],
+        "the sshd mirror is incomplete: fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes"
     );
     assert_eq!(
         keys(&main["forwards"][0]),
@@ -373,6 +429,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "listen",
             "origin",
             "owner",
+            "policy",
             "port",
             "probe",
             "spec",
@@ -406,6 +463,12 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
     assert_eq!(f[2]["listen"]["reason"], "addr_in_use");
     assert_eq!(f[3]["origin"], "request");
     assert_eq!(f[3]["consented"], false);
+    assert_eq!(f[3]["listen"]["reason"], "policy");
+    assert_eq!(
+        f[3]["policy"],
+        "AllowTcpForwarding local (/etc/ssh/sshd_config:3)"
+    );
+    assert_eq!(f[0]["policy"], serde_json::Value::Null);
     assert_eq!(f[4]["listen"], serde_json::Value::Null);
     assert_eq!(v["sessions"][1]["attached"], serde_json::Value::Null);
     assert_eq!(f[0]["target_other_user"], false);

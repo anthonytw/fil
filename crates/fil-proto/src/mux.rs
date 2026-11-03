@@ -24,6 +24,7 @@
 //!   received ([`Mux::link_up`]); a sender sends on a channel again only after the peer's
 //!   statement for it arrived (the *Resume gate*), restarting exactly there.
 
+pub mod policy;
 pub mod record;
 pub mod table;
 pub mod wire;
@@ -42,6 +43,9 @@ use crate::limits::{
 use crate::msg::ControlMsg;
 use crate::ring::ByteRing;
 
+pub use policy::{
+    FileFault, FileKey, Permit, PolicyRefusal, PolicySetting, PolicySource, TcpForwarding, Toggle,
+};
 pub use record::{RecordDecoder, RecordError, encode_record};
 pub use table::{Added, Entry, ForwardTable};
 pub use wire::*;

@@ -398,24 +398,30 @@ pub fn agent_filter(ctx: &Ctx, host: &str) -> Res {
     if let Some(m) = have_tools(&mut c)? {
         return missing(&m);
     }
-    let (_, del) = sess_status(&mut c, "ssh-add -D > /dev/null 2>&1")?;
+    // The refusal must be the agent's (through the filter), as ssh-add reports it: neither text
+    // is in the typed line, so its echo cannot match.
+    let (del_out, del) = sess_status(&mut c, "ssh-add -D 2>&1")?;
+    let del_refused = del_out.contains("Failed to remove all identities");
     // `-x` asks for a password twice: an askpass program that always gives the same one.
     c.run(
         "printf '#!/bin/sh\\necho dropin-lock\\n' > \"$D/ap\" && chmod 700 \"$D/ap\"",
         CMD_TIMEOUT,
     )?;
-    let (_, lock) = sess_status(
+    let (lock_out, lock) = sess_status(
         &mut c,
-        "SSH_ASKPASS_REQUIRE=force SSH_ASKPASS=\"$D/ap\" ssh-add -x < /dev/null > /dev/null 2>&1",
+        "SSH_ASKPASS_REQUIRE=force SSH_ASKPASS=\"$D/ap\" ssh-add -x < /dev/null 2>&1",
     )?;
+    let lock_refused = lock_out.contains("Failed to lock agent");
     let held = a.list().contains(&a.fp);
     let (ok, _) = sign(ctx, &mut c, &a, 1)?;
     let mut notes = vec![format!(
-        "from the session `ssh-add -D` exits {del} and `ssh-add -x` exits {lock} (asserted non-zero); the agent here still holds the key (asserted: {held}) and a signature still verifies (asserted: {ok})"
+        "from the session `ssh-add -D` exits {del} with \"Failed to remove all identities\" (asserted: {del_refused}) and `ssh-add -x` exits {lock} with \"Failed to lock agent\" (asserted: {lock_refused}): the agent refused them, not askpass; the agent here still holds the key (asserted: {held}) and a signature still verifies (asserted: {ok})"
     )];
-    if del == 0 || lock == 0 || !held || !ok {
+    if del == 0 || lock == 0 || !del_refused || !lock_refused || !held || !ok {
         notes.push(format!(
-            "{MISS}the filter let a change through: remove-all {del}, lock {lock}, key held {held}, signs {ok}"
+            "{MISS}the filter let a change through, or the refusal was not the agent's: remove-all {del} ({}), lock {lock} ({}), key held {held}, signs {ok}",
+            del_out.lines().rfind(|l| !l.trim().is_empty() && !l.contains("RC42")).unwrap_or("").trim(),
+            lock_out.lines().rfind(|l| !l.trim().is_empty() && !l.contains("RC42")).unwrap_or("").trim()
         ));
     }
     finish(c)?;

@@ -101,6 +101,8 @@ pub fn config(script: &str) -> DaemonConfig {
             clear_env: true,
         },
         scope: fil_session::ScopeMode::Tree,
+        // Not the machine's own sshd_config: tests that want a server policy write one.
+        policy: fil_session::policy::PolicySources::none(),
         ..DaemonConfig::default()
     }
 }

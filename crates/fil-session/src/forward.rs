@@ -32,7 +32,7 @@
 //! **Privacy** (section 11.1): targets, ports and addresses are user data. Nothing here logs them
 //! at any level; logs name the kind and the wire's enum reasons, at debug. `Debug` is counts only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -49,11 +49,12 @@ use fil_forward::{
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::{
-    AgentRow, ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, SessionName,
+    AgentRow, ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, RefusedRow, RefusedWhat,
+    SessionName,
 };
 use fil_proto::mux::{
     Added, BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable,
-    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, Side,
+    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, PolicyRefusal, Side,
 };
 use fil_transport::{Link, LinkError, LinkKind, LinkStatus};
 use tokio::sync::{mpsc, watch};
@@ -62,6 +63,10 @@ use tracing::debug;
 
 use crate::agent::{self, AgentSocket, Gate};
 use crate::core::{ConnEvent, ConnId};
+use crate::policy::ServerPolicy;
+
+/// Refusals by server policy a session keeps for `fil ports` (the newest; one per spec).
+const MAX_REFUSED: usize = 8;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -168,6 +173,15 @@ struct State {
     /// Whose agent connections are accepted: ours (a test hook changes it).
     agent_uid: u32,
     ended: bool,
+    /// The host's server policy (DESIGN.md section 11.2; [`crate::policy`]).
+    policy: Arc<dyn ServerPolicy>,
+    /// Entries server policy refuses now, though it allowed them when they were added: their
+    /// `-R` listener is closed and their connections are refused.
+    blocked: HashMap<ForwardId, PolicyRefusal>,
+    /// Adds server policy refused in this subscriber's run, for `fil ports` (newest last).
+    refused: VecDeque<(ForwardSpec, PolicyRefusal)>,
+    /// The subscriber asked for the agent and server policy refused it.
+    agent_refused: Option<PolicyRefusal>,
 }
 
 impl State {
@@ -180,7 +194,7 @@ impl State {
     /// Where the agent relay is (DESIGN.md section 10): on while a subscriber that relays holds
     /// the session, ready while its link is up.
     fn agent_gate(&self) -> Gate {
-        if self.ended || self.sub == Sub::Detached || !self.agent {
+        if self.ended || self.sub == Sub::Detached || !self.agent || self.agent_refused.is_some() {
             Gate::Off
         } else if self.linked {
             Gate::Ready
@@ -192,7 +206,42 @@ impl State {
     /// The agent checks of one connection ([`agent::check_open`]).
     fn agent_check(&self, peer: &LocalPeer) -> Result<(), OpenFailure> {
         let detached = self.ended || self.sub == Sub::Detached;
-        agent::check_open(self.agent_gate(), detached, peer, self.agent_uid)
+        agent::check_open(self.agent_gate(), detached, peer, self.agent_uid)?;
+        // The policy may have changed since the socket was bound.
+        self.policy.agent().map_err(|_| OpenFailure::Policy)
+    }
+
+    /// Server policy on a spec, on its way into the table: a refusal is kept for `fil ports`.
+    fn admit(&mut self, spec: &ForwardSpec) -> Result<(), ForwardRefusal> {
+        let Err(why) = self.policy.forward(spec) else {
+            return Ok(());
+        };
+        debug!(kind = ?spec.kind(), "forward refused by server policy");
+        self.refused.retain(|(s, _)| s != spec);
+        if self.refused.len() == MAX_REFUSED {
+            self.refused.pop_front();
+        }
+        self.refused.push_back((spec.clone(), why.clone()));
+        Err(ForwardRefusal::Policy(why))
+    }
+
+    /// Server policy on an entry already in the table, at a connection through it: a refusal
+    /// marks it blocked (for `fil ports`) until the next re-establish looks again.
+    fn still_allowed(&mut self, id: ForwardId) -> Result<(), OpenFailure> {
+        let Some(e) = self.table.get(id) else {
+            return Err(OpenFailure::NoSuchForward);
+        };
+        match self.policy.forward(&e.spec) {
+            Ok(()) => {
+                self.blocked.remove(&id);
+                Ok(())
+            }
+            Err(why) => {
+                debug!(kind = ?e.spec.kind(), "connection refused by server policy");
+                self.blocked.insert(id, why);
+                Err(OpenFailure::Policy)
+            }
+        }
     }
 }
 
@@ -205,6 +254,7 @@ impl fmt::Debug for State {
             .field("linked", &self.linked)
             .field("consented", &self.consented.len())
             .field("agent", &self.agent)
+            .field("blocked", &self.blocked.len())
             .field("ended", &self.ended)
             .finish()
     }
@@ -253,6 +303,7 @@ impl Forwards {
         name: SessionName,
         cfg: MuxConfig,
         agent_socket: Option<PathBuf>,
+        policy: Arc<dyn ServerPolicy>,
     ) -> Arc<Self> {
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
@@ -265,6 +316,10 @@ impl Forwards {
             agent: false,
             agent_uid: agent::our_uid(),
             ended: false,
+            policy,
+            blocked: HashMap::new(),
+            refused: VecDeque::new(),
+            agent_refused: None,
         }));
         #[cfg(feature = "test-hooks")]
         let gate = Arc::new(Mutex::new(None));
@@ -320,7 +375,11 @@ impl Forwards {
         st.conn = Some(conn);
         st.fatal = Some(events);
         st.agent = agent;
-        self.sync_agent(&st);
+        st.refused.clear();
+        self.sync_agent(&mut st);
+        // The table is re-established for the new subscriber: what server policy refuses now is
+        // closed, what it allows again is bound again (no records: the table follows).
+        self.recheck(&mut st);
         // The table, then the -R listeners' state; the new client adds its own specs after it.
         let entries: Vec<_> = st.table.iter().cloned().collect();
         for e in entries {
@@ -365,7 +424,51 @@ impl Forwards {
         st.conn = Some(conn);
         st.fatal = Some(events);
         st.agent = agent;
-        self.sync_agent(&st);
+        self.sync_agent(&mut st);
+        // Re-established on the resumed link: changes are told on the continuing MUX stream.
+        let changed = self.recheck(&mut st);
+        for id in changed {
+            if let Some(state) = st.listen.get(&id) {
+                self.tell(&st, MuxMsg::Listening { id, state: *state });
+            }
+        }
+    }
+
+    /// Server policy over the whole table (a re-establish): an entry it refuses now is marked
+    /// blocked and its `-R` listener closed (`Failed(Policy)`); one it allows again is unmarked,
+    /// and its `-R` bound again. Returns the `-R` entries whose listen state changed.
+    fn recheck(&self, st: &mut State) -> Vec<ForwardId> {
+        let mut changed = Vec::new();
+        let entries: Vec<_> = st.table.iter().cloned().collect();
+        for e in entries {
+            let remote = e.spec.kind() == ForwardKind::Remote;
+            match st.policy.forward(&e.spec) {
+                Err(why) => {
+                    if st.blocked.insert(e.id, why).is_none() {
+                        debug!(kind = ?e.spec.kind(), "forward blocked by server policy");
+                    }
+                    if remote
+                        && st.listen.get(&e.id) != Some(&ListenState::Failed(BindFailure::Policy))
+                    {
+                        self.ep.unlisten(e.id);
+                        st.listen
+                            .insert(e.id, ListenState::Failed(BindFailure::Policy));
+                        changed.push(e.id);
+                    }
+                }
+                Ok(()) => {
+                    st.blocked.remove(&e.id);
+                    if remote
+                        && st.listen.get(&e.id) == Some(&ListenState::Failed(BindFailure::Policy))
+                    {
+                        debug!("forward allowed again by server policy");
+                        self.bind_remote(st, e.id, &e.spec);
+                        changed.push(e.id);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// The subscriber detached (`~.` or `fil detach`): its channels are dropped, and the `-R`
@@ -378,7 +481,7 @@ impl Forwards {
         self.new_epoch(&mut st);
         st.sub = Sub::Detached;
         st.agent = false;
-        self.sync_agent(&st);
+        self.sync_agent(&mut st);
     }
 
     /// The session ended: every channel and every listener closes.
@@ -393,7 +496,7 @@ impl Forwards {
         st.linked = false;
         st.fatal = None;
         st.agent = false;
-        self.sync_agent(&st);
+        self.sync_agent(&mut st);
         drop(st);
         self.ep.shutdown();
         if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -432,7 +535,7 @@ impl Forwards {
         self.ep
             .attach_link(Arc::new(SessionLink::new(link)), resumed);
         st.linked = true;
-        self.sync_agent(&st);
+        self.sync_agent(&mut st);
     }
 
     /// Connection `conn` is over. If its link was the endpoint's, the subscriber is now between
@@ -448,7 +551,7 @@ impl Forwards {
         st.linked = false;
         st.conn = None;
         st.fatal = None;
-        self.sync_agent(&st);
+        self.sync_agent(&mut st);
     }
 
     /// A payload for the MUX channel or a dynamic channel, from connection `conn`. Never waits.
@@ -501,8 +604,16 @@ impl Forwards {
     // ---- the agent relay ------------------------------------------------------------------------
 
     /// After every change of the subscriber or its link: tells waiting agent connections where
-    /// the relay is, and binds or removes the socket (it exists only while the relay is on).
-    fn sync_agent(&self, st: &State) {
+    /// the relay is, and binds or removes the socket (it exists only while the relay is on, and
+    /// only where server policy allows it: asked before the socket is created).
+    fn sync_agent(&self, st: &mut State) {
+        st.agent_refused = None;
+        if st.agent && !st.ended && st.sub == Sub::Held {
+            st.agent_refused = st.policy.agent().err();
+            if st.agent_refused.is_some() {
+                debug!("agent relay refused by server policy");
+            }
+        }
         let g = st.agent_gate();
         self.agent_gate.send_if_modified(|v| {
             let changed = *v != g;
@@ -530,6 +641,34 @@ impl Forwards {
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .is_some_and(AgentSocket::is_bound)
+    }
+
+    /// Why server policy refuses the agent the subscriber asked for, if it does (the attach
+    /// reply says so).
+    pub(crate) fn agent_refusal(&self) -> Option<PolicyRefusal> {
+        self.lock().agent_refused.clone()
+    }
+
+    /// What server policy refused in this subscriber's run, for `fil ports`.
+    pub(crate) fn refused_rows(&self) -> Vec<RefusedRow> {
+        let st = self.lock();
+        let mut v: Vec<RefusedRow> = st
+            .refused
+            .iter()
+            .map(|(spec, why)| RefusedRow {
+                session: self.name.clone(),
+                what: RefusedWhat::Forward(spec.clone()),
+                why: why.clone(),
+            })
+            .collect();
+        if let Some(why) = &st.agent_refused {
+            v.push(RefusedRow {
+                session: self.name.clone(),
+                what: RefusedWhat::Agent,
+                why: why.clone(),
+            });
+        }
+        v
     }
 
     /// The `fil ports` agent row, while the relay is on. Counts only.
@@ -568,7 +707,10 @@ impl Forwards {
             return ForwardResult::Refused(ForwardRefusal::TooMany);
         }
         match op {
-            ForwardOp::Add(spec) => match st.table.add(spec, Origin::Request) {
+            ForwardOp::Add(spec) => match ForwardTable::permitted(&spec, Origin::Request)
+                .and_then(|()| st.admit(&spec))
+                .and_then(|()| st.table.add(spec, Origin::Request))
+            {
                 Ok(Added::Existing(id)) => ForwardResult::Added(id),
                 // A request never replaces (the table answers `Conflict`); if it ever did, it
                 // would be handled as the client's is.
@@ -636,6 +778,7 @@ impl Forwards {
                     owner: None,
                     probe: None,
                     target_other_user: false,
+                    policy: st.blocked.get(&e.id).cloned(),
                 }
             })
             .collect()
@@ -748,6 +891,7 @@ impl Forwards {
         self.ep.unlisten(id);
         st.listen.remove(&id);
         st.consented.remove(&id);
+        st.blocked.remove(&id);
         // Its open connections run until they close; then it has nothing left to count.
         self.ep.forget_stats(id);
         self.tell(st, MuxMsg::ForwardGone { id });
@@ -821,7 +965,10 @@ impl Forwards {
                     );
                     return;
                 }
-                match st.table.add(spec, Origin::Client) {
+                let added = ForwardTable::permitted(&spec, Origin::Client)
+                    .and_then(|()| st.admit(&spec))
+                    .and_then(|()| st.table.add(spec, Origin::Client));
+                match added {
                     Ok(added) => {
                         st.consented.insert(added.id());
                         self.install(st, added, Some(req));
@@ -926,9 +1073,20 @@ impl Policy for SessionPolicy {
             OpenKind::Remote { .. } | OpenKind::Agent => return Err(OpenFailure::NotPermitted),
         };
         match st.table.get(*forward) {
-            Some(e) if e.spec.kind() == want => Ok(()),
-            _ => Err(OpenFailure::NoSuchForward),
+            Some(e) if e.spec.kind() == want => {}
+            _ => return Err(OpenFailure::NoSuchForward),
         }
+        let mut st = st;
+        st.still_allowed(*forward)?;
+        // After the entry's check, which clears what an earlier target was refused for.
+        if let OpenKind::Dynamic { target, .. } = kind
+            && let Err(why) = st.policy.dynamic_target(target)
+        {
+            debug!("SOCKS target refused by server policy");
+            st.blocked.insert(*forward, why);
+            return Err(OpenFailure::Policy);
+        }
+        Ok(())
     }
 
     /// `peer` is who connected: the seam for OD-9's `forward.remote_peers = "same-user"` (the
@@ -952,6 +1110,8 @@ impl Policy for SessionPolicy {
         if !st.consented.contains(forward) {
             return Err(OpenFailure::NotPermitted);
         }
+        let mut st = st;
+        st.still_allowed(*forward)?;
         drop(st);
         #[cfg(feature = "test-hooks")]
         {

@@ -177,9 +177,10 @@ impl DialerConfig {
                 jitter_seed: random_seed(),
                 ..PathConfig::default()
             },
-            // A hint for the path manager's upgrade and redial; with the pipe only there is
-            // nothing to upgrade to and nobody to hint (and no wakeups to pay for).
-            watch_network: setting != TransportSetting::Pipe,
+            // A hint for the path manager's upgrade, redial and pipe restart. The pipe-only
+            // setting needs it too: it is what ends a pipe's backoff (up to 30 s) when the
+            // network comes back. The cost is one wakeup every two seconds.
+            watch_network: true,
         }
     }
 }

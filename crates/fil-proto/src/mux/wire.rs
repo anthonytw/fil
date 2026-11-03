@@ -4,7 +4,9 @@
 //! `PROTOCOL_REVISION`** (the golden in `tests/wire_golden.rs` fails until it has one).
 //!
 //! Errors are enums only. No free-form string travels in a refusal or a close: an OS error text
-//! is user data (DESIGN.md section 11.1) and, shown on a terminal, an injection vector.
+//! is user data (DESIGN.md section 11.1) and, shown on a terminal, an injection vector. The one
+//! exception is a server-policy refusal ([`PolicyRefusal`]), which names the path of the admin's
+//! config file that decided it: capped, and sanitized on display.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -15,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::frame::ChannelId;
 use crate::limits::{MAX_DNS_LABEL, MAX_DNS_NAME, MAX_WINDOW, MIN_WINDOW};
 use crate::msg::MsgError;
+use crate::mux::policy::PolicyRefusal;
 
 fn invalid(what: &'static str, why: &'static str) -> MsgError {
     MsgError::Invalid { what, why }
@@ -313,9 +316,12 @@ pub enum BindFailure {
     PermissionDenied,
     AddrNotAvailable,
     Other,
+    /// The host's server policy refuses this listener (DESIGN.md section 11.2); `fil ports`
+    /// names the setting.
+    Policy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ForwardRefusal {
     /// The same `(kind, bind, port)` with another target, from a requester that may not
     /// replace it.
@@ -330,6 +336,9 @@ pub enum ForwardRefusal {
     NoSuchForward,
     /// A removal without a kind matched more than one forward.
     Ambiguous,
+    /// The host's server policy refuses it (DESIGN.md section 11.2): the deciding setting and
+    /// where it is set.
+    Policy(PolicyRefusal),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -351,6 +360,9 @@ pub enum OpenFailure {
     /// No subscriber is attached (an `-R` or agent connection while detached).
     Detached,
     Other,
+    /// The host's server policy refuses this connection (DESIGN.md section 11.2): a `-D` target
+    /// its `PermitOpen` does not list, or a forward the policy has stopped allowing.
+    Policy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

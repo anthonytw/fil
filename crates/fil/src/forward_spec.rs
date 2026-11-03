@@ -78,22 +78,6 @@ pub enum SpecError {
     Flag,
 }
 
-/// What a spec says about itself that policy cares about, separate from whether it parses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PolicyError {
-    /// OD-7 (`docs/m2/plan.md` section 4.6) is the owner's and still open: until it is decided
-    /// fil refuses a `-R` listener that is not on loopback, from every origin.
-    #[error(
-        "a -R listener on a non-loopback address is not allowed yet (owner decision OD-7 is \
-         open); bind it to loopback and put a proxy in front, or use ssh -R for now"
-    )]
-    WideRemoteBind,
-}
-
-/// Whether the owner has decided OD-7 ("honour an explicit non-loopback `-R` bind"). Open:
-/// `false`. When it is decided, flip this and delete the refusal's tests together.
-const WIDE_REMOTE_BIND_ALLOWED: bool = false;
-
 /// `s` quoted for an error message: ASCII-escaped, cut to 60 characters. User text is shown only
 /// like this.
 pub fn quote(s: &str) -> String {
@@ -302,14 +286,6 @@ pub fn is_exposed(spec: &ForwardSpec) -> bool {
     }
 }
 
-/// Policy for a spec fil is about to carry out for its own user (their CLI or config).
-pub fn check_policy(spec: &ForwardSpec) -> Result<(), PolicyError> {
-    if spec.kind() == ForwardKind::Remote && is_exposed(spec) && !WIDE_REMOTE_BIND_ALLOWED {
-        return Err(PolicyError::WideRemoteBind);
-    }
-    Ok(())
-}
-
 fn fmt_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => v4.to_string(),
@@ -422,8 +398,6 @@ pub struct ForwardPlan {
 pub enum PlanError {
     #[error("{0} forwards were asked for; a session holds at most {MAX_FORWARDS}")]
     TooMany(usize),
-    #[error("{}: {why}", quote(&format_flag(spec)))]
-    Policy { spec: ForwardSpec, why: PolicyError },
     #[error(
         "{} and {} would listen on the same port; give one of them another port or bind address",
         quote(a),
@@ -489,12 +463,6 @@ impl ForwardPlan {
         // Counted before the cap so the message says what was asked for.
         if specs.len() > MAX_FORWARDS {
             return Err(PlanError::TooMany(specs.len()));
-        }
-        for s in &specs {
-            check_policy(s).map_err(|why| PlanError::Policy {
-                spec: s.clone(),
-                why,
-            })?;
         }
         if let Some((a, b)) = find_collision(&specs) {
             return Err(PlanError::Collision {

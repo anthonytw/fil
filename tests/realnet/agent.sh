@@ -112,7 +112,9 @@ f_agent_ssh_hop() {
   FWD_SESSION=aghopno
   ag_attach b "$FWD_SESSION"
   ag_hop b HOPC
-  [[ $AG_RC != 0 ]] || fwd_miss "without -A the ssh hop still authenticated: the key came from somewhere else"
+  # The specific failure: sshd refused the key (no agent to offer it), not some other error.
+  [[ $AG_RC != 0 ]] && grep -q 'Permission denied (publickey' <<< "$AG_OUT" \
+    || fwd_miss "without -A the ssh hop did not fail with 'Permission denied (publickey)' (status $AG_RC): $(tail -n 4 <<< "$AG_OUT")"
   note "hop_without_A=status_$AG_RC"
   fc_detach b
   cx_fk "$FWD_SESSION"
@@ -134,6 +136,7 @@ f_agent_other_user() {
   dir=$(dirname "$sock")
   note "agent_dir_mode=$(as_root stat -c %a "$dir") agent_sock_mode=$(as_root stat -c %a "$sock")"
   [[ $(as_root stat -c '%a %U' "$dir") == "700 rnfil" ]] || fwd_miss "the agent directory is $(as_root stat -c '%a %U' "$dir"), not 700 rnfil"
+  [[ $(as_root stat -c '%a %U' "$sock") == "600 rnfil" ]] || fwd_miss "the agent socket is $(as_root stat -c '%a %U' "$sock"), not 600 rnfil"
   # The session's SSH_AUTH_SOCK is that socket (the stable path, OD-6).
   FC_N=$((FC_N + 1))
   fc_line a "echo SOCK$FC_N=\$SSH_AUTH_SOCK"

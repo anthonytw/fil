@@ -122,8 +122,8 @@ client-pty:
 
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
-# `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd` or `fwd` (the M2 forwards,
-# docs/m2/realnet.md); add scenario names to narrow.
+# `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd`, `policy`, `fwd` (the M2
+# forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
 # `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
 realnet *args:
     tests/realnet/run.sh {{args}}

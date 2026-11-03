@@ -184,3 +184,32 @@ async fn confirm_yes_and_no() -> Test {
     }
     Ok(())
 }
+
+/// The host's server policy refuses the agent (the attach reply says so): the overlay says why,
+/// naming the setting and its source (DESIGN.md section 11.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_policy_refusal_of_the_agent_is_shown_with_its_setting() -> Test {
+    use fil_proto::mux::{PolicyRefusal, PolicySetting, PolicySource, Toggle};
+    let agent = MiniAgent::start(&sock("policy"), 1);
+    let rig = start(Some(relay(&agent))).await;
+    rig.daemon
+        .set_agent_refused(Some(PolicyRefusal {
+            setting: PolicySetting::AllowAgentForwarding(Toggle::No),
+            source: PolicySource::Sshd {
+                file: fil_proto::msg::PortsPath::capped("/etc/ssh/sshd_config"),
+                line: 12,
+                maybe: false,
+            },
+        }))
+        .await;
+    rig.daemon.kill_link(DownReason::Dead).await;
+    until("the notice", 10, || {
+        let t = rig.term.text();
+        t.contains("agent forwarding refused by")
+            && t.contains("server policy:")
+            && t.contains("AllowAgentForwarding no")
+            && t.contains("(/etc/ssh/sshd_config:12)")
+    })
+    .await;
+    Ok(())
+}

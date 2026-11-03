@@ -127,7 +127,7 @@ async fn the_client_is_told_how_the_shell_was_killed() {
     assert_eq!(c.exited, Some((None, Some(9))));
     // A later attach finds the session gone.
     let c2 = Client::attach(&h, Connect::new(&h, key(1))).await;
-    assert_eq!(c2.refused, Some(AttachRefusal::SessionGone));
+    assert_eq!(c2.refused, Some(AttachRefusal::SessionGone { exit: None }));
 }
 
 /// A client that acknowledges in small steps, slower than the old fixed one-second wait: the

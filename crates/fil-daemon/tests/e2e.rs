@@ -293,7 +293,7 @@ async fn a_session_that_ends_is_reported_then_gone() {
     // Reaped: the list is empty, and a late resume is told the session is gone.
     eventually(|| async { d.sessions_is_empty().await }).await;
     let c = Client::attach(d.pipe().await, Connect::new("main", k).resume(resume)).await;
-    assert_eq!(c.refused, Some(AttachRefusal::SessionGone));
+    assert_eq!(c.refused, Some(AttachRefusal::SessionGone { exit: None }));
     d.stop().await;
 }
 

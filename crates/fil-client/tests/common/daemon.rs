@@ -369,7 +369,7 @@ impl FakeDaemon {
         if st.gone {
             let _ = send(
                 &link,
-                &ControlMsg::AttachRefused(AttachRefusal::SessionGone),
+                &ControlMsg::AttachRefused(AttachRefusal::SessionGone { exit: None }),
             )
             .await;
             return false;

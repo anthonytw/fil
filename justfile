@@ -55,6 +55,11 @@ deny:
 netsim-soak:
     cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak
 
+# The MUX model (crates/fil-proto/tests/mux_model.rs: both ends over a reordering, dropping link)
+# over many seeds, in release. Not part of `ci`, which runs a few. MUX_SEED_BASE moves the range.
+mux-soak seeds="5000":
+    MUX_SEEDS={{seeds}} cargo test --release -p fil-proto --test mux_model -- --nocapture
+
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
     cargo run -q -p fil-term --example fixtures

@@ -28,9 +28,9 @@ pub struct ChannelId(pub u32);
 pub enum ChannelClass {
     /// Control messages: always first.
     Control,
-    /// Terminal, snapshot and agent: ahead of forwarded data, in the order they were queued.
+    /// Terminal, snapshot and MUX: ahead of forwarded data, in the order they were queued.
     Interactive,
-    /// Forwarded connections: round-robin among themselves.
+    /// Dynamic channels (forwarded and agent connections): round-robin among themselves.
     Forward,
 }
 
@@ -41,9 +41,11 @@ impl ChannelId {
     pub const TERMINAL: ChannelId = ChannelId(1);
     /// A snapshot being delivered to the client (DESIGN.md section 8.5). Not resumable.
     pub const SNAPSHOT: ChannelId = ChannelId(2);
-    /// The agent relay (M2).
-    pub const AGENT: ChannelId = ChannelId(3);
-    /// First id for forwarded connections (M2). Ids 4 to 15 are reserved.
+    /// The MUX channel: the forward table and the lifecycle of dynamic channels, as a reliable
+    /// stream of records (see [`crate::mux`]).
+    pub const MUX: ChannelId = ChannelId(3);
+    /// First id of the dynamic channels: forwarded connections and agent connections. Ids 4 to
+    /// 15 are reserved. The client opens even ids, the daemon odd ones.
     pub const FORWARD_BASE: u32 = 16;
 
     /// The postcard (LEB128) varint encoding of the id, built on the stack: the bytes
@@ -63,6 +65,12 @@ impl ChannelId {
             0x20_0000..0x1000_0000 => 4,
             _ => 5,
         }
+    }
+
+    /// A dynamic channel (a forwarded or agent connection), opened and closed through
+    /// [`ChannelId::MUX`].
+    pub fn is_dynamic(self) -> bool {
+        self.0 >= Self::FORWARD_BASE
     }
 
     pub fn class(self) -> ChannelClass {

@@ -340,7 +340,7 @@ impl Inner {
                     .iter()
                     .any(|(n, i)| *n == attach.name && *i == r.incarnation);
             return Err(Lookup::Refuse(if gone {
-                msg::AttachRefusal::SessionGone
+                msg::AttachRefusal::SessionGone { exit: None }
             } else {
                 msg::AttachRefusal::SessionReplaced
             }));
@@ -1122,6 +1122,7 @@ mod tests {
             host: "test".parse().unwrap(),
             key: msg::PublicKey::new(vec![9; 32]).unwrap(),
             echo_ack: false,
+            agent: false,
             size_gen: 0,
             resume: None,
         }

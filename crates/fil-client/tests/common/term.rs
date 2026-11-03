@@ -88,6 +88,19 @@ impl TermHandle {
         let _ = self.tx.send(TermEvent::Resize { cols, rows });
     }
 
+    /// The window changes size, but its event is not delivered (yet): the SIGWINCH that is still
+    /// waiting for a runtime thread while the keys already typed behind it have been read.
+    pub fn resize_quietly(&self, cols: u16, rows: u16) {
+        let mut s = self.shared.lock().unwrap();
+        s.size = (cols, rows);
+        s.emu.resize(Size { cols, rows });
+    }
+
+    /// Delivers a resize event as given, without touching the window: a late one.
+    pub fn resize_event(&self, cols: u16, rows: u16) {
+        let _ = self.tx.send(TermEvent::Resize { cols, rows });
+    }
+
     pub fn eof(&self) {
         let _ = self.tx.send(TermEvent::Eof);
     }

@@ -362,8 +362,11 @@ pub(crate) enum Cmd {
         seq: u64,
         data: Vec<u8>,
     },
+    /// An [`fil_proto::InputRecord::Resize`] from the terminal channel, in order with the input.
     Resize {
         conn: ConnId,
+        at: u64,
+        size_gen: u64,
         size: TermSize,
     },
     Detach {
@@ -447,6 +450,9 @@ pub(crate) struct Core {
     live: Option<Live>,
     next_conn: ConnId,
     size: TermSize,
+    /// The generation of `size` (DESIGN.md section 8.5): a size is applied only if its generation
+    /// is newer, so a stale one can never replace a newer one.
+    size_gen: u64,
 
     emu: Box<dyn Emulator>,
     boundary: Boundary,
@@ -595,6 +601,7 @@ pub(crate) fn start(
         live: None,
         next_conn: 0,
         size: cfg.size,
+        size_gen: 0,
         emu,
         boundary: Boundary::new(),
         tail: Vec::new(),
@@ -738,11 +745,12 @@ impl Core {
                 });
             }
             Cmd::Input { conn, seq, data } => self.on_input(conn, seq, data),
-            Cmd::Resize { conn, size } => {
-                if self.live.as_ref().is_some_and(|l| l.conn == conn) {
-                    self.apply_resize(size);
-                }
-            }
+            Cmd::Resize {
+                conn,
+                at,
+                size_gen,
+                size,
+            } => self.on_resize_record(conn, at, size_gen, size),
             Cmd::Detach { conn } => self.on_detach(conn),
             Cmd::ConnGone { conn } => {
                 if self.live.as_ref().is_some_and(|l| l.conn == conn) {
@@ -1012,6 +1020,34 @@ impl Core {
         });
     }
 
+    /// A resize record arrived between the input bytes before `at` and the ones from `at` on. It
+    /// is applied here, before any later input is handed to the PTY, which is the whole point of
+    /// sending it in band.
+    ///
+    /// The liveness check is load-bearing, not a formality: the serve task checks that it was not
+    /// kicked, then queues this command, and a takeover can be handled in between (a full queue).
+    /// Without it the old subscriber's late record would resize the new subscriber's PTY and
+    /// leave a stale generation in force (pinned by the `gate_resize` test hook).
+    fn on_resize_record(&mut self, conn: ConnId, at: u64, size_gen: u64, size: TermSize) {
+        if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
+            return;
+        }
+        // The client puts a record at the offset of the next byte it will send, which it knows
+        // from our `Resume`: beyond what we have received is a gap, as for input.
+        if at > self.input.received() {
+            tracing::warn!("resize record beyond the input received");
+            tracing::debug!(session = %self.name, "resize record beyond the input received in");
+            self.send(ConnEvent::Fatal(ErrorCode::Protocol));
+            return;
+        }
+        // An older or repeated generation is stale (the attach already carried it, or a newer
+        // record did): ignored, not an error.
+        if size_gen > self.size_gen {
+            self.size_gen = size_gen;
+            self.apply_resize(size);
+        }
+    }
+
     fn apply_effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -1058,6 +1094,20 @@ impl Core {
                 mode,
                 effects,
             } => (epoch, subscriber, mode, effects),
+        };
+        // A fresh attach sets the size (and its generation) unconditionally: it is a new
+        // subscriber, whose generations count from its own start. A resumed one is the same
+        // client again, whose size the session may already know better (a record on the old link
+        // can have outrun this attach): it applies only if it is newer.
+        let size_is_news = matches!(mode, AttachMode::Fresh) || a.size_gen > self.size_gen;
+        let effects = if size_is_news {
+            self.size_gen = a.size_gen;
+            effects
+        } else {
+            effects
+                .into_iter()
+                .filter(|e| !matches!(e, Effect::ResizePty(_)))
+                .collect()
         };
         self.apply_effects(effects);
 
@@ -1525,6 +1575,85 @@ mod tests {
         assert!(p.starts_with("\x1b[?2026l\x1b[?1049l\x1b(B\x1b)B\x1b*B\x1b+B\x0f"));
         assert!(p.contains("skipped 2 KB of output"));
         assert_eq!(p.matches("\r\n").count(), 1 + 5);
+    }
+
+    /// Input that a connection sends after it lost the session (a takeover is in the core's queue
+    /// ahead of it) must not reach the program: only the live connection's input does.
+    #[tokio::test]
+    async fn input_from_a_connection_that_lost_the_session_is_ignored() {
+        use crate::handle::SessionHandle;
+        use fil_proto::msg::{Attach, PublicKey, TermSize};
+
+        let out = std::env::temp_dir().join(format!("fil-stale-input-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let mut cfg = SessionConfig::new(
+            "stale".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            9,
+        );
+        cfg.scope = crate::config::ScopeMode::Tree;
+        cfg.clear_env = true;
+        cfg.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        cfg.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "stty -echo; while read l; do echo \"$l\" >> {}; done",
+                out.display()
+            ),
+        ]);
+        let handle = SessionHandle::spawn(cfg, Arc::new(crate::config::NoHost))
+            .await
+            .unwrap();
+        let attach = |n: u8, host: &str| Attach {
+            name: "stale".parse().unwrap(),
+            size: TermSize::new(80, 24).unwrap(),
+            term: "xterm".parse().unwrap(),
+            host: host.parse().unwrap(),
+            key: PublicKey::new(vec![n; 32]).unwrap(),
+            resume: None,
+            echo_ack: false,
+            size_gen: 0,
+        };
+        let accepted = |answer: AttachAnswer| match answer {
+            AttachAnswer::Accepted(a) => a,
+            AttachAnswer::Refused(r) => panic!("refused: {r:?}"),
+        };
+        let first = accepted(handle.attach(attach(1, "laptop")).await.ok().unwrap());
+        // The second attach takes the session over: the first connection is not live any more.
+        let second = accepted(handle.attach(attach(2, "desktop")).await.ok().unwrap());
+        assert_ne!(first.conn, second.conn);
+        handle
+            .send(Cmd::Input {
+                conn: first.conn,
+                seq: 0,
+                data: b"stale\n".to_vec(),
+            })
+            .await;
+        handle
+            .send(Cmd::Input {
+                conn: second.conn,
+                seq: 0,
+                data: b"live\n".to_vec(),
+            })
+            .await;
+        // The core handles its queue in order, so once the live line has got through, the stale
+        // one would have.
+        let end = Instant::now() + Duration::from_secs(20);
+        let got = loop {
+            let got = std::fs::read_to_string(&out).unwrap_or_default();
+            if !got.is_empty() {
+                break got;
+            }
+            assert!(Instant::now() < end, "the live input never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = std::fs::read_to_string(&out).unwrap_or(got);
+        let _ = handle.kill(Duration::from_secs(5)).await;
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(got, "live\n", "only the live connection's input is applied");
     }
 }
 

@@ -690,7 +690,9 @@ f_attach_detach() {
 
   fc_start b -- direct ad
   fc_wait b FIL-42 20
-  fc_has b "PID-$pid1" || fail "the earlier output (the shell pid) is not on the second screen"
+  # The snapshot is painted in more than one read: FIL-42 can be on the screen while the line
+  # below it is still on its way, so wait for the pid line instead of testing it once.
+  fc_wait b "PID-$pid1" 20
   fc_show_pid b
   [[ $(shell_pid b) == "$pid1" ]] || fail "the reattached shell is a different process: $(shell_pid b) vs $pid1"
   ok "reattached: earlier output visible, same shell (pid $pid1)"

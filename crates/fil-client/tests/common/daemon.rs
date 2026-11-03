@@ -11,7 +11,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, Segment};
 use fil_proto::epoch::{AttachInput, AttachMode, AttachOutcome, Effect, SessionEpoch};
-use fil_proto::frame::DataSegment;
+use fil_proto::input::{InputRecord, TerminalInput};
 use fil_proto::limits::MAX_DATA_PAYLOAD;
 use fil_proto::log::{CatchUpParams, OutputLog, StartDecision, decide_start};
 use fil_proto::msg::{
@@ -24,6 +24,24 @@ use fil_transport::{DownReason, Link};
 use tokio::sync::Mutex;
 
 pub const NOW_MS: u64 = 1_700_000_000_000;
+
+/// What reached the daemon on the terminal channel, in arrival order. The effective size is the
+/// one the PTY would have at that point, by the daemon's generation rule (DESIGN.md section 8.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TermLog {
+    /// Fresh keystrokes (retransmitted bytes are not repeated) and the size in force when they
+    /// were handed to the PTY.
+    Keys {
+        at: u64,
+        bytes: Vec<u8>,
+        size: (u16, u16),
+    },
+    Resize {
+        at: u64,
+        size_gen: u64,
+        size: (u16, u16),
+    },
+}
 
 struct Conn {
     link: Arc<MemLink>,
@@ -43,6 +61,11 @@ pub struct DState {
     sent: u64,
     pub client_acked: u64,
     pub sizes: Vec<(u16, u16)>,
+    /// The size the PTY has, and the generation it came with.
+    size: (u16, u16),
+    size_gen: u64,
+    /// The terminal channel, client to daemon, in arrival order.
+    pub term_log: Vec<TermLog>,
     pub attaches: Vec<Attach>,
     pub detaches: u32,
     /// Everything the daemon had received as input when the first `Detach` arrived.
@@ -61,6 +84,9 @@ pub struct DState {
     cut_snapshot: Option<usize>,
     /// Keystrokes arriving now are lost (as if the link dropped them).
     lose_input: bool,
+    /// Keystrokes are taken in but not acknowledged (a slow PTY reader): the client's send window
+    /// fills. The acknowledgement goes out with the next keystroke after this is cleared.
+    withhold_input_acks: bool,
     /// Direct-mode details for the reply.
     direct: Option<(u16, Vec<u8>)>,
     /// Send the output before the `AttachReply` (another stream overtaking the control stream).
@@ -132,6 +158,9 @@ impl FakeDaemon {
                 sent: 0,
                 client_acked: 0,
                 sizes: Vec::new(),
+                size: (80, 24),
+                size_gen: 0,
+                term_log: Vec::new(),
                 attaches: Vec::new(),
                 detaches: 0,
                 input_at_detach: None,
@@ -145,6 +174,7 @@ impl FakeDaemon {
                 send_input_resume: true,
                 cut_snapshot: None,
                 lose_input: false,
+                withhold_input_acks: false,
                 direct: None,
                 data_before_reply: false,
                 snapshot_delay: None,
@@ -220,7 +250,6 @@ impl FakeDaemon {
                                 st.pending_jump = None;
                             }
                         }
-                        ControlMsg::Resize(s) => st.sizes.push((s.cols(), s.rows())),
                         ControlMsg::Detach => {
                             st.detaches += 1;
                             let seen = st.input_all.clone();
@@ -239,14 +268,57 @@ impl FakeDaemon {
                     if st.lose_input {
                         continue;
                     }
-                    let seg = DataSegment::parse(&payload).expect("valid segment");
+                    let seg = match TerminalInput::parse(&payload).expect("valid terminal input") {
+                        TerminalInput::Record(InputRecord::Resize { at, size_gen, size }) => {
+                            // As the real daemon: beyond the input received is a gap.
+                            if at > st.input_rx.received() {
+                                let why = format!(
+                                    "resize record at {at}, input received {}",
+                                    st.input_rx.received()
+                                );
+                                st.violations.push(why);
+                                control.kill(DownReason::Dead);
+                                return;
+                            }
+                            if size_gen > st.size_gen {
+                                st.size_gen = size_gen;
+                                st.size = (size.cols(), size.rows());
+                                let now = st.size;
+                                st.sizes.push(now);
+                                st.emu.resize(Size {
+                                    cols: size.cols(),
+                                    rows: size.rows(),
+                                });
+                            }
+                            let rec = TermLog::Resize {
+                                at,
+                                size_gen,
+                                size: (size.cols(), size.rows()),
+                            };
+                            st.term_log.push(rec);
+                            continue;
+                        }
+                        TerminalInput::Keys(seg) => seg,
+                    };
+                    let before = st.input_rx.received();
                     let fresh = st
                         .input_rx
                         .accept(seg.seq, seg.data)
                         .expect("no gap")
                         .to_vec();
+                    if !fresh.is_empty() {
+                        let size = st.size;
+                        st.term_log.push(TermLog::Keys {
+                            at: before,
+                            bytes: fresh.clone(),
+                            size,
+                        });
+                    }
                     st.input_all.extend_from_slice(&fresh);
                     let upto = st.input_rx.received();
+                    if st.withhold_input_acks {
+                        continue;
+                    }
                     if let Some(a) = st.input_rx.ack_now() {
                         let _ = upto;
                         let _ = send(
@@ -325,11 +397,18 @@ impl FakeDaemon {
                     }
                 }
                 Effect::ResizePty(s) => {
-                    st.sizes.push((s.cols(), s.rows()));
-                    st.emu.resize(Size {
-                        cols: s.cols(),
-                        rows: s.rows(),
-                    });
+                    // As the real daemon: a fresh attach sets the size, a resumed one only if
+                    // its generation is newer than what the session already knows.
+                    if matches!(mode, AttachMode::Fresh) || a.size_gen > st.size_gen {
+                        st.size_gen = a.size_gen;
+                        st.size = (s.cols(), s.rows());
+                        let now = st.size;
+                        st.sizes.push(now);
+                        st.emu.resize(Size {
+                            cols: s.cols(),
+                            rows: s.rows(),
+                        });
+                    }
                 }
                 Effect::RevokeKey(_) => {}
             }
@@ -517,6 +596,17 @@ impl FakeDaemon {
         self.st.lock().await.sizes.clone()
     }
 
+    /// The terminal channel as it arrived, keystrokes and resize records in order.
+    pub async fn term_log(&self) -> Vec<TermLog> {
+        self.st.lock().await.term_log.clone()
+    }
+
+    /// The size the session's PTY has, and the generation it came with.
+    pub async fn pty_size(&self) -> ((u16, u16), u64) {
+        let st = self.st.lock().await;
+        (st.size, st.size_gen)
+    }
+
     /// The input the daemon had received when the first `Detach` came in (`None`: no `Detach`).
     pub async fn input_at_detach(&self) -> Option<Vec<u8>> {
         self.st.lock().await.input_at_detach.clone()
@@ -616,6 +706,8 @@ impl FakeDaemon {
         let cap = 8 * 1024 * 1024;
         st.log = OutputLog::new(cap);
         st.emu = emu(Size { cols: 80, rows: 24 });
+        st.size = (80, 24);
+        st.size_gen = 0;
         st.current = None;
         st.sent = 0;
         let conns: Vec<_> = st.conns.drain().collect();
@@ -931,6 +1023,32 @@ impl FakeDaemon {
 
     pub async fn lose_input(&self, on: bool) {
         self.st.lock().await.lose_input = on;
+    }
+
+    /// Withholds (or, with `false`, sends at once) the acknowledgement of the keystrokes taken in.
+    pub async fn withhold_input_acks(&self, on: bool) {
+        let mut st = self.st.lock().await;
+        st.withhold_input_acks = on;
+        if on {
+            return;
+        }
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        if let Some(upto) = st.input_rx.ack_now() {
+            let _ = send(
+                &link,
+                &ControlMsg::Ack {
+                    channel: ChannelId::TERMINAL,
+                    upto,
+                },
+            )
+            .await;
+        }
     }
 
     pub async fn cut_next_snapshot_after(&self, n: usize) {

@@ -975,22 +975,14 @@ mod tests {
         rustix::process::test_kill_process(pid).is_ok()
     }
 
-    /// A scratch directory that is removed when it goes out of scope, a failed test included.
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// A spawn that finishes after the timeout starts a shell; that shell must not be left running.
+    ///
+    /// Nothing here depends on how fast the machine is: the spawn is held back until the wait has
+    /// been seen to give up (a gate, not a sleep that a loaded machine can outlast), and the
+    /// shell's pid comes from the session handle (a shell that is killed the moment it exists
+    /// may not have got as far as writing its own down).
     #[tokio::test]
     async fn a_session_that_starts_after_the_timeout_is_killed() {
-        let dir = std::env::temp_dir().join(format!("fil-late-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _cleanup = TempDir(dir.clone());
-        let pidfile = dir.join("pid");
         let mut sc = SessionConfig::new(
             "late".parse().unwrap(),
             "xterm".parse().unwrap(),
@@ -1000,37 +992,43 @@ mod tests {
         sc.scope = fil_session::ScopeMode::Tree;
         sc.clear_env = true;
         sc.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
-        sc.command = Some(vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("echo $$ > {}; exec cat", pidfile.display()),
-        ]);
+        sc.command = Some(vec!["/bin/sh".into(), "-c".into(), "exec cat".into()]);
         let host = Arc::new(host(&KeyRegistry::new(), None)) as Arc<dyn SessionHost>;
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
         // The spawn is slow: it only starts the shell once the wait has been given up.
         let slow = async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            SessionHandle::spawn(sc, host).await
+            let _ = go_rx.await;
+            let spawned = SessionHandle::spawn(sc, host).await;
+            if let Ok(h) = &spawned {
+                let _ = pid_tx.send(h.pid());
+            }
+            spawned
         };
-        let r = spawn_bounded(slow, Duration::from_millis(50), |f| {
-            tokio::spawn(f);
+        let handed = Arc::new(std::sync::Mutex::new(None));
+        let tracked = handed.clone();
+        let r = spawn_bounded(slow, Duration::from_millis(50), move |f| {
+            *tracked.lock().unwrap() = Some(tokio::spawn(f));
         })
         .await;
         assert!(matches!(r, Err(BoundedSpawn::TimedOut)));
+        let _ = go_tx.send(());
 
-        let end = std::time::Instant::now() + Duration::from_secs(10);
-        let pid = loop {
-            if let Some(p) = std::fs::read_to_string(&pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok())
-            {
-                break p;
-            }
-            assert!(
-                std::time::Instant::now() < end,
-                "the late session never started"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let pid = tokio::time::timeout(Duration::from_secs(20), pid_rx)
+            .await
+            .expect("the late session never started")
+            .expect("the late spawn failed") as i32;
+        // The late future ends once it has killed what the spawn made.
+        let late = handed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the late wait was handed over");
+        tokio::time::timeout(Duration::from_secs(20), late)
+            .await
+            .expect("the late session was never dealt with")
+            .unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(20);
         while alive(pid) {
             assert!(
                 std::time::Instant::now() < end,
@@ -1124,6 +1122,7 @@ mod tests {
             host: "test".parse().unwrap(),
             key: msg::PublicKey::new(vec![9; 32]).unwrap(),
             echo_ack: false,
+            size_gen: 0,
             resume: None,
         }
     }

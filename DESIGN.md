@@ -101,7 +101,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
 2. The relay reads the client's hello, connects to the daemon of the client's wire (starting its own if that is the wire), and the two sides compare versions (§5.3, §8.5).
 3. The client sends:
    - the session name
-   - its terminal size and `TERM`
+   - its terminal size, with the generation of that size (§4.4), and `TERM`
    - its host label (shown to the previous subscriber on a takeover, §5.2)
    - its per-attach public key
    - when resuming, its last epoch and sequence number
@@ -137,6 +137,14 @@ The handling is configurable **(decided)**:
 - **Buffer:** keystrokes are buffered in client memory up to a configurable cap (proposed default: 4 KiB). The status overlay shows how much is buffered, and how much was dropped once the cap was reached. A cap of 0 drops all input while disconnected.
 - **Send on resume, or ask:** by default the buffer is sent as soon as the session resumes. Optionally (`offline_input.confirm`), when the disconnect lasted longer than a threshold, the client shows what was typed and asks before sending it. A Ctrl-C typed during a long outage then can't land late by surprise.
 - **Optional log:** `offline_input.log` keeps everything typed while disconnected, including anything over the cap, by appending it to a file or piping it to a command. It is **off by default**, because keystrokes can include passwords. A file log is bounded (rotated to `<file>.1` at 1 MiB, deleted when untouched for 30 days) and fil refuses one whose directory other users can write to. See §11.
+
+### 4.4 Window size
+
+A command typed right after a window resize must see the new size, as it does over ssh, where the window change travels in order with the keystrokes. On fil the two used to take different paths (a control message and a data segment), which §8.1 does not order, and the Raspberry Pi drop-in runs found the new size arriving after the command. The size now travels with the keystrokes:
+
+- **In band.** The client sends the size as a record in the terminal channel's keystroke stream, placed between the last key typed before the change and the first typed after it (§8.5, *In-band records*). It is applied when it arrives, so the PTY has the new size before it is handed any later key. A key typed *before* the change may still be read under the new size, as with sshd.
+- **Sampled.** The client reads the window size before it handles each batch of keystrokes, and a resize event re-reads it instead of trusting its payload. SIGWINCH goes through a different thread than the keyboard reader, so the event can be queued behind keys that were typed after the change; the read makes the order the user's, not the scheduler's.
+- **Generations.** Every change of the client's (clamped) size gets the next generation number, and the attach and the records carry it, so a stale size can never replace a newer one: the order in which a swap's old and new links reach the daemon does not matter. Each link remembers which generation its daemon has been told (`told_gen`), so a size changed during a swap is sent to the link that ends up as the session.
 
 ## 5. Sessions
 
@@ -349,7 +357,7 @@ trait Link {
 
 What every link must do:
 
-- **Order and backpressure per channel.** A full forward channel never delays control or terminal.
+- **Order and backpressure per channel.** A full forward channel never delays control or terminal. There is **no order across channels** (on QUIC they are separate streams, and a lost packet delays one and not another; even on the pipe, control goes ahead of queued interactive frames). Anything that must take effect in order with keystrokes therefore travels *in* the terminal channel, as an in-band record (§8.5): the window size is the case that needed it (§4.4).
 - **Liveness.** A link detects a dead path itself and goes `Down` within `dead_after` (default 5 s). It reports `Degraded` after `degraded_after` (default 2 s) of silence *from the peer*, which drives the status line (§4.2); a slow local consumer is never `Degraded`. The pipe needs fil's own heartbeats: ssh never notices a silent black hole by itself (`docs/m1/realnet.md`). Heartbeats are asymmetric (§8.5): the client pings, the daemon replies and pings only after 1.5 heartbeats of silence, and each side still detects a dead path within `dead_after`. On the pipe the consumer must keep up: past the inbound budget the link stops reading and freezes its silence clock, so a peer that dies meanwhile is not reported until the consumer catches up (§8.5).
 - **`Up` means the peer has proven itself.** On the pipe, that is after the preamble and the first frame; on QUIC, after the daemon's first frame (§8.3).
 - **Graceful close.** `close` discards what is still queued, so a last message (`TakenOver`, `AttachRefused`, `Error`, `SessionExited`) is followed by `flush` before `close`. `flush` resolves when every payload sent before the call has left this side, and fails if the link goes down first (also on a link that is down already). What "left" means depends on the transport:
@@ -371,7 +379,7 @@ The trait is not object-safe. A client that switches between the pipe and QUIC h
   - The scheduler sends terminal and control frames ahead of forward data.
   - Forward frames are capped at 16 KiB, so a large transfer through a forward can't delay keystrokes.
 - **Keepalive backstop:** when the program is `ssh`, fil adds `-o ServerAliveInterval=N -o ServerAliveCountMax=3`, unless the command line already sets them. `N` is `dead_after / 3` rounded up to whole seconds (2 s by default), so ssh gives up after between `N x 3` and `N x 4` of silence (6 to 8 s by default; measured 7.5 s) and never before `dead_after`. fil's heartbeat (§8.5) is the fast detector and kills the ssh process the moment it declares the link dead; the backstop is for a fil process that is gone while a black-holed ssh would linger for the TCP retry limit. A command that is not `ssh` runs untouched.
-- **Process handling:** until the first attach is accepted, ssh's stderr is copied to the user's terminal a line at a time, with control characters removed (Touch ID and password prompts use the terminal directly), so warnings and errors stay visible, and what had arrived when the attach is accepted is shown first; from then on it is only captured, for the status line and the log, because the terminal belongs to the session. Every run after the first attach is started in a process group of its own, so a command that prompts on the terminal (a jump host asking for a password) is stopped by SIGTTIN rather than reading keystrokes meant for the session; the preamble timeout ends it and its whole group is killed. When the command exits, the link reports `Down(Io)` with its exit status. Closing the link closes the command's stdin, gives it a second to exit, then kills and reaps it. The host name is checked against an allowlist (letters, digits and `. _ @ : % [ ] -`, not starting with `-`) before it reaches the command line, because `~/.ssh/config` may expand it in `ProxyCommand` or `Match exec`.
+- **Process handling:** until the first attach is accepted, ssh's stderr is copied to the user's terminal a line at a time (a line left unfinished for 200 ms, such as a prompt a wrapper script prints without a newline, is shown as it is), with control characters removed (Touch ID and password prompts use the terminal directly), so warnings and errors stay visible, and what had arrived when the attach is accepted is shown first; from then on it is only captured, for the status line and the log, because the terminal belongs to the session. Every run after the first attach is started in a process group of its own, so a command that prompts on the terminal (a jump host asking for a password) is stopped by SIGTTIN rather than reading keystrokes meant for the session; the preamble timeout ends it and its whole group is killed. When the command exits, the link reports `Down(Io)` with its exit status. Closing the link closes the command's stdin, gives it a second to exit, then kills and reaps it. The host name is checked against an allowlist (letters, digits and `. _ @ : % [ ] -`, not starting with `-`) before it reaches the command line, because `~/.ssh/config` may expand it in `ProxyCommand` or `Match exec`.
 - **Reconnect:** re-run the command.
 
 ### 8.3 Direct: QUIC over UDP
@@ -420,7 +428,7 @@ This is the byte-level contract implemented by `fil-proto`. It is a proposal, no
 | Id | Use | Scheduling |
 |---|---|---|
 | 0 | control messages (`ControlMsg`, one postcard value per frame, at most 4 KiB) | first |
-| 1 | terminal: PTY output to the client, keystrokes to the daemon | interactive |
+| 1 | terminal: PTY output to the client, keystrokes and in-band records to the daemon | interactive |
 | 2 | snapshot bytes | interactive |
 | 3 | agent relay (M2) | interactive |
 | 4 to 15 | reserved | interactive |
@@ -429,6 +437,19 @@ This is the byte-level contract implemented by `fil-proto`. It is a proposal, no
 Interactive frames keep the order they were queued in, so a snapshot and the output after it stay in order. Control frames are strictly first. Forwards have a guaranteed share: while forward data waits, one forward frame is sent after every N interactive frames (N is configurable, default 8), so a terminal that never goes idle cannot stall them. Forward channels take turns, one frame each.
 
 **Data segment** (payload on every channel except 0): a postcard varint `u64` giving the offset of the first byte in that channel's byte stream, then 1 to 16 384 data bytes. Offsets are explicit even though the pipe is ordered, so a receiver can detect a gap or an overlap instead of silently corrupting a stream. On the terminal channel the offset is the output log's global sequence number (§6.1).
+
+**In-band records** (terminal channel, client to daemon only). Between data segments the keystroke direction can carry a record: something that must take effect in order with the keys around it, but is not keys. The payload is the postcard varint `u64::MAX` (`RECORD_MARK`) followed by one postcard `InputRecord`; the daemon tells the two forms apart by the first varint. No data segment can start there: it holds at least one byte, so `seq + len` would overflow, which the segment parser already refuses. Keystroke bytes on the wire are unchanged.
+
+- A record takes up **no space in the input stream**: it has no sequence number, is never acknowledged and never retransmitted, and does not count in `Resume`, `Ack` or `EchoAck.input_upto`. What it carries is re-established by the attach and the resume instead (below).
+- Order comes from the link's per-channel order, which every transport guarantees (the pipe's FIFO interactive class, QUIC's one stream, the relay, `link::mem`).
+- `InputRecord::Resize { at, size_gen, size }` (variant 0; add kinds at the end only). `at` is the offset of the next input byte not yet sent on this link, so the record sits between the byte before `at` and the byte at `at`. The daemon refuses an `at` beyond the input it has received with `Error(Protocol)`, as for a gap; a smaller one (a resumed link re-sending) is tolerated. The size is validated like any other (the caps below): zero or oversize does not decode. A record that does not decode, or has trailing bytes or an unknown kind, ends the connection as a malformed segment does.
+- Records from a connection that no longer holds the session are ignored, like its keystrokes.
+
+**Size generation.** The client counts `size_gen`: it starts at 0 and goes up by one whenever its clamped size changes (an unchanged size, or a change that clamps to the same size, is not a change); it never resets while the process runs. `Attach.size_gen` is the generation of `Attach.size`.
+
+- **Daemon.** The session keeps the generation of the size it has. A *fresh* attach sets the size and takes the attach's generation (a new subscriber counts from its own start; the PTY is resized before the snapshot is rendered, so a takeover's snapshot has the new size). A *resumed* attach applies its size only if its generation is greater (a record on the old link can have overtaken it); the epoch state machine still emits its resize effect, and the session drops it when the generation is stale. A record applies only if its generation is greater, otherwise it is stale or a duplicate and ignored.
+- **Client.** Each link remembers `told_gen`: the generation its daemon has been told, initially that of the link's own `Attach`. When `told_gen < size_gen` and keystrokes may go on the link (the attach is accepted, the screen is current, and for a resume the daemon's `Resume` for the terminal channel has arrived, step 3 below), it sends a record at the next unsent offset, before releasing offline input or anything pending. The record goes through the data queue, never the control one. A swap's candidate link carries the generation of its own attach, so a resize the user made while it was being set up is sent to it after its `Resume`, whichever order the daemon saw things in.
+- **Guarantee:** the PTY has the new size before it is handed any byte typed after the change, as in ssh. A byte typed before the change can be read under the new size.
 
 **Limits.** The decoder refuses any `len` above 16 416 (16 KiB of data plus 32 bytes of slack; a channel id and an offset need at most 15) before allocating, and allocates only as bytes arrive. Session names are `[A-Za-z0-9._-]{1,64}`, `TERM` is `[A-Za-z0-9._+-]{1,64}`, host labels have no control characters, and opaque keys and fingerprints are at most 256 and 64 bytes. All of these are checked while decoding, so an invalid value cannot exist in memory.
 
@@ -457,7 +478,7 @@ Interactive frames keep the order they were queued in, so a snapshot and the out
 3. A sender sends on a channel only after the peer's `Resume` for it has arrived. It restarts exactly at `received`.
 4. If `received` is older than the oldest byte the sender still holds, the channel cannot resume: the sender answers with `Reset { channel, code: ResumeGone }`. The terminal channel never ends this way, because the daemon sends a snapshot instead (below). A forwarded connection closes.
 
-Frames still queued on the old transport are discarded. The send buffers rebuild them.
+Frames still queued on the old transport are discarded. The send buffers rebuild them. In-band records are not retransmitted: the size travels in the attach, and the client sends a record after the `Resume` if its size has changed since (*Size generation*).
 
 **Snapshots.** The daemon decides between replay and snapshot from the client's position, the log's range and the catch-up threshold (§6.2), as a pure function. A snapshot is announced in `AttachReply.start` (or, for a mid-stream catch-up jump, in `ControlMsg::Snapshot`; §6.2 says when one may follow another), which gives its byte length, the sequence number `at` where the terminal channel continues, and how many bytes were skipped for the marker line. The snapshot bytes then travel on channel 2. The snapshot channel is not resumable: if the link dies mid-snapshot the client reattaches without resume state and gets a new one.
 
@@ -497,6 +518,7 @@ The binding and the key end with the subscriber's hold on the session: on takeov
 **Revocation timing.** Removing a key from the registry blocks new handshakes with it at once. Its live QUIC connections are closed by the listener 2 s later (`revoke_backstop`) unless something closes them first, which the session does: it sends `TakenOver`, waits for it to be read, and closes the link, so the old client is told. The delay is only a backstop for a serve task that is stuck. The listener side (`QuicListener::revoke`, the sweep, why the delay is safe) is in `docs/m1/quic-link.md` § Revocation.
 
 - Terminal sizes are capped: at most 2000 columns, 1000 rows and 1,000,000 cells. Larger sizes are refused when decoded, because the emulator allocates the grid and an unbounded size would let one peer take down every session (M1 security sweep). The client clamps its real size.
+- `Attach.size_gen`: the generation of `Attach.size` (*Size generation*, above). `ControlMsg::Resize` is gone: the size travels as an in-band record. Builds from before and after this change do not interoperate (an old daemon refuses the record as a malformed segment). The change carries no version bump of its own: it is one of the wire changes that the protocol revision rule in this section (added with the wire-revision change, #44) accounts for.
 - `Attach.echo_ack`: only a predicting client asks for `EchoAck`, so other clients don't pay for them. The daemon also keeps the fast PTY mode poll for such a client. The M3 predictor must set it, or it gets neither.
 - `ResumeRequest.want_snapshot`: resume the session but repaint from a snapshot, for when the client's screen no longer matches its byte position. The snapshot's reason is `Requested`, and `skipped` is what the client had not yet seen (`ready - seq`), so the gap marker appears when it missed output and not when it was current.
 - `ErrorCode::SessionStartFailed`: the daemon could not start the session; the reason is in its log.

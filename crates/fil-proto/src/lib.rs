@@ -4,6 +4,8 @@
 //! crypto: callers pass in the time and the bytes, and act on the values returned.
 //!
 //! - [`frame`]: length-prefixed frames and the incremental [`frame::FrameDecoder`].
+//! - [`input`]: in-band records on the terminal channel (the resize that stays in order with the
+//!   keystrokes).
 //! - [`msg`]: the control messages and the validated types they carry.
 //! - [`ring`], [`chan`], [`log`]: sequence-numbered reliable channels, the terminal output log and
 //!   the resume-or-snapshot decision.
@@ -17,6 +19,7 @@
 pub mod chan;
 pub mod epoch;
 pub mod frame;
+pub mod input;
 pub mod limits;
 pub mod log;
 pub mod msg;
@@ -27,4 +30,5 @@ pub mod text;
 pub mod version;
 
 pub use frame::{ChannelClass, ChannelId, Frame, FrameDecoder, FrameError};
+pub use input::{InputRecord, TerminalInput};
 pub use msg::ControlMsg;

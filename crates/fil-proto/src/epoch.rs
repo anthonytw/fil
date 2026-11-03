@@ -39,7 +39,9 @@ pub enum Effect {
     },
     /// Close the subscriber's transport.
     DropTransport { subscriber: SubscriberId },
-    /// Resize the PTY (SIGWINCH) to the attaching client's size.
+    /// Resize the PTY (SIGWINCH) to the attaching client's size. The state machine always asks;
+    /// the session applies it for a fresh attach, and for a resumed one only if the attach's size
+    /// generation is newer than the size it already has (`Attach::size_gen`).
     ResizePty(TermSize),
 }
 

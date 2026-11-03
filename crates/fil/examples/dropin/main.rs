@@ -42,18 +42,14 @@ pub const LOCAL: &str = "local";
 
 /// Scenarios that fail on purpose until a known bug is fixed. They are reported as XFAIL and do
 /// not fail the run; when one starts to pass it is reported as XPASS, which does fail the run, so
-/// the entry gets removed with the fix. See docs/m1/dropin.md, finding 1.
-const XFAIL: &[&str] = &["resize_order", "terminal_sane_after_detach"];
+/// the entry gets removed with the fix. See docs/m1/dropin.md, findings.
+const XFAIL: &[&str] = &["terminal_sane_after_detach"];
 
 /// Whether an error is *the* expected failure of a known-failing scenario, and not some other
 /// error that happens in the same scenario (a timeout, a wrong first size, a missing tool...).
 /// Every part of the message must carry the signature.
 fn is_expected_failure(name: &str, err: &str) -> bool {
     match name {
-        // "auto: 6 of 200 commands typed right after a resize saw the old size (...) | pipe: ..."
-        "resize_order" => err
-            .split(" | ")
-            .all(|part| part.contains(" commands typed right after a resize saw the old size (")),
         // "terminal modes after `~.` are Modes {..}, wanted Modes {..}; the terminal is not in
         // cooked mode (...)": the modes left set, or the termios not restored.
         "terminal_sane_after_detach" => err.split("; ").all(|part| {
@@ -670,10 +666,9 @@ mod tests {
 
     #[test]
     fn only_the_expected_error_counts_as_the_known_failure() {
-        let old = "auto: 6 of 200 commands typed right after a resize saw the old size (38x100 then `stty size` said RO7-37x100) | pipe: 1 of 100 commands typed right after a resize saw the old size (57x100 then `stty size` said RO26-56x100)";
-        assert!(exp("resize_order", old));
-        assert!(!exp("resize_order", "no \"RDY-42\" within 25s"));
-        assert!(!exp("resize_order", &format!("{old} | something else")));
+        // A fixed scenario is no longer a known failure, whatever its error.
+        let old = "auto: 6 of 200 commands typed right after a resize saw the old size (38x100 then `stty size` said RO7-37x100)";
+        assert!(!exp("resize_order", old));
         let modes =
             "terminal modes after `~.` are Modes { alt: true }, wanted Modes { alt: false }";
         assert!(exp("terminal_sane_after_detach", modes));

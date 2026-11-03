@@ -309,6 +309,7 @@ async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
     first.type_bytes(b"before the upgrade\n").await;
     first.wait_screen("before the upgrade").await;
     let resume = first.resume_request();
+    let incarnation = first.reply.as_ref().expect("attached").incarnation;
     drop(first); // the pipe goes with the ssh connection; the session lives on
 
     // The remote is upgraded: ssh now runs the NEW relay. No new daemon exists yet.
@@ -321,7 +322,14 @@ async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
         again.refused,
         again.errors
     );
-    again.wait_screen("before the upgrade").await;
+    // The same session, not a new one of that name: the incarnation the old daemon chose, and
+    // what is typed now still reaches its shell. (Not "before the upgrade" on the screen: a
+    // resume continues from where the client was, and whether the shell's echo of that line
+    // had already arrived by then depends on timing.)
+    assert_eq!(
+        again.reply.as_ref().expect("attached").incarnation,
+        incarnation
+    );
     again.type_bytes(b"after\n").await;
     again.wait_screen("after").await;
 

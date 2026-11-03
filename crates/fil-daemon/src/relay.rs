@@ -292,6 +292,11 @@ where
         .write_all(&fil_proto::preamble::encode(opts.paths.major))
         .and_then(|()| output.flush())
         .map_err(RelayError::Output)?;
+    // The socket directory is checked before anything is read from the client, as it always was:
+    // a directory made by someone else, with the wrong mode, or a link is refused at once, with
+    // its reason on stderr, whatever the client does or does not send.
+    opts.paths.check_socket_len().map_err(EnsureError::from)?;
+    ensure_socket_dir(&opts.paths.dir).map_err(EnsureError::from)?;
     let rx = read_in_background(input);
     let (want, held, ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
     let own = (opts.paths.major, opts.paths.revision);
@@ -299,9 +304,8 @@ where
         Want::Gone => return Ok(RelayEnd::PipeClosed),
         Want::Wire { major, revision } if (major, revision) != own => {
             // Another build's client. Its daemon, if it is running; never a new daemon of
-            // another wire. The directory is checked as for our own: a socket in someone
-            // else's directory is not to be trusted.
-            ensure_socket_dir(&opts.paths.dir).map_err(EnsureError::from)?;
+            // another wire. (The directory was checked above: a socket in someone else's
+            // directory is not to be trusted.)
             match UnixStream::connect(opts.paths.socket_of(major, revision)) {
                 Ok(s) => s,
                 Err(_) => {

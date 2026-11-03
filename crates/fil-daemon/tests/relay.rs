@@ -137,6 +137,39 @@ fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
     );
 }
 
+/// The socket directory is checked before the relay reads a byte from the client, so a bad one
+/// is refused at once whatever the client sends (the realnet scenario runs `fil server --stdio`
+/// with no input at all and expects the refusal).
+#[test]
+fn a_bad_socket_directory_is_refused_before_anything_is_read_from_the_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    std::fs::create_dir_all(&s.dir).unwrap();
+    std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (relay_in, _keep) = UnixStream::pair().unwrap();
+    let (relay_out, _from_relay) = UnixStream::pair().unwrap();
+    let mut opts = options(&s, never_started());
+    opts.hello_wait = Duration::from_secs(30); // would show if the relay waited for the client
+    let started = std::time::Instant::now();
+    let err = relay(relay_in, relay_out, &opts).unwrap_err();
+    assert!(
+        matches!(err, RelayError::Daemon(EnsureError::Dir(_))),
+        "{err}"
+    );
+    assert!(err.to_string().contains("mode 0755"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // And with the client already gone (no input at all), the same.
+    let (relay_in, gone) = UnixStream::pair().unwrap();
+    drop(gone);
+    let (relay_out, _from_relay) = UnixStream::pair().unwrap();
+    let err = relay(relay_in, relay_out, &opts).unwrap_err();
+    assert!(
+        matches!(err, RelayError::Daemon(EnsureError::Dir(_))),
+        "{err}"
+    );
+    std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn the_preamble_carries_the_major_of_the_paths() {
     let s = Scratch::new();

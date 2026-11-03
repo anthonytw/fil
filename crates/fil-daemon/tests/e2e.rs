@@ -4,10 +4,14 @@
 
 mod common;
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use common::*;
 use fil_proto::ChannelId;
 use fil_proto::msg::{AttachRefusal, ControlMsg, ErrorCode, Hello, Request, Response, StartPoint};
 use fil_transport::Link;
+use fil_transport::pipe::PipeLink;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_output_detach_resume() {
@@ -301,4 +305,106 @@ async fn two_attaches_to_a_new_name_make_one_session() {
     };
     assert_eq!(list.len(), 1);
     d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_reports_when_a_session_last_printed() {
+    let unix_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let last = |list: Vec<fil_proto::msg::SessionSummary>| list[0].last_output_unix_ms;
+    let s = Scratch::new();
+    let d = start(&s, config(CAT)).await;
+    let t0 = unix_ms();
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+    a.wait_screen("ready").await;
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    let first = last(list);
+    assert!(
+        first >= t0 && first <= unix_ms(),
+        "`fil ls` would say \"never\" or a wrong age: {first} not in [{t0}, now]"
+    );
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    a.type_bytes(b"more\n").await;
+    a.wait("more echoed", |c| c.out_str().contains("more"))
+        .await;
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    assert!(last(list) > first, "later output moves the time");
+    d.stop().await;
+}
+
+/// A session creation that outlives its attach: the attach fails after `spawn_timeout`, the
+/// shell starts `spawn_delay` after the attach began, and writes its pid to the returned file.
+async fn slow_start(
+    s: &Scratch,
+    idle_exit: Option<Duration>,
+) -> (Running, PathBuf, Client<PipeLink>) {
+    let pidfile = s.dir.join("late.pid");
+    let mut cfg = config(&format!("echo $$ > {}; exec cat", pidfile.display()));
+    cfg.spawn_timeout = Duration::from_millis(50);
+    cfg.spawn_delay = Duration::from_millis(500);
+    cfg.idle_exit = idle_exit;
+    let d = start(s, cfg).await;
+    let c = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+    assert!(!c.errors.is_empty(), "the attach gives up: {:?}", c.errors);
+    (d, pidfile, c)
+}
+
+fn pid_alive(pid: i32) -> bool {
+    let pid = rustix::process::Pid::from_raw(pid).unwrap();
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_waits_for_and_kills_a_session_that_starts_late() {
+    let s = Scratch::new();
+    let (d, pidfile, _c) = slow_start(&s, None).await;
+    assert!(!pidfile.exists(), "the shell has not started yet");
+    // The daemon is stopped while the creation is still running.
+    d.stop().await;
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("stop waited for the late shell to start, and killed it")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !pid_alive(pid),
+        "the late shell {pid} outlived the daemon's shutdown"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
+    let s = Scratch::new();
+    let (mut d, pidfile, c) = slow_start(&s, Some(Duration::from_millis(100))).await;
+    // The failed attach's connection is gone, so only the creation can keep the daemon busy.
+    c.link.close();
+    drop(c);
+    // Idle time has passed twice over, but a creation is still running.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut d.task)
+            .await
+            .is_err(),
+        "the daemon idled out under a pending session creation"
+    );
+    // Once the late shell is started and killed, nothing is left and it does go.
+    let exit = tokio::time::timeout(WAIT, d.task)
+        .await
+        .expect("then it idles out")
+        .unwrap();
+    assert_eq!(exit, fil_daemon::Exit::Idle);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!pid_alive(pid));
 }

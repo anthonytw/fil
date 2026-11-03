@@ -728,3 +728,43 @@ async fn the_session_environment_is_set_up() {
     c.wait_screen("A=none").await;
     let _ = h.kill(Duration::from_secs(5)).await;
 }
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[tokio::test]
+async fn info_reports_when_the_shell_last_printed() {
+    let sc = Scratch::new();
+    // `cat` prints nothing until it is fed.
+    let h = spawn_plain(sh_config(&sc, "main", "cat")).await;
+    assert_eq!(h.info().await.unwrap().last_output_unix_ms, None);
+
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    let before = unix_ms();
+    c.type_bytes(b"one\n").await;
+    c.wait_out("one\r\none\r\n").await;
+    let first = h
+        .info()
+        .await
+        .unwrap()
+        .last_output_unix_ms
+        .expect("output seen");
+    assert!(
+        first >= before && first <= unix_ms(),
+        "{first} not in [{before}, now]"
+    );
+
+    // It tracks the latest output, not the first, and does not move on its own.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    c.type_bytes(b"two\n").await;
+    c.wait_out("two\r\ntwo\r\n").await;
+    let second = h.info().await.unwrap().last_output_unix_ms.unwrap();
+    assert!(second > first, "{second} should be after {first}");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(h.info().await.unwrap().last_output_unix_ms, Some(second));
+    let _ = h.kill(Duration::from_secs(5)).await;
+}

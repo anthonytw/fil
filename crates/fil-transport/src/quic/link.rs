@@ -11,8 +11,9 @@ use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::{ChannelClass, ChannelId, ControlMsg};
 use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, WriteError};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 
+use super::MAX_STREAMS;
 use super::inbox::{Closed, Inbox};
 use super::wire::{self, Frame, MAX_VARINT_LEN, VarintReader, parse_prefix, put_varint};
 use crate::auth::{self, ClientKey, Fingerprint, PublicKey, SERVER_NAME};
@@ -30,6 +31,10 @@ pub(super) mod code {
 /// How many payloads may wait in front of one channel's stream. A full queue is what makes
 /// `send` wait; what QUIC flow control holds back backs up into it.
 const WRITE_QUEUE: usize = 8;
+
+/// Payloads up to this size are copied into one buffer with their length prefix before they are
+/// written; larger ones are handed to quinn as they are.
+const COPY_BELOW: usize = 2048;
 
 /// What waits in front of a channel's stream.
 enum Item {
@@ -116,6 +121,8 @@ struct Io {
     got_frame: watch::Sender<bool>,
     /// The text of the error that ended the connection, for `Refused` messages.
     last_error: OnceLock<String>,
+    /// How often the supervisor has looked at the connection (a wakeup counter for tests).
+    ticks: std::sync::atomic::AtomicU64,
 }
 
 impl Io {
@@ -293,6 +300,7 @@ impl QuicLink {
             lost_payloads: AtomicBool::new(false),
             got_frame: watch::Sender::new(false),
             last_error: OnceLock::new(),
+            ticks: std::sync::atomic::AtomicU64::new(0),
         });
         let status = Arc::new(watch::Sender::new(LinkStatus::new(LinkState::Up)));
         tokio::spawn(accept_streams(io.clone()));
@@ -345,6 +353,13 @@ impl QuicLink {
     /// with the key in the attach request on a resume (DESIGN.md §8.5, resume rules).
     pub fn peer_key(&self) -> Option<PublicKey> {
         auth::peer_key(&self.io.conn)
+    }
+
+    /// How many times the link's supervisor task has woken up (feature `test-hooks`): the cost
+    /// of an idle link, which a test keeps bounded.
+    #[cfg(feature = "test-hooks")]
+    pub fn supervisor_ticks(&self) -> u64 {
+        self.io.ticks.load(Ordering::Relaxed)
     }
 
     /// Closes the link because the client's key was revoked. The client sees `Down(Closed)`.
@@ -501,18 +516,34 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
                 None => return,
             },
         };
-        let mut chunks = Vec::with_capacity(3);
-        chunks.extend(header.take());
-        match item {
-            Item::Payload(payload) => {
-                chunks.push(Bytes::copy_from_slice(
-                    &(payload.len() as u32).to_be_bytes(),
-                ));
-                chunks.push(payload);
+        let res = match item {
+            // A small payload (a keystroke, an ack) is copied behind its prefix into one buffer:
+            // one allocation and one chunk, where prefix, payload and a chunk list were three.
+            Item::Payload(payload) if payload.len() <= COPY_BELOW => {
+                let mut buf = Vec::with_capacity(MAX_VARINT_LEN + 4 + payload.len());
+                if let Some(h) = header.take() {
+                    buf.extend_from_slice(&h);
+                }
+                buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&payload);
+                stream.write_all_chunks(&mut [Bytes::from(buf)]).await
             }
-            Item::Flush(id) => chunks.push(Bytes::copy_from_slice(&wire::flush_marker(id))),
-        }
-        let res = stream.write_all_chunks(&mut chunks).await;
+            // A large one is handed to quinn as it is, with no copy.
+            Item::Payload(payload) => {
+                let prefix = Bytes::copy_from_slice(&(payload.len() as u32).to_be_bytes());
+                match header.take() {
+                    Some(h) => stream.write_all_chunks(&mut [h, prefix, payload]).await,
+                    None => stream.write_all_chunks(&mut [prefix, payload]).await,
+                }
+            }
+            Item::Flush(id) => {
+                let marker = Bytes::copy_from_slice(&wire::flush_marker(id));
+                match header.take() {
+                    Some(h) => stream.write_all_chunks(&mut [h, marker]).await,
+                    None => stream.write_all_chunks(&mut [marker]).await,
+                }
+            }
+        };
         match res {
             Ok(()) => {}
             Err(WriteError::Stopped(_)) => {
@@ -525,8 +556,19 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
 }
 
 /// Accepts the peer's streams and starts a reader for each.
+///
+/// A peer may open [`MAX_STREAMS`] streams over the life of the link. quinn only limits how many
+/// are open at once and hands out new credit as streams finish, so the lifetime cap is counted
+/// here: a peer that finishes its streams would otherwise register an unbounded number of
+/// channels in the inbox (security sweep #3).
 async fn accept_streams(io: Arc<Io>) {
+    let mut accepted: u32 = 0;
     while let Ok(stream) = io.conn.accept_uni().await {
+        accepted += 1;
+        if accepted > MAX_STREAMS {
+            io.violation("too many streams");
+            return;
+        }
         tokio::spawn(read_stream(io.clone(), stream));
     }
 }
@@ -628,38 +670,86 @@ fn reason_of(err: &ConnectionError) -> DownReason {
     }
 }
 
-/// How often the link looks at the connection's counters.
-fn sample_period(params: &LinkParams) -> Duration {
-    (params.degraded_after / 10).clamp(Duration::from_millis(10), Duration::from_millis(100))
+/// How often the link looks at the connection's counters while it is healthy (`slow`), and
+/// while it is silent or degraded (`fast`), when a prompt `Down` and a prompt recovery matter.
+///
+/// A healthy link hears from the peer about every `heartbeat`, so looking ten times a second
+/// bought nothing but wakeups (security/efficiency sweep, efficiency #4): `slow` is a quarter of
+/// `degraded_after` (500 ms by default), `fast` a tenth (100 ms at most).
+fn sample_periods(params: &LinkParams) -> (Duration, Duration) {
+    let fast =
+        (params.degraded_after / 10).clamp(Duration::from_millis(10), Duration::from_millis(100));
+    let slow = (params.degraded_after / 4).clamp(fast, Duration::from_millis(500));
+    (slow, fast)
+}
+
+/// The silence after which a link is `Degraded`: `degraded_after`, or more on a path with a long
+/// round trip. An idle link hears its peer once per heartbeat plus a round trip (the client's
+/// ping goes out a heartbeat after the last acknowledgement came back), so silence up to that is
+/// what a healthy link produces and must not show as trouble. Never more than three quarters of
+/// `dead_after`.
+fn degraded_threshold(params: &LinkParams, rtt: Duration) -> Duration {
+    let healthy_gap = params.heartbeat + rtt * 3 / 2;
+    params
+        .degraded_after
+        .max(healthy_gap)
+        .min(params.dead_after * 3 / 4)
 }
 
 /// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
 /// final `Down`.
+///
+/// The only clock available is quinn's count of received datagrams, so when the peer was last
+/// heard is known only to the precision of the sampling period (`slow`, 500 ms by default). A
+/// change seen at a look means a datagram arrived since the previous look, so the datagram's time
+/// is bracketed: no earlier than the previous look (`heard_after`), no later than this one
+/// (`heard_by`). Each decision uses the bound that errs the safe way:
+///
+/// - `Dead` uses the *earliest* bound, so the silence measured is never shorter than the real
+///   one and the link is never declared dead late by more than one fast period (100 ms at most,
+///   as before this sampling was coarser).
+/// - `Degraded` uses the *latest* bound, so it is never early: it shows after between
+///   `degraded_after` and `degraded_after` plus one sample (0.5 s) of real silence. Using the
+///   earliest bound here made an idle link on a long round trip flap `Degraded` (the client's
+///   pings and their acknowledgements are a heartbeat plus a round trip apart).
 async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: LinkParams) {
     let conn = &io.conn;
     let closed = conn.closed();
     tokio::pin!(closed);
-    let mut tick = tokio::time::interval(sample_period(&params));
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (slow, fast) = sample_periods(&params);
 
     let mut rx_datagrams = conn.stats().udp_rx.datagrams;
-    let mut last_rx = Instant::now();
+    let mut heard_after = Instant::now();
+    let mut heard_by = heard_after;
+    let mut last_tick = heard_after;
+    // The first look comes early, so a fresh link has its first round-trip estimate soon.
+    let mut period = fast;
     let mut remote: SocketAddr = conn.remote_address();
     let mut local_ip: Option<IpAddr> = conn.local_ip();
 
     let err = loop {
         tokio::select! {
             err = &mut closed => break err,
-            _ = tick.tick() => {}
+            () = tokio::time::sleep(period) => {}
         }
+        io.ticks.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let seen = conn.stats().udp_rx.datagrams;
         if seen != rx_datagrams {
             rx_datagrams = seen;
-            last_rx = now;
+            heard_after = last_tick;
+            heard_by = now;
         }
-        let silence = now.duration_since(last_rx);
-        let degraded = silence >= params.degraded_after;
+        last_tick = now;
+        let rtt = conn.rtt();
+        let silence = now.duration_since(heard_after); // the longest it can have been
+        let degraded = now.duration_since(heard_by) >= degraded_threshold(&params, rtt);
+        // Watch closely once the peer has been quiet for longer than a heartbeat and a half.
+        period = if degraded || silence >= params.heartbeat * 3 / 2 {
+            fast
+        } else {
+            slow
+        };
         if silence >= params.dead_after {
             // quinn's idle timer restarts whenever it sends a keep-alive, so on its own it can
             // take up to a heartbeat longer than `dead_after`. The contract is `dead_after`
@@ -686,7 +776,6 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
             local_ip = now_local;
         }
 
-        let rtt = conn.rtt();
         status.send_if_modified(|s| {
             let mut modified = false;
             if !matches!(s.state, LinkState::Down(_)) {

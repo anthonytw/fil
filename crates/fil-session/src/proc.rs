@@ -321,7 +321,8 @@ pub fn resolve_scope(
         }),
         Decision::Tree => Ok(Scope::Tree),
         Decision::TreeWithWarning(why) => {
-            tracing::warn!(session = name, %why, "no systemd scope; tracking the process tree instead");
+            tracing::warn!(%why, "no systemd scope; tracking the process tree instead");
+            tracing::debug!(session = name, "no systemd scope for");
             Ok(Scope::Tree)
         }
         Decision::Fail(why) => Err(crate::pty::SpawnError::Scope(why)),

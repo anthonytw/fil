@@ -8,8 +8,8 @@
 //! scrub:
 //!
 //! - the session's PTY child is scrubbed with it today, whichever way the daemon was started;
-//! - the daemon's launcher (`fil_daemon::start`) will scrub the environment of the daemon it
-//!   starts with the same list (it still has its own shorter one until it switches over).
+//! - the daemon's launcher (`fil_daemon::start`) scrubs the environment of the daemon it starts
+//!   with the same list.
 //!
 //! The list is tmux's `update-environment` set (the variables tmux refreshes per client because
 //! they belong to a login) plus the other SSH connection variables, logind's `XDG_SESSION_*`,

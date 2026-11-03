@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use fil_daemon::{DaemonLauncher, EnsureError, Paths, ensure_daemon};
-use fil_proto::msg::AttachRefusal;
+use fil_proto::msg::{AttachRefusal, Request, Response, SessionSummary};
 use fil_transport::pipe::{PipeCommand, PipeConfig, PipeLink};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
@@ -214,6 +214,12 @@ fn an_idle_daemon_exits_on_its_own_and_the_next_use_starts_a_new_one() {
         "it removed its socket on the way out"
     );
     assert!(!lock_is_held(&s.paths()));
+    // privacy #10: nothing of it is left in /tmp, not the pid in the lock file nor the start file.
+    assert!(!s.paths().lock().exists(), "the lock file was removed");
+    assert!(
+        !s.paths().start_lock().exists(),
+        "the start file was removed"
+    );
 
     let second = ensure_daemon(&s.paths(), &launcher(&s, None)).unwrap();
     assert!(second.started);
@@ -262,19 +268,36 @@ async fn relay_process_to_daemon_process_to_session_and_a_daemon_restart() {
         .unwrap();
     let mut b = Client::attach(two, Connect::new("second", key(2)).host("desktop")).await;
     b.wait_screen("ready").await;
-    assert!(run_tool(&s, &["detach", "second"]).await.contains("done"));
+    let name = |n: &str| n.parse().unwrap();
+    let detach = Request::DetachSession {
+        name: name("second"),
+    };
+    assert_eq!(manage(&s, detach).await, Response::Done);
     b.wait_down().await;
-    let ls = run_tool(&s, &["ls"]).await;
-    assert!(ls.contains("second") && ls.contains("detached"), "{ls}");
-    assert!(run_tool(&s, &["kill", "second"]).await.contains("done"));
-    eventually(|| async { !run_tool(&s, &["ls"]).await.contains("second") }).await;
+    let second = sessions(&s)
+        .await
+        .into_iter()
+        .find(|x| x.name.as_str() == "second");
+    assert!(second.expect("still there").attached.is_none());
+    let kill = Request::KillSession {
+        name: name("second"),
+    };
+    assert_eq!(manage(&s, kill).await, Response::Done);
+    eventually(|| async {
+        !sessions(&s)
+            .await
+            .iter()
+            .any(|x| x.name.as_str() == "second")
+    })
+    .await;
 
     // `ls` through a second real relay.
-    let ls = run_tool(&s, &["ls"]).await;
-    assert!(
-        ls.contains("main") && ls.contains("attached from laptop"),
-        "{ls}"
-    );
+    let list = sessions(&s).await;
+    let main = list
+        .iter()
+        .find(|x| x.name.as_str() == "main")
+        .expect("main");
+    assert_eq!(main.attached.as_ref().unwrap().host.as_str(), "laptop");
 
     // The daemon dies hard (its sessions with it) and a new one starts at the same place.
     let resume = a.resume_request();
@@ -301,20 +324,112 @@ async fn relay_process_to_daemon_process_to_session_and_a_daemon_restart() {
     assert_ne!(s.daemon_pid().unwrap(), pid);
 }
 
-async fn run_tool(s: &Scratch, args: &[&str]) -> String {
-    let out = tokio::process::Command::new(BIN)
+/// One request through a real relay process, as `fil ls`, `fil kill` and `fil detach` send it.
+async fn manage(s: &Scratch, request_: Request) -> Response {
+    let cmd = PipeCommand::custom([BIN, "--dir", &s.dir.display().to_string(), "relay"]).unwrap();
+    let link = PipeLink::spawn(&cmd, PipeConfig::default())
+        .await
+        .expect("through a real relay");
+    let response = request(&link, request_).await;
+    link.shutdown().await;
+    response
+}
+
+async fn sessions(s: &Scratch) -> Vec<SessionSummary> {
+    match manage(s, Request::ListSessions).await {
+        Response::Sessions { list, .. } => list,
+        other => panic!("not a session list: {other:?}"),
+    }
+}
+
+/// bugs #11: SIGTERM stops the daemon, but a client attached to a session hears how that session
+/// ended ("killed by a signal"), not just a closed connection that it answers by reconnecting to a
+/// new daemon and hearing "a different session now". The daemon is a real process here: an
+/// in-process one would keep its runtime, and so its connection tasks, alive after `run` returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_lets_attached_clients_hear_how_their_session_ended() {
+    let s = Scratch::new();
+    write_config(&s, "");
+    drop(ensure_daemon(&s.paths(), &launcher(&s, Some(CAT))).unwrap());
+    let pid = s.daemon_pid().unwrap();
+    let cmd = PipeCommand::custom([BIN, "--dir", &s.dir.display().to_string(), "relay"]).unwrap();
+    let link = PipeLink::spawn(&cmd, PipeConfig::default()).await.unwrap();
+    let mut a = Client::attach(link, Connect::new("main", key(1))).await;
+    a.wait_screen("ready").await;
+
+    // Output the client has not acknowledged yet: the daemon holds the ending back until it is
+    // (or a second has passed), which is the time a daemon that stopped at once would not give.
+    a.type_bytes(b"unread\n").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.wait("the session's ending", |c| c.exited.is_some() || c.down)
+        .await;
+    let (code, signal) = a
+        .exited
+        .expect("told how the session ended before the link closed");
+    assert!(code.is_some() || signal.is_some(), "{code:?} {signal:?}");
+    wait_until("the daemon to exit", || !pid_alive(pid));
+    // privacy #10, on the way out by a signal too.
+    assert!(!s.paths().lock().exists() && !s.paths().start_lock().exists());
+}
+
+/// security #9: the log lives in the socket directory when there is no home directory; a socket
+/// directory that is not ours (here: the wrong mode) is refused before anything is created in it.
+#[test]
+fn a_socket_directory_that_is_not_trusted_gets_no_log_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    std::fs::create_dir(&s.dir).unwrap();
+    std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = std::process::Command::new(BIN)
         .arg("--dir")
         .arg(&s.dir)
-        .args(args)
+        .arg("daemon")
         .output()
-        .await
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    assert!(!out.status.success(), "the daemon refused to start");
+    let names: Vec<_> = std::fs::read_dir(&s.dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(names.is_empty(), "nothing was created in it: {names:?}");
+}
+
+/// privacy #7: the daemon is set not to dump core (Linux: its `/proc` files are no longer
+/// readable even by us, which is what the dumpable flag does; elsewhere: the core limit, which its
+/// sessions inherit, so `ulimit -c` in a session shows it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_does_not_dump_core() {
+    let s = Scratch::new();
+    write_config(&s, "");
+    drop(
+        ensure_daemon(
+            &s.paths(),
+            &launcher(&s, Some("echo core=$(ulimit -c); exec cat")),
+        )
+        .unwrap(),
     );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let pid = s.daemon_pid().unwrap();
+    if cfg!(target_os = "linux") {
+        if fil_daemon::current_uid() == 0 {
+            return; // root can read anything
+        }
+        let read = std::fs::read(format!("/proc/{pid}/environ"));
+        assert!(
+            read.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+            "a dumpable process's environ is readable by its owner"
+        );
+    } else {
+        let cmd =
+            PipeCommand::custom([BIN, "--dir", &s.dir.display().to_string(), "relay"]).unwrap();
+        let link = PipeLink::spawn(&cmd, PipeConfig::default()).await.unwrap();
+        let mut a = Client::attach(link, Connect::new("main", key(1))).await;
+        a.wait_screen("core=0").await;
+    }
 }
 
 #[test]
@@ -331,4 +446,25 @@ fn the_default_paths_are_under_tmp_and_the_users_directories() {
     assert!(p.dir.starts_with("/tmp"), "not under $XDG_RUNTIME_DIR");
     assert!(p.config.ends_with("fil/daemon.toml"));
     assert!(p.log.ends_with("fil/daemon.log"));
+}
+
+/// privacy #7: the relay carries every byte of the session, and is not dumpable either (Linux:
+/// its `/proc` files are not readable even by us).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relay_does_not_dump_core() {
+    if !cfg!(target_os = "linux") || fil_daemon::current_uid() == 0 {
+        return; // on macOS the daemon the relay starts is checked instead; root reads anything
+    }
+    let s = Scratch::new();
+    write_config(&s, "");
+    drop(ensure_daemon(&s.paths(), &launcher(&s, Some(CAT))).unwrap());
+    let cmd = PipeCommand::custom([BIN, "--dir", &s.dir.display().to_string(), "relay"]).unwrap();
+    let link = PipeLink::spawn(&cmd, PipeConfig::default()).await.unwrap();
+    let pid = link.child_id().expect("a relay process");
+    let read = std::fs::read(format!("/proc/{pid}/environ"));
+    assert!(
+        read.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "a dumpable process's environ is readable by its owner"
+    );
+    link.shutdown().await;
 }

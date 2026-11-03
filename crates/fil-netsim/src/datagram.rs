@@ -141,11 +141,6 @@ impl Net {
         }
     }
 
-    /// Replace the conditions. Applies to datagrams sent from now on.
-    pub fn set_conditions(&self, cond: Conditions) {
-        lock(&self.state).cond = cond;
-    }
-
     /// Change the conditions in place.
     pub fn update_conditions(&self, f: impl FnOnce(&mut Conditions)) {
         f(&mut lock(&self.state).cond);

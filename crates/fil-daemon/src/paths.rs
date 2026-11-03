@@ -29,6 +29,27 @@ pub fn current_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// `$HOME`, when it is an absolute path.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The XDG base directory named by `var` when it is an absolute path, else `$HOME/fallback`.
+/// The one place the daemon and the client resolve these, so they cannot disagree.
+pub fn base_dir(var: &str, fallback: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home_dir().map(|h| h.join(fallback)))
+}
+
+/// `$XDG_STATE_HOME/fil` or `~/.local/state/fil`: where both logs live.
+pub fn state_dir() -> Option<PathBuf> {
+    base_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("fil"))
+}
+
 /// Every path the daemon, the relay and the launcher need, for one protocol major.
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -47,21 +68,11 @@ impl Paths {
     /// `~/.config/fil`) and `$XDG_STATE_HOME/fil` (or `~/.local/state/fil`).
     pub fn for_current_user() -> Paths {
         let dir = PathBuf::from(format!("/tmp/fil-{}", current_uid()));
-        let home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from);
-        let under = |xdg: &str, rel: &str| -> Option<PathBuf> {
-            std::env::var_os(xdg)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .or_else(|| home.as_ref().map(|h| h.join(rel)))
-        };
-        let config = under("XDG_CONFIG_HOME", ".config")
+        let config = base_dir("XDG_CONFIG_HOME", ".config")
             .map(|p| p.join("fil/daemon.toml"))
             .unwrap_or_else(|| dir.join("daemon.toml"));
-        let log = under("XDG_STATE_HOME", ".local/state")
-            .map(|p| p.join("fil/daemon.log"))
+        let log = state_dir()
+            .map(|p| p.join("daemon.log"))
             .unwrap_or_else(|| dir.join("daemon.log"));
         Paths {
             dir,

@@ -21,11 +21,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std", "registry"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std", "registry"] }
 
 [dev-dependencies]
 fil-term = { path = "../fil-term" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process", "test-util"] }
 
 [lints]
 workspace = true

@@ -709,7 +709,8 @@ impl Core {
                 self.eof = true;
             }
             Cmd::ChildExited(info) => {
-                tracing::info!(session = %self.name, code = info.code, "the shell exited");
+                tracing::info!(code = info.code, "the shell exited");
+                tracing::debug!(session = %self.name, "the shell exited in");
                 self.exit = Some(info);
                 self.exit_deadline = Some(Instant::now() + self.cfg.exit_drain);
                 // What the shell left behind in the background is told to hang up, as a closing
@@ -1184,14 +1185,16 @@ impl Core {
         // A child that is not reading leaves input piling up in front of its PTY. A client that
         // keeps sending past the point where acknowledgements stopped is cut off, not queued.
         if self.pty.queued() + data.len() > self.cfg.max_queued_input {
-            tracing::warn!(session = %self.name, "input backlog over the limit");
+            tracing::warn!("input backlog over the limit");
+            tracing::debug!(session = %self.name, "input backlog over the limit in");
             self.send(ConnEvent::Fatal(ErrorCode::Protocol));
             return;
         }
         let fresh = match self.input.accept(seq, &data) {
             Ok(f) => f.to_vec(),
             Err(e) => {
-                tracing::warn!(session = %self.name, error = %e, "input channel gap");
+                tracing::warn!(error = %e, "input channel gap");
+                tracing::debug!(session = %self.name, "input channel gap in");
                 self.send(ConnEvent::Fatal(ErrorCode::Protocol));
                 return;
             }

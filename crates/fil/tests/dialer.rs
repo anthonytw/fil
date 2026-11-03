@@ -825,3 +825,51 @@ async fn dropping_a_direct_offer_on_a_fresh_attach_tells_the_manager() {
     let v = d.view();
     assert_ne!(v.direct, fil_transport::path::Lane::Up, "{v:?}");
 }
+
+// ---- the sweep: the terminal, the network watcher --------------------------------------------
+
+/// bugs #6: the connector is told when the session starts over the pipe, which is when the first
+/// ssh's stderr stops going to the terminal. Not before the reply.
+#[tokio::test(start_paused = true)]
+async fn the_connector_is_told_when_a_session_starts_over_the_pipe() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = within(secs(5), &mut d, DialPurpose::Attach)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fake.sessions_started().is_empty(),
+        "the user is still waiting for the attach"
+    );
+    d.attached(&info(LinkKind::Pipe, false, true));
+    assert_eq!(fake.sessions_started(), [LinkKind::Pipe]);
+    // A reply over direct (a swap) is not a pipe session starting.
+    let cand = swap_within(secs(5), &mut d).await.expect("an upgrade");
+    d.attached(&info(LinkKind::Direct, true, true));
+    d.swapped(Ok(LinkKind::Direct));
+    drop(cand);
+    assert_eq!(fake.sessions_started(), [LinkKind::Pipe]);
+}
+
+/// efficiency #14: the network watcher is a hint for upgrading and redialing; with the pipe only
+/// there is nothing to hint, and it would wake twice a second for nothing.
+#[test]
+fn the_network_watcher_runs_only_when_direct_might_be_used() {
+    assert!(!DialerConfig::new(TransportSetting::Pipe).watch_network);
+    assert!(DialerConfig::new(TransportSetting::Auto).watch_network);
+    assert!(DialerConfig::new(TransportSetting::Direct).watch_network);
+}
+
+/// A change of network reaches the connector, which drops what it remembered about names.
+#[tokio::test(start_paused = true)]
+async fn the_connector_hears_of_a_network_change() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    assert_eq!(fake.network_changes(), 0);
+    d.network_changed();
+    // Hints are read the next time the dialer runs.
+    let _ = swap_within(secs(1), &mut d).await;
+    assert_eq!(fake.network_changes(), 1);
+}

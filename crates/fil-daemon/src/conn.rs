@@ -35,14 +35,14 @@ use fil_session::ServeEnd;
 use fil_transport::Link;
 use fil_transport::auth::PublicKey as TransportKey;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::daemon::{Binding, Inner, Lookup};
 
 /// How long `KillSession` waits for the session's processes to be gone.
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a last message is given to be read before the link is closed. A stand-in for
-/// `Link::flush`: see [`finish`].
-const HANGUP_GRACE: Duration = Duration::from_millis(500);
+/// How long a last message is given to reach the peer before the link is closed: see [`finish`].
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where a connection came from.
 pub(crate) enum Origin {
@@ -92,15 +92,33 @@ async fn recv_ctl<L: Link>(link: &L) -> Result<ControlMsg, Fail> {
     ControlMsg::decode(&payload).map_err(|_| Fail::Tell(ErrorCode::Protocol))
 }
 
-/// After the last message to a peer: lets it be read, then closes.
+/// After the last message to a peer: lets it get there, then closes.
 ///
-/// `Link::close` discards what is still queued, and until `Link::flush` exists the only way to
-/// know the peer has read the last message is that it hangs up on receiving it. So this waits
-/// for the peer to end the link, for at most [`HANGUP_GRACE`]. When `flush` lands this becomes
-/// `link.flush().await` and the constant goes.
+/// `Link::close` discards what is still queued, so the link is flushed first (DESIGN.md section
+/// 8.5), for at most [`FLUSH_TIMEOUT`]: a peer that has stopped reading does not hold the
+/// connection open. Unlike waiting for the peer to hang up, this returns as soon as the message
+/// is delivered.
 async fn finish<L: Link>(link: &L) {
-    let _ = tokio::time::timeout(HANGUP_GRACE, async { while link.recv().await.is_ok() {} }).await;
+    let _ = tokio::time::timeout(FLUSH_TIMEOUT, link.flush()).await;
     link.close();
+}
+
+/// How an attach ended, for the log. The label of the machine that took a session over is left
+/// out: the log says what fil did, not which of the user's machines did what (DESIGN.md section
+/// 11.1, principle 2).
+fn describe_end(end: &ServeEnd) -> String {
+    match end {
+        ServeEnd::TakenOver(_) => "TakenOver".to_string(),
+        ServeEnd::Refused(r) => format!("Refused({})", describe_refusal(r)),
+        other => format!("{other:?}"),
+    }
+}
+
+fn describe_refusal(r: &AttachRefusal) -> String {
+    match r {
+        AttachRefusal::TakenOver(_) => "TakenOver".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 async fn tell_and_close<L: Link>(link: &L, msg: ControlMsg) {
@@ -134,7 +152,12 @@ impl Inner {
             }
         };
         match (next, origin) {
-            (Next::Attach(attach), origin) => self.attach(link, origin, attach).await,
+            (Next::Attach(attach), origin) => {
+                // The session's name is in the span, so it is in the log at debug and not at the
+                // default level (DESIGN.md section 11.1, principle 2).
+                let span = tracing::debug_span!("attach", session = %attach.name);
+                self.attach(link, origin, attach).instrument(span).await;
+            }
             (Next::Request(req), Origin::Pipe) => {
                 let response = self.request(req).await;
                 tell_and_close(&link, ControlMsg::Response(response)).await;
@@ -151,7 +174,9 @@ impl Inner {
         let key = TransportKey::from_spki_der(attach.key.as_bytes());
         let session = attach.name.clone();
         let direct = matches!(origin, Origin::Direct { .. });
-        tracing::info!(%session, host = %attach.host, resuming = attach.resume.is_some(), direct, "attach");
+        tracing::info!(resuming = attach.resume.is_some(), direct, "attach");
+        // Which of the user's machines attached is for someone debugging fil, not for the record.
+        tracing::debug!(host = %attach.host, "attach from");
 
         // What the direct connection may do, decided before looking at any session.
         let required = match &origin {
@@ -178,7 +203,7 @@ impl Inner {
                 .binding(&key)
                 .is_some_and(|b| b.name != attach.name)
             {
-                tracing::warn!(%session, "a key already bound to another session");
+                tracing::warn!("a key already bound to another session");
                 tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
                 return;
             }
@@ -194,15 +219,15 @@ impl Inner {
         let handle = match self.session_for(&attach).await {
             Ok(h) => h,
             Err(Lookup::Refuse(refusal)) => {
-                tracing::info!(%session, ?refusal, "attach refused");
+                tracing::info!(refusal = %describe_refusal(&refusal), "attach refused");
                 let msg = refuse(ControlMsg::AttachRefused(refusal));
                 tell_and_close(&link, msg).await;
                 return;
             }
             Err(Lookup::Failed(why)) => {
-                tracing::error!(%session, %why, "cannot serve an attach");
-                // The wire has no better word for "the daemon failed" yet.
-                let msg = refuse(ControlMsg::Error(ErrorCode::Protocol));
+                tracing::error!(%why, "cannot serve an attach");
+                // The client says so and points at this log; the reason is here, not on the wire.
+                let msg = refuse(ControlMsg::Error(ErrorCode::SessionStartFailed));
                 tell_and_close(&link, msg).await;
                 return;
             }
@@ -218,7 +243,7 @@ impl Inner {
                     && self.host.binding(&key).as_ref() == Some(&bound)
                     && handle.incarnation() == bound.incarnation;
                 if !still {
-                    tracing::info!(%session, "direct attach whose key was revoked meanwhile");
+                    tracing::info!("direct attach whose key was revoked meanwhile");
                     link.close();
                     return;
                 }
@@ -244,7 +269,7 @@ impl Inner {
         }
 
         let end = handle.serve(link, attach).await;
-        tracing::info!(%session, direct, end = ?end, "attach ended");
+        tracing::info!(direct, end = %describe_end(&end), "attach ended");
         if newly_registered && matches!(end, ServeEnd::Refused(_)) {
             self.revoke_key(&key_bytes);
         }
@@ -257,27 +282,26 @@ impl Inner {
     ///   pipe with a new key, so QUIC can never create a session or take one over;
     /// - the key is bound to the session named, at the incarnation resumed.
     fn check_direct(&self, peer: &TransportKey, attach: &Attach) -> Result<Binding, Fail> {
-        let session = &attach.name;
         if peer.as_spki_der() != attach.key.as_bytes() {
-            tracing::warn!(%session, "direct attach with a key the connection did not authenticate with");
+            tracing::warn!("direct attach with a key the connection did not authenticate with");
             return Err(Fail::Tell(ErrorCode::Protocol));
         }
         let Some(resume) = &attach.resume else {
-            tracing::warn!(%session, "a fresh attach over a direct connection; refused");
+            tracing::warn!("a fresh attach over a direct connection; refused");
             return Err(Fail::Tell(ErrorCode::Protocol));
         };
         if !self.registry.contains(peer) {
-            tracing::info!(%session, "direct attach with a revoked key");
+            tracing::info!("direct attach with a revoked key");
             return Err(Fail::Drop("revoked key"));
         }
         match self.host.binding(peer) {
             Some(b) if b.name == attach.name && b.incarnation == resume.incarnation => Ok(b),
-            Some(b) => {
-                tracing::warn!(%session, bound = %b.name, "direct attach for a session the key is not bound to");
+            Some(_) => {
+                tracing::warn!("direct attach for a session the key is not bound to");
                 Err(Fail::Tell(ErrorCode::Protocol))
             }
             None => {
-                tracing::warn!(%session, "direct attach with a key bound to no session");
+                tracing::warn!("direct attach with a key bound to no session");
                 Err(Fail::Tell(ErrorCode::Protocol))
             }
         }
@@ -295,9 +319,13 @@ impl Inner {
                         created_unix_ms: info.created_unix_ms,
                         // 0 means the shell has printed nothing yet (`fil ls` shows "never").
                         last_output_unix_ms: info.last_output_unix_ms.unwrap_or(0),
-                        attached: info.subscriber.map(|s| SubscriberSummary {
-                            host: s.host,
-                            since_unix_ms: s.since_unix_ms,
+                        // A subscriber whose transport is gone (a laptop asleep for hours) holds
+                        // the session but is not attached: `fil ls` shows "-" for it.
+                        attached: info.subscriber.filter(|_| info.attached).map(|s| {
+                            SubscriberSummary {
+                                host: s.host,
+                                since_unix_ms: s.since_unix_ms,
+                            }
                         }),
                     });
                 }
@@ -306,9 +334,10 @@ impl Inner {
             Request::KillSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
                 Some(h) => {
-                    tracing::info!(session = %name, "kill requested");
+                    tracing::info!("kill requested");
+                    tracing::debug!(session = %name, "kill requested for");
                     if h.kill(KILL_TIMEOUT).await.is_none() {
-                        tracing::warn!(session = %name, "the session did not end within {KILL_TIMEOUT:?}");
+                        tracing::warn!("the session did not end within {KILL_TIMEOUT:?}");
                     }
                     Response::Done
                 }
@@ -316,7 +345,8 @@ impl Inner {
             Request::DetachSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
                 Some(h) => {
-                    tracing::info!(session = %name, "detach requested");
+                    tracing::info!("detach requested");
+                    tracing::debug!(session = %name, "detach requested for");
                     h.force_detach().await;
                     Response::Done
                 }
@@ -340,5 +370,67 @@ async fn negotiate<L: Link>(link: &L) -> Result<Next, Fail> {
         ControlMsg::Attach(a) => Ok(Next::Attach(a)),
         ControlMsg::Request(r) => Ok(Next::Request(r)),
         _ => Err(Fail::Tell(ErrorCode::Protocol)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fil_transport::LinkKind;
+    use fil_transport::link::mem;
+
+    /// bugs #12a: the last message is flushed and the link closed at once. It does not wait for
+    /// the peer to hang up, which a peer that has what it needs has no reason to do.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_message_is_flushed_not_waited_out() {
+        let (ours, theirs, _control) = mem::pair(LinkKind::Pipe, 8);
+        // The peer reads the message and keeps its end open.
+        let peer = tokio::spawn(async move {
+            let got = theirs.recv().await;
+            (got, theirs)
+        });
+        let t = tokio::time::Instant::now();
+        tell_and_close(&ours, ControlMsg::Error(ErrorCode::SessionStartFailed)).await;
+        assert!(
+            t.elapsed() < Duration::from_millis(50),
+            "took {:?}",
+            t.elapsed()
+        );
+        let (got, _theirs) = peer.await.unwrap();
+        let (chan, payload) = got.expect("the message arrived before the close");
+        assert_eq!(chan, ChannelId::CONTROL);
+        assert_eq!(
+            ControlMsg::decode(&payload).unwrap(),
+            ControlMsg::Error(ErrorCode::SessionStartFailed)
+        );
+    }
+
+    /// A peer that never reads does not hold the connection (and the daemon's idle exit) open.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_reads_is_given_up_on() {
+        let (ours, _theirs, _control) = mem::pair(LinkKind::Pipe, 8);
+        let t = tokio::time::Instant::now();
+        tell_and_close(&ours, ControlMsg::Error(ErrorCode::Protocol)).await;
+        assert!(t.elapsed() <= FLUSH_TIMEOUT + Duration::from_millis(50));
+    }
+
+    /// privacy #1: the log says a session was taken over, not by which of the user's machines.
+    #[test]
+    fn the_log_names_no_host_label() {
+        let by: fil_proto::msg::HostLabel = "laptop-a".parse().unwrap();
+        let taken = fil_proto::msg::TakenOver {
+            by,
+            at_unix_ms: 0,
+            epoch: 2,
+        };
+        for text in [
+            describe_end(&ServeEnd::TakenOver(taken.clone())),
+            describe_end(&ServeEnd::Refused(AttachRefusal::TakenOver(taken.clone()))),
+            describe_refusal(&AttachRefusal::TakenOver(taken)),
+        ] {
+            assert!(!text.contains("laptop"), "{text}");
+            assert!(text.contains("TakenOver"), "{text}");
+        }
+        assert_eq!(describe_end(&ServeEnd::Detached), "Detached");
     }
 }

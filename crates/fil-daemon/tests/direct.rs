@@ -267,3 +267,41 @@ async fn a_key_does_not_outlive_its_session() {
     eventually(|| async { d.registry.is_empty() }).await;
     d.stop().await;
 }
+
+/// bugs #3: the shipped default is the IPv6 wildcard, which takes IPv4 too, so a name that
+/// resolves to `::1` first (macOS `localhost`, dual-stack hosts, tailnet names) is reached over
+/// either address and no dial spends a connect timeout on an address nobody listens on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_bind_is_reached_over_both_address_families() {
+    // A host without IPv6 loopback cannot show the point (the daemon then falls back to IPv4).
+    let v6_works = std::net::UdpSocket::bind("[::1]:0").is_ok();
+    let s = Scratch::new();
+    let mut cfg = direct_config(CAT);
+    cfg.bind = fil_daemon::DaemonConfig::default().bind; // the shipped default
+    let d = start(&s, cfg).await;
+    let port = d.udp_port.expect("direct mode is on");
+    let pin = Fingerprint::from_bytes(
+        d.fingerprint
+            .as_ref()
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap(),
+    );
+    let ck = ClientKey::generate().unwrap();
+    let pk = proto_key(&ck);
+    let _a = Client::attach(d.pipe().await, Connect::new("main", pk)).await;
+
+    let mut addrs: Vec<SocketAddr> = vec![([127, 0, 0, 1], port).into()];
+    if v6_works {
+        addrs.push((std::net::Ipv6Addr::LOCALHOST, port).into());
+    }
+    for addr in addrs {
+        let t = std::time::Instant::now();
+        QuicLink::connect(addr, pin, &ck, LinkParams::default())
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{addr}");
+    }
+    let _ = d.stop().await;
+}

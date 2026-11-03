@@ -273,9 +273,17 @@ async fn a_daemon_restart_gives_session_replaced_on_resume() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_that_ends_is_reported_then_gone() {
     let s = Scratch::new();
-    let d = start(&s, config("echo bye; exit 3")).await;
+    // The shell waits for a line before it exits: a shell that has already gone when the attach
+    // arrives is refused as `SessionGone`, which is a different test and made this one flaky.
+    let d = start(&s, config("read line; echo bye; exit 3")).await;
     let k = key(1);
     let mut a = Client::attach(d.pipe().await, Connect::new("main", k.clone())).await;
+    assert!(
+        a.reply.is_some(),
+        "attached to a live session: {:?}",
+        a.refused
+    );
+    a.type_bytes(b"\n").await;
     a.wait_down().await;
     // (Reporting the exit status to the client is `SessionExited`, sent by fil-session since
     // package F; when it is there it must say 3.)
@@ -412,4 +420,70 @@ async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
         .parse()
         .unwrap();
     assert!(!pid_alive(pid));
+}
+
+/// bugs #9: a session that cannot be created is not "protocol error": the client is told the
+/// daemon could not start it (and where to look).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_cannot_start_is_reported_as_such() {
+    let s = Scratch::new();
+    let mut cfg = config(CAT);
+    cfg.session.command = Some(vec!["/nonexistent/fil-test-shell".into()]);
+    let d = start(&s, cfg).await;
+    let link = d.pipe().await;
+    let c = Client::attach(link, Connect::new("main", key(1))).await;
+    assert_eq!(c.errors, [ErrorCode::SessionStartFailed], "{:?}", c.errors);
+    assert!(c.reply.is_none() && c.refused.is_none());
+    d.stop().await;
+}
+
+/// bugs #12b: a laptop that dropped off hours ago still holds the session, but `fil ls` does not
+/// say it is attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_does_not_show_a_dropped_connection_as_attached() {
+    let s = Scratch::new();
+    let d = start(&s, config(CAT)).await;
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1)).host("laptop")).await;
+    a.wait_screen("ready").await;
+    let attached = |list: &[fil_proto::msg::SessionSummary]| list[0].attached.is_some();
+    let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+        panic!("a session list");
+    };
+    assert!(attached(&list));
+    // The connection dies without a goodbye.
+    a.link.close();
+    eventually(|| async {
+        let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
+            return false;
+        };
+        list.len() == 1 && !attached(&list)
+    })
+    .await;
+    d.stop().await;
+}
+
+/// `history_lines` in `daemon.toml` reaches the session: the scrollback a client that takes the
+/// session over is given is cut to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_lines_from_the_config_limits_the_scrollback_a_new_client_gets() {
+    let scrollback = |history_lines: usize| async move {
+        let s = Scratch::new();
+        let mut cfg = config("seq 1 300; echo done-printing; exec cat");
+        cfg.history_lines = history_lines;
+        let d = start(&s, cfg).await;
+        let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+        a.wait_screen("done-printing").await;
+        // Another client takes the session over and is sent its state as a snapshot.
+        let mut b = Client::attach(d.pipe().await, Connect::new("main", key(2))).await;
+        b.wait_screen("done-printing").await;
+        assert!(matches!(
+            b.reply.as_ref().unwrap().start,
+            StartPoint::Snapshot(_)
+        ));
+        let lines = b.emu.state(10_000).history.len();
+        d.stop().await;
+        lines
+    };
+    assert_eq!(scrollback(5).await, 5);
+    assert!(scrollback(1000).await > 200);
 }

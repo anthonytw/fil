@@ -733,13 +733,61 @@ async fn a_busy_link_keeps_probing_through_a_blackout_at_a_bounded_rate() {
         longest <= w.params.heartbeat / 2 + Duration::from_millis(60),
         "the client went {longest:?} without sending during the blackout ({times:?})"
     );
-    // At most two datagrams per lift, and quinn's own probes (two each): a few dozen at most.
+    // One transmit per lift (one datagram here: the simulated socket does not batch, two on
+    // Linux), and quinn's own probes (two each): a few dozen at most.
     assert!(
         during <= 20,
         "{during} datagrams sent into 3.5 s of the blackout: {times:?}"
     );
     assert!(!is_down(&client.status().borrow()));
     assert!(!is_down(&daemon.status().borrow()));
+}
+
+/// The lift needs quinn to transmit when it is due, and quinn transmits only when something wakes
+/// it; the link's supervisor does (`quic::wake`). With a writer still going, its writes would wake
+/// quinn anyway, so this one writes a burst and stops: data stays queued behind a full window, the
+/// path dies, and nothing but timers is left. Without the supervisor's wake the next transmit is
+/// the keep-alive, a heartbeat after the last send (0.88 s at 40 ms one way), not half of one.
+#[tokio::test(start_paused = true)]
+async fn a_burst_then_quiet_link_still_probes_every_half_heartbeat_in_a_blackout() {
+    let mut w = World::new(84);
+    w.net
+        .update_conditions(|c| c.latency = Duration::from_millis(40));
+    let (client, daemon, _) = w.pair().await;
+    let daemon = Arc::new(daemon);
+    let d = daemon.clone();
+    tokio::spawn(async move { while d.recv().await.is_ok() {} });
+    sleep(Duration::from_secs(1)).await;
+    // A burst of 300 ms, as fast as the link takes it, then no more writes.
+    let end = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        if timeout(
+            Duration::from_millis(10),
+            client.send(FWD, seq_payload(0, 1000)),
+        )
+        .await
+        .is_err()
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    let times = send_times(&client, t0, t0 + Duration::from_millis(4000)).await;
+    w.net.set_blackout(false);
+    let start = Duration::from_millis(500);
+    let mut last = start;
+    let mut longest = Duration::ZERO;
+    for &t in times.iter().filter(|&&t| t > start) {
+        longest = longest.max(t - last);
+        last = t;
+    }
+    longest = longest.max(Duration::from_millis(4000) - last);
+    assert!(
+        longest <= w.params.heartbeat / 2 + Duration::from_millis(60),
+        "the client went {longest:?} without sending during the blackout ({times:?})"
+    );
+    assert!(!is_down(&client.status().borrow()));
 }
 
 /// The blackout `s_quiclink_blackouts` expects a link to survive (3 s, with `dead_after` 5 s) on

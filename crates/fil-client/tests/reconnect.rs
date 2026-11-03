@@ -398,6 +398,53 @@ async fn the_exit_code_is_reported_and_the_client_does_not_reconnect() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn output_that_arrives_after_the_status_is_still_shown() {
+    // The status can overtake the last of the output; the run ends when the link closes, not
+    // when the status arrives.
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..3)).await;
+    settle().await;
+    rig.daemon
+        .end_session_status_before_output(0, b"the last screenful\r\n")
+        .await;
+    let term = rig.term.clone();
+    let out = rig.finish().await.unwrap();
+    assert_eq!(
+        out,
+        Outcome::SessionEnded {
+            code: Some(0),
+            signal: None
+        }
+    );
+    assert!(
+        term.text().contains("the last screenful"),
+        "{}",
+        term.text()
+    );
+    assert!(term.text().contains("exited 0"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_daemon_that_never_closes_the_link_after_the_status_does_not_hold_the_client() {
+    let rig = start(config());
+    rig.attached().await;
+    settle().await;
+    rig.daemon.send_status_only(Some(5), None).await;
+    let out = tokio::time::timeout(Duration::from_secs(30), rig.finish())
+        .await
+        .expect("the run ended by itself")
+        .unwrap();
+    assert_eq!(
+        out,
+        Outcome::SessionEnded {
+            code: Some(5),
+            signal: None
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_signal_is_reported_by_number_and_name() {
     let rig = start(config());
     rig.attached().await;

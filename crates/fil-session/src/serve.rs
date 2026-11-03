@@ -56,8 +56,11 @@ use crate::handle::{Gone, SessionHandle};
 /// `Link::close` discards what is still queued, so the message is flushed first. A peer that
 /// does not read (or a path that has died) holds the flush back; this bounds it.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a finished session waits for the client to acknowledge its last output.
+/// How long a finished session waits for the client to acknowledge its last output, counted from
+/// the last acknowledgement that made progress (a client reading a long tail is not hurried) ...
 const EXIT_ACK_WAIT: Duration = Duration::from_secs(1);
+/// ... and the most it waits in all, so a client that never acknowledges cannot hold the session.
+const EXIT_ACK_CAP: Duration = Duration::from_secs(10);
 /// While output is unacknowledged, how often the "waited too long" half of the catch-up rule is
 /// looked at again.
 const AGE_CHECK: Duration = Duration::from_millis(250);
@@ -112,8 +115,10 @@ pub async fn serve_subscriber<L: Link>(
         armed: true,
     };
     let end = conn.run(acc).await;
-    gone.armed = false;
+    // Disarmed only once the message is in the queue: the send can wait behind a flood of output,
+    // and a future dropped there must still reap the connection.
     handle.send(Cmd::ConnGone { conn: conn.id }).await;
+    gone.armed = false;
     link.close();
     end
 }
@@ -464,9 +469,18 @@ impl<'a, L: Link> Conn<'a, L> {
                 )
             };
             let wrapped = self.handle.shared().lock_log().start() > next;
+            if prog.exited && wrapped {
+                // The shell is gone and the log no longer reaches back to this client's position;
+                // there is no emulator left to take a snapshot from. The tail is lost, but the
+                // client is still told how the session ended.
+                return self.finish_exited(false).await;
+            }
             // Nothing is gained by jumping when everything is already sent: the delay is in the
-            // link, and a snapshot would only rewrite what the client has.
-            if wrapped || (prog.ready > next && should_snapshot(behind, age, &params)) {
+            // link, and a snapshot would only rewrite what the client has. And a finished
+            // session sends the rest of its log: a snapshot would cost the client the tail.
+            if !prog.exited
+                && (wrapped || (prog.ready > next && should_snapshot(behind, age, &params)))
+            {
                 match self.catch_up(out).await {
                     Ok(()) => continue,
                     Err(end) => return end,
@@ -542,7 +556,7 @@ impl<'a, L: Link> Conn<'a, L> {
             }
 
             if prog.exited && next >= prog.ready {
-                return self.finish_exited().await;
+                return self.finish_exited(true).await;
             }
 
             tokio::select! {
@@ -592,11 +606,12 @@ impl<'a, L: Link> Conn<'a, L> {
             if let Some(r) = out.drain_events() {
                 return Err(self.end_with(r).await);
             }
-            return Err(if self.handle.is_alive() {
-                ServeEnd::Superseded
-            } else {
-                ServeEnd::SessionExited(self.handle.wait_exit().await)
-            });
+            if self.handle.is_alive() {
+                return Err(ServeEnd::Superseded);
+            }
+            // The shell exited while we asked. The next round sees `exited` and sends the rest of
+            // the log instead of a snapshot, then the status.
+            return Ok(());
         };
         // The stream is at the snapshot's `at` from here on, before anything is sent: the client
         // may acknowledge `at` as soon as it has applied the snapshot, and that ack must not be
@@ -636,19 +651,36 @@ impl<'a, L: Link> Conn<'a, L> {
         }
     }
 
-    /// The shell has exited and everything is sent: wait for the client to have it, then hang up.
-    async fn finish_exited(&self) -> ServeEnd {
-        let deadline = tokio::time::Instant::now() + EXIT_ACK_WAIT;
+    /// The shell has exited and everything is sent: wait for the client to have it (not forever),
+    /// tell it how the session ended, then hang up. `wait_for_acks` is false when the rest of the
+    /// output could not be sent.
+    ///
+    /// The status can overtake output that is still in flight (control goes first on every
+    /// transport), so the client does not end its run on it but reads on until the link closes,
+    /// and the farewell flush below makes the link carry everything before it.
+    async fn finish_exited(&self, wait_for_acks: bool) -> ServeEnd {
+        let start = tokio::time::Instant::now();
+        let mut deadline = start + EXIT_ACK_WAIT;
+        let mut best = self.flow().acked;
         loop {
+            if !wait_for_acks {
+                break;
+            }
             {
                 let f = self.flow();
                 if f.acked >= f.next {
                     break;
                 }
+                if f.acked > best {
+                    // Progress: the client is reading, give it another second.
+                    best = f.acked;
+                    deadline = tokio::time::Instant::now() + EXIT_ACK_WAIT;
+                }
             }
+            let give_up = deadline.min(start + EXIT_ACK_CAP);
             tokio::select! {
                 () = self.acked.notified() => {}
-                () = tokio::time::sleep_until(deadline) => break,
+                () = tokio::time::sleep_until(give_up) => break,
             }
         }
         // The client has the output. Tell it how the session ended; it hangs up on receiving

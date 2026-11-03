@@ -69,6 +69,9 @@ const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
 /// How long output may sit behind a gap in the terminal stream before the link is given up on.
 const GAP_PATIENCE: Duration = Duration::from_secs(5);
+/// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
+/// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
+const EXIT_DRAIN: Duration = Duration::from_secs(3);
 
 /// Everything about the session that must survive a link.
 struct Session {
@@ -85,6 +88,10 @@ struct Session {
     input_ready: bool,
     /// `PtyMode` reports waiting for the output to reach their offset: (at, canonical, echo).
     modes: VecDeque<(u64, bool, bool)>,
+    /// The daemon said the shell exited: `(code, signal, when to stop waiting for the link to
+    /// close)`. The run ends when the link goes down, so the output that was still on its way
+    /// (QUIC hands control messages up ahead of data) is not dropped.
+    exited: Option<(Option<i32>, Option<i32>, Instant)>,
 }
 
 impl Session {
@@ -97,6 +104,7 @@ impl Session {
             input: SendChannel::new(window),
             input_ready: false,
             modes: VecDeque::new(),
+            exited: None,
         }
     }
 
@@ -774,6 +782,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     }
                     _ = at(wake) => {
                         self.on_tick()?;
+                        if self.sess.exited.is_some_and(|e| Instant::now() >= e.2) {
+                            ended = Some(Served::Reconnect); // turned into the status below
+                        }
                         if primary.conn.gap_since.is_some_and(|t| t.elapsed() >= GAP_PATIENCE) {
                             tracing::warn!("terminal data stayed out of order; reconnecting");
                             ended = Some(Served::Reconnect);
@@ -800,6 +811,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 {
                     promoted = None;
                     dialer.swapped(Ok(kind));
+                }
+                // The shell exited and the link is gone (or has had its time): that is the end of the
+                // session, not a reason to reconnect.
+                if let (Some(Served::Reconnect), Some((code, signal, _))) =
+                    (&ended, self.sess.exited)
+                {
+                    ended = Some(Served::Done(Outcome::SessionEnded { code, signal }));
                 }
                 match ended {
                     None => {}
@@ -1014,14 +1032,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     )));
                 }
             }
-            // The daemon sends this once it has all the output acknowledged, then closes the
-            // link. The link going down would make us reconnect and be told `SessionGone`
-            // without a status, so this ends the run now.
+            // The daemon sends this after the output, then flushes and closes the link. The
+            // output may still be on its way (control messages are handed up ahead of data on
+            // QUIC), so the run goes on, reading and acknowledging terminal data, until the link
+            // goes down; `serve` then ends it with this status instead of reconnecting.
             ControlMsg::SessionExited { code, signal } => {
-                return Ok(Flow::End(Served::Done(Outcome::SessionEnded {
-                    code,
-                    signal,
-                })));
+                self.sess
+                    .exited
+                    .get_or_insert((code, signal, Instant::now() + EXIT_DRAIN));
             }
             // Management messages belong to `fil ls`/`kill`/`detach`, never to an attach.
             ControlMsg::Request(_) | ControlMsg::Response(_) => {
@@ -1772,6 +1790,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         };
         min(self.ack_due);
         min(self.notice_until);
+        min(self.sess.exited.map(|e| e.2));
         if self.display.is_some()
             && ((!self.link_ok && self.disconnected_since.is_some())
                 || self.confirm_pending.is_some())

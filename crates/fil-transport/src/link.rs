@@ -141,8 +141,8 @@ pub trait Link: Send + Sync + 'static {
     fn status(&self) -> watch::Receiver<LinkStatus>;
 
     /// Resolves when every payload sent before the call has left this side: written to the byte
-    /// stream (pipe), or acknowledged by the peer's QUIC stack (direct). Fails if the link goes
-    /// down first.
+    /// stream (pipe), or read by the peer's link (direct: the peer's link has them, which is a
+    /// little more than QUIC's own acknowledgement). Fails if the link goes down first.
     ///
     /// This is what makes a graceful close possible: [`close`](Self::close) discards what is
     /// still queued, so a last message (`TakenOver`, `SessionExited`) is sent, flushed and only

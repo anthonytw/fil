@@ -33,6 +33,8 @@ struct Inner {
     exit: watch::Receiver<Option<ExitInfo>>,
     #[cfg(feature = "test-hooks")]
     gate: std::sync::Mutex<Option<Arc<CatchUpGate>>>,
+    #[cfg(feature = "test-hooks")]
+    gone_gate: std::sync::Mutex<Option<Arc<CatchUpGate>>>,
 }
 
 /// Holds every connection of a session just before it asks the core for a catch-up snapshot, so a
@@ -92,6 +94,8 @@ impl SessionHandle {
                 exit: started.exit,
                 #[cfg(feature = "test-hooks")]
                 gate: std::sync::Mutex::new(None),
+                #[cfg(feature = "test-hooks")]
+                gone_gate: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -196,6 +200,16 @@ impl SessionHandle {
         gate
     }
 
+    /// Test hook: from now on a connection that has ended waits at the returned gate just before
+    /// it tells the core (`ConnGone`), as if the core's queue were full. Only with the
+    /// `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn gate_conn_gone(&self) -> Arc<CatchUpGate> {
+        let gate = Arc::new(CatchUpGate::default());
+        *self.inner.gone_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
     // --- used by the subscriber task ---
 
     pub(crate) fn catch_up_params(&self) -> &CatchUpParams {
@@ -257,6 +271,14 @@ impl SessionHandle {
     }
 
     pub(crate) async fn send(&self, cmd: Cmd) {
+        #[cfg(feature = "test-hooks")]
+        if matches!(cmd, Cmd::ConnGone { .. }) {
+            let gate = self.inner.gone_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.arrived.notify_one();
+                gate.proceed.notified().await;
+            }
+        }
         let _ = self.inner.tx.send(cmd).await;
     }
 }

@@ -111,21 +111,137 @@ async fn the_client_is_told_how_the_shell_was_killed() {
     assert_eq!(c2.refused, Some(AttachRefusal::SessionGone));
 }
 
+/// A client that acknowledges in small steps, slower than the old fixed one-second wait: the
+/// session keeps waiting while the acknowledgements make progress, so the status is sent only
+/// when the client really has all of the output. (The wait restarts on every step; it was one
+/// second in all.)
 #[tokio::test]
-async fn a_client_that_is_slow_to_ack_still_gets_the_output_before_the_status() {
+async fn the_status_waits_for_a_client_that_acknowledges_in_pieces() {
+    let sc = Scratch::new();
+    let script = "read go; yes 'abcdefghijklmnopqrstuvwxyz0123456789' | head -c 120000; exit 0";
+    let h = spawn_plain(sh_config(&sc, "main", script)).await;
+    let mut c = Client::connect(&h, Connect::new(&h, key(1)));
+    c.auto_ack = false;
+    let end = c.serve.take().unwrap();
+    let mut acked = 0u64;
+    let drive = async {
+        c.wait("the attach reply", |c| c.reply.is_some()).await;
+        c.type_bytes(b"\n").await;
+        while c.exited.is_none() {
+            c.drain(Duration::from_millis(300)).await;
+            if c.exited.is_some() {
+                break;
+            }
+            // One step of 16 KiB per 300 ms: about 2.4 s for the 120 KB, more than a second.
+            if acked < c.next {
+                acked = c.next.min(acked + 16 * 1024);
+                c.send_ctl(ControlMsg::Ack {
+                    channel: ChannelId::TERMINAL,
+                    upto: acked,
+                })
+                .await;
+            }
+        }
+    };
+    let (end, ()) = tokio::join!(end, drive);
+    assert!(matches!(end.unwrap(), ServeEnd::SessionExited(i) if i.code == 0));
+    assert_eq!(c.exited, Some((Some(0), None)));
+    assert!(c.next >= 120_000, "{}", c.next);
+    assert_eq!(
+        acked, c.next,
+        "the status came before the client had acknowledged all of the output"
+    );
+}
+
+/// On a link that hands control up ahead of data (QUIC may) the status can arrive before the
+/// last of the output. It is still delivered: the farewell flush covers every channel, so the
+/// link does not close until the output has been read.
+#[tokio::test]
+async fn the_status_may_overtake_the_output_but_the_link_carries_it_before_closing() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(&sc, "main", "read go; echo bye; exit 0")).await;
-    let mut c = Client::connect(&h, Connect::new(&h, key(1)));
+    let mut c = Client::connect_delayed(&h, Connect::new(&h, key(1)), Duration::from_millis(1500));
     let end = c.serve.take().unwrap();
     let drive = async {
         c.wait("the attach reply", |c| c.reply.is_some()).await;
         c.type_bytes(b"\n").await;
         c.wait("the exit status", |c| c.exited.is_some()).await;
-        assert!(c.out_str().contains("bye"));
+        assert!(
+            !c.out_str().contains("bye"),
+            "the status did not overtake the output; the test would prove nothing"
+        );
+        // Keep reading until the link closes: the output is there before it does.
+        let _ = c.try_wait(Duration::from_secs(5), |_| false).await;
+        assert!(c.out_str().contains("bye"), "{:?}", c.out_str());
     };
     let (end, ()) = tokio::join!(end, drive);
     assert!(matches!(end.unwrap(), ServeEnd::SessionExited(i) if i.code == 0));
     assert_eq!(c.exited, Some((Some(0), None)));
+}
+
+/// A client far behind when the shell exits and the core has finished: no snapshot (there is no
+/// emulator to take one from), the rest of the log is sent, then the status. The core answering a
+/// catch-up with "gone" used to end the connection without the status.
+#[tokio::test]
+async fn a_client_that_is_behind_when_the_shell_exits_gets_the_tail_and_the_status() {
+    let sc = Scratch::new();
+    let script = "stty -echo; echo READY; read go; \
+        yes 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn' \
+        | head -c 600000; echo; echo END; exit 0";
+    let mut cfg = sh_config(&sc, "main", script);
+    cfg.catch_up = CatchUpParams {
+        max_bytes: 64 * 1024,
+        ..Default::default()
+    };
+    let h = spawn_plain(cfg).await;
+    let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
+    c.wait("the attach reply", |c| c.reply.is_some()).await;
+    c.wait_screen("READY").await;
+    c.auto_ack = false;
+    c.type_bytes(b"\n").await;
+    // The client stops reading while the shell floods and exits.
+    let _ = h.wait_exit().await;
+    sleep(Duration::from_millis(300)).await;
+    // Now it reads again, still without acknowledging: it is far behind.
+    let got = c
+        .try_wait(Duration::from_secs(5), |c| c.exited.is_some())
+        .await;
+    if !got {
+        let end = c.serve_end().await;
+        panic!("never told how the session ended; serve ended with {end:?}");
+    }
+    assert_eq!(c.exited, Some((Some(0), None)));
+    // And it has the end of the output, not a snapshot that skipped it.
+    let _ = c.try_wait(Duration::from_secs(2), |_| false).await;
+    assert!(c.screen().contains("END"), "the tail is missing");
+}
+
+/// The guard that reaps a dropped connection is armed until `ConnGone` is actually in the core's
+/// queue. Here the send is held up (as it is behind a flood), and the future is dropped there.
+#[tokio::test]
+async fn a_future_dropped_while_telling_the_core_it_is_gone_still_reaps_the_connection() {
+    let sc = Scratch::new();
+    let script = "stty raw -echo; \
+        while [ ! -e \"$T/go\" ]; do sleep 0.05; done; \
+        printf '\\033[c'; dd bs=1 count=3 of=\"$T/reply\" 2>/dev/null; sleep 30";
+    let h = spawn_plain(sh_config(&sc, "main", script)).await;
+    let gate = h.gate_conn_gone();
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.hang_up();
+    // The serve task ends and waits at the gate, with the message not yet sent.
+    timeout(Duration::from_secs(10), gate.arrived.notified())
+        .await
+        .expect("the connection got as far as telling the core");
+    c.serve.take().unwrap().abort();
+    sleep(Duration::from_millis(100)).await;
+    sc.touch("go");
+    let reply = sc.path("reply");
+    eventually("the query to be answered", || {
+        let reply = reply.clone();
+        async move { std::fs::read(&reply).is_ok_and(|b| b.len() == 3) }
+    })
+    .await;
+    let _ = h.kill(kill_wait()).await;
 }
 
 // ---------------------------------------------------------------------------------------------

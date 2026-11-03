@@ -1308,3 +1308,35 @@ async fn a_truncated_flush_marker_ends_the_link() {
     let st = wait_for(&mut ds, "daemon Down", is_down).await;
     assert!(matches!(down_reason(&st), DownReason::Io(m) if m.contains("flush marker")));
 }
+
+#[tokio::test(start_paused = true)]
+async fn flush_fails_when_a_channels_writer_gave_up_on_payloads_it_had_accepted() {
+    let mut w = World::new(57);
+    let (client, _daemon, _) = w.pair().await;
+    // The peer grants 1,024 streams; the next new channel can never get one.
+    for ch in 100..100 + 1024u32 {
+        client
+            .send(ChannelId(ch), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    client.flush().await.unwrap();
+    client
+        .send(ChannelId(5000), Bytes::from_static(b"stuck"))
+        .await
+        .unwrap();
+    // The flush must not report that the stuck payload left, and must not sit there until the
+    // caller gives up: it ends when the writer does (after `dead_after`).
+    let t0 = Instant::now();
+    let err = timeout(Duration::from_secs(60), client.flush())
+        .await
+        .expect("the flush ended on its own")
+        .unwrap_err();
+    assert!(
+        matches!(err.0, DownReason::Io(ref m) if m.contains("lost")),
+        "{err:?}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // From then on a flush fails at once.
+    assert!(client.flush().await.is_err());
+}

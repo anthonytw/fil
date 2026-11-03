@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -108,6 +108,10 @@ struct Io {
     /// Signalled when an acknowledgement arrives.
     flush_acked: Notify,
     next_flush: AtomicU32,
+    /// Set when a channel's writer gave up with payloads `send` had accepted (no stream could be
+    /// opened). The payloads are lost, so no flush can honestly say everything left: from then
+    /// on every flush fails.
+    lost_payloads: AtomicBool,
     /// True once any frame from the peer has arrived.
     got_frame: watch::Sender<bool>,
     /// The text of the error that ended the connection, for `Refused` messages.
@@ -143,6 +147,12 @@ impl Io {
         Ok(tx)
     }
 
+    fn lost_error(&self) -> LinkError {
+        LinkError(DownReason::Io(
+            "payloads were lost: a channel's stream could not be opened".into(),
+        ))
+    }
+
     fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
         self.flush_pending.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -163,6 +173,9 @@ impl Io {
             }
             if self.inbox.down_reason().is_some() {
                 return Err(self.down_error());
+            }
+            if self.lost_payloads.load(Ordering::SeqCst) {
+                return Err(self.lost_error());
             }
             tokio::select! {
                 () = &mut acked => {}
@@ -277,6 +290,7 @@ impl QuicLink {
             flush_pending: Mutex::new(HashSet::new()),
             flush_acked: Notify::new(),
             next_flush: AtomicU32::new(1),
+            lost_payloads: AtomicBool::new(false),
             got_frame: watch::Sender::new(false),
             last_error: OnceLock::new(),
         });
@@ -389,6 +403,9 @@ impl Link for QuicLink {
         if self.io.inbox.down_reason().is_some() {
             return Err(self.io.down_error());
         }
+        if self.io.lost_payloads.load(Ordering::SeqCst) {
+            return Err(self.io.lost_error());
+        }
         let writers: Vec<mpsc::Sender<Item>> = self
             .io
             .writers
@@ -400,7 +417,13 @@ impl Link for QuicLink {
         let mut ids = PendingIds(&self.io, Vec::new());
         let mut down = self.io.inbox.subscribe_down();
         for tx in writers {
-            let id = self.io.next_flush.fetch_add(1, Ordering::Relaxed).max(1);
+            // Ids are never 0 (the accept proof's nonce), also after the counter wraps.
+            let id = loop {
+                let id = self.io.next_flush.fetch_add(1, Ordering::Relaxed);
+                if id != 0 {
+                    break id;
+                }
+            };
             self.io.pending().insert(id);
             ids.1.push(id);
             let queued = tokio::select! {
@@ -411,11 +434,9 @@ impl Link for QuicLink {
                 return Err(if self.io.inbox.down_reason().is_some() {
                     self.io.down_error()
                 } else {
-                    // The channel's writer gave up (no stream could be opened): what was sent
+                    // The channel's writer is gone (it gave up opening a stream): what was sent
                     // on it is lost, which a flush must not report as done.
-                    LinkError(DownReason::Io(
-                        "a channel's stream could not be opened".into(),
-                    ))
+                    self.io.lost_error()
                 });
             }
         }
@@ -457,7 +478,10 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
     };
     let Ok(Ok(mut stream)) = opened else {
         // The peer's stream limit is spent (or the connection just ended). Forget this writer,
-        // which fails the senders waiting on it; the link stays up.
+        // which fails the senders waiting on it; the link stays up. What `send` accepted on this
+        // channel is lost: flushes fail from now on, and the ones waiting are woken.
+        io.lost_payloads.store(true, Ordering::SeqCst);
+        io.flush_acked.notify_waiters();
         io.writers
             .lock()
             .unwrap_or_else(|e| e.into_inner())

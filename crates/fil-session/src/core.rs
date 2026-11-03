@@ -78,46 +78,84 @@ impl ExitInfo {
     }
 }
 
-/// The number of the signal that portable-pty reports as `strsignal` text: "Killed" (glibc and
-/// musl), "Killed: 9" (macOS) or "Signal 9" (when the system has no description). The numbers of
-/// the common signals are the same on Linux and macOS except where noted.
+/// The number of the signal that portable-pty reports as `strsignal` text.
+///
+/// The text is all there is (no `unsafe`, so no asking the libc), and it differs by system:
+/// glibc and musl say "Killed", macOS says "Killed: 9"; both say "User defined signal 1", with a
+/// number that is 10 on Linux and 30 on macOS. So trailing digits count only where they are the
+/// signal number ("Name: 9", "Signal 9", "Unknown signal 9"); the known names are mapped through
+/// `nix`, which has this host's numbers (the daemon and the shell it reports on share the
+/// host); anything else is `None`, which the client words as "ended" rather than guessing.
 fn signal_number(text: &str) -> Option<i32> {
-    let digits: String = text
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if let Ok(n) = digits.parse::<i32>()
+    use nix::sys::signal::Signal as S;
+    let text = text.trim();
+    // Forms whose number is the signal's.
+    for prefix in ["Signal ", "Unknown signal ", "Unknown signal: "] {
+        if let Some(n) = text
+            .strip_prefix(prefix)
+            .and_then(|n| n.parse::<i32>().ok())
+            && n > 0
+        {
+            return Some(n);
+        }
+    }
+    if let Some((_, n)) = text.rsplit_once(": ")
+        && let Ok(n) = n.parse::<i32>()
         && n > 0
     {
         return Some(n);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(n) = text
+        .strip_prefix("Real-time signal ")
+        .and_then(|n| n.parse::<i32>().ok())
+        && n >= 0
+    {
+        // glibc counts from SIGRTMIN, which the C library chooses at run time.
+        return Some(nix::libc::SIGRTMIN() + n);
+    }
     let name = text.split(':').next().unwrap_or(text).trim();
-    Some(match name {
-        "Hangup" => 1,
-        "Interrupt" => 2,
-        "Quit" => 3,
-        "Illegal instruction" => 4,
-        "Trace/BPT trap" | "Trace/breakpoint trap" => 5,
-        "Aborted" | "Abort trap" => 6,
-        "Bus error" => {
-            if cfg!(target_os = "macos") {
-                10
-            } else {
-                7
-            }
-        }
-        "Floating point exception" => 8,
-        "Killed" => 9,
-        "Segmentation fault" => 11,
-        "Broken pipe" => 13,
-        "Alarm clock" => 14,
-        "Terminated" => 15,
+    let signal = match name {
+        "Hangup" => S::SIGHUP,
+        "Interrupt" => S::SIGINT,
+        "Quit" => S::SIGQUIT,
+        "Illegal instruction" => S::SIGILL,
+        "Trace/BPT trap" | "Trace/breakpoint trap" => S::SIGTRAP,
+        "Aborted" | "Abort trap" => S::SIGABRT,
+        "Bus error" => S::SIGBUS,
+        "Floating point exception" => S::SIGFPE,
+        "Killed" => S::SIGKILL,
+        "User defined signal 1" => S::SIGUSR1,
+        "Segmentation fault" => S::SIGSEGV,
+        "User defined signal 2" => S::SIGUSR2,
+        "Broken pipe" => S::SIGPIPE,
+        "Alarm clock" => S::SIGALRM,
+        "Terminated" => S::SIGTERM,
+        "Child exited" => S::SIGCHLD,
+        "Continued" => S::SIGCONT,
+        "Stopped (signal)" => S::SIGSTOP,
+        "Stopped" => S::SIGTSTP,
+        "Stopped (tty input)" => S::SIGTTIN,
+        "Stopped (tty output)" => S::SIGTTOU,
+        "Urgent I/O condition" => S::SIGURG,
+        "CPU time limit exceeded" => S::SIGXCPU,
+        "File size limit exceeded" => S::SIGXFSZ,
+        "Virtual timer expired" => S::SIGVTALRM,
+        "Profiling timer expired" => S::SIGPROF,
+        "Window changed" | "Window size changes" => S::SIGWINCH,
+        "I/O possible" => S::SIGIO,
+        "Bad system call" => S::SIGSYS,
+        #[cfg(target_os = "linux")]
+        "Power failure" => S::SIGPWR,
+        #[cfg(target_os = "linux")]
+        "Stack fault" => S::SIGSTKFLT,
+        #[cfg(target_os = "macos")]
+        "EMT trap" => S::SIGEMT,
+        #[cfg(target_os = "macos")]
+        "Information request" => S::SIGINFO,
         _ => return None,
-    })
+    };
+    Some(signal as i32)
 }
 
 /// What subscribers may read.
@@ -1119,5 +1157,54 @@ mod tests {
         assert!(p.starts_with("\x1b[?2026l\x1b[?1049l\x1b(B\x1b)B\x1b*B\x1b+B\x0f"));
         assert!(p.contains("skipped 2 KB of output"));
         assert_eq!(p.matches("\r\n").count(), 1 + 5);
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::signal_number;
+    use nix::sys::signal::Signal as S;
+
+    #[test]
+    fn digits_count_only_where_they_are_the_signal_number() {
+        // macOS spells the number out; so do the fallbacks for signals the libc has no name for.
+        assert_eq!(signal_number("Killed: 9"), Some(9));
+        assert_eq!(signal_number("Segmentation fault: 11"), Some(11));
+        assert_eq!(signal_number("Signal 34"), Some(34));
+        assert_eq!(signal_number("Unknown signal 77"), Some(77));
+        // glibc and musl have no number in "User defined signal 1": the 1 is not the signal.
+        assert_eq!(
+            signal_number("User defined signal 1"),
+            Some(S::SIGUSR1 as i32)
+        );
+        assert_eq!(
+            signal_number("User defined signal 2"),
+            Some(S::SIGUSR2 as i32)
+        );
+        assert_ne!(signal_number("User defined signal 1"), Some(1));
+    }
+
+    #[test]
+    fn names_map_to_this_hosts_numbers() {
+        assert_eq!(signal_number("Killed"), Some(S::SIGKILL as i32));
+        assert_eq!(signal_number("Terminated"), Some(S::SIGTERM as i32));
+        assert_eq!(signal_number("Bus error"), Some(S::SIGBUS as i32));
+        assert_eq!(signal_number("Abort trap"), Some(S::SIGABRT as i32));
+        assert_eq!(signal_number("Hangup"), Some(S::SIGHUP as i32));
+    }
+
+    #[test]
+    fn real_time_and_unknown_text() {
+        // "Real-time signal 2" is SIGRTMIN + 2 where the C library says so, and nothing is
+        // guessed elsewhere; in no case is it signal 2.
+        let rt = signal_number("Real-time signal 2");
+        assert_ne!(rt, Some(2));
+        #[cfg(target_os = "linux")]
+        assert_eq!(rt, Some(nix::libc::SIGRTMIN() + 2));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rt, None);
+        assert_eq!(signal_number("Something new"), None);
+        assert_eq!(signal_number(""), None);
+        assert_eq!(signal_number("Signal x"), None);
     }
 }

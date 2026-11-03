@@ -229,7 +229,23 @@ impl Client {
     }
 
     pub fn connect_with(h: &SessionHandle, c: Connect, capacity: usize) -> Client {
+        Self::connect_wrapped(h, c, capacity, |l| l)
+    }
+
+    /// Like `connect`, but the daemon's end holds terminal data back for `delay` while control
+    /// messages go through at once: the order a QUIC link may deliver in.
+    pub fn connect_delayed(h: &SessionHandle, c: Connect, delay: Duration) -> Client {
+        Self::connect_wrapped(h, c, 256, move |l| DelayLink::new(l, delay))
+    }
+
+    pub fn connect_wrapped<L: Link>(
+        h: &SessionHandle,
+        c: Connect,
+        capacity: usize,
+        wrap: impl FnOnce(MemLink) -> L,
+    ) -> Client {
         let (daemon_end, client_end, ctl) = pair(LinkKind::Pipe, capacity);
+        let daemon_end = wrap(daemon_end);
         let attach = Attach {
             name: c.name,
             size: c.size,
@@ -493,6 +509,87 @@ impl Client {
     /// Hangs up from the client side, as a client that gives up on this link would.
     pub fn hang_up(&self) {
         self.link.close();
+    }
+}
+
+/// The daemon's end of a link that delivers control messages at once and everything else after
+/// `delay` (per channel in order), and whose `flush` waits for what is held back.
+pub struct DelayLink {
+    inner: Arc<MemLink>,
+    held: tokio::sync::mpsc::UnboundedSender<(ChannelId, Bytes, tokio::time::Instant)>,
+    pending: Arc<tokio::sync::watch::Sender<usize>>,
+    delay: Duration,
+}
+
+impl DelayLink {
+    pub fn new(inner: MemLink, delay: Duration) -> Self {
+        let inner = Arc::new(inner);
+        let (held, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(ChannelId, Bytes, tokio::time::Instant)>();
+        let pending = Arc::new(tokio::sync::watch::Sender::new(0usize));
+        let (i, p) = (inner.clone(), pending.clone());
+        tokio::spawn(async move {
+            while let Some((ch, payload, due)) = rx.recv().await {
+                tokio::time::sleep_until(due).await;
+                let _ = i.send(ch, payload).await;
+                p.send_modify(|n| *n -= 1);
+            }
+        });
+        DelayLink {
+            inner,
+            held,
+            pending,
+            delay,
+        }
+    }
+}
+
+impl Link for DelayLink {
+    fn kind(&self) -> LinkKind {
+        self.inner.kind()
+    }
+    async fn send(
+        &self,
+        channel: ChannelId,
+        payload: Bytes,
+    ) -> Result<(), fil_transport::LinkError> {
+        if channel == ChannelId::CONTROL {
+            return self.inner.send(channel, payload).await;
+        }
+        if let fil_transport::LinkState::Down(r) = self.inner.status().borrow().state.clone() {
+            return Err(fil_transport::LinkError(r));
+        }
+        self.pending.send_modify(|n| *n += 1);
+        let due = tokio::time::Instant::now() + self.delay;
+        let _ = self.held.send((channel, payload, due));
+        Ok(())
+    }
+    async fn recv(&self) -> Result<(ChannelId, Bytes), fil_transport::LinkError> {
+        self.inner.recv().await
+    }
+    fn status(&self) -> tokio::sync::watch::Receiver<fil_transport::LinkStatus> {
+        self.inner.status()
+    }
+    async fn flush(&self) -> Result<(), fil_transport::LinkError> {
+        let mut rx = self.pending.subscribe();
+        let mut status = self.inner.status();
+        loop {
+            if *rx.borrow_and_update() == 0 {
+                break;
+            }
+            tokio::select! {
+                _ = rx.changed() => {}
+                _ = status.changed() => {
+                    if let fil_transport::LinkState::Down(r) = status.borrow().state.clone() {
+                        return Err(fil_transport::LinkError(r));
+                    }
+                }
+            }
+        }
+        self.inner.flush().await
+    }
+    fn close(&self) {
+        self.inner.close()
     }
 }
 

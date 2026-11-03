@@ -517,6 +517,40 @@ impl FakeDaemon {
         }
     }
 
+    /// The shell exited, and the status overtook the last of its output (control is handed up
+    /// ahead of data on QUIC): `SessionExited` first, then `last` as terminal output, then the
+    /// flush and the close.
+    pub async fn end_session_status_before_output(&self, code: i32, last: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.gone = true;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(
+                &c.link,
+                &ControlMsg::SessionExited {
+                    code: Some(code),
+                    signal: None,
+                },
+            )
+            .await;
+        }
+        st.log.append(last);
+        st.emu.feed(last);
+        self.pump(&mut st).await;
+        let conns: Vec<_> = st.conns.drain().collect();
+        for (_, c) in conns {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), c.link.flush()).await;
+            c.control.kill(DownReason::Closed);
+        }
+    }
+
+    /// `SessionExited` and nothing else: the link stays open.
+    pub async fn send_status_only(&self, code: Option<i32>, signal: Option<i32>) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(&c.link, &ControlMsg::SessionExited { code, signal }).await;
+        }
+    }
+
     /// The next attach is refused with this, whatever it says.
     pub async fn refuse_next(&self, r: AttachRefusal) {
         self.st.lock().await.refuse_next = Some(r);

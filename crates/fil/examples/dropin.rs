@@ -787,6 +787,13 @@ fn screen_ticks_intact(c: &Client) -> Result<(), String> {
     )
 }
 
+/// Answers one of the client's yes/no prompts: the prompt ignores keys until typing has been quiet
+/// for 300 ms and takes only a chunk that is exactly the key, so wait, then send it alone.
+fn answer(c: &mut Client, key: &str) {
+    thread::sleep(Duration::from_millis(500));
+    c.send(key);
+}
+
 /// Starts the counting loop `TICK-1 .. TICK-N`, a quarter second apart.
 fn start_ticks(c: &mut Client, n: u32) {
     c.send(&format!(
@@ -1572,7 +1579,7 @@ fn takeover_running(ctx: &Ctx, host: &str) -> Res {
     let seen = t0.elapsed();
     c1.want_screen("taken over", Duration::from_secs(10))?;
     let told = t0.elapsed();
-    c1.send("n");
+    answer(&mut c1, "n");
     let (_, code) = c1
         .wait_exit(Duration::from_secs(10))
         .ok_or_else(|| format!("first client did not exit\n{}", c1.dump()))?;
@@ -1608,7 +1615,7 @@ fn session_commands(ctx: &Ctx, host: &str) -> Res {
     let (st, out) = ctx.fil_cmd(host, Variant::Auto, &["detach", host, "dp-s1"]);
     ensure(st == 0, || format!("fil detach: rc {st}\n{out}"))?;
     c1.want_screen("detached from elsewhere", Duration::from_secs(10))?;
-    c1.send("n");
+    answer(&mut c1, "n");
     let (_, code1) = c1
         .wait_exit(Duration::from_secs(10))
         .ok_or("client 1 did not exit after answering n")?;
@@ -1876,7 +1883,7 @@ fn vim_session_life(ctx: &Ctx, host: &str) -> Res {
     c3.want_alt(true, ATTACH_TIMEOUT)?;
     c3.want_row("ROW-5", ATTACH_TIMEOUT)?;
     c2.want_screen("taken over", Duration::from_secs(10))?;
-    c2.send("n");
+    answer(&mut c2, "n");
     let (_, code) = c2
         .wait_exit(Duration::from_secs(10))
         .ok_or_else(|| format!("the taken-over client did not exit\n{}", c2.dump()))?;

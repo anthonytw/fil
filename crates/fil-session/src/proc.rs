@@ -507,6 +507,11 @@ impl Tracker {
             .retain(|pid, start| live.get(pid).is_some_and(|s| s == start));
     }
 
+    /// The recorded processes.
+    pub fn pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.known.keys().copied()
+    }
+
     /// Every process to signal: the current descendants of `root`, plus the recorded ones that
     /// are still the same process (they may have been orphaned since).
     pub fn victims(&self, root: u32, rows: &[ProcRow]) -> Vec<u32> {

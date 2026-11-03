@@ -56,6 +56,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::core::{Accepted, AttachAnswer, Cmd, ConnEvent, ConnId, ExitInfo, Progress};
+use crate::forward::Forwards;
 use crate::handle::{Gone, SessionHandle};
 
 /// How long the last message to a client we are about to drop may take to leave: sending it and
@@ -105,10 +106,13 @@ pub async fn serve_subscriber<L: Link>(
     handle: &SessionHandle,
     attach: Attach,
 ) -> ServeEnd {
-    let answer = handle
-        .attach(attach)
-        .await
-        .unwrap_or_else(|Gone| AttachAnswer::Refused(AttachRefusal::SessionGone { exit: None }));
+    // Shared with the session's forwards, which send on it from their own tasks.
+    let link = Arc::new(link);
+    let answer = handle.attach(attach).await.unwrap_or_else(|Gone| {
+        AttachAnswer::Refused(AttachRefusal::SessionGone {
+            exit: handle.exit_status(),
+        })
+    });
     let acc = match answer {
         AttachAnswer::Refused(r) => {
             let c = Conn::new(&link, handle, 0, 0, false, Arc::default());
@@ -134,6 +138,9 @@ pub async fn serve_subscriber<L: Link>(
         armed: true,
     };
     let end = conn.run(acc).await;
+    // The forwards let go of this link at once (they would otherwise send on it until the core
+    // gets to the `ConnGone` below); channels wait for the next link.
+    handle.forwards().link_gone(conn.id);
     // Disarmed only once the message is in the queue: the send can wait behind a flood of output,
     // and a future dropped there must still reap the connection.
     handle.send(Cmd::ConnGone { conn: conn.id }).await;
@@ -156,6 +163,7 @@ struct GoneGuard<'a> {
 impl Drop for GoneGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
+            self.handle.forwards().link_gone(self.conn);
             self.handle.conn_gone_nowait(self.conn);
         }
     }
@@ -310,7 +318,7 @@ impl Out {
 }
 
 struct Conn<'a, L: Link> {
-    link: &'a L,
+    link: &'a Arc<L>,
     handle: &'a SessionHandle,
     id: ConnId,
     /// Set by the core when this connection loses the session; nothing more is read from the
@@ -327,7 +335,7 @@ struct Conn<'a, L: Link> {
 
 impl<'a, L: Link> Conn<'a, L> {
     fn new(
-        link: &'a L,
+        link: &'a Arc<L>,
         handle: &'a SessionHandle,
         id: ConnId,
         start: u64,
@@ -406,7 +414,16 @@ impl<'a, L: Link> Conn<'a, L> {
     }
 
     async fn run(&self, acc: Accepted) -> ServeEnd {
-        if let Err(e) = self.greet(&acc).await {
+        let greeted = self.greet(&acc).await;
+        if greeted.is_ok() {
+            // The client has the attach reply and the terminal's `Resume`: the forwards take the
+            // link (sending their own restatements on a resume) before anything it delivered is
+            // read.
+            self.handle
+                .forwards()
+                .link_up(self.id, self.link.clone(), !acc.fresh);
+        }
+        if let Err(e) = greeted {
             // The link died while the reply or snapshot went out. A `~.` typed meanwhile may
             // still be in its inbound queue (`recv` hands out what arrived before the end).
             if self.detach_left_in_queue().await {
@@ -490,9 +507,14 @@ impl<'a, L: Link> Conn<'a, L> {
                         self.handle.send(Cmd::Detach { conn: self.id }).await;
                         return ServeEnd::Detached;
                     }
-                    // Hello and Resume are the host's and the attach request's business; acks of
-                    // other channels and the rest have nothing to do with a terminal.
-                    Ok(other) => tracing::debug!(?other, "ignored control message"),
+                    // Acks and `Resume`s of the MUX and dynamic channels are the forwards', which
+                    // take them without waiting. Hello and the terminal's Resume are the host's
+                    // and the attach request's business.
+                    Ok(other) => match self.handle.forwards().on_control(self.id, &other) {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => return self.forward_violation(e).await,
+                        None => tracing::debug!("ignored control message"),
+                    },
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },
                 ChannelId::TERMINAL => match TerminalInput::parse(&payload) {
@@ -518,9 +540,26 @@ impl<'a, L: Link> Conn<'a, L> {
                     }
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },
+                // The MUX channel and the dynamic channels: handed to the forwards, which never
+                // wait (a forward whose local application does not read must not hold up the
+                // terminal, or the link's receive loop).
+                ch if Forwards::handles(ch) => {
+                    if let Err(e) = self.handle.forwards().on_payload(self.id, ch, payload) {
+                        return self.forward_violation(e).await;
+                    }
+                }
                 other => tracing::debug!(channel = other.0, "ignored data on an unused channel"),
             }
         }
+    }
+
+    /// The client broke the forwards' protocol: it is told (`Error(Protocol)`) and the
+    /// connection ends.
+    async fn forward_violation(&self, e: fil_proto::mux::MuxError) -> ServeEnd {
+        let end = ServeEnd::Protocol(e.to_string());
+        self.decide(end.clone());
+        self.farewell(&ControlMsg::Error(ErrorCode::Protocol)).await;
+        end
     }
 
     /// Sends the terminal channel and what goes with it, in order.

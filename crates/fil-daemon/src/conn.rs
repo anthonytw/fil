@@ -19,8 +19,9 @@
 //!      section 8.5, resume rules), or the connection is closed with `Error(Protocol)`; and the
 //!      key must still be registered (a takeover that revoked it closes the connection anyway).
 //!      Keys are never registered on QUIC: only the pipe, the root of trust, registers.
-//! 4. **`Request`** (pipe only): `ListSessions`, `KillSession` and `DetachSession` are answered
-//!    with one `Response` and the connection closes.
+//! 4. **`Request`** (pipe only): `ListSessions`, `KillSession`, `DetachSession` and `Forward`
+//!    are answered with one `Response`, `Ports` with one or more parts, and the connection
+//!    closes.
 //!
 //! A connection that does not get through step 1 and the first request within the handshake
 //! timeout is dropped.
@@ -30,10 +31,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::msg::{
-    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, Hello, Request, Response, SessionSummary,
-    SubscriberSummary,
+    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, ForwardResult, Hello, PortsRow, Request,
+    Response, SessionSummary, SubscriberSummary,
 };
-use fil_session::ServeEnd;
+use fil_session::{ServeEnd, SessionHandle};
 use fil_transport::Link;
 use fil_transport::auth::PublicKey as TransportKey;
 use std::sync::Arc;
@@ -166,8 +167,17 @@ impl Inner {
                 self.attach(link, origin, attach).instrument(span).await;
             }
             (Next::Request(req), Origin::Pipe) => {
-                let response = self.request(req).await;
-                tell_and_close(&link, ControlMsg::Response(response)).await;
+                let mut parts = self.request(req).await.into_iter();
+                let last = parts.next_back();
+                for part in parts {
+                    if send_ctl(&link, &ControlMsg::Response(part)).await.is_err() {
+                        link.close();
+                        return;
+                    }
+                }
+                if let Some(last) = last {
+                    tell_and_close(&link, ControlMsg::Response(last)).await;
+                }
             }
             (Next::Request(_), Origin::Direct { .. }) => {
                 tracing::warn!("a request on a direct connection; refused");
@@ -316,30 +326,22 @@ impl Inner {
         }
     }
 
-    async fn request(self: &Arc<Self>, req: Request) -> Response {
+    /// The answer to a request: one response, or the parts of a `Ports` answer.
+    async fn request(self: &Arc<Self>, req: Request) -> Vec<Response> {
+        match req {
+            Request::Ports { session } => self.ports(session).await,
+            other => vec![self.request_one(other).await],
+        }
+    }
+
+    async fn request_one(self: &Arc<Self>, req: Request) -> Response {
         match req {
             Request::ListSessions => {
                 let mut list = Vec::new();
                 for h in self.sessions() {
-                    let Some(info) = h.info().await else { continue };
-                    list.push(SessionSummary {
-                        name: info.name,
-                        term: info.term,
-                        created_unix_ms: info.created_unix_ms,
-                        // 0 means the shell has printed nothing yet (`fil ls` shows "never").
-                        last_output_unix_ms: info.last_output_unix_ms.unwrap_or(0),
-                        // A subscriber whose transport is gone (a laptop asleep for hours) holds
-                        // the session but is not attached: `fil ls` shows "-" for it.
-                        attached: info.subscriber.filter(|_| info.attached).map(|s| {
-                            SubscriberSummary {
-                                host: s.host,
-                                since_unix_ms: s.since_unix_ms,
-                            }
-                        }),
-                        // Forwards and the agent relay arrive with M2's F2 and A1.
-                        forwards: 0,
-                        agent: false,
-                    });
+                    if let Some(s) = summary(&h).await {
+                        list.push(s);
+                    }
                 }
                 // Daemons of other wire revisions next to this one: their sessions are not in the
                 // list, and the user is told so (numbers only).
@@ -370,20 +372,77 @@ impl Inner {
                     Response::Done
                 }
             },
-            // The forward table and `fil ports` arrive with M2's F2 and P1. Until then no session
-            // has a table: an add is refused and the ports answer is empty.
-            Request::Forward { session, .. } => match self.session(&session) {
+            // `fil forward`, from anywhere: an entry of `Origin::Request`, which the attached
+            // client asks its user about (DESIGN.md section 7.3).
+            Request::Forward { session, op } => match self.session(&session) {
                 None => Response::NoSuchSession,
-                Some(_) => Response::Forward(fil_proto::msg::ForwardResult::Refused(
-                    fil_proto::mux::ForwardRefusal::NotPermitted,
-                )),
+                Some(h) => {
+                    let result = h.forward(op);
+                    match result {
+                        ForwardResult::Added(_) => tracing::info!("forward added by a request"),
+                        ForwardResult::Removed(_) => {
+                            tracing::info!("forward removed by a request");
+                        }
+                        ForwardResult::Refused(why) => {
+                            tracing::info!(?why, "forward request refused");
+                        }
+                    }
+                    Response::Forward(result)
+                }
             },
-            Request::Ports { session } => match session.map(|s| self.session(&s)) {
-                Some(None) => Response::NoSuchSession,
-                _ => Response::ports(Vec::new()).remove(0),
-            },
+            // Answered in parts by `ports`; never reaches here.
+            Request::Ports { .. } => Response::ports(Vec::new()).remove(0),
         }
     }
+
+    /// `fil ports [SESSION]`: each session's row, then its forwards.
+    ///
+    /// The seam for listener discovery (`docs/m2/plan.md`, P1): it adds, per session, the
+    /// listeners in it and on the host, the owner of each `-L` target and the probe. Until it is
+    /// wired the answer holds the sessions and their forward tables only.
+    async fn ports(
+        self: &Arc<Self>,
+        session: Option<fil_proto::msg::SessionName>,
+    ) -> Vec<Response> {
+        let handles = match &session {
+            Some(name) => match self.session(name) {
+                Some(h) => vec![h],
+                None => return vec![Response::NoSuchSession],
+            },
+            None => self.sessions(),
+        };
+        let mut rows = Vec::new();
+        for h in handles {
+            let Some(s) = summary(&h).await else { continue };
+            rows.push(PortsRow::Session(s));
+            rows.extend(h.forward_rows().into_iter().map(PortsRow::Forward));
+        }
+        Response::ports(rows)
+    }
+}
+
+/// A session as `fil ls` and `fil ports` show it; `None` once it has ended.
+async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
+    let info = h.info().await?;
+    Some(SessionSummary {
+        name: info.name,
+        term: info.term,
+        created_unix_ms: info.created_unix_ms,
+        // 0 means the shell has printed nothing yet (`fil ls` shows "never").
+        last_output_unix_ms: info.last_output_unix_ms.unwrap_or(0),
+        // A subscriber whose transport is gone (a laptop asleep for hours) holds the session but
+        // is not attached: `fil ls` shows "-" for it.
+        attached: info
+            .subscriber
+            .filter(|_| info.attached)
+            .map(|s| SubscriberSummary {
+                host: s.host,
+                since_unix_ms: s.since_unix_ms,
+            }),
+        forwards: h.forward_count(),
+        // The agent relay arrives with M2's A1.
+        agent: false,
+    })
 }
 
 /// `Hello` both ways, the version check, and the first request. The check comes before the

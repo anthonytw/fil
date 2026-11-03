@@ -297,6 +297,13 @@ Forwards must stay open across reconnects **(decided)**.
   - On a fresh attach the daemon sends every entry, then the client adds its own specs (CLI and config). Consent does not carry across subscribers. On a resume the table is continuous.
   - Removing an entry closes its listener at once; its open connections run until they close (ssh's `-O cancel`).
   - The client binds `-L` and `-D` and reports the result; the daemon binds `-R` and reports it, with the actual port for port 0.
+  - **On the daemon** (`fil_session`'s forwards, one endpoint per session that outlives its subscribers):
+    - The daemon binds an `-R` listener when its entry is added, from either origin, so a management entry has its port before anyone consents to it.
+    - It routes an `-R` connection only to a subscriber that holds the session (attached, or between links: the connection then waits up to `open_wait`) and has consented to that entry in its own run. Consent is the subscriber's own `AddForward` (an equal spec adopts the entry) or its `Consent { accepted: true }`; a fresh attach forgets it. Without both, the connection is reset at once and no `Open` is sent.
+    - While nobody holds the session (after `~.` or `fil detach`) the listeners stay bound and refuse at once.
+    - It accepts an `Open Local` or `Open Dynamic` only for an entry of that kind, and connects a `Local` one to the target in its own table.
+    - A replaced or removed entry is answered with `ForwardGone`, and its listener closes.
+    - A session that ends closes every channel and listener.
 - **The rule for every connection fil makes on the user's behalf:** a client listens, or connects out, only for forwards it named itself (CLI or config) or that its user confirmed on screen in this run; it connects only to the target in its own copy of the spec, never one from the wire; it never binds beyond loopback, nor connects to a non-loopback `-R` target, except from its own CLI or config. The daemon socket is reachable by any process of the user's uid on the remote, so a remote compromise must not be able to pivot into the laptop's network, squat laptop ports or reach the laptop's agent through fil. The daemon also gates on consent, for the user's experience; the client's check is the security boundary.
 - **The wire** (the MUX channel, dynamic channels, credit, close, resume and the limits) is in §8.5.
 

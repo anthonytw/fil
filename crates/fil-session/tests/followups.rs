@@ -125,9 +125,17 @@ async fn the_client_is_told_how_the_shell_was_killed() {
     // The client hanging up as it reads the news does not turn the outcome into a link failure.
     assert!(matches!(end.unwrap(), ServeEnd::SessionExited(_)));
     assert_eq!(c.exited, Some((None, Some(9))));
-    // A later attach finds the session gone.
+    // A later attach finds the session gone, and is told how it ended.
     let c2 = Client::attach(&h, Connect::new(&h, key(1))).await;
-    assert_eq!(c2.refused, Some(AttachRefusal::SessionGone { exit: None }));
+    assert_eq!(
+        c2.refused,
+        Some(AttachRefusal::SessionGone {
+            exit: Some(fil_proto::msg::ExitStatus {
+                code: None,
+                signal: Some(9)
+            })
+        })
+    );
 }
 
 /// A client that acknowledges in small steps, slower than the old fixed one-second wait: the

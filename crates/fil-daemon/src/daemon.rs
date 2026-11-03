@@ -174,13 +174,21 @@ impl SessionHost for Host {
 #[derive(Default)]
 struct State {
     live: std::collections::HashMap<SessionName, SessionHandle>,
-    /// `(name, incarnation)` of sessions that ended, oldest first.
-    ended: std::collections::VecDeque<(SessionName, u128)>,
+    /// Sessions that ended, oldest first: `(name, incarnation)` and how the shell ended, for a
+    /// client that missed `SessionExited` (`SessionGone { exit }`).
+    ended: std::collections::VecDeque<Tombstone>,
     /// Connections being served.
     conns: usize,
     /// Session creations that outlived their attach (it timed out) and are still running. Each
     /// kills what it produces, and keeps the daemon from idling out until it has.
     spawning: usize,
+}
+
+/// What the daemon remembers of a session that ended.
+struct Tombstone {
+    name: SessionName,
+    incarnation: u128,
+    exit: Option<msg::ExitStatus>,
 }
 
 /// Why a session could not be found or made for an attach.
@@ -331,18 +339,22 @@ impl Inner {
             return Ok(h.clone());
         }
         if let Some(r) = &attach.resume {
-            let gone = existing
+            // Ended and not reaped yet: its status is the handle's. Reaped: the tombstone's.
+            let gone = match existing
                 .as_ref()
-                .is_some_and(|dead| dead.incarnation() == r.incarnation)
-                || self
+                .filter(|dead| dead.incarnation() == r.incarnation)
+            {
+                Some(dead) => Some(dead.exit_status()),
+                None => self
                     .state()
                     .ended
                     .iter()
-                    .any(|(n, i)| *n == attach.name && *i == r.incarnation);
-            return Err(Lookup::Refuse(if gone {
-                msg::AttachRefusal::SessionGone { exit: None }
-            } else {
-                msg::AttachRefusal::SessionReplaced
+                    .find(|t| t.name == attach.name && t.incarnation == r.incarnation)
+                    .map(|t| t.exit),
+            };
+            return Err(Lookup::Refuse(match gone {
+                Some(exit) => msg::AttachRefusal::SessionGone { exit },
+                None => msg::AttachRefusal::SessionReplaced,
             }));
         }
 
@@ -403,7 +415,11 @@ impl Inner {
         {
             st.live.remove(h.name());
         }
-        st.ended.push_back((h.name().clone(), h.incarnation()));
+        st.ended.push_back(Tombstone {
+            name: h.name().clone(),
+            incarnation: h.incarnation(),
+            exit: h.exit_status(),
+        });
         while st.ended.len() > MAX_TOMBSTONES {
             st.ended.pop_front();
         }

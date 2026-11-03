@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{SessionConfig, SessionHost};
 use crate::echo::EchoTracker;
+use crate::forward::Forwards;
 use crate::proc::{self, ProcRow, Scope, Tracker};
 use crate::pty::{Pty, SpawnError, Spawned};
 use crate::queries::{QueryScanner, ReplyScanner, Terminal};
@@ -186,6 +187,12 @@ impl ExitInfo {
             Some(text) => (None, signal_number(text)),
         }
     }
+
+    /// How the session ended, as `AttachRefusal::SessionGone` carries it (neither field set for
+    /// a signal this cannot name). Always `Some`: `wire` never sets both.
+    pub fn status(&self) -> Option<fil_proto::msg::ExitStatus> {
+        fil_proto::msg::ExitStatus::try_from(self.wire()).ok()
+    }
 }
 
 /// The number of the signal that portable-pty reports as `strsignal` text.
@@ -282,6 +289,9 @@ pub(crate) struct Progress {
 pub(crate) struct Shared {
     pub log: Mutex<OutputLog>,
     pub progress: watch::Sender<Progress>,
+    /// The session's processes as recorded: the child and the descendants seen so far (for
+    /// `fil ports`' attribution without a scope).
+    pub pids: Mutex<Vec<u32>>,
 }
 
 impl Shared {
@@ -333,6 +343,8 @@ pub(crate) struct Accepted {
     /// Set by the core the moment this connection loses the session (taken over, detached,
     /// superseded). The connection's task reads nothing from its link once it is set.
     pub kicked: Arc<AtomicBool>,
+    /// A fresh attach (a new subscriber and a new mux epoch), not a resume.
+    pub fresh: bool,
 }
 
 pub(crate) enum AttachAnswer {
@@ -440,6 +452,7 @@ pub(crate) struct Core {
     cfg: SessionConfig,
     host: Arc<dyn SessionHost>,
     shared: Arc<Shared>,
+    forwards: Arc<Forwards>,
     tx: mpsc::Sender<Cmd>,
     exit_tx: watch::Sender<Option<ExitInfo>>,
     pty: Pty,
@@ -527,6 +540,7 @@ pub(crate) fn start(
     cfg: SessionConfig,
     scope: Scope,
     host: Arc<dyn SessionHost>,
+    forwards: Arc<Forwards>,
 ) -> Result<Started, SpawnError> {
     let size = fil_term::Size {
         cols: cfg.size.cols(),
@@ -550,6 +564,7 @@ pub(crate) fn start(
     let shared = Arc::new(Shared {
         log: Mutex::new(OutputLog::new(cfg.log_capacity)),
         progress,
+        pids: Mutex::new(vec![pid]),
     });
 
     // The reader reports output and end of file; the waiter reports the exit status. Blocking
@@ -608,6 +623,7 @@ pub(crate) fn start(
         last_output_unix_ms: None,
         host,
         shared: shared.clone(),
+        forwards,
         tx: tx.clone(),
         exit_tx,
         pty,
@@ -773,6 +789,7 @@ impl Core {
             } => self.on_resize_record(conn, at, size_gen, size),
             Cmd::Detach { conn } => self.on_detach(conn),
             Cmd::ConnGone { conn } => {
+                self.forwards.link_gone(conn);
                 if self.live.as_ref().is_some_and(|l| l.conn == conn) {
                     self.live = None;
                     self.next_mode_poll = None;
@@ -781,7 +798,13 @@ impl Core {
             Cmd::CatchUp { conn, sent, reply } => {
                 let _ = reply.send(self.on_catch_up(conn, sent));
             }
-            Cmd::ProcessTable(rows) => self.tracker.refresh(self.pty.pid, &rows),
+            Cmd::ProcessTable(rows) => {
+                self.tracker.refresh(self.pty.pid, &rows);
+                let pids = std::iter::once(self.pty.pid)
+                    .chain(self.tracker.pids())
+                    .collect();
+                *self.shared.pids.lock().unwrap_or_else(|e| e.into_inner()) = pids;
+            }
         }
     }
 
@@ -1098,7 +1121,8 @@ impl Core {
 
     fn on_attach(&mut self, a: Attach) -> AttachAnswer {
         if self.exit.is_some() || a.name != self.name {
-            return AttachAnswer::Refused(AttachRefusal::SessionGone { exit: None });
+            let exit = self.exit.as_ref().and_then(ExitInfo::status);
+            return AttachAnswer::Refused(AttachRefusal::SessionGone { exit });
         }
         self.sample_mode();
         let echo_ack = a.echo_ack;
@@ -1167,6 +1191,14 @@ impl Core {
             old.kick();
             let _ = old.events.send(ConnEvent::Drop);
         }
+        // The forwards follow the epoch: a fresh attach is a new subscriber and a new mux epoch
+        // (the old subscriber's channels are dropped), a resume goes on with this link.
+        let fresh = matches!(mode, AttachMode::Fresh);
+        if fresh {
+            self.forwards.fresh_attach(conn, events_tx.clone());
+        } else {
+            self.forwards.resumed_attach(conn, events_tx.clone());
+        }
         let kicked = Arc::new(AtomicBool::new(false));
         self.live = Some(Live {
             sub,
@@ -1196,6 +1228,7 @@ impl Core {
             input_received: self.input.received(),
             mode: self.mode_at(start_seq),
             kicked,
+            fresh,
         }))
     }
 
@@ -1309,6 +1342,7 @@ impl Core {
         };
         live.kick();
         self.next_mode_poll = None;
+        self.forwards.detached();
         // The connection is on its way out already, so it is taken out before the effects run.
         if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(live.epoch) {
             self.apply_effects(effects);
@@ -1333,6 +1367,7 @@ impl Core {
         if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(epoch) {
             self.apply_effects(effects);
         }
+        self.forwards.detached();
         self.next_mode_poll = None;
     }
 
@@ -1377,6 +1412,8 @@ impl Core {
             code: 1,
             signal: None,
         });
+        // Every forwarded connection and `-R` listener goes with the session.
+        self.forwards.end();
         self.exit_tx.send_replace(Some(info));
         self.live = None;
     }

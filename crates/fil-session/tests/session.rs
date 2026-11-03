@@ -770,9 +770,17 @@ async fn the_shell_exiting_ends_the_session_after_the_client_has_the_output() {
     assert!(!h.is_alive());
     assert!(h.info().await.is_none());
 
-    // Attaching to a session that has ended is refused.
+    // Attaching to a session that has ended is refused, with how it ended.
     let c2 = Client::attach(&h, Connect::new(&h, key(1))).await;
-    assert_eq!(c2.refused, Some(AttachRefusal::SessionGone { exit: None }));
+    assert_eq!(
+        c2.refused,
+        Some(AttachRefusal::SessionGone {
+            exit: Some(fil_proto::msg::ExitStatus {
+                code: Some(3),
+                signal: None
+            })
+        })
+    );
 }
 
 #[tokio::test]

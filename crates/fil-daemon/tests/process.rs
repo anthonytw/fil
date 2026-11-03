@@ -357,10 +357,15 @@ async fn sigterm_lets_attached_clients_hear_how_their_session_ended() {
     let mut a = Client::attach(link, Connect::new("main", key(1))).await;
     a.wait_screen("ready").await;
 
+    // Output the client has not acknowledged yet: the daemon holds the ending back until it is
+    // (or a second has passed), which is the time a daemon that stopped at once would not give.
+    a.type_bytes(b"unread\n").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
     a.wait("the session's ending", |c| c.exited.is_some() || c.down)
         .await;
     let (code, signal) = a

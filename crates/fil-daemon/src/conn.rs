@@ -293,8 +293,8 @@ impl Inner {
                         name: info.name,
                         term: info.term,
                         created_unix_ms: info.created_unix_ms,
-                        // The session does not report this yet.
-                        last_output_unix_ms: 0,
+                        // 0 means the shell has printed nothing yet (`fil ls` shows "never").
+                        last_output_unix_ms: info.last_output_unix_ms.unwrap_or(0),
                         attached: info.subscriber.map(|s| SubscriberSummary {
                             host: s.host,
                             since_unix_ms: s.since_unix_ms,

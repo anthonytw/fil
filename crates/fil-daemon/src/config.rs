@@ -39,6 +39,10 @@ use crate::paths::current_uid;
 /// How long the daemon with nothing to do waits before it exits (the `idle_exit_secs` default).
 pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
 
+/// How long creating a session (the PTY, the child, the probes for a systemd scope) may take
+/// before the attach fails.
+pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What a connection may take between connecting and having sent `Hello` and its `Attach` or
 /// `Request`.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,6 +104,12 @@ pub struct DaemonConfig {
     /// How long a starting daemon waits for the lock of one that is on its way out before it
     /// concludes one is running (default 3 s). Not in the file.
     pub lock_wait: Duration,
+    /// How long creating a session may take before the attach fails (default 30 s). Not in the
+    /// file.
+    pub spawn_timeout: Duration,
+    /// Extra time every session creation waits before it starts (default none). Not in the file;
+    /// tests use it to make a creation slow.
+    pub spawn_delay: Duration,
     /// Heartbeat and liveness timing of every link.
     pub link: LinkParams,
     pub session: SessionDefaults,
@@ -116,6 +126,8 @@ impl Default for DaemonConfig {
             allowed_uid: current_uid(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             lock_wait: Duration::from_secs(3),
+            spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
+            spawn_delay: Duration::ZERO,
             link: LinkParams::default(),
             session: SessionDefaults::default(),
         }

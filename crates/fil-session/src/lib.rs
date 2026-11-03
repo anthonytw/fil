@@ -47,7 +47,7 @@
 //! - **`PtyMode` and `EchoAck`** for prediction (DESIGN.md section 9): the PTY's `ICANON` and
 //!   `ECHO` flags are read once per batch of output, after the PTY has taken input and every
 //!   `mode_poll` while attached and within two seconds of the last input or output (ten times
-//!   that while it is quiet), and a change is sent at the offset of the output that follows it,
+//!   that while it is quiet, except for a client that asked for `EchoAck`), and a change is sent at the offset of the output that follows it,
 //!   in order with that output. The mode in force is stated again after every attach reply and
 //!   every snapshot (a snapshot resets the client's picture, an open password prompt included).
 //!   After the PTY has taken a keystroke and the *echo window* (`echo_window`, 50 ms as in mosh)

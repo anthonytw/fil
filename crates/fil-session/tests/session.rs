@@ -680,8 +680,8 @@ async fn a_resume_far_back_is_told_the_mode_in_force_there() {
 }
 
 /// `ResumeRequest::want_snapshot`: the session resumes (same epoch, same input stream) but the
-/// client is repainted from a snapshot instead of replayed from its position, without a gap
-/// marker, since nothing was skipped.
+/// client is repainted from a snapshot instead of replayed from its position. What it missed
+/// while disconnected is marked as a gap; a client that is current gets no marker.
 #[tokio::test]
 async fn a_resume_that_wants_a_snapshot_gets_one() {
     let sc = Scratch::new();
@@ -702,13 +702,32 @@ async fn a_resume_that_wants_a_snapshot_gets_one() {
     let StartPoint::Snapshot(info) = reply.start else {
         panic!("expected a snapshot, got {:?}", reply.start);
     };
-    assert_eq!(info.skipped, 0);
+    assert_eq!(info.reason, SnapshotReason::Requested);
+    assert_eq!(info.skipped, info.at - resume.seq, "it missed TWO");
+    assert!(info.skipped > 0);
     c2.wait_screen("TWO").await;
     assert!(c2.screen().contains("ONE"));
-    assert!(!c2.history().contains("skipped"));
+    assert!(c2.history().contains("skipped"), "{}", c2.history());
     // The input stream continues where it was: the session already has "x\n".
     c2.wait("the input position", |c| c.input_resume == Some(2))
         .await;
+    // Current now: a second repaint request skips nothing.
+    let current = c2.resume_request();
+    c2.hang_up();
+    c2.serve_end().await;
+    let c3 = Client::attach(
+        &h,
+        Connect::new(&h, key(1)).resume(ResumeRequest {
+            want_snapshot: true,
+            ..current
+        }),
+    )
+    .await;
+    let StartPoint::Snapshot(info) = c3.reply.clone().unwrap().start else {
+        panic!("expected a snapshot");
+    };
+    assert_eq!((info.skipped, info.reason), (0, SnapshotReason::Requested));
+    assert!(!c3.history().contains("skipped"));
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 

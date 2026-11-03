@@ -33,9 +33,10 @@
 //! the client's scrollback, so the client must not add one of its own.
 //!
 //! **One snapshot at a time.** No further snapshot is announced until the previous one is
-//! confirmed (an ack at or past its offset, or a flush of the link; see `Flow`'s
-//! `unconfirmed`), because control overtakes data on every transport and the announcement would
-//! reach the client ahead of the previous snapshot's bytes.
+//! confirmed by the client's ack at or past its offset (see `Flow`'s `unconfirmed`), because
+//! control overtakes data on every transport and the announcement would reach the client ahead of
+//! the previous snapshot's bytes. Nothing weaker confirms it: a QUIC flush only says the peer's
+//! link has queued the payloads, and its inbox hands control out before them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,9 +68,9 @@ const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
 const EXIT_ACK_WAIT: Duration = Duration::from_secs(1);
 /// ... and the most it waits in all, so a client that never acknowledges cannot hold the session.
 const EXIT_ACK_CAP: Duration = Duration::from_secs(10);
-/// How long the outbound half waits for the link to flush a snapshot before it looks at its
-/// events again.
-const SETTLE_WAIT: Duration = Duration::from_secs(1);
+/// Most `(end, began)` entries `Flow::sent` keeps. A client that never acks would otherwise grow
+/// it by one entry per segment, for as long as it stays connected.
+const SENT_MAX: usize = 256;
 /// While output is unacknowledged, how often the "waited too long" half of the catch-up rule is
 /// looked at again.
 const AGE_CHECK: Duration = Duration::from_millis(250);
@@ -177,8 +178,8 @@ struct Flow {
     /// overtake the first snapshot's unsent bytes, and both number theirs from 0: the client
     /// would take the old bytes for the new snapshot, or see a gap and reconnect.
     ///
-    /// Cleared by an ack of `at` or beyond, which the client only sends once it has applied the
-    /// snapshot (it acks no terminal position it has not reached), or by [`Flow::settle`].
+    /// Cleared by an ack of `at` or beyond, which the client sends once it has applied the
+    /// snapshot (it acks no terminal position it has not reached). Nothing else confirms it.
     unconfirmed: Option<u64>,
 }
 
@@ -206,16 +207,16 @@ impl Flow {
         self.unconfirmed.is_some()
     }
 
-    /// The snapshot is known to have reached the client by other means than an ack: the link
-    /// flushed everything sent before it.
-    fn settle(&mut self) {
-        self.unconfirmed = None;
-    }
-
     fn record_send(&mut self, end: u64, began: Instant) {
         self.next = end;
         self.high = self.high.max(end);
-        self.sent.push_back((end, began));
+        // At the cap the newest entry grows instead: the entries are only popped by acks and
+        // read at the front, so coarser ones at the back cost nothing but granularity.
+        let full = self.sent.len() >= SENT_MAX;
+        match self.sent.back_mut() {
+            Some(last) if full => last.0 = end,
+            _ => self.sent.push_back((end, began)),
+        }
     }
 
     fn ack(&mut self, upto: u64) -> Result<(), AckError> {
@@ -562,25 +563,18 @@ impl<'a, L: Link> Conn<'a, L> {
             //
             // Not while the previous snapshot is unconfirmed: the announcement would overtake
             // its bytes (see `Flow::unconfirmed`). Output past the snapshot is sent meanwhile,
-            // and the client's ack of it confirms the snapshot. Only when the log has wrapped
-            // past the stream's position is there nothing to send, and so nothing for the client
-            // to ack: the link's flush then stands in for the ack. It resolves once the snapshot
-            // has been delivered (written, on the pipe; read by the peer's link, on QUIC), which
-            // also keeps the next announcement behind it.
+            // and the client's ack confirms the snapshot (it acks `at` itself once the snapshot
+            // is applied, so this needs no output). If the log has wrapped past the stream's
+            // position there is nothing to send: the connection waits for that ack below, still
+            // looking at its events.
+            let stalled = wrapped && awaiting;
             if !prog.exited
+                && !awaiting
                 && (wrapped || (prog.ready > next && should_snapshot(behind, age, &params)))
             {
-                if !awaiting {
-                    match self.catch_up(out).await {
-                        Ok(()) => continue,
-                        Err(end) => return end,
-                    }
-                }
-                if wrapped {
-                    match self.settle_snapshot().await {
-                        Ok(()) => continue,
-                        Err(end) => return end,
-                    }
+                match self.catch_up(out).await {
+                    Ok(()) => continue,
+                    Err(end) => return end,
                 }
             }
 
@@ -626,7 +620,7 @@ impl<'a, L: Link> Conn<'a, L> {
                 .modes
                 .front()
                 .map_or(prog.ready, |m| m.0.min(prog.ready));
-            if next < limit {
+            if next < limit && !stalled {
                 let want = (limit - next).min(MAX_DATA_PAYLOAD as u64) as usize;
                 let data = self.handle.shared().lock_log().read(next, want);
                 if data.is_empty() {
@@ -691,22 +685,6 @@ impl<'a, L: Link> Conn<'a, L> {
                 }
                 None => out.events_open = false,
             }
-        }
-    }
-
-    /// Waits until the snapshot sent last is confirmed: by an ack past it, or by the link having
-    /// flushed it. Returns after one attempt, bounded by [`SETTLE_WAIT`]; the caller looks again.
-    async fn settle_snapshot(&self) -> Result<(), ServeEnd> {
-        tokio::select! {
-            () = self.acked.notified() => Ok(()),
-            r = tokio::time::timeout(SETTLE_WAIT, self.link.flush()) => match r {
-                Ok(Ok(())) => {
-                    self.flow().settle();
-                    Ok(())
-                }
-                Ok(Err(e)) => Err(ServeEnd::LinkDown(e.0)),
-                Err(_) => Ok(()),
-            },
         }
     }
 
@@ -837,10 +815,25 @@ mod tests {
         assert!(!Flow::new(7).awaiting_snapshot());
     }
 
+    /// A client that reads but never acks must not make the sender's book of unacknowledged
+    /// segments grow without bound.
     #[test]
-    fn settling_confirms_without_an_ack() {
-        let mut f = Flow::after_snapshot(7);
-        f.settle();
-        assert!(!f.awaiting_snapshot());
+    fn the_unacknowledged_book_is_bounded() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0);
+        for i in 1..=100_000u64 {
+            f.record_send(i * 10, t0 + Duration::from_millis(i));
+        }
+        assert!(f.sent.len() <= SENT_MAX, "{}", f.sent.len());
+        assert_eq!(f.next, 1_000_000);
+        // The front is still the oldest unacknowledged output.
+        assert_eq!(f.sent.front().unwrap().1, t0 + Duration::from_millis(1));
+        assert!(f.age(t0 + Duration::from_secs(10)) >= Duration::from_secs(9));
+        // Acks still drain it, and an ack of everything empties it.
+        f.ack(500).unwrap();
+        assert!(f.sent.front().unwrap().0 > 500);
+        f.ack(1_000_000).unwrap();
+        assert!(f.sent.is_empty());
+        assert_eq!(f.age(t0), Duration::ZERO);
     }
 }

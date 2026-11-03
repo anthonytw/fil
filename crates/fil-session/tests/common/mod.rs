@@ -423,7 +423,7 @@ impl Client {
                 let seg = DataSegment::parse(&payload).unwrap();
                 assert_eq!(seg.seq, self.snap_buf.len() as u64, "snapshot offsets");
                 self.snap_buf.extend_from_slice(seg.data);
-                self.finish_snapshot();
+                self.finish_snapshot().await;
             }
             ChannelId::TERMINAL => {
                 let seg = DataSegment::parse(&payload).unwrap();
@@ -447,13 +447,16 @@ impl Client {
         }
     }
 
-    fn expect_snapshot(&mut self, info: SnapshotInfo) {
+    async fn expect_snapshot(&mut self, info: SnapshotInfo) {
         assert!(self.snap_info.is_none(), "a snapshot while one is arriving");
         self.snap_info = Some(info);
-        self.finish_snapshot();
+        self.finish_snapshot().await;
     }
 
-    fn finish_snapshot(&mut self) {
+    /// Applies the snapshot once it is complete. Like the real client, a client that acks
+    /// (`auto_ack`) then acknowledges the snapshot's own offset: that ack, and nothing weaker,
+    /// is what tells the daemon the snapshot has arrived.
+    async fn finish_snapshot(&mut self) {
         let Some(info) = self.snap_info else { return };
         if self.snap_buf.len() as u64 != info.len {
             assert!(self.snap_buf.len() as u64 <= info.len, "snapshot too long");
@@ -466,6 +469,13 @@ impl Client {
         self.recv = RecvChannel::starting_at(info.at);
         self.next = info.at;
         self.snap_info = None;
+        if self.auto_ack {
+            self.send_ctl(ControlMsg::Ack {
+                channel: ChannelId::TERMINAL,
+                upto: info.at,
+            })
+            .await;
+        }
     }
 
     async fn apply_ctl(&mut self, msg: ControlMsg) {
@@ -476,7 +486,7 @@ impl Client {
                         self.recv = RecvChannel::starting_at(from);
                         self.next = from;
                     }
-                    StartPoint::Snapshot(info) => self.expect_snapshot(info),
+                    StartPoint::Snapshot(info) => self.expect_snapshot(info).await,
                 }
                 self.reply = Some(r);
             }
@@ -485,7 +495,7 @@ impl Client {
             ControlMsg::Detach => self.detached = true,
             ControlMsg::Snapshot(info) => {
                 self.mid_snapshots.push(info);
-                self.expect_snapshot(info);
+                self.expect_snapshot(info).await;
             }
             ControlMsg::PtyMode {
                 canonical,

@@ -51,7 +51,11 @@ const MAX_TAIL: usize = 1024 * 1024;
 const TRACK_INTERVAL: Duration = Duration::from_secs(5);
 /// Most entries of PTY mode history kept. The history is pruned to the log's range first (a
 /// resume further back gets a snapshot, which states the mode itself), so this only bounds a
-/// program that flips its mode between nearly every byte.
+/// program that flips its mode between nearly every byte. Known limit: past the cap the oldest
+/// entry goes even if the log still reaches back that far, and a resume from before the oldest
+/// kept entry is told that entry's mode (`mode_at`'s fallback), which can be wrong for the
+/// replayed stretch until the next change. Reaching it takes 4096 mode changes inside one log
+/// (8 MiB) of output.
 const MODE_HISTORY_MAX: usize = 4096;
 /// Input waiting for a child that is not reading it, beyond which the client is not acknowledged.
 const INPUT_BACKLOG: usize = 64 * 1024;
@@ -60,6 +64,9 @@ const CMD_CAPACITY: usize = 256;
 /// How long after the last input or output the PTY mode is polled at `mode_poll`. Mode changes
 /// follow a program's input or output, and both re-read the mode themselves; the poll is a net
 /// for the rest, so it slows to [`IDLE_POLL_FACTOR`] times `mode_poll` once things are quiet.
+/// Not for a client that predicts (`Attach::echo_ack`): a program that turns echo off after a
+/// silence (a password prompt) must reach it within `mode_poll`, or its first keystroke is
+/// painted before it knows.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_POLL_FACTOR: u32 = 10;
 /// Reads of PTY output closer together than this follow each other in a flood.
@@ -624,9 +631,13 @@ impl Core {
         let written = self.pty.written_signal.clone();
         loop {
             let deadline = self.next_deadline();
+            let mut passed_output = false;
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(cmd) => self.handle(cmd),
+                    Some(cmd) => {
+                        passed_output = matches!(cmd, Cmd::PtyOutput | Cmd::PtyEof);
+                        self.handle(cmd);
+                    }
                     None => break,
                 },
                 () = sleep_until(deadline) => self.on_tick(Instant::now()),
@@ -641,7 +652,10 @@ impl Core {
             // A batch of output is milliseconds of work, and the subscribers it wakes are woken
             // onto this worker's own queue: without a yield they wait for the runtime's
             // cooperative budget (128 operations, over a second of batches), and nothing is sent.
-            tokio::task::yield_now().await;
+            // Other work is too short to need it.
+            if passed_output {
+                tokio::task::yield_now().await;
+            }
         }
         self.finish();
     }
@@ -782,6 +796,7 @@ impl Core {
         poll_interval(
             now.saturating_duration_since(self.last_io),
             self.cfg.mode_poll,
+            self.live.as_ref().is_some_and(|l| l.echo_ack),
         )
     }
 
@@ -1131,8 +1146,14 @@ impl Core {
     fn resume_start(&mut self, r: ResumeRequest, ready: u64) -> (StartPoint, Option<Vec<u8>>, u64) {
         let seq = r.seq;
         if r.want_snapshot {
-            // Nothing was skipped: the client has seen all it was sent, so no gap marker.
-            return self.snapshot_start(ready, 0, SnapshotReason::BadResumePoint);
+            // The client may not have seen `seq..ready` (it was disconnected), and what it did
+            // see no longer matches its screen: repaint, with the gap marker for what it missed
+            // (a client that is current has `seq == ready` and gets no marker).
+            return self.snapshot_start(
+                ready,
+                ready.saturating_sub(seq),
+                SnapshotReason::Requested,
+            );
         }
         let decision = {
             let log = self.shared.lock_log();
@@ -1286,8 +1307,8 @@ impl Core {
 }
 
 /// The mode poll's period `quiet` after the last input or output.
-fn poll_interval(quiet: Duration, mode_poll: Duration) -> Duration {
-    if quiet < ACTIVE_WINDOW {
+fn poll_interval(quiet: Duration, mode_poll: Duration, predicting: bool) -> Duration {
+    if predicting || quiet < ACTIVE_WINDOW {
         mode_poll
     } else {
         mode_poll * IDLE_POLL_FACTOR
@@ -1436,10 +1457,20 @@ mod tests {
     #[test]
     fn the_mode_poll_slows_down_when_idle() {
         let fast = Duration::from_millis(50);
-        assert_eq!(poll_interval(Duration::ZERO, fast), fast);
-        assert_eq!(poll_interval(Duration::from_millis(1999), fast), fast);
-        assert_eq!(poll_interval(ACTIVE_WINDOW, fast), fast * IDLE_POLL_FACTOR);
-        assert!(poll_interval(Duration::from_secs(3600), fast) >= Duration::from_millis(500));
+        assert_eq!(poll_interval(Duration::ZERO, fast, false), fast);
+        assert_eq!(
+            poll_interval(Duration::from_millis(1999), fast, false),
+            fast
+        );
+        assert_eq!(
+            poll_interval(ACTIVE_WINDOW, fast, false),
+            fast * IDLE_POLL_FACTOR
+        );
+        assert!(
+            poll_interval(Duration::from_secs(3600), fast, false) >= Duration::from_millis(500)
+        );
+        // A predicting client is never left to the slow poll.
+        assert_eq!(poll_interval(Duration::from_secs(3600), fast, true), fast);
     }
 
     #[test]

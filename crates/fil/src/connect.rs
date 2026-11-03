@@ -520,6 +520,7 @@ async fn ssh_host(host: &str) -> Option<SshHost> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    fil_transport::fdlimit::keep_for_child(&mut cmd);
     let out = tokio::time::timeout(SSH_G_TIMEOUT, cmd.output())
         .await
         .ok()?

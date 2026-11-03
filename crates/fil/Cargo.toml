@@ -42,6 +42,8 @@ tracing = "0.1"
 # The test hooks (FIL_TEST_WIRE_REVISION, FIL_TEST_SOCKET_DIR) for the `fil` binary the integration
 # tests run. Dev-dependencies are not in the released build: `just release-deps` checks.
 fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }
+# The scripted daemon the engine tests share with fil-client (its forwards are a real endpoint).
+fil-forward = { path = "../fil-forward" }
 fil-session = { path = "../fil-session" }
 fil-term = { path = "../fil-term" }
 # The PTY driver the Pi examples share with ptydrive (examples/support/harness.rs).

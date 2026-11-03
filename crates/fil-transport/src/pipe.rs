@@ -623,6 +623,8 @@ impl PipeLink {
                 PipeStderr::Capture | PipeStderr::Tee => std::process::Stdio::piped(),
             })
             .kill_on_drop(true);
+        // Not the raised limit on open files of a client with forwards (`crate::fdlimit`).
+        crate::fdlimit::keep_for_child(&mut cmd);
         if cfg.own_process_group {
             // A new group with the child as its leader. Safe Rust: the standard library does the
             // `setpgid` between fork and exec.

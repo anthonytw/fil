@@ -12,8 +12,10 @@
 //!   changes and shutdown write to: an idle client makes no wakeups for it.
 //! - **Output** is written with blocking writes, in a loop that handles partial writes and
 //!   `EINTR`/`EAGAIN`. The client loop runs on the main thread (`block_on`), so a terminal that
-//!   cannot keep up applies backpressure to that loop, by design: the loop stops reading the
-//!   link, stops acknowledging output the terminal has not taken, and the daemon's catch-up rule
+//!   cannot keep up applies backpressure to that loop, by design: the loop stops taking the
+//!   link's terminal traffic (the link's reader holds up to `forward::MAX_WAITING` of it and
+//!   goes on handing forwards their traffic), stops acknowledging output the terminal has not
+//!   taken, and the daemon's catch-up rule
 //!   (DESIGN.md section 6.2) skips a slow client ahead with a snapshot instead of buffering
 //!   without bound. Liveness does not wait on the loop: the links' heartbeats and watchdogs run
 //!   on the runtime's worker threads. What does wait is the user's own input, resizes and

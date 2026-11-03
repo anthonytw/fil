@@ -664,6 +664,18 @@ impl Client {
         )
     }
 
+    /// The pids of all the client's children (the ssh of the pipe, or whatever the pipe command is).
+    pub fn children(&self) -> Vec<u32> {
+        let out = Command::new("pgrep")
+            .args(["-P", &self.pid().to_string()])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    }
+
     /// SIGKILL to the client alone (its ssh is not touched).
     pub fn kill9(&self) {
         let _ = Command::new("kill")

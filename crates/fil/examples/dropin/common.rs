@@ -4,7 +4,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::harness::{Client, ensure, signal_group};
+use crate::harness::{Client, ensure, pgid_of, signal_group};
 use crate::{Ctx, Variant};
 
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(25);
@@ -338,20 +338,38 @@ pub fn screen_ticks_intact(c: &Client) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // Stopping a process group
 
-/// Stops a whole process group (the client and the ssh it started, as a sleeping laptop stops
-/// everything), and continues it again when dropped, whatever happens in between.
-pub struct Stopped(u32);
+/// Stops everything the client runs, as a sleeping laptop does: its own process group and the
+/// group of each child it started (a reconnecting pipe runs in a group of its own, in the
+/// background of the terminal). Continues them all when dropped, whatever happens in between.
+pub struct Stopped(Vec<u32>);
 
 impl Stopped {
-    pub fn group(pgid: u32) -> Stopped {
-        signal_group(pgid, "STOP");
-        Stopped(pgid)
+    pub fn all(c: &Client) -> Stopped {
+        let mut groups = vec![c.pid()];
+        for child in c.children() {
+            if let Some(g) = pgid_of(child)
+                && !groups.contains(&g)
+            {
+                groups.push(g);
+            }
+        }
+        for g in &groups {
+            signal_group(*g, "STOP");
+        }
+        Stopped(groups)
+    }
+
+    /// How many process groups are stopped (the client's, and its children's if they differ).
+    pub fn groups(&self) -> usize {
+        self.0.len()
     }
 }
 
 impl Drop for Stopped {
     fn drop(&mut self) {
-        signal_group(self.0, "CONT");
+        for g in &self.0 {
+            signal_group(*g, "CONT");
+        }
     }
 }
 

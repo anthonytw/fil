@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::common::*;
-use crate::harness::{Client, ensure, ms, pgid_of, secs};
+use crate::harness::{Client, ensure, ms, secs};
 use crate::{Ctx, Variant};
 
 /// How many times the client logged that its link went down.
@@ -71,17 +71,12 @@ pub fn client_sleep(ctx: &Ctx, host: &str) -> Res {
         let from = c.len();
         start_ticks(&mut c, ticks);
         c.want_from("TICK-8", from, CMD_TIMEOUT)?;
-        let pgid = c.pid();
-        // The ssh (if any) must be in the group, or it would not be asleep.
-        for ssh in c.ssh_children() {
-            ensure(pgid_of(ssh) == Some(pgid), || {
-                format!("the ssh child {ssh} is not in the client's process group {pgid}")
-            })?;
-        }
         let downs = link_downs(&c);
         let mid;
+        let groups;
         {
-            let _stopped = Stopped::group(pgid);
+            let stopped = Stopped::all(&c);
+            groups = stopped.groups();
             thread::sleep(Duration::from_secs(stop_s / 2));
             // What the daemon thinks, halfway: recorded, not asserted.
             mid = ctx.ls_row(host, &format!("dp-{name}")).map(|(a, _)| a);
@@ -116,7 +111,7 @@ pub fn client_sleep(ctx: &Ctx, host: &str) -> Res {
             format!("three seconds after waking a command took {}", ms(settled))
         })?;
         notes.push(format!(
-            "{}: client and ssh stopped {stop_s} s (asserted: its link went down); `fil ls` halfway said attached = {}; first output (measured) {} after the wake, the last tick {}; round trip (measured) {} before, {} right after, {} three seconds later (asserted under 2 s); {res} (asserted); status line gone, screen intact (asserted)",
+            "{}: client and its {groups} process group(s) stopped {stop_s} s (asserted: its link went down); `fil ls` halfway said attached = {}; first output (measured) {} after the wake, the last tick {}; round trip (measured) {} before, {} right after, {} three seconds later (asserted under 2 s); {res} (asserted); status line gone, screen intact (asserted)",
             variant.tag(),
             mid.unwrap_or_else(|| "?".into()),
             ms(first),
@@ -164,8 +159,7 @@ pub fn disrupt_vim(ctx: &Ctx, host: &str) -> Res {
     let downs = link_downs(&c);
     let t = Instant::now();
     {
-        let pgid = c.pid();
-        let _stopped = Stopped::group(pgid);
+        let _stopped = Stopped::all(&c);
         thread::sleep(Duration::from_secs(2));
         type_rows(&mut c, 7, 9);
         thread::sleep(Duration::from_secs(13));

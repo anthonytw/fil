@@ -1133,3 +1133,68 @@ async fn an_open_checked_in_one_epoch_never_goes_out_in_the_next() {
     echo_once(port, 10, 4).await;
     w.settled().await;
 }
+
+/// A peer that floods table messages while the owner does not read its events: the events
+/// waiting stay bounded, because the endpoint stops feeding (and so acknowledging) the MUX stream
+/// and the peer's own MUX buffer then refuses its table messages (`TableError::Full`). Nothing is
+/// dropped: once the owner reads, every message the peer could send arrives, in order, and the
+/// muxes are healthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_owner_holds_back_a_table_flood() {
+    use fil_proto::mux::{MuxMsg, TableError};
+    let mut w = World::new_with(Transport::Mem, mux_config(), true).await;
+    let mut sent = 0u32;
+    let full = timeout(Duration::from_secs(30), async {
+        loop {
+            match w.daemon.ep.send_table(MuxMsg::ForwardGone {
+                id: ForwardId(sent),
+            }) {
+                Ok(()) => sent += 1,
+                Err(TableError::Full) => {
+                    // The peer's buffer is full only once the client stopped acknowledging.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if w.daemon.ep.send_table(MuxMsg::ForwardGone {
+                        id: ForwardId(sent),
+                    }) == Err(TableError::Full)
+                    {
+                        return;
+                    }
+                    sent += 1;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+            if sent.is_multiple_of(512) {
+                tokio::task::yield_now().await;
+            }
+        }
+    })
+    .await;
+    assert!(full.is_ok(), "the flood was never held back ({sent} sent)");
+    let c = w.client.ep.snapshot();
+    eprintln!("{sent} table messages sent before the peer's buffer filled; client {c:?}");
+    assert!(c.undelivered_events <= 4096, "{c:?}");
+    assert!(
+        c.held_mux_bytes <= 2 * fil_proto::limits::MUX_SEND_BUFFER,
+        "{c:?}"
+    );
+    assert!(!c.failed && !w.daemon.ep.snapshot().failed);
+    // The owner reads: everything arrives, in order.
+    let mut rx = w.client.events_rx.take().unwrap();
+    for i in 0..sent {
+        let ev = timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("event {i} of {sent} never came"))
+            .unwrap();
+        assert!(
+            ev == fil_forward::EndpointEvent::Table(MuxMsg::ForwardGone { id: ForwardId(i) }),
+            "event {i}"
+        );
+    }
+    // And the stream flows again: the peer's buffer drains.
+    eventually(Duration::from_secs(10), || {
+        w.daemon.ep.snapshot().mux_buffered == 0
+    })
+    .await;
+    w.client.assert_no_errors();
+    w.daemon.assert_no_errors();
+}

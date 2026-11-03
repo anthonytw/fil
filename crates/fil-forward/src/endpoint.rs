@@ -246,6 +246,10 @@ pub struct Snapshot {
     pub attached: bool,
     pub listeners: usize,
     pub failed: bool,
+    /// Events waiting for room in the owner's channel.
+    pub undelivered_events: usize,
+    /// MUX bytes held, unfed, while events wait.
+    pub held_mux_bytes: usize,
 }
 
 /// Data bytes the data sender takes from the mux ahead of the link. It hands them over one at a
@@ -270,6 +274,9 @@ const ACTIVE_FOR: Duration = Duration::from_millis(300);
 const READ_CHUNK: usize = fil_proto::limits::MAX_DATA_PAYLOAD;
 /// Largest piece taken from a channel's receive buffer for one socket write.
 const WRITE_CHUNK: usize = 64 * 1024;
+
+/// Events waiting in the owner's channel ([`Endpoint::new`]).
+pub const EVENT_QUEUE: usize = 64;
 
 /// How long a SOCKS client may take to send its request.
 pub const SOCKS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -453,7 +460,14 @@ struct State<L> {
     /// SOCKS handshakes in progress (they count against [`MAX_PENDING`]), by task.
     handshakes: HashMap<u64, AbortHandle>,
     next_handshake: u64,
-    events: mpsc::UnboundedSender<EndpointEvent>,
+    events: mpsc::Sender<EndpointEvent>,
+    /// Events the owner's channel had no room for, in order. While any wait, MUX payloads are
+    /// held rather than fed to the mux ([`State::held_mux`]).
+    undelivered: VecDeque<EndpointEvent>,
+    /// MUX payloads not yet fed (the owner is behind on events): the mux does not acknowledge
+    /// them, so the peer's MUX buffer fills and it stops sending table messages (`TableError::Full`).
+    held_mux: VecDeque<Bytes>,
+    held_mux_bytes: usize,
     failed_told: bool,
     last_tick: std::time::Instant,
     active_until: Option<std::time::Instant>,
@@ -502,6 +516,21 @@ impl<L: Link> State<L> {
         self.ctl_out.clear();
         self.data_out.clear();
         self.data_out_bytes = 0;
+        // Never fed, so never acknowledged: the peer sends them again on the next link.
+        self.held_mux.clear();
+        self.held_mux_bytes = 0;
+    }
+
+    /// Hands `ev` to the owner, or queues it (in order) when the owner's channel is full.
+    fn emit(&mut self, ev: EndpointEvent) {
+        if self.undelivered.is_empty() {
+            match self.events.try_send(ev) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(ev)) => self.undelivered.push_back(ev),
+            }
+        } else {
+            self.undelivered.push_back(ev);
+        }
     }
 
     fn active(&mut self, now: std::time::Instant) {
@@ -634,6 +663,10 @@ struct Inner<L> {
     unblocked: watch::Sender<u64>,
     pumps: AtomicUsize,
     pending_kick: Notify,
+    /// Events wait for room in the owner's channel.
+    events_kick: Notify,
+    /// Most MUX bytes held for a slow owner: twice what an honest peer may leave unacknowledged.
+    max_held_mux: usize,
     open_wait: Duration,
     connector: Arc<dyn Connector>,
     policy: Arc<dyn Policy>,
@@ -696,14 +729,18 @@ impl<L: Link> fmt::Debug for Endpoint<L> {
 
 impl<L: Link> Endpoint<L> {
     /// A new endpoint, not attached to any link. Must be called inside a tokio runtime; its tasks
-    /// run there. The receiver gets [`EndpointEvent`]s and must be drained.
+    /// run there. The receiver gets [`EndpointEvent`]s, at most [`EVENT_QUEUE`] waiting: while
+    /// the owner is behind, the endpoint stops feeding MUX payloads to the mux (so it does not
+    /// acknowledge them, and the peer's MUX buffer fills and refuses its table messages), and no
+    /// event is ever dropped.
     pub fn new(
         side: Side,
         cfg: MuxConfig,
         connector: Arc<dyn Connector>,
         policy: Arc<dyn Policy>,
-    ) -> (Self, mpsc::UnboundedReceiver<EndpointEvent>) {
-        let (events, events_rx) = mpsc::unbounded_channel();
+    ) -> (Self, mpsc::Receiver<EndpointEvent>) {
+        let (events, events_rx) = mpsc::channel(EVENT_QUEUE);
+        let max_held_mux = 2 * cfg.mux_buffer;
         let connect_timeout = cfg.connect_timeout;
         let open_wait = cfg.open_wait;
         let inner = Arc::new(Inner {
@@ -725,6 +762,9 @@ impl<L: Link> Endpoint<L> {
                 handshakes: HashMap::new(),
                 next_handshake: 0,
                 events,
+                undelivered: VecDeque::new(),
+                held_mux: VecDeque::new(),
+                held_mux_bytes: 0,
                 failed_told: false,
                 last_tick: now(),
                 active_until: None,
@@ -735,6 +775,8 @@ impl<L: Link> Endpoint<L> {
             unblocked: watch::Sender::new(0),
             pumps: AtomicUsize::new(0),
             pending_kick: Notify::new(),
+            events_kick: Notify::new(),
+            max_held_mux,
             open_wait,
             connector,
             policy,
@@ -749,7 +791,8 @@ impl<L: Link> Endpoint<L> {
             let ctl = inner.runtime.spawn(inner.clone().ctl_loop());
             let data = inner.runtime.spawn(inner.clone().data_loop());
             let pending = inner.runtime.spawn(inner.clone().pending_loop());
-            st.tasks.extend([ctl, data, pending]);
+            let events = inner.runtime.spawn(inner.clone().event_loop());
+            st.tasks.extend([ctl, data, pending, events]);
         }
         (
             Self {
@@ -863,6 +906,19 @@ impl<L: Link> Endpoint<L> {
     pub fn on_payload(&self, ch: ChannelId, payload: Bytes) -> Result<(), MuxError> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
+        if ch == ChannelId::MUX && !(st.undelivered.is_empty() && st.held_mux.is_empty()) {
+            // The owner is behind on events: hold the MUX stream (unacknowledged) until it
+            // catches up. An honest peer cannot get far ahead (its MUX buffer is bounded).
+            if st.held_mux_bytes + payload.len() > inner.max_held_mux {
+                drop(st);
+                return Err(MuxError::Protocol(
+                    "MUX data beyond what the peer may leave unacknowledged",
+                ));
+            }
+            st.held_mux_bytes += payload.len();
+            st.held_mux.push_back(payload);
+            return Ok(());
+        }
         let r = st.mux.on_payload(ch, payload);
         st.active(now());
         inner.drain(&mut st);
@@ -1187,6 +1243,8 @@ impl<L: Link> Endpoint<L> {
             attached: st.link.is_some(),
             listeners: st.listeners.len(),
             failed: st.mux.failed().is_some(),
+            undelivered_events: st.undelivered.len(),
+            held_mux_bytes: st.held_mux_bytes,
         }
     }
 
@@ -1315,19 +1373,22 @@ impl<L: Link> Inner<L> {
                     st.active(now());
                 }
                 MuxEvent::Table(msg) => {
-                    let _ = st.events.send(EndpointEvent::Table(msg));
+                    st.emit(EndpointEvent::Table(msg));
                 }
                 MuxEvent::Unblocked => {
                     self.pending_kick.notify_one();
                 }
             }
         }
+        if !st.undelivered.is_empty() {
+            self.events_kick.notify_one();
+        }
         if !st.failed_told
             && let Some(e) = st.mux.failed()
         {
             st.failed_told = true;
             debug!(error = %e, "forward mux failed");
-            let _ = st.events.send(EndpointEvent::Failed(e.clone()));
+            st.emit(EndpointEvent::Failed(e.clone()));
         }
     }
 
@@ -1690,6 +1751,43 @@ impl<L: Link> Inner<L> {
         }
     }
 
+    /// Delivers the events the owner's channel had no room for, as room appears; once all are
+    /// delivered, feeds the MUX payloads held meanwhile (which may produce more events, and stop
+    /// again).
+    async fn event_loop(self: Arc<Self>) {
+        let tx = lock(&self.state).events.clone();
+        loop {
+            let kick = self.events_kick.notified();
+            let waiting = !lock(&self.state).undelivered.is_empty();
+            if !waiting {
+                kick.await;
+                continue;
+            }
+            let Ok(permit) = tx.reserve().await else {
+                return;
+            };
+            let mut st = lock(&self.state);
+            if st.closed {
+                return;
+            }
+            if let Some(ev) = st.undelivered.pop_front() {
+                permit.send(ev);
+            }
+            while st.undelivered.is_empty() {
+                let Some(p) = st.held_mux.pop_front() else {
+                    break;
+                };
+                st.held_mux_bytes -= p.len();
+                // A protocol error here fails the mux; `drain` reports it (`Failed`).
+                let _ = st.mux.on_payload(ChannelId::MUX, p);
+                st.active(now());
+                self.drain(&mut st);
+            }
+            drop(st);
+            self.kick();
+        }
+    }
+
     // ---- the senders ----------------------------------------------------------------------------
 
     /// Acks, the MUX stream and the restatements; and the mux's timers.
@@ -1795,7 +1893,7 @@ impl<L: Link> Inner<L> {
         st.detach();
         if !down {
             debug!("forward send failed on a link that is not down; detached from it");
-            let _ = st.events.send(EndpointEvent::LinkFailed);
+            st.emit(EndpointEvent::LinkFailed);
         }
         self.drain(&mut st);
     }

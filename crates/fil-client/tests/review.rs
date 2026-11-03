@@ -252,9 +252,9 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     );
 }
 
-/// R2: a confirmation that a server chunk draws (after the light gates could not): the first `y`.
+/// R2: a confirmation that a server chunk draws (after the light gates could not): a `y` answers it.
 #[tokio::test(start_paused = true)]
-async fn review2_first_y_answers_a_confirmation_drawn_by_output() {
+async fn review2_y_answers_a_confirmation_drawn_by_output() {
     let mut cfg = config();
     cfg.offline.confirm_after = Some(Duration::from_secs(1));
     let daemon = FakeDaemon::new(4096);
@@ -278,7 +278,7 @@ async fn review2_first_y_answers_a_confirmation_drawn_by_output() {
     rig.daemon.output(b"\x1b[4l").await;
     settle().await;
     assert!(rig.term.text().contains("Send it?"), "{}", rig.term.text());
-    rig.type_str("y");
+    rig.answer("y").await;
     settle().await;
     let input = rig.daemon.input().await;
     assert_eq!(

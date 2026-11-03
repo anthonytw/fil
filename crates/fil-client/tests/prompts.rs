@@ -70,6 +70,60 @@ async fn only_the_key_itself_answers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_first_letter_of_a_word_typed_after_a_pause_is_not_an_answer() {
+    let rig = taken_over().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // "you": each human keystroke is a read of its own, so the `y` is alone in its chunk, but it
+    // is followed by more typing before the quiet period is over.
+    for part in ["y", "o", "u"] {
+        rig.type_str(part);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!rig.is_finished());
+    assert_eq!(
+        rig.daemon.attaches().await.len(),
+        1,
+        "the word took the session back"
+    );
+    assert!(rig.term.text().contains("Take it back?"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_enter_after_y_is_not_typed_into_the_session() {
+    // Enter as its own keystroke, after the quiet period has already made `y` the answer.
+    let rig = taken_over().await;
+    rig.answer("y").await;
+    rig.type_str("\r");
+    until_async("the new attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    assert_eq!(
+        rig.daemon.input().await,
+        b"",
+        "the Enter ran whatever the other client left on the line"
+    );
+    // Only that one Enter: the next one is the user's.
+    rig.type_str("\r");
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"\r");
+    // Enter right after the `y` (before the quiet period is over) is the answer itself.
+    let rig = taken_over().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.type_str("y");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.type_str("\r");
+    until_async("the new attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_refused_candidate_does_not_end_a_session_the_old_link_is_still_delivering() {
     let rig = start(config());
     rig.attached().await;

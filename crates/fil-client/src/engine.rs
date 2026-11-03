@@ -72,9 +72,13 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
-/// A yes/no question ignores the keyboard until the user has paused this long: it is only
-/// answered by someone who has seen it.
+/// A yes/no question ignores the keyboard until the user has paused this long, and a lone key
+/// answers it only if nothing else is typed for this long afterwards: it is only answered by
+/// someone who has read it, and the first letter of a word is not an answer.
 const PROMPT_QUIET: Duration = Duration::from_millis(300);
+/// After a question is answered, a lone Enter that arrives within this long is the end of the
+/// answer (`y`, then Enter) and is not passed on to the session.
+const ANSWER_ENTER_WINDOW: Duration = Duration::from_secs(1);
 /// After `~.`, how long the client waits for the daemon to acknowledge the input typed before it,
 /// so the `Detach` does not overtake it. Past this the `Detach` goes anyway: it matters more than
 /// the typed-ahead input, and acks that do not come (a slow path, a daemon that dropped the link)
@@ -254,7 +258,88 @@ enum Served {
 
 enum Confirm {
     /// Offline keystrokes waiting for y or n.
-    Typed { secs: u64 },
+    Typed { secs: u64, answer: Answer },
+}
+
+/// Reading the answer to a yes/no question from the keyboard, for the questions after a refusal
+/// and the confirmation of offline input. A question is a decision the user has to mean:
+///
+/// - input that arrives before the user has paused for [`PROMPT_QUIET`] (typing that was already
+///   under way) is dropped, and extends the pause;
+/// - `y` or `n` plus Enter, in one read, answers at once;
+/// - a lone `y`, `n`, `q`, ESC or ^C is only a candidate. It answers when nothing else is typed
+///   for [`PROMPT_QUIET`] (so the first letter of a word typed after a pause is not an answer),
+///   or when an Enter follows it;
+/// - anything else (an arrow key, which starts with ESC, other letters) is ignored, and the
+///   question stays.
+struct Answer {
+    armed_at: Instant,
+    candidate: Option<(bool, Instant)>,
+    /// The answer included its Enter (so there is none left to swallow).
+    enter_seen: bool,
+}
+
+impl Answer {
+    fn new() -> Self {
+        Self {
+            armed_at: Instant::now() + PROMPT_QUIET,
+            candidate: None,
+            enter_seen: false,
+        }
+    }
+
+    /// When a lone key becomes the answer, if nothing else is typed.
+    fn deadline(&self) -> Option<Instant> {
+        self.candidate.map(|c| c.1)
+    }
+
+    /// The candidate's quiet time is up: it is the answer.
+    fn tick(&mut self) -> Option<bool> {
+        match self.candidate {
+            Some((yes, at)) if Instant::now() >= at => {
+                self.candidate = None;
+                Some(yes)
+            }
+            _ => None,
+        }
+    }
+
+    /// A read from the keyboard. `Some` is the answer.
+    fn input(&mut self, bytes: &[u8]) -> Option<bool> {
+        if let Some(yes) = self.tick() {
+            return Some(yes);
+        }
+        let now = Instant::now();
+        if let Some((yes, _)) = self.candidate {
+            if matches!(bytes, [b'\r'] | [b'\n']) {
+                self.candidate = None;
+                self.enter_seen = true;
+                return Some(yes);
+            }
+            // More typing: the lone key was the start of something else.
+            self.candidate = None;
+            self.armed_at = now + PROMPT_QUIET;
+            return None;
+        }
+        if now < self.armed_at {
+            self.armed_at = now + PROMPT_QUIET;
+            return None;
+        }
+        match prompt_answer(bytes) {
+            Some((yes, true)) => {
+                self.enter_seen = true;
+                Some(yes)
+            }
+            Some((yes, false)) => {
+                self.candidate = Some((yes, now + PROMPT_QUIET));
+                None
+            }
+            None => {
+                self.armed_at = now + PROMPT_QUIET;
+                None
+            }
+        }
+    }
 }
 
 /// The queues to a link's two writer tasks. Control and data have a writer each: a `send` blocked
@@ -463,6 +548,8 @@ pub(crate) struct Core<I, O> {
     buf: OfflineBuffer,
     log: Option<LogSink>,
     confirm: Option<Confirm>,
+    /// An answer was just given without its Enter: a lone Enter before this is swallowed.
+    swallow_enter: Option<Instant>,
     /// The confirmation is due but could not be drawn yet; nothing is sent until it is shown
     /// and answered.
     confirm_pending: Option<u64>,
@@ -525,6 +612,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             buf,
             log,
             confirm: None,
+            swallow_enter: None,
             confirm_pending: None,
             prompt: None,
             prompt_plain: false,
@@ -1732,16 +1820,23 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn on_keys(&mut self, bytes: &[u8]) -> Result<Ev, ClientError> {
+        // The Enter that ends "y, Enter" is not the session's: it would run whatever the other
+        // client left half-typed on the shell's line.
+        if let Some(until) = self.swallow_enter.take()
+            && Instant::now() < until
+            && matches!(bytes, [b'\r'] | [b'\n'])
+        {
+            return Ok(Ev::Continue);
+        }
         // A confirmation that output has since let the overlay draw is entered now, so the key
         // that answers it is read as an answer and not as typing.
         if self.confirm_pending.is_some() {
             self.refresh_display()?;
         }
-        if self.confirm.is_some() {
-            let rest = self.confirm_keys(bytes);
-            if !rest.is_empty() {
-                // What followed the answer in the same read is ordinary typing.
-                return self.on_keys(&rest);
+        if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm {
+            if let Some(yes) = answer.input(bytes) {
+                let enter_seen = answer.enter_seen;
+                self.confirmed(yes, enter_seen);
             }
             self.refresh_display()?;
             self.pump_input();
@@ -1792,24 +1887,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    /// Reads the answer to the confirmation; returns what followed it in the same read.
-    fn confirm_keys(&mut self, bytes: &[u8]) -> Vec<u8> {
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'y' | b'Y' => {
-                    self.confirm = None;
-                    self.release_offline();
-                    return bytes[i + 1..].to_vec();
-                }
-                b'n' | b'N' | 0x1b | 0x03 | b'q' => {
-                    self.confirm = None;
-                    self.buf.reset();
-                    return bytes[i + 1..].to_vec();
-                }
-                _ => {}
-            }
+    /// The user answered the confirmation of offline input: send it, or forget it.
+    fn confirmed(&mut self, yes: bool, enter_seen: bool) {
+        self.confirm = None;
+        if yes {
+            self.release_offline();
+        } else {
+            self.buf.reset();
         }
-        Vec::new()
+        if !enter_seen {
+            self.swallow_enter = Some(Instant::now() + ANSWER_ENTER_WINDOW);
+        }
     }
 
     // ---- prompts after a refusal -------------------------------------------------------
@@ -1858,18 +1946,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(text.as_bytes())?;
             self.prompt_plain = true;
         }
-        // Typing that was still going on when the question appeared answers nothing: what is
-        // already queued is read and dropped, and so is anything that follows until the user has
-        // paused for `PROMPT_QUIET`. (A `y` in `python` is not a decision.)
-        let mut armed_at = Instant::now() + PROMPT_QUIET;
+        let mut keys = Answer::new();
         let answer = loop {
             let wake = self.next_wake();
             tokio::select! {
                 ev = self.input.next() => match ev {
                     TermEvent::Input(bytes) => {
-                        if Instant::now() < armed_at {
-                            armed_at = Instant::now() + PROMPT_QUIET;
-                        } else if let Some(yes) = prompt_answer(&bytes) {
+                        if let Some(yes) = keys.input(&bytes) {
                             break if yes { Ok(()) } else { Err(no) };
                         }
                     }
@@ -1877,9 +1960,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     TermEvent::Signal(n) => break Err(Outcome::Signalled(n)),
                     TermEvent::Eof => break Err(Outcome::InputClosed),
                 },
+                () = at(keys.deadline()) => {
+                    if let Some(yes) = keys.tick() {
+                        break if yes { Ok(()) } else { Err(no) };
+                    }
+                }
                 _ = at(wake) => self.on_tick()?,
             }
         };
+        if answer.is_ok() && !keys.enter_seen {
+            self.swallow_enter = Some(Instant::now() + ANSWER_ENTER_WINDOW);
+        }
         self.prompt = None;
         if !self.prompt_plain {
             self.show_lines(Vec::new())?;
@@ -1993,12 +2084,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let lines = self.confirm_text(secs);
             if self.show_or_open(lines, false)? {
                 self.confirm_pending = None;
-                self.confirm = Some(Confirm::Typed { secs });
+                self.confirm = Some(Confirm::Typed {
+                    secs,
+                    answer: Answer::new(),
+                });
             }
             return Ok(());
         }
         let mut lines = Vec::new();
-        if let Some(Confirm::Typed { secs }) = &self.confirm {
+        if let Some(Confirm::Typed { secs, .. }) = &self.confirm {
             lines = self.confirm_text(*secs);
         } else if let (false, Some(since)) = (self.link_ok, self.disconnected_since) {
             let secs = since.elapsed().as_secs();
@@ -2037,6 +2131,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         min(self.ack_due);
         min(self.notice_until);
         min(self.sess.exited.map(|e| e.2));
+        if let Some(Confirm::Typed { answer, .. }) = &self.confirm {
+            min(answer.deadline());
+        }
         if self.display.is_some()
             && ((!self.link_ok && self.disconnected_since.is_some())
                 || self.confirm_pending.is_some())
@@ -2058,6 +2155,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     upto,
                 });
             }
+        }
+        if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm
+            && let Some(yes) = answer.tick()
+        {
+            let enter_seen = answer.enter_seen;
+            self.confirmed(yes, enter_seen);
+            self.pump_input();
         }
         self.refresh_display()
     }
@@ -2141,19 +2245,19 @@ fn term_size(s: (u16, u16)) -> TermSize {
     TermSize::clamped(s.0, s.1)
 }
 
-/// The answer a chunk of typed bytes gives to a yes/no question: only a chunk that is exactly the
-/// key (optionally with the Enter after it). A `y` somewhere in a word that was still being typed
-/// when the question appeared (`python`, `yes`), or an escape sequence that starts with ESC, is
-/// not an answer. Taking a session back is a decision, and a stray key must not make it.
-fn prompt_answer(bytes: &[u8]) -> Option<bool> {
-    let key = match bytes {
-        [k, b'\r' | b'\n'] => *k,
-        [k] => *k,
+/// What a chunk of typed bytes says to a yes/no question: `(yes, with_enter)`. Only a chunk that
+/// is exactly the key counts, optionally with the Enter after it. A `y` somewhere in a word
+/// (`python`, `yes`), or an escape sequence that starts with ESC (an arrow key), is not an
+/// answer. Taking a session back is a decision, and a stray key must not make it.
+fn prompt_answer(bytes: &[u8]) -> Option<(bool, bool)> {
+    let (key, enter) = match bytes {
+        [k, b'\r' | b'\n'] => (*k, true),
+        [k] => (*k, false),
         _ => return None,
     };
     match key {
-        b'y' | b'Y' => Some(true),
-        b'n' | b'N' | b'q' | 0x1b | 0x03 => Some(false),
+        b'y' | b'Y' => Some((true, enter)),
+        b'n' | b'N' | b'q' | 0x1b | 0x03 => Some((false, enter)),
         _ => None,
     }
 }

@@ -195,7 +195,7 @@ pub enum ClientError {
     )]
     BadResume(String),
     #[error(
-        "the daemon could not start session \"{0}\"; the reason is in its log on that host (~/.local/state/fil/daemon.log)"
+        "the daemon could not start session \"{0}\"; the reason is in the fil daemon log on the remote host (daemon.log under $XDG_STATE_HOME/fil, default ~/.local/state/fil)"
     )]
     SessionStartFailed(String),
     #[error("protocol error: {0}")]

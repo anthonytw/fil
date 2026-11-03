@@ -711,6 +711,7 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.sent = at;
         st.snapshots += 1;
         let info = SnapshotInfo {
@@ -760,6 +761,7 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,
@@ -854,6 +856,7 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,

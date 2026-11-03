@@ -1006,7 +1006,11 @@ impl Out {
         self.set_pen(r.attrs);
         let t = sanitize(&r.text);
         self.put(if t.is_empty() { " " } else { &t });
-        if t.is_empty() || unicode_width::UnicodeWidthStr::width(&*t) == 1 {
+        // Only a printable ASCII cell is trusted to have moved the cursor by exactly one column.
+        // Anything else may be wider or narrower on the user's terminal than `unicode-width` says
+        // (ambiguous-width characters on a CJK-configured terminal), and a run built on that
+        // guess would shift every cell after it: it gets a cursor move of its own after it.
+        if t.is_empty() || (t.len() == 1 && (t.as_bytes()[0].is_ascii_graphic() || t == " ")) {
             self.wrote_one_cell();
         } else {
             self.at = None;
@@ -1025,8 +1029,13 @@ impl Out {
         self.set_pen(a);
         let mut b = [0u8; 4];
         self.put(s.ch.encode_utf8(&mut b));
-        // `predictable` and the status text are single-width.
-        self.wrote_one_cell();
+        // `predictable` also admits Latin letters beyond ASCII; only ASCII is trusted to be one
+        // column on every terminal (see `restore`).
+        if s.ch.is_ascii_graphic() || s.ch == ' ' {
+            self.wrote_one_cell();
+        } else {
+            self.at = None;
+        }
     }
 
     /// Ends a paint or erase: cursor to `target`, pen, hyperlink and visibility as the

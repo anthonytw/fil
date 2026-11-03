@@ -13,6 +13,23 @@ use common::*;
 use fil_transport::LinkKind;
 
 #[tokio::test(start_paused = true)]
+async fn a_catch_up_jump_owes_nothing_for_what_it_skipped() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..5)).await;
+    settle().await;
+    // The daemon jumps ahead with a snapshot: its flow restarts at the jump (`Flow::jump`), and
+    // so does the client's, so neither side waits for an ack of the skipped bytes.
+    rig.daemon.catch_up(&lines(5..30)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(rig.daemon.violations().await.is_empty());
+    assert_eq!(rig.daemon.unacked().await, 0);
+    let mut all = lines(0..5);
+    all.extend(lines(5..30));
+    assert_eq!(rig.term.state(), reference(&all));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_swap_whose_old_link_ran_ahead_is_acknowledged_in_full() {
     let rig = start(config());
     rig.attached().await;

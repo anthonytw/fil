@@ -116,6 +116,9 @@ async fn a_session_the_daemon_could_not_start_says_where_to_look() {
     );
     let text = err.to_string();
     assert!(text.contains("could not start"), "{text}");
-    assert!(text.contains("daemon.log"), "{text}");
+    assert!(
+        text.contains("daemon.log") && text.contains("XDG_STATE_HOME"),
+        "{text}"
+    );
     assert!(!text.contains("protocol"), "{text}");
 }

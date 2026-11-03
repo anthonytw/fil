@@ -307,9 +307,11 @@ impl Rig {
 
     /// Answers a yes/no question the client has put on the screen: after the pause a person
     /// who has read it takes (a question ignores the keyboard until the typing has stopped).
+    /// The key is a candidate until the typing has stayed quiet for 300 ms, which this waits out.
     pub async fn answer(&self, s: &str) {
         tokio::time::sleep(Duration::from_millis(400)).await;
         self.type_str(s);
+        tokio::time::sleep(Duration::from_millis(350)).await;
     }
 }
 

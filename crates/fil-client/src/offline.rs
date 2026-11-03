@@ -8,6 +8,7 @@
 //!   refuses an existing file that other users can read or write. A command sink pipes the bytes
 //!   to the command's stdin; the command decides where they end up.
 
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -193,86 +194,117 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// fil next opens it.
 const LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-fn rotated(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".1");
-    PathBuf::from(name)
+/// The directory a file log lives in, opened once. The directory is checked through that
+/// descriptor, and every later operation on the log (open, rotate, expire) is relative to it
+/// (`openat` and friends), so the check and the use see the same directory even if a component
+/// of the path is swapped meanwhile.
+struct LogDir {
+    dir: std::fs::File,
+    name: OsString,
 }
 
-/// The directory the log lives in must not let other users replace or delete the file: owned by
-/// you (or root), and not writable by group or others unless sticky (`/tmp`).
-fn check_dir(path: &Path) -> Result<(), String> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    let md = std::fs::metadata(dir).map_err(|e| format!("its directory {}: {e}", dir.display()))?;
-    let me = rustix::process::geteuid().as_raw();
-    if md.uid() != me && md.uid() != 0 {
-        return Err(format!("its directory {} is not yours", dir.display()));
-    }
-    if md.mode() & 0o022 != 0 && md.mode() & 0o1000 == 0 {
-        return Err(format!(
-            "its directory {} (mode {:o}) lets other users replace files in it; the log can hold passwords (chmod go-w it)",
-            dir.display(),
-            md.mode() & 0o7777
-        ));
-    }
-    Ok(())
-}
-
-/// Deletes the log and its rotated twin if they have not been written to for [`LOG_MAX_AGE`].
-fn expire(path: &Path, now: std::time::SystemTime) {
-    for p in [path.to_path_buf(), rotated(path)] {
-        let Ok(md) = std::fs::symlink_metadata(&p) else {
-            continue;
+impl LogDir {
+    /// Opens the directory of `path` and checks that other users cannot replace or delete the
+    /// file in it: owned by you (or root), and not writable by group or others unless sticky
+    /// (`/tmp`).
+    fn open(path: &Path) -> Result<LogDir, String> {
+        let parent = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
         };
-        let old = md
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age > LOG_MAX_AGE);
-        if md.is_file() && old {
-            let _ = std::fs::remove_file(&p);
+        let name = path
+            .file_name()
+            .ok_or_else(|| "no file name".to_string())?
+            .to_owned();
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC).bits() as i32,
+            )
+            .open(parent)
+            .map_err(|e| format!("its directory {}: {e}", parent.display()))?;
+        let md = dir
+            .metadata()
+            .map_err(|e| format!("its directory {}: {e}", parent.display()))?;
+        let me = rustix::process::geteuid().as_raw();
+        if md.uid() != me && md.uid() != 0 {
+            return Err(format!("its directory {} is not yours", parent.display()));
+        }
+        if md.mode() & 0o022 != 0 && md.mode() & 0o1000 == 0 {
+            return Err(format!(
+                "its directory {} (mode {:o}) lets other users replace files in it; the log can hold passwords (chmod go-w it)",
+                parent.display(),
+                md.mode() & 0o7777
+            ));
+        }
+        Ok(LogDir { dir, name })
+    }
+
+    fn rotated_name(&self) -> OsString {
+        let mut n = self.name.clone();
+        n.push(".1");
+        n
+    }
+
+    /// Deletes the log and its rotated twin if they have not been written to for
+    /// [`LOG_MAX_AGE`]. Only regular files, and never through a symlink.
+    fn expire(&self, now: std::time::SystemTime) {
+        use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+        let now = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for name in [self.name.clone(), self.rotated_name()] {
+            let Ok(st) = statat(&self.dir, &name, AtFlags::SYMLINK_NOFOLLOW) else {
+                continue;
+            };
+            let age = u64::try_from(now as i64 - st.st_mtime).unwrap_or(0);
+            if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+                && age > LOG_MAX_AGE.as_secs()
+            {
+                let _ = unlinkat(&self.dir, &name, AtFlags::empty());
+            }
         }
     }
-}
 
-/// Opens (creating, mode 0600) and checks the log file; returns it with its current size.
-fn open_file(path: &Path) -> Result<(std::fs::File, u64), String> {
-    // Never follow a symlink at the path (another local user could plant one at a predictable
-    // location such as /tmp to have our keystrokes appended to one of our own files), and check
-    // what was actually opened.
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    let md = f.metadata().map_err(|e| e.to_string())?;
-    if !md.is_file() {
-        return Err("not a regular file".into());
+    /// Opens (creating, mode 0600) and checks the log file; returns it with its current size.
+    fn open_file(&self) -> Result<(std::fs::File, u64), String> {
+        use rustix::fs::{Mode, OFlags, openat};
+        // Never follow a symlink at the name (another local user could plant one at a
+        // predictable location such as /tmp to have our keystrokes appended to one of our own
+        // files), and check what was actually opened.
+        let fd = openat(
+            &self.dir,
+            &self.name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|e| std::io::Error::from(e).to_string())?;
+        let f = std::fs::File::from(fd);
+        let md = f.metadata().map_err(|e| e.to_string())?;
+        if !md.is_file() {
+            return Err("not a regular file".into());
+        }
+        if md.uid() != rustix::process::geteuid().as_raw() {
+            return Err("not owned by you".into());
+        }
+        if md.nlink() != 1 {
+            return Err("has more than one hard link".into());
+        }
+        if md.mode() & 0o077 != 0 {
+            return Err(format!(
+                "mode {:o} lets other users read it; it can hold passwords (chmod 600 it)",
+                md.mode() & 0o777
+            ));
+        }
+        Ok((f, md.len()))
     }
-    if md.uid() != rustix::process::geteuid().as_raw() {
-        return Err("not owned by you".into());
-    }
-    if md.nlink() != 1 {
-        return Err("has more than one hard link".into());
-    }
-    if md.mode() & 0o077 != 0 {
-        return Err(format!(
-            "mode {:o} lets other users read it; it can hold passwords (chmod 600 it)",
-            md.mode() & 0o777
-        ));
-    }
-    Ok((f, md.len()))
-}
 
-/// Moves the full log to `<path>.1` and starts a new one.
-fn rotate(path: &Path) -> Result<(std::fs::File, u64), String> {
-    std::fs::rename(path, rotated(path)).map_err(|e| e.to_string())?;
-    open_file(path)
+    /// Moves the full log to `<name>.1` and starts a new one.
+    fn rotate(&self) -> Result<(std::fs::File, u64), String> {
+        rustix::fs::renameat(&self.dir, &self.name, &self.dir, self.rotated_name())
+            .map_err(|e| std::io::Error::from(e).to_string())?;
+        self.open_file()
+    }
 }
 
 impl LogSink {
@@ -286,18 +318,17 @@ impl LogSink {
                     path: p.clone(),
                     why,
                 };
-                check_dir(path).map_err(err)?;
-                expire(path, std::time::SystemTime::now());
-                let (mut f, mut written) = open_file(path).map_err(err)?;
+                let dir = LogDir::open(path).map_err(err)?;
+                dir.expire(std::time::SystemTime::now());
+                let (mut f, mut written) = dir.open_file().map_err(err)?;
                 if written >= LOG_MAX_BYTES {
-                    (f, written) = rotate(path).map_err(err)?;
+                    (f, written) = dir.rotate().map_err(err)?;
                 }
-                let path = path.clone();
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
                 std::thread::spawn(move || {
                     while let Some(b) = rx.blocking_recv() {
                         if written + b.len() as u64 > LOG_MAX_BYTES {
-                            match rotate(&path) {
+                            match dir.rotate() {
                                 Ok(next) => (f, written) = next,
                                 Err(why) => {
                                     tracing::warn!(
@@ -423,18 +454,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("dir");
         let path = dir.join("log");
-        assert!(check_dir(&path).is_ok());
+        assert!(LogDir::open(&path).is_ok());
         let set = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
         set(0o777);
-        let why = check_dir(&path).unwrap_err();
+        let why = LogDir::open(&path).err().unwrap();
         assert!(why.contains("replace files"), "{why}");
         set(0o770);
-        assert!(check_dir(&path).is_err(), "group-writable");
+        assert!(LogDir::open(&path).is_err(), "group-writable");
         // A sticky directory (like /tmp) only lets owners remove their own files.
         set(0o1777);
-        assert!(check_dir(&path).is_ok());
+        assert!(LogDir::open(&path).is_ok());
         set(0o700);
-        assert!(check_dir(&dir.join("missing/log")).is_err());
+        assert!(LogDir::open(&dir.join("missing/log")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -443,7 +474,8 @@ mod tests {
         let dir = scratch("age");
         let path = dir.join("log");
         std::fs::write(&path, b"old secrets").unwrap();
-        std::fs::write(rotated(&path), b"older secrets").unwrap();
+        let twin = dir.join("log.1");
+        std::fs::write(&twin, b"older secrets").unwrap();
         let week = Duration::from_secs(7 * 24 * 3600);
         let now = std::time::SystemTime::now();
         std::fs::File::options()
@@ -454,14 +486,15 @@ mod tests {
             .unwrap();
         std::fs::File::options()
             .write(true)
-            .open(rotated(&path))
+            .open(&twin)
             .unwrap()
             .set_modified(now - 5 * week)
             .unwrap();
-        expire(&path, now);
+        let log_dir = LogDir::open(&path).unwrap();
+        log_dir.expire(now);
         assert!(path.exists(), "a week-old log stays");
-        assert!(!rotated(&path).exists(), "five weeks old goes");
-        expire(&path, now + 4 * week);
+        assert!(!twin.exists(), "five weeks old goes");
+        log_dir.expire(now + 4 * week);
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -490,7 +523,7 @@ mod tests {
         }
         let (a, b) = (
             std::fs::metadata(&path).unwrap(),
-            std::fs::metadata(rotated(&path)).unwrap(),
+            std::fs::metadata(dir.join("log.1")).unwrap(),
         );
         assert!(a.len() <= LOG_MAX_BYTES && b.len() <= LOG_MAX_BYTES);
         assert!(b.len() > 0, "the full log moved aside");

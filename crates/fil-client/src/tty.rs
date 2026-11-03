@@ -11,9 +11,16 @@
 //!   with no timeout, on the terminal (while raw mode is on) and on a self-pipe that raw-mode
 //!   changes and shutdown write to: an idle client makes no wakeups for it.
 //! - **Output** is written with blocking writes, in a loop that handles partial writes and
-//!   `EINTR`/`EAGAIN`. A write that may wait (a large one, or a full terminal) runs inside
-//!   `block_in_place` on the multi-threaded runtime, so a slow terminal does not stall a runtime
-//!   worker.
+//!   `EINTR`/`EAGAIN`. The client loop runs on the main thread (`block_on`), so a terminal that
+//!   cannot keep up applies backpressure to that loop, by design: the loop stops reading the
+//!   link, stops acknowledging output the terminal has not taken, and the daemon's catch-up rule
+//!   (DESIGN.md section 6.2) skips a slow client ahead with a snapshot instead of buffering
+//!   without bound. Liveness does not wait on the loop: the links' heartbeats and watchdogs run
+//!   on the runtime's worker threads. What does wait is the user's own input, resizes and
+//!   signals, which are read by the same loop; against a terminal that has stopped for good (XOFF,
+//!   a hung emulator) the way out is the terminal's, not ours. If that ever matters, the fix is a
+//!   dedicated writer thread with a bounded queue, not `block_in_place` (which has no worker to
+//!   hand off from the main thread).
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -21,8 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use rustix::event::{PollFd, PollFlags, poll};
-use rustix::fs::{OFlags, fcntl_setfl};
-use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::io::Errno;
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -104,13 +110,28 @@ impl Shared {
 }
 
 /// A pipe whose two ends never block and do not leak into children.
+///
+/// Where the OS has `pipe2` (Linux, the BSDs) both flags are set atomically, so a child spawned
+/// by another thread at the same moment cannot inherit it. macOS has no `pipe2`: there the flags
+/// are set right after `pipe()`, and a `fork`+`exec` on another thread between the two calls
+/// could inherit the two ends. That child would only hold a pipe open (it never writes to
+/// it, and the reader thread never sees EOF on it), so the window is harmless; it is closed as
+/// far as the platform allows by setting the flags before anything else is done with the fds.
 fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let (rx, tx) = rustix::pipe::pipe().map_err(errno)?;
-    for fd in [&rx, &tx] {
-        fcntl_setfd(fd, FdFlags::CLOEXEC).map_err(errno)?;
-        fcntl_setfl(fd, OFlags::NONBLOCK).map_err(errno)?;
+    #[cfg(not(any(target_vendor = "apple", target_os = "haiku", target_os = "aix")))]
+    {
+        use rustix::pipe::{PipeFlags, pipe_with};
+        pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map_err(errno)
     }
-    Ok((rx, tx))
+    #[cfg(any(target_vendor = "apple", target_os = "haiku", target_os = "aix"))]
+    {
+        let (rx, tx) = rustix::pipe::pipe().map_err(errno)?;
+        for fd in [&rx, &tx] {
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).map_err(errno)?;
+            rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(errno)?;
+        }
+        Ok((rx, tx))
+    }
 }
 
 /// The output half of a real terminal.
@@ -281,20 +302,6 @@ impl TermInput for TtyInput {
     }
 }
 
-/// Writes this much or less run on the calling thread; a bigger write may take a while.
-const BLOCKING_WRITE: usize = 16 * 1024;
-
-/// Runs `f`, which may block, without holding up the runtime's other tasks: on the multi-threaded
-/// runtime the worker hands its queue to another thread first. Elsewhere it just runs.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
-}
-
 /// Writes all of `bytes`, handling partial writes, `EINTR` and `EAGAIN`.
 fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
@@ -303,11 +310,9 @@ fn write_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
             Ok(n) => bytes = &bytes[n..],
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
-                // The terminal is full: wait for room, off the worker.
-                blocking(|| {
-                    let mut fds = [PollFd::new(fd, PollFlags::OUT)];
-                    let _ = poll(&mut fds, None);
-                });
+                // The terminal is full: wait for room (backpressure, see the module docs).
+                let mut fds = [PollFd::new(fd, PollFlags::OUT)];
+                let _ = poll(&mut fds, None);
             }
             Err(e) => return Err(errno(e)),
         }
@@ -321,10 +326,6 @@ impl TermOutput for TtyOutput {
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // A big write can wait for a slow terminal; keep it off the runtime's worker.
-        if bytes.len() > BLOCKING_WRITE {
-            return blocking(|| write_fd(&self.fd, bytes));
-        }
         write_fd(&self.fd, bytes)
     }
 

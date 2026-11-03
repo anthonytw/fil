@@ -1448,8 +1448,6 @@ pub(crate) fn human_bytes(n: u64) -> String {
 mod tests {
     use super::*;
 
-    /// Many small reads are one wake-up and one batch (efficiency #1): the core is told once
-    /// while output is waiting, and takes it all, in order, in one go.
     /// A whole new segment is passed on as it is; the new tail of an overlapping one is a copy of
     /// its own, so it does not keep the rest of the frame alive.
     #[test]
@@ -1469,6 +1467,8 @@ mod tests {
         assert!(fresh_input(&data, &data[data.len()..]).is_empty());
     }
 
+    /// Many small reads are one wake-up and one batch (efficiency #1): the core is told once
+    /// while output is waiting, and takes it all, in order, in one go.
     #[test]
     fn small_reads_are_one_wakeup_and_one_batch() {
         let (tx, mut rx) = mpsc::channel(8);

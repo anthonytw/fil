@@ -129,6 +129,10 @@ impl Chunks {
     pub fn copy_to(&mut self, out: &mut [u8]) -> usize {
         let n = out.len().min(self.held.len());
         self.held.copy_to_slice(&mut out[..n]);
+        if self.held.is_empty() {
+            // An empty view still holds quinn's buffer; the reader may now wait on the stream.
+            self.held = Bytes::new();
+        }
         n
     }
 

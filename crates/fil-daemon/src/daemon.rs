@@ -939,15 +939,12 @@ where
             track_late(Box::pin(async move {
                 match task.await {
                     Ok(Ok(late)) => {
+                        tracing::debug!(session = %late.name(), "late session");
                         tracing::warn!(
-                            session = %late.name(),
                             "a session finished starting after the attach gave up; killing it"
                         );
                         if late.kill(KILL_TIMEOUT).await.is_none() {
-                            tracing::warn!(
-                                session = %late.name(),
-                                "the late session did not end within {KILL_TIMEOUT:?}"
-                            );
+                            tracing::warn!("the late session did not end within {KILL_TIMEOUT:?}");
                         }
                     }
                     Ok(Err(e)) => {

@@ -368,13 +368,27 @@ pub struct End {
     probes: mpsc::UnboundedSender<Bytes>,
     pub probes_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
     events: Option<JoinHandle<()>>,
+    /// The endpoint's events, when the test drains them itself ([`End::new_with`]).
+    pub events_rx: Option<mpsc::Receiver<fil_forward::EndpointEvent>>,
 }
 
 impl End {
     pub fn new(side: Side, cfg: MuxConfig) -> Self {
+        Self::new_with(side, cfg, false)
+    }
+
+    /// `hold_events`: the test takes the event receiver (`events_rx`) and drains it itself.
+    pub fn new_with(side: Side, cfg: MuxConfig, hold_events: bool) -> Self {
         let targets = Arc::new(Targets::default());
         let policy = Arc::new(TestPolicy::default());
-        let (ep, mut events) = Endpoint::new(side, cfg, targets.clone(), policy.clone());
+        let (ep, events) = Endpoint::new(side, cfg, targets.clone(), policy.clone());
+        let (events, events_rx) = if hold_events {
+            let (_, dummy) = mpsc::channel(1);
+            (dummy, Some(events))
+        } else {
+            (events, None)
+        };
+        let mut events = events;
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errs = errors.clone();
         let link_failed = Arc::new(AtomicUsize::new(0));
@@ -405,6 +419,7 @@ impl End {
             probes,
             probes_rx: Some(probes_rx),
             events: Some(events),
+            events_rx,
         }
     }
 
@@ -546,11 +561,16 @@ pub fn open_fds() -> usize {
 
 impl World {
     pub async fn new(t: Transport, cfg: MuxConfig) -> Self {
+        Self::new_with(t, cfg, false).await
+    }
+
+    /// `hold_client_events`: the client's events are left for the test (`client.events_rx`).
+    pub async fn new_with(t: Transport, cfg: MuxConfig, hold_client_events: bool) -> Self {
         raise_fd_limit();
         let mut w = Self {
             t,
             factory: Factory::new(),
-            client: End::new(Side::Client, cfg.clone()),
+            client: End::new_with(Side::Client, cfg.clone(), hold_client_events),
             daemon: End::new(Side::Daemon, cfg),
             link: None,
         };

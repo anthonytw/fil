@@ -72,9 +72,10 @@ mux-soak seeds="5000":
 # The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
 # forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
 # tests at 8 MiB and 2,000 (and 300 concurrent off QUIC). Release build. Also runs the SOCKS fuzz
-# table and the new-epoch race with more seeds and runs.
+# table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
+# tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports.
 forward-soak mib="256" seq="20000":
-    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture
+    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:

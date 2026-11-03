@@ -20,6 +20,7 @@ It is a manual check, like the rest of `linux-check`. It is never part of `just 
 | `quic-echo server` | the daemon's endpoint: binds a port in a range, echoes streams, logs every handshake and every path change | `DaemonIdentity`, `KeyRegistry`, `auth::server_config`, `peer_key` |
 | `quic-echo client` | the client: pins the fingerprint, presents a per-attach key, measures stalls, reconnects with a fresh handshake | `ClientKey`, `auth::client_config` |
 | `quic-echo udp-send`, `udp-recv` | nothing: a numbered-datagram probe that measures whether a path reorders | |
+| `quiclink-probe server` / `client` | the same two roles, built on the real `QuicListener` and `QuicLink` (P2): Retry, rate limits, the accept proof, `Degraded`, `Down(Dead)`, `path_generation` | `fil_transport::quic` |
 
 `pipe-echo` takes no arguments on purpose. The harness runs it as the fixed remote command, as `fil server --stdio` will be run.
 
@@ -143,6 +144,9 @@ Notes on the ssh results:
 | `s_ip_change` | add a second client address and route, switch the default route, take the first link down | pass: one handshake, the server learned the new public address after 77 ms, longest stall 180 ms |
 | `s_blackouts` | UDP dropped at the router for N seconds (table below) | pass |
 | `s_udp_blocked` | UDP dropped: how long until the client knows | pass: see below |
+| `s_quiclink_rebind` | `s_nat_rebind` through `QuicLink`: three NAT moves during a 16 s stream at 512 KiB/s | pass: see [QuicLink](#quiclink-through-the-same-faults) |
+| `s_quiclink_udp_blocked` | UDP blocked from the start, and blocked mid-session for good | pass: see below |
+| `s_quiclink_blackouts` | 3 s, 4.5 s and 8 s blackouts with the probe reconnecting as the path manager would | pass: see below |
 
 **Impairments** (2 MiB echo, 40 ms one way, `LivenessParams` defaults). Seconds. The simulator column is `docs/spikes/netsim.md`.
 
@@ -180,6 +184,21 @@ Notes on the ssh results:
 | blocked from the start, idle timeout 5 s | the connect attempt fails at **5.0 s** |
 | blocked from the start, idle timeout 15 s | it fails at **15.0 s** |
 | blocked in the middle of a session, never lifted | the connection ends **5.03 s** after the last packet, reason `TimedOut` |
+
+### QuicLink through the same faults
+
+P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink-probe` through the same topology. One run of the udp suite on a GitHub runner (linked in the pull request); all three scenarios passed, and the second run repeated the numbers within noise.
+
+| Scenario | Result |
+|---|---|
+| `s_quiclink_rebind` | one accepted link, echo intact, never lost. The daemon's link counted **3 path changes** (`path_generation` 3), the last one to the third public address, and never left `Up`. The client's own `path_generation` stayed 0: a client cannot see its NAT rebind. The listener's first packet from the client got a Retry |
+| `s_quiclink_udp_blocked`, blocked from the start | `Refused` after **2000 ms**, the connect timeout, against 5 s and 15 s (the idle timeout) for raw quinn in `s_udp_blocked`. The daemon never accepted anything |
+| `s_quiclink_udp_blocked`, blocked mid-session, never lifted | `Degraded` after **2.0 to 2.1 s**, `Down(Dead)` after **5.07 s** |
+| `s_quiclink_blackouts` 3 s | survived: `Degraded`, then `Up` again, one link, echo intact |
+| `s_quiclink_blackouts` 4.5 s | **lost** (`Down(Dead)` 5.07 s after the block began, as in `s_blackouts`: an unprompted link does not survive 4.5 s); the probe's fresh handshake with the same key was up **670 ms** after the network came back (the redial loop in the probe waits 200 ms between tries, and the path manager redials at once) |
+| `s_quiclink_blackouts` 8 s | lost at 5.07 s; fresh handshake **275 ms** after the network returned |
+
+The quic-echo blackout result stands: a link that is quiet when the network comes back is lost at the idle timeout whether the blackout lasted 4.5 s or 8 s. What changes is what the layer above sees: the link says so (`Down(Dead)`) 5 s after the last datagram, never later, and the redial takes about 0.3 to 0.7 s, so the worst case for a blackout of N seconds is about max(N, 5) + 0.7 s.
 
 ## Real versus simulator
 

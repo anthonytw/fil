@@ -388,6 +388,7 @@ dependencies = [
  "bytes",
  "fil-netsim",
  "fil-proto",
+ "fil-transport",
  "quinn",
  "rcgen",
  "ring",

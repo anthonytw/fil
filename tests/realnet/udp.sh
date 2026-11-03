@@ -18,6 +18,7 @@ PUB1=198.51.100.1 # the client's public address on link 1
 PUB2=198.51.100.2 # ... on link 2
 PUB3=198.51.100.3 # a third address, for NAT pool changes
 QUIC=$BIN_DIR/quic-echo
+QL=$BIN_DIR/quiclink-probe
 MIB=$((1 << 20))
 PROBE_PORT=62000
 
@@ -195,6 +196,45 @@ bg_client() { # bg_client NAME ARGS...: sets CLIENT_PID, CLIENT_OUT
 }
 
 handshakes() { count_lines "$SRV_LOG" CONNECTED; }
+
+# ---------------------------------------------------------------------------------------------
+# The same, for quiclink-probe: the real QuicLink and QuicListener (fil-transport::quic)
+
+# shellcheck disable=SC2120 # callers may pass extra server arguments
+# ql_start_server [EXTRA_ARGS...]: sets SRV_PID, SRV_LOG, PORT. Uses D.
+ql_start_server() {
+  SRV_LOG=$D/server.log
+  rm -f "$D/port" "$D/fp"
+  nsx "$NS_S" "$QL" server --keys-dir "$D/keys" --fp-out "$D/fp" --port-out "$D/port" "$@" \
+    > "$SRV_LOG" 2>&1 &
+  SRV_PID=$!
+  local i
+  for ((i = 0; i < 100; i++)); do
+    [[ -s $D/port ]] && break
+    sleep 0.1
+  done
+  [[ -s $D/port ]] || fail "the server did not start: $(cat "$SRV_LOG")"
+  PORT=$(cat "$D/port")
+}
+
+ql_run_client() { # ql_run_client NAME ARGS...: foreground; output in $D/NAME.out
+  local name=$1
+  shift
+  CLIENT_OUT=$D/$name.out
+  nsx "$NS_C" timeout 200 "$QL" client --server "$SRV_IP:$PORT" --pub-out "$D/keys/$name.pub" \
+    --pin-file "$D/fp" "$@" > "$CLIENT_OUT" 2>&1
+}
+
+ql_bg_client() { # ql_bg_client NAME ARGS...: sets CLIENT_PID, CLIENT_OUT
+  local name=$1
+  shift
+  CLIENT_OUT=$D/$name.out
+  nsx "$NS_C" timeout 200 "$QL" client --server "$SRV_IP:$PORT" --pub-out "$D/keys/$name.pub" \
+    --pin-file "$D/fp" "$@" > "$CLIENT_OUT" 2>&1 &
+  CLIENT_PID=$!
+}
+
+ql_accepts() { count_lines "$SRV_LOG" ACCEPTED; }
 
 # ---------------------------------------------------------------------------------------------
 # Scenarios
@@ -506,9 +546,139 @@ s_udp_blocked() {
   stop_server
 }
 
+# ---------------------------------------------------------------------------------------------
+# QuicLink scenarios (P2): the same faults, through the real link and listener. The link must
+# stay Up through NAT changes, report Degraded then Down(Dead) on a black hole, and refuse in
+# connect_timeout (2 s) rather than the idle timeout when UDP never works.
+
+s_quiclink_rebind() {
+  reset_net
+  netem_apply delay 20ms
+  new_run qlrebind
+  ql_start_server
+  ql_bg_client c --duration 16 --rate 524288
+  wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect: $(cat "$CLIENT_OUT")"
+  local spec
+  for spec in "$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999"; do
+    sleep 3.5
+    nsx "$NS_R" iptables -t nat -R POSTROUTING 1 -o rs -p udp -s 10.0.1.0/24 -j SNAT --to-source "$spec" --random
+    nsx "$NS_R" conntrack -F > /dev/null 2>&1 || true
+    log "NAT mapping moved to $spec"
+  done
+  wait_exit "$CLIENT_PID" 40
+  cat "$CLIENT_OUT"
+  local line gens
+  line=$(last_line "$CLIENT_OUT" RESULT)
+  assert "the client finished (rc=$WAIT_RC)" test "$WAIT_RC" -eq 0
+  assert "echo intact" test "$(kv "$line" sent)" = "$(kv "$line" recvd)"
+  assert "the link was never lost" test "$(kv "$line" conn_lost)" = false
+  assert "exactly one handshake (one accepted link)" test "$(ql_accepts)" -eq 1
+  assert "the listener answered the first packet with a Retry" grep -q '^ACCEPTED n=1 .* retried=1 ' "$SRV_LOG"
+  gens=$(count_lines "$SRV_LOG" PATH-GEN)
+  assert_num "the daemon's link counted the path changes (path_generation bumps)" "$gens" -ge 3
+  assert "the last change was to the third public address" grep -q "^PATH-GEN .* remote=$PUB3:3" "$SRV_LOG"
+  assert "the daemon's link never degraded" test "$(count_lines "$SRV_LOG" 'LINK-STATE n=1 state=Degraded')" -eq 0
+  note "daemon_path_gens=$gens" "client_path_gen=$(kv "$line" path_gen) (the client cannot see a NAT rebind)"
+  stop_server
+}
+
+s_quiclink_udp_blocked() {
+  reset_net
+  netem_apply delay 20ms
+  local line rc
+  # (a) blocked from the start: Refused at connect_timeout, not at the 5 s idle timeout.
+  new_run qlblocked-start
+  ql_start_server
+  udp_block
+  rc=0
+  ql_run_client c --duration 1 || rc=$?
+  udp_unblock
+  cat "$CLIENT_OUT"
+  line=$(last_line "$CLIENT_OUT" CONNECT-FAILED)
+  assert "blocked at start: the connect failed (rc=$rc)" test "$rc" -eq 4
+  assert "the daemon never accepted anything" test "$(ql_accepts)" -eq 0
+  assert_num "refused after about connect_timeout (ms)" "$(kv "$line" after_ms)" -ge 1900
+  assert_num "... and well before the idle timeout (ms)" "$(kv "$line" after_ms)" -le 2600
+  note "blocked_at_start=refused after $(kv "$line" after_ms)ms (connect_timeout 2000ms)"
+  stop_server
+
+  # (b) blocked in the middle of a session and never lifted: Degraded, then Down(Dead).
+  new_run qlblocked-mid
+  ql_start_server
+  ql_bg_client c --duration 30 --rate 262144
+  wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect"
+  sleep 3
+  local t
+  t=$(now_ms)
+  udp_block
+  wait_exit "$CLIENT_PID" 40
+  udp_unblock
+  cat "$CLIENT_OUT"
+  assert "mid-session: the client ended with an error status (rc=$WAIT_RC)" test "$WAIT_RC" -eq 4
+  local degraded dead
+  degraded=$(($(kv "$(grep -a '^LINK-STATE state=Degraded' "$CLIENT_OUT" | head -n 1)" at_ms) - t))
+  dead=$(($(kv "$(grep -a '^LINK-STATE state=Down:Dead' "$CLIENT_OUT" | head -n 1)" at_ms) - t))
+  assert_num "Degraded about degraded_after (2 s) after the block (ms)" "$degraded" -ge 1500
+  assert_num "... and not much later (ms)" "$degraded" -le 3500
+  assert_num "Down(Dead) about the idle timeout (5 s) after the block (ms)" "$dead" -ge 4000
+  assert_num "... and not much later (ms)" "$dead" -le 7000
+  note "blocked_mid_session: Degraded after ${degraded}ms, Down(Dead) after ${dead}ms (dead_after 5000ms)"
+  stop_server
+}
+
+# A blackout of DURATION seconds in the middle of a session. The client reconnects (a fresh
+# handshake with the same key) if the link is lost, as the path manager does.
+quiclink_blackout_case() { # quiclink_blackout_case SECONDS EXPECT(survive|lost|either)
+  local dur=$1 expect=$2 label="qlblackout-$1s"
+  reset_net
+  netem_apply delay 20ms
+  new_run "$label"
+  ql_start_server
+  ql_bg_client c --duration $((3 + ${dur%.*} + 8)) --rate 262144 --reconnect --reconnect-for 40
+  wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect: $(cat "$CLIENT_OUT")"
+  sleep 3
+  local t_block t_heal
+  t_block=$(now_ms)
+  udp_block
+  sleep "$dur"
+  udp_unblock
+  t_heal=$(now_ms)
+  wait_exit "$CLIENT_PID" 60
+  cat "$CLIENT_OUT"
+  local line lost=false
+  line=$(last_line "$CLIENT_OUT" RESULT)
+  assert "$label: the client finished (rc=$WAIT_RC)" test "$WAIT_RC" -eq 0
+  if [[ $(kv "$line" conn_lost) == true ]]; then
+    lost=true
+    assert "$label: it reconnected" grep -q '^RECONNECTED' "$CLIENT_OUT"
+    assert "$label: the daemon accepted a second link" test "$(ql_accepts)" -eq 2
+    local back
+    back=$(($(kv "$(last_line "$CLIENT_OUT" RECONNECTED)" at_ms) - t_heal))
+    note "$label=LOST (Down:Dead after $(($(kv "$(last_line "$CLIENT_OUT" CONN-LOST)" at_ms) - t_block))ms), fresh handshake ${back}ms after the link returned"
+  else
+    assert "$label: echo intact" test "$(kv "$line" sent)" = "$(kv "$line" recvd)"
+    assert "$label: one link" test "$(ql_accepts)" -eq 1
+    assert "$label: it reported Degraded" grep -q '^LINK-STATE state=Degraded' "$CLIENT_OUT"
+    assert "$label: and then Up again" awk '/^LINK-STATE state=Degraded/ { d = 1 } d && /^LINK-STATE state=Up/ { f = 1 } END { exit !f }' "$CLIENT_OUT"
+    note "$label=survived, Degraded then Up"
+  fi
+  case $expect in
+    survive) assert "$label: survived, as expected" test "$lost" = false ;;
+    lost) assert "$label: lost, as expected" test "$lost" = true ;;
+  esac
+  stop_server
+}
+
+s_quiclink_blackouts() {
+  quiclink_blackout_case 3.0 survive
+  quiclink_blackout_case 4.5 either
+  quiclink_blackout_case 8.0 lost
+}
+
 ALL_SCENARIOS=(
   s_netem_reorder_probe s_clean s_port_range s_impaired
   s_nat_rebind s_ip_change s_blackouts s_udp_blocked
+  s_quiclink_rebind s_quiclink_udp_blocked s_quiclink_blackouts
 )
 
 part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"

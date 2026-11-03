@@ -17,6 +17,7 @@ mod verify;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::link::LinkParams;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{IdleTimeout, TransportConfig};
 use rustls::client::{AlwaysResolvesClientRawPublicKeys, Resumption};
@@ -62,6 +63,17 @@ impl Default for LivenessParams {
         Self {
             keep_alive_interval: Duration::from_secs(1),
             max_idle_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl From<&LinkParams> for LivenessParams {
+    /// The QUIC keep-alive is the link's heartbeat and its idle timeout is the link's
+    /// `dead_after`.
+    fn from(p: &LinkParams) -> Self {
+        Self {
+            keep_alive_interval: p.heartbeat,
+            max_idle_timeout: p.dead_after,
         }
     }
 }

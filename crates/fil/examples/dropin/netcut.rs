@@ -11,11 +11,13 @@
 //!
 //! While the cable is out: datagrams are dropped both ways; bytes of a TCP connection are held,
 //! not dropped, and delivered when it is back (what TCP's retransmissions do across a real pull);
-//! a new TCP connection is closed at once, as a connect fails when the interface is down. The
-//! two paths can be cut separately (`set_udp` alone is a UDP outage, which moves a session to the
+//! a new TCP connection is closed at once, as a connect fails when the interface is down. A port of
+//! the range that another process here holds is left to it, and a scenario checks the daemon's
+//! announced port against [`Cut::covers`] before any QUIC goes through the relay. The two paths can
+//! be cut separately (`set_udp` alone is a UDP outage, which moves a session to the
 //! pipe).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,7 +44,9 @@ pub struct Cut {
     flags: Arc<Flags>,
     _rt: tokio::runtime::Runtime,
     pub tcp_port: u16,
-    /// The UDP ports bound here: always the whole range (`start` refuses otherwise).
+    /// The UDP ports of the range bound here. One another process holds (another agent's fil
+    /// daemon, `just ci`'s tests) is not: `covers` says whether the host's announced port is ours.
+    udp: HashSet<u16>,
     pub udp_bound: usize,
 }
 
@@ -67,10 +71,10 @@ impl Cut {
                 .map_err(|e| format!("netcut: tcp bind: {e}"))?;
             let port = l.local_addr().map_err(|e| e.to_string())?.port();
             tokio::spawn(tcp_accept(l, SocketAddr::new(up_ip, 22), flags.clone()));
-            let mut bound = 0;
+            let mut bound = HashSet::new();
             for p in UDP_LO..=UDP_HI {
                 if let Ok(s) = UdpSocket::bind((Ipv4Addr::LOCALHOST, p)).await {
-                    bound += 1;
+                    bound.insert(p);
                     tokio::spawn(udp_port(
                         Arc::new(s),
                         SocketAddr::new(up_ip, p),
@@ -80,21 +84,20 @@ impl Cut {
             }
             Ok::<_, String>((port, bound))
         })?;
-        // A port another process here holds would get the client's QUIC packets meant for the
-        // host's daemon (which announces a port of the whole range at random): refuse to run then,
-        // rather than touch a process outside the test.
-        let want = usize::from(UDP_HI - UDP_LO) + 1;
-        if udp_bound != want {
-            return Err(format!(
-                "netcut: only {udp_bound} of the {want} UDP ports {UDP_LO}-{UDP_HI} are free on this machine's loopback (another fil daemon, or `just ci`'s tests, may hold the rest); not running the relay"
-            ));
-        }
+
         Ok(Cut {
             flags,
             _rt: rt,
             tcp_port,
-            udp_bound,
+            udp_bound: udp_bound.len(),
+            udp: udp_bound,
         })
+    }
+
+    /// Whether the relay holds this UDP port: the client's QUIC goes to 127.0.0.1 at the port the
+    /// host's daemon announced, so one it does not hold would reach another process here.
+    pub fn covers(&self, port: u16) -> bool {
+        self.udp.contains(&port)
     }
 
     /// Pulls the cable (`true`) or puts it back: both paths.

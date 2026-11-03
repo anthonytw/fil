@@ -310,6 +310,11 @@ pub fn agent_reconnect(ctx: &Ctx, host: &str) -> Res {
 /// No `-A`: the session's `SSH_AUTH_SOCK` is the stable path (OD-6) but the socket is absent, and
 /// `ssh-add -l` says at once that there is no agent.
 pub fn agent_off_default(ctx: &Ctx, host: &str) -> Res {
+    if Ctx::is_local(host) {
+        return skip(
+            "this machine's login shell finds macOS's own agent (launchd sets SSH_AUTH_SOCK), so absent cannot be checked here",
+        );
+    }
     let a = Agent::start(ctx, "off")?;
     let mut c = ctx.shell_x(host, Variant::Auto, "aof", &x_agent(&a, &[], None))?;
     if let Some(m) = have_tools(&mut c)? {

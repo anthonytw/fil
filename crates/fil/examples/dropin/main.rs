@@ -126,25 +126,37 @@ impl Ctx {
 
     /// A scratch config for one host and variant; returns its path.
     pub fn config(&self, host: &str, variant: Variant) -> PathBuf {
-        self.config_via(host, variant, None, None)
+        self.config_via(host, variant, None, None, false)
     }
 
     /// The same, with both paths through the cut relay when `via` is given (`netcut.rs`): ssh to
     /// the relay's port with the host key checked under the real name, QUIC to 127.0.0.1; and with
     /// `agent = AGENT` for the host when given (`confirm`, agent.rs).
+    ///
+    /// `keep_agent`: the client's own `SSH_AUTH_SOCK` is a throwaway agent (agent.rs), so the pipe's
+    /// ssh is told to keep authenticating with the driver's own (`IdentityAgent`, or `none` for
+    /// the key files when the driver has no agent).
     pub fn config_via(
         &self,
         host: &str,
         variant: Variant,
         via: Option<&netcut::Cut>,
         agent: Option<&str>,
+        keep_agent: bool,
     ) -> PathBuf {
         let path = self.work.join(format!(
-            "config-{host}-{}{}{}.toml",
+            "config-{host}-{}{}{}{}.toml",
             variant.tag(),
             if via.is_some() { "-cut" } else { "" },
-            agent.map(|a| format!("-agent-{a}")).unwrap_or_default()
+            agent.map(|a| format!("-agent-{a}")).unwrap_or_default(),
+            if keep_agent { "-keep" } else { "" }
         ));
+        let keep = if keep_agent {
+            let own = std::env::var("SSH_AUTH_SOCK").unwrap_or_else(|_| "none".into());
+            format!("\"-o\", {}, ", toml_str(&format!("IdentityAgent={own}")))
+        } else {
+            String::new()
+        };
         let transport = if variant == Variant::Pipe {
             "pipe"
         } else {
@@ -162,14 +174,14 @@ impl Ctx {
             _ => match via {
                 None => (
                     format!(
-                        "[\"ssh\", \"-o\", \"BatchMode=yes\", {}, \"fil\", \"server\", \"--stdio\"]",
+                        "[\"ssh\", \"-o\", \"BatchMode=yes\", {keep}{}, \"fil\", \"server\", \"--stdio\"]",
                         toml_str(&self.targets.target(host))
                     ),
                     Some(self.targets.host_part(host)),
                 ),
                 Some(cut) => (
                     format!(
-                        "[\"ssh\", \"-o\", \"BatchMode=yes\", \"-o\", \"HostName=127.0.0.1\", \"-o\", \"Port={}\", \"-o\", {}, \"-o\", \"CheckHostIP=no\", {}, \"fil\", \"server\", \"--stdio\"]",
+                        "[\"ssh\", \"-o\", \"BatchMode=yes\", {keep}\"-o\", \"HostName=127.0.0.1\", \"-o\", \"Port={}\", \"-o\", {}, \"-o\", \"CheckHostIP=no\", {}, \"fil\", \"server\", \"--stdio\"]",
                         cut.tcp_port,
                         toml_str(&format!("HostKeyAlias={}", self.targets.host_part(host))),
                         toml_str(&self.targets.target(host))
@@ -226,7 +238,13 @@ impl Ctx {
         let mut c = Client::start_with(
             Spawn {
                 fil: &self.fil,
-                config: &self.config_via(host, variant, x.via, x.agent),
+                config: &self.config_via(
+                    host,
+                    variant,
+                    x.via,
+                    x.agent,
+                    x.env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"),
+                ),
                 host,
                 session,
                 rows,

@@ -477,6 +477,42 @@ impl Event {
     }
 }
 
+/// Before QUIC goes through the relay: a pipe-only client (which never dials UDP) attaches through
+/// it to a session of its own, which starts the host's daemon; its log has the UDP port the daemon
+/// announced. Unless the relay holds that port the scenario stops here, so no packet of the test
+/// reaches another process on this machine. The probe detaches; its session keeps the daemon (and
+/// so the port) until the cleanup after the scenario.
+pub fn relay_port_check(ctx: &Ctx, host: &str, cut: &Cut) -> Result<String, String> {
+    let mut p = ctx.shell_with(host, Variant::Pipe, "fprb", &[], Some(cut))?;
+    let port = p
+        .wait_for(Duration::from_secs(10), |c| {
+            c.log().contains("DirectAvailable { port: ")
+        })
+        .and_then(|_| {
+            let log = p.log();
+            let at = log.find("DirectAvailable { port: ")? + "DirectAvailable { port: ".len();
+            log[at..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u16>()
+                .ok()
+        })
+        .ok_or("the probe client never learnt the daemon's UDP port")?;
+    p.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;
+    p.detach()?;
+    ensure(cut.covers(port), || {
+        format!(
+            "the host's daemon announced UDP port {port}, which another process on this machine holds (the relay has {} of 1001): not sending QUIC through the relay",
+            cut.udp_bound
+        )
+    })?;
+    Ok(format!(
+        "relay: {} of the 1001 UDP ports bound, the daemon's (announced, {port}) among them",
+        cut.udp_bound
+    ))
+}
+
 /// The pair across `events`, one after another, on one client: each must leave both transfers
 /// byte-exact on the same connections, with the daemon untouched and the shell answering.
 fn pair_through(
@@ -501,6 +537,10 @@ fn pair_through(
     } else {
         None
     };
+    let mut notes = Vec::new();
+    if let Some(cut) = &cut {
+        notes.push(relay_port_check(ctx, host, cut)?);
+    }
     let mut c = ctx.fwd_shell(host, variant, name, &fwd_args(&p), cut.as_ref())?;
     if variant == Variant::Auto {
         c.wait_for(Duration::from_secs(15), |c| {
@@ -512,7 +552,6 @@ fn pair_through(
     let mut pair = pair_start(ctx, host, &mut c, &p, n, rate)?;
     // A few seconds of data before the first event.
     thread::sleep(Duration::from_secs(5));
-    let mut notes = Vec::new();
     for (i, ev) in events.iter().enumerate() {
         pair_running(&mut c, &mut pair, &format!("before the {}", ev.tag()))?;
         let downs = link_downs(&c);
@@ -604,8 +643,7 @@ fn pair_through(
     if let Some(cut) = &cut {
         let (d, r) = cut.counts();
         notes.push(format!(
-            "relay: {} UDP ports bound, {d} datagrams dropped and {r} TCP connections refused while cut",
-            cut.udp_bound
+            "relay: {d} datagrams dropped and {r} TCP connections refused while cut"
         ));
     }
     notes.push(format!(

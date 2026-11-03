@@ -24,7 +24,7 @@ The rules of `docs/m1/dropin.md` hold (fresh evidence, exact comparisons, a clea
 
 - **Every transfer is a seeded stream** and is compared by sha256 with `fwdprobe digest`.
 - **One accept.** The server at the far end counts its connections (`ACCEPT=`). After any disruption it must have seen exactly one: the application kept its TCP connection.
-- **Findings are `KNOWN-BUG:` notes.** A miss in what fil must do (a wrong sha256, a second accept, a reset where an EOF belongs, a daemon that changed) is recorded and the scenario goes on; the run reports it as `PASS*` and lists it at the end, and `--strict` makes it a failure. A broken precondition fails the scenario: an event that would land after the transfer ended, a disruption the client never saw (no `link down` in its log), a server that never listened.
+- **A miss fails the scenario.** A miss in what a done-when or a security property requires (a wrong sha256, a second accept, a reset where an EOF belongs, a sender or reader that did not end cleanly, a daemon that changed, a refused forward listening, the canary reached, a detached `-R` reaching this machine, a signature that does not verify, the agent filter letting a change through) is a `MISS:` note: the scenario carries on, so every miss is seen, and the driver fails it at its end with all of them listed, whatever `--allow-*` says. Only a **named finding**, a `KNOWN-BUG:` note that says what fixes it, passes, as `PASS*` (and fails with `--strict`); none is open on the Pis. A broken precondition fails the scenario at once: an event that would land after the transfer ended, a disruption the client never saw (no `link down` in its log), a server that never listened, the daemon's announced UDP port held by another process here.
 - **Files in the session are read through the shell** with a prefix only the shell computes (`sed "s/^/F$((6*7)): /"`), so the echo of the typed command is never read as the file.
 
 ### A cable the driver can pull: `netcut.rs`
@@ -35,11 +35,13 @@ The gate gives no root, and this Mac's network cannot be cut for a test. So the 
 - **QUIC:** the client's direct address is `127.0.0.1`. The relay binds every port of the daemon's range (60000 to 61000; the daemon picks one at random and announces it) and passes each datagram to the same port of the host, through one upstream socket per client address, and the answers back.
 - **Unplugged,** datagrams are dropped both ways; the bytes of a TCP connection are held and delivered when the cable is back (what TCP's retransmissions do across a real pull); a new TCP connection is closed at once, as a connect fails on a down interface. `set_udp` alone is a UDP outage, which moves a session to the pipe.
 
+**The relay never sends QUIC to a port it does not hold.** Other work on this Mac may hold a port of the range (another agent's fil daemon in direct mode held one during these runs; `just ci`'s daemon tests bind some too), and the client's QUIC goes to 127.0.0.1 at whatever port the host's daemon announced. So before any QUIC goes through the relay, a pipe-only probe client (it never dials UDP) attaches through it to a session of its own, which starts the daemon, and reads the announced port from its log; unless the relay holds that port (`Cut::covers`), the scenario fails there. The probe's session keeps the daemon, and so the port, until the cleanup after the scenario. The relay holds the range only while a scenario that uses it runs (`fwd_cable_pull`, `fwd_reconnect` on `auto`, `fwd_swap`, `fwd_remote`) and lets it go when the scenario ends. This Mac's ports for the forwards come from the driver's pid, from 30000 to 44999, below macOS's ephemeral range (49152 and up).
+
 The client cannot tell the relay from the network: it sees its link go silent, declares it dead, and its redials fail until the cable is back. What a relay does not model is a new address on the client's side (the realnet NAT scenarios do that) and a kernel that tells the client the interface went down (realnet's `ip link set c0 down` does).
 
 ## The scenarios
 
-| Scenario | What a person does | What is asserted (findings as KNOWN-BUG) |
+| Scenario | What a person does | What is asserted (each a miss when it fails) |
 |---|---|---|
 | `fwd_cable_pull` | **the done-when.** An `-L` download and an `-R` upload (200 MB each at 8 MB/s) while the cable is pulled 30 s and then 5 min, on `auto` (QUIC) and on the pipe | both byte-exact, one accept each, EOF; the client saw its link down at each pull (asserted); the daemon is the same process; no `ResumeGone`; the shell answers. Measured: how soon after the plug the shell answered |
 | `fwd_reconnect` | the same pair (60 MB at 2 MB/s) across a reconnect: the ssh killed on the pipe, the cable out 6 s on `auto` (past `dead_after`) | as above (this covers the plan's `fwd_local_kill_ssh`, for `-R` too) |
@@ -58,9 +60,20 @@ The client cannot tell the relay from the network: it sees its link go silent, d
 | `fwd_ports_view` | `fwdprobe serve` on 0.0.0.0 and on 127.0.0.1 from the session's shell, and `python3 -m http.server` if the host has python3 | `fil ports --json` in the session parses; both listeners are the session's, with their pids, the wide one `exposed` (asserted); the text view warns about it; the web server is probed as `http` 200 with its `Server` header as the label (the default probe is a `HEAD`; the page title needs `ports.probe = "full"`) |
 | `detach_inside` | `fil detach` with no arguments, in the session | the attached client is told ("detached from elsewhere") and exits 1; the session is still listed, detached (asserted) |
 | `fwd_bulk_typing` | types 20 lines into vim idle, then 20 more while an unpaced `-L` download runs (`auto` and pipe) | the file is exact. Measured: the echo of a typed line, p50 and p99, against H1's rule from L1 (p50 above 2x idle + 10 ms) |
-| `fwd_churn` | 2,000 short connections to warm up, then two rounds of 20,000 sequential ones, on `auto` and on the pipe | all echoed; the daemon's RSS grows under 16 MiB over the first round and does not grow again by as much over the second (growth that repeats is per connection, a leak; growth that flattens is the allocator), and its descriptor table does not grow (`FDSize` in `/proc/PID/status`: the daemon is not dumpable, so `/proc/PID/fd` is root's; the table doubles past each power of two and never shrinks, so a leak shows); the client's RSS grows under 16 MiB |
+| `fwd_churn` | 2,000 short connections to warm up, then two rounds of 20,000 sequential ones, on `auto` and on the pipe | all echoed; the daemon's RSS grows under 16 MiB over the first round and does not grow again by as much over the second (growth that repeats is per connection, a leak; growth that flattens is the allocator), and its descriptor table does not grow (`FDSize` in `/proc/PID/status`: the daemon is not dumpable, so `/proc/PID/fd` is root's; the table doubles past each power of two and never shrinks, so a leak that grows with the connections shows, at 20,000 of them; a slow leak of a few dozen descriptors, below the next power of two, would not); the client's RSS grows under 16 MiB |
 
-Not here yet: `agent_*` (A1, PR #74, still open) and `fwd_takeover`. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) is not covered by this package's first part.
+The agent scenarios (A1, DESIGN §10) use a throwaway `ssh-agent -D` on this Mac, a child of the driver holding a key made for the run, and the host's own `ssh-add` and `ssh-keygen` (now in the default `--require` list). The client is given that agent's `SSH_AUTH_SOCK`, never this Mac's own. A signature made in the session (`ssh-keygen -Y sign -f k.pub`, which signs with the agent's copy of the key) is verified here with `ssh-keygen -Y verify`, so only the agent's own signature passes.
+
+| Scenario | What a person does | What is asserted (each a miss when it fails) |
+|---|---|---|
+| `agent_list_sign` | `fil -A`; `ssh-add -l` and `ssh-keygen -Y sign` in the session | the agent's key is listed by fingerprint; the signature verifies here |
+| `agent_reconnect` | `-A` on the pipe; signs, the ssh is killed, signs, the client and its ssh sleep 15 s, signs | every signature verifies; `SSH_AUTH_SOCK` is the same path throughout; both disconnects were seen |
+| `agent_off_default` | no `-A` | `SSH_AUTH_SOCK` is set (the stable path, OD-6) but the socket does not exist; `ssh-add -l` exits 2 (no agent) |
+| `agent_detached` | `-A`, then `~.`; from another session, `ssh-add -l` on the first one's socket | it exits 2, in under 100 ms |
+| `agent_filter` | `ssh-add -D` (remove all) and `ssh-add -x` (lock, with an askpass that answers) from the session | both fail; the agent here still holds its key, and a signature still verifies |
+| `agent_confirm` | `agent = "confirm"` in the config; two signatures | the overlay asks each time; `n` refuses the signature, `y` signs and it verifies |
+
+Not here yet: `fwd_takeover`. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) is not covered by this package. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) is not covered by this package's first part.
 
 ## Results
 

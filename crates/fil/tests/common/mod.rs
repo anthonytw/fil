@@ -69,6 +69,8 @@ struct State {
     pipe_default: Option<Script>,
     /// What `diagnostics` says about a pipe that went down.
     diagnostics: Option<String>,
+    /// How many times `session_started` was called, and for which kinds of link.
+    started: Vec<LinkKind>,
     /// Direct dials dropped while still running (cancelled).
     direct_cancelled: usize,
     direct_default: Option<Script>,
@@ -114,6 +116,11 @@ impl Fake {
     pub fn set_direct_default(&self, s: Script) {
         self.state.lock().unwrap().direct_default = Some(s);
     }
+    /// The links `session_started` was told about, in order.
+    pub fn sessions_started(&self) -> Vec<LinkKind> {
+        self.state.lock().unwrap().started.clone()
+    }
+
     pub fn set_diagnostics(&self, note: Option<&str>) {
         self.state.lock().unwrap().diagnostics = note.map(str::to_string);
     }
@@ -233,6 +240,14 @@ impl Connector for Fake {
             }),
             Script::Hang => std::future::pending().await,
         }
+    }
+
+    fn session_started(&self, link: &MemLink) {
+        self.state
+            .lock()
+            .unwrap()
+            .started
+            .push(fil_transport::Link::kind(link));
     }
 
     fn diagnostics(&self, _link: &MemLink) -> Option<String> {

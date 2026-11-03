@@ -461,8 +461,7 @@ mod tests {
                 tracing::trace!(target: "quinn_proto::connection", "got Data packet");
                 tracing::trace!(target: "fil_transport::quic", "ours");
             });
-            let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-            out
+            String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
         };
         let quiet = run("trace");
         assert!(

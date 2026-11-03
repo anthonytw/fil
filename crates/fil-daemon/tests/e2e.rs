@@ -273,9 +273,17 @@ async fn a_daemon_restart_gives_session_replaced_on_resume() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_that_ends_is_reported_then_gone() {
     let s = Scratch::new();
-    let d = start(&s, config("echo bye; exit 3")).await;
+    // The shell waits for a line before it exits: a shell that has already gone when the attach
+    // arrives is refused as `SessionGone`, which is a different test and made this one flaky.
+    let d = start(&s, config("read line; echo bye; exit 3")).await;
     let k = key(1);
     let mut a = Client::attach(d.pipe().await, Connect::new("main", k.clone())).await;
+    assert!(
+        a.reply.is_some(),
+        "attached to a live session: {:?}",
+        a.refused
+    );
+    a.type_bytes(b"\n").await;
     a.wait_down().await;
     // (Reporting the exit status to the client is `SessionExited`, sent by fil-session since
     // package F; when it is there it must say 3.)

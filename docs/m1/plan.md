@@ -37,12 +37,27 @@ Each package is one PR in its own branch. File ownership keeps parallel packages
 | **P3: sessions** | new crate `fil-session` | One session, transport-agnostic: the PTY and child, the output log, and the alacritty emulator. **Detached behaviour:** query replies while detached, including the OSC 10/11 color queries vim sends. **Attaching:** the epoch state machine wired to its `Effect`s, resume or snapshot (snapshots only at escape-sequence boundaries), and the catch-up rule. **Process scope:** `systemd-run --user --scope` where lingering is on, the process tree otherwise. **Messages for M3:** the PTY's ICANON/ECHO mode, reported in order with the output, and an input-echo ack. Tested over `link::mem`. |
 | **P4: client** | new crate `fil-client` | The client, independent of the transport. **Terminal:** raw mode and restore, the escapes (`~.`, `~?`, `~~`), and the one-line status overlay while disconnected (on the `fil-predict` overlay core). **Input while disconnected:** buffer, confirm and log (§4.3). **Attaching:** the `TERM` mismatch warning, and the attach, resume and reconnect loop over a dialer that returns links. **Messages:** clear wording for "taken over", "session replaced" and the shell-noise warning. Tested over `link::mem` against a scripted daemon. |
 
-### Wave 2
+### Wave 1: merged
+
+P1 #16, P3 #18, P2 #19 and P4 #17 landed on 2026-11-02. Each went through the independent review, the author's fixes, one re-check and the coordinator's final check. Each review found real defects; see the PRs.
+
+The wire additions that wave 2 needs are on main too: `SessionExited`, and `Request`/`Response` for `fil ls`/`kill`/`detach` (DESIGN.md §8.5).
+
+### Wave 2 (in parallel)
 
 | Package | Owns | Builds |
 |---|---|---|
-| **P5: daemon** | new crate `fil-daemon` | **Socket:** `/tmp/fil-$UID/` with an owner and mode check, the protocol major version in the socket path, and a peer-UID check on every connection. **Process:** starts on the first attach, detached from the login session. **Relay:** `fil server --stdio` writes the preamble and relays stdio to the socket. **Bootstrap:** the version check, key registration, and the reply with the UDP port and fingerprint. **Hosting:** runs `fil-session` sessions and the QUIC listener. On direct attaches it checks `peer_key` against the attach key. Covers `fil ls` and `fil kill`. |
-| **P6: the `fil` binary** | new crate `fil` | One static binary for both ends: the CLI (§14), config (`~/.config/fil/config.toml`), and wiring for the client, daemon and both links. Includes `pipe = ["fil", "server", "--stdio"]` for local runs without sshd. |
+| **F: wave-1 follow-ups** | the listed items across `fil-transport`, `fil-session` and `fil-client` (no new crates) | **Graceful close:** `Link::flush()`, which waits until every payload sent before the call has gone out (pipe: written to the stream; QUIC: acknowledged by the peer), or fails if the link goes down first. It's implemented for `mem`, pipe and QUIC, and sessions use it before closing after `TakenOver`, `AttachRefused`, `Error` and `SessionExited`, replacing the 300 ms wait. **Exit status:** sessions send `SessionExited`, and the client reports it (`Outcome::SessionEnded { code, signal }`). **The follow-ups listed below.** |
+| **P5: daemon** | new crate `fil-daemon` | **Socket and process:** `/tmp/fil-$UID/` with the owner and mode check, the protocol major in the socket path, a peer-UID check on every connection, and starting on first use, detached. **Relay:** `fil server --stdio` writes the preamble and relays stdio to the socket. **Bootstrap:** `Hello`; then `Attach`, which registers the key, replies with the UDP port and fingerprint, and hands the link to `fil-session`; or a `Request` for ls, kill or detach. **Hosting:** `fil-session` sessions behind the `SessionHost` hooks (key revocation through `QuicListener::revoke`, `DirectInfo`), and the QUIC listener, with direct attaches checked as `peer_key` equal to the attach key. Exposes library entry points for the `fil` binary. |
+| **P6: the `fil` binary** | new crate `fil` | **Client side:** the CLI (§14), config (`~/.config/fil/config.toml`, including §4.3 offline input and per-host pipe commands), per-attach key generation, and the `Dialer` that drives `fil-transport::path` with `PipeLink` and `QuicLink`, mapping `attached`/`swapped` to the path manager as PR #17 describes. Also `fil ls`/`kill`/`detach` over a `Request`, clear error messages (including a version mismatch from the preamble), and `pipe = ["fil", "server", "--stdio"]` for local runs without sshd. **Server side:** the `fil server` subcommands call `fil-daemon`'s entry points. While P5 is in review they are stubs; they're wired in the same PR once P5 merges, or in a small follow-up. |
+
+### Follow-ups from the wave-1 reviews (package F)
+
+- **Post-takeover race:** check `kicked` right before each output send (#18).
+- **Weak tests:** the catch-up-vs-takeover and `kicked` tests must fail without their fixes. `kicked` needs a buffering link, so use `QuicLink` or a buffering test link (#18).
+- **Late reaping:** reaping a dropped connection is delayed during a continuous output flood (#18).
+- **Gap-marker order:** the gap-marker prologue resets charsets *before* its `?1049l`, and xterm's `?1049l` restores the saved cursor's charset. Leave the alternate screen first, then reset (#17's review).
+- **Lost payloads at the stream limit:** on the 1,025th QUIC channel, payloads already accepted with `Ok` are dropped (#19). This is an M2 item. Document it again only if F touches the code.
 
 ### Wave 3
 

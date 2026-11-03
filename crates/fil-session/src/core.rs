@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use fil_proto::chan::RecvChannel;
 use fil_proto::epoch::{
     AttachInput, AttachMode, AttachOutcome, DetachOutcome, Effect, SessionEpoch, SubscriberId,
@@ -360,7 +361,7 @@ pub(crate) enum Cmd {
     Input {
         conn: ConnId,
         seq: u64,
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// An [`fil_proto::InputRecord::Resize`] from the terminal channel, in order with the input.
     Resize {
@@ -923,7 +924,7 @@ impl Core {
                 replies.extend(self.terminal.answer(q, self.size.cols(), self.size.rows()));
             }
             if !replies.is_empty() {
-                self.pty.write(replies);
+                self.pty.write(Bytes::from(replies));
                 self.poison_end = self.ready();
             }
         }
@@ -1237,7 +1238,7 @@ impl Core {
         }
     }
 
-    fn on_input(&mut self, conn: ConnId, seq: u64, data: Vec<u8>) {
+    fn on_input(&mut self, conn: ConnId, seq: u64, data: Bytes) {
         if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
             return;
         }
@@ -1250,7 +1251,8 @@ impl Core {
             return;
         }
         let fresh = match self.input.accept(seq, &data) {
-            Ok(f) => f.to_vec(),
+            // The new part of the segment, as a slice of it: no copy on the way to the PTY.
+            Ok(f) => data.slice_ref(f),
             Err(e) => {
                 tracing::warn!(error = %e, "input channel gap");
                 tracing::debug!(session = %self.name, "input channel gap in");
@@ -1637,14 +1639,14 @@ mod tests {
             .send(Cmd::Input {
                 conn: first.conn,
                 seq: 0,
-                data: b"stale\n".to_vec(),
+                data: Bytes::from_static(b"stale\n"),
             })
             .await;
         handle
             .send(Cmd::Input {
                 conn: second.conn,
                 seq: 0,
-                data: b"live\n".to_vec(),
+                data: Bytes::from_static(b"live\n"),
             })
             .await;
         // The core handles its queue in order, so once the live line has got through, the stale

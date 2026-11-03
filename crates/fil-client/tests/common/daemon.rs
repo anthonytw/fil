@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
-use fil_proto::chan::{RecvChannel, Segment};
+use fil_proto::chan::RecvChannel;
 use fil_proto::epoch::{AttachInput, AttachMode, AttachOutcome, Effect, SessionEpoch};
+use fil_proto::frame::DataSegment;
 use fil_proto::input::{InputRecord, TerminalInput};
 use fil_proto::limits::MAX_DATA_PAYLOAD;
 use fil_proto::log::{CatchUpParams, OutputLog, StartDecision, decide_start};
@@ -22,6 +23,19 @@ use fil_term::{Emulator, Size};
 use fil_transport::link::mem::{MemControl, MemLink};
 use fil_transport::{DownReason, Link};
 use tokio::sync::Mutex;
+
+/// One data segment the scripted daemon sends.
+struct Segment {
+    seq: u64,
+    data: Vec<u8>,
+}
+
+impl Segment {
+    /// The payload of a data frame.
+    fn payload(&self) -> Vec<u8> {
+        DataSegment::encode(self.seq, &self.data).expect("segments are non-empty and capped")
+    }
+}
 
 pub const NOW_MS: u64 = 1_700_000_000_000;
 

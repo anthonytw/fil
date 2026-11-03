@@ -126,6 +126,14 @@ pub mod pinned {
     }
 }
 
+/// The stream reader's chunk assembly, for `tests/alloc.rs` (which counts its allocations). Not for
+/// use outside tests.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod chunks {
+    pub use super::wire::{Chunks, READ_MAX, SHARE_FROM};
+}
+
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).
 pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
 

@@ -301,7 +301,7 @@ async fn heartbeat_timing_follows_the_spec() {
     let (link, mut raw) = client_vs_raw(cfg(), b"", ping(77)).await;
     let t0 = Instant::now();
     // The handshake ping, then the reply to the peer's ping at once.
-    assert_eq!(raw.frame().await.payload, FROZEN_PING);
+    assert_eq!(raw.frame().await.payload, &FROZEN_PING[..]);
     let reply = raw.frame().await;
     assert_eq!(
         ControlMsg::decode(&reply.payload).unwrap(),
@@ -901,7 +901,7 @@ async fn the_daemon_side_has_no_preamble() {
     assert!(link.banner().is_empty());
     assert_eq!(link.peer_major(), None);
     // Its first frame to the peer is its own ping, then the reply.
-    assert_eq!(raw.frame().await.payload, FROZEN_PING);
+    assert_eq!(raw.frame().await.payload, &FROZEN_PING[..]);
     drop(link);
 }
 
@@ -1161,7 +1161,7 @@ async fn the_daemon_pings_on_its_own_only_after_a_heartbeat_and_a_half_of_silenc
     let t0 = Instant::now();
     let link = PipeLink::accept(a, cfg()).await.unwrap();
     // The handshake ping and the reply to the peer's, at once.
-    assert_eq!(raw.frame().await.payload, FROZEN_PING);
+    assert_eq!(raw.frame().await.payload, &FROZEN_PING[..]);
     assert_eq!(
         ControlMsg::decode(&raw.frame().await.payload).unwrap(),
         ControlMsg::Heartbeat {
@@ -1518,7 +1518,7 @@ async fn a_link_answers_the_frozen_ping_with_the_frozen_pong() {
     let mut raw = Raw::new(b);
     raw.put_frame(ChannelId::CONTROL, opening::PING).await;
     let link = PipeLink::accept(a, cfg()).await.unwrap();
-    assert_eq!(raw.frame().await.payload, FROZEN_PING);
+    assert_eq!(raw.frame().await.payload, &FROZEN_PING[..]);
     assert_eq!(raw.frame().await.payload, opening::PONG);
     raw.put_frame(ChannelId::CONTROL, opening::PONG).await;
     sleep(MS(10)).await;

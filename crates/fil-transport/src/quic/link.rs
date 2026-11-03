@@ -9,13 +9,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::{ChannelClass, ChannelId, ControlMsg};
-use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, WriteError};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, WriteError};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
 
 use super::MAX_STREAMS;
 use super::inbox::{Closed, Inbox};
-use super::wire::{self, Frame, MAX_VARINT_LEN, VarintReader, parse_prefix, put_varint};
+use super::wire::{
+    self, Chunks, Frame, MAX_VARINT_LEN, READ_MAX, VarintReader, parse_prefix, put_varint,
+};
 use crate::auth::{self, ClientKey, Fingerprint, PublicKey, SERVER_NAME};
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkState, LinkStatus};
 
@@ -573,12 +575,53 @@ async fn accept_streams(io: Arc<Io>) {
     }
 }
 
+/// Why a read from a stream ended before it had all the bytes it wanted.
+enum Short {
+    /// The peer finished the stream after this many of the bytes.
+    Finished(usize),
+    /// The stream was reset, or the connection ended.
+    Error,
+}
+
+/// Fills `out` from the stream: first what is left of the last chunk, then more chunks.
+async fn fill(stream: &mut RecvStream, chunks: &mut Chunks, out: &mut [u8]) -> Result<(), Short> {
+    let mut have = 0;
+    loop {
+        have += chunks.copy_to(&mut out[have..]);
+        if have == out.len() {
+            return Ok(());
+        }
+        match stream.read_chunk(READ_MAX, true).await {
+            Ok(Some(chunk)) => chunks.push(chunk.bytes),
+            Ok(None) => return Err(Short::Finished(have)),
+            Err(_) => return Err(Short::Error),
+        }
+    }
+}
+
+/// The next `len` bytes of the stream as one `Bytes` (see [`Chunks::poll_payload`]).
+async fn payload(stream: &mut RecvStream, chunks: &mut Chunks, len: usize) -> Result<Bytes, Short> {
+    chunks.start_payload(len);
+    loop {
+        if let Some(payload) = chunks.poll_payload() {
+            return Ok(payload);
+        }
+        // No more than is missing, so nothing is left over in `chunks` to carry on with.
+        match stream.read_chunk(chunks.missing(), true).await {
+            Ok(Some(chunk)) => chunks.push(chunk.bytes),
+            Ok(None) => return Err(Short::Finished(chunks.have())),
+            Err(_) => return Err(Short::Error),
+        }
+    }
+}
+
 async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
+    let mut chunks = Chunks::default();
     // The channel id.
     let mut varint = VarintReader::default();
     let channel = loop {
         let mut byte = [0u8; 1];
-        if stream.read_exact(&mut byte).await.is_err() {
+        if fill(&mut stream, &mut chunks, &mut byte).await.is_err() {
             return;
         }
         match varint.push(byte[0]) {
@@ -598,23 +641,23 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
     let mut proof_pending = io.role == Role::Client && channel == ChannelId::CONTROL;
     loop {
         let mut prefix = [0u8; 4];
-        match stream.read_exact(&mut prefix).await {
+        match fill(&mut stream, &mut chunks, &mut prefix).await {
             Ok(()) => {}
-            Err(ReadExactError::FinishedEarly(0)) => return, // the peer finished this channel
-            Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
-            Err(ReadExactError::ReadError(_)) => return,
+            Err(Short::Finished(0)) => return, // the peer finished this channel
+            Err(Short::Finished(_)) => return io.violation("truncated frame"),
+            Err(Short::Error) => return,
         }
         let len = match parse_prefix(prefix) {
             Some(Frame::Payload(len)) => len,
             Some(Frame::Flush) => {
                 // The peer wants to know we have read everything before this point.
                 let mut id = [0u8; 4];
-                match stream.read_exact(&mut id).await {
+                match fill(&mut stream, &mut chunks, &mut id).await {
                     Ok(()) => {}
-                    Err(ReadExactError::FinishedEarly(_)) => {
+                    Err(Short::Finished(_)) => {
                         return io.violation("truncated flush marker");
                     }
-                    Err(ReadExactError::ReadError(_)) => return,
+                    Err(Short::Error) => return,
                 }
                 let Ok(ack) = io.writer_for(ChannelId::CONTROL) else {
                     return;
@@ -627,12 +670,11 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             }
             None => return io.violation("frame length out of range"),
         };
-        let mut payload = vec![0u8; len];
-        match stream.read_exact(&mut payload).await {
-            Ok(()) => {}
-            Err(ReadExactError::FinishedEarly(_)) => return io.violation("truncated frame"),
-            Err(ReadExactError::ReadError(_)) => return,
-        }
+        let payload = match payload(&mut stream, &mut chunks, len).await {
+            Ok(p) => p,
+            Err(Short::Finished(_)) => return io.violation("truncated frame"),
+            Err(Short::Error) => return,
+        };
         io.got_frame
             .send_if_modified(|seen| !std::mem::replace(seen, true));
         if proof_pending {
@@ -649,12 +691,7 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
             io.flush_acked.notify_waiters();
             continue;
         }
-        if io
-            .inbox
-            .push(channel, Bytes::from(payload), &wake)
-            .await
-            .is_err()
-        {
+        if io.inbox.push(channel, payload, &wake).await.is_err() {
             return;
         }
     }

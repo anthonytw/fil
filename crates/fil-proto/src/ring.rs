@@ -8,6 +8,12 @@
 
 use std::collections::VecDeque;
 
+use bytes::{BufMut, Bytes, BytesMut};
+
+/// A drained ring keeps at most this much of its buffer for the next burst; the rest goes back to
+/// the allocator (see [`ByteRing::drop_to`]).
+const KEEP_WHEN_DRAINED: usize = 4 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ByteRing {
     buf: VecDeque<u8>,
@@ -80,31 +86,60 @@ impl ByteRing {
     }
 
     /// Discard everything below `seq` (clamped to the retained range).
+    ///
+    /// A ring that this empties gives its buffer back unless it is small: a forward that moved
+    /// a megabyte and went idle must not pin the megabyte until the connection ends (the buffer
+    /// regrows on the next write).
     pub fn drop_to(&mut self, seq: u64) {
         let seq = seq.clamp(self.start, self.end());
         let n = (seq - self.start) as usize;
         self.buf.drain(..n);
         self.start = seq;
+        if self.buf.is_empty() && self.buf.capacity() > KEEP_WHEN_DRAINED {
+            self.buf = VecDeque::new();
+        }
     }
 
     /// Copy up to `max` bytes starting at `seq`. Returns an empty vec if `seq` is outside
     /// `[start, end)`.
     pub fn read(&self, seq: u64, max: usize) -> Vec<u8> {
-        if seq < self.start || seq >= self.end() {
+        let Some((off, n)) = self.span(seq, max) else {
             return Vec::new();
+        };
+        let mut out = Vec::with_capacity(n);
+        self.copy_span(off, n, &mut out);
+        out
+    }
+
+    /// Like [`ByteRing::read`], with `prefix` in front: the two in one buffer of exactly their
+    /// size, so building a frame payload from the ring is one allocation and one copy of the data.
+    /// `None` if `seq` is outside `[start, end)`. Also returns how many data bytes were taken.
+    pub fn read_prefixed(&self, seq: u64, max: usize, prefix: &[u8]) -> Option<(Bytes, usize)> {
+        let (off, n) = self.span(seq, max)?;
+        let mut out = BytesMut::with_capacity(prefix.len() + n);
+        out.put_slice(prefix);
+        self.copy_span(off, n, &mut out);
+        Some((out.freeze(), n))
+    }
+
+    /// Where a read of up to `max` bytes at `seq` lands: an offset into the buffer and a length.
+    fn span(&self, seq: u64, max: usize) -> Option<(usize, usize)> {
+        if seq < self.start || seq >= self.end() || max == 0 {
+            return None;
         }
         let off = (seq - self.start) as usize;
-        let n = max.min(self.buf.len() - off);
+        Some((off, max.min(self.buf.len() - off)))
+    }
+
+    fn copy_span(&self, off: usize, n: usize, out: &mut impl BufMut) {
         let (a, b) = self.buf.as_slices();
-        let mut out = Vec::with_capacity(n);
         if off < a.len() {
             let take = n.min(a.len() - off);
-            out.extend_from_slice(&a[off..off + take]);
-            out.extend_from_slice(&b[..n - take]);
+            out.put_slice(&a[off..off + take]);
+            out.put_slice(&b[..n - take]);
         } else {
-            out.extend_from_slice(&b[off - a.len()..off - a.len() + n]);
+            out.put_slice(&b[off - a.len()..off - a.len() + n]);
         }
-        out
     }
 }
 
@@ -163,6 +198,55 @@ mod tests {
                 "first chunk {first}: capacity {cap}"
             );
         }
+    }
+
+    /// A ring that moved a burst and was acknowledged empty gives its buffer back; a small one
+    /// keeps its buffer, and a ring that still holds bytes keeps everything.
+    #[test]
+    fn a_drained_ring_gives_its_buffer_back() {
+        let mut r = ByteRing::new(1 << 20, 0);
+        assert_eq!(r.push(&vec![1u8; 1 << 20]), 1 << 20);
+        assert!(r.buf.capacity() >= 1 << 20);
+        r.drop_to(1 << 19);
+        assert!(r.buf.capacity() >= 1 << 20, "half full keeps its buffer");
+        r.drop_to(1 << 20);
+        assert!(r.is_empty());
+        assert!(
+            r.buf.capacity() <= KEEP_WHEN_DRAINED,
+            "{}",
+            r.buf.capacity()
+        );
+        // And it works afterwards, numbering intact.
+        assert_eq!(r.push(b"abc"), 3);
+        assert_eq!((r.start(), r.end()), (1 << 20, (1 << 20) + 3));
+        assert_eq!(r.read(1 << 20, 10), b"abc");
+
+        // A small ring that drains keeps its (small) buffer: no churn per keystroke.
+        let mut r = ByteRing::new(1 << 20, 0);
+        r.push(b"x");
+        let cap = r.buf.capacity();
+        r.drop_to(1);
+        assert_eq!(r.buf.capacity(), cap);
+    }
+
+    #[test]
+    fn a_prefixed_read_is_one_buffer_of_exactly_its_size() {
+        let mut r = ByteRing::new(8, 100);
+        for round in 0..20u8 {
+            r.push_evicting(&[round; 3]);
+            for seq in r.start()..r.end() {
+                let (got, n) = r.read_prefixed(seq, 5, b"HD").unwrap();
+                let want = r.read(seq, 5);
+                assert_eq!(n, want.len());
+                assert_eq!(&got[..2], b"HD");
+                assert_eq!(&got[2..], &want[..]);
+            }
+        }
+        let (got, _) = r.read_prefixed(r.start(), 4, b"HD").unwrap();
+        assert_eq!(got.len(), 6);
+        assert!(r.read_prefixed(r.end(), 4, b"HD").is_none());
+        assert!(r.read_prefixed(r.start() - 1, 4, b"HD").is_none());
+        assert!(r.read_prefixed(r.start(), 0, b"HD").is_none());
     }
 
     #[test]

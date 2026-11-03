@@ -163,15 +163,15 @@ impl Peer {
             if !t.ready || self.sched.has_queued(ch) {
                 continue;
             }
-            let seg = match &mut t.src {
+            let payload = match &mut t.src {
                 Source::Log { log, cursor, .. } => {
-                    cursor.as_mut().unwrap().next_segment(log).unwrap()
+                    cursor.as_mut().unwrap().next_payload(log).unwrap()
                 }
-                Source::Chan(c) => c.next_segment(),
+                Source::Chan(c) => c.next_payload(),
             };
-            if let Some(seg) = seg {
-                self.sent_bytes += seg.data.len() as u64;
-                self.sched.push(Frame::new(ch, seg.payload()));
+            if let Some(payload) = payload {
+                self.sent_bytes += DataSegment::parse(&payload).unwrap().data.len() as u64;
+                self.sched.push(Frame::new(ch, payload));
             }
         }
     }
@@ -277,7 +277,7 @@ impl Peer {
 async fn run(p: &mut Peer, io: StreamEnd) -> std::io::Result<()> {
     let (mut rd, mut wr) = tokio::io::split(io);
     p.on_connect();
-    let mut out: Vec<u8> = Vec::new();
+    let mut out = bytes::BytesMut::new();
     let mut buf = vec![0u8; 8192];
     loop {
         p.fill();
@@ -295,7 +295,7 @@ async fn run(p: &mut Peer, io: StreamEnd) -> std::io::Result<()> {
             }
             w = wr.write(&out), if !out.is_empty() => {
                 let n = w?;
-                out.drain(..n);
+                bytes::Buf::advance(&mut out, n);
             }
             _ = sleep(ACK_DELAY) => p.ack_all(),
         }

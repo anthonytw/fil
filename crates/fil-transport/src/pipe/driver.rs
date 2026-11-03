@@ -35,7 +35,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
@@ -98,7 +98,7 @@ struct State {
     reply_opening: bool,
     /// A ping is due and not written yet.
     ping_due: bool,
-    out: Vec<u8>,
+    out: BytesMut,
     out_pos: usize,
     dirty: bool,
     /// The write side failed; keep reading for the peer's last words until this grace ends.
@@ -123,7 +123,7 @@ where
             reply: None,
             reply_opening: false,
             ping_due: false,
-            out: Vec::new(),
+            out: BytesMut::new(),
             out_pos: 0,
             dirty: false,
             write_failed: None,
@@ -404,8 +404,7 @@ where
         // An undecodable control message is passed up like any other: it is the layer above's
         // call (a peer of another wire revision is refused at the hello, so in practice this is
         // a bug or a hostile peer, and the layer above ends the run).
-        self.shared
-            .push_inbound(frame.channel, Bytes::from(frame.payload));
+        self.shared.push_inbound(frame.channel, frame.payload);
     }
 
     /// The answer to our ping `nonce`: its round trip is the link's RTT.

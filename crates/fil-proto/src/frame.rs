@@ -8,7 +8,12 @@
 //! The payload of channel 0 is one postcard-encoded [`crate::ControlMsg`]. The payload of any other
 //! channel is a data segment (see [`DataSegment`]). The decoder never trusts the length prefix:
 //! it rejects anything above its limit before allocating.
+//!
+//! Payloads are [`Bytes`]: the decoder hands out the buffer it read the body into (one allocation
+//! per frame, one copy from the input), and the encoder writes into a caller-owned [`BytesMut`]
+//! with the channel varint built on the stack. Nothing here allocates per frame beyond that.
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::limits::{LEN_PREFIX, MAX_DATA_PAYLOAD, MAX_FRAME_BODY};
@@ -41,6 +46,25 @@ impl ChannelId {
     /// First id for forwarded connections (M2). Ids 4 to 15 are reserved.
     pub const FORWARD_BASE: u32 = 16;
 
+    /// The postcard (LEB128) varint encoding of the id, built on the stack: the bytes
+    /// `postcard::to_allocvec(&self)` would allocate. Returns the buffer and how much of it is used.
+    pub fn varint(self) -> ([u8; MAX_CHANNEL_VARINT], usize) {
+        let mut buf = [0u8; MAX_CHANNEL_VARINT];
+        let n = put_varint(u64::from(self.0), &mut buf);
+        (buf, n)
+    }
+
+    /// Bytes the varint encoding of the id takes.
+    pub fn varint_len(self) -> usize {
+        match self.0 {
+            0..0x80 => 1,
+            0x80..0x4000 => 2,
+            0x4000..0x20_0000 => 3,
+            0x20_0000..0x1000_0000 => 4,
+            _ => 5,
+        }
+    }
+
     pub fn class(self) -> ChannelClass {
         match self.0 {
             0 => ChannelClass::Control,
@@ -48,6 +72,24 @@ impl ChannelId {
             _ => ChannelClass::Forward,
         }
     }
+}
+
+/// The longest varint a channel id (`u32`) needs.
+pub const MAX_CHANNEL_VARINT: usize = 5;
+/// The longest varint a sequence number (`u64`) needs.
+pub const MAX_SEQ_VARINT: usize = 10;
+
+/// Writes the postcard (LEB128) varint of `v` into `buf`, which must be long enough for it
+/// (`MAX_SEQ_VARINT` always is). Returns the length.
+fn put_varint(mut v: u64, buf: &mut [u8]) -> usize {
+    let mut n = 0;
+    while v >= 0x80 {
+        buf[n] = (v & 0x7F) as u8 | 0x80;
+        v >>= 7;
+        n += 1;
+    }
+    buf[n] = v as u8;
+    n + 1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -58,46 +100,66 @@ pub enum FrameError {
     Malformed(&'static str),
 }
 
-/// One decoded frame.
+/// One frame. The payload is a [`Bytes`]: a decoded frame owns the buffer its body was read into
+/// (the channel varint is skipped, not moved), so passing it on copies nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub channel: ChannelId,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl Frame {
-    pub fn new(channel: ChannelId, payload: Vec<u8>) -> Self {
-        Self { channel, payload }
+    /// A frame for `payload`: a `Bytes`, or a `Vec<u8>` or `&'static [u8]` that becomes one
+    /// without a copy.
+    pub fn new(channel: ChannelId, payload: impl Into<Bytes>) -> Self {
+        Self {
+            channel,
+            payload: payload.into(),
+        }
+    }
+
+    /// Bytes the frame takes on the wire: length prefix, channel and payload.
+    pub fn wire_len(&self) -> usize {
+        LEN_PREFIX + self.channel.varint_len() + self.payload.len()
     }
 
     /// Append the encoded frame to `out`. Fails (leaving `out` untouched) if it would exceed
-    /// `MAX_FRAME_BODY`.
-    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
-        let head =
-            postcard::to_allocvec(&self.channel).map_err(|_| FrameError::Malformed("channel"))?;
-        let len = head.len() + self.payload.len();
+    /// `MAX_FRAME_BODY`. Allocates only if `out` has to grow.
+    pub fn encode_into(&self, out: &mut BytesMut) -> Result<(), FrameError> {
+        let (head, head_len) = self.channel.varint();
+        let len = head_len + self.payload.len();
         if len > MAX_FRAME_BODY {
             return Err(FrameError::TooLarge {
                 len,
                 max: MAX_FRAME_BODY,
             });
         }
-        out.extend_from_slice(&(len as u32).to_be_bytes());
-        out.extend_from_slice(&head);
-        out.extend_from_slice(&self.payload);
+        out.reserve(LEN_PREFIX + len);
+        out.put_u32(len as u32);
+        out.put_slice(&head[..head_len]);
+        out.put_slice(&self.payload);
         Ok(())
     }
 
+    /// The encoded frame in a new buffer (one allocation). The pipe's writer uses
+    /// [`Frame::encode_into`] on a buffer it keeps.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let mut v = Vec::with_capacity(self.payload.len() + LEN_PREFIX + 5);
+        let mut v = BytesMut::with_capacity(self.wire_len());
         self.encode_into(&mut v)?;
-        Ok(v)
+        Ok(v.into())
     }
 }
 
 enum State {
-    Len { buf: [u8; LEN_PREFIX], have: usize },
-    Body { buf: Vec<u8>, need: usize },
+    Len {
+        buf: [u8; LEN_PREFIX],
+        have: usize,
+    },
+    /// Reading a body of `need` bytes into `buf`, which was allocated at exactly that size.
+    Body {
+        buf: BytesMut,
+        need: usize,
+    },
 }
 
 /// Incremental frame decoder. Feed it whatever the transport read; it yields complete frames.
@@ -106,6 +168,12 @@ enum State {
 /// the declared length only after the length has been checked against the limit, and it grows only
 /// as bytes actually arrive. After an error the decoder is poisoned and returns the same error
 /// forever; the connection must be dropped.
+///
+/// Each frame gets one allocation of exactly its size, which becomes the frame's payload
+/// ([`Bytes`]) with the channel varint skipped. Frames are deliberately *not* sliced out of a
+/// shared slab: a payload that is held (queued for a slow consumer) would pin the whole slab, so
+/// a peer could keep 64 KiB resident per byte it asks us to hold by interleaving frames that are
+/// consumed at once (heartbeats) with ones that are not.
 pub struct FrameDecoder {
     max_body: usize,
     state: State,
@@ -179,13 +247,13 @@ impl FrameDecoder {
                     // Allocate at most what was declared, and the declared length is within the
                     // limit. A hostile peer that declares the limit and stalls costs us the limit.
                     self.state = State::Body {
-                        buf: Vec::with_capacity(len),
+                        buf: BytesMut::with_capacity(len),
                         need: len,
                     };
                 }
                 State::Body { buf, need } => {
                     let take = (*need - buf.len()).min(input.len());
-                    buf.extend_from_slice(&input[..take]);
+                    buf.put_slice(&input[..take]);
                     *input = &input[take..];
                     if buf.len() < *need {
                         return Ok(None);
@@ -202,15 +270,15 @@ impl FrameDecoder {
     }
 }
 
-fn parse_body(mut body: Vec<u8>) -> Result<Frame, FrameError> {
+fn parse_body(body: BytesMut) -> Result<Frame, FrameError> {
     let (channel, rest) = postcard::take_from_bytes::<ChannelId>(&body)
         .map_err(|_| FrameError::Malformed("channel id"))?;
     let head = body.len() - rest.len();
-    body.drain(..head);
-    Ok(Frame {
-        channel,
-        payload: body,
-    })
+    // `freeze` of a buffer filled to its capacity reuses it; `advance` moves the start past the
+    // channel varint. Neither allocates or copies.
+    let mut payload = body.freeze();
+    payload.advance(head);
+    Ok(Frame { channel, payload })
 }
 
 /// The payload of a data frame: where the bytes sit in the channel's byte stream, then the bytes.
@@ -224,7 +292,28 @@ pub struct DataSegment<'a> {
     pub data: &'a [u8],
 }
 
+/// The sequence-number varint that starts a data payload, built on the stack.
+#[derive(Clone, Copy, Debug)]
+pub struct SeqHeader {
+    buf: [u8; MAX_SEQ_VARINT],
+    len: usize,
+}
+
+impl SeqHeader {
+    pub fn new(seq: u64) -> Self {
+        let mut buf = [0u8; MAX_SEQ_VARINT];
+        let len = put_varint(seq, &mut buf);
+        Self { buf, len }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
 impl<'a> DataSegment<'a> {
+    /// The payload of a data frame: `seq` as a varint, then `data`, in one allocation of exactly
+    /// that size (so `Bytes::from` it is free).
     pub fn encode(seq: u64, data: &[u8]) -> Result<Vec<u8>, FrameError> {
         if data.is_empty() {
             return Err(FrameError::Malformed("empty data segment"));
@@ -235,8 +324,9 @@ impl<'a> DataSegment<'a> {
                 max: MAX_DATA_PAYLOAD,
             });
         }
-        let mut v = postcard::to_allocvec(&seq).map_err(|_| FrameError::Malformed("seq"))?;
-        v.reserve(data.len());
+        let head = SeqHeader::new(seq);
+        let mut v = Vec::with_capacity(head.as_bytes().len() + data.len());
+        v.extend_from_slice(head.as_bytes());
         v.extend_from_slice(data);
         Ok(v)
     }
@@ -265,7 +355,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     fn frame(ch: u32, n: usize) -> Frame {
-        Frame::new(ChannelId(ch), (0..n).map(|i| i as u8).collect())
+        Frame::new(ChannelId(ch), (0..n).map(|i| i as u8).collect::<Vec<u8>>())
     }
 
     fn decode_all(dec: &mut FrameDecoder, mut data: &[u8]) -> Result<Vec<Frame>, FrameError> {
@@ -289,6 +379,48 @@ mod tests {
         );
     }
 
+    /// The stack-built varints are the bytes postcard would allocate, at every length boundary.
+    #[test]
+    fn varints_built_on_the_stack_match_postcard() {
+        let mut edges = vec![0u64, 1, 127, 128, u64::MAX, u64::MAX - 1];
+        for bits in 1..64 {
+            edges.extend([(1u64 << bits) - 1, 1 << bits, (1 << bits) + 1]);
+        }
+        for v in edges {
+            let want = postcard::to_allocvec(&v).unwrap();
+            assert_eq!(SeqHeader::new(v).as_bytes(), want, "seq {v}");
+            if let Ok(id) = u32::try_from(v) {
+                let (buf, n) = ChannelId(id).varint();
+                let want = postcard::to_allocvec(&ChannelId(id)).unwrap();
+                assert_eq!(&buf[..n], want, "channel {id}");
+                assert_eq!(ChannelId(id).varint_len(), n, "channel {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_data_payload_is_built_in_one_exactly_sized_buffer() {
+        for seq in [0u64, 300, u64::MAX >> 1] {
+            let p = DataSegment::encode(seq, &[7; 1000]).unwrap();
+            assert_eq!(p.capacity(), p.len());
+            assert_eq!(
+                p,
+                [postcard::to_allocvec(&seq).unwrap(), vec![7; 1000]].concat()
+            );
+        }
+    }
+
+    /// A decoded payload is the body buffer itself with the channel varint skipped.
+    #[test]
+    fn a_decoded_payload_keeps_the_buffer_and_skips_the_channel() {
+        let wire = frame(300, 50).encode().unwrap();
+        let mut dec = FrameDecoder::default();
+        let f = decode_all(&mut dec, &wire).unwrap().remove(0);
+        assert_eq!(f.channel, ChannelId(300));
+        assert_eq!(f.payload.len(), 50);
+        assert_eq!(f.payload[..], frame(300, 50).payload[..]);
+    }
+
     #[test]
     fn round_trip_byte_at_a_time_and_whole() {
         let frames = [
@@ -297,7 +429,7 @@ mod tests {
             frame(77, MAX_DATA_PAYLOAD),
             frame(2, 0),
         ];
-        let mut wire = vec![];
+        let mut wire = BytesMut::new();
         for f in &frames {
             f.encode_into(&mut wire).unwrap();
         }
@@ -363,9 +495,9 @@ mod tests {
     fn encode_refuses_oversize() {
         let f = Frame::new(ChannelId(1), vec![0; MAX_FRAME_BODY]);
         assert!(matches!(f.encode(), Err(FrameError::TooLarge { .. })));
-        let mut out = vec![1];
+        let mut out = BytesMut::from(&[1u8][..]);
         assert!(f.encode_into(&mut out).is_err());
-        assert_eq!(out, [1]);
+        assert_eq!(&out[..], [1]);
         // A full data segment always fits.
         let seg = DataSegment::encode(u64::MAX >> 1, &[0; MAX_DATA_PAYLOAD]).unwrap();
         assert!(Frame::new(ChannelId(u32::MAX), seg).encode().is_ok());
@@ -408,10 +540,11 @@ mod tests {
     #[test]
     fn random_bytes_never_panic() {
         let mut rng = StdRng::seed_from_u64(0xF11);
-        let mut valid = vec![];
+        let mut valid = BytesMut::new();
         for i in 0..20 {
             frame(i, (i * 37) as usize).encode_into(&mut valid).unwrap();
         }
+        let valid = valid.to_vec();
         for round in 0..3000 {
             let mut data: Vec<u8> = if round % 2 == 0 {
                 let n = rng.random_range(0..200);

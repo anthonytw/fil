@@ -375,8 +375,8 @@ impl Outbox {
         }
     }
 
-    fn data(&self, channel: ChannelId, payload: Vec<u8>) {
-        let _ = self.data.send((channel, Bytes::from(payload)));
+    fn data(&self, channel: ChannelId, payload: impl Into<Bytes>) {
+        let _ = self.data.send((channel, payload.into()));
     }
 }
 
@@ -1892,9 +1892,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             let n = self.sess.input.write(&self.pending);
             self.pending.drain(..n);
         }
-        while let Some(seg) = self.sess.input.next_segment() {
+        while let Some(payload) = self.sess.input.next_payload() {
             if let Some(tx) = &self.tx {
-                tx.data(ChannelId::TERMINAL, seg.payload());
+                tx.data(ChannelId::TERMINAL, payload);
             }
         }
     }

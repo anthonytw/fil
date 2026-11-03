@@ -14,6 +14,7 @@
 //! The channel id is postcard's varint encoding of a `u32`, the same bytes the pipe puts at the
 //! start of a frame body, so one decoder's rules cover both transports.
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fil_proto::limits::MAX_FRAME_BODY;
 
 /// The longest varint a `u32` needs.
@@ -86,6 +87,97 @@ pub(super) fn flush_marker(id: u32) -> [u8; 8] {
     let mut out = [0u8; 8];
     out[4..].copy_from_slice(&id.to_be_bytes());
     out
+}
+
+/// How much of the stream one `read_chunk` may ask for. A chunk is what quinn received in one
+/// packet (about a kilobyte), so this is "whatever there is"; the point of asking for more than
+/// the piece in hand is that the rest stays in [`Chunks`] and starts the next piece.
+pub const READ_MAX: usize = MAX_FRAME_BODY + 4;
+
+/// A payload at least this long that lies inside one chunk is passed up as a slice of the chunk,
+/// without a copy. A shorter one is copied: a slice keeps the whole chunk (a packet's worth of
+/// memory, shared with the frames around it) alive for as long as the slice is, and a peer that
+/// sends one-byte frames and a consumer that reads slowly would make that a thousand times what
+/// the inbox budget counts.
+pub const SHARE_FROM: usize = 512;
+
+/// The unread rest of the chunk the stream reader last got from quinn, and the pieces it cuts out
+/// of the stream: a length prefix, a channel id, a payload.
+///
+/// This is the pure half of the read path (the async half is `link::read_stream`, which only
+/// feeds it chunks): a payload that lies inside the held chunk is a slice of it, and one that
+/// spans chunks is assembled into a single buffer of exactly its size. Neither zero-fills a buffer
+/// first, which `read_exact` into `vec![0; len]` did for every payload.
+#[derive(Default)]
+pub struct Chunks {
+    held: Bytes,
+    /// The payload being assembled across chunks, and its full length.
+    acc: Option<(BytesMut, usize)>,
+}
+
+impl Chunks {
+    /// Holds a chunk from the stream. The previous one must have been used up.
+    pub fn push(&mut self, chunk: Bytes) {
+        debug_assert!(
+            self.held.is_empty(),
+            "a chunk is read only when none is held"
+        );
+        self.held = chunk;
+    }
+
+    /// Copies up to `out.len()` held bytes into `out`; returns how many.
+    pub fn copy_to(&mut self, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.held.len());
+        self.held.copy_to_slice(&mut out[..n]);
+        n
+    }
+
+    /// Starts a payload of `len` bytes (1 or more).
+    pub fn start_payload(&mut self, len: usize) {
+        debug_assert!(self.acc.is_none() && len > 0);
+        self.acc = Some((BytesMut::new(), len));
+    }
+
+    /// The payload started with [`Chunks::start_payload`], once all of it has been pushed.
+    ///
+    /// If the held chunk has all of it, it is a slice of the chunk when it is at least
+    /// [`SHARE_FROM`] bytes and a copy of its own otherwise; if not, the payload is assembled in
+    /// a buffer of exactly its length. `None` means more chunks are needed
+    /// ([`Chunks::missing`] says how much).
+    pub fn poll_payload(&mut self) -> Option<Bytes> {
+        let (acc, len) = self.acc.as_mut()?;
+        let len = *len;
+        if acc.capacity() == 0 {
+            if self.held.len() >= len {
+                let piece = self.held.split_to(len);
+                self.acc = None;
+                return Some(if len >= SHARE_FROM {
+                    piece
+                } else {
+                    Bytes::copy_from_slice(&piece)
+                });
+            }
+            *acc = BytesMut::with_capacity(len);
+        }
+        let n = (len - acc.len()).min(self.held.len());
+        acc.put(self.held.split_to(n));
+        if acc.len() < len {
+            return None;
+        }
+        self.acc.take().map(|(acc, _)| acc.freeze())
+    }
+
+    /// How many bytes of the payload in progress are still to come.
+    pub fn missing(&self) -> usize {
+        self.acc
+            .as_ref()
+            .map_or(0, |(acc, len)| len.saturating_sub(acc.len()))
+    }
+
+    /// Bytes of the payload in progress that have arrived.
+    pub fn have(&self) -> usize {
+        self.acc.as_ref().map_or(0, |(acc, _)| acc.len())
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +253,72 @@ mod tests {
             None
         );
         assert_eq!(parse_prefix(u32::MAX.to_be_bytes()), None);
+    }
+
+    fn chunk(range: std::ops::Range<usize>) -> Bytes {
+        Bytes::from(
+            (range.start..range.end)
+                .map(|i| i as u8)
+                .collect::<Vec<u8>>(),
+        )
+    }
+
+    /// Payloads are cut out of the chunks, however the network split them.
+    #[test]
+    fn payloads_assemble_across_chunk_boundaries() {
+        let stream: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        for split in [1usize, 7, 511, 512, 513, 1200, 4999, 5000] {
+            for len in [1usize, 5, 511, 512, 513, 2000] {
+                let mut c = Chunks::default();
+                let mut fed = 0;
+                let mut prefix = [0u8; 4];
+                let mut have = 0;
+                // The prefix, then the payload, fed `split` bytes at a time.
+                while have < 4 {
+                    have += c.copy_to(&mut prefix[have..]);
+                    if have < 4 {
+                        c.push(Bytes::copy_from_slice(
+                            &stream[fed..fed + split.min(5000 - fed)],
+                        ));
+                        fed += split.min(5000 - fed);
+                    }
+                }
+                assert_eq!(prefix, stream[..4]);
+                c.start_payload(len);
+                let got = loop {
+                    if let Some(p) = c.poll_payload() {
+                        break p;
+                    }
+                    assert!(c.missing() > 0);
+                    let n = split.min(c.missing()).min(5000 - fed);
+                    c.push(Bytes::copy_from_slice(&stream[fed..fed + n]));
+                    fed += n;
+                };
+                assert_eq!(got[..], stream[4..4 + len], "split {split}, len {len}");
+                assert_eq!(c.missing(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_payload_inside_one_chunk_is_a_slice_of_it_when_long_and_a_copy_when_short() {
+        let big = chunk(0..2000);
+        let base = big.as_ptr() as usize;
+        let mut c = Chunks::default();
+        c.push(big);
+        let mut prefix = [0u8; 4];
+        assert_eq!(c.copy_to(&mut prefix), 4);
+        c.start_payload(SHARE_FROM);
+        let p = c.poll_payload().unwrap();
+        assert_eq!(p.as_ptr() as usize, base + 4, "no copy");
+        c.start_payload(SHARE_FROM - 1);
+        let p = c.poll_payload().unwrap();
+        let at = p.as_ptr() as usize;
+        assert!(
+            at < base || at >= base + 2000,
+            "a short payload must not pin the chunk"
+        );
+        assert_eq!(p[0], (4 + SHARE_FROM) as u8);
     }
 
     #[test]

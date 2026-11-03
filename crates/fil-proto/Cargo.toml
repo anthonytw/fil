@@ -11,6 +11,7 @@ publish.workspace = true
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
+bytes = "1"
 
 [features]
 # Lets a test override the wire revision with FIL_TEST_WIRE_REVISION (src/version.rs). Never in the

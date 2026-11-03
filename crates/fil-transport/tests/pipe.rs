@@ -18,6 +18,9 @@ use tokio::time::{Instant, sleep, timeout};
 /// The most the preamble scanner may hold beyond its bound: one read.
 const READ_CHUNK: usize = 16 * 1024 + 64;
 const MS: fn(u64) -> Duration = Duration::from_millis;
+/// The payload of the opening ping, spelled out: it is FROZEN (the golden's `[frozen]`), so these
+/// tests must not follow `fil_proto::opening::PING` if it ever changed.
+const FROZEN_PING: [u8; 3] = [0xff, 0x7f, 0x00];
 
 fn cfg() -> PipeConfig {
     PipeConfig::new(LinkParams::default())
@@ -298,7 +301,7 @@ async fn heartbeat_timing_follows_the_spec() {
     let (link, mut raw) = client_vs_raw(cfg(), b"", ping(77)).await;
     let t0 = Instant::now();
     // The handshake ping, then the reply to the peer's ping at once.
-    assert_eq!(raw.frame().await.payload, opening::PING);
+    assert_eq!(raw.frame().await.payload, FROZEN_PING);
     let reply = raw.frame().await;
     assert_eq!(
         ControlMsg::decode(&reply.payload).unwrap(),
@@ -898,7 +901,7 @@ async fn the_daemon_side_has_no_preamble() {
     assert!(link.banner().is_empty());
     assert_eq!(link.peer_major(), None);
     // Its first frame to the peer is its own ping, then the reply.
-    assert_eq!(raw.frame().await.payload, opening::PING);
+    assert_eq!(raw.frame().await.payload, FROZEN_PING);
     drop(link);
 }
 
@@ -1158,7 +1161,7 @@ async fn the_daemon_pings_on_its_own_only_after_a_heartbeat_and_a_half_of_silenc
     let t0 = Instant::now();
     let link = PipeLink::accept(a, cfg()).await.unwrap();
     // The handshake ping and the reply to the peer's, at once.
-    assert_eq!(raw.frame().await.payload, opening::PING);
+    assert_eq!(raw.frame().await.payload, FROZEN_PING);
     assert_eq!(
         ControlMsg::decode(&raw.frame().await.payload).unwrap(),
         ControlMsg::Heartbeat {
@@ -1488,13 +1491,13 @@ async fn the_clients_opening_is_the_frozen_ping_and_the_frozen_pong_answers_it()
     let mut raw = Raw::new(b);
     raw.put(&preamble::encode(1)).await;
     let link = tokio::spawn(PipeLink::connect(a, cfg()));
-    let first = raw.frame().await;
-    assert_eq!(
-        (first.channel, &first.payload[..]),
-        (ChannelId::CONTROL, opening::PING)
-    );
-    // Not the control message that the golden's `heartbeat-ping` is, and not any other.
-    assert!(ControlMsg::decode(&first.payload).is_err());
+    // The literal bytes on the wire, not the constant: they are frozen (the golden's
+    // `frame/opening-ping`), and a handshake switched to another form must fail here.
+    let mut first = [0u8; 8];
+    raw.s.read_exact(&mut first).await.unwrap();
+    assert_eq!(first, [0, 0, 0, 4, 0, 0xff, 0x7f, 0x00]);
+    // Not a control message of any kind.
+    assert!(ControlMsg::decode(&first[5..]).is_err());
     sleep(MS(40)).await;
     raw.put_frame(ChannelId::CONTROL, opening::PONG).await;
     let link = link.await.unwrap().unwrap();
@@ -1515,7 +1518,7 @@ async fn a_link_answers_the_frozen_ping_with_the_frozen_pong() {
     let mut raw = Raw::new(b);
     raw.put_frame(ChannelId::CONTROL, opening::PING).await;
     let link = PipeLink::accept(a, cfg()).await.unwrap();
-    assert_eq!(raw.frame().await.payload, opening::PING);
+    assert_eq!(raw.frame().await.payload, FROZEN_PING);
     assert_eq!(raw.frame().await.payload, opening::PONG);
     raw.put_frame(ChannelId::CONTROL, opening::PONG).await;
     sleep(MS(10)).await;

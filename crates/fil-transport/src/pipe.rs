@@ -7,8 +7,8 @@
 //! - **Establishing.** [`PipeLink::connect`] (client) first scans for the preamble
 //!   (`ESC "FIL-CONNECT " <major> LF`) and keeps whatever came before it as the *banner*
 //!   ([`PipeLink::banner`]). [`PipeLink::accept`] (daemon) has no preamble: the relay writes it.
-//!   Then each side sends a heartbeat at once and waits for the peer's first frame. Only then does
-//!   the constructor return, so **a `PipeLink` you hold is already `Up`**: the peer has proven
+//!   Then each side sends the opening ping at once and waits for the peer's first frame. Only
+//!   then does the constructor return, so **a `PipeLink` you hold is already `Up`**: the peer has proven
 //!   itself (§8.1). A frame that arrives first and is not a heartbeat is delivered by `recv`.
 //! - **Sending.** Frames go through [`fil_proto::sched::Scheduler`]: control first, then
 //!   terminal/snapshot/agent in order, then forwards round-robin with a guaranteed share. The
@@ -37,9 +37,9 @@
 //!   nonce; the pair measures RTT (so the daemon's RTT is the one from its handshake ping,
 //!   refreshed only when it has had to ping). The first ping of a connection, sent in the
 //!   handshake, is the frozen opening ping (`fil_proto::opening`), answered with the opening pong,
-//!   so a relay can answer it without knowing the peer's wire. Heartbeats never reach `recv`. An idle link carries
-//!   one ping and one reply a second, not two of each. They are encoded ahead of everything when
-//!   the writer is free: at most one reply (the latest ping's nonce) and one ping of our own are
+//!   so a relay can answer it without knowing the peer's wire. Heartbeats never reach `recv`. An
+//!   idle link carries one ping and one reply a second, not two of each. They are encoded ahead
+//!   of everything when the writer is free: at most one reply (the latest ping's nonce) and one ping of our own are
 //!   ever pending, so a peer that floods pings without reading costs one pending frame, and a
 //!   stuck write does not pile up stale pings.
 //! - **Liveness.** *Any* bytes from the peer count as proof of life, not only whole frames, so a
@@ -263,6 +263,10 @@ pub(crate) struct StderrCapture {
     /// waiting for data, so neither depends on the other being scheduled. The lock is held
     /// across the writes to the terminal, which can block (see `stop_tee`).
     tee: std::sync::Mutex<Tee>,
+    /// Set by [`silence`](Self::silence): nothing more is written to the terminal. Checked inside
+    /// the lock before every write, so setting it needs no lock (and so cannot wait for a write
+    /// that is stuck on a stopped terminal).
+    quiet: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The stream, and the state of copying it to the terminal ([`PipeStderr::Tee`]).
@@ -276,6 +280,8 @@ struct Tee {
     open: bool,
     /// Where the text goes: the terminal, except in tests.
     sink: Sink,
+    /// See [`StderrCapture::silence`].
+    quiet: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Where a tee writes: gets sanitized text.
@@ -328,6 +334,9 @@ impl Tee {
     /// are removed (the text can come from a remote host's rc files or banner).
     fn show(&mut self, text: &[u8]) {
         if text.is_empty() {
+            return;
+        }
+        if self.quiet.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let clean = fil_proto::text::sanitize(text);
@@ -384,6 +393,7 @@ impl StderrCapture {
     fn start(stderr: tokio::process::ChildStderr, tee: bool, sink: Sink) -> Arc<Self> {
         use std::task::Poll;
         let (done, _) = watch::channel(false);
+        let quiet = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cap = Arc::new(Self {
             buf: std::sync::Mutex::new(Vec::new()),
             done,
@@ -393,7 +403,9 @@ impl StderrCapture {
                 line: Vec::new(),
                 open: false,
                 sink,
+                quiet: quiet.clone(),
             }),
+            quiet,
         });
         let task = cap.clone();
         tokio::spawn(async move {
@@ -491,6 +503,13 @@ impl StderrCapture {
             }
         }
         t.finish();
+    }
+
+    /// Stops writing to the terminal from now on, without waiting for anything: not for the lock
+    /// (a write may be stuck on a stopped terminal), and without showing what has arrived but was
+    /// not shown yet, which is dropped (still captured). A write already under way finishes.
+    fn silence(&self) {
+        self.quiet.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Waits (briefly) for the stream to end, then returns what was captured.
@@ -725,7 +744,14 @@ impl PipeLink {
 
 impl Drop for PipeLink {
     fn drop(&mut self) {
-        self.close();
+        // A link dropped before its session started no longer has the terminal to write to, and
+        // a drop must not wait for it (it may be a runtime worker, and the terminal may be
+        // stopped with Ctrl-S): silence the tee at once. What had arrived and was not shown yet
+        // is not shown (still captured); an explicit `close` waits and shows it.
+        if let Some(c) = &self.stderr {
+            c.silence();
+        }
+        self.shared.set_down(DownReason::Closed);
     }
 }
 
@@ -738,7 +764,7 @@ struct Handshake {
 }
 
 impl Handshake {
-    /// Preamble (client), our heartbeat, the peer's first frame. Returns the peer's major (client
+    /// Preamble (client), our opening ping, the peer's first frame. Returns the peer's major (client
     /// only) and our ping, for RTT.
     async fn run<R, W>(
         &mut self,
@@ -954,7 +980,8 @@ impl Link for PipeLink {
     fn close(&self) {
         // A link that is closed before its session started (a refused attach, a failed hello)
         // no longer has the terminal to write to: its command's stderr is shown up to now, and
-        // not after (a no-op once the session has stopped the tee).
+        // not after (a no-op once the session has stopped the tee). Like `stop_stderr_tee` this
+        // waits for the terminal to take the text; a drop does not (see `Drop`).
         self.stop_stderr_tee();
         self.shared.set_down(DownReason::Closed);
     }
@@ -1146,6 +1173,16 @@ mod tests {
     /// A pipe run as `PipeLink::spawn` sets it up, with the tee going to a [`Shown`]. The script's
     /// stdout is the pipe's.
     async fn run_of(script: &str) -> (Result<PipeLink, PipeError>, Arc<StderrCapture>, Shown) {
+        let shown = Shown::default();
+        let (link, cap) = run_with(script, shown.sink()).await;
+        (link, cap, shown)
+    }
+
+    /// [`run_of`] with a sink of the test's own.
+    async fn run_with(
+        script: &str,
+        sink: Sink,
+    ) -> (Result<PipeLink, PipeError>, Arc<StderrCapture>) {
         let mut child = ChildGuard::new(
             tokio::process::Command::new("sh")
                 .args(["-c", script])
@@ -1158,8 +1195,7 @@ mod tests {
             false,
         );
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        let shown = Shown::default();
-        let cap = StderrCapture::start(child.stderr.take().unwrap(), true, shown.sink());
+        let cap = StderrCapture::start(child.stderr.take().unwrap(), true, sink);
         let mut cfg = PipeConfig::new(LinkParams::default());
         cfg.stderr = PipeStderr::Tee;
         let link = PipeLink::establish(
@@ -1171,7 +1207,7 @@ mod tests {
             Some(cap.clone()),
         )
         .await;
-        (link, cap, shown)
+        (link, cap)
     }
 
     async fn captured(cap: &StderrCapture, what: &str) {
@@ -1222,6 +1258,49 @@ mod tests {
             "hi\n",
             "the late line was captured, not shown"
         );
+    }
+
+    /// Dropping a link must not wait for the terminal: with our stderr stopped (Ctrl-S), the tee
+    /// task sits in a write holding its lock, and a drop that waited for the lock would hang the
+    /// thread that drops (it may be a runtime worker). The text after the drop is not shown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn dropping_a_link_does_not_wait_for_a_terminal_that_has_stopped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let entered = Arc::new(AtomicBool::new(false));
+        let shown = Shown::default();
+        let sink: Sink = {
+            let (entered, record) = (entered.clone(), shown.sink());
+            Arc::new(move |text: &str| {
+                if text == "hi\n" {
+                    entered.store(true, Ordering::SeqCst);
+                    // The terminal takes no text until released.
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                record(text);
+            })
+        };
+        let script = "printf '\\033FIL-CONNECT 1\\n\\000\\000\\000\\004\\000\\377\\177\\001'; \\
+                      echo hi >&2; (sleep 1; echo late >&2) & exec sleep 30";
+        let (link, cap) = run_with(script, sink).await;
+        let link = link.expect("the link comes up");
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < end, "the tee never wrote");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(link);
+            let _ = done_tx.send(());
+        });
+        let dropped = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Let the terminal go again whatever happened, so nothing is left stuck.
+        let _ = release_tx.send(());
+        assert!(dropped, "the drop waited for a stopped terminal");
+        captured(&cap, "late").await;
+        assert_eq!(shown.text(), "hi\n", "nothing after the drop is shown");
     }
 
     /// The tee's line state follows what was shown: text that is nothing once cleaned (a lone

@@ -7,7 +7,9 @@
 //! - `[frozen]`: the preamble, the hello (layout and decode limits), the opening ping and pong,
 //!   the frame layout and `Error(VersionMismatch)`: what a peer of any other build must be able
 //!   to read to say "different version", to exit cleanly on a refusal, and (the relay) to route
-//!   a client by its hello. A line may be added with a new revision; none may change;
+//!   a client by its hello. A line may be added with a new revision, but only one that pins
+//!   something no older peer has to read (a new probe, a new fact; a new *form* of the opening or
+//!   the hello needs a new major); none may change;
 //! - `[limits]`: every constant that bounds a decoder or a peer, the QUIC stream cap and the
 //!   ALPN format;
 //! - `[revisioned]`: a canonical instance of every control message and of every variant of the
@@ -15,7 +17,7 @@
 //!   the QUIC stream layout, and what each decoder makes of a value one step either side of
 //!   every limit and of the widest value of every narrow integer field (so widening a type or
 //!   loosening a check changes the file);
-//! - `[history]`: one line per revision, the hash of `[limits]` and `[revisioned]` as that
+//! - `[history]`: one line per revision, the hash of `[frozen]`, `[limits]` and `[revisioned]` as that
 //!   revision shipped. It only grows, and two branches that each bump to the same revision write
 //!   different lines in the same place, which git reports as a conflict.
 //!
@@ -674,6 +676,15 @@ fn raw_msg(index: u8, fields: &[Vec<u8>]) -> Vec<u8> {
     v
 }
 
+/// "err" when `payload` is not a control message.
+fn refused(payload: &[u8]) -> String {
+    if ControlMsg::decode(payload).is_err() {
+        "err".into()
+    } else {
+        "ok".into()
+    }
+}
+
 /// The bytes a peer of any other build must read to say "different version", and what an old
 /// client needs to exit cleanly on a refusal: the preamble, the hello (layout and decode limits),
 /// the frame layout, and `Error(VersionMismatch)`. Changing them needs a new major.
@@ -716,13 +727,15 @@ fn frozen() -> Entries {
             &opening::frame_of(opening::PONG).unwrap(),
         ),
         // ... and neither is, or can become, a control message.
+        // (Only that they are refused, not the kind of refusal, which a later revision may
+        // reclassify without touching what a peer reads.)
         (
             "decode/opening-ping-as-control".into(),
-            control_outcome(opening::PING),
+            refused(opening::PING),
         ),
         (
             "decode/opening-pong-as-control".into(),
-            control_outcome(opening::PONG),
+            refused(opening::PONG),
         ),
     ];
     for ch in [0u32, 1, 2, 3, 16, 127, 128, 300, 70_000, u32::MAX] {
@@ -1112,10 +1125,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The hash of what a revision number stands for: every limit and every revisioned encoding.
-fn wire_hash(limits: &[String], revisioned: &[String]) -> String {
+/// The hash of what a revision number stands for: every frozen line, limit and revisioned
+/// encoding. (The frozen lines are in it because a line may be added to them with a revision, and
+/// two branches that add different ones must not write the same history line.)
+fn wire_hash(frozen: &[String], limits: &[String], revisioned: &[String]) -> String {
     let mut text = String::new();
-    for l in limits.iter().chain(revisioned) {
+    for l in frozen.iter().chain(limits).chain(revisioned) {
         text.push_str(l);
         text.push('\n');
     }
@@ -1146,9 +1161,9 @@ fn render(
         "# regenerate with `just wire-golden`, after bumping PROTOCOL_REVISION in limits.rs\n",
     );
     s.push_str("# if any encoding or limit changed (or PROTOCOL_MAJOR if a [frozen] one did).\n");
-    s.push_str("# [history] only ever grows: one line per revision, the hash of [limits] and\n");
+    s.push_str("# [history] only ever grows: one line per revision, the hash of [frozen],\n");
     s.push_str(
-        "# [revisioned] as that revision shipped it. Two branches that each bump to the same\n",
+        "# [limits] and [revisioned] as that revision shipped it. Two branches that each bump to the same\n",
     );
     s.push_str(
         "# revision add different lines at the end and conflict in git: that is the point.\n",
@@ -1253,7 +1268,7 @@ impl Now {
     }
 
     fn hash(&self) -> String {
-        wire_hash(&self.limits, &self.revisioned)
+        wire_hash(&self.frozen, &self.limits, &self.revisioned)
     }
 }
 
@@ -1530,7 +1545,7 @@ fn two_bumps_to_the_same_revision_write_different_history_lines() {
         &base.frozen,
         &base.limits,
         &base.revisioned,
-        &[(5, wire_hash(&base.limits, &base.revisioned))],
+        &[(5, wire_hash(&base.frozen, &base.limits, &base.revisioned))],
     );
     let old = parse(&old_text);
     let branch = |extra: &str| {
@@ -1548,6 +1563,20 @@ fn two_bumps_to_the_same_revision_write_different_history_lines() {
         ha.last().unwrap().1,
         hb.last().unwrap().1,
         "different wires, different lines: git sees a conflict"
+    );
+    // The same when the only change is a frozen line (they may be added with a revision).
+    let frozen_branch = |extra: &str| {
+        let mut n = Now::get();
+        n.revision = 6;
+        n.frozen.push(extra.to_string());
+        n
+    };
+    let fa = next_history(Some(&old), &frozen_branch("opening/a = 00")).unwrap();
+    let fb = next_history(Some(&old), &frozen_branch("opening/b = 01")).unwrap();
+    assert_ne!(
+        fa.last().unwrap().1,
+        fb.last().unwrap().1,
+        "two different frozen additions to one revision must conflict too"
     );
     // An existing line is never rewritten: the same revision with another wire is refused.
     let already = Parsed {

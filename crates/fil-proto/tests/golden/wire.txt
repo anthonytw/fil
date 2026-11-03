@@ -1,8 +1,8 @@
 # The wire golden (crates/fil-proto/tests/wire_golden.rs). Do not edit by hand:
 # regenerate with `just wire-golden`, after bumping PROTOCOL_REVISION in limits.rs
 # if any encoding or limit changed (or PROTOCOL_MAJOR if a [frozen] one did).
-# [history] only ever grows: one line per revision, the hash of [limits] and
-# [revisioned] as that revision shipped it. Two branches that each bump to the same
+# [history] only ever grows: one line per revision, the hash of [frozen],
+# [limits] and [revisioned] as that revision shipped it. Two branches that each bump to the same
 # revision add different lines at the end and conflict in git: that is the point.
 major = 1
 revision = 3
@@ -17,8 +17,8 @@ opening/ping = ff7f00
 opening/pong = ff7f01
 frame/opening-ping = 0000000400ff7f00
 frame/opening-pong = 0000000400ff7f01
-decode/opening-ping-as-control = err malformed
-decode/opening-pong-as-control = err malformed
+decode/opening-ping-as-control = err
+decode/opening-pong-as-control = err
 frame/channel-0 = 000000040078797a
 frame/channel-1 = 000000040178797a
 frame/channel-2 = 000000040278797a
@@ -213,4 +213,4 @@ decode/response-3 = err
 [history]
 1 = 9534726b9f61a7db
 2 = 46a624dcce668487
-3 = 57c6cf48c225565a
+3 = 5bc45255045b0f43

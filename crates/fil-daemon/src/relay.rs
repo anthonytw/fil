@@ -67,7 +67,7 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const BUF: usize = 64 * 1024;
 const _: () = assert!(BUF >= 2 * fil_proto::limits::MAX_FRAME_BODY);
 /// How long the relay waits for the client's `Hello`. A client sends it as soon as the relay has
-/// answered its first heartbeat, so this is for something that is not a fil client.
+/// answered its ping, so this is for something that is not a fil client.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
 
 /// What the relay needs: where the daemon is and how to start it.
@@ -156,7 +156,7 @@ const MAX_PINGS: usize = 4;
 /// Both are a `Heartbeat { nonce: 0, .. }` control message in the encoding of its time: variant
 /// index 7 up to the removal of `Resize` (the `ede9cb2` build and the dev builds until then), 6
 /// since (wire revisions 1 and 2). The first is the real bytes of an `ede9cb2` client's opening
-/// (`tests/revision.rs` carries them as captured).
+/// (`tests/opening.rs` carries them as captured).
 const LEGACY_PINGS: [(&[u8], &[u8]); 2] = [(&[7, 0, 0], &[7, 0, 1]), (&[6, 0, 0], &[6, 0, 1])];
 
 /// The payload to answer a client's opening ping with, if `payload` is one.
@@ -322,22 +322,18 @@ fn refuse<W: Write>(output: &mut W, revision: u16) -> Result<(), RelayError> {
 }
 
 /// What to tell the user when this relay has just started a daemon and daemons of other wires
-/// are running: their sessions are not in the new one. Numbers only (DESIGN.md section 5.3).
+/// are running: their sessions are not in the new one. One line and no numbers: `fil ls` names
+/// the daemons (its "also running" lines), so the two do not say the same thing twice, and a
+/// plain `fil HOST` after an upgrade, which has no `fil ls` output, still hears it.
 fn others_note(paths: &Paths) -> Option<String> {
-    let others = crate::paths::other_daemons(paths);
-    if others.is_empty() {
+    if crate::paths::other_daemons(paths).is_empty() {
         return None;
     }
-    let mut note = String::from(
-        "fil: note: started a new fil daemon; sessions of the other fil version are not in it\n",
-    );
-    for d in &others {
-        note.push_str(&format!(
-            "fil: note: also running: {}; use that fil version for its sessions (`fil ls` lists them)\n",
-            d.describe()
-        ));
-    }
-    Some(note)
+    Some(
+        "fil: note: started a new fil daemon; sessions of other fil versions stay in their own \
+         daemons (`fil ls` names them)\n"
+            .to_string(),
+    )
 }
 
 /// The relay over any input and output. Writes the preamble to `output` first, so the client
@@ -489,8 +485,11 @@ mod tests {
         let lock = std::fs::File::create(old.with_extension("lock")).unwrap();
         flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
         let note = others_note(&paths).expect("an old daemon is running");
-        assert!(note.contains("a daemon of wire rev 4"), "{note}");
-        assert!(!note.contains("rev 5"), "{note}");
+        assert!(
+            note.contains("other fil versions") && note.ends_with('\n'),
+            "{note}"
+        );
+        assert_eq!(note.lines().count(), 1, "{note}");
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }

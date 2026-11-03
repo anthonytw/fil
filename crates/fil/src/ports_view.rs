@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use fil_client::text::format_utc;
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsRow, ProbeKind, ProcessInfo, Response,
-    SessionSummary,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsRow, ProbeKind,
+    ProcessInfo, Response, SessionSummary,
 };
 use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin};
 use serde::Serialize;
@@ -49,6 +49,8 @@ pub struct PortsAnswer {
     pub truncated: bool,
     /// The last part said no more were coming.
     pub complete: bool,
+    /// The host could not find all its listeners, and why (any part that says so).
+    pub incomplete: Option<PortsIncomplete>,
 }
 
 impl PortsAnswer {
@@ -58,6 +60,7 @@ impl PortsAnswer {
         let mut rows = Vec::new();
         let mut truncated = false;
         let mut complete = false;
+        let mut incomplete = None;
         if parts.is_empty() {
             return Err(ViewError::NoParts);
         }
@@ -66,6 +69,7 @@ impl PortsAnswer {
                 // Not the row text itself: a variant name only.
                 return Err(ViewError::NotPorts(variant_name(p).to_string()));
             };
+            incomplete = incomplete.or(part.incomplete);
             for row in &part.rows {
                 if rows.len() == MAX_PORTS_ROWS {
                     truncated = true;
@@ -79,6 +83,7 @@ impl PortsAnswer {
             rows,
             truncated,
             complete,
+            incomplete,
         })
     }
 }
@@ -351,6 +356,7 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         _ => (own, "→", "(SOCKS)".to_string()),
     };
     let owner = match spec.kind() {
+        ForwardKind::Local if f.target_other_user => "another user ⚠".to_string(),
         ForwardKind::Local => f.owner.as_ref().map_or("—".to_string(), process),
         ForwardKind::Remote => "your laptop".to_string(),
         ForwardKind::Dynamic => "—".to_string(),
@@ -366,6 +372,12 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     ];
 
     let mut detail = Vec::new();
+    if f.target_other_user {
+        detail.push(
+            "⚠ another user's listener holds this target on the host: connections through this forward reach them"
+                .to_string(),
+        );
+    }
     if let Some(p) = &f.probe {
         let mut line = String::new();
         // A web server on the far end of a `-L` is reached at the laptop's address.
@@ -576,11 +588,35 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
     if !answer.complete {
         out.push_str("(the answer ended early: some rows may be missing)\n");
     }
+    if let Some(why) = answer.incomplete {
+        out.push_str(&format!(
+            "(incomplete: {}; listeners may be missing)\n",
+            incomplete_text(why)
+        ));
+    }
     // One blank line between blocks, none at the very end.
     let trimmed = out.trim_end_matches('\n').len();
     out.truncate(trimmed);
     out.push('\n');
     out
+}
+
+fn incomplete_text(why: PortsIncomplete) -> &'static str {
+    match why {
+        PortsIncomplete::NoSocketTable => "the host's socket table could not be read",
+        PortsIncomplete::Bounded => "the scan on the host stopped at one of its bounds",
+        PortsIncomplete::TimedOut => "the scan on the host did not finish in time",
+        PortsIncomplete::Unsupported => "fil finds listeners on Linux hosts only",
+    }
+}
+
+fn incomplete_json(why: PortsIncomplete) -> &'static str {
+    match why {
+        PortsIncomplete::NoSocketTable => "no_socket_table",
+        PortsIncomplete::Bounded => "bounded",
+        PortsIncomplete::TimedOut => "timed_out",
+        PortsIncomplete::Unsupported => "unsupported",
+    }
 }
 
 // ---- JSON -------------------------------------------------------------------------------------
@@ -591,6 +627,9 @@ struct JsonOut {
     host: Option<String>,
     truncated: bool,
     complete: bool,
+    /// Why the listeners may be incomplete: `"no_socket_table"`, `"bounded"`, `"timed_out"`,
+    /// `"unsupported"`; `null` when they are all there.
+    incomplete: Option<&'static str>,
     sessions: Vec<JsonSession>,
     host_listeners: Vec<JsonListener>,
 }
@@ -640,6 +679,8 @@ struct JsonForward {
     last_unix_ms: Option<u64>,
     owner: Option<JsonProcess>,
     probe: Option<JsonProbe>,
+    /// Another user's listener takes the `-L` target on the host (a port squat).
+    target_other_user: bool,
 }
 
 #[derive(Serialize)]
@@ -756,6 +797,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         last_unix_ms: nonzero(f.last_unix_ms),
         owner: f.owner.as_ref().map(json_process),
         probe: f.probe.as_ref().map(json_probe),
+        target_other_user: f.target_other_user,
     }
 }
 
@@ -785,6 +827,7 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
         host: o.host.map(clean),
         truncated: answer.truncated,
         complete: answer.complete,
+        incomplete: answer.incomplete.map(incomplete_json),
         sessions: view
             .sessions
             .iter()

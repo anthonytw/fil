@@ -2,8 +2,9 @@
 //! and what they speak (DESIGN.md section 7.4; M2 plan, P1).
 //!
 //! [`ports`] is the whole answer to a `Request::Ports`: it takes the sessions (their summaries,
-//! forward rows, agent rows and how to recognise their processes) and gives the rows, in the order
-//! the client shows them, ready for [`Response::ports`](fil_proto::msg::Response::ports):
+//! forward rows, agent rows and how to recognise their processes) and gives an [`Answer`]: the
+//! rows, in the order the client shows them, and whether the listeners among them may be
+//! incomplete (and why), ready for [`Answer::into_responses`]:
 //!
 //! 1. per session: its `Session` row, its forwards (with the owner and probe of each `-L` target
 //!    filled in), the listeners started in it that no forward covers, its agent row;
@@ -42,8 +43,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsRow, ProcessInfo, SessionName,
-    SessionSummary,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsRow, ProcessInfo,
+    Response, SessionName, SessionSummary,
 };
 use fil_proto::mux::{ForwardKind, ListenState, Target, TargetHost};
 
@@ -164,8 +165,8 @@ pub struct Found {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discovery {
     pub listeners: Vec<Found>,
-    /// A bound of the scan was reached: some listeners may be missing or unattributed.
-    pub truncated: bool,
+    /// Some listeners may be missing or unattributed, and why.
+    pub incomplete: Option<PortsIncomplete>,
 }
 
 /// The listeners in `root`, attributed. Blocking, and bounded by `limits`.
@@ -191,6 +192,7 @@ pub fn discover(
         deadline,
     );
     let mut truncated = net.truncated || owners.truncated;
+    let missing = net.missing;
     let mut infos: HashMap<u32, Option<Holder>> = HashMap::new();
     let mut out: Vec<Found> = Vec::new();
     let mut at: HashMap<(IpAddr, NonZeroU16), usize> = HashMap::new();
@@ -251,7 +253,11 @@ pub fn discover(
     }
     Discovery {
         listeners: out,
-        truncated,
+        incomplete: if missing {
+            Some(PortsIncomplete::NoSocketTable)
+        } else {
+            truncated.then_some(PortsIncomplete::Bounded)
+        },
     }
 }
 
@@ -302,6 +308,8 @@ struct TargetMatch {
     forwarded: Vec<usize>,
     owner: Option<ProcessInfo>,
     probe: Option<SocketAddr>,
+    /// Another user's listener takes it.
+    other_user: bool,
 }
 
 /// The listeners a `-L` target reaches, ranked over *every* listener on the port, other users'
@@ -333,12 +341,17 @@ fn target_listener(d: &Discovery, t: &Target, remote_ports: &[NonZeroU16]) -> Ta
                 .map(|(_, i)| (c, i))
         })
         .collect();
-    if bests.is_empty()
-        || bests
-            .iter()
-            .any(|(_, i)| d.listeners[*i].holder == Holder::Other)
-    {
+    if bests.is_empty() {
         return TargetMatch::default();
+    }
+    if bests
+        .iter()
+        .any(|(_, i)| d.listeners[*i].holder == Holder::Other)
+    {
+        return TargetMatch {
+            other_user: true,
+            ..TargetMatch::default()
+        };
     }
     let mut m = TargetMatch {
         forwarded: bests.iter().map(|(_, i)| *i).collect(),
@@ -429,6 +442,7 @@ pub fn layout(
                     forwarded[i] = true;
                 }
                 f.owner = m.owner;
+                f.target_other_user = m.other_user;
                 probe_at = m.probe;
             }
             v.push((f, probe_at));
@@ -509,12 +523,16 @@ pub fn layout(
 const DISCOVERY_SLACK: Duration = Duration::from_millis(250);
 
 /// The answer to `fil ports`: discovery (in `spawn_blocking`), the probe (async, bounded), the
-/// rows. Never fails: what cannot be found is left out. The strings in the rows are untrusted:
+/// rows, and why the listeners may be incomplete (no socket table, a bound, a timeout, not Linux).
+/// Never fails: what cannot be found is left out. The strings in the rows are untrusted:
 /// sanitize them before display (see the module documentation). Feed the result to
-/// [`Response::ports`](fil_proto::msg::Response::ports).
-pub async fn ports(q: PortsQuery) -> Vec<PortsRow> {
+/// [`Answer::into_responses`].
+pub async fn ports(q: PortsQuery) -> Answer {
     let d = match q.proc_root.clone() {
-        None => Discovery::default(),
+        None => Discovery {
+            listeners: Vec::new(),
+            incomplete: Some(PortsIncomplete::Unsupported),
+        },
         Some(root) => {
             let scopes: Vec<(SessionName, Membership)> = q
                 .sessions
@@ -536,14 +554,14 @@ pub async fn ports(q: PortsQuery) -> Vec<PortsRow> {
                 Ok(Ok(d)) => d,
                 _ => Discovery {
                     listeners: Vec::new(),
-                    truncated: true,
+                    incomplete: Some(PortsIncomplete::TimedOut),
                 },
             }
         }
     };
-    if d.truncated {
-        // No numbers, addresses or names: only that the answer may be incomplete.
-        tracing::debug!("the listener scan stopped at one of its bounds");
+    if let Some(why) = d.incomplete.filter(|w| *w != PortsIncomplete::Unsupported) {
+        // A reason only: no numbers, addresses or names.
+        tracing::debug!(?why, "the listener scan is incomplete");
     }
     let (mut rows, slots) = layout(&q.sessions, q.focus.as_ref(), &d);
     let mut addrs: Vec<SocketAddr> = slots.iter().map(|s| s.addr).collect();
@@ -559,7 +577,24 @@ pub async fn ports(q: PortsQuery) -> Vec<PortsRow> {
             _ => {}
         }
     }
-    rows
+    Answer {
+        rows,
+        incomplete: d.incomplete,
+    }
+}
+
+/// A `fil ports` answer: the rows, and whether the listeners in them are all there is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub rows: Vec<PortsRow>,
+    pub incomplete: Option<PortsIncomplete>,
+}
+
+impl Answer {
+    /// The parts to send ([`Response::ports_with`]).
+    pub fn into_responses(self) -> Vec<Response> {
+        Response::ports_with(self.rows, self.incomplete)
+    }
 }
 
 #[cfg(test)]
@@ -696,7 +731,7 @@ mod tests {
     fn listeners_are_attributed_on_a_fake_proc() {
         let f = host();
         let d = discovered(&f);
-        assert!(!d.truncated);
+        assert_eq!(d.incomplete, None);
         let got: Vec<(u16, &str, Option<&str>, Option<&str>)> = d
             .listeners
             .iter()
@@ -855,6 +890,15 @@ mod tests {
         (fwds, ls)
     }
 
+    fn squats(rows: &[PortsRow]) -> Vec<bool> {
+        rows.iter()
+            .filter_map(|r| match r {
+                PortsRow::Forward(f) => Some(f.target_other_user),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn one_session(forwards: Vec<ForwardRow>) -> Vec<SessionPorts> {
         vec![SessionPorts {
             summary: summary("main"),
@@ -874,7 +918,7 @@ mod tests {
                 found("::", 18231, proc_in(500, "python3", Some("main"))),
                 found("127.0.0.1", 18231, Holder::Other),
             ],
-            truncated: false,
+            incomplete: None,
         };
         for host in ["127.0.0.1", "localhost"] {
             let s = one_session(vec![forward(
@@ -886,6 +930,7 @@ mod tests {
             let (rows, slots) = layout(&s, None, &d);
             let (fwds, ls) = forwards_and_listeners(&rows, &slots);
             assert_eq!(fwds, vec![(None, None)], "-L to {host}");
+            assert_eq!(squats(&rows), vec![true], "the client is told");
             assert_eq!(
                 ls,
                 vec![
@@ -913,7 +958,7 @@ mod tests {
                 found("127.0.0.1", 5173, proc_in(41, "vite", Some("main"))),
                 found("::1", 5173, Holder::Other),
             ],
-            truncated: false,
+            incomplete: None,
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Local, 1, Some(("localhost", 5173))),
@@ -930,6 +975,7 @@ mod tests {
                 (None, None),
             ]
         );
+        assert_eq!(squats(&rows), vec![true, false, true]);
         assert_eq!(ls, vec![("[::1]:5173 other".to_string(), false)]);
     }
 
@@ -942,7 +988,7 @@ mod tests {
                 found("::", 4000, proc_in(3, "dual", None)),
                 found("127.0.0.1", 6000, Holder::Unattributed),
             ],
-            truncated: false,
+            incomplete: None,
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Local, 1, Some(("127.0.0.1", 3000))),
@@ -963,6 +1009,7 @@ mod tests {
             ]
         );
         assert!(ls.is_empty(), "all of them are forwarded: {ls:?}");
+        assert_eq!(squats(&rows), vec![false; 4]);
     }
 
     /// N4: a `-L` to one of the `-R` ports reaches the daemon's own listener: never probed (that
@@ -971,7 +1018,7 @@ mod tests {
     fn a_target_on_a_remote_forward_port_is_never_probed() {
         let d = Discovery {
             listeners: vec![found("127.0.0.1", 9000, proc_in(77, "fil", None))],
-            truncated: false,
+            incomplete: None,
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Remote, 9000, Some(("127.0.0.1", 22))),
@@ -988,7 +1035,7 @@ mod tests {
     fn a_listener_forwarded_only_by_a_hidden_session_is_listed() {
         let d = Discovery {
             listeners: vec![found("127.0.0.1", 5000, proc_in(9, "srv", Some("a")))],
-            truncated: false,
+            incomplete: None,
         };
         let s = vec![
             SessionPorts {
@@ -1017,6 +1064,33 @@ mod tests {
         );
         let (rows, _) = layout(&s, None, &d);
         assert!(!rows.iter().any(|r| matches!(r, PortsRow::Listener(_))));
+    }
+
+    /// Each way discovery can fall short says so, with a reason and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_says_why_it_is_incomplete() {
+        let f = FakeProc::new("incomplete");
+        let mut q = PortsQuery::new(sessions(), None, ProbeMode::Off);
+        q.proc_root = Some(f.dir.clone());
+        // No `net/tcp` at all.
+        assert_eq!(
+            ports(q.clone()).await.incomplete,
+            Some(PortsIncomplete::NoSocketTable)
+        );
+        // A bound.
+        drop(f);
+        let f = host();
+        q.proc_root = Some(f.dir.clone());
+        assert_eq!(ports(q.clone()).await.incomplete, None);
+        q.scan.max_procs = 0;
+        let a = ports(q).await;
+        assert_eq!(a.incomplete, Some(PortsIncomplete::Bounded));
+        // Every part carries it.
+        let parts = a.into_responses();
+        assert!(parts.iter().all(|r| matches!(
+            r,
+            Response::Ports { part, .. } if part.incomplete == Some(PortsIncomplete::Bounded)
+        )));
     }
 
     #[test]
@@ -1076,7 +1150,7 @@ mod tests {
         f.process(4100, 1, "srv", "/home/u", &[201]);
         let mut q = PortsQuery::new(vec![], None, ProbeMode::Head);
         q.proc_root = Some(f.dir.clone());
-        let rows = ports(q.clone()).await;
+        let rows = ports(q.clone()).await.rows;
         let probes: Vec<(u16, Option<ProbeKind>)> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1098,7 +1172,7 @@ mod tests {
         );
         // `ports.probe = "off"`.
         q.probe = ProbeMode::Off;
-        let rows = ports(q).await;
+        let rows = ports(q).await.rows;
         assert!(
             rows.iter()
                 .all(|r| !matches!(r, PortsRow::Listener(l) if l.probe.is_some()))
@@ -1109,7 +1183,9 @@ mod tests {
     async fn without_a_proc_root_the_answer_is_the_sessions_alone() {
         let mut q = PortsQuery::new(sessions(), None, ProbeMode::Head);
         q.proc_root = None;
-        let rows = ports(q).await;
+        let a = ports(q).await;
+        assert_eq!(a.incomplete, Some(PortsIncomplete::Unsupported));
+        let rows = a.rows;
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|r| !matches!(r, PortsRow::Listener(_))));
     }
@@ -1205,7 +1281,7 @@ mod tests {
         }];
         let mut q = PortsQuery::new(s, None, ProbeMode::Full);
         q.daemon_pid = None;
-        let rows = ports(q).await;
+        let rows = ports(q).await.rows;
         let fwds: Vec<_> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1214,6 +1290,7 @@ mod tests {
             })
             .collect();
         assert_eq!(fwds, vec![(None, None), (None, None)], "{rows:?}");
+        assert_eq!(squats(&rows), vec![true, true]);
         let on_port: Vec<(IpAddr, bool)> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1255,7 +1332,7 @@ mod tests {
         s[0].forwards.clear();
         let mut q = PortsQuery::new(s, Some(name("other")), ProbeMode::Off);
         q.daemon_pid = None;
-        let rows = ports(q).await;
+        let rows = ports(q).await.rows;
         let row = rows
             .iter()
             .find_map(|r| match r {

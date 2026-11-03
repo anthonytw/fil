@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use fil_daemon::ports::{self, PortsQuery, ProbeMode, ScanLimits};
-use fil_proto::msg::{ListenerOwner, PortsRow, ProbeKind};
+use fil_proto::msg::{ListenerOwner, PortsIncomplete, PortsRow, ProbeKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone, Default)]
@@ -164,7 +164,9 @@ async fn nothing_ports_finds_reaches_the_log() {
         q.scan = scan;
         q
     };
-    let rows = ports::ports(query(&dir, ProbeMode::Full, ScanLimits::default())).await;
+    let rows = ports::ports(query(&dir, ProbeMode::Full, ScanLimits::default()))
+        .await
+        .rows;
     // It was all found (or the test would prove nothing) ...
     let listener = |rows: &[PortsRow], port: u16| {
         rows.iter()
@@ -198,7 +200,9 @@ async fn nothing_ports_finds_reaches_the_log() {
         listener(&rows, unattributed).owner,
         ListenerOwner::Mine(None)
     ));
-    let rows = ports::ports(query(&dir, ProbeMode::Head, ScanLimits::default())).await;
+    let rows = ports::ports(query(&dir, ProbeMode::Head, ScanLimits::default()))
+        .await
+        .rows;
     assert_eq!(
         listener(&rows, http)
             .probe
@@ -211,7 +215,12 @@ async fn nothing_ports_finds_reaches_the_log() {
         max_procs: 0,
         ..ScanLimits::default()
     };
-    ports::ports(query(&dir, ProbeMode::Head, cut)).await;
+    assert_eq!(
+        ports::ports(query(&dir, ProbeMode::Head, cut))
+            .await
+            .incomplete,
+        Some(PortsIncomplete::Bounded)
+    );
     // ... and a discovery that does not come back in time: `net/tcp` is a FIFO nobody writes,
     // so opening it blocks (in the blocking pool, never a runtime worker).
     let stuck = dir.join("stuck");
@@ -229,8 +238,9 @@ async fn nothing_ports_finds_reaches_the_log() {
         budget: std::time::Duration::from_millis(50),
         ..ScanLimits::default()
     };
-    let rows = ports::ports(query(&stuck, ProbeMode::Head, fast)).await;
-    assert!(rows.is_empty());
+    let a = ports::ports(query(&stuck, ProbeMode::Head, fast)).await;
+    assert!(a.rows.is_empty());
+    assert_eq!(a.incomplete, Some(PortsIncomplete::TimedOut));
     assert!(
         t.elapsed() < std::time::Duration::from_secs(2),
         "{:?}",
@@ -243,7 +253,7 @@ async fn nothing_ports_finds_reaches_the_log() {
 
     let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(
-        log.matches("the listener scan stopped").count() >= 2,
+        log.matches("the listener scan is incomplete").count() >= 2,
         "the capture works, on both paths: {log}"
     );
     let mut secrets = vec![

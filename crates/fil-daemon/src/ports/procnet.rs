@@ -159,7 +159,9 @@ pub fn split(sockets: Vec<Socket>, uid: u32) -> Split {
 #[derive(Debug, Default)]
 pub struct NetRead {
     pub sockets: Vec<Socket>,
-    /// A file could not be read, or a bound (lines, listeners, time) was reached.
+    /// `tcp` could not be read: nothing is known about the host's listeners.
+    pub missing: bool,
+    /// `tcp6` could not be read, or a bound (lines, listeners, time) was reached.
     pub truncated: bool,
 }
 
@@ -172,6 +174,7 @@ pub fn read(root: &Path, deadline: Instant) -> NetRead {
         match std::fs::File::open(root.join("net").join(name)) {
             Ok(f) => read_from(f, deadline, &mut out),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && name == "tcp6" => {}
+            Err(_) if name == "tcp" => out.missing = true,
             Err(_) => out.truncated = true,
         }
     }
@@ -355,13 +358,13 @@ mod tests {
         let later = Instant::now() + std::time::Duration::from_secs(1);
         let r = read(Path::new("/nonexistent/fil-ports-test"), later);
         assert!(r.sockets.is_empty());
-        assert!(r.truncated);
+        assert!(r.missing && !r.truncated);
         let dir = std::env::temp_dir().join(format!("fil-procnet-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("net")).unwrap();
         std::fs::write(dir.join("net/tcp"), fixture("tcp")).unwrap();
         let r = read(&dir, later);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!r.truncated);
+        assert!(!r.missing && !r.truncated);
         assert_eq!(r.sockets.len(), 5);
     }
 }

@@ -244,10 +244,17 @@ async fn a_fresh_attach_after_a_replaced_session_gets_a_new_key_through_a_new_pi
         rig.fake.pipe_runs() >= 2
     })
     .await;
+    // The dead direct link already starts a pipe run as a *resume* (same key, correctly), so
+    // "two pipe runs" can be satisfied before the user's "y" leads to the fresh attach. Wait for
+    // the attach that carries a new key rather than checking right after the second run.
+    let first = rig.keys().await[0].clone();
+    until_async("an attach with a new key", 60, || {
+        let rig = &rig;
+        let first = first.clone();
+        async move { rig.keys().await.last().is_some_and(|k| k != &first) }
+    })
+    .await;
     settle().await;
-    let keys = rig.keys().await;
-    let last = keys.last().unwrap();
-    assert_ne!(last, &keys[0], "a fresh attach brings a new key");
     assert!(
         !rig.fake.runs(LinkKind::Pipe)[1].interactive,
         "the terminal is the session's: this ssh must not prompt"

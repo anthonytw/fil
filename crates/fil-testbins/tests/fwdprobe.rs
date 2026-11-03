@@ -373,6 +373,35 @@ fn hold_for_closes_after_the_time_and_the_client_reports_open_while_held() {
 }
 
 #[test]
+fn hold_honors_the_idle_timeout() {
+    let srv = Server::start(&["hold", "--timeout", "1"]);
+    let start = Instant::now();
+    let mut c = srv.connect();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        c.read(&mut buf).unwrap(),
+        0,
+        "the idle connection is closed"
+    );
+    assert!(start.elapsed() >= Duration::from_millis(900));
+    assert_eq!(srv.block()["IN_END"], "timeout");
+}
+
+#[test]
+fn connect_has_no_idle_limit_unless_asked() {
+    // A server that says nothing for 2 s, then closes: a default limit shorter than that would
+    // report a timeout. (The old default of 30 s is too long to test; `--timeout 1` proves the
+    // opt-in works, and the quiet run proves a plain recv waits.)
+    let srv = Server::start(&["hold", "--for", "2"]);
+    let (kv, _) = run(&["connect", &srv.addr, "recv"]);
+    assert_eq!(kv["IN_END"], "eof");
+    assert!(kv["MS"].parse::<u64>().unwrap() >= 1900);
+    let srv = Server::start(&["hold"]);
+    let (kv, _) = run(&["connect", &srv.addr, "recv", "--timeout", "1"]);
+    assert_eq!(kv["IN_END"], "timeout");
+}
+
+#[test]
 fn accept_counter_counts_and_max_conns_ends_the_server() {
     let mut srv = Server::start(&["echo", "--max-conns", "12"]);
     let (kv, code) = run(&[

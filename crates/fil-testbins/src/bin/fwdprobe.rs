@@ -52,7 +52,8 @@
 //!
 //! Options on every mode: `--rate BYTES_PER_SEC` paces what this end sends (and, where it only
 //! reads, what it reads), so a transfer lasts long enough to be interrupted; `--timeout SECS`
-//! ends a connection that has been idle that long (default: never); `--max-conns N`.
+//! ends a connection that has been idle that long (default: never; with `hold`, idle means the peer
+//! sent nothing, so use `--for` to hold for a fixed time); `--max-conns N`.
 //!
 //! # connect
 //!
@@ -71,7 +72,9 @@
 //!   per connection). `--expect echo` (the default) needs the same bytes back. Prints `COUNT=`,
 //!   `OK=`, `FAILED=`, `FIRST_ERROR=` (when something failed) and `MS=`; exits 1 on any failure.
 //!
-//! Options: `--timeout SECS` (idle, default 30; 0 = never), `--rate BYTES_PER_SEC`.
+//! Options: `--timeout SECS` (give up after that long without a byte; default never, except 30 for
+//! `burst`; 0 = never), `--rate BYTES_PER_SEC`. A paced transfer that falls more than a second behind
+//! (a stall) paces from the moment it resumes.
 
 use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Read, Write};
@@ -90,6 +93,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEED: u64 = 1;
 /// How much of a reply `--show-reply` keeps.
 const KEEP_MAX: usize = 64 * 1024;
+/// How far behind its schedule a paced transfer may fall before it paces from now.
+const MAX_DEBT: Duration = Duration::from_secs(1);
 const THREAD_STACK: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------------------------
@@ -311,8 +316,17 @@ impl Pacer {
         let Some(rate) = self.rate else { return };
         self.done += n as u64;
         let due = Duration::from_secs_f64(self.done as f64 / rate as f64);
-        if let Some(wait) = due.checked_sub(self.start.elapsed()) {
-            thread::sleep(wait);
+        let elapsed = self.start.elapsed();
+        match due.checked_sub(elapsed) {
+            Some(wait) => thread::sleep(wait),
+            // Far behind schedule (the peer stalled, a link was down): pace from now on. Catching
+            // up at line rate would end a transfer soon after the stall, before a second
+            // interruption could land in it.
+            None if elapsed - due > MAX_DEBT => {
+                self.start = Instant::now();
+                self.done = 0;
+            }
+            None => {}
         }
     }
 }
@@ -688,7 +702,7 @@ fn handle(n: u64, mut stream: TcpStream, cfg: &Serve) {
             Report::new(inn, out)
         }
         Mode::Hold { for_ } => {
-            let inn = drain(&mut stream, &mut pacer, None, *for_);
+            let inn = drain(&mut stream, &mut pacer, cfg.idle, *for_);
             Report::new(inn, Half::skipped())
         }
         Mode::HalfClose { response, seed } => {
@@ -824,7 +838,9 @@ fn connect_main(args: &[String]) -> Result<ExitCode, String> {
     let addr: String = o.positional(0, "ADDR")?;
     let action: String = o.positional(1, "ACTION")?;
     let seed = o.or("--seed", DEFAULT_SEED)?;
-    let idle = o.secs("--timeout", Some(30))?;
+    // Idle never ends a single transfer unless asked to: the outage scenarios stall one for
+    // minutes. `burst` makes many, so a stuck one must not hang the run.
+    let idle = o.secs("--timeout", (action == "burst").then_some(30))?;
     let rate: Option<u64> = o.get("--rate")?;
 
     if action == "burst" {
@@ -1021,5 +1037,33 @@ fn main() -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacer_paces_from_now_after_a_stall() {
+        let mut p = Pacer::new(Some(10_000));
+        thread::sleep(Duration::from_millis(1300));
+        p.after(10); // far behind: the schedule restarts here
+        let t = Instant::now();
+        p.after(5000); // 0.5 s at 10 kB/s, not an instant catch-up
+        assert!(
+            t.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn pacer_catches_up_a_little_lag() {
+        let mut p = Pacer::new(Some(10_000));
+        thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        p.after(1000); // due at 0.1 s, already past: no sleep, no reset
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 }

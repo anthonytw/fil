@@ -39,6 +39,7 @@ fwdprobe digest N [--seed S]            the sha256 of a seeded stream of N bytes
 - **Output is `KEY=v` lines.** A server prints `LISTEN=`, then `ACCEPT=n` as each connection arrives, and a block per finished connection (`CONN=n` ... `CONN_END=n`) with `IN_BYTES`, `IN_SHA256`, `IN_END`, `OUT_BYTES`, `OUT_SHA256`, `OUT_END` and `MS`. `IN_END` is how the receive direction ended: `eof` (a FIN), `reset` (a RST), `timeout`, or `error:KIND`.
 - **The accept counter is the `ACCEPT=` lines.** A forward that survives a reconnect shows `ACCEPT=1` and no more; one that quietly reconnected the upstream shows `ACCEPT=2`. With `--max-conns N` the server exits after N connections and prints `ACCEPTS=N`.
 - **`--rate BYTES_PER_SEC`** paces a transfer so that a kill, a sleep or a cable pull lands mid-transfer (a 64 MiB loopback copy otherwise ends in a fraction of a second).
+- **`connect recv` and `send` wait forever** unless `--timeout SECS` is given (the outage scenarios stall a transfer for minutes); `burst` gives up on a silent connection after 30 s. A paced transfer that falls more than a second behind (a stall) paces from the moment it resumes, so a second interruption still lands mid-transfer.
 - A usage error exits 2. `connect` exits 1 when it cannot connect (`CONNECT=refused`, `timeout`, ...) and `burst` exits 1 when any connection failed.
 
 ## Using it in the scenarios
@@ -57,7 +58,7 @@ fwdprobe connect 127.0.0.1:18080 recv      # IN_SHA256= must equal: fwdprobe dig
 
 | Scenario (plan §5.2, §5.3) | Session side | Client side |
 |---|---|---|
-| `fwd_local_http`, `fwd_local_kill_ssh`, `fwd_local_sleep`, `f_fwd_cable_pull` | `serve ... source N --rate R` | `connect ... recv`; compare `IN_SHA256` with `digest`; `grep -c ^ACCEPT=` on the log is 1 |
+| `fwd_local_http`, `fwd_local_kill_ssh`, `fwd_local_sleep`, `f_fwd_cable_pull` | `serve ... source N --rate R` | `connect ... recv` (no `--timeout`: it must outlast the stop or the outage; the 45 s sleep and the 5 min cable pull end in a result, not a timeout); compare `IN_SHA256` with `digest`; `grep -c ^ACCEPT=` on the log is 1 |
 | `fwd_many_short`, `fwd_parallel` | `serve ... echo` | `connect ... burst --count 10000` / `--count 200 --parallel 200`; `FAILED=0` |
 | `fwd_halfclose` | `serve ... halfclose --response N` | `connect ... send M`: the request is shut down, the response must still arrive in full |
 | `fwd_rst` | `serve ... rst` (or `--after-read N`) | `connect ... recv`: `IN_END=reset`, not `eof` |

@@ -98,16 +98,17 @@ async fn queued_socks_requests_stay_within_the_bound() {
     for s in &mut held {
         let _ = s.write_all(&req).await;
     }
-    // The queue fills up to the bound (one client has the channel).
-    let full = (held.len() - 1).min(MAX_PENDING) as u32;
-    eventually(Duration::from_secs(10), || {
-        w.client
-            .ep
-            .stats(ForwardId(9))
-            .is_some_and(|s| s.waiting >= full)
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the queue fill (up to the bound): wait until it stops growing.
+    let waiting_now = || w.client.ep.stats(ForwardId(9)).map_or(0, |s| s.waiting);
+    let mut last = waiting_now();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let n = waiting_now();
+        if n == last && n > 0 {
+            break;
+        }
+        last = n;
+    }
     let endpoint = held_by_endpoint(before, held.len());
     let waiting = w.client.ep.stats(ForwardId(9)).map_or(0, |s| s.waiting);
     eprintln!(

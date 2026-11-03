@@ -781,8 +781,20 @@ pub async fn oneshot_echo_server(n: usize) -> Server {
     .await
 }
 
-/// A connection through a forward, as an application makes one.
+/// A connection through a forward, as an application makes one. A connect reset before fil
+/// accepts it is the kernel's listen queue overflowing (128 on macOS, on a machine busy with
+/// other work), not fil's answer: tried again, as a client library would.
 pub async fn connect(port: u16) -> TcpStream {
+    let mut backoff = Duration::from_millis(20);
+    for _ in 0..6 {
+        match TcpStream::connect(("127.0.0.1", port)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            r => return r.unwrap(),
+        }
+    }
     TcpStream::connect(("127.0.0.1", port)).await.unwrap()
 }
 

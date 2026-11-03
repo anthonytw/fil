@@ -302,7 +302,10 @@ impl<L: Link> Forwards<L> {
             })
             .collect();
         let current: Current<L> = Arc::new(Mutex::new(None));
+        let epoch_lock = Arc::new(Mutex::new(()));
         let mgr = Manager {
+            epoch: ep.epoch(),
+            epoch_lock: epoch_lock.clone(),
             ep: ep.clone(),
             current: current.clone(),
             grants,
@@ -334,6 +337,7 @@ impl<L: Link> Forwards<L> {
             ep,
             to_manager,
             current,
+            epoch_lock,
         };
         (Self { router, manager }, handle, notes_rx)
     }
@@ -367,6 +371,8 @@ pub(crate) struct Router<L: Link> {
     to_manager: mpsc::UnboundedSender<ToManager>,
     /// The link the endpoint is attached to.
     current: Current<L>,
+    /// Held for `new_epoch` here and by the manager while it acts on an event or an answer.
+    epoch_lock: Arc<Mutex<()>>,
 }
 
 /// The link the endpoint is on (shared by the readers and the manager).
@@ -382,6 +388,7 @@ impl<L: Link> Clone for Router<L> {
             ep: self.ep.clone(),
             to_manager: self.to_manager.clone(),
             current: self.current.clone(),
+            epoch_lock: self.epoch_lock.clone(),
         }
     }
 }
@@ -392,7 +399,11 @@ impl<L: Link> Router<L> {
     /// attach and a new epoch starts, with the manager's table forgotten first.
     async fn attach(&self, link: &Arc<L>, resumed: bool) {
         if !resumed {
-            self.ep.new_epoch();
+            // Under the manager's epoch lock: it acts on no event of the old epoch after this.
+            {
+                let _g = lock(&self.epoch_lock);
+                self.ep.new_epoch();
+            }
             let (done, wait) = oneshot::channel();
             if self.to_manager.send(ToManager::Fresh(done)).is_ok() {
                 let _ = wait.await;
@@ -659,6 +670,10 @@ struct Manager<L: Link> {
     ep: Endpoint<L>,
     /// The link the endpoint is on, to end it on `EndpointEvent::LinkFailed`.
     current: Current<L>,
+    /// The mux epoch the manager's state is for (set at each fresh attach), and the lock the
+    /// reader takes for `new_epoch` (see [`Manager::on_event`]).
+    epoch: u64,
+    epoch_lock: Arc<Mutex<()>>,
     grants: Arc<Mutex<Grants>>,
     own: Vec<Own>,
     entries: HashMap<ForwardId, Other>,
@@ -705,26 +720,23 @@ impl<L: Link> Manager<L> {
                     Some(ToManager::Fresh(done)) => {
                         while events.try_recv().is_ok() {}
                         self.dirty = true;
+                        self.epoch = self.ep.epoch();
                         self.fresh();
                         let _ = done.send(());
                     }
-                    Some(ToManager::Answer { id, token, yes }) => {
-                        self.dirty = true;
-                        self.answer(id, token, yes);
-                    }
+                    Some(ToManager::Answer { id, token, yes }) => self.on_answer(id, token, yes),
                 },
                 () = at(self.unanswered_by), if self.unanswered_by.is_some() => {
-                    self.dirty = true;
-                    self.unanswered();
-                }
-                ev = events.recv() => match ev {
-                    None => return,
-                    Some(EndpointEvent::Table(m)) => self.table(m),
-                    Some(EndpointEvent::LinkFailed) => self.link_failed(),
-                    Some(EndpointEvent::Failed(e)) => {
-                        debug!(error = %e, "forward protocol failed");
-                        self.broken(format!("the host broke the forward protocol: {e}"));
+                    let gate = self.epoch_lock.clone();
+                    let _g = lock(&gate);
+                    if self.ep.epoch() == self.epoch {
+                        self.dirty = true;
+                        self.unanswered();
                     }
+                }
+                ev = events.recv_with_epoch() => match ev {
+                    None => return,
+                    Some((epoch, ev)) => self.on_event(epoch, ev),
                 },
             }
             if std::mem::take(&mut self.dirty) {
@@ -758,6 +770,43 @@ impl<L: Link> Manager<L> {
 
     fn note(&self, n: Note) {
         let _ = self.notes.send(n);
+    }
+
+    /// An event of mux epoch `epoch`. Acted on only while that is the endpoint's epoch and the
+    /// manager's, checked under the lock a fresh attach takes for `new_epoch`: an event handed
+    /// out just before a new epoch (or before the manager has heard of it) would otherwise act
+    /// in the next one, under ids that may name other entries there.
+    fn on_event(&mut self, epoch: u64, ev: EndpointEvent) {
+        let gate = self.epoch_lock.clone();
+        let _g = lock(&gate);
+        if epoch != self.epoch || self.ep.epoch() != self.epoch {
+            debug!("a forward event of an ended epoch; dropped");
+            return;
+        }
+        if !matches!(ev, EndpointEvent::Table(MuxMsg::Forward { req: None, .. })) {
+            self.dirty = true;
+        }
+        match ev {
+            EndpointEvent::Table(m) => self.table(m),
+            EndpointEvent::LinkFailed => self.link_failed(),
+            EndpointEvent::Failed(e) => {
+                debug!(error = %e, "forward protocol failed");
+                self.broken(format!("the host broke the forward protocol: {e}"));
+            }
+        }
+    }
+
+    /// The user's answer, under the same rule as [`Manager::on_event`]: none counts once a
+    /// fresh attach has begun (its questions are moot, and new ones follow).
+    fn on_answer(&mut self, id: ForwardId, token: u64, yes: bool) {
+        let gate = self.epoch_lock.clone();
+        let _g = lock(&gate);
+        if self.ep.epoch() != self.epoch {
+            debug!("an answer during a fresh attach; dropped");
+            return;
+        }
+        self.dirty = true;
+        self.answer(id, token, yes);
     }
 
     /// The host broke the rules: the run ends with a protocol error, and nothing more is acted
@@ -820,10 +869,6 @@ impl<L: Link> Manager<L> {
     fn table(&mut self, msg: MuxMsg) {
         if self.failed {
             return;
-        }
-        // Only an announcement can be refused and forgotten; `other` says when it keeps one.
-        if !matches!(msg, MuxMsg::Forward { req: None, .. }) {
-            self.dirty = true;
         }
         let named = match &msg {
             MuxMsg::Forward { id, .. }
@@ -1385,6 +1430,8 @@ mod tests {
         );
         let (notes, rx) = mpsc::unbounded_channel();
         let m = Manager {
+            epoch: ep.epoch(),
+            epoch_lock: Arc::new(Mutex::new(())),
             ep,
             current: Arc::new(Mutex::new(None)),
             grants,
@@ -1493,6 +1540,47 @@ mod tests {
             1,
             "a fresh attach takes entries again"
         );
+    }
+
+    /// After `new_epoch` and before the manager has taken the fresh attach in, nothing of the
+    /// old epoch acts: an event handed out just before, or the user's answer.
+    #[tokio::test]
+    async fn nothing_of_an_ended_epoch_acts() {
+        let (mut m, mut rx) = manager();
+        let x = ForwardId(7);
+        let old = m.epoch;
+        m.on_event(
+            old,
+            EndpointEvent::Table(MuxMsg::Forward {
+                id: x,
+                spec: rspec(8000),
+                origin: Origin::Request,
+                req: None,
+            }),
+        );
+        let q = asked(&mut rx).pop().expect("asked in its epoch");
+        // A fresh attach begins (the reader's `new_epoch`), the manager not told yet.
+        m.ep.new_epoch();
+        m.on_answer(x, q.token, true);
+        assert_eq!(
+            lock(&m.grants).target(x),
+            None,
+            "an answer across epochs granted"
+        );
+        m.on_event(
+            old,
+            EndpointEvent::Table(MuxMsg::Forward {
+                id: ForwardId(8),
+                spec: rspec(22),
+                origin: Origin::Request,
+                req: None,
+            }),
+        );
+        assert!(
+            asked(&mut rx).is_empty(),
+            "an old event acted in the new epoch"
+        );
+        assert!(!m.entries.contains_key(&ForwardId(8)));
     }
 
     #[tokio::test]

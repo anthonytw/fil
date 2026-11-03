@@ -1,9 +1,8 @@
 //! The escapes typed after Enter, as in ssh (DESIGN.md section 14): `~.` detach, `~?` help,
-//! `~~` a literal tilde.
+//! `~#` the forwards, `~~` a literal tilde.
 //!
 //! A pure filter over the user's keystrokes. A `~` at the start of a line is held back until the
-//! next byte says what it was; every other byte is forwarded at once. `~#` (ports) belongs to M2
-//! and is forwarded as typed until then.
+//! next byte says what it was; every other byte is forwarded at once.
 //!
 //! Pasted text is never an escape: between the bracketed-paste markers (`ESC [ 200 ~` and
 //! `ESC [ 201 ~`) the filter forwards everything untouched, so a pasted log that happens to hold
@@ -16,6 +15,8 @@ pub enum Action {
     Send(Vec<u8>),
     /// `~?`: show the help.
     Help,
+    /// `~#`: show the forwards.
+    Ports,
     /// `~.`: detach. Bytes after it in the same chunk are discarded.
     Detach,
 }
@@ -111,6 +112,11 @@ impl EscapeFilter {
                         actions.push(Action::Help);
                         self.state = State::Normal;
                     }
+                    b'#' => {
+                        flush(&mut out, &mut actions);
+                        actions.push(Action::Ports);
+                        self.state = State::Normal;
+                    }
                     b'~' => {
                         out.push(b'~');
                         self.state = State::Normal;
@@ -197,8 +203,6 @@ mod tests {
     #[test]
     fn other_bytes_after_a_tilde_are_sent_with_it() {
         let mut f = EscapeFilter::new();
-        // `~#` is reserved for M2's ports; until then it is just typed text.
-        assert_eq!(sent(&f.feed(b"\r~#")), b"\r~#");
         assert_eq!(sent(&f.feed(b"\r~x")), b"\r~x");
         // `~` Enter leaves us at a line start again.
         assert_eq!(f.feed(b"\r~\r"), vec![Action::Send(b"\r~\r".to_vec())]);
@@ -216,6 +220,21 @@ mod tests {
                 Action::Send(b"b".to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn tilde_hash_shows_the_forwards() {
+        let mut f = EscapeFilter::new();
+        assert_eq!(
+            f.feed(b"a\r~#b"),
+            vec![
+                Action::Send(b"a\r".to_vec()),
+                Action::Ports,
+                Action::Send(b"b".to_vec())
+            ]
+        );
+        // Mid-line it is text.
+        assert_eq!(f.feed(b"~#"), vec![Action::Send(b"~#".to_vec())]);
     }
 
     #[test]

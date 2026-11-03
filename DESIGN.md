@@ -746,7 +746,7 @@ fil detach [HOST SESSION]                  with no arguments, inside a session (
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 
-M1 implements everything but forwards and `ports`. In M2 the forward flags and config keys are parsed and checked first (specs are written as in ssh: `docs/m2/binary.md`) and connected to the session afterwards; until then a run that asks for a forward is refused with a message. `-A` relays the local agent (§10), `-a` turns it off. The option `--transport auto|pipe|direct` overrides the config for one attach. The command line, the exit statuses and the dialer are in `docs/m1/binary.md`.
+M1 implements everything but forwards and `ports`. In M2 the forward flags and config keys are parsed and checked first (specs are written as in ssh: `docs/m2/binary.md`) and connected to the session afterwards: the client binds `-L` and `-D` before the attach, so a port in use is reported before the terminal goes raw (with `forward_failure = "exit"`, exit status 255 and no attach). Until the agent relay is connected, `-A` is refused with a message. `-A` relays the local agent (§10), `-a` turns it off. The option `--transport auto|pipe|direct` overrides the config for one attach. The command line, the exit statuses and the dialer are in `docs/m1/binary.md`.
 
 Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde. Pasted text (between the bracketed-paste markers) is never an escape.
 

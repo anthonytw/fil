@@ -22,8 +22,12 @@ const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Exit status of a normal end.
 const OK: u8 = 0;
-/// Why forwards and the agent do nothing yet.
-const NOT_WIRED: &str = "port forwards and agent relaying are parsed but not connected yet (milestone 2 is in progress)";
+/// Why the agent does nothing yet.
+const AGENT_NOT_WIRED: &str =
+    "agent relaying is parsed but not connected yet (milestone 2 is in progress)";
+/// Exit status when a forward cannot be set up and `forward_failure = "exit"`, as ssh's
+/// `ExitOnForwardFailure`.
+const FORWARD_FAILED: u8 = 255;
 
 /// Exit status of an error, and of a session that was taken, replaced or detached from elsewhere.
 const FAILED: u8 = 1;
@@ -111,9 +115,6 @@ async fn attach(
     settings: HostSettings,
 ) -> u8 {
     tidy_offline_log(&settings);
-    // Parsed and checked, not connected: the engine learns about forwards in the next part of
-    // M2. Until then what the command line asks for is refused (never dropped silently), and
-    // what only the config says is warned about.
     let plan = match ForwardPlan::resolve(&settings, &forwards) {
         Ok(p) => p,
         Err(e) => {
@@ -121,21 +122,30 @@ async fn attach(
             return FAILED;
         }
     };
-    if !forwards.specs.is_empty() || forwards.agent == Some(crate::forward_spec::AgentFlag::On) {
-        eprintln!("fil: {NOT_WIRED}. Attach without -L, -R, -D and -A, or use ssh for now");
+    // The agent relay is A1's: `-A` is refused (never dropped silently), the config's `agent`
+    // is warned about.
+    if forwards.agent == Some(crate::forward_spec::AgentFlag::On) {
+        eprintln!("fil: {AGENT_NOT_WIRED}. Attach without -A, or use ssh -A for now");
         return FAILED;
     }
-    // The config asked for forwards that cannot be set up yet. With `forward_failure = "exit"`
-    // the user said a forward that is not there must not leave a running session: refuse, as
-    // for the command line. Otherwise say so and carry on.
-    if plan.forward_failure == ForwardFailure::Exit && !plan.specs.is_empty() {
-        eprintln!(
-            "fil: {NOT_WIRED}, and `forward_failure = \"exit\"` is set: not attaching. Remove `forward` from the config for now, or use ssh"
-        );
-        return FAILED;
+    if plan.agent != crate::config::AgentMode::Off {
+        eprintln!("fil: warning: `agent` in the config is ignored: {AGENT_NOT_WIRED}");
     }
-    if !plan.is_empty() {
-        eprintln!("fil: warning: `forward` and `agent` in the config are ignored: {NOT_WIRED}");
+    // Many sockets with forwards; children keep the original limit (`fil_transport::fdlimit`).
+    let _ = fil_transport::fdlimit::raise();
+    // `-L` and `-D` listen from now on, before the attach and before the terminal is raw: a port
+    // that is taken is said here, and with `forward_failure = "exit"` nothing is attached.
+    let mut forward_set = forward_set(&plan);
+    let failed = forward_set.bind_local();
+    for f in &failed {
+        match plan.forward_failure {
+            ForwardFailure::Exit => eprintln!("fil: {f}"),
+            ForwardFailure::Warn => eprintln!("fil: warning: {f}"),
+        }
+    }
+    if !failed.is_empty() && plan.forward_failure == ForwardFailure::Exit {
+        eprintln!("fil: not attaching (`forward_failure = \"exit\"`)");
+        return FORWARD_FAILED;
     }
     let connector = match Connect::new(
         host,
@@ -171,6 +181,7 @@ async fn attach(
 
     let mut cfg = ClientConfig::new(session, host_label(settings.host_label.as_deref()));
     cfg.offline = settings.offline;
+    cfg.forwards = forward_set;
     // Only the path manager backs off; a second layer would double the waits.
     cfg.reconnect.backoff = Backoff::None;
 
@@ -192,6 +203,21 @@ async fn attach(
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
     exit_code(&result)
+}
+
+/// The client's forwards from the resolved plan.
+fn forward_set(plan: &ForwardPlan) -> fil_client::ForwardSet {
+    let mut set = fil_client::ForwardSet::new(plan.specs.clone());
+    set.remote_requests = match plan.remote_requests {
+        crate::config::RemoteRequests::Ask => fil_client::RemoteRequests::Ask,
+        crate::config::RemoteRequests::Deny => fil_client::RemoteRequests::Deny,
+    };
+    set.failure = match plan.forward_failure {
+        ForwardFailure::Warn => fil_client::ForwardFailure::Warn,
+        ForwardFailure::Exit => fil_client::ForwardFailure::Exit,
+    };
+    set.mux = plan.tunables.mux_config();
+    set
 }
 
 /// Applies the offline-input log's age rules to the log in the default place at the start of a
@@ -219,6 +245,7 @@ pub fn exit_code(result: &Result<Outcome, ClientError>) -> u8 {
             (None, None) => OK,
         },
         Ok(Outcome::Signalled(n)) => 128u8.saturating_add(u8::try_from(*n).unwrap_or(0).min(127)),
+        Err(ClientError::ForwardFailed(_)) => FORWARD_FAILED,
         Ok(_) | Err(_) => FAILED,
     }
 }
@@ -391,5 +418,10 @@ mod tests {
             1
         );
         assert_eq!(exit_code(&Err(ClientError::Dial("x".into()))), 1);
+        assert_eq!(
+            exit_code(&Err(ClientError::ForwardFailed("x".into()))),
+            255,
+            "ssh's ExitOnForwardFailure"
+        );
     }
 }

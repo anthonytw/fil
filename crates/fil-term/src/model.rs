@@ -152,12 +152,38 @@ pub struct PrimaryScreen {
     pub cursor: Cursor,
 }
 
+/// A character set that can be designated into G0 to G3. Only the two programs actually use:
+/// ASCII, and DEC special graphics (`ESC ( 0`, the box-drawing set).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Charset {
+    #[default]
+    Ascii,
+    LineDrawing,
+}
+
+/// The four designated character sets and which one is invoked into GL (SI selects G0, SO G1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Charsets {
+    /// G0 to G3.
+    pub g: [Charset; 4],
+    /// The index (0 to 3) of the set that printable characters go through.
+    pub active: u8,
+}
+
 /// The cursor saved by DECSC (`ESC 7`) on the active screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SavedCursor {
     pub row: u16,
     pub col: u16,
     pub pen: Attrs,
+    /// The G0 to G3 designations DECSC saved with the cursor (DECRC brings them back).
+    pub charsets: [Charset; 4],
+}
+
+/// The tab stops a fresh terminal of `cols` columns has: every 8th column, leaving out the first
+/// and the last (see [`TermState::tab_stops`]).
+pub fn default_tab_stops(cols: u16) -> Vec<u16> {
+    (1..cols.saturating_sub(1)).filter(|c| c % 8 == 0).collect()
 }
 
 /// Everything a snapshot needs, in one backend-neutral value.
@@ -175,4 +201,12 @@ pub struct TermState {
     pub saved_cursor: Option<SavedCursor>,
     pub modes: Modes,
     pub hyperlinks: Vec<Hyperlink>,
+    /// The character sets: what G0 to G3 are and which one is invoked.
+    pub charsets: Charsets,
+    /// Tab stops, as 0-based columns from 1 to `cols - 2`, ascending. The first column is left
+    /// out because a forward tab can never land on it, and the last because it always stops
+    /// there, so neither can be read back from a terminal and neither matters in practice.
+    /// `None` is the default (see [`default_tab_stops`]), which is what a fresh terminal has.
+    /// The snapshot writer sets the receiver's stops to the state's either way.
+    pub tab_stops: Option<Vec<u16>>,
 }

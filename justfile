@@ -133,3 +133,14 @@ local transport="pipe" session=("local-" + transport):
 pi-e2e *args:
     cargo build --release -p fil --bins --example pi_e2e
     target/release/examples/pi_e2e {{args}}
+
+# The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
+# floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
+# real client on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
+# --allow-missing, --allow-skip. `--local` runs against a private daemon on this machine instead (no
+# targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a missing tool
+# fails the run unless allowed. Never part of `ci`.
+dropin *args:
+    cargo build -q --release -p fil --bins --example dropin
+    cargo build -q --release -p fil-daemon --bin fil-daemon-dev
+    target/release/examples/dropin {{args}}

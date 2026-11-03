@@ -11,6 +11,15 @@ publish.workspace = true
 name = "fil"
 path = "src/main.rs"
 
+# The drivers are examples; their unit tests (exact sequence checks, target rules) run in `just ci`.
+[[example]]
+name = "dropin"
+test = true
+
+[[example]]
+name = "pi_e2e"
+test = true
+
 [dependencies]
 bytes = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -31,6 +40,7 @@ tracing = "0.1"
 fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }
 fil-term = { path = "../fil-term" }
 portable-pty = "0.9"
+nix = { version = "0.28", default-features = false, features = ["term"] }
 vt100 = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
 

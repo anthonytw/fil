@@ -4,8 +4,7 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use fil_proto::ChannelId;
@@ -354,50 +353,89 @@ async fn ls_reports_when_a_session_last_printed() {
     d.stop().await;
 }
 
-/// A session creation that outlives its attach: the attach fails after `spawn_timeout`, the
-/// shell starts `spawn_delay` after the attach began, and writes its pid to the returned file.
+/// How long the shell of [`slow_start`] is delayed.
+const SPAWN_DELAY: Duration = Duration::from_millis(500);
+
+/// A session creation that outlives its attach: the attach fails after `spawn_timeout`, and the
+/// shell starts `SPAWN_DELAY` after the attach began. The shell is told apart from every other
+/// process by a marker in its command line (returned), not by a pid it writes down: it can be
+/// killed at any moment after it starts, including before it has written anything, and a test
+/// that needs the file to be there is a test of that race.
 async fn slow_start(
     s: &Scratch,
     idle_exit: Option<Duration>,
-) -> (Running, PathBuf, Client<PipeLink>) {
-    let pidfile = s.dir.join("late.pid");
-    let mut cfg = config(&format!("echo $$ > {}; exec cat", pidfile.display()));
+) -> (Running, String, Instant, Client<PipeLink>) {
+    let marker = format!(
+        "fil-late-shell-{}-{}",
+        std::process::id(),
+        s.dir.file_name().unwrap().to_string_lossy()
+    );
+    // (Not `exec cat`: the marker has to stay in the command line.)
+    let mut cfg = config(&format!(": {marker}; cat; echo done"));
     cfg.spawn_timeout = Duration::from_millis(50);
-    cfg.spawn_delay = Duration::from_millis(500);
+    cfg.spawn_delay = SPAWN_DELAY;
     cfg.idle_exit = idle_exit;
     let d = start(s, cfg).await;
+    // Just before the attach: the creation's delay starts when the daemon handles it, so
+    // `began + SPAWN_DELAY` is never later than the moment the shell is created.
+    let began = Instant::now();
     let c = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
     assert!(!c.errors.is_empty(), "the attach gives up: {:?}", c.errors);
-    (d, pidfile, c)
+    (d, marker, began, c)
 }
 
-fn pid_alive(pid: i32) -> bool {
-    let pid = rustix::process::Pid::from_raw(pid).unwrap();
-    rustix::process::test_kill_process(pid).is_ok()
+/// Whether a process with `marker` in its command line exists. A process that has exited and not
+/// been reaped yet (`<defunct>`, where `ps` shows it with its command line at all) counts as
+/// gone: it holds no shell and runs nothing, and whether the daemon reaps it is not what these
+/// tests are about.
+fn shell_running(marker: &str) -> bool {
+    let ps = std::process::Command::new("ps")
+        .args(["-A", "-o", "command="])
+        .output()
+        .expect("ps");
+    assert!(ps.status.success(), "ps failed");
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .any(|l| l.contains(marker) && !l.contains("<defunct>"))
+}
+
+/// Once the late shell has had every chance to exist (`SPAWN_DELAY` after `began`, and a second
+/// more), waits (generously: it is a signal and a reap away) until the marked shell is gone. The
+/// wait for that moment is what makes this a check of "nothing outlives the daemon": looking at
+/// once would pass for a shell that has not been created yet.
+async fn assert_shell_gone(marker: &str, began: Instant) {
+    tokio::time::sleep_until((began + SPAWN_DELAY + Duration::from_secs(1)).into()).await;
+    let end = Instant::now() + Duration::from_secs(20);
+    while shell_running(marker) {
+        assert!(
+            Instant::now() < end,
+            "the late shell outlived the daemon's shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_waits_for_and_kills_a_session_that_starts_late() {
     let s = Scratch::new();
-    let (d, pidfile, _c) = slow_start(&s, None).await;
-    assert!(!pidfile.exists(), "the shell has not started yet");
+    let (d, marker, began, _c) = slow_start(&s, None).await;
+    assert!(!shell_running(&marker), "the shell has not started yet");
     // The daemon is stopped while the creation is still running.
     d.stop().await;
-    let pid: i32 = std::fs::read_to_string(&pidfile)
-        .expect("stop waited for the late shell to start, and killed it")
-        .trim()
-        .parse()
-        .unwrap();
+    // It waited for the creation to finish (that is when the shell exists, however briefly)...
     assert!(
-        !pid_alive(pid),
-        "the late shell {pid} outlived the daemon's shutdown"
+        began.elapsed() >= SPAWN_DELAY,
+        "stop returned after {:?}, before the late creation could have finished",
+        began.elapsed()
     );
+    // ... and killed what it made.
+    assert_shell_gone(&marker, began).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
     let s = Scratch::new();
-    let (mut d, pidfile, c) = slow_start(&s, Some(Duration::from_millis(100))).await;
+    let (mut d, marker, began, c) = slow_start(&s, Some(Duration::from_millis(100))).await;
     // The failed attach's connection is gone, so only the creation can keep the daemon busy.
     c.link.close();
     drop(c);
@@ -414,12 +452,8 @@ async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
         .expect("then it idles out")
         .unwrap();
     assert_eq!(exit, fil_daemon::Exit::Idle);
-    let pid: i32 = std::fs::read_to_string(&pidfile)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(!pid_alive(pid));
+    assert!(began.elapsed() >= SPAWN_DELAY, "it idled out too early");
+    assert_shell_gone(&marker, began).await;
 }
 
 /// bugs #9: a session that cannot be created is not "protocol error": the client is told the

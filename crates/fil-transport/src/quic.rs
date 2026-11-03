@@ -56,6 +56,11 @@
 //!   heartbeat plus one and a half round trips (up to three quarters of `dead_after`) on a path
 //!   with a long round trip, whose healthy gaps are that long. A consumer that stopped calling
 //!   `recv` neither hides a dead path nor looks like one.
+//! - **A busy link is heard through an outage** (`floor`): its full congestion window would hold
+//!   back everything but quinn's backed-off probe timeouts, the keep-alive and the acknowledgements
+//!   included. While the window is full and nothing has been sent or acknowledged for half a
+//!   heartbeat (or two round trips), one transmit may take two datagrams past it, and the
+//!   supervisor wakes quinn when that is due.
 //! - **`Up`:** the daemon's link sends one internal frame (a control-channel `Heartbeat` reply
 //!   that `recv` never returns) as soon as it accepts a connection. A client's [`connect`]
 //!   returns when that, or any other frame, has arrived. The daemon cannot be left waiting for the
@@ -68,6 +73,7 @@
 //!
 //! [`connect`]: QuicLink::connect
 
+mod floor;
 mod inbox;
 mod limiter;
 mod link;
@@ -204,6 +210,15 @@ pub struct ChannelState {
     pub markers_sent: u32,
 }
 
+/// How much this side may have sent and not had acknowledged, over all streams: quinn's default.
+const SEND_WINDOW: u64 = 10_000_000;
+
+/// Makes quinn look at the connection now (it transmits only when something wakes it). Setting
+/// the send window to the value it already has changes nothing else.
+pub(super) fn wake(conn: &quinn::Connection) {
+    conn.set_send_window(SEND_WINDOW);
+}
+
 /// quinn's receive window for the whole connection: how much the peer may have in flight that
 /// quinn has not yet delivered to our reader tasks. (Data our readers have taken is bounded
 /// separately by the inbox.)
@@ -236,6 +251,11 @@ fn transport_config(
     // quinn assumes 333 ms until it has a sample, which makes the first retransmission of a lost
     // handshake packet take about a second. The connect timeout is two.
     t.initial_rtt(Duration::from_millis(100));
+    // A busy link whose path dies must still be heard (`floor`): without this its window stayed
+    // full for the whole outage, and it sent only quinn's backed-off probes.
+    t.congestion_controller_factory(Arc::new(floor::Floor::new(params.heartbeat / 2)));
+    // quinn's default, set here so the link can set it again to wake the connection (`wake`).
+    t.send_window(SEND_WINDOW);
     Ok(Arc::new(t))
 }
 

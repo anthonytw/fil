@@ -425,6 +425,13 @@ impl QuicLink {
         self.io.ticks.load(Ordering::Relaxed)
     }
 
+    /// quinn's counters for the connection (feature `test-hooks`): datagrams sent and received,
+    /// the congestion window, losses. Tests of liveness read the packet timing from them.
+    #[cfg(feature = "test-hooks")]
+    pub fn quic_stats(&self) -> quinn::ConnectionStats {
+        self.io.conn.stats()
+    }
+
     /// What the link holds per channel (feature `test-hooks`), which tests of channel churn keep
     /// bounded by the channels that are open.
     #[cfg(feature = "test-hooks")]
@@ -927,11 +934,27 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
     let mut period = fast;
     let mut remote: SocketAddr = conn.remote_address();
     let mut local_ip: Option<IpAddr> = conn.local_ip();
+    // The lift of a full window (`floor`) this task last woke quinn for.
+    let mut woke_for: Option<Instant> = None;
 
     let err = loop {
+        // A busy link whose path went quiet gets a probe past its window when `floor` says so;
+        // quinn sends it only if something wakes it then, so this task does.
+        let mut nap = period;
+        if let Some(at) = super::floor::lift_at(conn).map(Instant::from_std)
+            && woke_for != Some(at)
+        {
+            let now = Instant::now();
+            if at <= now {
+                super::wake(conn);
+                woke_for = Some(at);
+            } else {
+                nap = nap.min(at - now);
+            }
+        }
         tokio::select! {
             err = &mut closed => break err,
-            () = tokio::time::sleep(period) => {}
+            () = tokio::time::sleep(nap) => {}
         }
         io.ticks.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();

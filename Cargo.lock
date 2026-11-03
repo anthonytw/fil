@@ -557,6 +557,7 @@ dependencies = [
  "fil-proto",
  "fil-transport",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring",
  "rustix",

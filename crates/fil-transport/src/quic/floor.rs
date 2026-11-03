@@ -13,19 +13,34 @@
 //!
 //! [`Floor`] wraps the congestion controller (quinn's default, Cubic). While the window is full
 //! and this side has neither sent anything nor heard an acknowledgement for `interval` (half a
-//! heartbeat) or two round trips, whichever is longer, it lifts the window by two full datagrams,
-//! as much as a PTO sends. The next transmit takes what is due (queued data, the PING, the
-//! acknowledgements), the lift ends with it, and the next comes `interval` later. A link whose
+//! heartbeat) or two round trips, whichever is longer, it lifts the window for one transmit: room
+//! for two full datagrams, as much as a PTO sends. quinn reports a transmit to the controller only
+//! once it is done, so the lift ends with the first transmit, which is two datagrams where the
+//! socket batches them (GSO, on Linux) and one where it does not (macOS, the simulator). That
+//! transmit takes what is due (queued data, the PING, the acknowledgements), and the next lift
+//! comes `interval` later. One ack-eliciting datagram is all liveness needs. A link whose
 //! window is not full, or that hears acknowledgements, never sees a lift, and nothing changes in
 //! how the window grows or shrinks.
 //!
-//! quinn only transmits when something wakes it, and a packet from the peer moves its keep-alive
-//! timer on, so the lift alone could wait for up to another keep-alive. The link's supervisor
+//! quinn only transmits when something wakes it, and its keep-alive timer restarts with every
+//! packet sent or received, so with nothing else to wake it the lift would wait for the keep-alive,
+//! a heartbeat after the last send (0.9 to 1 s measured, against 0.5 s). The link's supervisor
 //! therefore asks [`lift_at`] when the next lift is due and wakes the connection then.
 //!
-//! The cost is two datagrams per `interval` on a busy link while its path is dead (about 6 KB/s
-//! with a 1 s heartbeat), on top of quinn's own probes. RFC 9002 §7.5 lets probes past the window
-//! for the same reason.
+//! **Cost.** On a busy link whose path is dead, one transmit per `interval`, on top of quinn's own
+//! probes: two datagrams on Linux (about 6 KB/s with a 1 s heartbeat), one elsewhere (about
+//! 3 KB/s). The worst case is a peer that keeps sending PINGs and never acknowledges anything:
+//! fil's acknowledgement-only replies then inflate the estimate of what is in flight, and a lift
+//! can take a whole transmit, ten datagrams on Linux (`MAX_TRANSMIT_SEGMENTS`), about 29 KB/s.
+//! That needs an authenticated peer on a validated path, and is no amplification: a peer that does
+//! acknowledge gets the whole window anyway. The window can never be exceeded for longer than one
+//! transmit.
+//!
+//! **Against RFC 9002.** Cubic's state is never touched. The extra is at most two datagrams per
+//! `max(interval, 2 x RTT)` without an acknowledgement, which is below the minimum window of two
+//! datagrams per round trip (§7.2) that a sender keeps even after persistent congestion. What it
+//! overrides, on a busy link only, is the exponential backoff of probe timeouts (§6.2.1), with a
+//! rate-limited liveness probe, which is local policy as keep-alives are (RFC 9000 §10.1.2).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -107,9 +122,13 @@ struct Floored {
     /// The smoothed round trip, from the acknowledgements (zero before the first).
     srtt: Duration,
     /// Bytes in flight: quinn's figure at each acknowledgement, plus what was sent since, less
-    /// what was declared lost. Never less than quinn's (only quinn's path MTU probes, which are
-    /// not reported to the controller and do not go out while the window is full, are missing),
-    /// and more only by acknowledgement-only packets sent since the last acknowledgement.
+    /// what was declared lost; any error lasts until the next acknowledgement. It errs low by what
+    /// quinn sends without reporting it to the controller, path challenges and path MTU probes
+    /// (a probe goes out unchecked by the window, also while it is full, at most one at a time):
+    /// a lift then admits one datagram fewer. It errs high by acknowledgement-only packets sent
+    /// since the last acknowledgement, and for a moment after a migration (a NAT rebind), whose
+    /// new path starts with a copy of this controller and its figure while quinn's count starts
+    /// at zero: a lift then admits more, never more than one transmit.
     in_flight: u64,
     mtu: u16,
     clock: Clock,
@@ -198,7 +217,8 @@ impl Controller for Floored {
     }
 
     /// While lifted, room for two full datagrams beyond what is in flight. quinn checks the
-    /// window before each datagram and reports the transmit afterwards, so a third would not fit.
+    /// window before each datagram of a transmit and reports the transmit afterwards, so a third
+    /// would not fit; a transmit on a socket that does not batch is one datagram anyway.
     fn window(&self) -> u64 {
         let window = self.inner.window();
         if self.lifted(self.clock.now()) {

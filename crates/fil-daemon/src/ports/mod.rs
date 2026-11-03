@@ -1155,13 +1155,33 @@ mod tests {
             f.process(1000 + i, 1, "srv", "/", &[70000 + u64::from(i)]);
         }
         f.net("tcp", &tcp);
-        let open = std::fs::read_dir("/dev/fd").unwrap().count() as u64 - 1;
         let room = if mode == "roomy" { 16 } else { 2 };
+        // The limit is on descriptor NUMBERS: a new descriptor takes the lowest free one, and
+        // fails if that is not below the limit. So "room for N more" is a limit just above the
+        // N-th lowest free number, not "descriptors now open + N": a descriptor the harness
+        // left open above that (GitHub's runner leaves several) would add a free number below
+        // the limit for each one, and the "starved" run would have room to spare.
+        let limit = {
+            use rustix::fs::{Mode, OFlags, open};
+            use rustix::io::fcntl_dupfd_cloexec;
+            use std::os::fd::AsRawFd;
+            let base = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+            let mut held = vec![fcntl_dupfd_cloexec(&base, 0).unwrap()];
+            while held.len() + 1 < room {
+                held.push(fcntl_dupfd_cloexec(&base, 0).unwrap());
+            }
+            held.iter()
+                .map(AsRawFd::as_raw_fd)
+                .chain([base.as_raw_fd()])
+                .max()
+                .unwrap() as u64
+                + 1
+        };
         let lim = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         rustix::process::setrlimit(
             rustix::process::Resource::Nofile,
             rustix::process::Rlimit {
-                current: Some(open + room),
+                current: Some(limit),
                 maximum: lim.maximum,
             },
         )

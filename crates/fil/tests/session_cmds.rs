@@ -552,12 +552,20 @@ fn detach_without_arguments_detaches_the_session_it_runs_in() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Keys typed before the prompt reads are dropped, so answer until it has.
+    // Keys typed before the prompt reads are dropped, so answer until it has. The prompt reads a
+    // key only after a pause of 300 ms (and takes a lone `n` as the answer after another 300 ms
+    // with nothing typed), so the tries are further apart than that: tries every 300 ms land on
+    // the edge of both, each one cancelling the answer the one before it was about to give.
     let started = Instant::now();
     let status = loop {
         client.type_bytes(b"n");
-        std::thread::sleep(Duration::from_millis(300));
-        if let Some(s) = client.child.try_wait().unwrap() {
+        let tried = Instant::now();
+        let mut done = None;
+        while done.is_none() && tried.elapsed() < Duration::from_millis(1500) {
+            std::thread::sleep(Duration::from_millis(25));
+            done = client.child.try_wait().unwrap();
+        }
+        if let Some(s) = done {
             break s;
         }
         assert!(

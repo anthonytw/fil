@@ -496,6 +496,68 @@ async fn a_blackout_gives_degraded_then_down_dead_and_a_new_handshake_recovers()
     drop(again);
 }
 
+/// Efficiency sweep #4: the supervisor used to wake ten times a second on every link, forever.
+/// A healthy idle link now looks at its connection a few times a second (twice, by default).
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_does_not_wake_its_supervisor_ten_times_a_second() {
+    let mut w = World::new(61);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(1)).await;
+    let (c0, d0) = (client.supervisor_ticks(), daemon.supervisor_ticks());
+    sleep(Duration::from_secs(20)).await;
+    let (c, d) = (
+        client.supervisor_ticks() - c0,
+        daemon.supervisor_ticks() - d0,
+    );
+    // 500 ms ticks would be 40; a few more are fine when the silence between heartbeats makes
+    // the supervisor look closely for a moment. The old 100 ms tick was 200.
+    assert!(c <= 80 && d <= 80, "client {c}, daemon {d} ticks in 20 s");
+    assert_eq!(client.status().borrow().state, LinkState::Up);
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+}
+
+/// Efficiency sweep #7: both ends used to send a keep-alive every second, doubling an idle
+/// link's packets. Now only the client's keep-alive (its heartbeat) runs; the daemon's packets
+/// are the acknowledgements of it. Either side still finds a dead path (the blackout tests).
+#[tokio::test(start_paused = true)]
+async fn an_idle_direct_link_sends_one_ping_and_one_ack_a_second() {
+    let mut w = World::new(62);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(3)).await;
+    let before = w.net.stats().sent;
+    sleep(Duration::from_secs(30)).await;
+    let sent = w.net.stats().sent - before;
+    // A ping up and its acknowledgement back, about once a second: about 60 packets in 30 s.
+    // With both ends pinging it was 86.
+    assert!(sent <= 70, "{sent} datagrams in 30 s of idle");
+    assert_eq!(client.status().borrow().state, LinkState::Up);
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+}
+
+/// The daemon sends no keep-alive of its own, so its silence detector rests on the client's
+/// pings. A path that dies is still found by it within `dead_after`, and `Degraded` comes first.
+#[tokio::test(start_paused = true)]
+async fn the_daemon_without_a_keep_alive_still_finds_a_dead_path_within_dead_after() {
+    let mut w = World::new(63);
+    let (client, daemon, _) = w.pair().await;
+    sleep(Duration::from_secs(5)).await; // idle: only the client's pings keep it company
+    assert_eq!(daemon.status().borrow().state, LinkState::Up);
+    let mut ds = daemon.status();
+    let t0 = Instant::now();
+    w.net.set_blackout(true);
+    wait_for(&mut ds, "daemon Degraded", |s| {
+        s.state == LinkState::Degraded
+    })
+    .await;
+    let degraded = t0.elapsed();
+    let st = wait_for(&mut ds, "daemon Down", is_down).await;
+    assert_eq!(down_reason(&st), DownReason::Dead);
+    let dead = t0.elapsed();
+    assert!(degraded <= Duration::from_millis(2500), "{degraded:?}");
+    assert!(dead <= Duration::from_millis(5100), "{dead:?}");
+    drop(client);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_short_blackout_degrades_and_recovers() {
     let mut w = World::new(7);
@@ -768,6 +830,34 @@ async fn revoking_in_the_registry_alone_closes_live_links_only_after_the_backsto
         after >= Duration::from_secs(3) && after <= Duration::from_millis(3700),
         "closed {after:?} after the revocation"
     );
+}
+
+/// Efficiency sweep #6: the sweep used to tick twice a second for the life of the daemon, so a
+/// daemon with direct mode on and nothing connected never slept. It now runs only while a
+/// connection is live, and a connection that arrives after a long idle is still swept.
+#[tokio::test(start_paused = true)]
+async fn the_listener_sweeps_only_while_connections_are_live() {
+    let mut w = World::with(64, |c, _| c.revoke_backstop = Duration::from_secs(2));
+    sleep(Duration::from_secs(30)).await;
+    assert_eq!(w.listener.sweeps(), 0, "swept with nothing to sweep");
+
+    let (client, daemon, key) = w.pair().await;
+    sleep(Duration::from_secs(5)).await;
+    let busy = w.listener.sweeps();
+    assert!(busy >= 4, "the sweep did not run for a live link: {busy}");
+
+    // A revocation made in the registry alone still closes the link after the backstop, though
+    // the sweep slept for 30 s before this connection woke it.
+    let mut ds = daemon.status();
+    w.registry.revoke(key.public_key());
+    wait_for(&mut ds, "daemon Down", is_down).await;
+    drop((client, daemon));
+
+    // Once the connection is gone the sweep goes back to sleep.
+    sleep(Duration::from_secs(2)).await;
+    let after = w.listener.sweeps();
+    sleep(Duration::from_secs(30)).await;
+    assert_eq!(w.listener.sweeps(), after, "the sweep kept ticking");
 }
 
 /// The backstop is measured from the revocation, and registering the key again cancels it.

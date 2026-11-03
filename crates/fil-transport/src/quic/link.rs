@@ -11,7 +11,7 @@ use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::{ChannelClass, ChannelId, ControlMsg};
 use quinn::{Connection, ConnectionError, Endpoint, ReadExactError, RecvStream, WriteError};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 
 use super::MAX_STREAMS;
 use super::inbox::{Closed, Inbox};
@@ -117,6 +117,8 @@ struct Io {
     got_frame: watch::Sender<bool>,
     /// The text of the error that ended the connection, for `Refused` messages.
     last_error: OnceLock<String>,
+    /// How often the supervisor has looked at the connection (a wakeup counter for tests).
+    ticks: std::sync::atomic::AtomicU64,
 }
 
 impl Io {
@@ -294,6 +296,7 @@ impl QuicLink {
             lost_payloads: AtomicBool::new(false),
             got_frame: watch::Sender::new(false),
             last_error: OnceLock::new(),
+            ticks: std::sync::atomic::AtomicU64::new(0),
         });
         let status = Arc::new(watch::Sender::new(LinkStatus::new(LinkState::Up)));
         tokio::spawn(accept_streams(io.clone()));
@@ -346,6 +349,13 @@ impl QuicLink {
     /// with the key in the attach request on a resume (DESIGN.md §8.5, resume rules).
     pub fn peer_key(&self) -> Option<PublicKey> {
         auth::peer_key(&self.io.conn)
+    }
+
+    /// How many times the link's supervisor task has woken up (feature `test-hooks`): the cost
+    /// of an idle link, which a test keeps bounded.
+    #[cfg(feature = "test-hooks")]
+    pub fn supervisor_ticks(&self) -> u64 {
+        self.io.ticks.load(Ordering::Relaxed)
     }
 
     /// Closes the link because the client's key was revoked. The client sees `Down(Closed)`.
@@ -640,38 +650,63 @@ fn reason_of(err: &ConnectionError) -> DownReason {
     }
 }
 
-/// How often the link looks at the connection's counters.
-fn sample_period(params: &LinkParams) -> Duration {
-    (params.degraded_after / 10).clamp(Duration::from_millis(10), Duration::from_millis(100))
+/// How often the link looks at the connection's counters while it is healthy (`slow`), and
+/// while it is silent or degraded (`fast`), when a prompt `Down` and a prompt recovery matter.
+///
+/// A healthy link hears from the peer about every `heartbeat`, so looking ten times a second
+/// bought nothing but wakeups (security/efficiency sweep, efficiency #4): `slow` is a quarter of
+/// `degraded_after` (500 ms by default), `fast` a tenth (100 ms at most).
+fn sample_periods(params: &LinkParams) -> (Duration, Duration) {
+    let fast =
+        (params.degraded_after / 10).clamp(Duration::from_millis(10), Duration::from_millis(100));
+    let slow = (params.degraded_after / 4).clamp(fast, Duration::from_millis(500));
+    (slow, fast)
 }
 
 /// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
 /// final `Down`.
+///
+/// The only clock available is quinn's count of received datagrams, so "when did we last hear
+/// the peer" is known to the precision of the sampling period. A change seen at a tick is
+/// dated at the *previous* tick, the earliest it can have happened: the silence measured is
+/// never shorter than the real one, so `Down(Dead)` is never later than `dead_after` after the
+/// last datagram, and `Degraded` appears after between `degraded_after` minus one period and
+/// `degraded_after` of silence.
 async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: LinkParams) {
     let conn = &io.conn;
     let closed = conn.closed();
     tokio::pin!(closed);
-    let mut tick = tokio::time::interval(sample_period(&params));
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (slow, fast) = sample_periods(&params);
 
     let mut rx_datagrams = conn.stats().udp_rx.datagrams;
     let mut last_rx = Instant::now();
+    let mut last_tick = last_rx;
+    // The first look comes early, so a fresh link has its first round-trip estimate soon.
+    let mut period = fast;
     let mut remote: SocketAddr = conn.remote_address();
     let mut local_ip: Option<IpAddr> = conn.local_ip();
 
     let err = loop {
         tokio::select! {
             err = &mut closed => break err,
-            _ = tick.tick() => {}
+            () = tokio::time::sleep(period) => {}
         }
+        io.ticks.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let seen = conn.stats().udp_rx.datagrams;
         if seen != rx_datagrams {
             rx_datagrams = seen;
-            last_rx = now;
+            last_rx = last_tick;
         }
+        last_tick = now;
         let silence = now.duration_since(last_rx);
         let degraded = silence >= params.degraded_after;
+        // Watch closely once the peer has been quiet for longer than a heartbeat and a half.
+        period = if degraded || silence >= params.heartbeat * 3 / 2 {
+            fast
+        } else {
+            slow
+        };
         if silence >= params.dead_after {
             // quinn's idle timer restarts whenever it sends a keep-alive, so on its own it can
             // take up to a heartbeat longer than `dead_after`. The contract is `dead_after`

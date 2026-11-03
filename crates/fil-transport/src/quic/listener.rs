@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, EndpointConfig, Incoming, TokioRuntime};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -123,11 +123,23 @@ fn bump(c: &AtomicU64) {
 
 /// The live connections, by the client key they authenticated with.
 #[derive(Default)]
-struct Live(Mutex<Vec<(PublicKey, Connection)>>);
+struct Live {
+    conns: Mutex<Vec<(PublicKey, Connection)>>,
+    /// Wakes the sweep: a connection was added to an empty list.
+    added: Notify,
+    /// How often the sweep has run (a wakeup counter for tests).
+    #[cfg(feature = "test-hooks")]
+    sweeps: AtomicU64,
+}
 
 impl Live {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(PublicKey, Connection)>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.conns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, key: PublicKey, conn: Connection) {
+        self.lock().push((key, conn));
+        self.added.notify_one();
     }
 }
 
@@ -257,6 +269,13 @@ impl QuicListener {
         closed
     }
 
+    /// How many times the sweep has woken up (feature `test-hooks`): it sleeps while no
+    /// connection is live, and a test keeps that so.
+    #[cfg(feature = "test-hooks")]
+    pub fn sweeps(&self) -> u64 {
+        self.0.live.sweeps.load(Ordering::Relaxed)
+    }
+
     /// Connections currently open.
     pub fn live_connections(&self) -> usize {
         self.0
@@ -370,7 +389,7 @@ impl AcceptLoop {
                 return bump(&counters.handshake_failed);
             };
             // Listed first, then checked, so a revoke that lands in between still finds it.
-            live.lock().push((key.clone(), conn.clone()));
+            live.add(key.clone(), conn.clone());
             if !registry.contains(&key) {
                 QuicLink::close_revoked(&conn);
                 return;
@@ -386,11 +405,21 @@ impl AcceptLoop {
 ///
 /// A key that is not registered and has no recent revocation on record (it never was, or the
 /// record is older than the sweep keeps) is closed at once.
+///
+/// The sweep only has work while a connection is live, so it sleeps while the list is empty and
+/// the first connection wakes it (efficiency sweep #6). A daemon that holds detached sessions for
+/// days with direct mode on used to wake twice a second for all of that time.
 async fn sweep(registry: KeyRegistry, live: Arc<Live>, backstop: Duration) {
     let every = SWEEP_EVERY.min(backstop / 2).max(Duration::from_millis(10));
-    let mut tick = tokio::time::interval(every);
     loop {
-        tick.tick().await;
+        // Wait for a connection to sweep. `notify_one` leaves a permit, so an add between the
+        // check and the wait is not lost.
+        while live.lock().is_empty() {
+            live.added.notified().await;
+        }
+        tokio::time::sleep(every).await;
+        #[cfg(feature = "test-hooks")]
+        live.sweeps.fetch_add(1, Ordering::Relaxed);
         live.lock().retain(|(key, conn)| {
             if conn.close_reason().is_some() {
                 return false;

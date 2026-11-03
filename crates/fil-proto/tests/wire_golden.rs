@@ -1588,10 +1588,6 @@ fn limits() -> Entries {
         num("MAX_PORTS_PATH", MAX_PORTS_PATH),
         num("MAX_PROBE_LABEL", MAX_PROBE_LABEL),
         num(
-            "quic::MAX_STREAMS",
-            fil_transport::quic::pinned::MAX_STREAMS,
-        ),
-        num(
             "quic::MAX_VARINT_LEN",
             fil_transport::quic::pinned::MAX_VARINT_LEN,
         ),
@@ -1654,6 +1650,8 @@ fn revisioned() -> Entries {
             fil_transport::quic::pinned::prefix_kind(len),
         ));
     }
+    // How streams live and end: the open-at-once limit, finish, and the cap on unanswered ends.
+    e.extend(fil_transport::quic::pinned::stream_rules());
 
     // What each decoder accepts, one step either side of every limit: the golden pins the
     // behaviour as well as the constants, so a widened integer or a loosened check shows up.
@@ -2769,7 +2767,6 @@ fn the_golden_covers_the_whole_wire() {
         "MAX_DATA_PAYLOAD = 16384",
         "MAX_SESSION_NAME = 64",
         "TermSize::MAX_CELLS = 1000000",
-        "quic::MAX_STREAMS = 1024",
         "alpn/rev7 = fil/1.7",
         "MAX_MUX_RECORD = 1024",
         "ChannelId::MUX = 3",
@@ -2788,6 +2785,9 @@ fn the_golden_covers_the_whole_wire() {
         "control/max/session-exited-code-min ",
         "data/seq-0",
         "quic/stream-header-300 = ac02",
+        "quic/streams-open-at-once = 1024",
+        "quic/finished-stream = payloads, then a flush marker, then FIN",
+        "quic/unanswered-stream-ends-max = 2048",
         "decode/session-name-65 = err",
         "decode/control-payload-max-plus-1 = err too-large",
         "decode/exit-code-max-plus-1 = err",

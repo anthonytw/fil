@@ -96,9 +96,11 @@ pub use listener::{
 pub mod pinned {
     use super::wire;
 
-    /// Most streams a peer may have open at once in one direction (quinn's limit). (M1 counted
-    /// them over the link's life instead.)
+    /// Most streams a peer may have open at once in one direction (quinn's limit). (Until
+    /// revision 5 it was counted over the link's life, and the 1,025th stream ended the link.)
     pub const MAX_STREAMS: u32 = super::MAX_STREAMS;
+    /// Most finished channels whose end marker the peer may leave unanswered.
+    pub const MAX_ENDING: usize = super::MAX_ENDING;
     /// The longest channel-id varint on a stream.
     pub const MAX_VARINT_LEN: usize = wire::MAX_VARINT_LEN;
 
@@ -118,6 +120,37 @@ pub mod pinned {
             ));
         }
         out
+    }
+
+    /// How streams live and end (`Link::finish`), as rules: what a peer of this revision may
+    /// expect of the other's streams. No bytes of their own; the bytes are the stream layout.
+    pub fn stream_rules() -> Vec<(String, String)> {
+        let rule = |k: &str, v: String| (format!("quic/{k}"), v);
+        vec![
+            rule("streams-open-at-once", MAX_STREAMS.to_string()),
+            rule("streams-over-the-link-life", "unbounded".into()),
+            rule(
+                "finished-stream",
+                "payloads, then a flush marker, then FIN".into(),
+            ),
+            rule(
+                "finished-stream-forgotten",
+                "when its end marker is answered".into(),
+            ),
+            rule("unanswered-stream-ends-max", MAX_ENDING.to_string()),
+            rule(
+                "unanswered-stream-ends-past-max",
+                "protocol violation".into(),
+            ),
+            rule(
+                "later-stream-for-a-channel",
+                "read after the earlier stream ended and its payloads were handed up".into(),
+            ),
+            rule(
+                "no-stream-credit-within-dead-after",
+                "the link goes down (Io)".into(),
+            ),
+        ]
     }
 
     /// What the reader makes of a length prefix, by the length it states: a payload of that
@@ -147,6 +180,13 @@ pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
 /// not what a link carries over its life. The bound keeps a misbehaving peer's cost finite; the
 /// inbox registers at most this many channels (`inbox::MAX_CHANNELS`).
 const MAX_STREAMS: u32 = 1024;
+
+/// Most finished channels whose end marker the peer has not answered yet. A peer's link answers a
+/// marker before it reads the stream end that gives the stream back, so an honest peer has at
+/// most its stream credit plus the answers in flight outstanding; one that reads stream ends and
+/// never answers would otherwise make this side keep an entry per channel for the life of the
+/// link. Past this the link ends as a protocol violation.
+const MAX_ENDING: usize = 2 * MAX_STREAMS as usize;
 
 /// What a [`QuicLink`] holds per channel (feature `test-hooks`; [`QuicLink::channel_state`]).
 #[cfg(feature = "test-hooks")]

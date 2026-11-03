@@ -13,6 +13,7 @@ use quinn::{Connection, ConnectionError, Endpoint, RecvStream, WriteError};
 use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc, watch};
 use tokio::time::Instant;
 
+use super::MAX_ENDING;
 use super::inbox::{Closed, Inbox};
 use super::wire::{
     self, Chunks, Frame, MAX_VARINT_LEN, READ_MAX, VarintReader, parse_prefix, put_varint,
@@ -46,13 +47,6 @@ enum Writer {
     /// entry (`Io::answered`). Until then `send` on the channel fails.
     Finishing(u32),
 }
-
-/// Most finished channels whose end marker the peer has not answered yet. A peer's link answers a
-/// marker before it reads the stream end that gives the stream back, so an honest peer has at
-/// most its stream credit plus the answers in flight outstanding; one that reads stream ends and
-/// never answers would otherwise make this side keep an entry per channel for the life of the
-/// link. Past this the link ends as a protocol violation.
-const MAX_ENDING: usize = 2 * super::MAX_STREAMS as usize;
 
 /// What waits in front of a channel's stream.
 enum Item {

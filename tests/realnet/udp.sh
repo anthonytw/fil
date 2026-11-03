@@ -461,7 +461,7 @@ blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
   [[ $traffic != poke ]] || : > "$D/poke"
   wait_exit "$CLIENT_PID" 60
   cat "$CLIENT_OUT"
-  local line lost=false lost_after="" recov=""
+  local line lost=false lost_after="" lost_reason="" recov=""
   line=$(last_line "$CLIENT_OUT" RESULT)
   assert "$label: the client finished (rc=$WAIT_RC)" test "$WAIT_RC" -eq 0
   if [[ $(kv "$line" conn_lost) == true ]]; then
@@ -469,7 +469,12 @@ blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
     lost_after=$(($(kv "$(last_line "$CLIENT_OUT" CONN-LOST)" at_ms) - t_block))
     assert "$label: it reconnected" grep -q '^RECONNECTED' "$CLIENT_OUT"
     assert "$label: the server saw a second handshake" test "$(handshakes)" -eq 2
-    assert "$label: the reason was the idle timeout" grep -q '^CONN-LOST reason="TimedOut"' "$CLIENT_OUT"
+    # Either end may give up first. If the client's idle timer fires, the reason is TimedOut. If the
+    # server's fires first, it forgets the connection and answers the client's next packet (after
+    # the link returns) with a stateless reset, so the reason is Reset. Both are a lost connection.
+    lost_reason=$(kv "$(last_line "$CLIENT_OUT" CONN-LOST)" reason | tr -d '"')
+    assert "$label: lost by an idle timeout or the server's stateless reset (reason=$lost_reason)" \
+      test "$lost_reason" = TimedOut -o "$lost_reason" = Reset
     note "$label=LOST after ${lost_after}ms, reconnected $(kv "$(last_line "$CLIENT_OUT" RECONNECTED)" after_loss_ms)ms later"
   else
     assert "$label: echo intact" test "$(kv "$line" sent)" = "$(kv "$line" recvd)"
@@ -483,9 +488,13 @@ blackout_case() { # blackout_case SECONDS EXPECT(survive|lost|either) [quiet]
     survive) assert "$label: survived, as expected" test "$lost" = false ;;
     lost) assert "$label: lost, as expected" test "$lost" = true ;;
   esac
-  if [[ $lost == true ]]; then
+  if [[ $lost == true && $lost_reason == TimedOut ]]; then
     assert_num "$label: noticed about one idle timeout after the blackout began (ms)" "$lost_after" -ge 4000
     assert_num "$label: ... and not much later (ms)" "$lost_after" -le 7500
+  elif [[ $lost == true ]]; then
+    # A reset can only arrive once the link is back: after the blackout, and soon after it.
+    assert_num "$label: the reset came after the blackout (ms)" "$lost_after" -ge "$(awk -v d="$dur" 'BEGIN{print int(d*1000)}')"
+    assert_num "$label: ... and soon after it (ms)" "$lost_after" -le "$(awk -v d="$dur" 'BEGIN{print int(d*1000)+5000}')"
   fi
   stop_server
 }

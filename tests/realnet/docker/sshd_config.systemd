@@ -1,0 +1,11 @@
+# sshd for the systemd host (sysd.sh). The client's public key is copied in at run time.
+Port 22
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+# PAM on: pam_systemd gives the login a logind session and XDG_RUNTIME_DIR.
+UsePAM yes
+AuthorizedKeysFile /etc/fil-realnet/authorized_keys
+StrictModes no
+PermitTTY yes
+LogLevel VERBOSE

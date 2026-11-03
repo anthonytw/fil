@@ -9,6 +9,8 @@
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=fil.sh
+source "$(dirname "${BASH_SOURCE[0]}")/fil.sh"
 
 NS_C=rn-client
 NS_R=rn-router
@@ -76,6 +78,7 @@ udp_setup() {
   nsx "$NS_R" sysctl -q -w net.ipv4.ip_forward=1
   reset_net
   log "namespaces up: $NS_C | $NS_R | $NS_S"
+  udp_fil_setup
 }
 
 # veth A B NS_A NS_B: a veth pair with one end in each namespace.
@@ -101,12 +104,19 @@ reset_net() {
 
 udp_teardown() {
   local ns p
+  if [[ ${1:-} != quiet ]]; then
+    mkdir -p "$OUT/logs"
+    # The real daemon's log and the client's, before the users are removed.
+    as_root cat /home/rnfil/.local/state/fil/daemon.log > "$OUT/logs/fil-daemon-udp.log" 2> /dev/null || true
+  fi
   for ns in "$NS_C" "$NS_R" "$NS_S"; do
     for p in $(as_root ip netns pids "$ns" 2> /dev/null); do
       as_root kill -9 "$p" 2> /dev/null || true
     done
     as_root ip netns del "$ns" 2> /dev/null || true
   done
+  udp_fil_teardown
+  as_root chmod -R a+rX "$OUT/logs" 2> /dev/null || true
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -684,10 +694,315 @@ s_quiclink_blackouts() {
   quiclink_blackout_case 8.0 lost
 }
 
+# ---------------------------------------------------------------------------------------------
+# The real `fil`: client in the client namespace, sshd and the daemon in the server namespace
+#
+# The pipe needs an ssh path to the server namespace, so the harness runs the host's own sshd
+# inside it (on 198.51.100.10:22), with a throwaway host key, a throwaway client key and two
+# throwaway users made for the run: rnclient (runs the client, on a PTY) and rnfil (the account on
+# the "server"). Everything is removed again at the end. The ssh path crosses the same router, NAT
+# and netem as the UDP path; only UDP is ever blocked, so the pipe keeps working while QUIC does not.
+# `fil srv` finds the UDP address the way a user's setup would: `ssh -G srv` says HostName.
+
+UC_HOME=/home/rnclient
+FIL_BINS=(fil ptydrive sockprobe)
+PD=/tmp/rn-pd-udp
+# The programs live in a directory of their own, put first on the PATH of the client and (through
+# sshd's SetEnv) of the sessions sshd starts. Nothing is installed into /usr/local/bin.
+UDP_BIN=/tmp/rn-udp-bin
+UDP_PATH=$UDP_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+client_exec_on() {
+  shift
+  nsx "$NS_C" runuser -u rnclient -- env -i "HOME=$UC_HOME" USER=rnclient LOGNAME=rnclient \
+    "PATH=$UDP_PATH" "$@"
+}
+client_bg_on() {
+  shift
+  nsx "$NS_C" runuser -u rnclient -- env -i "HOME=$UC_HOME" USER=rnclient LOGNAME=rnclient \
+    "PATH=$UDP_PATH" "$@" > /dev/null 2>&1 &
+}
+
+udp_fil_setup() {
+  local c k=$OUT/run/udp-keys
+  for c in sshd runuser useradd userdel ssh-keygen; do
+    command -v "$c" > /dev/null || [[ -x /usr/sbin/$c ]] || { echo "realnet: '$c' is required (apt: openssh-server)" >&2; exit 2; }
+  done
+  rm -rf "$k"
+  mkdir -p "$k"
+  ssh-keygen -q -t ed25519 -N '' -C realnet-udp-user -f "$k/id"
+  ssh-keygen -q -t ed25519 -N '' -C realnet-udp-host -f "$k/host"
+  cat > "$k/sshd_config" << EOF
+Port 22
+ListenAddress 198.51.100.10
+HostKey /etc/fil-realnet-udp/host_ed25519
+PidFile /etc/fil-realnet-udp/sshd.pid
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+AuthorizedKeysFile /etc/fil-realnet-udp/authorized_keys
+StrictModes no
+AllowUsers rnfil
+PermitTTY yes
+LogLevel VERBOSE
+# ssh srv fil server --stdio must find the fil under test.
+SetEnv PATH=$UDP_PATH
+EOF
+  cat > "$k/ssh_config" << 'EOF'
+Host srv
+  HostName 198.51.100.10
+  User rnfil
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  BatchMode yes
+  ConnectTimeout 10
+EOF
+  as_root install -d -m 755 /etc/fil-realnet-udp /run/sshd
+  as_root install -m 644 "$k/id.pub" /etc/fil-realnet-udp/authorized_keys
+  as_root install -m 600 "$k/host" /etc/fil-realnet-udp/host_ed25519
+  as_root install -m 644 "$k/sshd_config" /etc/fil-realnet-udp/sshd_config
+  for c in rnclient rnfil; do
+    as_root useradd -m -s /bin/bash -p '*' "$c"
+  done
+  as_root install -d -o rnclient -g rnclient -m 700 "$UC_HOME/.ssh"
+  as_root install -m 600 -o rnclient -g rnclient "$k/id" "$UC_HOME/.ssh/id_ed25519"
+  as_root install -m 600 -o rnclient -g rnclient "$k/ssh_config" "$UC_HOME/.ssh/config"
+  # The daemon never retires on its own, so scenarios cannot race it.
+  as_root install -d -o rnfil -g rnfil -m 700 /home/rnfil/.config /home/rnfil/.config/fil
+  printf 'idle_exit_secs = 0\n' | as_root tee /home/rnfil/.config/fil/daemon.toml > /dev/null
+  as_root chown rnfil:rnfil /home/rnfil/.config/fil/daemon.toml
+  as_root install -d -m 755 "$UDP_BIN"
+  for c in "${FIL_BINS[@]}"; do as_root install -m 755 "$BIN_DIR/$c" "$UDP_BIN/$c"; done
+  nsx "$NS_S" /usr/sbin/sshd -D -E "$OUT/logs/sshd-udp.log" -f /etc/fil-realnet-udp/sshd_config &
+  local i
+  for ((i = 0; i < 100; i++)); do
+    client_exec_on x ssh -T srv true > /dev/null 2>&1 && break
+    sleep 0.2
+  done
+  client_exec_on x ssh -T srv true || { echo "realnet: ssh from the client namespace to the server namespace does not work" >&2; exit 1; }
+  # The fil that a login finds is the one under test (sshd's SetEnv PATH took effect).
+  [[ $(client_exec_on x ssh -T srv command -v fil) == "$UDP_BIN/fil" ]] \
+    || { echo "realnet: 'ssh srv fil' does not find $UDP_BIN/fil: $(client_exec_on x ssh -T srv 'echo $PATH; command -v fil')" >&2; exit 1; }
+  log "ssh path up: client namespace -> sshd in the server namespace ($(client_exec_on x ssh -V 2>&1))"
+}
+
+udp_fil_teardown() {
+  local c
+  for c in rnclient rnfil; do
+    as_root userdel -r -f "$c" > /dev/null 2>&1 || true
+  done
+  as_root rm -rf "$UDP_BIN" /etc/fil-realnet-udp "$PD" "$OUT/run/udp-keys"
+}
+
+# wait_log NAME TEXT SECONDS [MIN]: the client's log must have at least MIN (default 1) lines
+# containing TEXT. Prints nothing; fails the scenario.
+wait_log() {
+  local i
+  for ((i = 0; i < $3 * 10; i++)); do
+    if [[ $(fc_count_log "$1" "$2") -ge ${4:-1} ]]; then return 0; fi
+    sleep 0.1
+  done
+  fail "$1: the client log never showed '$2' (at least ${4:-1}) within $3 s: $(fc_log "$1" | tail -n 5)"
+}
+
+# The client's ssh process (the pipe), if it has one: its pid.
+pipe_ssh() { client_exec_on x pgrep -P "$1" -x ssh | head -n 1 || true; }
+
+# nat_move SPEC: from now on the client's UDP leaves the router as SPEC (ADDR:PORTRANGE), and the
+# old mapping is gone. TCP (the ssh pipe) keeps the rule it had.
+NAT_UDP=
+nat_move() {
+  if [[ -n $NAT_UDP ]]; then
+    nsx "$NS_R" iptables -t nat -D POSTROUTING -o rs -p udp -s 10.0.1.0/24 -j SNAT --to-source "$NAT_UDP" --random
+  fi
+  NAT_UDP=$1
+  nsx "$NS_R" iptables -t nat -I POSTROUTING 1 -o rs -p udp -s 10.0.1.0/24 -j SNAT --to-source "$NAT_UDP" --random
+  nsx "$NS_R" conntrack -F > /dev/null
+  log "NAT mapping for UDP moved to $NAT_UDP"
+}
+
+# nat_expect SPEC: the router's conntrack table must show the client's UDP flow to the daemon
+# mapped as SPEC says (ADDR:LOW-HIGH): the reply tuple's address is ADDR and its port in the range.
+# This is what proves a move really happened to the flow under test, not merely that a rule was added.
+nat_expect() {
+  local addr=${1%%:*} prange=${1##*:} lo hi i line dst dport
+  lo=${prange%-*}
+  hi=${prange#*-}
+  for ((i = 0; i < 40; i++)); do
+    line=$(nsx "$NS_R" conntrack -L -p udp 2> /dev/null | grep -E 'src=10\.0\.1\.2 .*dport=6[0-9]{4} ' | tail -n 1 || true)
+    if [[ -n $line ]]; then
+      # The second dst= and the second dport= are those of the reply tuple: the NATed side.
+      dst=$(awk '{ n = 0; for (i = 1; i <= NF; i++) if ($i ~ /^dst=/ && ++n == 2) print substr($i, 5) }' <<< "$line")
+      dport=$(awk '{ n = 0; for (i = 1; i <= NF; i++) if ($i ~ /^dport=/ && ++n == 2) print substr($i, 7) }' <<< "$line")
+      if [[ $dst == "$addr" && -n $dport && $dport -ge $lo && $dport -le $hi ]]; then
+        ok "conntrack: the client's UDP flow is now $dst:$dport (wanted $1)"
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  fail "the NAT mapping did not move to $1: conntrack has: $(nsx "$NS_R" conntrack -L -p udp 2>&1)"
+}
+
+# fil_attach_direct NAME SESSION: attach over `auto`, wait for the shell and for the move to direct.
+# Sets UP_MS (from the attach reply, the log's DirectAvailable, to Switched(Direct)), START_MS (from
+# starting the process) and FIL_PID. Fails if the log does not give the times.
+fil_attach_direct() {
+  local name=$1 session=$2 t0 t_reply t_up
+  t0=$(now_ms)
+  fc_start "$name" -- srv "$session"
+  fc_ready "$name"
+  note "attach_to_shell_ms=$(($(now_ms) - t0))"
+  wait_log "$name" 'Switched(Direct)' 15
+  t_reply=$(fc_log_ms "$name" 'DirectAvailable')
+  t_up=$(fc_log_ms "$name" 'Switched(Direct)')
+  [[ $t_reply =~ ^[0-9]+$ && $t_up =~ ^[0-9]+$ ]] \
+    || fail "$name: cannot read the times from the client log (DirectAvailable '$t_reply', Switched(Direct) '$t_up')"
+  UP_MS=$((t_up - t_reply))
+  START_MS=$((t_up - t0))
+  FIL_PID=$(fc_pid "$name")
+  note "direct_after_attach_reply_ms=$UP_MS" "direct_after_start_ms=$START_MS"
+  local i
+  for ((i = 0; i < 50; i++)); do
+    [[ -z $(pipe_ssh "$FIL_PID") ]] && break
+    sleep 0.1
+  done
+  [[ -z $(pipe_ssh "$FIL_PID") ]] || fail "the pipe's ssh is still running after the switch to direct"
+  ok "on direct: the pipe's ssh is closed ($UP_MS ms after the attach reply, $START_MS ms after the start)"
+}
+
+# Output that keeps coming: TICK-1 .. TICK-N, a quarter second apart.
+fc_ticks() { fc_line "$1" "for i in \$(seq 1 $2); do echo TICK-\$i; sleep 0.25; done"; }
+
+# Upgrade to QUIC through NAT and 40 ms of round trip, and the session works over it.
+f_upgrade() {
+  reset_net
+  netem_apply delay 20ms
+  fil_attach_direct a up
+  # DESIGN: "moves to QUIC within a second". The runner measures 0.17 s after the reply (0.9 s after
+  # the process start, most of it the ssh login); 1.5 s is the margin for a noisy VM.
+  assert_num "moved to direct within 1.5 s of the attach reply (ms)" "$UP_MS" -lt 1500
+  fc_line a 'echo UP-$((6*7))'
+  fc_wait a UP-42
+  fc_ticks a 40
+  fc_wait a TICK-40 30
+  fc_seq_ok a TICK 1 40 || fail "ticks over direct: $(fc_screen a)"
+  [[ $(fc_count_log a 'Switched(Pipe)') -eq 1 && $(fc_count_log a 'Switched(Direct)') -eq 1 ]] \
+    || fail "unexpected switches: $(fc_log a | grep -F 'Switched(')"
+  # The router's conntrack table has the UDP flow to the daemon's port.
+  nsx "$NS_R" conntrack -L -p udp 2> /dev/null | grep -E "dport=6[0-9]{4}" || fail "no UDP flow to the daemon's port in conntrack"
+  ok "the router carries a UDP flow to the daemon's port"
+  fc_detach a
+  cx_fk up
+}
+
+cx_fk() { client_exec_on x fil kill srv "$1" > /dev/null 2>&1 || true; }
+
+# NAT mappings change under a live session (new port, another new port, a new address): it stays on
+# direct, and no output is lost.
+f_nat_rebind() {
+  reset_net
+  netem_apply delay 20ms
+  NAT_UDP=
+  fil_attach_direct a nr
+  fc_ticks a 90
+  fc_wait a TICK-6 20
+  local spec
+  for spec in "$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999"; do
+    sleep 4
+    nat_move "$spec"
+    nat_expect "$spec"
+  done
+  fc_wait a TICK-90 40
+  fc_seq_ok a TICK 1 90 || fail "output lost or repeated across the NAT moves: $(fc_screen a)"
+  ok "TICK-1 to TICK-90 each once, in order, across three NAT moves"
+  [[ $(fc_count_log a 'Switched(') -eq 2 ]] || fail "the client switched transports again: $(fc_log a | grep -F 'Switched(')"
+  [[ -z $(pipe_ssh "$FIL_PID") ]] || fail "the client fell back to an ssh pipe"
+  ok "still on direct: no switch after the upgrade, no ssh"
+  if fc_has a 'skipped'; then fail "a gap marker on the screen"; fi
+  fc_detach a
+  cx_fk nr
+}
+
+# UDP stops for good in the middle of a session: the client falls back to the pipe and the output
+# carries on without loss. (Then UDP returns; whether and when the client goes back is recorded.)
+f_udp_blocked_mid() {
+  reset_net
+  netem_apply delay 20ms
+  fil_attach_direct a bm
+  fc_ticks a 120
+  fc_wait a TICK-8 20
+  local t0 pipes0
+  pipes0=$(fc_count_log a 'Switched(Pipe)')
+  t0=$(now_ms)
+  udp_block
+  local i ssh_pid=
+  for ((i = 0; i < 300; i++)); do
+    ssh_pid=$(pipe_ssh "$FIL_PID")
+    [[ -n $ssh_pid ]] && break
+    sleep 0.1
+  done
+  [[ -n $ssh_pid ]] || fail "no fallback to the pipe after 30 s of blocked UDP: $(fc_screen a | tail -n 8)"
+  note "pipe_back_ms=$(($(now_ms) - t0))"
+  # A Switched(Pipe) after the block (the attach itself logged the first one).
+  wait_log a 'Switched(Pipe)' 10 $((pipes0 + 1))
+  fc_wait a TICK-120 60
+  fc_seq_ok a TICK 1 120 || fail "output lost or repeated across the fallback: $(fc_screen a)"
+  ok "TICK-1 to TICK-120 each once, in order, across the fallback"
+  [[ $(fc_count_log a 'Switched(Pipe)') -ge 2 ]] || fail "no switch back to the pipe in the log"
+  udp_unblock
+  # Does it return to direct when UDP does? Recorded, not required.
+  local t1 back=no
+  t1=$(now_ms)
+  for ((i = 0; i < 450; i++)); do
+    if [[ $(fc_count_log a 'Switched(Direct)') -ge 2 ]]; then
+      back=$(($(now_ms) - t1))
+      break
+    fi
+    sleep 0.1
+  done
+  note "back_to_direct_after_unblock_ms=$back"
+  fc_line a 'echo AFTER-$((6*7))'
+  fc_wait a AFTER-42
+  fc_detach a
+  cx_fk bm
+}
+
+# UDP never works: the session stays on the pipe, and comes up as fast as ssh does.
+f_udp_blocked_start() {
+  reset_net
+  netem_apply delay 20ms
+  udp_block
+  local t0
+  t0=$(now_ms)
+  fc_start a -- srv bs
+  fc_ready a
+  note "attach_to_shell_ms=$(($(now_ms) - t0))"
+  local pid
+  pid=$(fc_pid a)
+  fc_ticks a 60
+  fc_wait a TICK-60 40
+  fc_seq_ok a TICK 1 60 || fail "ticks over the pipe: $(fc_screen a)"
+  [[ $(fc_count_log a 'Switched(Pipe)') -ge 1 ]] || fail "the client log is empty or missing (no Switched(Pipe)): $(fc_log a | tail -n 3)"
+  [[ $(fc_count_log a 'Switched(Direct)') -eq 0 ]] || fail "it switched to direct through a UDP block"
+  [[ -n $(pipe_ssh "$pid") ]] || fail "the pipe's ssh is not running"
+  note "direct_dial_failures=$(fc_count_log a 'direct dial failed')"
+  ok "15 s on the pipe, never on direct; the ssh pipe is running"
+  udp_unblock
+  fc_detach a
+  cx_fk bs
+}
+
+# Retired from the default run (still runnable by name): s_quiclink_rebind is covered by
+# f_nat_rebind, which moves the NAT mapping the same way under the real client and daemon.
 ALL_SCENARIOS=(
   s_netem_reorder_probe s_clean s_port_range s_impaired
   s_nat_rebind s_ip_change s_blackouts s_udp_blocked
-  s_quiclink_rebind s_quiclink_udp_blocked s_quiclink_blackouts
+  s_quiclink_udp_blocked s_quiclink_blackouts
+  f_upgrade f_nat_rebind f_udp_blocked_mid f_udp_blocked_start
 )
 
 part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"

@@ -2,7 +2,7 @@
 # The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
 # topology, network namespaces and root for the UDP/NAT topology.
 #
-#   run.sh [ssh|udp|all] [SCENARIO...]
+#   run.sh [ssh|udp|sysd|all] [SCENARIO...]
 #
 # Exit status: 0 if every scenario passed, 1 if any failed, 2 if the host cannot run it.
 set -uo pipefail
@@ -16,9 +16,10 @@ shift || true
 case $part in
   ssh) parts=(ssh) ;;
   udp) parts=(udp) ;;
-  all) parts=(ssh udp) ;;
+  sysd) parts=(sysd) ;;
+  all) parts=(ssh udp sysd) ;;
   *)
-    echo "usage: run.sh [ssh|udp|all] [SCENARIO...]" >&2
+    echo "usage: run.sh [ssh|udp|sysd|all] [SCENARIO...]" >&2
     exit 2
     ;;
 esac

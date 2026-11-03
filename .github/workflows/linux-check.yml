@@ -15,6 +15,10 @@ on:
         type: choice
         options: [check, realnet, aarch64, all]
         default: check
+      strict:
+        description: "realnet: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,22 +69,27 @@ jobs:
         run: cargo build --workspace --all-targets --target x86_64-unknown-linux-musl
 
   realnet:
-    # Tier 1 of the environment tests (docs/m1/realnet.md): real OpenSSH in Docker containers
-    # (ssh part) and the real Linux network stack with NAT and tc netem in network namespaces
-    # (udp part). Two parts, run in parallel, each through `just realnet PART`.
+    # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
+    # in Docker containers (ssh part), the real Linux network stack with NAT and tc netem in
+    # network namespaces (udp part) and a systemd host in a privileged container (sysd part).
+    # Three parts, run in parallel, each through `just realnet PART`.
+    # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
+    # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or lab
+    # runner.
     if: inputs.suite != 'check' && inputs.suite != 'aarch64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        part: [ssh, udp]
+        part: [ssh, udp, sysd]
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Packages (musl for static binaries; namespace and firewall tools)
-        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables
+        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
@@ -90,6 +99,9 @@ jobs:
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
+        env:
+          # A known finding in fil (KNOWN-BUG in the results) fails the scenario when strict.
+          REALNET_STRICT: ${{ inputs.strict && '1' || '0' }}
         run: just realnet ${{ matrix.part }}
       - name: Logs and measurements
         if: always()

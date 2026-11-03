@@ -522,8 +522,10 @@ dependencies = [
  "bytes",
  "fil-proto",
  "fil-transport",
+ "portable-pty",
  "quinn",
  "tokio",
+ "vt100",
 ]
 
 [[package]]

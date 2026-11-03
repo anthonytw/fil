@@ -654,7 +654,7 @@ async fn no_echo_ack_unless_asked_for() {
 #[tokio::test]
 async fn a_resume_far_back_is_told_the_mode_in_force_there() {
     let sc = Scratch::new();
-    let script = "stty -echo; echo S; read go; echo T; i=0; \
+    let script = "stty -echo; echo S; read go; echo T; sleep 0.2; i=0; \
                   while [ $i -lt 36 ]; do stty echo; sleep 0.03; echo x; \
                   stty -echo; sleep 0.03; echo y; i=$((i+1)); done; echo DONE; sleep 30";
     let h = spawn_plain(sh_config(&sc, "main", script)).await;

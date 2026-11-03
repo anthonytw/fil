@@ -257,7 +257,8 @@ pub(crate) struct StderrCapture {
     done: watch::Sender<bool>,
     /// The stream and what the tee has shown of it. Both the task and
     /// [`stop_tee`](Self::stop_tee) read the stream, only ever inside this lock and without
-    /// waiting, so neither depends on the other being scheduled.
+    /// waiting for data, so neither depends on the other being scheduled. The lock is held
+    /// across the writes to the terminal, which can block (see `stop_tee`).
     tee: std::sync::Mutex<Tee>,
 }
 
@@ -284,6 +285,31 @@ const TEE_LINE_MAX: usize = 4096;
 /// How long an unfinished line (a prompt: `read -p` in a wrapper script) may sit with no further
 /// bytes before it is shown anyway.
 const TEE_PARTIAL_AFTER: Duration = Duration::from_millis(200);
+
+/// The most `stop_tee` reads and shows. Anything over it stays in the pipe for the task, which
+/// captures it without showing it, so a command that never stops writing cannot hold the caller.
+const TEE_STOP_MAX: usize = 64 * 1024;
+
+/// How many bytes at the end of `bytes` are the start of a UTF-8 character whose end has not
+/// arrived (0 to 3), wherever any invalid byte may be earlier in the text.
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let b = bytes[bytes.len() - back];
+        if b & 0xC0 == 0x80 {
+            // A continuation byte: the lead is further back.
+            continue;
+        }
+        let need = match b {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            // ASCII or invalid: nothing is waiting for more.
+            _ => return 0,
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
+}
 
 /// Writes to our own stderr.
 fn terminal_sink() -> Sink {
@@ -318,15 +344,15 @@ impl Tee {
         }
     }
 
-    /// Shows the unfinished line as it is, without ending it: the rest may still come. A UTF-8
-    /// character cut in half stays back until its end arrives.
+    /// How much of the unfinished line could be shown now: all of it but a UTF-8 character cut in
+    /// half, which stays back until its end arrives.
+    fn showable(&self) -> usize {
+        self.line.len() - incomplete_tail(&self.line)
+    }
+
+    /// Shows the unfinished line as it is, without ending it: the rest may still come.
     fn show_partial(&mut self) {
-        let mut n = self.line.len();
-        if let Err(e) = std::str::from_utf8(&self.line)
-            && e.error_len().is_none()
-        {
-            n = e.valid_up_to();
-        }
+        let n = self.showable();
         let shown: Vec<u8> = self.line.drain(..n).collect();
         self.show(&shown);
     }
@@ -365,10 +391,11 @@ impl StderrCapture {
         let task = cap.clone();
         tokio::spawn(async move {
             loop {
-                // The partial-line timer only runs while there is something to show.
+                // The partial-line timer only runs while there is something to show (not for a
+                // lone first byte of a character, which waits for the rest of it).
                 let partial = {
                     let t = task.tee.lock().unwrap_or_else(|e| e.into_inner());
-                    t.on && !t.line.is_empty()
+                    t.on && t.showable() > 0
                 };
                 let read = std::future::poll_fn(|cx| {
                     let mut t = task.tee.lock().unwrap_or_else(|e| e.into_inner());
@@ -424,10 +451,15 @@ impl StderrCapture {
         }
     }
 
-    /// Stops copying to the terminal, after showing what the command had already written, so
-    /// that nothing is written to the terminal after this returns. It reads the stream itself
-    /// and does not wait for anything but the lock, which the task holds only while it reads
-    /// and shows; so it is the same from any thread or task, whichever runtime it is on.
+    /// Stops copying to the terminal, after showing what the command had already written (at
+    /// most [`TEE_STOP_MAX`] of it; the rest is still captured, by the task, not shown), so that
+    /// nothing is written to the terminal after this returns.
+    ///
+    /// It reads the stream itself and waits for no data and for no task to be scheduled, so it
+    /// is the same from any thread or task, whichever runtime it is on. It does wait for the
+    /// lock, which the task holds while it writes to the terminal, and it writes to the terminal
+    /// itself: if our stderr is flow-controlled (Ctrl-S on a terminal, a paused pager), the
+    /// caller is held until the terminal takes the text.
     fn stop_tee(&self) {
         let mut t = self.tee.lock().unwrap_or_else(|e| e.into_inner());
         if !t.on {
@@ -437,10 +469,12 @@ impl StderrCapture {
         // there is data depends on the reactor having run since it arrived, which is not up to
         // the caller. (A read that finds nothing leaves the task's registration alone.)
         let mut chunk = [0u8; 1024];
-        loop {
+        let mut read = 0;
+        while read < TEE_STOP_MAX {
             match rustix::io::read(&t.stderr, &mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
+                    read += n;
                     self.keep(&chunk[..n]);
                     t.feed(&chunk[..n]);
                 }
@@ -643,9 +677,11 @@ impl PipeLink {
     /// Stops copying the command's stderr to ours ([`PipeStderr::Tee`]); it is still captured.
     /// Call when the session takes over the terminal. Does nothing for the other modes.
     ///
-    /// What the command had already written is on our stderr when this returns, and nothing is
-    /// written after. It waits for nothing (no runtime or thread has to make progress), so it may
-    /// be called from any task or thread.
+    /// What the command had already written (up to 64 KiB of it; more is captured but not shown)
+    /// is on our stderr when this returns, and nothing is written after. No runtime or other
+    /// thread has to make progress for that, so it may be called from any task or thread. It
+    /// does wait for our stderr to take the text: if that is flow-controlled (Ctrl-S on a
+    /// terminal, a paused pager), the caller waits too.
     pub fn stop_stderr_tee(&self) {
         if let Some(c) = &self.stderr {
             c.stop_tee();
@@ -946,7 +982,8 @@ mod tests {
     }
 
     /// Runs `script` with its stderr teed to a [`Shown`] and its stdin open (`read` in the script
-    /// waits for the test).
+    /// waits for the test). Its stdout is a pipe the test may read to know how far the script has
+    /// got (`child.stdout`).
     fn tee_of(
         script: &str,
     ) -> (
@@ -958,7 +995,7 @@ mod tests {
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", script])
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -977,10 +1014,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn stop_tee_from_a_spawned_task_has_written_the_lines_when_it_returns() {
         tokio::spawn(async {
-            let (cap, shown, _child, _stdin) =
-                tee_of("printf 'one\\ntwo \\033[2Jtwo\\nunfinished' >&2; sleep 60");
-            // Blocking on purpose: the data reaches the pipe while no task can read it.
-            std::thread::sleep(Duration::from_millis(400));
+            // The script says on stdout that it has written its stderr text.
+            let (cap, shown, mut child, _stdin) =
+                tee_of("printf 'one\\ntwo \\033[2Jtwo\\nunfinished' >&2; echo x; exec sleep 60");
+            let stdout = child.stdout.take().unwrap().into_owned_fd().unwrap();
+            // Blocking on purpose (this is the only worker): the text is in the pipe while no
+            // task can read it.
+            let end = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let mut byte = [0u8; 1];
+                match rustix::io::read(&stdout, &mut byte) {
+                    Ok(1) => break,
+                    Err(rustix::io::Errno::AGAIN) => std::thread::sleep(Duration::from_millis(2)),
+                    other => panic!("the script's signal: {other:?}"),
+                }
+                assert!(
+                    std::time::Instant::now() < end,
+                    "the script never got there"
+                );
+            }
             assert_eq!(shown.text(), "", "nothing could have been shown yet");
             cap.stop_tee();
             assert_eq!(
@@ -998,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn stop_tee_is_silent_afterwards_and_the_capture_goes_on() {
         let (cap, shown, _child, mut stdin) =
-            tee_of("echo before >&2; read x; echo after >&2; sleep 60");
+            tee_of("echo before >&2; read x; echo after >&2; exec sleep 60");
         shown.until("the first line", |t| t == "before\n").await;
         let stopper = cap.clone();
         std::thread::spawn(move || stopper.stop_tee())
@@ -1019,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn a_partial_line_is_shown_after_a_pause() {
         let (_cap, shown, _child, mut stdin) = tee_of(
-            "printf 'Pa\\033[2Jss\\303' >&2; read x; printf '\\251: ' >&2; read y; echo \"got $y\" >&2; sleep 60",
+            "printf 'Pa\\033[2Jss\\303' >&2; read x; printf '\\251: ' >&2; read y; echo \"got $y\" >&2; exec sleep 60",
         );
         let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1044,9 +1096,38 @@ mod tests {
     /// new line.
     #[tokio::test]
     async fn stop_tee_ends_a_prompt_that_was_shown() {
-        let (cap, shown, _child, _stdin) = tee_of("printf 'Password: ' >&2; sleep 60");
+        let (cap, shown, _child, _stdin) = tee_of("printf 'Password: ' >&2; exec sleep 60");
         shown.until("a prompt", |t| t == "Password: ").await;
         cap.stop_tee();
         assert_eq!(shown.text(), "Password: \n");
+    }
+
+    #[test]
+    fn a_half_character_is_found_wherever_the_invalid_bytes_are() {
+        assert_eq!(incomplete_tail(b""), 0);
+        assert_eq!(incomplete_tail(b"abc"), 0);
+        assert_eq!(incomplete_tail("caf\u{e9}".as_bytes()), 0);
+        // The start of a 2-, 3- and 4-byte character, and the parts of longer ones.
+        assert_eq!(incomplete_tail(b"ab\xC3"), 1);
+        assert_eq!(incomplete_tail(b"ab\xE2"), 1);
+        assert_eq!(incomplete_tail(b"ab\xE2\x82"), 2);
+        assert_eq!(incomplete_tail(b"ab\xF0\x9F\x98"), 3);
+        // A character that is whole, a lead byte that cannot start one, stray continuations.
+        assert_eq!(incomplete_tail(b"ab\xE2\x82\xAC"), 0);
+        assert_eq!(incomplete_tail(b"ab\xFF"), 0);
+        assert_eq!(incomplete_tail(b"ab\x80\x80\x80"), 0);
+        // An invalid byte earlier on does not matter.
+        assert_eq!(incomplete_tail(b"\xFFab\xC3"), 1);
+        assert_eq!(incomplete_tail(b"\x80\xC3\xC3"), 1);
+    }
+
+    /// An invalid byte earlier in the line does not make the tee show half a character.
+    #[tokio::test]
+    async fn a_half_character_stays_back_after_an_invalid_byte() {
+        let (_cap, shown, _child, mut stdin) =
+            tee_of("printf '\\377ab\\303' >&2; read x; printf '\\251\\n' >&2; exec sleep 60");
+        shown.until("the first part", |t| t == "\u{FFFD}ab").await;
+        stdin.write_all(b"go\n").await.unwrap();
+        shown.until("the rest", |t| t == "\u{FFFD}ab\u{e9}\n").await;
     }
 }

@@ -375,25 +375,36 @@ async fn slow_start(
     cfg.spawn_timeout = Duration::from_millis(50);
     cfg.spawn_delay = SPAWN_DELAY;
     cfg.idle_exit = idle_exit;
-    let began = Instant::now();
     let d = start(s, cfg).await;
+    // Just before the attach: the creation's delay starts when the daemon handles it, so
+    // `began + SPAWN_DELAY` is never later than the moment the shell is created.
+    let began = Instant::now();
     let c = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
     assert!(!c.errors.is_empty(), "the attach gives up: {:?}", c.errors);
     (d, marker, began, c)
 }
 
-/// Whether a process with `marker` in its command line exists.
+/// Whether a process with `marker` in its command line exists. A process that has exited and not
+/// been reaped yet (`<defunct>`, where `ps` shows it with its command line at all) counts as
+/// gone: it holds no shell and runs nothing, and whether the daemon reaps it is not what these
+/// tests are about.
 fn shell_running(marker: &str) -> bool {
     let ps = std::process::Command::new("ps")
         .args(["-A", "-o", "command="])
         .output()
         .expect("ps");
     assert!(ps.status.success(), "ps failed");
-    String::from_utf8_lossy(&ps.stdout).contains(marker)
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .any(|l| l.contains(marker) && !l.contains("<defunct>"))
 }
 
-/// Waits (generously: it is a signal and a reap away) until the marked shell is gone.
-async fn assert_shell_gone(marker: &str) {
+/// Once the late shell has had every chance to exist (`SPAWN_DELAY` after `began`, and a second
+/// more), waits (generously: it is a signal and a reap away) until the marked shell is gone. The
+/// wait for that moment is what makes this a check of "nothing outlives the daemon": looking at
+/// once would pass for a shell that has not been created yet.
+async fn assert_shell_gone(marker: &str, began: Instant) {
+    tokio::time::sleep_until((began + SPAWN_DELAY + Duration::from_secs(1)).into()).await;
     let end = Instant::now() + Duration::from_secs(20);
     while shell_running(marker) {
         assert!(
@@ -418,7 +429,7 @@ async fn shutdown_waits_for_and_kills_a_session_that_starts_late() {
         began.elapsed()
     );
     // ... and killed what it made.
-    assert_shell_gone(&marker).await;
+    assert_shell_gone(&marker, began).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -442,7 +453,7 @@ async fn a_pending_late_start_keeps_the_daemon_from_idling_out() {
         .unwrap();
     assert_eq!(exit, fil_daemon::Exit::Idle);
     assert!(began.elapsed() >= SPAWN_DELAY, "it idled out too early");
-    assert_shell_gone(&marker).await;
+    assert_shell_gone(&marker, began).await;
 }
 
 /// bugs #9: a session that cannot be created is not "protocol error": the client is told the

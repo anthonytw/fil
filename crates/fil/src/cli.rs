@@ -33,8 +33,9 @@ Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 Configuration: ~/.config/fil/config.toml (see DESIGN.md section 14).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 
-Exit status: 0 on a normal end (detached, or the session ended); 128+N if fil was
-stopped by signal N;
+Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
+the shell's own status if it exited with one; 128+N if the shell was killed by signal N or
+fil was stopped by signal N;
 1 on an error or if the session was taken over, replaced or detached elsewhere;
 2 on a usage error.";
 

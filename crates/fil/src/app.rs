@@ -148,7 +148,13 @@ async fn attach(
 /// How a run ended, as an exit status (the list is in `fil --help`).
 pub fn exit_code(result: &Result<Outcome, ClientError>) -> u8 {
     match result {
-        Ok(Outcome::Detached | Outcome::InputClosed | Outcome::SessionEnded) => OK,
+        Ok(Outcome::Detached | Outcome::InputClosed) => OK,
+        // Like ssh: the shell's own status, 128+N for a signal, 0 when the daemon could not say.
+        Ok(Outcome::SessionEnded { code, signal }) => match (code, signal) {
+            (Some(c), _) => (*c & 0xff) as u8,
+            (None, Some(n)) => 128u8.saturating_add(u8::try_from(*n).unwrap_or(0).min(127)),
+            (None, None) => OK,
+        },
         Ok(Outcome::Signalled(n)) => 128u8.saturating_add(u8::try_from(*n).unwrap_or(0).min(127)),
         Ok(_) | Err(_) => FAILED,
     }
@@ -268,7 +274,12 @@ mod tests {
         use std::time::Duration;
         assert_eq!(exit_code(&Ok(Outcome::Detached)), 0);
         assert_eq!(exit_code(&Ok(Outcome::InputClosed)), 0);
-        assert_eq!(exit_code(&Ok(Outcome::SessionEnded)), 0);
+        let ended = |code, signal| exit_code(&Ok(Outcome::SessionEnded { code, signal }));
+        assert_eq!(ended(Some(0), None), 0);
+        assert_eq!(ended(Some(3), None), 3);
+        assert_eq!(ended(Some(256 + 7), None), 7, "a status is eight bits");
+        assert_eq!(ended(None, Some(9)), 137);
+        assert_eq!(ended(None, None), 0);
         assert_eq!(exit_code(&Ok(Outcome::Signalled(15))), 143);
         assert_eq!(exit_code(&Ok(Outcome::SessionReplaced)), 1);
         assert_eq!(exit_code(&Ok(Outcome::DetachedElsewhere)), 1);

@@ -37,6 +37,10 @@ impl<L: Link> Link for Shared<L> {
         self.0.recv()
     }
 
+    fn flush(&self) -> impl Future<Output = Result<(), LinkError>> + Send {
+        self.0.flush()
+    }
+
     fn status(&self) -> watch::Receiver<LinkStatus> {
         self.0.status()
     }
@@ -71,6 +75,13 @@ impl Link for AnyLink {
         match self {
             AnyLink::Pipe(l) => l.recv().await,
             AnyLink::Direct(l) => l.recv().await,
+        }
+    }
+
+    async fn flush(&self) -> Result<(), LinkError> {
+        match self {
+            AnyLink::Pipe(l) => l.flush().await,
+            AnyLink::Direct(l) => l.flush().await,
         }
     }
 

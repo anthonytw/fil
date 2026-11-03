@@ -73,7 +73,7 @@ realnet *args:
     tests/realnet/run.sh {{args}}
 
 # A real run of the `fil` binary without sshd: the pipe command is the local `fil server --stdio`
-# (docs/m1/binary.md). Needs the daemon from fil-daemon. `just local` attaches to session
+# (docs/m1/binary.md); the relay starts the daemon. `just local` attaches to session
 # "local" over the pipe only; `just local-direct` also lets it upgrade to QUIC on loopback.
 local session="local":
     cargo build -q -p fil

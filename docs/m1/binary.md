@@ -23,7 +23,7 @@ fil server --daemon                            the daemon itself (hidden; starte
 
 A host or session named `ls`, `kill`, `detach` or `server` is attached with `--`: `fil -- ls`, `fil orin -- ls`. (Without it `fil orin ls` fails loudly, because `ls` wants a host.)
 
-**Exit status.** 0: detached, input closed, or the session ended (package F will make it the shell's own status). 1: an error, or the session was taken over, replaced or detached elsewhere. 2: a usage error (clap). 128+N: stopped by signal N.
+**Exit status.** 0: detached or input closed. When the session ends (`Outcome::SessionEnded { code, signal }`), like ssh: the shell's own status if it exited with one (low eight bits), 128+N if it was killed by signal N (`fil kill` from elsewhere is signal 9, so 137), and 0 if the daemon could not say (a reconnect that learns the session is gone). 128+N also when fil itself is stopped by signal N. 1: an error, or the session was taken over, replaced or detached elsewhere (so a shell that exits 1 and an error are not told apart by the status alone; the message differs). 2: a usage error (clap).
 
 **Logs.** JSON lines in `~/.local/state/fil/client.log` (directory 0700, file 0600, rotated at 5 MiB). `FIL_LOG=debug` for more. Once the first attach has been accepted, nothing reaches the terminal except the client's own messages: a background run's stderr (ssh's, or any pipe command's) is captured, not inherited, and its last line goes to the status line and to the log. Until then ssh runs as written, with its prompts and errors on your terminal. The log holds no keystrokes, output or keys.
 
@@ -139,11 +139,9 @@ Mutation checks (each change made by hand, the suites run, the change reverted):
 
 ## Not done here
 
-- `fil server --stdio` and `fil server --daemon` call `fil-daemon`, which is package P5. Until it merges (PR #21) they print a message and fail; `src/server.rs` has the two calls (`run_relay`, `run_daemon`), and `app::main` already dispatches them before any runtime starts.
-- `Outcome::SessionEnded { code, signal }` and `Link::flush` are package F (PR #22). Until it merges a session that ends exits 0 (`app::exit_code`), and `Shared` and `AnyLink` (`src/link.rs`) have no `flush` to forward; both are small changes made when it lands.
 - Local time in the "taken over" message: the client formats UTC (labelled) because the local zone needs a database lookup this crate does not carry.
 - Port forwards (`-L`, `-R`, `forward = [...]`, `fil ports`, `fil forward`) are M2.
 
 ## On demand: a real run without sshd
 
-`just local` builds `fil`, writes a throwaway config whose pipe command is `fil server --stdio` run directly, and attaches to a session named `local`. It needs the daemon (P5).
+`just local` builds `fil`, writes a throwaway config whose pipe command is `fil server --stdio` run directly, and attaches to a session named `local`; the relay starts the daemon (`fil server --daemon`) on first use. `just local-direct` also lets it upgrade to QUIC over loopback (`direct.address = "127.0.0.1"`). The run on 2026-11-02 on macOS is in the pull request.

@@ -47,14 +47,16 @@ pub struct ListenerConfig {
     /// Called once for each connection whose handshake just completed, before the listener
     /// registers it. Tests use it to revoke a key at the one moment the post-handshake check
     /// exists for.
-    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub after_handshake: Option<TestHook>,
 }
 
-/// A callback for tests.
+/// A callback for tests (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
 #[derive(Clone)]
 pub struct TestHook(pub Arc<dyn Fn() + Send + Sync>);
 
+#[cfg(feature = "test-hooks")]
 impl std::fmt::Debug for TestHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TestHook")
@@ -70,6 +72,7 @@ impl Default for ListenerConfig {
             limits: HandshakeLimits::default(),
             retry: true,
             rng_seed: None,
+            #[cfg(feature = "test-hooks")]
             after_handshake: None,
         }
     }
@@ -196,6 +199,7 @@ impl QuicListener {
             retry: cfg.retry,
             limiter: Limiter::new(cfg.limits, Instant::now()),
             pending: Arc::new(Semaphore::new(cfg.limits.max_pending)),
+            #[cfg(feature = "test-hooks")]
             after_handshake: cfg.after_handshake.clone(),
             out: tx,
         };
@@ -276,6 +280,7 @@ struct AcceptLoop {
     retry: bool,
     limiter: Limiter,
     pending: Arc<Semaphore>,
+    #[cfg(feature = "test-hooks")]
     after_handshake: Option<TestHook>,
     out: mpsc::Sender<QuicLink>,
 }
@@ -333,6 +338,7 @@ impl AcceptLoop {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         let out = self.out.clone();
+        #[cfg(feature = "test-hooks")]
         let hook = self.after_handshake.clone();
         let params = self.params;
         tokio::spawn(async move {
@@ -344,6 +350,7 @@ impl AcceptLoop {
                 Ok(Ok(conn)) => conn,
                 _ => return bump(&counters.handshake_failed),
             };
+            #[cfg(feature = "test-hooks")]
             if let Some(TestHook(hook)) = hook {
                 hook();
             }

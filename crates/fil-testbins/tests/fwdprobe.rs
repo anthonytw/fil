@@ -10,6 +10,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,17 @@ fn run_raw(args: &[&str]) -> (String, i32) {
     (text, out.status.code().expect("exit code"))
 }
 
+/// Held while a test picks a port it needs to stay unused. Every server in this file binds an
+/// OS-assigned port, and only `Server::start` binds in this process, so a test that holds this
+/// lock from the moment it frees a port until its use of it is over cannot have it taken by
+/// another test (the OS hands out a free port, not a held one). Starting a server holds it
+/// until the server has said where it listens, so the bind is over by then.
+static PORT_PICK: Mutex<()> = Mutex::new(());
+
+fn port_pick() -> MutexGuard<'static, ()> {
+    PORT_PICK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A running `fwdprobe serve`, with its stdout lines arriving on a channel.
 struct Server {
     child: Child,
@@ -75,6 +87,7 @@ struct Server {
 
 impl Server {
     fn start(mode: &[&str]) -> Self {
+        let _pick = port_pick();
         let mut child = Command::new(BIN)
             .args(["serve", "127.0.0.1:0"])
             .args(mode)
@@ -467,6 +480,10 @@ fn rate_paces_a_transfer() {
 
 #[test]
 fn connect_to_a_closed_port_says_refused() {
+    // A port cannot be held and refuse at once (a bound socket that does not listen makes a
+    // connect hang on macOS), so keep every server of this file from binding while this one is
+    // free and in use.
+    let _pick = port_pick();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

@@ -43,7 +43,7 @@ use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
 use fil_proto::frame::DataSegment;
-use fil_proto::limits::ACK_DELAY;
+use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
     SnapshotInfo, StartPoint, TakenOver, TermName, TermSize,
@@ -91,6 +91,17 @@ struct Session {
     epoch: u64,
     /// Terminal output given to the user's terminal (or skipped by a snapshot) so far.
     recv: RecvChannel,
+    /// The highest terminal offset told to the daemon on the current link: what its flow control
+    /// counts as acknowledged. It starts at the point the daemon resumed (or jumped) to, not at
+    /// ours: a swap's old link may have delivered further than the candidate's resume point.
+    acked: u64,
+    /// The highest terminal offset the current link has delivered (`seq + len` of its segments,
+    /// duplicates of what the terminal already has included). The daemon rejects an ack beyond
+    /// what it sent on the link, so we never acknowledge beyond this.
+    link_high: u64,
+    /// Acks may go out: the current link's attach reply is in, so `acked` is known. A candidate
+    /// that took over before its reply has no position yet and must not be told one.
+    acking: bool,
     /// Keystrokes sent and not yet acknowledged, plus those queued.
     input: SendChannel,
     /// The daemon has said where to continue the input stream on this link.
@@ -110,6 +121,9 @@ impl Session {
             incarnation: 0,
             epoch: 0,
             recv: RecvChannel::new(),
+            acked: 0,
+            link_high: 0,
+            acking: false,
             input: SendChannel::new(window),
             input_ready: false,
             modes: VecDeque::new(),
@@ -119,6 +133,50 @@ impl Session {
 
     fn forget(&mut self, window: usize) {
         *self = Session::new(window);
+    }
+
+    /// A different link is now the session's: nothing is acknowledged on it until its attach
+    /// reply says where the daemon's flow starts.
+    fn link_changed(&mut self) {
+        self.acking = false;
+        self.link_high = 0;
+    }
+
+    /// The daemon's flow on this link starts at `at` (a resume point or a snapshot's position).
+    fn start_acks(&mut self, at: u64) {
+        self.acked = at;
+        self.link_high = self.link_high.max(at);
+        self.acking = true;
+    }
+
+    /// What the terminal can be acknowledged up to on this link.
+    fn ack_target(&self) -> u64 {
+        self.recv.received().min(self.link_high)
+    }
+
+    fn unacked(&self) -> u64 {
+        if self.acking {
+            self.ack_target().saturating_sub(self.acked)
+        } else {
+            0
+        }
+    }
+
+    fn ack_now(&mut self) -> Option<u64> {
+        let upto = self.ack_target();
+        (self.acking && upto > self.acked).then(|| {
+            self.acked = upto;
+            upto
+        })
+    }
+
+    /// The ack to send now if enough has built up.
+    fn ack_if_due(&mut self) -> Option<u64> {
+        if self.unacked() >= ACK_AFTER_BYTES {
+            self.ack_now()
+        } else {
+            None
+        }
     }
 
     fn resume_request(&self) -> Option<ResumeRequest> {
@@ -663,6 +721,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let mut primary = LinkCtx::open(dialed.link, resume.is_some());
         self.last_kind = Some(primary.kind);
         self.sess.input_ready = false;
+        self.sess.link_changed();
         self.link_ok = false;
         self.ack_due = None;
         self.quiet = false;
@@ -996,8 +1055,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn take_over_tx<L: Link>(&mut self, primary: &LinkCtx<L>) {
         self.tx = Some(primary.tx.clone());
         self.last_kind = Some(primary.kind);
-        // The new link's daemon tells us where its input stream stands.
+        // The new link's daemon tells us where its input stream stands, and its reply where its
+        // output flow starts: an ack that fell due for the old link means nothing to it.
         self.sess.input_ready = false;
+        self.sess.link_changed();
+        self.ack_due = None;
         // The old link may have been quiet; the session is only as quiet as the link it now
         // runs on (a new link's status watch has nothing to report while it stays `Up`).
         self.quiet = matches!(primary.status.borrow().state, LinkState::Degraded);
@@ -1230,7 +1292,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         self.sess.recv.received()
                     ));
                 }
-                self.sess.recv.on_reconnect();
+                // The daemon's flow starts at `from`, which may be behind us (a swap's old link
+                // went on delivering while the candidate was being set up): what it resends from
+                // there is acknowledged as it arrives, duplicates or not.
+                self.sess.start_acks(from);
                 self.sess.input_ready = false;
                 // Keystrokes wait for the daemon's `Resume` (section 8.5). Output that arrived
                 // before this reply can be applied now.
@@ -1256,6 +1321,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // The daemon's position replaces ours, even if it is behind (a resume point it
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
+                self.sess.start_acks(info.at);
                 return self.begin_snapshot(conn, info);
             }
         }
@@ -1281,6 +1347,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             return Self::reconnect("a catch-up snapshot behind the terminal position");
         }
         self.sess.recv.skip_to(info.at);
+        self.sess.start_acks(info.at);
         self.begin_snapshot(conn, info)
     }
 
@@ -1381,6 +1448,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.held_bytes + data.len() > self.cfg.max_held_output {
             return Self::reconnect("too much terminal data held back");
         }
+        self.sess.link_high = self.sess.link_high.max(seq + data.len() as u64);
         if let Some(old) = conn.term_held.insert(seq, data.to_vec()) {
             conn.held_bytes -= old.len();
         }
@@ -1395,7 +1463,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.awaiting_reply || conn.snap.is_some() {
             return Ok(Flow::Continue);
         }
-        let mut applied = false;
         while let Some(&seq) = conn.term_held.keys().next() {
             if seq > self.sess.recv.received() {
                 break;
@@ -1409,7 +1476,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             if !fresh.is_empty() {
                 let fresh = fresh.to_vec();
                 self.apply_output(pos, &fresh)?;
-                applied = true;
             }
         }
         conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
@@ -1417,9 +1483,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             (false, None) => Some(Instant::now()),
             (false, since) => since,
         };
-        if applied {
-            self.after_output();
-        }
+        // Also when nothing was new: a resend of what the terminal already has (a swap's) is
+        // still owed an ack on this link.
+        self.after_output();
         Ok(Flow::Continue)
     }
 
@@ -1467,13 +1533,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// Acks, when due, after output was applied.
     fn after_output(&mut self) {
-        if let Some(upto) = self.sess.recv.ack_if_due() {
+        if let Some(upto) = self.sess.ack_if_due() {
             self.send_ctl(&ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
                 upto,
             });
             self.ack_due = None;
-        } else if self.sess.recv.unacked() > 0 && self.ack_due.is_none() {
+        } else if self.sess.unacked() > 0 && self.ack_due.is_none() {
             self.ack_due = Some(Instant::now() + ACK_DELAY);
         }
     }
@@ -1521,10 +1587,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.awaiting_reply || conn.snap.is_some() || self.quiet {
             return Ok(());
         }
-        if !self.link_ok {
-            self.link_ok = true;
-            self.sess.recv.on_reconnect();
-        }
+        self.link_ok = true;
         self.ready_since.get_or_insert_with(Instant::now);
         // The window may have changed size while the daemon could not be told (a quiet link,
         // a snapshot on its way).
@@ -1937,7 +2000,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             && Instant::now() >= due
         {
             self.ack_due = None;
-            if let Some(upto) = self.sess.recv.ack_now() {
+            if let Some(upto) = self.sess.ack_now() {
                 self.send_ctl(&ControlMsg::Ack {
                     channel: ChannelId::TERMINAL,
                     upto,

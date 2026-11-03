@@ -24,10 +24,6 @@ async fn reconnect(rig: &Rig, attaches: usize) {
     settle().await;
 }
 
-fn lines(range: std::ops::Range<usize>) -> Vec<u8> {
-    range.flat_map(|i| numbered(i).into_bytes()).collect()
-}
-
 /// Terminal data that overtakes the catch-up `Snapshot` announcement (legal across channels).
 #[tokio::test(start_paused = true)]
 async fn review_output_overtaking_the_catch_up_announcement() {
@@ -42,7 +38,7 @@ async fn review_output_overtaking_the_catch_up_announcement() {
     rig.daemon.output(b"more\r\n").await;
     settle().await;
     assert!(!rig.is_finished(), "client died: {:?}", rig.finish().await);
-    let want = common::term::rows_of(&rig.daemon.screen(0).await);
+    let want = rig.daemon.screen(0).await.screen_text();
     assert_eq!(rig.term.rows(), want);
 }
 
@@ -205,7 +201,7 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     let row = st
         .screen
         .iter()
-        .position(|l| common::term::line_text(l).contains("fil:"))
+        .position(|l| l.text().contains("fil:"))
         .unwrap();
     eprintln!("status row {row}");
     rig.term.resize(60, 24);
@@ -223,11 +219,7 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
     r.resize(fil_term::Size { cols: 60, rows: 24 });
     let want = r.state(1000);
     let got = rig.term.state();
-    assert_eq!(
-        common::term::rows_of(&got),
-        common::term::rows_of(&want),
-        "screen differs"
-    );
+    assert_eq!(got.screen_text(), want.screen_text(), "screen differs");
     // The window narrowed under the overlay, so the client did not trust the screen and took a
     // snapshot (a fresh attach). The terminal had already re-wrapped the overlay's rows into
     // its scrollback by then, which nothing can undo: the history keeps those fragments and
@@ -236,7 +228,11 @@ async fn review2_narrowing_under_a_status_over_long_lines() {
         attaches[1].resume.is_none(),
         "narrowing under the overlay forces a snapshot"
     );
-    let wh: Vec<_> = want.history.iter().map(common::term::line_text).collect();
+    let wh: Vec<_> = want
+        .history
+        .iter()
+        .map(fil_term::model::Line::text)
+        .collect();
     let have = rig.term.history();
     assert!(have.len() >= wh.len());
     let mut it = have.iter();

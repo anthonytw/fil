@@ -245,13 +245,9 @@ async fn the_prompt_leaves_the_screen_as_it_was() {
     // The scrollback is untouched, and the rows above the message are the originals.
     assert_eq!(term.state().history, before.history);
     let after = term.rows();
-    let was = fil_term_rows(&before);
+    let was = before.screen_text();
     // The closing message goes below the cursor row (row 2); everything above is original.
     for i in 0..3 {
         assert_eq!(after[i], was[i], "row {i}");
     }
-}
-
-fn fil_term_rows(s: &fil_term::TermState) -> Vec<String> {
-    common::term::rows_of(s)
 }

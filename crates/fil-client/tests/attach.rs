@@ -4,7 +4,6 @@ mod common;
 
 use common::*;
 use fil_client::{DialError, DialPurpose, Outcome};
-use fil_term::Size;
 
 #[tokio::test(start_paused = true)]
 async fn attach_writes_the_snapshot_then_the_servers_bytes_exactly() {
@@ -28,10 +27,7 @@ async fn attach_writes_the_snapshot_then_the_servers_bytes_exactly() {
     settle().await;
     // The terminal got the server's bytes exactly: its screen and scrollback equal an emulator
     // that saw only the output.
-    let mut reference =
-        fil_term::create(fil_term::DEFAULT_BACKEND, Size { cols: 80, rows: 24 }, 1000).unwrap();
-    reference.feed(&want);
-    assert_eq!(rig.term.state(), reference.state(1000));
+    assert_eq!(rig.term.state(), reference(&want));
     assert!(rig.term.text().contains("line 0029"));
     assert!(rig.term.history().iter().any(|l| l == "line 0000"));
     // And the client acknowledged what it wrote.
@@ -309,7 +305,11 @@ async fn a_version_mismatch_is_reported() {
             &mut self,
             _: DialPurpose,
         ) -> Result<fil_client::Dialed<Self::Link>, DialError> {
-            let (a, b, _c) = mem::pair(fil_transport::LinkKind::Pipe, 64);
+            let (a, b, _c) = mem::pair_with(
+                fil_transport::LinkKind::Pipe,
+                64,
+                mem::Delivery::ControlFirst,
+            );
             tokio::spawn(async move {
                 let hello = ControlMsg::Hello(Hello {
                     major: 99,

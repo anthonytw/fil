@@ -115,7 +115,7 @@ impl TermHandle {
 
     /// The visible rows as text, trailing spaces trimmed.
     pub fn rows(&self) -> Vec<String> {
-        rows_of(&self.state())
+        self.state().screen_text()
     }
 
     /// Screen text joined, for `contains` checks. Lines that wrapped are joined without a break.
@@ -135,7 +135,7 @@ impl TermHandle {
                     })
                     .collect::<String>()
             } else {
-                line_text(l)
+                l.text()
             };
             out.push_str(&t);
             if !l.wrapped {
@@ -147,26 +147,10 @@ impl TermHandle {
 
     /// Scrollback lines as text.
     pub fn history(&self) -> Vec<String> {
-        self.state().history.iter().map(line_text).collect()
+        self.state()
+            .history
+            .iter()
+            .map(fil_term::model::Line::text)
+            .collect()
     }
-}
-
-pub fn line_text(l: &fil_term::model::Line) -> String {
-    l.cells
-        .iter()
-        .filter(|c| c.width != 0)
-        .map(|c| {
-            if c.text.is_empty() {
-                " "
-            } else {
-                c.text.as_str()
-            }
-        })
-        .collect::<String>()
-        .trim_end()
-        .to_string()
-}
-
-pub fn rows_of(s: &TermState) -> Vec<String> {
-    s.screen.iter().map(line_text).collect()
 }

@@ -134,7 +134,7 @@ struct SwapOffers {
 
 impl SwapOffers {
     fn offer(&self, delay_ms: Delay) {
-        let (a, b, ctl) = mem::pair(LinkKind::Pipe, 4096);
+        let (a, b, ctl) = mem::pair_with(LinkKind::Pipe, 4096, mem::Delivery::ControlFirst);
         self.daemon.accept(b, ctl);
         let _ = self.tx.send(Dialed::new(SlowLink::new(a, delay_ms)));
     }
@@ -148,7 +148,7 @@ impl Dialer for SlowDialer {
     }
 
     async fn dial(&mut self, _purpose: DialPurpose) -> Result<Dialed<SlowLink>, DialError> {
-        let (a, b, ctl) = mem::pair(LinkKind::Pipe, 4096);
+        let (a, b, ctl) = mem::pair_with(LinkKind::Pipe, 4096, mem::Delivery::ControlFirst);
         self.daemon.accept(b, ctl);
         Ok(Dialed::new(SlowLink::new(a, self.delay_ms.clone())))
     }

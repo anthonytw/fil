@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fil_proto::msg::{
-    Agent, ControlMsg, Hello, ListenerOwner, ListenerRow, PortsPart, PortsPath, PortsRow, Probe,
-    ProbeKind, ProbeLabel, ProcessInfo, ProcessName, Request, Response, SessionName,
-    SessionSummary, SubscriberSummary, TermName,
+    Agent, ControlMsg, Hello, ListenerOwner, ListenerRow, PortsPath, PortsRow, Probe, ProbeKind,
+    ProbeLabel, ProcessInfo, ProcessName, Request, Response, SessionName, SessionSummary,
+    SubscriberSummary, TermName,
 };
 use fil_transport::Link;
 use fil_transport::pipe::{PipeConfig, PipeLink};
@@ -154,12 +154,7 @@ impl World {
         };
         let started = Instant::now();
         loop {
-            let out = Out::of(
-                self.command(revision)
-                    .args(["ls", host])
-                    .output()
-                    .unwrap(),
-            );
+            let out = Out::of(self.command(revision).args(["ls", host]).output().unwrap());
             if out.ok && out.stdout.contains(session) {
                 return run;
             }
@@ -230,21 +225,6 @@ impl Attached {
     fn text(&self) -> String {
         self.output.lock().unwrap().clone()
     }
-
-    fn wait_for_exit(&mut self, limit: Duration) -> portable_pty::ExitStatus {
-        let started = Instant::now();
-        loop {
-            if let Some(s) = self.child.try_wait().unwrap() {
-                return s;
-            }
-            assert!(
-                started.elapsed() < limit,
-                "fil did not end within {limit:?}: {}",
-                self.text()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
 }
 
 impl Drop for Attached {
@@ -284,8 +264,9 @@ fn forward_inside_a_session_adds_and_removes() {
     // The table has it: one forward in `fil ls`, and a management-origin row in `fil ports`.
     let ls = w.laptop(&["ls", "probe"]);
     assert!(
-        ls.stdout.lines().any(|l| l.starts_with("main ")
-            && l.split_whitespace().any(|c| c == "1")),
+        ls.stdout
+            .lines()
+            .any(|l| l.starts_with("main ") && l.split_whitespace().any(|c| c == "1")),
         "{}",
         ls.stdout
     );
@@ -304,7 +285,11 @@ fn forward_inside_a_session_adds_and_removes() {
     let text = w.inside("main", &["ports"]);
     assert!(text.ok, "{}", text.stderr);
     assert!(text.stdout.contains("SESSION main"), "{}", text.stdout);
-    assert!(text.stdout.contains("asked for by a process"), "{}", text.stdout);
+    assert!(
+        text.stdout.contains("asked for by a process"),
+        "{}",
+        text.stdout
+    );
     assert!(!text.stdout.contains(" on probe"), "{}", text.stdout);
 
     let rm = w.inside("main", &["forward", "--rm", &port]);
@@ -332,7 +317,10 @@ fn removing_a_port_two_forwards_share_is_ambiguous_until_the_kind_is_named() {
     let w = World::new("ambig");
     let _client = w.attach(ours(), "probe", "main");
     let port = free_port();
-    let (l, r) = (format!("{port}:localhost:80"), format!("{port}:localhost:81"));
+    let (l, r) = (
+        format!("{port}:localhost:80"),
+        format!("{port}:localhost:81"),
+    );
     assert!(w.inside("main", &["forward", "-L", &l]).ok);
     let added = w.inside("main", &["forward", "-R", &r]);
     assert!(added.ok, "{}", added.stderr);
@@ -458,7 +446,9 @@ fn in_session_commands_name_a_daemon_of_another_revision() {
             out.stderr.contains("older")
                 && out.stderr.contains(&format!("wire rev {old}"))
                 && out.stderr.contains(&format!("wire rev {new}"))
-                && out.stderr.contains("only reach the daemon of its own wire revision"),
+                && out
+                    .stderr
+                    .contains("only reach the daemon of its own wire revision"),
             "{args:?}: {}",
             out.stderr
         );
@@ -547,7 +537,8 @@ fn detach_without_arguments_detaches_the_session_it_runs_in() {
     let out = w.inside("main", &["detach"]);
     assert!(out.ok, "{}", out.stderr);
     assert!(
-        out.stdout.contains("detached session \"main\" (it keeps running)"),
+        out.stdout
+            .contains("detached session \"main\" (it keeps running)"),
         "{}",
         out.stdout
     );
@@ -561,8 +552,20 @@ fn detach_without_arguments_detaches_the_session_it_runs_in() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    client.type_bytes(b"n");
-    let status = client.wait_for_exit(Duration::from_secs(15));
+    // Keys typed before the prompt reads are dropped, so answer until it has.
+    let started = Instant::now();
+    let status = loop {
+        client.type_bytes(b"n");
+        std::thread::sleep(Duration::from_millis(300));
+        if let Some(s) = client.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the client did not quit: {}",
+            client.text()
+        );
+    };
     assert!(!status.success(), "{}", client.text());
     // The session survives, with nobody attached.
     let ls = w.laptop(&["ls", "probe"]);
@@ -572,7 +575,11 @@ fn detach_without_arguments_detaches_the_session_it_runs_in() {
     // Outside a session it names no session.
     let out = w.on_host(&["detach"]);
     assert_eq!(out.code, Some(1));
-    assert!(out.stderr.contains("not inside a fil session"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("not inside a fil session"),
+        "{}",
+        out.stderr
+    );
 }
 
 // ---- fil ports against a daemon of the test's own ---------------------------------------------
@@ -605,14 +612,12 @@ impl FakeDaemon {
                     };
                     let (responses, log) = (responses.clone(), log.clone());
                     tokio::spawn(async move {
-                        let Ok(link) = PipeLink::accept(stream, PipeConfig::default()).await
-                        else {
+                        let Ok(link) = PipeLink::accept(stream, PipeConfig::default()).await else {
                             return;
                         };
                         let ctl = fil_proto::ChannelId::CONTROL;
-                        let send = |m: ControlMsg| {
-                            link.send(ctl, bytes::Bytes::from(m.encode().unwrap()))
-                        };
+                        let send =
+                            |m: ControlMsg| link.send(ctl, bytes::Bytes::from(m.encode().unwrap()));
                         // The client's Hello, then its request.
                         let (_, hello) = link.recv().await.unwrap();
                         assert!(matches!(
@@ -669,19 +674,6 @@ fn session_row(n: &str, host: &str, since_ms: u64) -> PortsRow {
         }),
         forwards: 0,
         agent: false,
-    })
-}
-
-fn listener(session: &str, p: u16, comm: &str) -> PortsRow {
-    PortsRow::Listener(ListenerRow {
-        addr: "127.0.0.1".parse().unwrap(),
-        port: port(p),
-        owner: ListenerOwner::Session {
-            session: name(session),
-            process: proc(100 + u32::from(p % 100), comm, Some("~/app")),
-        },
-        since_unix_ms: 0,
-        probe: None,
     })
 }
 
@@ -768,9 +760,7 @@ fn an_answer_in_several_parts_is_one_listing() {
     // The session asked about is sent as the request's focus.
     let asked = fake.asked.lock().unwrap().clone();
     assert!(
-        asked
-            .iter()
-            .all(|r| *r == Request::Ports { session: None }),
+        asked.iter().all(|r| *r == Request::Ports { session: None }),
         "{asked:?}"
     );
     let focused = w.inside("main", &["ports", "--json"]);
@@ -907,7 +897,6 @@ fn times_are_shown_in_the_local_zone() {
         Response::ports(vec![session_row("main", "laptop", now_ms())]),
     );
     let clock = |tz: &str| -> String {
-        let before = now_ms();
         let out = Out::of(
             w.command(ours())
                 .env("TZ", tz)
@@ -917,7 +906,6 @@ fn times_are_shown_in_the_local_zone() {
                 .unwrap(),
         );
         assert!(out.ok, "{}", out.stderr);
-        let _ = before;
         out.stdout
             .lines()
             .next()
@@ -940,7 +928,7 @@ fn times_are_shown_in_the_local_zone() {
         let after = now_ms();
         let ok = [expect(offset, before), expect(offset, after)];
         assert!(
-            ok.contains(&shown) || shown.ends_with(&ok[0]) || shown.ends_with(&ok[1]),
+            ok.contains(&shown),
             "TZ={tz}: shown {shown:?}, wanted one of {ok:?}"
         );
     }

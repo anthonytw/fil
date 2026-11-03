@@ -25,7 +25,9 @@ pub fn utc_offset_secs(unix_secs: i64) -> i32 {
     }
     // SAFETY: zero-initialized above, and `localtime_r` succeeded.
     let tm = unsafe { tm.assume_init() };
-    i64::from(tm.tm_gmtoff).clamp(-MAX_OFFSET_SECS, MAX_OFFSET_SECS) as i32
+    // `c_long`: 64 bits wherever `time_t` is.
+    let off = tm.tm_gmtoff;
+    off.clamp(-MAX_OFFSET_SECS, MAX_OFFSET_SECS) as i32
 }
 
 #[cfg(test)]

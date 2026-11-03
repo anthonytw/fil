@@ -242,15 +242,26 @@ impl ForwardArgs {
             .or(self.dynamic.as_ref());
         match (&self.rm, spec) {
             (None, Some(spec)) => Ok(ForwardOp::Add(spec.clone())),
-            (None, None) => Err("say what to forward (-L, -R or -D SPEC) or what to remove (--rm PORT)".into()),
-            (Some(Some(port)), None) => Ok(ForwardOp::Remove { kind: None, port: *port }),
+            (None, None) => {
+                Err("say what to forward (-L, -R or -D SPEC) or what to remove (--rm PORT)".into())
+            }
+            (Some(Some(port)), None) => Ok(ForwardOp::Remove {
+                kind: None,
+                port: *port,
+            }),
             (Some(Some(_)), Some(_)) => {
                 Err("--rm takes a PORT or a -L/-R/-D flag with the port, not both".into())
             }
-            (Some(None), None) => Err("--rm needs the port to remove: `--rm PORT`, or `--rm -L PORT` to say which kind".into()),
+            (Some(None), None) => Err(
+                "--rm needs the port to remove: `--rm PORT`, or `--rm -L PORT` to say which kind"
+                    .into(),
+            ),
             (Some(None), Some(spec)) => match spec.port() {
                 0 => Err("--rm needs the port of a forward that exists, not 0".into()),
-                port => Ok(ForwardOp::Remove { kind: Some(spec.kind()), port }),
+                port => Ok(ForwardOp::Remove {
+                    kind: Some(spec.kind()),
+                    port,
+                }),
             },
         }
     }
@@ -332,7 +343,10 @@ impl clap::builder::TypedValueParser for SessionParser {
         SessionName::new(raw.as_ref()).map_err(|why| {
             clap::Error::raw(
                 clap::error::ErrorKind::ValueValidation,
-                format!("invalid session name {}: {why}\n", forward_spec::quote(&raw)),
+                format!(
+                    "invalid session name {}: {why}\n",
+                    forward_spec::quote(&raw)
+                ),
             )
             .with_cmd(cmd)
         })

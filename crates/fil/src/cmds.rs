@@ -100,25 +100,24 @@ pub async fn connect_local(paths: &Paths) -> Result<PipeLink, LocalError> {
         .map_err(|e| LocalError::Unsafe(e.to_string()))?;
     check_socket_dir(&paths.dir)?;
     let sock = paths.socket();
-    let stream = match tokio::time::timeout(LOCAL_CONNECT, tokio::net::UnixStream::connect(&sock))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            let p = paths.clone();
-            let others = tokio::task::spawn_blocking(move || other_daemons(&p))
-                .await
-                .unwrap_or_default();
-            return Err(LocalError::NoDaemon(others));
-        }
-        Ok(Err(e)) => return Err(LocalError::Io(e.kind().to_string())),
-        Err(_) => return Err(LocalError::Timeout(LOCAL_CONNECT)),
-    };
+    let stream =
+        match tokio::time::timeout(LOCAL_CONNECT, tokio::net::UnixStream::connect(&sock)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                let p = paths.clone();
+                let others = tokio::task::spawn_blocking(move || other_daemons(&p))
+                    .await
+                    .unwrap_or_default();
+                return Err(LocalError::NoDaemon(others));
+            }
+            Ok(Err(e)) => return Err(LocalError::Io(e.kind().to_string())),
+            Err(_) => return Err(LocalError::Timeout(LOCAL_CONNECT)),
+        };
     // The directory is ours and 0700, so only we could have put a socket in it; the kernel says
     // who is listening all the same.
     match stream.peer_cred() {
@@ -126,7 +125,11 @@ pub async fn connect_local(paths: &Paths) -> Result<PipeLink, LocalError> {
         Ok(c) => return Err(LocalError::WrongUser(c.uid())),
         Err(e) => return Err(LocalError::Io(e.kind().to_string())),
     }
-    match tokio::time::timeout(LOCAL_CONNECT, PipeLink::accept(stream, PipeConfig::default())).await
+    match tokio::time::timeout(
+        LOCAL_CONNECT,
+        PipeLink::accept(stream, PipeConfig::default()),
+    )
+    .await
     {
         Ok(Ok(link)) => Ok(link),
         Ok(Err(e)) => Err(LocalError::Io(e.to_string())),
@@ -324,11 +327,7 @@ pub async fn detach_here(config: &Config) -> u8 {
 }
 
 /// `fil forward`: add to or remove from a session's forward table.
-pub async fn forward(
-    target: Target,
-    op: fil_proto::msg::ForwardOp,
-    config: &Config,
-) -> u8 {
+pub async fn forward(target: Target, op: fil_proto::msg::ForwardOp, config: &Config) -> u8 {
     let (place, session) = match &target {
         Target::Host { host, session } => (
             Place::Host(host),
@@ -422,8 +421,8 @@ pub async fn ports(target: Target, json: bool, config: &Config) -> u8 {
     let code = match &answer {
         Ok(parts) => match parts.as_slice() {
             [Response::NoSuchSession] => {
-                let mut e = mgmt::render(&request, &Response::NoSuchSession, conn.label(), 0)
-                    .unwrap_err();
+                let mut e =
+                    mgmt::render(&request, &Response::NoSuchSession, conn.label(), 0).unwrap_err();
                 e.push_str(&other_revisions_note(&conn).await);
                 eprintln!("fil: {e}");
                 FAILED

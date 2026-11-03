@@ -342,7 +342,10 @@ fn widths(head: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
 fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
     let session = shell_word(&clean(session));
     match (o.host, o.current_session) {
-        (Some(host), _) => format!("fil forward {} {session} -L {port}", shell_word(&clean(host))),
+        (Some(host), _) => format!(
+            "fil forward {} {session} -L {port}",
+            shell_word(&clean(host))
+        ),
         (None, Some(current)) if clean(current) == session => format!("fil forward -L {port}"),
         (None, _) => format!("FIL_SESSION={session} fil forward -L {port}"),
     }
@@ -352,9 +355,10 @@ fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
 /// single quotes. (A host the user typed is the user's, but it is pasted into a command line.)
 fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | ':' | '%' | '+' | '=' | ',' | '/'));
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '@' | '.' | '_' | '-' | ':' | '%' | '+' | '=' | ',' | '/')
+        });
     if plain {
         word.to_string()
     } else {

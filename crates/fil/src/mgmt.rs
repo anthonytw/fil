@@ -11,8 +11,8 @@ use fil_client::text::sanitize_inline;
 use fil_proto::ChannelId;
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    Agent, ControlMsg, ErrorCode, ForwardOp, ForwardResult, Hello, OtherDaemon,
-    Request, Response, SessionName, SessionSummary,
+    Agent, ControlMsg, ErrorCode, ForwardOp, ForwardResult, Hello, OtherDaemon, Request, Response,
+    SessionName, SessionSummary,
 };
 use fil_proto::mux::{ForwardKind, ForwardRefusal};
 use fil_proto::version::{Peer, VersionMismatch};
@@ -769,10 +769,7 @@ mod tests {
             },
             more: true,
         };
-        let d = tokio::spawn(daemon_says(
-            daemon,
-            vec![ControlMsg::Response(full); 50],
-        ));
+        let d = tokio::spawn(daemon_says(daemon, vec![ControlMsg::Response(full); 50]));
         let got = ask(&client, ports_request()).await.unwrap();
         // Three parts hold 300 rows, past the cap of 256: nothing more is read.
         assert_eq!(got.len(), 3);

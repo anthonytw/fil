@@ -388,7 +388,9 @@ the shadow backends, so after a restore that would change it the tracker treats 
 unknown (vt100 seed 79; both backends now run the full byte pool).
 
 Known limit: a resize erases against the old geometry, as for predictions. For a pinned status
-this matters when the window gets *narrower* than what is drawn: a reflowing terminal re-wraps the
-cells, which pushes lines into the scrollback and leaves fragments the erase cannot reach. The
+this matters when the window gets *narrower* while something is drawn: a reflowing terminal re-wraps
+the drawn cells and the program's rows under them, which pushes lines into the scrollback and leaves
+fragments the erase cannot reach. The
 client therefore keeps status lines short (40 columns, unpadded), `Display::resize` reports when
-the window narrowed under the drawing, and the client then starts the next attach from a snapshot.
+the window narrowed while something was drawn, and the client then starts the next attach from a
+snapshot (the scrollback keeps the re-wrapped fragments; the screen is repaired).

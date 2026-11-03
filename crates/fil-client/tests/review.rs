@@ -188,3 +188,125 @@ async fn review_take_back_prompt_is_visible_after_a_full_width_line() {
         "the client waits for y/n on an invisible question:\n{text}"
     );
 }
+
+/// R2: narrowing while the status sits over long program lines (cursor low, status at the top).
+#[tokio::test(start_paused = true)]
+async fn review2_narrowing_under_a_status_over_long_lines() {
+    let rig = start(config());
+    rig.attached().await;
+    let mut out = Vec::new();
+    for i in 0..30 {
+        out.extend(format!("{i:02} {}\r\n", "x".repeat(75)).into_bytes());
+    }
+    rig.daemon.output(&out).await;
+    settle().await;
+    go_offline(&rig).await;
+    let st = rig.term.state();
+    let row = st
+        .screen
+        .iter()
+        .position(|l| common::term::line_text(l).contains("fil:"))
+        .unwrap();
+    eprintln!("status row {row}");
+    rig.term.resize(60, 24);
+    settle().await;
+    reconnect(&rig, 2).await;
+    let attaches = rig.daemon.attaches().await;
+    eprintln!("second attach resume: {:?}", attaches[1].resume.is_some());
+    let mut r = fil_term::create(
+        fil_term::DEFAULT_BACKEND,
+        fil_term::Size { cols: 80, rows: 24 },
+        1000,
+    )
+    .unwrap();
+    r.feed(&out);
+    r.resize(fil_term::Size { cols: 60, rows: 24 });
+    let want = r.state(1000);
+    let got = rig.term.state();
+    assert_eq!(
+        common::term::rows_of(&got),
+        common::term::rows_of(&want),
+        "screen differs"
+    );
+    // The window narrowed under the overlay, so the client did not trust the screen and took a
+    // snapshot (a fresh attach). The terminal had already re-wrapped the overlay's rows into
+    // its scrollback by then, which nothing can undo: the history keeps those fragments and
+    // gains the snapshot's lines, but loses nothing.
+    assert!(
+        attaches[1].resume.is_none(),
+        "narrowing under the overlay forces a snapshot"
+    );
+    let wh: Vec<_> = want.history.iter().map(common::term::line_text).collect();
+    let have = rig.term.history();
+    assert!(have.len() >= wh.len());
+    let mut it = have.iter();
+    assert!(
+        wh.iter().all(|w| it.any(|h| h == w)),
+        "the program's own lines are all still in the scrollback, in order"
+    );
+}
+
+/// R2: a confirmation that a server chunk draws (after the light gates could not): the first `y`.
+#[tokio::test(start_paused = true)]
+async fn review2_first_y_answers_a_confirmation_drawn_by_output() {
+    let mut cfg = config();
+    cfg.offline.confirm_after = Some(Duration::from_secs(1));
+    let daemon = FakeDaemon::new(4096);
+    let rig = start_with(daemon, cfg, 80, 24, "xterm-256color");
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    go_offline(&rig).await;
+    let mut out = lines(0..400);
+    out.extend_from_slice(b"\x1b[4h");
+    rig.daemon.output_unsent(&out).await;
+    rig.type_str("ls\r");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    reconnect(&rig, 2).await;
+    eprintln!("snapshots {}", rig.daemon.snapshots().await);
+    eprintln!(
+        "after reconnect has prompt: {}",
+        rig.term.text().contains("Send it?")
+    );
+    rig.daemon.output(b"\x1b[4l").await;
+    settle().await;
+    assert!(rig.term.text().contains("Send it?"), "{}", rig.term.text());
+    rig.type_str("y");
+    settle().await;
+    let input = rig.daemon.input().await;
+    assert_eq!(
+        String::from_utf8_lossy(&input),
+        "ls\r",
+        "screen:\n{}",
+        rig.term.text()
+    );
+}
+
+/// R2: the path manager offers a new link because the old one went quiet (the main reason to swap).
+#[tokio::test(start_paused = true)]
+async fn review2_swap_away_from_a_degraded_link() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    rig.daemon.degrade_link().await;
+    settle().await;
+    assert!(rig.term.text().contains("no reply"), "{}", rig.term.text());
+    rig.dial.offer_swap(fil_transport::LinkKind::Direct);
+    until_async("the candidate attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!("swaps: {:?}", rig.dial.swaps());
+    rig.type_str("hello");
+    settle().await;
+    let text = rig.term.text();
+    assert!(
+        !text.contains("no reply"),
+        "status still up after the swap:\n{text}"
+    );
+    assert_eq!(rig.daemon.input().await, b"hello");
+}

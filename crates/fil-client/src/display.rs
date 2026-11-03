@@ -124,6 +124,8 @@ impl Display {
     /// back. (The snapshot clears the screen and sets the rest.)
     pub fn before_snapshot(&self) -> Vec<u8> {
         let mut v = Vec::new();
+        // A synchronized update the old stream left open would hold the snapshot back.
+        v.extend_from_slice(b"\x1b[?2026l");
         if self.in_alt_screen() {
             v.extend_from_slice(b"\x1b[?1049l");
         }
@@ -167,24 +169,18 @@ impl Display {
 
     /// The user's terminal changed size.
     ///
-    /// The second value is true when the window got narrower than what the overlay had drawn:
-    /// a terminal that reflows has then re-wrapped the drawing, which the erase (against the
-    /// old geometry) cannot undo, so the screen is no longer trustworthy and the caller should
-    /// get a fresh snapshot at the next attach.
+    /// The second value is true when the window got narrower while the overlay had something
+    /// drawn: a terminal that reflows has then re-wrapped the drawing and the program's rows
+    /// under it, which the erase (against the old geometry) cannot undo, so the screen is no
+    /// longer trustworthy and the caller should get a fresh snapshot at the next attach.
     pub fn resize(&mut self, cols: u16, rows: u16) -> (Vec<u8>, bool) {
         let size = Size { cols, rows };
         if size == self.size {
             return (Vec::new(), false);
         }
-        let widest = self
-            .overlay
-            .view(0)
-            .painted
-            .iter()
-            .map(|c| c.col)
-            .max()
-            .map(|c| usize::from(c) + 1);
-        let damaged = widest.is_some_and(|w| usize::from(cols) < w);
+        // A terminal that reflows re-wraps whole rows, the program's text under the overlay
+        // included, so any narrowing while something is drawn is damage.
+        let damaged = self.overlay.has_painted() && cols < self.size.cols;
         self.size = size;
         (self.overlay.resize(size).to_bytes(), damaged)
     }

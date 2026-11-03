@@ -644,7 +644,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.ack_due = None;
         self.quiet = false;
         self.tx = Some(primary.tx.clone());
-        self.begin_attach(&primary.tx, resume, dialer.public_key());
+        self.begin_attach(&primary.tx, resume, dialer.public_key(), true);
         // A candidate being tried, and the kind of a candidate that has taken over but whose
         // resume is not complete yet.
         let mut cand: Option<LinkCtx<D::Link>> = None;
@@ -769,7 +769,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     swap = dialer.next_swap(), if can_swap => {
                         let candidate = LinkCtx::open(swap.link, true);
                         let resume = self.sess.resume_request();
-                        self.begin_attach(&candidate.tx, resume, dialer.public_key());
+                        self.begin_attach(&candidate.tx, resume, dialer.public_key(), false);
                         cand = Some(candidate);
                     }
                     _ = at(wake) => {
@@ -851,6 +851,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.last_kind = Some(primary.kind);
         // The new link's daemon tells us where its input stream stands.
         self.sess.input_ready = false;
+        // The old link may have been quiet; the session is only as quiet as the link it now
+        // runs on (a new link's status watch has nothing to report while it stays `Up`).
+        self.quiet = matches!(primary.status.borrow().state, LinkState::Degraded);
     }
 
     /// Feeds what a candidate delivered before its reply into the link it became.
@@ -867,8 +870,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(None)
     }
 
-    fn begin_attach(&mut self, tx: &Outbox, resume: Option<ResumeRequest>, key: PublicKey) {
-        self.sent_size = self.size;
+    /// `primary`: this is the link the session runs on; only then does the attach count as
+    /// having told the daemon our size (a candidate may still fail).
+    fn begin_attach(
+        &mut self,
+        tx: &Outbox,
+        resume: Option<ResumeRequest>,
+        key: PublicKey,
+        primary: bool,
+    ) {
+        if primary {
+            self.sent_size = self.size;
+        }
         let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
             .expect("agent string is valid");
         send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
@@ -1444,6 +1457,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn on_keys(&mut self, bytes: &[u8]) -> Result<Ev, ClientError> {
+        // A confirmation that output has since let the overlay draw is entered now, so the key
+        // that answers it is read as an answer and not as typing.
+        if self.confirm_pending.is_some() {
+            self.refresh_display()?;
+        }
         if self.confirm.is_some() {
             let rest = self.confirm_keys(bytes);
             if !rest.is_empty() {

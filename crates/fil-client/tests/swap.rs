@@ -351,3 +351,20 @@ async fn a_gap_nothing_explains_ends_in_a_reconnect_not_an_error() {
     assert!(rig.term.text().contains("back"));
     assert!(!rig.term.text().contains("from nowhere"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_candidate_does_not_lose_the_pending_resize() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.degrade_link().await;
+    settle().await;
+    rig.term.resize(100, 30);
+    settle().await;
+    // A candidate carries the new size in its Attach, but dies; the old link then recovers.
+    rig.dial.offer_dead_swap(LinkKind::Direct);
+    settle().await;
+    rig.daemon.recover_link().await;
+    settle().await;
+    let sizes = rig.daemon.sizes().await;
+    assert!(sizes.contains(&(100, 30)), "{sizes:?}");
+}

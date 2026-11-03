@@ -123,6 +123,7 @@ dp_battery() {
   fc_line "$n" 'fg'
   sleep 1
   fc_type "$n" '\x03'
+  sleep 0.3 # as a person: readline can drop a character typed at the instant of a Ctrl-C
   fc_line "$n" 'echo RC-$?'
   fc_wait "$n" 'RC-130' 10
   note "$tag.job_control=ok"

@@ -257,6 +257,7 @@ impl Connect {
             term: "xterm-256color".parse().unwrap(),
             host: self.host.parse().unwrap(),
             key: self.key.clone(),
+            echo_ack: false,
             resume: self.resume,
         }
     }
@@ -344,6 +345,7 @@ impl<L: Link> Client<L> {
             incarnation: r.incarnation,
             epoch: r.epoch,
             seq: self.next,
+            want_snapshot: false,
         }
     }
 

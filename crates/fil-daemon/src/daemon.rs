@@ -1079,6 +1079,7 @@ mod tests {
             term: "xterm".parse().unwrap(),
             host: "test".parse().unwrap(),
             key: msg::PublicKey::new(vec![9; 32]).unwrap(),
+            echo_ack: false,
             resume: None,
         }
     }

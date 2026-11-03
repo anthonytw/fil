@@ -69,6 +69,7 @@ async fn a_refusal_is_flushed_before_the_link_closes() {
         incarnation: r.incarnation + 1,
         epoch: r.epoch,
         seq: 0,
+        want_snapshot: false,
     };
     let mut c = Client::connect(&h, Connect::new(&h, key(1)).resume(wrong));
     sleep(Duration::from_millis(500)).await;

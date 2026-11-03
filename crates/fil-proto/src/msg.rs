@@ -208,7 +208,11 @@ pub type PublicKey = Opaque<MAX_PUBLIC_KEY>;
 /// The daemon's certificate fingerprint, opaque to this crate.
 pub type Fingerprint = Opaque<MAX_FINGERPRINT>;
 
-/// Terminal size in cells. Both dimensions are at least 1.
+/// Terminal size in cells. Both dimensions are at least 1 and at most [`TermSize::MAX_COLS`] by
+/// [`TermSize::MAX_ROWS`], with at most [`TermSize::MAX_CELLS`] cells: the emulator allocates a
+/// grid of this size, so an unbounded size from the wire would let one peer exhaust the daemon's
+/// memory and take every session with it (M1 security sweep). The caps are far above any real
+/// terminal (an 8K display at a small font is about 1100 by 300).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "(u16, u16)", into = "(u16, u16)")]
 pub struct TermSize {
@@ -217,11 +221,32 @@ pub struct TermSize {
 }
 
 impl TermSize {
+    pub const MAX_COLS: u16 = 2000;
+    pub const MAX_ROWS: u16 = 1000;
+    pub const MAX_CELLS: u32 = 1_000_000;
+
     pub fn new(cols: u16, rows: u16) -> Result<Self, MsgError> {
         if cols == 0 || rows == 0 {
             return Err(invalid("terminal size", "zero dimension"));
         }
+        if cols > Self::MAX_COLS
+            || rows > Self::MAX_ROWS
+            || u32::from(cols) * u32::from(rows) > Self::MAX_CELLS
+        {
+            return Err(invalid("terminal size", "larger than fil supports"));
+        }
         Ok(Self { cols, rows })
+    }
+
+    /// The nearest valid size: for the client, whose real terminal may be larger than the caps
+    /// (it then uses the top-left part) or report zero.
+    pub fn clamped(cols: u16, rows: u16) -> Self {
+        let cols = cols.clamp(1, Self::MAX_COLS);
+        let mut rows = rows.clamp(1, Self::MAX_ROWS);
+        while u32::from(cols) * u32::from(rows) > Self::MAX_CELLS {
+            rows -= 1;
+        }
+        Self { cols, rows }
     }
     pub fn cols(&self) -> u16 {
         self.cols
@@ -288,6 +313,10 @@ pub struct ResumeRequest {
     pub incarnation: u128,
     pub epoch: u64,
     pub seq: u64,
+    /// Resume the session, but repaint from a snapshot instead of replaying from `seq`: the
+    /// client's screen no longer matches its byte position (for example after the terminal
+    /// reflowed under a resize). Keys, epoch and input stream are kept.
+    pub want_snapshot: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +328,9 @@ pub struct Attach {
     pub host: HostLabel,
     pub key: PublicKey,
     pub resume: Option<ResumeRequest>,
+    /// The client predicts (DESIGN.md section 9) and wants `EchoAck`s. Without it the daemon sends
+    /// none: they cost a frame, a timer and a termios read per keystroke for nothing.
+    pub echo_ack: bool,
 }
 
 /// Why a snapshot is sent instead of a replay.
@@ -452,6 +484,9 @@ pub enum ErrorCode {
     ResumeGone,
     /// The peer's sequence numbers or acks were impossible.
     Protocol,
+    /// The daemon could not start the session (the shell, its scope or working directory, or
+    /// a start that timed out). The details are in the daemon's log.
+    SessionStartFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,6 +619,7 @@ mod tests {
             term: "xterm-256color".parse().unwrap(),
             host: "laptop".parse().unwrap(),
             key: PublicKey::new(vec![7; 32]).unwrap(),
+            echo_ack: false,
             resume: None,
         });
         let wire = good.encode().unwrap();
@@ -795,5 +831,23 @@ mod tests {
         assert!(
             matches!(short, Response::Sessions { truncated: false, ref list } if list.len() == 3)
         );
+    }
+
+    #[test]
+    fn terminal_sizes_beyond_the_caps_are_refused_on_the_wire_and_clamped_locally() {
+        assert!(TermSize::new(TermSize::MAX_COLS, 500).is_ok());
+        assert!(TermSize::new(TermSize::MAX_COLS + 1, 10).is_err());
+        assert!(TermSize::new(10, TermSize::MAX_ROWS + 1).is_err());
+        assert!(TermSize::new(2000, 1000).is_err(), "over MAX_CELLS");
+        // Decoding goes through the same check: a hostile peer cannot send a giant size.
+        let wire = postcard::to_allocvec(&(65535u16, 65535u16)).unwrap();
+        assert!(postcard::from_bytes::<TermSize>(&wire).is_err());
+        let c = TermSize::clamped(65535, 65535);
+        assert!(u32::from(c.cols()) * u32::from(c.rows()) <= TermSize::MAX_CELLS);
+        assert_eq!(
+            (c.cols(), TermSize::clamped(0, 0).rows()),
+            (TermSize::MAX_COLS, 1)
+        );
+        assert_eq!(TermSize::clamped(80, 24), TermSize::new(80, 24).unwrap());
     }
 }

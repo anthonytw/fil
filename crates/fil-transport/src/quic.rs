@@ -37,18 +37,26 @@
 //!   On the wire forwards and interactive channels take turns per packet (see above), so the exact
 //!   8:1 weighting of the pipe's scheduler does not exist here. Anything that must stay in
 //!   order across channels (a snapshot and the output after it) carries offsets (§8.5).
-//! - **Liveness:** the QUIC keep-alive is `heartbeat`, its idle timeout is `dead_after`, and
-//!   `Degraded` appears after `degraded_after` without a datagram from the peer, and the link
-//!   goes `Down(Dead)` after `dead_after` without one (quinn's idle timeout, which restarts when
-//!   it sends a keep-alive, is the backstop). Both are measured on what quinn receives from the
-//!   network, so a consumer that stopped calling `recv` neither hides a dead path nor looks like
-//!   one.
+//! - **Liveness:** heartbeats are asymmetric. The client's QUIC keep-alive is `heartbeat`; the
+//!   daemon's is a fallback at one and a half heartbeats. quinn restarts the timer whenever a
+//!   packet *arrives*, so on a healthy link the daemon's never fires, and an idle link carries the
+//!   client's ping and its acknowledgement about once per heartbeat plus a round trip (not every
+//!   heartbeat). The idle timeout is `dead_after`. Silence is measured on what quinn receives
+//!   from the network, which is sampled every 500 ms while the link is healthy (every 100 ms or
+//!   less once the peer has been quiet for a heartbeat and a half). A sample brackets the time a
+//!   datagram arrived (after the previous sample, by this one), and each decision takes the safe
+//!   end: `Down(Dead)` the earliest, so it is never later than `dead_after` since the last
+//!   datagram by more than one fast period (100 ms); `Degraded` the latest, so it shows after
+//!   `degraded_after` of real silence, up to 0.5 s later, and after the longer of that and a
+//!   heartbeat plus one and a half round trips (up to three quarters of `dead_after`) on a path
+//!   with a long round trip, whose healthy gaps are that long. A consumer that stopped calling
+//!   `recv` neither hides a dead path nor looks like one.
 //! - **`Up`:** the daemon's link sends one internal frame (a control-channel `Heartbeat` reply
 //!   that `recv` never returns) as soon as it accepts a connection. A client's [`connect`]
 //!   returns when that, or any other frame, has arrived. The daemon cannot be left waiting for the
 //!   client to speak first.
 //! - **Path changes:** `path_generation` counts address changes the link observed (polled every
-//!   100 ms at most). The daemon sees every change of the client's source address, which is what
+//!   500 ms at most). The daemon sees every change of the client's source address, which is what
 //!   quinn's connection migration follows. A client cannot see its NAT rebind at all, and sees a
 //!   change of its own local IP only where the OS reports it to quinn (not on the simulated
 //!   socket).
@@ -90,12 +98,23 @@ const MAX_STREAMS: u32 = 1024;
 const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// The transport settings of both ends, from the link's timing.
-fn transport_config(params: &LinkParams) -> Result<Arc<TransportConfig>, AuthError> {
+///
+/// Heartbeats are asymmetric (efficiency sweep #7): the client's keep-alive is `heartbeat`, and
+/// the daemon's is a fallback at one and a half heartbeats. quinn restarts a keep-alive timer
+/// whenever a packet *arrives*, so on a link where the client's pings keep coming the daemon's
+/// never fires: an idle link carries a ping and its acknowledgement about once a heartbeat plus a
+/// round trip. It fires when the pings are further apart than that (a round trip over half a
+/// heartbeat), and then it is what keeps the client hearing from the daemon often enough not to
+/// call a healthy link `Degraded` (review of PR 38).
+fn transport_config(
+    params: &LinkParams,
+    keep_alive: Duration,
+) -> Result<Arc<TransportConfig>, AuthError> {
     let idle = quinn::IdleTimeout::try_from(params.dead_after)
         .map_err(|e| AuthError::Config(format!("dead_after: {e}")))?;
     let mut t = TransportConfig::default();
     t.max_idle_timeout(Some(idle));
-    t.keep_alive_interval(Some(params.heartbeat));
+    t.keep_alive_interval(Some(keep_alive));
     // Only unidirectional streams, and no datagrams: less to defend, and nothing to leak.
     t.max_concurrent_bidi_streams(0u32.into());
     t.max_concurrent_uni_streams(MAX_STREAMS.into());
@@ -115,7 +134,7 @@ pub fn server_config(
     params: &LinkParams,
 ) -> Result<quinn::ServerConfig, AuthError> {
     let mut cfg = auth::server_config(identity, registry, params.into())?;
-    cfg.transport_config(transport_config(params)?);
+    cfg.transport_config(transport_config(params, params.heartbeat * 3 / 2)?);
     cfg.max_incoming(1024);
     cfg.incoming_buffer_size(64 * 1024);
     cfg.incoming_buffer_size_total(4 * 1024 * 1024);
@@ -129,6 +148,6 @@ pub fn client_config(
     params: &LinkParams,
 ) -> Result<quinn::ClientConfig, AuthError> {
     let mut cfg = auth::client_config(pin, key, params.into())?;
-    cfg.transport_config(transport_config(params)?);
+    cfg.transport_config(transport_config(params, params.heartbeat)?);
     Ok(cfg)
 }

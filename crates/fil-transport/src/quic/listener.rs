@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, EndpointConfig, Incoming, TokioRuntime};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -123,11 +123,23 @@ fn bump(c: &AtomicU64) {
 
 /// The live connections, by the client key they authenticated with.
 #[derive(Default)]
-struct Live(Mutex<Vec<(PublicKey, Connection)>>);
+struct Live {
+    conns: Mutex<Vec<(PublicKey, Connection)>>,
+    /// Wakes the sweep: a connection was added to an empty list.
+    added: Notify,
+    /// How often the sweep has run (a wakeup counter for tests).
+    #[cfg(feature = "test-hooks")]
+    sweeps: AtomicU64,
+}
 
 impl Live {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(PublicKey, Connection)>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.conns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, key: PublicKey, conn: Connection) {
+        self.lock().push((key, conn));
+        self.added.notify_one();
     }
 }
 
@@ -176,7 +188,7 @@ impl QuicListener {
         let mut socket = None;
         for i in 0..span {
             let port = lo + ((start % span + i) % span) as u16;
-            match UdpSocket::bind(SocketAddr::new(cfg.bind, port)) {
+            match bind_udp(SocketAddr::new(cfg.bind, port)) {
                 Ok(s) => {
                     socket = Some(s);
                     break;
@@ -255,6 +267,13 @@ impl QuicListener {
             }
         });
         closed
+    }
+
+    /// How many times the sweep has woken up (feature `test-hooks`): it sleeps while no
+    /// connection is live, and a test keeps that so.
+    #[cfg(feature = "test-hooks")]
+    pub fn sweeps(&self) -> u64 {
+        self.0.live.sweeps.load(Ordering::Relaxed)
     }
 
     /// Connections currently open.
@@ -370,7 +389,7 @@ impl AcceptLoop {
                 return bump(&counters.handshake_failed);
             };
             // Listed first, then checked, so a revoke that lands in between still finds it.
-            live.lock().push((key.clone(), conn.clone()));
+            live.add(key.clone(), conn.clone());
             if !registry.contains(&key) {
                 QuicLink::close_revoked(&conn);
                 return;
@@ -386,11 +405,21 @@ impl AcceptLoop {
 ///
 /// A key that is not registered and has no recent revocation on record (it never was, or the
 /// record is older than the sweep keeps) is closed at once.
+///
+/// The sweep only has work while a connection is live, so it sleeps while the list is empty and
+/// the first connection wakes it (efficiency sweep #6). A daemon that holds detached sessions for
+/// days with direct mode on used to wake twice a second for all of that time.
 async fn sweep(registry: KeyRegistry, live: Arc<Live>, backstop: Duration) {
     let every = SWEEP_EVERY.min(backstop / 2).max(Duration::from_millis(10));
-    let mut tick = tokio::time::interval(every);
     loop {
-        tick.tick().await;
+        // Wait for a connection to sweep. `notify_one` leaves a permit, so an add between the
+        // check and the wait is not lost.
+        while live.lock().is_empty() {
+            live.added.notified().await;
+        }
+        tokio::time::sleep(every).await;
+        #[cfg(feature = "test-hooks")]
+        live.sweeps.fetch_add(1, Ordering::Relaxed);
         live.lock().retain(|(key, conn)| {
             if conn.close_reason().is_some() {
                 return false;
@@ -408,10 +437,58 @@ async fn sweep(registry: KeyRegistry, live: Arc<Live>, backstop: Duration) {
     }
 }
 
+/// Binds a UDP socket. A socket bound to an IPv6 address gets `IPV6_V6ONLY` switched off first,
+/// so `[::]` takes IPv4 clients too (as v4-mapped addresses) on every host: `std` would leave
+/// the option at the host's default, and a host with `net.ipv6.bindv6only=1` would then refuse
+/// IPv4 clients on the daemon's dual-stack bind. It has to be set before `bind`, which `std`
+/// has no way to do.
+pub(super) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use rustix::net::{AddressFamily, SocketType, bind, socket, sockopt};
+    if addr.is_ipv4() {
+        return UdpSocket::bind(addr);
+    }
+    // (rustix opens every descriptor close-on-exec, as `std` does.)
+    let fd = socket(AddressFamily::INET6, SocketType::DGRAM, None)?;
+    sockopt::set_ipv6_v6only(&fd, false)?;
+    bind(&fd, &addr)?;
+    Ok(UdpSocket::from(fd))
+}
+
 fn random_u32() -> u32 {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 4];
     // A failure here only makes the scan start at port 0 of the range.
     let _ = SystemRandom::new().fill(&mut b);
     u32::from_le_bytes(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An IPv6 bind is dual-stack whatever the host's `bindv6only` default is: the option is
+    /// switched off before the bind, and an IPv4 client reaches the socket. (On a host without
+    /// IPv6 there is nothing to test.)
+    #[test]
+    fn an_ipv6_bind_takes_ipv4_clients() {
+        let Ok(sock) = bind_udp("[::]:0".parse().unwrap()) else {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        };
+        assert!(!rustix::net::sockopt::ipv6_v6only(&sock).unwrap());
+        let port = sock.local_addr().unwrap().port();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.send_to(b"hello", ("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(from.ip().to_canonical(), client.local_addr().unwrap().ip());
+    }
+
+    #[test]
+    fn an_ipv4_bind_is_unchanged() {
+        let sock = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(sock.local_addr().unwrap().is_ipv4());
+    }
 }

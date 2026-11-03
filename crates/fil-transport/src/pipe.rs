@@ -12,8 +12,11 @@
 //!   itself (§8.1). A frame that arrives first and is not a heartbeat is delivered by `recv`.
 //! - **Sending.** Frames go through [`fil_proto::sched::Scheduler`]: control first, then
 //!   terminal/snapshot/agent in order, then forwards round-robin with a guaranteed share. The
-//!   driver writes **one frame at a time**, so a control frame waits behind at most the frame
-//!   already on the wire (16 KiB).
+//!   driver fills one buffer with every frame that is ready, in that order, while they fit in
+//!   8 KiB (a frame that does not is held for the next write, and a control frame still goes
+//!   ahead of it), and writes it with a single `write`, so the small frames of a keystroke (the
+//!   echo, the acks) share an SSH packet. A write is never longer than 8 KiB unless it is one
+//!   larger frame, so a control frame waits behind at most one frame's worth, as it always did.
 //! - **Backpressure.** Every channel has its own bounded queue, counted in frames
 //!   (`control_queue`, `interactive_queue` and `forward_queue` in [`PipeConfig`]; at most 16 KiB
 //!   each). `send` waits only while *that channel's* queue is full. Heartbeats are not queued
@@ -22,15 +25,21 @@
 //!   (`inbound_budget`, 2 MiB by default; one read, 64 KiB, may overshoot it). Under the budget
 //!   the driver keeps reading, so the peer's bytes keep proving it alive and a black hole is
 //!   still found by `Dead`, however far behind the consumer is. Past the budget it stops reading
-//!   (the stream's own flow control pushes back on the peer), freezes the silence clock and
-//!   reports `Degraded`; it reads again, and returns to `Up`, once the consumer has caught up to
-//!   half the budget. A well-behaved peer stays under the budget through acks (§8.5).
-//! - **Heartbeats (§8.5).** After [`LinkParams::heartbeat`] without sending, a
-//!   `Heartbeat { reply: false }` goes out on channel 0. Each ping is answered at once with
-//!   `reply: true` and the same nonce; the pair measures RTT. Heartbeats never reach `recv`.
-//!   They are encoded ahead of everything when the writer is free: at most one reply (the latest
-//!   ping's nonce) and one ping of our own are ever pending, so a peer that floods pings
-//!   without reading costs one pending frame, and a stuck write does not pile up stale pings.
+//!   (the stream's own flow control pushes back on the peer) and freezes the silence clock; it
+//!   reads again once the consumer has caught up to half the budget. The link stays `Up`
+//!   throughout: `Degraded` means the *peer* has been silent, never that the local consumer is
+//!   slow (the client would paint "no reply" over a healthy link for as long as a flood outpaces
+//!   its terminal). A well-behaved peer stays under the budget through acks (§8.5).
+//! - **Heartbeats (§8.5).** They are asymmetric. A `Heartbeat { reply: false }` goes out on
+//!   channel 0 from the *client* once [`LinkParams::heartbeat`] has passed without anything sent
+//!   or anything received (at most one per heartbeat), and from the *daemon* only after one and a
+//!   half heartbeats of either. Every ping is answered at once with `reply: true` and the same
+//!   nonce; the pair measures RTT (so the daemon's RTT is the one from its handshake ping,
+//!   refreshed only when it has had to ping). Heartbeats never reach `recv`. An idle link carries
+//!   one ping and one reply a second, not two of each. They are encoded ahead of everything when
+//!   the writer is free: at most one reply (the latest ping's nonce) and one ping of our own are
+//!   ever pending, so a peer that floods pings without reading costs one pending frame, and a
+//!   stuck write does not pile up stale pings.
 //! - **Liveness.** *Any* bytes from the peer count as proof of life, not only whole frames, so a
 //!   large frame crawling over a slow pipe does not look like silence. After
 //!   [`LinkParams::degraded_after`] of silence the link is `Degraded` (and `Up` again if the peer
@@ -59,14 +68,13 @@ use fil_proto::limits::{MAX_FRAME_BODY, MAX_PREAMBLE_SKIP, PROTOCOL_MAJOR};
 use fil_proto::preamble::{PreambleError, PreambleScanner, Scan};
 use fil_proto::{ChannelId, ControlMsg, Frame, FrameDecoder, FrameError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Child;
 use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
 
 pub use command::{PipeCommand, server_alive};
 
 use crate::link::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkStatus};
-use driver::{Driver, reap};
+use driver::{ChildGuard, Driver, reap};
 use shared::{Pop, Shared};
 
 /// Knobs for a [`PipeLink`]. [`PipeConfig::new`] gives the defaults.
@@ -94,6 +102,21 @@ pub struct PipeConfig {
     pub close_grace: Duration,
     /// What happens to the command's stderr ([`PipeLink::spawn`] only). Default `Inherit`.
     pub stderr: PipeStderr,
+    /// Start the command in its own process group, which is a *background* group of the
+    /// terminal the client runs on ([`PipeLink::spawn`] only). Default `false`.
+    ///
+    /// Set it for a run nobody is watching, that is every reconnect after the first attach. The
+    /// terminal then belongs to the session, and a prompt from the command (a password, a
+    /// passphrase, a 2FA code from `ssh -J` or a `ProxyCommand`) must not compete with the
+    /// client's raw-mode reader: with the group in the background, a read from or a mode change on
+    /// `/dev/tty` stops the command (`SIGTTIN`/`SIGTTOU`) instead of taking the user's keystrokes
+    /// and sending them to the remote shell. The command's `connect` then ends at the preamble
+    /// timeout or at the connect timeout of the layer above, and the client reports that the
+    /// pipe needs an interactive login (security sweep #2).
+    ///
+    /// Leave it off for the first, interactive run, whose prompts the user answers, and for
+    /// anything that must receive the terminal's `^C`: a command in another group no longer does.
+    pub own_process_group: bool,
 }
 
 /// Where a pipe command's stderr goes.
@@ -124,6 +147,7 @@ impl PipeConfig {
             inbound_budget: 2 * 1024 * 1024,
             close_grace: Duration::from_secs(1),
             stderr: PipeStderr::Inherit,
+            own_process_group: false,
         }
     }
 }
@@ -342,15 +366,6 @@ impl PipeLink {
         Self::establish(r, w, Role::Daemon, cfg, None, None).await
     }
 
-    /// Like [`connect`](Self::connect), for a stream that comes as two halves.
-    pub async fn connect_halves<R, W>(read: R, write: W, cfg: PipeConfig) -> Result<Self, PipeError>
-    where
-        R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
-    {
-        Self::establish(read, write, Role::Client, cfg, None, None).await
-    }
-
     /// Like [`accept`](Self::accept), for a stream that comes as two halves (a process's stdin
     /// and stdout).
     pub async fn accept_halves<R, W>(read: R, write: W, cfg: PipeConfig) -> Result<Self, PipeError>
@@ -369,8 +384,8 @@ impl PipeLink {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| PipeError::new(PipeErrorKind::InvalidCommand("empty command".into())))?;
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(match cfg.stderr {
@@ -378,11 +393,19 @@ impl PipeLink {
                 PipeStderr::Null => std::process::Stdio::null(),
                 PipeStderr::Capture => std::process::Stdio::piped(),
             })
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?;
+            .kill_on_drop(true);
+        if cfg.own_process_group {
+            // A new group with the child as its leader. Safe Rust: the standard library does the
+            // `setpgid` between fork and exec.
+            cmd.process_group(0);
+        }
+        let mut child = ChildGuard::new(
+            cmd.spawn()
+                .map_err(|e| PipeError::new(PipeErrorKind::Spawn(e)))?,
+            cfg.own_process_group,
+        );
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            let _ = child.start_kill();
+            child.kill();
             let _ = child.wait().await;
             return Err(PipeError::new(PipeErrorKind::Io(io::Error::other(
                 "the child has no stdin or stdout",
@@ -397,14 +420,14 @@ impl PipeLink {
         mut write: W,
         role: Role,
         cfg: PipeConfig,
-        mut child: Option<Child>,
+        mut child: Option<ChildGuard>,
         stderr: Option<Arc<StderrCapture>>,
     ) -> Result<Self, PipeError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let child_id = child.as_ref().and_then(Child::id);
+        let child_id = child.as_ref().and_then(|c| c.id());
         let mut hs = Handshake {
             skipped: Vec::new(),
             decoder: FrameDecoder::default(),
@@ -431,6 +454,7 @@ impl PipeLink {
         let (done_tx, done_rx) = watch::channel(false);
         tokio::spawn(
             Driver {
+                role,
                 shared: shared.clone(),
                 read,
                 write,
@@ -661,7 +685,9 @@ impl Link for PipeLink {
             self.shared.set_down(reason.clone());
             return Err(LinkError(reason));
         }
-        let mut frame = Frame::new(channel, payload.to_vec());
+        // (No copy when `payload` is the only handle on its buffer, which it is for everything
+        // the session and the client build.)
+        let mut frame = Frame::new(channel, Vec::from(payload));
         loop {
             // Register for the next "space freed" signal before looking, so none is missed.
             let space = self.shared.space.notified();

@@ -35,7 +35,7 @@ let ep = quinn::Endpoint::new_with_abstract_socket(
 net.set_blackout(true);                       // or: net.blackout_for(Duration::from_secs(3)).await
 client_sock.rebind();                         // new public port, same IP, effective immediately
 client_sock.rebind_to_ip("203.0.113.9".parse()?); // new IP too (Wi-Fi to cellular)
-net.set_conditions(Conditions::default());    // clean link again
+net.update_conditions(|c| *c = Conditions::default());    // clean link again
 net.stats();                                  // sent / queued / lost / blackholed / unroutable / duplicated / reordered
 
 // Stream link: AsyncRead + AsyncWrite ends plus a control handle.

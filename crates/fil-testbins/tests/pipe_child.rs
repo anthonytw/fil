@@ -352,7 +352,7 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
     // Our own stderr is what the tee writes to, so the test runs itself as a child and reads that.
     if std::env::var_os("FIL_TEE_PARENT").is_some() {
         let script = format!(
-            "(sleep 1; echo after-stop >&2) & printf 'before-stop\\033[2J\\n' >&2; exec {PROBE}"
+            "(sleep 1; echo after-stop >&2) & printf 'before-stop\\033[2J\\n' >&2; printf unfinished-line >&2; exec {PROBE}"
         );
         let cfg = PipeConfig {
             stderr: PipeStderr::Tee,
@@ -384,6 +384,10 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
     let shown = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{shown}");
     assert!(shown.contains("before-stop"), "teed while running: {shown}");
+    assert!(
+        shown.contains("unfinished-line\n"),
+        "a line that was not finished is shown, ended, when the tee stops: {shown}"
+    );
     assert!(
         !shown.contains('\u{1b}'),
         "escape sequences are removed: {shown:?}"

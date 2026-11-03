@@ -123,18 +123,9 @@ pub fn render(
 pub fn other_daemons_note(others: &[OtherDaemon]) -> String {
     let mut out = String::new();
     for d in others {
-        // The major is named when it is not ours: `fil-2-3.sock` is not "wire rev 3" of this fil.
-        let what = match (d.major == fil_proto::limits::PROTOCOL_MAJOR, d.revision) {
-            (true, 0) => "a daemon from an older fil (before wire revisions)".to_string(),
-            (true, rev) => format!("a daemon of wire rev {rev}"),
-            (false, 0) => format!(
-                "a daemon of protocol major {} (before wire revisions)",
-                d.major
-            ),
-            (false, rev) => format!("a daemon of protocol major {} (wire rev {rev})", d.major),
-        };
         out.push_str(&format!(
-            "also running: {what}; use that fil version for its sessions\n"
+            "also running: {}; use that fil version for its sessions\n",
+            d.describe()
         ));
     }
     out

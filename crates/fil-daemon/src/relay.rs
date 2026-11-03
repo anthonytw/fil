@@ -321,6 +321,25 @@ fn refuse<W: Write>(output: &mut W, revision: u16) -> Result<(), RelayError> {
     write_control(output, &ControlMsg::Error(ErrorCode::VersionMismatch))
 }
 
+/// What to tell the user when this relay has just started a daemon and daemons of other wires
+/// are running: their sessions are not in the new one. Numbers only (DESIGN.md section 5.3).
+fn others_note(paths: &Paths) -> Option<String> {
+    let others = crate::paths::other_daemons(paths);
+    if others.is_empty() {
+        return None;
+    }
+    let mut note = String::from(
+        "fil: note: started a new fil daemon; sessions of the other fil version are not in it\n",
+    );
+    for d in &others {
+        note.push_str(&format!(
+            "fil: note: also running: {}; use that fil version for its sessions (`fil ls` lists them)\n",
+            d.describe()
+        ));
+    }
+    Some(note)
+}
+
 /// The relay over any input and output. Writes the preamble to `output` first, so the client
 /// knows fil started even if the daemon cannot be reached, then reads the client's opening,
 /// connects to the daemon of the client's wire (starting this relay's own daemon if that is the
@@ -358,10 +377,15 @@ where
         }
         Want::Own | Want::Wire { .. } => {
             let ensured = ensure_daemon(&opts.paths, &opts.launcher)?;
-            if ensured.started
-                && let Some(w) = linger::check_host()
-            {
-                eprintln!("fil: warning: {w}");
+            if ensured.started {
+                if let Some(w) = linger::check_host() {
+                    eprintln!("fil: warning: {w}");
+                }
+                // A first connection after an upgrade starts a daemon with no sessions beside the
+                // old one that has them: say so now, or `main` silently becomes a second one.
+                if let Some(note) = others_note(&opts.paths) {
+                    eprint!("{note}");
+                }
             }
             ensured.stream
         }
@@ -442,5 +466,32 @@ where
             let _ = done.recv_timeout(HALF_CLOSE_GRACE);
             Ok(RelayEnd::PipeClosed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustix::fs::{FlockOperation, flock};
+
+    /// A first connection after an upgrade starts a daemon beside the old one: the relay says the
+    /// old one is there (numbers only), and says nothing when it is alone.
+    #[test]
+    fn a_new_daemon_beside_an_old_one_is_mentioned_and_alone_it_is_not() {
+        let dir = std::path::PathBuf::from(format!("/tmp/fil-rn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::paths::ensure_socket_dir(&dir).unwrap();
+        let paths = Paths::in_dir(&dir).with_revision(5);
+        assert_eq!(others_note(&paths), None);
+        // A running daemon of revision 4: its socket and its held lock.
+        let old = paths.socket_of(paths.major, 4);
+        drop(std::os::unix::net::UnixListener::bind(&old).unwrap());
+        let lock = std::fs::File::create(old.with_extension("lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let note = others_note(&paths).expect("an old daemon is running");
+        assert!(note.contains("a daemon of wire rev 4"), "{note}");
+        assert!(!note.contains("rev 5"), "{note}");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

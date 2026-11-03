@@ -479,6 +479,22 @@ pub struct OtherDaemon {
     pub revision: u16,
 }
 
+impl OtherDaemon {
+    /// Words for it, numbers only: the major is named when it is not ours (`fil-2-3.sock` is not
+    /// "wire rev 3" of this fil).
+    pub fn describe(&self) -> String {
+        match (self.major == PROTOCOL_MAJOR, self.revision) {
+            (true, 0) => "a daemon from an older fil (before wire revisions)".to_string(),
+            (true, rev) => format!("a daemon of wire rev {rev}"),
+            (false, 0) => format!(
+                "a daemon of protocol major {} (before wire revisions)",
+                self.major
+            ),
+            (false, rev) => format!("a daemon of protocol major {} (wire rev {rev})", self.major),
+        }
+    }
+}
+
 /// The most [`OtherDaemon`]s one answer names. The sender cuts its list to this and the decoder
 /// refuses a longer one.
 pub const MAX_OTHER_DAEMONS: usize = 8;

@@ -2,29 +2,27 @@
 //! through a real relay, and a scripted client over any `Link`.
 
 #![allow(dead_code)]
+// Each test file uses some of the shared helpers re-exported here, never all of them.
+#![allow(unused_imports)]
 
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use bytes::Bytes;
 use fil_daemon::{
     Daemon, DaemonConfig, DaemonHandle, DaemonLauncher, Exit, Paths, RelayOptions, SessionDefaults,
 };
 use fil_proto::ChannelId;
-use fil_proto::chan::RecvChannel;
-use fil_proto::frame::DataSegment;
 use fil_proto::msg::{
-    Agent, Attach, AttachRefusal, AttachReply, ControlMsg, ErrorCode, Hello, PublicKey, Request,
-    Response, ResumeRequest, SnapshotInfo, StartPoint, TakenOver, TermSize,
+    Agent, Attach, ControlMsg, Hello, PublicKey, Request, Response, ResumeRequest, TermSize,
 };
-use fil_term::{Emulator, Size};
 use fil_transport::Link;
 use fil_transport::pipe::{PipeConfig, PipeLink};
 use tokio::task::JoinHandle;
 
-pub const WAIT: Duration = Duration::from_secs(15);
+// The small helpers, and the scripted client itself, are shared with fil-session's tests.
+pub use fil_testkit::{WAIT, key, pid_alive, size};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -85,14 +83,6 @@ pub fn lock_is_held(paths: &Paths) -> bool {
         return false;
     };
     flock(&f, FlockOperation::NonBlockingLockExclusive).is_err()
-}
-
-pub fn key(n: u8) -> PublicKey {
-    PublicKey::new(vec![n; 32]).unwrap()
-}
-
-pub fn size(cols: u16, rows: u16) -> TermSize {
-    TermSize::new(cols, rows).unwrap()
 }
 
 /// A config for tests: no QUIC port unless asked, sessions run `script` under `sh -c` with a
@@ -285,35 +275,28 @@ impl Connect {
     }
 }
 
-/// The scripted client: speaks the protocol over any link, with a real emulator behind it.
+/// The scripted client over any link: `fil_testkit::Client` (reached through `Deref`).
 pub struct Client<L: Link> {
-    pub link: L,
-    pub key: PublicKey,
-    pub hello: Option<Hello>,
-    pub reply: Option<AttachReply>,
-    pub refused: Option<AttachRefusal>,
-    pub taken_over: Option<TakenOver>,
-    /// The daemon sent `Detach` (the session was detached from outside).
-    pub detached: bool,
-    pub exited: Option<(Option<i32>, Option<i32>)>,
-    pub errors: Vec<ErrorCode>,
-    /// Terminal bytes received after the start point.
-    pub out: Vec<u8>,
-    /// How far the terminal channel has been received.
-    pub next: u64,
-    pub down: bool,
-    recv: RecvChannel,
-    snap_buf: Vec<u8>,
-    snap_info: Option<SnapshotInfo>,
-    input_sent: u64,
-    pub input_resume: Option<u64>,
-    pub emu: Box<dyn Emulator>,
+    inner: fil_testkit::Client<L>,
+}
+
+impl<L: Link> std::ops::Deref for Client<L> {
+    type Target = fil_testkit::Client<L>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<L: Link> std::ops::DerefMut for Client<L> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 impl<L: Link> Client<L> {
     /// Sends `Hello` and `Attach` and waits for the reply or a refusal.
     pub async fn attach(link: L, c: Connect) -> Self {
-        let mut cl = Self::new(link, c.key.clone(), c.size);
+        let mut cl = Self::new(link, c.size);
         send_ctl(&cl.link, &hello()).await;
         send_ctl(&cl.link, &ControlMsg::Attach(c.attach())).await;
         cl.wait("the attach reply", |c| {
@@ -324,220 +307,26 @@ impl<L: Link> Client<L> {
             // A resumed client sends its input from where the daemon says it has it up to.
             cl.wait("Resume for the input", |c| c.input_resume.is_some())
                 .await;
-            cl.input_sent = cl.input_resume.unwrap();
         }
         cl
     }
 
-    pub fn new(link: L, key: PublicKey, size: TermSize) -> Self {
-        let emu = fil_term::create(
-            "alacritty",
-            Size {
-                cols: size.cols(),
-                rows: size.rows(),
-            },
-            1000,
-        )
-        .unwrap();
-        Client {
-            link,
-            key,
-            hello: None,
-            reply: None,
-            refused: None,
-            taken_over: None,
-            detached: false,
-            exited: None,
-            errors: Vec::new(),
-            out: Vec::new(),
-            next: 0,
-            down: false,
-            recv: RecvChannel::new(),
-            snap_buf: Vec::new(),
-            snap_info: None,
-            input_sent: 0,
-            input_resume: None,
-            emu,
-        }
+    /// A client that has sent nothing yet.
+    pub fn new(link: L, size: TermSize) -> Self {
+        let mut inner = fil_testkit::Client::new(link, size);
+        // The daemon says Hello first.
+        inner.hello_expected = true;
+        Client { inner }
     }
-
-    pub fn resume_request(&self) -> ResumeRequest {
-        let r = self.reply.as_ref().expect("attached");
-        ResumeRequest {
-            incarnation: r.incarnation,
-            epoch: r.epoch,
-            seq: self.next,
-            want_snapshot: false,
-        }
-    }
-
-    pub fn screen(&self) -> String {
-        self.emu.state(0).screen_text().join("\n")
-    }
-
-    pub fn out_str(&self) -> String {
-        String::from_utf8_lossy(&self.out).into_owned()
-    }
-
-    pub async fn type_bytes(&mut self, data: &[u8]) {
-        let payload = DataSegment::encode(self.input_sent, data).unwrap();
-        self.input_sent += data.len() as u64;
-        self.link
-            .send(ChannelId::TERMINAL, Bytes::from(payload))
-            .await
-            .unwrap();
-    }
-
-    pub async fn detach(&self) {
-        send_ctl(&self.link, &ControlMsg::Detach).await;
-    }
-
-    pub async fn wait(&mut self, what: &str, pred: impl Fn(&Self) -> bool) {
-        if !self.try_wait(WAIT, pred).await {
-            panic!(
-                "timed out waiting for {what}\n  out: {:?}\n  screen: {:?}\n  reply: {:?} refused: {:?} errors: {:?} down: {}",
-                self.out_str(),
-                self.screen(),
-                self.reply,
-                self.refused,
-                self.errors,
-                self.down
-            );
-        }
-    }
-
-    pub async fn try_wait(&mut self, within: Duration, pred: impl Fn(&Self) -> bool) -> bool {
-        let end = tokio::time::Instant::now() + within;
-        loop {
-            if pred(self) {
-                return true;
-            }
-            if self.down {
-                return false;
-            }
-            match tokio::time::timeout_at(end, self.link.recv()).await {
-                Ok(Ok((ch, payload))) => self.apply(ch, payload).await,
-                Ok(Err(_)) => self.down = true,
-                Err(_) => return pred(self),
-            }
-        }
-    }
-
-    pub async fn wait_screen(&mut self, needle: &str) {
-        let n = needle.to_string();
-        self.wait(&format!("{needle:?} on the screen"), move |c| {
-            c.screen().contains(&n)
-        })
-        .await;
-    }
-
-    pub async fn wait_down(&mut self) {
-        self.wait("the link to go down", |c| c.down).await;
-    }
-
-    async fn apply(&mut self, ch: ChannelId, payload: Bytes) {
-        match ch {
-            ChannelId::CONTROL => self.apply_ctl(ControlMsg::decode(&payload).unwrap()).await,
-            ChannelId::SNAPSHOT => {
-                let seg = DataSegment::parse(&payload).unwrap();
-                assert_eq!(seg.seq, self.snap_buf.len() as u64, "snapshot offsets");
-                self.snap_buf.extend_from_slice(seg.data);
-                self.finish_snapshot();
-            }
-            ChannelId::TERMINAL => {
-                let seg = DataSegment::parse(&payload).unwrap();
-                let fresh = self
-                    .recv
-                    .accept(seg.seq, seg.data)
-                    .expect("no gap on the terminal channel")
-                    .to_vec();
-                self.out.extend_from_slice(&fresh);
-                self.emu.feed(&fresh);
-                self.next = self.recv.received();
-                if !fresh.is_empty() {
-                    send_ctl(
-                        &self.link,
-                        &ControlMsg::Ack {
-                            channel: ChannelId::TERMINAL,
-                            upto: self.next,
-                        },
-                    )
-                    .await;
-                }
-            }
-            other => panic!("data on channel {}", other.0),
-        }
-    }
-
-    fn finish_snapshot(&mut self) {
-        let Some(info) = self.snap_info else { return };
-        if self.snap_buf.len() as u64 != info.len {
-            return;
-        }
-        let bytes = std::mem::take(&mut self.snap_buf);
-        self.emu.feed(&bytes);
-        self.recv = RecvChannel::starting_at(info.at);
-        self.next = info.at;
-        self.snap_info = None;
-    }
-
-    async fn apply_ctl(&mut self, msg: ControlMsg) {
-        match msg {
-            ControlMsg::Hello(h) => self.hello = Some(h),
-            ControlMsg::AttachReply(r) => {
-                match r.start {
-                    StartPoint::Resume { from } => {
-                        self.recv = RecvChannel::starting_at(from);
-                        self.next = from;
-                    }
-                    StartPoint::Snapshot(info) => {
-                        self.snap_info = Some(info);
-                        self.finish_snapshot();
-                    }
-                }
-                self.reply = Some(r);
-            }
-            ControlMsg::AttachRefused(r) => self.refused = Some(r),
-            ControlMsg::TakenOver(t) => self.taken_over = Some(t),
-            ControlMsg::Detach => self.detached = true,
-            ControlMsg::Snapshot(info) => {
-                self.snap_info = Some(info);
-                self.finish_snapshot();
-            }
-            ControlMsg::SessionExited { code, signal } => self.exited = Some((code, signal)),
-            ControlMsg::Error(code) => self.errors.push(code),
-            ControlMsg::Resume {
-                channel: ChannelId::TERMINAL,
-                received,
-            } => self.input_resume = Some(received),
-            // Acks, PTY mode and echo acks: not needed here.
-            _ => {}
-        }
-    }
-}
-
-pub fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 /// Polls `cond` until it holds.
-pub async fn eventually<F, Fut>(mut cond: F)
+pub async fn eventually<F, Fut>(cond: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let end = std::time::Instant::now() + WAIT;
-    while std::time::Instant::now() < end {
-        if cond().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for a condition");
+    fil_testkit::eventually("a condition", cond).await;
 }
 
 impl Running {

@@ -71,12 +71,17 @@ async fn kill_reaches_a_process_that_was_orphaned_out_of_the_group() {
     let sc = Scratch::new();
     // The inner shell is a job of its own; its background sleep outlives it, so it is
     // reparented to init and sits in a group the session does not own. Only the periodic
-    // record of the tree remembers it.
-    let script = "set -m; sh -c 'sleep 300 & echo O=$!; sleep 0.4'; echo INNER_DONE; sleep 300";
+    // record of the tree remembers it. The inner shell waits for a file, so that it is a
+    // descendant exactly as long as the test wants: the record is taken by the test, not by
+    // the 100 ms timer, which a slow start (the `sleep 0.3` stands for one) would miss.
+    let script = "sleep 0.3; set -m; sh -c 'sleep 300 & echo O=$!; while [ ! -e $T/go ]; do sleep 0.05; done'; echo INNER_DONE; sleep 300";
     let h = spawn_plain(sh_config(&sc, "main", script)).await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
-    c.wait_screen("INNER_DONE").await;
+    c.wait_screen("O=").await;
     let orphan = pids(&c.screen(), "O")[0];
+    h.record_processes().await;
+    sc.touch("go");
+    c.wait_screen("INNER_DONE").await;
     eventually("the orphan to be reparented", || async {
         ppid(orphan) == Some(1)
     })

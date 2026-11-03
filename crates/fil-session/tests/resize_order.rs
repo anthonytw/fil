@@ -9,12 +9,13 @@ use std::time::Duration;
 use common::*;
 use fil_proto::msg::ErrorCode;
 use fil_session::ServeEnd;
+use fil_transport::link::mem::MemLink;
 
 /// A shell that prints the size the PTY has each time it is sent a line.
 const STTY_SIZE: &str = "stty -echo; while read x; do stty size; done";
 
 /// Lines the program has printed so far, without the empty tail.
-fn lines(c: &Client) -> Vec<String> {
+fn lines(c: &fil_testkit::Client<MemLink>) -> Vec<String> {
     c.out_str()
         .split("\r\n")
         .filter(|l| !l.is_empty())

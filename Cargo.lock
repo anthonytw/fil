@@ -406,6 +406,7 @@ dependencies = [
  "fil-proto",
  "fil-session",
  "fil-term",
+ "fil-testbins",
  "fil-transport",
  "nix",
  "portable-pty",
@@ -441,7 +442,7 @@ dependencies = [
  "fil-daemon",
  "fil-proto",
  "fil-session",
- "fil-term",
+ "fil-testkit",
  "fil-transport",
  "ring",
  "rustix",
@@ -498,6 +499,7 @@ dependencies = [
  "fil-proto",
  "fil-session",
  "fil-term",
+ "fil-testkit",
  "fil-transport",
  "nix",
  "portable-pty",
@@ -529,6 +531,17 @@ dependencies = [
  "quinn",
  "tokio",
  "vt100",
+]
+
+[[package]]
+name = "fil-testkit"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fil-proto",
+ "fil-term",
+ "fil-transport",
+ "tokio",
 ]
 
 [[package]]

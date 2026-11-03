@@ -20,6 +20,45 @@ fn options(s: &Scratch, launcher: DaemonLauncher) -> RelayOptions {
     opts
 }
 
+/// How long a test waits on the relay's output or a thread before it fails with a name, so a stall
+/// is a failure that says where, not a hang.
+const STALL: Duration = Duration::from_secs(20);
+
+/// Reads until the relay closes its output; the read timeout (`STALL`, set by `output_pair`)
+/// makes a relay that goes quiet a failure, not a hang.
+fn read_all(from_relay: &mut UnixStream, what: &str) -> Vec<u8> {
+    let mut got = Vec::new();
+    from_relay.read_to_end(&mut got).unwrap_or_else(|e| {
+        panic!(
+            "{what}: reading the relay's output: {e} (after {} bytes)",
+            got.len()
+        )
+    });
+    got
+}
+
+/// Joins a thread, failing (not hanging) if it has not finished after a generous time.
+fn join_within<T>(h: thread::JoinHandle<T>, what: &str) -> T {
+    let end = std::time::Instant::now() + 2 * STALL;
+    while !h.is_finished() {
+        assert!(
+            std::time::Instant::now() < end,
+            "{what}: the thread did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    h.join().unwrap()
+}
+
+/// The relay's output end and the test's end of it, with the read timeout set while the pair is
+/// still connected: on macOS, setsockopt on a socket whose peer has already closed can fail with
+/// EINVAL, which made a test flaky under load.
+fn output_pair() -> (UnixStream, UnixStream) {
+    let (relay_out, from_relay) = UnixStream::pair().unwrap();
+    from_relay.set_read_timeout(Some(STALL)).unwrap();
+    (relay_out, from_relay)
+}
+
 fn never_started() -> DaemonLauncher {
     DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new())
 }
@@ -54,7 +93,7 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
     });
 
     let (mut to_relay, relay_in) = UnixStream::pair().unwrap();
-    let (relay_out, mut from_relay) = UnixStream::pair().unwrap();
+    let (relay_out, mut from_relay) = output_pair();
     let opts = options(&s, never_started());
     let relay_thread = thread::spawn(move || relay(relay_in, relay_out, &opts));
 
@@ -67,8 +106,7 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
         to_relay
     });
 
-    let mut got = Vec::new();
-    from_relay.read_to_end(&mut got).unwrap();
+    let got = read_all(&mut from_relay, "the echo through the relay");
     let preamble = fil_proto::preamble::encode(fil_proto::limits::PROTOCOL_MAJOR);
     assert_eq!(
         &got[..preamble.len()],
@@ -78,10 +116,10 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
     assert_eq!(got.len(), preamble.len() + data.len());
     assert!(got[preamble.len()..] == data[..], "bytes differ");
 
-    let end = relay_thread.join().unwrap().unwrap();
+    let end = join_within(relay_thread, "the relay").unwrap();
     assert!(matches!(end, RelayEnd::DaemonClosed | RelayEnd::PipeClosed));
-    echo.join().unwrap();
-    drop(writer.join().unwrap());
+    join_within(echo, "the echo daemon");
+    drop(join_within(writer, "the writer"));
 }
 
 #[test]
@@ -96,26 +134,25 @@ fn the_relay_ends_when_the_daemon_closes() {
     });
     // The client's side stays open (a pipe that never ends): the relay must still finish.
     let (_keep_open, relay_in) = UnixStream::pair().unwrap();
-    let (relay_out, mut from_relay) = UnixStream::pair().unwrap();
+    let (relay_out, mut from_relay) = output_pair();
     let opts = options(&s, never_started());
     let relay_thread = thread::spawn(move || relay(relay_in, relay_out, &opts));
 
-    let end = relay_thread.join().unwrap().unwrap();
+    let end = join_within(relay_thread, "the relay").unwrap();
     assert_eq!(end, RelayEnd::DaemonClosed);
-    let mut got = Vec::new();
-    from_relay.read_to_end(&mut got).unwrap();
+    let got = read_all(&mut from_relay, "the daemon's last words");
     assert!(
         got.ends_with(b"last words"),
         "what the daemon said before closing is delivered"
     );
-    daemon.join().unwrap();
+    join_within(daemon, "the daemon");
 }
 
 #[test]
 fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
     let s = Scratch::new();
     let (relay_in, _keep) = UnixStream::pair().unwrap();
-    let (relay_out, mut from_relay) = UnixStream::pair().unwrap();
+    let (relay_out, mut from_relay) = output_pair();
     // Set the timeout while the pair is still connected: on macOS, setsockopt on a socket whose
     // peer has already closed can fail with EINVAL, which made this test flaky under load.
     from_relay
@@ -129,8 +166,7 @@ fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
     );
     // The relay is gone (its output dropped), so reading ends; what it wrote is the preamble
     // and nothing else, so the client can tell fil started and why it failed (ssh's stderr).
-    let mut got = Vec::new();
-    from_relay.read_to_end(&mut got).unwrap();
+    let got = read_all(&mut from_relay, "the preamble");
     assert_eq!(
         got,
         fil_proto::preamble::encode(fil_proto::limits::PROTOCOL_MAJOR)
@@ -174,11 +210,10 @@ fn a_bad_socket_directory_is_refused_before_anything_is_read_from_the_client() {
 fn the_preamble_carries_the_major_of_the_paths() {
     let s = Scratch::new();
     let (relay_in, _keep) = UnixStream::pair().unwrap();
-    let (relay_out, mut from_relay) = UnixStream::pair().unwrap();
+    let (relay_out, mut from_relay) = output_pair();
     let mut opts = options(&s, never_started());
     opts.paths = opts.paths.with_major(7);
     let _ = relay(relay_in, relay_out, &opts);
-    let mut got = Vec::new();
-    from_relay.read_to_end(&mut got).unwrap();
+    let got = read_all(&mut from_relay, "the preamble");
     assert_eq!(got, b"\x1bFIL-CONNECT 7\n");
 }

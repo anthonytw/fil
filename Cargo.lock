@@ -408,6 +408,7 @@ dependencies = [
  "fil-term",
  "fil-testbins",
  "fil-transport",
+ "libc",
  "nix",
  "portable-pty",
  "rustix",

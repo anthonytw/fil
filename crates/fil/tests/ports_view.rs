@@ -32,6 +32,7 @@ fn opts(host: Option<&str>) -> ViewOptions<'_> {
         host,
         now_unix_ms: NOW,
         utc_offset_secs: 0,
+        current_session: None,
     }
 }
 
@@ -432,6 +433,7 @@ fn the_json_is_the_same_whatever_the_clock_and_the_zone() {
             host: Some("orin"),
             now_unix_ms: 0,
             utc_offset_secs: -5 * 3600,
+            current_session: None,
         },
     );
     assert_eq!(a, b);
@@ -454,6 +456,7 @@ fn times_follow_the_zone_and_name_the_day_when_it_is_not_today() {
             host: None,
             now_unix_ms: NOW,
             utc_offset_secs: 3600,
+            current_session: None,
         },
     );
     assert!(

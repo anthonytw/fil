@@ -34,7 +34,10 @@
 //! empty path again, so its base would creep up with every period it forgets. Once per period, if
 //! the cap held something back in it, the cap drops to [`MIN_CAP`] until a payload sent while at
 //! most that much was in flight has been acknowledged (about one round trip), then returns to
-//! where it was. That costs about one round trip in 30 s.
+//! where it was. That costs about one round trip in 30 s. The first such drain comes two round
+//! trips after slow start ends (as LEDBAT++'s initial slowdown): slow start's samples include the
+//! queue of its own bursts and of the path's own ramp-up (TCP's slow start under the pipe), and a
+//! base measured then would leave a standing queue until the next period.
 //!
 //! **What is never paced.** Only dynamic channels (forwarded and agent connections) pass through
 //! here. Control messages, the terminal, the snapshot and the MUX channel never do: the
@@ -165,6 +168,10 @@ pub struct Pacer {
     base_prev: Option<Duration>,
     period_start: Instant,
     drain: Option<Drain>,
+    /// The first drain, due two round trips after slow start ends: what slow start measured
+    /// includes the queue its own bursts and the path's own ramp-up (TCP's slow start under the
+    /// pipe) made, so the base is measured once more before the controller trusts it.
+    first_drain_at: Option<Instant>,
     path_generation: u64,
     samples: u64,
 }
@@ -185,6 +192,7 @@ impl Pacer {
             base_prev: None,
             period_start: now,
             drain: None,
+            first_drain_at: None,
             path_generation: 0,
             samples: 0,
         }
@@ -366,6 +374,7 @@ impl Pacer {
         self.base_prev = None;
         self.recent.clear();
         self.drain = None;
+        self.first_drain_at = None;
     }
 
     pub fn path_generation(&self) -> u64 {
@@ -396,6 +405,18 @@ impl Pacer {
             }
             self.limited_in_period = false;
         }
+        if self.first_drain_at.is_some_and(|t| now >= t) && self.drain.is_none() {
+            self.first_drain_at = None;
+            debug!(
+                cap = self.cap,
+                "forward pacing: measuring the base after slow start"
+            );
+            self.drain = Some(Drain {
+                saved: self.cap,
+                started: now,
+                low_at: None,
+            });
+        }
         self.base_now = Some(self.base_now.map_or(rtt, |b| b.min(rtt)));
         if self.recent.len() == CURRENT_SAMPLES {
             self.recent.pop_front();
@@ -424,6 +445,7 @@ impl Pacer {
             } else {
                 self.slow_start = false;
                 self.cap /= 2;
+                self.first_drain_at = Some(now + 2 * current);
                 debug!(
                     cap = self.cap,
                     base_us = base.as_micros() as u64,

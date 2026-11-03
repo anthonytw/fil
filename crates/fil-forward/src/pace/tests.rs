@@ -570,3 +570,48 @@ fn records_are_bounded() {
     p.on_ack(ch(16), 10_000, t0 + Duration::from_secs(60));
     assert_eq!(p.state().in_flight, 0);
 }
+
+/// Slow start measured the base with a queue in it (its own bursts, or the path's ramp-up: TCP's
+/// slow start under the pipe): two round trips after slow start ends, the pacer drains to its
+/// floor once and measures the base again, rather than keeping a queue on a wrong base until the
+/// next period.
+#[test]
+fn a_base_measured_in_slow_start_is_measured_again() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let c = ch(16);
+    let mut off = 0u64;
+    let mut t = t0;
+    // One payload out at `at`, acknowledged `rtt` later.
+    let mut exchange = |p: &mut Pacer, at: Instant, rtt: u64| {
+        p.on_sent(c, off, off + PAYLOAD, at);
+        off += PAYLOAD;
+        p.on_ack(c, off, at + Duration::from_millis(rtt));
+    };
+    // Slow start sees 80 ms, then 100 ms: it ends, with 80 ms as the base.
+    for _ in 0..4 {
+        exchange(&mut p, t, 80);
+        t += Duration::from_millis(10);
+    }
+    for _ in 0..4 {
+        exchange(&mut p, t, 100);
+        t += Duration::from_millis(10);
+    }
+    let st = p.state();
+    assert!(!st.slow_start, "{st:?}");
+    assert_eq!(st.base, Some(Duration::from_millis(80)));
+    assert!(!st.draining);
+    // Two round trips later the next sample starts a drain: the cap is the floor.
+    t += Duration::from_millis(250);
+    exchange(&mut p, t, 100);
+    assert!(p.state().draining, "{:?}", p.state());
+    // A payload sent with less than the floor in flight comes back in 45 ms: that is the base,
+    // and the drain ends with the cap where it was.
+    t += Duration::from_millis(10);
+    assert!(p.admit(c, t));
+    exchange(&mut p, t, 45);
+    let end = p.state();
+    assert!(!end.draining, "{end:?}");
+    assert_eq!(end.base, Some(Duration::from_millis(45)));
+    assert!(end.cap > MIN_CAP, "{end:?}");
+}

@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
-use fil_proto::limits::LEN_PREFIX;
 use fil_proto::sched::Scheduler;
 use fil_proto::{ChannelClass, ChannelId, Frame};
 use tokio::sync::{Notify, watch};
@@ -185,7 +184,7 @@ impl Shared {
         if let Some(room) = room
             && !was_held
             && frame.channel.class() != ChannelClass::Control
-            && LEN_PREFIX + super::channel_varint_len(frame.channel) + frame.payload.len() > room
+            && frame.wire_len() > room
         {
             debug_assert!(q.held.is_none());
             q.held = Some(frame);

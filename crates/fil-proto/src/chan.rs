@@ -6,23 +6,11 @@
 //! states its position ([`crate::ControlMsg::Resume`]), and the sender restarts exactly there
 //! ([`SendChannel::resume`]) or says the data is gone ([`ResumeError::Gone`]).
 
-use crate::frame::DataSegment;
+use bytes::Bytes;
+
+use crate::frame::SeqHeader;
 use crate::limits::{ACK_AFTER_BYTES, MAX_DATA_PAYLOAD};
 use crate::ring::ByteRing;
-
-/// One data segment ready to go into a frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segment {
-    pub seq: u64,
-    pub data: Vec<u8>,
-}
-
-impl Segment {
-    /// The payload of a data frame.
-    pub fn payload(&self) -> Vec<u8> {
-        DataSegment::encode(self.seq, &self.data).expect("segments are non-empty and capped")
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ResumeError {
@@ -92,17 +80,19 @@ impl SendChannel {
         self.ring.start()
     }
 
-    /// The next segment of at most [`MAX_DATA_PAYLOAD`] bytes, or `None` if everything queued has
-    /// been sent.
-    pub fn next_segment(&mut self) -> Option<Segment> {
-        let data = self.ring.read(self.next, MAX_DATA_PAYLOAD);
-        if data.is_empty() {
-            return None;
-        }
+    /// The payload of the next data frame: the sequence number of its first byte as a varint,
+    /// then at most [`MAX_DATA_PAYLOAD`] bytes (see [`crate::frame::DataSegment`]). `None` if
+    /// everything queued has been sent.
+    ///
+    /// The payload is built in one allocation, with one copy of the data out of the ring.
+    pub fn next_payload(&mut self) -> Option<Bytes> {
         let seq = self.next;
-        self.next += data.len() as u64;
+        let (payload, n) =
+            self.ring
+                .read_prefixed(seq, MAX_DATA_PAYLOAD, SeqHeader::new(seq).as_bytes())?;
+        self.next += n as u64;
         self.high = self.high.max(self.next);
-        Some(Segment { seq, data })
+        Some(payload)
     }
 
     /// The peer has everything below `upto`. Stale acks (below what is already acknowledged)
@@ -234,6 +224,14 @@ impl RecvChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::DataSegment;
+
+    /// The next segment as (seq, data).
+    fn next_segment(s: &mut SendChannel) -> Option<(u64, Vec<u8>)> {
+        let payload = s.next_payload()?;
+        let seg = DataSegment::parse(&payload).unwrap();
+        Some((seg.seq, seg.data.to_vec()))
+    }
 
     #[test]
     fn segments_are_capped_and_contiguous() {
@@ -242,15 +240,15 @@ mod tests {
         assert_eq!(s.write(&data), 40_000);
         let mut got = vec![];
         let mut want_seq = 0;
-        while let Some(seg) = s.next_segment() {
-            assert_eq!(seg.seq, want_seq);
-            assert!(seg.data.len() <= MAX_DATA_PAYLOAD);
-            want_seq += seg.data.len() as u64;
-            got.extend(seg.data);
+        while let Some((seq, seg)) = next_segment(&mut s) {
+            assert_eq!(seq, want_seq);
+            assert!(seg.len() <= MAX_DATA_PAYLOAD);
+            want_seq += seg.len() as u64;
+            got.extend(seg);
         }
         assert_eq!(got, data);
         assert_eq!(s.unsent(), 0);
-        assert!(s.next_segment().is_none());
+        assert!(s.next_payload().is_none());
     }
 
     #[test]
@@ -258,8 +256,8 @@ mod tests {
         let mut s = SendChannel::new(10);
         assert_eq!(s.write(b"0123456789abc"), 10);
         assert_eq!(s.write(b"x"), 0);
-        let seg = s.next_segment().unwrap();
-        assert_eq!(seg.data.len(), 10);
+        let (_, seg) = next_segment(&mut s).unwrap();
+        assert_eq!(seg.len(), 10);
         assert_eq!(
             s.write(b"x"),
             0,
@@ -277,7 +275,7 @@ mod tests {
         let mut s = SendChannel::new(100);
         s.write(b"hello");
         assert!(s.ack(1).is_err(), "nothing sent yet");
-        s.next_segment().unwrap();
+        s.next_payload().unwrap();
         assert!(s.ack(5).is_ok());
         assert_eq!(
             s.ack(6),
@@ -292,34 +290,28 @@ mod tests {
     fn resume_resends_exactly_from_the_receiver_position() {
         let mut s = SendChannel::new(1000);
         s.write(b"0123456789");
-        let seg = s.next_segment().unwrap();
-        assert_eq!(seg.seq, 0);
+        let (seq, _) = next_segment(&mut s).unwrap();
+        assert_eq!(seq, 0);
         s.ack(3).unwrap();
         // The link died; the receiver only got 7 bytes.
         s.resume(7).unwrap();
         assert_eq!(s.acked(), 7);
-        assert_eq!(
-            s.next_segment().unwrap(),
-            Segment {
-                seq: 7,
-                data: b"789".to_vec()
-            }
-        );
-        assert!(s.next_segment().is_none());
+        assert_eq!(next_segment(&mut s).unwrap(), (7, b"789".to_vec()));
+        assert!(s.next_payload().is_none());
     }
 
     #[test]
     fn resume_edges() {
         let mut s = SendChannel::new(1000);
         s.write(b"0123456789");
-        s.next_segment().unwrap();
+        s.next_payload().unwrap();
         s.ack(4).unwrap();
         // Exactly at the oldest retained byte: fine.
         s.resume(4).unwrap();
-        assert_eq!(s.next_segment().unwrap().seq, 4);
+        assert_eq!(next_segment(&mut s).unwrap().0, 4);
         // Exactly at the end: fine, nothing to resend.
         s.resume(10).unwrap();
-        assert!(s.next_segment().is_none());
+        assert!(s.next_payload().is_none());
         // Below the oldest retained byte: data is gone.
         assert_eq!(
             s.resume(3),
@@ -338,13 +330,7 @@ mod tests {
         );
         // Nothing changed after the failures: new writes continue the numbering.
         s.write(b"ab");
-        assert_eq!(
-            s.next_segment().unwrap(),
-            Segment {
-                seq: 10,
-                data: b"ab".to_vec()
-            }
-        );
+        assert_eq!(next_segment(&mut s).unwrap(), (10, b"ab".to_vec()));
     }
 
     #[test]

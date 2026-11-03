@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+use bytes::Bytes;
 use nix::sys::termios::LocalFlags;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::Notify;
@@ -30,7 +31,7 @@ pub enum SpawnError {
 /// The PTY's master side and the way to write to it.
 pub(crate) struct Pty {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: mpsc::Sender<Vec<u8>>,
+    writer: mpsc::Sender<Bytes>,
     /// Bytes ever handed to `write`.
     queued: AtomicU64,
     /// Bytes the writer thread has got into the PTY (the line discipline has them).
@@ -155,7 +156,7 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
 
     // Writes can block when the child is not reading, so they have a thread of their own and
     // the session never waits on them.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<Bytes>();
     let written = Arc::new(AtomicU64::new(0));
     let taken = written.clone();
     let signal = Arc::new(Notify::new());
@@ -195,7 +196,7 @@ impl Pty {
     /// Queues bytes for the child's input. Never blocks.
     ///
     /// Returns a ticket: [`Pty::written`] reaches it once the PTY has taken these bytes.
-    pub fn write(&self, bytes: Vec<u8>) -> u64 {
+    pub fn write(&self, bytes: Bytes) -> u64 {
         let ticket =
             self.queued.fetch_add(bytes.len() as u64, Ordering::SeqCst) + bytes.len() as u64;
         let _ = self.writer.send(bytes);

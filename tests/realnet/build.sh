@@ -16,7 +16,7 @@ log "building fil and fil-testbins for $TARGET"
 (cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil -p fil-testbins)
 
 mkdir -p "$BIN_DIR"
-for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe keyprobe; do
+for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe fwdprobe keyprobe; do
   cp "$REPO_ROOT/target/$TARGET/release/$b" "$BIN_DIR/$b"
   # Static means no dynamic loader: ldd says so. Anything else would not run in a bare container.
   if ldd "$BIN_DIR/$b" 2>&1 | grep -qE 'not a dynamic|statically linked'; then

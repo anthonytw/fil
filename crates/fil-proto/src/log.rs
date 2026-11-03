@@ -8,7 +8,10 @@
 
 use std::time::Duration;
 
-use crate::chan::{AckError, Segment};
+use bytes::Bytes;
+
+use crate::chan::AckError;
+use crate::frame::SeqHeader;
 use crate::limits::{DEFAULT_LOG_CAPACITY, MAX_DATA_PAYLOAD};
 use crate::msg::SnapshotReason;
 use crate::ring::ByteRing;
@@ -48,6 +51,17 @@ impl OutputLog {
 
     pub fn read(&self, seq: u64, max: usize) -> Vec<u8> {
         self.ring.read(seq, max)
+    }
+
+    /// The payload of a data frame holding up to `max` bytes (at most [`MAX_DATA_PAYLOAD`]) from
+    /// `seq` on, and how many log bytes it holds: the sequence number as a varint, then the
+    /// bytes, in one allocation with one copy out of the ring. `None` if `seq` is not in the log.
+    pub fn read_payload(&self, seq: u64, max: usize) -> Option<(Bytes, usize)> {
+        self.ring.read_prefixed(
+            seq,
+            max.min(MAX_DATA_PAYLOAD),
+            SeqHeader::new(seq).as_bytes(),
+        )
     }
 }
 
@@ -157,22 +171,21 @@ impl Cursor {
         log.end().saturating_sub(self.acked)
     }
 
-    /// The next segment to send, or `None` when caught up.
-    pub fn next_segment(&mut self, log: &OutputLog) -> Result<Option<Segment>, Wrapped> {
+    /// The payload of the next data frame to send ([`OutputLog::read_payload`]), or `None` when
+    /// caught up.
+    pub fn next_payload(&mut self, log: &OutputLog) -> Result<Option<Bytes>, Wrapped> {
         if self.next < log.start() {
             return Err(Wrapped {
                 cursor: self.next,
                 start: log.start(),
             });
         }
-        let data = log.read(self.next, MAX_DATA_PAYLOAD);
-        if data.is_empty() {
+        let Some((payload, n)) = log.read_payload(self.next, MAX_DATA_PAYLOAD) else {
             return Ok(None);
-        }
-        let seq = self.next;
-        self.next += data.len() as u64;
+        };
+        self.next += n as u64;
         self.high = self.high.max(self.next);
-        Ok(Some(Segment { seq, data }))
+        Ok(Some(payload))
     }
 
     pub fn ack(&mut self, upto: u64) -> Result<(), AckError> {
@@ -196,6 +209,7 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::DataSegment;
 
     fn log_with(cap: usize, total: usize) -> OutputLog {
         let mut l = OutputLog::new(cap);
@@ -299,9 +313,11 @@ mod tests {
     fn cursor_streams_and_detects_wrap() {
         let mut l = log_with(64, 40);
         let mut c = Cursor::at(10);
-        let seg = c.next_segment(&l).unwrap().unwrap();
+        let p = c.next_payload(&l).unwrap().unwrap();
+        let seg = DataSegment::parse(&p).unwrap();
         assert_eq!((seg.seq, seg.data.len()), (10, 30));
-        assert!(c.next_segment(&l).unwrap().is_none());
+        assert_eq!(seg.data, &(10..40u8).collect::<Vec<_>>()[..]);
+        assert!(c.next_payload(&l).unwrap().is_none());
         assert_eq!(c.behind(&l), 30);
         c.ack(25).unwrap();
         assert_eq!(c.behind(&l), 15);
@@ -310,15 +326,16 @@ mod tests {
         l.append(&[7; 200]);
         assert_eq!(c.next_seq(), 40);
         assert_eq!(
-            c.next_segment(&l),
+            c.next_payload(&l),
             Err(Wrapped {
                 cursor: 40,
                 start: 176
             })
         );
         c.jump_to(l.end());
-        assert!(c.next_segment(&l).unwrap().is_none());
+        assert!(c.next_payload(&l).unwrap().is_none());
         l.append(b"after");
-        assert_eq!(c.next_segment(&l).unwrap().unwrap().data, b"after");
+        let p = c.next_payload(&l).unwrap().unwrap();
+        assert_eq!(DataSegment::parse(&p).unwrap().data, b"after");
     }
 }

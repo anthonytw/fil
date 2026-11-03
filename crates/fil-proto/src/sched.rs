@@ -169,10 +169,10 @@ mod tests {
         for i in 0..100 {
             s.push(f(20, i));
         }
-        assert_eq!(s.pop().unwrap().payload, [0]);
+        assert_eq!(s.pop().unwrap().payload, &[0][..]);
         s.push(f(1, 200));
         assert_eq!(s.pop().unwrap().channel, ChannelId::TERMINAL);
-        assert_eq!(s.pop().unwrap().payload, [1]);
+        assert_eq!(s.pop().unwrap().payload, &[1][..]);
     }
 
     #[test]

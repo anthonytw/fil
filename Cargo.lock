@@ -482,6 +482,7 @@ dependencies = [
 name = "fil-proto"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fil-netsim",
  "fil-transport",
  "postcard",
@@ -529,6 +530,8 @@ dependencies = [
  "nix",
  "portable-pty",
  "quinn",
+ "ring",
+ "rustix",
  "tokio",
  "vt100",
 ]

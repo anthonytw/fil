@@ -179,8 +179,16 @@ pub fn answer(c: &mut Client, key: &str) {
 /// `PREFIX<digits>...`.
 pub fn numbers(plain: &[u8], prefix: &str) -> Vec<u64> {
     let text = String::from_utf8_lossy(plain);
-    text.lines()
-        .filter_map(|l| {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            // A skip (catch-up) cuts at a byte, so the line just before the marker may be a
+            // stump (`LINE-024`); it is not a line that was printed.
+            if lines.get(i + 1).is_some_and(|n| n.contains("fil: skipped")) {
+                return None;
+            }
             // The status line ("fil: disconnected ...") is drawn by cursor moves and padded with
             // blanks; once the escapes are gone, the output that follows can sit on its line. Read
             // what comes after the last run of two blanks.
@@ -294,19 +302,43 @@ pub fn check_text(
     ))
 }
 
+/// The text just after the line before the first difference (escaped), and whatever the output
+/// says about skipped output anywhere.
 fn around(tail: &str, prefix: &str, nums: &[u64], want: &[u64]) -> String {
-    let at = nums
-        .iter()
-        .zip(want)
-        .position(|(a, b)| a != b)
-        .and_then(|i| tail.find(&format!("{prefix}{}", want[i].saturating_sub(2))))
-        .unwrap_or(0);
-    let end = (at + 300).min(tail.len());
+    let Some(i) = nums.iter().zip(want).position(|(a, b)| a != b) else {
+        return String::new();
+    };
+    let before = i.checked_sub(1).map(|j| nums[j]);
+    let mut at = 0;
+    if let Some(v) = before {
+        let mut off = 0;
+        for l in tail.split_inclusive('\n') {
+            if numbers(l.as_bytes(), prefix) == [v] {
+                at = off;
+                break;
+            }
+            off += l.len();
+        }
+    }
+    let end = (at + 700).min(tail.len());
     let end = (at..=end)
         .rev()
         .find(|&i| tail.is_char_boundary(i))
         .unwrap_or(at);
-    tail[at..end].to_string()
+    let mut s = format!("{:?}", &tail[at..end]);
+    if let Some(k) = tail.find("skipped") {
+        let from = (k.saturating_sub(40)..=k)
+            .find(|&i| tail.is_char_boundary(i))
+            .unwrap_or(k);
+        let to = (k + 80..=k + 120)
+            .find(|&i| i <= tail.len() && tail.is_char_boundary(i))
+            .unwrap_or(tail.len());
+        s.push_str(&format!(
+            "\n(the word \"skipped\" is at byte {k}: {:?})",
+            &tail[from..to]
+        ));
+    }
+    s
 }
 
 /// Starts the counting loop `TICK-1 .. TICK-N`, a quarter second apart.
@@ -453,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_marker_does_not_excuse_repeats_reordering_or_a_missing_tail() {
-        let dup = format!("{}{GAP}{}", ticks(1..=12), ticks(12..=60));
+        let dup = format!("{}{GAP}{}", ticks(1..=12), ticks(10..=60));
         assert!(check_text(&dup, "TICK-", 1, 60, Gap::Allowed).is_err());
         let order = format!("{}{GAP}{}{}", ticks(1..=12), ticks(50..=60), ticks(30..=40));
         assert!(check_text(&order, "TICK-", 1, 60, Gap::Allowed).is_err());
@@ -490,6 +522,15 @@ mod tests {
     fn a_status_line_in_the_middle_of_a_line_does_not_hide_the_number() {
         let t = "TICK-1\nTICK-2\n fil: disconnected 0s  reconnecting over pipe                TICK-3\nTICK-4\n";
         assert!(check_text(t, "TICK-", 1, 4, Gap::Forbidden).is_ok());
+    }
+
+    #[test]
+    fn the_stump_of_a_line_cut_by_a_skip_is_not_a_line() {
+        let t = format!(
+            "TICK-1\nTICK-2\nTICK-3\nTICK-4\nTICK-5\nTICK-6\nTICK-7\nTICK-8\nTICK-9\nTICK-1{GAP}{}",
+            ticks(40..=45)
+        );
+        assert_eq!(numbers(t.as_bytes(), "TICK-").len(), 9 + 6);
     }
 
     #[test]

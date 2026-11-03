@@ -1,5 +1,5 @@
 # Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
-# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|all`),
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|all`),
 # then `gh run watch`.
 #
 # Supply chain: every action is pinned by full commit SHA (the comment names the release tag), the
@@ -16,9 +16,9 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md) or all (check, realnet and aarch64)"
+        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem; one job, never part of the others) or all (check, realnet and aarch64)"
         type: choice
-        options: [check, realnet, aarch64, all]
+        options: [check, realnet, aarch64, latency, all]
         default: check
       strict:
         description: "realnet: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   check:
-    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64'
+    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'latency'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -66,7 +66,8 @@ jobs:
     # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
     # in Docker containers (ssh part), the real Linux network stack with NAT and tc netem in
     # network namespaces (udp part) and a systemd host in a privileged container (sysd part).
-    # Three parts, run in parallel, each through `just realnet PART`. It builds `fil` and the test
+    # Three parts, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
+    # the one part `latency` (the latency lab, docs/m2/latency.md) instead. It builds `fil` and the test
     # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
     # release-target check.
     # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
@@ -78,14 +79,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [ssh, udp, sysd]
+        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Packages (musl for static binaries; namespace and firewall tools)
-        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server vim less
+        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server vim less strace
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1

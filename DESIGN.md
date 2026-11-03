@@ -1,6 +1,6 @@
 # fil — design
 
-> **Status: draft for discussion, 2026-11-03.** M0 and M1 are built and the M1 sweep is finishing (§15); M2 onward is not started.
+> **Status: draft for discussion, 2026-11-03.** M0 and M1 are done, the M1 sweep included (§15); M2 is in progress.
 > Items marked **(decided)** are the owner's decisions. Everything else is a proposal.
 
 *fil* is French for thread or wire. *Reprendre le fil*: to pick up the thread where you left off.
@@ -757,10 +757,10 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | Milestone | Scope | Done when | Status |
 |---|---|---|---|
 | **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison across the modular backends (§6.5) | the default emulator is chosen, and the overlay never corrupts the screen in the harness | done (M0) |
-| **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed | done (M1): the scope and the drop-in suite; the sweep is not yet closed |
-| **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed | not started |
+| **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed | done (M1), closed 2026-11-03: the sweep's fixes are merged and verified; the drop-in suite passes 60 of 60 on both Pis with no expected failures, and `linux-check` passes every suite on main |
+| **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed | in progress: plan in `docs/m2/plan.md`; Wave 0 (the wire and link contracts) under way |
 | **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, and the sweep is closed | not started |
-| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-public sweep; go public; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners, which are free once the repo is public | the pre-public sweep is closed before the repo goes public | not started |
+| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | not started |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
 

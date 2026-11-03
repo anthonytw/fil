@@ -13,7 +13,7 @@ fil is a remote shell for development over SSH:
 - **`DESIGN.md` is the source of truth.**
   - Items marked **(decided)** are the owner's decisions. Build on them; don't reopen them.
   - Everything else is a proposal and can change. When one changes, update `DESIGN.md` in the same PR.
-- **Open questions** are in `DESIGN.md` §16. **Milestones** are in §15. Work goes riskiest first. M0 and M1 are built; the M1 sweep is finishing.
+- **Open questions** are in `DESIGN.md` §16. **Milestones** are in §15. Work goes riskiest first. M0 and M1 are done; M2 is in progress (`docs/m2/plan.md`).
 - **Ask before starting unrequested work.** Propose it and wait for the owner's OK. A question like "how hard would X be?" wants a feasibility answer, not an implementation.
 
 ## Conventions
@@ -33,11 +33,11 @@ fil is a remote shell for development over SSH:
 
 ## Delivery
 
-- **Workflow:** branch, then PR, then squash merge, using `gh`. The repo is on GitHub (private for now). One task per PR.
+- **Workflow:** branch, then PR, then squash merge, using `gh`. The repo is on GitHub and public. One task per PR.
 - **The merge gate is local.** There is no required CI on GitHub. Before merging, run `just ci` on the branch, rebased on current `main`. It runs `cargo fmt --check`, `clippy -D warnings`, a default-features `cargo check -p fil`, `cargo test` and `cargo deny` (the license, source and ban policy and the RustSec advisories, including yanked crates, in `deny.toml`; the advisory database is fetched, so it needs network access; `FIL_DENY_FLAGS=--offline just ci` checks against the cached copy instead, which can be stale, so an offline pass is not a merge pass). It also fails if the vt100 emulator backend is back in the release binary's dependency graph (`just release-deps`). Say in the PR that it passed.
 - **Linux check:** a manual GitHub workflow (`gh workflow run linux-check -f ref=BRANCH`) runs `just ci` and the on-demand harnesses on Linux. Use it when a change touches PTYs, termios, sockets or anything else platform-specific. It is a check, not a gate. `-f suite=realnet` runs the real-network harness instead (real OpenSSH in Docker, NAT and `tc netem` in network namespaces, on static x86_64 musl binaries; `just realnet` on a Linux box, see `docs/m1/realnet.md`); `-f suite=aarch64` builds the static aarch64 binary for the lab Pis (`docs/m1/pi.md`, `just pi-e2e`); `-f suite=all` runs all three.
 - **Signing:** the global git config SSH-signs commits. Don't disable it.
-- **The repo will go public.** Never commit secrets, IP addresses or personal data.
+- **The repo is public.** Everything pushed is world-visible, including PR branches and their commits, which GitHub keeps even after a squash merge. Never push secrets, IP addresses or personal data, not even in a work-in-progress commit.
 - **Reviews and sweeps.**
   - Every PR gets an independent review, and the review always covers **user privacy** (DESIGN.md §11.1) alongside correctness and security.
   - Every milestone ends with a whole-tree **sweep** (DESIGN.md §15): independent audits for redundancy, efficiency, user privacy, security and bugs, then fix PRs, then a verification pass.

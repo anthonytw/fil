@@ -5,9 +5,18 @@
 //! A reader task whose channel is over budget stops reading its stream, QUIC flow control then
 //! stops the peer's writer on that stream, and no other channel is affected. Once the connection
 //! budget is spent, only channels that already hold more than a small guaranteed amount are
-//! held back, so a pile of stalled forwards cannot stop the terminal or control channel. `recv` hands out control payloads first, then interactive ones in
-//! the order they arrived, with a guaranteed share for forwarded channels (the same rule as the
-//! pipe's scheduler, DESIGN.md §8.5).
+//! held back, so a pile of stalled forwards cannot stop the terminal or control channel. `recv`
+//! hands out control payloads first, then interactive ones in the order they arrived, with a
+//! guaranteed share for forwarded channels (the same rule as the pipe's scheduler, DESIGN.md
+//! §8.5).
+//!
+//! **Channels come and go.** A stream the peer finished is deregistered once `recv` has handed up
+//! its payloads, so a link that carries thousands of short forwarded connections holds only the
+//! ones still open. At most [`MAX_CHANNELS`] are registered at once: a reader takes a slot before
+//! it reads its stream and gives it back when its channel is deregistered. quinn grants the peer a
+//! new stream as soon as a reader has read a stream's end, so without the slots a peer that
+//! finishes streams faster than the consumer reads them would register channels without bound
+//! (security sweep #3).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
@@ -16,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::Bytes;
 use fil_proto::limits::DEFAULT_FORWARD_SHARE;
 use fil_proto::{ChannelClass, ChannelId};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::link::DownReason;
 
@@ -29,10 +38,15 @@ pub(super) const CHANNEL_BUDGET: usize = 256 * 1024;
 pub(super) const CONNECTION_BUDGET: usize = 16 * 1024 * 1024;
 
 /// What a channel may always hold, whatever the other channels hold. At least one maximum-size
-/// payload plus a little more, so control and the terminal keep moving. With a peer allowed 1,024
-/// streams the unread data is bounded by `CONNECTION_BUDGET + 1,024 * (CHANNEL_GUARANTEE + one
-/// payload)`, about 50 MiB, instead of 1,024 channel budgets.
+/// payload plus a little more, so control and the terminal keep moving. With at most
+/// [`MAX_CHANNELS`] registered the unread data is bounded by `CONNECTION_BUDGET + 1,024 *
+/// (CHANNEL_GUARANTEE + one payload)`, about 50 MiB, instead of 1,024 channel budgets.
 pub(super) const CHANNEL_GUARANTEE: usize = 16 * 1024;
+
+/// Most channels registered at once: the streams being read plus finished ones whose payloads
+/// `recv` has not handed up yet. The same as quinn's limit on streams open at once, so a peer
+/// within that limit never waits for a slot while the consumer keeps up.
+pub(super) const MAX_CHANNELS: usize = super::MAX_STREAMS as usize;
 
 #[derive(Default)]
 struct Queues {
@@ -53,6 +67,11 @@ struct Queues {
 struct Chan {
     queued: usize,
     wake: Arc<Notify>,
+    /// The stream has ended: nothing more will be pushed. The channel is deregistered once
+    /// `queued` is 0.
+    ended: bool,
+    /// The channel's place among the [`MAX_CHANNELS`]; given back when it is deregistered.
+    _slot: OwnedSemaphorePermit,
 }
 
 pub(super) struct Inbox {
@@ -61,6 +80,12 @@ pub(super) struct Inbox {
     ready: Notify,
     /// True once the link is down, for tasks that wait for that (`flush`).
     down: watch::Sender<bool>,
+    /// The [`MAX_CHANNELS`] places a reader takes before it reads its stream. Closed when the link
+    /// goes down, which wakes the readers waiting for one.
+    slots: Arc<Semaphore>,
+    /// Signalled when a channel is deregistered, for a later stream of the same channel that
+    /// waits for the earlier one's payloads to be handed up.
+    gone: Notify,
 }
 
 /// The link is down; this is why.
@@ -72,6 +97,8 @@ impl Inbox {
             q: Mutex::new(Queues::default()),
             ready: Notify::new(),
             down: watch::Sender::new(false),
+            slots: Arc::new(Semaphore::new(MAX_CHANNELS)),
+            gone: Notify::new(),
         }
     }
 
@@ -79,22 +106,77 @@ impl Inbox {
         self.q.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Registers the reader of `channel`'s stream. `None` if a stream for this channel was
-    /// already registered (a peer opening a second stream for one channel) or the link is down.
-    pub(super) fn register(&self, channel: ChannelId) -> Option<Arc<Notify>> {
-        let mut q = self.lock();
-        if q.closed.is_some() || q.chans.contains_key(&channel) {
-            return None;
+    /// A place for one more channel: waits while [`MAX_CHANNELS`] are registered. `None` once the
+    /// link is down.
+    pub(super) async fn slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.slots.clone().acquire_owned().await.ok()
+    }
+
+    /// [`register_parking`](Self::register_parking) for tests that have nothing to let go of.
+    #[cfg(test)]
+    pub(super) async fn register(
+        &self,
+        channel: ChannelId,
+        slot: OwnedSemaphorePermit,
+    ) -> Option<Arc<Notify>> {
+        self.register_parking(channel, slot, || {}).await
+    }
+
+    /// Registers the reader of `channel`'s stream, in the place `slot` took. `None` if the link
+    /// is down.
+    ///
+    /// If an earlier stream of the same channel is still registered (its end not read yet, or
+    /// payloads of it still waiting for `recv`), this waits until it is deregistered, so the
+    /// channel's payloads stay in order. A correct peer opens a later stream for a channel only
+    /// after it finished the earlier one (`Link::finish`); one that opens two at once stalls
+    /// only the second, which holds one of its own streams and nothing else.
+    ///
+    /// `on_park` is called each time before it waits (the reader lets go of quinn's buffer there).
+    pub(super) async fn register_parking(
+        &self,
+        channel: ChannelId,
+        slot: OwnedSemaphorePermit,
+        mut on_park: impl FnMut(),
+    ) -> Option<Arc<Notify>> {
+        loop {
+            // Register for the next deregistration before looking, so none is missed.
+            let gone = self.gone.notified();
+            tokio::pin!(gone);
+            gone.as_mut().enable();
+            {
+                let mut q = self.lock();
+                if q.closed.is_some() {
+                    return None;
+                }
+                if let std::collections::hash_map::Entry::Vacant(e) = q.chans.entry(channel) {
+                    let wake = Arc::new(Notify::new());
+                    e.insert(Chan {
+                        queued: 0,
+                        wake: wake.clone(),
+                        ended: false,
+                        _slot: slot,
+                    });
+                    return Some(wake);
+                }
+            }
+            on_park();
+            gone.await;
         }
-        let wake = Arc::new(Notify::new());
-        q.chans.insert(
-            channel,
-            Chan {
-                queued: 0,
-                wake: wake.clone(),
-            },
-        );
-        Some(wake)
+    }
+
+    /// The reader of `channel`'s stream is done (the stream ended, cleanly or not). The channel
+    /// is deregistered once `recv` has handed up what it holds.
+    pub(super) fn end(&self, channel: ChannelId) {
+        let mut q = self.lock();
+        let Some(chan) = q.chans.get_mut(&channel) else {
+            return;
+        };
+        chan.ended = true;
+        if chan.queued == 0 {
+            q.chans.remove(&channel);
+            drop(q);
+            self.gone.notify_waiters();
+        }
     }
 
     /// Adds a payload, waiting while the channel is over budget. `wake` is what `register`
@@ -175,6 +257,12 @@ impl Inbox {
             if was_over_total && was_held && chan.queued < CHANNEL_GUARANTEE {
                 chan.wake.notify_one();
             }
+            // The last payload of a stream that ended: the channel's place is free again.
+            let deregistered = chan.ended && chan.queued == 0;
+            if deregistered {
+                q.chans.remove(channel);
+                self.gone.notify_waiters();
+            }
             if was_over_total && q.total < CONNECTION_BUDGET {
                 // Readers parked on the connection budget may go on.
                 for chan in q.chans.values() {
@@ -210,6 +298,8 @@ impl Inbox {
             chan.wake.notify_one();
         }
         drop(q);
+        self.slots.close();
+        self.gone.notify_waiters();
         self.down.send_replace(true);
         self.ready.notify_one();
     }
@@ -226,6 +316,12 @@ impl Inbox {
 
     pub(super) fn down_reason(&self) -> Option<DownReason> {
         self.lock().closed.clone()
+    }
+
+    /// Channels registered now.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn channels(&self) -> usize {
+        self.lock().chans.len()
     }
 }
 
@@ -276,6 +372,11 @@ mod tests {
         inbox.push(ChannelId(ch), b(n), wake).await.ok().unwrap();
     }
 
+    async fn reg(inbox: &Inbox, ch: u32) -> Arc<Notify> {
+        let slot = inbox.slot().await.unwrap();
+        inbox.register(ChannelId(ch), slot).await.unwrap()
+    }
+
     fn pop_ch(inbox: &Inbox) -> Option<u32> {
         inbox.try_pop().ok().flatten().map(|(c, _)| c.0)
     }
@@ -283,10 +384,10 @@ mod tests {
     #[tokio::test]
     async fn control_first_then_interactive_in_arrival_order() {
         let inbox = Inbox::new();
-        let w: Vec<_> = [16, 2, 1, 0]
-            .iter()
-            .map(|c| inbox.register(ChannelId(*c)).unwrap())
-            .collect();
+        let mut w = Vec::new();
+        for c in [16, 2, 1, 0] {
+            w.push(reg(&inbox, c).await);
+        }
         push(&inbox, &w[0], 16, 10).await;
         push(&inbox, &w[1], 2, 10).await;
         push(&inbox, &w[2], 1, 10).await;
@@ -300,9 +401,9 @@ mod tests {
     #[tokio::test]
     async fn forward_channels_get_their_share_and_take_turns() {
         let inbox = Inbox::new();
-        let t = inbox.register(ChannelId(1)).unwrap();
-        let f1 = inbox.register(ChannelId(16)).unwrap();
-        let f2 = inbox.register(ChannelId(17)).unwrap();
+        let t = reg(&inbox, 1).await;
+        let f1 = reg(&inbox, 16).await;
+        let f2 = reg(&inbox, 17).await;
         for _ in 0..30 {
             push(&inbox, &t, 1, 10).await;
         }
@@ -320,8 +421,8 @@ mod tests {
     #[tokio::test]
     async fn a_full_channel_blocks_only_its_own_reader() {
         let inbox = Arc::new(Inbox::new());
-        let fwd = inbox.register(ChannelId(16)).unwrap();
-        let term = inbox.register(ChannelId(1)).unwrap();
+        let fwd = reg(&inbox, 16).await;
+        let term = reg(&inbox, 1).await;
         // Fill the forward channel to its budget.
         while inbox.lock().chans[&ChannelId(16)].queued < CHANNEL_BUDGET {
             push(&inbox, &fwd, 16, 16 * 1024).await;
@@ -346,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_is_told_before_it_parks() {
         let inbox = Arc::new(Inbox::new());
-        let fwd = inbox.register(ChannelId(16)).unwrap();
+        let fwd = reg(&inbox, 16).await;
         let parked = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = |parked: &Arc<std::sync::atomic::AtomicU32>| {
             let parked = parked.clone();
@@ -379,15 +480,12 @@ mod tests {
     #[tokio::test]
     async fn close_returns_queued_payloads_first() {
         let inbox = Inbox::new();
-        let w = inbox.register(ChannelId(1)).unwrap();
+        let w = reg(&inbox, 1).await;
         push(&inbox, &w, 1, 4).await;
         inbox.close(DownReason::Closed);
         assert!(inbox.recv().await.is_ok());
         assert!(inbox.recv().await.is_err());
-        assert!(
-            inbox.register(ChannelId(2)).is_none(),
-            "no new streams after close"
-        );
+        assert!(inbox.slot().await.is_none(), "no new streams after close");
     }
 
     /// The round-robin cursor used to compute `ChannelId(c.0 + 1)`, which overflows (and panics
@@ -395,8 +493,8 @@ mod tests {
     #[tokio::test]
     async fn the_highest_channel_id_does_not_overflow_the_round_robin() {
         let inbox = Inbox::new();
-        let top = inbox.register(ChannelId(u32::MAX)).unwrap();
-        let low = inbox.register(ChannelId(16)).unwrap();
+        let top = reg(&inbox, u32::MAX).await;
+        let low = reg(&inbox, 16).await;
         for _ in 0..2 {
             push(&inbox, &top, u32::MAX, 10).await;
             push(&inbox, &low, 16, 10).await;
@@ -405,18 +503,89 @@ mod tests {
         assert_eq!(order, [16, u32::MAX, 16, u32::MAX]);
     }
 
-    #[test]
-    fn a_second_stream_for_one_channel_is_refused() {
+    /// A finished stream's channel goes once its payloads are handed up, and gives its place
+    /// back; one with nothing waiting goes at once.
+    #[tokio::test]
+    async fn an_ended_channel_is_deregistered_once_drained() {
         let inbox = Inbox::new();
-        assert!(inbox.register(ChannelId(5)).is_some());
-        assert!(inbox.register(ChannelId(5)).is_none());
+        let w = reg(&inbox, 16).await;
+        push(&inbox, &w, 16, 10).await;
+        push(&inbox, &w, 16, 10).await;
+        inbox.end(ChannelId(16));
+        assert_eq!(inbox.channels(), 1, "payloads still wait");
+        assert_eq!(pop_ch(&inbox), Some(16));
+        assert_eq!(inbox.channels(), 1);
+        assert_eq!(pop_ch(&inbox), Some(16));
+        assert_eq!(inbox.channels(), 0);
+        assert_eq!(inbox.slots.available_permits(), MAX_CHANNELS);
+
+        let _w = reg(&inbox, 17).await;
+        inbox.end(ChannelId(17));
+        assert_eq!(inbox.channels(), 0);
+        inbox.end(ChannelId(17)); // a second end is harmless
+    }
+
+    /// A later stream for a channel is read after the earlier one is gone, so the channel's
+    /// payloads stay in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_stream_for_a_channel_waits_for_the_earlier_one() {
+        use std::time::Duration;
+        let inbox = Arc::new(Inbox::new());
+        let first = reg(&inbox, 5).await;
+        push(&inbox, &first, 5, 1).await;
+        let second = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { reg(&inbox, 5).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!second.is_finished(), "registered beside a live stream");
+        inbox.end(ChannelId(5));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !second.is_finished(),
+            "registered before the payloads were handed up"
+        );
+        assert_eq!(pop_ch(&inbox), Some(5));
+        let w = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("registered once the first was gone")
+            .unwrap();
+        push(&inbox, &w, 5, 2).await;
+        assert_eq!(pop_ch(&inbox), Some(5));
+    }
+
+    /// No more than `MAX_CHANNELS` are registered: the next reader waits for a place, and gets
+    /// one when a channel goes.
+    #[tokio::test(start_paused = true)]
+    async fn registered_channels_are_capped() {
+        use std::time::Duration;
+        let inbox = Arc::new(Inbox::new());
+        for ch in 0..MAX_CHANNELS as u32 {
+            let w = reg(&inbox, 100 + ch).await;
+            push(&inbox, &w, 100 + ch, 1).await;
+            inbox.end(ChannelId(100 + ch));
+        }
+        assert_eq!(inbox.channels(), MAX_CHANNELS);
+        let next = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.slot().await.is_some() })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!next.is_finished(), "a place past the cap");
+        assert!(pop_ch(&inbox).is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), next)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_channel_parked_by_the_connection_cap_wakes_when_it_drains() {
         use std::time::Duration;
         let inbox = Arc::new(Inbox::new());
-        let term = inbox.register(ChannelId(1)).unwrap();
+        let term = reg(&inbox, 1).await;
         // The terminal holds 64 KiB (the connection is far from its cap, so this is allowed).
         for _ in 0..4 {
             push(&inbox, &term, 1, 16 * 1024).await;
@@ -426,7 +595,7 @@ mod tests {
         // (Well past it, so that reading the terminal's backlog does not by itself bring the
         // connection back under the budget.)
         while inbox.unread_bytes() < CONNECTION_BUDGET + 512 * 1024 {
-            let wake = inbox.register(ChannelId(ch)).unwrap();
+            let wake = reg(&inbox, ch).await;
             while tokio::time::timeout(
                 Duration::from_millis(1),
                 inbox.push(ChannelId(ch), b(16 * 1024), &wake),

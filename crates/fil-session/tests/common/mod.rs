@@ -222,6 +222,7 @@ impl Client {
             host: c.host.parse().unwrap(),
             key: c.key,
             echo_ack: c.echo_ack,
+            agent: false,
             resume: c.resume,
         };
         let h = h.clone();
@@ -331,6 +332,10 @@ impl Link for DelayLink {
         }
         self.inner.flush().await
     }
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }

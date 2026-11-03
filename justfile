@@ -4,6 +4,10 @@
 # just ci` checks against the cached database instead: that is NOT a merge pass (CLAUDE.md § Delivery).
 deny_flags := env("FIL_DENY_FLAGS", "")
 
+# Where cargo puts its output. The recipes that run a built binary use this, so they work under
+# `just vm-run` (docs/dev/vm.md), which gives each worktree its own CARGO_TARGET_DIR.
+target_dir := if env("CARGO_TARGET_DIR", "") == "" { source_directory() / "target" } else { env("CARGO_TARGET_DIR") }
+
 default:
     @just --list
 
@@ -55,6 +59,11 @@ deny:
 netsim-soak:
     cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak
 
+# The MUX model (crates/fil-proto/tests/mux_model.rs: both ends over a reordering, dropping link)
+# over many seeds, in release. Not part of `ci`, which runs a few. MUX_SEED_BASE moves the range.
+mux-soak seeds="5000":
+    MUX_SEEDS={{seeds}} cargo test --release -p fil-proto --test mux_model -- --nocapture
+
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
     cargo run -q -p fil-term --example fixtures
@@ -101,6 +110,7 @@ client-pty:
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh`, `udp` or `sysd`; add scenario names to narrow.
+# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
 realnet *args:
     tests/realnet/run.sh {{args}}
 
@@ -146,12 +156,12 @@ local transport="pipe" session=("local-" + transport):
     mkdir -p target/local
     config=target/local/config-{{transport}}.toml
     {
-      printf '[defaults]\ntransport = "%s"\npipe = ["%s/target/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{source_directory()}}"
+      printf '[defaults]\ntransport = "%s"\npipe = ["%s/debug/fil", "server", "--stdio"]\n' "{{transport}}" "{{target_dir}}"
       if [ "{{transport}}" != pipe ]; then
         printf '[defaults.direct]\naddress = "127.0.0.1"\n'
       fi
     } > "$config"
-    exec target/debug/fil --config "$config" localhost "{{session}}"
+    exec "{{target_dir}}/debug/fil" --config "$config" localhost "{{session}}"
 
 # M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
@@ -160,8 +170,8 @@ local transport="pipe" session=("local-" + transport):
 pi-e2e *args:
     cargo build --release -p fil --bins
     cargo build --release -p fil --example pi_e2e
-    just no-test-hooks target/release/fil
-    target/release/examples/pi_e2e {{args}}
+    just no-test-hooks "{{target_dir}}/release/fil"
+    "{{target_dir}}/release/examples/pi_e2e" {{args}}
 
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
@@ -173,8 +183,8 @@ dropin *args:
     cargo build -q --release -p fil --bins
     cargo build -q --release -p fil --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
-    just no-test-hooks target/release/fil target/release/fil-daemon-dev
-    target/release/examples/dropin {{args}}
+    just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
+    "{{target_dir}}/release/examples/dropin" {{args}}
 
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil
@@ -185,8 +195,17 @@ no-test-hooks +binaries:
     #!/usr/bin/env bash
     set -euo pipefail
     for b in {{binaries}}; do
-      if grep -aq 'FIL_TEST_' "$b"; then
-        echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
-        exit 1
-      fi
+      # A missing binary must fail, not pass: grep reports it as an error (status 2), which an
+      # `if grep` would read as "no hooks found".
+      [[ -f $b && -r $b ]] || { echo "no-test-hooks: $b is missing or unreadable (build it first)" >&2; exit 1; }
+      rc=0
+      grep -aq 'FIL_TEST_' "$b" || rc=$?
+      case $rc in
+        0)
+          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
+          exit 1
+          ;;
+        1) ;;
+        *) echo "no-test-hooks: could not read $b (grep status $rc)" >&2; exit 1 ;;
+      esac
     done

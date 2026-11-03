@@ -1138,7 +1138,9 @@ mod tests {
             .open(&path)
             .unwrap();
         let old = old_header(SystemTime::now(), 8 * DAY);
-        write!(f, "{old}typed eight days ago").unwrap();
+        // One write, so the tick cannot catch the header without the text after it.
+        f.write_all(format!("{old}typed eight days ago").as_bytes())
+            .unwrap();
         drop(f);
         for _ in 0..500 {
             if twin.exists() {
@@ -1146,11 +1148,17 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A rotation is a rename and then a create, both under the directory's lock, so for
+        // an instant the twin exists and the log does not. Anything that looks at the pair
+        // takes the lock first, as every client does; by the time it has it, the rotation is
+        // whole.
+        let held = LogDir::open(&path).unwrap().lock().ok().flatten();
         assert!(
             std::fs::read_to_string(&twin).is_ok_and(|t| t.contains("eight days ago")),
             "the tick did not rotate the old log"
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+        drop(held);
         drop(sink);
         std::fs::remove_dir_all(dir).unwrap();
     }

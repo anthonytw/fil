@@ -14,8 +14,12 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use std::net::IpAddr;
+use std::num::NonZeroU16;
+
 use crate::frame::{ChannelId, Frame};
 use crate::limits::*;
+use crate::mux::{ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState, Origin};
 use crate::version::WireVersion;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -155,6 +159,82 @@ validated_string!(
     "agent",
     check_agent
 );
+
+fn check_process_name(s: &str) -> Result<(), &'static str> {
+    if s.len() > MAX_PROCESS_NAME {
+        return Err("longer than 32 bytes");
+    }
+    Ok(())
+}
+
+fn check_ports_path(s: &str) -> Result<(), &'static str> {
+    if s.len() > MAX_PORTS_PATH {
+        return Err("longer than 128 bytes");
+    }
+    Ok(())
+}
+
+fn check_probe_label(s: &str) -> Result<(), &'static str> {
+    if s.len() > MAX_PROBE_LABEL {
+        return Err("longer than 64 bytes");
+    }
+    Ok(())
+}
+
+// The `fil ports` strings come from processes on the remote host, which may name themselves
+// anything. They are capped, and otherwise not checked: refusing control characters here would
+// let any local process make the whole answer undecodable. The client sanitizes them before
+// showing them (`crate::text`), always.
+validated_string!(
+    /// A process name (`comm`) in a `fil ports` row: at most 32 bytes. Untrusted text.
+    ProcessName,
+    "process name",
+    check_process_name
+);
+validated_string!(
+    /// A working directory in a `fil ports` row (`~` for home): at most 128 bytes. Untrusted
+    /// text.
+    PortsPath,
+    "path",
+    check_ports_path
+);
+validated_string!(
+    /// What a protocol probe found (an HTTP `Server` header or title): at most 64 bytes.
+    /// Untrusted text.
+    ProbeLabel,
+    "probe label",
+    check_probe_label
+);
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary: how
+/// the daemon cuts a `fil ports` string to its cap.
+pub fn cut_to(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+impl ProcessName {
+    /// `s` cut to the cap.
+    pub fn capped(s: &str) -> Self {
+        Self(cut_to(s, MAX_PROCESS_NAME).to_string())
+    }
+}
+impl PortsPath {
+    pub fn capped(s: &str) -> Self {
+        Self(cut_to(s, MAX_PORTS_PATH).to_string())
+    }
+}
+impl ProbeLabel {
+    pub fn capped(s: &str) -> Self {
+        Self(cut_to(s, MAX_PROBE_LABEL).to_string())
+    }
+}
 
 /// Opaque bytes of at most `N`. The protocol crate does not interpret keys or fingerprints.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -352,6 +432,38 @@ pub struct Attach {
     /// The client predicts (DESIGN.md section 9) and wants `EchoAck`s. Without it the daemon sends
     /// none: they cost a frame, a timer and a termios read per keystroke for nothing.
     pub echo_ack: bool,
+    /// This client relays its agent (DESIGN.md section 10): the session's agent socket exists
+    /// only while such a subscriber holds the session.
+    pub agent: bool,
+}
+
+/// How a session's shell ended, as in [`ControlMsg::SessionExited`]: exactly one field is set
+/// when the status is known.
+///
+/// Both set does not decode. Neither set is an ending whose status is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    try_from = "(Option<i32>, Option<i32>)",
+    into = "(Option<i32>, Option<i32>)"
+)]
+pub struct ExitStatus {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl TryFrom<(Option<i32>, Option<i32>)> for ExitStatus {
+    type Error = MsgError;
+    fn try_from((code, signal): (Option<i32>, Option<i32>)) -> Result<Self, MsgError> {
+        if code.is_some() && signal.is_some() {
+            return Err(invalid("exit status", "both a code and a signal"));
+        }
+        Ok(Self { code, signal })
+    }
+}
+impl From<ExitStatus> for (Option<i32>, Option<i32>) {
+    fn from(e: ExitStatus) -> Self {
+        (e.code, e.signal)
+    }
 }
 
 /// Why a snapshot is sent instead of a replay.
@@ -420,8 +532,9 @@ pub enum AttachRefusal {
     TakenOver(TakenOver),
     /// The session was detached since; attach afresh.
     Detached,
-    /// The session no longer exists.
-    SessionGone,
+    /// The session no longer exists. `exit` is how it ended, if the daemon still remembers it
+    /// (its tombstone), for a client that missed `SessionExited`.
+    SessionGone { exit: Option<ExitStatus> },
     /// The resume request makes no sense (an epoch from the future).
     BadResume,
     /// The session was killed and recreated (or the daemon restarted) since the client attached.
@@ -450,6 +563,10 @@ pub struct SessionSummary {
     pub last_output_unix_ms: u64,
     /// `None` when detached.
     pub attached: Option<SubscriberSummary>,
+    /// Entries in the session's forward table.
+    pub forwards: u16,
+    /// The agent is relayed (the subscriber asked for it).
+    pub agent: bool,
 }
 
 /// Session management (`fil ls`, `fil kill`, `fil detach`). The remote command is fixed
@@ -467,6 +584,34 @@ pub enum Request {
     DetachSession {
         name: SessionName,
     },
+    /// `fil forward`: add to or remove from a session's forward table. The forward has
+    /// `Origin::Request`: the daemon cannot tell who asked, so the attached client asks its
+    /// user (DESIGN.md section 7.3).
+    Forward {
+        session: SessionName,
+        op: ForwardOp,
+    },
+    /// `fil ports`: one session, or all of them.
+    Ports {
+        session: Option<SessionName>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardOp {
+    Add(ForwardSpec),
+    /// `fil forward --rm [KIND] PORT`: without a kind, the one forward on that port.
+    Remove {
+        kind: Option<ForwardKind>,
+        port: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardResult {
+    Added(ForwardId),
+    Removed(ForwardId),
+    Refused(ForwardRefusal),
 }
 
 /// A daemon of another wire revision, running next to the one that answers (DESIGN.md section
@@ -512,17 +657,133 @@ pub enum Response {
     },
     Done,
     NoSuchSession,
+    Forward(ForwardResult),
+    /// One part of a `fil ports` answer; `more` is set on every part but the last. See
+    /// [`Response::ports`].
+    Ports {
+        part: PortsPart,
+        more: bool,
+    },
 }
 
-/// Reads `others`, refusing a list longer than [`MAX_OTHER_DAEMONS`] as soon as it is seen to be:
-/// the sender caps it, and a receiver does not rely on that (a hostile daemon could otherwise make
-/// `fil ls` print a line per entry that fits in a control message).
-fn capped_others<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OtherDaemon>, D::Error> {
-    struct Capped;
-    impl<'de> serde::de::Visitor<'de> for Capped {
-        type Value = Vec<OtherDaemon>;
+/// Rows of a `fil ports` answer (DESIGN.md section 7.4). A part is at most one control message
+/// and [`MAX_PORTS_ROWS`] rows; an answer is at most [`MAX_PORTS_ROWS`] rows over all its parts,
+/// and a receiver stops collecting there. Every string in it is untrusted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortsPart {
+    #[serde(deserialize_with = "capped_rows")]
+    pub rows: Vec<PortsRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PortsRow {
+    /// A session the rows that follow it belong to.
+    Session(SessionSummary),
+    Forward(ForwardRow),
+    Listener(ListenerRow),
+    /// The session's agent relay, while it is on.
+    Agent(AgentRow),
+}
+
+/// One forward of a session's table, with its state and traffic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRow {
+    pub session: SessionName,
+    pub id: ForwardId,
+    pub spec: ForwardSpec,
+    pub origin: Origin,
+    /// What the binder last reported; `None` before any report (an `-L` with no client).
+    pub listen: Option<ListenState>,
+    /// The client consented to a management-origin entry (always true for `Origin::Client`).
+    pub consented: bool,
+    pub conns: u32,
+    /// Connections waiting for a link (accepted while disconnected).
+    pub waiting: u32,
+    /// Bytes toward the client machine, and toward the remote.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    /// Milliseconds since the Unix epoch of the last traffic; 0 if none.
+    pub last_unix_ms: u64,
+    /// The process listening on the target on the remote host (`-L`), if it is the user's.
+    pub owner: Option<ProcessInfo>,
+    pub probe: Option<Probe>,
+}
+
+/// A TCP listener on the remote host that no forward owns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerRow {
+    pub addr: IpAddr,
+    pub port: NonZeroU16,
+    pub owner: ListenerOwner,
+    /// Milliseconds since the Unix epoch the listener was first seen; 0 if unknown.
+    pub since_unix_ms: u64,
+    pub probe: Option<Probe>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListenerOwner {
+    /// One of the user's processes, started in `session`.
+    Session {
+        session: SessionName,
+        process: ProcessInfo,
+    },
+    /// One of the user's processes, not started from a fil session (`None`: it could not be
+    /// attributed).
+    Mine(Option<ProcessInfo>),
+    /// Another user's: port and address only (fil cannot, and does not, read their processes).
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: ProcessName,
+    pub cwd: Option<PortsPath>,
+}
+
+/// What the light protocol probe found on a listener (loopback, the user's own, on demand).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probe {
+    pub kind: ProbeKind,
+    pub label: Option<ProbeLabel>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeKind {
+    Tls,
+    Http {
+        status: u16,
+    },
+    Postgres,
+    Redis,
+    /// It accepted and said nothing recognisable.
+    Unknown,
+}
+
+/// The agent relay of a session: counts only (fingerprints live on the client).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRow {
+    pub session: SessionName,
+    pub conns: u32,
+    pub requests: u64,
+    pub last_unix_ms: u64,
+}
+
+/// Reads a list, refusing it once it is seen to be longer than `max`, before reading the rest.
+fn capped_seq<'de, D, T>(d: D, max: usize, what: &'static str) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Capped<T> {
+        max: usize,
+        what: &'static str,
+        _t: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Capped<T> {
+        type Value = Vec<T>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "at most {MAX_OTHER_DAEMONS} daemons")
+            write!(f, "at most {} {}", self.max, self.what)
         }
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
             self,
@@ -530,15 +791,30 @@ fn capped_others<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OtherDaemon>, D:
         ) -> Result<Self::Value, A::Error> {
             let mut v = Vec::new();
             while let Some(one) = seq.next_element()? {
-                if v.len() == MAX_OTHER_DAEMONS {
-                    return Err(serde::de::Error::custom("too many other daemons"));
+                if v.len() == self.max {
+                    return Err(serde::de::Error::custom("list too long"));
                 }
                 v.push(one);
             }
             Ok(v)
         }
     }
-    d.deserialize_seq(Capped)
+    d.deserialize_seq(Capped {
+        max,
+        what,
+        _t: std::marker::PhantomData,
+    })
+}
+
+fn capped_rows<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PortsRow>, D::Error> {
+    capped_seq(d, MAX_PORTS_ROWS, "rows")
+}
+
+/// Reads `others`, refusing a list longer than [`MAX_OTHER_DAEMONS`] as soon as it is seen to be:
+/// the sender caps it, and a receiver does not rely on that (a hostile daemon could otherwise make
+/// `fil ls` print a line per entry that fits in a control message).
+fn capped_others<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OtherDaemon>, D::Error> {
+    capped_seq(d, MAX_OTHER_DAEMONS, "daemons")
 }
 
 impl Response {
@@ -560,6 +836,51 @@ impl Response {
             truncated = true;
         }
     }
+
+    /// A `fil ports` answer in parts: `rows` cut to [`MAX_PORTS_ROWS`], each part as many rows
+    /// as fit in one control message (in order), `more` on all but the last. Always at least one
+    /// part.
+    pub fn ports(mut rows: Vec<PortsRow>) -> Vec<Response> {
+        rows.truncate(MAX_PORTS_ROWS);
+        let mut parts = Vec::new();
+        let mut part: Vec<PortsRow> = Vec::new();
+        let fits = |rows: &[PortsRow]| {
+            ControlMsg::Response(Response::Ports {
+                part: PortsPart {
+                    rows: rows.to_vec(),
+                },
+                more: true,
+            })
+            .encode()
+            .is_ok()
+        };
+        for row in rows {
+            part.push(row);
+            if !fits(&part) {
+                let row = part.pop().expect("just pushed");
+                if !part.is_empty() {
+                    parts.push(std::mem::take(&mut part));
+                }
+                part.push(row);
+                if !fits(&part) {
+                    // One row that cannot fit alone (not possible with the string caps): drop it.
+                    part.clear();
+                }
+            }
+        }
+        if !part.is_empty() || parts.is_empty() {
+            parts.push(part);
+        }
+        let n = parts.len();
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, rows)| Response::Ports {
+                part: PortsPart { rows },
+                more: i + 1 < n,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +898,10 @@ pub enum ErrorCode {
     /// a start that timed out). The details are in the daemon's log.
     SessionStartFailed,
 }
+
+/// No values: the payload of a retired [`ControlMsg`] slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Retired {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
@@ -606,11 +931,10 @@ pub enum ControlMsg {
     },
     /// Mid-stream catch-up jump (DESIGN.md section 6.2): a snapshot follows on the snapshot channel.
     Snapshot(SnapshotInfo),
-    /// A channel cannot continue; the receiver should drop it.
-    Reset {
-        channel: ChannelId,
-        code: ErrorCode,
-    },
+    /// Index 10 was `Reset { channel, code }` until revision 4, when the close of a dynamic
+    /// channel moved to the MUX channel (`crate::mux`). The slot stays so that `Error` keeps its
+    /// frozen index 11. [`Retired`] has no values: this variant can be neither built nor decoded.
+    Retired(Retired),
     /// Frozen at index 11 within a protocol major (see [`ErrorCode::VersionMismatch`]).
     Error(ErrorCode),
     /// Daemon to client: the PTY's line discipline changed (DESIGN.md section 9). Takes effect at
@@ -710,6 +1034,7 @@ mod tests {
             host: "laptop".parse().unwrap(),
             key: PublicKey::new(vec![7; 32]).unwrap(),
             echo_ack: false,
+            agent: false,
             resume: None,
         });
         let wire = good.encode().unwrap();
@@ -852,6 +1177,8 @@ mod tests {
                         host: "laptop".parse().unwrap(),
                         since_unix_ms: 3,
                     }),
+                    forwards: 2,
+                    agent: true,
                 }],
                 vec![OtherDaemon {
                     major: 1,
@@ -872,10 +1199,6 @@ mod tests {
                 received: 12,
             },
             ControlMsg::Snapshot(snap),
-            ControlMsg::Reset {
-                channel: ChannelId(17),
-                code: ErrorCode::ResumeGone,
-            },
             ControlMsg::Error(ErrorCode::VersionMismatch),
         ];
         for m in msgs {
@@ -949,6 +1272,8 @@ mod tests {
                 host: "a-fairly-long-host-label.example".parse().unwrap(),
                 since_unix_ms: u64::MAX,
             }),
+            forwards: u16::MAX,
+            agent: true,
         };
         let r = Response::sessions((0..500).map(one).collect(), Vec::new());
         let Response::Sessions {

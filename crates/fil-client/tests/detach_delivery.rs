@@ -112,6 +112,8 @@ impl Link for SlowLink {
         }
     }
 
+    fn finish(&self, _channel: ChannelId) {}
+
     fn close(&self) {
         if let Some(p) = self.pump.lock().unwrap().take() {
             p.abort();

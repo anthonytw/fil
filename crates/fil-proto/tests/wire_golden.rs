@@ -38,8 +38,15 @@ use fil_proto::frame::{ChannelId, DataSegment, Frame, FrameDecoder};
 use fil_proto::input::{InputRecord, RECORD_MARK, TerminalInput};
 use fil_proto::limits::*;
 use fil_proto::msg::*;
+use fil_proto::mux::{
+    BindAddr, BindFailure, CloseReason, DnsName, ForwardId, ForwardKind, ForwardRefusal,
+    ForwardSpec, ListenState, MuxMsg, OpenFailure, OpenKind, Origin, Target, TargetHost, Window,
+    encode_record,
+};
 use fil_proto::opening;
 use fil_proto::preamble;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU16;
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire.txt");
 
@@ -121,7 +128,12 @@ fn refusals() -> Vec<AttachRefusal> {
     let all = vec![
         AttachRefusal::TakenOver(taken_over()),
         AttachRefusal::Detached,
-        AttachRefusal::SessionGone,
+        AttachRefusal::SessionGone {
+            exit: Some(ExitStatus {
+                code: Some(0),
+                signal: None,
+            }),
+        },
         AttachRefusal::BadResume,
         AttachRefusal::SessionReplaced,
         AttachRefusal::WrongKey,
@@ -130,7 +142,7 @@ fn refusals() -> Vec<AttachRefusal> {
         match c {
             AttachRefusal::TakenOver(_)
             | AttachRefusal::Detached
-            | AttachRefusal::SessionGone
+            | AttachRefusal::SessionGone { .. }
             | AttachRefusal::BadResume
             | AttachRefusal::SessionReplaced
             | AttachRefusal::WrongKey => {}
@@ -159,14 +171,680 @@ fn requests() -> Vec<Request> {
             name: name("build"),
         },
         Request::DetachSession { name: name("main") },
+        Request::Forward {
+            session: name("main"),
+            op: ForwardOp::Add(spec_local()),
+        },
+        Request::Forward {
+            session: name("main"),
+            op: ForwardOp::Remove {
+                kind: Some(ForwardKind::Remote),
+                port: 9000,
+            },
+        },
+        Request::Forward {
+            session: name("main"),
+            op: ForwardOp::Remove {
+                kind: None,
+                port: 5173,
+            },
+        },
+        Request::Ports { session: None },
+        Request::Ports {
+            session: Some(name("main")),
+        },
     ];
     for c in &all {
         match c {
-            Request::ListSessions | Request::KillSession { .. } | Request::DetachSession { .. } => {
-            }
+            Request::ListSessions
+            | Request::KillSession { .. }
+            | Request::DetachSession { .. }
+            | Request::Forward { .. }
+            | Request::Ports { .. } => {}
         }
     }
     all
+}
+
+// ---- forwards (fil_proto::mux) ----------------------------------------------------------------
+
+fn port(p: u16) -> NonZeroU16 {
+    NonZeroU16::new(p).unwrap()
+}
+
+fn spec_local() -> ForwardSpec {
+    ForwardSpec::new(
+        ForwardKind::Local,
+        BindAddr::Loopback,
+        5173,
+        Some(Target {
+            host: TargetHost::Name("localhost".parse().unwrap()),
+            port: port(5173),
+        }),
+    )
+    .unwrap()
+}
+
+/// The longest DNS name: four labels, 253 bytes.
+fn longest_name() -> DnsName {
+    let l = "a".repeat(63);
+    DnsName::new(format!("{l}.{l}.{l}.{}", "b".repeat(61))).unwrap()
+}
+
+/// Every field of a spec at its widest: an IPv6 bind, the longest name, the top port.
+fn spec_widest() -> ForwardSpec {
+    ForwardSpec::new(
+        ForwardKind::Remote,
+        BindAddr::Ip(IpAddr::V6(Ipv6Addr::new(
+            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        ))),
+        u16::MAX,
+        Some(Target {
+            host: TargetHost::Name(longest_name()),
+            port: port(u16::MAX),
+        }),
+    )
+    .unwrap()
+}
+
+fn forward_kinds() -> Vec<ForwardKind> {
+    let all = vec![
+        ForwardKind::Local,
+        ForwardKind::Remote,
+        ForwardKind::Dynamic,
+    ];
+    for c in &all {
+        match c {
+            ForwardKind::Local | ForwardKind::Remote | ForwardKind::Dynamic => {}
+        }
+    }
+    all
+}
+
+fn bind_addrs() -> Vec<BindAddr> {
+    let all = vec![
+        BindAddr::Loopback,
+        BindAddr::Any,
+        BindAddr::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+        BindAddr::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    ];
+    for c in &all {
+        match c {
+            BindAddr::Loopback | BindAddr::Any | BindAddr::Ip(_) => {}
+        }
+    }
+    all
+}
+
+fn target_hosts() -> Vec<TargetHost> {
+    let all = vec![
+        TargetHost::Ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+        TargetHost::Ip(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        TargetHost::Name("db.example.com".parse().unwrap()),
+    ];
+    for c in &all {
+        match c {
+            TargetHost::Ip(_) | TargetHost::Name(_) => {}
+        }
+    }
+    all
+}
+
+fn origins() -> Vec<Origin> {
+    let all = vec![Origin::Client, Origin::Request];
+    for c in &all {
+        match c {
+            Origin::Client | Origin::Request => {}
+        }
+    }
+    all
+}
+
+fn bind_failures() -> Vec<BindFailure> {
+    let all = vec![
+        BindFailure::AddrInUse,
+        BindFailure::PermissionDenied,
+        BindFailure::AddrNotAvailable,
+        BindFailure::Other,
+    ];
+    for c in &all {
+        match c {
+            BindFailure::AddrInUse
+            | BindFailure::PermissionDenied
+            | BindFailure::AddrNotAvailable
+            | BindFailure::Other => {}
+        }
+    }
+    all
+}
+
+fn listen_states() -> Vec<ListenState> {
+    let mut all = vec![ListenState::Listening { port: port(8080) }];
+    all.extend(bind_failures().into_iter().map(ListenState::Failed));
+    for c in &all {
+        match c {
+            ListenState::Listening { .. } | ListenState::Failed(_) => {}
+        }
+    }
+    all
+}
+
+fn forward_refusals() -> Vec<ForwardRefusal> {
+    let all = vec![
+        ForwardRefusal::Conflict,
+        ForwardRefusal::TooMany,
+        ForwardRefusal::BadSpec,
+        ForwardRefusal::NotPermitted,
+        ForwardRefusal::NoSuchForward,
+        ForwardRefusal::Ambiguous,
+    ];
+    for c in &all {
+        match c {
+            ForwardRefusal::Conflict
+            | ForwardRefusal::TooMany
+            | ForwardRefusal::BadSpec
+            | ForwardRefusal::NotPermitted
+            | ForwardRefusal::NoSuchForward
+            | ForwardRefusal::Ambiguous => {}
+        }
+    }
+    all
+}
+
+fn open_failures() -> Vec<OpenFailure> {
+    let all = vec![
+        OpenFailure::NoSuchForward,
+        OpenFailure::NotPermitted,
+        OpenFailure::Refused,
+        OpenFailure::Unreachable,
+        OpenFailure::NameNotFound,
+        OpenFailure::TimedOut,
+        OpenFailure::TooMany,
+        OpenFailure::Busy,
+        OpenFailure::AgentUnavailable,
+        OpenFailure::Detached,
+        OpenFailure::Other,
+    ];
+    for c in &all {
+        match c {
+            OpenFailure::NoSuchForward
+            | OpenFailure::NotPermitted
+            | OpenFailure::Refused
+            | OpenFailure::Unreachable
+            | OpenFailure::NameNotFound
+            | OpenFailure::TimedOut
+            | OpenFailure::TooMany
+            | OpenFailure::Busy
+            | OpenFailure::AgentUnavailable
+            | OpenFailure::Detached
+            | OpenFailure::Other => {}
+        }
+    }
+    all
+}
+
+fn close_reasons() -> Vec<CloseReason> {
+    let all = vec![
+        CloseReason::Done,
+        CloseReason::Reset,
+        CloseReason::TimedOut,
+        CloseReason::Removed,
+        CloseReason::ResumeGone,
+        CloseReason::Violation,
+    ];
+    for c in &all {
+        match c {
+            CloseReason::Done
+            | CloseReason::Reset
+            | CloseReason::TimedOut
+            | CloseReason::Removed
+            | CloseReason::ResumeGone
+            | CloseReason::Violation => {}
+        }
+    }
+    all
+}
+
+fn open_kinds() -> Vec<OpenKind> {
+    let all = vec![
+        OpenKind::Local {
+            forward: ForwardId(1),
+        },
+        OpenKind::Remote {
+            forward: ForwardId(2),
+        },
+        OpenKind::Dynamic {
+            forward: ForwardId(3),
+            target: Target {
+                host: TargetHost::Name("db.example.com".parse().unwrap()),
+                port: port(5432),
+            },
+        },
+        OpenKind::Agent,
+    ];
+    for c in &all {
+        match c {
+            OpenKind::Local { .. }
+            | OpenKind::Remote { .. }
+            | OpenKind::Dynamic { .. }
+            | OpenKind::Agent => {}
+        }
+    }
+    all
+}
+
+/// One canonical instance of every `MuxMsg` variant and of every variant of what it holds, then
+/// the widest of each. Encoded as records: the length varint is pinned with the message.
+fn mux_msgs() -> Vec<(String, MuxMsg)> {
+    let mut v: Vec<(String, MuxMsg)> = Vec::new();
+    let mut add = |label: String, m: MuxMsg| v.push((label, m));
+    for (i, kind) in forward_kinds().into_iter().enumerate() {
+        let (p, target) = match kind {
+            ForwardKind::Dynamic => (1080, None),
+            ForwardKind::Remote => (
+                0,
+                Some(Target {
+                    host: TargetHost::Name("localhost".parse().unwrap()),
+                    port: port(9000),
+                }),
+            ),
+            ForwardKind::Local => (
+                5173,
+                Some(Target {
+                    host: TargetHost::Name("localhost".parse().unwrap()),
+                    port: port(5173),
+                }),
+            ),
+        };
+        add(
+            format!("add-forward-kind-{i}"),
+            MuxMsg::AddForward {
+                req: 1,
+                spec: ForwardSpec::new(kind, BindAddr::Loopback, p, target).unwrap(),
+            },
+        );
+    }
+    for (i, bind) in bind_addrs().into_iter().enumerate() {
+        add(
+            format!("add-forward-bind-{i}"),
+            MuxMsg::AddForward {
+                req: 2,
+                spec: ForwardSpec::new(ForwardKind::Dynamic, bind, 1080, None).unwrap(),
+            },
+        );
+    }
+    for (i, host) in target_hosts().into_iter().enumerate() {
+        add(
+            format!("add-forward-host-{i}"),
+            MuxMsg::AddForward {
+                req: 3,
+                spec: ForwardSpec::new(
+                    ForwardKind::Local,
+                    BindAddr::Loopback,
+                    8080,
+                    Some(Target {
+                        host,
+                        port: port(80),
+                    }),
+                )
+                .unwrap(),
+            },
+        );
+    }
+    for (i, origin) in origins().into_iter().enumerate() {
+        add(
+            format!("forward-{i}"),
+            MuxMsg::Forward {
+                id: ForwardId(4),
+                spec: spec_local(),
+                origin,
+                req: if i == 0 { Some(1) } else { None },
+            },
+        );
+    }
+    for (i, why) in forward_refusals().into_iter().enumerate() {
+        add(
+            format!("forward-refused-{i}"),
+            MuxMsg::ForwardRefused { req: 5, why },
+        );
+    }
+    add(
+        "remove-forward".into(),
+        MuxMsg::RemoveForward { id: ForwardId(6) },
+    );
+    add(
+        "forward-gone".into(),
+        MuxMsg::ForwardGone { id: ForwardId(7) },
+    );
+    for (i, state) in listen_states().into_iter().enumerate() {
+        add(
+            format!("listening-{i}"),
+            MuxMsg::Listening {
+                id: ForwardId(8),
+                state,
+            },
+        );
+    }
+    add(
+        "consent-yes".into(),
+        MuxMsg::Consent {
+            id: ForwardId(9),
+            accepted: true,
+        },
+    );
+    add(
+        "consent-no".into(),
+        MuxMsg::Consent {
+            id: ForwardId(9),
+            accepted: false,
+        },
+    );
+    for (i, kind) in open_kinds().into_iter().enumerate() {
+        add(
+            format!("open-{i}"),
+            MuxMsg::Open {
+                channel: ChannelId(16 + i as u32),
+                window: Window::DEFAULT,
+                kind,
+            },
+        );
+    }
+    add(
+        "open-ok".into(),
+        MuxMsg::OpenOk {
+            channel: ChannelId(17),
+            window: Window::new(MIN_WINDOW).unwrap(),
+        },
+    );
+    for (i, why) in open_failures().into_iter().enumerate() {
+        add(
+            format!("open-failed-{i}"),
+            MuxMsg::OpenFailed {
+                channel: ChannelId(18),
+                why,
+            },
+        );
+    }
+    add(
+        "eof".into(),
+        MuxMsg::Eof {
+            channel: ChannelId(19),
+            at: 300,
+        },
+    );
+    for (i, why) in close_reasons().into_iter().enumerate() {
+        add(
+            format!("close-{i}"),
+            MuxMsg::Close {
+                channel: ChannelId(20),
+                why,
+            },
+        );
+    }
+
+    add(
+        "window".into(),
+        MuxMsg::Window {
+            channel: ChannelId(21),
+            window: Window::new(2 * MIN_WINDOW).unwrap(),
+        },
+    );
+
+    // The widest of each.
+    let max_ch = ChannelId(u32::MAX);
+    let max_id = ForwardId(u32::MAX);
+    let max_window = Window::new(MAX_WINDOW).unwrap();
+    add(
+        "max/add-forward".into(),
+        MuxMsg::AddForward {
+            req: u32::MAX,
+            spec: spec_widest(),
+        },
+    );
+    add(
+        "max/forward".into(),
+        MuxMsg::Forward {
+            id: max_id,
+            spec: spec_widest(),
+            origin: Origin::Request,
+            req: Some(u32::MAX),
+        },
+    );
+    add(
+        "max/forward-refused".into(),
+        MuxMsg::ForwardRefused {
+            req: u32::MAX,
+            why: ForwardRefusal::Ambiguous,
+        },
+    );
+    add(
+        "max/remove-forward".into(),
+        MuxMsg::RemoveForward { id: max_id },
+    );
+    add(
+        "max/forward-gone".into(),
+        MuxMsg::ForwardGone { id: max_id },
+    );
+    add(
+        "max/listening".into(),
+        MuxMsg::Listening {
+            id: max_id,
+            state: ListenState::Listening {
+                port: port(u16::MAX),
+            },
+        },
+    );
+    add(
+        "max/consent".into(),
+        MuxMsg::Consent {
+            id: max_id,
+            accepted: true,
+        },
+    );
+    add(
+        "max/open".into(),
+        MuxMsg::Open {
+            channel: max_ch,
+            window: max_window,
+            kind: OpenKind::Dynamic {
+                forward: max_id,
+                target: Target {
+                    host: TargetHost::Name(longest_name()),
+                    port: port(u16::MAX),
+                },
+            },
+        },
+    );
+    add(
+        "max/open-ok".into(),
+        MuxMsg::OpenOk {
+            channel: max_ch,
+            window: max_window,
+        },
+    );
+    add(
+        "max/open-failed".into(),
+        MuxMsg::OpenFailed {
+            channel: max_ch,
+            why: OpenFailure::Other,
+        },
+    );
+    add(
+        "max/eof".into(),
+        MuxMsg::Eof {
+            channel: max_ch,
+            at: u64::MAX,
+        },
+    );
+    add(
+        "max/close".into(),
+        MuxMsg::Close {
+            channel: max_ch,
+            why: CloseReason::Violation,
+        },
+    );
+    add(
+        "max/window".into(),
+        MuxMsg::Window {
+            channel: max_ch,
+            window: max_window,
+        },
+    );
+    for (_, m) in &v {
+        match m {
+            MuxMsg::AddForward { .. }
+            | MuxMsg::Forward { .. }
+            | MuxMsg::ForwardRefused { .. }
+            | MuxMsg::RemoveForward { .. }
+            | MuxMsg::ForwardGone { .. }
+            | MuxMsg::Listening { .. }
+            | MuxMsg::Consent { .. }
+            | MuxMsg::Open { .. }
+            | MuxMsg::OpenOk { .. }
+            | MuxMsg::OpenFailed { .. }
+            | MuxMsg::Eof { .. }
+            | MuxMsg::Close { .. }
+            | MuxMsg::Window { .. } => {}
+        }
+    }
+    v
+}
+
+fn process(name_len: usize, path_len: usize) -> ProcessInfo {
+    ProcessInfo {
+        pid: if name_len > 4 { u32::MAX } else { 41872 },
+        name: ProcessName::new("v".repeat(name_len)).unwrap(),
+        cwd: Some(PortsPath::new(format!("~/{}", "p".repeat(path_len - 2))).unwrap()),
+    }
+}
+
+fn probes() -> Vec<Probe> {
+    let all = vec![
+        Probe {
+            kind: ProbeKind::Tls,
+            label: None,
+        },
+        Probe {
+            kind: ProbeKind::Http { status: 200 },
+            label: Some(ProbeLabel::new("Vite + React").unwrap()),
+        },
+        Probe {
+            kind: ProbeKind::Postgres,
+            label: None,
+        },
+        Probe {
+            kind: ProbeKind::Redis,
+            label: None,
+        },
+        Probe {
+            kind: ProbeKind::Unknown,
+            label: None,
+        },
+    ];
+    for c in &all {
+        match c.kind {
+            ProbeKind::Tls
+            | ProbeKind::Http { .. }
+            | ProbeKind::Postgres
+            | ProbeKind::Redis
+            | ProbeKind::Unknown => {}
+        }
+    }
+    all
+}
+
+fn ports_rows() -> Vec<PortsRow> {
+    let mut rows = vec![
+        PortsRow::Session(summary()),
+        PortsRow::Forward(ForwardRow {
+            session: name("main"),
+            id: ForwardId(1),
+            spec: spec_local(),
+            origin: Origin::Client,
+            listen: Some(ListenState::Listening { port: port(5173) }),
+            consented: true,
+            conns: 2,
+            waiting: 0,
+            bytes_down: 14_000_000,
+            bytes_up: 220_000,
+            last_unix_ms: 1_700_000_000_000,
+            owner: Some(process(4, 5)),
+            probe: Some(probes()[1].clone()),
+        }),
+        PortsRow::Agent(AgentRow {
+            session: name("main"),
+            conns: 1,
+            requests: 3,
+            last_unix_ms: 9,
+        }),
+    ];
+    let owners = vec![
+        ListenerOwner::Session {
+            session: name("main"),
+            process: process(6, 6),
+        },
+        ListenerOwner::Mine(Some(process(8, 3))),
+        ListenerOwner::Mine(None),
+        ListenerOwner::Other,
+    ];
+    for o in &owners {
+        match o {
+            ListenerOwner::Session { .. } | ListenerOwner::Mine(_) | ListenerOwner::Other => {}
+        }
+    }
+    for (i, owner) in owners.into_iter().enumerate() {
+        rows.push(PortsRow::Listener(ListenerRow {
+            addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            port: port(8000 + i as u16),
+            owner,
+            since_unix_ms: 1_700_000_000_000,
+            probe: probes().get(i).cloned(),
+        }));
+    }
+    rows.push(PortsRow::Listener(ListenerRow {
+        addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        port: port(5432),
+        owner: ListenerOwner::Other,
+        since_unix_ms: 0,
+        probe: Some(probes()[4].clone()),
+    }));
+    for r in &rows {
+        match r {
+            PortsRow::Session(_)
+            | PortsRow::Forward(_)
+            | PortsRow::Listener(_)
+            | PortsRow::Agent(_) => {}
+        }
+    }
+    rows
+}
+
+/// A forward row with every field at its widest.
+fn widest_forward_row() -> PortsRow {
+    PortsRow::Forward(ForwardRow {
+        session: name(&"n".repeat(MAX_SESSION_NAME)),
+        id: ForwardId(u32::MAX),
+        spec: spec_widest(),
+        origin: Origin::Request,
+        listen: Some(ListenState::Listening {
+            port: port(u16::MAX),
+        }),
+        consented: true,
+        conns: u32::MAX,
+        waiting: u32::MAX,
+        bytes_down: u64::MAX,
+        bytes_up: u64::MAX,
+        last_unix_ms: u64::MAX,
+        owner: Some(ProcessInfo {
+            pid: u32::MAX,
+            name: ProcessName::new("v".repeat(MAX_PROCESS_NAME)).unwrap(),
+            cwd: Some(PortsPath::new("p".repeat(MAX_PORTS_PATH)).unwrap()),
+        }),
+        probe: Some(Probe {
+            kind: ProbeKind::Http { status: u16::MAX },
+            label: Some(ProbeLabel::new("l".repeat(MAX_PROBE_LABEL)).unwrap()),
+        }),
+    })
 }
 
 fn summary() -> SessionSummary {
@@ -179,6 +857,8 @@ fn summary() -> SessionSummary {
             host: host("laptop"),
             since_unix_ms: 3,
         }),
+        forwards: 2,
+        agent: true,
     }
 }
 
@@ -205,10 +885,33 @@ fn responses() -> Vec<Response> {
         },
         Response::Done,
         Response::NoSuchSession,
+        Response::Forward(ForwardResult::Added(ForwardId(3))),
+        Response::Forward(ForwardResult::Removed(ForwardId(4))),
     ];
+    let mut all = all;
+    all.extend(
+        forward_refusals()
+            .into_iter()
+            .map(|r| Response::Forward(ForwardResult::Refused(r))),
+    );
+    all.push(Response::Ports {
+        part: PortsPart { rows: ports_rows() },
+        more: false,
+    });
+    all.push(Response::Ports {
+        part: PortsPart::default(),
+        more: true,
+    });
     for c in &all {
         match c {
-            Response::Sessions { .. } | Response::Done | Response::NoSuchSession => {}
+            Response::Sessions { .. }
+            | Response::Done
+            | Response::NoSuchSession
+            | Response::Ports { .. } => {}
+            Response::Forward(r) => match r {
+                ForwardResult::Added(_) | ForwardResult::Removed(_) | ForwardResult::Refused(_) => {
+                }
+            },
         }
     }
     all
@@ -224,6 +927,7 @@ fn attach(resume: Option<ResumeRequest>, echo_ack: bool) -> Attach {
         resume,
         echo_ack,
         size_gen: 7,
+        agent: echo_ack,
     }
 }
 
@@ -327,13 +1031,6 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         );
     }
     for (i, c) in error_codes().into_iter().enumerate() {
-        add(
-            &format!("reset-{i}"),
-            ControlMsg::Reset {
-                channel: ChannelId(17),
-                code: c,
-            },
-        );
         add(&format!("error-{i}"), ControlMsg::Error(c));
     }
     add(
@@ -396,6 +1093,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             }),
             echo_ack: true,
             size_gen: u64::MAX,
+            agent: true,
         }),
     );
     add(
@@ -449,13 +1147,17 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             reason: SnapshotReason::BadResumePoint,
         }),
     );
-    add(
-        "max/reset",
-        ControlMsg::Reset {
-            channel: ChannelId(u32::MAX),
-            code: ErrorCode::SessionStartFailed,
-        },
-    );
+    for (label, code, signal) in [
+        ("code-min", Some(i32::MIN), None),
+        ("signal-min", None, Some(i32::MIN)),
+    ] {
+        add(
+            &format!("max/session-gone-{label}"),
+            ControlMsg::AttachRefused(AttachRefusal::SessionGone {
+                exit: Some(ExitStatus { code, signal }),
+            }),
+        );
+    }
     add(
         "max/pty-mode",
         ControlMsg::PtyMode {
@@ -489,6 +1191,42 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         }),
     );
     add(
+        "max/request-forward-add",
+        ControlMsg::Request(Request::Forward {
+            session: name(&longest('n', MAX_SESSION_NAME)),
+            op: ForwardOp::Add(spec_widest()),
+        }),
+    );
+    add(
+        "max/request-forward-remove",
+        ControlMsg::Request(Request::Forward {
+            session: name(&longest('n', MAX_SESSION_NAME)),
+            op: ForwardOp::Remove {
+                kind: Some(ForwardKind::Dynamic),
+                port: u16::MAX,
+            },
+        }),
+    );
+    add(
+        "max/request-ports",
+        ControlMsg::Request(Request::Ports {
+            session: Some(name(&longest('n', MAX_SESSION_NAME))),
+        }),
+    );
+    add(
+        "max/response-forward",
+        ControlMsg::Response(Response::Forward(ForwardResult::Added(ForwardId(u32::MAX)))),
+    );
+    add(
+        "max/response-ports",
+        ControlMsg::Response(Response::Ports {
+            part: PortsPart {
+                rows: vec![widest_forward_row(); 4],
+            },
+            more: true,
+        }),
+    );
+    add(
         "max/response",
         ControlMsg::Response(Response::Sessions {
             list: vec![SessionSummary {
@@ -500,6 +1238,8 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                     host: host(&longest('h', MAX_HOST_LABEL)),
                     since_unix_ms: u64::MAX,
                 }),
+                forwards: u16::MAX,
+                agent: true,
             }],
             truncated: true,
             others: vec![
@@ -553,6 +1293,8 @@ fn input_records() -> Vec<(String, InputRecord)> {
 
 /// How many `ControlMsg` variants there are. Extend it with the match below.
 const VARIANTS: usize = 17;
+/// Retired slots (`ControlMsg::Retired`): no instance can exist.
+const RETIRED: [usize; 1] = [10];
 
 /// The variant index postcard writes: the position in the enum. Exhaustive on purpose.
 fn variant_index(m: &ControlMsg) -> usize {
@@ -567,7 +1309,7 @@ fn variant_index(m: &ControlMsg) -> usize {
         ControlMsg::Ack { .. } => 7,
         ControlMsg::Resume { .. } => 8,
         ControlMsg::Snapshot(_) => 9,
-        ControlMsg::Reset { .. } => 10,
+        ControlMsg::Retired(r) => match *r {},
         ControlMsg::Error(_) => 11,
         ControlMsg::PtyMode { .. } => 12,
         ControlMsg::EchoAck { .. } => 13,
@@ -814,10 +1556,37 @@ fn limits() -> Entries {
         num("TermSize::MAX_ROWS", TermSize::MAX_ROWS),
         num("TermSize::MAX_CELLS", TermSize::MAX_CELLS),
         num("MAX_OTHER_DAEMONS", MAX_OTHER_DAEMONS),
+        // Forwards and the MUX channel.
+        num("ChannelId::MUX", ChannelId::MUX.0),
+        num("ChannelId::FORWARD_BASE", ChannelId::FORWARD_BASE),
         num(
-            "quic::MAX_STREAMS",
-            fil_transport::quic::pinned::MAX_STREAMS,
+            "mux::first-id/client",
+            fil_proto::mux::Side::Client.first_id(),
         ),
+        num(
+            "mux::first-id/daemon",
+            fil_proto::mux::Side::Daemon.first_id(),
+        ),
+        num("MAX_FORWARDS", MAX_FORWARDS),
+        num("MAX_OPEN_CHANNELS", MAX_OPEN_CHANNELS),
+        num("MAX_MUX_RECORD", MAX_MUX_RECORD),
+        num("MUX_SEND_BUFFER", MUX_SEND_BUFFER),
+        num("MIN_WINDOW", MIN_WINDOW),
+        num("DEFAULT_WINDOW", DEFAULT_WINDOW),
+        num("MAX_WINDOW", MAX_WINDOW),
+        num("DEFAULT_FORWARD_BUFFER", DEFAULT_FORWARD_BUFFER),
+        num("FORWARD_BUDGET", FORWARD_BUDGET),
+        num("CONNECT_TIMEOUT_MS", CONNECT_TIMEOUT.as_millis()),
+        num("OPEN_WAIT_MS", OPEN_WAIT.as_millis()),
+        num("LINGER_MS", LINGER.as_millis()),
+        num("AGENT_WAIT_MS", AGENT_WAIT.as_millis()),
+        num("MAX_AGENT_MSG", MAX_AGENT_MSG),
+        num("MAX_PORTS_ROWS", MAX_PORTS_ROWS),
+        num("MAX_DNS_NAME", MAX_DNS_NAME),
+        num("MAX_DNS_LABEL", MAX_DNS_LABEL),
+        num("MAX_PROCESS_NAME", MAX_PROCESS_NAME),
+        num("MAX_PORTS_PATH", MAX_PORTS_PATH),
+        num("MAX_PROBE_LABEL", MAX_PROBE_LABEL),
         num(
             "quic::MAX_VARINT_LEN",
             fil_transport::quic::pinned::MAX_VARINT_LEN,
@@ -864,6 +1633,13 @@ fn revisioned() -> Entries {
             &rec.encode().unwrap(),
         ));
     }
+    // Records on the MUX channel (fil_proto::mux): the length varint and the message.
+    for (label, m) in mux_msgs() {
+        e.push(bytes_entry(
+            format!("mux/{label}"),
+            &encode_record(&m).unwrap(),
+        ));
+    }
     // The QUIC stream layout (fil-transport): stream headers, flush markers, length prefixes.
     for (k, v) in fil_transport::quic::pinned::stream_layout() {
         e.push(bytes_entry(k, &v));
@@ -874,6 +1650,8 @@ fn revisioned() -> Entries {
             fil_transport::quic::pinned::prefix_kind(len),
         ));
     }
+    // How streams live and end: the open-at-once limit, finish, and the cap on unanswered ends.
+    e.extend(fil_transport::quic::pinned::stream_rules());
 
     // What each decoder accepts, one step either side of every limit: the golden pins the
     // behaviour as well as the constants, so a widened integer or a loosened check shows up.
@@ -1108,10 +1886,376 @@ fn revisioned() -> Entries {
         outcome::<AttachRefusal>(&past(6)),
     ));
     e.push(("decode/request-0".into(), outcome::<Request>(&past(0))));
-    e.push(("decode/request-3".into(), outcome::<Request>(&past(3))));
+    e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0])));
+    e.push(("decode/request-5".into(), outcome::<Request>(&[5, 0])));
     e.push(("decode/response-2".into(), outcome::<Response>(&past(2))));
-    e.push(("decode/response-3".into(), outcome::<Response>(&past(3))));
+    e.push(("decode/response-3".into(), outcome::<Response>(&[3, 0, 1])));
+    e.push(("decode/response-5".into(), outcome::<Response>(&[5, 0, 0])));
+    // Index 10 was `Reset`: retired, and nothing decodes there.
+    e.push((
+        "decode/control-10-retired".into(),
+        control_outcome(&[10, 17, 0]),
+    ));
+    e.extend(forward_probes());
     e
+}
+
+/// What the record decoder makes of a byte string fed in one piece.
+fn record_outcome(bytes: &[u8]) -> String {
+    let mut dec = fil_proto::mux::RecordDecoder::new();
+    let mut input = bytes;
+    let mut n = 0;
+    loop {
+        match dec.push(&mut input) {
+            Ok(Some(_)) => n += 1,
+            Ok(None) if dec.at_boundary() => return format!("records {n}"),
+            Ok(None) => return format!("records {n} then partial"),
+            Err(fil_proto::mux::RecordError::BadLength(_)) => return "err bad-length".into(),
+            Err(fil_proto::mux::RecordError::BadVarint) => return "err bad-varint".into(),
+            Err(fil_proto::mux::RecordError::Malformed) => return "err malformed".into(),
+        }
+    }
+}
+
+/// The decode limits of the forward types, one step either side of each, and the widest value
+/// of each narrow integer field.
+fn forward_probes() -> Entries {
+    let mut e: Entries = Vec::new();
+    let name_wire = |s: &str| counted_str(s);
+    let longest = longest_name().as_str().to_string();
+    e.push((
+        "decode/dns-name-253".into(),
+        outcome::<DnsName>(&name_wire(&longest)),
+    ));
+    e.push((
+        "decode/dns-name-254".into(),
+        outcome::<DnsName>(&name_wire(&format!("{longest}c"))),
+    ));
+    e.push((
+        "decode/dns-label-63".into(),
+        outcome::<DnsName>(&name_wire(&"a".repeat(63))),
+    ));
+    e.push((
+        "decode/dns-label-64".into(),
+        outcome::<DnsName>(&name_wire(&"a".repeat(64))),
+    ));
+    e.push((
+        "decode/dns-name-all-digit-top".into(),
+        outcome::<DnsName>(&name_wire("192.0.2.5")),
+    ));
+    e.push((
+        "decode/dns-name-underscore".into(),
+        outcome::<DnsName>(&name_wire("a_b.example")),
+    ));
+    e.push((
+        "decode/dns-name-trailing-dot".into(),
+        outcome::<DnsName>(&name_wire("example.com.")),
+    ));
+    for v in [
+        u64::from(MIN_WINDOW) - 1,
+        u64::from(MIN_WINDOW),
+        u64::from(MAX_WINDOW),
+        u64::from(MAX_WINDOW) + 1,
+        u64::from(u32::MAX) + 1,
+    ] {
+        e.push((format!("decode/window-{v}"), outcome::<Window>(&varint(v))));
+    }
+    // A spec as postcard writes it: kind, bind, port, target.
+    let loopback = vec![0u8];
+    let target = |p: u64| [vec![1u8], vec![1], counted_str("localhost"), varint(p)].concat();
+    let spec = |kind: u8, p: u64, target: Option<Vec<u8>>| {
+        let mut v = vec![kind];
+        v.extend(&loopback);
+        v.extend(varint(p));
+        match target {
+            Some(t) => v.extend(t),
+            None => v.push(0),
+        }
+        outcome::<ForwardSpec>(&v)
+    };
+    e.push((
+        "decode/spec-local-port-0".into(),
+        spec(0, 0, Some(target(80))),
+    ));
+    e.push((
+        "decode/spec-local-port-1".into(),
+        spec(0, 1, Some(target(80))),
+    ));
+    e.push((
+        "decode/spec-remote-port-0".into(),
+        spec(1, 0, Some(target(80))),
+    ));
+    e.push(("decode/spec-dynamic-port-0".into(), spec(2, 0, None)));
+    e.push(("decode/spec-local-no-target".into(), spec(0, 1, None)));
+    e.push(("decode/spec-remote-no-target".into(), spec(1, 1, None)));
+    e.push((
+        "decode/spec-dynamic-target".into(),
+        spec(2, 1, Some(target(80))),
+    ));
+    e.push((
+        "decode/spec-port-65535".into(),
+        spec(0, 65535, Some(target(80))),
+    ));
+    e.push((
+        "decode/spec-port-65536".into(),
+        spec(0, 65536, Some(target(80))),
+    ));
+    e.push(("decode/target-port-0".into(), spec(0, 1, Some(target(0)))));
+    e.push((
+        "decode/target-port-65536".into(),
+        spec(0, 1, Some(target(65536))),
+    ));
+    e.push(("decode/spec-kind-3".into(), spec(3, 1, None)));
+    e.push(("decode/bind-addr-3".into(), outcome::<BindAddr>(&[3])));
+    let listening = |p: u64| [vec![0u8], varint(p)].concat();
+    e.push((
+        "decode/listening-port-0".into(),
+        outcome::<ListenState>(&listening(0)),
+    ));
+    e.push((
+        "decode/listening-port-1".into(),
+        outcome::<ListenState>(&listening(1)),
+    ));
+    e.push((
+        "decode/listening-port-65536".into(),
+        outcome::<ListenState>(&listening(65536)),
+    ));
+    for v in [u64::from(u32::MAX), u64::from(u32::MAX) + 1] {
+        e.push((
+            format!("decode/forward-id-{v}"),
+            outcome::<ForwardId>(&varint(v)),
+        ));
+    }
+    // Enum sizes: the last index and the first past it.
+    for (what, last, r) in [
+        (
+            "forward-kind",
+            2u8,
+            outcome::<ForwardKind> as fn(&[u8]) -> String,
+        ),
+        ("origin", 1, outcome::<Origin>),
+        ("bind-failure", 3, outcome::<BindFailure>),
+        ("forward-refusal", 5, outcome::<ForwardRefusal>),
+        ("open-failure", 10, outcome::<OpenFailure>),
+        ("close-reason", 5, outcome::<CloseReason>),
+    ] {
+        e.push((format!("decode/{what}-{last}"), r(&[last])));
+        e.push((format!("decode/{what}-{}", last + 1), r(&[last + 1])));
+    }
+    // The enums with fields: their last variant, and the first index past it.
+    type EnumProbe = (&'static str, Vec<u8>, Vec<u8>, fn(&[u8]) -> String);
+    let last_and_past: [EnumProbe; 7] = [
+        (
+            "listen-state",
+            vec![1, 0],
+            vec![2, 0],
+            outcome::<ListenState>,
+        ),
+        (
+            "target-host",
+            [vec![1u8], counted_str("a")].concat(),
+            [vec![2u8], counted_str("a")].concat(),
+            outcome::<TargetHost>,
+        ),
+        (
+            "forward-op",
+            vec![1, 0, 1],
+            vec![2, 0, 1],
+            outcome::<ForwardOp>,
+        ),
+        (
+            "forward-result",
+            vec![2, 0],
+            vec![3, 0],
+            outcome::<ForwardResult>,
+        ),
+        (
+            "ports-row",
+            vec![3, 1, b'a', 0, 0, 0],
+            vec![4, 1, b'a', 0, 0, 0],
+            outcome::<PortsRow>,
+        ),
+        ("listener-owner", vec![2], vec![3], outcome::<ListenerOwner>),
+        ("probe-kind", vec![4], vec![5], outcome::<ProbeKind>),
+    ];
+    for (what, last, past, r) in last_and_past {
+        e.push((format!("decode/{what}-last"), r(&last)));
+        e.push((format!("decode/{what}-past"), r(&past)));
+    }
+    // An exit status names a code or a signal, not both.
+    for (what, wire) in [
+        ("code", vec![1u8, 2, 0]),
+        ("signal", vec![0, 1, 18]),
+        ("neither", vec![0, 0]),
+        ("both", vec![1, 2, 1, 18]),
+    ] {
+        e.push((
+            format!("decode/exit-status-{what}"),
+            outcome::<ExitStatus>(&wire),
+        ));
+    }
+    e.push(("decode/open-kind-3".into(), outcome::<OpenKind>(&[3])));
+    e.push(("decode/open-kind-4".into(), outcome::<OpenKind>(&[4])));
+    e.push(("decode/mux-msg-11".into(), outcome::<MuxMsg>(&[11, 16, 0])));
+    let window_msg = |w: u64| [vec![12u8, 16], varint(w)].concat();
+    e.push((
+        "decode/mux-msg-12".into(),
+        outcome::<MuxMsg>(&window_msg(u64::from(MIN_WINDOW))),
+    ));
+    e.push((
+        "decode/mux-msg-13".into(),
+        outcome::<MuxMsg>(&[vec![13u8, 16], varint(u64::from(MIN_WINDOW))].concat()),
+    ));
+    // A `Window` record one step either side of the bounds (raise-only is the mux's rule, not
+    // the decoder's: see `fil_proto::mux` tests).
+    for (what, w) in [
+        ("min-minus-1", u64::from(MIN_WINDOW) - 1),
+        ("max", u64::from(MAX_WINDOW)),
+        ("max-plus-1", u64::from(MAX_WINDOW) + 1),
+    ] {
+        let body = window_msg(w);
+        e.push((
+            format!("decode/mux-window-{what}"),
+            record_outcome(&[vec![body.len() as u8], body].concat()),
+        ));
+    }
+
+    // Record framing on the MUX stream.
+    let close = encode_record(&MuxMsg::Close {
+        channel: ChannelId(16),
+        why: CloseReason::Done,
+    })
+    .unwrap();
+    e.push(("decode/mux-record".into(), record_outcome(&close)));
+    e.push((
+        "decode/mux-record-twice".into(),
+        record_outcome(&[close.clone(), close.clone()].concat()),
+    ));
+    e.push((
+        "decode/mux-record-cut".into(),
+        record_outcome(&close[..close.len() - 1]),
+    ));
+    e.push(("decode/mux-record-len-0".into(), record_outcome(&[0])));
+    e.push((
+        format!("decode/mux-record-len-{MAX_MUX_RECORD}"),
+        record_outcome(&varint(MAX_MUX_RECORD as u64)),
+    ));
+    e.push((
+        format!("decode/mux-record-len-{}", MAX_MUX_RECORD + 1),
+        record_outcome(&varint(MAX_MUX_RECORD as u64 + 1)),
+    ));
+    e.push((
+        format!("decode/mux-record-body-{MAX_MUX_RECORD}"),
+        record_outcome(&[varint(MAX_MUX_RECORD as u64), vec![0xFF; MAX_MUX_RECORD]].concat()),
+    ));
+    e.push((
+        "decode/mux-record-len-non-canonical".into(),
+        record_outcome(&[0x83, 0x00]),
+    ));
+    e.push((
+        "decode/mux-record-len-3-bytes".into(),
+        record_outcome(&[0x80, 0x80, 0x01]),
+    ));
+    let mut trailing = close[1..].to_vec();
+    trailing.push(0);
+    e.push((
+        "decode/mux-record-trailing-byte".into(),
+        record_outcome(&[vec![trailing.len() as u8], trailing].concat()),
+    ));
+
+    // The `fil ports` strings and rows.
+    for (what, max) in [
+        ("process-name", MAX_PROCESS_NAME),
+        ("ports-path", MAX_PORTS_PATH),
+        ("probe-label", MAX_PROBE_LABEL),
+    ] {
+        for n in [max, max + 1] {
+            let wire = counted(n, b'a');
+            let r = match what {
+                "process-name" => outcome::<ProcessName>(&wire),
+                "ports-path" => outcome::<PortsPath>(&wire),
+                _ => outcome::<ProbeLabel>(&wire),
+            };
+            e.push((format!("decode/{what}-{n}"), r));
+        }
+    }
+    // A part of n minimal rows (`Agent { session "a", 0, 0, 0 }`).
+    for n in [MAX_PORTS_ROWS, MAX_PORTS_ROWS + 1] {
+        let mut v = varint(n as u64);
+        for _ in 0..n {
+            v.extend([3u8, 1, b'a', 0, 0, 0]);
+        }
+        e.push((format!("decode/ports-rows-{n}"), outcome::<PortsPart>(&v)));
+    }
+    for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
+        // SessionSummary { name, term, created, last, attached: None, forwards, agent }.
+        let summary = [
+            counted_str("main"),
+            counted_str("xterm"),
+            varint(1),
+            varint(2),
+            vec![0],
+            varint(v),
+            vec![1],
+        ]
+        .concat();
+        e.push((
+            format!("decode/summary-forwards-{v}"),
+            outcome::<SessionSummary>(&summary),
+        ));
+        // ForwardOp::Remove { kind: None, port }.
+        e.push((
+            format!("decode/remove-port-{v}"),
+            outcome::<ForwardOp>(&[vec![1u8, 0], varint(v)].concat()),
+        ));
+        // Probe { kind: Http { status }, label: None }.
+        e.push((
+            format!("decode/http-status-{v}"),
+            outcome::<Probe>(&[vec![1u8], varint(v), vec![0]].concat()),
+        ));
+    }
+    for (what, v) in [
+        ("max", i64::from(i32::MAX)),
+        ("max-plus-1", i64::from(i32::MAX) + 1),
+    ] {
+        // AttachRefused(SessionGone { exit: Some(ExitStatus { code: Some(v), signal: None }) }).
+        e.push((
+            format!("decode/session-gone-code-{what}"),
+            control_outcome(&raw_msg(3, &[vec![2, 1, 1], zigzag(v), vec![0]])),
+        ));
+    }
+    // The chunker keeps a full answer within the limits.
+    let parts = Response::ports(vec![widest_forward_row(); MAX_PORTS_ROWS + 10]);
+    let rows: usize = parts
+        .iter()
+        .map(|r| match r {
+            Response::Ports { part, .. } => part.rows.len(),
+            _ => 0,
+        })
+        .sum();
+    let fits = parts
+        .iter()
+        .all(|r| ControlMsg::Response(r.clone()).encode().is_ok());
+    let last_only = parts
+        .iter()
+        .rev()
+        .skip(1)
+        .all(|r| matches!(r, Response::Ports { more: true, .. }))
+        && matches!(parts.last(), Some(Response::Ports { more: false, .. }));
+    e.push((
+        "ports/chunked-widest".into(),
+        format!(
+            "parts {} rows {rows} fit {fits} more-on-all-but-last {last_only}",
+            parts.len()
+        ),
+    ));
+    e
+}
+
+fn counted_str(s: &str) -> Vec<u8> {
+    let mut v = varint(s.len() as u64);
+    v.extend_from_slice(s.as_bytes());
+    v
 }
 
 /// 64-bit FNV-1a: not for security, only to make two different wires of one revision number
@@ -1372,6 +2516,10 @@ fn every_control_variant_has_an_instance() {
     for (_, m) in control_msgs() {
         seen[variant_index(&m)] = true;
     }
+    for r in RETIRED {
+        assert!(!seen[r]);
+        seen[r] = true;
+    }
     assert!(
         seen.iter().all(|s| *s),
         "a ControlMsg variant has no instance in control_msgs(): {seen:?}"
@@ -1619,8 +2767,9 @@ fn the_golden_covers_the_whole_wire() {
         "MAX_DATA_PAYLOAD = 16384",
         "MAX_SESSION_NAME = 64",
         "TermSize::MAX_CELLS = 1000000",
-        "quic::MAX_STREAMS = 1024",
         "alpn/rev7 = fil/1.7",
+        "MAX_MUX_RECORD = 1024",
+        "ChannelId::MUX = 3",
     ] {
         assert!(
             g.limits.iter().any(|l| l == want),
@@ -1636,11 +2785,21 @@ fn the_golden_covers_the_whole_wire() {
         "control/max/session-exited-code-min ",
         "data/seq-0",
         "quic/stream-header-300 = ac02",
+        "quic/streams-open-at-once = 1024",
+        "quic/finished-stream = payloads, then a flush marker, then FIN",
+        "quic/unanswered-stream-ends-max = 2048",
         "decode/session-name-65 = err",
         "decode/control-payload-max-plus-1 = err too-large",
         "decode/exit-code-max-plus-1 = err",
         "decode/udp-port-65536 = err",
         "decode/heartbeat-nonce-4294967296 = err",
+        "mux/open-0 ",
+        "mux/max/forward ",
+        "decode/dns-name-254 = err",
+        "decode/window-16383 = err",
+        "decode/spec-local-port-0 = err",
+        "decode/mux-record-len-1025 = err bad-length",
+        "decode/control-10-retired = err",
     ] {
         assert!(
             g.revisioned.iter().any(|l| l.starts_with(want)),

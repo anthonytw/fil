@@ -26,7 +26,7 @@ gh run watch                                   # wait for it
 gh run download RUN_ID -n fil-aarch64-musl -D out
 ```
 
-The build is reproducible: `cross` is pinned to 0.2.5, its image is pinned by digest in `Cross.toml`, and the build uses `--locked`. The runs before and after the pinning gave the same sha256. The job fails unless `file` reports a static aarch64 ELF. The artifact has `fil` (about 11 MB) and `fil.sha256`.
+The build is reproducible: `cross` is pinned to 0.2.5, its image is pinned by digest in `Cross.toml`, and the build uses `--locked`. The runs before and after the pinning gave the same sha256. The job fails unless `file` reports a static aarch64 ELF. The artifact has `fil` (about 11 MB) and `fil.sha256`, and, since M2 T1, `fwdprobe` and `fwdprobe.sha256` (the TCP test tool, `docs/m2/pi.md`).
 
 ### 2. Install and check
 

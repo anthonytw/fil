@@ -267,7 +267,9 @@ impl Inner {
                 // A session that ended while we were binding has already been reaped, so
                 // nothing else would revoke the key.
                 if !bound || !handle.is_alive() {
-                    let msg = refuse(ControlMsg::AttachRefused(AttachRefusal::SessionGone));
+                    let msg = refuse(ControlMsg::AttachRefused(AttachRefusal::SessionGone {
+                        exit: None,
+                    }));
                     self.revoke_key(&key_bytes);
                     tell_and_close(&link, msg).await;
                     return;
@@ -334,6 +336,9 @@ impl Inner {
                                 since_unix_ms: s.since_unix_ms,
                             }
                         }),
+                        // Forwards and the agent relay arrive with M2's F2 and A1.
+                        forwards: 0,
+                        agent: false,
                     });
                 }
                 // Daemons of other wire revisions next to this one: their sessions are not in the
@@ -364,6 +369,18 @@ impl Inner {
                     h.force_detach().await;
                     Response::Done
                 }
+            },
+            // The forward table and `fil ports` arrive with M2's F2 and P1. Until then no session
+            // has a table: an add is refused and the ports answer is empty.
+            Request::Forward { session, .. } => match self.session(&session) {
+                None => Response::NoSuchSession,
+                Some(_) => Response::Forward(fil_proto::msg::ForwardResult::Refused(
+                    fil_proto::mux::ForwardRefusal::NotPermitted,
+                )),
+            },
+            Request::Ports { session } => match session.map(|s| self.session(&s)) {
+                Some(None) => Response::NoSuchSession,
+                _ => Response::ports(Vec::new()).remove(0),
             },
         }
     }

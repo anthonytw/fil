@@ -49,6 +49,10 @@ impl Link for JammedData {
         self.inner.flush().await
     }
 
+    fn finish(&self, channel: ChannelId) {
+        self.inner.finish(channel);
+    }
+
     fn close(&self) {
         self.inner.close()
     }

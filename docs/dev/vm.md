@@ -6,13 +6,13 @@ The real-network harness (`docs/m1/realnet.md`) needs Linux, Docker and root: ne
 
 ## What the VM is
 
-One Lima instance, `fil` (override the name with `FIL_VM`): Ubuntu 24.04, `vz` virtualization, 6 CPUs, 12 GiB, 40 GiB disk, with Docker, iproute2, iptables, the `sch_netem` module, `musl-tools`, `strace`, `shellcheck`, git and rustup. `just vm-setup` adds what the image lacks: `conntrack`, `openssh-server`, the pinned toolchain, `just` and `cargo-deny` (the versions `linux-check` pins).
+One Lima instance, `fil` (override the name with `FIL_VM`): Ubuntu 24.04, `vz` virtualization, 6 CPUs, 12 GiB, 40 GiB disk, with Docker, iproute2, iptables, the `sch_netem` module, `musl-tools`, `strace`, `shellcheck`, git and rustup. `just vm-setup` adds what the image lacks: the `conntrack` package, then (through rustup and `cargo install --locked`) the toolchain pinned in `rust-toolchain.toml`, `just` and `cargo-deny`, at the versions `linux-check` pins. The Mac needs `limactl` and an `rsync`; macOS's own is enough (the recipes use no option it lacks, and say so if yours is too old).
 
 ## Isolation
 
 The VM can reach the network, but it can see nothing of the Mac, and root in it is root in a throwaway machine. That is the point: the harness creates users, namespaces and a privileged container, and some of it runs as root with the host's kernel.
 
-- **No host mounts** (`mounts: []`). Nothing on the Mac's disk is visible in the VM, and a bug in a test cannot write to it. Code goes in by `rsync` over Lima's own ssh connection (`just vm-sync`), which copies the working tree, uncommitted work included, to `~/src/<worktree name>`.
+- **No host mounts** (`mounts: []`). Nothing on the Mac's disk is visible in the VM, and a bug in a test cannot write to it. Code goes in by `rsync` over Lima's own ssh connection (`just vm-sync`), which copies the working tree, uncommitted work included, to `~/src/<name>` (`<name>` is the directory's name plus a short hash of its path, so two checkouts with the same name never collide).
 - **No port forwards.** The three catch-all `ignore` rules switch off Lima's automatic forwarding of guest ports to the Mac, so a service a scenario starts (an sshd, a daemon, a QUIC endpoint on a documentation address) is not reachable from the Mac's network.
 - **No host ssh keys and no agent.** `loadDotSSHPubKeys: false` and `forwardAgent: false`: the VM does not get the Mac user's public keys, and a compromised VM cannot use the Mac's ssh agent. Lima's own key for the instance is the only way in, and it only opens this VM.
 - **No containerd**, to keep the VM to what it is used for. Docker is the one container engine.
@@ -84,6 +84,8 @@ provision:
     "$HOME/.cargo/bin/rustup" target list --installed >/dev/null 2>&1 || true
 ```
 
+The rustup bootstrap is the standard unpinned installer; it runs only inside the throwaway VM, and the toolchain itself is pinned by `rust-toolchain.toml`.
+
 Then, once, from a checkout: `just vm-setup`.
 
 ## Recipes
@@ -92,8 +94,8 @@ All of them are in the `justfile`, run on the Mac, and call `tests/realnet/vm.sh
 
 | Recipe | What it does |
 |---|---|
-| `just vm-setup` | Installs `conntrack`, `openssh-server`, the toolchain from `rust-toolchain.toml`, `just` and `cargo-deny` in the VM. Run once after creating it. |
-| `just vm-sync` | `rsync` of this worktree to `~/src/<worktree name>` in the VM. It skips `.git`, `.claude`, `target/` and everything `.gitignore` ignores, and deletes files you deleted, so uncommitted work and untracked files arrive and a stale file does not linger. Unchanged files keep their modification time, so cargo rebuilds only what changed. |
+| `just vm-setup` | Installs `conntrack`, the toolchain from `rust-toolchain.toml`, `just` and `cargo-deny` in the VM. Run once after creating it. |
+| `just vm-sync` | `rsync` of this worktree to `~/src/<name>` in the VM. It skips `.git`, `.claude`, `target/` and everything `.gitignore` ignores, and deletes files you deleted, so uncommitted work and untracked files arrive and a stale file does not linger. Unchanged files keep their modification time, so cargo rebuilds only what changed. |
 | `just vm-run CMD...` | Sync, then run `CMD` in that directory in the VM with the pinned toolchain (installed on first use). `just vm-run just ci` is the merge gate on Linux; `just vm-run cargo test -p fil-transport` works too. |
 | `just vm-realnet [PART] [SCENARIO...]` | Sync, then `just realnet ...` in the VM. Arguments as for `just realnet`: `udp`, `sysd`, `ssh` or none for all three, and scenario names. |
 | `just vm-clean` | Removes this worktree's copy and build directory from the VM. Do it when a worktree is removed: each build directory is a few GiB. |
@@ -101,8 +103,8 @@ All of them are in the `justfile`, run on the Mac, and call `tests/realnet/vm.sh
 Three things `vm-run` and `vm-realnet` arrange:
 
 - **`umask 022`.** Ubuntu's login default is `002`, and `fil-client`'s `offline` test makes its log directory with the process umask, so it came out group-writable and fil (correctly) refused it: `the_log_is_off_by_default_and_a_file_log_is_created_0600` failed deterministically in the VM. The recipes run with `022`, as the CI runners do.
-- **One copy and one `CARGO_TARGET_DIR` per worktree** (`~/src/<name>`, `~/target/<name>`), so two agents on two branches never share build state. `tests/realnet/build.sh` honors `CARGO_TARGET_DIR`.
-- **One realnet run at a time across the whole VM.** The harness uses fixed names (Docker containers and networks `rn-*`, namespaces `rn-*`, the users `rnclient` and `rnfil`), so two concurrent runs would break each other. `vm-realnet` holds an `flock` on `~/.fil-realnet.lock` for the whole run and says so if it has to wait. The run is killed after `FIL_VM_TIMEOUT` (default `60m`), which releases the lock.
+- **One copy and one `CARGO_TARGET_DIR` per worktree** (`~/src/<name>`, `~/target/<name>`), so two agents on two branches never share build state. `tests/realnet/build.sh` and the `local`, `pi-e2e` and `dropin` recipes honor `CARGO_TARGET_DIR` instead of assuming `target/`.
+- **One realnet run at a time across the whole VM.** The harness uses fixed names (Docker containers and networks `rn-*`, namespaces `rn-*`, the users `rnclient` and `rnfil`), so two concurrent runs would break each other. `vm-realnet` holds an `flock` on `~/.fil-realnet.lock` for the whole run and says so if it has to wait. The run is killed after `FIL_VM_TIMEOUT` (default `60m`), which releases the lock. The next run's teardown cleans up what a killed run left behind; `build.sh` replaces its binaries by rename, so one still running from the killed run does not stop the build ("Text file busy").
 
 Logs and per-scenario output are in `target/realnet` inside the synced directory in the VM (`just vm-run ls target/realnet/logs`), as on GitHub.
 

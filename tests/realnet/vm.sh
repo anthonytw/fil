@@ -16,7 +16,9 @@ set -euo pipefail
 VM=${FIL_VM:-fil}
 LIMA_HOME_DIR=${LIMA_HOME:-$HOME/.lima}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-NAME=$(basename "$ROOT")
+# The name is the directory's plus a short hash of its absolute path, so two checkouts with the
+# same name (a second clone, say) never share a copy or a build directory.
+NAME=$(basename "$ROOT")-$(printf %s "$ROOT" | shasum | cut -c1-8)
 # One copy and one cargo target directory per worktree, so agents on different branches never share
 # build state. Paths are relative to the VM user's home.
 SRC="src/$NAME"
@@ -55,22 +57,37 @@ vm_sh() {
 # group-writable, and fil rightly refuses such a directory for its offline log (a test assumes 022).
 PRELUDE='export PATH="$HOME/.cargo/bin:$PATH"
 umask 022
-src=$1 target=$2
-shift 2
+src=$1 target=$2 timeout=$3
+shift 3
 cd "$HOME/$src"
 export CARGO_TARGET_DIR="$HOME/$target"
 rustup show active-toolchain > /dev/null 2>&1 || rustup toolchain install
 '
 
+# The rsync on this machine must understand the options sync() uses. macOS's own (openrsync) does;
+# one that does not fails here with a clear message, not with a usage screen.
+check_rsync() {
+  command -v rsync > /dev/null || die "rsync not found (brew install rsync)"
+  local t
+  t=$(mktemp -d)
+  mkdir "$t/a" "$t/b"
+  rsync -a --delete --exclude=/x --filter=':- .gitignore' "$t/a/" "$t/b/" > /dev/null 2>&1 \
+    || { rm -rf "$t"; die "this rsync ($(command -v rsync)) rejects -a --delete --exclude --filter; install a current one (brew install rsync)"; }
+  rm -rf "$t"
+}
+
 sync() {
   check
+  check_rsync
   local cfg=$LIMA_HOME_DIR/$VM/ssh.config
   [[ -f $cfg ]] || die "no ssh config for '$VM' at $cfg"
   # Uncommitted work is what matters, so this copies the working tree, not a commit. Whatever
   # .gitignore ignores stays out (target/ among it), and so do .git (a worktree's is a file that
   # points outside the tree) and .claude. --delete removes files deleted here; excluded paths in
   # the VM (the build outputs, target/realnet) are left alone.
-  rsync -a --delete --mkpath \
+  # (No --mkpath: macOS's rsync lacks it, so the directory is made first.)
+  vm_sh 'mkdir -p "$HOME/$1"' "$SRC"
+  rsync -a --delete \
     -e "ssh -F $cfg" \
     --exclude=/.git --exclude=/.claude --exclude=/target --exclude=.DS_Store \
     --filter=':- .gitignore' \
@@ -79,7 +96,7 @@ sync() {
 
 run() {
   sync
-  vm_sh "$PRELUDE"'exec "$@"' "$SRC" "$TARGET" "$@"
+  vm_sh "$PRELUDE"'exec "$@"' "$SRC" "$TARGET" "$TIMEOUT" "$@"
 }
 
 realnet() {
@@ -89,23 +106,23 @@ realnet() {
 if ! flock -n -o "$lock" true; then
   echo "vm-realnet: another realnet run holds the VM lock; waiting for it" >&2
 fi
-exec flock -o "$lock" timeout -k 60 '"$TIMEOUT"' just realnet "$@"' "$SRC" "$TARGET" "$@"
+exec flock -o "$lock" timeout -k 60 "$timeout" just realnet "$@"' "$SRC" "$TARGET" "$TIMEOUT" "$@"
 }
 
 setup() {
   check
   sync
-  # Packages the image does not have (the VM config in docs/dev/vm.md stays as created), then the
+  # The one package the image lacks (the VM config in docs/dev/vm.md stays as created), then the
   # toolchain and the two tools `just ci` needs, at the versions the CI jobs pin.
   vm_sh "$PRELUDE"'
-if ! command -v conntrack > /dev/null || ! command -v sshd > /dev/null; then
+if ! command -v conntrack > /dev/null; then
   sudo apt-get update -q
-  sudo apt-get install -y -q conntrack openssh-server rsync vim less
+  sudo apt-get install -y -q conntrack
 fi
 command -v just > /dev/null || cargo install --locked just@1.59.0
 command -v cargo-deny > /dev/null || cargo install --locked cargo-deny@0.20.2
 just --version
-cargo --version' "$SRC" "$TARGET"
+cargo --version' "$SRC" "$TARGET" "$TIMEOUT"
 }
 
 clean() {

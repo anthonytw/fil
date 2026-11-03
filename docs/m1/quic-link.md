@@ -54,6 +54,8 @@ The listener keeps every live connection with the key it authenticated with. `Qu
 
 ### Channels and priorities
 
+> **Superseded in M2 C3 (2026-11-03): see DESIGN §8.5, QUIC stream mapping.** Channels now end with `Link::finish`, which ends the stream (marker, then FIN). quinn's 1,024-stream limit counts open streams only, with no cap over the link's life. A second stream for a channel waits for the first instead of ending the link. Starved stream credit takes the link `Down(Io)` instead of dropping payloads. The text below is the M1 record.
+
 | | |
 |---|---|
 | Stream per channel and direction | opened on the first `send`; starts with the channel id (varint), then `u32`-BE length-prefixed payloads of 1 to `MAX_FRAME_BODY` bytes |

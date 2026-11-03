@@ -214,7 +214,9 @@ async fn a_refused_candidate_does_not_end_a_session_the_old_link_is_still_delive
     settle().await;
     // The shell exits during the swap: the candidate's resume is refused (`SessionGone`), but
     // the old link is still carrying the tail and the exit status.
-    rig.daemon.refuse_next(AttachRefusal::SessionGone).await;
+    rig.daemon
+        .refuse_next(AttachRefusal::SessionGone { exit: None })
+        .await;
     rig.dial.offer_swap(LinkKind::Direct);
     until_async("the refusal", 30, || async {
         rig.daemon.attaches().await.len() == 2

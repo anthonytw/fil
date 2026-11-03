@@ -19,8 +19,11 @@ log "building fil and fil-testbins for $TARGET"
 (cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil -p fil-testbins)
 
 mkdir -p "$BIN_DIR"
-for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe; do
-  cp "$TARGET_DIR/$TARGET/release/$b" "$BIN_DIR/$b"
+for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe fwdprobe keyprobe; do
+  # Copy to a temporary name and rename over the old file: a rename works while a process left over
+  # from a killed run still executes the old binary (a plain cp fails with "Text file busy").
+  cp "$TARGET_DIR/$TARGET/release/$b" "$BIN_DIR/$b.new"
+  mv -f "$BIN_DIR/$b.new" "$BIN_DIR/$b"
   # Static means no dynamic loader: ldd says so. Anything else would not run in a bare container.
   # Capture ldd's output first: under pipefail, `ldd | grep -q` fails when grep exits before ldd
   # has written (SIGPIPE), which showed up on aarch64.

@@ -79,8 +79,7 @@ fn run_under_a_pty(mode: &str, mark: &Path, line: &[u8], typed_after: Duration) 
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(200));
-    let text = output.lock().unwrap().clone();
-    text
+    output.lock().unwrap().clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

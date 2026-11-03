@@ -638,6 +638,29 @@ client_bg_on() {
 # fk HOST SESSION: kill a session, whatever state it is in.
 fk() { cx fil kill "$1" "$2" > /dev/null 2>&1 || true; }
 
+# Of the ten clean detaches (`~.`) in f_detach_delivery, how many may be lost before the scenario
+# fails. A lost detach is a known defect in fil (see "Real binary: findings" in
+# docs/m1/realnet.md) and is recorded as KNOWN-BUG up to this number. When the fix lands, set it
+# to 0 (or run with REALNET_STRICT=1, which fails on any known finding).
+DETACH_LOST_MAX=${DETACH_LOST_MAX:-7}
+
+# ls_detached HOST SESSION [MS]: polls `fil ls HOST` until SESSION is listed as not attached (the
+# ATTACHED column is "-"), for at most MS milliseconds (default 5000). Returns 0 once it is, 1 if
+# it is still listed as attached at the deadline. The session not being listed at all is a failure
+# of the scenario (the daemon lost it), never a "lost detach". Sets LS_OUT.
+ls_detached() {
+  local host=$1 session=$2 limit=${3:-5000} deadline
+  deadline=$(($(now_ms) + limit))
+  while :; do
+    LS_OUT=$(cx fil ls "$host")
+    awk -v s="$session" '$1 == s { f = 1 } END { exit !f }' <<< "$LS_OUT" \
+      || fail "fil ls does not list the session $session at all: $LS_OUT"
+    if awk -v s="$session" '$1 == s && $3 == "-" { f = 1 } END { exit !f }' <<< "$LS_OUT"; then return 0; fi
+    [[ $(now_ms) -lt $deadline ]] || return 1
+    sleep 0.1
+  done
+}
+
 # Attach, run something, detach with ~. ; list; reattach and see the earlier output, in the same
 # shell; the exit status and the messages of each step.
 f_attach_detach() {
@@ -655,18 +678,13 @@ f_attach_detach() {
   fc_detach a
 
   # The daemon notices the closed link a moment after the client has gone; allow it a few seconds.
-  local out i t0
-  t0=$(now_ms)
-  for ((i = 0; i < 50; i++)); do
-    out=$(cx fil ls direct)
-    awk '$1 == "ad" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" && break
-    sleep 0.1
-  done
-  if awk '$1 == "ad" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out"; then
-    note "listed_as_detached_after_ms=$(($(now_ms) - t0))"
+  local t1
+  t1=$(now_ms)
+  if ls_detached direct ad 5000; then
+    note "listed_as_detached_after_ms=$(($(now_ms) - t1))"
     ok "fil ls lists the session as detached"
   else
-    log "fil ls, 5 s after ~. : $out"
+    log "fil ls, 5 s after ~. : $LS_OUT"
     known_bug "after ~. over ssh, fil ls still lists the client as attached (the daemon logs LinkDown, not a detach)"
   fi
 
@@ -680,31 +698,35 @@ f_attach_detach() {
   fk direct ad
 }
 
-# Does `~.` always reach the daemon? Ten attach/detach cycles over ssh; after each, `fil ls` must
-# stop listing the client as attached within 3 s. (A detach that is lost leaves the daemon holding
-# a client that has gone: it shows as attached until somebody takes the session over.)
+# Does `~.` always reach the daemon? Ten attach/detach cycles over ssh to the same session; after
+# each, `fil ls` must stop listing the client as attached within 5 s. A detach that is lost leaves
+# the daemon holding a client that has gone: it shows as attached until somebody takes the session
+# over. Every cycle must find the same shell (the session survived), and the session must be
+# listed (a missing one fails the scenario). Up to DETACH_LOST_MAX lost detaches are recorded as a
+# known finding; more fail.
 f_detach_delivery() {
-  local n lost=0 i j out ok_one
+  local n lost=0 pid0='' pid
   for n in 1 2 3 4 5 6 7 8 9 10; do
     fc_start "d$n" -- direct dd
     fc_ready "d$n"
+    fc_show_pid "d$n"
+    pid=$(shell_pid "d$n")
+    [[ -n $pid ]] || fail "cycle $n: no shell pid on the screen: $(fc_screen "d$n")"
+    if [[ -z $pid0 ]]; then
+      pid0=$pid
+    elif [[ $pid != "$pid0" ]]; then
+      fail "cycle $n: the session's shell is pid $pid, it was $pid0: the session was lost between cycles"
+    fi
     fc_detach "d$n"
-    ok_one=0
-    for ((i = 0; i < 30; i++)); do
-      out=$(cx fil ls direct)
-      if awk '$1 == "dd" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out"; then
-        ok_one=1
-        break
-      fi
-      sleep 0.1
-    done
-    j=$n
-    if [[ $ok_one -eq 0 ]]; then
+    if ! ls_detached direct dd 5000; then
       lost=$((lost + 1))
-      log "cycle $j: the detach was not seen by the daemon: $out"
+      log "cycle $n: the detach did not reach the daemon: $LS_OUT"
     fi
   done
-  note "detach_not_seen_by_daemon=$lost/10"
+  note "detach_not_seen_by_daemon=$lost/10 (allowed: $DETACH_LOST_MAX)"
+  if [[ $lost -gt $DETACH_LOST_MAX ]]; then
+    fail "$lost of 10 detaches were lost, more than the $DETACH_LOST_MAX allowed"
+  fi
   if [[ $lost -gt 0 ]]; then
     known_bug "$lost of 10 clean detaches (~.) over ssh never reached the daemon: fil ls kept listing the client as attached"
   fi
@@ -737,7 +759,7 @@ f_ls_kill_detach() {
   fc_wait_exit b 20
   note "exit_after_kill=$FC_CODE"
   [[ $FC_CODE -ge 128 ]] || fail "the client of a killed session exited $FC_CODE, wanted 128+signal: $(fc_screen b)"
-  fc_has b 'lkd' || fail "no message about the session: $(fc_screen b)"
+  fc_has b 'killed by signal' || fail "the client did not say the session was killed by a signal: $(fc_screen b)"
   out=$(cx fil ls direct)
   if grep -q '^lkd ' <<< "$out"; then fail "the killed session is still listed: $out"; fi
   local rc=0
@@ -780,13 +802,18 @@ f_takeover_back() {
   fc_on client2
   fc_start b -- viajumps tb
   fc_wait b FIRST-42 30
+  # Output produced while the second client holds the session: the first client has not seen it,
+  # so it can only appear on its screen if the take-back really restores the session.
+  fc_line b 'echo SECOND-$((5*5))'
+  fc_wait b SECOND-25
   fc_wait a 'Take it back' 20
   fc_type a y
   fc_wait b 'was taken over' 20
-  fc_wait b 'by client' 5
+  fc_wait b 'by client at' 5
+  fc_wait a SECOND-25 30
+  fc_has a FIRST-42 || fail "the first client lost the earlier output after taking the session back: $(fc_screen a)"
   fc_line a 'echo BACK-$((2*8))'
   fc_wait a BACK-16 20
-  fc_has a FIRST-42 || fail "the first client lost the earlier output after taking the session back: $(fc_screen a)"
   fc_type b n
   fc_expect_exit b 1
   fc_detach a

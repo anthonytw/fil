@@ -39,16 +39,18 @@ Both programs are built statically for `x86_64-unknown-linux-musl` (`aarch64` on
 
 ```mermaid
 flowchart LR
-    client["client<br/>ssh client + pipe-echo driver"]
+    client["client<br/>ssh client + fil on a PTY"]
+    client2["client2<br/>a second machine, same user"]
     jump1["jump1<br/>sshd"]
     jump2["jump2<br/>sshd"]
-    target["target<br/>sshd + pipe-echo server"]
+    target["target<br/>sshd + fil relay and daemon"]
     client ---|"Docker network rn-c"| jump1
+    client2 ---|"Docker network rn-c"| jump1
     jump1 ---|"Docker network rn-1"| jump2
     jump2 ---|"Docker network rn-2"| target
 ```
 
-The three Docker networks are `--internal`, so the target is reachable only through the two jumps. The first scenario proves it: ssh to `target` by name and by address both fail from the client, and the target's sshd logs the login as coming from jump2's address. All four containers use one image (Ubuntu 24.04, OpenSSH 9.6, the two static binaries). Host keys are generated when each container starts.
+The three Docker networks are `--internal`, so the target is reachable only through the two jumps. The first scenario proves it: ssh to `target` by name and by address both fail from the client, and the target's sshd logs the login as coming from jump2's address. All five containers use one image (Ubuntu 24.04 pinned by digest, OpenSSH 9.6, the real `fil` and the static test programs: the stand-ins, `ptydrive`, `sockprobe`). Host keys are generated when each container starts.
 
 Accounts on every host: `fil` (clean), `noisy` (`.bashrc` echoes text), `loud` (prints 60000 bytes) and `flood` (prints 100000 bytes), and for the real-`fil` scenarios `mallory` (a second ordinary user) and `victim`, `victim2`, `victim3` (users whose socket directory somebody else prepared). The client runs as `tester`. A host reached without a jump is `jump1`; `ssh direct` goes there. A second client machine, `client2` (same image, same user and keys), takes sessions over from `client`. Containers have their own host names, so the "taken over by ..." message names a real machine, and run under `--init` (a PID 1 that reaps orphans, so "the process is gone" is not fooled by zombies).
 
@@ -83,7 +85,7 @@ flowchart LR
 - Segmentation offloads are switched off on every interface. Otherwise netem would delay and drop 64 KiB GSO bursts instead of packets.
 - Documentation addresses (RFC 5737) and RFC 1918 only. Nothing here is a real host.
 
-**The real `fil` needs an ssh path in this topology too** (it logs in over the pipe first, then upgrades). The choice: run the runner's own `sshd` inside `rn-server` (on `198.51.100.10:22`, a throwaway host key, public-key logins only, one allowed user) and have the client reach it through the same router. The alternatives were a Docker container attached to the namespace (needs more plumbing and a second sshd build) and ssh over loopback (would skip the NAT, which is the point). The ssh traffic crosses the same NAT and netem as the UDP; only UDP is ever dropped, so the pipe keeps working while QUIC does not. The harness makes two users for the run, `rnclient` (runs `ptydrive` and `fil` in `rn-client`) and `rnfil` (the account on the "server"), a throwaway key pair and an ssh config with `Host srv` (`HostName 198.51.100.10`); it installs the three binaries in `/usr/local/bin` (so `ssh srv fil server --stdio` finds `fil`) and removes users, keys and binaries at the end. `fil srv` finds the UDP address the way a user's setup does, from `ssh -G srv`. Nothing secret is committed; the keys are made at run time.
+**The real `fil` needs an ssh path in this topology too** (it logs in over the pipe first, then upgrades). The choice: run the runner's own `sshd` inside `rn-server` (on `198.51.100.10:22`, a throwaway host key, public-key logins only, one allowed user) and have the client reach it through the same router. The alternatives were a Docker container attached to the namespace (needs more plumbing and a second sshd build) and ssh over loopback (would skip the NAT, which is the point). The ssh traffic crosses the same NAT and netem as the UDP; only UDP is ever dropped, so the pipe keeps working while QUIC does not. The harness makes two users for the run, `rnclient` (runs `ptydrive` and `fil` in `rn-client`) and `rnfil` (the account on the "server"), a throwaway key pair and an ssh config with `Host srv` (`HostName 198.51.100.10`); it puts the three binaries in `/tmp/rn-udp-bin`, first on the client's `PATH` and, through sshd's `SetEnv PATH=...`, on the `PATH` of the sessions sshd starts (so `ssh srv fil server --stdio` finds the `fil` under test; setup checks it), and removes users, keys and that directory at the end. Nothing is installed into `/usr/local/bin`. `fil srv` finds the UDP address the way a user's setup does, from `ssh -G srv`. Nothing secret is committed; the keys are made at run time.
 
 ### systemd: a host with a user manager
 
@@ -114,11 +116,11 @@ On macOS (or without the tools) it refuses with a message and exits 2. From anyw
 gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet
 ```
 
-`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet` or `all`. The three parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
+`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet`, `aarch64` (the static binary for the lab Pis, `docs/m1/pi.md`) or `all`. The three realnet parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
 
 The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `sysd.sh` (one bash function per scenario, each run in its own process so `set -euo pipefail` applies), `lib.sh` (assertions, parsing, the summary table), `fil.sh` (driving the real client through `ptydrive`: start, type, wait for text, exit status, the client's log), `build.sh` and `docker/`. `shellcheck` is part of the CI job. The scenarios named `f_*` use the real `fil`; `s_*` are the stand-in scenarios.
 
-**Known findings.** When a scenario catches a defect in fil itself, it records `KNOWN-BUG: ...` in its measurements and carries on, so one finding does not hide the results after it. `REALNET_STRICT=1` makes them fail. The current list is under "Real binary: findings".
+**Known findings.** When a scenario catches a defect in fil itself, it records `KNOWN-BUG: ...` in its measurements and carries on, so one finding does not hide the results after it. A scenario that recorded one passes with the status `PASS*` in the table, so a green run cannot be skimmed as clean. `REALNET_STRICT=1` makes them fail (`just realnet` with the variable set; in the workflow, the `strict` input: `gh workflow run linux-check -f suite=realnet -f strict=true`, default off). The current list is under "Real binary: findings".
 
 ## Results: the real `fil` binary
 
@@ -129,10 +131,10 @@ From [run 41571100070](https://github.com/anthonytw/fil/actions/runs/41571100070
 | Scenario | What it checks | Result |
 |---|---|---|
 | `f_attach_detach` | attach to `direct`, run a command, `~.`; `fil ls`; attach again | pass: shell prompt 300 to 380 ms after the start; `~.` printed `detached from session` and exited 0; the second client saw the earlier output on its screen and the same shell (same pid) |
-| `f_detach_delivery` | ten attach and `~.` cycles; after each, `fil ls` must stop listing the client as attached within 3 s | **finding 1**: 3 of 10 detaches never reached the daemon. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
+| `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. Up to `DETACH_LOST_MAX` (7) lost detaches are recorded as a known finding; more fail | **finding 1**: 3 of 10 detaches never reached the daemon. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
 | `f_ls_kill_detach` | `fil ls` shows who is attached; `fil detach` tells the client; `fil kill` of an attached session; kill again | pass; the client of a killed session exits **129** (SIGHUP), see finding 2 |
 | `f_takeover` | a second machine (`client2`) attaches to a session held by `client` | pass: the first client was told `by client2` with the time, answered `n` and exited 1 with `was taken over by client2 ... (left alone)`; the second screen showed the earlier output; `fil ls` named `client2` |
-| `f_takeover_back` | the first client answers `y` (take it back) | pass: the second client is told in turn; the first client has the earlier output and a working shell again |
+| `f_takeover_back` | the first client answers `y` (take it back) | pass: the second client is told in turn (`by client at ...`); the first client's screen shows a line the second client printed while it held the session, so the take-back really carries the session's state; a working shell again |
 | `f_kill_ssh` | `kill -9` the client's ssh in the middle of a 15 s output run | pass: a new ssh was running **0.9 to 1.2 s** later; `TICK-1` to `TICK-60` each once, in order, no gap marker, the session continued |
 | `f_daemon_restart` | `kill -9` the daemon | pass: the client said `is a different session now (killed and recreated, or the daemon restarted)` after **1.4 to 1.6 s**; answering `n` exited 1 with that message; a second session, answering `y`, got a fresh working shell |
 | `f_noisy` | `.bashrc` prints on every login | pass: the client's warning (`your shell printed this before fil started`) with the text, `fil ls` printed it too; the session works. Note the warning is printed before the first snapshot, which pushes it into the scrollback |
@@ -151,8 +153,8 @@ From [run 41571100070](https://github.com/anthonytw/fil/actions/runs/41571100070
 
 | Scenario | What it checks | Result |
 |---|---|---|
-| `f_upgrade` | `fil srv` over `auto` | pass: the client log shows `Switched(Direct)` **0.91 to 0.94 s after the process started** (the first prompt came at 0.8 to 1.4 s, the ssh login being most of that); the ssh process was closed after the switch; the router's conntrack held the UDP flow to the daemon's port; 40 ticks over direct arrived once each in order |
-| `f_nat_rebind` | three NAT moves under a 22 s output run (new port, another new port, a new address; each flushes conntrack) | pass: `TICK-1` to `TICK-90` once each in order, no gap marker, **no further switch** after the upgrade and no ssh started: the session stayed on direct |
+| `f_upgrade` | `fil srv` over `auto` | pass: the client log shows `Switched(Direct)` **0.1 s after the attach reply and 0.9 to 0.94 s after the process started** (the first prompt came at 0.8 to 1.4 s, the ssh login being most of that); the check allows 1.5 s from the attach reply; the ssh process was closed after the switch; the router's conntrack held the UDP flow to the daemon's port; 40 ticks over direct arrived once each in order |
+| `f_nat_rebind` | three NAT moves under a 22 s output run (new port, another new port, a new address; each flushes conntrack). After each move the router's `conntrack -L` must show the client's flow mapped to the new address and a port in the new range, or the scenario fails | pass: `TICK-1` to `TICK-90` once each in order, no gap marker, **no further switch** after the upgrade and no ssh started: the session stayed on direct |
 | `f_udp_blocked_mid` | UDP dropped for good in the middle of an output run | pass: a new ssh was running **5.1 to 5.2 s** after the block (QUIC `Degraded` at 2 s, `Down(Dead)` at 5 s, then the pipe); `TICK-1` to `TICK-120` once each in order across the fallback. After the block was lifted the client went back to direct **11 to 16 s later** (the path manager's retry backoff) |
 | `f_udp_blocked_start` | UDP dropped before the attach | pass: first prompt at 0.8 s (QUIC does not delay the pipe); 15 s of output over the pipe, never switched; 3 to 4 failed direct dials in that time, none visible to the user |
 
@@ -313,10 +315,8 @@ Out of scope here and later: lab hardware, macOS as a remote host, and real mobi
 
 Verified on a runner: everything in the tables above, in the run linked at the top of each results section. The real-binary scenarios needed three runs to pass: the first run's failures were the harness's (a missing `ssh.socket` in the systemd image, the banner checked on the screen after it had scrolled off, the daemon's greeting mistaken for silence, and the runner's `XDG_CONFIG_HOME` leaking into the client's environment), plus one real finding (the lost detach, which is intermittent: it passed in one of the three runs of the first scenario that checks it).
 
-Not rendered: the new mermaid diagram (the systemd host) was written in the same form as the existing ones, but the renderer could not be run in this environment.
-
 Verified on a runner (stand-ins): Across the runs, one scenario failed once (NAT rebinding in the first run, on a missing `-p udp` in the SNAT rule; fixed), and the first run's 6.9 s heartbeat figure was a driver bug (the timestamp was taken after a 2 s wait for the child to exit; fixed, and it is 4.9 s). The hostile-name scenario has a positive control showing that the canary file would be created if the text reached a shell, so a passing result is not a blind check.
 
-Assumed, not measured, for the real binary: that the three scenarios of the UDP topology behave the same on the lab's networks (the numbers are one runner's); that a systemd container on this runner stands in for a real host (cgroup v2, logind and a user manager are real, but there is no graphical session, no `KillUserProcesses=yes` and no real logout); the suspected cause of finding 1.
+Assumed, not measured, for the real binary: that the four scenarios of the UDP topology behave the same on the lab's networks (the numbers are one runner's); that a systemd container on this runner stands in for a real host (cgroup v2, logind and a user manager are real, but there is no graphical session, no `KillUserProcesses=yes` and no real logout); the suspected cause of finding 1.
 
 Assumed, not measured: the explanation for the blackout cutoff (probe timing, idle-timeout stretching); that the Ubuntu runner's veth and netem behave like a real link at these rates (the throughput numbers are the runner's, not a network's); that other OpenSSH versions behave like the one tested (9.6p1, logged by the harness) (the process title `sshd: USER@notty` that the sshd-kill scenario matches changed in later releases); and that one runner is typical.

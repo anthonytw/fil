@@ -1,6 +1,7 @@
 # One image for every host in the SSH topology: client, jump1, jump2 and target.
 # Nothing secret is baked in. Keys and host keys are made at run time (see ssh.sh, entrypoint.sh).
-FROM ubuntu:24.04
+# Pinned by digest (the 24.04 index); update on purpose.
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-server openssh-client procps iproute2 \

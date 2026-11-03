@@ -124,7 +124,15 @@ run_scenarios() {
     rc=0
     bash "$script" --one "$s" 2>&1 | tee "$OUT/logs/$part-$s.log"
     rc=${PIPESTATUS[0]}
-    if [[ $rc -eq 0 ]]; then status=PASS; else status=FAIL; failed=1; fi
+    if [[ $rc -ne 0 ]]; then
+      status=FAIL
+      failed=1
+    elif grep -qs 'KNOWN-BUG' "$OUT/notes/$s.txt"; then
+      # Passed, but it recorded a defect in fil: not to be skimmed as clean.
+      status='PASS*'
+    else
+      status=PASS
+    fi
     printf '%s\t%s\t%s\t%s\n' "$s" "$status" "$((SECONDS - start))" \
       "$( (cat "$OUT/notes/$s.txt" 2> /dev/null || true) | tr '\n' ' ')" >> "$OUT/results-$part.tsv"
   done

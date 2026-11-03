@@ -8,6 +8,10 @@
 # session's processes end up (DESIGN.md section 5.1): with lingering on, under
 # `systemd-run --user --scope`; with it off, in the process tree.
 # Needs Docker and a runner that lets a privileged container run systemd. Run: sysd.sh [SCENARIO...]
+#
+# SAFETY: the container is --privileged, which is root on the machine it runs on. That is fine on a
+# GitHub-hosted runner (a throwaway VM, no secrets in this job). NEVER run this part on a
+# self-hosted runner, a lab machine or a developer's own computer; the other parts are not like this.
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -50,7 +54,10 @@ sysd_setup() {
 
   ssh-keygen -q -t ed25519 -N '' -C realnet-sysd -f "$SD_DIR/id"
   # privileged + cgroup v2: systemd runs as PID 1 and owns the container's cgroup subtree.
-  docker run -d --name "$SD" --hostname sysd --privileged --tmpfs /run --tmpfs /run/lock "$IMAGE" > /dev/null
+  # The cgroup namespace is private (explicitly: with the host's, systemd could disturb the
+  # runner's cgroups).
+  docker run -d --name "$SD" --hostname sysd --privileged --cgroupns=private \
+    --tmpfs /run --tmpfs /run/lock "$IMAGE" > /dev/null
 
   local i state=
   for ((i = 0; i < 240; i++)); do
@@ -77,7 +84,7 @@ sysd_setup() {
     exit 1
   }
 
-  SD_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' "$SD")
+  SD_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SD")
   [[ -n $SD_IP ]] || { echo "realnet: the container has no address" >&2; exit 1; }
   cat > "$SD_DIR/ssh_config" << EOF
 Host sysd
@@ -230,7 +237,10 @@ f_no_linger_tree() {
   log "plain job:     $cg_plain"
   log "setsid job:    $cg_setsid"
   [[ $cg_shell != *fil-nl1-* && $cg_plain != *fil-nl1-* ]] || fail "a scope was used with lingering off: $cg_shell"
-  ok "no fil scope: the session is in the process tree"
+  # The processes sit where the login put them: the PAM session's scope, not a scope of fil's.
+  [[ $cg_shell == *session-*.scope* && $cg_plain == *session-*.scope* ]] \
+    || fail "the session's processes are not in the login's session scope: $cg_shell | $cg_plain"
+  ok "no fil scope: the session is in the process tree, inside the login's session scope"
   fil_cmd kill sysd nl1 > /dev/null || fail "fil kill failed"
   fc_wait_exit a 30
   note "exit_after_kill=$FC_CODE"

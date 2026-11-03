@@ -132,7 +132,27 @@ struct State {
     parser: vt100::Parser,
     raw: Vec<u8>,
     exit: Option<Exit>,
+    /// When the program was found to have ended.
+    exit_at: Option<Instant>,
+    /// The program's output has ended (the reader saw end of file).
+    eof: bool,
     pid: Option<u32>,
+}
+
+/// After the program ends, its last output may still be on its way from the PTY to the screen.
+/// `exited` waits for the end of the output, but not longer than this (a grandchild that keeps
+/// the PTY open would otherwise hold it for ever).
+const OUTPUT_SETTLE: Duration = Duration::from_millis(500);
+
+/// How long `quit` lets the program take to end after SIGHUP before it uses SIGKILL.
+const QUIT_GRACE: Duration = Duration::from_secs(1);
+
+impl State {
+    /// The program has ended and everything it printed has been read.
+    fn exited(&self) -> bool {
+        self.exit.is_some()
+            && (self.eof || self.exit_at.is_some_and(|t| t.elapsed() >= OUTPUT_SETTLE))
+    }
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -227,6 +247,8 @@ fn serve(args: &[String]) -> Result<(), Fail> {
         parser: vt100::Parser::new(nz(rows)?, nz(cols)?, 0),
         raw: Vec::new(),
         exit: None,
+        exit_at: None,
+        eof: false,
         pid: child.process_id(),
     }));
     let mut killer = child.clone_killer();
@@ -242,11 +264,13 @@ fn serve(args: &[String]) -> Result<(), Fail> {
             g.raw.extend_from_slice(&buf[..n]);
             g.parser.process(&buf[..n]);
         }
+        lock(&st).eof = true;
     });
     let st = state.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         let mut g = lock(&st);
+        g.exit_at = Some(Instant::now());
         g.exit = Some(match status {
             Ok(s) => Exit {
                 code: s.exit_code(),
@@ -303,8 +327,19 @@ fn serve(args: &[String]) -> Result<(), Fail> {
             }
         });
     }
+    // Stop the program: SIGHUP (portable-pty's kill), a grace period, then SIGKILL by pid.
     if lock(&state).exit.is_none() {
         let _ = killer.kill();
+        let end = Instant::now() + QUIT_GRACE;
+        while lock(&state).exit.is_none() && Instant::now() < end {
+            std::thread::sleep(POLL);
+        }
+        let pid = lock(&state).pid;
+        if let (true, Some(pid)) = (lock(&state).exit.is_none(), pid) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
     }
     let _ = std::fs::remove_file(&sock);
     Ok(())
@@ -312,12 +347,22 @@ fn serve(args: &[String]) -> Result<(), Fail> {
 
 fn status_line(st: &State) -> String {
     match &st.exit {
-        None => format!("running pid={}", st.pid.unwrap_or(0)),
-        Some(e) => match &e.signal {
+        // Ended, but its last output is not on the screen yet: still "running" for a moment.
+        Some(e) if st.exited() => match &e.signal {
             Some(s) => format!("exited code={} signal={}", e.code, s.replace(' ', "_")),
             None => format!("exited code={}", e.code),
         },
+        _ => format!("running pid={}", st.pid.unwrap_or(0)),
     }
+}
+
+/// A timeout argument as a duration: never negative, never absurd.
+fn seconds(t: f64) -> Duration {
+    Duration::from_secs_f64(if t.is_finite() {
+        t.clamp(0.0, 3600.0)
+    } else {
+        10.0
+    })
 }
 
 fn handle(
@@ -366,7 +411,7 @@ fn handle(
                 Err(e) => return (false, e),
             };
             let want_present = verb == "wait";
-            let end = Instant::now() + Duration::from_secs_f64(timeout);
+            let end = Instant::now() + seconds(timeout);
             loop {
                 let (present, shown) = {
                     let g = lock(state);
@@ -407,11 +452,11 @@ fn handle(
             if rest.first().map(String::as_str) == Some("--timeout") {
                 timeout = rest.get(1).and_then(|v| v.parse().ok()).unwrap_or(10.0);
             }
-            let end = Instant::now() + Duration::from_secs_f64(timeout);
+            let end = Instant::now() + seconds(timeout);
             loop {
                 {
                     let g = lock(state);
-                    if g.exit.is_some() {
+                    if g.exited() {
                         return (true, status_line(&g));
                     }
                 }

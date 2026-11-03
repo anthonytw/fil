@@ -2,7 +2,8 @@
 # `systemd-run --user --scope` can really be tested (sysd.sh). Run with --privileged.
 # Nothing secret is baked in: the host keys come from the openssh-server package, made when this
 # image is built on the machine running the tests; the client key is copied in at run time.
-FROM ubuntu:24.04
+# Pinned by digest (the 24.04 index); update on purpose.
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 ENV container=docker DEBIAN_FRONTEND=noninteractive
 

@@ -43,12 +43,9 @@ fc_start() {
   local envargs=(--env FIL_LOG=debug --env "XDG_STATE_HOME=$PD/state-${SCENARIO:-x}-$name")
   for e in ${FC_ENV[@]+"${FC_ENV[@]}"}; do envargs+=(--env "$e"); done
   client_bg_on "$FC_HOST" ptydrive serve --dir "$PD" "${envargs[@]}" "$name" -- fil "$@"
-  local i
-  for ((i = 0; i < 100; i++)); do
-    fc "$name" status > /dev/null 2>&1 && return 0
-    sleep 0.1
-  done
-  fail "ptydrive for $name did not start"
+  # `ctl` retries the connection for 5 s by itself: a server that is not up by then never will be
+  # (a missing binary, a bad directory).
+  fc "$name" status > /dev/null 2>&1 || fail "ptydrive for $name did not start within 5 s"
 }
 
 # fc NAME VERB ARGS...: `ptydrive ctl`. The answer is on stdout; the status is its status.

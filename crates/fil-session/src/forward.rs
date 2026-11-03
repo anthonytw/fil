@@ -160,7 +160,12 @@ struct State {
     listen: HashMap<ForwardId, ListenState>,
     /// The endpoint's events. Read only under this lock, so a fresh attach can drop the old
     /// epoch's leftovers before the new client is heard (see [`Forwards::new_epoch`]).
-    events: mpsc::UnboundedReceiver<EndpointEvent>,
+    events: mpsc::Receiver<EndpointEvent>,
+    /// Set by a new epoch until the next link is up: any event that arrives meanwhile is of the
+    /// previous epoch (the endpoint may still hold some that its bounded channel had no room
+    /// for, and delivers them after `new_epoch`), since nothing of the new one can arrive before
+    /// its link does.
+    stale: bool,
     ended: bool,
 }
 
@@ -217,7 +222,7 @@ impl Forwards {
     pub(crate) fn new(name: SessionName, cfg: MuxConfig) -> Arc<Self> {
         // The policy and the connector need the table, and the endpoint's events go into the
         // state they read: the state is made first with a stand-in receiver.
-        let (_, placeholder) = mpsc::unbounded_channel();
+        let (_, placeholder) = mpsc::channel(1);
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
             sub: Sub::Detached,
@@ -227,6 +232,7 @@ impl Forwards {
             consented: HashSet::new(),
             listen: HashMap::new(),
             events: placeholder,
+            stale: false,
             ended: false,
         }));
         #[cfg(feature = "test-hooks")]
@@ -348,6 +354,7 @@ impl Forwards {
         // new one can come before its link is attached: what is waiting now is all stale (a late
         // `AddForward` of the old client must not be answered to the new one).
         while st.events.try_recv().is_ok() {}
+        st.stale = true;
         st.linked = false;
         st.conn = None;
         st.fatal = None;
@@ -373,6 +380,7 @@ impl Forwards {
         self.ep
             .attach_link(Arc::new(SessionLink::new(link)), resumed);
         st.linked = true;
+        st.stale = false;
     }
 
     /// Connection `conn` is over. If its link was the endpoint's, the subscriber is now between
@@ -513,8 +521,7 @@ impl Forwards {
                     listen: st.listen.get(&e.id).copied(),
                     consented: st.consented.contains(&e.id),
                     conns: s.open,
-                    // The endpoint does not say which of its waiting opens are whose.
-                    waiting: 0,
+                    waiting: s.waiting,
                     // From the daemon's sockets toward the client machine, and back.
                     bytes_down: s.from_local,
                     bytes_up: s.to_local,
@@ -655,6 +662,10 @@ impl Forwards {
     }
 
     fn on_event(&self, st: &mut State, ev: EndpointEvent) {
+        if st.stale {
+            debug!("an event of the previous mux epoch dropped");
+            return;
+        }
         match ev {
             EndpointEvent::Table(msg) => self.on_table(st, msg),
             // A payload the link refused while it stays up: the endpoint has let go of the link,

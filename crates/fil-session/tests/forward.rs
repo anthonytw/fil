@@ -477,6 +477,9 @@ async fn forwards_survive_a_reconnect() {
     let waiting = tokio::spawn(round_trip(port, b"while down", 10));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!waiting.is_finished(), "refused instead of waiting");
+    // `fil ports` shows it waiting.
+    let row = h.forward_rows().into_iter().find(|r| r.id == rid).unwrap();
+    assert_eq!(row.waiting, 1);
     c.resume(&h).await;
     assert_eq!(waiting.await.unwrap().as_deref(), Some(&b"while down"[..]));
     let _ = app;

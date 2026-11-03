@@ -768,6 +768,25 @@ fn status_cleared(c: &Client) -> Result<(), String> {
         })
 }
 
+/// The tick lines on the screen are consecutive: the status line, which is drawn over the bottom
+/// row, left no damage behind it once it went.
+fn screen_ticks_intact(c: &Client) -> Result<(), String> {
+    let nums: Vec<u64> = c
+        .rows()
+        .iter()
+        .filter_map(|r| r.trim().strip_prefix("TICK-")?.parse().ok())
+        .collect();
+    ensure(
+        nums.len() >= 10 && nums.windows(2).all(|w| w[1] == w[0] + 1),
+        || {
+            format!(
+                "the tick lines on the screen are not consecutive: {nums:?}\n{}",
+                c.dump()
+            )
+        },
+    )
+}
+
 /// Starts the counting loop `TICK-1 .. TICK-N`, a quarter second apart.
 fn start_ticks(c: &mut Client, n: u32) {
     c.send(&format!(
@@ -1666,6 +1685,7 @@ fn killed_ssh_midcommand(ctx: &Ctx, host: &str) -> Res {
     let res = check_seq(&c, from, "TICK-", 1, 80)?;
     c.roundtrip("KSM", CMD_TIMEOUT)?;
     status_cleared(&c)?;
+    screen_ticks_intact(&c)?;
     finish(c)?;
     Ok(vec![format!(
         "ssh killed at tick 12 of 80; the last tick arrived {} later; {res}",
@@ -1706,6 +1726,7 @@ fn client_sleep(ctx: &Ctx, host: &str) -> Res {
         thread::sleep(Duration::from_millis(500));
         let rt = c.roundtrip("SLP", CMD_TIMEOUT)?;
         status_cleared(&c)?;
+        screen_ticks_intact(&c)?;
         thread::sleep(Duration::from_secs(3));
         let settled = c.roundtrip("SLPS", CMD_TIMEOUT)?;
         let log = c.log();

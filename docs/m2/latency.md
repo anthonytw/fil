@@ -157,7 +157,7 @@ Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-
 
 ## Results
 
-Run: [41640812186](https://github.com/anthonytw/fil/actions/runs/41640812186), 2026-11-03 (ET), on `m2-l1` at `c0a2721` (all four scenarios passed; an earlier run, 41639007590, on the previous commit agreed with it to about 1 ms in every cell, apart from `l_catchup` failing there on a harness bug). Runner: GitHub `ubuntu-24.04`, OpenSSH 9.6p1 for the client and the sshd, a single run per cell (300 to 1000 keys each), so read differences under 1 to 2 ms as noise. No key was lost in any cell.
+Run: GitHub Actions run 41640812186 (`linux-check`, `suite=latency`), 2026-11-03 08:02 ET, branch `m2-l1` at commit `c0a2721`, all four scenarios passed. OpenSSH_9.6p1 (Ubuntu 24.04) on both ends. The network is the one above: round trip 40 ms with up to +-10 ms of spread, no loss. Every cell echoed every key (`lost=0` in all 17 cells).
 
 ### 1. `TCP_NODELAY`
 
@@ -165,59 +165,69 @@ Run: [41640812186](https://github.com/anthonytw/fil/actions/runs/41640812186), 2
 |---|---|---|---|
 | `ssh -T` | yes | yes | no |
 | `ssh -tt` | yes | yes | no |
-| the `ssh` fil starts (client side) | yes | not traced (it is the `-T` case) | no |
+| the `ssh` fil starts (client side) | yes | not traced | no |
 
-OpenSSH 9.6 sets `TCP_NODELAY` on the connection whether or not there is a pty. The only difference in the traces is `IP_TOS`: 0x08 (throughput) for `-T` and 0x10 (low delay) for `-tt`, which does nothing on this path. The claim in the plan, that `ssh -T` may Nagle, does not hold for this OpenSSH. The raw traces are in the artifact (`run/lat-strace-*.txt`).
+Contrary to the plan's claim, OpenSSH 9.6 sets `TCP_NODELAY` on both ends for `-T` too, not only for sessions with a terminal. The one visible difference is `IP_TOS`: `-T` sets 8 (throughput), `-tt` sets 16 (low delay). Netem ignores it, so it does not show in these numbers. This was measured on 9.6 only; the plan's claim may hold for older releases.
 
-### 2. Keystroke-to-echo, idle, 40 ms round trip (20 ms each way, +-5 ms jitter in each direction) (ms, p50 / p99)
+### 2. Keystroke-to-echo, idle, 40 ms round trip +-5 ms (ms)
 
-| Path | 5 keys/s | 20 keys/s | 50 keys/s | 20 keys/s, no netem |
+| Path | 5 keys/s p50 | p99 | 20 keys/s p50 | p99 | 50 keys/s p50 | p99 | 20 keys/s, no netem p50 | p99 |
+|---|---|---|---|---|---|---|---|---|
+| `ssh -tt` | 52.04 | 64.93 | 50.05 | 64.93 | 50.45 | 64.73 | 10.67 | 21.20 |
+| `ssh -tt -o ObscureKeystrokeTiming=no` (control) | not run | not run | 40.37 | 49.28 | not run | not run | 0.47 | 0.52 |
+| fil, pipe | 42.42 | 49.81 | 41.81 | 49.18 | 41.40 | 49.51 | 0.83 | 0.97 |
+| fil, QUIC | 41.45 | 49.05 | 41.34 | 49.10 | 41.03 | 49.43 | 0.70 | 0.81 |
+
+Lost keys in any cell: 0 (of 300 to 1000 per cell).
+
+**`ssh -tt` carries about 10 ms of its own.** OpenSSH 9.5 and later send keystrokes at fixed intervals (`ObscureKeystrokeTiming`, default on, applies to sessions with a terminal). With it on, plain `ssh -tt` is 10.67 ms p50 with no network, where the same command with it off is 0.47 ms. On the 40 ms network the difference is +9.7 ms p50 (50.05 against 40.37) and +15.7 ms p99. It does not touch `ssh -T`: fil's pipe, which runs over `ssh -T`, is 0.83 ms with no network (0.36 ms above `ssh -tt` with the option off) and 1.44 ms above the no-option control on the 40 ms network, with nothing near 10 ms. (That is an inference from fil's pipe cells; `ssh -T` was not run with the option itself.) So the fil-over-ssh p50 beats `ssh -tt` by about 8 ms, but that is the cost of the option in the baseline, not a gain from fil. The honest baseline is the `ObscureKeystrokeTiming=no` row.
+
+**fil's excess over plain ssh**, by OD-10's formula `(path p50 - ssh -tt p50) - (path local p50 - ssh local p50)`, in ms:
+
+| Path | 5 keys/s | 20 keys/s | 50 keys/s | 20 keys/s against the control (option off) |
 |---|---|---|---|---|
-| `ssh -tt` | 52.04 / 64.93 | 50.05 / 64.93 | 50.45 / 64.73 | 10.67 / 21.20 |
-| `ssh -tt -o ObscureKeystrokeTiming=no` | n/a | 40.37 / 49.28 | n/a | 0.47 / 0.52 |
-| fil, pipe (`ssh -T` underneath) | 42.42 / 49.81 | 41.81 / 49.18 | 41.40 / 49.51 | 0.83 / 0.97 |
-| fil, QUIC | 41.45 / 49.05 | 41.34 / 49.10 | 41.03 / 49.43 | 0.70 / 0.81 |
+| fil, pipe | +0.2 | +1.6 | +0.8 | +1.1 |
+| fil, QUIC | -0.6 | +1.3 | +0.6 | +0.7 |
 
-Lost keys: 0 of 300 to 1000 in every cell. fil's p50 is the round trip plus about 1 ms: 41.8 against `sshno`'s 40.4 on the network, and 0.8 against 0.5 with none.
+The local term is the 20 keys/s no-netem cell for all three rates. The pipe is 0.5 ms (20 keys/s) behind QUIC, which has no Nagle.
 
-**`ssh -tt` is slow because of `ObscureKeystrokeTiming`, not because of fil.** With no network at all, `ssh -tt` takes 10.7 ms at p50 and 21.2 ms at p99 for an echo that fil's pipe answers in 0.8 ms. That is OpenSSH 9.5 and later sending an interactive session's keystrokes in packets at fixed 20 ms intervals (the median wait is half an interval, the p99 nearly a whole one). Turning it off with `-o ObscureKeystrokeTiming=no` brings `ssh -tt` to 0.47 ms with no network and 40.4 ms on it, so the option costs 9.7 ms at p50. It only applies to sessions with a pty, so the pipe (`ssh -T`) never pays it. A fil that adopted `ssh -tt` would pay it unless it also passed that option.
+### 3. Keystrokes under a bulk transfer through `ssh -L`, 20 keys/s, 20 Mbit/s bottleneck (ms)
 
-### 3. Keystrokes under a bulk transfer through `ssh -L`, 20 keys/s, 20 Mbit/s each way, 500-packet queue (ms)
-
-| Load | bulk Mbit/s | p50 | p99 | p50 / idle | H1 rule exceeded (> 2x idle + 10 ms) |
+| Load | bulk Mbit/s | p50 | p99 | p50 / idle | H1 rule exceeded (> 2x idle + 10 ms = 109.9 ms) |
 |---|---|---|---|---|---|
 | idle | none | 49.93 | 66.24 | 1.0x | no |
-| bulk up (client to server) | 20.0 | 851.75 | 1142.18 | 17.1x | yes (110 ms) |
-| bulk down (server to client) | 20.0 | 844.67 | 1113.82 | 16.9x | yes (110 ms) |
+| bulk up (client to server) | 20.0 | 851.75 | 1142.18 | 17.1x | yes |
+| bulk down (server to client) | 20.0 | 844.67 | 1113.82 | 16.9x | yes |
 
-The bulk fills the 500-packet queue of the direction it loads (about 300 ms at 20 Mbit/s), and `ssh -L` shares one TCP connection between the typing and the bulk data, so the keystroke or its echo waits behind that queue and ssh's own buffers whichever way the bulk goes: about 850 ms, 8 times the bar H1 sets. The idle row has `ssh -tt`'s obscure timing in it (50 ms); it is the same ssh the loaded rows were made with.
+Typing and bulk share one ssh connection. The idle row includes `ssh -tt`'s ~10 ms (above), which is small next to the effect. Lost keys: 0. The 845 to 850 ms is far more than the 300 ms the router queue can hold. It is close to what ssh's 2 MiB channel window holds at 20 Mbit/s (about 840 ms), so the keystrokes most likely wait in ssh's and TCP's own buffers, not in the router. That inference was not measured here.
 
-### 4. Catch-up with a fast discarding consumer, `cat` of 4.0 MB (55000 lines), runs with a `fil: skipped` marker
+### 4. Catch-up with a fast discarding consumer, `cat` of 4 MB, runs with a `fil: skipped` marker
 
-| Path | Network | Realnet (5 runs) | pi1 (20) | pi2 (20) |
-|---|---|---|---|---|
-| `ssh -tt` (control) | clean | 0/5 (55000 lines every run) | n/a | n/a |
-| `ssh -tt` (control) | 40 ms | 0/5 (55000 lines every run) | n/a | n/a |
-| fil, pipe | clean | **5/5**, 8 markers | not run | not run |
-| fil, pipe | 40 ms | **5/5**, 5 markers | n/a | n/a |
-| fil, QUIC | clean | **5/5**, 5 markers | not run | not run |
-| fil, QUIC | 40 ms | **5/5**, 10 markers | n/a | n/a |
+| Path | Network | Realnet (R = 5) | marker total | run times (ms) | pi1 (20) | pi2 (20) |
+|---|---|---|---|---|---|---|
+| `ssh -tt` (control) | clean | 0/5 | 0 | 100 to 107 | n/a | n/a |
+| `ssh -tt` (control) | 40 ms | 0/5 | 0 | 412 to 722 | n/a | n/a |
+| fil, pipe | clean | 5/5 | 8 | 158 to 173 | not run | not run |
+| fil, pipe | 40 ms | 5/5 | 5 | 478 to 1146 | n/a | n/a |
+| fil, QUIC | clean | 5/5 | 5 | 162 to 179 | not run | not run |
+| fil, QUIC | 40 ms | 5/5 | 10 | 210 to 331 | n/a | n/a |
 
-Catch-up fires on every `cat` of a file this size, on both transports, even with a consumer that parses nothing (the daemon's threshold is 1 MiB behind or 2 s, DESIGN.md §6.2; the file is four times that). `ssh -tt` delivers every line in under 0.8 s, so the consumer is not what holds fil back. The `LINE-` tally of a fil run (44.7k to 51.8k of 55k on the pipe and on QUIC on the clean network, 48.8k to 49.2k on the pipe at 40 ms) counts the snapshot's re-rendered history too, so it is not "lines kept". On QUIC at 40 ms the first run skipped almost everything (174 KB read, two markers) and the next four read 2.6 to 3.1 MB with two markers each. The per-run times (clean network, pipe) were 158 to 173 ms against ssh's 100 to 107, and at 40 ms 478 to 1146 ms against 412 to 722. The Pi half (20 runs per transport on each Pi) is the procedure above; it was not run in this package.
+The control delivered all 55000 `LINE-` tokens in every run, so the consumer is fast. Every fil run skipped, with one or two markers per run, and fil's clean-pipe runs delivered 44700 to 51200 of the 55000 `LINE-` tokens (a tally can include snapshot re-renders). One QUIC run on the 40 ms network delivered only 2341. Catch-up is therefore the normal outcome of a 4 MB burst, not a rare one, on both transports. The Pi half of this measurement is written (see above) and has not been run; the pi1 and pi2 columns stay empty until it is.
 
 ### Recommendation for OD-10
 
-**Do not adopt the NODELAY remedy. Keep the pipe as it is, `ssh -T`.** OD-10 closes without a code change.
-
-1. Step 1 of the rule: both ends of the connection `fil` starts set `TCP_NODELAY`. There is no Nagle to remedy.
-2. Step 2: fil's pipe costs 1.4 ms over `sshno` on the network (41.81 against 40.37 at 20 keys/s) and 0.4 ms with none, and sits within 0.5 ms of QUIC (41.81 against 41.34). QUIC has no Nagle by construction, so the most the remedy could gain is about 0.5 ms, against the 20 ms the plan asks for.
-3. `ssh -tt` would lose: it costs 8.2 ms more at p50 and 15.8 ms more at p99 than the pipe on this network, 9.7 ms of it ObscureKeystrokeTiming, besides the costs the plan lists (a pty, utmp entries, stderr merged into the stream). If a later change ever needs `-tt`, it must pass `-o ObscureKeystrokeTiming=no`.
+**Do not adopt the remedy; keep `ssh -T`.** OpenSSH 9.6 sets `TCP_NODELAY` on the client and on sshd for `-T`, and the pipe's keystroke latency is 1.6 ms above plain `ssh -tt` at 20 keys/s (0.8 ms at 50, 0.2 at 5) on the 40 ms network, and 1.1 ms above it with `ObscureKeystrokeTiming=no`. QUIC, which cannot Nagle, is 1.3 ms. The remedy's threshold is 20 ms and both conditions fail (the option is set; the excess is 1/12 of the bar). `ssh -tt` would cost a pty, utmp entries and merged stderr, and for fil it would add the ~10 ms keystroke-timing delay measured above. Close the "pipe Nagle" claim in the plan as not found on OpenSSH 9.6. If a user's ssh is old enough to leave `-T` without `TCP_NODELAY`, that is a separate check; this run has no data on it.
 
 ### Thresholds for H1
 
-H1 stays conditional on V1's `f_fwd_vs_ssh`. What this run fixes:
+H1's trigger has two arms; one is settled and one waits for V1.
 
-- **The trigger** is the plan's rule, with fil's own idle numbers on this network at 20 keys/s: a keystroke p50 under a bulk forward above **2 x idle + 10 ms**, that is, above **93.6 ms** on the pipe (idle 41.81) and **92.7 ms** on QUIC (idle 41.34).
-- **The comparison bar** for `f_fwd_vs_ssh`: `ssh -L` on the same network and the same 20 Mbit/s, 500-packet bottleneck gives p50 **852 ms** (up) and **845 ms** (down) and p99 **1142 ms** and **1114 ms**. fil's target, from the plan, is keystroke p99 no worse than that, and the trigger above is a far tighter test, so the real bar is the trigger.
-- **Expect H1 to be needed unless forwards are paced.** `ssh -L` exceeds the rule 8-fold. On the pipe, fil's forwards share ssh's TCP connection and its buffers exactly as `ssh -L` does, so V1 should expect the same queueing there; on QUIC the channels share one priority (§8.5), and the bottleneck's queue would fill the same way. A forward that is not held back by a delay-based cap will measure like these two rows.
-- **The conditions must be kept** when V1 repeats it: 20 keys/s, `delay 20ms 5ms rate 20mbit limit 500` each way, an upload and a download, the same `keyprobe --shell` echo, the link checked as loaded (at least 2 Mbit/s of bulk).
+- **`ssh -T` Nagles:** no (section 1). This arm does not start H1.
+- **Keystroke p50 under a bulk forward above 2x idle plus 10 ms:** `ssh -L` exceeds it by a wide margin (17.1x up, 16.9x down, p50 852 and 845 ms against a bar of 109.9 ms) at 20 keys/s, 40 ms round trip, a 20 Mbit/s bottleneck with a 500 packet queue. That is the baseline, not fil's number. fil has no forwards yet, so the arm is decided by V1 (`f_fwd_vs_ssh`) on this same network and bottleneck:
+
+| Condition | Threshold |
+|---|---|
+| H1 is needed if fil's forward p50 under bulk exceeds | 2x idle + 10 ms: about 93 ms on the pipe and on QUIC (idle p50 41.4 and 41.3 ms), in either direction |
+| `f_fwd_vs_ssh` fails if fil's forward p99 under bulk exceeds | `ssh -L`'s: 1142 ms (up), 1114 ms (down) |
+
+H1 also needs the owner's approval (plan, H1). If V1 shows fil's forward under both lines, H1 is not built.

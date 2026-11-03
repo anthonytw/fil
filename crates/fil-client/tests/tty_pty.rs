@@ -227,4 +227,14 @@ async fn a_panic_puts_the_terminal_back_before_unwinding_reaches_anyone() {
     let r = std::panic::catch_unwind(|| panic!("boom"));
     assert!(r.is_err());
     assert_eq!(lflags(&p.slave), before.local_modes);
+    // ...and it also switched off what a program may have left on, in a form that is invisible
+    // when it is already off. (Not the alternate screen or the kitty stack: see the hook.)
+    let got = read_master(&p.master, 100);
+    let text = String::from_utf8_lossy(&got).into_owned();
+    for want in [
+        "\x18", "?1000l", "?1006l", "?1004l", "?2004l", "?1l", "\x1b>", "?25h",
+    ] {
+        assert!(text.contains(want), "{want:?} missing from {text:?}");
+    }
+    assert!(!text.contains("?1049"), "{text:?}");
 }

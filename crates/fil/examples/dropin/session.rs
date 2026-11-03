@@ -504,8 +504,8 @@ pub fn client_kill9(ctx: &Ctx, host: &str) -> Res {
 
 /// `~.` while a program has the terminal in its own modes (alternate screen, mouse reporting,
 /// application cursor keys, a hidden cursor): the local terminal should be sane afterwards.
-/// **A known failure** (docs/m1/dropin.md, finding 3): the client takes its own drawing off and
-/// leaves raw mode, and nothing more. ssh leaves the same mess; mosh restores the modes.
+/// (docs/m1/dropin.md, finding 3, fixed by R3: the client resets the modes it knows are set, as
+/// mosh does. ssh leaves them on.)
 pub fn terminal_sane_after_detach(ctx: &Ctx, host: &str) -> Res {
     let mut c = ctx.shell(host, Variant::Auto, "sane")?;
     c.send("printf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[?1h\\033[?25l'; sleep 3003\r");

@@ -316,6 +316,10 @@ impl<L: Link> Forwards<L> {
             refusals: 0,
             next_token: 0,
             gone_ids: HashSet::new(),
+            saturated: false,
+            answer_wait: set.mux.open_wait,
+            unanswered_by: None,
+            busy_noted: false,
             failed: false,
             dirty: true,
             view: view.clone(),
@@ -616,9 +620,29 @@ pub const MAX_QUESTIONS: usize = 4;
 /// [`fil_proto::limits::MAX_FORWARDS`] in all; past this every further one is refused without
 /// being kept.
 pub const MAX_OTHERS: usize = 2 * fil_proto::limits::MAX_FORWARDS;
-/// Most ids remembered as gone in one epoch (an id never comes back: section 2.4). A host that
-/// goes past it ends the run with a protocol error.
+/// Most ids remembered as gone in one epoch (an id never comes back: section 2.4). Past it, no
+/// new entry is taken until the next fresh attach.
 const MAX_GONE: usize = 4096;
+/// The first of the forward ids the client keeps for itself: an own listener waits under
+/// `private_id(i)` from a fresh attach until the new table names its id. A daemon's ids count up
+/// from 0 and never come near; one in this range is a protocol error.
+const PRIVATE_IDS: u32 = u32::MAX - 1023;
+
+fn private_id(i: usize) -> ForwardId {
+    ForwardId(u32::MAX - u32::try_from(i).expect("at most MAX_FORWARDS own specs"))
+}
+
+fn is_private(id: ForwardId) -> bool {
+    id.0 >= PRIVATE_IDS
+}
+
+async fn at(t: Option<tokio::time::Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Refusals logged at info and shown as a notice; after that only at debug.
 const LOUD_REFUSALS: u32 = 8;
 
@@ -649,6 +673,14 @@ struct Manager<L: Link> {
     next_token: u64,
     /// Ids that went (`ForwardGone`) in this epoch: never taken again.
     gone_ids: HashSet<ForwardId>,
+    /// [`MAX_GONE`] ids went in this epoch: no new entry is taken until the next fresh attach.
+    saturated: bool,
+    /// How long the new table may take to answer the own forwards (`open_wait`), and until when
+    /// it has now.
+    answer_wait: std::time::Duration,
+    unanswered_by: Option<tokio::time::Instant>,
+    /// The refusal of a burst for room was said (until a question is asked again).
+    busy_noted: bool,
     /// The run is over for the forwards (the host broke the rules): nothing more is done.
     failed: bool,
     view: Arc<Mutex<View>>,
@@ -681,6 +713,10 @@ impl<L: Link> Manager<L> {
                         self.answer(id, token, yes);
                     }
                 },
+                () = at(self.unanswered_by), if self.unanswered_by.is_some() => {
+                    self.dirty = true;
+                    self.unanswered();
+                }
                 ev = events.recv() => match ev {
                     None => return,
                     Some(EndpointEvent::Table(m)) => self.table(m),
@@ -694,6 +730,29 @@ impl<L: Link> Manager<L> {
             if std::mem::take(&mut self.dirty) {
                 self.refresh_view();
             }
+        }
+    }
+
+    /// The new table did not answer some own forwards in time: their listeners (paused since the
+    /// fresh attach) close, so an application waiting in the backlog is refused rather than left
+    /// hanging; the bind is tried again at the next fresh attach.
+    fn unanswered(&mut self) {
+        self.unanswered_by = None;
+        for i in 0..self.own.len() {
+            if self.own[i].req.is_none() {
+                continue;
+            }
+            self.own[i].req = None;
+            match std::mem::replace(&mut self.own[i].listener, Listener::None) {
+                Listener::On(parked) => {
+                    self.ep.unlisten(parked);
+                }
+                // Bound before the first attach and never handed over: closed too.
+                Listener::Prebound(b) => drop(b),
+                Listener::None => {}
+            }
+            let text = format!("{}: the host did not answer", describe(&self.own[i].spec));
+            self.failed(text);
         }
     }
 
@@ -726,12 +785,22 @@ impl<L: Link> Manager<L> {
         }
         self.note(Note::CancelAll);
         self.gone_ids.clear();
+        self.saturated = false;
         // The own listeners hold their ports and backlogs, but open nothing until the new
-        // table names their ids: an old id may name another entry now.
-        for o in &self.own {
-            if let Listener::On(old) = o.listener {
+        // table names their ids: an old id may name another entry now. They wait under ids of
+        // the client's own, so the new table's ids (which may be one another's old ones) can
+        // never land on another own listener.
+        for i in 0..self.own.len() {
+            if let Listener::On(old) = self.own[i].listener {
                 self.ep.pause_listener(old);
+                let parked = private_id(i);
+                if old != parked && self.ep.rekey_listener(old, parked) {
+                    self.own[i].listener = Listener::On(parked);
+                }
             }
+        }
+        if !self.own.is_empty() {
+            self.unanswered_by = Some(tokio::time::Instant::now() + self.answer_wait);
         }
         for i in 0..self.own.len() {
             let req = self.next_req;
@@ -756,6 +825,16 @@ impl<L: Link> Manager<L> {
         if !matches!(msg, MuxMsg::Forward { req: None, .. }) {
             self.dirty = true;
         }
+        let named = match &msg {
+            MuxMsg::Forward { id, .. }
+            | MuxMsg::ForwardGone { id }
+            | MuxMsg::Listening { id, .. } => Some(*id),
+            _ => None,
+        };
+        if named.is_some_and(is_private) {
+            self.broken("the host used a forward id the client keeps for itself");
+            return;
+        }
         match msg {
             MuxMsg::Forward {
                 id,
@@ -765,7 +844,10 @@ impl<L: Link> Manager<L> {
             } => {
                 let _ = origin;
                 match self.own.iter().position(|o| o.req == Some(req)) {
-                    Some(i) => self.own_answer(i, id, &spec),
+                    Some(i) => {
+                        self.own_answer(i, id, &spec);
+                        self.all_answered();
+                    }
                     None => debug!("an answer to no request of ours"),
                 }
             }
@@ -779,6 +861,7 @@ impl<L: Link> Manager<L> {
                 if let Some(i) = self.own.iter().position(|o| o.req == Some(req)) {
                     self.own[i].req = None;
                     debug!(why = ?why, "an own forward was refused");
+                    self.all_answered();
                     // Its listener (paused since the fresh attach) refuses what waits on it; the
                     // bind is tried again at the next fresh attach.
                     if let Listener::On(old) =
@@ -803,6 +886,13 @@ impl<L: Link> Manager<L> {
 
     /// The daemon's answer to an own `AddForward`: entry `id`. What it said the spec is
     /// (`_wire`) is not used: the run's own copy is what the forward does.
+    /// No own forward waits for its answer any more: the deadline goes.
+    fn all_answered(&mut self) {
+        if self.own.iter().all(|o| o.req.is_none()) {
+            self.unanswered_by = None;
+        }
+    }
+
     fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
         if *_wire != self.own[i].spec {
             debug!("the host's entry differs from the spec asked for; the own copy is used");
@@ -859,10 +949,12 @@ impl<L: Link> Manager<L> {
                 self.own[i].port.ok_or(BindFailure::Other)
             }
             Listener::On(old) => {
-                // Not movable (`id` has a listener already, which the checks in `own_answer`
-                // rule out): let the old one go and bind again.
-                self.ep.unlisten(old);
-                self.ep.listen(id, kind, spec.bind(), spec.port())
+                // Not movable: `id` has a listener already. Own listeners wait under ids of the
+                // client's (`private_id`) and `own_answer` refuses ids in use, so only a host that
+                // named one id twice gets here. Never replace another forward's listener.
+                self.own[i].listener = Listener::On(old);
+                self.broken("the host answered two forwards with one id");
+                return;
             }
             // Bound before the attach: handed over, so the port is never let go.
             Listener::Prebound(b) => self.ep.listen_bound(id, kind, b),
@@ -899,10 +991,13 @@ impl<L: Link> Manager<L> {
     /// is ended, and the client reconnects and resumes. Unless the endpoint is on another link
     /// by now, which means the failed one is gone already.
     fn link_failed(&mut self) {
+        // Under the `current` lock (the order the readers use: `current`, then the endpoint), so
+        // a link a reader attaches meanwhile is not the one closed.
+        let mut cur = lock(&self.current);
         if self.ep.snapshot().attached {
             return;
         }
-        if let Some(link) = lock(&self.current).take() {
+        if let Some(link) = cur.take() {
             debug!("forward send failed on a live link; ending it");
             link.close();
         }
@@ -924,18 +1019,24 @@ impl<L: Link> Manager<L> {
             });
             return;
         }
-        if self.entries.len() >= MAX_OTHERS {
-            // More than an honest daemon ever has: refused, and not kept.
+        if self.saturated {
+            // The host went through more forwards in this attach than are remembered: nothing
+            // new is taken until the next fresh attach (the run goes on).
             self.refuse(id, &spec, consent::Refusal::TooMany);
             return;
         }
-        // The identity of an own spec whose answer is still on its way: that answer names this
-        // entry, or replaces it.
-        let mine = spec.port() != 0
-            && self
-                .own
-                .iter()
-                .any(|o| o.id.is_none() && o.spec.identity() == spec.identity());
+        if self.entries.len() >= MAX_OTHERS {
+            // More than an honest daemon ever has: refused, and not kept.
+            self.refuse(id, &spec, consent::Refusal::Busy);
+            return;
+        }
+        // An own spec whose answer is still on its way, equal to this entry (an `-R 0` too: it
+        // has no identity, but an equal add is answered with the equal entry), or with its
+        // identity: that answer names this entry, or replaces it.
+        let mine = self.own.iter().any(|o| {
+            o.id.is_none()
+                && (o.spec == spec || (spec.port() != 0 && o.spec.identity() == spec.identity()))
+        });
         self.dirty = true;
         if mine {
             self.entries.insert(id, Other::new(spec, State::Superseded));
@@ -947,8 +1048,9 @@ impl<L: Link> Manager<L> {
             .filter(|o| o.state == State::Asking)
             .count();
         let decision = match consent::decide(&spec, self.rules, self.denials) {
-            // Questions enough are waiting: this one is refused, and counts as a refusal.
-            Decision::Ask if asking >= MAX_QUESTIONS => Decision::Refuse(consent::Refusal::TooMany),
+            // Questions enough are waiting: this one is refused. Not the user's refusal: it does
+            // not count toward the rule.
+            Decision::Ask if asking >= MAX_QUESTIONS => Decision::Refuse(consent::Refusal::Busy),
             d => d,
         };
         match decision {
@@ -960,6 +1062,7 @@ impl<L: Link> Manager<L> {
                 let mut o = Other::new(spec, State::Asking);
                 o.token = token;
                 self.entries.insert(id, o);
+                self.busy_noted = false;
                 self.note(Note::Ask(Question { id, token, lines }));
             }
             Decision::Refuse(why) => {
@@ -969,21 +1072,20 @@ impl<L: Link> Manager<L> {
         }
     }
 
-    /// Refuses an entry without asking.
+    /// Refuses an entry without asking. Only the user's answers count toward the refusal rule,
+    /// so this does not. A burst refused for room is said once, not per entry.
     fn refuse(&mut self, id: ForwardId, spec: &ForwardSpec, why: consent::Refusal) {
         self.send(MuxMsg::Consent {
             id,
             accepted: false,
         });
         self.refusals = self.refusals.saturating_add(1);
-        if self.refusals <= LOUD_REFUSALS {
+        let repeat = why == consent::Refusal::Busy && std::mem::replace(&mut self.busy_noted, true);
+        if self.refusals <= LOUD_REFUSALS && !repeat {
             tracing::info!(kind = ?spec.kind(), why = ?why, "forward from the host refused");
             self.note(Note::Notice(consent::refusal_lines(spec, why)));
         } else {
             debug!(kind = ?spec.kind(), why = ?why, "forward from the host refused");
-        }
-        if why == consent::Refusal::TooMany {
-            self.denied();
         }
     }
 
@@ -1074,11 +1176,13 @@ impl<L: Link> Manager<L> {
         if !known {
             return;
         }
-        if self.gone_ids.len() >= MAX_GONE {
-            self.broken("the host went through too many forwards");
-            return;
+        if self.gone_ids.len() < MAX_GONE {
+            self.gone_ids.insert(id);
+        } else if !std::mem::replace(&mut self.saturated, true) {
+            // Past what is remembered: from now on nothing new is taken in this attach, so an id
+            // that went can never come back as something else. Fails closed; the run goes on.
+            debug!("too many forwards gone in one attach; refusing new ones");
         }
-        self.gone_ids.insert(id);
         lock(&self.grants).revoke(id);
         self.ep.forget_stats(id);
         if let Some(i) = self.own_index(id) {
@@ -1294,6 +1398,10 @@ mod tests {
             refusals: 0,
             next_token: 0,
             gone_ids: HashSet::new(),
+            saturated: false,
+            answer_wait: std::time::Duration::from_secs(30),
+            unanswered_by: None,
+            busy_noted: false,
             failed: false,
             dirty: true,
             view: Arc::new(Mutex::new(View::default())),
@@ -1362,6 +1470,29 @@ mod tests {
         );
         m.other(ForwardId(100), rspec(8000), Origin::Request);
         assert!(asked(&mut rx).is_empty());
+    }
+
+    /// Past [`MAX_GONE`] gone ids nothing new is taken (not even asked about) until the next
+    /// fresh attach, and the run goes on.
+    #[tokio::test]
+    async fn past_the_gone_ids_nothing_new_is_taken() {
+        let (mut m, mut rx) = manager();
+        for i in 0..MAX_GONE as u32 + 10 {
+            m.other(ForwardId(i), rspec(8000), Origin::Request);
+            m.gone(ForwardId(i));
+        }
+        assert!(!m.failed);
+        assert!(m.gone_ids.len() <= MAX_GONE);
+        let _ = asked(&mut rx);
+        m.other(ForwardId(1_000_000), rspec(8000), Origin::Request);
+        assert!(asked(&mut rx).is_empty(), "asked while saturated");
+        m.fresh();
+        m.other(ForwardId(2_000_000), rspec(8000), Origin::Request);
+        assert_eq!(
+            asked(&mut rx).len(),
+            1,
+            "a fresh attach takes entries again"
+        );
     }
 
     #[tokio::test]

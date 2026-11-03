@@ -18,23 +18,29 @@ use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 static ORIGINAL: OnceLock<Rlimit> = OnceLock::new();
 
 /// Raises the soft limit on open files to the hard one (on macOS at most `OPEN_MAX`, which its
-/// `setrlimit` insists on). Best effort; idempotent.
+/// `setrlimit` insists on). Best effort; idempotent; never lowers it.
 pub fn raise() {
     let lim = getrlimit(Resource::Nofile);
-    let mut want = lim.maximum.unwrap_or(u64::MAX);
-    if cfg!(target_os = "macos") {
-        want = want.min(10_240);
-    }
-    if lim.current.is_some_and(|c| c >= want) {
+    let Some(raised) = raised(lim, cfg!(target_os = "macos")) else {
         return;
-    }
-    let raised = Rlimit {
-        current: Some(want),
-        maximum: lim.maximum,
     };
     if setrlimit(Resource::Nofile, raised).is_ok() {
         let _ = ORIGINAL.set(lim);
     }
+}
+
+/// The limit [`raise`] sets for `lim`, or `None` to leave it: a soft limit that is already at
+/// the target, or infinite (`None`), is never lowered.
+fn raised(lim: Rlimit, macos: bool) -> Option<Rlimit> {
+    let current = lim.current?;
+    let mut want = lim.maximum.unwrap_or(u64::MAX);
+    if macos {
+        want = want.min(10_240);
+    }
+    (current < want).then_some(Rlimit {
+        current: Some(want),
+        maximum: lim.maximum,
+    })
 }
 
 /// Makes `cmd`'s child start with the soft limit this process started with (a no-op unless
@@ -50,8 +56,10 @@ pub fn keep_for_child(cmd: &mut tokio::process::Command) {
 /// outside tests. `pre_exec` is unsafe because the closure runs in the forked child, where only
 /// async-signal-safe calls are allowed. This closure:
 ///
-/// - makes a single `setrlimit` system call (rustix calls it directly, no libc wrapper that
-///   could take a lock);
+/// - makes a single `setrlimit` call. On Linux rustix makes the system call itself; on macOS it
+///   goes through libc's `setrlimit`, which in Darwin's libc is a bare system-call stub (no lock,
+///   no allocation). `setrlimit` is not on POSIX's async-signal-safe list, so this relies on
+///   those two implementations;
 /// - allocates nothing, touches no lock, and uses only `limit`, a `Copy` value captured by move;
 /// - ignores the result: lowering a soft limit to a value at or below the hard limit cannot fail,
 ///   and if it did the child would only keep the higher limit, which is what it had without this.
@@ -69,6 +77,30 @@ fn restore_in_child(cmd: &mut tokio::process::Command, limit: Rlimit) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raising_never_lowers() {
+        let lim = |current, maximum| Rlimit { current, maximum };
+        // An infinite soft limit stays infinite.
+        assert_eq!(raised(lim(None, None), false), None);
+        assert_eq!(raised(lim(None, Some(4096)), true), None);
+        // Already at (or above) the target: left alone.
+        assert_eq!(raised(lim(Some(10_240), None), true), None);
+        assert_eq!(raised(lim(Some(4096), Some(4096)), false), None);
+        // Up to the hard limit; on macOS at most OPEN_MAX.
+        assert_eq!(
+            raised(lim(Some(256), Some(4096)), false),
+            Some(lim(Some(4096), Some(4096)))
+        );
+        assert_eq!(
+            raised(lim(Some(256), None), true),
+            Some(lim(Some(10_240), None))
+        );
+        assert_eq!(
+            raised(lim(Some(1024), None), false),
+            Some(lim(Some(u64::MAX), None))
+        );
+    }
 
     /// A child sees the soft limit the process started with, not the raised one.
     #[tokio::test]

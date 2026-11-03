@@ -336,9 +336,9 @@ async fn a_gone_id_announced_again_is_refused() -> Test {
     Ok(())
 }
 
-/// Ten entries at once (B2): at most [`fil_client::forward::MAX_QUESTIONS`] are asked, the
-/// refusals that follow trip the 3-refusal rule, and that refuses the questions still waiting.
-/// Nothing holds the keyboard, and no answer was needed.
+/// Ten entries at once (B2): at most [`fil_client::forward::MAX_QUESTIONS`] are asked and the
+/// rest are refused at once (without counting as the user's refusals). Three `n` answers trip
+/// the rule, which refuses the question still waiting. The keyboard is free again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_burst_of_requests_is_refused_and_does_not_hold_the_keyboard() -> Test {
     let bait = canary().await;
@@ -346,6 +346,14 @@ async fn a_burst_of_requests_is_refused_and_does_not_hold_the_keyboard() -> Test
     let fwd = rig.daemon.fwd.clone();
     for i in 0..10u32 {
         fwd.announce(ForwardId(100 + i), remote(0, bait.port), Origin::Request);
+    }
+    eventually("the overflow refused", 5, || fwd.consents().len() == 6).await;
+    until("a question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    for _ in 0..3 {
+        rig.answer("n").await;
     }
     eventually("all refused", 5, || fwd.consents().len() == 10).await;
     assert!(fwd.consents().iter().all(|c| !c.1), "{:?}", fwd.consents());
@@ -422,9 +430,11 @@ async fn an_entry_flood_stays_bounded_in_memory() -> Test {
             }
         }
     };
+    // Every entry is refused at once but the first few, which are asked (and stay asked).
+    let asked = fil_client::forward::MAX_QUESTIONS;
     let answered = |n: usize| {
         let fwd = fwd.clone();
-        move || fwd.st.lock().unwrap().nconsents >= n
+        move || fwd.st.lock().unwrap().nconsents >= n - asked
     };
     // A first flood brings every pool and buffer on the way to its working size; a second one
     // of the same size must then add nothing that grows with it.
@@ -532,5 +542,97 @@ async fn a_grant_does_not_survive_a_take_back() -> Test {
     let mut s = fwd.open(OpenKind::Remote { forward: id }).await;
     assert!(ends_without_data(&mut s, REFUSED_WITHIN).await);
     assert_eq!(target.accepts(), 1, "an old grant was used");
+    Ok(())
+}
+
+/// Seven entries in the table after a take-back (what another client leaves): four are asked,
+/// three refused for room, and that is not the user refusing: later requests are still asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_refused_for_room_does_not_stop_later_questions() -> Test {
+    let target = echo_server().await;
+    let rig = attached(vec![], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    rig.daemon.take_over("other").await;
+    {
+        let mut st = fwd.st.lock().unwrap();
+        // Seven different ones (an equal add would be answered with the same entry).
+        for i in 0..7 {
+            st.table.add(remote(0, 7000 + i), Origin::Client).unwrap();
+        }
+    }
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("three refused for room", 5, || fwd.consents().len() == 3).await;
+    for _ in 0..4 {
+        until("a question", 5, || {
+            rig.term.text().contains("asks to forward")
+        })
+        .await;
+        rig.answer("y").await;
+    }
+    eventually("four allowed", 5, || {
+        fwd.consents().iter().filter(|c| c.1).count() == 4
+    })
+    .await;
+    let later = fwd.request(remote(0, target.port));
+    until("the later question", 5, || {
+        rig.term.text().contains("asks to forward")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the later one allowed", 5, || {
+        fwd.consents().contains(&(later, true))
+    })
+    .await;
+    Ok(())
+}
+
+/// A tool on the host that adds and removes forwards in a loop (R4): past the ids the client
+/// remembers, new entries are refused without asking, and the run goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_forwards_come_and_go_without_ending_the_run() -> Test {
+    use fil_proto::mux::MuxMsg;
+    let rig = attached(
+        vec![],
+        Rules {
+            remote_requests: fil_client::RemoteRequests::Deny,
+            ..Rules::default()
+        },
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    const N: u32 = 4_200;
+    for i in 0..N {
+        fwd.send(MuxMsg::Forward {
+            id: ForwardId(10 + i),
+            spec: remote(0, 22),
+            origin: Origin::Request,
+            req: None,
+        })
+        .await;
+        fwd.send(MuxMsg::ForwardGone {
+            id: ForwardId(10 + i),
+        })
+        .await;
+    }
+    // Every one is refused (`deny`; past the cap of remembered ids, refused whatever the rule).
+    eventually("the late ones refused", 30, || {
+        fwd.consents()
+            .iter()
+            .any(|c| c.0 == ForwardId(10 + N - 1) && !c.1)
+    })
+    .await;
+    assert!(!fwd.consents().iter().any(|c| c.1));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.is_finished(), "the run ended");
+    rig.type_str("ls\r");
+    common::until_async("typing reaches the session", 5, || {
+        let d = rig.daemon.clone();
+        async move { String::from_utf8_lossy(&d.input().await).contains("ls\r") }
+    })
+    .await;
     Ok(())
 }

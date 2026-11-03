@@ -1191,6 +1191,8 @@ pub struct FwdState {
     pub held: Vec<(u32, ForwardSpec)>,
     /// Every `Consent` received (`consents` keeps the first 5,000).
     pub nconsents: usize,
+    /// `-L` entries a test answered by hand (ids the table never gave): their targets.
+    pub local_targets: HashMap<ForwardId, fil_proto::mux::Target>,
 }
 
 pub struct FakeFwd {
@@ -1211,6 +1213,9 @@ impl Policy for DaemonPolicy {
             OpenKind::Dynamic { forward, .. } => (forward, ForwardKind::Dynamic),
             _ => return Err(OpenFailure::NotPermitted),
         };
+        if want == ForwardKind::Local && st.local_targets.contains_key(forward) {
+            return Ok(());
+        }
         match st.table.get(*forward) {
             Some(e) if e.spec.kind() == want => Ok(()),
             _ => Err(OpenFailure::NoSuchForward),
@@ -1230,13 +1235,14 @@ struct DaemonConnector(Arc<std::sync::Mutex<FwdState>>);
 impl Connector for DaemonConnector {
     fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
         let target = match kind {
-            OpenKind::Local { forward } => self
-                .0
-                .lock()
-                .unwrap()
-                .table
-                .get(*forward)
-                .and_then(|e| e.spec.target().cloned()),
+            OpenKind::Local { forward } => {
+                let st = self.0.lock().unwrap();
+                st.local_targets.get(forward).cloned().or_else(|| {
+                    st.table
+                        .get(*forward)
+                        .and_then(|e| e.spec.target().cloned())
+                })
+            }
             OpenKind::Dynamic { target, .. } => Some(target.clone()),
             _ => None,
         };

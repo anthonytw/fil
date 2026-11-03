@@ -100,6 +100,8 @@ pub async fn canary() -> Server {
 pub struct Rules {
     pub remote_requests: RemoteRequests,
     pub failure: ForwardFailure,
+    /// `open_wait` (also how long the table may take to answer the own forwards).
+    pub open_wait: Option<Duration>,
 }
 
 impl Default for Rules {
@@ -107,6 +109,7 @@ impl Default for Rules {
         Self {
             remote_requests: RemoteRequests::Ask,
             failure: ForwardFailure::Warn,
+            open_wait: None,
         }
     }
 }
@@ -121,6 +124,9 @@ pub fn config_with(
     let mut set = ForwardSet::new(specs);
     set.remote_requests = rules.remote_requests;
     set.failure = rules.failure;
+    if let Some(w) = rules.open_wait {
+        set.mux.open_wait = w;
+    }
     let failed = set.bind_local();
     cfg.forwards = set;
     (cfg, failed)

@@ -486,3 +486,155 @@ async fn a_connection_during_a_take_back_opens_under_the_new_id_only() -> Test {
     assert!(!opened.is_empty());
     Ok(())
 }
+
+/// An own `-R 0` across a take-back (R1): the new table holds the previous epoch's entry for it,
+/// which has no identity (port 0) but is equal to the own spec, and the own add is answered with
+/// it. Adopted, not asked about, and not a protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_ephemeral_remote_forward_survives_a_take_back() -> Test {
+    let server = echo_server().await;
+    let rig = attached(vec![remote(0, server.port)], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("own -R in the table", 5, || !fwd.ids().is_empty()).await;
+    let id = fwd.ids()[0].0;
+    rig.daemon.take_over("other").await;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the own add answered again", 5, || {
+        fwd.st.lock().unwrap().added.len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!rig.is_finished(), "the run ended");
+    assert!(
+        !rig.term.text().contains("asks to forward"),
+        "asked about its own"
+    );
+    assert_eq!(fwd.ids().len(), 1);
+    let mut s = fwd
+        .open(fil_proto::mux::OpenKind::Remote { forward: id })
+        .await;
+    assert!(round_trip(&mut s, b"own -R 0").await);
+    Ok(())
+}
+
+/// Two own `-L`s (ids 0 and 1) whose ids cross after a take-back (R2): `a` is answered with 1
+/// (`b`'s old id), `b` with 900. Each port reaches its own forward, under its own new id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_listeners_keep_their_targets_when_the_ids_cross() -> Test {
+    use fil_proto::mux::{ForwardId, MuxMsg, OpenKind, Origin};
+    let (sa, sb) = (echo_server().await, echo_server().await);
+    let (pa, pb) = (free_port(), free_port());
+    let (a, b) = (local(pa, sa.port), local(pb, sb.port));
+    let rig = attached(vec![a.clone(), b.clone()], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("both in the table", 5, || fwd.ids().len() == 2).await;
+    let ids = fwd.ids();
+    let old_a = ids.iter().find(|e| e.1 == a).unwrap().0;
+    let old_b = ids.iter().find(|e| e.1 == b).unwrap().0;
+    assert_eq!((old_a, old_b), (ForwardId(0), ForwardId(1)));
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("both asked again", 5, || {
+        fwd.st.lock().unwrap().held.len() == 2
+    })
+    .await;
+    let held = fwd.st.lock().unwrap().held.clone();
+    let req_a = held.iter().find(|h| h.1 == a).unwrap().0;
+    let req_b = held.iter().find(|h| h.1 == b).unwrap().0;
+    let (new_a, new_b) = (old_b, ForwardId(900));
+    {
+        let mut st = fwd.st.lock().unwrap();
+        st.local_targets.insert(new_a, common::fwd::target(sa.port));
+        st.local_targets.insert(new_b, common::fwd::target(sb.port));
+    }
+    fwd.send(MuxMsg::Forward {
+        id: new_a,
+        spec: a.clone(),
+        origin: Origin::Client,
+        req: Some(req_a),
+    })
+    .await;
+    fwd.send(MuxMsg::Forward {
+        id: new_b,
+        spec: b.clone(),
+        origin: Origin::Client,
+        req: Some(req_b),
+    })
+    .await;
+    eventually("both listening", 5, || {
+        let st = fwd.st.lock().unwrap();
+        [new_a, new_b].iter().all(|id| {
+            st.listening
+                .iter()
+                .any(|(i, s)| i == id && matches!(s, ListenState::Listening { .. }))
+        })
+    })
+    .await;
+    let before = fwd.st.lock().unwrap().incoming.len();
+    let mut ca = connect(pa).await.expect("a listens");
+    assert!(round_trip(&mut ca, b"to a").await);
+    let mut cb = connect(pb).await.expect("b listens");
+    assert!(round_trip(&mut cb, b"to b").await);
+    let opened = fwd.st.lock().unwrap().incoming[before..].to_vec();
+    assert_eq!(
+        opened,
+        vec![
+            OpenKind::Local { forward: new_a },
+            OpenKind::Local { forward: new_b }
+        ]
+    );
+    assert_eq!((sa.accepts(), sb.accepts()), (1, 1));
+    assert!(!rig.is_finished());
+    Ok(())
+}
+
+/// The new table never answers an own `-L` after a take-back: its listener (paused, holding the
+/// port) closes after `open_wait`, so an application waiting in the backlog is refused rather
+/// than left hanging, and a later one is refused at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_forward_the_new_table_never_answers_is_closed_not_left_hanging() -> Test {
+    let server = echo_server().await;
+    let mine = free_port();
+    let wait = Duration::from_secs(2);
+    let rig = attached(
+        vec![local(mine, server.port)],
+        Rules {
+            open_wait: Some(wait),
+            ..Rules::default()
+        },
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("asked again", 5, || !fwd.st.lock().unwrap().held.is_empty()).await;
+    let mut waiting = connect(mine).await.expect("the backlog takes it");
+    let started = tokio::time::Instant::now();
+    assert!(
+        common::fwd::ends_without_data(&mut waiting, wait + Duration::from_secs(3)).await,
+        "the waiting application hangs"
+    );
+    assert!(started.elapsed() >= wait - Duration::from_millis(500));
+    assert!(connect(mine).await.is_none(), "still listening");
+    until("the warning", 5, || {
+        rig.term.text().contains("did not")
+    })
+    .await;
+    assert!(!rig.is_finished());
+    Ok(())
+}

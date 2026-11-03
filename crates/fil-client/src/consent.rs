@@ -63,8 +63,12 @@ pub enum Refusal {
     /// `-R` bound beyond loopback on the host (owner decision OD-7 is open: refused from every
     /// origin).
     WideRemoteBind,
-    /// [`MAX_DENIALS`] requests were refused already in this run.
+    /// [`MAX_DENIALS`] requests were refused already in this run, or the host went through more
+    /// forwards in one attach than the client keeps track of.
     TooMany,
+    /// Too many at once: the questions waiting are at their cap (or the entries kept are). Not
+    /// the user's refusal, so it does not count toward [`MAX_DENIALS`].
+    Busy,
 }
 
 /// What to do with a table entry the client did not name.
@@ -280,6 +284,7 @@ pub fn refusal_lines(spec: &ForwardSpec, why: Refusal) -> Vec<String> {
             Refusal::WideTarget => "(its target is not this machine)",
             Refusal::WideRemoteBind => "(a -R beyond localhost: not yet)",
             Refusal::TooMany => "(too many requests; refusing all)",
+            Refusal::Busy => "(too many requests at once)",
         }
         .to_string(),
     );
@@ -525,6 +530,7 @@ mod tests {
             Refusal::WideTarget,
             Refusal::WideRemoteBind,
             Refusal::TooMany,
+            Refusal::Busy,
         ] {
             let l = refusal_lines(&s, why);
             assert!(l.iter().all(|l| l.chars().count() <= 40), "{l:?}");

@@ -359,6 +359,7 @@ dependencies = [
 name = "fil-testbins"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fil-proto",
  "fil-transport",
  "quinn",
@@ -1264,6 +1265,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

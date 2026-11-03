@@ -96,8 +96,9 @@ fc_gone() {
 fc_type() { fc "$1" send "$2" > /dev/null || fail "$1: could not type"; }
 fc_line() { fc_type "$1" "$2\\r"; }
 # fc_answer NAME KEY: the answer to a yes/no question on the screen. The client ignores the
-# keyboard until the typing has paused for 300 ms (a word typed ahead must not answer for the user),
-# and a key typed right after a lone answer cancels it: wait before the key and keep quiet after it.
+# keyboard until the typing has paused for 300 ms (a word typed ahead must not answer for the user).
+# A prompt takes a lone key as its answer only after 300 ms with nothing else typed (DESIGN §4.2),
+# so wait before the key and again after it, before typing anything more.
 fc_answer() { sleep 0.5; fc_type "$1" "$2"; sleep 0.6; }
 
 # fc_ready NAME [SECONDS]: the session's shell answers. (The typed text never contains the

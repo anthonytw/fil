@@ -437,6 +437,13 @@ pub enum MuxMsg {
         channel: ChannelId,
         why: CloseReason,
     },
+    /// The sender raises its receive window on an open channel to `window` (ssh's
+    /// `WINDOW_ADJUST`): the peer's credit grows. Raise-only: one that is not above the window
+    /// in force is a protocol error, and one beyond the bounds does not decode.
+    Window {
+        channel: ChannelId,
+        window: Window,
+    },
 }
 
 impl MuxMsg {
@@ -447,7 +454,8 @@ impl MuxMsg {
             | MuxMsg::OpenOk { channel, .. }
             | MuxMsg::OpenFailed { channel, .. }
             | MuxMsg::Eof { channel, .. }
-            | MuxMsg::Close { channel, .. } => Some(*channel),
+            | MuxMsg::Close { channel, .. }
+            | MuxMsg::Window { channel, .. } => Some(*channel),
             MuxMsg::AddForward { .. }
             | MuxMsg::Forward { .. }
             | MuxMsg::ForwardRefused { .. }
@@ -473,7 +481,8 @@ impl MuxMsg {
             | MuxMsg::OpenOk { .. }
             | MuxMsg::OpenFailed { .. }
             | MuxMsg::Eof { .. }
-            | MuxMsg::Close { .. } => None,
+            | MuxMsg::Close { .. }
+            | MuxMsg::Window { .. } => None,
         }
     }
 

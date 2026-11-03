@@ -582,6 +582,14 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
         );
     }
 
+    add(
+        "window".into(),
+        MuxMsg::Window {
+            channel: ChannelId(21),
+            window: Window::new(2 * MIN_WINDOW).unwrap(),
+        },
+    );
+
     // The widest of each.
     let max_ch = ChannelId(u32::MAX);
     let max_id = ForwardId(u32::MAX);
@@ -675,6 +683,13 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
             why: CloseReason::Violation,
         },
     );
+    add(
+        "max/window".into(),
+        MuxMsg::Window {
+            channel: max_ch,
+            window: max_window,
+        },
+    );
     for (_, m) in &v {
         match m {
             MuxMsg::AddForward { .. }
@@ -688,7 +703,8 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
             | MuxMsg::OpenOk { .. }
             | MuxMsg::OpenFailed { .. }
             | MuxMsg::Eof { .. }
-            | MuxMsg::Close { .. } => {}
+            | MuxMsg::Close { .. }
+            | MuxMsg::Window { .. } => {}
         }
     }
     v
@@ -2083,7 +2099,28 @@ fn forward_probes() -> Entries {
     e.push(("decode/open-kind-3".into(), outcome::<OpenKind>(&[3])));
     e.push(("decode/open-kind-4".into(), outcome::<OpenKind>(&[4])));
     e.push(("decode/mux-msg-11".into(), outcome::<MuxMsg>(&[11, 16, 0])));
-    e.push(("decode/mux-msg-12".into(), outcome::<MuxMsg>(&[12, 16, 0])));
+    let window_msg = |w: u64| [vec![12u8, 16], varint(w)].concat();
+    e.push((
+        "decode/mux-msg-12".into(),
+        outcome::<MuxMsg>(&window_msg(u64::from(MIN_WINDOW))),
+    ));
+    e.push((
+        "decode/mux-msg-13".into(),
+        outcome::<MuxMsg>(&[vec![13u8, 16], varint(u64::from(MIN_WINDOW))].concat()),
+    ));
+    // A `Window` record one step either side of the bounds (raise-only is the mux's rule, not
+    // the decoder's: see `fil_proto::mux` tests).
+    for (what, w) in [
+        ("min-minus-1", u64::from(MIN_WINDOW) - 1),
+        ("max", u64::from(MAX_WINDOW)),
+        ("max-plus-1", u64::from(MAX_WINDOW) + 1),
+    ] {
+        let body = window_msg(w);
+        e.push((
+            format!("decode/mux-window-{what}"),
+            record_outcome(&[vec![body.len() as u8], body].concat()),
+        ));
+    }
 
     // Record framing on the MUX stream.
     let close = encode_record(&MuxMsg::Close {

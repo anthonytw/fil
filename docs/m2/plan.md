@@ -129,6 +129,7 @@ pub enum MuxMsg {
     OpenFailed { channel: ChannelId, why: OpenFailure },
     Eof { channel: ChannelId, at: u64 },
     Close { channel: ChannelId, why: CloseReason },
+    Window { channel: ChannelId, window: u32 },      // raise-only receive window (C2 review: a channel that opened small grows when shares free up)
 }
 pub enum OpenKind {
     Local { forward: ForwardId },                   // C→D: the daemon connects to the target in its table

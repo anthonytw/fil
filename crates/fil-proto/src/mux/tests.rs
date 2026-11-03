@@ -1197,3 +1197,152 @@ fn a_full_mux_buffer_refuses_table_messages_without_failing() {
         "only the daemon sends ForwardGone"
     );
 }
+
+/// Review R1: a channel opened while the budget was tight starts small, and its window (and
+/// send buffer) grow once shares come back: the peer's credit grows with the `Window` record.
+#[test]
+fn windows_grow_when_shares_come_back() {
+    let mut p = Pair::with(MuxConfig::default(), MuxConfig::default());
+    let idle: Vec<ChannelId> = (0..12).map(|_| open_pair(&mut p)).collect();
+    for &ch in &idle {
+        assert_eq!(p.c.info(ch).unwrap().window, DEFAULT_WINDOW);
+    }
+    let bulk = open_pair(&mut p);
+    let small = p.c.info(bulk).unwrap();
+    assert!(small.window < DEFAULT_WINDOW, "{small:?}");
+    assert_eq!(p.d.info(bulk).unwrap().peer_window, small.window);
+    // The idle ones close; on the next tick the bulk channel gets the configured share.
+    for &ch in &idle {
+        p.c.abort(ch, CloseReason::Reset);
+    }
+    p.pump();
+    p.advance(Duration::from_millis(1));
+    p.pump();
+    let big = p.c.info(bulk).unwrap();
+    assert_eq!(
+        (big.window, big.send_capacity),
+        (DEFAULT_WINDOW, DEFAULT_FORWARD_BUFFER)
+    );
+    assert_eq!(
+        p.d.info(bulk).unwrap().peer_window,
+        DEFAULT_WINDOW,
+        "credit grew"
+    );
+    assert!(p.c.reserved() <= MuxConfig::default().budget / 2);
+    // The daemon's accepted side grew its own share too, and now a full window flows.
+    let d = p.d.info(bulk).unwrap();
+    assert_eq!(
+        (d.window, d.send_capacity),
+        (DEFAULT_WINDOW, DEFAULT_FORWARD_BUFFER)
+    );
+    let before = data_bytes(&p.d_sent, bulk);
+    assert_eq!(p.d.write(bulk, &vec![1; 4 << 20]), DEFAULT_FORWARD_BUFFER);
+    p.pump();
+    assert_eq!(data_bytes(&p.d_sent, bulk) - before, DEFAULT_FORWARD_BUFFER);
+}
+
+#[test]
+fn raise_window_reserves_and_refuses_what_is_not_a_raise() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    let before = p.c.reserved();
+    assert!(
+        !p.c.raise_window(ch, Window::new(MIN_WINDOW).unwrap()),
+        "not a raise"
+    );
+    assert!(p.c.raise_window(ch, Window::new(64 * 1024).unwrap()));
+    assert_eq!(p.c.reserved(), before + 48 * 1024);
+    assert_eq!(p.c.info(ch).unwrap().window, 64 * 1024);
+    p.pump();
+    assert_eq!(p.d.info(ch).unwrap().peer_window, 64 * 1024);
+    // Beyond what the budget can spare: refused, nothing reserved.
+    let tight = MuxConfig {
+        budget: 64 * 1024,
+        ..cfg()
+    };
+    let mut q = Pair::with(tight.clone(), tight);
+    let ch = open_pair(&mut q);
+    let r = q.c.reserved();
+    assert!(!q.c.raise_window(ch, Window::new(32 * 1024).unwrap()));
+    assert_eq!(q.c.reserved(), r);
+    // A channel not yet open is not raised.
+    let opening = p.c.open(local()).unwrap();
+    assert!(!p.c.raise_window(opening, Window::new(64 * 1024).unwrap()));
+}
+
+/// A hostile peer's `Window`: a decrease, an equal one, one before the channel is open, or one
+/// beyond the bounds is a protocol error; one for a closed channel is dropped.
+#[test]
+fn a_window_that_is_not_a_raise_is_a_protocol_error() {
+    let window_rec = |ch: u32, w: u32| {
+        encode_record(&MuxMsg::Window {
+            channel: ChannelId(ch),
+            window: Window::new(w).unwrap(),
+        })
+        .unwrap()
+    };
+    let mux_end = |p: &Pair| {
+        p.d_sent
+            .iter()
+            .filter(|(c, _)| *c == ChannelId::MUX)
+            .map(|(_, pl)| {
+                let s = DataSegment::parse(pl).unwrap();
+                s.seq + s.data.len() as u64
+            })
+            .max()
+            .unwrap()
+    };
+    let feed = |p: &mut Pair, rec: Vec<u8>| {
+        let at = mux_end(p);
+        p.c.on_payload(
+            ChannelId::MUX,
+            Bytes::from(DataSegment::encode(at, &rec).unwrap()),
+        )
+    };
+    // Equal, raise, then a decrease below the raised one.
+    for (steps, ok) in [
+        (vec![MIN_WINDOW], false),
+        (vec![MIN_WINDOW + 1], true),
+        (vec![64 * 1024, 32 * 1024], false),
+    ] {
+        let mut p = Pair::new();
+        let ch = open_pair(&mut p);
+        let recs: Vec<u8> = steps.iter().flat_map(|&w| window_rec(ch.0, w)).collect();
+        let r = feed(&mut p, recs);
+        assert_eq!(r.is_ok(), ok, "{steps:?}: {r:?}");
+        if ok {
+            assert_eq!(p.c.info(ch).unwrap().peer_window, *steps.last().unwrap());
+        }
+    }
+    // Before the channel is open.
+    let mut c = Mux::new(Side::Client, cfg());
+    c.link_up(false);
+    let ch2 = c.open(local()).unwrap();
+    let rec = window_rec(ch2.0, 64 * 1024);
+    assert!(
+        c.on_payload(
+            ChannelId::MUX,
+            Bytes::from(DataSegment::encode(0, &rec).unwrap())
+        )
+        .is_err()
+    );
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    // For a closed channel: dropped.
+    p.c.abort(ch, CloseReason::Reset);
+    p.pump();
+    assert!(feed(&mut p, window_rec(ch.0, 64 * 1024)).is_ok());
+    // Beyond the bounds: the record does not decode.
+    let mut bad = encode_record(&MuxMsg::Window {
+        channel: ChannelId(16),
+        window: Window::new(crate::limits::MAX_WINDOW).unwrap(),
+    })
+    .unwrap();
+    let n = bad.len();
+    // The window's varint: MAX_WINDOW is 0x400000 (`80 80 80 02`); make it 0x400001.
+    bad[n - 4] = 0x81;
+    let mut q = Pair::new();
+    let ch = open_pair(&mut q);
+    let _ = ch;
+    assert!(feed(&mut q, bad).is_err());
+}

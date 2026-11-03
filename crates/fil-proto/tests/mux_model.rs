@@ -17,6 +17,9 @@
 //! 5. no Resume gate is bypassed: after a resumed link a side that had sent on a channel sends
 //!    nothing more on it until the peer's `Resume` for it was delivered.
 //!
+//! Windows grow while channels run: the caller raises some at random (`raise_window`) and the
+//! mux tops up small shares after others close; the bounds above hold through every raise.
+//!
 //! Honest peers never see a protocol error, a `Violation` or a `ResumeGone`, and the MUX
 //! table messages (here, numbered `Listening` reports) arrive exactly once and in order.
 //!
@@ -155,6 +158,8 @@ struct Stats {
     early_data: u64,
     busy: u64,
     small_shares: u64,
+    raises: u64,
+    topups: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -170,6 +175,8 @@ impl std::ops::AddAssign for Stats {
         self.early_data += o.early_data;
         self.busy += o.busy;
         self.small_shares += o.small_shares;
+        self.raises += o.raises;
+        self.topups += o.topups;
     }
 }
 
@@ -771,9 +778,25 @@ impl World {
                     Err(e) => self.fail(format!("send_table: {e}")),
                 }
             }
-            870..960 => {
+            870..885 => {
+                // A window raise asked for by the caller: it reserves or is refused.
+                if let Some(ch) = self.pick(i) {
+                    let w = self.rng.random_range(MIN_WINDOW..=4 * MIN_WINDOW);
+                    if self.sides[i].mux.raise_window(ch, Window::new(w).unwrap()) {
+                        self.stats.raises += 1;
+                    }
+                }
+            }
+            885..960 => {
                 let ms = self.rng.random_range(0..300);
+                let before: Vec<usize> = self.sides.iter().map(|s| s.mux.reserved()).collect();
                 self.advance(Duration::from_millis(ms));
+                // A tick can top up channels that got a small share.
+                for (k, s) in self.sides.iter().enumerate() {
+                    if s.mux.reserved() > before[k] {
+                        self.stats.topups += 1;
+                    }
+                }
             }
             960..975 => {
                 let ms = self.rng.random_range(0..5_000);
@@ -936,4 +959,5 @@ fn the_model_holds_for_every_seed() {
     );
     assert!(total.resumes_gated > n, "{total:?}");
     assert!(total.busy > 0 && total.small_shares > 0, "{total:?}");
+    assert!(total.raises > n && total.topups > 0, "{total:?}");
 }

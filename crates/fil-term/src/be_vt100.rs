@@ -19,8 +19,8 @@ use std::cell::RefCell;
 use vt100::{Callbacks, Color as VColor, CursorStyle, MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::model::{
-    Attrs, Cell, Color, Cursor, CursorShape, Line, Modes, MouseEncoding, MouseTracking, Size,
-    TermState,
+    Attrs, Cell, Charsets, Color, Cursor, CursorShape, Line, Modes, MouseEncoding, MouseTracking,
+    Size, TermState,
 };
 use crate::sniff::RegionTracker;
 use crate::{Backend, Capabilities, Emulator};
@@ -46,6 +46,8 @@ pub(crate) const BACKEND: Backend = Backend {
         history_in_alt: false,
         cursor_shape: true,
         mouse_encoding_extra: false,
+        charsets: false,
+        tab_stops: false,
     },
     create,
 };
@@ -264,6 +266,8 @@ impl Emulator for Vt100 {
                 ..Modes::default()
             },
             hyperlinks: Vec::new(),
+            charsets: Charsets::default(),
+            tab_stops: None,
         }
     }
 }

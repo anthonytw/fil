@@ -1,7 +1,8 @@
 //! Constructors and defaults for the model types.
 
 use crate::model::{
-    Attrs, Cell, Cursor, CursorShape, Line, Modes, MouseEncoding, MouseTracking, Size, TermState,
+    Attrs, Cell, Charsets, Cursor, CursorShape, Line, Modes, MouseEncoding, MouseTracking, Size,
+    TermState,
 };
 
 impl Default for Cursor {
@@ -94,6 +95,8 @@ impl TermState {
             saved_cursor: None,
             modes: Modes::default(),
             hyperlinks: Vec::new(),
+            charsets: Charsets::default(),
+            tab_stops: None,
         }
     }
 

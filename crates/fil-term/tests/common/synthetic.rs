@@ -81,6 +81,7 @@ pub fn all() -> Vec<Fixture> {
         pending_wrap_mid(),
         line_drawing(),
         hidden_state(),
+        shift_out_tabs(),
         kitty_stack(),
         kitty_alt(),
         alt_decsc(),
@@ -627,6 +628,28 @@ fn hidden_state() -> Fixture {
         50,
         8,
         "DECSC saved cursor, G0 left in DEC graphics, custom tab stops (HTS/TBC): not in TermState",
+        &mut s,
+    )
+}
+
+/// SO with G1 in DEC graphics (the invoked set is not the designated G0), custom tab stops that
+/// have been used, and DECSC taken while G1 was line drawing. Reading the state twice must give
+/// the same thing, and a snapshot must restore all of it.
+fn shift_out_tabs() -> Fixture {
+    let mut s = S::new();
+    s.t("shift out and tab stops").nl();
+    // Clear every stop, set two (columns 5 and 12, 1-based 6 and 13).
+    s.c("3g").at(2, 6).e("H").at(2, 13).e("H").at(2, 1);
+    s.t("a\tb\tc").nl();
+    // G1 is line drawing; SO invokes it, and DECSC saves the designations.
+    s.e(")0").t("\x0e").t("lqqk").nl();
+    s.e("7");
+    s.t("\x0f").t("back in G0").t("\x0e");
+    fx(
+        "shift_out_tabs",
+        40,
+        8,
+        "SO with G1 in DEC graphics left invoked, custom tab stops, DECSC taken in line drawing",
         &mut s,
     )
 }

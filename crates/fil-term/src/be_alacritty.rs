@@ -15,6 +15,13 @@
 //!   test in `tests/roundtrip.rs` guards the whole class.
 //! - The scroll region (`Term::scroll_region`) is private, so it is shadowed by a second
 //!   tiny parser (`sniff::RegionTracker`) fed the same bytes.
+//! - Tab stops (`Term::tabs`) are private. They are read back by probing: park the cursor on
+//!   each column in turn and ask `move_forward_tabs` where one tab goes (a tab stop at column
+//!   `c` is a stop exactly when a tab from `c - 1` lands on `c`), then put the cursor back.
+//!   `move_forward_tabs` moves the cursor only (unlike `put_tab` it writes no cell).
+//! - Charset designations are public on the cursor (`grid.cursor.charsets`, and the saved
+//!   cursor's), but the invoked set (`active_charset`) is private, so the `sniff` tracker
+//!   follows SO and SI for it.
 //! - `Term::cursor_style` folds "unset" into a configured default; a sentinel default
 //!   (hollow, blinking) tells "never set" from "explicitly steady block".
 //! - Replies arrive as `Event::PtyWrite`; color and text-area-size queries arrive as
@@ -30,13 +37,14 @@ use alacritty_terminal::index::{Column, Line as GLine};
 use alacritty_terminal::term::cell::{Cell as ACell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler, KeyboardModes,
-    KeyboardModesApplyBehavior, NamedColor, Processor,
+    CharsetIndex, Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler,
+    KeyboardModes, KeyboardModesApplyBehavior, NamedColor, Processor, StandardCharset,
 };
 
 use crate::model::{
-    Attrs, Cell, Color, Cursor, CursorShape, Hyperlink, Line, Modes, MouseEncoding, MouseTracking,
-    PrimaryScreen, SavedCursor, Size, TermState, Underline,
+    Attrs, Cell, Charset, Charsets, Color, Cursor, CursorShape, Hyperlink, Line, Modes,
+    MouseEncoding, MouseTracking, PrimaryScreen, SavedCursor, Size, TermState, Underline,
+    default_tab_stops,
 };
 use crate::sniff::RegionTracker;
 use crate::{Backend, Capabilities, Emulator};
@@ -62,6 +70,8 @@ pub(crate) const BACKEND: Backend = Backend {
         history_in_alt: true,
         cursor_shape: true,
         mouse_encoding_extra: false,
+        charsets: true,
+        tab_stops: true,
     },
     create,
 };
@@ -157,6 +167,15 @@ impl Emulator for Alacritty {
         self.region.feed(bytes);
     }
 
+    fn apply_pending(&mut self) {
+        // The processor holds a program's synchronized-update batch (`CSI ? 2026 h`) until the
+        // program ends it. Ending it here applies the bytes; the program's later `CSI ? 2026 l`
+        // is then a no-op, and what follows in the same batch is applied as it arrives.
+        if self.parser.sync_bytes_count() > 0 {
+            self.parser.stop_sync(self.term.get_mut());
+        }
+    }
+
     fn resize(&mut self, size: Size) {
         self.size = size;
         self.term.get_mut().resize(Dims::from(size));
@@ -174,6 +193,10 @@ impl Emulator for Alacritty {
         let style = term.cursor_style();
         let mode = *term.mode();
         let kitty = kitty_flags(mode);
+        // Read before the alternate-screen path swaps grids: the live designations belong to
+        // the grid that is active now.
+        let live_sets = charset_array(&term.grid().cursor.charsets);
+        let tab_stops = read_tab_stops(&mut term);
 
         let (screen, history, cursor, primary, saved) = if !alt {
             let (screen, history, cursor) = read_grid(term.grid(), history_lines, &mut links);
@@ -270,8 +293,50 @@ impl Emulator for Alacritty {
                 title: self.shared.title.lock().unwrap().clone(),
             },
             hyperlinks: links.table,
+            charsets: Charsets {
+                g: live_sets,
+                active: self.region.active_charset(),
+            },
+            tab_stops,
         }
     }
+}
+
+fn charset_of(c: StandardCharset) -> Charset {
+    match c {
+        StandardCharset::Ascii => Charset::Ascii,
+        StandardCharset::SpecialCharacterAndLineDrawing => Charset::LineDrawing,
+    }
+}
+
+fn charset_array(c: &alacritty_terminal::grid::Charsets) -> [Charset; 4] {
+    [
+        CharsetIndex::G0,
+        CharsetIndex::G1,
+        CharsetIndex::G2,
+        CharsetIndex::G3,
+    ]
+    .map(|i| charset_of(c[i]))
+}
+
+/// The tab stops of columns `1..=cols-2`, probed (see the module notes), or `None` when they
+/// are the defaults.
+fn read_tab_stops(term: &mut Term<Shared>) -> Option<Vec<u16>> {
+    let cols = term.columns();
+    let parked = term.grid().cursor.point;
+    let wrap = term.grid().cursor.input_needs_wrap;
+    let mut stops = Vec::new();
+    for c in 1..cols.saturating_sub(1) {
+        term.grid_mut().cursor.point.column = Column(c - 1);
+        Handler::move_forward_tabs(&mut *term, 1);
+        if term.grid().cursor.point.column.0 == c {
+            stops.push(c as u16);
+        }
+    }
+    let cursor = &mut term.grid_mut().cursor;
+    cursor.point = parked;
+    cursor.input_needs_wrap = wrap;
+    (stops != default_tab_stops(cols as u16)).then_some(stops)
 }
 
 fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>) -> Option<SavedCursor> {
@@ -279,6 +344,7 @@ fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>) -> Option<SavedCursor> 
         row: c.point.line.0.max(0) as u16,
         col: c.point.column.0 as u16,
         pen: attrs(&c.template),
+        charsets: charset_array(&c.charsets),
     };
     (saved != SavedCursor::default()).then_some(saved)
 }

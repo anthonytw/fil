@@ -67,7 +67,7 @@ A peer that breaks a rule (length 0 or too large, a bad channel id, a second str
 
 **Forwards and the terminal share the link; the exact 8:1 weighting of the pipe does not exist here.** An earlier version gave forwards a lower priority than interactive channels. quinn's priorities are strict, so a terminal that never goes idle (a build scrolling, `tail -f` of a busy log) held a forward back for as long as it ran, which breaks DESIGN §8.5. Interactive and forward channels now share priority 10 and quinn takes turns between their streams, so a forward gets at least `1/(k+1)` of the sending turns with `k` busy interactive channels. The price: a bulk forward can take up to half of the terminal's throughput on QUIC, against one frame in nine on the pipe. Keystrokes are still never queued behind a forward: a full forward channel only stops that channel. `recv` also hands up one forward payload in every nine while both wait, but that only orders what has already arrived. If the exact weighting is wanted, it needs a link-level scheduler (one writer applying the 8:1 rule over per-channel queues, with a small `send_window`); not done.
 
-**The 1,024 streams are per link, not per moment.** A channel's stream is never finished, so its slot is not returned. In M1 there are a handful of channels. M2 gives each forwarded connection a channel, so channel close (finish the stream, free the writer and the receive entry) must come with it. Until then `send` on a channel that cannot get a stream fails with an `Io` error after `dead_after`, and the link stays up.
+**The 1,024 streams are per link, not per moment.** A channel's stream is never finished, so its slot is not returned. In M1 there are a handful of channels. M2 gives each forwarded connection a channel, so channel close (finish the stream, free the writer and the receive entry) must come with it. Until then `send` on a channel that cannot get a stream fails with an `Io` error after `dead_after`, and the link stays up. M2 note: on the 1,025th channel, up to 8 payloads that `send` had already accepted with `Ok` (the queue in front of the stuck stream) are dropped silently when the writer gives up.
 
 ### Liveness and path changes
 
@@ -102,7 +102,8 @@ stateDiagram-v2
     Dialing --> OnPipe: dial failed, retry later
     Dialing --> Switching: direct up
     Switching --> OnDirect: resumed, pipe closed
-    Switching --> OnPipe: resume failed
+    Switching --> OnPipe: resume failed, pipe up
+    Switching --> Reconnecting: resume failed, no pipe
     OnDirect --> Reconnecting: direct lost
     OnPipe --> Reconnecting: pipe lost
     Reconnecting --> Switching: redial up
@@ -110,7 +111,7 @@ stateDiagram-v2
     Reconnecting --> Starting: dial failed, no timer pending
 ```
 
-How to read it: `Starting` is a pipe run in flight, `OnPipe` and `OnDirect` name the link that carries the session, `Dialing` is `OnPipe` with a dial in flight, `Switching` is a resume running on the new link while the old one stays open, and `Reconnecting` is no carrier with a redial in flight and the pipe fallback timer running. In `Reconnecting`, a failed dial does **not** start the pipe while that timer is pending (the timer decides, 3 s with `auto`, 10 s with `direct`); the "dial failed, no timer pending" edge is the case where the manager has already been failing and started no timer. `Switching --> OnPipe` needs the pipe to still be up; if it is not, the manager goes through `Reconnecting`. The diagram is a summary: the manager's real state is two *lanes* (pipe and direct, each `Idle`, `Waiting`, `Busy` or `Up`) plus a carrier and a pending switch (see the module docs of `path.rs`).
+How to read it: `Starting` is a pipe run in flight, `OnPipe` and `OnDirect` name the link that carries the session, `Dialing` is `OnPipe` with a dial in flight, `Switching` is a resume running on the new link while the old one stays open, and `Reconnecting` is no carrier with a redial in flight and the pipe fallback timer running. In `Reconnecting`, a dial that times out does **not** start the pipe while that timer is pending (the timer decides, 3 s with `auto`, 10 s with `direct`). A dial the daemon refuses outright (an answer in under a second, as when it restarted and no longer knows the key) starts the pipe at once, because only a new bootstrap helps; so does a dial that fails when the manager has already been failing and started no timer. Both are the "dial failed, no timer pending" edge. A failed resume goes back to `OnPipe` if a pipe link is up (it carries the session again with no new ssh login), and to `Reconnecting` if the switch started from `Reconnecting` and there is no pipe. The diagram is a summary: the manager's real state is two *lanes* (pipe and direct, each `Idle`, `Waiting`, `Busy` or `Up`) plus a carrier and a pending switch (see the module docs of `path.rs`).
 
 This is a summary: the manager's real state is two *lanes* (pipe and direct, each `Idle`, `Waiting`, `Busy` or `Up`) plus a carrier and a pending switch. See the module docs of `path.rs` for the full rules.
 
@@ -132,7 +133,7 @@ The client reports `Start`, `PipeUp`, `PipeDown`, `DirectAvailable` / `DirectUna
 |---|---|
 | a pipe link was established, before the attach over it | `PipeUp` |
 | the pipe run failed, or the pipe link ended | `PipeDown` |
-| `attached(&AttachInfo)` after every attach reply: UDP port and fingerprint present or absent | `DirectAvailable` / `DirectUnavailable` |
+| `attached(&AttachInfo)` after every attach reply: UDP port and fingerprint present or absent (`resumed` is false for a fresh attach) | `DirectAvailable { port, fingerprint, fresh_attach: !resumed }` / `DirectUnavailable` |
 | the dial of `QuicLink::connect` succeeded or was `Refused` | `DirectUp` / `DirectDialFailed` |
 | the direct link ended | `DirectDown` |
 | `swapped(Ok(kind))` / `swapped(Err(..))` after the resume on the new link | `Switched(kind)` / `SwitchFailed(kind)` |
@@ -140,7 +141,7 @@ The client reports `Start`, `PipeUp`, `PipeDown`, `DirectAvailable` / `DirectUna
 | a timer it was asked to set fires | `Timer(..)` |
 | the manager says `SwitchTo(kind)` | the client keeps the old link open, resumes on `kind`, then reports `swapped` |
 
-A reply that arrives while a pipe link exists comes from a fresh bootstrap (the ssh login has just registered the key), so `DirectAvailable` clears direct's backoff then. A reply over direct does not: otherwise a direct link that resumes, dies after two seconds and reattaches would erase its own flapping penalty. Only the path manager backs off; the client's loop must not add a second layer.
+The manager compares each `DirectAvailable` with the last one and clears direct's backoff (and starts a waiting dial) only when the bootstrap really changed: another port or fingerprint (the daemon restarted), or `fresh_attach` (a new key). A plain resume reply, over the pipe or over direct, changes nothing. Clearing it on every reply, or on every reply over a pipe, let a direct link that keeps dying young cause an ssh login every few seconds (150 in ten simulated minutes); now it is about a dozen. Only the path manager backs off; the client's loop must not add a second layer.
 
 `ClosePipe` follows `Switched(Direct)`, not `DirectUp`, and not a pipe run finishing during a pending switch: a direct link that comes up but cannot resume the session (the daemon restarted and refuses the resume, say) costs nothing, because the pipe is still carrying or still there to carry. If the switch fails and a pipe link is already up, the manager sends `SwitchTo(Pipe)` instead of starting a second ssh login.
 
@@ -154,7 +155,7 @@ A reply that arrives while a pipe link exists comes from a fresh bootstrap (the 
 | Direct up, dead, up, dead | a link that dies within 10 s counts as a failure and backs the next dial off; only a link that lived 10 s resets the count; a failed `SwitchTo` counts the same way |
 | A long outage | both lanes sit at their maximum delay: about two ssh attempts and half a dial a minute, for as long as it lasts (measured over a simulated day: 3,000 ssh attempts, 750 dials) |
 | A network that reports changes all day | a hint dials at once and clears the backoff, but hints inside 2 s are merged, a waiting pipe is restarted by a hint only if its last run began 5 s ago, and only 4 hints a minute are honoured. Measured over a simulated hour of one hint a second with everything failing: about 6 ssh attempts and 9 dials a minute |
-| Waiting for ssh when direct is gone for good | after a loss, direct is tried at once and the pipe follows after the fallback timer (3 s; 10 s with `direct`), however quickly the redial fails; if direct has been failing and no timer is pending, the pipe starts at once |
+| Waiting for ssh when direct is gone for good | after a loss, direct is tried at once and the pipe follows after the fallback timer (3 s; 10 s with `direct`) while the redial merely times out; if the daemon refuses the dial outright, or direct has been failing and no timer is pending, the pipe starts at once |
 
 ## Tests
 
@@ -162,8 +163,8 @@ All times are real time on an Apple M-series laptop, debug build.
 
 | Where | What | Time |
 |---|---|---|
-| `src/quic/*` unit tests | varint and length rules; inbox order, forward share, per-channel budget, close semantics; rate-limiter buckets, source-first rule, IPv6 /64, bounded table | under 0.05 s |
-| `src/path/tests.rs` (25) | each transition above; backoff growth and caps; flapping; hints and the hint budget; stale reports; random event sequences (3 settings x 60 seeds x 400 steps) checking that no action contradicts the model; one simulated day and one simulated flapping hour of failures; convergence to direct in a healthy world | 0.05 s |
+| `src/quic/*` unit tests | varint and length rules; inbox order, forward share, per-channel budget, close semantics; rate-limiter buckets, source-first rule, IPv6 /64, bounded table; a reader parked on the connection cap wakes when its channel drains | under 0.05 s |
+| `src/path/tests.rs` (30) | each transition above; backoff growth and caps; flapping; hints and the hint budget; stale reports; random event sequences (3 settings x 60 seeds x 400 steps) checking that no action contradicts the model; one simulated day and one simulated flapping hour of failures; convergence to direct in a healthy world | 0.05 s |
 | `tests/quic_link.rs` (30), over `fil-netsim`, paused time, seeded | connect and the accept proof; per-channel order under 2% loss; forwards making progress while the terminal never goes idle on a 2%-loss path, with control ahead of both; a stalled forward blocks neither terminal nor control, and drains intact; NAT rebind twice mid-transfer (link stays `Up`, daemon's `path_generation` is 2, one handshake); blackout gives `Degraded` then `Down(Dead)` between 4 and 5.5 s, and a fresh handshake then works; a short outage recovers; payloads received before a close are still returned; a consumer that stopped reading neither hides a dead path nor makes a healthy one look dead; wrong pin and unregistered key refused in under 2 s; UDP black-holed from the start refused at exactly the connect timeout; 10% loss still connects 9 times in 10; revoke closes the key's links and no one else's; registry-only revoke is swept; Retry on every new address; a flood from one address refused after its burst while another address connects; global limit; malformed streams end the link; dropping links ends all their tasks (tokio's live task count returns to its baseline); the 1,025th channel's `send` fails instead of hanging; unread data is capped for the connection with an authenticated raw peer, and the terminal is not stuck behind it; a daemon passes up a client's first control frame even if it looks like the accept frame; a key revoked at the end of its handshake never reaches `accept`; finished handshakes free the handshake cap before `accept` | 0.46 s |
 | `tests/quic_udp.rs` (3), real loopback UDP | connect through a real Retry; port scan takes the first free port and reports `NoFreePort`; a closed port is `Refused` at the connect timeout | 0.6 s |
 

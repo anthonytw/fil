@@ -25,6 +25,8 @@
 //!   [`MAX_STREAMS`] of them (1,024) over the link's whole life; after that `send` on a new
 //!   channel fails with an `Io` error after `dead_after` instead of hanging. Channel close
 //!   (finishing a stream and freeing its slot) belongs to M2, with forwarded connections.
+//!   (M2 note: up to 8 payloads `send` already accepted on such a channel are dropped when its
+//!   writer gives up.)
 //! - **Order across channels:** none from QUIC. `recv` hands out control first, then interactive
 //!   payloads in arrival order, with forwards guaranteed a share of what has already arrived.
 //!   On the wire forwards and interactive channels take turns per packet (see above), so the exact

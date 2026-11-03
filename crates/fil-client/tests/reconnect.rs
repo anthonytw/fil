@@ -342,7 +342,7 @@ async fn a_degraded_link_that_recovers_resumes_nothing_and_loses_nothing() {
     rig.daemon.degrade_link().await;
     settle().await;
     assert!(
-        rig.term.text().contains("no reply from the host"),
+        rig.term.text().contains("no reply for"),
         "{}",
         rig.term.text()
     );

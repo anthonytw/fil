@@ -8,29 +8,41 @@ use fil_proto::msg::{HostLabel, SessionName};
 use crate::offline::OfflineInput;
 use crate::text::format_utc;
 
-#[derive(Clone, Debug)]
+/// How the client waits between attempts. See [`crate::dialer`] ("Who backs off").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backoff {
+    /// No waiting: the dialer's `dial` waits for itself until it has a link.
+    None,
+    /// Wait `initial` after the first failure, doubling up to `max`. The delay also applies
+    /// (and grows) after a link that died before it had stayed attached for `reset_after`, so
+    /// a daemon that crash-loops on resume is not hammered; it resets after a link has stayed
+    /// attached that long.
+    Exponential {
+        initial: Duration,
+        max: Duration,
+        reset_after: Duration,
+    },
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff::Exponential {
+            initial: Duration::from_millis(250),
+            max: Duration::from_secs(2),
+            reset_after: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Reconnect {
-    /// First wait between dial attempts after a failure.
-    pub initial_backoff: Duration,
-    /// The wait doubles up to this.
-    pub max_backoff: Duration,
+    pub backoff: Backoff,
     /// Stop reconnecting after being disconnected this long. `None` (the default) never gives
     /// up: the user ends it with `~.`.
     pub give_up_after: Option<Duration>,
     /// Dial failures tolerated on the *first* attach before reporting the error. 0 (the default)
     /// reports the first failure at once: a typo in the host name should not retry forever.
     pub initial_retries: u32,
-}
-
-impl Default for Reconnect {
-    fn default() -> Self {
-        Self {
-            initial_backoff: Duration::from_millis(250),
-            max_backoff: Duration::from_secs(2),
-            give_up_after: None,
-            initial_retries: 0,
-        }
-    }
 }
 
 pub struct ClientConfig {
@@ -80,8 +92,9 @@ impl ClientConfig {
 /// How a run ended without an error. [`Outcome::message`] is what was shown to the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The user typed `~.` (or the caller asked): the session was told to detach and keeps
-    /// running.
+    /// The user typed `~.`. If a link was up the daemon was told to detach (it revokes the key);
+    /// if not (the user gave up during an outage) nothing could be sent, and the session stays
+    /// attached to this client's key until another client takes it over.
     Detached,
     /// The terminal closed or stdin ended. The session keeps running, still attached to this
     /// client's key until another client takes it over.

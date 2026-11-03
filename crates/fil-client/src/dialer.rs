@@ -7,14 +7,37 @@
 //!   finished a QUIC handshake in the background (an upgrade), or the direct link failed and the
 //!   pipe is ready (a fallback).
 //!
-//! A swap is nothing special to the loop: it drops the old link and runs the resume on the new
-//! one (`Hello`, then `Attach` with the incarnation, epoch and terminal position). The daemon
-//! accepts it because the key is the same, and the position tells it exactly where to continue,
-//! so no byte is lost or repeated.
+//! And it tells the dialer what happened, so the path manager above it can be driven:
+//!
+//! - [`Dialer::attached`] after every accepted `AttachReply`, with the direct-mode details
+//!   (`udp_port`, `fingerprint`) the path manager needs for `DirectAvailable`/`Unavailable`;
+//! - [`Dialer::swapped`] when a swap ends, for `Switched`/`SwitchFailed`.
+//!
+//! # A swap is a transaction
+//!
+//! `next_swap` yields a *candidate*. The client sends `Hello` and `Attach` (with the incarnation,
+//! epoch and terminal position, the same key) on it **while the old link stays open and keeps
+//! carrying traffic**. Only once the candidate's reply is in (and, if the daemon answered with a
+//! snapshot, the snapshot has landed) is the swap done: the client reports `swapped(Ok(kind))`.
+//! If the candidate fails first (the link dies, the daemon refuses), it reports
+//! `swapped(Err(..))`, drops the candidate and carries on over the old link. A swap is never
+//! started before the first reply and any snapshot are in, and never without a session to
+//! resume.
+//!
+//! The daemon drops a subscriber's previous transport when it accepts a resume, so from the
+//! candidate's reply on the client stops reading the old link and closes it. Bytes still in
+//! flight on the old link are covered by the position the resume carried: the receiver
+//! deduplicates, so none is lost or repeated.
+//!
+//! # Who backs off
+//!
+//! Only one layer should. By default the client waits between failed dials (and after links that
+//! die soon after connecting): see [`crate::Backoff`]. A dialer that owns its retry policy (the
+//! path manager) sets `Backoff::None`, and `dial` then waits itself until it has a link.
 
 use std::future::Future;
 
-use fil_proto::msg::PublicKey;
+use fil_proto::msg::{Fingerprint, PublicKey, TermName};
 use fil_transport::{Link, LinkKind};
 
 /// A new link, ready to carry fil-proto payloads (the pipe's preamble is already consumed).
@@ -110,4 +133,47 @@ pub trait Dialer: Send + 'static {
     fn next_kind(&self) -> Option<LinkKind> {
         None
     }
+
+    /// An `AttachReply` was accepted (on the first link, after every reconnect, and on a swapped
+    /// link). Feed `udp_port` and `fingerprint` to the path manager. Default: nothing.
+    fn attached(&mut self, _info: &AttachInfo) {}
+
+    /// A swap offered through [`Dialer::next_swap`] ended: `Ok` with the kind of the link now
+    /// carrying the session, or why it did not happen (the client is still on the old link,
+    /// unless `SwapError::Lost`). Default: nothing.
+    fn swapped(&mut self, _result: Result<LinkKind, SwapError>) {}
+}
+
+/// What an accepted `AttachReply` said, for the dialer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachInfo {
+    /// The link the reply came on.
+    pub kind: LinkKind,
+    pub incarnation: u128,
+    pub epoch: u64,
+    /// The attach was a resume (not a fresh attach).
+    pub resumed: bool,
+    /// The daemon's UDP port, when direct mode is on.
+    pub udp_port: Option<u16>,
+    /// The daemon's certificate fingerprint, when direct mode is on.
+    pub fingerprint: Option<Fingerprint>,
+    /// The session's `TERM`.
+    pub term: TermName,
+}
+
+/// Why a swap did not happen.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SwapError {
+    /// The candidate link died, or did something it must not, before the resume completed. The
+    /// client carries on over the old link.
+    #[error("the candidate link failed: {0}")]
+    LinkFailed(String),
+    /// The daemon refused the resume on the candidate. The client carries on over the old link
+    /// (a refusal that also ends the session is handled as usual).
+    #[error("the daemon refused the resume: {0}")]
+    Refused(String),
+    /// The candidate had taken over (the old link was already dropped) and then died before its
+    /// snapshot landed. The client reconnects through [`Dialer::dial`].
+    #[error("the new link was lost before the resume completed")]
+    Lost,
 }

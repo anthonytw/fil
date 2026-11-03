@@ -95,7 +95,7 @@ pub struct TtyOutput {
 
 /// The input half: keystrokes, size changes and signals.
 pub struct TtyInput {
-    rx: mpsc::UnboundedReceiver<TermEvent>,
+    rx: mpsc::Receiver<TermEvent>,
     shared: Arc<Shared>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -131,7 +131,9 @@ pub fn from_fds(
         enabled: AtomicBool::new(false),
         stop: AtomicBool::new(false),
     });
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Bounded: when the client stops reading (a big paste on a slow link) the reader thread
+    // blocks, and the kernel's queue pushes back on the terminal.
+    let (tx, rx) = mpsc::channel(64);
     let mut tasks = Vec::new();
 
     // Signals first, so a failure here leaves no thread behind.
@@ -141,7 +143,7 @@ pub fn from_fds(
     tasks.push(tokio::spawn(async move {
         while winch.recv().await.is_some() {
             let (cols, rows) = winsize(&size_fd);
-            if txw.send(TermEvent::Resize { cols, rows }).is_err() {
+            if txw.send(TermEvent::Resize { cols, rows }).await.is_err() {
                 break;
             }
         }
@@ -156,7 +158,7 @@ pub fn from_fds(
         let txs = tx.clone();
         tasks.push(tokio::spawn(async move {
             if s.recv().await.is_some() {
-                let _ = txs.send(TermEvent::Signal(num));
+                let _ = txs.send(TermEvent::Signal(num)).await;
             }
         }));
     }
@@ -188,7 +190,7 @@ fn winsize<Fd: AsFd>(fd: Fd) -> (u16, u16) {
     }
 }
 
-fn read_loop(fd: OwnedFd, tx: mpsc::UnboundedSender<TermEvent>, shared: Arc<Shared>) {
+fn read_loop(fd: OwnedFd, tx: mpsc::Sender<TermEvent>, shared: Arc<Shared>) {
     let mut buf = [0u8; 4096];
     let tick = rustix::event::Timespec {
         tv_sec: 0,
@@ -208,7 +210,7 @@ fn read_loop(fd: OwnedFd, tx: mpsc::UnboundedSender<TermEvent>, shared: Arc<Shar
             Ok(_) => {}
             Err(Errno::INTR) => continue,
             Err(_) => {
-                let _ = tx.send(TermEvent::Eof);
+                let _ = tx.blocking_send(TermEvent::Eof);
                 return;
             }
         }
@@ -218,17 +220,20 @@ fn read_loop(fd: OwnedFd, tx: mpsc::UnboundedSender<TermEvent>, shared: Arc<Shar
         }
         match rustix::io::read(&fd, &mut buf[..]) {
             Ok(0) => {
-                let _ = tx.send(TermEvent::Eof);
+                let _ = tx.blocking_send(TermEvent::Eof);
                 return;
             }
             Ok(n) => {
-                if tx.send(TermEvent::Input(buf[..n].to_vec())).is_err() {
+                if tx
+                    .blocking_send(TermEvent::Input(buf[..n].to_vec()))
+                    .is_err()
+                {
                     return;
                 }
             }
             Err(Errno::INTR | Errno::AGAIN) => continue,
             Err(_) => {
-                let _ = tx.send(TermEvent::Eof);
+                let _ = tx.blocking_send(TermEvent::Eof);
                 return;
             }
         }

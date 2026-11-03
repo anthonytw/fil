@@ -25,10 +25,12 @@ async fn a_takeover_notice_says_by_whom_and_when_and_offers_to_take_it_back() {
     .await;
     let text = rig.term.text();
     assert!(
-        text.contains("taken over by desktop at 2023-11-14 22:14:20 UTC"),
+        text.contains("was taken over")
+            && text.contains("by desktop")
+            && text.contains("at 2023-11-14 22:14:20 UTC"),
         "{text}"
     );
-    assert!(text.contains("y = take it back"), "{text}");
+    assert!(text.contains("y = yes, n = no"), "{text}");
     // The session's own output is still there under the prompt.
     assert!(text.contains("building..."), "{text}");
     // Nothing reconnects by itself: a laptop waking in a bag never steals the session.
@@ -112,7 +114,7 @@ async fn a_takeover_found_out_on_resume_is_the_same_prompt() {
         rig.term.text().contains("Take it back?")
     })
     .await;
-    assert!(rig.term.text().contains("taken over by desktop"));
+    assert!(rig.term.text().contains("by desktop"));
     let a = rig.daemon.attaches().await;
     assert!(
         a.last().unwrap().resume.is_some(),

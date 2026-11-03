@@ -282,27 +282,8 @@ impl Rng {
     }
 }
 
-/// Bytes every backend models well.
-const PLAIN_POOL: &[&str] = &[
-    "hello world ",
-    "\r\n",
-    "\x1b[31mred\x1b[0m ",
-    "\x1b[5;10H",
-    "\x1b[H\x1b[2J",
-    "日本語 ",
-    "\x1b[?1049h",
-    "\x1b[?1049l",
-    "\x1b[?25l",
-    "\x1b[?25h",
-    "\x1b[K",
-    "x",
-    "\x08",
-    "\t",
-    "0123456789012345678901234567890123456789",
-];
-
-/// Everything, including the states a light backend does not model (regions with origin mode,
-/// insert mode, charsets, soft reset); only the default backend is held to these.
+/// Everything, including regions with origin mode, insert mode, charsets, soft reset and cursor
+/// saves; both backends are held to all of it.
 const POOL: &[&str] = &[
     "hello world ",
     "\r\n",
@@ -346,7 +327,8 @@ const STATUSES: &[&[&str]] = &[
 
 /// Seeds that once failed, kept forever: 39 found that DECSTR leaves alacritty's scroll region
 /// out of step with the one it reports, so an origin-mode cursor restore landed a row off.
-const REGRESSION_SEEDS: &[u64] = &[39];
+/// 79 (vt100) found that DECSC saves origin mode in xterm but not in the shadow backends.
+const REGRESSION_SEEDS: &[u64] = &[39, 79];
 
 #[test]
 fn random_sessions_never_corrupt_the_screen() {
@@ -355,11 +337,7 @@ fn random_sessions_never_corrupt_the_screen() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(6);
     for b in backends() {
-        let pool = if b.name == fil_term::DEFAULT_BACKEND {
-            POOL
-        } else {
-            PLAIN_POOL
-        };
+        let pool = POOL;
         for seed in (1..=seeds).chain(REGRESSION_SEEDS.iter().copied()) {
             eprintln!("backend {} seed {seed}", b.name);
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -398,4 +376,103 @@ fn random_sessions_never_corrupt_the_screen() {
             r.assert_clean();
         }
     }
+}
+
+// ---- review probes (not part of the PR) ---------------------------------------------------
+
+fn resize_both(r: &mut Rig, to: Size) {
+    let f = r.overlay.resize(to);
+    // The real terminal resizes first (SIGWINCH comes after), then the client writes.
+    r.user.resize(to);
+    r.reference.resize(to);
+    r.user.write(&f.erase);
+    r.user.write(&f.paint);
+}
+
+#[test]
+fn review_grow_with_status_then_clean() {
+    each_backend(|r| {
+        r.server(b"$ ");
+        r.status(lines(&[" status "]));
+        resize_both(r, Size { cols: 60, rows: 12 });
+        r.assert_clean();
+    });
+}
+
+#[test]
+fn review_shrink_rows_with_status_then_clean() {
+    each_backend(|r| {
+        r.server(b"hello\r\n$ ");
+        r.status(lines(&[" status line one ", " status line two "]));
+        resize_both(r, Size { cols: 40, rows: 6 });
+        r.assert_clean();
+    });
+}
+
+#[test]
+fn review_shrink_cols_with_status_then_clean() {
+    each_backend(|r| {
+        r.server(b"$ ");
+        // Short lines do not touch a narrower window's wrapping; the client keeps them short.
+        r.status(lines(&[" status ", " second line "]));
+        resize_both(r, Size { cols: 20, rows: 10 });
+        r.assert_clean();
+    });
+}
+
+#[test]
+fn review_decrc_restores_origin_mode() {
+    for b in backends() {
+        eprintln!("backend {}", b.name);
+        let mut r = Rig::new(&b);
+        r.server(b"hello\r\n\x1b[2;8r\x1b[?6h\x1b7\x1b[?6l\x1b8x");
+        r.status(lines(&[" fil: disconnected "]));
+        r.server(b"y");
+        r.server(b"\x1b[?6l\x1b[r");
+        r.assert_clean();
+    }
+}
+
+#[test]
+fn review_print_origin_after_decrc() {
+    for b in backends() {
+        let mut e = (b.create)(SIZE, 0);
+        e.feed(b"\x1b[2;8r\x1b[?6h\x1b7\x1b[?6l\x1b8");
+        let st = e.state(0);
+        eprintln!(
+            "REVIEW backend {} origin after DECRC = {}",
+            b.name, st.modes.origin
+        );
+    }
+}
+
+#[test]
+fn review_resize_with_status_and_predictions_shown() {
+    each_backend(|r| {
+        r.overlay.set_rtt(std::time::Duration::from_millis(500));
+        r.server(b"$ ");
+        r.status(lines(&[" status "]));
+        let f = r
+            .overlay
+            .on_input(b"a", std::time::Duration::from_millis(10));
+        r.user.write(&f.erase);
+        r.user.write(&f.paint);
+        r.server(b"a");
+        for _ in 0..3 {
+            let f = r.overlay.on_input(b"a", std::time::Duration::from_secs(1));
+            r.user.write(&f.erase);
+            r.user.write(&f.paint);
+        }
+        let shown = r
+            .overlay
+            .view(0)
+            .painted
+            .iter()
+            .filter(|c| c.row == 0)
+            .count();
+        eprintln!("REVIEW predicted cells on row 0: {shown}");
+        resize_both(r, Size { cols: 40, rows: 12 });
+        r.check();
+        r.assert_clean();
+    });
 }

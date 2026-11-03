@@ -229,10 +229,8 @@ async fn the_confirmation_mentions_what_the_cap_dropped() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     back(&rig, 2).await;
     let text = rig.term.text();
-    assert!(
-        text.contains("You typed 3 bytes while offline (3 bytes dropped)"),
-        "{text}"
-    );
+    assert!(text.contains("You typed 3 bytes while offline"), "{text}");
+    assert!(text.contains("(3 bytes dropped)"), "{text}");
     assert!(text.contains("\"abc\""), "{text}");
 }
 
@@ -265,13 +263,16 @@ fn tmp(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The log is written by a helper thread; the clock is paused, so wait in real time.
-fn wait_for_file(path: &std::path::Path, want: &[u8]) {
-    for _ in 0..200 {
+/// The log is written by a helper thread or a task, and the clock is paused: wait in real time,
+/// but without blocking the runtime (the log's writer task needs it to run).
+async fn wait_for_file(path: &std::path::Path, want: &[u8]) {
+    for _ in 0..300 {
         if std::fs::read(path).map(|b| b == want).unwrap_or(false) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(10)))
+            .await
+            .unwrap();
     }
     panic!(
         "log file {} holds {:?}, wanted {:?}",
@@ -297,7 +298,7 @@ async fn the_log_is_off_by_default_and_a_file_log_is_created_0600() {
     // Typed offline: everything is logged, including what the 3-byte cap dropped.
     rig.type_str("secret");
     settle().await;
-    wait_for_file(&path, b"secret");
+    wait_for_file(&path, b"secret").await;
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "{mode:o}");
     back(&rig, 2).await;
@@ -306,7 +307,7 @@ async fn the_log_is_off_by_default_and_a_file_log_is_created_0600() {
     offline(&rig).await;
     rig.type_str("more");
     settle().await;
-    wait_for_file(&path, b"secretmore");
+    wait_for_file(&path, b"secretmore").await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -359,6 +360,90 @@ async fn a_log_command_gets_the_keystrokes_on_stdin() {
     offline(&rig).await;
     rig.type_str("typed offline");
     settle().await;
-    wait_for_file(&out, b"typed offline");
+    wait_for_file(&out, b"typed offline").await;
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- confirmation details ------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn what_follows_the_answer_in_the_same_read_is_ordinary_typing() {
+    let rig = start(confirming());
+    rig.attached().await;
+    offline(&rig).await;
+    rig.type_str("pwd\r");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    back(&rig, 2).await;
+    assert!(rig.term.text().contains("Send it?"));
+    rig.type_str("yls\r");
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"pwd\rls\r");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_confirmation_is_drawn_even_when_the_stream_stopped_at_a_pending_wrap() {
+    let rig = start(confirming());
+    rig.attached().await;
+    // The stream ends with a wrap pending, which closes the overlay's gate.
+    rig.daemon.output("x".repeat(80).as_bytes()).await;
+    settle().await;
+    // (The status line is gated too, so there is nothing to wait for.)
+    rig.dial.fail_all(true);
+    rig.daemon.kill_link(DownReason::Dead).await;
+    settle().await;
+    rig.type_str("ls\r");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    back(&rig, 2).await;
+    let text = rig.term.text();
+    assert!(text.contains("Send it?"), "{text}");
+    rig.type_str("y");
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"ls\r");
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_are_not_eaten_by_a_confirmation_nobody_can_see() {
+    let rig = start(confirming());
+    rig.attached().await;
+    // Wide characters on the top and bottom rows and the cursor in the middle: nowhere safe to
+    // draw anything.
+    rig.daemon
+        .output("\x1b[1;1H日本語\x1b[24;1H日本語\x1b[10;1Hhi".as_bytes())
+        .await;
+    settle().await;
+    // (The status line is gated too, so there is nothing to wait for.)
+    rig.dial.fail_all(true);
+    rig.daemon.kill_link(DownReason::Dead).await;
+    settle().await;
+    rig.type_str("ls\r");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    back(&rig, 2).await;
+    // The question cannot be shown, so it is not asked: a 'y' is not an answer to anything...
+    rig.type_str("y");
+    settle().await;
+    assert_eq!(rig.daemon.input().await, b"", "nothing is sent unseen");
+    assert!(!rig.is_finished());
+    // ...until the screen allows it.
+    rig.daemon
+        .output("\x1b[1;1H\x1b[K\x1b[10;3H".as_bytes())
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.term.text().contains("Send it?"), "{}", rig.term.text());
+}
+
+#[tokio::test(start_paused = true)]
+async fn masking_depends_on_the_daemon_reporting_the_pty_mode() {
+    // Documents the contract: the client cannot tell a password prompt from output, so a daemon
+    // that never sends `PtyMode` gets a confirmation that shows the keys. (P3 sends the current
+    // mode after every attach reply and snapshot.)
+    let rig = start(confirming());
+    rig.attached().await;
+    rig.daemon.output(b"Password: ").await;
+    settle().await;
+    offline(&rig).await;
+    rig.type_str("hunter2\r");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    back(&rig, 2).await;
+    assert!(rig.term.text().contains("hunter2"));
+    // With the report, the same keys are masked (status.rs).
 }

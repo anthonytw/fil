@@ -64,7 +64,7 @@ async fn the_status_line_comes_and_goes_leaving_the_screen_exactly_as_it_was() {
         .unwrap();
     assert!(during.screen[status_row].cells[1].attrs.inverse);
     // The cursor row is not covered (the cursor is at row 10, so the bottom edge is used).
-    assert_eq!(status_row, 23);
+    assert_eq!(status_row, 21, "three lines at the bottom edge");
     assert_eq!(during.cursor.row, before.cursor.row);
     // The scrollback never sees it.
     assert_eq!(during.history, before.history);
@@ -120,7 +120,7 @@ async fn a_full_screen_puts_the_line_at_the_top_and_the_scrollback_stays_clean()
     reconnect(&rig, 2).await;
     rig.daemon.degrade_link().await;
     settle().await;
-    assert!(rig.term.text().contains("no reply from the host"));
+    assert!(rig.term.text().contains("no reply for"));
     let more = lines(60..80);
     rig.daemon.output(&more).await;
     settle().await;
@@ -340,13 +340,13 @@ async fn a_resize_while_offline_redraws_the_line_at_the_new_size() {
         "{}",
         rig.term.text()
     );
-    // The line spans the new width.
+    // The lines stay short whatever the width: nothing for a narrower window to re-wrap.
     let row = st
         .screen
         .iter()
         .find(|l| common::term::line_text(l).contains("fil: disconnected"))
         .unwrap();
-    assert!(row.cells[90].attrs.inverse);
+    assert!(!row.cells[60].attrs.inverse);
     rig.type_str("\r~.");
     let _ = rig.finish().await.unwrap();
 }

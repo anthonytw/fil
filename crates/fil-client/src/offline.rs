@@ -143,10 +143,20 @@ impl OfflineBuffer {
         self.dropped
     }
 
-    /// Takes the first `n` bytes (at most what is held), for sending.
-    pub fn take(&mut self, n: usize) -> Vec<u8> {
-        let n = n.min(self.held.len());
-        self.held.drain(..n).collect()
+    /// Takes everything held, for sending. If the cap cut a bracketed paste in half (the start
+    /// marker kept, the end marker dropped), the paste is closed, so the remote line editor is
+    /// not left in paste mode.
+    pub fn take_all(&mut self) -> Vec<u8> {
+        const BEGIN: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+        let mut v = std::mem::take(&mut self.held);
+        let last = |m: &[u8]| v.windows(m.len()).rposition(|w| w == m);
+        match (last(BEGIN), last(END)) {
+            (Some(b), Some(e)) if b > e => v.extend_from_slice(END),
+            (Some(_), None) => v.extend_from_slice(END),
+            _ => {}
+        }
+        v
     }
 
     /// Forgets everything held and the drop count.
@@ -172,8 +182,13 @@ pub enum LogError {
 /// The running log. Writes go through a task, so a slow command never blocks typing.
 #[derive(Debug)]
 pub struct LogSink {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    warned: std::sync::atomic::AtomicBool,
 }
+
+/// Chunks the log may have queued before new ones are dropped (a stalled command must not grow
+/// memory without bound).
+const LOG_QUEUE: usize = 4096;
 
 impl LogSink {
     /// Opens the log. A file is created with mode 0600 and appended to; an existing file is
@@ -186,15 +201,25 @@ impl LogSink {
                     path: p.clone(),
                     why,
                 };
+                // Never follow a symlink at the path (another local user could plant one at a
+                // predictable location such as /tmp to have our keystrokes appended to one of
+                // our own files), and check what was actually opened.
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .mode(0o600)
+                    .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
                     .open(path)
                     .map_err(|e| err(e.to_string()))?;
                 let md = f.metadata().map_err(|e| err(e.to_string()))?;
                 if !md.is_file() {
                     return Err(err("not a regular file".into()));
+                }
+                if md.uid() != rustix::process::geteuid().as_raw() {
+                    return Err(err("not owned by you".into()));
+                }
+                if md.nlink() != 1 {
+                    return Err(err("has more than one hard link".into()));
                 }
                 if md.mode() & 0o077 != 0 {
                     return Err(err(format!(
@@ -202,7 +227,7 @@ impl LogSink {
                         md.mode() & 0o777
                     )));
                 }
-                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
                 std::thread::spawn(move || {
                     while let Some(b) = rx.blocking_recv() {
                         if f.write_all(&b).and_then(|_| f.flush()).is_err() {
@@ -210,7 +235,7 @@ impl LogSink {
                         }
                     }
                 });
-                Ok(LogSink { tx })
+                Ok(LogSink::new(tx))
             }
             OfflineLog::Command(argv) => {
                 let cmd = argv.join(" ");
@@ -230,7 +255,7 @@ impl LogSink {
                     .spawn()
                     .map_err(|e| err(e.to_string()))?;
                 let mut stdin = child.stdin.take().ok_or_else(|| err("no stdin".into()))?;
-                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(LOG_QUEUE);
                 tokio::spawn(async move {
                     use tokio::io::AsyncWriteExt;
                     while let Some(b) = rx.recv().await {
@@ -241,14 +266,24 @@ impl LogSink {
                     drop(stdin);
                     let _ = child.wait().await;
                 });
-                Ok(LogSink { tx })
+                Ok(LogSink::new(tx))
             }
         }
     }
 
+    fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     pub fn write(&self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            let _ = self.tx.send(bytes.to_vec());
+        if !bytes.is_empty()
+            && self.tx.try_send(bytes.to_vec()).is_err()
+            && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!("the offline-input log is not keeping up; dropping log entries");
         }
     }
 }
@@ -266,13 +301,24 @@ mod tests {
         assert_eq!(b.dropped(), 3);
         assert_eq!(b.push(b"z"), 1);
         assert_eq!(b.dropped(), 4);
-        assert_eq!(b.take(2), b"ab");
-        assert_eq!(b.held(), b"cde");
-        // Space freed by sending is usable again.
-        assert_eq!(b.push(b"xy"), 0);
+        assert_eq!(b.take_all(), b"abcde");
+        assert!(b.is_empty());
         b.reset();
         assert!(b.is_empty());
         assert_eq!(b.dropped(), 0);
+    }
+
+    #[test]
+    fn a_paste_cut_by_the_cap_is_closed() {
+        let mut b = OfflineBuffer::new(12);
+        b.push(b"\x1b[200~line one\nline two\x1b[201~");
+        assert!(b.dropped() > 0);
+        let out = b.take_all();
+        assert!(out.ends_with(b"\x1b[201~"), "{out:?}");
+        // A complete paste is left alone.
+        let mut b = OfflineBuffer::new(100);
+        b.push(b"\x1b[200~x\x1b[201~y");
+        assert_eq!(b.take_all(), b"\x1b[200~x\x1b[201~y");
     }
 
     #[test]

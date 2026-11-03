@@ -95,10 +95,55 @@ impl Display {
     /// begins by clearing the screen, so the terminal and the shadow agree again once it lands.
     /// Anything the overlay had drawn must have been erased first (the caller does not need to:
     /// the snapshot clears the screen).
+    ///
+    /// The PTY's mode is not a property of the screen, so it is kept (a password prompt stays a
+    /// password prompt across a snapshot).
     pub fn reset(&mut self) {
         self.overlay = Self::overlay_for(&self.backend, self.size, &self.make_predictor);
-        self.pty = PtyMode::default();
+        let _ = self.overlay.set_pty_mode(self.pty);
         self.lines.clear();
+    }
+
+    /// The session is a different one: forget what is known about its PTY.
+    pub fn forget_pty(&mut self) -> Vec<u8> {
+        self.set_pty_mode(true, true)
+    }
+
+    /// True while the shadow screen (and so the terminal) is on the alternate screen.
+    pub fn in_alt_screen(&self) -> bool {
+        self.overlay.view(0).shadow.modes.alt_screen
+    }
+
+    /// True while the overlay has something drawn.
+    pub fn is_painted(&self) -> bool {
+        self.overlay.has_painted()
+    }
+
+    /// What to write before a snapshot onto a terminal that has been showing a session: leave
+    /// the alternate screen if the old stream entered it, and put the character sets and the pen
+    /// back. (The snapshot clears the screen and sets the rest.)
+    pub fn before_snapshot(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        if self.in_alt_screen() {
+            v.extend_from_slice(b"\x1b[?1049l");
+        }
+        v.extend_from_slice(b"\x1b(B\x1b)B\x0f\x1b[0m");
+        v
+    }
+
+    /// Writes what it takes to open the overlay's gates, through the shadow so both stay in step:
+    /// cancel a half-written escape sequence and clear a pending wrap. With `heavy` also leave
+    /// insert mode, the character sets, origin mode, margins and the scroll region, and close a
+    /// hyperlink. Used for questions the user must see (heavy, because the answer ends or restarts
+    /// the session) and for the offline-input confirmation (light, because the session goes on).
+    pub fn open_gates(&mut self, heavy: bool) -> Vec<u8> {
+        let cursor = self.overlay.view(0).shadow.cursor;
+        let mut seq = String::from("\x18");
+        if heavy {
+            seq.push_str("\x0f\x1b(B\x1b[4l\x1b[?2026l\x1b[?69l\x1b[?6l\x1b[r\x1b]8;;\x1b\\");
+        }
+        seq.push_str(&format!("\x1b[{};{}H", cursor.row + 1, cursor.col + 1));
+        self.server(seq.as_bytes())
     }
 
     pub fn size(&self) -> Size {
@@ -121,13 +166,27 @@ impl Display {
     }
 
     /// The user's terminal changed size.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Vec<u8> {
+    ///
+    /// The second value is true when the window got narrower than what the overlay had drawn:
+    /// a terminal that reflows has then re-wrapped the drawing, which the erase (against the
+    /// old geometry) cannot undo, so the screen is no longer trustworthy and the caller should
+    /// get a fresh snapshot at the next attach.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> (Vec<u8>, bool) {
         let size = Size { cols, rows };
         if size == self.size {
-            return Vec::new();
+            return (Vec::new(), false);
         }
+        let widest = self
+            .overlay
+            .view(0)
+            .painted
+            .iter()
+            .map(|c| c.col)
+            .max()
+            .map(|c| usize::from(c) + 1);
+        let damaged = widest.is_some_and(|w| usize::from(cols) < w);
         self.size = size;
-        self.overlay.resize(size).to_bytes()
+        (self.overlay.resize(size).to_bytes(), damaged)
     }
 
     /// `PtyMode` from the daemon, already ordered with the output.
@@ -150,26 +209,21 @@ impl Display {
         self.echo_ack
     }
 
-    /// Shows these lines (inverse video, padded to the width), or removes them when empty.
+    /// Shows these lines (inverse video, one space of margin each side, wrapped to at most 40
+    /// columns), or removes them when empty.
     /// Returns what to write; only the difference from what is already drawn. Calling it again
     /// with the same lines is cheap, and retries the drawing if a gate was closed before.
     pub fn set_lines(&mut self, lines: Vec<String>) -> Vec<u8> {
         self.lines = lines.clone();
+        let wrap_at = usize::from(self.size.cols).saturating_sub(4).clamp(8, 40);
         let status = if lines.is_empty() {
             None
         } else {
-            let width = usize::from(self.size.cols).saturating_sub(1);
             Some(Status {
                 lines: lines
                     .iter()
-                    .map(|l| {
-                        let mut s = format!(" {l} ");
-                        let n = s.chars().count();
-                        if n < width {
-                            s.push_str(&" ".repeat(width - n));
-                        }
-                        s
-                    })
+                    .flat_map(|l| crate::text::wrap(l, wrap_at))
+                    .map(|l| format!(" {l} "))
                     .collect(),
                 placement: self.placement,
             })

@@ -57,6 +57,12 @@ pub struct DState {
     cut_snapshot: Option<usize>,
     /// Keystrokes arriving now are lost (as if the link dropped them).
     lose_input: bool,
+    /// Direct-mode details for the reply.
+    direct: Option<(u16, Vec<u8>)>,
+    /// Send the output before the `AttachReply` (another stream overtaking the control stream).
+    data_before_reply: bool,
+    /// Wait this long before sending snapshot bytes.
+    snapshot_delay: Option<Duration>,
     now_ms: u64,
 }
 
@@ -93,6 +99,9 @@ impl FakeDaemon {
                 send_input_resume: true,
                 cut_snapshot: None,
                 lose_input: false,
+                direct: None,
+                data_before_reply: false,
+                snapshot_delay: None,
                 now_ms: NOW_MS,
             }),
         })
@@ -261,12 +270,21 @@ impl FakeDaemon {
             incarnation: st.incarnation,
             epoch,
             start: start_point,
-            udp_port: None,
-            fingerprint: None,
+            udp_port: st.direct.as_ref().map(|d| d.0),
+            fingerprint: st
+                .direct
+                .as_ref()
+                .map(|d| fil_proto::msg::Fingerprint::new(d.1.clone()).unwrap()),
             term: TermName::new("xterm-256color").unwrap(),
         };
+        if st.data_before_reply {
+            self.pump(st).await;
+        }
         let _ = send(&link, &ControlMsg::AttachReply(reply)).await;
         if let Some(mut bytes) = snapshot_bytes {
+            if let Some(d) = st.snapshot_delay {
+                tokio::time::sleep(d).await;
+            }
             let cut = st.cut_snapshot.take();
             if let Some(n) = cut {
                 bytes.truncate(n);
@@ -555,6 +573,125 @@ impl FakeDaemon {
                 .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
                 .await;
         }
+    }
+
+    /// REVIEW: terminal data past `at` arrives *before* the `Snapshot` announcement (control is
+    /// a separate QUIC stream, so the Link contract allows it).
+    pub async fn catch_up_announcement_overtaken(&self, skip: &[u8], after: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+        let at = st.log.end();
+        st.snapshots += 1;
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: skip.len() as u64,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+        };
+        st.log.append(after);
+        st.emu.feed(after);
+        let seg = Segment {
+            seq: at,
+            data: after.to_vec(),
+        };
+        st.sent = at + after.len() as u64;
+        let _ = link
+            .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+            .await;
+        let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    pub async fn set_direct(&self, port: u16, fingerprint: Vec<u8>) {
+        self.st.lock().await.direct = Some((port, fingerprint));
+    }
+
+    pub async fn set_data_before_reply(&self, on: bool) {
+        self.st.lock().await.data_before_reply = on;
+    }
+
+    pub async fn set_snapshot_delay(&self, d: Option<Duration>) {
+        self.st.lock().await.snapshot_delay = d;
+    }
+
+    /// A terminal segment that starts `skip` bytes past what was sent, with nothing between
+    /// (a gap that no announcement explains).
+    pub async fn send_gap(&self, skip: u64, bytes: &[u8]) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let seg = Segment {
+                seq: st.sent + skip,
+                data: bytes.to_vec(),
+            };
+            let _ = c
+                .link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    /// The worst order across streams: snapshot bytes, then output past it, then the announcement.
+    pub async fn catch_up_everything_overtaken(&self, skip: &[u8], after: &[u8]) {
+        let mut st = self.st.lock().await;
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+        let at = st.log.end();
+        st.snapshots += 1;
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: skip.len() as u64,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+        };
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+        st.log.append(after);
+        st.emu.feed(after);
+        let seg = Segment {
+            seq: at,
+            data: after.to_vec(),
+        };
+        st.sent = at + after.len() as u64;
+        let _ = link
+            .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+            .await;
+        let _ = send(&link, &ControlMsg::Snapshot(info)).await;
     }
 
     pub async fn lose_input(&self, on: bool) {

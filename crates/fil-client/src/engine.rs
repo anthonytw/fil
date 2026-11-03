@@ -1,10 +1,11 @@
 //! The client loop: attach, resume and reconnect (DESIGN.md sections 4.1, 4.2, 5.2, 8.5).
 //!
 //! One run is a sequence of links. For each: get a link from the [`Dialer`], say `Hello` and
-//! `Attach` (with the resume position if there is one), then serve it until it dies, is swapped
-//! for another, or the user ends the session. The session state that makes a resume exact (the
-//! incarnation, the epoch, how many output bytes the terminal has been given, the keystrokes
-//! the daemon has not acknowledged) lives in [`Session`] and outlives every link.
+//! `Attach` (with the resume position if there is one), then serve it until it dies or the user
+//! ends the session. While one is served the dialer may offer a better one, which replaces it
+//! through a swap transaction (see [`crate::dialer`]). The session state that makes a resume
+//! exact (the incarnation, the epoch, how many output bytes the terminal has been given, the
+//! keystrokes the daemon has not acknowledged) lives in [`Session`] and outlives every link.
 //!
 //! # What the loop expects of the daemon
 //!
@@ -18,12 +19,23 @@
 //! - It acknowledges keystrokes with `Ack { channel: 1, upto }`.
 //! - Output is `StartPoint::Resume { from }` then terminal data, or a snapshot of exactly `len`
 //!   bytes on channel 2 (as data segments from offset 0) with terminal data continuing at `at`.
-//!   The client holds back terminal data behind an incomplete snapshot, so channel order across
-//!   QUIC streams does not matter.
+//! - **After every `AttachReply` and every `Snapshot` it should send the PTY's current
+//!   `PtyMode`**, so that a password prompt is known as one even for a client that missed the
+//!   report. The client keeps the last mode it was told across snapshots.
 //! - The end of a session is the link closing; the client then reconnects and learns
 //!   `SessionGone`.
+//!
+//! # Channels are independent
+//!
+//! On QUIC every channel is its own stream, so the control message that announces something
+//! (`AttachReply`, `Snapshot`) can arrive *after* the data it announces. The client therefore
+//! holds terminal data it cannot place yet (before the reply, behind a snapshot, past a gap that
+//! a not-yet-arrived `Snapshot` will explain) and snapshot data that arrives before its
+//! announcement, up to `max_held_output`, and applies it in order when it can. A stream that
+//! stays inconsistent (the bound is exceeded, a gap never closes, an ack is beyond what was
+//! sent) is repaired by reconnecting and resuming, not by ending the run.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,17 +45,17 @@ use fil_proto::chan::{RecvChannel, SendChannel};
 use fil_proto::frame::DataSegment;
 use fil_proto::limits::ACK_DELAY;
 use fil_proto::msg::{
-    Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, ResumeRequest, SnapshotInfo,
-    StartPoint, TakenOver, TermName, TermSize,
+    Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
+    SnapshotInfo, StartPoint, TakenOver, TermName, TermSize,
 };
 use fil_term::Size;
-use fil_transport::{Link, LinkError, LinkKind, LinkState};
-use tokio::sync::mpsc;
+use fil_transport::{Link, LinkError, LinkKind, LinkState, LinkStatus};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
-use crate::config::{ClientConfig, ClientError, Outcome};
-use crate::dialer::{DialError, DialPurpose, Dialed, Dialer};
+use crate::config::{Backoff, ClientConfig, ClientError, Outcome};
+use crate::dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 use crate::display::{Display, PredictorFactory};
 use crate::escape::{Action, EscapeFilter};
 use crate::offline::{LogSink, OfflineBuffer};
@@ -55,6 +67,8 @@ use crate::text::{sanitize_inline, sanitize_lines};
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 /// Keystrokes waiting for room in the send window; past this the terminal is not read.
 const MAX_PENDING_INPUT: usize = 64 * 1024;
+/// How long output may sit behind a gap in the terminal stream before the link is given up on.
+const GAP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Everything about the session that must survive a link.
 struct Session {
@@ -99,15 +113,37 @@ impl Session {
     }
 }
 
-/// Per-link state.
+/// Per-link protocol state.
 struct Conn {
+    kind: LinkKind,
     awaiting_reply: bool,
     /// What the `Attach` on this link asked for.
     resumed: bool,
-    attach_size: (u16, u16),
     snap: Option<Snap>,
-    /// Terminal output that arrived behind an incomplete snapshot.
-    held: Vec<u8>,
+    /// Terminal segments received and not yet applied, by offset.
+    term_held: BTreeMap<u64, Vec<u8>>,
+    held_bytes: usize,
+    /// Since when `term_held` starts past the terminal position (a gap), if it does.
+    gap_since: Option<Instant>,
+    /// Snapshot segments that arrived before the snapshot was announced.
+    snap_early: Vec<(u64, Vec<u8>)>,
+    early_bytes: usize,
+}
+
+impl Conn {
+    fn new(kind: LinkKind, resumed: bool) -> Self {
+        Self {
+            kind,
+            awaiting_reply: true,
+            resumed,
+            snap: None,
+            term_held: BTreeMap::new(),
+            held_bytes: 0,
+            gap_since: None,
+            snap_early: Vec::new(),
+            early_bytes: 0,
+        }
+    }
 }
 
 struct Snap {
@@ -124,11 +160,9 @@ enum Prompt {
 }
 
 /// What a link's service ended with.
-enum Served<L> {
-    /// The link is gone (or was dropped on purpose): dial again.
+enum Served {
+    /// The link is gone: dial again.
     Reconnect,
-    /// The dialer offered another link.
-    Swap(Dialed<L>),
     Refused(Prompt),
     Done(Outcome),
 }
@@ -138,16 +172,177 @@ enum Confirm {
     Typed { secs: u64 },
 }
 
-struct Tasks(Vec<JoinHandle<()>>);
-impl Drop for Tasks {
-    fn drop(&mut self) {
-        for t in &self.0 {
-            t.abort();
+type Outbox = mpsc::UnboundedSender<(ChannelId, Bytes)>;
+type Inbox = mpsc::Receiver<Result<(ChannelId, Bytes), LinkError>>;
+
+/// One link and the tasks that move its payloads.
+struct LinkCtx<L> {
+    link: Arc<L>,
+    kind: LinkKind,
+    tx: Outbox,
+    rrx: Inbox,
+    status: watch::Receiver<LinkStatus>,
+    writer: JoinHandle<()>,
+    reader: JoinHandle<()>,
+    conn: Conn,
+    /// The link said `Down`; what it queued before is still being read out.
+    down: bool,
+    /// Data a candidate link delivered before its `AttachReply` (a separate stream can overtake
+    /// it): replayed in order once the reply is in.
+    pre: Vec<(ChannelId, Bytes)>,
+    pre_bytes: usize,
+}
+
+impl<L: Link> LinkCtx<L> {
+    fn open(link: L, resumed: bool) -> Self {
+        let kind = link.kind();
+        let link = Arc::new(link);
+        let (tx, mut wrx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
+        let writer = {
+            let link = link.clone();
+            tokio::spawn(async move {
+                while let Some((c, p)) = wrx.recv().await {
+                    if link.send(c, p).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let (rtx, rrx) = mpsc::channel(256);
+        let reader = {
+            let link = link.clone();
+            tokio::spawn(async move {
+                loop {
+                    let m = link.recv().await;
+                    let end = m.is_err();
+                    if rtx.send(m).await.is_err() || end {
+                        break;
+                    }
+                }
+            })
+        };
+        let status = link.status();
+        Self {
+            link,
+            kind,
+            tx,
+            rrx,
+            status,
+            writer,
+            reader,
+            conn: Conn::new(kind, resumed),
+            down: false,
+            pre: Vec::new(),
+            pre_bytes: 0,
         }
+    }
+
+    fn close(self) {
+        self.reader.abort();
+        self.writer.abort();
+        self.link.close();
+    }
+
+    /// Lets what was queued (a `Detach`) reach the daemon, then closes.
+    async fn close_after_flush(self) {
+        let Self {
+            link,
+            tx,
+            writer,
+            reader,
+            ..
+        } = self;
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        reader.abort();
+        link.close();
     }
 }
 
-type Outbox = mpsc::UnboundedSender<(ChannelId, Bytes)>;
+/// The next payload of the candidate link, or never when there is none.
+async fn cand_recv<L: Link>(
+    cand: &mut Option<LinkCtx<L>>,
+) -> Option<Result<(ChannelId, Bytes), LinkError>> {
+    match cand {
+        Some(c) => c.rrx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What a candidate link's message means.
+enum CandStep {
+    Keep,
+    Hold(ChannelId, Bytes),
+    Fail(SwapError),
+    Promote(AttachReply),
+    Refused(AttachRefusal),
+}
+
+fn candidate_step(m: Option<Result<(ChannelId, Bytes), LinkError>>) -> CandStep {
+    match m {
+        Some(Ok((chan, payload))) if chan == ChannelId::CONTROL => {
+            match ControlMsg::decode(&payload) {
+                Ok(ControlMsg::Hello(h)) => {
+                    let ours = Hello::ours(Agent::new("fil-client").expect("valid"));
+                    match ours.check(&h) {
+                        Ok(()) => CandStep::Keep,
+                        Err(e) => CandStep::Fail(SwapError::LinkFailed(e.to_string())),
+                    }
+                }
+                Ok(ControlMsg::AttachReply(r)) => CandStep::Promote(r),
+                Ok(ControlMsg::AttachRefused(r)) => CandStep::Refused(r),
+                Ok(_) => CandStep::Keep,
+                Err(e) => {
+                    CandStep::Fail(SwapError::LinkFailed(format!("bad control message: {e}")))
+                }
+            }
+        }
+        Some(Ok((chan, payload))) => CandStep::Hold(chan, payload),
+        Some(Err(LinkError(reason))) => {
+            CandStep::Fail(SwapError::LinkFailed(format!("{reason:?}")))
+        }
+        None => CandStep::Fail(SwapError::LinkFailed("closed".into())),
+    }
+}
+
+/// The wait between attempts, shared by dial failures and links that die young.
+struct BackoffState {
+    cfg: Backoff,
+    cur: Duration,
+}
+
+impl BackoffState {
+    fn new(cfg: Backoff) -> Self {
+        let cur = match cfg {
+            Backoff::None => Duration::ZERO,
+            Backoff::Exponential { initial, .. } => initial,
+        };
+        Self { cfg, cur }
+    }
+
+    /// The wait to use now (and the next one doubles), or none when the client does not wait.
+    fn next(&mut self) -> Option<Duration> {
+        match self.cfg {
+            Backoff::None => None,
+            Backoff::Exponential { max, .. } => {
+                let d = self.cur;
+                self.cur = (self.cur * 2).min(max);
+                Some(d)
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.cfg);
+    }
+
+    fn reset_after(&self) -> Duration {
+        match self.cfg {
+            Backoff::None => Duration::ZERO,
+            Backoff::Exponential { reset_after, .. } => reset_after,
+        }
+    }
+}
 
 pub(crate) struct Core<I, O> {
     cfg: ClientConfig,
@@ -155,6 +350,8 @@ pub(crate) struct Core<I, O> {
     out: O,
     local_term: Option<String>,
     size: (u16, u16),
+    /// The size the daemon was last told.
+    sent_size: (u16, u16),
     raw: bool,
     display: Option<Display>,
     make_predictor: Option<PredictorFactory>,
@@ -162,16 +359,23 @@ pub(crate) struct Core<I, O> {
     buf: OfflineBuffer,
     log: Option<LogSink>,
     confirm: Option<Confirm>,
+    /// The confirmation is due but could not be drawn yet; nothing is sent until it is shown
+    /// and answered.
+    confirm_pending: Option<u64>,
     /// A question to the user (after a refusal); it replaces everything else on the overlay.
     prompt: Option<Vec<String>>,
+    /// The question could not be drawn on the overlay and was printed below the cursor.
+    prompt_plain: bool,
     sess: Session,
     /// Keystrokes accepted from the user, waiting for room in the send window.
     pending: Vec<u8>,
     tx: Option<Outbox>,
     /// The link is up, the attach is accepted, and the screen is current.
     link_ok: bool,
-    /// A link swap is in progress: keystrokes are held for the new link, not treated as offline.
-    swapping: bool,
+    /// When the link last became ready (for the backoff reset).
+    ready_since: Option<Instant>,
+    /// An accepted attach reply the dialer has not been told about yet.
+    attached: Option<AttachInfo>,
     disconnected_since: Option<Instant>,
     quiet: bool,
     last_kind: Option<LinkKind>,
@@ -204,6 +408,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             out,
             local_term: term.local_term,
             size,
+            sent_size: size,
             raw: false,
             display: None,
             make_predictor,
@@ -211,12 +416,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             buf,
             log,
             confirm: None,
+            confirm_pending: None,
             prompt: None,
+            prompt_plain: false,
             sess: Session::new(window),
             pending: Vec::new(),
             tx: None,
             link_ok: false,
-            swapping: false,
+            ready_since: None,
+            attached: None,
             disconnected_since: None,
             quiet: false,
             last_kind: None,
@@ -242,33 +450,22 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     async fn main<D: Dialer>(&mut self, dialer: &mut D) -> Result<Outcome, ClientError> {
         let mut purpose = DialPurpose::Attach;
-        let mut swapped: Option<Dialed<D::Link>> = None;
         let mut failures = 0u32;
+        let mut backoff = BackoffState::new(self.cfg.reconnect.backoff);
         loop {
-            let dialed = match swapped.take() {
-                Some(d) => d,
-                None => match self.dial_phase(dialer, purpose, &mut failures).await? {
-                    Ok(d) => d,
-                    Err(outcome) => return Ok(outcome),
-                },
+            let dialed = match self
+                .dial_phase(dialer, purpose, &mut failures, &mut backoff)
+                .await?
+            {
+                Ok(d) => d,
+                Err(outcome) => return Ok(outcome),
             };
             self.note_banner(&dialed.skipped);
-            let started = Instant::now();
+            self.ready_since = None;
             match self.serve(dialer, dialed).await? {
                 Served::Reconnect => {
                     self.mark_disconnected();
                     purpose = self.purpose();
-                    if started.elapsed() < Duration::from_secs(1) {
-                        // A link that dies at once (a crash-looping daemon) must not become a
-                        // busy loop of dials.
-                        let wait = Instant::now() + self.cfg.reconnect.initial_backoff;
-                        if let Pumped::Done(o) = self
-                            .pump(self.give_up_deadline(), sleep_until(wait))
-                            .await?
-                        {
-                            return Ok(o);
-                        }
-                    }
                     if !self.first_attached {
                         failures += 1;
                         if failures > self.cfg.reconnect.initial_retries {
@@ -277,20 +474,36 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             ));
                         }
                     }
-                }
-                Served::Swap(d) => {
-                    swapped = Some(d);
-                    purpose = self.purpose();
-                }
-                Served::Refused(prompt) => match self.ask(prompt).await? {
-                    Ok(()) => {
-                        // A fresh attach: new session state, and the dialer installs a new key.
-                        self.sess.forget(self.cfg.input_window);
-                        self.pending.clear();
-                        purpose = DialPurpose::Attach;
+                    // A link that stayed attached for a while resets the wait; one that died
+                    // young (a crash-looping daemon) waits, and the wait grows.
+                    let lived = self.ready_since.take().map(|t| t.elapsed());
+                    if lived.is_some_and(|l| l >= backoff.reset_after()) {
+                        backoff.reset();
+                    } else if let Some(wait) = backoff.next() {
+                        let until = Instant::now() + wait;
+                        let give_up = self.give_up_deadline();
+                        if let Pumped::Done(o) = self.pump(give_up, sleep_until(until)).await? {
+                            return Ok(o);
+                        }
                     }
-                    Err(outcome) => return Ok(outcome),
-                },
+                }
+                Served::Refused(prompt) => {
+                    let replaced = matches!(prompt, Prompt::Replaced);
+                    match self.ask(prompt).await? {
+                        Ok(()) => {
+                            // A fresh attach: new session state, and the dialer installs a new key.
+                            self.sess.forget(self.cfg.input_window);
+                            self.pending.clear();
+                            if replaced && let Some(d) = self.display.as_mut() {
+                                // A different session has a different PTY.
+                                let bytes = d.forget_pty();
+                                self.write(&bytes)?;
+                            }
+                            purpose = DialPurpose::Attach;
+                        }
+                        Err(outcome) => return Ok(outcome),
+                    }
+                }
                 Served::Done(outcome) => return Ok(outcome),
             }
         }
@@ -339,8 +552,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         dialer: &mut D,
         purpose: DialPurpose,
         failures: &mut u32,
+        backoff: &mut BackoffState,
     ) -> Result<Result<Dialed<D::Link>, Outcome>, ClientError> {
-        let mut backoff = self.cfg.reconnect.initial_backoff;
         loop {
             let give_up = self.give_up_deadline();
             self.attempt += 1;
@@ -363,11 +576,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     if !self.first_attached && *failures > self.cfg.reconnect.initial_retries {
                         return Err(ClientError::Dial(e.message));
                     }
-                    let until = Instant::now() + backoff;
-                    backoff = (backoff * 2).min(self.cfg.reconnect.max_backoff);
-                    match self.pump(give_up, sleep_until(until)).await? {
-                        Pumped::Ready(()) => {}
-                        Pumped::Done(o) => return Ok(Err(o)),
+                    if let Some(wait) = backoff.next() {
+                        let until = Instant::now() + wait;
+                        match self.pump(give_up, sleep_until(until)).await? {
+                            Pumped::Ready(()) => {}
+                            Pumped::Done(o) => return Ok(Err(o)),
+                        }
                     }
                 }
             }
@@ -413,98 +627,133 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    // ---- serving one link --------------------------------------------------------------
+    // ---- serving links -----------------------------------------------------------------
 
+    /// Serves the session over `dialed` until it ends or the link is lost. While serving, the
+    /// dialer may offer a candidate link (a swap); see [`crate::dialer`].
     async fn serve<D: Dialer>(
         &mut self,
         dialer: &mut D,
         dialed: Dialed<D::Link>,
-    ) -> Result<Served<D::Link>, ClientError> {
-        let link = Arc::new(dialed.link);
-        self.last_kind = Some(link.kind());
-        let (tx, mut wrx) = mpsc::unbounded_channel::<(ChannelId, Bytes)>();
-        let writer = {
-            let link = link.clone();
-            tokio::spawn(async move {
-                while let Some((c, p)) = wrx.recv().await {
-                    if link.send(c, p).await.is_err() {
-                        break;
-                    }
-                }
-            })
-        };
-        let (rtx, mut rrx) = mpsc::channel::<Result<(ChannelId, Bytes), LinkError>>(256);
-        let reader = {
-            let link = link.clone();
-            tokio::spawn(async move {
-                loop {
-                    let m = link.recv().await;
-                    let end = m.is_err();
-                    if rtx.send(m).await.is_err() || end {
-                        break;
-                    }
-                }
-            })
-        };
-        let mut status = link.status();
-        let guard = Tasks(vec![reader]);
-        let writer_handle = writer;
-
-        // Say hello and attach, back to back: no round trip before the first screen.
-        let size = self.size;
+    ) -> Result<Served, ClientError> {
         let resume = self.sess.resume_request();
-        let mut conn = Conn {
-            awaiting_reply: true,
-            resumed: resume.is_some(),
-            attach_size: size,
-            snap: None,
-            held: Vec::new(),
-        };
+        let mut primary = LinkCtx::open(dialed.link, resume.is_some());
+        self.last_kind = Some(primary.kind);
         self.sess.input_ready = false;
         self.link_ok = false;
         self.ack_due = None;
-        self.tx = Some(tx.clone());
         self.quiet = false;
-        let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
-            .expect("agent string is valid");
-        self.send_ctl(&ControlMsg::Hello(Hello::ours(agent)));
-        self.send_ctl(&ControlMsg::Attach(Attach {
-            name: self.cfg.session.clone(),
-            size: term_size(size),
-            term: self.local_term_name(),
-            host: self.cfg.host_label.clone(),
-            key: dialer.public_key(),
-            resume,
-        }));
+        self.tx = Some(primary.tx.clone());
+        self.begin_attach(&primary.tx, resume, dialer.public_key());
+        // A candidate being tried, and the kind of a candidate that has taken over but whose
+        // resume is not complete yet.
+        let mut cand: Option<LinkCtx<D::Link>> = None;
+        let mut promoted: Option<LinkKind> = None;
 
-        let result: Result<Served<D::Link>, ClientError> = async {
+        let result: Result<Served, ClientError> = async {
             Ok(loop {
-                let wake = self.next_wake();
+                let gap_deadline = primary.conn.gap_since.map(|t| t + GAP_PATIENCE);
+                let wake = match (self.next_wake(), gap_deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                // No swap before the reply and any snapshot are in, and none without a session
+                // to resume (a fresh attach would reuse the key).
+                let can_swap = self.sess.established
+                    && cand.is_none()
+                    && promoted.is_none()
+                    && !primary.conn.awaiting_reply
+                    && primary.conn.snap.is_none();
+                let mut ended: Option<Served> = None;
                 tokio::select! {
-                    m = rrx.recv() => {
-                        let flow = match m {
-                            Some(Ok((chan, payload))) => self.on_payload(&mut conn, chan, payload)?,
-                            Some(Err(LinkError(reason))) => {
-                                tracing::debug!(?reason, "link down");
-                                Flow::End(Served::Reconnect)
-                            }
-                            None => Flow::End(Served::Reconnect),
-                        };
-                        if let Flow::End(s) = flow { break s; }
-                    }
-                    changed = status.changed() => {
-                        if changed.is_err() {
-                            break Served::Reconnect;
-                        }
-                        let state = status.borrow_and_update().state.clone();
-                        match state {
-                            LinkState::Up => self.link_recovered(&conn)?,
-                            LinkState::Degraded => {
-                                if conn.awaiting_reply || self.link_ok {
-                                    self.link_quiet()?;
+                    m = primary.rrx.recv() => {
+                        ended = match m {
+                            Some(Ok((chan, payload))) => {
+                                match self.on_payload(&mut primary.conn, chan, payload)? {
+                                    Flow::Continue => None,
+                                    Flow::End(s) => Some(s),
                                 }
                             }
-                            LinkState::Down(_) => break Served::Reconnect,
+                            Some(Err(LinkError(reason))) => {
+                                tracing::debug!(?reason, "link down");
+                                Some(Served::Reconnect)
+                            }
+                            None => Some(Served::Reconnect),
+                        };
+                    }
+                    changed = primary.status.changed(), if !primary.down => {
+                        if changed.is_err() {
+                            primary.down = true;
+                        } else {
+                            let state = primary.status.borrow_and_update().state.clone();
+                            match state {
+                                LinkState::Up => self.link_recovered(&primary.conn)?,
+                                LinkState::Degraded => {
+                                    if primary.conn.awaiting_reply || self.link_ok {
+                                        self.link_quiet()?;
+                                    }
+                                }
+                                // What the link queued before going down is still read out
+                                // (a `TakenOver` sent just before the peer closed); the
+                                // reader then fails and ends the link.
+                                LinkState::Down(_) => primary.down = true,
+                            }
+                        }
+                    }
+                    m = cand_recv(&mut cand) => {
+                        match candidate_step(m) {
+                            CandStep::Keep => {}
+                            CandStep::Hold(chan, payload) => {
+                                let c = cand.as_mut().expect("candidate");
+                                c.pre_bytes += payload.len();
+                                if c.pre_bytes > self.cfg.max_held_output {
+                                    dialer.swapped(Err(SwapError::LinkFailed(
+                                        "too much data before the attach reply".into(),
+                                    )));
+                                    if let Some(c) = cand.take() {
+                                        c.close();
+                                    }
+                                } else {
+                                    c.pre.push((chan, payload));
+                                }
+                            }
+                            CandStep::Fail(e) => {
+                                dialer.swapped(Err(e));
+                                if let Some(c) = cand.take() {
+                                    c.close();
+                                }
+                            }
+                            CandStep::Promote(r) => {
+                                let c = cand.take().expect("candidate");
+                                let old = std::mem::replace(&mut primary, c);
+                                old.close();
+                                self.take_over_tx(&primary);
+                                promoted = Some(primary.kind);
+                                ended = match self.on_control(
+                                    &mut primary.conn,
+                                    ControlMsg::AttachReply(r),
+                                )? {
+                                    Flow::Continue => None,
+                                    Flow::End(s) => Some(s),
+                                };
+                                if ended.is_none() {
+                                    ended = self.replay_pre(&mut primary)?;
+                                }
+                            }
+                            CandStep::Refused(r) => {
+                                dialer.swapped(Err(SwapError::Refused(format!("{r:?}"))));
+                                if let Some(c) = cand.take() {
+                                    c.close();
+                                }
+                                ended = match r {
+                                    // Nothing wrong with the session: stay on the old link.
+                                    AttachRefusal::WrongKey | AttachRefusal::BadResume => None,
+                                    other => match self.on_refusal(other)? {
+                                        Flow::End(s) => Some(s),
+                                        Flow::Continue => None,
+                                    },
+                                };
+                            }
                         }
                     }
                     ev = self.input.next(), if self.pending.len() < MAX_PENDING_INPUT => {
@@ -512,39 +761,128 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             Ev::Continue => {}
                             Ev::Detach => {
                                 self.send_ctl(&ControlMsg::Detach);
-                                break Served::Done(Outcome::Detached);
+                                ended = Some(Served::Done(Outcome::Detached));
                             }
-                            Ev::End(o) => break Served::Done(o),
+                            Ev::End(o) => ended = Some(Served::Done(o)),
                         }
                     }
-                    sw = dialer.next_swap() => {
-                        // Bytes still in flight on the old link are covered by the position the
-                        // resume will carry: everything written to the terminal so far.
-                        self.swapping = true;
-                        break Served::Swap(sw);
+                    swap = dialer.next_swap(), if can_swap => {
+                        let candidate = LinkCtx::open(swap.link, true);
+                        let resume = self.sess.resume_request();
+                        self.begin_attach(&candidate.tx, resume, dialer.public_key());
+                        cand = Some(candidate);
                     }
-                    _ = at(wake) => self.on_tick()?,
+                    _ = at(wake) => {
+                        self.on_tick()?;
+                        if primary.conn.gap_since.is_some_and(|t| t.elapsed() >= GAP_PATIENCE) {
+                            tracing::warn!("terminal data stayed out of order; reconnecting");
+                            ended = Some(Served::Reconnect);
+                        }
+                    }
+                }
+
+                if let Some(info) = self.attached.take() {
+                    dialer.attached(&info);
+                }
+                // A snapshot started on the old link: the candidate's position is stale.
+                if cand.is_some() && primary.conn.snap.is_some() {
+                    dialer.swapped(Err(SwapError::LinkFailed(
+                        "superseded by a snapshot".into(),
+                    )));
+                    if let Some(c) = cand.take() {
+                        c.close();
+                    }
+                }
+                if ended.is_none()
+                    && let Some(kind) = promoted
+                    && !primary.conn.awaiting_reply
+                    && primary.conn.snap.is_none()
+                {
+                    promoted = None;
+                    dialer.swapped(Ok(kind));
+                }
+                match ended {
+                    None => {}
+                    Some(Served::Reconnect) if cand.is_some() => {
+                        // The old link ended (the daemon drops it when it accepts the
+                        // candidate's resume, and may do so before the reply is read): the
+                        // candidate carries on as the link. Nothing is shown to the user: from
+                        // their side the session never left.
+                        let c = cand.take().expect("candidate");
+                        let old = std::mem::replace(&mut primary, c);
+                        old.close();
+                        self.take_over_tx(&primary);
+                        promoted = Some(primary.kind);
+                        if let Some(s) = self.replay_pre(&mut primary)? {
+                            break s;
+                        }
+                    }
+                    Some(s) => break s,
                 }
             })
         }
         .await;
 
-        // Leave the link tidy (also when the loop failed: the daemon should see the link close). A detach must reach the daemon before the link closes.
+        // Leave the links tidy, also when the loop failed: the daemon should see them close.
         self.tx = None;
-        if conn.snap.is_some() {
+        if primary.conn.snap.is_some() {
             // The snapshot never landed: the terminal and the daemon disagree about the
             // position, and a snapshot is not resumable. The next attach starts afresh.
             self.sess.established = false;
         }
-        drop(tx);
-        if matches!(result, Ok(Served::Done(Outcome::Detached))) {
-            let _ = tokio::time::timeout(Duration::from_secs(2), writer_handle).await;
-        } else {
-            writer_handle.abort();
+        if promoted.is_some() {
+            dialer.swapped(Err(SwapError::Lost));
         }
-        link.close();
-        drop(guard);
+        if let Some(c) = cand.take() {
+            dialer.swapped(Err(SwapError::LinkFailed("the session ended first".into())));
+            c.close();
+        }
+        if matches!(result, Ok(Served::Done(Outcome::Detached))) {
+            primary.close_after_flush().await;
+        } else {
+            primary.close();
+        }
         result
+    }
+
+    /// `primary` (a candidate that took over) is now the link keystrokes and acks go to.
+    fn take_over_tx<L: Link>(&mut self, primary: &LinkCtx<L>) {
+        self.tx = Some(primary.tx.clone());
+        self.last_kind = Some(primary.kind);
+        // The new link's daemon tells us where its input stream stands.
+        self.sess.input_ready = false;
+    }
+
+    /// Feeds what a candidate delivered before its reply into the link it became.
+    fn replay_pre<L: Link>(
+        &mut self,
+        primary: &mut LinkCtx<L>,
+    ) -> Result<Option<Served>, ClientError> {
+        for (chan, payload) in std::mem::take(&mut primary.pre) {
+            if let Flow::End(s) = self.on_payload(&mut primary.conn, chan, payload)? {
+                return Ok(Some(s));
+            }
+        }
+        primary.pre_bytes = 0;
+        Ok(None)
+    }
+
+    fn begin_attach(&mut self, tx: &Outbox, resume: Option<ResumeRequest>, key: PublicKey) {
+        self.sent_size = self.size;
+        let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
+            .expect("agent string is valid");
+        send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
+        send_on(
+            tx,
+            &ControlMsg::Attach(Attach {
+                name: self.cfg.session.clone(),
+                size: term_size(self.size),
+                term: self.local_term_name(),
+                host: self.cfg.host_label.clone(),
+                key,
+                resume,
+            }),
+        );
     }
 
     fn local_term_name(&self) -> TermName {
@@ -555,19 +893,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn send_ctl(&self, msg: &ControlMsg) {
-        if let (Some(tx), Ok(bytes)) = (&self.tx, msg.encode()) {
-            let _ = tx.send((ChannelId::CONTROL, Bytes::from(bytes)));
+        if let Some(tx) = &self.tx {
+            send_on(tx, msg);
         }
     }
 
     // ---- messages from the daemon ------------------------------------------------------
 
-    fn on_payload<L>(
+    fn on_payload(
         &mut self,
         conn: &mut Conn,
         chan: ChannelId,
         payload: Bytes,
-    ) -> Result<Flow<L>, ClientError> {
+    ) -> Result<Flow, ClientError> {
         if chan == ChannelId::CONTROL {
             let msg = ControlMsg::decode(&payload)
                 .map_err(|e| ClientError::Protocol(format!("bad control message: {e}")))?;
@@ -576,11 +914,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if chan == ChannelId::TERMINAL || chan == ChannelId::SNAPSHOT {
             let seg = DataSegment::parse(&payload)
                 .map_err(|e| ClientError::Protocol(format!("bad data segment: {e}")))?;
-            if conn.awaiting_reply {
-                return Err(ClientError::Protocol(
-                    "terminal data before the attach reply".into(),
-                ));
-            }
             return if chan == ChannelId::TERMINAL {
                 self.on_terminal(conn, seg.seq, seg.data)
             } else {
@@ -595,7 +928,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(Flow::Continue)
     }
 
-    fn on_control<L>(&mut self, conn: &mut Conn, msg: ControlMsg) -> Result<Flow<L>, ClientError> {
+    /// The stream is inconsistent in a way a new link and a resume repair.
+    fn reconnect(why: &str) -> Result<Flow, ClientError> {
+        tracing::warn!("{why}; reconnecting");
+        Ok(Flow::End(Served::Reconnect))
+    }
+
+    fn on_control(&mut self, conn: &mut Conn, msg: ControlMsg) -> Result<Flow, ClientError> {
         match msg {
             ControlMsg::Hello(h) => {
                 let ours = Hello::ours(Agent::new("fil-client").expect("valid"));
@@ -606,7 +945,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             ControlMsg::AttachReply(r) => {
                 if !conn.awaiting_reply {
-                    return Err(ClientError::Protocol("a second attach reply".into()));
+                    return Self::reconnect("a second attach reply");
                 }
                 return self.on_attach_reply(conn, r);
             }
@@ -616,17 +955,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             ControlMsg::Detach => return Ok(Flow::End(Served::Refused(Prompt::DetachedElsewhere))),
             ControlMsg::Ack { channel, upto } if channel == ChannelId::TERMINAL => {
-                self.sess
-                    .input
-                    .ack(upto)
-                    .map_err(|e| ClientError::Protocol(e.to_string()))?;
+                if let Err(e) = self.sess.input.ack(upto) {
+                    return Self::reconnect(&e.to_string());
+                }
                 self.pump_input();
             }
             ControlMsg::Resume { channel, received } if channel == ChannelId::TERMINAL => {
-                self.sess
-                    .input
-                    .resume(received)
-                    .map_err(|e| ClientError::Protocol(e.to_string()))?;
+                if let Err(e) = self.sess.input.resume(received) {
+                    return Self::reconnect(&e.to_string());
+                }
                 self.sess.input_ready = true;
                 self.link_became_ready(conn)?;
             }
@@ -673,7 +1010,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(Flow::Continue)
     }
 
-    fn on_refusal<L>(&mut self, r: AttachRefusal) -> Result<Flow<L>, ClientError> {
+    fn on_refusal(&mut self, r: AttachRefusal) -> Result<Flow, ClientError> {
         let name = self.cfg.session.to_string();
         // A refused resume leaves nothing to resume: whatever happens next is a fresh attach.
         self.sess.established = false;
@@ -687,33 +1024,40 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    fn on_attach_reply<L>(
-        &mut self,
-        conn: &mut Conn,
-        r: AttachReply,
-    ) -> Result<Flow<L>, ClientError> {
+    fn on_attach_reply(&mut self, conn: &mut Conn, r: AttachReply) -> Result<Flow, ClientError> {
         conn.awaiting_reply = false;
         self.sess.established = true;
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;
         self.term_warning(&r.term);
+        self.attached = Some(AttachInfo {
+            kind: conn.kind,
+            incarnation: r.incarnation,
+            epoch: r.epoch,
+            resumed: conn.resumed,
+            udp_port: r.udp_port,
+            fingerprint: r.fingerprint.clone(),
+            term: r.term.clone(),
+        });
         match r.start {
             StartPoint::Resume { from } => {
                 if !conn.resumed {
-                    return Err(ClientError::Protocol(
-                        "a fresh attach was answered with a resume".into(),
-                    ));
+                    self.sess.established = false;
+                    return Self::reconnect("a fresh attach was answered with a resume");
                 }
                 if from > self.sess.recv.received() {
-                    return Err(ClientError::Protocol(format!(
+                    return Self::reconnect(&format!(
                         "the daemon resumes at {from} but the terminal is at {}",
                         self.sess.recv.received()
-                    )));
+                    ));
                 }
                 self.sess.recv.on_reconnect();
                 self.sess.input_ready = false;
-                // Keystrokes wait for the daemon's `Resume` (section 8.5).
-                self.sync_size_after_attach(conn);
+                // Keystrokes wait for the daemon's `Resume` (section 8.5). Output that arrived
+                // before this reply can be applied now.
+                if let Flow::End(s) = self.drain_terminal(conn)? {
+                    return Ok(Flow::End(s));
+                }
             }
             StartPoint::Snapshot(info) => {
                 if info.len > MAX_SNAPSHOT {
@@ -727,15 +1071,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     let window = self.cfg.input_window;
                     self.sess.input = SendChannel::new(window);
                     self.sess.input_ready = true;
-                    self.sess.modes.clear();
-                    self.sess.recv = RecvChannel::starting_at(info.at);
                 } else {
                     self.sess.input_ready = false;
-                    self.sess.recv = RecvChannel::starting_at(info.at);
                 }
-                self.begin_snapshot(conn, info)?;
-                self.sync_size_after_attach(conn);
-                return Ok(Flow::Continue);
+                // The daemon's position replaces ours, even if it is behind (a resume point it
+                // has never reached).
+                self.sess.recv = RecvChannel::starting_at(info.at);
+                return self.begin_snapshot(conn, info);
             }
         }
         // A resume: the screen is current as soon as the daemon continues.
@@ -743,80 +1085,102 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(Flow::Continue)
     }
 
-    fn sync_size_after_attach(&mut self, conn: &Conn) {
-        if self.size != conn.attach_size {
-            self.send_ctl(&ControlMsg::Resize(term_size(self.size)));
-        }
-    }
-
-    fn on_snapshot_announced<L>(
+    fn on_snapshot_announced(
         &mut self,
         conn: &mut Conn,
         info: SnapshotInfo,
-    ) -> Result<Flow<L>, ClientError> {
+    ) -> Result<Flow, ClientError> {
         if conn.awaiting_reply {
-            return Err(ClientError::Protocol(
-                "a snapshot before the attach reply".into(),
-            ));
+            return Self::reconnect("a snapshot before the attach reply");
         }
         if info.len > MAX_SNAPSHOT {
             return Err(ClientError::Protocol("snapshot too large".into()));
         }
-        // A catch-up jump: what is in flight below `at` is covered by the snapshot.
-        self.sess.recv = RecvChannel::starting_at(info.at);
-        self.begin_snapshot(conn, info)?;
-        Ok(Flow::Continue)
+        // A catch-up jump: what is in flight below `at` is covered by the snapshot. The position
+        // only ever moves forward.
+        if info.at < self.sess.recv.received() {
+            return Self::reconnect("a catch-up snapshot behind the terminal position");
+        }
+        self.sess.recv.skip_to(info.at);
+        self.begin_snapshot(conn, info)
     }
 
-    fn begin_snapshot(&mut self, conn: &mut Conn, info: SnapshotInfo) -> Result<(), ClientError> {
+    fn begin_snapshot(&mut self, conn: &mut Conn, info: SnapshotInfo) -> Result<Flow, ClientError> {
         conn.snap = Some(Snap {
             info,
             recv: RecvChannel::new(),
             buf: Vec::with_capacity(usize::try_from(info.len).unwrap_or(0).min(1 << 20)),
         });
-        conn.held.clear();
-        if info.len == 0 {
+        // Snapshot bytes that arrived before their announcement.
+        conn.early_bytes = 0;
+        for (seq, data) in std::mem::take(&mut conn.snap_early) {
+            if conn.snap.is_none() {
+                break;
+            }
+            if let Flow::End(s) = self.feed_snapshot(conn, seq, &data)? {
+                return Ok(Flow::End(s));
+            }
+        }
+        if info.len == 0 && conn.snap.is_some() {
             return self.finish_snapshot(conn);
         }
-        Ok(())
+        Ok(Flow::Continue)
     }
 
-    fn on_snapshot_data<L>(
+    fn on_snapshot_data(
         &mut self,
         conn: &mut Conn,
         seq: u64,
         data: &[u8],
-    ) -> Result<Flow<L>, ClientError> {
+    ) -> Result<Flow, ClientError> {
+        if conn.awaiting_reply || conn.snap.is_none() {
+            // The announcement is on another stream and has not arrived: hold the bytes.
+            if conn.early_bytes + data.len() > self.cfg.max_held_output {
+                return Self::reconnect("too much snapshot data before its announcement");
+            }
+            conn.early_bytes += data.len();
+            conn.snap_early.push((seq, data.to_vec()));
+            return Ok(Flow::Continue);
+        }
+        self.feed_snapshot(conn, seq, data)
+    }
+
+    fn feed_snapshot(
+        &mut self,
+        conn: &mut Conn,
+        seq: u64,
+        data: &[u8],
+    ) -> Result<Flow, ClientError> {
         let Some(snap) = conn.snap.as_mut() else {
-            return Err(ClientError::Protocol(
-                "snapshot data nobody announced".into(),
-            ));
+            return Ok(Flow::Continue);
         };
-        let fresh = snap
-            .recv
-            .accept(seq, data)
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let Ok(fresh) = snap.recv.accept(seq, data) else {
+            return Self::reconnect("a gap in the snapshot");
+        };
         snap.buf.extend_from_slice(fresh);
         let len = snap.buf.len() as u64;
         if len > snap.info.len {
-            return Err(ClientError::Protocol(
-                "snapshot longer than announced".into(),
-            ));
+            return Self::reconnect("a snapshot longer than announced");
         }
         if len == snap.info.len {
-            self.finish_snapshot(conn)?;
+            return self.finish_snapshot(conn);
         }
         Ok(Flow::Continue)
     }
 
     /// The snapshot is complete: write it in one go, then whatever waited behind it.
-    fn finish_snapshot(&mut self, conn: &mut Conn) -> Result<(), ClientError> {
+    fn finish_snapshot(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
         let Some(snap) = conn.snap.take() else {
-            return Ok(());
+            return Ok(Flow::Continue);
         };
         let first = !self.first_attached;
         if first {
             self.enter_session_screen()?;
+        } else if let Some(d) = self.display.as_ref() {
+            // The terminal still shows the old stream: it may be on the alternate screen, with a
+            // character set or a pen the fresh shadow does not assume.
+            let prefix = d.before_snapshot();
+            self.write(&prefix)?;
         }
         // The snapshot begins by clearing the screen, so a fresh shadow matches the terminal
         // once it lands. What the overlay had drawn is cleared with it.
@@ -825,43 +1189,58 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         d.reset();
         let bytes = d.server(&snap.buf);
         self.write(&bytes)?;
-        self.sess.modes.retain(|m| m.0 >= snap.info.at);
-        let held = std::mem::take(&mut conn.held);
-        if !held.is_empty() {
-            let start = snap.info.at;
-            self.apply_output(start, &held)?;
+        // The PTY mode in force at the snapshot's point (the last report below it).
+        self.apply_modes(snap.info.at)?;
+        if let Flow::End(s) = self.drain_terminal(conn)? {
+            return Ok(Flow::End(s));
         }
-        self.link_became_ready(conn)
+        self.link_became_ready(conn)?;
+        Ok(Flow::Continue)
     }
 
-    fn on_terminal<L>(
-        &mut self,
-        conn: &mut Conn,
-        seq: u64,
-        data: &[u8],
-    ) -> Result<Flow<L>, ClientError> {
-        let start = self.sess.recv.received();
-        let fresh = self
-            .sess
-            .recv
-            .accept(seq, data)
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        if fresh.is_empty() {
+    fn on_terminal(&mut self, conn: &mut Conn, seq: u64, data: &[u8]) -> Result<Flow, ClientError> {
+        if conn.held_bytes + data.len() > self.cfg.max_held_output {
+            return Self::reconnect("too much terminal data held back");
+        }
+        if let Some(old) = conn.term_held.insert(seq, data.to_vec()) {
+            conn.held_bytes -= old.len();
+        }
+        conn.held_bytes += data.len();
+        self.drain_terminal(conn)
+    }
+
+    /// Applies the held terminal segments that are next in line. They wait while the reply or a
+    /// snapshot is outstanding, and while a gap (which a not-yet-arrived `Snapshot` will
+    /// explain) separates them from the terminal position.
+    fn drain_terminal(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
+        if conn.awaiting_reply || conn.snap.is_some() {
             return Ok(Flow::Continue);
         }
-        if conn.snap.is_some() {
-            // Behind an incomplete snapshot: hold it.
-            if conn.held.len() + fresh.len() > self.cfg.max_held_output {
-                return Err(ClientError::Protocol(
-                    "too much output arrived behind an incomplete snapshot".into(),
-                ));
+        let mut applied = false;
+        while let Some(&seq) = conn.term_held.keys().next() {
+            if seq > self.sess.recv.received() {
+                break;
             }
-            conn.held.extend_from_slice(fresh);
-        } else {
-            let fresh = fresh.to_vec();
-            self.apply_output(start, &fresh)?;
+            let data = conn.term_held.remove(&seq).expect("just seen");
+            conn.held_bytes -= data.len();
+            let pos = self.sess.recv.received();
+            let Ok(fresh) = self.sess.recv.accept(seq, &data) else {
+                return Self::reconnect("terminal data out of order");
+            };
+            if !fresh.is_empty() {
+                let fresh = fresh.to_vec();
+                self.apply_output(pos, &fresh)?;
+                applied = true;
+            }
         }
-        self.after_output();
+        conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
+            (true, _) => None,
+            (false, None) => Some(Instant::now()),
+            (false, since) => since,
+        };
+        if applied {
+            self.after_output();
+        }
         Ok(Flow::Continue)
     }
 
@@ -924,9 +1303,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn mark_disconnected(&mut self) {
         self.link_ok = false;
-        self.swapping = false;
         self.quiet = false;
         self.confirm = None;
+        self.confirm_pending = None;
         if self.disconnected_since.is_none() {
             self.disconnected_since = Some(Instant::now());
             self.attempt = 0;
@@ -939,6 +1318,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.quiet = true;
         self.link_ok = false;
         self.confirm = None;
+        self.confirm_pending = None;
         if self.disconnected_since.is_none() {
             self.disconnected_since = Some(Instant::now());
         }
@@ -962,10 +1342,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if conn.awaiting_reply || conn.snap.is_some() || self.quiet {
             return Ok(());
         }
-        self.swapping = false;
         if !self.link_ok {
             self.link_ok = true;
             self.sess.recv.on_reconnect();
+        }
+        self.ready_since.get_or_insert_with(Instant::now);
+        // The window may have changed size while the daemon could not be told (a quiet link,
+        // a snapshot on its way).
+        if self.size != self.sent_size {
+            self.sent_size = self.size;
+            self.send_ctl(&ControlMsg::Resize(term_size(self.size)));
         }
         if self.sess.input_ready {
             self.flush_offline();
@@ -977,7 +1363,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// Typed-while-offline bytes go to the daemon, or to a confirmation first.
     fn flush_offline(&mut self) {
-        if self.confirm.is_some() {
+        if self.confirm.is_some() || self.confirm_pending.is_some() {
             return;
         }
         if self.buf.is_empty() {
@@ -991,9 +1377,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             .unwrap_or_default();
         match self.cfg.offline.confirm_after {
             Some(limit) if secs >= limit => {
-                self.confirm = Some(Confirm::Typed {
-                    secs: secs.as_secs(),
-                });
+                // Entered once it is drawn: an unseen question must not eat keystrokes.
+                self.confirm_pending = Some(secs.as_secs());
             }
             _ => self.release_offline(),
         }
@@ -1001,7 +1386,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn release_offline(&mut self) {
-        let all = self.buf.take(usize::MAX);
+        let all = self.buf.take_all();
         self.buf.reset();
         self.pending.extend_from_slice(&all);
     }
@@ -1042,10 +1427,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         self.size = (cols, rows);
         if let Some(d) = self.display.as_mut() {
-            let bytes = d.resize(cols, rows);
+            let (bytes, damaged) = d.resize(cols, rows);
             self.write(&bytes)?;
+            if damaged {
+                // The window narrowed under something we had drawn; the terminal re-wrapped it
+                // and the erase cannot undo that. The next attach starts from a snapshot.
+                tracing::warn!("window narrowed under the overlay; the next attach is fresh");
+                self.sess.established = false;
+            }
         }
-        if self.link_ok {
+        if self.link_ok && self.tx.is_some() {
+            self.sent_size = self.size;
             self.send_ctl(&ControlMsg::Resize(term_size(self.size)));
         }
         self.refresh_display()
@@ -1053,7 +1445,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn on_keys(&mut self, bytes: &[u8]) -> Result<Ev, ClientError> {
         if self.confirm.is_some() {
-            self.confirm_keys(bytes);
+            let rest = self.confirm_keys(bytes);
+            if !rest.is_empty() {
+                // What followed the answer in the same read is ordinary typing.
+                return self.on_keys(&rest);
+            }
             self.refresh_display()?;
             self.pump_input();
             return Ok(Ev::Continue);
@@ -1065,7 +1461,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     self.notice = status::help_lines();
                     self.notice_until = Some(Instant::now() + self.cfg.notice_for);
                 }
-                Action::Detach => return Ok(Ev::Detach),
+                Action::Detach => {
+                    // What was typed before the escape still goes out.
+                    self.pump_input();
+                    return Ok(Ev::Detach);
+                }
             }
         }
         self.refresh_display()?;
@@ -1076,12 +1476,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// Keystrokes that are the session's: sent now, held for the next link, or kept offline.
     fn user_bytes(&mut self, b: &[u8]) -> Result<(), ClientError> {
         // Order matters: once anything is held offline, everything after it is too.
-        if (self.link_ok || self.swapping) && self.buf.is_empty() {
-            // Connected, or switching links (these are not offline keystrokes: they just wait
-            // for the new link).
-            if self.link_ok
-                && let Some(d) = self.display.as_mut()
-            {
+        if self.link_ok && self.buf.is_empty() {
+            if let Some(d) = self.display.as_mut() {
                 let out = d.input(b);
                 self.write(&out)?;
             }
@@ -1103,22 +1499,24 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    fn confirm_keys(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+    /// Reads the answer to the confirmation; returns what followed it in the same read.
+    fn confirm_keys(&mut self, bytes: &[u8]) -> Vec<u8> {
+        for (i, &b) in bytes.iter().enumerate() {
             match b {
                 b'y' | b'Y' => {
                     self.confirm = None;
                     self.release_offline();
-                    return;
+                    return bytes[i + 1..].to_vec();
                 }
                 b'n' | b'N' | 0x1b | 0x03 | b'q' => {
                     self.confirm = None;
                     self.buf.reset();
-                    return;
+                    return bytes[i + 1..].to_vec();
                 }
                 _ => {}
             }
         }
+        Vec::new()
     }
 
     // ---- prompts after a refusal -------------------------------------------------------
@@ -1153,8 +1551,20 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             // Typed for the old session; it must not land in the new one.
             self.buf.reset();
         }
-        self.prompt = Some(lines);
-        self.refresh_display()?;
+        self.prompt = Some(lines.clone());
+        self.prompt_plain = false;
+        if !self.show_or_open(lines.clone(), true)? && self.display.is_some() {
+            // Nothing safe to draw on (wide characters on every candidate row, say): print the
+            // question below the cursor instead. The answer ends the session or starts a fresh
+            // snapshot, so the screen is not coming back to this state anyway.
+            let mut text = String::from("\r\n");
+            for l in &lines {
+                text.push_str(l);
+                text.push_str("\r\n");
+            }
+            self.write(text.as_bytes())?;
+            self.prompt_plain = true;
+        }
         let answer = loop {
             let wake = self.next_wake();
             tokio::select! {
@@ -1172,7 +1582,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
         };
         self.prompt = None;
-        self.show_lines(Vec::new())?;
+        if !self.prompt_plain {
+            self.show_lines(Vec::new())?;
+        }
+        self.prompt_plain = false;
         if answer.is_ok() {
             // The new attach starts the clock again.
             self.disconnected_since.get_or_insert_with(Instant::now);
@@ -1240,22 +1653,54 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(())
     }
 
+    /// Draws `lines`; if the overlay would not (a gate is closed), opens the gates (`heavy` or
+    /// light, see `Display::open_gates`) and tries once more. True if they are on the screen.
+    fn show_or_open(&mut self, lines: Vec<String>, heavy: bool) -> Result<bool, ClientError> {
+        self.show_lines(lines.clone())?;
+        let Some(d) = self.display.as_mut() else {
+            return Ok(false);
+        };
+        if !d.is_painted() {
+            let bytes = d.open_gates(heavy);
+            self.write(&bytes)?;
+            self.show_lines(lines)?;
+        }
+        Ok(self.display.as_ref().is_some_and(Display::is_painted))
+    }
+
+    /// The lines of the confirmation, as they would be shown now.
+    fn confirm_text(&self, secs: u64) -> Vec<String> {
+        let mask = self
+            .display
+            .as_ref()
+            .map(Display::password_prompt)
+            .unwrap_or(false);
+        status::confirm_lines(self.buf.held(), self.buf.dropped(), secs, mask, 36)
+    }
+
     /// Recomputes what the status line should say and draws the difference.
     fn refresh_display(&mut self) -> Result<(), ClientError> {
         if self.display.is_none() {
             return Ok(());
         }
-        let width = usize::from(self.size.0);
+        if let Some(p) = self.prompt.clone() {
+            if self.prompt_plain {
+                return Ok(());
+            }
+            return self.show_lines(p);
+        }
+        if let Some(secs) = self.confirm_pending {
+            // Enter the confirmation only once it is on the screen.
+            let lines = self.confirm_text(secs);
+            if self.show_or_open(lines, false)? {
+                self.confirm_pending = None;
+                self.confirm = Some(Confirm::Typed { secs });
+            }
+            return Ok(());
+        }
         let mut lines = Vec::new();
-        if let Some(p) = &self.prompt {
-            lines = p.clone();
-        } else if let Some(Confirm::Typed { secs }) = &self.confirm {
-            let mask = self
-                .display
-                .as_ref()
-                .map(Display::password_prompt)
-                .unwrap_or(false);
-            lines = status::confirm_lines(self.buf.held(), self.buf.dropped(), *secs, mask, width);
+        if let Some(Confirm::Typed { secs }) = &self.confirm {
+            lines = self.confirm_text(*secs);
         } else if let (false, Some(since)) = (self.link_ok, self.disconnected_since) {
             let secs = since.elapsed().as_secs();
             lines.extend(status::connection_lines(&Connection {
@@ -1268,9 +1713,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 dropped: self.buf.dropped(),
                 discarding: self.cfg.offline.buffer == 0,
             }));
-        }
-        if self.prompt.is_some() {
-            return self.show_lines(lines);
         }
         if let Some(until) = self.notice_until {
             if Instant::now() >= until {
@@ -1294,7 +1736,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         };
         min(self.ack_due);
         min(self.notice_until);
-        if self.display.is_some() && !self.link_ok && self.disconnected_since.is_some() {
+        if self.display.is_some()
+            && ((!self.link_ok && self.disconnected_since.is_some())
+                || self.confirm_pending.is_some())
+        {
             // The status line counts seconds.
             min(Some(Instant::now() + Duration::from_secs(1)));
         }
@@ -1408,7 +1853,13 @@ enum Ev {
     End(Outcome),
 }
 
-enum Flow<L> {
+enum Flow {
     Continue,
-    End(Served<L>),
+    End(Served),
+}
+
+fn send_on(tx: &Outbox, msg: &ControlMsg) {
+    if let Ok(bytes) = msg.encode() {
+        let _ = tx.send((ChannelId::CONTROL, Bytes::from(bytes)));
+    }
 }

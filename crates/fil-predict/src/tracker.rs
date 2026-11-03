@@ -68,6 +68,8 @@ enum Charset {
 struct SavedCharsets {
     g: [Charset; 4],
     gl: usize,
+    /// DECSC also saves DECOM (xterm, the VT spec); alacritty does not.
+    origin: bool,
 }
 
 struct Modes {
@@ -128,12 +130,19 @@ impl Modes {
         self.saved = Some(SavedCharsets {
             g: self.g,
             gl: self.gl,
+            origin: self.origin,
         });
     }
 
     fn restore(&mut self) {
         if self.link_possible {
             self.link_unknown = true;
+        }
+        // Whether a restore brings origin mode back depends on the terminal (xterm does,
+        // alacritty does not). If the saved value differs from the current one, the terminal's
+        // mode is unknown until the program sets it. (Nothing saved restores "off".)
+        if self.saved.is_some_and(|s| s.origin) != self.origin {
+            self.origin_unknown = true;
         }
         match self.saved {
             Some(s) => {
@@ -237,6 +246,7 @@ impl Perform for Modes {
                 self.saved = Some(SavedCharsets {
                     g: [Charset::Other; 4],
                     gl: 0,
+                    origin: false,
                 });
             }
             ([], 'r') => self.region_unknown = false,
@@ -456,7 +466,8 @@ impl Tracker {
     fn uncertain(&self) -> bool {
         self.modes.insert_unknown
             || self.modes.origin_unknown
-            || self.modes.region_unknown
+            // The region only matters where an origin-mode cursor is placed.
+            || (self.modes.region_unknown && (self.modes.origin || self.modes.origin_unknown))
             || self.modes.link_unknown
     }
 
@@ -584,10 +595,12 @@ mod tests {
             t.blockers(),
             vec![Blocker::Insert, Blocker::Charset, Blocker::Uncertain]
         );
-        // The region is unknown too, until the program sets one.
+        // The region is unknown too, but it only matters while origin mode is on.
         let t = fed(b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B");
+        assert!(t.blockers().is_empty());
+        let t = fed(b"\x1b[!p\x1b[4l\x1b[?6h\x1b(B");
         assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
-        let t = fed(b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B\x1b[r");
+        let t = fed(b"\x1b[!p\x1b[4l\x1b[?6h\x1b(B\x1b[r");
         assert!(t.blockers().is_empty());
         let t = fed(b"\x1b[4h\x1bc");
         assert!(!t.insert());
@@ -649,14 +662,39 @@ mod tests {
 
     #[test]
     fn a_soft_reset_leaves_the_scroll_region_uncertain_until_one_is_set() {
-        // xterm resets the region on DECSTR; alacritty keeps its own while reporting none.
-        let reset = b"\x1b[!p\x1b[4l\x1b[?6l\x1b(B";
+        // xterm resets the region on DECSTR; alacritty keeps its own while reporting none. It
+        // decides where an origin-mode cursor lands, so it matters once origin mode is on.
+        let reset = b"\x1b[!p\x1b[4l\x1b(B\x1b[?6h";
         let t = fed(&[&b"\x1b[2;8r"[..], reset].concat());
         assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
         for set in [&b"\x1b[r"[..], b"\x1b[1;5r"] {
             let t = fed(&[&b"\x1b[2;8r"[..], reset, set].concat());
             assert!(t.blockers().is_empty(), "{set:?}");
         }
+        // With origin mode off the region is irrelevant.
+        let t = fed(b"\x1b[2;8r\x1b[!p\x1b[4l\x1b[?6l\x1b(B");
+        assert!(t.blockers().is_empty());
+    }
+
+    #[test]
+    fn a_cursor_restore_may_change_origin_mode_in_some_terminals() {
+        // DECSC saves DECOM in xterm, not in alacritty: after a restore that would change it,
+        // the mode is unknown until the program sets it.
+        let t = fed(b"\x1b[2;8r\x1b[?6h\x1b7\x1b[?6l\x1b8");
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        assert!(
+            fed(b"\x1b[?6h\x1b7\x1b[?6l\x1b8\x1b[?6l")
+                .blockers()
+                .is_empty()
+        );
+        // A restore that changes nothing is fine, as is leaving the alternate screen normally.
+        assert!(fed(b"\x1b7\x1b8").blockers().is_empty());
+        assert!(fed(b"\x1b[?1049h\x1b[?1049l").blockers().is_empty());
+        // Restoring "on" with nothing saved: the terminal may reset it.
+        assert_eq!(
+            fed(b"\x1b[?6h\x1b8").blockers(),
+            vec![Blocker::Charset, Blocker::Uncertain]
+        );
     }
 
     #[test]

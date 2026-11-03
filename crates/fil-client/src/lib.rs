@@ -34,8 +34,8 @@ pub mod terminal;
 pub mod text;
 pub mod tty;
 
-pub use config::{ClientConfig, ClientError, Outcome, Reconnect};
-pub use dialer::{DialError, DialPurpose, Dialed, Dialer};
+pub use config::{Backoff, ClientConfig, ClientError, Outcome, Reconnect};
+pub use dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 pub use display::{Display, NoPrediction, PredictorFactory};
 pub use escape::{Action, EscapeFilter};
 pub use offline::{OfflineBuffer, OfflineInput, OfflineLog, parse_byte_size, parse_confirm};

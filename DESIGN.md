@@ -125,6 +125,7 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
     - **Shown on** `Degraded` and `Down`, never before the first screen.
     - **Says** what is happening ("reconnecting over pipe", how long, which try), and on a second line how many bytes of input are held and how many were dropped.
     - **Drawn** in inverse video, at the edge of the screen farthest from the cursor, never on the cursor's row, and never over a wide character. If no place is safe, or the terminal is in the middle of an escape sequence, nothing is drawn; it comes back as soon as it is safe.
+    - **Short and unpadded:** at most 40 columns a line, with a space of margin each side. A terminal that reflows on a width change re-wraps anything wider than the new width, and the erase cannot undo that; so if the window narrows below what is drawn, the screen can no longer be trusted and the next attach starts from a snapshot instead of a resume.
     - **The same overlay** carries the `~?` help and the questions the client asks (take the session back, confirm offline input, a replaced session), so none of them can corrupt the screen either.
   - Keystrokes typed while disconnected are handled as decided in §4.3.
 

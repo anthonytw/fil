@@ -383,6 +383,12 @@ cell cannot be drawn safely there (a wide character) the other edge, then the fi
 is tried, and then nothing. `crates/fil-predict/tests/status.rs` checks them against the oracle
 after every flush, on both backends, with scripted cases and seeded random sessions
 (`just status-soak`). The random sessions found one more hazard (row 7, the scroll region after
-DECSTR). Known limit: a resize while the status is up erases against the old geometry, as for
-predictions, so a terminal that has already reflowed can show a stale row until the next full
-redraw.
+DECSTR), and review of the client found another: DECSC saves origin mode in xterm but not in
+the shadow backends, so after a restore that would change it the tracker treats origin mode as
+unknown (vt100 seed 79; both backends now run the full byte pool).
+
+Known limit: a resize erases against the old geometry, as for predictions. For a pinned status
+this matters when the window gets *narrower* than what is drawn: a reflowing terminal re-wraps the
+cells, which pushes lines into the scrollback and leaves fragments the erase cannot reach. The
+client therefore keeps status lines short (40 columns, unpadded), `Display::resize` reports when
+the window narrowed under the drawing, and the client then starts the next attach from a snapshot.

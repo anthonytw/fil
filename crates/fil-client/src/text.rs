@@ -1,33 +1,36 @@
 //! Text shown to the user: sanitizing untrusted text, rendering keystrokes, formatting times.
 
-/// Characters that must never reach the terminal from an untrusted source: control characters
-/// (C0, DEL, C1, including ESC) and the Unicode controls that reorder or hide text.
-fn is_unsafe(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206f}' | '\u{feff}'
-        )
+/// Characters the transport's sanitizer (`fil_transport::pipe::sanitize_banner`) does not catch
+/// but that are invisible or reorder text all the same: filler and combining joiners,
+/// variation selectors, the whole tag block.
+fn is_extra_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{034F}'
+        | '\u{115F}'..='\u{1160}'
+        | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0000}'..='\u{E007F}'
+        | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// Untrusted text (the pipe's skipped banner, for one) made safe to show: invalid UTF-8 replaced,
-/// control characters removed, tabs turned into spaces. Newlines (and carriage returns, as a
-/// line break of their own) are kept as line breaks, so the result is a list of lines. At most
-/// `max_lines` lines of at most `max_cols` characters are kept; `truncated` says if anything
-/// was cut.
+/// Untrusted text made safe to show: invalid UTF-8 replaced, control and invisible characters
+/// removed (the transport's list plus [`is_extra_invisible`]), tabs turned into spaces.
+fn clean(raw: &[u8]) -> String {
+    fil_transport::pipe::sanitize_banner(raw)
+        .chars()
+        .filter(|&c| !is_extra_invisible(c))
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .collect()
+}
+
+/// Untrusted text (the pipe's skipped banner, for one) as a list of lines. At most `max_lines`
+/// lines of at most `max_cols` characters are kept; `truncated` says if anything was cut.
 pub fn sanitize_lines(raw: &[u8], max_lines: usize, max_cols: usize) -> (Vec<String>, bool) {
-    let text = String::from_utf8_lossy(raw);
+    let text = clean(raw);
     let mut lines = Vec::new();
     let mut truncated = false;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    for line in normalized.split('\n') {
-        let clean: String = line
-            .chars()
-            .map(|c| if c == '\t' { ' ' } else { c })
-            .filter(|&c| !is_unsafe(c))
-            .collect();
-        let clean = clean.trim_end().to_string();
+    for line in text.split('\n') {
+        let clean = line.trim_end().to_string();
         if clean.is_empty() {
             continue;
         }
@@ -47,7 +50,45 @@ pub fn sanitize_lines(raw: &[u8], max_lines: usize, max_cols: usize) -> (Vec<Str
 
 /// One short, safe string from untrusted text (a host label in a message, say).
 pub fn sanitize_inline(s: &str) -> String {
-    s.chars().filter(|&c| !is_unsafe(c)).collect()
+    clean(s.as_bytes()).replace('\n', " ")
+}
+
+/// Splits `line` into pieces of at most `width` characters, at spaces where possible. Status text
+/// is kept short on purpose: a terminal that reflows on a width change re-wraps anything wider
+/// than the new width.
+pub fn wrap(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in line.split(' ') {
+        let mut word = word;
+        loop {
+            let have = cur.chars().count();
+            let need = word.chars().count() + usize::from(have > 0);
+            if have + need <= width {
+                if have > 0 {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+                break;
+            }
+            if have > 0 {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            // A word longer than a whole line: cut it.
+            let head: String = word.chars().take(width).collect();
+            out.push(head.clone());
+            word = &word[head.len()..];
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Typed bytes shown for a confirmation: printable ASCII as is, controls in caret notation
@@ -119,7 +160,10 @@ mod tests {
         assert!(!truncated);
         let joined = lines.join(" / ");
         for c in joined.chars() {
-            assert!(!is_unsafe(c), "{c:?} survived in {joined:?}");
+            assert!(
+                !c.is_control() && !is_extra_invisible(c),
+                "{c:?} survived in {joined:?}"
+            );
         }
         assert!(joined.contains("Welcome"));
         assert!(joined.contains("indented"));
@@ -156,5 +200,64 @@ mod tests {
         assert_eq!(format_elapsed(5), "5s");
         assert_eq!(format_elapsed(75), "1m15s");
         assert_eq!(format_elapsed(3700), "1h01m");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    /// Everything the review listed as surviving the old sanitizer.
+    #[test]
+    fn review_invisible_characters_survive() {
+        for c in [
+            '\u{fff9}',
+            '\u{fffa}',
+            '\u{fffb}',
+            '\u{e0041}',
+            '\u{e007f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{ad}',
+            '\u{34f}',
+            '\u{180e}',
+            '\u{3164}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{fe0f}',
+            '\u{e0101}',
+            '\u{202e}',
+            '\u{200b}',
+        ] {
+            let s = format!("host{c}name");
+            assert_eq!(
+                sanitize_inline(&s),
+                "hostname",
+                "U+{:04X} survived",
+                c as u32
+            );
+            let (lines, _) = sanitize_lines(s.as_bytes(), 3, 80);
+            assert_eq!(
+                lines,
+                vec!["hostname".to_string()],
+                "U+{:04X} survived",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_keeps_lines_short() {
+        assert_eq!(
+            wrap("fil: disconnected 12s", 40),
+            vec!["fil: disconnected 12s"]
+        );
+        let w = wrap("Take it back?  y = take it back   n = leave it, please", 20);
+        assert!(w.iter().all(|l| l.chars().count() <= 20), "{w:?}");
+        assert_eq!(w.join(" ").split_whitespace().count(), 13);
+        let w = wrap(&"x".repeat(50), 20);
+        assert_eq!(w.len(), 3);
+        assert!(w.iter().all(|l| l.chars().count() <= 20));
+        assert_eq!(wrap("", 20), vec![String::new()]);
     }
 }

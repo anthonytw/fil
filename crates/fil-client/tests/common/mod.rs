@@ -39,6 +39,11 @@ pub struct DialShared {
     pub purposes: Mutex<Vec<DialPurpose>>,
     pub keys: Mutex<Vec<Vec<u8>>>,
     pub controls: Mutex<Vec<MemControl>>,
+    pub attached: Mutex<Vec<fil_client::AttachInfo>>,
+    pub dial_times: Mutex<Vec<tokio::time::Instant>>,
+    /// How long a failing dial takes to fail (a dialer that waits for itself).
+    pub fail_delay: Mutex<Duration>,
+    pub swaps: Mutex<Vec<Result<LinkKind, fil_client::SwapError>>>,
     swap_tx: mpsc::UnboundedSender<Dialed<MemLink>>,
     next_kind: Mutex<Option<LinkKind>>,
     /// Every dial fails (retryably) while set.
@@ -59,6 +64,10 @@ pub fn test_dialer(daemon: &Arc<FakeDaemon>) -> (TestDialer, Arc<DialShared>) {
         purposes: Mutex::new(Vec::new()),
         keys: Mutex::new(Vec::new()),
         controls: Mutex::new(Vec::new()),
+        attached: Mutex::new(Vec::new()),
+        dial_times: Mutex::new(Vec::new()),
+        fail_delay: Mutex::new(Duration::ZERO),
+        swaps: Mutex::new(Vec::new()),
         swap_tx,
         next_kind: Mutex::new(Some(LinkKind::Pipe)),
         failing: std::sync::atomic::AtomicBool::new(false),
@@ -99,8 +108,33 @@ impl DialShared {
         let _ = self.swap_tx.send(Dialed::new(link));
     }
 
+    /// A candidate whose daemon end nobody serves: it never answers.
+    pub fn offer_silent_swap(&self, kind: LinkKind) -> MemControl {
+        let (a, b, ctl) = mem::pair(kind, 4096);
+        // Keep the far end alive so the link does not die by itself.
+        std::mem::forget(b);
+        let _ = self.swap_tx.send(Dialed::new(a));
+        ctl
+    }
+
+    /// A candidate that is dead on arrival.
+    pub fn offer_dead_swap(&self, kind: LinkKind) {
+        let link = self.connect(kind);
+        let ctl = self.controls.lock().unwrap().last().unwrap().clone();
+        ctl.kill(fil_transport::DownReason::Dead);
+        let _ = self.swap_tx.send(Dialed::new(link));
+    }
+
+    pub fn swaps(&self) -> Vec<Result<LinkKind, fil_client::SwapError>> {
+        self.swaps.lock().unwrap().clone()
+    }
+
     pub fn fail_all(&self, on: bool) {
         self.failing.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_fail_delay(&self, d: Duration) {
+        *self.fail_delay.lock().unwrap() = d;
     }
 
     pub fn set_next_kind(&self, k: Option<LinkKind>) {
@@ -125,11 +159,20 @@ impl Dialer for TestDialer {
             .lock()
             .unwrap()
             .push(self.public_key().as_bytes().to_vec());
+        self.shared
+            .dial_times
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
         if self
             .shared
             .failing
             .load(std::sync::atomic::Ordering::SeqCst)
         {
+            let d = *self.shared.fail_delay.lock().unwrap();
+            if !d.is_zero() {
+                tokio::time::sleep(d).await;
+            }
             return Err(DialError::retry("no route to host"));
         }
         let step = self.shared.script.lock().unwrap().pop_front();
@@ -158,6 +201,14 @@ impl Dialer for TestDialer {
 
     fn next_kind(&self) -> Option<LinkKind> {
         *self.shared.next_kind.lock().unwrap()
+    }
+
+    fn attached(&mut self, info: &fil_client::AttachInfo) {
+        self.shared.attached.lock().unwrap().push(info.clone());
+    }
+
+    fn swapped(&mut self, result: Result<LinkKind, fil_client::SwapError>) {
+        self.shared.swaps.lock().unwrap().push(result);
     }
 }
 

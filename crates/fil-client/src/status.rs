@@ -29,42 +29,37 @@ pub struct Connection {
     pub discarding: bool,
 }
 
-/// The status line: one line about the connection, and a second one about typed input when
-/// there is any to report. Short enough for 80 columns.
+/// The status line: short lines (at most about 40 columns, see [`crate::text::wrap`]) about the
+/// connection and, when there is any to report, the input typed while offline.
 pub fn connection_lines(c: &Connection) -> Vec<String> {
-    let mut s = String::from("fil: ");
+    let mut lines = Vec::new();
     if c.quiet {
-        s.push_str("no reply from the host");
-        if let Some(k) = c.kind {
-            s.push_str(&format!(" over {}", kind_name(k)));
-        }
-        s.push_str(&format!(" for {}, waiting", format_elapsed(c.secs)));
+        lines.push(format!("fil: no reply for {}", format_elapsed(c.secs)));
+        let mut l = match c.kind {
+            Some(k) => format!("over {}, waiting", kind_name(k)),
+            None => "waiting".to_string(),
+        };
+        l.push_str("  (~. detaches)");
+        lines.push(l);
     } else {
-        s.push_str(&format!(
-            "disconnected {}, reconnecting",
-            format_elapsed(c.secs)
-        ));
+        lines.push(format!("fil: disconnected {}", format_elapsed(c.secs)));
+        let mut l = String::from("reconnecting");
         if let Some(k) = c.next.or(c.kind) {
-            s.push_str(&format!(" over {}", kind_name(k)));
+            l.push_str(&format!(" over {}", kind_name(k)));
         }
         if c.attempt > 1 {
-            s.push_str(&format!(" (try {})", c.attempt));
+            l.push_str(&format!(" (try {})", c.attempt));
         }
+        lines.push(l);
+        lines.push("(~. detaches)".to_string());
     }
-    s.push_str("  (~. detaches)");
-    let mut lines = vec![s];
     if c.discarding {
-        let mut l = String::from("typing is discarded while offline (the offline buffer is 0)");
-        if c.dropped > 0 {
-            l.push_str(&format!(": {} dropped", bytes(c.dropped)));
-        }
-        lines.push(l);
-    } else if c.buffered > 0 || c.dropped > 0 {
-        let mut l = format!("typed while offline: {} held", bytes(c.buffered as u64));
-        if c.dropped > 0 {
-            l.push_str(&format!(", {} dropped (buffer full)", bytes(c.dropped)));
-        }
-        lines.push(l);
+        lines.push("typing is discarded".to_string());
+    } else if c.buffered > 0 {
+        lines.push(format!("typed offline: {} held", bytes(c.buffered as u64)));
+    }
+    if c.dropped > 0 {
+        lines.push(format!("{} dropped", bytes(c.dropped)));
     }
     lines
 }
@@ -77,7 +72,8 @@ fn bytes(n: u64) -> String {
     }
 }
 
-/// The confirmation shown after a long disconnect (section 4.3).
+/// The confirmation shown after a long disconnect (section 4.3). `width` is how many columns a
+/// line may use.
 pub fn confirm_lines(
     typed: &[u8],
     dropped: u64,
@@ -85,64 +81,63 @@ pub fn confirm_lines(
     mask: bool,
     width: usize,
 ) -> Vec<String> {
-    let mut first = format!(
-        "fil: reconnected after {}. You typed {} while offline",
-        format_elapsed(secs),
-        bytes(typed.len() as u64)
-    );
+    let mut v = vec![
+        format!("fil: reconnected after {}.", format_elapsed(secs)),
+        format!("You typed {} while offline", bytes(typed.len() as u64)),
+    ];
     if dropped > 0 {
-        first.push_str(&format!(" ({} dropped)", bytes(dropped)));
+        v.push(format!("({} dropped)", bytes(dropped)));
     }
-    first.push(':');
     let shown = render_keys(typed, mask);
-    // Leave room for the frame the display adds, and show the end if it does not fit: the
-    // newest keys are the ones most likely to be wrong.
-    let room = width.saturating_sub(6).max(8);
+    // Show the end if it does not fit: the newest keys are the ones most likely to be wrong.
+    let room = width.saturating_sub(2).max(8);
     let n = shown.chars().count();
-    let quoted = if n > room {
+    v.push(if n > room {
         let tail: String = shown.chars().skip(n - (room - 3)).collect();
         format!("\"...{tail}\"")
     } else {
         format!("\"{shown}\"")
-    };
-    vec![
-        first,
-        quoted,
-        "Send it?  y = send   n = discard".to_string(),
-    ]
+    });
+    v.push("Send it?  y = send, n = discard".to_string());
+    v
 }
 
 pub fn help_lines() -> Vec<String> {
     vec![
-        "fil escapes (type them after Enter):".into(),
-        "  ~.  detach     ~~  a literal ~     ~?  this help".into(),
+        "fil escapes, typed after Enter:".into(),
+        "~.  detach".into(),
+        "~~  a literal ~".into(),
+        "~?  this help".into(),
     ]
 }
 
 pub fn confirm_take_back(by: &str, when: &str, session: &str) -> Vec<String> {
     vec![
-        format!("fil: session \"{session}\" was taken over by {by} at {when}."),
-        "Take it back?  y = take it back   n = leave it".into(),
+        format!("fil: \"{session}\" was taken over"),
+        format!("by {by}"),
+        format!("at {when}."),
+        "Take it back?  y = yes, n = no".into(),
     ]
 }
 
 pub fn confirm_replaced(session: &str, discarding: bool) -> Vec<String> {
-    let mut v = vec![format!(
-        "fil: \"{session}\" is a different session now (killed and recreated, or the daemon restarted)."
-    )];
+    let mut v = vec![
+        format!("fil: \"{session}\" is a different session now"),
+        "(killed and recreated, or the daemon".into(),
+        "restarted).".into(),
+    ];
     if discarding {
-        v.push(
-            "What you typed while offline was meant for the old one and will be discarded.".into(),
-        );
+        v.push("What you typed offline was for the old".into());
+        v.push("one and will be discarded.".into());
     }
-    v.push("Start a fresh attach?  y = attach   n = quit".into());
+    v.push("Start a fresh attach?  y = yes, n = quit".into());
     v
 }
 
 pub fn confirm_detached(session: &str) -> Vec<String> {
     vec![
-        format!("fil: session \"{session}\" was detached from elsewhere."),
-        "Attach again?  y = attach   n = quit".into(),
+        format!("fil: \"{session}\" was detached from elsewhere"),
+        "Attach again?  y = yes, n = quit".into(),
     ]
 }
 
@@ -166,16 +161,16 @@ mod tests {
     #[test]
     fn the_line_says_what_is_happening() {
         let l = connection_lines(&conn());
-        assert_eq!(l.len(), 1);
-        assert!(l[0].contains("disconnected 12s"), "{l:?}");
-        assert!(l[0].contains("reconnecting over pipe"), "{l:?}");
+        assert_eq!(l[0], "fil: disconnected 12s");
+        assert_eq!(l[1], "reconnecting over pipe");
         let mut c = conn();
         c.quiet = true;
         let l = connection_lines(&c);
-        assert!(
-            l[0].contains("no reply from the host over direct for 12s"),
-            "{l:?}"
-        );
+        assert_eq!(l[0], "fil: no reply for 12s");
+        assert!(l[1].contains("over direct, waiting"), "{l:?}");
+        c.quiet = false;
+        c.attempt = 3;
+        assert_eq!(connection_lines(&c)[1], "reconnecting over pipe (try 3)");
     }
 
     #[test]
@@ -184,29 +179,36 @@ mod tests {
         c.buffered = 14;
         c.dropped = 3;
         let l = connection_lines(&c);
-        assert_eq!(l.len(), 2);
-        assert!(l[1].contains("14 bytes held"), "{l:?}");
-        assert!(l[1].contains("3 bytes dropped"), "{l:?}");
+        assert!(l.iter().any(|x| x.contains("14 bytes held")), "{l:?}");
+        assert_eq!(l.last().unwrap(), "3 bytes dropped");
         c.discarding = true;
-        assert!(connection_lines(&c)[1].contains("typing is discarded"));
-        // Short enough for an 80-column terminal, and plain ASCII.
+        assert!(
+            connection_lines(&c)
+                .iter()
+                .any(|x| x == "typing is discarded")
+        );
+        // Short, and plain ASCII: a narrower window must not re-wrap them.
         c.attempt = 99;
         c.secs = 4000;
+        c.buffered = 100_000;
+        c.dropped = 100_000;
+        c.discarding = false;
         for line in connection_lines(&c) {
-            assert!(line.is_ascii() && line.len() <= 76, "{line}");
+            assert!(line.is_ascii() && line.len() <= 40, "{line}");
         }
     }
 
     #[test]
     fn the_confirmation_shows_the_keys_or_masks_them() {
-        let l = confirm_lines(b"ls -la\r", 0, 42, false, 80);
-        assert!(l[0].contains("42s") && l[0].contains("7 bytes"));
-        assert_eq!(l[1], "\"ls -la^M\"");
-        let l = confirm_lines(b"hunter2", 0, 42, true, 80);
-        assert_eq!(l[1], "\"*******\"");
+        let l = confirm_lines(b"ls -la\r", 0, 42, false, 36);
+        assert!(l[0].contains("42s"));
+        assert!(l.iter().any(|x| x.contains("7 bytes")));
+        assert!(l.iter().any(|x| x == "\"ls -la^M\""), "{l:?}");
+        let l = confirm_lines(b"hunter2", 0, 42, true, 36);
+        assert!(l.iter().any(|x| x == "\"*******\""), "{l:?}");
         let long = vec![b'x'; 500];
-        let l = confirm_lines(&long, 9, 42, false, 40);
-        assert!(l[0].contains("9 bytes dropped"), "{}", l[0]);
-        assert!(l[1].chars().count() <= 40, "{}", l[1]);
+        let l = confirm_lines(&long, 9, 42, false, 36);
+        assert!(l.iter().any(|x| x == "(9 bytes dropped)"), "{l:?}");
+        assert!(l.iter().all(|x| x.chars().count() <= 40), "{l:?}");
     }
 }

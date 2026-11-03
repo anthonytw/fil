@@ -547,8 +547,10 @@ impl Overlay {
         self.shadow.resize(size);
         self.size = size;
         if self.status.is_some() {
+            // `retract` may have put the erase of predicted cells in `paint`; keep it.
             let st = self.shadow.state(0);
-            f.paint = self.paint(&st);
+            let again = self.paint(&st);
+            f.paint.extend_from_slice(&again);
         }
         f
     }

@@ -1624,9 +1624,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if first {
             self.enter_session_screen()?;
         } else if let Some(d) = self.display.as_ref() {
-            // The terminal still shows the old stream: it may be on the alternate screen, with a
-            // character set or a pen the fresh shadow does not assume.
-            let prefix = d.before_snapshot();
+            // The terminal still shows the old stream: it may be on the alternate screen, with
+            // mouse reporting or a character set or a pen the fresh shadow does not assume. The
+            // snapshot writer turns modes on and never off, so start from all-off (also what
+            // the exit restore relies on: the shadow and the terminal must agree).
+            let prefix = d.restore_bytes();
             self.write(&prefix)?;
         }
         // The snapshot begins by clearing the screen, so a fresh shadow matches the terminal

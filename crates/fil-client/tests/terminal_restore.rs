@@ -2,6 +2,10 @@
 //! programs turned on (alternate screen, mouse reporting, application keys, a hidden cursor...)
 //! is off again. ssh leaves these on; mosh resets them, and so does fil.
 
+//! Note: the fake terminal is the same emulator as the client's shadow screen, so these tests
+//! check the client against its own model. A mode that emulator does not track (`?9`, `?2031`,
+//! `?2048`) cannot show up here; the exact bytes are asserted for those instead.
+
 mod common;
 
 use std::time::Duration;
@@ -200,4 +204,52 @@ async fn a_plain_session_leaves_the_screen_alone() {
     let rows = term.rows();
     assert_eq!(&rows[..3], ["$ ls", "a b c", "$"], "{rows:?}");
     assert!(rows[3].contains("detached"), "{rows:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_modes_a_snapshot_does_not_turn_off_are_still_reset_on_exit() {
+    // The laptop runs a program with the mouse on; the desktop takes the session over and the
+    // program quits there; the laptop takes it back. The fresh snapshot has everything off, but
+    // the laptop's terminal still has the mouse on (a snapshot only turns modes on), so the
+    // client must reset them before the snapshot, and so again when it leaves.
+    let rig = in_a_program().await;
+    rig.daemon.take_over("desktop").await;
+    rig.daemon
+        .output(b"\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[<u\x1b[?6l\x1b[r\x1b[?25h\x1b[0 q\x1b[?1049l$ ")
+        .await;
+    until("the prompt", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    until_async("the new attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    // Back in the session, the terminal agrees with the daemon's screen: no mouse reporting.
+    let st = rig.term.state();
+    assert_eq!(st.modes.mouse_tracking, MouseTracking::Off);
+    assert_eq!(st.modes.mouse_encoding, MouseEncoding::Default);
+    assert!(!st.modes.alt_screen && !st.modes.bracketed_paste);
+    rig.type_str("\r~.");
+    let term = rig.term.clone();
+    assert_eq!(rig.finish().await.unwrap(), Outcome::Detached);
+    let st = term.state();
+    assert_eq!(st.modes.mouse_tracking, MouseTracking::Off);
+    assert_eq!(st.modes.mouse_encoding, MouseEncoding::Default);
+    assert_eq!(st.modes.kitty_keyboard, 0);
+    assert!(st.cursor.visible);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_restore_includes_the_modes_the_emulator_cannot_show() {
+    let rig = in_a_program().await;
+    rig.type_str("\r~.");
+    let term = rig.term.clone();
+    assert_eq!(rig.finish().await.unwrap(), Outcome::Detached);
+    let written = String::from_utf8_lossy(&term.written()).into_owned();
+    for want in ["\x1b[>4m", "\x1b[?9l", "\x1b[?2031l", "\x1b[?2048l"] {
+        assert!(written.contains(want), "{want:?} not written: {written:?}");
+    }
 }

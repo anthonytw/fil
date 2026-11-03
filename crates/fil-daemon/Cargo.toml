@@ -23,7 +23,15 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std", "registry"] }
 
+[features]
+# Test hooks (never in the released binary: `just release-deps` checks): the wire revision from
+# FIL_TEST_WIRE_REVISION (fil-proto) and the socket directory from FIL_TEST_SOCKET_DIR, so a test can
+# run the real `fil` against a private directory as a build of another revision.
+test-hooks = ["fil-proto/test-hooks"]
+
 [dev-dependencies]
+# Enables `test-hooks` for this crate's own tests and for the dev binary they spawn.
+fil-daemon = { path = ".", features = ["test-hooks"] }
 fil-term = { path = "../fil-term" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process", "test-util"] }
 

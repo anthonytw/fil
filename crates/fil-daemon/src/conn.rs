@@ -5,7 +5,9 @@
 //!
 //! 1. The daemon sends `Hello` at once. The client sends `Hello` and then, without waiting,
 //!    either an `Attach` or a `Request`.
-//! 2. A different protocol major gets `Error(VersionMismatch)` and the connection is closed.
+//! 2. A different protocol major **or wire revision** gets `Error(VersionMismatch)` and the
+//!    connection is closed, before the request is read (it may not decode). The daemon's `Hello`
+//!    went first, so the client already knows both numbers and says what to do about them.
 //! 3. **`Attach`.** The daemon finds the session by name, or creates it (a fresh attach only; a
 //!    resume of a session that is not here is refused, see [`Inner::session_for`]), and hands the
 //!    link and the request to [`SessionHandle::serve`], which does everything from the
@@ -66,10 +68,11 @@ enum Fail {
     Drop(&'static str),
 }
 
-fn our_hello() -> Hello {
+/// The daemon's hello: the wire revision in its paths, which is also the one in its socket's name.
+fn our_hello(revision: u16) -> Hello {
     let agent = Agent::new(format!("fil-daemon {}", env!("CARGO_PKG_VERSION")))
         .expect("the agent string is valid");
-    Hello::ours(agent)
+    Hello::with_revision(agent, revision)
 }
 
 async fn send_ctl<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), Fail> {
@@ -132,7 +135,11 @@ async fn tell_and_close<L: Link>(link: &L, msg: ControlMsg) {
 impl Inner {
     /// Serves one connection. See the [module docs](self).
     pub(crate) async fn handle<L: Link>(self: &Arc<Self>, link: L, origin: Origin) {
-        let negotiated = tokio::time::timeout(self.cfg.handshake_timeout, negotiate(&link)).await;
+        let negotiated = tokio::time::timeout(
+            self.cfg.handshake_timeout,
+            negotiate(&link, self.paths.revision),
+        )
+        .await;
         let next = match negotiated {
             Ok(Ok(next)) => next,
             Ok(Err(Fail::Tell(code))) => {
@@ -329,7 +336,14 @@ impl Inner {
                         }),
                     });
                 }
-                Response::sessions(list)
+                // Daemons of other wire revisions next to this one: their sessions are not in the
+                // list, and the user is told so (numbers only).
+                let paths = self.paths.clone();
+                let others =
+                    tokio::task::spawn_blocking(move || crate::paths::other_daemons(&paths))
+                        .await
+                        .unwrap_or_default();
+                Response::sessions(list, others)
             }
             Request::KillSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
@@ -355,9 +369,11 @@ impl Inner {
     }
 }
 
-/// `Hello` both ways, the version check, and the first request.
-async fn negotiate<L: Link>(link: &L) -> Result<Next, Fail> {
-    let ours = our_hello();
+/// `Hello` both ways, the version check, and the first request. The check comes before the
+/// request is read: a peer of another wire revision may have encoded its `Attach` in a way this
+/// daemon cannot decode, and the answer then must be "different version", not "protocol error".
+async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<Next, Fail> {
+    let ours = our_hello(revision);
     send_ctl(link, &ControlMsg::Hello(ours.clone())).await?;
     let ControlMsg::Hello(theirs) = recv_ctl(link).await? else {
         return Err(Fail::Tell(ErrorCode::Protocol));

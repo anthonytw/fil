@@ -99,6 +99,88 @@ fn concurrent_ensure_daemon_calls_start_exactly_one_daemon() {
     assert_ne!(session_of(pid), session_of(std::process::id()));
 }
 
+/// Relays of two wire revisions starting together, in one socket directory: each revision has its
+/// own start lock, daemon lock and socket, so each gets exactly one daemon of its own and neither
+/// waits for (or kills, or replaces) the other. The start race is the point.
+#[test]
+fn concurrent_starts_of_two_revisions_each_start_exactly_one_daemon() {
+    let s = Scratch::new();
+    write_config(&s, "");
+    let rev_a = fil_proto::version::wire_revision();
+    let rev_b = rev_a + 1;
+    // `Scratch` stops revision A's daemon (the one in its own lock file); this stops revision B's
+    // whatever the test does, by the pid in B's lock file (a private directory: ours alone), so a
+    // failed assertion leaves nothing running. Declared after `s`: dropped before the files go.
+    let _stop_b = KillDaemonOnDrop(s.paths().with_revision(rev_b).lock());
+    let launcher_for = |rev: u16| {
+        DaemonLauncher::new(
+            BIN,
+            [
+                "--dir".to_string(),
+                s.dir.display().to_string(),
+                "--revision".into(),
+                rev.to_string(),
+                "daemon".into(),
+            ],
+        )
+    };
+    const N: usize = 6;
+    let barrier = Arc::new(Barrier::new(2 * N));
+    let threads: Vec<_> = (0..2 * N)
+        .map(|i| {
+            let rev = if i % 2 == 0 { rev_a } else { rev_b };
+            let (paths, launcher, barrier) = (
+                s.paths().with_revision(rev),
+                launcher_for(rev),
+                barrier.clone(),
+            );
+            std::thread::spawn(move || {
+                barrier.wait();
+                (
+                    rev,
+                    ensure_daemon(&paths, &launcher).expect("ensure_daemon"),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for rev in [rev_a, rev_b] {
+        let started = results
+            .iter()
+            .filter(|(r, e)| *r == rev && e.started)
+            .count();
+        assert_eq!(started, 1, "exactly one daemon started for revision {rev}");
+    }
+    assert_eq!(
+        count_processes(&s.dir),
+        2,
+        "one daemon process per revision"
+    );
+    let (pa, pb) = (
+        std::fs::read_to_string(s.paths().with_revision(rev_a).lock()).unwrap(),
+        std::fs::read_to_string(s.paths().with_revision(rev_b).lock()).unwrap(),
+    );
+    assert_ne!(pa.trim(), pb.trim(), "two different daemons");
+    // Each connection reached the daemon of its own revision: the socket named for it.
+    assert!(UnixStream::connect(s.paths().with_revision(rev_b).socket()).is_ok());
+    assert!(UnixStream::connect(s.paths().with_revision(rev_a).socket()).is_ok());
+}
+
+/// Kills the daemon whose pid is in `lock`, when dropped.
+struct KillDaemonOnDrop(std::path::PathBuf);
+
+impl Drop for KillDaemonOnDrop {
+    fn drop(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(&self.0)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
 fn session_of(pid: u32) -> u32 {
     let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
     rustix::process::getsid(Some(pid))
@@ -439,9 +521,14 @@ fn the_default_paths_are_under_tmp_and_the_users_directories() {
         p.dir,
         Path::new(&format!("/tmp/fil-{}", fil_daemon::current_uid()))
     );
+    // The name holds the protocol major and the wire revision, and nothing else.
     assert_eq!(
         p.socket().file_name().unwrap().to_str().unwrap(),
-        "fil-1.sock"
+        format!(
+            "fil-{}-{}.sock",
+            fil_proto::limits::PROTOCOL_MAJOR,
+            fil_proto::version::wire_revision()
+        )
     );
     assert!(p.dir.starts_with("/tmp"), "not under $XDG_RUNTIME_DIR");
     assert!(p.config.ends_with("fil/daemon.toml"));

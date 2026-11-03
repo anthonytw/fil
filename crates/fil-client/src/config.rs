@@ -184,8 +184,15 @@ pub enum ClientError {
     Config(String),
     #[error("could not connect: {0}")]
     Dial(String),
-    #[error("protocol version mismatch: this fil speaks major {ours}, the daemon speaks {peer}")]
-    VersionMismatch { ours: u16, peer: u16 },
+    /// The daemon's `Hello` states another protocol major or wire revision: said at once, before
+    /// anything that could fail to decode (DESIGN.md section 8.5, "Versioning").
+    #[error("{}", .0.explain(fil_proto::version::Peer::RemoteHost))]
+    VersionMismatch(fil_proto::version::VersionMismatch),
+    /// The daemon refused this client's version (`Error(VersionMismatch)`) without the numbers.
+    #[error(
+        "the fil on the remote host refused this fil's version (a different wire revision): upgrade whichever fil is older"
+    )]
+    VersionRefused,
     #[error(
         "the daemon did not accept this client's key for session \"{0}\" (nothing was changed); attach again"
     )]

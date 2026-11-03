@@ -12,8 +12,16 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
 
+[features]
+# Lets a test override the wire revision with FIL_TEST_WIRE_REVISION (src/version.rs). Never in the
+# released binary: `just release-deps` fails if the feature reaches it.
+test-hooks = []
+
 [dev-dependencies]
 fil-netsim = { path = "../fil-netsim" }
+# For tests/wire_golden.rs only, which pins the QUIC stream layout (fil_transport::quic::pinned)
+# next to the messages. A dev-dependency cycle: fil-transport depends on this crate.
+fil-transport = { path = "../fil-transport" }
 rand = "0.10"
 tokio = { version = "1", features = ["rt", "test-util", "macros", "io-util", "time", "sync"] }
 

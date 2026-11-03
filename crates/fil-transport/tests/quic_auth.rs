@@ -329,7 +329,7 @@ async fn registered_public_key_without_its_private_key_is_rejected() {
     .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(Arc::new(
         spoofed,
     ))));
-    tls.alpn_protocols = vec![auth::ALPN.to_vec()];
+    tls.alpn_protocols = vec![auth::alpn()];
     let cfg = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
     ));
@@ -339,4 +339,47 @@ async fn registered_public_key_without_its_private_key_is_rejected() {
         .unwrap_err();
     assert!(err.contains("BadSignature"), "{err}");
     assert!(matches!(f.server.seen.recv().await.unwrap(), Seen::Failed));
+}
+
+/// A client of another wire revision is refused by the handshake itself: the ALPN names the
+/// revision (`fil/<major>.<revision>`), so no stream is opened and no message decoded. The
+/// matching client still works against the same server.
+#[tokio::test(start_paused = true)]
+async fn another_wire_revision_fails_the_handshake() {
+    let mut f = fixture();
+    let key = ClientKey::generate().unwrap();
+    f.registry.register(key.public_key().clone());
+
+    let ours = fil_proto::version::wire_revision();
+    assert_eq!(auth::alpn(), auth::alpn_for(ours));
+    assert_ne!(auth::alpn_for(ours), auth::alpn_for(ours + 1));
+
+    let mut tls = auth::client_tls(
+        Arc::new(PinnedServerVerifier::new(f.identity.fingerprint())),
+        Some(&key),
+    )
+    .unwrap();
+    tls.alpn_protocols = vec![auth::alpn_for(ours + 1)];
+    let cfg = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+    ));
+    let err = f
+        .client_ep
+        .connect_with(cfg, f.server.addr, SERVER_NAME)
+        .unwrap()
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    // TLS alert no_application_protocol (120) as a QUIC crypto error (0x100 + 120): the code
+    // `QuicLink::connect_on` turns into "the daemon speaks a different wire revision".
+    assert!(
+        matches!(&err, quinn::ConnectionError::ConnectionClosed(c) if u64::from(c.error_code) == 0x178),
+        "expected a no-application-protocol failure, got: {err:?}"
+    );
+    assert!(matches!(f.server.seen.recv().await.unwrap(), Seen::Failed));
+
+    // The same server, a client of its own revision: fine.
+    try_echo(&f.client_ep, f.server.addr, f.client_cfg(&key))
+        .await
+        .unwrap();
 }

@@ -566,7 +566,7 @@ async fn pty_mode_follows_bash_read_s() {
 async fn echo_acks_follow_input_after_the_window() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(&sc, "main", "cat")).await;
-    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1)).echo_ack()).await;
     c.type_bytes(b"ab").await;
     c.wait("an echo ack", |c| c.echo_acks.iter().any(|a| a.0 == 2))
         .await;
@@ -591,7 +591,7 @@ async fn echo_acks_say_nothing_is_coming_when_the_program_does_not_echo() {
     let sc = Scratch::new();
     let script = "stty -echo -icanon min 1; echo RAW; dd bs=1 count=100 >/dev/null 2>&1";
     let h = spawn_plain(sh_config(&sc, "main", script)).await;
-    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1)).echo_ack()).await;
     c.wait_screen("RAW").await;
     let out_before = c.next;
     c.type_bytes(b"x").await;
@@ -599,6 +599,116 @@ async fn echo_acks_say_nothing_is_coming_when_the_program_does_not_echo() {
         .await;
     let (_, output_at, _) = c.echo_acks[0];
     assert_eq!(output_at, out_before, "no output followed the keystroke");
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// Input that waits for a child that is not reading starts its echo window when the PTY finally
+/// takes it, and the writer thread says so; nothing polls for it (efficiency #9). The mode poll is
+/// an hour here, so it cannot be what notices.
+#[tokio::test]
+async fn the_echo_window_starts_when_the_writer_thread_finishes() {
+    let sc = Scratch::new();
+    let script = "stty -echo -icanon min 1; echo RAW; sleep 0.5; \
+                  head -c 30000 >/dev/null; sleep 30";
+    let mut cfg = sh_config(&sc, "main", script);
+    cfg.mode_poll = Duration::from_secs(3600);
+    let h = spawn_plain(cfg).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1)).echo_ack()).await;
+    c.wait_screen("RAW").await;
+    let started = std::time::Instant::now();
+    for _ in 0..3 {
+        c.type_bytes(&[b'x'; 10_000]).await;
+    }
+    c.wait("the echo ack for all of it", |c| {
+        c.echo_acks.iter().any(|a| a.0 == 30_000)
+    })
+    .await;
+    // The child reads after 0.5 s. Only the 5 s process-table tick would notice it otherwise.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the echo window waited for a poll: {:?}",
+        started.elapsed()
+    );
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// `Attach::echo_ack` is the client's request: without it no `EchoAck` is sent (it costs a frame,
+/// a timer and a termios read per keystroke), but the input is still acknowledged.
+#[tokio::test]
+async fn no_echo_ack_unless_asked_for() {
+    let sc = Scratch::new();
+    let h = spawn_plain(sh_config(&sc, "main", "cat")).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.type_bytes(b"ab").await;
+    c.wait_out("ab").await;
+    c.wait("the input ack", |c| c.input_acked == 2).await;
+    // Well past the echo window (20 ms in these tests).
+    c.drain(Duration::from_millis(300)).await;
+    assert!(c.echo_acks.is_empty(), "{:?}", c.echo_acks);
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// The mode history is bounded by the log's range, not by a count: a resume far back in the log
+/// (more than 64 mode changes ago) is told the mode that was in force there, not the oldest
+/// one kept.
+#[tokio::test]
+async fn a_resume_far_back_is_told_the_mode_in_force_there() {
+    let sc = Scratch::new();
+    let script = "stty -echo; echo S; read go; echo T; i=0; \
+                  while [ $i -lt 36 ]; do stty echo; sleep 0.03; echo x; \
+                  stty -echo; sleep 0.03; echo y; i=$((i+1)); done; echo DONE; sleep 30";
+    let h = spawn_plain(sh_config(&sc, "main", script)).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_screen("S").await;
+    let resume = c.resume_request();
+    c.type_bytes(b"\n").await;
+    c.wait_out("DONE").await;
+    c.hang_up();
+    c.serve_end().await;
+    let mut c2 = Client::attach(&h, Connect::new(&h, key(1)).resume(resume)).await;
+    let StartPoint::Resume { from } = c2.reply.clone().unwrap().start else {
+        panic!("expected a resume");
+    };
+    assert_eq!(from, resume.seq);
+    // The mode stated at the start point: echo was off after the first line.
+    c2.wait("the mode at the start", |c| !c.modes.is_empty())
+        .await;
+    let (_, echo, at, _) = c2.modes[0];
+    assert_eq!(at, from);
+    assert!(!echo, "echo was off at the resume point: {:?}", c2.modes[0]);
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// `ResumeRequest::want_snapshot`: the session resumes (same epoch, same input stream) but the
+/// client is repainted from a snapshot instead of replayed from its position, without a gap
+/// marker, since nothing was skipped.
+#[tokio::test]
+async fn a_resume_that_wants_a_snapshot_gets_one() {
+    let sc = Scratch::new();
+    let script = "stty -echo; echo ONE; read a; echo TWO; sleep 30";
+    let h = spawn_plain(sh_config(&sc, "main", script)).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_screen("ONE").await;
+    let mut resume = c.resume_request();
+    let epoch = resume.epoch;
+    c.type_bytes(b"x\n").await;
+    c.wait_out("TWO").await;
+    c.hang_up();
+    c.serve_end().await;
+    resume.want_snapshot = true;
+    let mut c2 = Client::attach(&h, Connect::new(&h, key(1)).resume(resume)).await;
+    let reply = c2.reply.clone().unwrap();
+    assert_eq!(reply.epoch, epoch, "the epoch is kept");
+    let StartPoint::Snapshot(info) = reply.start else {
+        panic!("expected a snapshot, got {:?}", reply.start);
+    };
+    assert_eq!(info.skipped, 0);
+    c2.wait_screen("TWO").await;
+    assert!(c2.screen().contains("ONE"));
+    assert!(!c2.history().contains("skipped"));
+    // The input stream continues where it was: the session already has "x\n".
+    c2.wait("the input position", |c| c.input_resume == Some(2))
+        .await;
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 

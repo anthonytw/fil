@@ -197,6 +197,8 @@ pub struct Connect {
     pub host: &'static str,
     pub size: TermSize,
     pub resume: Option<ResumeRequest>,
+    /// Ask for `EchoAck`s (`Attach::echo_ack`).
+    pub echo_ack: bool,
 }
 
 impl Connect {
@@ -207,7 +209,12 @@ impl Connect {
             host: "laptop",
             size: size(80, 24),
             resume: None,
+            echo_ack: false,
         }
+    }
+    pub fn echo_ack(mut self) -> Self {
+        self.echo_ack = true;
+        self
     }
     pub fn host(mut self, host: &'static str) -> Self {
         self.host = host;
@@ -254,7 +261,7 @@ impl Client {
             term: "xterm-256color".parse().unwrap(),
             host: c.host.parse().unwrap(),
             key: c.key,
-            echo_ack: false,
+            echo_ack: c.echo_ack,
             resume: c.resume,
         };
         let h = h.clone();

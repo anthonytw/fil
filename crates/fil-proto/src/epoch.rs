@@ -123,6 +123,7 @@ impl SessionEpoch {
     }
 
     /// May this key open a direct connection to the session right now?
+    #[cfg(test)]
     pub fn key_authorized(&self, key: &PublicKey) -> bool {
         self.current.as_ref().is_some_and(|s| &s.key == key)
     }

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use nix::sys::termios::LocalFlags;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use tokio::sync::Notify;
 
 use fil_proto::msg::TermSize;
 
@@ -33,6 +34,8 @@ pub(crate) struct Pty {
     queued: AtomicU64,
     /// Bytes the writer thread has got into the PTY (the line discipline has them).
     written: Arc<AtomicU64>,
+    /// Signalled by the writer thread after each write, so the core need not poll `written`.
+    pub written_signal: Arc<Notify>,
     /// The child's pid, which is also its process group id: it is a session leader.
     pub pid: u32,
 }
@@ -153,6 +156,8 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let written = Arc::new(AtomicU64::new(0));
     let taken = written.clone();
+    let signal = Arc::new(Notify::new());
+    let writer_signal = signal.clone();
     std::thread::Builder::new()
         .name("fil-pty-write".into())
         .spawn(move || {
@@ -162,6 +167,7 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
                     .and_then(|()| writer.flush())
                     .is_ok();
                 taken.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                writer_signal.notify_one();
                 if !written {
                     break;
                 }
@@ -175,6 +181,7 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
             writer: tx,
             queued: AtomicU64::new(0),
             written,
+            written_signal: signal,
             pid,
         },
         child,

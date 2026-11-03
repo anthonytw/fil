@@ -24,3 +24,5 @@ vte = { version = "0.15", optional = true }
 
 [dev-dependencies]
 portable-pty = "0.9"
+# The boundary scanner is checked against a real parser (src/boundary.rs).
+vte = "0.15"

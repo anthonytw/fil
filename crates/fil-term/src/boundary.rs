@@ -1,6 +1,8 @@
 //! Finding the places in a byte stream where a terminal's parser is at rest.
 //!
-//! A snapshot describes the terminal's state at one point in the output. If that point is in
+//! One machine serves both ends: the session holds output back until the parser is at rest
+//! (a snapshot is never taken mid-escape), and the client's prediction overlay paints only when
+//! the terminal is at rest, so the two must agree on where a sequence ends. A snapshot describes the terminal's state at one point in the output. If that point is in
 //! the middle of an escape sequence (or of a UTF-8 character), the emulator has already
 //! consumed the half sequence into its parser, which neither emulator crate exposes, so the
 //! snapshot loses it, and the client's terminal would then read the rest of the sequence as
@@ -35,6 +37,10 @@ pub struct Boundary {
     state: State,
     /// Continuation bytes still owed to a UTF-8 character that has started.
     utf8_left: u8,
+    /// The string just started is an APC, and its first byte has not come yet.
+    apc_first: bool,
+    /// A kitty graphics command (`ESC _ G`) was seen since the last [`Boundary::take_graphics`].
+    graphics: bool,
 }
 
 impl Default for Boundary {
@@ -48,6 +54,8 @@ impl Boundary {
         Self {
             state: State::Ground,
             utf8_left: 0,
+            apc_first: false,
+            graphics: false,
         }
     }
 
@@ -59,6 +67,12 @@ impl Boundary {
     /// Forgets any partial sequence (the caller gave up waiting for its end).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Whether a kitty graphics command started since this was last asked; clears the flag. A
+    /// shadow screen cannot hold an image, so the overlay stops predicting after one.
+    pub fn take_graphics(&mut self) -> bool {
+        std::mem::take(&mut self.graphics)
     }
 
     /// Consumes `bytes`. Returns the length of the longest prefix of `bytes` after which the
@@ -88,10 +102,12 @@ impl Boundary {
         // CAN and SUB cancel any sequence; ESC starts a new one even inside a string.
         if matches!(b, 0x18 | 0x1a) {
             self.state = State::Ground;
+            self.apc_first = false;
             return;
         }
         if b == 0x1b {
             self.state = State::Escape;
+            self.apc_first = false;
             return;
         }
         match self.state {
@@ -99,7 +115,10 @@ impl Boundary {
             State::Escape => match b {
                 b'[' => self.state = State::Csi,
                 b']' => self.state = State::Osc,
-                b'P' | b'X' | b'^' | b'_' => self.state = State::String,
+                b'P' | b'X' | b'^' | b'_' => {
+                    self.state = State::String;
+                    self.apc_first = b == b'_';
+                }
                 0x20..=0x2f => self.state = State::EscapeIntermediate,
                 0x30..=0x7e => self.state = State::Ground,
                 // Other C0 controls are executed and the escape goes on; DEL is ignored.
@@ -120,7 +139,11 @@ impl Boundary {
                     self.state = State::Ground;
                 }
             }
-            State::String => {}
+            State::String => {
+                if std::mem::take(&mut self.apc_first) && b == b'G' {
+                    self.graphics = true;
+                }
+            }
         }
     }
 
@@ -197,6 +220,23 @@ mod tests {
         assert_eq!(rest_of(b"\x1b[3\x1b[1m"), 7);
         // A lead byte followed by a non-continuation is abandoned.
         assert_eq!(rest_of(b"\xc3a"), 2);
+    }
+
+    #[test]
+    fn a_kitty_graphics_command_is_noticed_once() {
+        let mut b = Boundary::new();
+        b.scan(b"a\x1b_Gf=100;AAAA");
+        assert!(b.take_graphics());
+        assert!(!b.take_graphics(), "taking clears it");
+        // Other APCs, and a G that is not the first byte, are not graphics.
+        b.scan(b"\x1b\\\x1b_xG\x1b\\\x1b]0;G\x07\x1bPG\x1b\\");
+        assert!(!b.take_graphics());
+        b.scan(b"\x1b\\\x1b_G\x1b\\");
+        assert!(b.take_graphics());
+        // The first byte of the string decides, wherever it falls in the input.
+        b.scan(b"\x1b_");
+        b.scan(b"G");
+        assert!(b.take_graphics());
     }
 
     #[test]

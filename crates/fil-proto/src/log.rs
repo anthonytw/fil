@@ -187,6 +187,7 @@ impl Cursor {
     }
 
     /// After a catch-up jump the subscriber continues at the snapshot's `at`.
+    #[cfg(test)]
     pub fn jump_to(&mut self, at: u64) {
         *self = Self::at(at);
     }

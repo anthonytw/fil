@@ -6,6 +6,7 @@
 //! features and chosen by name at run time, so several can coexist and the fidelity
 //! suite can compare them on the same recordings.
 
+mod boundary;
 pub mod compare;
 pub mod model;
 mod model_impls;
@@ -18,6 +19,7 @@ mod be_alacritty;
 #[cfg(feature = "vt100")]
 mod be_vt100;
 
+pub use boundary::Boundary;
 pub use model::{Size, TermState};
 
 /// Which parts of [`TermState`] a backend can report. The fidelity suite scores a field

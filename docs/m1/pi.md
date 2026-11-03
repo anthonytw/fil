@@ -60,24 +60,37 @@ Do not run two copies at once. `reset` kills everything the account runs.
 
 ## Results
 
-Run on 2026-11-02 (ET) on main at a472d35 plus this branch: Pi binary sha256 `ced51e9d…` (from the `aarch64` job, runs 41569420955 and 41571148759), client built from the same tree on macOS aarch64. All scenarios passed on both Pis. Times are single runs from this network; the two Pis agree within noise, except that the daemon restart's wait varies with the client's reconnect backoff (0.5 to 4.5 s).
+Run on 2026-11-02 (ET), after the hosts' firewall was opened for UDP 60000–61000 from this machine, on main at a472d35 plus this branch: Pi binary sha256 `ced51e9d…` (from the `aarch64` job, runs 41569420955 and 41571148759), client built from the same tree on macOS aarch64. All scenarios passed on both Pis. Times are single runs from this network; the two Pis agree within noise, except that the daemon restart's wait varies with the client's reconnect backoff (0.5 to 4.5 s). Since UDP is open, the scenarios that attach with the default transport can now move to QUIC right after attaching (which is why the detach time below changed); the ones that need ssh as the transport (killed ssh, daemon restart, lingering) use the pipe only.
 
 | Scenario | What the driver checks | pi1 | pi2 |
 |---|---|---|---|
-| attach and detach | attach, run a command, `~.` | first prompt 530 ms (the ssh login is about 400 ms of it); round trip 6 ms; client gone 6 ms after `~.` | 557 ms; 6 ms; 6 ms |
-| reattach | a second client sees the earlier output and the same shell (a shell variable) | earlier output on screen after 143 ms | 176 ms |
-| `fil ls`, `detach`, `kill` | `ls` lists the session; `detach` tells the attached client, which exits 1 when it declines to reattach; `kill` ends the client and the session | `ls` 152 ms; detach told after 1.4 s; kill: client exit 129 | 167 ms; 1.0 s; 129 |
-| takeover | a second client takes the session; the first is told and exits 1 when it declines to take it back | second client sees the session in 177 ms; first told **within** 190 ms of the second starting (an upper bound: the driver checks the first client after the second one's own round trip) | 162 ms; within 187 ms |
-| killed ssh | `kill -9` the local ssh child mid-session, with input typed right after; then a second kill with nothing typed until the client has started a new ssh by itself | same shell back, the typed command ran: 1181 ms; second kill: new ssh after 2.4 s, resumed at 2.5 s | 976 ms; 2.1 s, 2.3 s |
-| daemon restart | client kept offline, gate `reset`, client may log in again; it must show "is a different session now" (a client that exits instead fails the scenario) and a fresh shell must work after `y` | prompt 4.5 s after it could log in; the old shell variable gone | 0.5 s; same |
+| attach and detach | attach, run a command, `~.` | first prompt 528 ms (the ssh login is about 400 ms of it); round trip 6 ms; client gone 6 ms after `~.` | 586 ms; 6 ms; 5 ms |
+| reattach | a second client sees the earlier output and the same shell (a shell variable) | earlier output on screen after 176 ms | 154 ms |
+| `fil ls`, `detach`, `kill` | `ls` lists the session; `detach` tells the attached client, which exits 1 when it declines to reattach; `kill` ends the client and the session | `ls` 182 ms; detach told after 186 ms (1.0 to 1.4 s when the pipe carried the session, see finding 1); kill: client exit 129 | 184 ms; 167 ms; 129 |
+| takeover | a second client takes the session; the first is told and exits 1 when it declines to take it back | second client sees the session in 155 ms; first told **within** 186 ms of the second starting (an upper bound: the driver checks the first client after the second one's own round trip) | 179 ms; within 185 ms |
+| killed ssh | `kill -9` the local ssh child mid-session, with input typed right after; then a second kill with nothing typed until the client has started a new ssh by itself | same shell back, the typed command ran: 1151 ms; second kill: new ssh after 2.3 s, resumed at 2.5 s | 1054 ms; 2.2 s, 2.3 s |
+| daemon restart | client kept offline, gate `reset`, client may log in again; it must show "is a different session now" (a client that exits instead fails the scenario) and a fresh shell must work after `y` | prompt 3.9 s after it could log in; the old shell variable gone | 4.4 s; same |
 | lingering | detach, wait 40 s with no login: the daemon is still there and the shell kept running (a background job's output waited in the session); the shell must have run in a `fil session` systemd scope (asserted from the user journal) | yes | yes |
-| direct mode | does it move to QUIC? | **no**: stayed on the pipe | **no**: stayed on the pipe |
+| direct mode | with the default UDP address: moves to QUIC within 1 s of the attach reply, the ssh pipe closes, the session works over QUIC, and the Pi's daemon log shows the direct attach (asserted). With a blackholed UDP address: stays on the pipe and works (asserted) | **yes**: ssh login and attach reply 478 ms after start, QUIC up 26 ms later, carrying the session 2 ms after that: **507 ms** from start; round trip over QUIC 6 ms. Blackhole: pipe, 3 failed dials in 10 s | **yes**: 437 ms, +26 ms, +3 ms: **467 ms**; round trip 6 ms. Blackhole: same |
 
-### Direct mode did not upgrade from this Mac
+### Direct mode
 
-With the UDP address set to the Pi's name, the client got the Pi's QUIC port (60000–61000 range) and certificate fingerprint in the attach reply and dialed four times in 20 s, each with "no answer from the daemon within 2s", the backoff growing between tries. The session kept working on the pipe throughout, so the **fallback to the pipe works** (round trip 6 to 12 ms during the failed dials). With the address set to a documentation address nothing answers on, the result is the same.
+**Direct mode works.** With UDP open, `fil` moves from the pipe to QUIC as soon as the attach reply gives it the port and certificate fingerprint. The timeline from the client log, the same on both Pis within noise:
 
-Why it fails: a UDP probe to pi1 on ports 9, 40000, 60001, 60500, 60999 and 61001, and to pi2 on 40000, 60001 and 60500, got silence every time. Ports outside fil's range and ports nothing listens on never produced an ICMP "unreachable" either, so this path drops inbound UDP to the Pis altogether (something between this Mac and them), not just the 60000–61000 range. This confirms the blocked-path half of the plan's "Done when" on real hardware. It does **not** show the other half (moving to QUIC within a second where UDP works) on hardware: that needs a client with a UDP path to the Pis, and nothing here gives one. The QUIC path is exercised on loopback by `just local-direct`, and by the realnet suite on Linux (`docs/m1/realnet.md`). That the daemon itself answers on its UDP port on the Pi was not checked.
+| Step | Time |
+|---|---|
+| client starts, ssh login, attach reply | about 440 to 480 ms (almost all of it the ssh login) |
+| QUIC handshake complete (`DirectUp`) | 26 ms later |
+| QUIC carries the session, pipe closes (`Switched(Direct)`) | 2 to 3 ms later |
+| start to carrying the session | **467 to 507 ms** |
+
+So the upgrade itself takes about 30 ms after the reply, well inside the plan's "within a second". The pipe's ssh process is gone a moment later, and a command's round trip over QUIC is 6 ms. The Pi's daemon log shows two attaches for the session, the first with `direct: false` (the pipe) and the second with `resuming: true, direct: true`, and `daemon started` names the UDP port it picked in the 60000–61000 range.
+
+With the UDP address set to a documentation address nothing answers on, the client dials three times in 10 s, each with "no answer from the daemon within 2s", and the session stays on the pipe and keeps working (round trip 6 ms). So the **fallback to the pipe works when UDP is blocked from the start**. The driver asserts both cases. If UDP is blocked again, the `direct_mode` scenario fails with a message that says so, rather than passing quietly on the pipe.
+
+**What blocked it earlier.** The first runs, before the hosts' firewall allowed UDP 60000–61000 from this machine's network, stayed on the pipe: four dials in 20 s, each "no answer from the daemon within 2s". A closed-port UDP probe to a Pi got silence on every port, in and outside the range, where an open path returns ICMP "port unreachable". Once the firewall was opened for the admin network, a probe to port 60999 got "unreachable" (the path is open) and 59999 stayed silent (still dropped, as intended). The cause was the hosts' firewall, not the network between; it was opened for the admin network.
+
+**Not tested: UDP lost in the middle of a session.** Falling back to the pipe after QUIC has been carrying a session would need UDP blocked from this side while the session runs. That needs a firewall rule (`pf` on the Mac, `ufw` on the Pi), both of which need root, and the gate offers no firewall verb. The path manager's fallback is covered by the netsim and realnet suites (`docs/m1/realnet.md`) and by the dialer tests, not on the Pis.
 
 ### Gate behavior worth knowing
 
@@ -85,11 +98,11 @@ Why it fails: a UDP probe to pi1 on ports 9, 40000, 60001, 60500, 60999 and 6100
 - **`reset` restarts the whole systemd user manager** (it kills every process of the account, `systemd --user` included, and lingering starts it again). That is harmless for fil.
 - **The `logs` verb shows the user journal**, which has a `Started fil-SESSION-….scope - fil session SESSION` line for each session (it proves the process-scope path). fil keeps no daemon log file there.
 
-Runs: the `aarch64` job builds, [run 41565928944](https://github.com/anthonytw/fil/actions/runs/41565928944) (first tree), [run 41569420955](https://github.com/anthonytw/fil/actions/runs/41569420955) (merged tree) and [run 41571148759](https://github.com/anthonytw/fil/actions/runs/41571148759) (pinned `cross`, `--locked`, static check: same binary hash).
+Runs: the `aarch64` job builds, [run 41565928944](https://github.com/anthonytw/fil/actions/runs/41565928944) (first tree), [run 41569420955](https://github.com/anthonytw/fil/actions/runs/41569420955) (merged tree) and [run 41571148759](https://github.com/anthonytw/fil/actions/runs/41571148759) (pinned `cross`, `--locked`, static check: same binary hash). The scenarios in the results table ran against that binary.
 
 ## Findings
 
 Each is reproducible with the steps given.
 
-1. **`fil detach` reaches the attached client late.** The detached client learns after 1.0 to 1.4 s, not at once, and by a reconnect. Reproduce: attach, then `fil detach HOST SESSION` from another shell. The client log shows `link down` (pipe command exited 0) at the moment of the detach, then a new ssh login after the path manager's 0.8 to 1.0 s pipe backoff, and only then the "detached from elsewhere" prompt. A takeover is told in about 0.2 s over the open link. The user sees "disconnected, reconnecting" before the prompt. The daemon closes the link without sending the notice the client already knows how to show. This is being fixed separately in `fil-session`.
+1. **`fil detach` reaches the attached client late.** On the pipe the detached client learns after 1.0 to 1.4 s, not at once, and by a reconnect. (With QUIC carrying the session the same reconnect is a quick redial with no ssh login, so it takes only about 0.2 s; the daemon still sends no notice.) Reproduce: attach, then `fil detach HOST SESSION` from another shell. The client log shows `link down` (pipe command exited 0) at the moment of the detach, then a new ssh login after the path manager's 0.8 to 1.0 s pipe backoff, and only then the "detached from elsewhere" prompt. A takeover is told in about 0.2 s over the open link. The user sees "disconnected, reconnecting" before the prompt. The daemon closes the link without sending the notice the client already knows how to show. This is being fixed separately in `fil-session`.
 2. **`docs/m1/binary.md` said `fil kill` from elsewhere gives exit status 137 (SIGKILL); it gives 129 in practice.** The client prints `session "…" killed by signal 1 (SIGHUP)`. The kill is SIGHUP first and SIGKILL only to what survives the grace period (`crates/fil-session/src/proc.rs`), so the code is deliberate and the doc was stale; it is fixed in this PR. Reproduce: `fil kill HOST SESSION` with a client attached and an idle shell.

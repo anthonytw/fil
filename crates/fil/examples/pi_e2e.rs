@@ -810,64 +810,126 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
     ])
 }
 
-/// Does the session upgrade to QUIC? With the default address, and with a UDP blackhole. The
-/// session must work either way; the notes say which transport carried it.
+/// Seconds into the day of a client-log line's `"timestamp":"...THH:MM:SS.ffffffZ"`.
+fn log_seconds(line: &str) -> Option<f64> {
+    let t = line.split("\"timestamp\":\"").nth(1)?.split('T').nth(1)?;
+    let mut parts = t.get(..15)?.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// The time of the first log line containing `needle`.
+fn first_at(log: &str, needle: &str) -> Option<f64> {
+    log.lines()
+        .find(|l| l.contains(needle))
+        .and_then(log_seconds)
+}
+
+/// The last "direct dial failed" reason in a client log.
+fn last_dial_failure(log: &str) -> String {
+    log.lines()
+        .rev()
+        .find(|l| l.contains("direct dial failed"))
+        .and_then(|l| l.split("\"reason\":\"").nth(1))
+        .map(|r| r.split("\"}").next().unwrap_or("").replace("\\\"", "\""))
+        .unwrap_or_default()
+}
+
+/// With the default UDP address the session must move to QUIC within a second of the attach
+/// reply, close the pipe, and keep working; the Pi's daemon log must show the direct attach. If
+/// it does not, UDP 60000-61000 to the host is probably blocked (docs/m1/pi.md): the scenario
+/// fails and says so. With a UDP blackhole it must stay on the pipe and keep working.
 fn direct_mode(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();
-    for variant in [Variant::Auto, Variant::Blackhole] {
-        let mut c = Client::spawn(ctx, host, variant, "e2e-dm");
-        let prompt = spawn_to_prompt(&c)?;
-        c.roundtrip("DM1", ATTACH_TIMEOUT)?;
-        // Wait for the switch to direct (up to 20 s).
-        let t0 = Instant::now();
-        let mut upgraded = None;
-        while t0.elapsed() < Duration::from_secs(20) {
-            if c.log().contains("Switched(Direct)") {
-                upgraded = Some(c.started.elapsed());
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        // Whatever carries the session now, it must work.
-        let rt = c.roundtrip("DM2", Duration::from_secs(20))?;
-        let log = c.log();
-        let failed = log.matches("direct dial failed").count();
-        let reason = log
-            .lines()
-            .rev()
-            .find(|l| l.contains("direct dial failed"))
-            .and_then(|l| l.split("\"reason\":\"").nth(1))
-            .map(|r| r.split("\"}").next().unwrap_or("").replace("\\\"", "\""))
-            .unwrap_or_default();
-        let sshs = c.ssh_children().len();
-        let pi_logs = ctx.gate(host, "logs 80");
-        if ctx.verbose {
-            eprintln!(
-                "--- client log ({}) ---\n{log}\n--- pi logs ---\n{pi_logs}",
-                variant.tag()
-            );
-        }
-        let quic_lines = pi_logs
-            .lines()
-            .filter(|l| l.contains("quic") || l.contains("direct") || l.contains("udp"))
-            .count();
-        notes.push(format!(
-            "{}: {} (first prompt {}, round trip {}, {} failed direct dials, {} ssh children, {} Pi log lines about quic/direct/udp){}",
-            variant.tag(),
-            match upgraded {
-                Some(t) => format!("UPGRADED to direct at {}", ms(t)),
-                None => "stayed on the pipe (no upgrade within 20 s)".to_string(),
-            },
-            ms(prompt),
-            ms(rt),
-            failed,
-            sshs,
-            quic_lines,
-            if reason.is_empty() { String::new() } else { format!("; last failure: {reason}") }
-        ));
-        c.detach()?;
-        ctx.reset(host);
+
+    // 1. UDP open: upgrade.
+    let mut c = Client::spawn(ctx, host, Variant::Auto, "e2e-dm");
+    let prompt = spawn_to_prompt(&c)?;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(20) && !c.log().contains("Switched(Direct)") {
+        thread::sleep(Duration::from_millis(20));
     }
+    let log = c.log();
+    if !log.contains("Switched(Direct)") {
+        return Err(format!(
+            "direct mode did not upgrade within 20 s: {} failed direct dials, last: {}. UDP 60000-61000 from this machine to the host is probably blocked again (the host's firewall or something on the path); the session stayed on the pipe",
+            log.matches("direct dial failed").count(),
+            last_dial_failure(&log)
+        ));
+    }
+    let start = first_at(&log, "\"message\":\"starting\"");
+    let reply = first_at(&log, "DirectAvailable");
+    let up = first_at(&log, "\"input\":\"DirectUp\"");
+    let switched = first_at(&log, "Switched(Direct)");
+    let (Some(start), Some(reply), Some(up), Some(switched)) = (start, reply, up, switched) else {
+        return Err(format!(
+            "cannot read the upgrade timeline from the client log\n{log}"
+        ));
+    };
+    ensure(switched - reply <= 1.0, || {
+        format!(
+            "the upgrade took {:.0} ms after the attach reply, over the 1 s limit",
+            (switched - reply) * 1000.0
+        )
+    })?;
+    // The pipe closes once QUIC carries the session.
+    let t1 = Instant::now();
+    while !c.ssh_children().is_empty() && t1.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    ensure(c.ssh_children().is_empty(), || {
+        "the ssh pipe was still open 5 s after the switch to direct".to_string()
+    })?;
+    let rt = c.roundtrip("DM1", Duration::from_secs(20))?;
+    let pi_logs = ctx.gate(host, "logs 200");
+    if ctx.verbose {
+        eprintln!("--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}");
+    }
+    ensure(
+        pi_logs
+            .lines()
+            .any(|l| l.contains("\"message\":\"attach\"") && l.contains("\"direct\":true")),
+        || "the Pi's daemon log has no direct attach".to_string(),
+    )?;
+    notes.push(format!(
+        "UPGRADED to QUIC: attach reply {} after start (the ssh login is most of it), QUIC up {} later, switched {} after that; {} from start to carrying the session; pipe closed; round trip over QUIC {}; the Pi's log shows the direct attach (first prompt {})",
+        ms(Duration::from_secs_f64(reply - start)),
+        ms(Duration::from_secs_f64(up - reply)),
+        ms(Duration::from_secs_f64(switched - up)),
+        ms(Duration::from_secs_f64(switched - start)),
+        ms(rt),
+        ms(prompt)
+    ));
+    c.detach()?;
+    ctx.reset(host);
+
+    // 2. UDP blackholed: stay on the pipe.
+    let mut c = Client::spawn(ctx, host, Variant::Blackhole, "e2e-dm");
+    let prompt = spawn_to_prompt(&c)?;
+    c.roundtrip("DM2", ATTACH_TIMEOUT)?;
+    thread::sleep(Duration::from_secs(10));
+    let log = c.log();
+    ensure(!log.contains("Switched(Direct)"), || {
+        "upgraded to direct through a blackholed UDP address".to_string()
+    })?;
+    ensure(log.contains("direct dial failed"), || {
+        "no direct dial was attempted with the blackhole address".to_string()
+    })?;
+    let rt = c.roundtrip("DM3", Duration::from_secs(20))?;
+    ensure(c.ssh_children().len() == 1, || {
+        "the pipe is not the one ssh child".to_string()
+    })?;
+    notes.push(format!(
+        "blackholed UDP: stayed on the pipe, session worked (first prompt {}, round trip {} after {} failed direct dials; last: {})",
+        ms(prompt),
+        ms(rt),
+        log.matches("direct dial failed").count(),
+        last_dial_failure(&log)
+    ));
+    c.detach()?;
+    ctx.reset(host);
     Ok(notes)
 }
 

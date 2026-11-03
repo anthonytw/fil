@@ -735,6 +735,9 @@ udp_fil_setup() {
   UDP_BIN=$(as_root mktemp -d /tmp/rn-udp-bin.XXXXXX)
   as_root chmod 755 "$UDP_BIN"
   UDP_PATH=$UDP_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  # Each scenario runs in a fresh process that sources this file (part_main --one), so the
+  # per-run directory must be written down here, as ssh.sh and sysd.sh do with their state.
+  printf 'UDP_BIN=%q\nUDP_PATH=%q\n' "$UDP_BIN" "$UDP_PATH" > "$OUT/udp.env"
   ssh-keygen -q -t ed25519 -N '' -C realnet-udp-user -f "$k/id"
   ssh-keygen -q -t ed25519 -N '' -C realnet-udp-host -f "$k/host"
   cat > "$k/sshd_config" << EOF

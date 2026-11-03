@@ -518,8 +518,8 @@ impl Response {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
-    /// **Frozen: index 0 within a protocol major.** With `ControlMsg::Error` (index 12) it is
-    /// the refusal a client of any older build understands (`0c00`), the one thing it must be
+    /// **Frozen: index 0 within a protocol major.** With `ControlMsg::Error` (index 11) it is
+    /// the refusal a client of any build with a revision understands (`0b00`), the one thing it must be
     /// able to read from a newer peer to exit at once instead of timing out. The golden's
     /// `[frozen]` section holds its bytes.
     VersionMismatch,
@@ -565,7 +565,7 @@ pub enum ControlMsg {
         channel: ChannelId,
         code: ErrorCode,
     },
-    /// Frozen at index 12 within a protocol major (see [`ErrorCode::VersionMismatch`]).
+    /// Frozen at index 11 within a protocol major (see [`ErrorCode::VersionMismatch`]).
     Error(ErrorCode),
     /// Daemon to client: the PTY's line discipline changed (DESIGN.md section 9). Takes effect at
     /// terminal-channel offset `at`, so the client applies it in order with the output.

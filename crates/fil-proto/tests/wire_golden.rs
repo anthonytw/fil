@@ -32,6 +32,7 @@
 use std::fmt::Write as _;
 
 use fil_proto::frame::{ChannelId, DataSegment, Frame, FrameDecoder};
+use fil_proto::input::{InputRecord, RECORD_MARK, TerminalInput};
 use fil_proto::limits::*;
 use fil_proto::msg::*;
 use fil_proto::preamble;
@@ -218,6 +219,7 @@ fn attach(resume: Option<ResumeRequest>, echo_ack: bool) -> Attach {
         key: PublicKey::new(vec![7; 32]).unwrap(),
         resume,
         echo_ack,
+        size_gen: 7,
     }
 }
 
@@ -277,10 +279,6 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
     }
     add("taken-over", ControlMsg::TakenOver(taken_over()));
     add("detach", ControlMsg::Detach);
-    add(
-        "resize",
-        ControlMsg::Resize(TermSize::new(200, 50).unwrap()),
-    );
     add(
         "heartbeat-ping",
         ControlMsg::Heartbeat {
@@ -393,6 +391,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                 want_snapshot: true,
             }),
             echo_ack: true,
+            size_gen: u64::MAX,
         }),
     );
     add(
@@ -416,14 +415,6 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         ControlMsg::AttachRefused(AttachRefusal::TakenOver(widest_taken_over.clone())),
     );
     add("max/taken-over", ControlMsg::TakenOver(widest_taken_over));
-    add(
-        "max/resize-wide",
-        ControlMsg::Resize(TermSize::new(TermSize::MAX_COLS, 500).unwrap()),
-    );
-    add(
-        "max/resize-tall",
-        ControlMsg::Resize(TermSize::new(1000, TermSize::MAX_ROWS).unwrap()),
-    );
     add(
         "max/heartbeat",
         ControlMsg::Heartbeat {
@@ -519,8 +510,45 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
     v
 }
 
+/// One canonical instance of every `InputRecord` variant, and its widest, by label. The match is
+/// exhaustive on purpose: a new kind stops this file compiling until it has an instance.
+fn input_records() -> Vec<(String, InputRecord)> {
+    let all = vec![
+        (
+            "resize".to_string(),
+            InputRecord::Resize {
+                at: 1234,
+                size_gen: 3,
+                size: TermSize::new(200, 50).unwrap(),
+            },
+        ),
+        (
+            "resize-widest".to_string(),
+            InputRecord::Resize {
+                at: u64::MAX,
+                size_gen: u64::MAX,
+                size: TermSize::new(TermSize::MAX_COLS, 500).unwrap(),
+            },
+        ),
+        (
+            "resize-tallest".to_string(),
+            InputRecord::Resize {
+                at: 0,
+                size_gen: 0,
+                size: TermSize::new(1000, TermSize::MAX_ROWS).unwrap(),
+            },
+        ),
+    ];
+    for (_, r) in &all {
+        match r {
+            InputRecord::Resize { .. } => {}
+        }
+    }
+    all
+}
+
 /// How many `ControlMsg` variants there are. Extend it with the match below.
-const VARIANTS: usize = 18;
+const VARIANTS: usize = 17;
 
 /// The variant index postcard writes: the position in the enum. Exhaustive on purpose.
 fn variant_index(m: &ControlMsg) -> usize {
@@ -531,18 +559,17 @@ fn variant_index(m: &ControlMsg) -> usize {
         ControlMsg::AttachRefused(_) => 3,
         ControlMsg::TakenOver(_) => 4,
         ControlMsg::Detach => 5,
-        ControlMsg::Resize(_) => 6,
-        ControlMsg::Heartbeat { .. } => 7,
-        ControlMsg::Ack { .. } => 8,
-        ControlMsg::Resume { .. } => 9,
-        ControlMsg::Snapshot(_) => 10,
-        ControlMsg::Reset { .. } => 11,
-        ControlMsg::Error(_) => 12,
-        ControlMsg::PtyMode { .. } => 13,
-        ControlMsg::EchoAck { .. } => 14,
-        ControlMsg::SessionExited { .. } => 15,
-        ControlMsg::Request(_) => 16,
-        ControlMsg::Response(_) => 17,
+        ControlMsg::Heartbeat { .. } => 6,
+        ControlMsg::Ack { .. } => 7,
+        ControlMsg::Resume { .. } => 8,
+        ControlMsg::Snapshot(_) => 9,
+        ControlMsg::Reset { .. } => 10,
+        ControlMsg::Error(_) => 11,
+        ControlMsg::PtyMode { .. } => 12,
+        ControlMsg::EchoAck { .. } => 13,
+        ControlMsg::SessionExited { .. } => 14,
+        ControlMsg::Request(_) => 15,
+        ControlMsg::Response(_) => 16,
     }
 }
 
@@ -592,6 +619,48 @@ fn zigzag(v: i64) -> Vec<u8> {
     postcard::to_allocvec(&v).unwrap()
 }
 
+/// The variant index of a control message, from the enum (so a renumbering moves the probes
+/// below with it instead of leaving them aimed at another variant).
+fn index_of(m: &ControlMsg) -> u8 {
+    variant_index(m) as u8
+}
+
+fn heartbeat_index() -> u8 {
+    index_of(&ControlMsg::Heartbeat {
+        nonce: 0,
+        reply: false,
+    })
+}
+
+fn ack_index() -> u8 {
+    index_of(&ControlMsg::Ack {
+        channel: ChannelId(0),
+        upto: 0,
+    })
+}
+
+fn exited_index() -> u8 {
+    index_of(&ControlMsg::SessionExited {
+        code: None,
+        signal: None,
+    })
+}
+
+fn attach_reply_index() -> u8 {
+    index_of(&ControlMsg::AttachReply(AttachReply {
+        incarnation: 0,
+        epoch: 0,
+        start: StartPoint::Resume { from: 0 },
+        udp_port: None,
+        fingerprint: None,
+        term: term("x"),
+    }))
+}
+
+fn response_index() -> u8 {
+    index_of(&ControlMsg::Response(Response::Done))
+}
+
 /// A control message built from raw field encodings: the variant index, then the fields as
 /// postcard writes them. With a field wider than the real one, it is how the golden asks "does
 /// the decoder still refuse a value one past the limit?", which widening a field would change.
@@ -622,7 +691,7 @@ fn frozen() -> Entries {
         bytes_entry("preamble/65535", &preamble::encode(65535)),
         bytes_entry("hello", &hello.encode().unwrap()),
         bytes_entry("hello/widest", &widest.encode().unwrap()),
-        // The refusal an old client understands: variant `Error` (12) of `ControlMsg`, variant
+        // The refusal an old client understands: variant `Error` (11) of `ControlMsg`, variant
         // `VersionMismatch` (0) of `ErrorCode`. Neither index may move within a major.
         bytes_entry(
             "error/version-mismatch",
@@ -685,6 +754,8 @@ fn limits() -> Entries {
         num("MAX_PUBLIC_KEY", MAX_PUBLIC_KEY),
         num("MAX_FINGERPRINT", MAX_FINGERPRINT),
         num("MAX_PREAMBLE_SKIP", MAX_PREAMBLE_SKIP),
+        // The first varint of a record payload; no data segment can start there.
+        num("input::RECORD_MARK", RECORD_MARK),
         num("TermSize::MAX_COLS", TermSize::MAX_COLS),
         num("TermSize::MAX_ROWS", TermSize::MAX_ROWS),
         num("TermSize::MAX_CELLS", TermSize::MAX_CELLS),
@@ -730,6 +801,13 @@ fn revisioned() -> Entries {
         e.push(bytes_entry(
             format!("data/seq-{seq}"),
             &DataSegment::encode(seq, data).unwrap(),
+        ));
+    }
+    // In-band records on the terminal channel, client to daemon (fil_proto::input).
+    for (label, rec) in input_records() {
+        e.push(bytes_entry(
+            format!("input/{label}"),
+            &rec.encode().unwrap(),
         ));
     }
     // The QUIC stream layout (fil-transport): stream headers, flush markers, length prefixes.
@@ -831,16 +909,68 @@ fn revisioned() -> Entries {
     e.push(("decode/data-empty".into(), segment(0, 0)));
     e.push(("decode/data-seq-overflow".into(), segment(u64::MAX, 1)));
 
+    // What the terminal channel's keystroke direction makes of a record, and of what is not one.
+    let record_wire = |body: &[u8]| {
+        let mut v = varint(RECORD_MARK);
+        v.extend_from_slice(body);
+        v
+    };
+    let parsed = |payload: &[u8]| match TerminalInput::parse(payload) {
+        Ok(TerminalInput::Record(_)) => "record".to_string(),
+        Ok(TerminalInput::Keys(_)) => "keys".to_string(),
+        Err(_) => "err".to_string(),
+    };
+    let resize_body = postcard::to_allocvec(&InputRecord::Resize {
+        at: 1,
+        size_gen: 1,
+        size: TermSize::new(80, 24).unwrap(),
+    })
+    .unwrap();
+    e.push((
+        "decode/input-record".into(),
+        parsed(&record_wire(&resize_body)),
+    ));
+    let mut trailing = resize_body.clone();
+    trailing.push(0);
+    e.push((
+        "decode/input-record-trailing-byte".into(),
+        parsed(&record_wire(&trailing)),
+    ));
+    e.push((
+        "decode/input-record-unknown-kind".into(),
+        parsed(&record_wire(&[1, 1, 1, 80, 24])),
+    ));
+    let mut zero_size = resize_body.clone();
+    let n = zero_size.len();
+    zero_size[n - 1] = 0;
+    e.push((
+        "decode/input-record-zero-size".into(),
+        parsed(&record_wire(&zero_size)),
+    ));
+    e.push((
+        "decode/input-record-nothing-after-the-mark".into(),
+        parsed(&record_wire(&[])),
+    ));
+    e.push((
+        "decode/input-keys-last-sequence".into(),
+        // The last sequence a data segment can start at is one below the mark (at the mark it would
+        // overflow, which is what makes the mark free to mean a record).
+        parsed(&{
+            let mut v = varint(RECORD_MARK - 1);
+            v.push(b'x');
+            v
+        }),
+    ));
     // Integer widths: the widest value of each narrower field, and one past it.
     for v in [u64::from(u32::MAX), u64::from(u32::MAX) + 1] {
-        // Heartbeat { nonce: u32, reply } (7), Ack { channel: ChannelId(u32), upto } (8).
+        // Heartbeat { nonce: u32, reply }, Ack { channel: ChannelId(u32), upto }.
         e.push((
             format!("decode/heartbeat-nonce-{v}"),
-            control_outcome(&raw_msg(7, &[varint(v), vec![0]])),
+            control_outcome(&raw_msg(heartbeat_index(), &[varint(v), vec![0]])),
         ));
         e.push((
             format!("decode/ack-channel-{v}"),
-            control_outcome(&raw_msg(8, &[varint(v), varint(0)])),
+            control_outcome(&raw_msg(ack_index(), &[varint(v), varint(0)])),
         ));
     }
     for (what, v) in [
@@ -849,22 +979,22 @@ fn revisioned() -> Entries {
         ("min", i64::from(i32::MIN)),
         ("min-minus-1", i64::from(i32::MIN) - 1),
     ] {
-        // SessionExited { code: Option<i32>, signal: Option<i32> } (15).
+        // SessionExited { code: Option<i32>, signal: Option<i32> }.
         e.push((
             format!("decode/exit-code-{what}"),
-            control_outcome(&raw_msg(15, &[vec![1], zigzag(v), vec![0]])),
+            control_outcome(&raw_msg(exited_index(), &[vec![1], zigzag(v), vec![0]])),
         ));
         e.push((
             format!("decode/exit-signal-{what}"),
-            control_outcome(&raw_msg(15, &[vec![0], vec![1], zigzag(v)])),
+            control_outcome(&raw_msg(exited_index(), &[vec![0], vec![1], zigzag(v)])),
         ));
     }
     for port in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
-        // AttachReply { incarnation, epoch, start, udp_port: Option<u16>, fingerprint, term } (2).
+        // AttachReply { incarnation, epoch, start, udp_port: Option<u16>, fingerprint, term }.
         e.push((
             format!("decode/udp-port-{port}"),
             control_outcome(&raw_msg(
-                2,
+                attach_reply_index(),
                 &[
                     varint(1),
                     varint(1),
@@ -882,14 +1012,14 @@ fn revisioned() -> Entries {
         e.push((
             format!("decode/other-daemon-major-{v}"),
             control_outcome(&raw_msg(
-                17,
+                response_index(),
                 &[vec![0, 0, 0], vec![1], varint(v), varint(1)],
             )),
         ));
         e.push((
             format!("decode/other-daemon-revision-{v}"),
             control_outcome(&raw_msg(
-                17,
+                response_index(),
                 &[vec![0, 0, 0], vec![1], varint(1), varint(v)],
             )),
         ));
@@ -1349,7 +1479,7 @@ fn the_golden_covers_the_whole_wire() {
             .any(|l| l.starts_with("preamble/1 = 1b46494c2d434f4e4e4543542031"))
     );
     for want in [
-        "error/version-mismatch = 0c00",
+        "error/version-mismatch = 0b00",
         "limit/MAX_AGENT = 64",
         "hello/widest",
         "decode/hello-agent-65 = err",

@@ -41,6 +41,24 @@ async fn a_takeover_notice_is_flushed_before_the_link_closes() {
     let _ = h.kill(kill_wait()).await;
 }
 
+/// The same for `fil detach`: the `Detach` notice is flushed before the link closes.
+#[tokio::test]
+async fn a_detach_notice_is_flushed_before_the_link_closes() {
+    let sc = Scratch::new();
+    let h = spawn_plain(sh_config(&sc, "main", "cat")).await;
+    let mut a = Client::attach(&h, Connect::new(&h, key(1))).await;
+    h.force_detach().await;
+    // `a` is slow to read. The task must still be waiting for it, not have closed the link.
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        !a.serve.as_ref().unwrap().is_finished(),
+        "the link was closed before the notice was read"
+    );
+    a.wait("the Detach notice", |c| c.detached).await;
+    assert_eq!(a.serve_end().await, ServeEnd::Detached);
+    let _ = h.kill(kill_wait()).await;
+}
+
 #[tokio::test]
 async fn a_refusal_is_flushed_before_the_link_closes() {
     let sc = Scratch::new();

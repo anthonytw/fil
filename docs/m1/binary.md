@@ -144,4 +144,4 @@ Mutation checks (each change made by hand, the suites run, the change reverted):
 
 ## On demand: a real run without sshd
 
-`just local` builds `fil`, writes a throwaway config whose pipe command is `fil server --stdio` run directly, and attaches to a session named `local`; the relay starts the daemon (`fil server --daemon`) on first use. `just local-direct` also lets it upgrade to QUIC over loopback (`direct.address = "127.0.0.1"`). The run on 2026-11-02 on macOS is in the pull request.
+`just local` builds `fil`, writes a throwaway config whose pipe command is `fil server --stdio` run directly, and attaches to a session named `local-pipe` (`local-auto` for `just local auto`); the relay starts the daemon (`fil server --daemon`) on first use. `just local auto` also lets it upgrade to QUIC over loopback (`direct.address = "127.0.0.1"`). The run on 2026-11-02 on macOS is in the pull request.

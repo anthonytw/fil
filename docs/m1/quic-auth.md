@@ -49,7 +49,7 @@ Everything is in memory. The daemon's key and certificate are made at start. The
 - Intermediates are refused. Client authentication is mandatory.
 - Session resumption and 0-RTT are off on both sides. Every connection runs the full client check, so a revoked key cannot return through a cached session.
 
-**Revocation scope.** `revoke` blocks new handshakes. It does not close a connection that already completed one. The daemon does that, using `auth::peer_key(&conn)`, which returns the key a server-side connection authenticated with.
+**Revocation scope.** `KeyRegistry::revoke` blocks new handshakes. It does not close a connection that already completed one. `QuicListener::revoke` does both (it uses `auth::peer_key(&conn)`, which returns the key a server-side connection authenticated with); see `docs/m1/quic-link.md` § Revocation.
 
 **Caveat for callers.** In TLS 1.3 the client finishes its handshake before the server judges the client key. `connect().await` can therefore succeed on a connection the server is about to reject. The client must treat the link as authenticated only after the daemon's first reply (the tests do a one-stream echo for this reason).
 
@@ -66,9 +66,9 @@ rustls 0.23.46 supports RFC 7250 raw public keys on both sides, and mixing is al
 |---|---|
 | Anyone on the network | The handshake succeeds only with a registered key and a valid signature by it. Tests: unregistered key, no key, and a registered public key without its private key are all refused. |
 | A man in the middle | The client accepts only the pinned certificate and checks that its key signed the handshake. Tests: a different valid server, a wrong pin, and the right certificate with a different signing key are all refused. |
-| Someone who steals a client key | The key is in memory only (no storage code here). `KeyRegistry::revoke` blocks new handshakes at once, and `peer_key` lets the daemon close live ones. Wiring revoke into detach and takeover belongs to the daemon. |
+| Someone who steals a client key | The key is in memory only (no storage code here). `KeyRegistry::revoke` blocks new handshakes at once, and `QuicListener::revoke` also closes the live ones (`docs/m1/quic-link.md` § Revocation). |
 
-Not covered here: stateless retry and handshake rate limiting (§8.3, "exposure before authentication"). They belong to the endpoint's accept loop in the daemon.
+Not covered here: stateless retry and handshake rate limiting (§8.3, "exposure before authentication"). They belong to the listener's accept loop, are implemented there (`HandshakeLimits`) and are described in `docs/m1/quic-link.md`; this document covers only the authentication itself.
 
 ## Liveness defaults
 

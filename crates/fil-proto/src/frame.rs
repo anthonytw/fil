@@ -262,7 +262,7 @@ impl<'a> DataSegment<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     fn frame(ch: u32, n: usize) -> Frame {
         Frame::new(ChannelId(ch), (0..n).map(|i| i as u8).collect())

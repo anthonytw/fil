@@ -12,10 +12,16 @@
 //! - `pipe-probe`: the same for the real `PipeLink`, on a pipe command.
 //! - `pipe-detach`: the daemon side and a slow ssh stand-in for the detach-delivery test.
 //!
+//! Shared by the programs: [`keys`] (the key bootstrap of the two QUIC programs) and [`pty`] (a
+//! program on a pseudo-terminal, shared by `ptydrive` and the Pi examples).
+//!
 //! Output is line-oriented text meant for `grep` in the bash harness: `KEY k=v k=v ...`.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod keys;
+pub mod pty;
 
 /// Milliseconds since the Unix epoch. The harness subtracts these from its own `date +%s%3N`,
 /// which works because all processes share the runner's clock.

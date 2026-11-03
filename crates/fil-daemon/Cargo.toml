@@ -32,7 +32,8 @@ test-hooks = ["fil-proto/test-hooks"]
 [dev-dependencies]
 # Enables `test-hooks` for this crate's own tests and for the dev binary they spawn.
 fil-daemon = { path = ".", features = ["test-hooks"] }
-fil-term = { path = "../fil-term" }
+# The scripted protocol client, shared with fil-session's tests.
+fil-testkit = { path = "../fil-testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process", "test-util"] }
 
 [lints]

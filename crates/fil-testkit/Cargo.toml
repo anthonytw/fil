@@ -1,0 +1,18 @@
+[package]
+name = "fil-testkit"
+description = "Dev-only test support shared by the fil-session and fil-daemon tests: the scripted protocol client. A dev-dependency only; never in a release build (just release-deps)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+fil-proto = { path = "../fil-proto" }
+fil-term = { path = "../fil-term" }
+fil-transport = { path = "../fil-transport" }
+tokio = { version = "1", features = ["time"] }
+
+[lints]
+workspace = true

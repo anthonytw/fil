@@ -25,11 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fil_testbins::{Args, epoch_ms, fill_pattern, hex_decode, hex_encode, pattern};
-use fil_transport::auth::{
-    self, ClientKey, DaemonIdentity, Fingerprint, KeyRegistry, LivenessParams, PublicKey,
-    SERVER_NAME,
-};
+use fil_testbins::keys::{client_bootstrap, watch_keys, write_atomic};
+use fil_testbins::{Args, epoch_ms, fill_pattern, pattern};
+use fil_transport::auth::{self, DaemonIdentity, KeyRegistry, LivenessParams, SERVER_NAME};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
@@ -77,13 +75,6 @@ fn liveness(a: &Args) -> Result<LivenessParams, String> {
             a.num("idle-ms", d.max_idle_timeout.as_millis() as u64)?,
         ),
     })
-}
-
-/// Write a file so a reader never sees it half written.
-fn write_atomic(path: &str, content: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, content).map_err(|e| format!("write {tmp}: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp}: {e}"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -135,7 +126,9 @@ async fn server(a: &Args) -> Result<u8, String> {
         identity.fingerprint()
     );
 
-    tokio::spawn(watch_keys(keys_dir, registry));
+    tokio::spawn(watch_keys(keys_dir, registry, |key, file| {
+        println!("REGISTERED key={key:?} file={file}");
+    }));
 
     let accepted = Arc::new(AtomicU64::new(0));
     while let Some(incoming) = endpoint.accept().await {
@@ -153,38 +146,6 @@ async fn server(a: &Args) -> Result<u8, String> {
         });
     }
     Ok(0)
-}
-
-/// Register every `*.pub` file (hex of the client's SPKI) that appears in `dir`.
-async fn watch_keys(dir: PathBuf, registry: KeyRegistry) {
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "pub")
-                    && !seen.contains(&path)
-                    && let Some(bytes) = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| hex_decode(&s))
-                {
-                    seen.insert(path.clone());
-                    let key = PublicKey::from_spki_der(bytes);
-                    println!("REGISTERED key={key:?} file={}", file_name(&path));
-                    registry.register(key);
-                    // The acknowledgement the client waits for: the bootstrap's "registered".
-                    let _ = std::fs::write(path.with_extension("registered"), b"ok");
-                }
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn file_name(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 async fn serve_connection(n: u64, conn: Connection) {
@@ -287,26 +248,7 @@ async fn client(a: &Args) -> Result<u8, String> {
 
     // Per attach: a key in memory, its public half handed to the "bootstrap" (a file), then wait
     // for the pin (the daemon's fingerprint) to come back.
-    let key = ClientKey::generate().map_err(|e| e.to_string())?;
-    write_atomic(
-        a.require("pub-out")?,
-        &hex_encode(key.public_key().as_spki_der()),
-    )?;
-    let pin_file = a.require("pin-file")?;
-    let registered = Path::new(a.require("pub-out")?).with_extension("registered");
-    let waited = Instant::now();
-    let pin: Fingerprint = loop {
-        if registered.exists()
-            && let Ok(s) = std::fs::read_to_string(pin_file)
-            && let Ok(fp) = s.trim().parse()
-        {
-            break fp;
-        }
-        if waited.elapsed() > Duration::from_secs(60) {
-            return Err("no registration and pin after 60 s".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    };
+    let (key, pin) = client_bootstrap(a).await?;
     let live = liveness(a)?;
     let cfg = auth::client_config(pin, &key, live).map_err(|e| e.to_string())?;
     let mut endpoint = Endpoint::client(local).map_err(|e| format!("endpoint: {e}"))?;

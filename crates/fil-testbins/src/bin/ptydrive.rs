@@ -36,7 +36,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use fil_testbins::pty::{CommandBuilder, PtyProc, PtyState};
 
 const IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
 const POLL: Duration = Duration::from_millis(20);
@@ -123,22 +123,6 @@ fn unescape(s: &str) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------------------------
 // The server
 
-struct Exit {
-    code: u32,
-    signal: Option<String>,
-}
-
-struct State {
-    parser: vt100::Parser,
-    raw: Vec<u8>,
-    exit: Option<Exit>,
-    /// When the program was found to have ended.
-    exit_at: Option<Instant>,
-    /// The program's output has ended (the reader saw end of file).
-    eof: bool,
-    pid: Option<u32>,
-}
-
 /// After the program ends, its last output may still be on its way from the PTY to the screen.
 /// `exited` waits for the end of the output, but not longer than this (a grandchild that keeps
 /// the PTY open would otherwise hold it for ever).
@@ -147,18 +131,11 @@ const OUTPUT_SETTLE: Duration = Duration::from_millis(500);
 /// How long `quit` lets the program take to end after SIGHUP before it uses SIGKILL.
 const QUIT_GRACE: Duration = Duration::from_secs(1);
 
-impl State {
-    /// The program has ended and everything it printed has been read.
-    fn exited(&self) -> bool {
-        self.exit.is_some()
-            && (self.eof || self.exit_at.is_some_and(|t| t.elapsed() >= OUTPUT_SETTLE))
-    }
-}
+type State = PtyState<()>;
 
-type Shared = Arc<Mutex<State>>;
-
-fn lock(s: &Shared) -> std::sync::MutexGuard<'_, State> {
-    s.lock().unwrap_or_else(|e| e.into_inner())
+/// The program has ended and everything it printed has been read.
+fn exited(st: &State) -> bool {
+    st.exit.is_some() && (st.eof || st.exit_at.is_some_and(|t| t.elapsed() >= OUTPUT_SETTLE))
 }
 
 fn screen_text(st: &State) -> String {
@@ -220,71 +197,14 @@ fn serve(args: &[String]) -> Result<(), Fail> {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).map_err(|e| io_err("cannot bind the socket", e))?;
 
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| io_err("openpty", e))?;
+    nz(rows)?;
+    nz(cols)?;
     let mut cmd = CommandBuilder::from_argv(command.iter().map(Into::into).collect());
     for (k, v) in &env {
         cmd.env(k, v);
     }
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| io_err("cannot start the program", e))?;
-    drop(pair.slave);
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| io_err("reader", e))?;
-    let writer = pair.master.take_writer().map_err(|e| io_err("writer", e))?;
+    let pty = Arc::new(PtyProc::spawn(cmd, rows, cols, ()).map_err(Fail::Io)?);
 
-    let state: Shared = Arc::new(Mutex::new(State {
-        parser: vt100::Parser::new(nz(rows)?, nz(cols)?, 0),
-        raw: Vec::new(),
-        exit: None,
-        exit_at: None,
-        eof: false,
-        pid: child.process_id(),
-    }));
-    let mut killer = child.clone_killer();
-
-    let st = state.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let mut g = lock(&st);
-            g.raw.extend_from_slice(&buf[..n]);
-            g.parser.process(&buf[..n]);
-        }
-        lock(&st).eof = true;
-    });
-    let st = state.clone();
-    std::thread::spawn(move || {
-        let status = child.wait();
-        let mut g = lock(&st);
-        g.exit_at = Some(Instant::now());
-        g.exit = Some(match status {
-            Ok(s) => Exit {
-                code: s.exit_code(),
-                signal: s.signal().map(str::to_string),
-            },
-            Err(_) => Exit {
-                code: 255,
-                signal: None,
-            },
-        });
-    });
-
-    let master = Arc::new(Mutex::new(pair.master));
-    let writer = Arc::new(Mutex::new(writer));
     let last = Arc::new(Mutex::new(Instant::now()));
     let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -311,15 +231,14 @@ fn serve(args: &[String]) -> Result<(), Fail> {
         if let Ok(mut l) = last.lock() {
             *l = Instant::now();
         }
-        let (state, master, writer, quit) =
-            (state.clone(), master.clone(), writer.clone(), quit.clone());
+        let (pty, quit) = (pty.clone(), quit.clone());
         let sockp = sock.clone();
         std::thread::spawn(move || {
             let mut conn = conn;
             let Ok(req) = read_request(&mut conn) else {
                 return;
             };
-            let (ok, body) = handle(&req, &state, &master, &writer);
+            let (ok, body) = handle(&req, &pty);
             let _ = write_reply(&mut conn, ok, &body);
             if req.first().map(String::as_str) == Some("quit") {
                 quit.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -328,14 +247,14 @@ fn serve(args: &[String]) -> Result<(), Fail> {
         });
     }
     // Stop the program: SIGHUP (portable-pty's kill), a grace period, then SIGKILL by pid.
-    if lock(&state).exit.is_none() {
-        let _ = killer.kill();
+    if pty.state().exit.is_none() {
+        pty.hangup();
         let end = Instant::now() + QUIT_GRACE;
-        while lock(&state).exit.is_none() && Instant::now() < end {
+        while pty.state().exit.is_none() && Instant::now() < end {
             std::thread::sleep(POLL);
         }
-        let pid = lock(&state).pid;
-        if let (true, Some(pid)) = (lock(&state).exit.is_none(), pid) {
+        let pid = pty.pid();
+        if let (true, Some(pid)) = (pty.state().exit.is_none(), pid) {
             // The system call itself, not the `kill` program, so PATH cannot matter.
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -347,14 +266,14 @@ fn serve(args: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
-fn status_line(st: &State) -> String {
+fn status_line(st: &State, pid: Option<u32>) -> String {
     match &st.exit {
         // Ended, but its last output is not on the screen yet: still "running" for a moment.
-        Some(e) if st.exited() => match &e.signal {
+        Some(e) if exited(st) => match &e.signal {
             Some(s) => format!("exited code={} signal={}", e.code, s.replace(' ', "_")),
             None => format!("exited code={}", e.code),
         },
-        _ => format!("running pid={}", st.pid.unwrap_or(0)),
+        _ => format!("running pid={}", pid.unwrap_or(0)),
     }
 }
 
@@ -367,12 +286,7 @@ fn seconds(t: f64) -> Duration {
     })
 }
 
-fn handle(
-    req: &[String],
-    state: &Shared,
-    master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-) -> (bool, String) {
+fn handle(req: &[String], pty: &PtyProc) -> (bool, String) {
     let Some(verb) = req.first() else {
         return (false, "empty request".into());
     };
@@ -384,13 +298,10 @@ fn handle(
             };
             match unescape(text) {
                 Err(e) => (false, e),
-                Ok(bytes) => {
-                    let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                    match w.write_all(&bytes).and_then(|()| w.flush()) {
-                        Ok(()) => (true, String::new()),
-                        Err(e) => (false, format!("write failed: {e}")),
-                    }
-                }
+                Ok(bytes) => match pty.send(&bytes) {
+                    Ok(()) => (true, String::new()),
+                    Err(e) => (false, format!("write failed: {e}")),
+                },
             }
         }
         "wait" | "gone" => {
@@ -416,7 +327,7 @@ fn handle(
             let end = Instant::now() + seconds(timeout);
             loop {
                 let (present, shown) = {
-                    let g = lock(state);
+                    let g = pty.state();
                     if raw {
                         (
                             String::from_utf8_lossy(&g.raw).contains(&pattern),
@@ -432,7 +343,7 @@ fn handle(
                 }
                 if Instant::now() >= end {
                     let shown = if raw {
-                        screen_text(&lock(state))
+                        screen_text(&pty.state())
                     } else {
                         shown
                     };
@@ -446,9 +357,9 @@ fn handle(
                 std::thread::sleep(POLL);
             }
         }
-        "screen" => (true, screen_text(&lock(state))),
-        "raw" => (true, String::from_utf8_lossy(&lock(state).raw).into_owned()),
-        "status" => (true, status_line(&lock(state))),
+        "screen" => (true, screen_text(&pty.state())),
+        "raw" => (true, String::from_utf8_lossy(&pty.state().raw).into_owned()),
+        "status" => (true, status_line(&pty.state(), pty.pid())),
         "wait-exit" => {
             let mut timeout = 10.0f64;
             if rest.first().map(String::as_str) == Some("--timeout") {
@@ -457,13 +368,13 @@ fn handle(
             let end = Instant::now() + seconds(timeout);
             loop {
                 {
-                    let g = lock(state);
-                    if g.exited() {
-                        return (true, status_line(&g));
+                    let g = pty.state();
+                    if exited(&g) {
+                        return (true, status_line(&g, pty.pid()));
                     }
                 }
                 if Instant::now() >= end {
-                    let g = lock(state);
+                    let g = pty.state();
                     return (
                         false,
                         format!(
@@ -480,22 +391,9 @@ fn handle(
             let [rows, cols] = dims[..] else {
                 return (false, "resize ROWS COLS".into());
             };
-            let m = master.lock().unwrap_or_else(|e| e.into_inner());
-            let r = m.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-            if let (Some(r), Some(c)) = (
-                std::num::NonZeroU16::new(rows),
-                std::num::NonZeroU16::new(cols),
-            ) {
-                lock(state).parser.set_size(r, c);
-            }
-            match r {
+            match pty.resize(rows, cols) {
                 Ok(()) => (true, String::new()),
-                Err(e) => (false, e.to_string()),
+                Err(e) => (false, e),
             }
         }
         "quit" => (true, String::new()),

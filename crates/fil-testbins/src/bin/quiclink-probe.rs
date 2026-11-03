@@ -17,14 +17,15 @@
 //! mismatch.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
-use fil_testbins::{Args, epoch_ms, hex_decode, hex_encode, pattern};
-use fil_transport::auth::{ClientKey, DaemonIdentity, Fingerprint, KeyRegistry, PublicKey};
+use fil_testbins::keys::{client_bootstrap, watch_keys, write_atomic};
+use fil_testbins::{Args, epoch_ms, pattern};
+use fil_transport::auth::{DaemonIdentity, KeyRegistry};
 use fil_transport::quic::{ListenError, ListenerConfig, QuicLink, QuicListener};
 use fil_transport::{DownReason, Link, LinkParams, LinkState};
 use tokio::time::{Instant, sleep, timeout};
@@ -79,12 +80,6 @@ fn params(a: &Args) -> Result<LinkParams, String> {
     })
 }
 
-fn write_atomic(path: &str, content: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, content).map_err(|e| format!("write {tmp}: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp}: {e}"))
-}
-
 fn describe(state: &LinkState) -> String {
     match state {
         LinkState::Up => "Up".into(),
@@ -137,7 +132,9 @@ async fn server(a: &Args) -> Result<u8, String> {
         "LISTEN addr={bind}:{port} port={port} range={lo}-{hi} fingerprint={}",
         identity.fingerprint()
     );
-    tokio::spawn(watch_keys(keys_dir, registry));
+    tokio::spawn(watch_keys(keys_dir, registry, |_, file| {
+        println!("REGISTERED file={file}");
+    }));
 
     let mut n = 0u64;
     while let Some(link) = listener.accept().await {
@@ -200,36 +197,6 @@ async fn serve(n: u64, link: QuicLink) {
     }
 }
 
-/// Registers every `*.pub` file (hex of the client's SPKI) that appears in `dir`.
-async fn watch_keys(dir: PathBuf, registry: KeyRegistry) {
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "pub")
-                    && !seen.contains(&path)
-                    && let Some(bytes) = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| hex_decode(&s))
-                {
-                    seen.insert(path.clone());
-                    registry.register(PublicKey::from_spki_der(bytes));
-                    println!("REGISTERED file={}", file_name(&path));
-                    let _ = std::fs::write(path.with_extension("registered"), b"ok");
-                }
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn file_name(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------------------------
 // Client
 
@@ -243,24 +210,7 @@ async fn client(a: &Args) -> Result<u8, String> {
     let reconnect_for = Duration::from_secs_f64(a.num("reconnect-for", 60.0)?);
     let params = params(a)?;
 
-    let key = ClientKey::generate().map_err(|e| e.to_string())?;
-    let pub_out = a.require("pub-out")?;
-    write_atomic(pub_out, &hex_encode(key.public_key().as_spki_der()))?;
-    let pin_file = a.require("pin-file")?;
-    let registered = Path::new(pub_out).with_extension("registered");
-    let waited = std::time::Instant::now();
-    let pin: Fingerprint = loop {
-        if registered.exists()
-            && let Ok(s) = std::fs::read_to_string(pin_file)
-            && let Ok(fp) = s.trim().parse()
-        {
-            break fp;
-        }
-        if waited.elapsed() > Duration::from_secs(60) {
-            return Err("no registration and pin after 60 s".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    };
+    let (key, pin) = client_bootstrap(a).await?;
     println!(
         "CLIENT server={server} heartbeat_ms={} degraded_ms={} dead_ms={} connect_timeout_ms={}",
         params.heartbeat.as_millis(),

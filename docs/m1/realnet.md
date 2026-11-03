@@ -12,7 +12,7 @@ It is a manual check, like the rest of `linux-check`. It is never part of `just 
 
 ## The test programs (`crates/fil-testbins`, test-only, `publish = false`)
 
-The first two drive the real binary; the rest are the stand-ins.
+The first two drive the real binary; the rest are the stand-ins. The PTY side of `ptydrive` (open, spawn, the reader and exit threads, the headless screen, send, resize, hang up) is `fil_testbins::pty::PtyProc`, which the Pi examples' harness (`crates/fil/examples/support/harness.rs`) uses too; each keeps its own waiting, because the two wait differently (a pattern with a settle time, against a closure that also stops when the client exits). The key bootstrap the two QUIC programs share (`write_atomic`, `watch_keys`, `client_bootstrap`) is `fil_testbins::keys`.
 
 | Program | What it is | Uses |
 |---|---|---|
@@ -180,7 +180,18 @@ These are defects or surprises in `fil` itself, found by this suite. None is fix
 
 ## Results: the stand-ins
 
-Three stand-in scenarios are **retired from the default run** because the real binary now covers what they showed (they still run by name, and their results below stand): `s_pipelink_echo` (PipeLink at both ends through the jumps and the noisy login: `f_proxyjump`, `f_noisy`, `f_attach_detach`), `s_pipelink_kill_ssh` (`f_kill_ssh`, which also checks the session resumes) and `s_quiclink_rebind` (`f_nat_rebind`). The rest stay: they measure what the real binary does not print (raw quinn, netem, the bare pipe's detection times, the QuicLink state changes).
+Six stand-in scenarios were **removed in M1 S6b** because the real binary, or `cargo test`, now covers what they showed. Their results are in the history of this file (the rows are gone from the tables below). What covers each:
+
+| Removed | Covered by |
+|---|---|
+| `s_pipelink_echo` (PipeLink at both ends through the jumps and the noisy login) | `f_proxyjump`, `f_noisy`, `f_attach_detach`; the `ServerAlive` options it checked are the unit test in `crates/fil-transport/src/pipe/command.rs` |
+| `s_pipelink_kill_ssh` | `f_kill_ssh`, which also checks the session resumes |
+| `s_flood` (pipe-echo) | `s_pipelink_flood`: the same 100000 bytes through the real `PipeLink` (the preamble code is the same), plus the in-process test in `crates/fil-transport/tests/pipe.rs` |
+| `s_netdown_app_heartbeat` (pipe-echo) | `s_pipelink_netdown_heartbeat`: the same black hole with ssh's keepalive off, so only the heartbeat can notice |
+| `s_port_range` | `crates/fil-transport/tests/quic_udp.rs`: `QuicListener::bind` scans the range on real UDP. The scenario only exercised quic-echo's own copy of the scan |
+| `s_quiclink_rebind` | `f_nat_rebind` (the same three NAT moves under the real client and daemon); the Retry and the `path_generation` count are in `crates/fil-transport/tests/quic_link.rs` |
+
+`s_netdown_ssh_keepalive` stays although `s_pipelink_netdown_keepalive` looks alike: it is the only run in which ssh's own keepalive is the sole detector, which proves the backstop works when fil's heartbeat is off. The rest stay too: they measure what the real binary does not print (raw quinn, netem, the bare pipe's detection times, the QuicLink state changes).
 
 From [run 41531920383](https://github.com/anthonytw/fil/actions/runs/41531920383) (GitHub `ubuntu-24.04`, image 20261021.618). Both parts passed. A fourth run of the final commit (after merging main, [run 41533608653](https://github.com/anthonytw/fil/actions/runs/41533608653)) passed too. Timings are from the first of those; ranges over the runs are noted where they matter. The ranges come from four runs of the same scripts (three for the scenarios added after the first run: NAT rebinding, the quiet and keystroke blackouts). One runner, a shared VM: treat throughput as indicative only.
 
@@ -194,16 +205,12 @@ From [run 41531920383](https://github.com/anthonytw/fil/actions/runs/41531920383
 | `s_controlmaster` | second session reuses the master | pass: no second login on the target, preamble 491 ms then 11 ms |
 | `s_certs` | login with an SSH user certificate from a per-run CA, through both jumps | pass: valid certificate works (the sshd logs show `ED25519-CERT`); the same key without the certificate, with an expired one, and with the wrong principal are refused, and the driver reports it (status 4) instead of hanging |
 | `s_noisy` | `.bashrc` prints before the program starts | pass: scanner skipped 48 bytes, reported them (control characters stripped), transfer byte-exact; 60000 bytes of noise (under the bound) also pass |
-| `s_flood` | `.bashrc` prints 100000 bytes | pass: driver gives up with "no preamble" after 204 ms, having held 96 to 128 KiB (the 64 KiB bound plus a read); remote program cleaned up |
 | `s_hostile_names` | 17 hostile names (command substitution, quotes, newlines, `-oProxyCommand=`, NUL, invalid UTF-8) inside frames | pass: all came back byte-exact, no canary file on any host, the remote command line is exactly `pipe-echo`. Control: the same text interpolated into the remote command string does run |
 | `s_kill_ssh_client` | `kill -9` the ssh client mid-stream | pass: driver sees EOF in 1 ms (1 to 4 ms), remote program exits |
 | `s_kill_sshd_child` | `kill -9` the target's per-connection sshd | pass: EOF in 6 ms (4 to 26 ms) |
-| `s_netdown_app_heartbeat` | `docker network disconnect` jump2 from the target's network; only the driver's own 5 s silence rule is active | pass: dead after **4.9 s** |
 | `s_netdown_ssh_keepalive` | same, only ssh's keepalive (`ServerAliveInterval 2`, `ServerAliveCountMax 3`) | pass: ssh gives up after **7.5 s** ("Timeout, server target not responding", status 255) |
 | `s_netdown_no_detection` | same, neither | the client was **still waiting after 25 s**. This is the control that shows why a detector is needed |
-| `s_pipelink_echo` | `PipeLink::spawn` at both ends (`pipe-probe`), through both jumps and through the noisy login | pass: byte-exact echo for 4 s, RTT 0.8 ms; ssh was started with `ServerAliveInterval=2 ServerAliveCountMax=3`; the noisy login's 48-byte banner was kept and shown with control characters stripped |
 | `s_pipelink_flood` | 100000 bytes of shell noise, through `PipeLink::spawn` | pass: refused with "no preamble" after 189 ms, 80 KiB held (the bound plus a read), the local ssh and the remote program both gone |
-| `s_pipelink_kill_ssh` | `kill -9` the ssh client under a live `PipeLink` | pass: `Down(Io)` in 1 to 2 ms, the reason names the signal, the remote program exits |
 | `s_pipelink_netdown_heartbeat` | the black hole again, with fil's ssh keepalive switched off | pass: `Degraded`, then `Down(Dead)` after **4.9 s**, and the dead link's ssh was killed |
 | `s_pipelink_netdown_keepalive` | the same with the keepalive fil normally adds (`ServerAliveInterval=2`, ssh gives up at 6 to 8 s) | pass: `Down(Dead)` after **4.9 s**, well before ssh's own 8 s, and ssh was killed at once |
 
@@ -211,8 +218,8 @@ Notes on the ssh results:
 
 - **Clean closes are instant.** A killed ssh client or a killed sshd is a FIN or reset, and the client sees EOF within milliseconds, at every hop of the jump chain.
 - **A silent black hole is not detected by ssh unless it is told to.** With no keepalive the stream just stops, with no error, for as long as the TCP connection lives (Linux's default TCP retry limit is about 15 minutes). fil's own heartbeat (`DEAD_AFTER` 5 s, over the pipe) found the break in 4.9 s without any ssh option. ssh's keepalive found it at interval times (count + 1), about 8 s, and also tears the ssh process down. Both are needed in production: the heartbeat for the fast answer, `ServerAliveInterval` so a dead ssh process does not linger.
-- **fil's heartbeat finds the black hole by itself.** `s_pipelink_netdown_heartbeat` runs the real `PipeLink` with the ssh keepalive off: the link reports `Degraded` and then `Down(Dead)` at 4.9 s, the same time as the stand-in driver, and kills the ssh process rather than leaving it behind. With the keepalive on (the default) fil still wins, because the options it adds make ssh give up no earlier than `interval x count`, which is at least `dead_after` (6 to 8 s by default).
-- The banner is a pre-authentication message: sshd sends it on stderr, never on the stream. The clean-login scenario asserts the preamble is the first thing on stdout.
+- **fil's heartbeat finds the black hole by itself.** `s_pipelink_netdown_heartbeat` runs the real `PipeLink` with the ssh keepalive off: the link reports `Degraded` and then `Down(Dead)` at 4.9 s, the same time the pipe-echo driver measured (the removed `s_netdown_app_heartbeat`), and kills the ssh process rather than leaving it behind. With the keepalive on (the default) fil still wins, because the options it adds make ssh give up no earlier than `interval x count`, which is at least `dead_after` (6 to 8 s by default).
+- The banner is a pre-authentication message: sshd sends it on stderr, never on the stream. Every real-binary scenario over a clean login depends on the preamble being the first thing on stdout.
 - Through two jumps, the handshake costs about 490 ms to the first byte, against 190 ms direct. A ControlMaster session starts in 11 ms.
 
 ### Direct QUIC over NAT and netem
@@ -221,13 +228,11 @@ Notes on the ssh results:
 |---|---|---|
 | `s_netem_reorder_probe` | does netem reorder when it adds jitter? (3000 numbered datagrams, 1 ms apart) | clean: 0 reordered. `delay 55ms 15ms`: **2269 of 3000 reordered** (up to 29 positions). The same with `rate 1gbit`: **0 reordered** |
 | `s_clean` | 32 MiB echo, byte-exact, NAT in the path | pass, one handshake in about 1 ms, 501 Mbit/s (378 to 709); the server saw `198.51.100.1`, not the client's own address; the port was in 60000 to 61000 |
-| `s_port_range` | four servers on 60000-60003, then a fifth | four distinct ports in range; the fifth exits with status 3 and `NO-FREE-PORT` |
 | `s_impaired` | 2 MiB echo under impairments (table below) | all pass: intact, one handshake each |
 | `s_nat_rebind` | three NAT moves during a 16 s stream: new public port, another new port, then a new public address. Each move re-points the SNAT rule and flushes conntrack | pass: **one handshake**, no loss of the connection, the server's path changed 3 times, learned each move after 51, 84 and 54 ms (49 to 84 ms over three runs), longest stall 140 ms (121 to 140) |
 | `s_ip_change` | add a second client address and route, switch the default route, take the first link down | pass: one handshake, the server learned the new public address after 77 ms, longest stall 180 ms |
 | `s_blackouts` | UDP dropped at the router for N seconds (table below) | pass |
 | `s_udp_blocked` | UDP dropped: how long until the client knows | pass: see below |
-| `s_quiclink_rebind` | `s_nat_rebind` through `QuicLink`: three NAT moves during a 16 s stream at 512 KiB/s | pass: see [QuicLink](#quiclink-through-the-same-faults) |
 | `s_quiclink_udp_blocked` | UDP blocked from the start, and blocked mid-session for good | pass: see below |
 | `s_quiclink_blackouts` | 3 s, 4.5 s and 8 s blackouts with the probe reconnecting as the path manager would | pass: see below |
 
@@ -270,11 +275,10 @@ Notes on the ssh results:
 
 ### QuicLink through the same faults
 
-P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink-probe` through the same topology. One run of the udp suite on a GitHub runner (linked in the pull request); all three scenarios passed, and the second run repeated the numbers within noise.
+P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink-probe` through the same topology. One run of the udp suite on a GitHub runner (linked in the pull request); both scenarios passed, and the second run repeated the numbers within noise.
 
 | Scenario | Result |
 |---|---|
-| `s_quiclink_rebind` | one accepted link, echo intact, never lost. The daemon's link counted **3 path changes** (`path_generation` 3), the last one to the third public address, and never left `Up`. The client's own `path_generation` stayed 0: a client cannot see its NAT rebind. The listener's first packet from the client got a Retry |
 | `s_quiclink_udp_blocked`, blocked from the start | `Refused` after **2000 ms**, the connect timeout, against 5 s and 15 s (the idle timeout) for raw quinn in `s_udp_blocked`. The daemon never accepted anything |
 | `s_quiclink_udp_blocked`, blocked mid-session, never lifted | `Degraded` after **2.0 to 2.1 s**, `Down(Dead)` after **5.07 s** |
 | `s_quiclink_blackouts` 3 s | survived: `Degraded`, then `Up` again, one link, echo intact |

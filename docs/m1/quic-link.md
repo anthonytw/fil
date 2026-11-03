@@ -168,4 +168,4 @@ All times are real time on an Apple M-series laptop, debug build.
 
 `just ci` runs all of them. Mutation checks (each change made by hand, the suite run, the change reverted): dropping the first-frame wait, equal stream priorities, a sweep that never closes, no Retry, `revoke` that does not close, a stable-link check that always passes, closing the pipe at `DirectUp` instead of `Switched`, no hint cooldown, a limiter that does not judge the source first, and no per-channel budget each fail at least one test.
 
-The `realnet` suite adds `s_quiclink_rebind`, `s_quiclink_udp_blocked` and `s_quiclink_blackouts` (`tests/realnet/udp.sh`), run through `quiclink-probe` in `crates/fil-testbins`. Results are in the pull request and in `docs/m1/realnet.md`.
+The `realnet` suite adds `s_quiclink_udp_blocked` and `s_quiclink_blackouts` (`tests/realnet/udp.sh`), run through `quiclink-probe` in `crates/fil-testbins`. Results are in the pull request and in `docs/m1/realnet.md`. (`s_quiclink_rebind` was removed: `f_nat_rebind` covers it.)

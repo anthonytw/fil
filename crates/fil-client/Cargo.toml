@@ -11,7 +11,7 @@ publish.workspace = true
 bytes = "1"
 fil-predict = { path = "../fil-predict" }
 fil-proto = { path = "../fil-proto" }
-fil-term = { path = "../fil-term" }
+fil-term = { path = "../fil-term", default-features = false, features = ["alacritty"] }
 fil-transport = { path = "../fil-transport" }
 # Safe termios, poll and fd I/O for the real terminal (DESIGN.md section 13).
 rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "process"] }

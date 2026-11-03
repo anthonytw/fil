@@ -4,6 +4,19 @@ use super::*;
 use PathAction::*;
 use PathInput as I;
 
+/// An attach reply over a resume, for the daemon as first seen.
+fn avail() -> PathInput {
+    info(1, false)
+}
+
+fn info(fingerprint: u8, fresh_attach: bool) -> PathInput {
+    I::DirectAvailable {
+        port: 60000,
+        fingerprint: vec![fingerprint; 32],
+        fresh_attach,
+    }
+}
+
 const S: fn(u64) -> Duration = Duration::from_secs;
 
 struct T {
@@ -58,7 +71,7 @@ impl T {
     /// Direct up and carrying, pipe closed. `t` is 30 s into the session.
     fn on_direct() -> Self {
         let mut t = Self::on_pipe_with_direct_info(TransportSetting::Auto);
-        assert_eq!(t.feed(I::DirectAvailable), [DialDirect]);
+        assert_eq!(t.feed(avail()), [DialDirect]);
         t.advance(S(1));
         assert_eq!(t.feed(I::DirectUp), [SwitchTo(LinkKind::Direct)]);
         assert_eq!(t.feed(I::Switched(LinkKind::Direct)), [ClosePipe]);
@@ -91,7 +104,7 @@ fn auto_starts_on_the_pipe_upgrades_to_direct_and_closes_the_pipe() {
     assert_eq!(t.view().carrier, Some(LinkKind::Pipe));
 
     // The attach reply says where direct is: dial in the background.
-    assert_eq!(t.feed(I::DirectAvailable), [DialDirect]);
+    assert_eq!(t.feed(avail()), [DialDirect]);
     assert_eq!(
         t.view().carrier,
         Some(LinkKind::Pipe),
@@ -115,7 +128,7 @@ fn pipe_setting_never_dials() {
     assert_eq!(t.feed(I::Start), [RunPipe]);
     t.feed(I::PipeUp);
     t.feed(I::Switched(LinkKind::Pipe));
-    assert_eq!(t.feed(I::DirectAvailable), []);
+    assert_eq!(t.feed(avail()), []);
     assert_eq!(t.feed(I::NetworkChanged), []);
     // A stray direct link is closed.
     assert_eq!(t.feed(I::DirectUp), [CloseDirect]);
@@ -135,7 +148,7 @@ fn a_daemon_without_direct_stays_on_the_pipe() {
 fn reconnect_after_a_pipe_kill_goes_direct_first_without_ssh() {
     // On the pipe, direct info known but the first dial has not happened yet (hopeful).
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable); // dial in flight
+    t.feed(avail()); // dial in flight
     t.feed(I::DirectDialFailed(refused())); // UDP blocked: waiting
     // Direct had been failing, so a killed ssh is re-run at once.
     let a = t.after(S(60), I::PipeDown(DownReason::Io("killed".into())));
@@ -204,7 +217,7 @@ fn the_direct_setting_waits_out_its_patience_after_a_failed_redial() {
     // An 8 s outage with `transport = direct`: dead at 5 s, the redial fails at 7 s (the connect
     // timeout), and the ssh login must still wait for the 10 s patience, not start at 7 s.
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Direct);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     t.advance(S(1));
     t.feed(I::DirectUp);
     t.feed(I::Switched(LinkKind::Direct));
@@ -247,27 +260,109 @@ fn the_pipe_is_not_closed_while_a_switch_to_direct_is_still_to_prove_itself() {
 }
 
 #[test]
-fn a_reply_over_direct_does_not_clear_the_flapping_backoff() {
+fn only_a_changed_bootstrap_clears_direct_backoff() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     t.advance(S(1));
     t.feed(I::DirectUp);
     t.feed(I::Switched(LinkKind::Direct)); // pipe closed
     t.advance(S(2));
     t.feed(I::DirectDown(DownReason::Dead)); // young: failure 1
     assert_eq!(t.view().direct_failures, 1);
-    // The client reports `attached` after every reply, including one received over direct.
+    // A resume reply with the same port and fingerprint, over a pipe or over direct, changes
+    // nothing.
     t.feed(I::PipeUp);
-    t.feed(I::DirectAvailable); // over the fresh pipe: a new bootstrap, clears it
+    t.feed(avail());
+    assert_eq!(t.view().direct_failures, 1);
+    // The same daemon but a fresh attach (a new key): the backoff goes.
+    t.feed(info(1, true));
     assert_eq!(t.view().direct_failures, 0);
+    // A different fingerprint (the daemon restarted) also clears it.
     t.feed(I::Switched(LinkKind::Pipe));
     t.feed(I::DirectUp);
     t.feed(I::Switched(LinkKind::Direct));
     t.advance(S(2));
     t.feed(I::DirectDown(DownReason::Dead));
     assert_eq!(t.view().direct_failures, 1);
-    t.feed(I::DirectAvailable); // no pipe link exists: this reply came over direct
-    assert_eq!(t.view().direct_failures, 1);
+    t.feed(info(2, false));
+    assert_eq!(t.view().direct_failures, 0);
+}
+
+/// Drives a manager through the documented client protocol against a direct link that comes up
+/// and dies `lifetime` after every dial, for `minutes`. Returns (ssh logins, dials).
+fn flapping_direct(minutes: u64, lifetime: Duration) -> (u64, u64) {
+    use std::collections::BTreeMap;
+    let mut t = T::new(TransportSetting::Auto);
+    let mut due: BTreeMap<(Duration, u64), PathInput> = BTreeMap::new();
+    let mut timers: std::collections::HashMap<PathTimer, u64> = Default::default();
+    let mut seq = 0u64;
+    let (mut runs, mut dials) = (0u64, 0u64);
+    let mut pending: Vec<PathInput> = vec![I::Start];
+    let end = S(60 * minutes);
+    while t.at < end {
+        for input in std::mem::take(&mut pending) {
+            for action in t.feed(input.clone()) {
+                let mut at = |d: Duration, i: PathInput, due: &mut BTreeMap<_, _>| {
+                    seq += 1;
+                    due.insert((t.at + d, seq), i);
+                };
+                match action {
+                    RunPipe => {
+                        runs += 1;
+                        at(Duration::from_millis(800), I::PipeUp, &mut due);
+                    }
+                    DialDirect => {
+                        dials += 1;
+                        at(Duration::from_millis(150), I::DirectUp, &mut due);
+                    }
+                    SwitchTo(kind) => {
+                        // The resume, then the reply is reported (a resume, same daemon).
+                        at(Duration::from_millis(50), avail(), &mut due);
+                        at(Duration::from_millis(100), I::Switched(kind), &mut due);
+                    }
+                    ScheduleRetry(timer, after) => {
+                        seq += 1;
+                        timers.insert(timer, seq);
+                        due.insert((t.at + after, seq), I::Timer(timer));
+                    }
+                    CancelTimer(timer) => {
+                        timers.remove(&timer);
+                    }
+                    ClosePipe | CloseDirect => {}
+                }
+            }
+            if input == I::DirectUp {
+                seq += 1;
+                due.insert((t.at + lifetime, seq), I::DirectDown(DownReason::Dead));
+            }
+        }
+        let Some(((at, id), input)) = due.pop_first() else {
+            break;
+        };
+        if let I::Timer(timer) = &input
+            && timers.get(timer) != Some(&id)
+        {
+            continue; // cancelled or replaced
+        }
+        if let I::Timer(timer) = &input {
+            timers.remove(timer);
+        }
+        t.at = t.at.max(at);
+        pending.push(input);
+    }
+    (runs, dials)
+}
+
+#[test]
+fn a_direct_link_that_dies_young_does_not_cause_an_ssh_login_storm() {
+    // Direct comes up and dies 3 s later, forever, and the client reports `DirectAvailable`
+    // after every reply, as the client contract says. Ten minutes.
+    let (runs, dials) = flapping_direct(10, S(3));
+    // The backoff doubles each cycle (1, 2, 4 ... 120 s), so ten minutes is about a dozen
+    // cycles. With the backoff cleared by every reply it was 150 logins.
+    assert!(runs <= 20, "{runs} ssh logins in ten minutes");
+    assert!(dials <= 20, "{dials} dials in ten minutes");
+    assert!(runs >= 5 && dials >= 5, "it keeps trying: {runs}, {dials}");
 }
 
 #[test]
@@ -278,9 +373,9 @@ fn a_daemon_restart_needs_a_new_bootstrap_and_dials_the_new_port() {
     t.after(S(3), I::Timer(PathTimer::PipeFallback)); // RunPipe
     t.feed(I::PipeUp);
     t.feed(I::Switched(LinkKind::Pipe));
-    // Fresh bootstrap over the new pipe: new key, new port. The backoff is forgotten.
+    // Bootstrap over the new pipe: a new daemon, so a new fingerprint. The backoff is forgotten.
     assert_eq!(t.view().direct, Lane::Waiting);
-    let a = t.after(S(1), I::DirectAvailable);
+    let a = t.after(S(1), info(2, false));
     assert_eq!(a, [CancelTimer(PathTimer::DirectRetry), DialDirect]);
     assert_eq!(t.view().direct_failures, 0);
 }
@@ -288,7 +383,7 @@ fn a_daemon_restart_needs_a_new_bootstrap_and_dials_the_new_port() {
 #[test]
 fn direct_setting_waits_longer_before_an_ssh_login() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Direct);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     t.advance(S(1));
     t.feed(I::DirectUp);
     t.feed(I::Switched(LinkKind::Direct));
@@ -304,7 +399,7 @@ fn direct_setting_waits_longer_before_an_ssh_login() {
 #[test]
 fn udp_blocked_keeps_the_pipe_and_retries_with_growing_delays() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    assert_eq!(t.feed(I::DirectAvailable), [DialDirect]);
+    assert_eq!(t.feed(avail()), [DialDirect]);
     let mut delays = vec![];
     for _ in 0..12 {
         let a = t.after(S(2), I::DirectDialFailed(refused()));
@@ -340,7 +435,7 @@ fn udp_blocked_keeps_the_pipe_and_retries_with_growing_delays() {
 #[test]
 fn a_flapping_direct_link_slows_down_and_a_stable_one_resets() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     let mut delays = vec![];
     for _ in 0..5 {
         t.advance(Duration::from_millis(300));
@@ -373,7 +468,7 @@ fn a_flapping_direct_link_slows_down_and_a_stable_one_resets() {
 #[test]
 fn a_switch_that_fails_keeps_the_pipe_and_counts_as_a_failure() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     assert_eq!(t.feed(I::DirectUp), [SwitchTo(LinkKind::Direct)]);
     let a = t.feed(I::SwitchFailed(LinkKind::Direct));
     assert_eq!(a[0], CloseDirect);
@@ -437,7 +532,7 @@ fn a_failed_pipe_run_is_retried_with_backoff_and_direct_is_tried_meanwhile() {
 #[test]
 fn a_network_change_dials_direct_immediately_and_forgets_the_backoff() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     for _ in 0..6 {
         let a = t.after(S(2), I::DirectDialFailed(refused()));
         let d = delay_of(&a, PathTimer::DirectRetry).unwrap();
@@ -465,7 +560,7 @@ fn a_network_change_dials_direct_immediately_and_forgets_the_backoff() {
 #[test]
 fn hints_are_budgeted() {
     let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
-    t.feed(I::DirectAvailable);
+    t.feed(avail());
     t.feed(I::DirectDialFailed(refused()));
     let mut dials = 0;
     // A hint every 2.5 s for ten minutes, with every dial failing at once.
@@ -773,7 +868,7 @@ impl World {
                 self.feed(if r == 0 {
                     I::DirectUnavailable
                 } else {
-                    I::DirectAvailable
+                    avail()
                 });
             }
         }
@@ -815,7 +910,7 @@ fn storm(setting: TransportSetting, hint_every: Option<Duration>, hours: u64) ->
         42,
     );
     w.feed(I::Start);
-    w.feed(I::DirectAvailable);
+    w.feed(avail());
     let end = S(3600 * hours);
     let mut next_hint = hint_every;
     while w.t.at < end {
@@ -929,7 +1024,7 @@ fn a_healthy_world_converges_to_direct_and_stays_there() {
                 w.feed(I::Switched(k));
             }
             if w.t.view().carrier == Some(LinkKind::Pipe) {
-                w.feed(I::DirectAvailable);
+                w.feed(avail());
             }
             if let Some((due, i)) = w.timers.iter().next().copied() {
                 w.timers.remove(&(due, i));

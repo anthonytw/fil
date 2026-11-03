@@ -20,7 +20,7 @@
 //! |---|---|
 //! | starts, or has no link and no bootstrap information | `Start` |
 //! | has a pipe link (before it attaches over it) | `PipeUp`; the pipe run failed, or the link ended: `PipeDown` |
-//! | received an attach reply | `DirectAvailable` or `DirectUnavailable`, from its UDP port, after *every* reply |
+//! | received an attach reply | `DirectAvailable { port, fingerprint, fresh_attach }` or `DirectUnavailable`, after *every* reply |
 //! | dialed direct | `DirectUp` or `DirectDialFailed`; the link ended: `DirectDown` |
 //! | finished the resume on the link it was told to switch to | `Switched(kind)`, or `SwitchFailed(kind)` |
 //! | the OS says the network changed, or a timer it was asked for fired | `NetworkChanged`, `Timer(..)` |
@@ -140,11 +140,20 @@ pub enum PathInput {
     PipeUp,
     /// A pipe run failed, or the pipe link ended.
     PipeDown(DownReason),
-    /// An attach reply carried a UDP port and fingerprint, so direct can be dialed. Reported after
-    /// every reply. A reply that arrives while a pipe link exists comes from a fresh bootstrap
-    /// (the key was just registered and the port may have changed), so it clears direct's
-    /// backoff and a waiting dial starts at once; a reply over direct changes nothing.
-    DirectAvailable,
+    /// An attach reply carried a UDP port and fingerprint, so direct can be dialed. Reported
+    /// after every reply, over either transport.
+    ///
+    /// The manager compares it with the last one it saw. Direct's backoff is cleared (and a
+    /// waiting dial starts at once) only when the bootstrap really changed: the port or
+    /// fingerprint differ (the daemon restarted), or `fresh_attach` says this was a new attach
+    /// with a new key rather than a resume. Clearing it on every reply would let a direct link that
+    /// keeps dying young trigger an ssh login every few seconds.
+    DirectAvailable {
+        port: u16,
+        fingerprint: Vec<u8>,
+        /// True if the reply answered a fresh attach (a new key), false for a resume.
+        fresh_attach: bool,
+    },
     /// The daemon does not offer direct (no port in the attach reply).
     DirectUnavailable,
     /// [`PathAction::DialDirect`] succeeded: a direct link is `Up`.
@@ -166,7 +175,7 @@ pub enum PathInput {
 }
 
 /// The timers the manager asks for. Scheduling one that is already pending replaces it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PathTimer {
     /// Dial direct again.
     DirectRetry,
@@ -259,6 +268,8 @@ pub struct PathView {
 pub struct PathManager {
     cfg: PathConfig,
     info: Info,
+    /// The port and fingerprint of the last `DirectAvailable`.
+    last_info: Option<(u16, Vec<u8>)>,
     pipe: Lane,
     direct: Lane,
     carrier: Option<LinkKind>,
@@ -279,6 +290,7 @@ impl PathManager {
         Self {
             cfg,
             info: Info::Unknown,
+            last_info: None,
             pipe: Lane::Idle,
             direct: Lane::Idle,
             carrier: None,
@@ -322,9 +334,16 @@ impl PathManager {
             PathInput::Start => self.on_start(now, &mut out),
             PathInput::PipeUp => self.on_pipe_up(now, &mut out),
             PathInput::PipeDown(_) => self.on_pipe_down(now, &mut out),
-            PathInput::DirectAvailable => {
+            PathInput::DirectAvailable {
+                port,
+                fingerprint,
+                fresh_attach,
+            } => {
                 self.info = Info::Available;
-                if self.pipe == Lane::Up {
+                let seen = (port, fingerprint);
+                let changed = self.last_info.as_ref() != Some(&seen);
+                self.last_info = Some(seen);
+                if changed || fresh_attach {
                     self.direct_failures = 0;
                     if self.direct == Lane::Waiting {
                         self.direct = Lane::Idle;
@@ -334,6 +353,7 @@ impl PathManager {
             }
             PathInput::DirectUnavailable => {
                 self.info = Info::Unavailable;
+                self.last_info = None;
                 if self.direct == Lane::Waiting {
                     self.direct = Lane::Idle;
                     self.cancel(PathTimer::DirectRetry, &mut out);

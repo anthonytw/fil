@@ -15,6 +15,7 @@
 //! client cannot make it grow, and it never panics on any input (`tests/socks.rs` and the
 //! `cargo-fuzz` target in `fuzz/`).
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 
@@ -34,14 +35,23 @@ pub enum Version {
 }
 
 /// A complete CONNECT request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     pub version: Version,
     pub target: Target,
 }
 
+/// The version only: the target is user data (DESIGN.md section 11.1).
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What the handshake wants next.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Progress {
     /// Read more from the client.
     NeedMore,
@@ -51,6 +61,17 @@ pub enum Progress {
     /// The request is complete. Open the channel, then answer with [`reply`]. Bytes the client
     /// sent after it are in [`Handshake::rest`].
     Connect(Request),
+}
+
+/// No bytes and no target.
+impl fmt::Debug for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Progress::NeedMore => f.write_str("NeedMore"),
+            Progress::Send(b) => write!(f, "Send({} bytes)", b.len()),
+            Progress::Connect(r) => f.debug_tuple("Connect").field(r).finish(),
+        }
+    }
 }
 
 /// Why a handshake ended.
@@ -96,11 +117,23 @@ enum Stage {
 
 /// One client's handshake. Feed it what the client sent ([`Handshake::feed`]) and act on
 /// [`Handshake::advance`] until it is `NeedMore`, `Connect` or an error.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Handshake {
     buf: Vec<u8>,
     stage: Stage,
     version: Option<Version>,
+}
+
+/// Counts and states only: the buffer holds the request (its target) and early application
+/// bytes.
+impl fmt::Debug for Handshake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Handshake")
+            .field("stage", &self.stage)
+            .field("version", &self.version)
+            .field("buffered", &self.buf.len())
+            .finish()
+    }
 }
 
 impl Default for Handshake {
@@ -238,7 +271,11 @@ impl Handshake {
                 };
                 let mut o = [0u8; 16];
                 o.copy_from_slice(a);
-                (TargetHost::Ip(IpAddr::V6(Ipv6Addr::from(o))), 20)
+                // An IPv4-mapped address is the IPv4 address it is.
+                (
+                    TargetHost::Ip(IpAddr::V6(Ipv6Addr::from(o)).to_canonical()),
+                    20,
+                )
             }
             3 => {
                 let Some(&n) = b.get(4) else {
@@ -308,12 +345,12 @@ fn host_from_name(raw: &[u8]) -> Result<TargetHost, SocksError> {
     let s = std::str::from_utf8(raw).map_err(|_| SocksError::BadTarget)?;
     let s = s.strip_suffix('.').unwrap_or(s);
     if let Ok(ip) = s.parse::<IpAddr>() {
-        return Ok(TargetHost::Ip(ip));
+        return Ok(TargetHost::Ip(ip.to_canonical()));
     }
     if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']'))
         && let Ok(ip) = inner.parse::<Ipv6Addr>()
     {
-        return Ok(TargetHost::Ip(IpAddr::V6(ip)));
+        return Ok(TargetHost::Ip(IpAddr::V6(ip).to_canonical()));
     }
     DnsName::new(s)
         .map(TargetHost::Name)

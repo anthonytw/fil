@@ -160,7 +160,7 @@ From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104
 | `f_nat_rebind` | three NAT moves under a 22 s output run (new port, another new port, a new address; each flushes conntrack). After each move the router's `conntrack -L` must show the client's flow mapped to the new address and a port in the new range, or the scenario fails | pass: `TICK-1` to `TICK-90` once each in order, no gap marker, **no further switch** after the upgrade and no ssh started: the session stayed on direct |
 | `f_udp_blocked_mid` | UDP dropped for good in the middle of an output run | pass: a new ssh was running **5.1 to 5.2 s** after the block (QUIC `Degraded` at 2 s, `Down(Dead)` at 5 s, then the pipe); `TICK-1` to `TICK-120` once each in order across the fallback. After the block was lifted the client went back to direct **11 to 16 s later** (the path manager's retry backoff) |
 | `f_udp_blocked_start` | UDP dropped before the attach | pass: first prompt at 0.8 s (QUIC does not delay the pipe); 15 s of output over the pipe, never switched; 3 to 4 failed direct dials in that time, none visible to the user |
-| `f_dropin_vim_nat`, `f_dropin_vim_loss`, `f_dropin_vs_ssh` | the drop-in suite's network part (`docs/m1/dropin.md`): typing into vim across three NAT moves, and across UDP loss, a 6 s blackout and more loss; the same everyday battery through `ssh -tt` and through fil | pass: every typed line reached the file in order; the final screens match ssh's; a 4 MB `cat` reaches fil's scrollback with a gap marker (about 25000 of 50000 lines) where ssh keeps all (`dropin.md` finding 2) |
+| `f_dropin_vim_nat`, `f_dropin_vim_loss`, `f_dropin_vs_ssh` | the drop-in suite's network part (`docs/m1/dropin.md`): typing into vim across three NAT moves, and across UDP loss, a 9 s blackout (long enough that the pipe always starts: dead at about 4.6 s plus the 3 s fallback) and more loss; the same everyday battery through `ssh -tt` and through fil | pass: every typed line reached the file in order; the final screens match ssh's; a 4 MB `cat` reaches fil's scrollback with a gap marker (about 25000 of 50000 lines) where ssh keeps all (`dropin.md` finding 2) |
 
 ### systemd host (`sysd`)
 
@@ -288,6 +288,30 @@ P2's `QuicLink` and `QuicListener` (`docs/m1/quic-link.md`), driven by `quiclink
 | `s_quiclink_blackouts` 8 s | lost at 5.07 s; fresh handshake **275 ms** after the network returned |
 
 The quic-echo blackout result stands: a link that is quiet when the network comes back is lost at the idle timeout whether the blackout lasted 4.5 s or 8 s. What changes is what the layer above sees: the link says so (`Down(Dead)`) 5 s after the last datagram, never later, and the redial takes about 0.3 to 0.7 s, so the worst case for a blackout of N seconds is about max(N, 5) + 0.7 s.
+
+### A busy link through a 3 s blackout (the window floor)
+
+`s_quiclink_blackouts` expects the 3 s case to survive (`dead_after` is 5 s), and on the seat's aarch64 VM (`docs/dev/vm.md`) it did not, most of the time: `Down(Dead)` about 4.6 to 4.7 s after the cut, then a fresh handshake. A packet-gap log in `quiclink-probe` (quinn's datagram counters sampled every 2 ms, on both ends) showed why, in a lost run (times from the cut, heal at 3.0 s, 20 ms each way):
+
+| | What it sent |
+|---|---|
+| client (streaming 256 KiB/s, window full) | quinn's probe timeouts only, two datagrams each, about 0.43, 0.74, 1.34 and 2.54 s (gaps 0.15, 0.3, 0.6, 1.2 s); the next would have been about 4.9 s. No keep-alive and no acknowledgements: quinn 0.11 skips the whole packet space while it is congestion-blocked |
+| daemon (echo, window not full) | its own probe timeouts, then its 1.5 s keep-alive at 3.85 s, which got through |
+| result | the client heard the daemon at 3.88 s and could not answer it; the daemon heard nothing after the cut and declared `Down(Dead)` at 4.62 s (silence measured from the sample before the last datagram, up to 0.5 s early, §8.5) |
+
+In the runs that survived, a probe from the daemon that carried acknowledgements got through after the heal and freed the client's window. Which happened first depended on a few tens of milliseconds, which is why `tcpdump` on the server made it pass. On a quieter link (window not full) quinn's keep-alive caps the gap at a heartbeat, so the quiet blackouts above were never affected.
+
+The fix is in `crates/fil-transport/src/quic/floor.rs` (DESIGN.md §8.5, liveness): while a link's window is full and nothing has been sent or acknowledged for half a heartbeat, one transmit may take two datagrams past it, and the link's supervisor wakes quinn when that is due. With it, the logged run shows the client sending two datagrams every 0.5 s through the outage (1.22, 1.73, 2.23, 2.73, 3.23 s); the one at 3.23 s, just after the heal, reached the daemon, and both ends were `Up` at 3.33 s. Same VM, the `s_quiclink_blackouts` cases repeated, no packet log (it shifts the timing):
+
+| Blackout | Before | After |
+|---|---|---|
+| 3.0 s | 11 of 20 survived; the 9 lost were all `Down(Dead)` 4.68 s after the cut | **20 of 20 survived** |
+| 4.5 s | 5 of 5 lost (4.53 to 5.19 s) | 5 of 5 lost (`Down(Dead)` 4.58 to 4.68 s after the cut), fresh handshake 0.19 to 0.28 s after the network returned |
+| 8.0 s | 3 of 3 lost (4.63 to 4.68 s) | 3 of 3 lost at 4.58 to 4.63 s, fresh handshake 1.08 to 1.14 s after it returned |
+
+On GitHub's x86_64 runner the 3 s case had survived in all 22 earlier attempts of the suite, so there the margin was thin but held; the 4.5 s and 8 s cases were lost at the same 4.67 s. With the floor, two runs of this branch: 3 s survived, 4.5 s lost at 4.67 s (fresh handshake 0.26 to 0.27 s after the heal), 8 s lost at 4.67 s (1.17 to 1.18 s), as DESIGN expects: a link survives an outage that ends early enough for a probe sent at most half a heartbeat later to arrive within `dead_after` of the last datagram.
+
+The `quic-echo` scenarios (`s_clean`, `s_impaired`, `s_blackouts` and the other raw-quinn rows above) run quinn's stock Cubic without the floor, by design: they measure quinn itself, with fil's authentication (`auth::*_config`), not the link.
 
 ## Real versus simulator
 

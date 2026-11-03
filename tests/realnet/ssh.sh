@@ -588,18 +588,51 @@ fk() { cx fil kill "$1" "$2" > /dev/null 2>&1 || true; }
 # regression without failing the run.
 DETACH_LOST_MAX=${DETACH_LOST_MAX:-0}
 
+# ls_cell OUT SESSION COLUMN: prints one cell of `fil ls` output OUT (the session's row, the
+# column named in the header: NAME, TERM, FORWARDS, ATTACHED, "LAST OUTPUT" or CREATED). The table
+# is padded: the header's column names, each followed by two spaces or the end of the line, give
+# every column's offset, and a cell may hold spaces ("client for 3s"). Nothing counts fields, so a
+# column added to `fil ls` (FORWARDS came in with M2 F4) cannot shift the one a scenario reads.
+# Prints nothing and returns 1 when the session has no row; fails the scenario when the header has
+# no such column (a renamed or removed column must be noticed, not read as "no match").
+ls_cell() {
+  local out=$1 session=$2 column=$3 rc=0
+  awk -v s="$session" -v col="$column" '
+    !n && /^NAME  / {
+      rest = $0; off = 0
+      while (match(rest, /[^ ]+( [^ ]+)*/)) {
+        n++; start[n] = off + RSTART; name[n] = substr(rest, RSTART, RLENGTH)
+        off += RSTART + RLENGTH - 1; rest = substr(rest, RSTART + RLENGTH)
+      }
+      for (i = 1; i <= n; i++) if (name[i] == col) c = i
+      if (!c) { bad = 1; exit }
+      next
+    }
+    n {
+      first = substr($0, start[1], start[2] - start[1]); sub(/ +$/, "", first)
+      if (first == s) {
+        end = (c < n) ? start[c + 1] : length($0) + 3
+        cell = substr($0, start[c], end - start[c]); sub(/ +$/, "", cell); print cell; found = 1; exit
+      }
+    }
+    END { if (bad) exit 3; exit !found }
+  ' <<< "$out" || rc=$?
+  [[ $rc -ne 3 ]] || fail "fil ls has no $column column in its header: $out"
+  return "$rc"
+}
+
 # ls_detached HOST SESSION [MS]: polls `fil ls HOST` until SESSION is listed as not attached (the
 # ATTACHED column is "-"), for at most MS milliseconds (default 5000). Returns 0 once it is, 1 if
 # it is still listed as attached at the deadline. The session not being listed at all is a failure
 # of the scenario (the daemon lost it), never a "lost detach". Sets LS_OUT.
 ls_detached() {
-  local host=$1 session=$2 limit=${3:-5000} deadline
+  local host=$1 session=$2 limit=${3:-5000} deadline attached
   deadline=$(($(now_ms) + limit))
   while :; do
     LS_OUT=$(cx fil ls "$host")
-    awk -v s="$session" '$1 == s { f = 1 } END { exit !f }' <<< "$LS_OUT" \
+    attached=$(ls_cell "$LS_OUT" "$session" ATTACHED) \
       || fail "fil ls does not list the session $session at all: $LS_OUT"
-    if awk -v s="$session" '$1 == s && $3 == "-" { f = 1 } END { exit !f }' <<< "$LS_OUT"; then return 0; fi
+    if [[ $attached == - ]]; then return 0; fi
     [[ $(now_ms) -lt $deadline ]] || return 1
     sleep 0.1
   done
@@ -687,7 +720,7 @@ f_ls_kill_detach() {
   fc_ready a
   local out
   out=$(cx fil ls direct)
-  awk '$1 == "lkd" && $3 == "client" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls: 'lkd' should show the attached client: $out"
+  [[ $(ls_cell "$out" lkd ATTACHED) == 'client for '* ]] || fail "fil ls: 'lkd' should show the attached client: $out"
   ok "fil ls shows who is attached"
 
   out=$(cx fil detach direct lkd)
@@ -696,7 +729,7 @@ f_ls_kill_detach() {
   fc_answer a n
   fc_expect_exit a 1
   out=$(cx fil ls direct)
-  awk '$1 == "lkd" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls after detach: $out"
+  [[ $(ls_cell "$out" lkd ATTACHED) == - ]] || fail "fil ls after detach: $out"
   ok "after fil detach the session is listed as detached, and it kept running"
 
   fc_start b -- direct lkd
@@ -729,7 +762,7 @@ f_takeover() {
   fc_wait a 'by client2' 5
   local out
   out=$(cx fil ls viajumps)
-  awk '$1 == "tk" && $3 == "client2" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls should show client2 as attached: $out"
+  [[ $(ls_cell "$out" tk ATTACHED) == 'client2 for '* ]] || fail "fil ls should show client2 as attached: $out"
   fc_answer a n
   fc_expect_exit a 1
   fc_has a 'taken over by client2' || fail "no final message on the first client: $(fc_screen a)"

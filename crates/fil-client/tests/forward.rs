@@ -635,3 +635,101 @@ async fn an_own_forward_the_new_table_never_answers_is_closed_not_left_hanging()
     assert!(!rig.is_finished());
     Ok(())
 }
+
+/// The new table answers an own `-L` only after `open_wait` (re-check 2): the listener was
+/// closed meanwhile (an application was refused, not left hanging), and the late answer is still
+/// taken: the forward listens again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_still_brings_the_forward_back() -> Test {
+    let server = echo_server().await;
+    let mine = free_port();
+    let rig = attached(
+        vec![local(mine, server.port)],
+        Rules {
+            open_wait: Some(Duration::from_secs(1)),
+            ..Rules::default()
+        },
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("asked again", 5, || !fwd.st.lock().unwrap().held.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(
+        connect(mine).await.is_none(),
+        "still listening past open_wait"
+    );
+    until("the warning", 5, || rig.term.text().contains("did not")).await;
+    let reports = fwd.st.lock().unwrap().listening.len();
+    fwd.release_adds();
+    eventually("listening again", 5, || {
+        fwd.st.lock().unwrap().listening.len() > reports
+    })
+    .await;
+    let mut app = connect(mine).await.expect("the own -L listens again");
+    assert!(round_trip(&mut app, b"after the late answer").await);
+    assert!(!rig.is_finished());
+    Ok(())
+}
+
+/// Time with no link does not count toward `open_wait`, and the run does not fail for it, even
+/// under `forward_failure = "exit"`: the link drops right after a take-back and stays down past
+/// `open_wait`; once it is back the answer arrives and the forward is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_link_no_failure_while_an_answer_is_awaited() -> Test {
+    let server = echo_server().await;
+    let mine = free_port();
+    let rig = attached(
+        vec![local(mine, server.port)],
+        Rules {
+            failure: ForwardFailure::Exit,
+            open_wait: Some(Duration::from_secs(2)),
+            ..Rules::default()
+        },
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("asked again", 5, || !fwd.st.lock().unwrap().held.is_empty()).await;
+    // The link goes, and stays gone past open_wait.
+    rig.dial.fail_all(true);
+    rig.daemon.kill_link(DownReason::Dead).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(!rig.is_finished(), "failed for time with no link");
+    // An application meanwhile is refused, not left hanging.
+    assert!(connect(mine).await.is_none());
+    let attaches = rig.daemon.attaches().await.len();
+    rig.dial.fail_all(false);
+    common::until_async("the resume", 10, || {
+        let d = rig.daemon.clone();
+        async move { d.attaches().await.len() > attaches }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fwd.release_adds();
+    eventually("listening again", 5, || {
+        let st = fwd.st.lock().unwrap();
+        st.listening
+            .last()
+            .is_some_and(|(_, s)| matches!(s, ListenState::Listening { .. }))
+    })
+    .await;
+    let mut app = connect(mine).await.expect("the own -L listens");
+    assert!(round_trip(&mut app, b"back").await);
+    assert!(!rig.is_finished());
+    Ok(())
+}

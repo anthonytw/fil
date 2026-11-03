@@ -59,7 +59,7 @@ use fil_proto::mux::{
     BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState, MuxMsg,
     OpenFailure, OpenKind, Origin, Side,
 };
-use fil_transport::{Link, LinkError};
+use fil_transport::{Link, LinkError, LinkState};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -214,6 +214,8 @@ enum ToManager {
         token: u64,
         yes: bool,
     },
+    /// A link was attached (any: a fresh attach, a reconnect, a swap).
+    Attached,
 }
 
 // ---- the policy and the connector --------------------------------------------------------------
@@ -282,6 +284,15 @@ impl<L: Link> Forwards<L> {
         let (to_manager, from_router) = mpsc::unbounded_channel();
         let (notes, notes_rx) = mpsc::unbounded_channel();
         let view = Arc::new(Mutex::new(View::default()));
+        // At most `MAX_FORWARDS` own specs (the plan refuses more; the daemon would too), which
+        // also keeps `private_id` inside its range.
+        if set.specs.len() > MAX_OWN {
+            debug!(
+                specs = set.specs.len(),
+                "more own forwards than a session holds; the rest dropped"
+            );
+            set.specs.truncate(MAX_OWN);
+        }
         let mut prebound = std::mem::take(&mut set.prebound).0;
         prebound.resize_with(set.specs.len(), || None);
         let own = set
@@ -298,6 +309,7 @@ impl<L: Link> Forwards<L> {
                 req: None,
                 id: None,
                 bind_reported: false,
+                wait_failed: false,
                 port: None,
             })
             .collect();
@@ -398,6 +410,7 @@ impl<L: Link> Router<L> {
     /// continued the session (a reconnect or a swap: the same mux epoch); otherwise it is a fresh
     /// attach and a new epoch starts, with the manager's table forgotten first.
     async fn attach(&self, link: &Arc<L>, resumed: bool) {
+        let before = lock(&self.current).clone();
         if !resumed {
             // Under the manager's epoch lock: it acts on no event of the old epoch after this.
             {
@@ -410,8 +423,22 @@ impl<L: Link> Router<L> {
             }
         }
         let mut cur = lock(&self.current);
+        // A fresh attach waited for the manager: if this link died meanwhile, or another one was
+        // attached after it, it must not take the endpoint from that one.
+        let moved = !resumed
+            && match (&before, &*cur) {
+                (None, None) => false,
+                (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                _ => true,
+            };
+        if moved || matches!(link.status().borrow().state, LinkState::Down(_)) {
+            debug!("not attaching a link that died or was overtaken");
+            return;
+        }
         self.ep.attach_link(link.clone(), resumed);
         *cur = Some(link.clone());
+        drop(cur);
+        let _ = self.to_manager.send(ToManager::Attached);
     }
 
     /// Hands the endpoint a payload `link` delivered, if the endpoint is on `link`. Once it has
@@ -589,6 +616,8 @@ struct Own {
     listener: Listener,
     /// A bind failure was said already (before the attach, or since).
     bind_reported: bool,
+    /// Its answer did not come in time over a working link, and that was said.
+    wait_failed: bool,
     /// The port it listens on (an `-R 0`'s comes from the daemon).
     port: Option<u16>,
 }
@@ -639,7 +668,15 @@ const MAX_GONE: usize = 4096;
 /// from 0 and never come near; one in this range is a protocol error.
 const PRIVATE_IDS: u32 = u32::MAX - 1023;
 
+/// Most own specs a run carries: a session holds [`fil_proto::limits::MAX_FORWARDS`].
+const MAX_OWN: usize = fil_proto::limits::MAX_FORWARDS;
+const _: () = assert!(
+    MAX_OWN as u64 <= (u32::MAX - PRIVATE_IDS) as u64 + 1,
+    "every own spec has a private id"
+);
+
 fn private_id(i: usize) -> ForwardId {
+    debug_assert!(i < MAX_OWN);
     ForwardId(u32::MAX - u32::try_from(i).expect("at most MAX_FORWARDS own specs"))
 }
 
@@ -725,6 +762,7 @@ impl<L: Link> Manager<L> {
                         let _ = done.send(());
                     }
                     Some(ToManager::Answer { id, token, yes }) => self.on_answer(id, token, yes),
+                    Some(ToManager::Attached) => self.attached(),
                 },
                 () = at(self.unanswered_by), if self.unanswered_by.is_some() => {
                     let gate = self.epoch_lock.clone();
@@ -748,13 +786,18 @@ impl<L: Link> Manager<L> {
     /// The new table did not answer some own forwards in time: their listeners (paused since the
     /// fresh attach) close, so an application waiting in the backlog is refused rather than left
     /// hanging; the bind is tried again at the next fresh attach.
+    ///
+    /// The request stays: an answer that comes later (a link that stalled and resumed) is still
+    /// taken, and the forward listens again. And the run fails (`forward_failure`) only for a
+    /// host that did not answer over a working link: with no link the time does not count, and
+    /// the next attach starts the wait over ([`ToManager::Attached`]).
     fn unanswered(&mut self) {
         self.unanswered_by = None;
+        let live = self.ep.snapshot().attached;
         for i in 0..self.own.len() {
             if self.own[i].req.is_none() {
                 continue;
             }
-            self.own[i].req = None;
             match std::mem::replace(&mut self.own[i].listener, Listener::None) {
                 Listener::On(parked) => {
                     self.ep.unlisten(parked);
@@ -763,8 +806,18 @@ impl<L: Link> Manager<L> {
                 Listener::Prebound(b) => drop(b),
                 Listener::None => {}
             }
-            let text = format!("{}: the host did not answer", describe(&self.own[i].spec));
-            self.failed(text);
+            if live && !std::mem::replace(&mut self.own[i].wait_failed, true) {
+                let text = format!("{}: the host did not answer", describe(&self.own[i].spec));
+                self.failed(text);
+            }
+        }
+    }
+
+    /// A link was attached (a reconnect or a swap): own forwards still waiting for their answer
+    /// get the full wait again, now that there is a link to answer over.
+    fn attached(&mut self) {
+        if self.own.iter().any(|o| o.req.is_some()) {
+            self.unanswered_by = Some(tokio::time::Instant::now() + self.answer_wait);
         }
     }
 
@@ -856,6 +909,7 @@ impl<L: Link> Manager<L> {
             self.next_req = self.next_req.wrapping_add(1);
             self.own[i].req = Some(req);
             self.own[i].id = None;
+            self.own[i].wait_failed = false;
             let spec = self.own[i].spec.clone();
             self.send(MuxMsg::AddForward { req, spec });
         }
@@ -961,6 +1015,7 @@ impl<L: Link> Manager<L> {
         }
         let o = &mut self.own[i];
         o.req = None;
+        o.wait_failed = false;
         if let Some(old) = o.id.replace(id)
             && old != id
         {

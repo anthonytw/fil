@@ -623,7 +623,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. |
 | OD-9 | The `-R` peer check (`same-user`) | §11 table row "`-R` ports on 127.0.0.1" | Ship it as an option, default `any` (ssh parity). |
 | OD-10 | The NODELAY remedy, if L1 finds Nagle (for example `ssh -tt` with the relay setting raw mode before the preamble: a pty, utmp entries, stderr merged into the stream), and forward pacing (H1) | §8.2 (the pipe invocation; the remote command itself stays fixed) | Decide on L1's data; avoid `-tt` unless p50 improves by more than 20 ms. |
-| OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. |
+| OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. **Decided 2026-11-03:** the owner made the repo public, so Actions minutes are no longer scarce; T1 skipped the local cross build (the CI `aarch64` job builds `fil` and `fwdprobe`), and a seat-owned Lima VM runs realnet locally. |
 | OD-12 | `-N` tunnel-only mode | §2 non-goal | Not in M2; consider it for M4 ("autossh replacement"). |
 
 **Decision status (coordinator, 2026-11-03).** The owner asked for M1 to M2 to run without waiting on them. They still decide access changes, router changes and anything that weakens a §11 invariant. So:
@@ -633,7 +633,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
   - **OD-5** (destination-constrained keys through the relay). Interim: the agent stays off by default, and the limitation is documented. A1 must not turn the agent on anywhere by default.
   - **OD-7** (non-loopback `-R` bind). Interim: refused, with a message naming the decision, until the owner rules.
   - **OD-8** (bypassing sshd's forwarding and agent switches). Interim: documented in §11 as a known property; no policy file.
-  - **OD-11** (infrastructure: making the repo public, a self-hosted runner, local cross builds). Interim: local `just ci`, the Pis, and batched Actions runs inside the free minutes.
+  - **OD-11** (infrastructure): decided, the repo is public (see the table).
 
 ## 5. Verification
 
@@ -699,7 +699,7 @@ These rely on `ssh-add` and `ssh-keygen` being on the Pis; `tools` reports them,
 | B | after V1 | `all` (check, realnet three parts, aarch64) | 70 |
 | C | sweep close | `all` | 70 |
 
-- Pi binaries come from the local aarch64 build (OD-11). Otherwise each extra Pi round costs one `aarch64` job, about 4 min.
+- Pi binaries come from the CI `aarch64` artifact (OD-11 decided: the repo is public, so the minutes here no longer bind; batch runs anyway).
 - Pi runs are free, so they are the main end-to-end check:
   - after Wave 2: the forward subset;
   - after V1: the full M2 suite, both Pis;

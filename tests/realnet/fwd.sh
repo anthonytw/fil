@@ -537,6 +537,7 @@ f_fwd_many_short() {
   FWD_SESSION=fwdmany
   # 20,000 channels write about 4 MiB of per-channel debug lines, the client log's rotation size:
   # keep those at info, so the link's own lines (link down, path moves, a violation) stay in it.
+  # shellcheck disable=SC2034 # read by fc_start (fil.sh)
   FC_ENV=("FIL_LOG=fil=debug,fil_forward=info")
   reset_net
   fwd_attach "$name" "$FWD_SESSION" auto
@@ -576,6 +577,7 @@ f_fwd_ending_stress() {
   FWD_SESSION=fwdstress
   # 20,000 channels write about 4 MiB of per-channel debug lines, the client log's rotation size:
   # keep those at info, so the link's own lines (link down, path moves, a violation) stay in it.
+  # shellcheck disable=SC2034 # read by fc_start (fil.sh)
   FC_ENV=("FIL_LOG=fil=debug,fil_forward=info")
   reset_net
   fwd_attach "$name" "$FWD_SESSION" auto

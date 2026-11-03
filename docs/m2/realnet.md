@@ -91,7 +91,21 @@ One QUIC link throughout: no link down, no switch. Another user (`rnmallory`) re
 
 ### The `MAX_ENDING` stress (`f_fwd_ending_stress`)
 
-MAX_STRESS_TABLE
+**It did not trip.** In no cell, either way, did either side end the link as "the peer does not answer stream ends", and no link went down or moved to the pipe. Every connection was echoed. The VM, aarch64 (`just vm-realnet fwd f_fwd_many_short f_fwd_ending_stress`, 14:29 ET), 200 connections at a time, 1000 bytes echoed each:
+
+| Path (`tc netem` each way) | Connections | -L: per second | -R: per second | Failed | Trips (client / daemon) |
+|---|---|---|---|---|---|
+| lossy: `delay 20ms 5ms loss 3%` | 20,000 each way | 141 | 133 | 0 | 0 / 0 |
+| slow: `delay 20ms 5ms rate 5mbit` | 20,000 each way | 422 | 418 | 0 | 0 / 0 |
+| lossy and slow: `loss 3% rate 5mbit` | 20,000 each way | 125 | 118 | 0 | 0 / 0 |
+| harsh: `delay 40ms 10ms loss 8% rate 2mbit` | 5,000 each way | 29 | 27 | 0 | 0 / 0 |
+
+GITHUB_STRESS
+
+What the numbers say about the concern (C3's review: marker answers ride the control channel while stream credit returns in QUIC frames): at most 200 connections are open at a time, and each one's end marker is answered within a round trip or two of its stream end. Even at 420 connections a second, with every answer delayed by a full second of loss recovery, about 420 ends would be waiting, a fifth of the 2,048 limit. The limit would need an answer delay of about five seconds at that rate, or ten times the concurrency the opener allows (`MAX_OPEN_CHANNELS` is 256). A lossy path makes the rate fall faster than the delay grows: at 3 % loss the connection rate drops to a third, so the product (the ends waiting) goes down, not up.
+
+**A slower measurement worth having (not a bug): a lossy path cuts the connection rate to a third.** On the clean network 200 concurrent connections finish in about 30 ms (`f_fwd_many_short`); on the 3 % lossy path the same burst sustains 135 a second, about 1.5 s per connection with 200 open. Every channel's open, acknowledgement and close travels on the one MUX channel (§8.5), one QUIC stream, so a lost packet there holds up every connection's bookkeeping until it is retransmitted. The ssh -L reference row (added after these runs; one TCP connection, the same head-of-line effect) puts it in scale.
+
 
 ### H1's data (`f_fwd_vs_ssh`)
 

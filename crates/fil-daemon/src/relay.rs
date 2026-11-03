@@ -64,7 +64,8 @@ pub enum RelayEnd {
 /// `fil server --stdio`: [`relay`] on this process's stdin and stdout. Returns the exit status
 /// for the process: success when the relay ran and ended, failure with a message on stderr
 /// (which ssh shows on the user's terminal) when the daemon could not be reached. The
-/// binary's `main` should exit with it directly, without running anything else.
+/// binary's `main` should exit with it directly, without running anything else. It uses no
+/// async runtime, so it can be called from a plain `main`.
 pub fn run_relay(opts: &RelayOptions) -> ExitCode {
     // Raw descriptors, not `std::io::stdout()`, whose line buffering would hold frames back.
     use std::os::fd::AsFd;

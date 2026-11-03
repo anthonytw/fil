@@ -617,6 +617,9 @@ fn bind_direct(
 /// leader, such as one started by hand, stays where it is), log as JSON to `paths.log`, read
 /// `paths.config`, run until idle or stopped, exit. A daemon that finds another running exits
 /// with success and no noise; a start that fails exits with failure, the reason in the log.
+///
+/// It builds its own tokio runtime, so call it from a plain `main` before any runtime exists
+/// (not from inside `#[tokio::main]`), and exit with the result.
 pub fn run_daemon(paths: &Paths) -> ExitCode {
     run_daemon_with(paths, |_| {})
 }

@@ -20,6 +20,10 @@
 //! 4. `PtyMode` for the start point, then the terminal channel: output as data segments, with
 //!    `PtyMode` and `EchoAck` in order with it.
 //!
+//! **Ending a connection on purpose.** The last message (`TakenOver`, `AttachRefused`, `Error`,
+//! `SessionExited`) is sent and then `Link::flush`ed, bounded by a timeout, before the link is
+//! closed, so the client always gets to read it.
+//!
 //! **Flow control.** The client acks the terminal channel cumulatively. The session never sends
 //! beyond what the emulator has seen at a sequence boundary. When the client falls too far
 //! behind (`fil_proto::log::should_snapshot`), or falls off the back of the log, the stream
@@ -39,21 +43,19 @@ use fil_proto::frame::DataSegment;
 use fil_proto::limits::MAX_DATA_PAYLOAD;
 use fil_proto::log::should_snapshot;
 use fil_proto::msg::{Attach, AttachRefusal, ControlMsg, ErrorCode, TakenOver};
-use fil_transport::{DownReason, Link, LinkError, LinkState};
+use fil_transport::{DownReason, Link, LinkError};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::core::{Accepted, AttachAnswer, Cmd, ConnEvent, ConnId, ExitInfo, Progress};
 use crate::handle::{Gone, SessionHandle};
 
-/// How long a message to a client we are about to drop may take.
-const NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long, after the last message, the client is given to read it and hang up before we do.
+/// How long the last message to a client we are about to drop may take to leave: sending it and
+/// then `Link::flush`.
 ///
-/// `Link::close` discards what is still queued, and `Link` has no flush, so closing straight
-/// after sending `TakenOver` could lose it. The client hangs up on receiving it; if it does not,
-/// we do after this.
-const HANGUP_GRACE: Duration = Duration::from_millis(300);
+/// `Link::close` discards what is still queued, so the message is flushed first. A peer that
+/// does not read (or a path that has died) holds the flush back; this bounds it.
+const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a finished session waits for the client to acknowledge its last output.
 const EXIT_ACK_WAIT: Duration = Duration::from_secs(1);
 /// While output is unacknowledged, how often the "waited too long" half of the catch-up rule is
@@ -95,20 +97,44 @@ pub async fn serve_subscriber<L: Link>(
     let acc = match answer {
         AttachAnswer::Refused(r) => {
             let c = Conn::new(&link, handle, 0, 0, Arc::default());
-            let _ =
-                tokio::time::timeout(NOTIFY_TIMEOUT, c.ctl(&ControlMsg::AttachRefused(r.clone())))
-                    .await;
-            c.wait_for_hangup().await;
+            c.farewell(&ControlMsg::AttachRefused(r.clone())).await;
             link.close();
             return ServeEnd::Refused(r);
         }
         AttachAnswer::Accepted(a) => *a,
     };
     let conn = Conn::new(&link, handle, acc.conn, acc.start, acc.kicked.clone());
+    // If this future is dropped (an aborted task, a host-side timeout) or panics, the guard still
+    // tells the core, in order behind anything this connection queued.
+    let mut gone = GoneGuard {
+        handle,
+        conn: conn.id,
+        armed: true,
+    };
     let end = conn.run(acc).await;
+    gone.armed = false;
     handle.send(Cmd::ConnGone { conn: conn.id }).await;
     link.close();
     end
+}
+
+/// Tells the core this connection is gone when the serve future ends without getting to say so.
+///
+/// The message goes through the same queue as the connection's `Input` and `Detach` commands, and
+/// after them, so the core handles it in order: a `Detach` queued just before the drop is not
+/// lost, and the connection is reaped as soon as the core gets to it, flood or no flood.
+struct GoneGuard<'a> {
+    handle: &'a SessionHandle,
+    conn: ConnId,
+    armed: bool,
+}
+
+impl Drop for GoneGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.conn_gone_nowait(self.conn);
+        }
+    }
 }
 
 /// The sender's view of the terminal channel.
@@ -287,18 +313,13 @@ impl<'a, L: Link> Conn<'a, L> {
         Ok(())
     }
 
-    /// Waits until the peer has hung up, for at most [`HANGUP_GRACE`].
-    async fn wait_for_hangup(&self) {
-        let mut status = self.link.status();
-        let _ = tokio::time::timeout(HANGUP_GRACE, async {
-            loop {
-                if matches!(status.borrow_and_update().state, LinkState::Down(_)) {
-                    return;
-                }
-                if status.changed().await.is_err() {
-                    return;
-                }
-            }
+    /// Sends the connection's last message and waits, for at most [`FAREWELL_TIMEOUT`], for it
+    /// to leave: `Link::flush` resolves when everything sent before it has been written (pipe)
+    /// or acknowledged by the peer (direct). The caller closes the link afterwards.
+    async fn farewell(&self, msg: &ControlMsg) {
+        let _ = tokio::time::timeout(FAREWELL_TIMEOUT, async {
+            self.ctl(msg).await?;
+            self.link.flush().await
         })
         .await;
     }
@@ -456,6 +477,9 @@ impl<'a, L: Link> Conn<'a, L> {
             if let Some(&(at, canonical, echo)) = out.modes.front()
                 && at <= next
             {
+                if self.kicked.load(Ordering::SeqCst) {
+                    return self.lost(out).await;
+                }
                 out.modes.pop_front();
                 if let Err(e) = self
                     .ctl(&ControlMsg::PtyMode {
@@ -472,6 +496,9 @@ impl<'a, L: Link> Conn<'a, L> {
             if let Some((input_upto, output_at)) = out.echo
                 && next >= output_at
             {
+                if self.kicked.load(Ordering::SeqCst) {
+                    return self.lost(out).await;
+                }
                 out.echo = None;
                 let msg = ControlMsg::EchoAck {
                     input_upto,
@@ -496,6 +523,12 @@ impl<'a, L: Link> Conn<'a, L> {
                     continue;
                 }
                 let end = next + data.len() as u64;
+                // Right before the send, not only at the top of the loop: the core may have taken
+                // the session since the events were looked at, and this client must not be sent
+                // output produced after that.
+                if self.kicked.load(Ordering::SeqCst) {
+                    return self.lost(out).await;
+                }
                 self.flow().record_send(end, Instant::now());
                 let seg = Segment { seq: next, data };
                 if let Err(e) = self
@@ -524,6 +557,28 @@ impl<'a, L: Link> Conn<'a, L> {
                 },
                 () = self.acked.notified() => {}
                 () = tokio::time::sleep(AGE_CHECK), if behind > 0 => {}
+            }
+        }
+    }
+
+    /// The core took the session from this connection while the outbound half was about to send:
+    /// nothing more goes out, and the reason, which the core queued right after setting the flag,
+    /// ends the connection.
+    async fn lost(&self, out: &mut Out) -> ServeEnd {
+        loop {
+            if let Some(r) = out.drain_events() {
+                return self.end_with(r).await;
+            }
+            if !out.events_open {
+                return ServeEnd::Superseded;
+            }
+            match out.events.recv().await {
+                Some(ev) => {
+                    if let Some(r) = out.absorb(ev) {
+                        return self.end_with(r).await;
+                    }
+                }
+                None => out.events_open = false,
             }
         }
     }
@@ -569,20 +624,13 @@ impl<'a, L: Link> Conn<'a, L> {
         match reason {
             Reason::TakenOver(info) => {
                 self.decide(ServeEnd::TakenOver(info.clone()));
-                let _ = tokio::time::timeout(
-                    NOTIFY_TIMEOUT,
-                    self.ctl(&ControlMsg::TakenOver(info.clone())),
-                )
-                .await;
-                self.wait_for_hangup().await;
+                self.farewell(&ControlMsg::TakenOver(info.clone())).await;
                 ServeEnd::TakenOver(info)
             }
             Reason::Superseded => ServeEnd::Superseded,
             Reason::Fatal(code) => {
                 self.decide(ServeEnd::Protocol(format!("{code:?}")));
-                let _ =
-                    tokio::time::timeout(NOTIFY_TIMEOUT, self.ctl(&ControlMsg::Error(code))).await;
-                self.wait_for_hangup().await;
+                self.farewell(&ControlMsg::Error(code)).await;
                 ServeEnd::Protocol(format!("{code:?}"))
             }
         }
@@ -603,6 +651,13 @@ impl<'a, L: Link> Conn<'a, L> {
                 () = tokio::time::sleep_until(deadline) => break,
             }
         }
-        ServeEnd::SessionExited(self.handle.wait_exit().await)
+        // The client has the output. Tell it how the session ended; it hangs up on receiving
+        // this, which must not turn the outcome into a plain link failure.
+        let info = self.handle.wait_exit().await;
+        self.decide(ServeEnd::SessionExited(info.clone()));
+        let (code, signal) = info.wire();
+        self.farewell(&ControlMsg::SessionExited { code, signal })
+            .await;
+        ServeEnd::SessionExited(info)
     }
 }

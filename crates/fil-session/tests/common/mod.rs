@@ -164,6 +164,8 @@ pub struct Client {
     pub reply: Option<AttachReply>,
     pub refused: Option<AttachRefusal>,
     pub taken_over: Option<TakenOver>,
+    /// `SessionExited { code, signal }`, once the daemon has said how the shell ended.
+    pub exited: Option<(Option<i32>, Option<i32>)>,
     /// Terminal bytes received, in order, after the start point.
     pub out: Vec<u8>,
     /// How far the terminal channel has been received.
@@ -254,6 +256,7 @@ impl Client {
             reply: None,
             refused: None,
             taken_over: None,
+            exited: None,
             out: Vec::new(),
             next: 0,
             recv: RecvChannel::new(),
@@ -473,6 +476,7 @@ impl Client {
                 received,
             } => self.input_resume = Some(received),
             ControlMsg::Error(code) => self.errors.push(code),
+            ControlMsg::SessionExited { code, signal } => self.exited = Some((code, signal)),
             other => panic!("unexpected control message {other:?}"),
         }
     }

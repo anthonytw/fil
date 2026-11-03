@@ -503,6 +503,20 @@ impl FakeDaemon {
         }
     }
 
+    /// The shell exited and the daemon tells the client how, the way the real one does: the
+    /// message is sent and flushed, and only then does the link close. Every later attach hears
+    /// `SessionGone`.
+    pub async fn end_session_with_status(&self, code: Option<i32>, signal: Option<i32>) {
+        let mut st = self.st.lock().await;
+        st.gone = true;
+        let conns: Vec<_> = st.conns.drain().collect();
+        for (_, c) in conns {
+            let _ = send(&c.link, &ControlMsg::SessionExited { code, signal }).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), c.link.flush()).await;
+            c.control.kill(DownReason::Closed);
+        }
+    }
+
     /// The next attach is refused with this, whatever it says.
     pub async fn refuse_next(&self, r: AttachRefusal) {
         self.st.lock().await.refuse_next = Some(r);

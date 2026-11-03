@@ -79,6 +79,8 @@ mod serve;
 
 pub use config::{DirectInfo, NoHost, ScopeMode, SessionConfig, SessionHost};
 pub use core::{ExitInfo, SessionInfo, SubscriberInfo};
+#[cfg(feature = "test-hooks")]
+pub use handle::CatchUpGate;
 pub use handle::{Gone, SessionHandle};
 pub use proc::Scope;
 pub use pty::SpawnError;

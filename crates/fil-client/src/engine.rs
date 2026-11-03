@@ -1014,9 +1014,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     )));
                 }
             }
-            // The link closes right after this; reporting the exit status lands with the
-            // M1 follow-ups (docs/m1/plan.md).
-            ControlMsg::SessionExited { .. } => {}
+            // The daemon sends this once it has all the output acknowledged, then closes the
+            // link. The link going down would make us reconnect and be told `SessionGone`
+            // without a status, so this ends the run now.
+            ControlMsg::SessionExited { code, signal } => {
+                return Ok(Flow::End(Served::Done(Outcome::SessionEnded {
+                    code,
+                    signal,
+                })));
+            }
             // Management messages belong to `fil ls`/`kill`/`detach`, never to an attach.
             ControlMsg::Request(_) | ControlMsg::Response(_) => {
                 return Err(ClientError::Protocol(
@@ -1040,7 +1046,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             AttachRefusal::TakenOver(t) => Ok(Flow::End(Served::Refused(Prompt::TakeBack(t)))),
             AttachRefusal::SessionReplaced => Ok(Flow::End(Served::Refused(Prompt::Replaced))),
             AttachRefusal::Detached => Ok(Flow::End(Served::Refused(Prompt::DetachedElsewhere))),
-            AttachRefusal::SessionGone => Ok(Flow::End(Served::Done(Outcome::SessionEnded))),
+            AttachRefusal::SessionGone => Ok(Flow::End(Served::Done(Outcome::SessionEnded {
+                code: None,
+                signal: None,
+            }))),
             AttachRefusal::WrongKey => Err(ClientError::WrongKey(name)),
             AttachRefusal::BadResume => Err(ClientError::BadResume(name)),
         }

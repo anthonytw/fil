@@ -350,6 +350,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fil-proto",
+ "fil-session",
  "fil-term",
  "fil-transport",
  "nix",

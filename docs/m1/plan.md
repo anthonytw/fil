@@ -53,6 +53,8 @@ The wire additions that wave 2 needs are on main too: `SessionExited`, and `Requ
 
 ### Follow-ups from the wave-1 reviews (package F)
 
+All but the last are done in package F's PR; the last stays an M2 item.
+
 - **Post-takeover race:** check `kicked` right before each output send (#18).
 - **Weak tests:** the catch-up-vs-takeover and `kicked` tests must fail without their fixes. `kicked` needs a buffering link, so use `QuicLink` or a buffering test link (#18).
 - **Late reaping:** reaping a dropped connection is delayed during a continuous output flood (#18).

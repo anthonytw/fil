@@ -66,6 +66,60 @@ pub struct ExitInfo {
     pub signal: Option<String>,
 }
 
+impl ExitInfo {
+    /// How the session ended, as `ControlMsg::SessionExited` carries it: a signal number when
+    /// the shell was killed by one, the exit code otherwise. Both are `None` if the shell was
+    /// killed by a signal this cannot name.
+    pub fn wire(&self) -> (Option<i32>, Option<i32>) {
+        match &self.signal {
+            None => (i32::try_from(self.code).ok(), None),
+            Some(text) => (None, signal_number(text)),
+        }
+    }
+}
+
+/// The number of the signal that portable-pty reports as `strsignal` text: "Killed" (glibc and
+/// musl), "Killed: 9" (macOS) or "Signal 9" (when the system has no description). The numbers of
+/// the common signals are the same on Linux and macOS except where noted.
+fn signal_number(text: &str) -> Option<i32> {
+    let digits: String = text
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if let Ok(n) = digits.parse::<i32>()
+        && n > 0
+    {
+        return Some(n);
+    }
+    let name = text.split(':').next().unwrap_or(text).trim();
+    Some(match name {
+        "Hangup" => 1,
+        "Interrupt" => 2,
+        "Quit" => 3,
+        "Illegal instruction" => 4,
+        "Trace/BPT trap" | "Trace/breakpoint trap" => 5,
+        "Aborted" | "Abort trap" => 6,
+        "Bus error" => {
+            if cfg!(target_os = "macos") {
+                10
+            } else {
+                7
+            }
+        }
+        "Floating point exception" => 8,
+        "Killed" => 9,
+        "Segmentation fault" => 11,
+        "Broken pipe" => 13,
+        "Alarm clock" => 14,
+        "Terminated" => 15,
+        _ => return None,
+    })
+}
+
 /// What subscribers may read.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Progress {
@@ -405,13 +459,10 @@ impl Core {
             let deadline = self.next_deadline();
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(cmd) => {
-                        let idle = rx.is_empty();
-                        self.handle(cmd, idle)
-                    }
+                    Some(cmd) => self.handle(cmd),
                     None => break,
                 },
-                () = sleep_until(deadline) => self.on_tick(Instant::now(), rx.is_empty()),
+                () = sleep_until(deadline) => self.on_tick(Instant::now()),
             }
             if self.finished() {
                 break;
@@ -457,15 +508,12 @@ impl Core {
         .min()
     }
 
-    fn handle(&mut self, cmd: Cmd, idle: bool) {
+    fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::PtyOutput(chunk) => {
-                // Whether anyone is there to answer a query is decided here, so a connection
-                // whose task is gone must not count. (Not reaped on every command: a connection
-                // that detached or sent input and then ended has commands still queued.)
-                self.reap_live(idle);
-                self.on_output(chunk)
-            }
+            // Whether anyone is there to answer a query is decided while handling output, so a
+            // connection whose task is gone must already have been dropped by then: its
+            // `ConnGone` is in the queue behind its own commands (`serve::GoneGuard`).
+            Cmd::PtyOutput(chunk) => self.on_output(chunk),
             Cmd::PtyEof => self.eof = true,
             Cmd::ChildExited(info) => {
                 tracing::info!(session = %self.name, code = info.code, "the shell exited");
@@ -515,8 +563,7 @@ impl Core {
         }
     }
 
-    fn on_tick(&mut self, now: Instant, idle: bool) {
-        self.reap_live(idle);
+    fn on_tick(&mut self, now: Instant) {
         self.pump_echo(now);
         if let Some(upto) = self.echo.due(now) {
             let output_at = self.log_end();
@@ -539,21 +586,6 @@ impl Core {
             tokio::task::spawn_blocking(move || {
                 let _ = tx.blocking_send(Cmd::ProcessTable(proc::list_processes()));
             });
-        }
-    }
-
-    /// A connection whose task is gone (its serve future was dropped or panicked, or it ended
-    /// without saying so) has closed its event channel: it is no longer attached.
-    ///
-    /// Only when no command is waiting (`idle`): a connection that sent input or a detach and
-    /// then ended has those commands queued, and they must still find it.
-    fn reap_live(&mut self, idle: bool) {
-        if !idle {
-            return;
-        }
-        if self.live.as_ref().is_some_and(|l| l.events.is_closed()) {
-            self.live = None;
-            self.next_mode_poll = None;
         }
     }
 
@@ -994,13 +1026,19 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// then redraws from a clear screen.
 pub(crate) fn gap_prologue(rows: u16, skipped: u64) -> Vec<u8> {
     let mut s = String::new();
-    // The client may have been cut off in the middle of anything: with a character set other
-    // than ASCII invoked (the marker would come out as line drawing), or inside a synchronized
-    // update (it would hold everything back until its own timeout).
-    s.push_str("\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[?2026l");
-    // Primary screen (the client may be in an alternate one), plain scroll region and origin,
+    // The client may have been cut off inside a synchronized update (it would hold everything
+    // back until its own timeout).
+    s.push_str("\x1b[?2026l");
+    // Primary screen first (the client may be in an alternate one). The order matters: xterm
+    // restores the saved cursor on leaving the alternate screen, and the saved cursor carries
+    // the character sets that were in force when it was saved, so a program that saved its
+    // cursor in DEC line drawing brings line drawing back with `?1049l`.
+    s.push_str("\x1b[?1049l");
+    // Then the character sets, which the client may have been cut off in the middle of using
+    // (the marker would come out as line drawing), and the rest: plain scroll region and origin,
     // no mouse reporting or kitty flags left over from a program that has since gone.
-    s.push_str("\x1b[?1049l\x1b[0m\x1b[?25l\x1b[?6l\x1b[r");
+    s.push_str("\x1b(B\x1b)B\x1b*B\x1b+B\x0f");
+    s.push_str("\x1b[0m\x1b[?25l\x1b[?6l\x1b[r");
     s.push_str(
         "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
     );
@@ -1041,10 +1079,44 @@ mod tests {
         assert_eq!(human_bytes(3 << 30), "3 GB");
     }
 
+    fn real_emulator_history(prologue: &[u8], backend: &str) -> String {
+        let mut emu = fil_term::create(backend, fil_term::Size { cols: 40, rows: 5 }, 100).unwrap();
+        emu.feed(b"\x1b(0\x1b[?1049h");
+        emu.feed(prologue);
+        emu.apply_pending();
+        emu.state(100)
+            .history
+            .iter()
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A client that was cut off in an alternate screen entered (`?1049h`, which saves the
+    /// cursor) while DEC line drawing was in force: the saved cursor holds line drawing, and
+    /// leaving the alternate screen restores it, as xterm does and alacritty copies. The
+    /// prologue has to leave first and reset the character sets after, or the marker comes out
+    /// as line drawing.
+    #[test]
+    fn the_prologue_leaves_the_alternate_screen_before_resetting_the_charsets() {
+        let new = gap_prologue(5, 2048);
+        let text = String::from_utf8(new.clone()).unwrap();
+        assert!(
+            real_emulator_history(&new, "alacritty").contains("── fil: skipped 2 KB of output ──"),
+            "marker garbled: {text:?}"
+        );
+        // The old order, charsets first, garbles it: the test above is not vacuous.
+        let old = format!(
+            "\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[?2026l\x1b[?1049l{}",
+            &text[text.find("\x1b[0m").unwrap()..]
+        );
+        assert!(!real_emulator_history(old.as_bytes(), "alacritty").contains("skipped 2 KB"));
+    }
+
     #[test]
     fn the_prologue_scrolls_one_screen_and_the_marker() {
         let p = String::from_utf8(gap_prologue(5, 2048)).unwrap();
-        assert!(p.starts_with("\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[?2026l\x1b[?1049l"));
+        assert!(p.starts_with("\x1b[?2026l\x1b[?1049l\x1b(B\x1b)B\x1b*B\x1b+B\x0f"));
         assert!(p.contains("skipped 2 KB of output"));
         assert_eq!(p.matches("\r\n").count(), 1 + 5);
     }

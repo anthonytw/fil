@@ -49,6 +49,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use fil_proto::ChannelId;
+use tracing::debug;
 
 /// The queueing delay the pacer aims for. Keystrokes wait behind about this much forward data
 /// (DESIGN.md §8.5 "Pacing"; H1's target was a keystroke p50 under load of at most twice idle
@@ -386,6 +387,7 @@ impl Pacer {
             self.period_start = now;
             self.base_prev = self.base_now.take();
             if self.limited_in_period && self.drain.is_none() && self.cfg.fixed_cap.is_none() {
+                debug!(cap = self.cap, "forward pacing: measuring the base again");
                 self.drain = Some(Drain {
                     saved: self.cap,
                     started: now,
@@ -422,6 +424,11 @@ impl Pacer {
             } else {
                 self.slow_start = false;
                 self.cap /= 2;
+                debug!(
+                    cap = self.cap,
+                    base_us = base.as_micros() as u64,
+                    "forward pacing: slow start ends"
+                );
             }
         } else {
             let target = TARGET.as_secs_f64();

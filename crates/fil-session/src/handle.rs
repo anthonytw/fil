@@ -116,7 +116,7 @@ impl SessionHandle {
             config.catch_up,
         );
         // The forwards' endpoint runs on this runtime and outlives every subscriber.
-        let forwards = Forwards::new(name.clone(), config.forward.clone());
+        let forwards = Forwards::new(name.clone(), config.forward.clone(), agent_socket.clone());
         let fw = forwards.clone();
         // Deciding the scope may run `loginctl` and `systemd-run`, opening the PTY and starting
         // the child fork and exec: none of that belongs on an async worker. (`tokio::spawn` of
@@ -176,9 +176,28 @@ impl SessionHandle {
         &self.inner.scope
     }
 
-    /// The session's `SSH_AUTH_SOCK` path, as configured. M2's agent relay listens there.
+    /// The session's `SSH_AUTH_SOCK` path, as configured. The agent relay listens there while
+    /// the subscriber relays its agent (DESIGN.md section 10).
     pub fn agent_socket(&self) -> Option<&Path> {
         self.inner.agent_socket.as_deref()
+    }
+
+    /// The agent is relayed now: the subscriber asked for it (`Attach.agent`) and the socket is
+    /// there (`SessionSummary::agent`).
+    pub fn agent_relayed(&self) -> bool {
+        self.inner.forwards.agent_on()
+    }
+
+    /// The agent relay's `fil ports` row while it is on: counts only.
+    pub fn agent_row(&self) -> Option<fil_proto::msg::AgentRow> {
+        self.inner.forwards.agent_row()
+    }
+
+    /// Test hook: the agent socket accepts connections of `uid` instead of ours, so a test's own
+    /// connection stands for another user's (the peer-UID check).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_agent_uid(&self, uid: u32) {
+        self.inner.forwards.set_agent_uid(uid);
     }
 
     /// The session has not ended.

@@ -431,6 +431,7 @@ dependencies = [
  "fil-predict",
  "fil-proto",
  "fil-term",
+ "fil-testkit",
  "fil-transport",
  "rustix",
  "thiserror 2.0.21",
@@ -466,6 +467,7 @@ dependencies = [
  "fil-forward",
  "fil-netsim",
  "fil-proto",
+ "fil-testkit",
  "fil-transport",
  "quinn",
  "rand",
@@ -567,6 +569,7 @@ dependencies = [
  "fil-proto",
  "fil-term",
  "fil-transport",
+ "ring",
  "tokio",
 ]
 

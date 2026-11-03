@@ -12,7 +12,9 @@ bytes = "1"
 fil-proto = { path = "../fil-proto" }
 fil-term = { path = "../fil-term" }
 fil-transport = { path = "../fil-transport" }
-tokio = { version = "1", features = ["time"] }
+# The test-only mini ssh-agent: Ed25519 keys made at test time, a Unix socket.
+ring = "0.17"
+tokio = { version = "1", features = ["time", "net", "io-util", "rt", "sync"] }
 
 [lints]
 workspace = true

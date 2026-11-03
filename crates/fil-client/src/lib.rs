@@ -25,6 +25,7 @@
 //!
 //! What the loop expects of the daemon, beyond `fil-proto`, is in [`engine`]'s module docs.
 
+pub mod agent;
 pub mod config;
 pub mod consent;
 pub mod dialer;
@@ -38,6 +39,7 @@ pub mod terminal;
 pub mod text;
 pub mod tty;
 
+pub use agent::AgentRelay;
 pub use config::{
     Backoff, ClientConfig, ClientError, ForwardFailure, ForwardSet, Outcome, Reconnect,
     RemoteRequests,

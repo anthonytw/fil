@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+pub mod agent;
 pub mod client;
 
 pub use client::Client;

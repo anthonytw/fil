@@ -111,9 +111,10 @@ pub struct ForwardSet {
     pub specs: Vec<ForwardSpec>,
     pub remote_requests: RemoteRequests,
     pub failure: ForwardFailure,
-    /// The agent relay is on for this run (`-A`, DESIGN.md section 10). Off by default; until
-    /// the relay exists (A1) an agent channel is refused even when this is on.
-    pub agent: bool,
+    /// The agent relay, when this run relays its agent (`-A`, DESIGN.md section 10). Off by
+    /// default; off, an agent channel the daemon opens is refused and nothing connects to the
+    /// local agent.
+    pub agent: Option<crate::agent::AgentRelay>,
     /// Windows, buffers and timers of the forwarded connections (`[defaults.forward]`).
     pub mux: MuxConfig,
     /// The listeners [`ForwardSet::bind_local`] bound, by index into `specs`.

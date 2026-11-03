@@ -1002,7 +1002,10 @@ impl Core {
     }
 
     fn force_detach(&mut self) {
-        if self.epoch.subscriber().is_none() {
+        // Once the shell has exited the connection is on its way to `SessionExited`, which must
+        // not be replaced by `Detach` (the client would offer to attach to a dead session); the
+        // reaper revokes the session's keys.
+        if self.exit.is_some() || self.epoch.subscriber().is_none() {
             return;
         }
         let epoch = self.epoch.epoch();

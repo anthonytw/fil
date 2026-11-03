@@ -147,8 +147,9 @@ impl SessionHandle {
         rx.await.ok()
     }
 
-    /// Detaches whoever is attached: revokes its key and drops its transport, as if it had
-    /// detached itself (`fil detach`). Does nothing if nobody is attached.
+    /// Detaches whoever is attached (`fil detach`): sends the client `Detach`, as a takeover sends
+    /// `TakenOver`, so it learns at once rather than through a reconnect, then revokes its key
+    /// and drops its transport. Does nothing if nobody is attached or the shell has exited.
     pub async fn force_detach(&self) {
         let _ = self.inner.tx.send(Cmd::ForceDetach).await;
     }

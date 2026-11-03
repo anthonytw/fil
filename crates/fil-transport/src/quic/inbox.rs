@@ -1,9 +1,11 @@
 //! The receive side of a [`QuicLink`](super::QuicLink): what the per-stream reader tasks have
 //! read and `recv` has not yet returned.
 //!
-//! Each channel has its own byte budget. A reader task whose channel is over budget stops
-//! reading its stream, QUIC flow control then stops the peer's writer on that stream, and no
-//! other channel is affected. `recv` hands out control payloads first, then interactive ones in
+//! Each channel has its own byte budget, and the connection has one for all channels together.
+//! A reader task whose channel is over budget stops reading its stream, QUIC flow control then
+//! stops the peer's writer on that stream, and no other channel is affected. Once the connection
+//! budget is spent, only channels that already hold more than a small guaranteed amount are
+//! held back, so a pile of stalled forwards cannot stop the terminal or control channel. `recv` hands out control payloads first, then interactive ones in
 //! the order they arrived, with a guaranteed share for forwarded channels (the same rule as the
 //! pipe's scheduler, DESIGN.md §8.5).
 
@@ -21,6 +23,16 @@ use crate::link::DownReason;
 /// (One more payload may land on top: the budget is checked before a payload is added.)
 pub(super) const CHANNEL_BUDGET: usize = 256 * 1024;
 
+/// How many unread bytes all channels together may hold before channels holding more than
+/// [`CHANNEL_GUARANTEE`] are held back.
+pub(super) const CONNECTION_BUDGET: usize = 16 * 1024 * 1024;
+
+/// What a channel may always hold, whatever the other channels hold. At least one maximum-size
+/// payload plus a little more, so control and the terminal keep moving. With a peer allowed 1,024
+/// streams the unread data is bounded by `CONNECTION_BUDGET + 1,024 * (CHANNEL_GUARANTEE + one
+/// payload)`, about 50 MiB, instead of 1,024 channel budgets.
+pub(super) const CHANNEL_GUARANTEE: usize = 16 * 1024;
+
 #[derive(Default)]
 struct Queues {
     control: VecDeque<Bytes>,
@@ -31,6 +43,8 @@ struct Queues {
     /// Interactive payloads handed out since the last forward one, while forward data waited.
     interactive_streak: u32,
     chans: HashMap<ChannelId, Chan>,
+    /// Unread bytes over all channels.
+    total: usize,
     /// Set once; later closes are ignored.
     closed: Option<DownReason>,
 }
@@ -93,9 +107,16 @@ impl Inbox {
                 if let Some(reason) = &q.closed {
                     return Err(Closed(reason.clone()));
                 }
+                let total = q.total;
                 let chan = q.chans.get_mut(&channel).expect("registered");
-                if chan.queued < CHANNEL_BUDGET {
+                let limit = if total >= CONNECTION_BUDGET {
+                    CHANNEL_GUARANTEE
+                } else {
+                    CHANNEL_BUDGET
+                };
+                if chan.queued < limit {
                     chan.queued += payload.len();
+                    q.total += payload.len();
                     match channel.class() {
                         ChannelClass::Control => q.control.push_back(payload),
                         ChannelClass::Interactive => q.interactive.push_back((channel, payload)),
@@ -120,11 +141,19 @@ impl Inbox {
         let mut q = self.lock();
         if let Some(item) = q.pop() {
             let (channel, payload) = &item;
+            let was_over_total = q.total >= CONNECTION_BUDGET;
+            q.total -= payload.len();
             let chan = q.chans.get_mut(channel).expect("registered");
             let was_full = chan.queued >= CHANNEL_BUDGET;
             chan.queued -= payload.len();
             if was_full && chan.queued < CHANNEL_BUDGET {
                 chan.wake.notify_one();
+            }
+            if was_over_total && q.total < CONNECTION_BUDGET {
+                // Readers parked on the connection budget may go on.
+                for chan in q.chans.values() {
+                    chan.wake.notify_one();
+                }
             }
             return Ok(Some(item));
         }
@@ -156,6 +185,11 @@ impl Inbox {
         }
         drop(q);
         self.ready.notify_one();
+    }
+
+    /// Bytes received and not yet returned by `recv`.
+    pub(super) fn unread_bytes(&self) -> usize {
+        self.lock().total
     }
 
     pub(super) fn down_reason(&self) -> Option<DownReason> {

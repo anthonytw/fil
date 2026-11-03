@@ -12,19 +12,22 @@
 //! the link the session currently runs on. Each lane is `Idle`, `Waiting` (a retry timer is
 //! running), `Busy` (a pipe is starting, or a dial is in flight) or `Up` (a link exists).
 //!
-//! ```text
-//!             Start
-//!               |  RunPipe                      pipe: the bootstrap and the fallback
-//!               v
-//!         pipe Busy --PipeUp--> SwitchTo(Pipe) --Switched--> carrier = pipe
-//!                                                              |
-//!        DirectAvailable (from the attach reply)               |
-//!               |  DialDirect                                  |
-//!               v                                              |
-//!        direct Busy --DirectUp--> SwitchTo(Direct) --Switched--> carrier = direct,
-//!               |                                                  ClosePipe
-//!               +--DirectDialFailed--> Waiting --Timer--> DialDirect (backoff, no end)
-//! ```
+//! The states and transitions are drawn in `docs/m1/quic-link.md` ("The path manager").
+//!
+//! # How the client drives it
+//!
+//! | The client | reports |
+//! |---|---|
+//! | starts, or has no link and no bootstrap information | `Start` |
+//! | has a pipe link (before it attaches over it) | `PipeUp`; the pipe run failed, or the link ended: `PipeDown` |
+//! | received an attach reply | `DirectAvailable` or `DirectUnavailable`, from its UDP port, after *every* reply |
+//! | dialed direct | `DirectUp` or `DirectDialFailed`; the link ended: `DirectDown` |
+//! | finished the resume on the link it was told to switch to | `Switched(kind)`, or `SwitchFailed(kind)` |
+//! | the OS says the network changed, or a timer it was asked for fired | `NetworkChanged`, `Timer(..)` |
+//!
+//! A swap is a transaction: on `SwitchTo(kind)` the client keeps the old link open, resumes on
+//! the new one, and only then reports `Switched`; the old pipe is closed by a later `ClosePipe`.
+//! The manager owns all retry timing, so the client's own loop must not back off as well.
 //!
 //! # Settings
 //!
@@ -34,7 +37,7 @@
 //!   [`PathConfig::fallback_after`], re-run the pipe too. Direct keeps being retried, so the
 //!   session returns to it from the pipe.
 //! - **`Direct`**: as `Auto`, except that re-running the pipe (a new ssh login) waits
-//!   [`PathConfig::direct_patience`] instead. The first attach still needs the pipe: it carries
+//!   [`PathConfig::direct_patience`] instead, and a failed redial does not shorten that wait. The first attach still needs the pipe: it carries
 //!   the bootstrap and the key registration.
 //!
 //! # Why it does not flap or storm
@@ -131,12 +134,16 @@ impl Default for PathConfig {
 pub enum PathInput {
     /// The client wants a session and has no links and no bootstrap information.
     Start,
-    /// The pipe is up and has been attached: [`PathAction::RunPipe`] succeeded.
+    /// The pipe link exists: [`PathAction::RunPipe`] got as far as a connected pipe. Reported
+    /// before the attach over it, so that the attach reply (`DirectAvailable`) is seen as coming
+    /// from a fresh bootstrap.
     PipeUp,
     /// A pipe run failed, or the pipe link ended.
     PipeDown(DownReason),
-    /// The attach reply carried a UDP port and fingerprint, so direct can be dialed. Also the
-    /// signal that the key was just registered: a fresh bootstrap clears direct's failure count.
+    /// An attach reply carried a UDP port and fingerprint, so direct can be dialed. Reported after
+    /// every reply. A reply that arrives while a pipe link exists comes from a fresh bootstrap
+    /// (the key was just registered and the port may have changed), so it clears direct's
+    /// backoff and a waiting dial starts at once; a reply over direct changes nothing.
     DirectAvailable,
     /// The daemon does not offer direct (no port in the attach reply).
     DirectUnavailable,
@@ -317,10 +324,12 @@ impl PathManager {
             PathInput::PipeDown(_) => self.on_pipe_down(now, &mut out),
             PathInput::DirectAvailable => {
                 self.info = Info::Available;
-                self.direct_failures = 0;
-                if self.direct == Lane::Waiting {
-                    self.direct = Lane::Idle;
-                    self.cancel(PathTimer::DirectRetry, &mut out);
+                if self.pipe == Lane::Up {
+                    self.direct_failures = 0;
+                    if self.direct == Lane::Waiting {
+                        self.direct = Lane::Idle;
+                        self.cancel(PathTimer::DirectRetry, &mut out);
+                    }
                 }
             }
             PathInput::DirectUnavailable => {
@@ -359,14 +368,14 @@ impl PathManager {
         self.pipe_up_at = Some(now);
         self.cancel(PathTimer::PipeRetry, out);
         self.cancel(PathTimer::PipeFallback, out);
-        if self.carrier == Some(LinkKind::Direct) || self.switching == Some(LinkKind::Direct) {
-            // A run that finished after direct took over: not needed.
+        if self.carrier == Some(LinkKind::Direct) {
+            // A run that finished after direct took over: not needed. (While a switch to direct
+            // is only *in progress* the pipe stays: if that switch fails, it is the way back.
+            // `on_switched` closes it when the switch succeeds.)
             self.pipe = Lane::Idle;
             out.push(PathAction::ClosePipe);
-        } else if self.needs_carrier() {
-            self.switching = Some(LinkKind::Pipe);
-            out.push(PathAction::SwitchTo(LinkKind::Pipe));
         }
+        // Otherwise `settle` moves the session to the pipe if nothing carries it.
     }
 
     fn on_pipe_down(&mut self, now: Instant, out: &mut Vec<PathAction>) {
@@ -579,6 +588,11 @@ impl PathManager {
             self.switching = Some(LinkKind::Direct);
             out.push(PathAction::SwitchTo(LinkKind::Direct));
         }
+        // A pipe link that exists, with nothing carrying the session, carries it.
+        if self.pipe == Lane::Up && self.needs_carrier() {
+            self.switching = Some(LinkKind::Pipe);
+            out.push(PathAction::SwitchTo(LinkKind::Pipe));
+        }
         // Direct is dialed whenever it is possible and not already running, backing off,
         // or carrying.
         if self.dialable() && self.direct == Lane::Idle {
@@ -587,16 +601,16 @@ impl PathManager {
             out.push(PathAction::DialDirect);
         }
         if self.needs_carrier() {
-            if self.pipe == Lane::Idle {
+            if self.pipe == Lane::Idle && !self.pending.pipe_fallback {
                 if self.direct_hopeful() {
                     // Direct was fine a moment ago: give it a few seconds before an ssh login.
-                    if !self.pending.pipe_fallback {
-                        self.schedule(PathTimer::PipeFallback, self.fallback_delay(), out);
-                    }
+                    self.schedule(PathTimer::PipeFallback, self.fallback_delay(), out);
                 } else {
                     self.start_pipe(now, out);
                 }
             }
+            // With the fallback timer pending, the timer decides: a dial that fails meanwhile
+            // does not start the pipe early (that is what `direct_patience` is for).
         } else {
             self.cancel(PathTimer::PipeFallback, out);
         }

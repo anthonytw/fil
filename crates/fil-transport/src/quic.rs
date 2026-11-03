@@ -15,12 +15,20 @@
 //! - **Channels** are unidirectional streams, one per channel and direction, opened on first send.
 //!   A stream starts with the channel id (a postcard varint), then carries payloads with a `u32`
 //!   big-endian length prefix (1 to `MAX_FRAME_BODY` bytes). Control streams get quinn priority
-//!   100, interactive ones 10, forwards 0.
+//!   100; interactive and forward ones share 10, so quinn round-robins them and a terminal that
+//!   never goes idle cannot starve a forward.
 //! - **Backpressure** is per channel and comes from QUIC: each channel's writer waits on its own
 //!   stream's flow control, and on the receiving side a channel with `inbox::CHANNEL_BUDGET`
-//!   unread bytes stops being read, which stops only that stream.
+//!   unread bytes stops being read, which stops only that stream. Unread data is also capped for
+//!   the connection as a whole (`inbox::CONNECTION_BUDGET`).
+//! - **Streams are one-shot:** a channel's stream lives as long as the link. A peer may open
+//!   [`MAX_STREAMS`] of them (1,024) over the link's whole life; after that `send` on a new
+//!   channel fails with an `Io` error after `dead_after` instead of hanging. Channel close
+//!   (finishing a stream and freeing its slot) belongs to M2, with forwarded connections.
 //! - **Order across channels:** none from QUIC. `recv` hands out control first, then interactive
-//!   payloads in arrival order, with forwards guaranteed a share. Anything that must stay in
+//!   payloads in arrival order, with forwards guaranteed a share of what has already arrived.
+//!   On the wire forwards and interactive channels take turns per packet (see above), so the exact
+//!   8:1 weighting of the pipe's scheduler does not exist here. Anything that must stay in
 //!   order across channels (a snapshot and the output after it) carries offsets (§8.5).
 //! - **Liveness:** the QUIC keep-alive is `heartbeat`, its idle timeout is `dead_after`, and
 //!   `Degraded` appears after `degraded_after` without a datagram from the peer, and the link
@@ -56,7 +64,7 @@ use crate::link::LinkParams;
 
 pub use limiter::HandshakeLimits;
 pub use link::QuicLink;
-pub use listener::{ListenError, ListenerConfig, ListenerStats, QuicListener};
+pub use listener::{ListenError, ListenerConfig, ListenerStats, QuicListener, TestHook};
 
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).
 pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
@@ -65,7 +73,9 @@ pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
 /// channel (M2); the bound keeps a misbehaving peer's cost finite.
 const MAX_STREAMS: u32 = 1024;
 
-/// What a connection may buffer in total for the peer's unread data.
+/// quinn's receive window for the whole connection: how much the peer may have in flight that
+/// quinn has not yet delivered to our reader tasks. (Data our readers have taken is bounded
+/// separately by the inbox.)
 const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// The transport settings of both ends, from the link's timing.

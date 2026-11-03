@@ -184,13 +184,90 @@ fn direct_back_within_the_grace_period_means_no_ssh_login() {
 }
 
 #[test]
-fn a_refused_dial_with_nothing_carrying_runs_the_pipe_immediately() {
+fn a_refused_dial_leaves_the_pipe_to_the_fallback_timer() {
     let mut t = T::on_direct();
-    t.feed(I::DirectDown(DownReason::Dead)); // dialing, pipe fallback pending
+    t.feed(I::DirectDown(DownReason::Dead)); // dialing, pipe fallback pending (3 s)
     let a = t.after(Duration::from_millis(500), I::DirectDialFailed(refused()));
-    assert!(a.contains(&RunPipe), "{a:?}");
-    assert!(a.contains(&CancelTimer(PathTimer::PipeFallback)), "{a:?}");
+    assert!(!a.contains(&RunPipe), "{a:?}");
     assert!(delay_of(&a, PathTimer::DirectRetry).is_some());
+    assert_eq!(
+        t.after(
+            Duration::from_millis(2500),
+            I::Timer(PathTimer::PipeFallback)
+        ),
+        [RunPipe]
+    );
+}
+
+#[test]
+fn the_direct_setting_waits_out_its_patience_after_a_failed_redial() {
+    // An 8 s outage with `transport = direct`: dead at 5 s, the redial fails at 7 s (the connect
+    // timeout), and the ssh login must still wait for the 10 s patience, not start at 7 s.
+    let mut t = T::on_pipe_with_direct_info(TransportSetting::Direct);
+    t.feed(I::DirectAvailable);
+    t.advance(S(1));
+    t.feed(I::DirectUp);
+    t.feed(I::Switched(LinkKind::Direct));
+    t.advance(S(60));
+    let a = t.feed(I::DirectDown(DownReason::Dead));
+    assert_eq!(delay_of(&a, PathTimer::PipeFallback), Some(S(10)));
+    let a = t.after(S(2), I::DirectDialFailed(refused()));
+    assert!(
+        !a.contains(&RunPipe) && !a.contains(&CancelTimer(PathTimer::PipeFallback)),
+        "{a:?}"
+    );
+    // The retry fires and dials again; still no pipe.
+    let d = delay_of(&a, PathTimer::DirectRetry).unwrap();
+    assert_eq!(t.after(d, I::Timer(PathTimer::DirectRetry)), [DialDirect]);
+    // At 10 s after the loss, the pipe.
+    let a = t.after(S(10) - S(2) - d, I::Timer(PathTimer::PipeFallback));
+    assert_eq!(a, [RunPipe]);
+}
+
+#[test]
+fn the_pipe_is_not_closed_while_a_switch_to_direct_is_still_to_prove_itself() {
+    let mut t = T::on_direct();
+    t.feed(I::DirectDown(DownReason::Dead)); // redial in flight, pipe fallback pending
+    t.after(S(3), I::Timer(PathTimer::PipeFallback)); // RunPipe
+    // The redial lands first and the session starts moving to it.
+    assert_eq!(
+        t.after(Duration::from_millis(100), I::DirectUp),
+        [SwitchTo(LinkKind::Direct)]
+    );
+    // The ssh login finishes meanwhile: the pipe is kept as the way back.
+    assert_eq!(t.after(Duration::from_millis(100), I::PipeUp), []);
+    assert_eq!(t.view().pipe, Lane::Up);
+    // The resume on direct fails: the session goes to the pipe that is already there.
+    let a = t.feed(I::SwitchFailed(LinkKind::Direct));
+    assert_eq!(a[0], CloseDirect);
+    assert!(a.contains(&SwitchTo(LinkKind::Pipe)), "{a:?}");
+    assert!(!a.contains(&RunPipe), "no second ssh login: {a:?}");
+    assert_eq!(t.feed(I::Switched(LinkKind::Pipe)), []);
+    assert_eq!(t.view().carrier, Some(LinkKind::Pipe));
+}
+
+#[test]
+fn a_reply_over_direct_does_not_clear_the_flapping_backoff() {
+    let mut t = T::on_pipe_with_direct_info(TransportSetting::Auto);
+    t.feed(I::DirectAvailable);
+    t.advance(S(1));
+    t.feed(I::DirectUp);
+    t.feed(I::Switched(LinkKind::Direct)); // pipe closed
+    t.advance(S(2));
+    t.feed(I::DirectDown(DownReason::Dead)); // young: failure 1
+    assert_eq!(t.view().direct_failures, 1);
+    // The client reports `attached` after every reply, including one received over direct.
+    t.feed(I::PipeUp);
+    t.feed(I::DirectAvailable); // over the fresh pipe: a new bootstrap, clears it
+    assert_eq!(t.view().direct_failures, 0);
+    t.feed(I::Switched(LinkKind::Pipe));
+    t.feed(I::DirectUp);
+    t.feed(I::Switched(LinkKind::Direct));
+    t.advance(S(2));
+    t.feed(I::DirectDown(DownReason::Dead));
+    assert_eq!(t.view().direct_failures, 1);
+    t.feed(I::DirectAvailable); // no pipe link exists: this reply came over direct
+    assert_eq!(t.view().direct_failures, 1);
 }
 
 #[test]
@@ -198,6 +275,7 @@ fn a_daemon_restart_needs_a_new_bootstrap_and_dials_the_new_port() {
     let mut t = T::on_direct();
     t.feed(I::DirectDown(DownReason::Dead));
     t.after(Duration::from_millis(500), I::DirectDialFailed(refused())); // key unknown now
+    t.after(S(3), I::Timer(PathTimer::PipeFallback)); // RunPipe
     t.feed(I::PipeUp);
     t.feed(I::Switched(LinkKind::Pipe));
     // Fresh bootstrap over the new pipe: new key, new port. The backoff is forgotten.
@@ -555,6 +633,11 @@ impl World {
                 }
                 ClosePipe => {
                     assert!(self.pipe_running || self.pipe_up, "ClosePipe with no pipe");
+                    assert_eq!(
+                        self.t.view().carrier,
+                        Some(LinkKind::Direct),
+                        "ClosePipe while direct does not carry the session"
+                    );
                     self.pipe_running = false;
                     self.pipe_up = false;
                 }

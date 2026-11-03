@@ -46,10 +46,10 @@ fn endpoint_config(n: u64) -> EndpointConfig {
 
 impl World {
     fn new(n: u64) -> Self {
-        Self::with(n, |_| {})
+        Self::with(n, |_, _| {})
     }
 
-    fn with(n: u64, tweak: impl FnOnce(&mut ListenerConfig)) -> Self {
+    fn with(n: u64, tweak: impl FnOnce(&mut ListenerConfig, &KeyRegistry)) -> Self {
         let net = Net::new(n);
         net.update_conditions(|c| c.latency = Duration::from_millis(20));
         let identity = DaemonIdentity::generate().unwrap();
@@ -58,7 +58,7 @@ impl World {
             rng_seed: Some(seed(n)),
             ..ListenerConfig::default()
         };
-        tweak(&mut cfg);
+        tweak(&mut cfg, &registry);
         let server: SocketAddr = "192.0.2.10:60000".parse().unwrap();
         let server_cfg = quic::server_config(&identity, &registry, &cfg.params).unwrap();
         let endpoint = Endpoint::new_with_abstract_socket(
@@ -279,37 +279,40 @@ async fn control_overtakes_a_bulk_forward() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_terminal_is_sent_ahead_of_a_forward_that_is_already_queued() {
+async fn forwards_make_progress_while_the_terminal_never_goes_idle() {
+    // DESIGN §8.5: a terminal that never goes idle must not stall forwards. The path is
+    // congestion-limited (2% loss), so the sender's scheduling decides who gets the packets.
     let mut w = World::new(31);
+    w.net.update_conditions(|c| c.loss = 0.02);
     let (client, daemon, _) = w.pair().await;
-    let client = Arc::new(client);
-    const CHUNKS: u32 = 160; // 2.5 MiB each way
-    for (ch, tag) in [(FWD, 0u8), (TERM, 1u8)] {
-        let client = client.clone();
-        tokio::spawn(async move {
-            for n in 0..CHUNKS {
-                let mut p = seq_payload(n, 16 * 1024).to_vec();
-                p[4] = tag;
-                client.send(ch, Bytes::from(p)).await.unwrap();
-            }
-        });
-    }
-    // And a few control messages, once both are well under way.
+    let daemon = Arc::new(daemon);
+    const TERM_CHUNKS: u32 = 400;
+    const FWD_CHUNKS: u32 = 50;
     {
-        let client = client.clone();
+        let daemon = daemon.clone();
         tokio::spawn(async move {
-            sleep(Duration::from_millis(150)).await;
-            for n in 0..5u8 {
-                client.send(CTRL, Bytes::from(vec![n])).await.unwrap();
+            for n in 0..TERM_CHUNKS {
+                daemon.send(TERM, seq_payload(n, 16 * 1024)).await.unwrap();
             }
         });
     }
-    // Both channels are saturating the link. When the last terminal payload arrives, the
-    // forward channel has only had its guaranteed share.
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            for n in 0..FWD_CHUNKS {
+                daemon.send(FWD, seq_payload(n, 16 * 1024)).await.unwrap();
+            }
+            // And control messages, strictly ahead of both.
+            for n in 0..5u8 {
+                daemon.send(CTRL, Bytes::from(vec![n])).await.unwrap();
+            }
+        });
+    }
     let (mut term, mut fwd, mut ctl) = (0u32, 0u32, 0u32);
     let mut term_at_last_ctl = None;
-    while term < CHUNKS {
-        match daemon.recv().await.unwrap() {
+    while term < TERM_CHUNKS {
+        match client.recv().await.unwrap() {
             (TERM, _) => term += 1,
             (FWD, _) => fwd += 1,
             (CTRL, _) => {
@@ -321,20 +324,17 @@ async fn the_terminal_is_sent_ahead_of_a_forward_that_is_already_queued() {
             other => panic!("{other:?}"),
         }
     }
+    // The forward got through while the terminal was still sending (quinn round-robins streams
+    // of equal priority), and the terminal was not starved either.
+    assert!(
+        fwd >= FWD_CHUNKS * 4 / 5,
+        "{fwd} of {FWD_CHUNKS} forward payloads arrived while the terminal was sending"
+    );
     let at = term_at_last_ctl.expect("control messages arrived");
     assert!(
-        at < CHUNKS / 2,
-        "control waited for {at} of {CHUNKS} terminal payloads"
+        at < TERM_CHUNKS / 2,
+        "control waited for {at} of {TERM_CHUNKS} terminal payloads"
     );
-    assert!(
-        fwd < CHUNKS / 3,
-        "{fwd} of {CHUNKS} forward payloads arrived before the terminal finished"
-    );
-    // ...and the forward then completes.
-    while fwd < CHUNKS {
-        assert_eq!(daemon.recv().await.unwrap().0, FWD);
-        fwd += 1;
-    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -763,7 +763,7 @@ async fn every_new_address_is_asked_to_prove_itself_with_a_retry() {
 
 #[tokio::test(start_paused = true)]
 async fn a_flood_from_one_source_is_refused_and_other_sources_still_connect() {
-    let mut w = World::with(16, |c| {
+    let mut w = World::with(16, |c, _| {
         c.limits = HandshakeLimits {
             per_source_burst: 4.0,
             per_source_per_sec: 0.5,
@@ -806,7 +806,7 @@ async fn a_flood_from_one_source_is_refused_and_other_sources_still_connect() {
 
 #[tokio::test(start_paused = true)]
 async fn the_global_limit_drops_handshakes_from_many_sources() {
-    let mut w = World::with(17, |c| {
+    let mut w = World::with(17, |c, _| {
         c.limits = HandshakeLimits {
             global_burst: 5.0,
             global_per_sec: 0.1,
@@ -884,4 +884,233 @@ async fn bidirectional_streams_are_not_allowed() {
     // The daemon grants zero bidirectional streams, so opening one never completes.
     let r = timeout(Duration::from_secs(1), conn.open_bi()).await;
     assert!(r.is_err(), "a bidirectional stream was granted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes
+
+#[tokio::test(start_paused = true)]
+async fn dropping_links_ends_their_tasks() {
+    let mut w = World::new(40);
+    let ep = w.client_endpoint();
+    // Keep an endpoint handle so its driver task stays in the baseline.
+    let base = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    {
+        let (client, daemon, _) = w.pair_on(ep.clone()).await;
+        for ch in [CTRL, TERM, FWD, FWD2] {
+            client.send(ch, Bytes::from_static(b"x")).await.unwrap();
+            daemon.send(ch, Bytes::from_static(b"y")).await.unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+        let during = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        assert!(
+            during > base + 10,
+            "{during} tasks with a link, {base} before"
+        );
+    }
+    sleep(Duration::from_secs(30)).await;
+    let after = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    assert!(
+        after <= base + 1,
+        "{after} tasks 30 s after dropping both ends, {base} before"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_fails_instead_of_hanging_when_the_stream_limit_is_spent() {
+    let mut w = World::new(41);
+    let (client, daemon, _) = w.pair().await;
+    // The peer grants 1,024 streams over the link's life; one tiny payload on each channel.
+    for ch in 100..100 + 1024u32 {
+        client
+            .send(ChannelId(ch), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    sleep(Duration::from_millis(500)).await;
+    // The next new channel cannot get a stream. Its first sends queue; then `send` reports it.
+    let t0 = Instant::now();
+    let mut failed = None;
+    for _ in 0..40 {
+        match timeout(
+            Duration::from_secs(20),
+            client.send(ChannelId(5000), Bytes::from_static(b"y")),
+        )
+        .await
+        .expect("send must not hang")
+        {
+            Ok(()) => {}
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    let err = failed.expect("an error once the queue in front of the stuck channel filled");
+    assert!(
+        matches!(err.0, DownReason::Io(ref m) if m.contains("channel 5000")),
+        "{err:?}"
+    );
+    assert!(
+        t0.elapsed() <= Duration::from_secs(10),
+        "{:?}",
+        t0.elapsed()
+    );
+    // The link itself is fine, and the channels that did get a stream still work.
+    assert!(matches!(client.status().borrow().state, LinkState::Up));
+    client
+        .send(ChannelId(100), Bytes::from_static(b"z"))
+        .await
+        .unwrap();
+    let mut n = 0;
+    while n < 1025 {
+        daemon.recv().await.unwrap();
+        n += 1;
+    }
+}
+
+/// The stream bytes of one channel carrying `frames` frames of 16 KiB.
+fn raw_stream_bytes(channel: u8, frames: usize) -> Vec<u8> {
+    let mut v = vec![channel];
+    for _ in 0..frames {
+        v.extend_from_slice(&(16 * 1024u32).to_be_bytes());
+        v.extend_from_slice(&[7u8; 16 * 1024]);
+    }
+    v
+}
+
+#[tokio::test(start_paused = true)]
+async fn unread_data_is_capped_for_the_whole_connection() {
+    let mut w = World::new(42);
+    let (conn, daemon) = raw_peer(&mut w).await;
+    // 100 forwarded channels, 288 KiB each (29 MiB), to a daemon that never calls `recv`.
+    let mut writers = vec![];
+    for i in 0..100u8 {
+        let conn = conn.clone();
+        writers.push(tokio::spawn(async move {
+            let mut s = conn.open_uni().await.unwrap();
+            s.write_all(&raw_stream_bytes(20 + i, 18)).await.unwrap();
+            s.finish().unwrap();
+        }));
+    }
+    sleep(Duration::from_secs(60)).await;
+    let held = daemon.unread_bytes();
+    let cap = 16 * 1024 * 1024;
+    // The cap plus what each channel may always hold (16 KiB and the payload that crosses it).
+    assert!(held >= cap, "{held} bytes held: the cap was not reached");
+    assert!(
+        held <= cap + 100 * (16 * 1024 + 16_416),
+        "{held} bytes held"
+    );
+    assert!(held < 29 * 1024 * 1024, "all of it was buffered: {held}");
+
+    // The terminal is not behind the forwards.
+    let mut s = conn.open_uni().await.unwrap();
+    s.write_all(&[1, 0, 0, 0, 3, b'k', b'e', b'y'])
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(300)).await;
+    let mut first_terminal = None;
+    for i in 0..20 {
+        let (ch, _) = daemon.recv().await.unwrap();
+        if ch == TERM {
+            first_terminal = Some(i);
+            break;
+        }
+    }
+    assert!(
+        first_terminal.is_some(),
+        "the terminal payload was not among the first 20"
+    );
+
+    // Reading frees the rest, and every byte arrives.
+    let mut total = 0usize;
+    while total < 100 * 18 * 16 * 1024 - 20 * 16 * 1024 {
+        total += daemon.recv().await.unwrap().1.len();
+    }
+    for w in writers {
+        w.await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_daemon_passes_up_a_clients_first_control_frame_even_if_it_looks_like_the_accept_frame() {
+    let mut w = World::new(43);
+    let (client, daemon, _) = w.pair().await;
+    let lookalike = fil_proto::ControlMsg::Heartbeat {
+        nonce: 0,
+        reply: true,
+    }
+    .encode()
+    .unwrap();
+    client
+        .send(CTRL, Bytes::from(lookalike.clone()))
+        .await
+        .unwrap();
+    client
+        .send(CTRL, Bytes::from_static(b"next"))
+        .await
+        .unwrap();
+    assert_eq!(daemon.recv().await.unwrap(), (CTRL, Bytes::from(lookalike)));
+    assert_eq!(daemon.recv().await.unwrap().1, Bytes::from_static(b"next"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_revoked_while_its_handshake_finishes_never_reaches_the_daemon() {
+    use std::sync::Mutex;
+    let key = ClientKey::generate().unwrap();
+    let victim = Arc::new(Mutex::new(Some(key.public_key().clone())));
+    let mut w = World::with(44, |c, registry| {
+        let (registry, victim) = (registry.clone(), victim.clone());
+        // The one moment the check after the handshake exists for: the handshake has passed,
+        // the connection is not yet registered with the listener.
+        c.after_handshake = Some(quic::TestHook(Arc::new(move || {
+            if let Some(k) = victim.lock().unwrap().take() {
+                registry.revoke(&k);
+            }
+        })));
+    });
+    w.registry.register(key.public_key().clone());
+    let ep = w.client_endpoint();
+    let err = QuicLink::connect_on(ep, w.server, w.pin(), &key, w.params)
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(err.0, DownReason::Refused(_)), "{err:?}");
+    assert!(
+        timeout(Duration::from_secs(1), w.listener.accept())
+            .await
+            .is_err(),
+        "the daemon was handed a link for a revoked key"
+    );
+    assert_eq!(w.listener.stats().accepted, 0);
+    assert_eq!(w.listener.live_connections(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn finished_handshakes_do_not_hold_the_handshake_cap_until_accept() {
+    let mut w = World::with(45, |c, _| {
+        c.limits.max_pending = 1;
+        c.limits.per_source_burst = 100.0;
+    });
+    // More clients than the listener's hand-over queue holds (32) connect one after another,
+    // and the daemon never calls `accept`.
+    let mut links = vec![];
+    for _ in 0..40 {
+        let ep = w.client_endpoint();
+        let key = ClientKey::generate().unwrap();
+        w.registry.register(key.public_key().clone());
+        links.push(
+            QuicLink::connect_on(ep, w.server, w.pin(), &key, w.params)
+                .await
+                .expect("not turned away as busy"),
+        );
+    }
+    assert_eq!(w.listener.stats().refused_busy, 0);
 }

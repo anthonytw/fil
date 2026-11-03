@@ -30,12 +30,13 @@ pub(super) mod code {
 /// `send` wait; what QUIC flow control holds back backs up into it.
 const WRITE_QUEUE: usize = 8;
 
-/// quinn stream priorities: higher goes first (DESIGN.md §8.5).
+/// quinn stream priorities: higher goes first (DESIGN.md §8.5). Control is strictly ahead of
+/// everything. Interactive and forward channels share one priority on purpose: quinn then
+/// round-robins their streams, so a terminal that never goes idle cannot starve a forward.
 fn priority(channel: ChannelId) -> i32 {
     match channel.class() {
         ChannelClass::Control => 100,
-        ChannelClass::Interactive => 10,
-        ChannelClass::Forward => 0,
+        ChannelClass::Interactive | ChannelClass::Forward => 10,
     }
 }
 
@@ -65,6 +66,9 @@ pub(super) enum Role {
 /// the link can close the connection.
 struct Io {
     conn: Connection,
+    role: Role,
+    /// How long opening a stream may wait for stream credit before `send` gives up.
+    open_timeout: Duration,
     inbox: Inbox,
     writers: Mutex<HashMap<ChannelId, mpsc::Sender<Bytes>>>,
     /// True once any frame from the peer has arrived.
@@ -189,6 +193,8 @@ impl QuicLink {
     fn start(conn: Connection, endpoint: Option<Endpoint>, role: Role, params: LinkParams) -> Self {
         let io = Arc::new(Io {
             conn: conn.clone(),
+            role,
+            open_timeout: params.dead_after,
             inbox: Inbox::new(),
             writers: Mutex::new(HashMap::new()),
             got_frame: watch::Sender::new(false),
@@ -234,6 +240,13 @@ impl QuicLink {
         self.io.conn.remote_address()
     }
 
+    /// Bytes received from the peer that `recv` has not returned yet. Bounded: a channel holds at
+    /// most 256 KiB, and once all channels together hold 16 MiB only channels with more than
+    /// 16 KiB are held back.
+    pub fn unread_bytes(&self) -> usize {
+        self.io.inbox.unread_bytes()
+    }
+
     /// The client key this connection authenticated with (daemon side). The daemon compares it
     /// with the key in the attach request on a resume (DESIGN.md §8.5, resume rules).
     pub fn peer_key(&self) -> Option<PublicKey> {
@@ -267,7 +280,18 @@ impl Link for QuicLink {
             ))));
         }
         let tx = self.io.writer_for(channel)?;
-        tx.send(payload).await.map_err(|_| self.io.down_error())
+        tx.send(payload).await.map_err(|_| {
+            if self.io.inbox.down_reason().is_some() {
+                self.io.down_error()
+            } else {
+                // The writer gave up because no stream could be opened (the peer's limit on
+                // streams is spent, see `MAX_STREAMS`). The link itself is fine.
+                LinkError(DownReason::Io(format!(
+                    "cannot open a stream for channel {}",
+                    channel.0
+                )))
+            }
+        })
     }
 
     async fn recv(&self) -> Result<(ChannelId, Bytes), LinkError> {
@@ -288,13 +312,33 @@ impl Link for QuicLink {
 // Tasks
 
 /// One channel's outgoing stream: opened with the first payload, then a stream of length-prefixed
-/// payloads.
+/// payloads. Ends when the connection does (a link that is dropped or dies must not leave its
+/// writers behind), and when no stream can be opened.
 async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<Bytes>) {
-    let Some(first) = rx.recv().await else {
+    /// The next payload to write, or `None` when the queue's senders are gone or the connection
+    /// has ended.
+    async fn next(io: &Io, rx: &mut mpsc::Receiver<Bytes>) -> Option<Bytes> {
+        tokio::select! {
+            p = rx.recv() => p,
+            _ = io.conn.closed() => None,
+        }
+    }
+
+    let Some(first) = next(&io, &mut rx).await else {
         return;
     };
-    let Ok(mut stream) = io.conn.open_uni().await else {
-        return; // the connection is gone; `supervise` reports why
+    let opened = tokio::select! {
+        r = tokio::time::timeout(io.open_timeout, io.conn.open_uni()) => r,
+        _ = io.conn.closed() => return, // `supervise` reports why
+    };
+    let Ok(Ok(mut stream)) = opened else {
+        // The peer's stream limit is spent (or the connection just ended). Forget this writer,
+        // which fails the senders waiting on it; the link stays up.
+        io.writers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&channel);
+        return;
     };
     let _ = stream.set_priority(priority(channel));
     let mut header = Vec::with_capacity(MAX_VARINT_LEN);
@@ -304,7 +348,7 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<By
     loop {
         let payload = match pending.take() {
             Some(p) => p,
-            None => match rx.recv().await {
+            None => match next(&io, &mut rx).await {
                 Some(p) => p,
                 None => return,
             },
@@ -352,7 +396,9 @@ async fn read_stream(io: Arc<Io>, mut stream: RecvStream) {
         }
         return;
     };
-    let mut proof_pending = channel == ChannelId::CONTROL;
+    // Only a client expects the daemon's accept frame; a daemon passes up whatever the client's
+    // first control frame is.
+    let mut proof_pending = io.role == Role::Client && channel == ChannelId::CONTROL;
     loop {
         let mut prefix = [0u8; 4];
         match stream.read_exact(&mut prefix).await {

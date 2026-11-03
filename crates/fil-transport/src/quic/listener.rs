@@ -44,6 +44,21 @@ pub struct ListenerConfig {
     pub retry: bool,
     /// Makes quinn's random choices repeatable. For simulator tests only.
     pub rng_seed: Option<[u8; 32]>,
+    /// Called once for each connection whose handshake just completed, before the listener
+    /// registers it. Tests use it to revoke a key at the one moment the post-handshake check
+    /// exists for.
+    #[doc(hidden)]
+    pub after_handshake: Option<TestHook>,
+}
+
+/// A callback for tests.
+#[derive(Clone)]
+pub struct TestHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 
 impl Default for ListenerConfig {
@@ -55,6 +70,7 @@ impl Default for ListenerConfig {
             limits: HandshakeLimits::default(),
             retry: true,
             rng_seed: None,
+            after_handshake: None,
         }
     }
 }
@@ -180,6 +196,7 @@ impl QuicListener {
             retry: cfg.retry,
             limiter: Limiter::new(cfg.limits, Instant::now()),
             pending: Arc::new(Semaphore::new(cfg.limits.max_pending)),
+            after_handshake: cfg.after_handshake.clone(),
             out: tx,
         };
         let tasks = vec![
@@ -259,6 +276,7 @@ struct AcceptLoop {
     retry: bool,
     limiter: Limiter,
     pending: Arc<Semaphore>,
+    after_handshake: Option<TestHook>,
     out: mpsc::Sender<QuicLink>,
 }
 
@@ -315,13 +333,20 @@ impl AcceptLoop {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         let out = self.out.clone();
+        let hook = self.after_handshake.clone();
         let params = self.params;
         tokio::spawn(async move {
-            let _permit = permit;
-            let conn = match tokio::time::timeout(params.dead_after, connecting).await {
+            // The permit counts handshakes in progress. It is released as soon as this one is over,
+            // not when the daemon gets around to `accept`.
+            let handshake = tokio::time::timeout(params.dead_after, connecting).await;
+            drop(permit);
+            let conn = match handshake {
                 Ok(Ok(conn)) => conn,
                 _ => return bump(&counters.handshake_failed),
             };
+            if let Some(TestHook(hook)) = hook {
+                hook();
+            }
             let Some(key) = auth::peer_key(&conn) else {
                 conn.close(0u32.into(), b"no client key");
                 return bump(&counters.handshake_failed);

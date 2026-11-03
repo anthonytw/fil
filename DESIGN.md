@@ -122,7 +122,12 @@ fil is one static binary, used on both ends. The remote side runs as `fil server
 - **Which transport, when:** the choice is `fil_transport::path::PathManager`, a state machine with no IO (`docs/m1/quic-link.md`). Direct retries back off from 1 s to 2 min and the pipe's from 1 s to 30 s, with jitter. A link that dies within 10 s counts as a failure, so a flapping one slows down instead of cycling. A network-change hint tries direct at once, at most four times a minute. The pipe is closed only after the session has been moved to QUIC.
 - **Resume:** either way, the client sends "resume session S, epoch E, from byte N", and the daemon continues from byte N (§6.2).
 - **While disconnected:**
-  - The client paints a one-line status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect.
+  - The client paints a status overlay, using the same erase-before-write mechanism as predictions (§9). It removes the overlay on reconnect, leaving the screen and the scrollback exactly as they were.
+    - **Shown on** `Degraded` and `Down`, never before the first screen.
+    - **Says** what is happening ("reconnecting over pipe", how long, which try), and on a second line how many bytes of input are held and how many were dropped.
+    - **Drawn** in inverse video, at the edge of the screen farthest from the cursor, never on the cursor's row, and never over a wide character. If no place is safe, or the terminal is in the middle of an escape sequence, nothing is drawn; it comes back as soon as it is safe.
+    - **Short and unpadded:** at most 40 columns a line, with a space of margin each side. A terminal that reflows on a width change re-wraps anything wider than the new width, and the erase cannot undo that; so if the window narrows at all while something is drawn (the rows under it are re-wrapped too), the screen can no longer be trusted and the next attach starts from a snapshot instead of a resume.
+    - **The same overlay** carries the `~?` help and the questions the client asks (take the session back, confirm offline input, a replaced session), so none of them can corrupt the screen either.
   - Keystrokes typed while disconnected are handled as decided in §4.3.
 
 ### 4.3 Input while disconnected
@@ -418,7 +423,7 @@ Interactive frames keep the order they were queued in, so a snapshot and the out
 **Reconnect.** After a new transport comes up:
 
 1. Each side sends `Hello`.
-2. Each side sends `Resume { channel, received }` for every channel it receives on. For the terminal channel the attach request carries it (§4.1), and the daemon answers with a start point.
+2. Each side sends `Resume { channel, received }` for every channel it receives on. For the terminal channel's output direction the attach request carries it (§4.1), and the daemon answers with a start point. For its keystroke direction the daemon sends `Resume { channel: 1, received }` after the `AttachReply`; the client sends no keystroke on a resumed attach before it arrives.
 3. A sender sends on a channel only after the peer's `Resume` for it has arrived. It restarts exactly at `received`.
 4. If `received` is older than the oldest byte the sender still holds, the channel cannot resume: the sender answers with `Reset { channel, code: ResumeGone }`. The terminal channel never ends this way, because the daemon sends a snapshot instead (below). A forwarded connection closes.
 
@@ -578,7 +583,7 @@ fil detach
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 
-Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde.
+Escapes, typed after Enter as in ssh: `~.` detach, `~#` ports, `~?` help, `~~` a literal tilde. Pasted text (between the bracketed-paste markers) is never an escape.
 
 `~/.config/fil/config.toml`:
 

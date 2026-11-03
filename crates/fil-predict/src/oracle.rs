@@ -140,6 +140,7 @@ pub fn check_view(view: &View, user: &TermState, caps: &Capabilities) -> Result<
                 !caps.underline_styles || cell.attrs.underline != Underline::None
             }
             CellStyle::Plain => true,
+            CellStyle::Reverse => cell.attrs.inverse,
         };
         if !ok_text || !ok_style {
             return Err(Violation {

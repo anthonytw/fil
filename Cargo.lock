@@ -293,6 +293,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fil-client"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fil-predict",
+ "fil-proto",
+ "fil-term",
+ "fil-transport",
+ "rustix",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fil-netsim"
 version = "0.0.0"
 dependencies = [

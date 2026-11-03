@@ -121,7 +121,7 @@ scripted scenarios with each guard off. `sim.rs` is the randomized sweep with ev
 | 4 | **Insert mode (IRM)** | Block (model `insert` and tracker); unknown after DECSTR counts as on | `insert_mode_is_not_painted_into`, mutant `insert` |
 | 5 | **Origin mode / scroll region** | Leave DECOM with `?6 l` for the paint (absolute addressing reaches every row), end with `?6 h` and a region-relative `CUP`; the target must be inside the region. A backend that cannot model DECOM (`vt100`) blocks painting while it is on | `origin_mode_is_addressed_absolutely`, mutant `origin` |
 | 6 | **Charsets** (DEC graphics turns `a` into a glyph): neither backend reports them | Tracker follows `ESC ( ) * +`, SO/SI, `ESC n o`, single shifts, DECSC/DECRC, `CSI s/u`, `?1048/?1049`; paint only if the invoked set is US-ASCII | `dec_graphics_is_not_painted_into`, mutant `charset` |
-| 7 | **Terminals disagree about resets and restores** (all found by the harness): DECSTR (`CSI ! p`) resets the charsets in xterm, not in alacritty; `?1049 l` outside the alternate screen restores in xterm, is ignored by alacritty; `ESC 8` brings back the open hyperlink in alacritty (it saves it with the cursor), xterm has no links | The tracker does not guess. After DECSTR the charsets, insert and origin are *unknown* until set explicitly; a restore with nothing saved makes the charset unknown; a restore after the program has used OSC 8 makes the open link unknown (until its next OSC 8). Unknown blocks painting | `soft_reset_leaves_the_charset_unknown`, `restore_without_a_save_leaves_the_charset_unknown`, `a_cursor_restore_may_drop_the_open_hyperlink` |
+| 7 | **Terminals disagree about resets and restores** (all found by the harness): DECSTR (`CSI ! p`) resets the charsets in xterm, not in alacritty; `?1049 l` outside the alternate screen restores in xterm, is ignored by alacritty; `ESC 8` brings back the open hyperlink in alacritty (it saves it with the cursor), xterm has no links | The tracker does not guess. After DECSTR the charsets, insert, origin and the scroll region are *unknown* until set explicitly (alacritty keeps its own region while reporting none: found by the status-line fuzz, seed 39); a restore with nothing saved makes the charset unknown; a restore after the program has used OSC 8 makes the open link unknown (until its next OSC 8). Unknown blocks painting | `soft_reset_leaves_the_charset_unknown`, `restore_without_a_save_leaves_the_charset_unknown`, `a_cursor_restore_may_drop_the_open_hyperlink` |
 | 8 | **Wide characters and combining marks** | The target cell must be width 1 (never a wide head or its spacer, so half a wide character is never overwritten); predicted characters are only printable ASCII and Latin letters (U+00A1-024F), never combining marks, CJK or emoji | `wide_characters_are_never_split`, mutant `wide` |
 | 9 | **Cursor visibility and shape** | Hide during paint, show again only if the shadow cursor is visible; shape is never touched | `cursor_visibility_is_restored`, mutant `cursor_visibility` |
 | 10 | **Autowrap off / writing at the last column** | Never paint in the last column. Besides the wrap, overwriting the last cell of a soft-wrapped line **loses the line's wrap flag** (found by the harness; reflow and snapshots need it). `vt100` has no DECAWM, so a shadow from it is wrong once a program turns it off: block | `last_column_cell_keeps_the_line_wrap_flag`, mutant `last_column` |
@@ -370,3 +370,27 @@ just predict-demo 200ms
 
 Code: `crates/fil-predict/src/{overlay,predictor,mosh,tracker,keys,oracle,driver,sim,pty}.rs`,
 `examples/{predict_harness,predict_demo}.rs`, `tests/{overlay,hazards,mutants,sim}.rs`.
+
+## Addendum: the pinned status (M1, `fil-client`)
+
+The overlay core also draws lines of text for the client itself: the disconnect status line, the
+`~?` help and the questions it asks (`Overlay::set_status`, `Status`, `Placement`). They go
+through the same plan, the same cell validation and the same gates as predictions, with two
+differences: they ignore the password and alternate-screen rules (those are about guessing what
+a program will echo), and they are drawn in inverse video (`CellStyle::Reverse`). Placement is
+the edge of the screen farthest from the cursor; the cursor's row is never covered, and if a
+cell cannot be drawn safely there (a wide character) the other edge, then the first line alone,
+is tried, and then nothing. `crates/fil-predict/tests/status.rs` checks them against the oracle
+after every flush, on both backends, with scripted cases and seeded random sessions
+(`just status-soak`). The random sessions found one more hazard (row 7, the scroll region after
+DECSTR), and review of the client found another: DECSC saves origin mode in xterm but not in
+the shadow backends, so after a restore that would change it the tracker treats origin mode as
+unknown (vt100 seed 79; both backends now run the full byte pool).
+
+Known limit: a resize erases against the old geometry, as for predictions. For a pinned status
+this matters when the window gets *narrower* while something is drawn: a reflowing terminal re-wraps
+the drawn cells and the program's rows under them, which pushes lines into the scrollback and leaves
+fragments the erase cannot reach. The
+client therefore keeps status lines short (40 columns, unpadded), `Display::resize` reports when
+the window narrowed while something was drawn, and the client then starts the next attach from a
+snapshot (the scrollback keeps the re-wrapped fragments; the screen is repaired).

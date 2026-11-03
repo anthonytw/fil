@@ -24,6 +24,6 @@ pub mod tracker;
 pub mod pty;
 
 pub use mosh::{MoshConfig, MoshPredictor};
-pub use overlay::{Bracket, Config, Flush, Guards, Overlay, PtyMode, View};
+pub use overlay::{Bracket, Config, Flush, Guards, Overlay, Placement, PtyMode, Status, View};
 pub use predictor::{CellStyle, Ctx, KeyEvent, OverlayEdit, Predictor, Time};
 pub use tracker::{Blocker, Tracker};

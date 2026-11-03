@@ -44,6 +44,8 @@ jobs:
         run: just predict-mutants
       - name: Prediction PTY harness (real programs on Linux PTYs)
         run: just predict-harness --seeds 2 --keys 60
+      - name: Client terminal tests (raw mode, signals and window size on a Linux PTY)
+        run: just client-pty
 
   musl:
     # Static builds are a release target (DESIGN.md §13). Informational for now.

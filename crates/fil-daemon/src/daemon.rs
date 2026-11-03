@@ -45,7 +45,6 @@ use fil_session::{DirectInfo, SessionConfig, SessionHandle, SessionHost};
 use fil_transport::auth::{AuthError, DaemonIdentity, KeyRegistry, PublicKey as TransportKey};
 use fil_transport::pipe::{PipeConfig, PipeLink};
 use fil_transport::quic::{ListenError, ListenerConfig, QuicListener};
-use rustix::fs::{FlockOperation, flock};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
@@ -53,7 +52,7 @@ use crate::config::{ConfigError, DaemonConfig};
 use crate::conn::Origin;
 use crate::linger;
 use crate::paths::{DirError, Paths, ensure_socket_dir};
-use crate::start::{clean_up_files, is_current, open_lock_file};
+use crate::start::{LockStep, clean_up_files, lock_step, open_lock_file};
 
 /// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
 const MAX_TOMBSTONES: usize = 256;
@@ -378,7 +377,8 @@ impl Inner {
             st.live.insert(attach.name.clone(), handle.clone());
             self.publish(&st);
         }
-        tracing::info!(session = %attach.name, pid = handle.pid(), "session created");
+        tracing::info!(pid = handle.pid(), "session created");
+        tracing::debug!(session = %attach.name, "session created for");
         let inner = self.clone();
         let h = handle.clone();
         tokio::spawn(async move {
@@ -406,7 +406,8 @@ impl Inner {
         drop(st);
         // The session's keys die with it: a registered key must not outlive its session.
         self.host.revoke_session(h.name(), h.incarnation());
-        tracing::info!(session = %h.name(), code, signal, "session ended");
+        tracing::info!(code, signal, "session ended");
+        tracing::debug!(session = %h.name(), "session ended for");
     }
 
     /// Serves an accepted Unix connection on its own task.
@@ -513,21 +514,15 @@ impl Daemon {
         let mut lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?;
         let deadline = tokio::time::Instant::now() + cfg.lock_wait;
         loop {
-            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-                // A daemon on its way out removes the lock file it held (see `clean_up_files`).
-                // A lock taken on a file that is no longer at the path would exclude nobody.
-                Ok(()) if is_current(&lock, &lock_path) => break,
-                Ok(()) => lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
+            match lock_step(&mut lock, &lock_path, || {}).map_err(io(lock_path.clone()))? {
+                LockStep::Locked => break,
+                LockStep::Replaced => {}
+                LockStep::Busy => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(StartError::AlreadyRunning(lock_path));
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                    if !is_current(&lock, &lock_path) {
-                        lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?;
-                    }
                 }
-                Err(e) => return Err(io(lock_path)(e.into())),
             }
         }
         lock.set_len(0).map_err(io(lock_path.clone()))?;
@@ -849,7 +844,8 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
                 return ExitCode::FAILURE;
             }
         };
-        if let Some(w) = linger::check_host() {
+        // Blocking (it runs `loginctl`): not on a runtime worker.
+        if let Ok(Some(w)) = tokio::task::spawn_blocking(linger::check_host).await {
             tracing::warn!("{w}");
         }
         let daemon = match Daemon::start(paths.clone(), cfg).await {

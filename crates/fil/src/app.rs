@@ -293,10 +293,7 @@ mod tests {
 
     #[test]
     fn the_default_label_is_the_short_host_name() {
-        assert_eq!(
-            short_name("Anthonys-MacBook-Pro.local"),
-            "Anthonys-MacBook-Pro"
-        );
+        assert_eq!(short_name("host-a.local"), "host-a");
         assert_eq!(short_name("box.example.net"), "box");
         assert_eq!(short_name("box"), "box");
         assert_eq!(short_name(".hidden"), ".hidden");

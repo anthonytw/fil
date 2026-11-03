@@ -53,7 +53,7 @@ fn the_client_sets_its_core_limit_to_zero() {
 fn the_first_run_shows_the_pipe_commands_stderr() {
     let home = home_with_pipe("tee", "echo said-on-stderr >&2; exit 1");
     let err = run_ls(&home).expect("sh runs");
-    // Once from the tee, once in the failure message that quotes the last line.
-    assert!(err.matches("said-on-stderr").count() >= 2, "{err}");
+    // Shown once, as it arrived: the failure message does not quote it again.
+    assert_eq!(err.matches("said-on-stderr").count(), 1, "{err}");
     let _ = std::fs::remove_dir_all(&home);
 }

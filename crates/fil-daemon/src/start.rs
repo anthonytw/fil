@@ -40,16 +40,6 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// A daemon that exited cleanly without serving (it lost a race) is replaced this many times.
 const MAX_RESPAWNS: u32 = 3;
-/// Environment variables of the SSH login that must not leak into the daemon and its sessions:
-/// they describe the login that happened to start the daemon, not the sessions.
-const LOGIN_VARS: [&str; 6] = [
-    "SSH_AUTH_SOCK",
-    "SSH_CLIENT",
-    "SSH_CONNECTION",
-    "SSH_TTY",
-    "SSH_ORIGINAL_COMMAND",
-    "SSH_USER_AUTH",
-];
 
 /// How to start a daemon: the executable and the arguments that make it call
 /// [`run_daemon`](crate::run_daemon).
@@ -88,10 +78,90 @@ impl DaemonLauncher {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir("/");
-        for v in LOGIN_VARS {
-            c.env_remove(v);
-        }
+        // What describes the login that happened to start the daemon must not leak into the
+        // daemon and its sessions: the one list that sessions scrub with, read from the real
+        // environment. `FIL_LOG` is not in it: the daemon reads its log level from it.
+        remove_login_vars(&mut c, fil_session::env::login_session_vars_in_env());
         c
+    }
+}
+
+/// Removes `names` from the environment `c` will start with.
+fn remove_login_vars(c: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for v in names {
+        c.env_remove(v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fil-lock-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The file is removed (and another created in its place) after the lock was taken and
+    /// before the check: the lock is on a file nobody else will look at, so it must not count.
+    #[test]
+    fn a_lock_on_a_file_that_was_removed_meanwhile_does_not_count() {
+        let dir = scratch("replaced");
+        let path = dir.join("x.lock");
+        let mut file = open_lock_file(&path).unwrap();
+        let step = lock_step(&mut file, &path, || {
+            std::fs::remove_file(&path).unwrap();
+            drop(open_lock_file(&path).unwrap());
+        })
+        .unwrap();
+        assert_eq!(step, LockStep::Replaced);
+        assert!(is_current(&file, &path), "it follows the file at the path");
+        assert_eq!(
+            lock_step(&mut file, &path, || {}).unwrap(),
+            LockStep::Locked
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock that is held, on a file that is then removed, is not waited on forever.
+    #[test]
+    fn a_busy_file_that_was_removed_is_followed() {
+        let dir = scratch("busy");
+        let path = dir.join("x.lock");
+        let holder = open_lock_file(&path).unwrap();
+        flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let mut waiter = open_lock_file(&path).unwrap();
+        assert_eq!(
+            lock_step(&mut waiter, &path, || {}).unwrap(),
+            LockStep::Busy
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            lock_step(&mut waiter, &path, || {}).unwrap(),
+            LockStep::Replaced
+        );
+        assert_eq!(
+            lock_step(&mut waiter, &path, || {}).unwrap(),
+            LockStep::Locked
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn login_variables_are_removed_and_the_log_level_is_not() {
+        let mut c = Command::new("true");
+        remove_login_vars(&mut c, ["DISPLAY".into(), "XDG_SESSION_ID".into()]);
+        let removed: Vec<_> = c
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_owned())
+            .collect();
+        assert_eq!(removed, ["DISPLAY", "XDG_SESSION_ID"]);
+        // The real list never names the variable the daemon reads its log level from.
+        let in_env = fil_session::env::login_session_vars_in_env();
+        assert!(!in_env.iter().any(|v| v == "FIL_LOG"));
     }
 }
 
@@ -261,23 +331,61 @@ impl StartLock {
         let mut file = open_lock_file(path).map_err(io)?;
         let deadline = Instant::now() + timeout;
         loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                // A daemon on its way out removes the start file (see `clean_up_files`); a lock
-                // taken on a file that is no longer at the path would exclude nobody.
-                Ok(()) if is_current(&file, path) => return Ok(Self { _file: file }),
-                Ok(()) => file = open_lock_file(path).map_err(io)?,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
+            match lock_step(&mut file, path, || {}).map_err(io)? {
+                LockStep::Locked => return Ok(Self { _file: file }),
+                LockStep::Replaced => {}
+                LockStep::Busy => {
                     if Instant::now() >= deadline {
                         return Err(EnsureError::StartLockTimeout(timeout));
                     }
                     std::thread::sleep(Duration::from_millis(10));
-                    if !is_current(&file, path) {
-                        file = open_lock_file(path).map_err(io)?;
-                    }
                 }
-                Err(e) => return Err(io(e.into())),
             }
         }
+    }
+}
+
+/// What one try at an exclusive lock on a lock file came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockStep {
+    /// The lock is held, on the file that is at the path.
+    Locked,
+    /// Somebody else holds it; try again soon.
+    Busy,
+    /// The file was removed or replaced (a daemon on its way out removes its files: see
+    /// [`clean_up_files`]) and `file` now is the new one; try again at once.
+    Replaced,
+}
+
+/// One try at locking `file`, which was opened from `path`. A lock taken on a file that is no
+/// longer at the path would exclude nobody (the next process creates and locks a new one), so
+/// the lock only counts if the file is still the one at the path once it is held; otherwise
+/// `file` is reopened. `between` runs after the lock was taken and before the check (a seam for
+/// the test that removes the file at exactly that moment).
+pub(crate) fn lock_step(
+    file: &mut std::fs::File,
+    path: &Path,
+    between: impl FnOnce(),
+) -> io::Result<LockStep> {
+    match flock(&*file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            between();
+            if is_current(file, path) {
+                Ok(LockStep::Locked)
+            } else {
+                *file = open_lock_file(path)?;
+                Ok(LockStep::Replaced)
+            }
+        }
+        Err(rustix::io::Errno::WOULDBLOCK) => {
+            // Waiting on a file that has been unlinked meanwhile is waiting for nothing.
+            if !is_current(file, path) {
+                *file = open_lock_file(path)?;
+                return Ok(LockStep::Replaced);
+            }
+            Ok(LockStep::Busy)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

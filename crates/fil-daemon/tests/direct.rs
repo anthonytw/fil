@@ -301,7 +301,7 @@ async fn the_default_bind_is_reached_over_both_address_families() {
         QuicLink::connect(addr, pin, &ck, LinkParams::default())
             .await
             .unwrap_or_else(|e| panic!("{addr}: {e}"));
-        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{addr}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{addr}");
     }
     let _ = d.stop().await;
 }

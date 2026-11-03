@@ -8,9 +8,14 @@
 //! - **Bounded in size.** A log over [`LogPolicy::max_bytes`] (4 MiB) is moved to `NAME.1`,
 //!   replacing the previous one. This happens while the process runs, not only when it starts:
 //!   a daemon kept alive by its sessions, or a client attached for weeks, cannot outgrow it.
-//! - **Bounded in age.** The file in use is moved aside once it is [`LogPolicy::rotate_after`]
-//!   (7 days) old, and a rotated file is deleted when it is [`LogPolicy::keep_for`] (7 days)
-//!   past its last write. So nothing older than 14 days stays on disk, however little is logged.
+//! - **Bounded in age.** The file in use is moved aside once its first line is
+//!   [`LogPolicy::rotate_after`] (7 days) old, and a rotated file is deleted when it is
+//!   [`LogPolicy::keep_for`] (7 days) past its last write. So nothing older than 14 days stays on
+//!   disk, however little is logged. The age comes from the first line's own `timestamp`, not
+//!   from a file birth time (musl's `std` has none, and a log must age out there too); a first
+//!   line that does not parse falls back to the file's last write, never to "now". It is checked
+//!   when a line is written, when the log is opened, and every [`MAINTAIN_EVERY`] (an hour) by
+//!   [`RotatingLog::keep_tidy`], so a process that logs little honours it as well.
 //! - **Quiet by default.** `FIL_LOG` names the level (`error`, `warn`, `info`, `debug`, `trace`;
 //!   default `info`) and by default applies to fil's own crates only: `FIL_LOG=trace` shows what
 //!   fil does, not what the QUIC stack does (quinn at trace logs the size and time of every
@@ -47,8 +52,10 @@ impl Default for LogPolicy {
     }
 }
 
-/// How often a running log looks at its rotated file's age.
+/// How often a running log looks at its rotated file's age when it is written to.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+/// How often an idle log looks at its own age and its rotated file's.
+pub const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
 
 /// fil's own crates: what a bare `FIL_LOG` level applies to.
 const FIL_TARGETS: [&str; 9] = [
@@ -73,8 +80,7 @@ pub struct RotatingLog {
 struct State {
     file: File,
     len: u64,
-    /// When the file in use was created (or, where the file system cannot say, when this
-    /// process opened it).
+    /// When the oldest line in the file in use was written (see [`file_born`]).
     born: SystemTime,
     last_prune: Instant,
 }
@@ -90,7 +96,7 @@ impl RotatingLog {
         let rotated = rotated_path(path);
         let now = SystemTime::now();
         if let Ok(meta) = std::fs::metadata(path) {
-            let born = meta.created().unwrap_or(now);
+            let born = file_born(path, &meta);
             if meta.len() > policy.max_bytes || too_old(born, now, policy.rotate_after) {
                 let _ = std::fs::rename(path, &rotated);
             }
@@ -107,6 +113,32 @@ impl RotatingLog {
                 last_prune: Instant::now(),
             }),
         })
+    }
+
+    /// Moves the file in use aside if it has grown too old, and deletes a rotated file that is
+    /// past its age. A write does the first as it goes; this is for a process that writes little
+    /// or nothing, whose old lines would otherwise stay.
+    pub fn maintain(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.len > 0 && too_old(st.born, SystemTime::now(), self.policy.rotate_after) {
+            self.rotate(&mut st);
+        }
+        st.last_prune = Instant::now();
+        prune(&rotated_path(&self.path), self.policy.keep_for);
+    }
+
+    /// Runs [`maintain`](Self::maintain) every `every` on a thread of its own, for as long as the
+    /// process lives. The daemon and the client do this hourly ([`MAINTAIN_EVERY`]).
+    pub fn keep_tidy(self: &Arc<Self>, every: Duration) {
+        let log = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .name("fil-log".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    log.maintain();
+                }
+            });
     }
 
     fn rotate(&self, st: &mut State) {
@@ -150,6 +182,59 @@ fn rotated_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// When the oldest line in the file at `path` was written: the time stamp of its first line (the
+/// JSON `timestamp` field), which is the same on every platform and file system. Not the file's
+/// birth time: musl's `std` cannot read one, and a log that never ages out is the failure this
+/// exists to prevent. A line that does not parse falls back to the file's last write (a file
+/// last written long ago is old), and never to "now". An empty file has no old lines.
+fn file_born(path: &Path, meta: &std::fs::Metadata) -> SystemTime {
+    if meta.len() == 0 {
+        return SystemTime::now();
+    }
+    first_line_time(path)
+        .or_else(|| meta.modified().ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn first_line_time(path: &Path) -> Option<SystemTime> {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let n = File::open(path).ok()?.read(&mut head).ok()?;
+    let line = head[..n].split(|b| *b == b'\n').next()?;
+    parse_timestamp(std::str::from_utf8(line).ok()?)
+}
+
+/// The `"timestamp":"2026-11-03T06:05:59.123456Z"` of a JSON log line (UTC, as tracing writes it).
+fn parse_timestamp(line: &str) -> Option<SystemTime> {
+    let rest = line.split_once("\"timestamp\":\"")?.1;
+    let b = rest.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let t = rest.get(from..from + len)?;
+        if t.bytes().all(|c| c.is_ascii_digit()) {
+            t.parse().ok()
+        } else {
+            None
+        }
+    };
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') || b.get(10) != Some(&b'T') {
+        return None;
+    }
+    let (y, m, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hh, mm, ss) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
 fn too_old(born: SystemTime, now: SystemTime, limit: Duration) -> bool {
     now.duration_since(born).is_ok_and(|age| age > limit)
 }
@@ -177,7 +262,7 @@ fn open_private(path: &Path) -> io::Result<(File, u64, SystemTime)> {
     if meta.mode() & 0o077 != 0 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    let born = meta.created().unwrap_or_else(|_| SystemTime::now());
+    let born = file_born(path, &meta);
     Ok((file, meta.len(), born))
 }
 
@@ -246,11 +331,13 @@ pub fn init(path: &Path, log_panics: bool) -> bool {
     let Some(log) = RotatingLog::open(path, LogPolicy::default()) else {
         return false;
     };
+    let log = Arc::new(log);
+    log.keep_tidy(MAINTAIN_EVERY);
     let installed = tracing_subscriber::fmt()
         .json()
         .with_env_filter(env_filter())
         .with_ansi(false)
-        .with_writer(Arc::new(log))
+        .with_writer(log)
         .try_init()
         .is_ok();
     if installed && log_panics {
@@ -395,24 +482,162 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A line as tracing writes it, `days` old.
+    fn line_from(days_ago: u64) -> String {
+        let t = SystemTime::now() - Duration::from_secs(days_ago * 86_400);
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        // The inverse of `parse_timestamp`, via the civil-from-days algorithm.
+        let z = (secs / 86_400) as i64 + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        let rem = secs % 86_400;
+        format!(
+            "{{\"timestamp\":\"{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.123456Z\",\"level\":\"INFO\"}}\n",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
     #[test]
-    fn a_log_from_long_ago_does_not_survive_a_start() {
-        let dir = temp("stale");
+    fn timestamps_are_read_from_the_first_line() {
+        let t = |s: &str| {
+            parse_timestamp(s)
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(t(r#"{"timestamp":"1970-01-01T00:00:00.000000Z"}"#), 0);
+        assert_eq!(
+            t(r#"{"timestamp":"2000-03-01T00:00:01Z","x":1}"#),
+            951_868_801
+        );
+        assert_eq!(
+            t(r#"{"timestamp":"2026-11-03T06:05:59.5Z"}"#),
+            1_793_685_959
+        );
+        assert_eq!(t(r#"{"timestamp":"2024-02-29T23:59:59Z"}"#), 1_709_251_199);
+        for bad in [
+            "last year",
+            "",
+            r#"{"timestamp":"yesterday"}"#,
+            r#"{"timestamp":"2026-13-03T06:05:59Z"}"#,
+            r#"{"timestamp":"2026-11-03 06:05:59Z"}"#,
+            r#"{"level":"INFO"}"#,
+        ] {
+            assert!(parse_timestamp(bad).is_none(), "{bad:?}");
+        }
+        // And what the helper above writes round-trips.
+        let want = SystemTime::now() - Duration::from_secs(3 * 86_400);
+        let got = parse_timestamp(&line_from(3)).unwrap();
+        let off = want.duration_since(got).unwrap_or_else(|e| e.duration());
+        assert!(off < Duration::from_secs(2), "{off:?}");
+    }
+
+    /// The age of a file comes from its first line, not from a birth time (which musl cannot
+    /// read): a file whose lines are weeks old is moved aside at start although it was written
+    /// to a moment ago, and the same on macOS as on Linux.
+    #[test]
+    fn a_log_whose_first_line_is_old_is_moved_aside_whatever_its_mtime() {
+        let dir = temp("firstline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.log");
+        std::fs::write(&path, format!("{}{}", line_from(10), line_from(0))).unwrap();
+        // Its mtime is now: only the first line says it is old.
+        let log = RotatingLog::open(&path, LogPolicy::default()).unwrap();
+        write(&log, "fresh\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        assert!(
+            std::fs::read_to_string(rotated_path(&path))
+                .unwrap()
+                .contains("INFO")
+        );
+        // A file whose first line is recent stays.
+        drop(log);
+        std::fs::write(&path, line_from(1)).unwrap();
+        let _ = std::fs::remove_file(rotated_path(&path));
+        let log = RotatingLog::open(&path, LogPolicy::default()).unwrap();
+        write(&log, "more\n");
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("more\n"));
+        assert!(!rotated_path(&path).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first line that is not a time stamp falls back to the file's last write: an old file is
+    /// old, and it is never taken for new.
+    #[test]
+    fn a_log_with_no_readable_time_stamp_is_aged_by_its_mtime() {
+        let dir = temp("mtime");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.log");
         std::fs::write(&path, "last year\n").unwrap();
         set_mtime(&path, Duration::from_secs(30 * 24 * 3600));
-        let policy = LogPolicy {
-            rotate_after: Duration::from_secs(1),
-            ..LogPolicy::default()
-        };
-        // The file's birth time is when the test made it: let that pass the policy's limit.
-        std::thread::sleep(Duration::from_millis(1100));
-        let log = RotatingLog::open(&path, policy).unwrap();
+        let log = RotatingLog::open(&path, LogPolicy::default()).unwrap();
         write(&log, "now\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "now\n");
         // What was moved aside last wrote 30 days ago, so it was deleted rather than kept.
         assert!(!rotated_path(&path).exists());
+        drop(log);
+        // A recently written file with no time stamps is not old.
+        std::fs::write(&path, "recent\n").unwrap();
+        let log = RotatingLog::open(&path, LogPolicy::default()).unwrap();
+        write(&log, "more\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "recent\nmore\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A process that logs nothing still honours the age limits: `maintain` (what the hourly tick
+    /// runs) moves an old file aside and deletes an old rotated one.
+    #[test]
+    fn an_idle_log_ages_out_without_a_write() {
+        let dir = temp("idle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.log");
+        let policy = LogPolicy {
+            rotate_after: Duration::from_millis(50),
+            keep_for: Duration::from_millis(400),
+            ..LogPolicy::default()
+        };
+        let log = Arc::new(RotatingLog::open(&path, policy).unwrap());
+        write(&log, "once\n");
+        std::thread::sleep(Duration::from_millis(120));
+        log.maintain();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(rotated_path(&path)).unwrap(),
+            "once\n"
+        );
+        // Later still, the rotated file goes too.
+        std::thread::sleep(Duration::from_millis(450));
+        log.maintain();
+        assert!(!rotated_path(&path).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tick_runs_maintenance_by_itself() {
+        let dir = temp("tick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.log");
+        let policy = LogPolicy {
+            rotate_after: Duration::from_millis(30),
+            ..LogPolicy::default()
+        };
+        let log = Arc::new(RotatingLog::open(&path, policy).unwrap());
+        write(&log, "once\n");
+        log.keep_tidy(Duration::from_millis(40));
+        let end = Instant::now() + Duration::from_secs(5);
+        while !rotated_path(&path).exists() {
+            assert!(Instant::now() < end, "nothing rotated an idle log");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

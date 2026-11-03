@@ -351,13 +351,16 @@ async fn null_stderr_discards_it() {
 async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
     // Our own stderr is what the tee writes to, so the test runs itself as a child and reads that.
     if std::env::var_os("FIL_TEE_PARENT").is_some() {
-        let script = format!("(sleep 1; echo after-stop >&2) & echo before-stop >&2; exec {PROBE}");
+        let script = format!(
+            "(sleep 1; echo after-stop >&2) & printf 'before-stop\\033[2J\\n' >&2; exec {PROBE}"
+        );
         let cfg = PipeConfig {
             stderr: PipeStderr::Tee,
             ..cfg()
         };
         let link = PipeLink::spawn(&sh(&script), cfg).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // No wait: what the command had written before fil started must be shown by the stop at
+        // the latest, not lost because the tee had not read it yet.
         link.stop_stderr_tee();
         tokio::time::sleep(Duration::from_millis(1300)).await;
         // Still captured for the status line, whether or not it was shown.
@@ -381,6 +384,10 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
     let shown = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{shown}");
     assert!(shown.contains("before-stop"), "teed while running: {shown}");
+    assert!(
+        !shown.contains('\u{1b}'),
+        "escape sequences are removed: {shown:?}"
+    );
     assert!(
         !shown.contains("after-stop"),
         "silent after the stop: {shown}"

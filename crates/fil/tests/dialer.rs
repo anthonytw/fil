@@ -860,3 +860,16 @@ fn the_network_watcher_runs_only_when_direct_might_be_used() {
     assert!(DialerConfig::new(TransportSetting::Auto).watch_network);
     assert!(DialerConfig::new(TransportSetting::Direct).watch_network);
 }
+
+/// A change of network reaches the connector, which drops what it remembered about names.
+#[tokio::test(start_paused = true)]
+async fn the_connector_hears_of_a_network_change() {
+    let fake = Fake::new();
+    let mut d = auto(&fake);
+    let _pipe = first_attach(&mut d).await;
+    assert_eq!(fake.network_changes(), 0);
+    d.network_changed();
+    // Hints are read the next time the dialer runs.
+    let _ = swap_within(secs(1), &mut d).await;
+    assert_eq!(fake.network_changes(), 1);
+}

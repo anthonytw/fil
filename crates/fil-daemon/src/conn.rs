@@ -35,6 +35,7 @@ use fil_session::ServeEnd;
 use fil_transport::Link;
 use fil_transport::auth::PublicKey as TransportKey;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::daemon::{Binding, Inner, Lookup};
 
@@ -151,7 +152,12 @@ impl Inner {
             }
         };
         match (next, origin) {
-            (Next::Attach(attach), origin) => self.attach(link, origin, attach).await,
+            (Next::Attach(attach), origin) => {
+                // The session's name is in the span, so it is in the log at debug and not at the
+                // default level (DESIGN.md section 11.1, principle 2).
+                let span = tracing::debug_span!("attach", session = %attach.name);
+                self.attach(link, origin, attach).instrument(span).await;
+            }
             (Next::Request(req), Origin::Pipe) => {
                 let response = self.request(req).await;
                 tell_and_close(&link, ControlMsg::Response(response)).await;
@@ -168,9 +174,9 @@ impl Inner {
         let key = TransportKey::from_spki_der(attach.key.as_bytes());
         let session = attach.name.clone();
         let direct = matches!(origin, Origin::Direct { .. });
-        tracing::info!(%session, resuming = attach.resume.is_some(), direct, "attach");
+        tracing::info!(resuming = attach.resume.is_some(), direct, "attach");
         // Which of the user's machines attached is for someone debugging fil, not for the record.
-        tracing::debug!(%session, host = %attach.host, "attach from");
+        tracing::debug!(host = %attach.host, "attach from");
 
         // What the direct connection may do, decided before looking at any session.
         let required = match &origin {
@@ -197,7 +203,7 @@ impl Inner {
                 .binding(&key)
                 .is_some_and(|b| b.name != attach.name)
             {
-                tracing::warn!(%session, "a key already bound to another session");
+                tracing::warn!("a key already bound to another session");
                 tell_and_close(&link, ControlMsg::Error(ErrorCode::Protocol)).await;
                 return;
             }
@@ -213,13 +219,13 @@ impl Inner {
         let handle = match self.session_for(&attach).await {
             Ok(h) => h,
             Err(Lookup::Refuse(refusal)) => {
-                tracing::info!(%session, refusal = %describe_refusal(&refusal), "attach refused");
+                tracing::info!(refusal = %describe_refusal(&refusal), "attach refused");
                 let msg = refuse(ControlMsg::AttachRefused(refusal));
                 tell_and_close(&link, msg).await;
                 return;
             }
             Err(Lookup::Failed(why)) => {
-                tracing::error!(%session, %why, "cannot serve an attach");
+                tracing::error!(%why, "cannot serve an attach");
                 // The client says so and points at this log; the reason is here, not on the wire.
                 let msg = refuse(ControlMsg::Error(ErrorCode::SessionStartFailed));
                 tell_and_close(&link, msg).await;
@@ -237,7 +243,7 @@ impl Inner {
                     && self.host.binding(&key).as_ref() == Some(&bound)
                     && handle.incarnation() == bound.incarnation;
                 if !still {
-                    tracing::info!(%session, "direct attach whose key was revoked meanwhile");
+                    tracing::info!("direct attach whose key was revoked meanwhile");
                     link.close();
                     return;
                 }
@@ -263,7 +269,7 @@ impl Inner {
         }
 
         let end = handle.serve(link, attach).await;
-        tracing::info!(%session, direct, end = %describe_end(&end), "attach ended");
+        tracing::info!(direct, end = %describe_end(&end), "attach ended");
         if newly_registered && matches!(end, ServeEnd::Refused(_)) {
             self.revoke_key(&key_bytes);
         }
@@ -276,27 +282,26 @@ impl Inner {
     ///   pipe with a new key, so QUIC can never create a session or take one over;
     /// - the key is bound to the session named, at the incarnation resumed.
     fn check_direct(&self, peer: &TransportKey, attach: &Attach) -> Result<Binding, Fail> {
-        let session = &attach.name;
         if peer.as_spki_der() != attach.key.as_bytes() {
-            tracing::warn!(%session, "direct attach with a key the connection did not authenticate with");
+            tracing::warn!("direct attach with a key the connection did not authenticate with");
             return Err(Fail::Tell(ErrorCode::Protocol));
         }
         let Some(resume) = &attach.resume else {
-            tracing::warn!(%session, "a fresh attach over a direct connection; refused");
+            tracing::warn!("a fresh attach over a direct connection; refused");
             return Err(Fail::Tell(ErrorCode::Protocol));
         };
         if !self.registry.contains(peer) {
-            tracing::info!(%session, "direct attach with a revoked key");
+            tracing::info!("direct attach with a revoked key");
             return Err(Fail::Drop("revoked key"));
         }
         match self.host.binding(peer) {
             Some(b) if b.name == attach.name && b.incarnation == resume.incarnation => Ok(b),
-            Some(b) => {
-                tracing::warn!(%session, bound = %b.name, "direct attach for a session the key is not bound to");
+            Some(_) => {
+                tracing::warn!("direct attach for a session the key is not bound to");
                 Err(Fail::Tell(ErrorCode::Protocol))
             }
             None => {
-                tracing::warn!(%session, "direct attach with a key bound to no session");
+                tracing::warn!("direct attach with a key bound to no session");
                 Err(Fail::Tell(ErrorCode::Protocol))
             }
         }
@@ -329,9 +334,10 @@ impl Inner {
             Request::KillSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
                 Some(h) => {
-                    tracing::info!(session = %name, "kill requested");
+                    tracing::info!("kill requested");
+                    tracing::debug!(session = %name, "kill requested for");
                     if h.kill(KILL_TIMEOUT).await.is_none() {
-                        tracing::warn!(session = %name, "the session did not end within {KILL_TIMEOUT:?}");
+                        tracing::warn!("the session did not end within {KILL_TIMEOUT:?}");
                     }
                     Response::Done
                 }
@@ -339,7 +345,8 @@ impl Inner {
             Request::DetachSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
                 Some(h) => {
-                    tracing::info!(session = %name, "detach requested");
+                    tracing::info!("detach requested");
+                    tracing::debug!(session = %name, "detach requested for");
                     h.force_detach().await;
                     Response::Done
                 }
@@ -410,7 +417,7 @@ mod tests {
     /// privacy #1: the log says a session was taken over, not by which of the user's machines.
     #[test]
     fn the_log_names_no_host_label() {
-        let by: fil_proto::msg::HostLabel = "Anthonys-MacBook".parse().unwrap();
+        let by: fil_proto::msg::HostLabel = "laptop-a".parse().unwrap();
         let taken = fil_proto::msg::TakenOver {
             by,
             at_unix_ms: 0,
@@ -421,7 +428,7 @@ mod tests {
             describe_end(&ServeEnd::Refused(AttachRefusal::TakenOver(taken.clone()))),
             describe_refusal(&AttachRefusal::TakenOver(taken)),
         ] {
-            assert!(!text.contains("Anthony"), "{text}");
+            assert!(!text.contains("laptop"), "{text}");
             assert!(text.contains("TakenOver"), "{text}");
         }
         assert_eq!(describe_end(&ServeEnd::Detached), "Detached");

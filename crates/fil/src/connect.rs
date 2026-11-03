@@ -49,8 +49,11 @@ const MAX_ADDRESSES: usize = 4;
 /// already failed.
 const STAGGER: Duration = Duration::from_millis(250);
 /// How long what a lookup found is kept. Past that the name is looked up again (the network may
-/// have changed, and so what the name means).
+/// have changed, and so what the name means). A network change drops it at once.
 const LOOKUP_TTL: Duration = Duration::from_secs(300);
+/// How long a failed lookup is remembered, so that a name that does not resolve here is not asked
+/// for again at every redial.
+const LOOKUP_FAILED_TTL: Duration = Duration::from_secs(30);
 
 type LookupFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<IpAddr>>> + Send>>;
 /// Resolves a name to its addresses. The system resolver in production.
@@ -98,7 +101,8 @@ pub struct Connect {
 struct Resolved {
     name: String,
     at: Instant,
-    ips: Vec<IpAddr>,
+    /// The addresses, or the failure (kind and words) to repeat.
+    found: Result<Vec<IpAddr>, (std::io::ErrorKind, String)>,
 }
 
 impl Connect {
@@ -142,9 +146,12 @@ impl Connect {
                 hostname: Some(name),
                 ..
             }) => Target::Dial(name.clone()),
+            // ssh answered, but with something that is not a host name: the alias the user typed
+            // is not a name for DNS either (it stands for whatever ssh makes of it).
+            Some(_) => Target::PipeOnly("ssh reports no host name that can be dialed"),
             // ssh could not say (it is not there, or too slow): the host as typed is what ssh
             // would have looked up too.
-            _ => Target::Dial(dns_name(&self.host)),
+            None => Target::Dial(dns_name(&self.host)),
         }
     }
 
@@ -157,18 +164,31 @@ impl Connect {
             let cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(r) = cache.as_ref()
                 && r.name == name
-                && r.at.elapsed() < LOOKUP_TTL
             {
-                return Ok(r.ips.clone());
+                match &r.found {
+                    Ok(ips) if r.at.elapsed() < LOOKUP_TTL => return Ok(ips.clone()),
+                    Err((kind, why)) if r.at.elapsed() < LOOKUP_FAILED_TTL => {
+                        return Err(std::io::Error::new(*kind, why.clone()));
+                    }
+                    _ => {}
+                }
             }
         }
-        let ips = (self.lookup)(name.to_string()).await?;
+        let found = (self.lookup)(name.to_string()).await;
         *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(Resolved {
             name: name.to_string(),
             at: Instant::now(),
-            ips: ips.clone(),
+            found: match &found {
+                Ok(ips) => Ok(ips.clone()),
+                Err(e) => Err((e.kind(), e.to_string())),
+            },
         });
-        Ok(ips)
+        found
+    }
+
+    /// The network changed: what a name meant on the last one is not to be trusted.
+    fn forget_lookups(&self) {
+        *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -259,8 +279,13 @@ impl Connector for Connect {
                     banner,
                 })
             }
-            Err(e) => Err(failure(e)),
+            // The interactive run's stderr was shown as it arrived: not said again.
+            Err(e) => Err(failure_with(e, interactive)),
         }
+    }
+
+    fn network_changed(&self) {
+        self.forget_lookups();
     }
 
     fn session_started(&self, link: &AnyLink) {
@@ -318,6 +343,13 @@ impl Connector for Connect {
 
 /// What a failed pipe run means for the client, in words a user can act on.
 pub fn failure(e: PipeError) -> PipeFailure {
+    failure_with(e, false)
+}
+
+/// [`failure`]; with `stderr_shown` (the first, interactive run, whose stderr went to the
+/// terminal as it was written) the command's last line is not repeated in the message and the
+/// status note, which would show it twice.
+pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
     let (severity, message) = match &e.kind {
         PipeErrorKind::Version { ours, theirs } => (
             Severity::Version,
@@ -337,7 +369,11 @@ pub fn failure(e: PipeError) -> PipeFailure {
         }
         _ => (Severity::Transient, e.to_string()),
     };
-    let stderr = e.stderr_text();
+    let stderr = if stderr_shown {
+        String::new()
+    } else {
+        e.stderr_text()
+    };
     let note = stderr_note(&stderr);
     let message = match last_line(&stderr) {
         Some(l) => format!("{message} ({l})"),
@@ -796,5 +832,79 @@ mod tests {
         .await;
         assert_eq!(got, Ok(addr(2)));
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_host_name_ssh_cannot_be_dialed_by_is_not_sent_to_dns() {
+        let c = connect_with(None, None);
+        // ssh answered, but its `hostname` is not a name the program accepts.
+        c.ssh_host
+            .set(Some(SshHost {
+                hostname: None,
+                proxied: false,
+            }))
+            .unwrap();
+        assert!(matches!(c.target().await, Target::PipeOnly(_)));
+        // ssh not answering at all is a different matter: the typed host is what ssh looked up.
+        let c = connect_with(None, None);
+        c.ssh_host.set(None).unwrap();
+        assert_eq!(c.target().await, Target::Dial("k8s-dev".into()));
+        let c = connect_with(None, None);
+        c.ssh_host
+            .set(Some(SshHost {
+                hostname: Some("box.example.net".into()),
+                proxied: true,
+            }))
+            .unwrap();
+        assert!(matches!(c.target().await, Target::PipeOnly(_)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_is_remembered_briefly_and_a_network_change_forgets_everything() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        let mut c = connect_with(None, Some("gone.example.net"));
+        c.lookup = Arc::new(move |_| {
+            n.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(std::io::Error::other("no such host")) })
+        });
+        for _ in 0..4 {
+            let e = c.resolve("gone.example.net").await.unwrap_err();
+            assert!(e.to_string().contains("no such host"), "{e}");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "asked once, not at every redial"
+        );
+        // The network changed: it may resolve now.
+        Connector::network_changed(&c);
+        c.resolve("gone.example.net").await.unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // After the failure's own time it is asked again too.
+        c.resolved.lock().unwrap().as_mut().unwrap().at -=
+            LOOKUP_FAILED_TTL + Duration::from_secs(1);
+        c.resolve("gone.example.net").await.unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn what_was_shown_as_it_arrived_is_not_said_again() {
+        let err = || PipeError {
+            kind: PipeErrorKind::Closed,
+            skipped: Vec::new(),
+            exit: Some("exited with status 255".into()),
+            stderr: b"orin: Permission denied (publickey).\n".to_vec(),
+        };
+        let shown = failure_with(err(), true);
+        assert!(
+            !shown.message.contains("Permission denied"),
+            "{}",
+            shown.message
+        );
+        assert!(shown.note.is_none());
+        let not_shown = failure_with(err(), false);
+        assert!(not_shown.message.contains("Permission denied"));
+        assert!(not_shown.note.is_some());
     }
 }

@@ -461,3 +461,29 @@ async fn ls_does_not_show_a_dropped_connection_as_attached() {
     .await;
     d.stop().await;
 }
+
+/// `history_lines` in `daemon.toml` reaches the session: the scrollback a client that takes the
+/// session over is given is cut to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_lines_from_the_config_limits_the_scrollback_a_new_client_gets() {
+    let scrollback = |history_lines: usize| async move {
+        let s = Scratch::new();
+        let mut cfg = config("seq 1 300; echo done-printing; exec cat");
+        cfg.history_lines = history_lines;
+        let d = start(&s, cfg).await;
+        let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+        a.wait_screen("done-printing").await;
+        // Another client takes the session over and is sent its state as a snapshot.
+        let mut b = Client::attach(d.pipe().await, Connect::new("main", key(2))).await;
+        b.wait_screen("done-printing").await;
+        assert!(matches!(
+            b.reply.as_ref().unwrap().start,
+            StartPoint::Snapshot(_)
+        ));
+        let lines = b.emu.state(10_000).history.len();
+        d.stop().await;
+        lines
+    };
+    assert_eq!(scrollback(5).await, 5);
+    assert!(scrollback(1000).await > 200);
+}

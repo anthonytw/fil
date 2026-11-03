@@ -24,7 +24,7 @@ impl Write for Sink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_default_log_names_no_host_label() {
+async fn the_default_log_names_no_host_label_and_no_session() {
     let sink = Sink::default();
     let writer = sink.clone();
     tracing_subscriber::fmt()
@@ -37,14 +37,15 @@ async fn the_default_log_names_no_host_label() {
     let d = start(&s, config(CAT)).await;
     let mut a = Client::attach(
         d.pipe().await,
-        Connect::new("main", key(1)).host("Anthonys-MacBook"),
+        Connect::new("project-x", key(1)).host("laptop-a"),
     )
     .await;
     a.wait_screen("ready").await;
-    // A second machine takes the session over: the old one is told by whom, the log is not.
+    // A second machine takes the session over: the old one is told by whom; the log names neither
+    // machine and not the session.
     let b = Client::attach(
         d.pipe().await,
-        Connect::new("main", key(2)).host("Rachaels-iPad"),
+        Connect::new("project-x", key(2)).host("tablet-b"),
     )
     .await;
     assert!(b.reply.is_some());
@@ -52,14 +53,14 @@ async fn the_default_log_names_no_host_label() {
         .await;
     assert_eq!(
         a.taken_over.as_ref().unwrap().by.as_str(),
-        "Rachaels-iPad",
+        "tablet-b",
         "the user's other client is told"
     );
     d.stop().await;
 
     let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(log.contains("\"attach\""), "the attach was logged: {log}");
-    for label in ["Anthonys-MacBook", "Rachaels-iPad"] {
+    for label in ["laptop-a", "tablet-b", "project-x"] {
         assert!(!log.contains(label), "{label} is in the log:\n{log}");
     }
 }

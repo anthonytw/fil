@@ -70,6 +70,9 @@ pub enum RelayEnd {
 /// binary's `main` should exit with it directly, without running anything else. It uses no
 /// async runtime, so it can be called from a plain `main`.
 pub fn run_relay(opts: &RelayOptions) -> ExitCode {
+    // Everything the pipe carries passes through this process: no core dump of it. Without a core
+    // limit (on Linux): the relay starts the daemon, and a limit would pass to its sessions.
+    let _ = crate::hardening::disable_core_dumps(false);
     // Raw descriptors, not `std::io::stdout()`, whose line buffering would hold frames back.
     use std::os::fd::AsFd;
     let dup = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().map(std::fs::File::from);

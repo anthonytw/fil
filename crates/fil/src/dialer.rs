@@ -137,6 +137,10 @@ pub trait Connector: Send + Sync + 'static {
         interactive: bool,
     ) -> impl Future<Output = Result<PipeUp<Self::Link>, PipeFailure>> + Send;
 
+    /// The network changed (or the machine woke): anything remembered about where names lead is
+    /// stale. Default: nothing to forget.
+    fn network_changed(&self) {}
+
     /// The session has started over this pipe link (an attach was accepted on it): from here on
     /// the terminal belongs to the session, so the command's stderr must no longer be written to
     /// it. Default: nothing to do.
@@ -646,7 +650,10 @@ impl<C: Connector> PathDialer<C> {
                 }
                 // Otherwise: a link we already closed or replaced.
             }
-            Event::NetworkChanged => self.feed(Instant::now(), PathInput::NetworkChanged),
+            Event::NetworkChanged => {
+                self.connector.network_changed();
+                self.feed(Instant::now(), PathInput::NetworkChanged);
+            }
         }
     }
 

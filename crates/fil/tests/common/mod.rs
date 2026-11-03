@@ -71,6 +71,8 @@ struct State {
     diagnostics: Option<String>,
     /// How many times `session_started` was called, and for which kinds of link.
     started: Vec<LinkKind>,
+    /// How many times the connector was told the network changed.
+    network_changes: usize,
     /// Direct dials dropped while still running (cancelled).
     direct_cancelled: usize,
     direct_default: Option<Script>,
@@ -117,6 +119,10 @@ impl Fake {
         self.state.lock().unwrap().direct_default = Some(s);
     }
     /// The links `session_started` was told about, in order.
+    pub fn network_changes(&self) -> usize {
+        self.state.lock().unwrap().network_changes
+    }
+
     pub fn sessions_started(&self) -> Vec<LinkKind> {
         self.state.lock().unwrap().started.clone()
     }
@@ -240,6 +246,10 @@ impl Connector for Fake {
             }),
             Script::Hang => std::future::pending().await,
         }
+    }
+
+    fn network_changed(&self) {
+        self.state.lock().unwrap().network_changes += 1;
     }
 
     fn session_started(&self, link: &MemLink) {

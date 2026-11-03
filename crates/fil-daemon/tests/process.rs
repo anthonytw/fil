@@ -447,3 +447,24 @@ fn the_default_paths_are_under_tmp_and_the_users_directories() {
     assert!(p.config.ends_with("fil/daemon.toml"));
     assert!(p.log.ends_with("fil/daemon.log"));
 }
+
+/// privacy #7: the relay carries every byte of the session, and is not dumpable either (Linux:
+/// its `/proc` files are not readable even by us).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relay_does_not_dump_core() {
+    if !cfg!(target_os = "linux") || fil_daemon::current_uid() == 0 {
+        return; // on macOS the daemon the relay starts is checked instead; root reads anything
+    }
+    let s = Scratch::new();
+    write_config(&s, "");
+    drop(ensure_daemon(&s.paths(), &launcher(&s, Some(CAT))).unwrap());
+    let cmd = PipeCommand::custom([BIN, "--dir", &s.dir.display().to_string(), "relay"]).unwrap();
+    let link = PipeLink::spawn(&cmd, PipeConfig::default()).await.unwrap();
+    let pid = link.child_id().expect("a relay process");
+    let read = std::fs::read(format!("/proc/{pid}/environ"));
+    assert!(
+        read.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "a dumpable process's environ is readable by its owner"
+    );
+    link.shutdown().await;
+}

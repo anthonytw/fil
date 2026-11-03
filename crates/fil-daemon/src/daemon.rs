@@ -7,7 +7,7 @@
 //!
 //! # Lifecycle
 //!
-//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>.lock` for its
+//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>-<rev>.lock` for its
 //!   whole life (its pid is written there). A second daemon for the same major waits briefly,
 //!   for one on its way out, then reports [`StartError::AlreadyRunning`] and exits cleanly. The
 //!   lock dies with the process, so a socket file that exists while the lock is free is stale
@@ -16,10 +16,12 @@
 //!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
 //!   last look for a connection that raced it, and exits. A relay that arrives later starts a
 //!   new one. A session counts as long as its shell runs, attached or not.
-//! - **Upgrades.** The protocol major is in the socket path, so daemons of different versions
-//!   run side by side. New sessions go to the newest (the client dials the path of its own
-//!   major); old sessions stay on the old daemon until they end, and the old daemon then idles
-//!   out. [`list_sockets`](crate::list_sockets) finds them all for `fil ls`.
+//! - **Upgrades.** The protocol major and the wire revision are in the socket path, so daemons
+//!   of different builds run side by side. New sessions go to the daemon of the client's own
+//!   wire (the relay routes by the client's hello and starts only its own); old sessions stay on
+//!   the old daemon until they end, reachable by a client of the old wire through any relay on
+//!   the host, and the old daemon then idles out. The daemon's answer to `ListSessions` names the
+//!   others it finds ([`other_daemons`](crate::other_daemons)) for `fil ls` to mention.
 //! - **Stopping.** SIGTERM and SIGINT stop the daemon after hanging up every session (as
 //!   closing their terminals would). SIGHUP is ignored.
 //!
@@ -189,6 +191,9 @@ pub(crate) enum Lookup {
 
 pub(crate) struct Inner {
     pub(crate) cfg: DaemonConfig,
+    /// Where this daemon lives: its wire revision (the one its `Hello` states) and the directory
+    /// `fil ls` looks in for daemons of other revisions.
+    pub(crate) paths: Paths,
     pub(crate) registry: KeyRegistry,
     pub(crate) host: Arc<Host>,
     state: Mutex<State>,
@@ -553,6 +558,7 @@ impl Daemon {
         let (busy, _) = watch::channel(0);
         let inner = Arc::new(Inner {
             cfg,
+            paths: paths.clone(),
             registry,
             host,
             state: Mutex::default(),

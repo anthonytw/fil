@@ -131,7 +131,7 @@ async fn a_second_daemon_for_the_same_major_does_not_start() {
     assert_eq!(
         fil_daemon::list_sockets(&s.dir)
             .iter()
-            .map(|(m, _)| *m)
+            .map(|d| d.major)
             .collect::<Vec<_>>(),
         [1, 2]
     );

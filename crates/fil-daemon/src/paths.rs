@@ -2,12 +2,17 @@
 //!
 //! ```text
 //! /tmp/fil-$UID/             mode 0700, owned by us (refused otherwise)
-//!     fil-<major>.sock       the daemon's Unix socket (mode 0600)
-//!     fil-<major>.lock       held (flock) by the running daemon for its whole life; holds its pid
-//!     fil-<major>.start      held briefly by a relay that is starting the daemon
+//!     fil-<major>-<rev>.sock  the daemon's Unix socket (mode 0600)
+//!     fil-<major>-<rev>.lock  held (flock) by the running daemon for its whole life; holds its pid
+//!     fil-<major>-<rev>.start held briefly by a relay that is starting the daemon
 //! ~/.config/fil/daemon.toml  optional configuration (see [`crate::DaemonConfig`])
 //! ~/.local/state/fil/daemon.log
 //! ```
+//!
+//! `<rev>` is the wire revision (`fil_proto::limits::PROTOCOL_REVISION`): a new build starts its own
+//! daemon next to the old build's, which keeps serving the sessions it has. The names hold two
+//! numbers and nothing else: no session name, no host name. A daemon from before revisions used
+//! `fil-<major>.sock` (and `.lock`, `.start`); it is found, never started.
 //!
 //! The directory is deliberately not under `$XDG_RUNTIME_DIR`: systemd-logind removes that
 //! directory when the user's last login ends, which would strand a live daemon.
@@ -19,6 +24,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fil_proto::limits::PROTOCOL_MAJOR;
+use fil_proto::msg::{MAX_OTHER_DAEMONS, OtherDaemon};
+use fil_proto::version::wire_revision;
 
 /// The longest socket path `bind` accepts everywhere we run (macOS allows 103 bytes plus the
 /// terminator; Linux 107).
@@ -50,13 +57,30 @@ pub fn state_dir() -> Option<PathBuf> {
     base_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("fil"))
 }
 
-/// Every path the daemon, the relay and the launcher need, for one protocol major.
+/// `FIL_TEST_SOCKET_DIR`, in builds with the `test-hooks` feature only: a released `fil` never
+/// reads it, so no environment can move the socket directory of a production daemon.
+#[cfg(feature = "test-hooks")]
+fn socket_dir_override() -> Option<PathBuf> {
+    std::env::var_os("FIL_TEST_SOCKET_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn socket_dir_override() -> Option<PathBuf> {
+    None
+}
+
+/// Every path the daemon, the relay and the launcher need, for one protocol major and wire revision.
 #[derive(Clone, Debug)]
 pub struct Paths {
     /// The socket directory (`/tmp/fil-$UID`).
     pub dir: PathBuf,
     /// The protocol major in the file names. Daemons of different majors run side by side.
     pub major: u16,
+    /// The wire revision in the file names, and the one the daemon speaks. Daemons of different
+    /// revisions run side by side.
+    pub revision: u16,
     /// The optional configuration file.
     pub config: PathBuf,
     /// The daemon's log.
@@ -67,7 +91,8 @@ impl Paths {
     /// The standard locations for the current user: `/tmp/fil-$UID`, `$XDG_CONFIG_HOME/fil` (or
     /// `~/.config/fil`) and `$XDG_STATE_HOME/fil` (or `~/.local/state/fil`).
     pub fn for_current_user() -> Paths {
-        let dir = PathBuf::from(format!("/tmp/fil-{}", current_uid()));
+        let dir = socket_dir_override()
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/fil-{}", current_uid())));
         let config = base_dir("XDG_CONFIG_HOME", ".config")
             .map(|p| p.join("fil/daemon.toml"))
             .unwrap_or_else(|| dir.join("daemon.toml"));
@@ -77,6 +102,7 @@ impl Paths {
         Paths {
             dir,
             major: PROTOCOL_MAJOR,
+            revision: wire_revision(),
             config,
             log,
         }
@@ -88,6 +114,7 @@ impl Paths {
         let dir = dir.into();
         Paths {
             major: PROTOCOL_MAJOR,
+            revision: wire_revision(),
             config: dir.join("daemon.toml"),
             log: dir.join("daemon.log"),
             dir,
@@ -101,23 +128,42 @@ impl Paths {
         self
     }
 
-    /// `fil-<major>.sock`.
+    /// The same locations for another wire revision (a daemon of another build, side by side
+    /// with this one).
+    pub fn with_revision(mut self, revision: u16) -> Paths {
+        self.revision = revision;
+        self
+    }
+
+    /// `fil-<major>-<rev>.sock`.
     pub fn socket(&self) -> PathBuf {
         self.file("sock")
     }
 
-    /// `fil-<major>.lock`: held by the running daemon.
+    /// The socket of the daemon of wire `major`/`revision` in this directory, whichever it is:
+    /// `fil-<major>-<rev>.sock`, or the pre-revision `fil-<major>.sock` for revision 0. Numbers
+    /// only, so a client's claim of a wire cannot name any other path.
+    pub fn socket_of(&self, major: u16, revision: u16) -> PathBuf {
+        if revision == 0 {
+            self.dir.join(format!("fil-{major}.sock"))
+        } else {
+            self.dir.join(format!("fil-{major}-{revision}.sock"))
+        }
+    }
+
+    /// `fil-<major>-<rev>.lock`: held by the running daemon.
     pub fn lock(&self) -> PathBuf {
         self.file("lock")
     }
 
-    /// `fil-<major>.start`: held by a relay that is starting the daemon.
+    /// `fil-<major>-<rev>.start`: held by a relay that is starting the daemon.
     pub fn start_lock(&self) -> PathBuf {
         self.file("start")
     }
 
     fn file(&self, ext: &str) -> PathBuf {
-        self.dir.join(format!("fil-{}.{ext}", self.major))
+        self.dir
+            .join(format!("fil-{}-{}.{ext}", self.major, self.revision))
     }
 
     /// Checks the socket path fits in `sockaddr_un`, with a message that says so.
@@ -227,32 +273,88 @@ pub fn ensure_socket_dir(dir: &Path) -> Result<(), DirError> {
     check_dir(dir, DirFacts::of(&meta), ours)
 }
 
-/// The protocol majors that have a socket in `dir`, with the path of each: `fil-<major>.sock`
-/// files only. `fil ls` asks every daemon (DESIGN.md section 5.3). The directory is not
-/// created; a missing one gives an empty list.
-pub fn list_sockets(dir: &Path) -> Vec<(u16, PathBuf)> {
+/// A daemon's socket in the socket directory.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DaemonSocket {
+    pub major: u16,
+    /// The wire revision in the name; 0 for `fil-<major>.sock`, a daemon from before revisions.
+    pub revision: u16,
+    pub path: PathBuf,
+}
+
+impl DaemonSocket {
+    /// This daemon's lock file, next to its socket.
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+}
+
+/// The daemon sockets in `dir`, of every major and revision: `fil-<major>-<rev>.sock` and the
+/// older `fil-<major>.sock`. The directory is not created; a missing one gives an empty list. A
+/// socket may be a crashed daemon's: see [`other_daemons`] for the ones that are alive.
+pub fn list_sockets(dir: &Path) -> Vec<DaemonSocket> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(u16, PathBuf)> = rd
+    let mut out: Vec<DaemonSocket> = rd
         .filter_map(Result::ok)
         .filter_map(|e| {
-            let name = e.file_name();
-            let major = parse_socket_name(&name)?;
-            Some((major, e.path()))
+            let (major, revision) = parse_socket_name(&e.file_name())?;
+            Some(DaemonSocket {
+                major,
+                revision,
+                path: e.path(),
+            })
         })
         .collect();
     out.sort();
     out
 }
 
-fn parse_socket_name(name: &OsStr) -> Option<u16> {
-    let s = name.to_str()?;
-    let digits = s.strip_prefix("fil-")?.strip_suffix(".sock")?;
-    if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+fn parse_socket_name(name: &OsStr) -> Option<(u16, u16)> {
+    let stem = name.to_str()?.strip_prefix("fil-")?.strip_suffix(".sock")?;
+    let number = |s: &str| {
+        if s.is_empty() || s.len() > 5 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<u16>().ok()
+    };
+    match stem.split_once('-') {
+        Some((major, rev)) => Some((number(major)?, number(rev)?)),
+        None => Some((number(stem)?, 0)),
     }
-    digits.parse().ok()
+}
+
+/// Whether the daemon with this lock file is running: it holds the lock for its whole life. A
+/// shared, non-blocking probe on a file opened read-only: it creates nothing, removes nothing and
+/// connects to nothing, so it cannot disturb a daemon that is starting or exiting (a starter that
+/// meets the probe's instant of lock sees the file busy and tries again, as it does for any
+/// other daemon). No file, or a lock nobody holds, is no daemon.
+fn lock_is_held(lock: &Path) -> bool {
+    use rustix::fs::{FlockOperation, flock};
+    let Ok(file) = std::fs::File::open(lock) else {
+        return false;
+    };
+    matches!(
+        flock(&file, FlockOperation::NonBlockingLockShared),
+        Err(rustix::io::Errno::WOULDBLOCK)
+    )
+}
+
+/// The running daemons in `dir` other than the one `paths` names: those of another wire revision
+/// (or major), which a fil of this revision cannot talk to. `fil ls` mentions them
+/// (DESIGN.md section 5.3). Numbers only, at most [`MAX_OTHER_DAEMONS`].
+pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
+    list_sockets(&paths.dir)
+        .into_iter()
+        .filter(|d| (d.major, d.revision) != (paths.major, paths.revision))
+        .filter(|d| lock_is_held(&d.lock_path()))
+        .map(|d| OtherDaemon {
+            major: d.major,
+            revision: d.revision,
+        })
+        .take(MAX_OTHER_DAEMONS)
+        .collect()
 }
 
 #[cfg(test)]
@@ -305,22 +407,31 @@ mod tests {
     #[test]
     fn socket_names() {
         let ok = |s: &str| parse_socket_name(OsStr::new(s));
-        assert_eq!(ok("fil-1.sock"), Some(1));
-        assert_eq!(ok("fil-12.sock"), Some(12));
-        assert_eq!(ok("fil-1.lock"), None);
+        assert_eq!(ok("fil-1-3.sock"), Some((1, 3)));
+        assert_eq!(ok("fil-12-40.sock"), Some((12, 40)));
+        assert_eq!(ok("fil-1.sock"), Some((1, 0)), "from before revisions");
+        assert_eq!(ok("fil-1-3.lock"), None);
         assert_eq!(ok("fil-.sock"), None);
         assert_eq!(ok("fil-x.sock"), None);
-        assert_eq!(ok("fil-1.sock.bak"), None);
+        assert_eq!(ok("fil-1-.sock"), None);
+        assert_eq!(ok("fil--3.sock"), None);
+        assert_eq!(ok("fil-1-3-4.sock"), None);
+        assert_eq!(ok("fil-1-3.sock.bak"), None);
         assert_eq!(ok("fil-123456.sock"), None);
-        assert_eq!(ok("fil-99999.sock"), None, "does not fit a u16");
+        assert_eq!(ok("fil-1-99999.sock"), None, "does not fit a u16");
     }
 
     #[test]
     fn file_names_carry_the_major() {
-        let p = Paths::in_dir("/tmp/x").with_major(7);
-        assert_eq!(p.socket(), Path::new("/tmp/x/fil-7.sock"));
-        assert_eq!(p.lock(), Path::new("/tmp/x/fil-7.lock"));
-        assert_eq!(p.start_lock(), Path::new("/tmp/x/fil-7.start"));
+        let p = Paths::in_dir("/tmp/x").with_major(7).with_revision(3);
+        assert_eq!(p.socket(), Path::new("/tmp/x/fil-7-3.sock"));
+        assert_eq!(p.lock(), Path::new("/tmp/x/fil-7-3.lock"));
+        assert_eq!(p.start_lock(), Path::new("/tmp/x/fil-7-3.start"));
+        // The same major at another revision shares no file.
+        let q = p.clone().with_revision(4);
+        assert_ne!(p.socket(), q.socket());
+        assert_ne!(p.lock(), q.lock());
+        assert_ne!(p.start_lock(), q.start_lock());
         assert!(p.check_socket_len().is_ok());
         let long = Paths::in_dir(format!("/tmp/{}", "a".repeat(120)));
         assert!(matches!(

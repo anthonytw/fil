@@ -1,8 +1,10 @@
 //! Control messages (channel 0) and the validated types they carry.
 //!
-//! Postcard encodes enums by variant index, so the wire contract is: **never reorder or remove
-//! variants or fields; add new variants at the end.** [`Hello`] must stay decodable by every
-//! protocol major, so its layout and its variant index (0) are frozen.
+//! Postcard encodes enums by variant index, so prefer additive changes (new variants at the end,
+//! nothing reordered or removed). **Any change to what a message encodes as, additive or not
+//! (here, in `frame.rs` or in the preamble), needs a new `PROTOCOL_REVISION`**:
+//! `tests/wire_golden.rs` fails until it has one. [`Hello`] must stay decodable by every build,
+//! so its layout and its variant index (0) are frozen within a protocol major.
 //!
 //! Untrusted strings and byte blobs are newtypes that validate while deserializing, so a value of
 //! these types cannot exist with invalid contents, whether it came from the wire or a constructor.
@@ -13,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::frame::{ChannelId, Frame};
 use crate::limits::*;
+use crate::version::WireVersion;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MsgError {
@@ -267,38 +270,51 @@ impl From<TermSize> for (u16, u16) {
     }
 }
 
-/// Frozen: the first message each side sends. Compare majors before anything else.
+/// Frozen: the first message each side sends. Compare versions before anything else.
+///
+/// The second field was once an additive `minor` that nothing checked; it is now the wire
+/// `revision`, in the same place with the same width. A build from before revisions existed sends
+/// 0 there, which no build speaks, so it is told apart from every revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub major: u16,
-    pub minor: u16,
+    pub revision: u16,
     pub agent: Agent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("protocol version mismatch: peer speaks major {peer}, we speak {ours}")]
-pub struct VersionMismatch {
-    pub ours: u16,
-    pub peer: u16,
-}
+pub use crate::version::VersionMismatch;
 
 impl Hello {
     pub fn ours(agent: Agent) -> Self {
+        Self::with_revision(agent, crate::version::wire_revision())
+    }
+
+    /// A hello for the wire revision `revision` (a daemon names its own in its paths; tests name
+    /// others).
+    pub fn with_revision(agent: Agent, revision: u16) -> Self {
         Self {
             major: PROTOCOL_MAJOR,
-            minor: PROTOCOL_MINOR,
+            revision,
             agent,
         }
     }
 
-    /// Majors must match exactly; minors are compatible by construction (additive only).
+    pub fn version(&self) -> WireVersion {
+        WireVersion {
+            major: self.major,
+            revision: self.revision,
+        }
+    }
+
+    /// Major and revision must both match exactly: the encoding of every other message is a
+    /// function of the pair.
     pub fn check(&self, peer: &Hello) -> Result<(), VersionMismatch> {
-        if self.major == peer.major {
+        if self.version() == peer.version() {
             Ok(())
         } else {
             Err(VersionMismatch {
-                ours: self.major,
-                peer: peer.major,
+                ours: self.version(),
+                peer: peer.version(),
             })
         }
     }
@@ -452,13 +468,28 @@ pub enum Request {
     },
 }
 
+/// A daemon of another wire revision, running next to the one that answers (DESIGN.md section
+/// 5.3). Its sessions cannot be listed or reached from here: only a fil of its own revision can
+/// speak to it. Numbers only: it names no session and no host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtherDaemon {
+    pub major: u16,
+    /// 0 is a daemon from before wire revisions.
+    pub revision: u16,
+}
+
+/// The most [`OtherDaemon`]s one answer names.
+pub const MAX_OTHER_DAEMONS: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     /// `truncated` is set when the list did not fit in one control message; see
-    /// [`Response::sessions`].
+    /// [`Response::sessions`]. `others` are the daemons of other wire revisions that are running,
+    /// whose sessions this one cannot list.
     Sessions {
         list: Vec<SessionSummary>,
         truncated: bool,
+        others: Vec<OtherDaemon>,
     },
     Done,
     NoSuchSession,
@@ -467,12 +498,14 @@ pub enum Response {
 impl Response {
     /// A `Sessions` response holding as many of `list` as fit in one control message (the list is
     /// kept in order and cut at the end).
-    pub fn sessions(mut list: Vec<SessionSummary>) -> Self {
+    pub fn sessions(mut list: Vec<SessionSummary>, mut others: Vec<OtherDaemon>) -> Self {
+        others.truncate(MAX_OTHER_DAEMONS);
         let mut truncated = false;
         loop {
             let r = Response::Sessions {
                 list: list.clone(),
                 truncated,
+                others: others.clone(),
             };
             if ControlMsg::Response(r.clone()).encode().is_ok() || list.is_empty() {
                 return r;
@@ -485,6 +518,10 @@ impl Response {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
+    /// **Frozen: index 0 within a protocol major.** With `ControlMsg::Error` (index 11) it is
+    /// the refusal a client of any build with a revision understands (`0b00`), the one thing it must be
+    /// able to read from a newer peer to exit at once instead of timing out. The golden's
+    /// `[frozen]` section holds its bytes.
     VersionMismatch,
     /// The peer can no longer supply the bytes it was asked to resume from.
     ResumeGone,
@@ -528,6 +565,7 @@ pub enum ControlMsg {
         channel: ChannelId,
         code: ErrorCode,
     },
+    /// Frozen at index 11 within a protocol major (see [`ErrorCode::VersionMismatch`]).
     Error(ErrorCode),
     /// Daemon to client: the PTY's line discipline changed (DESIGN.md section 9). Takes effect at
     /// terminal-channel offset `at`, so the client applies it in order with the output.
@@ -729,16 +767,22 @@ mod tests {
             }),
             ControlMsg::Response(Response::Done),
             ControlMsg::Response(Response::NoSuchSession),
-            ControlMsg::Response(Response::sessions(vec![SessionSummary {
-                name: "main".parse().unwrap(),
-                term: "xterm-256color".parse().unwrap(),
-                created_unix_ms: 1,
-                last_output_unix_ms: 2,
-                attached: Some(SubscriberSummary {
-                    host: "laptop".parse().unwrap(),
-                    since_unix_ms: 3,
-                }),
-            }])),
+            ControlMsg::Response(Response::sessions(
+                vec![SessionSummary {
+                    name: "main".parse().unwrap(),
+                    term: "xterm-256color".parse().unwrap(),
+                    created_unix_ms: 1,
+                    last_output_unix_ms: 2,
+                    attached: Some(SubscriberSummary {
+                        host: "laptop".parse().unwrap(),
+                        since_unix_ms: 3,
+                    }),
+                }],
+                vec![OtherDaemon {
+                    major: 1,
+                    revision: 0,
+                }],
+            )),
             ControlMsg::Detach,
             ControlMsg::Heartbeat {
                 nonce: 9,
@@ -770,29 +814,37 @@ mod tests {
 
     #[test]
     fn hello_is_frozen() {
-        // Variant 0, major 1, minor 0, agent "x". If this changes, old daemons cannot even say
-        // "version mismatch" to new clients.
+        // Variant 0, major 1, revision (once the unchecked minor) 0, agent "x". If this changes,
+        // old daemons cannot even say "version mismatch" to new clients.
         let w = ControlMsg::Hello(Hello {
             major: 1,
-            minor: 0,
+            revision: 0,
             agent: "x".parse().unwrap(),
         })
         .encode()
         .unwrap();
         assert_eq!(w, [0, 1, 0, 1, b'x']);
-        let a = Hello::ours("a".parse().unwrap());
+        let a = Hello::with_revision("a".parse().unwrap(), 4);
         let mut b = a.clone();
         assert!(a.check(&b).is_ok());
-        b.minor = 9;
-        assert!(a.check(&b).is_ok());
-        b.major = 2;
+        b.revision = 9;
         assert_eq!(
             a.check(&b).unwrap_err(),
             VersionMismatch {
-                ours: PROTOCOL_MAJOR,
-                peer: 2
-            }
+                ours: WireVersion {
+                    major: PROTOCOL_MAJOR,
+                    revision: 4
+                },
+                peer: WireVersion {
+                    major: PROTOCOL_MAJOR,
+                    revision: 9
+                },
+            },
+            "a different revision of the same major is a mismatch"
         );
+        b.revision = 4;
+        b.major = 2;
+        assert_eq!(a.check(&b).unwrap_err().peer.major, 2);
     }
 
     #[test]
@@ -823,8 +875,11 @@ mod tests {
                 since_unix_ms: u64::MAX,
             }),
         };
-        let r = Response::sessions((0..500).map(one).collect());
-        let Response::Sessions { list, truncated } = &r else {
+        let r = Response::sessions((0..500).map(one).collect(), Vec::new());
+        let Response::Sessions {
+            list, truncated, ..
+        } = &r
+        else {
             panic!("not a session list")
         };
         assert!(truncated);
@@ -833,9 +888,9 @@ mod tests {
         let wire = ControlMsg::Response(r.clone()).encode().unwrap();
         assert_eq!(ControlMsg::decode(&wire).unwrap(), ControlMsg::Response(r));
 
-        let short = Response::sessions((0..3).map(one).collect());
+        let short = Response::sessions((0..3).map(one).collect(), Vec::new());
         assert!(
-            matches!(short, Response::Sessions { truncated: false, ref list } if list.len() == 3)
+            matches!(short, Response::Sessions { truncated: false, ref list, .. } if list.len() == 3)
         );
     }
 

@@ -286,16 +286,15 @@ async fn initial_retries_are_honoured() {
     assert_eq!(rig.dial.dials(), 3);
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_version_mismatch_is_reported() {
+/// A daemon whose `Hello` says `major` and `revision`, then nothing: what the client does with it.
+async fn run_against_hello(major: u16, revision: u16) -> Result<(), fil_client::ClientError> {
     use bytes::Bytes;
     use fil_proto::ChannelId;
     use fil_proto::msg::{Agent, ControlMsg, Hello};
     use fil_transport::Link;
     use fil_transport::link::mem;
 
-    // A daemon speaking another major.
-    struct Odd;
+    struct Odd(u16, u16);
     impl fil_client::Dialer for Odd {
         type Link = fil_transport::link::mem::MemLink;
         fn public_key(&self) -> fil_proto::msg::PublicKey {
@@ -310,16 +309,17 @@ async fn a_version_mismatch_is_reported() {
                 64,
                 mem::Delivery::ControlFirst,
             );
+            let (major, revision) = (self.0, self.1);
             tokio::spawn(async move {
                 let hello = ControlMsg::Hello(Hello {
-                    major: 99,
-                    minor: 0,
+                    major,
+                    revision,
                     agent: Agent::new("odd").unwrap(),
                 });
                 let _ = b
                     .send(ChannelId::CONTROL, Bytes::from(hello.encode().unwrap()))
                     .await;
-                // Keep the link open.
+                // Keep the link open: the client must not need the daemon to say more.
                 std::future::pending::<()>().await;
                 drop(b);
             });
@@ -327,9 +327,49 @@ async fn a_version_mismatch_is_reported() {
         }
     }
     let (terminal, _h) = fake_terminal(80, 24, "xterm");
-    let r = fil_client::run(Odd, terminal, config()).await;
-    match r {
-        Err(fil_client::ClientError::VersionMismatch { peer: 99, .. }) => {}
+    fil_client::run(Odd(major, revision), terminal, config())
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_version_mismatch_is_reported() {
+    // A daemon speaking another major.
+    match run_against_hello(99, 0).await {
+        Err(fil_client::ClientError::VersionMismatch(m)) if m.peer.major == 99 => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The same major with another wire revision (the case a changed encoding makes): refused at the
+/// `Hello`, at once (no retries, so no waiting), with words that name both revisions.
+#[tokio::test(start_paused = true)]
+async fn another_wire_revision_is_reported_at_once_with_both_numbers() {
+    let ours = fil_proto::version::wire_revision();
+    let started = tokio::time::Instant::now();
+    match run_against_hello(fil_proto::limits::PROTOCOL_MAJOR, ours + 5).await {
+        Err(e @ fil_client::ClientError::VersionMismatch(_)) => {
+            let text = e.to_string();
+            assert!(
+                text.contains(&format!("wire rev {}", ours + 5))
+                    && text.contains(&format!("wire rev {ours}"))
+                    && text.contains("newer")
+                    && text.contains("upgrade this fil"),
+                "{text}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// A build from before revisions sent `minor: 0`; it is told apart from every revision.
+#[tokio::test(start_paused = true)]
+async fn a_build_from_before_revisions_is_named_as_such() {
+    match run_against_hello(fil_proto::limits::PROTOCOL_MAJOR, 0).await {
+        Err(e @ fil_client::ClientError::VersionMismatch(_)) => {
+            assert!(e.to_string().contains("predates wire revisions"), "{e}");
+        }
         other => panic!("{other:?}"),
     }
 }

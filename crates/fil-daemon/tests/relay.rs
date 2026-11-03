@@ -1,5 +1,6 @@
 //! The relay: the preamble first, then bytes in both directions exactly as they come, and
-//! nothing else.
+//! nothing else. (Routing by a client's `Hello` is in `revision.rs`; what does not open like a
+//! fil client goes to the relay's own daemon unchanged, which is what these tests send.)
 
 mod common;
 
@@ -12,10 +13,11 @@ use common::*;
 use fil_daemon::{DaemonLauncher, EnsureError, RelayEnd, RelayError, RelayOptions, relay};
 
 fn options(s: &Scratch, launcher: DaemonLauncher) -> RelayOptions {
-    RelayOptions {
-        paths: s.paths(),
-        launcher,
-    }
+    let mut opts = RelayOptions::with_paths(s.paths(), launcher);
+    // These tests' clients send raw bytes or nothing, not a fil client's opening: the relay
+    // gives up waiting for a hello soon and passes the stream to its own daemon.
+    opts.hello_wait = Duration::from_millis(300);
+    opts
 }
 
 fn never_started() -> DaemonLauncher {
@@ -133,6 +135,39 @@ fn the_preamble_is_written_even_when_the_daemon_cannot_be_started() {
         got,
         fil_proto::preamble::encode(fil_proto::limits::PROTOCOL_MAJOR)
     );
+}
+
+/// The socket directory is checked before the relay reads a byte from the client, so a bad one
+/// is refused at once whatever the client sends (the realnet scenario runs `fil server --stdio`
+/// with no input at all and expects the refusal).
+#[test]
+fn a_bad_socket_directory_is_refused_before_anything_is_read_from_the_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    std::fs::create_dir_all(&s.dir).unwrap();
+    std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (relay_in, _keep) = UnixStream::pair().unwrap();
+    let (relay_out, _from_relay) = UnixStream::pair().unwrap();
+    let mut opts = options(&s, never_started());
+    opts.hello_wait = Duration::from_secs(30); // would show if the relay waited for the client
+    let started = std::time::Instant::now();
+    let err = relay(relay_in, relay_out, &opts).unwrap_err();
+    assert!(
+        matches!(err, RelayError::Daemon(EnsureError::Dir(_))),
+        "{err}"
+    );
+    assert!(err.to_string().contains("mode 0755"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // And with the client already gone (no input at all), the same.
+    let (relay_in, gone) = UnixStream::pair().unwrap();
+    drop(gone);
+    let (relay_out, _from_relay) = UnixStream::pair().unwrap();
+    let err = relay(relay_in, relay_out, &opts).unwrap_err();
+    assert!(
+        matches!(err, RelayError::Daemon(EnsureError::Dir(_))),
+        "{err}"
+    );
+    std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]

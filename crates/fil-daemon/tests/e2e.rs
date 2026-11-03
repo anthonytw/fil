@@ -133,7 +133,10 @@ async fn requests_ls_detach_kill() {
     )
     .await;
 
-    let Response::Sessions { list, truncated } = ask(&d, Request::ListSessions).await else {
+    let Response::Sessions {
+        list, truncated, ..
+    } = ask(&d, Request::ListSessions).await
+    else {
         panic!("a session list");
     };
     assert!(!truncated);

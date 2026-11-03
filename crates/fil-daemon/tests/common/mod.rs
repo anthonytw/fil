@@ -162,11 +162,22 @@ impl Running {
     }
 
     pub fn relay_options(&self) -> RelayOptions {
-        RelayOptions {
-            paths: self.paths.clone(),
+        RelayOptions::with_paths(
+            self.paths.clone(),
             // Never used: the daemon is already running.
-            launcher: DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
-        }
+            DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+        )
+    }
+
+    /// A pipe link straight to the daemon's socket, with no relay in between (so no routing by
+    /// the client's hello): the daemon's own checks are all that stand between a client and it.
+    pub async fn direct_link(&self) -> PipeLink {
+        let sock = tokio::net::UnixStream::connect(self.paths.socket())
+            .await
+            .unwrap();
+        PipeLink::accept(sock, PipeConfig::default())
+            .await
+            .expect("pipe link to the daemon socket")
     }
 
     /// A pipe link to the daemon through a real relay (`fil_daemon::relay`), exactly as the
@@ -201,7 +212,17 @@ pub async fn send_ctl<L: Link>(link: &L, msg: &ControlMsg) {
 
 /// Sends `Hello` and `Request` and returns the response, skipping the daemon's `Hello`.
 pub async fn request<L: Link>(link: &L, req: Request) -> Response {
-    send_ctl(link, &hello()).await;
+    request_rev(link, req, fil_proto::version::wire_revision()).await
+}
+
+/// [`request`], with a `Hello` that states wire revision `revision` (a daemon of another revision
+/// refuses any other).
+pub async fn request_rev<L: Link>(link: &L, req: Request, revision: u16) -> Response {
+    send_ctl(
+        link,
+        &ControlMsg::Hello(Hello::with_revision(Agent::new("test").unwrap(), revision)),
+    )
+    .await;
     send_ctl(link, &ControlMsg::Request(req)).await;
     loop {
         let (chan, payload) = tokio::time::timeout(WAIT, link.recv())
@@ -219,7 +240,7 @@ pub async fn request<L: Link>(link: &L, req: Request) -> Response {
 
 pub async fn ask(d: &Running, req: Request) -> Response {
     let link = d.pipe().await;
-    let r = request(&link, req).await;
+    let r = request_rev(&link, req, d.paths.revision).await;
     link.close();
     r
 }

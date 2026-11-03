@@ -146,7 +146,16 @@ async fn attach(
     let result = fil_client::run(dialer, term, cfg).await;
     // The client has restored the terminal and printed how it ended; an error still needs saying.
     if let Err(e) = &result {
-        eprintln!("fil: {e}");
+        // A version error is about "the fil on the remote host": say which host, here at the
+        // print site (the host is what the user typed; the error type and the logs never carry it).
+        if matches!(
+            e,
+            ClientError::VersionMismatch(_) | ClientError::VersionRefused
+        ) {
+            eprintln!("fil: {}: {e}", fil_client::text::sanitize_inline(host));
+        } else {
+            eprintln!("fil: {e}");
+        }
     }
     exit_code(&result)
 }
@@ -199,6 +208,11 @@ async fn manage(host: &str, request: Request, config: &Config) -> u8 {
                 FAILED
             }
         },
+        Err(e @ (mgmt::MgmtError::Version(_) | mgmt::MgmtError::VersionRefused)) => {
+            // Which host: see `attach`.
+            eprintln!("fil: {}: {e}", fil_client::text::sanitize_inline(host));
+            FAILED
+        }
         Err(e) => {
             eprintln!("fil: {e}");
             FAILED

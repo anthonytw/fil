@@ -12,6 +12,7 @@
 //! - [`epoch`]: the one-subscriber-with-takeover state machine for a session.
 //! - [`sched`]: the pipe's frame scheduler (control and terminal ahead of forwarded data).
 //! - [`text`]: untrusted text made safe to show.
+//! - [`version`]: the wire revision this build speaks and the words for a mismatch.
 //!
 //! The byte layout and the limits are documented in DESIGN.md section 8.5 ("Frames and channels").
 
@@ -26,6 +27,7 @@ pub mod preamble;
 pub mod ring;
 pub mod sched;
 pub mod text;
+pub mod version;
 
 pub use frame::{ChannelClass, ChannelId, Frame, FrameDecoder, FrameError};
 pub use input::{InputRecord, TerminalInput};

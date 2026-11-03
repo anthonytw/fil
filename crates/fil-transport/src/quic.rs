@@ -85,6 +85,47 @@ pub use listener::{
     DEFAULT_REVOKE_BACKSTOP, ListenError, ListenerConfig, ListenerStats, QuicListener,
 };
 
+/// What of this crate's QUIC layout the wire golden (`fil-proto/tests/golden/wire.txt`) pins, so
+/// that changing it needs a new `PROTOCOL_REVISION` like any other encoding. Not for use outside
+/// that test.
+pub mod pinned {
+    use super::wire;
+
+    /// Most channels a peer may have open in one direction over a link's life: the peer that
+    /// opens one more has its link ended.
+    pub const MAX_STREAMS: u32 = super::MAX_STREAMS;
+    /// The longest channel-id varint on a stream.
+    pub const MAX_VARINT_LEN: usize = wire::MAX_VARINT_LEN;
+
+    /// The bytes of stream headers and flush markers, by name: the channel-id varint that opens a
+    /// stream, and the eight bytes of a flush marker.
+    pub fn stream_layout() -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for channel in [0u32, 1, 16, 127, 128, 300, 70_000, u32::MAX] {
+            let mut header = Vec::new();
+            wire::put_varint(channel, &mut header);
+            out.push((format!("quic/stream-header-{channel}"), header));
+        }
+        for id in [1u32, 0x0102_0304, u32::MAX] {
+            out.push((
+                format!("quic/flush-marker-{id}"),
+                wire::flush_marker(id).to_vec(),
+            ));
+        }
+        out
+    }
+
+    /// What the reader makes of a length prefix, by the length it states: a payload of that
+    /// size, a flush marker (length 0), or a refusal (over the frame body limit).
+    pub fn prefix_kind(len: u32) -> String {
+        match wire::parse_prefix(len.to_be_bytes()) {
+            Some(wire::Frame::Payload(n)) => format!("payload {n}"),
+            Some(wire::Frame::Flush) => "flush".to_string(),
+            None => "refused".to_string(),
+        }
+    }
+}
+
 /// The default UDP port range for the daemon, the same as mosh's (§8.3).
 pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 60000..=61000;
 

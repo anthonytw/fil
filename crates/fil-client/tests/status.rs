@@ -338,6 +338,39 @@ async fn a_resize_while_offline_redraws_the_line_at_the_new_size() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_pty_mode_from_before_a_reconnect_is_not_applied_after_it() {
+    // A report for an offset the client has not reached waits in the queue. If the link dies
+    // first, the daemon restates the mode in force after the next `AttachReply`, so what waited
+    // is stale and must not land when the resent output reaches its offset (sweep bugs #12).
+    let mut cfg = config();
+    cfg.offline.confirm_after = Some(Duration::from_secs(1));
+    let rig = start(cfg);
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    // The daemon reports a password prompt at an offset whose output is still on its way.
+    rig.daemon.output_unsent(b"Password: ").await;
+    rig.daemon.pty_mode(true, false).await;
+    settle().await;
+    go_offline(&rig).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The resume replays "Password: ", reaching the stale report's offset. This daemon (like
+    // the real one) states the mode in force after the reply: here, none.
+    reconnect(&rig, 2).await;
+    assert!(rig.term.text().contains("Password:"));
+    go_offline(&rig).await;
+    rig.type_str("ls\r");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    reconnect(&rig, 3).await;
+    let text = rig.term.text();
+    assert!(
+        text.contains("\"ls^M\""),
+        "keys were masked as a password: {text}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_pty_mode_report_is_applied_in_order_with_the_output() {
     // The mode lands at its offset: the client's display learns "password prompt" only after
     // the bytes before it were written. The offline confirmation masks keys while it is on.

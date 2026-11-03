@@ -1399,6 +1399,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn on_attach_reply(&mut self, conn: &mut Conn, r: AttachReply) -> Result<Flow, ClientError> {
         conn.awaiting_reply = false;
+        // The daemon states the PTY mode in force after every reply and snapshot, so reports
+        // still waiting for their offset (from before this link) are stale: applied when the
+        // resent output reached them, they would put back a mode the PTY has since left.
+        // Control is ordered on every link, so this link's own restatement comes after.
+        self.sess.modes.clear();
         self.sess.established = true;
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;

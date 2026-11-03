@@ -182,6 +182,45 @@ impl fmt::Debug for LocalPeer {
     }
 }
 
+/// The owner's end of the endpoint's events ([`Endpoint::new`]). At most [`EVENT_QUEUE`] wait
+/// in it. Events of an epoch that has ended ([`Endpoint::new_epoch`]) are discarded, never
+/// handed to the owner.
+pub struct EventReceiver {
+    rx: mpsc::Receiver<(u64, EndpointEvent)>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl EventReceiver {
+    /// The next event of the current epoch; `None` once the endpoint is gone.
+    pub async fn recv(&mut self) -> Option<EndpointEvent> {
+        loop {
+            let (epoch, ev) = self.rx.recv().await?;
+            if epoch == self.epoch.load(Ordering::SeqCst) {
+                return Some(ev);
+            }
+        }
+    }
+
+    /// The next event of the current epoch, if one is waiting.
+    pub fn try_recv(&mut self) -> Result<EndpointEvent, mpsc::error::TryRecvError> {
+        loop {
+            let (epoch, ev) = self.rx.try_recv()?;
+            if epoch == self.epoch.load(Ordering::SeqCst) {
+                return Ok(ev);
+            }
+        }
+    }
+}
+
+/// Counts only.
+impl fmt::Debug for EventReceiver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventReceiver")
+            .field("waiting", &self.rx.len())
+            .finish()
+    }
+}
+
 /// What the endpoint tells its owner. Drain the receiver: it is unbounded, and table messages
 /// are never dropped.
 #[derive(Clone, PartialEq, Eq)]
@@ -455,10 +494,12 @@ struct State<L> {
     /// SOCKS handshakes in progress (they count against [`MAX_PENDING`]), by task.
     handshakes: HashMap<u64, AbortHandle>,
     next_handshake: u64,
-    events: mpsc::Sender<EndpointEvent>,
+    /// Events for the owner, tagged with the epoch they belong to ([`EventReceiver`] discards
+    /// those of an earlier epoch).
+    events: mpsc::Sender<(u64, EndpointEvent)>,
     /// Events the owner's channel had no room for, in order. While any wait, MUX payloads are
     /// held rather than fed to the mux ([`State::held_mux`]).
-    undelivered: VecDeque<EndpointEvent>,
+    undelivered: VecDeque<(u64, EndpointEvent)>,
     /// MUX payloads not yet fed (the owner is behind on events): the mux does not acknowledge
     /// them, so the peer's MUX buffer fills and it stops sending table messages (`TableError::Full`).
     held_mux: VecDeque<Bytes>,
@@ -518,6 +559,7 @@ impl<L: Link> State<L> {
 
     /// Hands `ev` to the owner, or queues it (in order) when the owner's channel is full.
     fn emit(&mut self, ev: EndpointEvent) {
+        let ev = (self.epoch, ev);
         if self.undelivered.is_empty() {
             match self.events.try_send(ev) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -669,6 +711,8 @@ struct Inner<L> {
     pending_kick: Notify,
     /// Events wait for room in the owner's channel.
     events_kick: Notify,
+    /// The current epoch, for the owner's [`EventReceiver`].
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Most MUX bytes held for a slow owner: twice what an honest peer may leave unacknowledged.
     max_held_mux: usize,
     open_wait: Duration,
@@ -742,8 +786,9 @@ impl<L: Link> Endpoint<L> {
         cfg: MuxConfig,
         connector: Arc<dyn Connector>,
         policy: Arc<dyn Policy>,
-    ) -> (Self, mpsc::Receiver<EndpointEvent>) {
+    ) -> (Self, EventReceiver) {
         let (events, events_rx) = mpsc::channel(EVENT_QUEUE);
+        let epoch_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let max_held_mux = 2 * cfg.mux_buffer;
         let connect_timeout = cfg.connect_timeout;
         let open_wait = cfg.open_wait;
@@ -780,6 +825,7 @@ impl<L: Link> Endpoint<L> {
             pumps: AtomicUsize::new(0),
             pending_kick: Notify::new(),
             events_kick: Notify::new(),
+            epoch: epoch_seen.clone(),
             max_held_mux,
             open_wait,
             connector,
@@ -802,7 +848,10 @@ impl<L: Link> Endpoint<L> {
             Self {
                 handle: Arc::new(Handle(inner)),
             },
-            events_rx,
+            EventReceiver {
+                rx: events_rx,
+                epoch: epoch_seen,
+            },
         )
     }
 
@@ -883,6 +932,11 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         st.epoch += 1;
+        // Events of the old epoch are not the new subscriber's (a stale `AddForward` or `Consent`
+        // must not reach it): those still waiting here go now, and the receiver drops those
+        // already in its channel.
+        st.undelivered.clear();
+        inner.epoch.store(st.epoch, Ordering::SeqCst);
         for ch in st.mux.new_epoch() {
             st.end_slot(ch, CloseReason::Reset);
         }

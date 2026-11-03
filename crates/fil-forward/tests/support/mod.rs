@@ -369,7 +369,7 @@ pub struct End {
     pub probes_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
     events: Option<JoinHandle<()>>,
     /// The endpoint's events, when the test drains them itself ([`End::new_with`]).
-    pub events_rx: Option<mpsc::Receiver<fil_forward::EndpointEvent>>,
+    pub events_rx: Option<fil_forward::EventReceiver>,
 }
 
 impl End {
@@ -382,18 +382,19 @@ impl End {
         let targets = Arc::new(Targets::default());
         let policy = Arc::new(TestPolicy::default());
         let (ep, events) = Endpoint::new(side, cfg, targets.clone(), policy.clone());
-        let (events, events_rx) = if hold_events {
-            let (_, dummy) = mpsc::channel(1);
-            (dummy, Some(events))
+        let (drained, events_rx) = if hold_events {
+            (None, Some(events))
         } else {
-            (events, None)
+            (Some(events), None)
         };
-        let mut events = events;
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errs = errors.clone();
         let link_failed = Arc::new(AtomicUsize::new(0));
         let lf = link_failed.clone();
         let events = tokio::spawn(async move {
+            let Some(mut events) = drained else {
+                return;
+            };
             while let Some(e) = events.recv().await {
                 match e {
                     fil_forward::EndpointEvent::Failed(e) => {

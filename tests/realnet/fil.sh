@@ -94,6 +94,9 @@ fc_gone() {
 # fc_type NAME TEXT: keystrokes (C escapes: \r is Enter). fc_line NAME COMMAND: a line and Enter.
 fc_type() { fc "$1" send "$2" > /dev/null || fail "$1: could not type"; }
 fc_line() { fc_type "$1" "$2\\r"; }
+# fc_answer NAME KEY: the answer to a yes/no question on the screen. The client ignores the
+# keyboard until the typing has paused for 300 ms (a word typed ahead must not answer for the user).
+fc_answer() { sleep 0.5; fc_type "$1" "$2"; }
 
 # fc_ready NAME [SECONDS]: the session's shell answers. (The typed text never contains the
 # answer, so the echo of the keystrokes cannot satisfy it.)

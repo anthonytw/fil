@@ -256,19 +256,10 @@ impl Connector for Connect {
     type Link = AnyLink;
 
     async fn run_pipe(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
-        let mut cfg = PipeConfig::new(self.params);
+        let cfg = pipe_config(self.params, interactive);
         let command = if interactive {
-            // The user is waiting for the first attach: ssh's prompts and errors are theirs.
-            // ssh's own messages reach the terminal through the tee until the session starts
-            // (`session_started`), so a `Connection to X closed` in the middle of the raw-mode
-            // screen cannot happen; they are kept for the status line either way.
-            cfg.stderr = PipeStderr::Tee;
             self.command.clone()
         } else {
-            // The terminal belongs to the session: ssh must not prompt, and what it says goes
-            // to the status line and the log, not onto the screen.
-            cfg.preamble_timeout = Some(BACKGROUND_PREAMBLE);
-            cfg.stderr = PipeStderr::Capture;
             without_tty(&self.command)
         };
         match PipeLink::spawn(&command, cfg).await {
@@ -339,6 +330,32 @@ impl Connector for Connect {
         })
         .await
     }
+}
+
+/// How a pipe run is set up.
+///
+/// - **The first, interactive run** (the user is waiting for the first attach): the command runs
+///   in the terminal's foreground group, so its prompts work (Touch ID, passwords, host keys) and
+///   `^C` reaches it; its stderr reaches the terminal as it is written, through the tee, until
+///   the session starts (`session_started`), so that a `Connection to X closed` cannot land in
+///   the middle of the raw-mode screen later. It is kept for the status line either way.
+/// - **Every later run** (a reconnect, a fresh attach after a take-over) is a background run: the
+///   terminal belongs to the session, so the command is started in a process group of its own
+///   (security sweep #2). A command that then prompts on `/dev/tty` (a jump host asking for a
+///   password, a 2FA helper) is stopped by SIGTTIN instead of competing with fil's raw-mode
+///   reader for the user's keystrokes, which would send the answer to the remote shell and the
+///   offline-input log; the preamble timeout ends such a run and reaps the whole group. The
+///   status note then says the pipe needs an interactive login. Its stderr is captured, not shown.
+pub fn pipe_config(params: LinkParams, interactive: bool) -> PipeConfig {
+    let mut cfg = PipeConfig::new(params);
+    if interactive {
+        cfg.stderr = PipeStderr::Tee;
+    } else {
+        cfg.preamble_timeout = Some(BACKGROUND_PREAMBLE);
+        cfg.stderr = PipeStderr::Capture;
+        cfg.own_process_group = true;
+    }
+    cfg
 }
 
 /// What a failed pipe run means for the client, in words a user can act on.
@@ -906,5 +923,23 @@ mod tests {
         let not_shown = failure_with(err(), false);
         assert!(not_shown.message.contains("Permission denied"));
         assert!(not_shown.note.is_some());
+    }
+
+    #[test]
+    fn only_a_background_run_gets_a_process_group_of_its_own() {
+        let first = pipe_config(LinkParams::default(), true);
+        assert!(
+            !first.own_process_group,
+            "prompts and ^C need the foreground group"
+        );
+        assert_eq!(first.stderr, PipeStderr::Tee);
+        assert_eq!(
+            first.preamble_timeout, None,
+            "the user may take as long as ssh does"
+        );
+        let later = pipe_config(LinkParams::default(), false);
+        assert!(later.own_process_group);
+        assert_eq!(later.stderr, PipeStderr::Capture);
+        assert_eq!(later.preamble_timeout, Some(BACKGROUND_PREAMBLE));
     }
 }

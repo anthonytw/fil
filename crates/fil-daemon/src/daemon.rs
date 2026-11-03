@@ -328,10 +328,12 @@ impl Inner {
         sc.env = self.cfg.session.env.clone();
         sc.clear_env = self.cfg.session.clear_env;
         let spawn = SessionHandle::spawn(sc, self.host.clone() as Arc<dyn SessionHost>);
-        let handle = match tokio::time::timeout(SPAWN_TIMEOUT, spawn).await {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => return Err(Lookup::Failed(format!("cannot start the session: {e}"))),
-            Err(_) => {
+        let handle = match spawn_bounded(spawn, SPAWN_TIMEOUT).await {
+            Ok(h) => h,
+            Err(BoundedSpawn::Failed(e)) => {
+                return Err(Lookup::Failed(format!("cannot start the session: {e}")));
+            }
+            Err(BoundedSpawn::TimedOut) => {
                 return Err(Lookup::Failed(format!(
                     "starting the session took more than {SPAWN_TIMEOUT:?}"
                 )));
@@ -818,9 +820,132 @@ impl Signals {
     }
 }
 
+/// Why [`spawn_bounded`] gave no session.
+#[derive(Debug)]
+enum BoundedSpawn {
+    Failed(fil_session::SpawnError),
+    TimedOut,
+}
+
+/// Runs a session spawn for at most `timeout`.
+///
+/// The spawn is blocking work (the PTY, the child, the probes for a systemd scope) that does not
+/// stop when the wait is abandoned. One that finishes after the timeout has started a shell that
+/// nothing tracks and nobody can reach. So the spawn runs on its own task; when the wait times
+/// out, that task is left to finish and the session it produces, if any, is killed.
+async fn spawn_bounded<F>(spawn: F, timeout: Duration) -> Result<SessionHandle, BoundedSpawn>
+where
+    F: std::future::Future<Output = Result<SessionHandle, fil_session::SpawnError>>
+        + Send
+        + 'static,
+{
+    let mut task = tokio::spawn(spawn);
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(Ok(h))) => Ok(h),
+        Ok(Ok(Err(e))) => Err(BoundedSpawn::Failed(e)),
+        Ok(Err(e)) => Err(BoundedSpawn::Failed(fil_session::SpawnError::Pty(
+            e.to_string(),
+        ))),
+        Err(_) => {
+            tokio::spawn(async move {
+                if let Ok(Ok(late)) = task.await {
+                    tracing::warn!(
+                        session = %late.name(),
+                        "a session finished starting after the attach gave up; killing it"
+                    );
+                    if late.kill(KILL_TIMEOUT).await.is_none() {
+                        tracing::warn!(
+                            session = %late.name(),
+                            "the late session did not end within {KILL_TIMEOUT:?}"
+                        );
+                    }
+                }
+            });
+            Err(BoundedSpawn::TimedOut)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alive(pid: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        rustix::process::test_kill_process(pid).is_ok()
+    }
+
+    /// A spawn that finishes after the timeout starts a shell; that shell must not be left running.
+    #[tokio::test]
+    async fn a_session_that_starts_after_the_timeout_is_killed() {
+        let dir = std::env::temp_dir().join(format!("fil-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let mut sc = SessionConfig::new(
+            "late".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            msg::TermSize::new(80, 24).unwrap(),
+            7,
+        );
+        sc.scope = fil_session::ScopeMode::Tree;
+        sc.clear_env = true;
+        sc.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        sc.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("echo $$ > {}; exec cat", pidfile.display()),
+        ]);
+        let host = Arc::new(host(&KeyRegistry::new(), None)) as Arc<dyn SessionHost>;
+        // The spawn is slow: it only starts the shell once the wait has been given up.
+        let slow = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            SessionHandle::spawn(sc, host).await
+        };
+        let r = spawn_bounded(slow, Duration::from_millis(50)).await;
+        assert!(matches!(r, Err(BoundedSpawn::TimedOut)));
+
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break p;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "the late session never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        while alive(pid) {
+            assert!(
+                std::time::Instant::now() < end,
+                "the late session's shell {pid} is still running, untracked"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_spawn_is_returned_and_kept() {
+        let mut sc = SessionConfig::new(
+            "prompt".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            msg::TermSize::new(80, 24).unwrap(),
+            8,
+        );
+        sc.scope = fil_session::ScopeMode::Tree;
+        sc.command = Some(vec!["/bin/sh".into(), "-c".into(), "exec cat".into()]);
+        let host = Arc::new(host(&KeyRegistry::new(), None)) as Arc<dyn SessionHost>;
+        let h = spawn_bounded(SessionHandle::spawn(sc, host), Duration::from_secs(10))
+            .await
+            .expect("spawned in time");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.is_alive(), "an in-time session is not killed");
+        let _ = h.kill(Duration::from_secs(5)).await;
+    }
     use fil_transport::auth::{ClientKey, Fingerprint};
     use fil_transport::quic::QuicLink;
     use fil_transport::{Link, LinkParams, LinkState};

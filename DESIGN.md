@@ -174,8 +174,13 @@ A client that resumes with a stale epoch is refused with the takeover message an
 - **Socket location:** the directory `/tmp/fil-$UID/` (mode 0700) holds the socket.
   - The daemon refuses to start if that directory exists with the wrong owner or mode. This defends against another user creating it first, as tmux does.
   - The socket is deliberately not in `$XDG_RUNTIME_DIR`. systemd-logind deletes that directory when your last login ends, which would strand a live daemon.
-- **Logout cleanup:** hosts with `KillUserProcesses=yes` need `loginctl enable-linger`. The bootstrap detects this and warns.
+- **Logout cleanup:** hosts with `KillUserProcesses=yes` need `loginctl enable-linger`. The bootstrap detects this and warns (see below).
 - **Peer check:** the daemon verifies every connection's peer UID (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and refuses mismatches.
+- **Files:** the socket is `/tmp/fil-$UID/fil-<major>.sock` (mode 0600). Next to it, `fil-<major>.lock` is held (`flock`) by the running daemon for its whole life and holds its pid, and `fil-<major>.start` is held for a moment by a relay that is starting a daemon. The directory is checked with `lstat` (a symbolic link in its place is refused), for its owner first and then for mode exactly 0700. The daemon logs JSON lines to `~/.local/state/fil/daemon.log` (mode 0600, moved to `daemon.log.1` at 4 MiB when a daemon starts; `FIL_LOG` sets the level).
+- **Starting:** the relay tries the socket; if nobody answers it takes the start lock, tries again, and runs the same binary with the daemon subcommand (null stdio, in `/`, without the SSH login's `SSH_*` variables). The daemon calls `setsid` first thing, so a hangup of the login does not reach it. Relays that start together serialize on the start lock, so one daemon starts. A daemon that finds the daemon lock taken waits briefly (one may be on its way out), then exits quietly. The lock dies with the process, so a socket file left by a crash is known to be stale and is removed by the next daemon.
+- **Idle exit:** with no session and no connection for five minutes (`idle_exit_secs`, 0 for never), the daemon removes its socket and exits. A session counts for as long as its shell runs, attached or not.
+- **Configuration:** `~/.config/fil/daemon.toml`, all keys optional, unknown keys an error: `direct` (default true), `bind` (default the wildcard), `port_range` (default `[60000, 61000]`), `idle_exit_secs` (default 300) and `scope` (`auto`, `systemd` or `tree`).
+- **Logout warning:** the relay prints a warning on its stderr, which ssh shows on the user's terminal, when it started the daemon on a host whose `logind.conf` says `KillUserProcesses=yes` and where the user does not linger (and the daemon logs it). Only an explicit `yes` warns.
 - **Upgrades:** the socket path includes the protocol major version, so daemons of different versions can run side by side.
   - New sessions go to the newest daemon.
   - Old sessions stay on their daemon until they end.
@@ -373,7 +378,7 @@ Direct mode is first-class **(decided)**.
 - **Mutual authentication, set up during the bootstrap:**
   - **Daemon to client:** the daemon's certificate fingerprint arrives over the pipe and is pinned. Nothing is trusted on first use.
   - **Client to daemon:** the client generates a key pair in memory for each attach. Only the public half is sent, over the pipe, and the daemon accepts only that key.
-  - Keys are revoked on detach and on takeover, and nothing is written to disk.
+  - A key is bound to the one session its pipe attach was accepted for, and over QUIC it can only resume that session (§8.5). Keys are revoked on detach, on takeover, when the session ends and when the attach is refused, and nothing is written to disk.
 - **Port:** one UDP port per user, not per session. The default range is 60000–61000, the same range mosh uses, so hosts already opened for mosh work unchanged. Both the range and the bind address are configurable, for example to bind only to the LAN or tailnet interface.
 - **Address:** the client dials the same host name it used for the pipe, resolved locally, unless the host config sets `direct.address`. Hosts reached through a jump host usually aren't directly reachable, so they stay on the pipe.
 - **Roaming:** QUIC connection migration covers both client IP changes and NAT rebinding (a router changing the outside port).
@@ -381,7 +386,7 @@ Direct mode is first-class **(decided)**.
 - **Exposure before authentication** is limited to handshake parsing in quinn and rustls. Stateless retry and handshake rate limiting blunt floods:
   - **Retry:** the first packet from an address that has not been validated gets a stateless Retry and nothing else. No handshake state is kept and no crypto is done until the client answers it, so forged source addresses cost one small packet each.
   - **Rate limits:** only validated addresses are counted, so a spoofed flood cannot spend a real client's allowance. Each source address has a token bucket (default burst 8, one a second) and the port has one (burst 100, 50 a second). Over the source limit the handshake is refused with a short close; over the global limit the packet is dropped silently. At most 128 handshakes are in progress at once.
-  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke`; a sweep every 500 ms catches a registry change made directly).
+  - **Revocation:** a revoked key's live connections are closed, not just refused at the next handshake (`QuicListener::revoke` closes at once). Removing a key from the registry blocks new handshakes at once and closes its live connections after a 2 s backstop (`revoke_backstop`), so the layer above can send its last message first; this is safe because a session that lost its subscriber neither reads from nor writes to the old connection.
 
 ### 8.4 Extensibility is compile-time, not runtime
 
@@ -461,6 +466,18 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 **Session management.** `fil ls`, `fil kill` and `fil detach` reuse the fixed remote command. The client sends `Hello`, then one `Request` (`ListSessions`, `KillSession { name }` or `DetachSession { name }`) in place of an `Attach`. The daemon answers with one `Response`: `Sessions { list, truncated }`, `Done` or `NoSuchSession`. A session list is cut to fit one control message (4 KiB) and marked `truncated`.
 
+**What the daemon does with a connection** (`fil-daemon`). It sends its `Hello` at once and expects the client's `Hello` and then an `Attach` or a `Request`, all within 10 s. A different major gets `Error(VersionMismatch)`. A resume for a session the daemon does not have is refused with `SessionGone` if it ended recently (the daemon remembers the last 256 endings) and with `SessionReplaced` otherwise, and never creates a session.
+
+**A direct key is bound to its session.** A pipe `Attach` registers its key for QUIC (the bootstrap) and, once the session accepts the attach, binds the key to that session's name and incarnation. Over QUIC the key reaches that session and nothing else:
+
+- a QUIC `Attach` must be a **resume**; a fresh attach (a take-back included) always goes over the pipe, with a new key, so QUIC can neither create a session nor take one over;
+- it must carry the key the connection authenticated with, name the bound session and carry the bound incarnation, or it gets `Error(Protocol)`;
+- a QUIC `Attach` never registers a key, and a `Request` on QUIC is refused.
+
+The binding and the key end with the subscriber's hold on the session: on takeover and detach (the session's `RevokeKey`), when the session ends or is killed, and when the attach is refused (a key that attach newly registered is revoked again). The registry therefore holds at most one key per live session.
+
+**Revocation timing.** Removing a key from the registry blocks new handshakes with it at once. Its live QUIC connections are closed by the listener 2 s later (`revoke_backstop`) unless something closes them first, which the session does: it sends `TakenOver`, waits for it to be read, and closes the link, so the old client is told. This is safe because a session whose subscriber lost it neither reads from nor writes to the old connection; the delay is only a backstop for a serve task that is stuck.
+
 Before v1 these changes are made in place, with no compatibility kept.
 
 **Pipe heartbeats.** The pipe link sends `Heartbeat { reply: false }` on channel 0 after `heartbeat` (default 1 s) without sending anything else, and answers each one at once with `reply: true` and the same nonce. It measures RTT from the pairs, and consumes heartbeats itself without passing them to the layer above. Any bytes received count as proof of life (so a large frame crawling over a slow pipe is not silence). At most one reply (to the latest ping) and one ping of our own are ever pending, and they are written ahead of everything else, so a flood of pings costs nothing and stale pings do not pile up behind a stuck write. Received payloads wait for the layer above in a queue with a byte budget (2 MiB by default). Under the budget the link keeps reading, so a lagging consumer does not hide a dead peer; past it the link stops reading, freezes the silence clock and reports `Degraded` until the consumer has caught up to half the budget. `recv` still returns the payloads received before the link went down, then fails (a `TakenOver` sent just before the peer closed must not be lost). Each side sends a heartbeat as soon as the preamble is past (the daemon side: as soon as it accepts the stream), and the link is `Up` once the peer's first frame has arrived. The pipe has no goodbye frame: after `close()` the peer sees the stream end and reports `Down(Io)`, not `Down(Closed)`.
@@ -533,7 +550,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 |---|---|---|
 | Anyone on the network | sshd; the UDP port when direct mode is on | OpenSSH as before. The QUIC handshake succeeds only with the per-attach client key that was registered over the pipe. Everything else is dropped. |
 | A man in the middle | the direct connection | The client pins the daemon's certificate fingerprint received over the pipe. Nothing is trusted on first use. |
-| Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, and is revoked on detach and takeover. |
+| Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, is bound to its one session (over QUIC it can only resume that session), and is revoked on detach, takeover and when the session ends. |
 | Other users on the remote host | the socket directory | 0700 and owned by you; the daemon refuses a directory created by someone else; every connection's peer UID is checked by the kernel. |
 | Other users on the remote host | `-R` ports on 127.0.0.1 | Reachable by every user on that host, the same as `ssh -R`. Documented. |
 | Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |
@@ -579,7 +596,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
   - `fil-session`: one session (PTY, log, emulator, the subscriber protocol over any `Link`)
   - `fil-predict`: the trait and the default predictor
   - `fil-netsim`: the in-process link simulator (§12), used only by tests
-  - `fil-daemon`
+  - `fil-daemon`: the daemon, its socket and lifecycle, and the stdio relay (`fil server --stdio`)
   - `fil`: the CLI
 
 ## 14. CLI and configuration (sketch)

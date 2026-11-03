@@ -75,12 +75,44 @@ fn on_path(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How long the probes (`loginctl`, the trial scope) may take. A user manager that does not
+/// answer, common right after logout without lingering, must not hang session creation.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `cmd` with its output captured and kills it after `timeout`.
+fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let end = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("did not answer within {timeout:?}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Blocking: runs `loginctl`. Call from a blocking context.
 fn linger_enabled() -> bool {
     let uid = nix::unistd::getuid();
-    Command::new("loginctl")
-        .args(["show-user", &uid.to_string(), "-p", "Linger"])
-        .output()
+    let mut cmd = Command::new("loginctl");
+    cmd.args(["show-user", &uid.to_string(), "-p", "Linger"]);
+    output_with_timeout(cmd, PROBE_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .is_some_and(|o| parse_linger(&String::from_utf8_lossy(&o.stdout)))
@@ -150,12 +182,12 @@ fn trial_scope() -> Result<(), String> {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let unit = format!("fil-trial-{}-{n}", std::process::id());
-    let out = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect"])
+    let mut cmd = Command::new("systemd-run");
+    cmd.args(["--user", "--scope", "--quiet", "--collect"])
         .arg(format!("--unit={unit}"))
-        .args(["--", "true"])
-        .output()
-        .map_err(|e| format!("systemd-run did not start: {e}"))?;
+        .args(["--", "true"]);
+    let out = output_with_timeout(cmd, PROBE_TIMEOUT)
+        .map_err(|e| format!("systemd-run did not run: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -399,6 +431,20 @@ pub fn hang_up(root: u32, scope: &Scope, tracker: &Tracker) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_that_hangs_is_killed_at_the_timeout() {
+        let mut slow = Command::new("sleep");
+        slow.arg("30");
+        let t = Instant::now();
+        let err = output_with_timeout(slow, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        let mut quick = Command::new("echo");
+        quick.arg("hi");
+        let out = output_with_timeout(quick, Duration::from_secs(5)).unwrap();
+        assert!(out.status.success() && out.stdout.starts_with(b"hi"));
+    }
 
     fn row(pid: u32, ppid: u32, start: &str) -> ProcRow {
         ProcRow {

@@ -20,6 +20,9 @@ use crate::link::LinkParams;
 /// How often live connections are checked against the key registry.
 const SWEEP_EVERY: Duration = Duration::from_millis(500);
 
+/// The default for [`ListenerConfig::revoke_backstop`].
+pub const DEFAULT_REVOKE_BACKSTOP: Duration = Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ListenError {
     #[error("no free UDP port in {lo}-{hi}")]
@@ -39,6 +42,11 @@ pub struct ListenerConfig {
     pub ports: RangeInclusive<u16>,
     pub params: LinkParams,
     pub limits: HandshakeLimits,
+    /// How long after a key is revoked in the registry its live connections are closed (default
+    /// 2 s). New handshakes with the key fail at once; the delay lets the layer above send its
+    /// last message (a takeover notice) on a connection that is no longer serving the key's
+    /// holder. [`QuicListener::revoke`] closes at once instead.
+    pub revoke_backstop: Duration,
     /// Answer unvalidated addresses with a stateless Retry before spending any work on them.
     /// Costs one round trip per handshake. Turn it off only in tests.
     pub retry: bool,
@@ -70,6 +78,7 @@ impl Default for ListenerConfig {
             ports: DEFAULT_PORT_RANGE,
             params: LinkParams::default(),
             limits: HandshakeLimits::default(),
+            revoke_backstop: DEFAULT_REVOKE_BACKSTOP,
             retry: true,
             rng_seed: None,
             #[cfg(feature = "test-hooks")]
@@ -146,7 +155,9 @@ impl Drop for Inner {
 /// Every accepted [`QuicLink`] belongs to a client whose key was in the [`KeyRegistry`] when it
 /// connected. Use [`QuicLink::peer_key`] to compare it with the attach request. When a key is
 /// revoked, call [`revoke`](Self::revoke): it closes that key's live connections now. Revoking
-/// in the registry directly also works, within [`SWEEP_EVERY`] (half a second).
+/// in the registry directly blocks new handshakes at once and closes the live connections
+/// after [`ListenerConfig::revoke_backstop`] (2 s by default), so the layer above can send its
+/// last message on them first.
 #[derive(Clone)]
 pub struct QuicListener(Arc<Inner>);
 
@@ -205,7 +216,7 @@ impl QuicListener {
         };
         let tasks = vec![
             tokio::spawn(accept_loop.run()).abort_handle(),
-            tokio::spawn(sweep(registry.clone(), live.clone())).abort_handle(),
+            tokio::spawn(sweep(registry.clone(), live.clone(), cfg.revoke_backstop)).abort_handle(),
         ];
         Self(Arc::new(Inner {
             endpoint,
@@ -371,9 +382,13 @@ impl AcceptLoop {
     }
 }
 
-/// Closes connections whose key is no longer registered, and forgets closed ones.
-async fn sweep(registry: KeyRegistry, live: Arc<Live>) {
-    let mut tick = tokio::time::interval(SWEEP_EVERY);
+/// Closes connections whose key was revoked at least `backstop` ago, and forgets closed ones.
+///
+/// A key that is not registered and has no recent revocation on record (it never was, or the
+/// record is older than the sweep keeps) is closed at once.
+async fn sweep(registry: KeyRegistry, live: Arc<Live>, backstop: Duration) {
+    let every = SWEEP_EVERY.min(backstop / 2).max(Duration::from_millis(10));
+    let mut tick = tokio::time::interval(every);
     loop {
         tick.tick().await;
         live.lock().retain(|(key, conn)| {
@@ -383,9 +398,13 @@ async fn sweep(registry: KeyRegistry, live: Arc<Live>) {
             if registry.contains(key) {
                 return true;
             }
+            if registry.revoked_ago(key).is_some_and(|ago| ago < backstop) {
+                return true;
+            }
             QuicLink::close_revoked(conn);
             false
         });
+        registry.forget_revocations_older_than(backstop * 2);
     }
 }
 

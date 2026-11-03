@@ -84,7 +84,9 @@ pub struct MuxConfig {
     pub window: Window,
     /// What a channel's sender keeps until the peer consumed it (`forward.buffer`).
     pub buffer: usize,
-    /// Buffered forward data, both directions, over all channels (`forward budget`).
+    /// Buffered forward data, both directions, over all channels (`forward budget`): a hard cap.
+    /// Half of it is for the channels this side opens, half for those the peer opens; each
+    /// channel reserves its receive window and its send buffer from its half when it opens.
     pub budget: usize,
     /// The MUX send buffer.
     pub mux_buffer: usize,
@@ -123,6 +125,24 @@ pub enum MuxError {
     #[error("the MUX send buffer overflowed: the peer does not acknowledge it")]
     Overflow,
 }
+
+/// Why [`Mux::send_table`] did not queue a message.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TableError {
+    /// The MUX send buffer is past three quarters: refuse the request (or retry later). The mux
+    /// is unharmed.
+    #[error("the MUX send buffer is full")]
+    Full,
+    /// Not a table message, or one only the other side sends.
+    #[error("not a table message this side may send")]
+    Direction,
+    /// The mux had already failed.
+    #[error(transparent)]
+    Failed(#[from] MuxError),
+}
+
+/// The smallest send buffer a channel is given when the budget is short.
+const MIN_BUFFER: usize = 16 * 1024;
 
 /// What the caller has to act on, from [`Mux::poll_event`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,8 +199,10 @@ pub struct ChannelInfo {
     pub send_buffered: usize,
     /// Bytes received and not yet consumed.
     pub recv_buffered: usize,
-    /// This side's receive window.
+    /// The receive window this side advertised for the channel.
     pub window: u32,
+    /// The send buffer the channel was given.
+    pub send_capacity: usize,
     /// Bytes this side put on the wire, ever (the end of the highest segment sent).
     pub sent_high: u64,
 }
@@ -349,13 +371,17 @@ impl Receiver {
 
 // ---- a dynamic channel ------------------------------------------------------------------------
 
-#[derive(Debug)]
 struct Chan {
     ours: bool,
     opening: bool,
     accepting: bool,
     send: Sender,
     recv: Receiver,
+    /// The receive window this side advertised for the channel (its share of the budget).
+    window: u64,
+    /// What the channel holds of the budget: its window plus its send buffer, given back when it
+    /// closes.
+    grant: usize,
     /// The peer's window and the highest consumed count it acknowledged: the credit.
     peer_window: u64,
     peer_consumed: u64,
@@ -371,6 +397,8 @@ struct Chan {
     told: bool,
     /// May send data on this link: false after a resumed link until the peer's `Resume`.
     gate: bool,
+    /// A `Resume` from the peer is expected on this link (one per channel per resumed link).
+    resume_due: bool,
     /// Acceptor: the MUX offset just past its `OpenOk`; data goes out only once the MUX stream
     /// has been sent that far.
     ok_at: u64,
@@ -381,14 +409,35 @@ struct Chan {
     blocked: bool,
 }
 
+/// Counts and states only: a channel's `Debug` never shows its bytes or its target.
+impl std::fmt::Debug for Chan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Chan")
+            .field("ours", &self.ours)
+            .field("state", &self.state())
+            .field("send", &self.send)
+            .field("recv", &self.recv)
+            .field("window", &self.window)
+            .field("peer_window", &self.peer_window)
+            .field("peer_consumed", &self.peer_consumed)
+            .field("eof_sent", &self.eof_sent)
+            .field("peer_eof", &self.peer_eof)
+            .field("close_recv", &self.close_recv)
+            .field("gate", &self.gate)
+            .finish()
+    }
+}
+
 impl Chan {
-    fn new(ours: bool, buffer: usize) -> Self {
+    fn new(ours: bool, grant: Grant) -> Self {
         Self {
             ours,
             opening: ours,
             accepting: !ours,
-            send: Sender::new(buffer),
+            send: Sender::new(grant.buffer),
             recv: Receiver::default(),
+            window: u64::from(grant.window.get()),
+            grant: grant.total(),
             peer_window: 0,
             peer_consumed: 0,
             local_eof: false,
@@ -399,6 +448,7 @@ impl Chan {
             close_recv: false,
             told: false,
             gate: true,
+            resume_due: false,
             ok_at: 0,
             opened_at: None,
             opened_at_pending: ours,
@@ -427,6 +477,19 @@ impl Chan {
     }
 }
 
+/// A channel's share of the budget: the window it advertises and its send buffer.
+#[derive(Clone, Copy, Debug)]
+struct Grant {
+    window: Window,
+    buffer: usize,
+}
+
+impl Grant {
+    fn total(self) -> usize {
+        self.window.get() as usize + self.buffer
+    }
+}
+
 /// How an id that is not in the table is treated (DESIGN.md section 8.5, "Unknown ids").
 enum Lookup {
     Found,
@@ -437,7 +500,6 @@ enum Lookup {
 }
 
 /// The MUX state machine for one session and side. See the module documentation.
-#[derive(Debug)]
 pub struct Mux {
     side: Side,
     cfg: MuxConfig,
@@ -453,8 +515,12 @@ pub struct Mux {
     chans: BTreeMap<u32, Chan>,
     ours_open: usize,
     theirs_open: usize,
+    /// Budget held by the channels this side opened, and by those the peer opened.
+    reserved_ours: usize,
+    reserved_theirs: usize,
     mux_tx: Sender,
     mux_gate: bool,
+    mux_resume_due: bool,
     mux_rx: RecvChannel,
     mux_ack_since: Option<Instant>,
     records: RecordDecoder,
@@ -465,6 +531,28 @@ pub struct Mux {
     rr: u32,
     failed: Option<MuxError>,
     open_blocked: bool,
+}
+
+/// Counts and states only (DESIGN.md section 11.1): no target, port or byte of a channel, and
+/// no queued event (an event can name a SOCKS target or a forward's spec).
+impl std::fmt::Debug for Mux {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mux")
+            .field("side", &self.side)
+            .field("up", &self.up)
+            .field("failed", &self.failed)
+            .field("next_ours", &self.next_ours)
+            .field("next_theirs", &self.next_theirs)
+            .field("chans", &self.chans)
+            .field("reserved_ours", &self.reserved_ours)
+            .field("reserved_theirs", &self.reserved_theirs)
+            .field("mux_tx", &self.mux_tx)
+            .field("mux_gate", &self.mux_gate)
+            .field("mux_rx_received", &self.mux_rx.received())
+            .field("records", &self.records)
+            .field("events", &self.events.len())
+            .finish()
+    }
 }
 
 impl Mux {
@@ -483,8 +571,11 @@ impl Mux {
             chans: BTreeMap::new(),
             ours_open: 0,
             theirs_open: 0,
+            reserved_ours: 0,
+            reserved_theirs: 0,
             mux_tx: Sender::new(mux_buffer),
             mux_gate: true,
+            mux_resume_due: false,
             mux_rx: RecvChannel::new(),
             mux_ack_since: None,
             records: RecordDecoder::new(),
@@ -518,11 +609,7 @@ impl Mux {
     /// Whether [`Mux::open`] would get past the caps and the budget now. While it is false the
     /// caller stops accepting on its listeners; [`MuxEvent::Unblocked`] follows when it turns true.
     pub fn can_open(&mut self) -> bool {
-        let ok = self.failed.is_none()
-            && self.ours_open < self.cfg.max_open
-            && self.buffered() < self.cfg.budget
-            && self.mux_tx.ring.len() * 4 <= self.cfg.mux_buffer * 3
-            && self.next_ours <= u64::from(u32::MAX);
+        let ok = self.can_open_quiet();
         if !ok {
             self.open_blocked = true;
         }
@@ -542,16 +629,18 @@ impl Mux {
                 OpenFailure::Busy
             });
         }
+        let grant = self.grant(true).expect("can_open checked the budget");
         let channel = ChannelId(self.next_ours as u32);
         self.next_ours += 2;
-        let mut chan = Chan::new(true, self.cfg.buffer);
+        let mut chan = Chan::new(true, grant);
         chan.opened_at = self.now;
         chan.opened_at_pending = self.now.is_none();
         self.chans.insert(channel.0, chan);
         self.ours_open += 1;
+        self.reserved_ours += grant.total();
         self.queue(MuxMsg::Open {
             channel,
-            window: self.cfg.window,
+            window: grant.window,
             kind,
         });
         Ok(channel)
@@ -559,7 +648,6 @@ impl Mux {
 
     /// Accept the peer's `Open` (the target is connected).
     pub fn accept(&mut self, ch: ChannelId) {
-        let window = self.cfg.window;
         let Some(c) = self.chans.get_mut(&ch.0) else {
             return;
         };
@@ -567,6 +655,7 @@ impl Mux {
             return;
         }
         c.accepting = false;
+        let window = Window::new(c.window as u32).expect("a granted window is in bounds");
         self.queue(MuxMsg::OpenOk {
             channel: ch,
             window,
@@ -579,6 +668,12 @@ impl Mux {
     }
 
     /// Refuse the peer's `Open`. The channel is released at once.
+    ///
+    /// Like [`Mux::accept`], [`Mux::eof`] and [`Mux::abort`], this queues a record the protocol
+    /// requires. Those are bounded per channel and fit in the quarter of the MUX buffer that
+    /// opens and table messages never use; if they still do not fit, the peer has stopped
+    /// acknowledging, the mux fails with [`MuxError::Overflow`], and the next `on_*` or `tick`
+    /// says so.
     pub fn reject(&mut self, ch: ChannelId, why: OpenFailure) {
         let Some(c) = self.chans.get(&ch.0) else {
             return;
@@ -592,16 +687,17 @@ impl Mux {
 
     /// Bytes read from the local socket. Returns how many were taken; on a short count, stop
     /// reading the socket until [`MuxEvent::Writable`].
+    ///
+    /// Each channel writes into its own send buffer, reserved from the budget when it opened, so
+    /// a channel whose peer never consumes stops only itself.
     pub fn write(&mut self, ch: ChannelId, data: &[u8]) -> usize {
-        let room = self.cfg.budget.saturating_sub(self.buffered());
         let Some(c) = self.chans.get_mut(&ch.0) else {
             return 0;
         };
         if c.local_eof || c.close_sent || data.is_empty() {
             return 0;
         }
-        let take = data.len().min(room);
-        let n = c.send.ring.push(&data[..take]);
+        let n = c.send.ring.push(data);
         if n < data.len() {
             c.blocked = true;
         }
@@ -632,7 +728,7 @@ impl Mux {
             return;
         }
         c.recv.consumed += n;
-        let threshold = ACK_AFTER_BYTES.min(u64::from(self.cfg.window.get()) / 4);
+        let threshold = ACK_AFTER_BYTES.min(c.window / 4);
         if c.recv.consumed - c.recv.acked >= threshold {
             self.acks.insert(ch.0);
         } else if c.recv.ack_since.is_none() {
@@ -640,7 +736,6 @@ impl Mux {
         }
         self.check_peer_eof(ch);
         self.check_done(ch);
-        self.wake_writers();
     }
 
     /// The local socket hit EOF: no more [`Mux::write`]s.
@@ -666,7 +761,8 @@ impl Mux {
 
     // ---- what the link delivered ------------------------------------------------------------
 
-    /// A payload for the MUX channel or a dynamic channel.
+    /// A payload for the MUX channel or a dynamic channel. Drain [`Mux::poll_event`] after each
+    /// call: one MUX segment can carry thousands of small records.
     pub fn on_payload(&mut self, ch: ChannelId, payload: Bytes) -> Result<(), MuxError> {
         self.check()?;
         let r = if ch == ChannelId::MUX {
@@ -715,6 +811,10 @@ impl Mux {
         self.down_since_pending = false;
         self.lingered = false;
         self.acks.clear();
+        self.mux_resume_due = false;
+        for c in self.chans.values_mut() {
+            c.resume_due = false;
+        }
         let mut out = Vec::new();
         if !resumed {
             debug_assert!(
@@ -730,6 +830,7 @@ impl Mux {
         // A sender that has never put a byte on the wire has nothing the peer could hold: it
         // needs no Resume (and the peer may not know its channel yet to send one).
         self.mux_gate = self.mux_tx.high == 0;
+        self.mux_resume_due = true;
         self.mux_rx.on_reconnect();
         self.mux_ack_since = None;
         out.push(ControlMsg::Resume {
@@ -738,6 +839,7 @@ impl Mux {
         });
         for (&id, c) in &mut self.chans {
             c.gate = c.send.high == 0;
+            c.resume_due = true;
             out.push(ControlMsg::Resume {
                 channel: ChannelId(id),
                 received: c.recv.received,
@@ -806,17 +908,19 @@ impl Mux {
         {
             return Some((ChannelId::MUX, p));
         }
-        let mux_high = self.mux_tx.high;
+        // The acceptor's data goes only once its OpenOk is on this link's wire (or was received
+        // on an earlier one): MUX not gated, and sent past the OpenOk.
+        let mux_sent = if self.mux_gate { self.mux_tx.next } else { 0 };
         let start = self.rr;
         let after = start.saturating_add(1);
         for (&id, c) in self.chans.range_mut(after..) {
-            if let Some(p) = Self::next_data(c, mux_high) {
+            if let Some(p) = Self::next_data(c, mux_sent) {
                 self.rr = id;
                 return Some((ChannelId(id), p));
             }
         }
         for (&id, c) in self.chans.range_mut(..after) {
-            if let Some(p) = Self::next_data(c, mux_high) {
+            if let Some(p) = Self::next_data(c, mux_sent) {
                 self.rr = id;
                 return Some((ChannelId(id), p));
             }
@@ -827,9 +931,9 @@ impl Mux {
     /// The next data segment of `c`, if it may send one now: the Resume gate is open, the
     /// channel is open (no data before `OpenOk`; an acceptor's only once its `OpenOk` is on the
     /// wire), and the peer's credit allows it.
-    fn next_data(c: &mut Chan, mux_high: u64) -> Option<Bytes> {
+    fn next_data(c: &mut Chan, mux_sent: u64) -> Option<Bytes> {
         let may =
-            c.gate && c.is_open() && (c.ours || mux_high >= c.ok_at) && c.send.next < c.send.end();
+            c.gate && c.is_open() && (c.ours || mux_sent >= c.ok_at) && c.send.next < c.send.end();
         if !may {
             return None;
         }
@@ -845,8 +949,11 @@ impl Mux {
         self.events.pop_front()
     }
 
-    /// Send a forward-table message. Its direction must be this side's.
-    pub fn send_table(&mut self, msg: MuxMsg) -> Result<(), MuxError> {
+    /// Send a forward-table message. Its direction must be this side's. Past three quarters of
+    /// the MUX buffer it is refused with [`TableError::Full`] and nothing changes: the caller
+    /// refuses the request that caused it (management requests come from any process of the
+    /// uid, so they must never be able to fail the mux).
+    pub fn send_table(&mut self, msg: MuxMsg) -> Result<(), TableError> {
         self.check()?;
         let ok = match msg.sent_by_client() {
             _ if !msg.is_table() => false,
@@ -854,10 +961,14 @@ impl Mux {
             None => true,
         };
         if !ok {
-            return Err(MuxError::Protocol("not a table message this side may send"));
+            return Err(TableError::Direction);
         }
-        self.queue(msg);
-        self.check()
+        let rec = encode_record(&msg).expect("every MuxMsg fits in a record");
+        if (self.mux_tx.ring.len() + rec.len()) * 4 > self.cfg.mux_buffer * 3 {
+            return Err(TableError::Full);
+        }
+        self.mux_tx.ring.push(&rec);
+        Ok(())
     }
 
     /// The time is `now`: acks that are due, open and linger timeouts.
@@ -932,9 +1043,23 @@ impl Mux {
         self.chans.values().map(Chan::buffered).sum()
     }
 
-    /// What senders keep, over all channels (the part [`Mux::write`] bounds by the budget).
+    /// What senders keep, over all channels.
     pub fn send_buffered(&self) -> usize {
         self.chans.values().map(|c| c.send.ring.len()).sum()
+    }
+
+    /// What receivers hold and have not consumed, over all channels.
+    pub fn recv_buffered(&self) -> usize {
+        self.chans
+            .values()
+            .map(|c| c.recv.unconsumed() as usize)
+            .sum()
+    }
+
+    /// The budget the open channels hold (windows plus send buffers): never above the budget,
+    /// and every buffered byte is inside it.
+    pub fn reserved(&self) -> usize {
+        self.reserved_ours + self.reserved_theirs
     }
 
     pub fn info(&self, ch: ChannelId) -> Option<ChannelInfo> {
@@ -944,7 +1069,8 @@ impl Mux {
             state: c.state(),
             send_buffered: c.send.ring.len(),
             recv_buffered: c.recv.unconsumed() as usize,
-            window: self.cfg.window.get(),
+            window: c.window as u32,
+            send_capacity: c.send.ring.capacity(),
             sent_high: c.send.high,
         })
     }
@@ -986,9 +1112,57 @@ impl Mux {
     fn can_open_quiet(&self) -> bool {
         self.failed.is_none()
             && self.ours_open < self.cfg.max_open
-            && self.buffered() < self.cfg.budget
+            && self.grant(true).is_some()
             && self.mux_tx.ring.len() * 4 <= self.cfg.mux_buffer * 3
             && self.next_ours <= u64::from(u32::MAX)
+    }
+
+    /// The share of the budget a new channel gets (`ours`: one this side opens), or `None` when
+    /// even the smallest share does not fit. Each opener has half the budget. A channel gets the
+    /// configured window and buffer if, after it, the rest of that half still holds the smallest
+    /// share for every channel that opener may yet open; otherwise less, down to the smallest
+    /// share (`MIN_WINDOW` and `MIN_BUFFER`). So the first channels get full windows, every one
+    /// up to the open cap fits, and nothing is buffered beyond the budget.
+    fn grant(&self, ours: bool) -> Option<Grant> {
+        let pool = self.cfg.budget / 2;
+        let (reserved, open) = if ours {
+            (self.reserved_ours, self.ours_open)
+        } else {
+            (self.reserved_theirs, self.theirs_open)
+        };
+        let free = pool.saturating_sub(reserved);
+        let want_window = self.cfg.window.get() as usize;
+        let min_window = crate::limits::MIN_WINDOW as usize;
+        let min_buffer = MIN_BUFFER.min(self.cfg.buffer);
+        let floor = min_window + min_buffer;
+        if free < floor {
+            return None;
+        }
+        let later = self.cfg.max_open.saturating_sub(open + 1);
+        let spare = free.saturating_sub(floor * later).max(floor);
+        let want = want_window + self.cfg.buffer;
+        let g = want.min(spare);
+        // Split in proportion to what was asked for, each part within its bounds.
+        let window = (g * want_window / want).clamp(min_window, want_window.max(min_window));
+        let window = window.min(g - min_buffer).max(min_window);
+        let buffer = (g - window).clamp(min_buffer, self.cfg.buffer.max(min_buffer));
+        Some(Grant {
+            window: Window::new(window as u32).expect("clamped into the window bounds"),
+            buffer,
+        })
+    }
+
+    /// Give a channel's share back (once).
+    fn ungrant(&mut self, ch: ChannelId) {
+        let Some(c) = self.chans.get_mut(&ch.0) else {
+            return;
+        };
+        let g = std::mem::take(&mut c.grant);
+        if c.ours {
+            self.reserved_ours -= g;
+        } else {
+            self.reserved_theirs -= g;
+        }
     }
 
     /// Put a record on the MUX stream. A full stream means the peer stopped acknowledging it:
@@ -1063,17 +1237,18 @@ impl Mux {
                     return Err(MuxError::Protocol("the peer opened too many channels"));
                 }
                 self.next_theirs += 2;
-                if self.buffered() >= self.cfg.budget {
+                let Some(grant) = self.grant(false) else {
                     self.queue(MuxMsg::OpenFailed {
                         channel,
                         why: OpenFailure::Busy,
                     });
                     return Ok(());
-                }
-                let mut c = Chan::new(false, self.cfg.buffer);
+                };
+                let mut c = Chan::new(false, grant);
                 c.peer_window = u64::from(window.get());
                 self.chans.insert(channel.0, c);
                 self.theirs_open += 1;
+                self.reserved_theirs += grant.total();
                 self.events.push_back(MuxEvent::Incoming { channel, kind });
             }
             MuxMsg::OpenOk { channel, window } => {
@@ -1149,6 +1324,18 @@ impl Mux {
                 }
                 let c = self.chans.get_mut(&channel.0).expect("known");
                 c.close_recv = true;
+                // A peer's `Done` is passed on as `Done` only if this side's own checks agree
+                // (our `Eof` sent, every byte below the peer's consumed): otherwise a peer could
+                // turn a truncated stream into a clean end.
+                let why = match why {
+                    CloseReason::Done
+                        if !(c.eof_sent.is_some()
+                            && c.peer_eof.is_some_and(|at| c.recv.consumed >= at)) =>
+                    {
+                        CloseReason::Reset
+                    }
+                    other => other,
+                };
                 if !c.close_sent {
                     if !c.told {
                         c.told = true;
@@ -1192,8 +1379,8 @@ impl Mux {
             Lookup::Never => return Err(MuxError::Protocol("data for a channel never opened")),
         }
         let seg = DataSegment::parse(&payload).map_err(|_| MuxError::Segment)?;
-        let window = u64::from(self.cfg.window.get());
         let c = self.chans.get_mut(&ch.0).expect("found");
+        let window = c.window;
         if c.close_sent {
             return Ok(());
         }
@@ -1249,13 +1436,18 @@ impl Mux {
             return Ok(());
         }
         c.peer_consumed = c.peer_consumed.max(upto);
+        self.wake(ch);
         self.check_done(ch);
-        self.wake_writers();
         Ok(())
     }
 
     fn resume(&mut self, ch: ChannelId, received: u64) -> Result<(), MuxError> {
         if ch == ChannelId::MUX {
+            // One per resumed link. Another would make this side resend everything it holds for
+            // the price of a few bytes; an honest peer never sends one, so it is ignored.
+            if !self.mux_resume_due {
+                return Ok(());
+            }
             match self.mux_tx.resume(received) {
                 Ok(()) => {}
                 Err(ResumeFault::Ahead) => {
@@ -1268,6 +1460,7 @@ impl Mux {
                 }
             }
             self.mux_gate = true;
+            self.mux_resume_due = false;
             return Ok(());
         }
         if !ch.is_dynamic() {
@@ -1283,6 +1476,13 @@ impl Mux {
             Lookup::Never => return Ok(()),
         }
         let c = self.chans.get_mut(&ch.0).expect("found");
+        // One per channel per resumed link (see MUX above). A channel created on this link
+        // expects none: the peer's restated pending open may arrive after the retransmitted
+        // `Open`, and there is nothing to resume.
+        if !c.resume_due {
+            return Ok(());
+        }
+        c.resume_due = false;
         c.gate = true;
         if c.close_sent {
             return Ok(());
@@ -1292,7 +1492,7 @@ impl Mux {
             Err(ResumeFault::Ahead) => self.violation(ch),
             Err(ResumeFault::Gone) => self.close(ch, CloseReason::ResumeGone),
         }
-        self.wake_writers();
+        self.wake(ch);
         Ok(())
     }
 
@@ -1366,9 +1566,10 @@ impl Mux {
             c.told = true;
             self.events.push_back(MuxEvent::Closed { channel: ch, why });
         }
+        // Nothing more is buffered for it: its share goes back to the budget now.
+        self.ungrant(ch);
         self.queue(MuxMsg::Close { channel: ch, why });
         self.maybe_release(ch);
-        self.wake_writers();
     }
 
     fn maybe_release(&mut self, ch: ChannelId) {
@@ -1382,6 +1583,7 @@ impl Mux {
     }
 
     fn forget(&mut self, ch: ChannelId) {
+        self.ungrant(ch);
         let Some(c) = self.chans.remove(&ch.0) else {
             return;
         };
@@ -1392,21 +1594,17 @@ impl Mux {
         }
         self.acks.remove(&ch.0);
         self.events.push_back(MuxEvent::Released { channel: ch });
-        self.wake_writers();
     }
 
-    /// Room appeared (an ack, a consume, a close): writers that were cut short may go on.
-    fn wake_writers(&mut self) {
-        if self.buffered() >= self.cfg.budget {
-            return;
-        }
-        for (&id, c) in &mut self.chans {
-            if c.blocked && c.send.ring.free() > 0 {
-                c.blocked = false;
-                self.events.push_back(MuxEvent::Writable {
-                    channel: ChannelId(id),
-                });
-            }
+    /// Room appeared in `ch`'s send buffer (an ack, a resume): a writer that was cut short may go
+    /// on.
+    fn wake(&mut self, ch: ChannelId) {
+        if let Some(c) = self.chans.get_mut(&ch.0)
+            && c.blocked
+            && c.send.ring.free() > 0
+        {
+            c.blocked = false;
+            self.events.push_back(MuxEvent::Writable { channel: ch });
         }
     }
 }

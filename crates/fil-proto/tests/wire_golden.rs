@@ -2028,6 +2028,58 @@ fn forward_probes() -> Entries {
         e.push((format!("decode/{what}-{last}"), r(&[last])));
         e.push((format!("decode/{what}-{}", last + 1), r(&[last + 1])));
     }
+    // The enums with fields: their last variant, and the first index past it.
+    type EnumProbe = (&'static str, Vec<u8>, Vec<u8>, fn(&[u8]) -> String);
+    let last_and_past: [EnumProbe; 7] = [
+        (
+            "listen-state",
+            vec![1, 0],
+            vec![2, 0],
+            outcome::<ListenState>,
+        ),
+        (
+            "target-host",
+            [vec![1u8], counted_str("a")].concat(),
+            [vec![2u8], counted_str("a")].concat(),
+            outcome::<TargetHost>,
+        ),
+        (
+            "forward-op",
+            vec![1, 0, 1],
+            vec![2, 0, 1],
+            outcome::<ForwardOp>,
+        ),
+        (
+            "forward-result",
+            vec![2, 0],
+            vec![3, 0],
+            outcome::<ForwardResult>,
+        ),
+        (
+            "ports-row",
+            vec![3, 1, b'a', 0, 0, 0],
+            vec![4, 1, b'a', 0, 0, 0],
+            outcome::<PortsRow>,
+        ),
+        ("listener-owner", vec![2], vec![3], outcome::<ListenerOwner>),
+        ("probe-kind", vec![4], vec![5], outcome::<ProbeKind>),
+    ];
+    for (what, last, past, r) in last_and_past {
+        e.push((format!("decode/{what}-last"), r(&last)));
+        e.push((format!("decode/{what}-past"), r(&past)));
+    }
+    // An exit status names a code or a signal, not both.
+    for (what, wire) in [
+        ("code", vec![1u8, 2, 0]),
+        ("signal", vec![0, 1, 18]),
+        ("neither", vec![0, 0]),
+        ("both", vec![1, 2, 1, 18]),
+    ] {
+        e.push((
+            format!("decode/exit-status-{what}"),
+            outcome::<ExitStatus>(&wire),
+        ));
+    }
     e.push(("decode/open-kind-3".into(), outcome::<OpenKind>(&[3])));
     e.push(("decode/open-kind-4".into(), outcome::<OpenKind>(&[4])));
     e.push(("decode/mux-msg-11".into(), outcome::<MuxMsg>(&[11, 16, 0])));

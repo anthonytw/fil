@@ -161,7 +161,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 
 ### 2.5 Forward table semantics
 
-- **Identity of a spec** is `(kind, bind, port)`.
+- **Identity of a spec** is `(kind, bind, port)`. Port 0 (an ephemeral `-R`) has no identity: every `-R 0` is its own listener and never clashes (C2 review). Equal specs still dedup.
 - **`AddForward` from the attached client:**
   - equal to an existing entry: answered with that entry;
   - conflicting (same identity, different target): the client's spec **replaces** it under a new id. The old entry's open channels run until they close.
@@ -219,7 +219,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 
 - **The pipe:** unchanged. MUX is interactive. Dynamic channels are in the forward class: 16 KiB frames, round-robin, one forward frame after every 8 interactive ones.
 - **QUIC:** dynamic channels share the interactive priority (§8.5). L1 and V1 measure keystroke latency under a bulk forward on both transports; H1 acts on the result (§3).
-- **Memory budget per side and session:** 64 MiB of buffered forward data. Past it, a side stops reading local sockets and refuses new opens with `Busy`.
+- **Memory budget per side and session:** 64 MiB of buffered forward data, a hard cap (C2 review). Each opener has half; a channel reserves its window and send buffer from its opener's half at open, full while the rest still covers the smallest share (16 KiB + 16 KiB) for every channel that opener may yet open, smaller down to that share otherwise, and `Busy` when not even that fits (DESIGN §8.5, "Memory").
 - **`ByteRing` gives memory back when drained** (C1), so an idle channel after a burst does not pin 1 MiB.
 - **A full forward never blocks the link's `recv` loop.** Payloads go into per-channel buffers that credit bounds, with no await on a socket write. This keeps §8.1's "the consumer must keep up" on the pipe.
 

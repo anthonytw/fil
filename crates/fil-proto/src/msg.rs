@@ -439,10 +439,31 @@ pub struct Attach {
 
 /// How a session's shell ended, as in [`ControlMsg::SessionExited`]: exactly one field is set
 /// when the status is known.
+///
+/// Both set does not decode. Neither set is an ending whose status is unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    try_from = "(Option<i32>, Option<i32>)",
+    into = "(Option<i32>, Option<i32>)"
+)]
 pub struct ExitStatus {
     pub code: Option<i32>,
     pub signal: Option<i32>,
+}
+
+impl TryFrom<(Option<i32>, Option<i32>)> for ExitStatus {
+    type Error = MsgError;
+    fn try_from((code, signal): (Option<i32>, Option<i32>)) -> Result<Self, MsgError> {
+        if code.is_some() && signal.is_some() {
+            return Err(invalid("exit status", "both a code and a signal"));
+        }
+        Ok(Self { code, signal })
+    }
+}
+impl From<ExitStatus> for (Option<i32>, Option<i32>) {
+    fn from(e: ExitStatus) -> Self {
+        (e.code, e.signal)
+    }
 }
 
 /// Why a snapshot is sent instead of a replay.

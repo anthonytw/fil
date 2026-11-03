@@ -8,10 +8,12 @@
 //!    checked against the writer's generator at its offset), and a channel that ends gracefully
 //!    delivered every byte written; otherwise the channel ends with a reason;
 //! 2. every channel is eventually released on both sides;
-//! 3. buffered bytes stay at or below the window per channel, and what senders keep stays
-//!    within the budget;
+//! 3. buffered bytes stay at or below the window per channel and the send buffer per channel,
+//!    and everything a side buffers (received and unconsumed, plus kept to send) stays within
+//!    its budget, a hard cap, against any peer (the budget varies per seed, so channels get
+//!    full shares, small shares and `Busy`);
 //! 4. no data leaves before `OpenOk` (the opener: before it saw `Opened`; the acceptor: before
-//!    its `OpenOk` was on the wire);
+//!    its `OpenOk` was on the wire, on this link or received on an earlier one);
 //! 5. no Resume gate is bypassed: after a resumed link a side that had sent on a channel sends
 //!    nothing more on it until the peer's `Resume` for it was delivered.
 //!
@@ -35,11 +37,11 @@ use rand::{RngExt, SeedableRng};
 
 const STEPS: usize = 2500;
 
-fn cfg() -> MuxConfig {
+fn cfg(budget: usize) -> MuxConfig {
     MuxConfig {
         window: Window::new(MIN_WINDOW).unwrap(),
         buffer: 24 * 1024,
-        budget: 96 * 1024,
+        budget,
         max_open: 5,
         connect_timeout: Duration::from_secs(10),
         open_wait: Duration::from_secs(30),
@@ -86,7 +88,14 @@ struct ChanModel {
 struct Tap {
     mux_rx: RecvChannel,
     records: RecordDecoder,
-    ok_sent: BTreeSet<u32>,
+    /// Where each `OpenOk` record ends in the MUX stream.
+    ok_end: BTreeMap<u32, u64>,
+    /// What the peer had received of the MUX stream when this link started, and the end of the
+    /// MUX bytes sent on this link: a record is on the wire if it ends below either.
+    link_floor: u64,
+    link_sent: u64,
+    /// The end of the MUX bytes delivered to the peer.
+    delivered: u64,
     mux_high: u64,
     high: BTreeMap<u32, u64>,
     /// Channels (MUX included) that may not send until the peer's Resume is delivered.
@@ -104,10 +113,10 @@ struct SideModel {
 }
 
 impl SideModel {
-    fn new(side: Side) -> Self {
+    fn new(side: Side, budget: usize) -> Self {
         Self {
             side,
-            mux: Mux::new(side, cfg()),
+            mux: Mux::new(side, cfg(budget)),
             chans: BTreeMap::new(),
             pending: Vec::new(),
             tap: Tap::default(),
@@ -144,6 +153,8 @@ struct Stats {
     epochs: u64,
     resumes_gated: u64,
     early_data: u64,
+    busy: u64,
+    small_shares: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -157,6 +168,8 @@ impl std::ops::AddAssign for Stats {
         self.epochs += o.epochs;
         self.resumes_gated += o.resumes_gated;
         self.early_data += o.early_data;
+        self.busy += o.busy;
+        self.small_shares += o.small_shares;
     }
 }
 
@@ -167,6 +180,8 @@ impl World {
     fn new(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let quic = rng.random_bool(0.5);
+        // From one smallest share per opener (Busy often) to full shares for all.
+        let budget = rng.random_range(80..=512) * 1024;
         let now = Instant::now();
         let mut w = Self {
             seed,
@@ -175,7 +190,10 @@ impl World {
             epoch: 0,
             now,
             up: true,
-            sides: [SideModel::new(Side::Client), SideModel::new(Side::Daemon)],
+            sides: [
+                SideModel::new(Side::Client, budget),
+                SideModel::new(Side::Daemon, budget),
+            ],
             wire: [BTreeMap::new(), BTreeMap::new()],
             checked: 0,
             stats: Stats::default(),
@@ -229,20 +247,27 @@ impl World {
         let tap = &mut self.sides[i].tap;
         if ch == ChannelId::MUX {
             tap.mux_high = tap.mux_high.max(end);
+            tap.link_sent = tap.link_sent.max(end);
             let mut fresh = tap
                 .mux_rx
                 .accept(seg.seq, seg.data)
                 .unwrap_or_else(|_| panic!("gap in the sent MUX stream"));
+            let base = tap.mux_rx.received() - fresh.len() as u64;
+            let len = fresh.len();
             while let Some(m) = tap.records.push(&mut fresh).unwrap() {
                 if let MuxMsg::OpenOk { channel, .. } = m {
-                    tap.ok_sent.insert(channel.0);
+                    let at = base + (len - fresh.len()) as u64;
+                    tap.ok_end.insert(channel.0, at);
                 }
             }
             return;
         }
         let h = tap.high.entry(ch.0).or_default();
         *h = (*h).max(end);
-        let ok_sent = tap.ok_sent.contains(&ch.0);
+        let ok_sent = tap
+            .ok_end
+            .get(&ch.0)
+            .is_some_and(|&at| at <= tap.link_floor.max(tap.link_sent));
         let m = self.sides[i].chans.get(&ch.0);
         let allowed = match m {
             Some(m) if m.ours => m.open,
@@ -270,6 +295,11 @@ impl World {
             }
             let k = keys[self.rng.random_range(0..keys.len())];
             let (ch, p) = untag(self.wire[from].get_mut(&k).unwrap().pop_front().unwrap());
+            if ch == ChannelId::MUX {
+                let seg = DataSegment::parse(&p).unwrap();
+                let tap = &mut self.sides[from].tap;
+                tap.delivered = tap.delivered.max(seg.seq + seg.data.len() as u64);
+            }
             self.feed(to, ch, p);
             self.events(to);
         }
@@ -322,6 +352,9 @@ impl World {
         self.up = true;
         for i in [C, D] {
             let tap = &mut self.sides[i].tap;
+            // Invariant 4 is per link: what went out on the old one counts only if it arrived.
+            tap.link_floor = tap.delivered;
+            tap.link_sent = 0;
             tap.gated = tap
                 .high
                 .iter()
@@ -409,7 +442,10 @@ impl World {
                 let m = s.chans.get_mut(&channel.0).expect("opened ours");
                 m.open = true;
             }
-            MuxEvent::OpenFailed { channel, .. } => {
+            MuxEvent::OpenFailed { channel, why } => {
+                if why == OpenFailure::Busy {
+                    self.stats.busy += 1;
+                }
                 let m = s.chans.get_mut(&channel.0).expect("ours");
                 m.ended = Some(End::OpenFailed);
             }
@@ -497,7 +533,14 @@ impl World {
             },
             (Side::Daemon, _) => OpenKind::Agent,
         };
-        if let Ok(ch) = self.sides[i].mux.open(kind) {
+        let r = self.sides[i].mux.open(kind);
+        if r == Err(OpenFailure::Busy) {
+            self.stats.busy += 1;
+        }
+        if let Ok(ch) = r {
+            if self.sides[i].mux.info(ch).unwrap().send_capacity < cfg(0).buffer {
+                self.stats.small_shares += 1;
+            }
             let m = ChanModel {
                 ours: true,
                 ..ChanModel::default()
@@ -602,11 +645,21 @@ impl World {
     fn check_bounds(&self) {
         for s in &self.sides {
             let cfg = s.mux.config();
-            if s.mux.send_buffered() > cfg.budget {
+            if s.mux.buffered() > cfg.budget || s.mux.recv_buffered() > cfg.budget {
                 self.fail(format!(
-                    "{:?} keeps {} bytes to send, over the budget {} (invariant 3)",
+                    "{:?} buffers {} bytes ({} received, unconsumed), over the budget {} (invariant 3)",
                     s.side,
-                    s.mux.send_buffered(),
+                    s.mux.buffered(),
+                    s.mux.recv_buffered(),
+                    cfg.budget
+                ));
+            }
+            if s.mux.reserved() > cfg.budget || s.mux.buffered() > s.mux.reserved() {
+                self.fail(format!(
+                    "{:?}: {} reserved, {} buffered, budget {} (invariant 3)",
+                    s.side,
+                    s.mux.reserved(),
+                    s.mux.buffered(),
                     cfg.budget
                 ));
             }
@@ -618,7 +671,7 @@ impl World {
                         s.side, info.recv_buffered
                     ));
                 }
-                if info.send_buffered > cfg.buffer {
+                if info.send_buffered > info.send_capacity || info.send_capacity > cfg.buffer {
                     self.fail(format!("{:?}: {ch:?} send buffer over its cap", s.side));
                 }
             }
@@ -708,14 +761,14 @@ impl World {
             858..870 => {
                 // A numbered table message, checked for exactly once and in order.
                 let s = &mut self.sides[i];
-                if s.mux.mux_buffered() < 16 * 1024 {
-                    let id = ForwardId(s.table_sent);
-                    s.table_sent += 1;
-                    let r = s.mux.send_table(MuxMsg::Listening {
-                        id,
-                        state: ListenState::Failed(BindFailure::AddrInUse),
-                    });
-                    self.ok(r, "send_table");
+                let id = ForwardId(s.table_sent);
+                match s.mux.send_table(MuxMsg::Listening {
+                    id,
+                    state: ListenState::Failed(BindFailure::AddrInUse),
+                }) {
+                    Ok(()) => s.table_sent += 1,
+                    Err(TableError::Full) => {}
+                    Err(e) => self.fail(format!("send_table: {e}")),
                 }
             }
             870..960 => {
@@ -882,4 +935,5 @@ fn the_model_holds_for_every_seed() {
         "{total:?}"
     );
     assert!(total.resumes_gated > n, "{total:?}");
+    assert!(total.busy > 0 && total.small_shares > 0, "{total:?}");
 }

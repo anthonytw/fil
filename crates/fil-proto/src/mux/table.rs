@@ -1,7 +1,9 @@
 //! The forward table's rules (DESIGN.md section 7.2), as a pure value the daemon owns.
 //!
-//! - A spec's identity is `(kind, bind, port)`.
-//! - An add equal to an entry is answered with that entry.
+//! - A spec's identity is `(kind, bind, port)`, except that port 0 (an ephemeral `-R`) has
+//!   none: each is a listener of its own, as with `ssh -R 0`, and never clashes.
+//! - An add equal to an entry is answered with that entry (an equal add from the client makes
+//!   a management-origin entry the client's own).
 //! - An add from the attached client with the identity of an entry and another target
 //!   **replaces** it under a new id (the old entry's open channels run until they close). From a
 //!   management request it is a `Conflict`: a process on the remote must not redirect the user's
@@ -75,13 +77,19 @@ impl ForwardTable {
 
     pub fn add(&mut self, spec: ForwardSpec, origin: Origin) -> Result<Added, ForwardRefusal> {
         Self::permitted(&spec, origin)?;
-        if let Some(e) = self.entries.iter().find(|e| e.spec == spec) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.spec == spec) {
+            if origin == Origin::Client {
+                e.origin = Origin::Client;
+            }
             return Ok(Added::Existing(e.id));
         }
-        let clash = self
-            .entries
-            .iter()
-            .position(|e| e.spec.identity() == spec.identity());
+        let clash = match spec.port() {
+            0 => None,
+            _ => self
+                .entries
+                .iter()
+                .position(|e| e.spec.identity() == spec.identity()),
+        };
         if clash.is_some() && origin == Origin::Request {
             return Err(ForwardRefusal::Conflict);
         }
@@ -204,6 +212,50 @@ mod tests {
             t("localhost", 80),
         );
         assert_eq!(tab.add(c, Origin::Client), Ok(Added::New(ForwardId(2))));
+    }
+
+    /// Every `-R 0` is a listener of its own (ssh allows any number); an equal one still dedups.
+    #[test]
+    fn ephemeral_remote_forwards_never_clash() {
+        let mut tab = ForwardTable::new();
+        let a = remote(BindAddr::Loopback, 0, t("localhost", 80));
+        let b = remote(BindAddr::Loopback, 0, t("localhost", 81));
+        assert_eq!(
+            tab.add(a.clone(), Origin::Client),
+            Ok(Added::New(ForwardId(0)))
+        );
+        assert_eq!(
+            tab.add(b.clone(), Origin::Client),
+            Ok(Added::New(ForwardId(1)))
+        );
+        assert_eq!(
+            tab.add(b, Origin::Request),
+            Ok(Added::Existing(ForwardId(1)))
+        );
+        assert_eq!(
+            tab.add(a, Origin::Client),
+            Ok(Added::Existing(ForwardId(0)))
+        );
+        let c = remote(BindAddr::Loopback, 0, t("localhost", 82));
+        assert_eq!(tab.add(c, Origin::Request), Ok(Added::New(ForwardId(2))));
+        assert_eq!(tab.len(), 3);
+    }
+
+    /// The client's own add of an entry management made takes it over.
+    #[test]
+    fn an_equal_client_add_makes_the_entry_the_clients() {
+        let mut tab = ForwardTable::new();
+        let s = local(BindAddr::Loopback, 5173, t("localhost", 5173));
+        tab.add(s.clone(), Origin::Request).unwrap();
+        assert_eq!(tab.get(ForwardId(0)).unwrap().origin, Origin::Request);
+        assert_eq!(
+            tab.add(s.clone(), Origin::Client),
+            Ok(Added::Existing(ForwardId(0)))
+        );
+        assert_eq!(tab.get(ForwardId(0)).unwrap().origin, Origin::Client);
+        // ...and a later management add does not take it back.
+        tab.add(s, Origin::Request).unwrap();
+        assert_eq!(tab.get(ForwardId(0)).unwrap().origin, Origin::Client);
     }
 
     #[test]

@@ -101,11 +101,11 @@ impl DnsName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-    /// `localhost` or a name under `.localhost` (RFC 6761), in any case: a name that always
-    /// resolves to loopback.
+    /// The name `localhost`, in any case. Names under `.localhost` are not counted: RFC 6761
+    /// says they resolve to loopback, but not every resolver does, and one that asks DNS would
+    /// make a "loopback" target reach the network.
     pub fn is_localhost(&self) -> bool {
-        let s = self.0.to_ascii_lowercase();
-        s == "localhost" || s.ends_with(".localhost")
+        self.0.eq_ignore_ascii_case("localhost")
     }
 }
 impl TryFrom<String> for DnsName {
@@ -539,7 +539,7 @@ mod tests {
         let wire = postcard::to_allocvec(&"a_b").unwrap();
         assert!(postcard::from_bytes::<DnsName>(&wire).is_err());
         assert!(DnsName::new("LocalHost").unwrap().is_localhost());
-        assert!(DnsName::new("app.localhost").unwrap().is_localhost());
+        assert!(!DnsName::new("app.localhost").unwrap().is_localhost());
         assert!(
             !DnsName::new("localhost.example.com")
                 .unwrap()

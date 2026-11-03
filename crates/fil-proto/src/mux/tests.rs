@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::frame::DataSegment;
+use crate::limits::{DEFAULT_FORWARD_BUFFER, DEFAULT_WINDOW, MAX_DATA_PAYLOAD, MIN_WINDOW};
 
 fn cfg() -> MuxConfig {
     MuxConfig {
@@ -521,6 +522,9 @@ fn resume_below_what_was_acknowledged() {
     p.advance(ACK_DELAY);
     p.pump();
     assert_eq!(p.c.info(ch).unwrap().send_buffered, 0);
+    // A Resume counts only once per resumed link.
+    p.c.link_down();
+    let _ = p.c.link_up(true);
     p.c.on_resume(ch, 10).unwrap();
     assert_eq!(
         events(&mut p.c),
@@ -529,8 +533,6 @@ fn resume_below_what_was_acknowledged() {
             why: CloseReason::ResumeGone
         }]
     );
-    p.advance(ACK_DELAY);
-    p.pump();
     assert!(p.c.on_resume(ChannelId::MUX, 0).is_err());
 }
 
@@ -661,8 +663,6 @@ fn linger_closes_every_channel_and_the_records_go_on_the_next_link() {
 fn opens_stop_at_the_cap_the_budget_and_the_mux_buffer() {
     let small = MuxConfig {
         max_open: 2,
-        budget: 32 * 1024,
-        buffer: 64 * 1024,
         ..cfg()
     };
     let mut p = Pair::with(small.clone(), small);
@@ -674,29 +674,62 @@ fn opens_stop_at_the_cap_the_budget_and_the_mux_buffer() {
     p.pump();
     let ev = events(&mut p.c);
     assert!(ev.contains(&MuxEvent::Unblocked), "{ev:?}");
-    // The budget: writes stop at it, opens are Busy, and the peer's opens are refused Busy.
-    let mut p = Pair::with(
-        MuxConfig {
-            budget: 32 * 1024,
-            ..cfg()
-        },
-        cfg(),
-    );
+    // The budget: each opener has half of it; a channel reserves its window and send buffer.
+    // 64 KiB: 32 KiB per opener, one smallest share (16 KiB window + 16 KiB buffer) each.
+    let tight = MuxConfig {
+        budget: 64 * 1024,
+        ..cfg()
+    };
+    let mut p = Pair::with(tight.clone(), tight);
     let ch = open_pair(&mut p);
-    assert_eq!(p.c.write(ch, &vec![0; 64 * 1024]), 32 * 1024);
+    let info = p.c.info(ch).unwrap();
+    assert_eq!((info.window, info.send_capacity), (MIN_WINDOW, MIN_BUFFER));
+    assert_eq!(p.c.reserved(), 32 * 1024);
     assert_eq!(p.c.open(local()), Err(OpenFailure::Busy));
+    // The daemon's own opens draw from its own half: still possible...
     let incoming = p.d.open(OpenKind::Agent).unwrap();
+    let late = p.d.open(OpenKind::Agent);
+    assert_eq!(late, Err(OpenFailure::Busy));
     p.pump();
-    assert!(events(&mut p.d).contains(&MuxEvent::OpenFailed {
+    // ...and the client's half for the peer's channels is still free, so it is accepted.
+    assert!(events(&mut p.c).contains(&MuxEvent::Incoming {
         channel: incoming,
-        why: OpenFailure::Busy
+        kind: OpenKind::Agent
     }));
-    // Room comes back as the peer consumes: Writable, then opens again.
+    // A write stops at the channel's own buffer, and room comes back as the peer consumes.
+    assert_eq!(p.c.write(ch, &vec![0; 64 * 1024]), MIN_BUFFER);
+    p.pump();
     drain(&mut p.d, ch);
     p.advance(ACK_DELAY);
     p.pump();
     let ev = events(&mut p.c);
     assert!(ev.contains(&MuxEvent::Writable { channel: ch }), "{ev:?}");
+    // Closing gives the share back: opens again.
+    p.c.abort(ch, CloseReason::Reset);
+    p.pump();
+    assert!(events(&mut p.c).contains(&MuxEvent::Unblocked));
+    assert!(p.c.open(local()).is_ok());
+    // With room for one opener's full share, the first channel gets the configured window and
+    // buffer, and later ones less, down to the smallest share, so all of them fit.
+    let mid = MuxConfig {
+        // Per opener: one full share (64 KiB + 64 KiB) and the smallest share for the 3 others.
+        budget: 2 * (2 * 64 * 1024 + 3 * 32 * 1024),
+        buffer: 64 * 1024,
+        window: Window::new(64 * 1024).unwrap(),
+        max_open: 4,
+        ..MuxConfig::default()
+    };
+    let mut m = Mux::new(Side::Client, mid.clone());
+    let grants: Vec<(u32, usize)> = (0..4)
+        .map(|_| {
+            let ch = m.open(local()).unwrap();
+            let i = m.info(ch).unwrap();
+            (i.window, i.send_capacity)
+        })
+        .collect();
+    assert_eq!(grants[0], (64 * 1024, 64 * 1024), "{grants:?}");
+    assert_eq!(grants[3], (MIN_WINDOW, MIN_BUFFER), "{grants:?}");
+    assert!(m.reserved() <= mid.budget / 2);
     // The MUX buffer: past three quarters, no opens.
     let mut m = Mux::new(
         Side::Client,
@@ -709,6 +742,79 @@ fn opens_stop_at_the_cap_the_budget_and_the_mux_buffer() {
     assert!(m.mux_buffered() * 4 > 48 * 3 - 1);
     assert_eq!(m.open(local()), Err(OpenFailure::Busy));
     assert!(m.failed().is_none());
+}
+
+/// The review's worst case: a hostile daemon opens 256 `-R` channels in one burst and fills
+/// every window. The client holds at most its budget (the peer's half of it), and its own `-L`
+/// forwards still open and write: a stuck `-R` channel holds only its own share.
+#[test]
+fn a_burst_of_hostile_remote_opens_stays_within_the_budget() {
+    let mut c = Mux::new(Side::Client, MuxConfig::default());
+    c.link_up(false);
+    let mut seq = 0u64;
+    let mut stream = vec![];
+    for i in 0..MAX_OPEN_CHANNELS as u32 {
+        stream.extend(
+            encode_record(&MuxMsg::Open {
+                channel: ChannelId(17 + 2 * i),
+                window: Window::DEFAULT,
+                kind: OpenKind::Remote {
+                    forward: ForwardId(0),
+                },
+            })
+            .unwrap(),
+        );
+    }
+    for chunk in stream.chunks(MAX_DATA_PAYLOAD) {
+        c.on_payload(
+            ChannelId::MUX,
+            Bytes::from(DataSegment::encode(seq, chunk).unwrap()),
+        )
+        .unwrap();
+        seq += chunk.len() as u64;
+    }
+    let incoming: Vec<ChannelId> = events(&mut c)
+        .into_iter()
+        .filter_map(|e| match e {
+            MuxEvent::Incoming { channel, .. } => Some(channel),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        incoming.len(),
+        MAX_OPEN_CHANNELS,
+        "all fit, at least the smallest share"
+    );
+    for &ch in &incoming {
+        c.accept(ch);
+    }
+    // Fill every window to the byte; one byte more would be a violation.
+    for &ch in &incoming {
+        let w = c.info(ch).unwrap().window as usize;
+        let mut off = 0;
+        while off < w {
+            let n = (w - off).min(MAX_DATA_PAYLOAD);
+            hostile_data(&mut c, ch, off as u64, n).unwrap();
+            off += n;
+        }
+    }
+    let budget = MuxConfig::default().budget;
+    assert!(c.failed().is_none());
+    assert!(
+        c.recv_buffered() <= budget / 2,
+        "{} held",
+        c.recv_buffered()
+    );
+    assert!(c.buffered() <= c.reserved() && c.reserved() <= budget);
+    // The user's own -L: opens with a full share and writes its whole buffer.
+    let l = c.open(local()).unwrap();
+    let info = c.info(l).unwrap();
+    assert_eq!(info.window, DEFAULT_WINDOW);
+    assert_eq!(
+        c.write(l, &vec![0; DEFAULT_FORWARD_BUFFER + 1]),
+        DEFAULT_FORWARD_BUFFER
+    );
+    assert!(c.buffered() <= budget);
 }
 
 #[test]
@@ -927,4 +1033,167 @@ fn the_acceptors_data_waits_for_its_open_ok_while_mux_is_gated() {
     assert_eq!(p.d.write(b, b"early"), 5);
     let sent: Vec<ChannelId> = std::iter::from_fn(|| p.d.poll_transmit().map(|(c, _)| c)).collect();
     assert!(!sent.contains(&b), "data before its OpenOk left: {sent:?}");
+}
+
+/// A `Resume` counts once per channel per resumed link: more cannot make this side resend what
+/// it holds again and again for a few bytes each.
+#[test]
+fn one_resume_per_channel_per_link() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    p.c.write(ch, &[5; 16 * 1024]);
+    p.pump();
+    let once = data_bytes(&p.c_sent, ch);
+    assert_eq!(once, 16 * 1024);
+    // Mid-link: ignored.
+    for _ in 0..10 {
+        p.d.on_resume(ch, 0).unwrap_or_else(|e| panic!("{e}"));
+        p.c.on_resume(ch, 0).unwrap();
+        p.c.on_resume(ChannelId::MUX, 0).unwrap();
+    }
+    p.pump();
+    assert_eq!(data_bytes(&p.c_sent, ch), once, "nothing resent");
+    // After a resumed link: the first counts, a second is ignored.
+    p.c.link_down();
+    let _ = p.c.link_up(true);
+    p.c.on_resume(ch, 0).unwrap();
+    p.c.on_resume(ChannelId::MUX, 0).unwrap_or(());
+    let first: usize = std::iter::from_fn(|| p.c.poll_transmit())
+        .filter(|(c, _)| *c == ch)
+        .map(|(_, pl)| DataSegment::parse(&pl).unwrap().data.len())
+        .sum();
+    p.c.on_resume(ch, 0).unwrap();
+    let second: usize = std::iter::from_fn(|| p.c.poll_transmit())
+        .filter(|(c, _)| *c == ch)
+        .map(|(_, pl)| DataSegment::parse(&pl).unwrap().data.len())
+        .sum();
+    assert_eq!((first, second), (16 * 1024, 0));
+}
+
+/// The review's case: the `OpenOk` is lost with the link; on the resumed link the acceptor's
+/// channel is not gated (it never sent), but its data still waits until the `OpenOk` has gone
+/// out again.
+#[test]
+fn the_acceptors_data_waits_for_a_retransmitted_open_ok() {
+    let mut p = Pair::new();
+    let ch = p.c.open(local()).unwrap();
+    p.pump();
+    events(&mut p.d);
+    p.d.accept(ch);
+    let (mux, _lost) = p.d.poll_transmit().unwrap();
+    assert_eq!(mux, ChannelId::MUX);
+    p.c.link_down();
+    p.d.link_down();
+    let from_c = p.c.link_up(true);
+    let _from_d = p.d.link_up(true);
+    assert_eq!(p.d.write(ch, b"early"), 5);
+    let sent: Vec<ChannelId> = std::iter::from_fn(|| p.d.poll_transmit().map(|(c, _)| c)).collect();
+    assert!(
+        !sent.contains(&ch),
+        "data before its OpenOk went out again: {sent:?}"
+    );
+    for m in &from_c {
+        deliver_ctl(&mut p.d, m).unwrap();
+    }
+    let order: Vec<ChannelId> =
+        std::iter::from_fn(|| p.d.poll_transmit().map(|(c, _)| c)).collect();
+    let ok = order.iter().position(|c| *c == ChannelId::MUX).unwrap();
+    let data = order.iter().position(|c| *c == ch).unwrap();
+    assert!(ok < data, "{order:?}");
+}
+
+/// A peer's `Close { Done }` is passed on as `Done` only when this side's own checks agree.
+#[test]
+fn a_peers_done_without_the_bytes_is_a_reset() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    p.c.write(ch, b"abc");
+    p.pump();
+    events(&mut p.d);
+    let rec = encode_record(&MuxMsg::Close {
+        channel: ch,
+        why: CloseReason::Done,
+    })
+    .unwrap();
+    // The client's next MUX offset, as the daemon has received it.
+    let at = p
+        .c_sent
+        .iter()
+        .filter(|(c, _)| *c == ChannelId::MUX)
+        .map(|(_, pl)| {
+            let s = DataSegment::parse(pl).unwrap();
+            s.seq + s.data.len() as u64
+        })
+        .max()
+        .unwrap();
+    p.d.on_payload(
+        ChannelId::MUX,
+        Bytes::from(DataSegment::encode(at, &rec).unwrap()),
+    )
+    .unwrap();
+    assert!(events(&mut p.d).contains(&MuxEvent::Closed {
+        channel: ch,
+        why: CloseReason::Reset
+    }));
+}
+
+/// `Debug` of a mux shows counts and states, never a target, a port or a byte (DESIGN.md
+/// section 11.1): it may end up in an error message.
+#[test]
+fn debug_names_no_target() {
+    let mut d = Mux::new(Side::Daemon, cfg());
+    d.link_up(false);
+    let rec = encode_record(&MuxMsg::Open {
+        channel: ChannelId(16),
+        window: Window::DEFAULT,
+        kind: OpenKind::Dynamic {
+            forward: ForwardId(1),
+            target: Target {
+                host: TargetHost::Name("secret-host.example".parse().unwrap()),
+                port: NonZeroU16::new(4433).unwrap(),
+            },
+        },
+    })
+    .unwrap();
+    d.on_payload(
+        ChannelId::MUX,
+        Bytes::from(DataSegment::encode(0, &rec).unwrap()),
+    )
+    .unwrap();
+    hostile_data(&mut d, ChannelId(16), 0, 1).unwrap();
+    let text = format!("{d:?}");
+    assert!(!text.contains("secret-host"), "{text}");
+    assert!(!text.contains("4433"), "{text}");
+}
+
+/// Table messages past three quarters of the MUX buffer are refused, and the mux stays healthy.
+#[test]
+fn a_full_mux_buffer_refuses_table_messages_without_failing() {
+    let mut p = Pair::new();
+    p.d.link_down();
+    let gone = |i: u32| MuxMsg::ForwardGone { id: ForwardId(i) };
+    let mut n = 0;
+    loop {
+        match p.d.send_table(gone(n)) {
+            Ok(()) => n += 1,
+            Err(TableError::Full) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(n > 1000);
+    assert!(p.d.failed().is_none());
+    assert_eq!(p.d.send_table(gone(n)), Err(TableError::Full));
+    // Once the peer has it, room again.
+    let _ = p.d.link_up(true);
+    p.d.on_resume(ChannelId::MUX, 0).unwrap();
+    p.pump();
+    p.advance(ACK_DELAY);
+    p.pump();
+    assert_eq!(p.d.mux_buffered(), 0);
+    assert_eq!(p.d.send_table(gone(n)), Ok(()));
+    assert_eq!(
+        p.c.send_table(gone(0)),
+        Err(TableError::Direction),
+        "only the daemon sends ForwardGone"
+    );
 }

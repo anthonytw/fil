@@ -2,7 +2,7 @@
 # The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
 # topology, network namespaces and root for the UDP/NAT topology.
 #
-#   run.sh [ssh|udp|sysd|fwd|latency|all] [SCENARIO...]
+#   run.sh [ssh|udp|sysd|fwd|fwd-cable|fwd-rest|agent|latency|all] [SCENARIO...]
 #
 # Exit status: 0 if every scenario passed, 1 if any failed, 2 if the host cannot run it.
 set -uo pipefail
@@ -18,10 +18,12 @@ case $part in
   udp) parts=(udp) ;;
   sysd) parts=(sysd) ;;
   fwd) parts=(fwd) ;; # the M2 forward scenarios, docs/m2/realnet.md
+  fwd-cable | fwd-rest) parts=("$part") ;; # the two halves of fwd, CI's two jobs
+  agent) parts=(agent) ;; # the M2 agent scenarios
   latency) parts=(latency) ;; # not in `all`: the latency lab, docs/m2/latency.md
-  all) parts=(ssh udp sysd fwd) ;;
+  all) parts=(ssh udp sysd fwd agent) ;;
   *)
-    echo "usage: run.sh [ssh|udp|sysd|fwd|latency|all] [SCENARIO...]" >&2
+    echo "usage: run.sh [ssh|udp|sysd|fwd|fwd-cable|fwd-rest|agent|latency|all] [SCENARIO...]" >&2
     exit 2
     ;;
 esac
@@ -31,7 +33,11 @@ mkdir -p "$OUT"
 rc=0
 for p in "${parts[@]}"; do
   # Part scripts exit 2 when the host lacks Docker, root or a tool; that is not a test failure.
-  bash "$REALNET_DIR/$p.sh" "$@"
+  case $p in
+    fwd-cable) bash "$REALNET_DIR/fwd.sh" f_fwd_cable_pull ;;
+    fwd-rest) bash "$REALNET_DIR/fwd.sh" --rest "$@" ;;
+    *) bash "$REALNET_DIR/$p.sh" "$@" ;;
+  esac
   prc=$?
   if [[ $prc -eq 2 ]]; then exit 2; fi
   if [[ $prc -ne 0 ]]; then rc=1; fi

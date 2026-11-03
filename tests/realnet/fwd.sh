@@ -49,6 +49,34 @@ FWD_SSH_TARGET=18001
 FWD_MALLORY=rnmallory
 
 # ---------------------------------------------------------------------------------------------
+# Misses and findings
+#
+# A miss is a failure of what the done-when or a security property requires (plan §1): a wrong
+# sha256, a second accept, a reader that did not end on EOF, a changed daemon, ResumeGone, a refused
+# forward that listens, another user reaching a socket. Each is recorded at once (a note and the
+# log) and collected, so every miss of a scenario is visible, and fwd_verdict fails the scenario at
+# its end if there was any. known_bug (fil.sh) is only for a named finding, which says which change
+# fixes it: today the pipe's slow return after a long outage (FWD_PIPE_RECOVERY_FIX).
+FWD_MISSES=()
+fwd_miss() {
+  FWD_MISSES+=("$1")
+  note "MISS: $1"
+  log "MISS: $1"
+}
+fwd_verdict() {
+  [[ ${#FWD_MISSES[@]} -eq 0 ]] || fail "${#FWD_MISSES[@]} miss(es): $(printf '%s; ' "${FWD_MISSES[@]}")"
+  ok "no misses"
+}
+
+# The named finding: on --transport pipe the network watcher is off, so after a long outage the
+# client returns only at its next pipe retry (backoff up to 30 s). The fix runs the watcher for the
+# pipe too (a separate PR); when it lands, this becomes a miss like any other.
+FWD_PIPE_RECOVERY_FIX="the pipe network-watcher fix (separate PR): it makes this check strict"
+# How soon after the cable is back the forwards must move again. auto measured 0.6 to 1.9 s in four
+# runs (its watcher sees the route return); 5 s is that and margin.
+FWD_RECOVERY_MS=5000
+
+# ---------------------------------------------------------------------------------------------
 # Setup and teardown
 
 fwd_setup() {
@@ -56,7 +84,8 @@ fwd_setup() {
   cp "$OUT/udp.env" "$OUT/fwd.env"
   printf 'cell\ttransport\tload\trate\tsent\techoed\tlost\tmin_ms\tp50_ms\tp90_ms\tp99_ms\tmax_ms\n' > "$LAT_CELLS"
   client_exec_on x mkdir -p "$PD"
-  # Another user on the "server", for f_fwd_other_user.
+  # Another user on the "server", for f_fwd_other_user (a leftover of a killed run goes first).
+  as_root userdel -r -f "$FWD_MALLORY" > /dev/null 2>&1 || true
   as_root useradd -m -s /bin/bash -p '*' "$FWD_MALLORY"
 }
 
@@ -250,7 +279,7 @@ fwd_pair_check() {
     ok "$FWD_TAG: -L and -R byte-exact ($FWD_N bytes each, sha256), one accept at each server, ended with EOF"
   else
     local b
-    for b in "${bad[@]}"; do known_bug "$FWD_TAG: $b"; done
+    for b in "${bad[@]}"; do fwd_miss "$FWD_TAG: $b"; done
   fi
   lat_stop_listener "$NS_S" "$FWD_L_TARGET"
   lat_stop_listener "$NS_C" "$FWD_R_TARGET"
@@ -261,11 +290,14 @@ fwd_pair_check() {
 fwd_after_checks() {
   local name=$1 tag=$2 dpid
   dpid=$(fwd_daemon_pid)
-  [[ $dpid == "$DAEMON_PID" ]] || known_bug "$tag: the daemon changed (pid $DAEMON_PID, now ${dpid:-none})"
-  fc "$name" status | grep -q '^running' || known_bug "$tag: the client exited: $(fc "$name" status)"
+  [[ $dpid == "$DAEMON_PID" ]] || fwd_miss "$tag: the daemon changed (pid $DAEMON_PID, now ${dpid:-none})"
+  if ! fc "$name" status | grep -q '^running'; then
+    fwd_miss "$tag: the client exited: $(fc "$name" status)"
+    return 0
+  fi
   fc_ready "$name" 60
-  if fc_log "$name" | grep -q 'ResumeGone'; then known_bug "$tag: a forward channel ended with ResumeGone"; fi
-  if fc_has "$name" 'different session'; then known_bug "$tag: the session was replaced"; fi
+  if fc_log "$name" | grep -q 'ResumeGone'; then fwd_miss "$tag: a forward channel ended with ResumeGone"; fi
+  if fc_has "$name" 'different session'; then fwd_miss "$tag: the session was replaced"; fi
   # How the client's forward channels ended (Done is a clean close).
   note "$tag.channel_closes=$(fc_log "$name" | grep -F 'forward channel closed' | grep -o '"why":"[A-Za-z]*"' | sort | uniq -c | tr -s ' ' | tr '\n' ',' || true)"
 }
@@ -292,14 +324,23 @@ cable_plug() {
   log "cable plugged back in"
 }
 
-FWD_STOPPED=
+# A laptop sleep: the client's process group and the group of each child it started (a reconnect's
+# pipe ssh runs in a group of its own, connect.rs), as dropin's Stopped::all does.
+FWD_STOPPED=()
 client_stop() {
-  FWD_STOPPED=$FIL_PID
-  as_root kill -STOP -- "-$FIL_PID"
+  local c g
+  FWD_STOPPED=("$FIL_PID")
+  for c in $(as_root pgrep -P "$FIL_PID" || true); do
+    g=$(ps -o pgid= -p "$c" | tr -d ' ')
+    [[ -z $g || " ${FWD_STOPPED[*]} " == *" $g "* ]] || FWD_STOPPED+=("$g")
+  done
+  for g in "${FWD_STOPPED[@]}"; do as_root kill -STOP -- "-$g"; done
+  note "${SCENARIO}.stopped_groups=${#FWD_STOPPED[@]}"
 }
 client_cont() {
-  [[ -z $FWD_STOPPED ]] || as_root kill -CONT -- "-$FWD_STOPPED" 2> /dev/null || true
-  FWD_STOPPED=
+  local g
+  for g in ${FWD_STOPPED[@]+"${FWD_STOPPED[@]}"}; do as_root kill -CONT -- "-$g" 2> /dev/null || true; done
+  FWD_STOPPED=()
 }
 
 # The end of every scenario (fc_finish calls it): nothing stays stopped, unplugged or blocked.
@@ -355,10 +396,17 @@ fwd_cable_case() {
     note "$tr.pull$k.down_ms=$((t - pull))"
     fwd_wait_resumed "$t" 120
     note "$tr.pull$k.l_resumed_after_plug_ms=$FWD_RESUMED_L $tr.pull$k.r_resumed_after_plug_ms=$FWD_RESUMED_R"
-    # The network is back: the client should be too, within seconds, as on auto (its network
-    # watcher sees the route come back). The pipe's retry backoff is capped at 30 s.
-    if [[ $FWD_RESUMED_L -gt 10000 || $FWD_RESUMED_R -gt 10000 ]]; then
-      known_bug "$tr: after a ${secs} s cable pull the forwards moved again only $FWD_RESUMED_L ms after the cable was back (the client reconnects at its next pipe retry; with --transport pipe it does not watch the network)"
+    # The network is back: the client must be too, within FWD_RECOVERY_MS (recorded above on every
+    # run). auto's network watcher sees the route return; the pipe's is off, which is the named
+    # finding (it then waits for its retry, up to 30 s).
+    local slow=$FWD_RESUMED_L
+    [[ $FWD_RESUMED_R -le $slow ]] || slow=$FWD_RESUMED_R
+    if [[ $slow -gt $FWD_RECOVERY_MS ]]; then
+      if [[ $tr == pipe ]]; then
+        known_bug "$tr: after a ${secs} s cable pull the forwards moved again only $slow ms after the cable was back, over the ${FWD_RECOVERY_MS} ms bound (no network watcher on the pipe; fixed by $FWD_PIPE_RECOVERY_FIX)"
+      else
+        fwd_miss "$tr: after a ${secs} s cable pull the forwards moved again only $slow ms after the cable was back (bound ${FWD_RECOVERY_MS} ms)"
+      fi
     fi
     [[ $(link_downs "$name") -gt $downs0 ]] || fail "$tr: the client never logged its link down during pull $k: it was not a disconnect"
     downs0=$(link_downs "$name")
@@ -395,6 +443,7 @@ fwd_cable_case() {
 f_fwd_cable_pull() {
   fwd_cable_case auto
   fwd_cable_case pipe
+  fwd_verdict
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -463,13 +512,18 @@ fwd_event_case() {
 f_fwd_reconnect() {
   fwd_event_case auto reconnect
   fwd_event_case pipe reconnect
+  fwd_verdict
 }
 
-f_fwd_swap() { fwd_event_case auto swap; }
+f_fwd_swap() {
+  fwd_event_case auto swap
+  fwd_verdict
+}
 
 f_fwd_sleep() {
   fwd_event_case auto sleep
   fwd_event_case pipe sleep
+  fwd_verdict
 }
 
 # Three NAT moves during the pair: no reconnect, the same connections, byte-exact.
@@ -492,12 +546,13 @@ f_fwd_roam() {
     nat_expect "$spec"
   done
   fwd_pair_check 300
-  [[ $(link_downs "$name") -eq $downs0 ]] || known_bug "roam: the link went down across the NAT moves ($(link_downs "$name") downs)"
-  [[ $(fc_count_log "$name" 'Switched(') -eq 2 ]] || known_bug "roam: the client switched transports: $(fc_log "$name" | grep -F 'Switched(' | tr '\n' ' ')"
-  [[ -z $(pipe_ssh "$FIL_PID") ]] || known_bug "roam: the client fell back to an ssh pipe"
+  [[ $(link_downs "$name") -eq $downs0 ]] || fwd_miss "roam: the link went down across the NAT moves ($(link_downs "$name") downs)"
+  [[ $(fc_count_log "$name" 'Switched(') -eq 2 ]] || fwd_miss "roam: the client switched transports: $(fc_log "$name" | grep -F 'Switched(' | tr '\n' ' ')"
+  [[ -z $(pipe_ssh "$FIL_PID") ]] || fwd_miss "roam: the client fell back to an ssh pipe"
   fwd_after_checks "$name" "$tag"
   fc_detach "$name"
   cx_fk "$FWD_SESSION"
+  fwd_verdict
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -546,24 +601,28 @@ f_fwd_many_short() {
     fwd_burst "seq$dir" "$dir" "$FWD_MANY" 1
     note "seq$dir: ok=$BURST_OK failed=$BURST_FAILED ms=$BURST_MS rc=$BURST_RC"
     [[ $BURST_RC -eq 0 && $BURST_FAILED == 0 && $BURST_OK == "$FWD_MANY" ]] \
-      || { failed=1; known_bug "$FWD_MANY sequential -$dir connections: ok=$BURST_OK failed=$BURST_FAILED ($(fpv "$OUT/run/$SCENARIO/seq$dir.burst" FIRST_ERROR))"; }
+      || { failed=1; fwd_miss "$FWD_MANY sequential -$dir connections: ok=$BURST_OK failed=$BURST_FAILED ($(fpv "$OUT/run/$SCENARIO/seq$dir.burst" FIRST_ERROR))"; }
     fwd_burst "par$dir" "$dir" 200 200
     note "par$dir: ok=$BURST_OK failed=$BURST_FAILED ms=$BURST_MS rc=$BURST_RC"
     [[ $BURST_RC -eq 0 && $BURST_FAILED == 0 && $BURST_OK == 200 ]] \
-      || { failed=1; known_bug "200 concurrent -$dir connections: ok=$BURST_OK failed=$BURST_FAILED ($(fpv "$OUT/run/$SCENARIO/par$dir.burst" FIRST_ERROR))"; }
+      || { failed=1; fwd_miss "200 concurrent -$dir connections: ok=$BURST_OK failed=$BURST_FAILED ($(fpv "$OUT/run/$SCENARIO/par$dir.burst" FIRST_ERROR))"; }
   done
-  [[ $(link_downs "$name") -eq $downs0 ]] || known_bug "many_short: the link went down ($(link_downs "$name") downs)"
-  [[ $(fc_count_log "$name" 'Switched(') -eq 2 ]] || known_bug "many_short: the client switched transports: $(fc_log "$name" | grep -F 'Switched(' | tr '\n' ' ')"
+  [[ $(link_downs "$name") -eq $downs0 ]] || fwd_miss "many_short: the link went down ($(link_downs "$name") downs)"
+  [[ $(fc_count_log "$name" 'Switched(') -eq 2 ]] || fwd_miss "many_short: the client switched transports: $(fc_log "$name" | grep -F 'Switched(' | tr '\n' ' ')"
   [[ $failed -eq 1 ]] || ok "$FWD_MANY sequential and 200 concurrent connections each way, all echoed, on one QUIC link with no reconnect"
   fwd_after_checks "$name" many
   fc_detach "$name"
   cx_fk "$FWD_SESSION"
+  fwd_verdict
 }
 
 # How often the daemon's log says a link ended on unanswered stream ends (grep -c prints 0 on none).
+FWD_DAEMON_LOG=/home/rnfil/.local/state/fil/daemon.log
 fwd_daemon_trips() {
+  # A missing or empty log would read as no trip: that is an error, not a zero.
+  as_root test -s "$FWD_DAEMON_LOG" || fail "the daemon's log $FWD_DAEMON_LOG is missing or empty: trips cannot be counted"
   local n
-  n=$(as_root grep -c 'does not answer stream ends' /home/rnfil/.local/state/fil/daemon.log 2> /dev/null || true)
+  n=$(as_root grep -c 'does not answer stream ends' "$FWD_DAEMON_LOG" || true)
   printf '%s' "${n:-0}"
 }
 
@@ -620,11 +679,15 @@ f_fwd_ending_stress() {
       local rate=n/a
       [[ ${BURST_MS:-0} -gt 0 ]] && rate=$(awk -v n="${BURST_OK:-0}" -v ms="$BURST_MS" 'BEGIN { printf "%.0f", n * 1000 / ms }')
       note "$cell$dir: net='$net' conns=$count parallel=$FWD_STRESS_PAR ok=$BURST_OK failed=$BURST_FAILED ms=$BURST_MS conns_per_s=$rate ending_trips_client=$vc ending_trips_daemon=$vd link_downs=$(($(link_downs "$name") - downs0)) to_pipe=$(($(fc_count_log "$name" 'Switched(Pipe)') - to_pipe0))"
+      # A trip ends the link and the channels resume on the next one, so the burst itself still
+      # succeeds: the link's own record is the check (the log lines, and any link down or move).
+      local downs=$(($(link_downs "$name") - downs0)) moves=$(($(fc_count_log "$name" 'Switched(Pipe)') - to_pipe0))
+      [[ $downs -eq 0 && $moves -eq 0 ]] || fwd_miss "$cell$dir: the link went down $downs time(s) and moved to the pipe $moves time(s) during the burst over '$net'"
       if [[ $vc -gt 0 || $vd -gt 0 ]]; then
         trips=$((trips + 1))
-        known_bug "MAX_ENDING tripped on an honest link: $count -$dir connections, $FWD_STRESS_PAR at a time, over '$net': the link ended as 'the peer does not answer stream ends' $vc time(s) on the client and $vd on the daemon ($BURST_OK of $count connections echoed, $BURST_FAILED failed, at $rate per second)"
+        fwd_miss "MAX_ENDING tripped on an honest link: $count -$dir connections, $FWD_STRESS_PAR at a time, over '$net': the link ended as 'the peer does not answer stream ends' $vc time(s) on the client and $vd on the daemon ($BURST_OK of $count connections echoed, $BURST_FAILED failed, at $rate per second)"
       fi
-      [[ ${BURST_FAILED:-x} == 0 ]] || known_bug "$cell$dir: $BURST_FAILED of $count short -$dir connections failed over '$net' ($(fpv "$OUT/run/$SCENARIO/$cell$dir.burst" FIRST_ERROR))"
+      [[ ${BURST_FAILED:-x} == 0 ]] || fwd_miss "$cell$dir: $BURST_FAILED of $count short -$dir connections failed over '$net' ($(fpv "$OUT/run/$SCENARIO/$cell$dir.burst" FIRST_ERROR))"
     done
   done
   note "max_ending_trips=$trips"
@@ -647,12 +710,41 @@ f_fwd_ending_stress() {
   fwd_after_checks "$name" stress
   fc_detach "$name"
   cx_fk "$FWD_SESSION"
+  fwd_verdict
+}
+
+# fwd_door_check WHAT SOCK CONTROL DIR...: another user cannot reach the Unix socket SOCK. First the
+# directories stop it (EACCES). Then, with the directories and the socket opened by hand (as root,
+# restored at once), the owner's own peer-UID check must: the server hangs up on the stranger
+# (CLOSED) while the owner's connection is let in (CONTROL: DATA for the daemon, which greets its
+# user; WAITING for the agent socket, which waits for a request). A stranger let in is a miss.
+fwd_door_check() {
+  local what=$1 sock=$2 control=$3 p modes=() x
+  shift 3
+  probe=$(nsx "$NS_S" runuser -u "$FWD_MALLORY" -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
+  note "$what.closed_door=$probe"
+  [[ $probe == 'REFUSED errno=13'* ]] || fwd_miss "another user's connect to the $what socket, with the directories as fil left them: $probe"
+  for x in "$@" "$sock"; do modes+=("$(as_root stat -c %a "$x")"); done
+  for x in "$@"; do as_root chmod 711 "$x"; done
+  as_root chmod 666 "$sock"
+  p=$(nsx "$NS_S" runuser -u rnfil -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
+  probe=$(nsx "$NS_S" runuser -u "$FWD_MALLORY" -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
+  local i=0
+  for x in "$@" "$sock"; do
+    as_root chmod "${modes[$i]}" "$x"
+    i=$((i + 1))
+  done
+  note "$what.open_door: owner=$p stranger=$probe"
+  [[ $p == "$control"* ]] || fail "control: the owner's own connection to the $what socket got '$p', wanted $control"
+  [[ $probe == CLOSED* ]] || fwd_miss "another user's connect to the $what socket with the door opened was not hung up on (the peer-UID check): $probe"
+  ok "$what socket: another user is stopped by the directories, and with them open by the peer-UID check"
 }
 
 # Another user of the host can reach a loopback -R port (as with ssh: documented in the plan, §5.3)
-# but not the daemon's socket.
+# but not the daemon's socket: neither through the 0700 directory nor, with it opened, past the
+# daemon's peer-UID check. (The plan's `same-user` -R policy is not built yet, OD-9: not covered.)
 f_fwd_other_user() {
-  local name=o o muid fuid sock probe
+  local name=o o muid fuid sock
   FWD_SESSION=fwdother
   reset_net
   fwd_attach "$name" "$FWD_SESSION" auto
@@ -671,11 +763,10 @@ f_fwd_other_user() {
   [[ $fuid != "$muid" ]] || fail "mallory has fil's uid"
   sock=$(as_root find "/tmp/fil-$fuid" -maxdepth 1 -name '*.sock' | head -n 1)
   [[ -n $sock ]] || fail "no daemon socket in /tmp/fil-$fuid"
-  probe=$(nsx "$NS_S" runuser -u "$FWD_MALLORY" -- "$UDP_BIN/sockprobe" "$sock" 2>&1 || true)
-  [[ $probe == 'REFUSED errno=13'* ]] || known_bug "another user's connect to the daemon socket: $probe"
-  note "mallory_daemon_socket=$probe"
+  fwd_door_check daemon "$sock" DATA "/tmp/fil-$fuid"
   fc_detach "$name"
   cx_fk "$FWD_SESSION"
+  fwd_verdict
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -687,13 +778,30 @@ fwd_bulk_cmd() {
   local kind=$1 name=$2 l=(-L "127.0.0.1:$LAT_FWD_UP:127.0.0.1:$LAT_SINK_PORT" -L "127.0.0.1:$LAT_FWD_DOWN:127.0.0.1:$LAT_SOURCE_PORT")
   case $kind in
     ssh) FWD_CMD=(ssh -tt "${l[@]}" srv) ;;
+    # The same without OpenSSH's keystroke-timing obfuscation (20 ms batches on a pty session,
+    # docs/m2/latency.md): the like-for-like baseline, as fil's pipe never pays it.
+    sshno) FWD_CMD=(ssh -tt -o ObscureKeystrokeTiming=no "${l[@]}" srv) ;;
     pipe) FWD_CMD=(fil --transport pipe "${l[@]}" srv "$name") ;;
     quic) FWD_CMD=(fil --transport direct "${l[@]}" srv "$name") ;;
   esac
 }
 
+# fwd_app_bytes up|down: the bytes the application has received so far: for an upload the sink's
+# socket in the server namespace (what came out of the forward there), for a download the reader's
+# socket in the client namespace. That is goodput, not the wire: retransmissions and framing do not
+# count, so a forward that resent a lot would show it.
+fwd_app_bytes() {
+  local b
+  case $1 in
+    up) b=$(nsx "$NS_S" ss -tniH state established "( sport = :$LAT_SINK_PORT )" 2> /dev/null | grep -o 'bytes_received:[0-9]*' | head -n 1 | cut -d: -f2 || true) ;;
+    down) b=$(fwd_rx_bytes "dport = :$LAT_FWD_DOWN") ;;
+  esac
+  printf '%s' "${b:-0}"
+}
+
 # fwd_bulk_cell KIND LOAD: one keystroke cell at 20 keys/s with the bulk LOAD (idle, up, down)
-# through the same client's forward, on the bottleneck. Notes the bulk rate; records the cell.
+# through the same client's forward, on the bottleneck. Notes the goodput (and the wire rate, for
+# reference); records the cell.
 fwd_bulk_cell() {
   local kind=$1 load=$2 rate=20 tag name kp bulk='' b0 b1 t0 t1 dev mbit settle=6000
   tag=$kind$load
@@ -720,26 +828,32 @@ fwd_bulk_cell() {
       bulk=$!
       ;;
   esac
+  local a0 a1 wire
   if [[ -n $bulk ]]; then
     sleep 5
     b0=$(lat_tx_bytes "$dev")
+    a0=$(fwd_app_bytes "$load")
     t0=$(now_ms)
+    # Read the end while keyprobe still types (its last key ends the client, and the transfer).
+    sleep $(($(lat_count "$rate") / rate - 8))
+    b1=$(lat_tx_bytes "$dev")
+    a1=$(fwd_app_bytes "$load")
+    t1=$(now_ms)
   fi
   local rc=0
   wait "$kp" || rc=$?
   if [[ -n $bulk ]]; then
-    b1=$(lat_tx_bytes "$dev")
-    t1=$(now_ms)
-    mbit=$(awk -v b0="$b0" -v b1="$b1" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", (b1 - b0) * 8 / ((t1 - t0) / 1000) / 1e6 }')
-    note "$tag.bulk_mbit=$mbit"
+    mbit=$(awk -v b0="$a0" -v b1="$a1" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", (b1 - b0) * 8 / ((t1 - t0) / 1000) / 1e6 }')
+    wire=$(awk -v b0="$b0" -v b1="$b1" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", (b1 - b0) * 8 / ((t1 - t0) / 1000) / 1e6 }')
+    note "$tag.goodput_mbit=$mbit $tag.wire_mbit=$wire"
     printf -v "FWD_MBIT_$tag" '%s' "$mbit"
     kill "$bulk" 2> /dev/null || true
     wait "$bulk" 2> /dev/null || true
-    awk -v m="$mbit" 'BEGIN { exit !(m >= 2) }' || fail "$tag: the bulk transfer moved $mbit Mbit/s: the link was not loaded"
+    awk -v m="$mbit" 'BEGIN { exit !(m >= 2) }' || fail "$tag: the application received $mbit Mbit/s: the link was not loaded (wire $wire Mbit/s)"
   fi
   [[ $rc -eq 0 ]] || fail "$tag: keyprobe failed: $(tail -n 3 "$OUT/run/$SCENARIO-$tag.err" 2> /dev/null)"
   lat_finish "$kind" "$tag" "$load" "$rate"
-  if [[ $kind != ssh ]]; then
+  if [[ $kind != ssh && $kind != sshno ]]; then
     lat_save_log "$tag"
     lat_check_path "$tag" "$kind" "$(lat_cell_field "$tag" first_key_ms)"
     cx_fk "$name"
@@ -759,11 +873,11 @@ f_fwd_vs_ssh() {
   lat_wait_listen "$NS_S" "$LAT_SOURCE_PORT"
   lat_wait_listen "$NS_S" "$LAT_SINK_PORT"
   local kind load
-  for kind in ssh pipe quic; do
+  for kind in ssh sshno pipe quic; do
     for load in idle up down; do fwd_bulk_cell "$kind" "$load"; done
   done
-  local idle p50 p99 sp99 trig mbit smbit v
-  for kind in ssh pipe quic; do
+  local idle p50 p99 sp99 np99 trig mbit smbit v
+  for kind in ssh sshno pipe quic; do
     idle=$(lat_cell_field "${kind}idle" p50_ms)
     trig=$(awk -v i="$idle" 'BEGIN { printf "%.1f", 2 * i + 10 }')
     note "$kind.idle_p50_ms=$idle $kind.h1_trigger_p50_ms=$trig"
@@ -776,11 +890,13 @@ f_fwd_vs_ssh() {
       v="FWD_MBIT_ssh$load"
       smbit=${!v}
       note "$kind.$load: p50_ms=$p50 p99_ms=$p99 bulk_mbit=$mbit p50_vs_idle=$(awk -v p="$p50" -v i="$idle" 'BEGIN { printf "%.1fx", p / i }') h1_rule_exceeded=$(awk -v p="$p50" -v t="$trig" 'BEGIN { print (p > t) ? "yes" : "no" }')"
-      if [[ $kind != ssh ]]; then
-        note "$kind.$load.vs_ssh: p99_no_worse=$(awk -v a="$p99" -v b="$sp99" 'BEGIN { print (a <= b) ? "yes" : "no" }') (ssh p99_ms=$sp99) throughput_within_2x=$(awk -v a="$mbit" -v b="$smbit" 'BEGIN { print (a * 2 >= b) ? "yes" : "no" }') (ssh mbit=$smbit)"
+      if [[ $kind == pipe || $kind == quic ]]; then
+        np99=$(lat_cell_field "sshno$load" p99_ms)
+        note "$kind.$load.vs_ssh: p99_no_worse=$(awk -v a="$p99" -v b="$sp99" 'BEGIN { print (a <= b) ? "yes" : "no" }') (ssh p99_ms=$sp99) p99_no_worse_than_sshno=$(awk -v a="$p99" -v b="$np99" 'BEGIN { print (a <= b) ? "yes" : "no" }') (sshno p99_ms=$np99) goodput_within_2x=$(awk -v a="$mbit" -v b="$smbit" 'BEGIN { print (a * 2 >= b) ? "yes" : "no" }') (ssh goodput_mbit=$smbit)"
       fi
     done
   done
+  fwd_verdict
 }
 
 FWD_SCENARIOS=(
@@ -788,4 +904,14 @@ FWD_SCENARIOS=(
   f_fwd_many_short f_fwd_ending_stress f_fwd_other_user f_fwd_vs_ssh
 )
 
-part_main fwd fwd_setup fwd_teardown "${FWD_SCENARIOS[@]}" -- "$@"
+# Sourced by agent.sh for the topology and the helpers; run directly, it is the fwd part.
+# `--rest` is every scenario but the cable pull (CI runs the two halves as two jobs, run.sh).
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  if [[ ${1:-} == --rest ]]; then
+    shift
+    rest=()
+    for x in "${FWD_SCENARIOS[@]}"; do [[ $x == f_fwd_cable_pull ]] || rest+=("$x"); done
+    set -- "${rest[@]}" "$@"
+  fi
+  part_main fwd fwd_setup fwd_teardown "${FWD_SCENARIOS[@]}" -- "$@"
+fi

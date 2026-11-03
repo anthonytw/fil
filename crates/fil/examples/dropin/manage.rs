@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::common::*;
-use crate::forward::{KB, MacPorts, PL, digest, kv, mac_ports};
+use crate::forward::{MISS, MacPorts, PL, digest, kv, mac_ports};
 use crate::harness::{Client, ensure, ms};
 use crate::{Ctx, Variant};
 
@@ -54,7 +54,7 @@ fn listening_here(port: u16) -> bool {
 
 /// A command typed in the session; its output (with the echo) and its exit status, read with a
 /// marker only the shell computes.
-fn sess_status(c: &mut Client, cmd: &str) -> Result<(String, i32), String> {
+pub fn sess_status(c: &mut Client, cmd: &str) -> Result<(String, i32), String> {
     let out = c.run(&format!("{cmd}; echo \"RC$((6*7))=$?\""), CMD_TIMEOUT)?;
     let rc = out
         .lines()
@@ -110,7 +110,7 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
     })?;
     if bound_after_no {
         notes.push(format!(
-            "{KB}a forward the user refused listens on this machine"
+            "{MISS}a forward the user refused listens on this machine"
         ));
     }
     // The refused entry stays in the table, unconsented, and an equal add returns it without a
@@ -119,10 +119,17 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
     let refused_row = session_of(&v, "dp-fia")
         .and_then(|s| s["forwards"].as_array())
         .and_then(|f| f.iter().find(|f| f["port"] == port).cloned());
+    let unconsented = refused_row
+        .as_ref()
+        .is_some_and(|r| r["consented"] == false && r["origin"] == "request");
     notes.push(format!(
-        "after `n`, `fil ports --json` shows the entry as consented = {:?}",
-        refused_row.as_ref().map(|r| r["consented"].clone())
+        "after `n`, `fil ports --json` shows the entry as a request, not consented (asserted: {unconsented})"
     ));
+    if !unconsented {
+        notes.push(format!(
+            "{MISS}after `n` the refused entry is not shown as an unconsented request: {refused_row:?}"
+        ));
+    }
     let port = port + 1;
     let spec = format!("{port}:127.0.0.1:{PL}");
     ensure(!listening_here(port), || {
@@ -177,7 +184,7 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
     ));
     if !exact {
         notes.push(format!(
-            "{KB}a forward added from inside did not carry 1 MB exactly: {}",
+            "{MISS}a forward added from inside did not carry 1 MB exactly: {}",
             got.replace('\n', " ")
         ));
     }
@@ -195,7 +202,7 @@ pub fn fwd_inside_add_rm(ctx: &Ctx, host: &str) -> Res {
     ensure(rc == 0, || format!("fil forward --rm exited {rc}: {said}"))?;
     if !gone {
         notes.push(format!(
-            "{KB}after `fil forward --rm` the -L still listens here"
+            "{MISS}after `fil forward --rm` the -L still listens here"
         ));
     }
     finish(c)?;
@@ -243,7 +250,10 @@ pub fn fwd_hostile_remote(ctx: &Ctx, host: &str) -> Res {
     )?;
     thread::sleep(Duration::from_millis(500));
     let reached = canary.accept().is_ok();
-    let refused = rc != 0;
+    // The daemon's NotPermitted, as `fil forward` words it (crates/fil/src/cmds.rs), not just any
+    // failure (a daemon it could not reach would fail too).
+    let not_permitted = said.contains("non-loopback target");
+    let refused = rc != 0 && not_permitted;
     let msg = said
         .lines()
         .rfind(|l| !l.contains("forward -R") && l.contains("fil"))
@@ -251,14 +261,14 @@ pub fn fwd_hostile_remote(ctx: &Ctx, host: &str) -> Res {
         .trim()
         .to_string();
     let notes = vec![format!(
-        "`fil forward -R 19001:<lan>:{canary_port}` inside: exit {rc} (asserted non-zero), no question asked (asserted: {}), the canary here was never reached (asserted: {}); it said {:?}",
+        "`fil forward -R 19001:<lan>:{canary_port}` inside: exit {rc} (asserted non-zero) with the daemon's NotPermitted (asserted: {not_permitted}), no question asked (asserted: {}), the canary here was never reached (asserted: {}); it said {:?}",
         !asked,
         !reached,
         ctx.targets.scrub(&msg)
     )];
     let mut notes = notes;
     if !refused || asked || reached {
-        notes.push(format!("{KB}a hostile -R from inside to this machine's network: exit {rc}, asked {asked}, canary reached {reached}"));
+        notes.push(format!("{MISS}a hostile -R from inside to this machine's network: exit {rc}, NotPermitted {not_permitted}, asked {asked}, canary reached {reached}"));
     }
     finish(c)?;
     Ok(notes)
@@ -339,14 +349,14 @@ pub fn fwd_ports_view(ctx: &Ctx, host: &str) -> Res {
             || status != Some(200)
             || !label.as_deref().is_some_and(|l| l.contains("SimpleHTTP"))
         {
-            notes.push(format!("{KB}the HTTP probe did not identify the session's web server (kind {kind:?}, status {status:?}, label {label:?})"));
+            notes.push(format!("{MISS}the HTTP probe did not identify the session's web server (kind {kind:?}, status {status:?}, label {label:?})"));
         }
     } else {
         notes.push("no python3 on the host: the HTTP label is not checked here (the realnet and unit tests cover the probe)".into());
     }
     if !ok_w || !ok_n || !warned {
         notes.push(format!(
-            "{KB}fil ports: wide {w:?}, narrow {n:?}, warned {warned}"
+            "{MISS}fil ports: wide {w:?}, narrow {n:?}, warned {warned}"
         ));
     }
     let _ = c.run("kill %1 %2 %3 2>/dev/null; true", CMD_TIMEOUT)?;

@@ -138,7 +138,7 @@ impl Ctx {
         rows: u16,
         cols: u16,
     ) -> Result<Client, String> {
-        self.shell_full(host, variant, name, rows, cols, &[], None)
+        self.shell_full(host, variant, name, rows, cols, &crate::Extra::default())
     }
 
     /// A shell whose client has options before the host (`-L`, `-R`, `-D`) and, with `via`, both
@@ -151,10 +151,31 @@ impl Ctx {
         args: &[String],
         via: Option<&crate::netcut::Cut>,
     ) -> Result<Client, String> {
-        self.shell_full(host, variant, name, 30, 100, args, via)
+        self.shell_full(
+            host,
+            variant,
+            name,
+            30,
+            100,
+            &crate::Extra {
+                args,
+                via,
+                ..Default::default()
+            },
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// A shell whose client has what `x` adds (environment, the agent setting, flags).
+    pub fn shell_x(
+        &self,
+        host: &str,
+        variant: Variant,
+        name: &str,
+        x: &crate::Extra<'_>,
+    ) -> Result<Client, String> {
+        self.shell_full(host, variant, name, 30, 100, x)
+    }
+
     fn shell_full(
         &self,
         host: &str,
@@ -162,10 +183,9 @@ impl Ctx {
         name: &str,
         rows: u16,
         cols: u16,
-        args: &[String],
-        via: Option<&crate::netcut::Cut>,
+        x: &crate::Extra<'_>,
     ) -> Result<Client, String> {
-        let mut c = self.client_with(host, variant, &format!("dp-{name}"), rows, cols, args, via);
+        let mut c = self.client_with(host, variant, &format!("dp-{name}"), rows, cols, x);
         c.roundtrip("RDY", ATTACH_TIMEOUT)?;
         // What an earlier failure left in the lab account's /tmp goes first; on this machine
         // nothing is swept (the scenarios remove their own directory).

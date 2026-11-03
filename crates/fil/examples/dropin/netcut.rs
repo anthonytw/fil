@@ -42,7 +42,7 @@ pub struct Cut {
     flags: Arc<Flags>,
     _rt: tokio::runtime::Runtime,
     pub tcp_port: u16,
-    /// How many of the 1,001 UDP ports could be bound here (the rest are in use on this machine).
+    /// The UDP ports bound here: always the whole range (`start` refuses otherwise).
     pub udp_bound: usize,
 }
 
@@ -80,6 +80,15 @@ impl Cut {
             }
             Ok::<_, String>((port, bound))
         })?;
+        // A port another process here holds would get the client's QUIC packets meant for the
+        // host's daemon (which announces a port of the whole range at random): refuse to run then,
+        // rather than touch a process outside the test.
+        let want = usize::from(UDP_HI - UDP_LO) + 1;
+        if udp_bound != want {
+            return Err(format!(
+                "netcut: only {udp_bound} of the {want} UDP ports {UDP_LO}-{UDP_HI} are free on this machine's loopback (another fil daemon, or `just ci`'s tests, may hold the rest); not running the relay"
+            ));
+        }
         Ok(Cut {
             flags,
             _rt: rt,

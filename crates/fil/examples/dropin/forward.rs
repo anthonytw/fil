@@ -4,10 +4,10 @@
 //!
 //! Every transfer is checked whole: a seeded stream's sha256 against `fwdprobe digest`, and the
 //! accept counter of the server at the far end (`ACCEPT=` lines), which says whether the
-//! application kept the same TCP connection. A miss there is a finding in fil, recorded as a
-//! `KNOWN-BUG:` note (the scenario passes, the summary marks it `PASS*`, `--strict` fails it), so
-//! one finding does not hide the results after it. A harness problem (a server that never
-//! listened, an event that did not land mid-transfer) fails the scenario.
+//! application kept the same TCP connection. A miss there (or in a security property) is a `MISS:`
+//! note: the scenario carries on, so every miss is seen, and the driver fails it at the end with
+//! all of them (main.rs). A harness problem (a server that never listened, an event that did not
+//! land mid-transfer) fails the scenario at once.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -26,8 +26,9 @@ pub const PL: u16 = 18000;
 const PR: u16 = 19000;
 const PS: u16 = 18100;
 
-/// Ports on this machine: the `-L` listener, the `-R` target, the SOCKS listener. Picked from the
-/// driver's pid so that two drivers (one per host) and other users of this machine do not collide.
+/// Ports on this machine: the `-L` listener, the `-R` target, the SOCKS listener (and the next few,
+/// for the management scenarios). Picked from the driver's pid so that two drivers (one per host)
+/// and other users of this machine do not collide, and below macOS's ephemeral range (49152 up).
 pub struct MacPorts {
     pub l: u16,
     pub r: u16,
@@ -35,7 +36,7 @@ pub struct MacPorts {
 }
 
 pub fn mac_ports() -> MacPorts {
-    let base = 30000 + (std::process::id() % 2000) as u16 * 10;
+    let base = 30000 + (std::process::id() % 1500) as u16 * 10; // at most 44,999
     MacPorts {
         l: base,
         r: base + 1,
@@ -43,7 +44,8 @@ pub fn mac_ports() -> MacPorts {
     }
 }
 
-pub const KB: &str = "KNOWN-BUG: ";
+/// A miss: the scenario goes on (so every miss is seen) and fails at its end (main.rs).
+pub const MISS: &str = "MISS: ";
 
 // ---------------------------------------------------------------------------------------------
 // fwdprobe on this machine
@@ -201,7 +203,7 @@ fn sess_bg(c: &mut Client, cmd: &str, out: &str) -> Result<(), String> {
 
 /// A file of `$D`, read through the shell: each line comes back behind a prefix that only the
 /// shell can compute, so the echo of the typed command is never mistaken for the file.
-fn sess_cat(c: &mut Client, file: &str) -> Result<String, String> {
+pub fn sess_cat(c: &mut Client, file: &str) -> Result<String, String> {
     let out = c.run(
         &format!("sed \"s/^/F$((6*7)): /\" \"$D/{file}\""),
         CMD_TIMEOUT,
@@ -373,6 +375,7 @@ fn pair_check(
     }
     let lsrv = sess_cat(c, "lsrv.out")?;
     let rcli = sess_cat(c, "rcli.out")?;
+    let rrc = sess_cat(c, "rcli.out.rc")?.trim().to_string();
     let want_l = digest(ctx, pair.n, 7)?;
     let want_r = digest(ctx, pair.n, 9)?;
     let got_l = pair.lcli.kv("IN_SHA256");
@@ -410,6 +413,18 @@ fn pair_check(
     if acc_r != 1 {
         bugs.push(format!(
             "{tag}: -R the server on this machine accepted {acc_r} connections, not 1"
+        ));
+    }
+    if rrc != "0" {
+        bugs.push(format!(
+            "{tag}: the -R sender in the session exited {rrc:?}: {}",
+            rcli.replace('\n', " ")
+        ));
+    }
+    if pair.rsrv.kv("IN_END") != "eof" {
+        bugs.push(format!(
+            "{tag}: -R the sink's end was {:?}, not eof",
+            pair.rsrv.kv("IN_END")
         ));
     }
     if pair.lcli.kv("IN_END") != "eof" {
@@ -600,7 +615,7 @@ fn pair_through(
         c.log().matches("Switched(Direct)").count()
     ));
     finish(c)?;
-    notes.extend(all_bugs.into_iter().map(|b| format!("{KB}{b}")));
+    notes.extend(all_bugs.into_iter().map(|b| format!("{MISS}{b}")));
     Ok(notes)
 }
 
@@ -725,7 +740,7 @@ pub fn fwd_local_http(ctx: &Ctx, host: &str) -> Res {
     )];
     if rc != Some(0) || r.kv("IN_SHA256") != want || accepts(&srv) != 1 {
         notes.push(format!(
-            "{KB}-L 64 MiB: exit {rc:?}, {} bytes, sha256 {}, {} accepts",
+            "{MISS}-L 64 MiB: exit {rc:?}, {} bytes, sha256 {}, {} accepts",
             r.kv("IN_BYTES"),
             r.kv("IN_SHA256"),
             accepts(&srv)
@@ -754,7 +769,7 @@ pub fn fwd_local_http(ctx: &Ctx, host: &str) -> Res {
     ));
     if row.is_none() || down < n {
         notes.push(format!(
-            "{KB}fil ports does not show the -L with its 64 MiB down: {row:?}"
+            "{MISS}fil ports does not show the -L with its 64 MiB down: {row:?}"
         ));
     }
     finish(c)?;
@@ -840,12 +855,12 @@ pub fn fwd_many_short(ctx: &Ctx, host: &str) -> Res {
     )];
     if ok != 10_000 || failed != 0 {
         notes.push(format!(
-            "{KB}10000 sequential connections: {ok} ok, {failed} failed ({first})"
+            "{MISS}10000 sequential connections: {ok} ok, {failed} failed ({first})"
         ));
     }
     if link_downs(&c) != downs || c.log().matches("Switched(").count() != 2 {
         notes.push(format!(
-            "{KB}the link went down or switched during 10000 sequential connections"
+            "{MISS}the link went down or switched during 10000 sequential connections"
         ));
     }
     finish(c)?;
@@ -869,7 +884,7 @@ pub fn fwd_parallel(ctx: &Ctx, host: &str) -> Res {
         ));
         if ok != 200 || failed != 0 {
             notes.push(format!(
-                "{KB}200 concurrent {dir}: {ok} ok, {failed} failed ({first})"
+                "{MISS}200 concurrent {dir}: {ok} ok, {failed} failed ({first})"
             ));
         }
     }
@@ -921,7 +936,7 @@ pub fn fwd_halfclose(ctx: &Ctx, host: &str) -> Res {
     ));
     if !l_ok {
         notes.push(format!(
-            "{KB}-L half-close: exit {rc:?}, response {} bytes, request seen as {} bytes ending {}",
+            "{MISS}-L half-close: exit {rc:?}, response {} bytes, request seen as {} bytes ending {}",
             m.kv("IN_BYTES"),
             kv(&srv, "IN_BYTES"),
             kv(&srv, "IN_END")
@@ -963,7 +978,7 @@ pub fn fwd_halfclose(ctx: &Ctx, host: &str) -> Res {
     ));
     if !r_ok {
         notes.push(format!(
-            "{KB}-R half-close: response {} bytes, request seen as {} bytes ending {}",
+            "{MISS}-R half-close: response {} bytes, request seen as {} bytes ending {}",
             kv(&cli, "IN_BYTES"),
             s.kv("IN_BYTES"),
             s.kv("IN_END")
@@ -1007,7 +1022,7 @@ pub fn fwd_rst(ctx: &Ctx, host: &str) -> Res {
     ));
     if m.kv("IN_END") != "reset" {
         notes.push(format!(
-            "{KB}-L: a reset by the server reached the client as {:?}, not a reset",
+            "{MISS}-L: a reset by the server reached the client as {:?}, not a reset",
             m.kv("IN_END")
         ));
     }
@@ -1029,7 +1044,7 @@ pub fn fwd_rst(ctx: &Ctx, host: &str) -> Res {
     ));
     if kv(&cli, "IN_END") != "reset" {
         notes.push(format!(
-            "{KB}-R: a reset by the server reached the client as {:?}, not a reset",
+            "{MISS}-R: a reset by the server reached the client as {:?}, not a reset",
             kv(&cli, "IN_END")
         ));
     }
@@ -1087,7 +1102,7 @@ pub fn fwd_remote(ctx: &Ctx, host: &str) -> Res {
         ));
         if got != want || s.accepts() != 1 {
             notes.push(format!(
-                "{KB}-R 16 MiB: sha256 {got:?}, {} accepts",
+                "{MISS}-R 16 MiB: sha256 {got:?}, {} accepts",
                 s.accepts()
             ));
         }
@@ -1135,7 +1150,7 @@ pub fn fwd_remote(ctx: &Ctx, host: &str) -> Res {
         s.accepts()
     ));
     if got != want_small || s.accepts() != 1 || waited > 30_000 {
-        notes.push(format!("{KB}-R opened while the link was down: sha256 {got:?}, {} accepts, {waited} ms (open_wait is 30 s); {}", s.accepts(), out.replace('\n', " ")));
+        notes.push(format!("{MISS}-R opened while the link was down: sha256 {got:?}, {} accepts, {waited} ms (open_wait is 30 s); {}", s.accepts(), out.replace('\n', " ")));
     }
     finish(c)?;
     Ok(notes)
@@ -1149,7 +1164,7 @@ pub fn fwd_remote_detached(ctx: &Ctx, host: &str) -> Res {
     if !have_fp(ctx, host, &mut a)? {
         return missing("fwdprobe is not installed in the session (docs/m2/pi.md)");
     }
-    let _s = Mac::serve(
+    let s = Mac::serve(
         ctx,
         "rd",
         &["serve".into(), format!("127.0.0.1:{}", p.r), "sink".into()],
@@ -1187,8 +1202,19 @@ pub fn fwd_remote_detached(ctx: &Ctx, host: &str) -> Res {
     ));
     if worst >= 100 {
         notes.push(format!(
-            "{KB}a connect to a detached session's -R port was not refused within 100 ms ({})",
+            "{MISS}a connect to a detached session's -R port was not refused within 100 ms ({})",
             how.join(", ")
+        ));
+    }
+    // The direct form: nothing reached this machine's server through the detached session.
+    notes.push(format!(
+        "the server here (the -R target) accepted {} connections (asserted 0)",
+        s.accepts()
+    ));
+    if s.accepts() != 0 {
+        notes.push(format!(
+            "{MISS}a detached session's -R port reached the server on this machine ({} accepts)",
+            s.accepts()
         ));
     }
     finish(b)?;
@@ -1247,7 +1273,7 @@ pub fn fwd_dynamic(ctx: &Ctx, host: &str) -> Res {
     )];
     if got != want || accepts(&srv) != 1 {
         notes.push(format!(
-            "{KB}-D: curl exit {:?}, {size} bytes, sha256 {got}, {} accepts; {}",
+            "{MISS}-D: curl exit {:?}, {size} bytes, sha256 {got}, {} accepts; {}",
             out.status.code(),
             accepts(&srv),
             String::from_utf8_lossy(&out.stderr).trim()
@@ -1389,7 +1415,7 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
         ));
         if grew2 > 1024 && grew2 * 10 >= grew * 8 {
             notes.push(format!(
-                "{KB}{}: the daemon's RSS grew {grew} KiB over the first 20000 connections and {grew2} KiB over the next: it grows with the connections",
+                "{MISS}{}: the daemon's RSS grew {grew} KiB over the first 20000 connections and {grew2} KiB over the next: it grows with the connections",
                 v.tag()
             ));
         }
@@ -1398,7 +1424,7 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
         let (ok, failed) = (ok.min(ok2), failed + failed2);
         if ok != 20_000 || failed != 0 || ok0 != 2000 || failed0 != 0 {
             notes.push(format!(
-                "{KB}{}: churn: {ok} ok, {failed} failed ({first}{first0})",
+                "{MISS}{}: churn: {ok} ok, {failed} failed ({first}{first0})",
                 v.tag()
             ));
         }
@@ -1407,16 +1433,16 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
         // than it was (it doubles past each power of two, so a leak of even a few hundred shows).
         if grew > 16 * 1024 {
             notes.push(format!(
-                "{KB}{}: the daemon's RSS grew {grew} KiB over 20000 connections",
+                "{MISS}{}: the daemon's RSS grew {grew} KiB over 20000 connections",
                 v.tag()
             ));
         }
         if fds0 >= 0 && fds1 > fds0 {
-            notes.push(format!("{KB}{}: the daemon's descriptor table grew from {fds0} to {fds1} over 20000 connections", v.tag()));
+            notes.push(format!("{MISS}{}: the daemon's descriptor table grew from {fds0} to {fds1} over 20000 connections", v.tag()));
         }
         if (crss1 as i64 - crss0 as i64) > 16 * 1024 {
             notes.push(format!(
-                "{KB}{}: the client's RSS grew {} KiB over 20000 connections",
+                "{MISS}{}: the client's RSS grew {} KiB over 20000 connections",
                 v.tag(),
                 crss1 as i64 - crss0 as i64
             ));

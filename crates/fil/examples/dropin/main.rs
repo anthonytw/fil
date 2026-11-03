@@ -32,6 +32,7 @@ use std::time::Instant;
 #[path = "../support/harness.rs"]
 mod harness;
 
+mod agent;
 mod common;
 mod disrupt;
 mod forward;
@@ -65,7 +66,8 @@ fn is_expected_failure(name: &str, err: &str) -> bool {
 
 /// The tools every host must have. A host without one fails the run (finding: a reimaged Pi must
 /// not turn the gate green by dropping the vim scenarios).
-const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git"];
+/// `ssh-add` and `ssh-keygen` are the agent scenarios' (plan §5.2).
+const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git", "ssh-add", "ssh-keygen"];
 
 pub struct Ctx {
     pub fil: PathBuf,
@@ -104,6 +106,19 @@ impl Variant {
 
 static SEQ: Mutex<u32> = Mutex::new(0);
 
+/// What a client may have beyond the default (`Ctx::client_with`).
+#[derive(Default)]
+pub struct Extra<'a> {
+    /// Options before the host: `-L`, `-R`, `-D`, `-A`.
+    pub args: &'a [String],
+    /// Both paths through the cut relay (`netcut.rs`).
+    pub via: Option<&'a netcut::Cut>,
+    /// Environment for the client (the throwaway agent's `SSH_AUTH_SOCK`).
+    pub env: Vec<(String, String)>,
+    /// `agent = ...` for the host in its config.
+    pub agent: Option<&'static str>,
+}
+
 impl Ctx {
     pub fn is_local(host: &str) -> bool {
         host == LOCAL
@@ -111,16 +126,24 @@ impl Ctx {
 
     /// A scratch config for one host and variant; returns its path.
     pub fn config(&self, host: &str, variant: Variant) -> PathBuf {
-        self.config_via(host, variant, None)
+        self.config_via(host, variant, None, None)
     }
 
     /// The same, with both paths through the cut relay when `via` is given (`netcut.rs`): ssh to
-    /// the relay's port with the host key checked under the real name, QUIC to 127.0.0.1.
-    pub fn config_via(&self, host: &str, variant: Variant, via: Option<&netcut::Cut>) -> PathBuf {
+    /// the relay's port with the host key checked under the real name, QUIC to 127.0.0.1; and with
+    /// `agent = AGENT` for the host when given (`confirm`, agent.rs).
+    pub fn config_via(
+        &self,
+        host: &str,
+        variant: Variant,
+        via: Option<&netcut::Cut>,
+        agent: Option<&str>,
+    ) -> PathBuf {
         let path = self.work.join(format!(
-            "config-{host}-{}{}.toml",
+            "config-{host}-{}{}{}.toml",
             variant.tag(),
-            if via.is_some() { "-cut" } else { "" }
+            if via.is_some() { "-cut" } else { "" },
+            agent.map(|a| format!("-agent-{a}")).unwrap_or_default()
         ));
         let transport = if variant == Variant::Pipe {
             "pipe"
@@ -157,6 +180,9 @@ impl Ctx {
         };
         let mut s =
             format!("[defaults]\ntransport = \"{transport}\"\n\n[host.{host}]\npipe = {pipe}\n");
+        if let Some(a) = agent {
+            s.push_str(&format!("agent = {}\n", toml_str(a)));
+        }
         if variant == Variant::Auto
             && let Some(a) = address
         {
@@ -178,11 +204,11 @@ impl Ctx {
         rows: u16,
         cols: u16,
     ) -> Client {
-        self.client_with(host, variant, session, rows, cols, &[], None)
+        self.client_with(host, variant, session, rows, cols, &Extra::default())
     }
 
-    /// A client with options before the host (forward flags), its paths through `via` if given.
-    #[allow(clippy::too_many_arguments)]
+    /// A client with what `x` adds: options before the host (forward flags, `-A`), its paths
+    /// through the cut relay, environment (`SSH_AUTH_SOCK`), the `agent` setting.
     pub fn client_with(
         &self,
         host: &str,
@@ -190,8 +216,7 @@ impl Ctx {
         session: &str,
         rows: u16,
         cols: u16,
-        args: &[String],
-        via: Option<&netcut::Cut>,
+        x: &Extra<'_>,
     ) -> Client {
         let n = {
             let mut s = SEQ.lock().unwrap();
@@ -201,7 +226,7 @@ impl Ctx {
         let mut c = Client::start_with(
             Spawn {
                 fil: &self.fil,
-                config: &self.config_via(host, variant, via),
+                config: &self.config_via(host, variant, x.via, x.agent),
                 host,
                 session,
                 rows,
@@ -210,9 +235,9 @@ impl Ctx {
                     .work
                     .join("state")
                     .join(format!("{n}-{host}-{session}")),
-                env: Vec::new(),
+                env: x.env.clone(),
             },
-            args,
+            x.args,
         );
         c.set_scrub(self.targets.clone());
         c
@@ -430,6 +455,13 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("fwd_hostile_remote", manage::fwd_hostile_remote),
         ("fwd_ports_view", manage::fwd_ports_view),
         ("detach_inside", manage::detach_inside),
+        // M2: the agent relay (A1).
+        ("agent_list_sign", agent::agent_list_sign),
+        ("agent_reconnect", agent::agent_reconnect),
+        ("agent_off_default", agent::agent_off_default),
+        ("agent_detached", agent::agent_detached),
+        ("agent_filter", agent::agent_filter),
+        ("agent_confirm", agent::agent_confirm),
     ]
 }
 
@@ -758,6 +790,22 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
     let xfail = XFAIL.contains(&name);
     match r {
         Ok(notes) => {
+            // A miss in what a done-when or a security property requires (forward.rs): every one
+            // the scenario collected fails it, all listed. Only a named finding (KNOWN-BUG:,
+            // which says what fixes it) passes as PASS*.
+            let misses: Vec<&String> = notes.iter().filter(|n| n.starts_with("MISS:")).collect();
+            if !misses.is_empty() {
+                return End::Fail(format!(
+                    "{} miss(es): {}\n{}",
+                    misses.len(),
+                    misses
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    notes.join("\n")
+                ));
+            }
             if xfail && local {
                 // The known bugs need a network (resize order) or are the same everywhere; on
                 // this machine a pass proves nothing either way.
@@ -835,6 +883,28 @@ mod tests {
         assert_eq!(ls_row_of(&table, "busy").unwrap().0, "client2");
         assert!(ls_row_of(&table, "gone").is_none());
         assert!(ls_row_of("no sessions\n", "idle").is_none());
+    }
+
+    #[test]
+    fn a_miss_fails_the_scenario_and_a_named_finding_does_not() {
+        use super::{End, classify};
+        let miss = vec![
+            "sha256 equal".to_string(),
+            "MISS: -L sha256 differs".to_string(),
+        ];
+        assert!(
+            matches!(classify("fwd_reconnect", Ok(miss.clone()), false, false, false), End::Fail(e) if e.contains("1 miss") && e.contains("-L sha256 differs"))
+        );
+        // Also with every allowance a run can give.
+        assert!(matches!(
+            classify("fwd_reconnect", Ok(miss), true, true, true),
+            End::Fail(_)
+        ));
+        let named = vec!["KNOWN-BUG: slow, fixed by PR X".to_string()];
+        assert!(matches!(
+            classify("fwd_cable_pull", Ok(named), false, false, false),
+            End::Pass(_)
+        ));
     }
 
     #[test]

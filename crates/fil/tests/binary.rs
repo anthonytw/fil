@@ -90,6 +90,8 @@ fn forward_flags_and_the_agent_reach_the_attach_and_bad_ones_are_usage_errors() 
     for args in [
         &["-L", l.as_str(), "probe"][..],
         &["-R", "9000:localhost:9000", "probe"][..],
+        // OD-7: a wide -R is the host's call (server policy), not a usage error.
+        &["-R", "*:9000:h:80", "probe"][..],
         &["-D", d.as_str(), "probe"][..],
         &["-A", "probe"][..],
     ] {
@@ -101,11 +103,7 @@ fn forward_flags_and_the_agent_reach_the_attach_and_bad_ones_are_usage_errors() 
     // `-A` with no local agent says so, and goes on.
     let err = String::from_utf8_lossy(&run(&["-A", "probe"]).stderr).to_string();
     assert!(err.contains("no local agent"), "{err}");
-    for args in [
-        &["-L", "0:h:80", "probe"][..],
-        &["-R", "*:9000:h:80", "probe"][..],
-        &["-D", "nope", "probe"][..],
-    ] {
+    for args in [&["-L", "0:h:80", "probe"][..], &["-D", "nope", "probe"][..]] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(!String::from_utf8_lossy(&out.stderr).contains("dialed"));

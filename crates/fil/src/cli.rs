@@ -287,9 +287,7 @@ fn default_session() -> SessionName {
 }
 
 fn parse_forward(kind: ForwardKind, s: &str) -> Result<ForwardSpec, String> {
-    let spec = forward_spec::parse(kind, s).map_err(|e| e.to_string())?;
-    forward_spec::check_policy(&spec).map_err(|e| e.to_string())?;
-    Ok(spec)
+    forward_spec::parse(kind, s).map_err(|e| e.to_string())
 }
 
 /// The value parser of `-L`, `-R` and `-D`. A bad value is reported by this parser's own words,
@@ -721,6 +719,13 @@ mod tests {
         assert_eq!(forwards(&["-a", "-A", "orin"]).agent, Some(AgentFlag::On));
     }
 
+    /// OD-7: a wide `-R` from the command line is the host's call (server policy), not refused
+    /// here.
+    #[test]
+    fn a_wide_remote_bind_parses() {
+        assert_eq!(forwards(&["-R", "*:80:h:80", "orin"]).specs.len(), 1);
+    }
+
     #[test]
     fn a_bad_forward_spec_is_a_usage_error_that_says_why() {
         for (args, why) in [
@@ -729,7 +734,6 @@ mod tests {
             (&["-L", "80:h:99999", "orin"][..], "not a port"),
             (&["-L", "[::1:80:h:80", "orin"][..], "bracket"),
             (&["-L", "8080:h:80\x1b[2J", "orin"][..], "outside"),
-            (&["-R", "*:80:h:80", "orin"][..], "OD-7"),
         ] {
             let e = parse(args).expect_err(&format!("{args:?}"));
             assert_eq!(e.kind(), ErrorKind::ValueValidation, "{args:?}: {e}");

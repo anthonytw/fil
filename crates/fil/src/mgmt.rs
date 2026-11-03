@@ -193,13 +193,13 @@ fn render_forward(
                 ForwardKind::Dynamic => "-D ",
             })
         )),
-        (_, ForwardResult::Refused(why)) => Err(refusal(*why, port)),
+        (_, ForwardResult::Refused(why)) => Err(refusal(why, port)),
         (_, other) => Err(format!("unexpected answer from the daemon: {other:?}")),
     }
 }
 
 /// Why the daemon refused a forward request, in words that say what to do.
-fn refusal(why: ForwardRefusal, port: u16) -> String {
+fn refusal(why: &ForwardRefusal, port: u16) -> String {
     match why {
         ForwardRefusal::Conflict => format!(
             "port {port} already has a forward with another target; remove it first (`fil forward --rm {port}`)"
@@ -209,11 +209,13 @@ fn refusal(why: ForwardRefusal, port: u16) -> String {
             fil_proto::limits::MAX_FORWARDS
         ),
         ForwardRefusal::BadSpec => "the daemon refused that forward as malformed".to_string(),
-        ForwardRefusal::NotPermitted => "a forward added with `fil forward` may not listen beyond loopback on your machine (-L, -D) or connect to a non-loopback target from it (-R); put it on the attach command line or in the config instead".to_string(),
+        ForwardRefusal::NotPermitted => "a forward added with `fil forward` may not listen beyond loopback on your machine (-L, -D) or on the host (-R), or connect to a non-loopback target from your machine (-R); put it on the attach command line or in the config instead".to_string(),
         ForwardRefusal::NoSuchForward => format!("the session has no forward on port {port}"),
         ForwardRefusal::Ambiguous => format!(
             "more than one forward listens on port {port} (a -L and a -R, say); name the kind: `fil forward --rm -L {port}` (or -R, -D)"
         ),
+        // The setting and its source, as the host's admin wrote them (DESIGN.md section 11.2).
+        ForwardRefusal::Policy(r) => format!("refused by server policy: {r}"),
     }
 }
 
@@ -863,13 +865,35 @@ mod tests {
         ] {
             let e = render(
                 &rm(None, 80),
-                &Response::Forward(ForwardResult::Refused(why)),
+                &Response::Forward(ForwardResult::Refused(why.clone())),
                 "orin",
                 NOW,
             )
             .unwrap_err();
             assert!(!e.is_empty() && !e.contains('{'), "{why:?}: {e}");
         }
+        // A server-policy refusal names the setting and its source, inert.
+        let policy = ForwardRefusal::Policy(fil_proto::mux::PolicyRefusal {
+            setting: fil_proto::mux::PolicySetting::AllowTcpForwarding(
+                fil_proto::mux::TcpForwarding::No,
+            ),
+            source: fil_proto::mux::PolicySource::Sshd {
+                file: fil_proto::msg::PortsPath::capped("/etc/ssh/sshd_config\u{1b}[2J"),
+                line: 42,
+                maybe: false,
+            },
+        });
+        let e = render(
+            &add,
+            &Response::Forward(ForwardResult::Refused(policy)),
+            "orin",
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "refused by server policy: AllowTcpForwarding no (/etc/ssh/sshd_config[2J:42)"
+        );
         // The session is missing, on a host with a hostile name.
         let e = render(&add, &Response::NoSuchSession, "or\u{1b}[2Jin", NOW).unwrap_err();
         assert_eq!(e, "no session \"main\" on or[2Jin");

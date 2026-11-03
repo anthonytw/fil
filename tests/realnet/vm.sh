@@ -106,6 +106,8 @@ realnet() {
 if ! flock -n -o "$lock" true; then
   echo "vm-realnet: another realnet run holds the VM lock; waiting for it" >&2
 fi
+# The policy part runs only where asked for (tests/realnet/policy.sh): the VM is that place.
+export FIL_REALNET_POLICY=1
 exec flock -o "$lock" timeout -k 60 "$timeout" just realnet "$@"' "$SRC" "$TARGET" "$TIMEOUT" "$@"
 }
 

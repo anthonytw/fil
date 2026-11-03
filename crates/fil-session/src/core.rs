@@ -1248,6 +1248,11 @@ impl Core {
                 udp_port: direct.as_ref().map(|d| d.udp_port),
                 fingerprint: direct.map(|d| d.fingerprint),
                 term: self.term.clone(),
+                agent_refused: if agent {
+                    self.forwards.agent_refusal()
+                } else {
+                    None
+                },
             },
             snapshot: snapshot_bytes,
             start: start_seq,

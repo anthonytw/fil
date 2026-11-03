@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use fil_client::text::format_utc;
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
-    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PortsIncomplete, PortsRow, ProbeKind,
-    ProcessInfo, Response, SessionSummary,
+    AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsRow,
+    ProbeKind, ProcessInfo, RefusedRow, RefusedWhat, Response, SessionSummary,
 };
 use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin};
 use serde::Serialize;
@@ -123,12 +123,14 @@ struct SessionView<'a> {
     forwards: Vec<&'a ForwardRow>,
     listeners: Vec<(&'a ListenerRow, &'a ProcessInfo)>,
     agent: Option<&'a AgentRow>,
+    refused: Vec<&'a RefusedRow>,
 }
 
 struct View<'a> {
     sessions: Vec<SessionView<'a>>,
     mine: Vec<&'a ListenerRow>,
     other: Vec<&'a ListenerRow>,
+    policy: Vec<&'a PolicyLine>,
 }
 
 fn group(rows: &[PortsRow]) -> View<'_> {
@@ -143,7 +145,7 @@ fn group(rows: &[PortsRow]) -> View<'_> {
             sessions.len() - 1
         })
     };
-    let (mut mine, mut other) = (Vec::new(), Vec::new());
+    let (mut mine, mut other, mut policy) = (Vec::new(), Vec::new(), Vec::new());
     for row in rows {
         match row {
             PortsRow::Session(s) => {
@@ -166,12 +168,48 @@ fn group(rows: &[PortsRow]) -> View<'_> {
                 ListenerOwner::Mine(_) => mine.push(l),
                 ListenerOwner::Other => other.push(l),
             },
+            PortsRow::Refused(r) => {
+                let i = slot(r.session.as_str(), &mut sessions);
+                sessions[i].refused.push(r);
+            }
+            PortsRow::Policy(p) => policy.push(p),
         }
     }
     View {
         sessions,
         mine,
         other,
+        policy,
+    }
+}
+
+/// A server-policy line of `fil ports` (DESIGN.md section 11.2). The refusal's `Display`
+/// sanitizes what came from the host.
+fn policy_line(p: &PolicyLine) -> String {
+    match p {
+        PolicyLine::Unreadable { file } => format!(
+            "fil cannot read {} (some systems keep it root's alone): OpenSSH's defaults apply instead, so a -R beyond loopback is refused",
+            clean(file.as_str())
+        ),
+        PolicyLine::Partial { file, more: 0 } => format!(
+            "the sshd mirror is incomplete: fil cannot read {}, which the sshd config includes",
+            clean(file.as_str())
+        ),
+        PolicyLine::Partial { file, more } => format!(
+            "the sshd mirror is incomplete: fil cannot read {} and {more} more file{} the sshd config includes",
+            clean(file.as_str()),
+            if *more == 1 { "" } else { "s" }
+        ),
+        PolicyLine::DenyAll(r) => format!("every forward and the agent are refused: {r}"),
+        PolicyLine::Direct(r) => format!("direct mode is refused (attaches use the pipe): {r}"),
+    }
+}
+
+/// What a session's refused row was for.
+fn refused_what(r: &RefusedRow) -> String {
+    match &r.what {
+        RefusedWhat::Forward(spec) => clean(&forward_spec::format_flag(spec)),
+        RefusedWhat::Agent => "agent forwarding".to_string(),
     }
 }
 
@@ -272,6 +310,7 @@ fn bind_failure(b: BindFailure) -> &'static str {
         BindFailure::PermissionDenied => "permission denied (a privileged port?)",
         BindFailure::AddrNotAvailable => "the address is not available on that machine",
         BindFailure::Other => "the bind failed",
+        BindFailure::Policy => "refused by server policy",
     }
 }
 
@@ -440,12 +479,17 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
             Side::Laptop => "not listening yet: no client has bound it".to_string(),
             Side::Remote => "not listening yet".to_string(),
         }),
+        // The policy line below says it, with the setting.
+        Some(ListenState::Failed(BindFailure::Policy)) if f.policy.is_some() => {}
         Some(ListenState::Failed(why)) => detail.push(format!(
             "⚠ not listening on {}: {}",
             side_name(bind_side),
             bind_failure(why)
         )),
         Some(ListenState::Listening { .. }) => {}
+    }
+    if let Some(r) = &f.policy {
+        detail.push(format!("⚠ refused by server policy: {r}"));
     }
     if f.waiting > 0 {
         detail.push(format!(
@@ -614,6 +658,12 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
                 }
             ));
         }
+        if !s.refused.is_empty() {
+            out.push_str("\nREFUSED BY SERVER POLICY\n");
+            for r in &s.refused {
+                out.push_str(&format!("  {}: {}\n", refused_what(r), r.why));
+            }
+        }
         out.push('\n');
     }
     if view.sessions.is_empty() {
@@ -627,6 +677,13 @@ pub fn render_text(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
     if !view.other.is_empty() {
         out.push_str("LISTENERS OF OTHER USERS ON THIS HOST (port and address only)\n");
         host_listener_lines(view.other.iter().copied(), &mut out, o);
+        out.push('\n');
+    }
+    if !view.policy.is_empty() {
+        out.push_str("SERVER POLICY\n");
+        for p in &view.policy {
+            out.push_str(&format!("  {}\n", policy_line(p)));
+        }
         out.push('\n');
     }
     if answer.truncated {
@@ -690,6 +747,8 @@ struct JsonOut {
     incomplete: Option<&'static str>,
     sessions: Vec<JsonSession>,
     host_listeners: Vec<JsonListener>,
+    /// The `fil ports` lines about the host's server policy, as text (sanitized).
+    server_policy: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -700,6 +759,16 @@ struct JsonSession {
     agent: Option<JsonAgent>,
     forwards: Vec<JsonForward>,
     listeners: Vec<JsonListener>,
+    /// What server policy refused in this run.
+    refused: Vec<JsonRefused>,
+}
+
+#[derive(Serialize)]
+struct JsonRefused {
+    /// The spec as `-L`/`-R`/`-D` read it, or `"agent"`.
+    what: String,
+    /// The deciding setting and its source (sanitized).
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -739,6 +808,8 @@ struct JsonForward {
     probe: Option<JsonProbe>,
     /// Another user's listener takes the `-L` target on the host (a port squat).
     target_other_user: bool,
+    /// Server policy refuses this forward now: the deciding setting and its source.
+    policy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -844,6 +915,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
                     BindFailure::PermissionDenied => "permission_denied",
                     BindFailure::AddrNotAvailable => "addr_not_available",
                     BindFailure::Other => "other",
+                    BindFailure::Policy => "policy",
                 },
             },
         }),
@@ -856,6 +928,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         owner: f.owner.as_ref().map(json_process),
         probe: f.probe.as_ref().map(json_probe),
         target_other_user: f.target_other_user,
+        policy: f.policy.as_ref().map(|r| r.to_string()),
     }
 }
 
@@ -906,6 +979,17 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
                 }),
                 forwards: s.forwards.iter().map(|f| json_forward(f)).collect(),
                 listeners: s.listeners.iter().map(|(l, _)| json_listener(l)).collect(),
+                refused: s
+                    .refused
+                    .iter()
+                    .map(|r| JsonRefused {
+                        what: match &r.what {
+                            RefusedWhat::Forward(spec) => clean(&forward_spec::format_flag(spec)),
+                            RefusedWhat::Agent => "agent".to_string(),
+                        },
+                        reason: r.why.to_string(),
+                    })
+                    .collect(),
             })
             .collect(),
         host_listeners: view
@@ -914,6 +998,7 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
             .chain(&view.other)
             .map(|l| json_listener(l))
             .collect(),
+        server_policy: view.policy.iter().map(|p| policy_line(p)).collect(),
     };
     let mut text = serde_json::to_string_pretty(&out).expect("plain data serializes");
     text.push('\n');

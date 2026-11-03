@@ -19,7 +19,9 @@ use std::num::NonZeroU16;
 
 use crate::frame::{ChannelId, Frame};
 use crate::limits::*;
-use crate::mux::{ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState, Origin};
+use crate::mux::{
+    ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState, Origin, PolicyRefusal,
+};
 use crate::version::WireVersion;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -513,6 +515,9 @@ pub struct AttachReply {
     /// The session's `TERM`, fixed when it was created (DESIGN.md section 6.4). The client warns
     /// once when its own differs.
     pub term: TermName,
+    /// The attach asked to relay its agent (`Attach.agent`) and the host's server policy refuses
+    /// it (DESIGN.md section 11.2): the session has no agent socket, and the client says why.
+    pub agent_refused: Option<PolicyRefusal>,
 }
 
 /// "Taken over by `<host label>` at `<time>`" (DESIGN.md section 5.2).
@@ -617,7 +622,7 @@ pub enum ForwardOp {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForwardResult {
     Added(ForwardId),
     Removed(ForwardId),
@@ -712,6 +717,44 @@ pub enum PortsRow {
     Listener(ListenerRow),
     /// The session's agent relay, while it is on.
     Agent(AgentRow),
+    /// The host's server policy, when there is something to say about it (DESIGN.md section
+    /// 11.2). Host-wide; it comes before the sessions.
+    Policy(PolicyLine),
+    /// Something of a session's that server policy refused: a forward its client asked for, or
+    /// the agent relay.
+    Refused(RefusedRow),
+}
+
+/// What `fil ports` says about the host's server policy (DESIGN.md section 11.2). Only the
+/// deciding setting or the file, never the config's contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyLine {
+    /// The sshd config could not be read (RHEL and Fedora keep it 0600): OpenSSH's defaults
+    /// stand in for it.
+    Unreadable { file: PortsPath },
+    /// Files the sshd config includes could not be read: the mirror is incomplete (fil mirrors
+    /// the rest). `file` is the first; `more` counts the others. Names files, never contents.
+    Partial { file: PortsPath, more: u16 },
+    /// fil's policy file is there but cannot be used: every forward and the agent are refused.
+    DenyAll(PolicyRefusal),
+    /// Server policy refuses fil's direct (QUIC) transport: attaches use the pipe.
+    Direct(PolicyRefusal),
+}
+
+/// A refusal by server policy in one session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedRow {
+    pub session: SessionName,
+    pub what: RefusedWhat,
+    pub why: PolicyRefusal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefusedWhat {
+    /// A forward the attached client (or `fil forward`) asked for, never added to the table.
+    Forward(ForwardSpec),
+    /// The agent relay the attached client asked for.
+    Agent,
 }
 
 /// One forward of a session's table, with its state and traffic.
@@ -741,6 +784,10 @@ pub struct ForwardRow {
     /// client warns. `owner` and `probe` are `None` then: fil neither reads nor probes another
     /// user's process.
     pub target_other_user: bool,
+    /// Server policy refuses this entry, though it allowed it when it was added: its `-R`
+    /// listener is closed, or its connections are refused (DESIGN.md section 11.2). For a `-D`,
+    /// also the last SOCKS target the policy refused.
+    pub policy: Option<PolicyRefusal>,
 }
 
 /// A TCP listener on the remote host that no forward owns.
@@ -1170,6 +1217,7 @@ mod tests {
                 udp_port: Some(60001),
                 fingerprint: Some(Fingerprint::new(vec![1; 32]).unwrap()),
                 term: "xterm-256color".parse().unwrap(),
+                agent_refused: None,
             }),
             ControlMsg::AttachReply(AttachReply {
                 incarnation: 1,
@@ -1178,6 +1226,12 @@ mod tests {
                 udp_port: None,
                 fingerprint: None,
                 term: "xterm-ghostty".parse().unwrap(),
+                agent_refused: Some(PolicyRefusal {
+                    setting: crate::mux::PolicySetting::AllowAgentForwarding(
+                        crate::mux::Toggle::No,
+                    ),
+                    source: crate::mux::PolicySource::Default,
+                }),
             }),
             ControlMsg::AttachRefused(AttachRefusal::TakenOver(t.clone())),
             ControlMsg::AttachRefused(AttachRefusal::Detached),

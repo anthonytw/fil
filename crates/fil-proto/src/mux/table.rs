@@ -12,8 +12,10 @@
 //!   or `-D` beyond loopback (that binds wide on the laptop), nor aim `-R` at a non-loopback
 //!   target (a pivot into the laptop's network): `NotPermitted`. This is for the user's
 //!   experience and the daemon's honesty; the client's own check is the security boundary.
-//! - `-R` beyond loopback is refused from every origin for now (owner decision OD-7 is open; the
-//!   wire carries it so the decision does not change the wire).
+//! - `-R` beyond loopback is refused from a management request (it would expose a port of the
+//!   remote host on a request any local process can make). From the attached client's own CLI
+//!   or config it is the host's call: the daemon honours it where server policy allows it
+//!   (`GatewayPorts`, DESIGN.md section 11.2; OD-7, settled by the owner on 2026-11-03).
 //! - At most [`MAX_FORWARDS`] entries. Ids are never reused.
 
 use crate::limits::MAX_FORWARDS;
@@ -61,9 +63,11 @@ impl ForwardTable {
     pub fn permitted(spec: &ForwardSpec, origin: Origin) -> Result<(), ForwardRefusal> {
         let target_loopback = spec.target().is_none_or(|t| t.host.is_loopback());
         match spec.kind() {
-            // OD-7 (open): no wide -R bind from anyone until the owner rules.
-            ForwardKind::Remote if !spec.bind().is_loopback() => Err(ForwardRefusal::NotPermitted),
-            ForwardKind::Remote if origin == Origin::Request && !target_loopback => {
+            // OD-7: a wide -R bind only from the client's own CLI or config (and then where server
+            // policy allows it, which the daemon checks).
+            ForwardKind::Remote
+                if origin == Origin::Request && !(target_loopback && spec.bind().is_loopback()) =>
+            {
                 Err(ForwardRefusal::NotPermitted)
             }
             ForwardKind::Local | ForwardKind::Dynamic
@@ -298,12 +302,16 @@ mod tests {
     }
 
     #[test]
-    fn wide_remote_bind_is_refused_from_everyone_for_now() {
+    fn wide_remote_bind_only_from_the_client() {
+        // OD-7: the client's own wide -R is the host's call (server policy, checked by the
+        // daemon); a management request never binds one.
         let mut tab = ForwardTable::new();
-        for origin in [Origin::Client, Origin::Request] {
-            let s = remote(BindAddr::Any, 9000, t("localhost", 9000));
-            assert_eq!(tab.add(s, origin), Err(ForwardRefusal::NotPermitted));
-        }
+        let s = remote(BindAddr::Any, 9000, t("localhost", 9000));
+        assert_eq!(
+            tab.add(s.clone(), Origin::Request),
+            Err(ForwardRefusal::NotPermitted)
+        );
+        assert!(tab.add(s, Origin::Client).is_ok());
     }
 
     #[test]

@@ -60,8 +60,8 @@ pub enum Refusal {
     WideBind,
     /// `-R` to a target beyond loopback: a pivot into this machine's network.
     WideTarget,
-    /// `-R` bound beyond loopback on the host (owner decision OD-7 is open: refused from every
-    /// origin).
+    /// `-R` bound beyond loopback on the host, which this run did not name (OD-7: honoured only
+    /// from the client's own CLI or config, where the host's server policy allows it).
     WideRemoteBind,
     /// [`MAX_DENIALS`] requests were refused already in this run, or the host went through more
     /// forwards in one attach than the client keeps track of.
@@ -282,7 +282,7 @@ pub fn refusal_lines(spec: &ForwardSpec, why: Refusal) -> Vec<String> {
             Refusal::Denied => "(remote_requests = \"deny\")",
             Refusal::WideBind => "(it would listen beyond localhost)",
             Refusal::WideTarget => "(its target is not this machine)",
-            Refusal::WideRemoteBind => "(a -R beyond localhost: not yet)",
+            Refusal::WideRemoteBind => "(a wide -R: only from your config)",
             Refusal::TooMany => "(too many requests; refusing all)",
             Refusal::Busy => "(too many requests at once)",
         }

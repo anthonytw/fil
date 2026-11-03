@@ -118,6 +118,8 @@ pub struct DState {
     withhold_input_acks: bool,
     /// Direct-mode details for the reply.
     direct: Option<(u16, Vec<u8>)>,
+    /// The reply says server policy refuses the agent.
+    pub agent_refused: Option<fil_proto::mux::PolicyRefusal>,
     /// Send the output before the `AttachReply` (another stream overtaking the control stream).
     data_before_reply: bool,
     /// Wait this long before sending snapshot bytes.
@@ -212,6 +214,7 @@ impl FakeDaemon {
                 lose_input: false,
                 withhold_input_acks: false,
                 direct: None,
+                agent_refused: None,
                 data_before_reply: false,
                 snapshot_delay: None,
                 force_snapshot: false,
@@ -546,6 +549,7 @@ impl FakeDaemon {
                 .as_ref()
                 .map(|d| fil_proto::msg::Fingerprint::new(d.1.clone()).unwrap()),
             term: TermName::new("xterm-256color").unwrap(),
+            agent_refused: st.agent_refused.clone(),
         };
         if st.data_before_reply {
             self.pump(st).await;
@@ -1028,6 +1032,11 @@ impl FakeDaemon {
     /// unacknowledged (a daemon that sees acks stop will, in time, jump to a snapshot).
     pub async fn unacked(&self) -> u64 {
         self.st.lock().await.unacked()
+    }
+
+    /// Every attach reply from now on says server policy refuses the agent.
+    pub async fn set_agent_refused(&self, why: Option<fil_proto::mux::PolicyRefusal>) {
+        self.st.lock().await.agent_refused = why;
     }
 
     pub async fn set_data_before_reply(&self, on: bool) {

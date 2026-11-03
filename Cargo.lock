@@ -529,8 +529,10 @@ dependencies = [
  "nix",
  "portable-pty",
  "rustix",
+ "serde",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
  "vte",
 ]

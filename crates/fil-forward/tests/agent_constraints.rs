@@ -184,7 +184,11 @@ async fn a_destination_constrained_key_fails_closed_and_others_still_sign() {
 
     for bound in [true, false] {
         let rules = Rules {
-            bind: if bound { Rules::default().bind } else { None },
+            bind: if bound {
+                Rules::default().bind
+            } else {
+                fil_forward::agent::Bind::Unbound
+            },
             ..Rules::default()
         };
         let mut s = connect_local(sock.clone(), Arc::new(rules), Arc::new(KeyUses::default()))

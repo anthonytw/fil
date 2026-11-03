@@ -206,7 +206,7 @@ pub struct TermState {
     /// Tab stops, as 0-based columns from 1 to `cols - 2`, ascending. The first column is left
     /// out because a forward tab can never land on it, and the last because it always stops
     /// there, so neither can be read back from a terminal and neither matters in practice.
-    /// `None` is the default (see [`default_tab_stops`]), which is what a fresh terminal has and
-    /// so what the snapshot writer assumes unless told otherwise.
+    /// `None` is the default (see [`default_tab_stops`]), which is what a fresh terminal has.
+    /// The snapshot writer sets the receiver's stops to the state's either way.
     pub tab_stops: Option<Vec<u16>>,
 }

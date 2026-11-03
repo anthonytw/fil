@@ -148,3 +148,25 @@ fn synchronized_output_is_visible_after_apply_pending() {
         );
     }
 }
+
+/// The writer does not assume the receiver has the default tab stops: one that has seen other
+/// output (or had them changed locally) gets the state's, defaults included.
+#[test]
+fn tab_stops_are_restored_into_a_receiver_that_has_others() {
+    for b in backends().into_iter().filter(|b| b.capabilities.tab_stops) {
+        for (fed, custom_in_receiver) in [
+            (&b"hello"[..], &b"\x1b[3g"[..]),
+            (b"hello", b"\x1b[3g\x1b[5G\x1bH"),
+            (b"\x1b[3g\x1b[9G\x1bH", b"\x1b[3g\x1b[5G\x1bH"),
+        ] {
+            let mut src = (b.create)(SIZE, 0);
+            src.feed(fed);
+            let want = src.state(0).tab_stops;
+            let snap = snapshot(&src.state(0));
+            let mut dst = (b.create)(SIZE, 0);
+            dst.feed(custom_in_receiver);
+            dst.feed(&snap);
+            assert_eq!(dst.state(0).tab_stops, want, "{} after {fed:?}", b.name);
+        }
+    }
+}

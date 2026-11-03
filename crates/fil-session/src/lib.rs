@@ -26,10 +26,10 @@
 //!   ends, so a snapshot is exact for the offset it is announced at ([`boundary`]).
 //! - **Terminal queries** (DESIGN.md section 6.3). With a client attached they pass through to
 //!   its terminal and the replies come back as input. With none, the emulator answers (device
-//!   attributes, cursor position, kitty keyboard) and the session answers what the emulator
-//!   does not: the OSC 10, 11, 12 and 4 colour queries, from the colours the last attached
-//!   terminal reported or dark-theme defaults, and the text-area-size requests
-//!   ([`queries`]).
+//!   attributes, cursor position, kitty keyboard, the text area in characters) and the session
+//!   answers what the emulator does not: the OSC 10, 11, 12 and 4 colour queries, from the
+//!   colours the last attached terminal reported or dark-theme defaults, and the text area and
+//!   cell size in pixels ([`queries`]).
 //!
 //!   *Output that carries a query the emulator answered cannot be replayed to a client that
 //!   missed it*: its terminal would answer again, and the second answer would arrive as
@@ -43,11 +43,19 @@
 //!   This is the simplest behavior that cannot inject a stray reply into the new client's
 //!   session.
 //! - **`PtyMode` and `EchoAck`** for prediction (DESIGN.md section 9): the PTY's `ICANON` and
-//!   `ECHO` flags are read after every read of output, every write of input and every
+//!   `ECHO` flags are read after every read of output, after the PTY has taken input and every
 //!   `mode_poll` while attached, and a change is sent at the offset of the output that follows it,
-//!   in order with that output. After a keystroke has been in the PTY for the *echo window*
-//!   (`echo_window`, 50 ms as in mosh) an `EchoAck` says that no echo of it is still to come
-//!   beyond a given output offset.
+//!   in order with that output. The mode in force is stated again after every attach reply and
+//!   every snapshot (a snapshot resets the client's picture, an open password prompt included).
+//!   After the PTY has taken a keystroke and the *echo window* (`echo_window`, 50 ms as in mosh)
+//!   has passed, an `EchoAck` says that no echo of it is still to come beyond a given output
+//!   offset.
+//! - **A connection that lost the session reads nothing more.** On a takeover, a detach or being
+//!   superseded, the core marks the connection and its task stops reading its link (a transport
+//!   that buffers, like QUIC, still holds what the old client had sent); the core also ignores
+//!   input from any connection but the live one. A serve future that is dropped counts as gone.
+//! - **Input is bounded.** Acknowledgements stop at 64 KiB queued in front of a child that is not
+//!   reading; a connection that sends on past `max_queued_input` is cut off with `Error`.
 //! - **Process grouping** ([`proc`]): a systemd user scope where lingering is on, the process
 //!   tree otherwise; [`SessionHandle::kill`] tears down all of it.
 //!

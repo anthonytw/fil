@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use nix::sys::termios::LocalFlags;
@@ -21,14 +21,18 @@ pub enum SpawnError {
     UnknownEmulator(String),
     #[error("could not start the PTY or its child: {0}")]
     Pty(String),
+    #[error("cannot run the session in a systemd user scope: {0}")]
+    Scope(String),
 }
 
 /// The PTY's master side and the way to write to it.
 pub(crate) struct Pty {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: mpsc::Sender<Vec<u8>>,
-    /// Bytes handed to `write` that the PTY has not taken yet.
-    queued: Arc<AtomicUsize>,
+    /// Bytes ever handed to `write`.
+    queued: AtomicU64,
+    /// Bytes the writer thread has got into the PTY (the line discipline has them).
+    written: Arc<AtomicU64>,
     /// The child's pid, which is also its process group id: it is a session leader.
     pub pid: u32,
 }
@@ -50,7 +54,13 @@ fn size_of(s: TermSize) -> PtySize {
 
 /// The variables that describe the SSH login which happened to start the daemon, not the
 /// session's user.
-const STALE_SSH_VARS: [&str; 3] = ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
+const STALE_SSH_VARS: [&str; 5] = [
+    "SSH_TTY",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_ORIGINAL_COMMAND",
+    "SSH_USER_AUTH",
+];
 
 fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, SpawnError> {
     if cfg.command.as_ref().is_some_and(|c| c.is_empty()) {
@@ -141,8 +151,8 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
     // Writes can block when the child is not reading, so they have a thread of their own and
     // the session never waits on them.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let queued = Arc::new(AtomicUsize::new(0));
-    let taken = queued.clone();
+    let written = Arc::new(AtomicU64::new(0));
+    let taken = written.clone();
     std::thread::Builder::new()
         .name("fil-pty-write".into())
         .spawn(move || {
@@ -151,7 +161,7 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
                     .write_all(&bytes)
                     .and_then(|()| writer.flush())
                     .is_ok();
-                taken.fetch_sub(bytes.len(), Ordering::Relaxed);
+                taken.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                 if !written {
                     break;
                 }
@@ -163,7 +173,8 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
         pty: Pty {
             master: Mutex::new(pair.master),
             writer: tx,
-            queued,
+            queued: AtomicU64::new(0),
+            written,
             pid,
         },
         child,
@@ -173,14 +184,24 @@ pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, Spawn
 
 impl Pty {
     /// Queues bytes for the child's input. Never blocks.
-    pub fn write(&self, bytes: Vec<u8>) {
-        self.queued.fetch_add(bytes.len(), Ordering::Relaxed);
+    ///
+    /// Returns a ticket: [`Pty::written`] reaches it once the PTY has taken these bytes.
+    pub fn write(&self, bytes: Vec<u8>) -> u64 {
+        let ticket =
+            self.queued.fetch_add(bytes.len() as u64, Ordering::SeqCst) + bytes.len() as u64;
         let _ = self.writer.send(bytes);
+        ticket
+    }
+
+    /// Bytes the PTY has taken so far, counted like the tickets.
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::SeqCst)
     }
 
     /// Bytes passed to [`Pty::write`] that the PTY has not taken yet.
     pub fn queued(&self) -> usize {
-        self.queued.load(Ordering::Relaxed)
+        let queued = self.queued.load(Ordering::SeqCst);
+        queued.saturating_sub(self.written()) as usize
     }
 
     pub fn resize(&self, size: TermSize) {

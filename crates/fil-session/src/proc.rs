@@ -86,25 +86,107 @@ fn linger_enabled() -> bool {
         .is_some_and(|o| parse_linger(&String::from_utf8_lossy(&o.stdout)))
 }
 
-/// Decides the scope for a new session. Blocking (it may run `loginctl`).
-pub fn resolve_scope(mode: ScopeMode, name: &str, incarnation: u128) -> Scope {
-    let unit = || Scope::Systemd {
-        unit: unit_name(name, incarnation),
-    };
+/// What is known about the host before choosing a scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Facts {
+    pub linux: bool,
+    pub systemd_run_on_path: bool,
+    pub xdg_runtime_dir_set: bool,
+}
+
+/// The outcome of choosing a scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Systemd,
+    Tree,
+    /// Systemd looked usable but the trial scope failed: the tree, and say so.
+    TreeWithWarning(String),
+    /// `ScopeMode::Systemd` was asked for and cannot be had.
+    Fail(String),
+}
+
+/// The decision logic, with the expensive probes passed in so they run only when needed.
+///
+/// - `Tree`: the tree.
+/// - `Systemd`: the scope, or a failure naming what is missing or what the trial said.
+/// - `Auto`: the scope when this is Linux with `systemd-run`, a user runtime directory, lingering
+///   enabled and a trial scope that starts; the tree otherwise. A failed trial after all the other
+///   conditions held is worth a warning, because lingering is on and the user expects a scope.
+pub fn decide_scope(
+    mode: ScopeMode,
+    facts: Facts,
+    linger: impl FnOnce() -> bool,
+    trial: impl FnOnce() -> Result<(), String>,
+) -> Decision {
     match mode {
-        ScopeMode::Tree => Scope::Tree,
-        ScopeMode::Systemd => unit(),
-        ScopeMode::Auto => {
-            if cfg!(target_os = "linux")
-                && on_path("systemd-run")
-                && std::env::var_os("XDG_RUNTIME_DIR").is_some()
-                && linger_enabled()
-            {
-                unit()
-            } else {
-                Scope::Tree
+        ScopeMode::Tree => Decision::Tree,
+        ScopeMode::Systemd => {
+            if !facts.systemd_run_on_path {
+                return Decision::Fail("systemd-run is not on PATH".into());
+            }
+            if !facts.xdg_runtime_dir_set {
+                return Decision::Fail("XDG_RUNTIME_DIR is not set".into());
+            }
+            match trial() {
+                Ok(()) => Decision::Systemd,
+                Err(e) => Decision::Fail(e),
             }
         }
+        ScopeMode::Auto => {
+            if !(facts.linux && facts.systemd_run_on_path && facts.xdg_runtime_dir_set) || !linger()
+            {
+                return Decision::Tree;
+            }
+            match trial() {
+                Ok(()) => Decision::Systemd,
+                Err(e) => Decision::TreeWithWarning(e),
+            }
+        }
+    }
+}
+
+/// Starts a throwaway scope to see that the user manager answers. Blocking.
+fn trial_scope() -> Result<(), String> {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unit = format!("fil-trial-{}-{n}", std::process::id());
+    let out = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .args(["--", "true"])
+        .output()
+        .map_err(|e| format!("systemd-run did not start: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "systemd-run --user --scope failed: {}",
+        err.lines().next().unwrap_or("no output").trim()
+    ))
+}
+
+/// Decides the scope for a new session. Blocking (it may run `loginctl` and `systemd-run`).
+pub fn resolve_scope(
+    mode: ScopeMode,
+    name: &str,
+    incarnation: u128,
+) -> Result<Scope, crate::pty::SpawnError> {
+    let facts = Facts {
+        linux: cfg!(target_os = "linux"),
+        systemd_run_on_path: on_path("systemd-run"),
+        xdg_runtime_dir_set: std::env::var_os("XDG_RUNTIME_DIR").is_some(),
+    };
+    match decide_scope(mode, facts, linger_enabled, trial_scope) {
+        Decision::Systemd => Ok(Scope::Systemd {
+            unit: unit_name(name, incarnation),
+        }),
+        Decision::Tree => Ok(Scope::Tree),
+        Decision::TreeWithWarning(why) => {
+            tracing::warn!(session = name, %why, "no systemd scope; tracking the process tree instead");
+            Ok(Scope::Tree)
+        }
+        Decision::Fail(why) => Err(crate::pty::SpawnError::Scope(why)),
     }
 }
 
@@ -294,13 +376,24 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
     }
 }
 
-/// The hangup a terminal sends when it closes, to the group and the recorded tree. Used when the
-/// shell exits by itself: what it left running in the background is told, not killed.
-pub fn hang_up(root: u32, tracker: &Tracker) {
+/// The hangup a terminal sends when it closes, to the group, the recorded tree and the scope.
+/// Used when the shell exits by itself: what it left running in the background is told, not
+/// killed.
+pub fn hang_up(root: u32, scope: &Scope, tracker: &Tracker) {
     let rows = list_processes();
     let victims = tracker.victims(root, &rows);
     let _ = killpg(Pid::from_raw(root as i32), Signal::SIGHUP);
     signal_all(&victims, Signal::SIGHUP);
+    if let Scope::Systemd { unit } = scope {
+        let _ = Command::new("systemctl")
+            .args([
+                "--user",
+                "kill",
+                "--signal=SIGHUP",
+                &format!("{unit}.scope"),
+            ])
+            .output();
+    }
 }
 
 #[cfg(test)]
@@ -423,5 +516,80 @@ mod tests {
         assert!(descendants(me, &rows).iter().any(|r| r.pid == child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    const LINUX: Facts = Facts {
+        linux: true,
+        systemd_run_on_path: true,
+        xdg_runtime_dir_set: true,
+    };
+
+    #[test]
+    fn scope_decisions() {
+        let yes = || true;
+        let no = || false;
+        let ok = || Ok(());
+        let bad = || Err("no bus".to_string());
+        let never = || -> Result<(), String> { panic!("the trial must not run") };
+
+        assert_eq!(
+            decide_scope(ScopeMode::Tree, LINUX, yes, ok),
+            Decision::Tree
+        );
+        // Auto: only with everything in place.
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, LINUX, yes, ok),
+            Decision::Systemd
+        );
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, LINUX, no, never),
+            Decision::Tree
+        );
+        let mac = Facts {
+            linux: false,
+            ..LINUX
+        };
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, mac, || panic!("no probe off Linux"), never),
+            Decision::Tree
+        );
+        let no_run = Facts {
+            systemd_run_on_path: false,
+            ..LINUX
+        };
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, no_run, yes, never),
+            Decision::Tree
+        );
+        let no_dir = Facts {
+            xdg_runtime_dir_set: false,
+            ..LINUX
+        };
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, no_dir, yes, never),
+            Decision::Tree
+        );
+        // Lingering on but the manager does not answer: the tree, with a warning.
+        assert_eq!(
+            decide_scope(ScopeMode::Auto, LINUX, yes, bad),
+            Decision::TreeWithWarning("no bus".into())
+        );
+        // Explicit: no silent fallback.
+        assert_eq!(
+            decide_scope(ScopeMode::Systemd, LINUX, no, ok),
+            Decision::Systemd
+        );
+        assert_eq!(
+            decide_scope(ScopeMode::Systemd, LINUX, yes, bad),
+            Decision::Fail("no bus".into())
+        );
+        assert!(matches!(
+            decide_scope(ScopeMode::Systemd, no_run, yes, never),
+            Decision::Fail(_)
+        ));
+        assert!(matches!(
+            decide_scope(ScopeMode::Systemd, no_dir, yes, never),
+            Decision::Fail(_)
+        ));
     }
 }

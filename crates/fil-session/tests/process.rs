@@ -172,6 +172,12 @@ async fn an_endless_escape_sequence_is_eventually_released() {
     let fil_proto::msg::StartPoint::Snapshot(info) = c.reply.clone().unwrap().start else {
         panic!("expected a snapshot");
     };
-    assert!(info.at > 1_000_000, "released up to {}", info.at);
+    // Released when the tail passed 1 MiB, not chunk by chunk as it came in (which would put
+    // `at` near the end), and the rest is held again.
+    assert!(
+        (1_000_000..1_200_000).contains(&info.at),
+        "released up to {}",
+        info.at
+    );
     let _ = h.kill(Duration::from_secs(5)).await;
 }

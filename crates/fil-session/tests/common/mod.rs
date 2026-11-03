@@ -145,6 +145,17 @@ pub fn pid_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Alive and not a zombie: a process that has been killed but not yet reaped does not count.
+pub fn pid_running(pid: u32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
 /// The scripted client: the far end of the in-memory link, with a real emulator behind it.
 pub struct Client {
     pub link: MemLink,

@@ -49,20 +49,22 @@ impl SessionHandle {
         config: SessionConfig,
         host: Arc<dyn SessionHost>,
     ) -> Result<SessionHandle, SpawnError> {
-        let (mode, scope_name, incarnation) =
-            (config.scope, config.name.to_string(), config.incarnation);
-        // Deciding the scope may run `loginctl`.
-        let scope =
-            tokio::task::spawn_blocking(move || resolve_scope(mode, &scope_name, incarnation))
-                .await
-                .map_err(|e| SpawnError::Pty(e.to_string()))?;
+        let incarnation = config.incarnation;
         let (name, term, agent_socket, catch_up) = (
             config.name.clone(),
             config.term.clone(),
             config.agent_socket.clone(),
             config.catch_up,
         );
-        let started = core::start(config, scope, host)?;
+        // Deciding the scope may run `loginctl` and `systemd-run`, opening the PTY and starting
+        // the child fork and exec: none of that belongs on an async worker. (`tokio::spawn` of
+        // the core task works from a blocking thread.)
+        let started = tokio::task::spawn_blocking(move || {
+            let scope = resolve_scope(config.scope, config.name.as_str(), config.incarnation)?;
+            core::start(config, scope, host)
+        })
+        .await
+        .map_err(|e| SpawnError::Pty(e.to_string()))??;
         Ok(SessionHandle {
             inner: Arc::new(Inner {
                 name,
@@ -155,12 +157,19 @@ impl SessionHandle {
     }
 
     /// Ends the session: hangs up the shell and everything it started, then kills what is left.
-    /// Returns once the session has ended, or `None` if it has not within `timeout`.
+    /// Returns once the killing is done and the session has ended, or `None` if that takes
+    /// longer than `timeout`.
     pub async fn kill(&self, timeout: Duration) -> Option<ExitInfo> {
-        if self.inner.tx.send(Cmd::Kill).await.is_err() {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.inner.tx.send(Cmd::Kill(done_tx)).await.is_err() {
             return Some(self.wait_exit().await);
         }
-        tokio::time::timeout(timeout, self.wait_exit()).await.ok()
+        let all = async {
+            // An error means the shell was already gone, so there was nothing to kill.
+            let _ = done_rx.await;
+            self.wait_exit().await
+        };
+        tokio::time::timeout(timeout, all).await.ok()
     }
 
     // --- used by the subscriber task ---

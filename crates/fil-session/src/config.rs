@@ -11,11 +11,14 @@ use fil_proto::msg::{Fingerprint, PublicKey, SessionName, TermName, TermSize};
 /// How the session's processes are grouped (DESIGN.md section 5.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScopeMode {
-    /// A systemd user scope where Linux has systemd and lingering is on for the user, the
-    /// process tree otherwise.
+    /// A systemd user scope where Linux has systemd, lingering is on for the user and a trial
+    /// scope starts; the process tree otherwise (with a warning in the log when systemd looked
+    /// usable but the trial failed).
     #[default]
     Auto,
-    /// Always run under `systemd-run --user --scope`. Spawning fails if that does not work.
+    /// Always run under `systemd-run --user --scope`. Spawning fails with
+    /// [`SpawnError::Scope`](crate::SpawnError::Scope) if a trial scope cannot be started (no
+    /// `systemd-run`, or the user manager is unreachable).
     Systemd,
     /// Always the process group and tree.
     Tree,
@@ -69,7 +72,16 @@ pub struct SessionConfig {
     /// addition to after every read of output and every write of input.
     pub mode_poll: Duration,
     /// How long after the shell exits the rest of its output is waited for.
+    ///
+    /// If something the shell started still holds the PTY open after that, the session ends
+    /// anyway. Its reader thread (and one duplicate of the PTY's file descriptor) lives on,
+    /// blocked in a read, until that process closes the PTY or exits: a long-lived `nohup`ed job
+    /// costs one thread and one descriptor per dead session. Nothing safe can interrupt the read.
     pub exit_drain: Duration,
+    /// Input queued in front of a child that is not reading it, beyond which the connection is
+    /// cut with `Error(Protocol)`. Acknowledgements stop well before this (64 KiB), so a client
+    /// that honors its send window never gets here.
+    pub max_queued_input: usize,
 }
 
 impl SessionConfig {
@@ -92,6 +104,7 @@ impl SessionConfig {
             echo_window: Duration::from_millis(50),
             mode_poll: Duration::from_millis(50),
             exit_drain: Duration::from_millis(300),
+            max_queued_input: 4 * 1024 * 1024,
         }
     }
 }

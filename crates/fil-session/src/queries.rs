@@ -1,9 +1,12 @@
 //! Terminal queries the emulator does not answer, and the answers (DESIGN.md section 6.3).
 //!
-//! alacritty answers device attributes, cursor position, status and the kitty keyboard query
-//! itself (`Emulator::take_replies`), but not the OSC 10, 11, 12 and 4 colour queries (vim sends
-//! them to pick a light or dark theme) nor the text-area-size requests: those need the host's
-//! answer (`docs/spikes/emulator.md`). While no terminal is attached the session answers them:
+//! alacritty answers device attributes, cursor position, status, the kitty keyboard query and the
+//! text area size in characters (`CSI 18 t`) itself (`Emulator::take_replies`). It does not
+//! answer the OSC 10, 11, 12 and 4 colour queries (vim sends them to pick a light or dark
+//! theme), the text area size in pixels (`CSI 14 t`) nor the cell size (`CSI 16 t`): those need
+//! the host's answer (`docs/spikes/emulator.md`). `CSI 18 t` is deliberately not here: answering
+//! it as well would give the program two replies, the second of which it would read as
+//! keystrokes. While no terminal is attached the session answers the others:
 //!
 //! - [`QueryScanner`] finds them in the PTY output;
 //! - [`ReplyScanner`] watches the *input* a real terminal sends back while a client is attached
@@ -26,8 +29,6 @@ pub enum Query {
     TextAreaPixels,
     /// `CSI 16 t`: one cell in pixels.
     CellPixels,
-    /// `CSI 18 t`: the text area in characters.
-    TextAreaChars,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -168,7 +169,6 @@ impl Perform for QueryCollector {
         match first {
             14 => self.found.push(Query::TextAreaPixels),
             16 => self.found.push(Query::CellPixels),
-            18 => self.found.push(Query::TextAreaChars),
             _ => {}
         }
     }
@@ -285,13 +285,15 @@ pub struct Terminal {
     palette: HashMap<u8, Rgb16>,
     /// (height, width) of one cell, as the last attached terminal reported it.
     cell_px: Option<(u16, u16)>,
-    /// (height, width) of the text area, as reported.
-    area_px: Option<(u16, u16)>,
 }
 
 impl Terminal {
-    /// Remembers what a real terminal said.
-    pub fn learn(&mut self, r: Reply) {
+    /// Remembers what a real terminal said. `cols` and `rows` are the size of its text area now.
+    ///
+    /// The size of the text area in pixels is not kept as such: it goes stale when the window
+    /// is resized. What it tells about the size of a cell is kept, and the area is worked out
+    /// from that and the grid whenever it is asked for.
+    pub fn learn(&mut self, r: Reply, cols: u16, rows: u16) {
         match r {
             Reply::Color(slot, rgb) => {
                 self.colors.insert(slot, rgb);
@@ -302,8 +304,11 @@ impl Terminal {
             Reply::CellPixels { height, width } if height > 0 && width > 0 => {
                 self.cell_px = Some((height, width));
             }
-            Reply::TextAreaPixels { height, width } if height > 0 && width > 0 => {
-                self.area_px = Some((height, width));
+            Reply::TextAreaPixels { height, width }
+                if height >= rows && width >= cols && rows > 0 && cols > 0 =>
+            {
+                // An explicit cell size from the same terminal is the better source.
+                self.cell_px.get_or_insert((height / rows, width / cols));
             }
             _ => {}
         }
@@ -313,7 +318,6 @@ impl Terminal {
     /// still the best guess until it says otherwise).
     pub fn forget_geometry(&mut self) {
         self.cell_px = None;
-        self.area_px = None;
     }
 
     fn color(&self, slot: ColorSlot) -> Rgb16 {
@@ -357,17 +361,17 @@ impl Terminal {
                 term(bell)
             ),
             Query::TextAreaPixels => {
-                let (h, w) = self.area_px.unwrap_or_else(|| {
-                    let (ch, cw) = self.cell_px.unwrap_or(DEFAULT_CELL_PX);
-                    (ch.saturating_mul(rows), cw.saturating_mul(cols))
-                });
-                format!("\x1b[4;{h};{w}t")
+                let (ch, cw) = self.cell_px.unwrap_or(DEFAULT_CELL_PX);
+                format!(
+                    "\x1b[4;{};{}t",
+                    ch.saturating_mul(rows),
+                    cw.saturating_mul(cols)
+                )
             }
             Query::CellPixels => {
                 let (h, w) = self.cell_px.unwrap_or(DEFAULT_CELL_PX);
                 format!("\x1b[6;{h};{w}t")
             }
-            Query::TextAreaChars => format!("\x1b[8;{rows};{cols}t"),
         };
         s.into_bytes()
     }
@@ -431,12 +435,9 @@ mod tests {
         );
         assert_eq!(
             s.scan(b"\x1b[14t\x1b[16t\x1b[18t\x1b[8;24;80t\x1b[1;2t"),
-            vec![
-                Query::TextAreaPixels,
-                Query::CellPixels,
-                Query::TextAreaChars
-            ],
-            "only the three requests; a resize command is not a query"
+            vec![Query::TextAreaPixels, Query::CellPixels],
+            "only the two the emulator does not answer: 18 t is its own, and a resize command is \
+             not a query"
         );
     }
 
@@ -540,7 +541,6 @@ mod tests {
             ),
             b"\x1b]4;1;rgb:cdcd/0000/0000\x07"
         );
-        assert_eq!(t.answer(&Query::TextAreaChars, 100, 30), b"\x1b[8;30;100t");
         assert_eq!(
             t.answer(&Query::TextAreaPixels, 100, 30),
             b"\x1b[4;480;800t"
@@ -557,7 +557,7 @@ mod tests {
         );
         assert_eq!(found.len(), 4);
         for f in found {
-            t.learn(f);
+            t.learn(f, 80, 24);
         }
         assert_eq!(
             t.answer(
@@ -582,9 +582,11 @@ mod tests {
             b"\x1b]4;1;rgb:aaaa/bbbb/cccc\x07"
         );
         assert_eq!(t.answer(&Query::CellPixels, 80, 24), b"\x1b[6;20;10t");
+        // The text area follows the grid: after a resize it is not the size it was reported at.
+        assert_eq!(t.answer(&Query::TextAreaPixels, 80, 24), b"\x1b[4;480;800t");
         assert_eq!(
-            t.answer(&Query::TextAreaPixels, 80, 24),
-            b"\x1b[4;800;1000t"
+            t.answer(&Query::TextAreaPixels, 100, 30),
+            b"\x1b[4;600;1000t"
         );
         // Another terminal attaches: its pixel sizes are unknown again, its colours are a
         // better guess than the defaults.

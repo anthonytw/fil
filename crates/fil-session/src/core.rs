@@ -16,6 +16,7 @@
 //! and a snapshot is never taken mid-escape. [`Progress::ready`] is that offset.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +53,8 @@ const TRACK_INTERVAL: Duration = Duration::from_secs(5);
 const MODE_HISTORY: usize = 64;
 /// Input waiting for a child that is not reading it, beyond which the client is not acknowledged.
 const INPUT_BACKLOG: usize = 64 * 1024;
+/// While input waits for the PTY to take it, how often that is looked at.
+const ECHO_POLL: Duration = Duration::from_millis(5);
 /// Capacity of the command channel.
 const CMD_CAPACITY: usize = 256;
 
@@ -122,6 +125,9 @@ pub(crate) struct Accepted {
     pub input_received: u64,
     /// The PTY's mode at `start`.
     pub mode: (bool, bool),
+    /// Set by the core the moment this connection loses the session (taken over, detached,
+    /// superseded). The connection's task reads nothing from its link once it is set.
+    pub kicked: Arc<AtomicBool>,
 }
 
 pub(crate) enum AttachAnswer {
@@ -144,7 +150,8 @@ pub(crate) enum Cmd {
     Attach(Box<Attach>, oneshot::Sender<AttachAnswer>),
     Info(oneshot::Sender<SessionInfo>),
     ForceDetach,
-    Kill,
+    /// Hang up, then kill; the sender fires when the killing is done.
+    Kill(oneshot::Sender<()>),
     // From connections.
     Input {
         conn: ConnId,
@@ -202,6 +209,13 @@ struct Live {
     conn: ConnId,
     epoch: u64,
     events: mpsc::UnboundedSender<ConnEvent>,
+    kicked: Arc<AtomicBool>,
+}
+
+impl Live {
+    fn kick(&self) {
+        self.kicked.store(true, Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct Core {
@@ -239,6 +253,9 @@ pub(crate) struct Core {
     input: RecvChannel,
     input_ack_due: Option<Instant>,
     echo: EchoTracker,
+    /// Input handed to the PTY writer and not yet written: `(end offset in the subscriber's
+    /// input stream, the writer's ticket)`. The echo window starts when the PTY has taken it.
+    echo_wait: VecDeque<(u64, u64)>,
 
     /// PTY mode changes `(at, canonical, echo)`, oldest first; never empty.
     modes: VecDeque<(u64, bool, bool)>,
@@ -364,6 +381,7 @@ pub(crate) fn start(
         input: RecvChannel::new(),
         input_ack_due: None,
         echo: EchoTracker::new(cfg.echo_window),
+        echo_wait: VecDeque::new(),
         modes: VecDeque::from([(0, initial_mode.0, initial_mode.1)]),
         next_mode_poll: None,
         exit: None,
@@ -387,10 +405,13 @@ impl Core {
             let deadline = self.next_deadline();
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(cmd) => self.handle(cmd),
+                    Some(cmd) => {
+                        let idle = rx.is_empty();
+                        self.handle(cmd, idle)
+                    }
                     None => break,
                 },
-                () = sleep_until(deadline) => self.on_tick(Instant::now()),
+                () = sleep_until(deadline) => self.on_tick(Instant::now(), rx.is_empty()),
             }
             if self.finished() {
                 break;
@@ -429,26 +450,32 @@ impl Core {
             self.next_mode_poll,
             self.next_track,
             self.exit_deadline,
+            (!self.echo_wait.is_empty()).then(|| Instant::now() + ECHO_POLL),
         ]
         .into_iter()
         .flatten()
         .min()
     }
 
-    fn handle(&mut self, cmd: Cmd) {
+    fn handle(&mut self, cmd: Cmd, idle: bool) {
         match cmd {
-            Cmd::PtyOutput(chunk) => self.on_output(chunk),
+            Cmd::PtyOutput(chunk) => {
+                // Whether anyone is there to answer a query is decided here, so a connection
+                // whose task is gone must not count. (Not reaped on every command: a connection
+                // that detached or sent input and then ended has commands still queued.)
+                self.reap_live(idle);
+                self.on_output(chunk)
+            }
             Cmd::PtyEof => self.eof = true,
             Cmd::ChildExited(info) => {
                 tracing::info!(session = %self.name, code = info.code, "the shell exited");
                 self.exit = Some(info);
                 self.exit_deadline = Some(Instant::now() + self.cfg.exit_drain);
-                if matches!(self.scope, Scope::Tree) {
-                    // What the shell left behind in the background is told to hang up, as a
-                    // closing terminal would. It is not killed.
-                    let (pid, tracker) = (self.pty.pid, self.tracker.clone());
-                    tokio::task::spawn_blocking(move || proc::hang_up(pid, &tracker));
-                }
+                // What the shell left behind in the background is told to hang up, as a closing
+                // terminal would (DESIGN.md section 5.1). It is not killed.
+                let (pid, scope, tracker) =
+                    (self.pty.pid, self.scope.clone(), self.tracker.clone());
+                tokio::task::spawn_blocking(move || proc::hang_up(pid, &scope, &tracker));
             }
             Cmd::Attach(attach, reply) => {
                 let answer = self.on_attach(*attach);
@@ -459,12 +486,13 @@ impl Core {
             }
             Cmd::ForceDetach => self.force_detach(),
             // Once the shell is gone its pid may be anyone's.
-            Cmd::Kill if self.exit.is_some() => {}
-            Cmd::Kill => {
+            Cmd::Kill(done) if self.exit.is_some() => drop(done),
+            Cmd::Kill(done) => {
                 let (pid, scope, tracker) =
                     (self.pty.pid, self.scope.clone(), self.tracker.clone());
                 tokio::task::spawn_blocking(move || {
-                    proc::kill_session(pid, &scope, &tracker, proc::KILL_GRACE)
+                    proc::kill_session(pid, &scope, &tracker, proc::KILL_GRACE);
+                    let _ = done.send(());
                 });
             }
             Cmd::Input { conn, seq, data } => self.on_input(conn, seq, data),
@@ -487,7 +515,9 @@ impl Core {
         }
     }
 
-    fn on_tick(&mut self, now: Instant) {
+    fn on_tick(&mut self, now: Instant, idle: bool) {
+        self.reap_live(idle);
+        self.pump_echo(now);
         if let Some(upto) = self.echo.due(now) {
             let output_at = self.log_end();
             self.send(ConnEvent::EchoAck {
@@ -512,6 +542,39 @@ impl Core {
         }
     }
 
+    /// A connection whose task is gone (its serve future was dropped or panicked, or it ended
+    /// without saying so) has closed its event channel: it is no longer attached.
+    ///
+    /// Only when no command is waiting (`idle`): a connection that sent input or a detach and
+    /// then ended has those commands queued, and they must still find it.
+    fn reap_live(&mut self, idle: bool) {
+        if !idle {
+            return;
+        }
+        if self.live.as_ref().is_some_and(|l| l.events.is_closed()) {
+            self.live = None;
+            self.next_mode_poll = None;
+        }
+    }
+
+    /// Starts the echo window for input the PTY has now taken, and looks at the mode again,
+    /// since a program that has just read a key may have changed it.
+    fn pump_echo(&mut self, now: Instant) {
+        let written = self.pty.written();
+        let mut any = false;
+        while let Some(&(end, ticket)) = self.echo_wait.front() {
+            if ticket > written {
+                break;
+            }
+            self.echo_wait.pop_front();
+            self.echo.on_input(end, now);
+            any = true;
+        }
+        if any {
+            self.sample_mode();
+        }
+    }
+
     fn send(&self, ev: ConnEvent) {
         if let Some(l) = &self.live {
             let _ = l.events.send(ev);
@@ -525,14 +588,23 @@ impl Core {
         // the first byte that may have been written under it.
         self.sample_mode();
         self.shared.lock_log().append(&chunk);
+        // `scan` returns 0 both when the chunk starts a sequence it does not finish and when
+        // it never reaches a boundary; only the first case moves the old tail on.
+        let was_at_rest = self.boundary.at_rest();
         let k = self.boundary.scan(&chunk);
-        let mut feed = std::mem::take(&mut self.tail);
-        feed.extend_from_slice(&chunk[..k]);
-        self.tail = chunk[k..].to_vec();
+        let mut feed = Vec::new();
+        if k == 0 && !was_at_rest {
+            self.tail.extend_from_slice(&chunk);
+        } else {
+            feed = std::mem::take(&mut self.tail);
+            feed.extend_from_slice(&chunk[..k]);
+            self.tail = chunk[k..].to_vec();
+        }
         if self.tail.len() > MAX_TAIL {
+            // The bytes go on; the tracker stays where it is, in step with the emulator's own
+            // parser, which is still inside the string.
             tracing::debug!(session = %self.name, "releasing an unfinished sequence");
             feed.append(&mut self.tail);
-            self.boundary.reset();
         }
         if !feed.is_empty() {
             self.feed_emulator(&feed);
@@ -643,6 +715,9 @@ impl Core {
             match effect {
                 Effect::NotifyTakenOver { subscriber, info } => {
                     if let Some(l) = self.live.as_ref().filter(|l| l.sub == subscriber) {
+                        // From here nothing more is read from its link: it no longer has the
+                        // session, and a transport that buffers (QUIC) must not be drained.
+                        l.kick();
                         let _ = l.events.send(ConnEvent::TakenOver(info));
                     }
                 }
@@ -651,6 +726,7 @@ impl Core {
                     // After a takeover notification the old connection is already on its way
                     // out; this reaches the ones that have nothing to say.
                     if let Some(l) = self.live.take_if(|l| l.sub == subscriber) {
+                        l.kick();
                         let _ = l.events.send(ConnEvent::Drop);
                     }
                 }
@@ -689,6 +765,7 @@ impl Core {
         if matches!(mode, AttachMode::Fresh) {
             self.input = RecvChannel::new();
             self.echo.reset();
+            self.echo_wait.clear();
             self.input_ack_due = None;
         }
 
@@ -710,11 +787,17 @@ impl Core {
                 at,
             });
         }
+        if let Some(old) = self.live.take() {
+            old.kick();
+            let _ = old.events.send(ConnEvent::Drop);
+        }
+        let kicked = Arc::new(AtomicBool::new(false));
         self.live = Some(Live {
             sub,
             conn,
             epoch,
             events: events_tx,
+            kicked: kicked.clone(),
         });
         self.next_mode_poll = Some(Instant::now() + self.cfg.mode_poll);
 
@@ -734,6 +817,7 @@ impl Core {
             start: start_seq,
             input_received: self.input.received(),
             mode: self.mode_at(start_seq),
+            kicked,
         }))
     }
 
@@ -781,6 +865,13 @@ impl Core {
         if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
             return;
         }
+        // A child that is not reading leaves input piling up in front of its PTY. A client that
+        // keeps sending past the point where acknowledgements stopped is cut off, not queued.
+        if self.pty.queued() + data.len() > self.cfg.max_queued_input {
+            tracing::warn!(session = %self.name, "input backlog over the limit");
+            self.send(ConnEvent::Fatal(ErrorCode::Protocol));
+            return;
+        }
         let fresh = match self.input.accept(seq, &data) {
             Ok(f) => f.to_vec(),
             Err(e) => {
@@ -794,10 +885,11 @@ impl Core {
         }
         // The attached terminal's answers to colour and size queries, on their way to the program.
         for r in self.rscan.scan(&fresh) {
-            self.terminal.learn(r);
+            self.terminal.learn(r, self.size.cols(), self.size.rows());
         }
-        self.pty.write(fresh);
-        self.echo.on_input(self.input.received(), Instant::now());
+        let ticket = self.pty.write(fresh);
+        self.echo_wait.push_back((self.input.received(), ticket));
+        self.pump_echo(Instant::now());
         if self.input.unacked() >= ACK_AFTER_BYTES {
             self.ack_input(Instant::now());
         } else if self.input_ack_due.is_none() {
@@ -822,6 +914,7 @@ impl Core {
         let Some(live) = self.live.take_if(|l| l.conn == conn) else {
             return;
         };
+        live.kick();
         self.next_mode_poll = None;
         // The connection is on its way out already, so it is taken out before the effects run.
         if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(live.epoch) {
@@ -838,7 +931,10 @@ impl Core {
         if let DetachOutcome::Detached { effects, .. } = self.epoch.detach(epoch) {
             self.apply_effects(effects);
         }
-        self.live = None;
+        if let Some(l) = self.live.take() {
+            l.kick();
+            let _ = l.events.send(ConnEvent::Drop);
+        }
         self.next_mode_poll = None;
     }
 
@@ -851,7 +947,7 @@ impl Core {
             pid: self.pty.pid,
             size: self.size,
             epoch: self.epoch.epoch(),
-            attached: self.live.is_some(),
+            attached: self.live.as_ref().is_some_and(|l| !l.events.is_closed()),
             subscriber: self.epoch.subscriber().map(|s| SubscriberInfo {
                 host: s.host.clone(),
                 since_unix_ms: s.since_unix_ms,
@@ -898,6 +994,10 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// then redraws from a clear screen.
 pub(crate) fn gap_prologue(rows: u16, skipped: u64) -> Vec<u8> {
     let mut s = String::new();
+    // The client may have been cut off in the middle of anything: with a character set other
+    // than ASCII invoked (the marker would come out as line drawing), or inside a synchronized
+    // update (it would hold everything back until its own timeout).
+    s.push_str("\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[?2026l");
     // Primary screen (the client may be in an alternate one), plain scroll region and origin,
     // no mouse reporting or kitty flags left over from a program that has since gone.
     s.push_str("\x1b[?1049l\x1b[0m\x1b[?25l\x1b[?6l\x1b[r");
@@ -944,7 +1044,7 @@ mod tests {
     #[test]
     fn the_prologue_scrolls_one_screen_and_the_marker() {
         let p = String::from_utf8(gap_prologue(5, 2048)).unwrap();
-        assert!(p.starts_with("\x1b[?1049l"));
+        assert!(p.starts_with("\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[?2026l\x1b[?1049l"));
         assert!(p.contains("skipped 2 KB of output"));
         assert_eq!(p.matches("\r\n").count(), 1 + 5);
     }

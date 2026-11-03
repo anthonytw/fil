@@ -14,13 +14,14 @@
 //!    are written without a newline and left to autowrap, which restores the wrap flag;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
 //!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
-//! 4. the scroll region, tab stops, the saved cursor with the character sets it saved, origin
+//! 4. tab stops, the scroll region, the saved cursor with the character sets it saved, origin
 //!    mode, the cursor (with the pending-wrap flag), the pen;
 //! 5. the live character sets, input modes, mouse, kitty keyboard flags, title, cursor shape
 //!    and visibility.
 //!
-//! The writer assumes the receiver's tab stops are the defaults (every 8th column), as a
-//! fresh terminal's are, and only writes them when the state's differ.
+//! The writer makes no assumption about the receiver's tab stops: it clears them all and sets the
+//! state's, defaults included (a receiver that has seen other output, or a local tab-stop
+//! command, need not have the defaults).
 //!
 //! Everything that came from the remote program (cell text, titles, link targets) is
 //! stripped of control characters before it is written, so a snapshot cannot be used to
@@ -31,7 +32,7 @@
 
 use crate::model::{
     Attrs, Cell, Charset, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking,
-    TermState, Underline,
+    TermState, Underline, default_tab_stops,
 };
 
 /// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
@@ -88,19 +89,21 @@ impl<'a> Writer<'a> {
             self.pen = Attrs::default();
             self.positioned_lines(&st.screen);
         }
-        // 4. Scroll region, origin, cursor, pen.
+        // 4. Tab stops: all cleared, then the state's set, whatever the receiver had. Column 1
+        // is always a stop (a backward tab needs somewhere to land, and it cannot be read
+        // back). The cursor moves, but it is placed for good further down.
+        let default = default_tab_stops(st.size.cols);
+        let stops = st.tab_stops.as_ref().unwrap_or(&default);
+        self.put("\x1b[3g\x1b[1G\x1bH");
+        for &c in stops {
+            self.put(&format!("\x1b[{}G\x1bH", u32::from(c) + 1));
+        }
+        // Scroll region, origin, cursor, pen.
         match st.modes.scroll_region {
             Some((top, bottom)) => {
                 self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
             }
             None => self.put("\x1b[r"),
-        }
-        // Tab stops. The cursor moves, but it is placed for good further down.
-        if let Some(stops) = &st.tab_stops {
-            self.put("\x1b[3g");
-            for &c in stops {
-                self.put(&format!("\x1b[{}G\x1bH", u32::from(c) + 1));
-            }
         }
         // DECSC with origin mode still off, so the saved position is absolute. It saves the
         // character sets too, so designate the saved ones first and the ASCII ones after (the

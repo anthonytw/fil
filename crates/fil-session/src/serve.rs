@@ -28,7 +28,8 @@
 //! the client's scrollback, so the client must not add one of its own.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -93,7 +94,7 @@ pub async fn serve_subscriber<L: Link>(
         .unwrap_or_else(|Gone| AttachAnswer::Refused(AttachRefusal::SessionGone));
     let acc = match answer {
         AttachAnswer::Refused(r) => {
-            let c = Conn::new(&link, handle, 0, 0);
+            let c = Conn::new(&link, handle, 0, 0, Arc::default());
             let _ =
                 tokio::time::timeout(NOTIFY_TIMEOUT, c.ctl(&ControlMsg::AttachRefused(r.clone())))
                     .await;
@@ -103,7 +104,7 @@ pub async fn serve_subscriber<L: Link>(
         }
         AttachAnswer::Accepted(a) => *a,
     };
-    let conn = Conn::new(&link, handle, acc.conn, acc.start);
+    let conn = Conn::new(&link, handle, acc.conn, acc.start, acc.kicked.clone());
     let end = conn.run(acc).await;
     handle.send(Cmd::ConnGone { conn: conn.id }).await;
     link.close();
@@ -185,6 +186,24 @@ struct Out {
 }
 
 impl Out {
+    /// Takes in every event that is waiting; returns the reason to end, if one is among them.
+    fn drain_events(&mut self) -> Option<Reason> {
+        loop {
+            match self.events.try_recv() {
+                Ok(ev) => {
+                    if let Some(r) = self.absorb(ev) {
+                        return Some(r);
+                    }
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.events_open = false;
+                    return None;
+                }
+            }
+        }
+    }
+
     fn absorb(&mut self, ev: ConnEvent) -> Option<Reason> {
         match ev {
             ConnEvent::TakenOver(info) => return Some(Reason::TakenOver(info)),
@@ -209,6 +228,9 @@ struct Conn<'a, L: Link> {
     link: &'a L,
     handle: &'a SessionHandle,
     id: ConnId,
+    /// Set by the core when this connection loses the session; nothing more is read from the
+    /// link after that.
+    kicked: Arc<AtomicBool>,
     flow: Mutex<Flow>,
     /// Signalled when an ack arrives.
     acked: Notify,
@@ -219,11 +241,18 @@ struct Conn<'a, L: Link> {
 }
 
 impl<'a, L: Link> Conn<'a, L> {
-    fn new(link: &'a L, handle: &'a SessionHandle, id: ConnId, start: u64) -> Self {
+    fn new(
+        link: &'a L,
+        handle: &'a SessionHandle,
+        id: ConnId,
+        start: u64,
+        kicked: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             link,
             handle,
             id,
+            kicked,
             flow: Mutex::new(Flow::new(start)),
             acked: Notify::new(),
             verdict: Mutex::new(None),
@@ -325,10 +354,19 @@ impl<'a, L: Link> Conn<'a, L> {
     /// Reads what the client sends.
     async fn inbound(&self) -> ServeEnd {
         loop {
+            // A connection that has lost the session reads nothing more: whatever its link still
+            // holds (QUIC returns what it had already received) is not the session's to take.
+            // The outbound half is what ends the connection, and says why.
+            if self.kicked.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let (channel, payload) = match self.link.recv().await {
                 Ok(m) => m,
                 Err(e) => return ServeEnd::LinkDown(e.0),
             };
+            if self.kicked.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             match channel {
                 ChannelId::CONTROL => match ControlMsg::decode(&payload) {
                     Ok(ControlMsg::Ack {
@@ -378,20 +416,9 @@ impl<'a, L: Link> Conn<'a, L> {
     async fn outbound(&self, out: &mut Out) -> ServeEnd {
         let params = *self.handle.catch_up_params();
         loop {
-            loop {
-                match out.events.try_recv() {
-                    Ok(ev) => {
-                        if let Some(r) = out.absorb(ev) {
-                            return self.end_with(r).await;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        out.events_open = false;
-                        break;
-                    }
-                }
-            }
+            // The one await before output is sent comes first, and the events (a takeover among
+            // them) are looked at after it, so output produced after a takeover is not sent
+            // to the client that lost the session.
             if let Some(upto) = out.input_ack.take()
                 && let Err(e) = self
                     .ctl(&ControlMsg::Ack {
@@ -401,6 +428,9 @@ impl<'a, L: Link> Conn<'a, L> {
                     .await
             {
                 return ServeEnd::LinkDown(e.0);
+            }
+            if let Some(r) = out.drain_events() {
+                return self.end_with(r).await;
             }
 
             let prog = *out.progress.borrow_and_update();
@@ -502,20 +532,30 @@ impl<'a, L: Link> Conn<'a, L> {
     async fn catch_up(&self, out: &mut Out) -> Result<(), ServeEnd> {
         let sent = self.flow().next;
         let Some(c) = self.handle.catch_up(self.id, sent).await else {
+            // Not the live connection any more. If the reason is a takeover, its notice is
+            // already waiting (the core queues it before it answers anything later).
+            if let Some(r) = out.drain_events() {
+                return Err(self.end_with(r).await);
+            }
             return Err(if self.handle.is_alive() {
                 ServeEnd::Superseded
             } else {
                 ServeEnd::SessionExited(self.handle.wait_exit().await)
             });
         };
+        // The stream is at the snapshot's `at` from here on, before anything is sent: the client
+        // may acknowledge `at` as soon as it has applied the snapshot, and that ack must not be
+        // taken for one beyond what was sent. Changes before the snapshot are folded into its
+        // mode.
+        self.flow().jump(c.info.at);
+        out.modes.retain(|m| m.0 > c.info.at);
         let down = |e: LinkError| ServeEnd::LinkDown(e.0);
         self.ctl(&ControlMsg::Snapshot(c.info))
             .await
             .map_err(down)?;
         self.send_snapshot(&c.bytes).await.map_err(down)?;
-        self.flow().jump(c.info.at);
-        // Changes before the snapshot are folded into its mode.
-        out.modes.retain(|m| m.0 > c.info.at);
+        // A snapshot resets the client's picture of the terminal, an open password prompt
+        // included, so the mode in force at its offset is stated again.
         self.ctl(&ControlMsg::PtyMode {
             canonical: c.mode.0,
             echo: c.mode.1,

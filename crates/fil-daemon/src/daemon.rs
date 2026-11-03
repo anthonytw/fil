@@ -56,9 +56,6 @@ use crate::start::open_lock_file;
 
 /// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
 const MAX_TOMBSTONES: usize = 256;
-/// How long creating a session (the PTY, the child, the probes for a systemd scope) may take
-/// before the attach fails.
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long stopping the daemon waits for each session to be killed.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -176,6 +173,9 @@ struct State {
     ended: std::collections::VecDeque<(SessionName, u128)>,
     /// Connections being served.
     conns: usize,
+    /// Session creations that outlived their attach (it timed out) and are still running. Each
+    /// kills what it produces, and keeps the daemon from idling out until it has.
+    spawning: usize,
 }
 
 /// Why a session could not be found or made for an attach.
@@ -191,6 +191,9 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     /// Sessions plus connections: zero means idle.
     busy: watch::Sender<usize>,
+    /// The tasks that wait for a timed-out session creation and kill its session, so that
+    /// shutdown can wait for them.
+    late: Mutex<tokio::task::JoinSet<()>>,
     /// One lock per session name while it is being looked up or created, so two attaches to a
     /// new name make one session and an attach to one name never waits for another's.
     name_locks: Mutex<HashMap<SessionName, Arc<tokio::sync::Mutex<()>>>>,
@@ -213,7 +216,8 @@ impl Inner {
     }
 
     fn publish(&self, st: &State) {
-        self.busy.send_replace(st.live.len() + st.conns);
+        self.busy
+            .send_replace(st.live.len() + st.conns + st.spawning);
     }
 
     pub(crate) fn revoke_key(&self, key: &msg::PublicKey) {
@@ -236,6 +240,25 @@ impl Inner {
         if Arc::strong_count(&lock) == 2 {
             map.remove(name);
         }
+    }
+
+    /// Runs `fut`, which finishes a session creation whose attach gave up, as a task that the
+    /// daemon counts as busy and that shutdown waits for.
+    fn track_late(self: &Arc<Self>, fut: LateFuture) {
+        let mut st = self.state();
+        st.spawning += 1;
+        self.publish(&st);
+        drop(st);
+        let inner = self.clone();
+        let mut set = self.late.lock().unwrap_or_else(|e| e.into_inner());
+        // Forget the ones that have finished.
+        while set.try_join_next().is_some() {}
+        set.spawn(async move {
+            fut.await;
+            let mut st = inner.state();
+            st.spawning -= 1;
+            inner.publish(&st);
+        });
     }
 
     pub(crate) fn guard(self: &Arc<Self>) -> ConnGuard {
@@ -327,15 +350,21 @@ impl Inner {
         sc.cwd = self.cfg.session.cwd.clone();
         sc.env = self.cfg.session.env.clone();
         sc.clear_env = self.cfg.session.clear_env;
-        let spawn = SessionHandle::spawn(sc, self.host.clone() as Arc<dyn SessionHost>);
-        let handle = match spawn_bounded(spawn, SPAWN_TIMEOUT).await {
+        let host = self.host.clone() as Arc<dyn SessionHost>;
+        let delay = self.cfg.spawn_delay;
+        let spawn = async move {
+            tokio::time::sleep(delay).await;
+            SessionHandle::spawn(sc, host).await
+        };
+        let timeout = self.cfg.spawn_timeout;
+        let handle = match spawn_bounded(spawn, timeout, |late| self.track_late(late)).await {
             Ok(h) => h,
             Err(BoundedSpawn::Failed(e)) => {
                 return Err(Lookup::Failed(format!("cannot start the session: {e}")));
             }
             Err(BoundedSpawn::TimedOut) => {
                 return Err(Lookup::Failed(format!(
-                    "starting the session took more than {SPAWN_TIMEOUT:?}"
+                    "starting the session took more than {timeout:?}"
                 )));
             }
         };
@@ -522,6 +551,7 @@ impl Daemon {
             host,
             state: Mutex::default(),
             busy,
+            late: Mutex::default(),
             name_locks: Mutex::default(),
         });
         let (stop, _) = watch::channel(None);
@@ -670,6 +700,17 @@ impl Daemon {
             set.spawn(async move { s.kill(KILL_TIMEOUT).await });
         }
         while set.join_next().await.is_some() {}
+        // A session whose creation finished after its attach gave up is killed by its own task;
+        // wait for those too, so that none outlives the daemon.
+        let mut late =
+            std::mem::take(&mut *self.inner.late.lock().unwrap_or_else(|e| e.into_inner()));
+        let waited = tokio::time::timeout(KILL_TIMEOUT, async {
+            while late.join_next().await.is_some() {}
+        })
+        .await;
+        if waited.is_err() {
+            tracing::warn!("a session was still starting at shutdown; giving up on it");
+        }
     }
 }
 
@@ -827,13 +868,20 @@ enum BoundedSpawn {
     TimedOut,
 }
 
+type LateFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// Runs a session spawn for at most `timeout`.
 ///
 /// The spawn is blocking work (the PTY, the child, the probes for a systemd scope) that does not
 /// stop when the wait is abandoned. One that finishes after the timeout has started a shell that
 /// nothing tracks and nobody can reach. So the spawn runs on its own task; when the wait times
-/// out, that task is left to finish and the session it produces, if any, is killed.
-async fn spawn_bounded<F>(spawn: F, timeout: Duration) -> Result<SessionHandle, BoundedSpawn>
+/// out, a future that waits for the spawn and kills the session it produces, if any, is handed to
+/// `track_late` (which must run it to the end), and the result is [`BoundedSpawn::TimedOut`].
+async fn spawn_bounded<F>(
+    spawn: F,
+    timeout: Duration,
+    track_late: impl FnOnce(LateFuture),
+) -> Result<SessionHandle, BoundedSpawn>
 where
     F: std::future::Future<Output = Result<SessionHandle, fil_session::SpawnError>>
         + Send
@@ -847,20 +895,28 @@ where
             e.to_string(),
         ))),
         Err(_) => {
-            tokio::spawn(async move {
-                if let Ok(Ok(late)) = task.await {
-                    tracing::warn!(
-                        session = %late.name(),
-                        "a session finished starting after the attach gave up; killing it"
-                    );
-                    if late.kill(KILL_TIMEOUT).await.is_none() {
+            track_late(Box::pin(async move {
+                match task.await {
+                    Ok(Ok(late)) => {
                         tracing::warn!(
                             session = %late.name(),
-                            "the late session did not end within {KILL_TIMEOUT:?}"
+                            "a session finished starting after the attach gave up; killing it"
                         );
+                        if late.kill(KILL_TIMEOUT).await.is_none() {
+                            tracing::warn!(
+                                session = %late.name(),
+                                "the late session did not end within {KILL_TIMEOUT:?}"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "a session start that the attach gave up on failed");
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "a session start that the attach gave up on panicked");
                     }
                 }
-            });
+            }));
             Err(BoundedSpawn::TimedOut)
         }
     }
@@ -875,11 +931,21 @@ mod tests {
         rustix::process::test_kill_process(pid).is_ok()
     }
 
+    /// A scratch directory that is removed when it goes out of scope, a failed test included.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A spawn that finishes after the timeout starts a shell; that shell must not be left running.
     #[tokio::test]
     async fn a_session_that_starts_after_the_timeout_is_killed() {
         let dir = std::env::temp_dir().join(format!("fil-late-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = TempDir(dir.clone());
         let pidfile = dir.join("pid");
         let mut sc = SessionConfig::new(
             "late".parse().unwrap(),
@@ -901,7 +967,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             SessionHandle::spawn(sc, host).await
         };
-        let r = spawn_bounded(slow, Duration::from_millis(50)).await;
+        let r = spawn_bounded(slow, Duration::from_millis(50), |f| {
+            tokio::spawn(f);
+        })
+        .await;
         assert!(matches!(r, Err(BoundedSpawn::TimedOut)));
 
         let end = std::time::Instant::now() + Duration::from_secs(10);
@@ -925,7 +994,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -939,9 +1007,13 @@ mod tests {
         sc.scope = fil_session::ScopeMode::Tree;
         sc.command = Some(vec!["/bin/sh".into(), "-c".into(), "exec cat".into()]);
         let host = Arc::new(host(&KeyRegistry::new(), None)) as Arc<dyn SessionHost>;
-        let h = spawn_bounded(SessionHandle::spawn(sc, host), Duration::from_secs(10))
-            .await
-            .expect("spawned in time");
+        let h = spawn_bounded(
+            SessionHandle::spawn(sc, host),
+            Duration::from_secs(10),
+            |_| panic!("not late"),
+        )
+        .await
+        .expect("spawned in time");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(h.is_alive(), "an in-time session is not killed");
         let _ = h.kill(Duration::from_secs(5)).await;

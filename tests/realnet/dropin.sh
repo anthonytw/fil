@@ -86,6 +86,14 @@ dp_battery() {
   dp_snap "$n" "$DP_OUT/$tag.flood" -E '^[0-9]+$'
   [[ $(tail -n 1 "$DP_OUT/$tag.flood") == 200000 ]] || fail "$tag: the flood does not end with 200000: $(tail -n 3 "$DP_OUT/$tag.flood")"
 
+  # `cat` of a 4 MB file: ssh delivers every line to the scrollback. fil may skip some with a gap
+  # marker (DESIGN.md catch-up); count what reached the terminal.
+  fc_line "$n" "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 50000 > big.txt"
+  fc_line "$n" 'cat big.txt; echo CATEND-$((6*7))'
+  fc_wait "$n" 'CATEND-42' 120
+  fc_wait "$n" 'LINE-050000' 20
+  note "$tag.cat_lines_received=$(fc "$n" raw | grep -a -o 'LINE-[0-9][0-9][0-9][0-9][0-9][0-9]' | wc -l | tr -d ' ') $tag.cat_gap_markers=$(fc "$n" raw | grep -a -c 'fil: skipped' || true)"
+
   # Ctrl-C during a flood: the next command's output comes back.
   fc_line "$n" 'yes'
   sleep 3

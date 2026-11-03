@@ -925,6 +925,7 @@ fn less_pager(ctx: &Ctx, host: &str) -> Res {
     c.want_row("1", CMD_TIMEOUT)?;
     c.send("q");
     c.want_alt(false, CMD_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(500));
     c.roundtrip("LESS", CMD_TIMEOUT)?;
     finish(c)?;
     Ok(vec![format!(
@@ -965,6 +966,8 @@ fn top_htop(ctx: &Ctx, host: &str) -> Res {
             )
         })?;
         c.send("q");
+        // top (like vim) discards what is typed ahead while it leaves.
+        thread::sleep(Duration::from_millis(500));
         c.roundtrip("TOPQ", CMD_TIMEOUT)?;
         notes.push(format!(
             "top: drew, and its header changed {} times in 6 s; `q` quit",
@@ -982,6 +985,7 @@ fn top_htop(ctx: &Ctx, host: &str) -> Res {
             .ok_or_else(|| format!("htop never redrew\n{}", c.dump()))?;
         c.send("q");
         c.want_alt(false, CMD_TIMEOUT)?;
+        thread::sleep(Duration::from_millis(500));
         c.roundtrip("HTOPQ", CMD_TIMEOUT)?;
         notes.push("htop: drew, redrew, `q` quit".to_string());
     }
@@ -1033,6 +1037,7 @@ fn git_tools(ctx: &Ctx, host: &str) -> Res {
     c.send(" ");
     c.want_screen("commit number", CMD_TIMEOUT)?;
     c.send("q");
+    thread::sleep(Duration::from_millis(500));
     c.roundtrip("GITQ", CMD_TIMEOUT)?;
     c.run("cd ..", CMD_TIMEOUT)?;
     finish(c)?;
@@ -1673,6 +1678,8 @@ fn client_sleep(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();
     for (variant, stop_s, ticks) in [(Variant::Auto, 12u64, 100u32), (Variant::Pipe, 45, 280)] {
         let mut c = shell(ctx, host, variant, &format!("slp{}", variant.tag()))?;
+        thread::sleep(Duration::from_secs(2));
+        let base = c.roundtrip("SLPB", CMD_TIMEOUT)?;
         let from = c.len();
         start_ticks(&mut c, ticks);
         c.want_from("TICK-8", from, CMD_TIMEOUT)?;
@@ -1695,17 +1702,23 @@ fn client_sleep(ctx: &Ctx, host: &str) -> Res {
         )?;
         let done = woke.elapsed();
         let res = check_seq(&c, from, "TICK-", 1, u64::from(ticks))?;
+        // The loop's last `sleep 0.25` is still running; let it end before timing the shell.
+        thread::sleep(Duration::from_millis(500));
         let rt = c.roundtrip("SLP", CMD_TIMEOUT)?;
         status_cleared(&c)?;
+        thread::sleep(Duration::from_secs(3));
+        let settled = c.roundtrip("SLPS", CMD_TIMEOUT)?;
         let log = c.log();
         let note = format!(
-            "{}: client stopped {} s at tick ~{}, continued; first output {} after the wake, the last tick {}; a command's round trip afterwards {}; {res}",
+            "{}: client stopped {} s at tick ~{}, continued; first output {} after the wake, the last tick {}; a command's round trip: {} before, {} right after the last tick, {} three seconds later; {res}",
             variant.tag(),
             stop_s,
             (at.duration_since(c.started).as_secs_f64() / 0.25) as u32,
             ms(first),
             secs(done),
-            ms(rt)
+            ms(base),
+            ms(rt),
+            ms(settled)
         );
         notes.push(note);
         if ctx.verbose {
@@ -1862,38 +1875,141 @@ fn vim_session_life(ctx: &Ctx, host: &str) -> Res {
 /// A resize and a command typed right after it: the command must see the new size, as it does
 /// over ssh (the window change and the data travel one ordered stream).
 fn resize_order(ctx: &Ctx, host: &str) -> Res {
-    let mut c = shell(ctx, host, Variant::Auto, "rord")?;
     let mut bad = Vec::new();
-    for i in 0..30u16 {
-        let rows = 31 + i;
-        c.resize(rows, 100);
-        let from = c.len();
-        c.send(&format!("echo RO{i}-$(stty size | tr ' ' x)\r"));
-        let want = format!("RO{i}-{rows}x100");
-        if c.expect_from(&want, from, Duration::from_secs(5)).is_none() {
-            let seen = c.with_plain(|p| {
-                let t = String::from_utf8_lossy(&p[from.min(p.len())..]).into_owned();
-                t.lines()
-                    .find(|l| l.starts_with(&format!("RO{i}-")) && !l.contains("$("))
-                    .unwrap_or("(nothing)")
-                    .to_string()
-            });
+    for variant in [Variant::Auto, Variant::Pipe] {
+        let mut c = shell(ctx, host, variant, &format!("rord{}", variant.tag()))?;
+        // Auto: give the session time to move to QUIC first.
+        thread::sleep(Duration::from_secs(2));
+        let mut n = 0;
+        let mut seen_bad = Vec::new();
+        for i in 0..30u16 {
+            let rows = 31 + i;
+            c.resize(rows, 100);
+            let from = c.len();
+            c.send(&format!("echo RO{i}-$(stty size | tr ' ' x)\r"));
+            let want = format!("RO{i}-{rows}x100");
+            if c.expect_from(&want, from, Duration::from_secs(5)).is_none() {
+                n += 1;
+                let seen = c.with_plain(|p| {
+                    let t = String::from_utf8_lossy(&p[from.min(p.len())..]).into_owned();
+                    t.lines()
+                        .find(|l| l.starts_with(&format!("RO{i}-")) && !l.contains("$("))
+                        .unwrap_or("(nothing)")
+                        .to_string()
+                });
+                seen_bad.push(format!("{rows}x100 then `stty size` said {seen}"));
+            }
+        }
+        if n > 0 {
             bad.push(format!(
-                "resize to {rows}x100 then at once `stty size`: {seen}"
+                "{}: {n} of 30 commands typed right after a resize saw the old size ({})",
+                variant.tag(),
+                seen_bad.join("; ")
             ));
         }
+        finish(c)?;
+        ctx.reset(host);
     }
-    ensure(bad.is_empty(), || {
+    ensure(bad.is_empty(), || bad.join(" | "))?;
+    Ok(vec![
+        "30 times each on QUIC and on the pipe: a resize, then at once a command that prints the size: always the new size"
+            .into(),
+    ])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scenarios: robustness in everyday accidents
+
+/// A 250 KB paste into `cat > file` (one write, as a terminal pastes) arrives complete.
+fn paste_big(ctx: &Ctx, host: &str) -> Res {
+    let mut c = shell(ctx, host, Variant::Auto, "paste")?;
+    c.run(
+        "seq -f 'paste line %06g the quick brown fox jumps over' 1 6000 > expect.txt; wc -c < expect.txt",
+        CMD_TIMEOUT,
+    )?;
+    c.send("cat > paste.txt\r");
+    thread::sleep(Duration::from_millis(500));
+    let body: String = (1..=6000)
+        .map(|i| format!("paste line {i:06} the quick brown fox jumps over\r"))
+        .collect();
+    let t = Instant::now();
+    c.send(&body);
+    c.send(CTRL_D);
+    let out = c.run(
+        "cmp -s paste.txt expect.txt && echo PASTE-$((6*7)); wc -c < paste.txt",
+        Duration::from_secs(120),
+    )?;
+    let took = t.elapsed();
+    ensure(out.contains("PASTE-42"), || {
         format!(
-            "{} of 30 commands typed right after a resize saw the old size: {}",
-            bad.len(),
-            bad.join("; ")
+            "the pasted file differs from what was pasted ({} bytes sent)\n{out}",
+            body.len()
         )
     })?;
     finish(c)?;
+    Ok(vec![format!(
+        "{} KB pasted in one write into `cat`: the file is identical after {}",
+        body.len() / 1024,
+        secs(took)
+    )])
+}
+
+/// A minute and a half of doing nothing: no flicker of the status line, and the session answers.
+fn idle(ctx: &Ctx, host: &str) -> Res {
+    let mut c = shell(ctx, host, Variant::Auto, "idle")?;
+    let base = c.roundtrip("IDLE0", CMD_TIMEOUT)?;
+    let t = Instant::now();
+    let mut flicker = 0;
+    while t.elapsed() < Duration::from_secs(90) {
+        if c.screen().contains("fil:") {
+            flicker += 1;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let after = c.roundtrip("IDLE1", CMD_TIMEOUT)?;
+    ensure(flicker == 0, || {
+        format!(
+            "the status line showed up {flicker} times during 90 s of idle\n{}",
+            c.dump()
+        )
+    })?;
+    finish(c)?;
+    Ok(vec![format!(
+        "90 s idle: no status line at any point; a command's round trip {} before and {} after",
+        ms(base),
+        ms(after)
+    )])
+}
+
+/// `cat` of a binary, as happens by accident: the session survives, `reset` recovers the
+/// terminal, and a second client can attach to the session that saw the garbage.
+fn binary_garbage(ctx: &Ctx, host: &str) -> Res {
+    let mut c = shell(ctx, host, Variant::Auto, "bin")?;
+    c.run("ZV=alive7", CMD_TIMEOUT)?;
+    let from = c.len();
+    c.send("cat \"$(command -v ls)\"; echo BINEND-$((6*7))\r");
+    c.want_from("BINEND-42", from, Duration::from_secs(60))?;
+    thread::sleep(Duration::from_millis(500));
+    // `reset` restores the terminal modes the garbage changed.
+    c.send("reset\r");
+    thread::sleep(Duration::from_secs(3));
+    c.roundtrip("BIN1", CMD_TIMEOUT)?;
+    ensure(!c.alt(), || {
+        format!(
+            "the terminal is stuck in the alternate screen\n{}",
+            c.dump()
+        )
+    })?;
+    c.detach()?;
+    drop(c);
+    let mut c2 = Client::spawn(ctx, host, Variant::Auto, "dp-bin", 30, 100);
+    let out = c2.run("echo V-$ZV", ATTACH_TIMEOUT)?;
+    ensure(out.contains("V-alive7"), || {
+        format!("after the garbage a new client does not find the same shell\n{out}")
+    })?;
+    finish(c2)?;
     Ok(vec![
-        "30 times: a resize, then at once a command that prints the size: always the new size"
-            .into(),
+        "cat of a binary, `reset`, then a fresh client: same shell, usable".into(),
     ])
 }
 
@@ -1925,6 +2041,9 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("killed_ssh_midcommand", killed_ssh_midcommand),
         ("client_sleep", client_sleep),
         ("vim_session_life", vim_session_life),
+        ("paste_big", paste_big),
+        ("binary_garbage", binary_garbage),
+        ("idle", idle),
         ("disrupt_vim", disrupt_vim),
     ]
 }

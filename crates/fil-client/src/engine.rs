@@ -777,8 +777,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         result
     }
 
-    /// Gives the screen back, once: the overlay comes off, the ending is shown, the terminal is
-    /// cooked again.
+    /// Gives the screen back, once: the overlay comes off, the terminal's modes are reset, the
+    /// ending is shown, the terminal is cooked again.
     fn leave_screen(&mut self, result: &Result<Outcome, ClientError>) {
         if std::mem::replace(&mut self.screen_left, true) {
             return;
@@ -787,6 +787,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if let Some(d) = self.display.as_mut() {
             let bytes = d.set_lines(Vec::new());
             let _ = self.out.write_all(&bytes);
+        }
+        // Give the terminal back as it was: whatever the session's programs left on (the
+        // alternate screen, mouse reporting, application keys, a hidden cursor...) goes off,
+        // on every way out, a disconnected one included. The shadow screen knows what is set.
+        // Only once the session screen was entered: before that nothing of ours is on it.
+        if self.first_attached
+            && let Some(d) = self.display.as_ref()
+        {
+            let _ = self.out.write_all(&d.restore_bytes());
         }
         let mut text = String::new();
         if !self.first_attached {

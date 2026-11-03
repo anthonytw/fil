@@ -15,7 +15,8 @@ use std::time::Duration;
 use fil_predict::{
     Config, Ctx, KeyEvent, Overlay, OverlayEdit, Placement, Predictor, PtyMode, Status, Time,
 };
-use fil_term::{Backend, Size};
+use fil_term::model::{CursorShape, MouseEncoding, MouseTracking};
+use fil_term::{Backend, Size, TermState};
 use tokio::time::Instant;
 
 /// A predictor that never predicts: M1's stand-in for the real one.
@@ -129,6 +130,19 @@ impl Display {
         v
     }
 
+    /// What to write to give the user's terminal back, after the overlay is off: undo everything
+    /// the session's programs can have turned on, so a shell that was started before `fil` finds
+    /// its terminal as it left it (mosh does the same on exit; ssh does not).
+    ///
+    /// It is built from the shadow screen, which has seen every byte the terminal has, so only
+    /// what is actually set is reset: no stray `?1049l` (which would move the cursor on a
+    /// terminal that is not on the alternate screen) and no cursor jump when no margins are set.
+    /// It never sends `RIS`, which would wipe the scrollback, and it leaves the window title
+    /// alone (as ssh does: there is no way to read the old one back). See [`restore_sequence`].
+    pub fn restore_bytes(&self) -> Vec<u8> {
+        restore_sequence(&self.overlay.view(0).shadow)
+    }
+
     /// Writes what it takes to open the overlay's gates, through the shadow so both stay in step:
     /// cancel a half-written escape sequence and clear a pending wrap. With `heavy` also leave
     /// insert mode, the character sets, origin mode, margins and the scroll region, and close a
@@ -216,5 +230,144 @@ impl Display {
     /// Time since the display was created, for the overlay's clock.
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
+    }
+}
+
+/// The bytes that put a terminal in the state `st` back to its defaults (see
+/// [`Display::restore_bytes`]).
+///
+/// Order matters: input modes first, then the alternate screen (the kitty keyboard stacks are
+/// per screen, so both are popped), then the margins and origin mode (resetting either homes the
+/// cursor, so the cursor is put back afterwards), then the cursor, the pen and the character sets.
+pub fn restore_sequence(st: &TermState) -> Vec<u8> {
+    let m = &st.modes;
+    let mut s = String::new();
+    // Cancel a half-written escape sequence (the link can drop mid-sequence), then end a
+    // synchronized update the program left open: it would hold everything below back.
+    s.push_str("\x18\x1b[?2026l");
+    if m.mouse_tracking != MouseTracking::Off || m.mouse_encoding != MouseEncoding::Default {
+        // Every tracking mode and every encoding: a program may have used several, and the
+        // shadow keeps only the last.
+        s.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+        s.push_str("\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l");
+    }
+    if m.focus_events {
+        s.push_str("\x1b[?1004l");
+    }
+    if m.bracketed_paste {
+        s.push_str("\x1b[?2004l");
+    }
+    if m.app_cursor_keys {
+        s.push_str("\x1b[?1l");
+    }
+    if m.app_keypad {
+        s.push_str("\x1b>");
+    }
+    // Pop the kitty keyboard protocol (a count past the depth empties the stack), and set the
+    // xterm `modifyOtherKeys` resource back to its initial value (not tracked, so always sent:
+    // a terminal that lacks it ignores the sequence).
+    if m.kitty_keyboard != 0 {
+        s.push_str("\x1b[<99u");
+    }
+    s.push_str("\x1b[>4m");
+    // Where the cursor will be once the alternate screen is gone.
+    let cursor = match (&st.primary_behind_alt, m.alt_screen) {
+        (Some(p), true) => p.cursor,
+        _ => st.cursor,
+    };
+    if m.alt_screen {
+        s.push_str("\x1b[?1049l");
+        if m.kitty_keyboard != 0 {
+            s.push_str("\x1b[<99u");
+        }
+    }
+    if m.insert {
+        s.push_str("\x1b[4l");
+    }
+    if !m.autowrap {
+        s.push_str("\x1b[?7h");
+    }
+    if m.origin || m.scroll_region.is_some() {
+        if m.origin {
+            s.push_str("\x1b[?6l");
+        }
+        if m.scroll_region.is_some() {
+            s.push_str("\x1b[r");
+        }
+        // Both home the cursor: put it back where the content ends.
+        s.push_str(&format!("\x1b[{};{}H", cursor.row + 1, cursor.col + 1));
+    }
+    s.push_str("\x1b[?25h");
+    if st.cursor.shape != CursorShape::Default || st.cursor.blinking {
+        s.push_str("\x1b[0 q");
+    }
+    // The pen, the character sets, a hyperlink left open.
+    s.push_str("\x1b[0m\x1b(B\x1b)B\x0f\x1b]8;;\x1b\\");
+    s.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fil_term::Emulator;
+
+    fn emu() -> Box<dyn Emulator> {
+        fil_term::create(fil_term::DEFAULT_BACKEND, Size { cols: 40, rows: 10 }, 100)
+            .expect("default backend")
+    }
+
+    /// Everything a remote program can turn on.
+    const BUSY: &[u8] = b"$ vim\r\n\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?1h\x1b=\x1b[>1u\x1b[>4;2m\x1b[?25l\x1b[5 q\x1b[1;31m\x1b[2;5r\x1b[?6h\x1b(0\x1b[4h\x1b[?7l\x1b[3;3Hedit";
+
+    fn after(program: &[u8]) -> (TermState, Vec<u8>) {
+        let mut term = emu();
+        let mut shadow = emu();
+        term.feed(program);
+        shadow.feed(program);
+        let seq = restore_sequence(&shadow.state(0));
+        term.feed(&seq);
+        (term.state(100), seq)
+    }
+
+    #[test]
+    fn everything_a_program_turned_on_is_off_again() {
+        let (st, seq) = after(BUSY);
+        assert_eq!(st.modes.title, "");
+        let plain = fil_term::model::Modes::default();
+        assert_eq!(st.modes, plain);
+        assert!(st.cursor.visible);
+        assert_eq!(st.cursor.shape, CursorShape::Default);
+        assert_eq!(st.cursor.pen, Default::default());
+        assert!(!seq.windows(2).any(|w| w == b"\x1bc"), "no RIS");
+    }
+
+    #[test]
+    fn the_cursor_returns_to_the_primary_screen_where_it_was() {
+        let (st, _) = after(BUSY);
+        // The shell line was on row 0; the cursor was at the start of row 1 when vim began.
+        assert_eq!((st.cursor.row, st.cursor.col), (1, 0));
+        assert_eq!(st.screen_text()[0], "$ vim");
+    }
+
+    #[test]
+    fn a_plain_terminal_gets_no_side_effects() {
+        // Nothing set: no leaving the alternate screen (which moves the cursor), no margins reset
+        // (which homes it).
+        let (st, seq) = after(b"hello\r\nworld");
+        let text = String::from_utf8_lossy(&seq).into_owned();
+        for bad in ["?1049", "?6l", "[r", "?1000", "?2004", "?1l"] {
+            assert!(!text.contains(bad), "{bad} in {text:?}");
+        }
+        assert_eq!((st.cursor.row, st.cursor.col), (1, 5));
+        assert_eq!(st.screen_text()[..2], ["hello", "world"]);
+    }
+
+    #[test]
+    fn margins_are_cleared_without_moving_the_cursor() {
+        let (st, _) = after(b"a\r\nb\x1b[3;8r\x1b[?6h\x1b[2;4H");
+        assert_eq!(st.modes.scroll_region, None);
+        assert!(!st.modes.origin);
+        // `CSI 2;4 H` under origin mode with margins from row 3 is row 3, column 3.
+        assert_eq!((st.cursor.row, st.cursor.col), (3, 3));
     }
 }

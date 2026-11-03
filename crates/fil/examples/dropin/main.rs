@@ -43,21 +43,18 @@ pub const LOCAL: &str = "local";
 /// Scenarios that fail on purpose until a known bug is fixed. They are reported as XFAIL and do
 /// not fail the run; when one starts to pass it is reported as XPASS, which does fail the run, so
 /// the entry gets removed with the fix. See docs/m1/dropin.md, findings.
-const XFAIL: &[&str] = &["terminal_sane_after_detach"];
+const XFAIL: &[&str] = &[];
 
 /// Whether an error is *the* expected failure of a known-failing scenario, and not some other
 /// error that happens in the same scenario (a timeout, a wrong first size, a missing tool...).
 /// Every part of the message must carry the signature.
+///
+/// None is known at the moment (`XFAIL` is empty). To record one, add its name to `XFAIL` and a
+/// `match name { "scenario" => err.split("; ").all(|part| part.starts_with("...")), _ => false }`
+/// here, with a unit test that a different error in the same scenario is a real failure.
 fn is_expected_failure(name: &str, err: &str) -> bool {
-    match name {
-        // "terminal modes after `~.` are Modes {..}, wanted Modes {..}; the terminal is not in
-        // cooked mode (...)": the modes left set, or the termios not restored.
-        "terminal_sane_after_detach" => err.split("; ").all(|part| {
-            part.starts_with("terminal modes after `~.` are ")
-                || part.starts_with("the terminal is not in cooked mode")
-        }),
-        _ => false,
-    }
+    let _ = (name, err);
+    false
 }
 
 /// The tools every host must have. A host without one fails the run (finding: a reimaged Pi must
@@ -666,25 +663,14 @@ mod tests {
 
     #[test]
     fn only_the_expected_error_counts_as_the_known_failure() {
-        // A fixed scenario is no longer a known failure, whatever its error.
+        // A fixed scenario is no longer a known failure, whatever its error (`resize_order` was
+        // fixed by R1, `terminal_sane_after_detach` by R3).
         let old = "auto: 6 of 200 commands typed right after a resize saw the old size (38x100 then `stty size` said RO7-37x100)";
         assert!(!exp("resize_order", old));
-        let modes =
-            "terminal modes after `~.` are Modes { alt: true }, wanted Modes { alt: false }";
-        assert!(exp("terminal_sane_after_detach", modes));
-        assert!(exp(
-            "terminal_sane_after_detach",
-            &format!("{modes}; the terminal is not in cooked mode (termios: Some(false))")
-        ));
-        // A different error in the same scenario is a real failure.
-        assert!(!exp(
-            "terminal_sane_after_detach",
-            "while the program holds them: terminal modes are Modes { alt: false }, wanted"
-        ));
-        assert!(!exp(
-            "terminal_sane_after_detach",
-            "no \"RDY-42\" within 25s"
-        ));
         assert!(!exp("vim_edit", old));
+        assert!(!exp(
+            "terminal_sane_after_detach",
+            "terminal modes after `~.` are Modes { alt: true }, wanted Modes { alt: false }"
+        ));
     }
 }

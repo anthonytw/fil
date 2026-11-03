@@ -302,40 +302,6 @@ s_clean() {
   stop_server
 }
 
-s_port_range() {
-  reset_net
-  new_run range
-  local i ports=() pids=() p
-  for i in 1 2 3 4; do
-    mkdir -p "$D/s$i/keys"
-    nsx "$NS_S" "$QUIC" server --keys-dir "$D/s$i/keys" --fp-out "$D/s$i/fp" --port-out "$D/s$i/port" \
-      --port-range 60000-60003 > "$D/s$i/server.log" 2>&1 &
-    pids+=($!)
-    for ((p = 0; p < 100; p++)); do
-      [[ -s $D/s$i/port ]] && break
-      sleep 0.1
-    done
-    ports+=("$(cat "$D/s$i/port")")
-  done
-  log "ports taken: ${ports[*]}"
-  assert "four servers got four distinct ports" test "$(printf '%s\n' "${ports[@]}" | sort -u | wc -l)" -eq 4
-  for p in "${ports[@]}"; do
-    assert_num "port $p is in the range" "$p" -ge 60000
-    assert_num "..." "$p" -le 60003
-  done
-  mkdir -p "$D/s5/keys"
-  local rc=0
-  nsx "$NS_S" "$QUIC" server --keys-dir "$D/s5/keys" --fp-out "$D/s5/fp" --port-out "$D/s5/port" \
-    --port-range 60000-60003 > "$D/s5/server.log" 2>&1 || rc=$?
-  assert "a fifth server finds no free port and exits with status 3 (rc=$rc)" test "$rc" -eq 3
-  assert "and says so" grep -q NO-FREE-PORT "$D/s5/server.log"
-  for p in "${pids[@]}"; do
-    as_root kill "$p" 2> /dev/null || true
-  done
-  wait 2> /dev/null || true
-  note "ports=${ports[*]}"
-}
-
 # One 2 MiB echo under one set of impairments. Sets the globals CASE_SECS, CASE_RC.
 impaired_case() { # impaired_case LABEL SIM_REFERENCE -- netem_apply ARGS | chain STAGE1 STAGE2
   local label=$1 sim=$2
@@ -571,37 +537,6 @@ s_udp_blocked() {
 # QuicLink scenarios (P2): the same faults, through the real link and listener. The link must
 # stay Up through NAT changes, report Degraded then Down(Dead) on a black hole, and refuse in
 # connect_timeout (2 s) rather than the idle timeout when UDP never works.
-
-s_quiclink_rebind() {
-  reset_net
-  netem_apply delay 20ms
-  new_run qlrebind
-  ql_start_server
-  ql_bg_client c --duration 16 --rate 524288
-  wait_for_line "$CLIENT_OUT" CONNECTED 10 || fail "client did not connect: $(cat "$CLIENT_OUT")"
-  local spec
-  for spec in "$PUB1:31000-31999" "$PUB1:32000-32999" "$PUB3:33000-33999"; do
-    sleep 3.5
-    nsx "$NS_R" iptables -t nat -R POSTROUTING 1 -o rs -p udp -s 10.0.1.0/24 -j SNAT --to-source "$spec" --random
-    nsx "$NS_R" conntrack -F > /dev/null 2>&1 || true
-    log "NAT mapping moved to $spec"
-  done
-  wait_exit "$CLIENT_PID" 40
-  cat "$CLIENT_OUT"
-  local line gens
-  line=$(last_line "$CLIENT_OUT" RESULT)
-  assert "the client finished (rc=$WAIT_RC)" test "$WAIT_RC" -eq 0
-  assert "echo intact" test "$(kv "$line" sent)" = "$(kv "$line" recvd)"
-  assert "the link was never lost" test "$(kv "$line" conn_lost)" = false
-  assert "exactly one handshake (one accepted link)" test "$(ql_accepts)" -eq 1
-  assert "the listener answered the first packet with a Retry" grep -q '^ACCEPTED n=1 .* retried=1 ' "$SRV_LOG"
-  gens=$(count_lines "$SRV_LOG" PATH-GEN)
-  assert_num "the daemon's link counted the path changes (path_generation bumps)" "$gens" -ge 3
-  assert "the last change was to the third public address" grep -q "^PATH-GEN .* remote=$PUB3:3" "$SRV_LOG"
-  assert "the daemon's link never degraded" test "$(count_lines "$SRV_LOG" 'LINK-STATE n=1 state=Degraded')" -eq 0
-  note "daemon_path_gens=$gens" "client_path_gen=$(kv "$line" path_gen) (the client cannot see a NAT rebind)"
-  stop_server
-}
 
 s_quiclink_udp_blocked() {
   reset_net
@@ -930,6 +865,8 @@ f_nat_rebind() {
   fc_seq_ok a TICK 1 90 || fail "output lost or repeated across the NAT moves: $(fc_screen a)"
   ok "TICK-1 to TICK-90 each once, in order, across three NAT moves"
   [[ $(fc_count_log a 'Switched(') -eq 2 ]] || fail "the client switched transports again: $(fc_log a | grep -F 'Switched(')"
+  # The client log has no line for a link going quiet (Degraded); the status line says so on the screen.
+  fc_not_raw a 'no reply for'
   [[ -z $(pipe_ssh "$FIL_PID") ]] || fail "the client fell back to an ssh pipe"
   ok "still on direct: no switch after the upgrade, no ssh"
   if fc_has a 'skipped'; then fail "a gap marker on the screen"; fi
@@ -1128,10 +1065,14 @@ f_dropin_vs_ssh() {
   cx_fk dpf
 }
 
-# Retired from the default run (still runnable by name): s_quiclink_rebind is covered by
-# f_nat_rebind, which moves the NAT mapping the same way under the real client and daemon.
+# Removed in M1 S6b because something else covers them (docs/m1/realnet.md, "Results"):
+#   s_port_range       -> fil-transport's tests/quic_udp.rs (QuicListener::bind scans the range on real
+#                         UDP); this scenario only exercised quic-echo's own copy of the scan
+#   s_quiclink_rebind  -> f_nat_rebind (the same three NAT moves under the real client and daemon);
+#                         the Retry on a new address and the path_generation count are in fil-transport's
+#                         tests/quic_link.rs
 ALL_SCENARIOS=(
-  s_netem_reorder_probe s_clean s_port_range s_impaired
+  s_netem_reorder_probe s_clean s_impaired
   s_nat_rebind s_ip_change s_blackouts s_udp_blocked
   s_quiclink_udp_blocked s_quiclink_blackouts
   f_upgrade f_nat_rebind f_udp_blocked_mid f_udp_blocked_start

@@ -40,6 +40,8 @@ tracing = "0.1"
 fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }
 fil-session = { path = "../fil-session" }
 fil-term = { path = "../fil-term" }
+# The PTY driver the Pi examples share with ptydrive (examples/support/harness.rs).
+fil-testbins = { path = "../fil-testbins" }
 portable-pty = "0.9"
 nix = { version = "0.28", default-features = false, features = ["term"] }
 vt100 = "0.18"

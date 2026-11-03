@@ -220,6 +220,20 @@ impl SessionHandle {
         gate
     }
 
+    /// Test hook: records the session's process tree now, from a fresh scan, and returns once the
+    /// core has taken it. The periodic recording is at 100 ms and then every 5 s, from a table that
+    /// may be shared and up to 2 s old, so a test that needs a process recorded at a known moment
+    /// asks for it. Only with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub async fn record_processes(&self) {
+        let rows = tokio::task::spawn_blocking(crate::proc::scan_processes)
+            .await
+            .unwrap_or_default();
+        let _ = self.inner.tx.send(Cmd::ProcessTable(rows)).await;
+        // Commands are handled in order: once this one is answered, the table has been recorded.
+        let _ = self.info().await;
+    }
+
     // --- used by the subscriber task ---
 
     pub(crate) fn catch_up_params(&self) -> &CatchUpParams {

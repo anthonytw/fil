@@ -12,14 +12,12 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use fil_testbins::pty::{CommandBuilder, PtyProc, Tap};
 
 // ---------------------------------------------------------------------------------------------
 // Targets and the gate
@@ -249,17 +247,18 @@ pub fn strip_escapes(b: &[u8]) -> Vec<u8> {
     out
 }
 
-struct Shared {
-    /// Everything the client wrote to the terminal.
-    buf: Vec<u8>,
-    /// `buf` with the escapes removed, kept up to date as bytes arrive.
+/// What the client wrote to the terminal with the escapes removed, kept up to date as bytes
+/// arrive (the output itself and the emulator's screen are the `PtyProc`'s).
+#[derive(Default)]
+struct Plain {
     plain: Vec<u8>,
     stripper: Stripper,
-    /// What a terminal would show now (the status line is drawn by cursor moves, one changed
-    /// cell at a time, so only an emulator reads it right).
-    parser: vt100::Parser,
-    /// The client's exit status once it has ended, and when.
-    exit: Option<(u32, Instant)>,
+}
+
+impl Tap for Plain {
+    fn feed(&mut self, bytes: &[u8]) {
+        self.stripper.feed(bytes, &mut self.plain);
+    }
 }
 
 /// How to start a client.
@@ -276,11 +275,11 @@ pub struct Spawn<'a> {
 }
 
 pub struct Client {
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The client on its pseudo-terminal. Its screen is what a terminal would show now (the
+    /// status line is drawn by cursor moves, one changed cell at a time, so only an emulator
+    /// reads it right); its exit is the client's exit status once it has ended, and when.
+    pty: PtyProc<Plain>,
     pid: u32,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    shared: Arc<Mutex<Shared>>,
     pub started: Instant,
     pub state: PathBuf,
     /// The output may hold the gap marker (a flood). Anywhere else it must not.
@@ -288,22 +287,10 @@ pub struct Client {
     scrub: Targets,
 }
 
-fn nz(n: u16) -> std::num::NonZeroU16 {
-    std::num::NonZeroU16::new(n).expect("non-zero size")
-}
-
 impl Client {
     pub fn start(s: Spawn<'_>) -> Client {
         let _ = std::fs::remove_dir_all(&s.state);
         std::fs::create_dir_all(&s.state).expect("state dir");
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: s.rows,
-                cols: s.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
         let mut cmd = CommandBuilder::new(s.fil);
         cmd.arg("--config");
         cmd.arg(s.config);
@@ -316,44 +303,10 @@ impl Client {
             cmd.env(k, v);
         }
         let started = Instant::now();
-        let mut child = pty.slave.spawn_command(cmd).expect("spawn fil");
-        drop(pty.slave);
-        let pid = child.process_id().unwrap_or(0);
-        let killer = child.clone_killer();
-        let mut reader = pty.master.try_clone_reader().expect("reader");
-        let writer = pty.master.take_writer().expect("writer");
-        let shared = Arc::new(Mutex::new(Shared {
-            buf: Vec::new(),
-            plain: Vec::new(),
-            stripper: Stripper::default(),
-            parser: vt100::Parser::new(nz(s.rows), nz(s.cols), 0),
-            exit: None,
-        }));
-        let sh = shared.clone();
-        thread::spawn(move || {
-            let mut chunk = [0u8; 16384];
-            while let Ok(n) = reader.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                let mut g = sh.lock().unwrap();
-                let g = &mut *g;
-                g.buf.extend_from_slice(&chunk[..n]);
-                g.stripper.feed(&chunk[..n], &mut g.plain);
-                g.parser.process(&chunk[..n]);
-            }
-        });
-        let sh = shared.clone();
-        thread::spawn(move || {
-            let code = child.wait().map_or(255, |st| st.exit_code());
-            sh.lock().unwrap().exit = Some((code, Instant::now()));
-        });
+        let pty = PtyProc::spawn(cmd, s.rows, s.cols, Plain::default()).expect("spawn fil");
         Client {
-            killer,
-            pid,
-            writer,
-            master: pty.master,
-            shared,
+            pid: pty.pid().unwrap_or(0),
+            pty,
             started,
             state: s.state,
             gap_ok: false,
@@ -373,30 +326,17 @@ impl Client {
     }
 
     pub fn send(&mut self, s: &str) {
-        self.writer.write_all(s.as_bytes()).expect("write to pty");
-        self.writer.flush().ok();
+        self.pty.send(s.as_bytes()).expect("write to pty");
     }
 
     /// Resizes the terminal (the client gets SIGWINCH) and the emulator.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("resize pty");
-        self.shared
-            .lock()
-            .unwrap()
-            .parser
-            .set_size(nz(rows), nz(cols));
+        self.pty.resize(rows, cols).expect("resize pty");
     }
 
     /// The exit status, if the client has ended.
     pub fn exit_code(&self) -> Option<u32> {
-        self.shared.lock().unwrap().exit.map(|(c, _)| c)
+        self.pty.state().exit.as_ref().map(|e| e.code)
     }
 
     /// Polls for the exit. Returns (time since the call, exit code).
@@ -418,7 +358,7 @@ impl Client {
     // ---- reading ---------------------------------------------------------------------------
 
     pub fn with_plain<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(&self.shared.lock().unwrap().plain)
+        f(&self.pty.state().tap.plain)
     }
 
     pub fn text(&self) -> String {
@@ -441,18 +381,18 @@ impl Client {
 
     /// The length of the raw output (escapes and all).
     pub fn raw_len(&self) -> usize {
-        self.shared.lock().unwrap().buf.len()
+        self.pty.state().raw.len()
     }
 
     pub fn raw_has(&self, needle: &str, from: usize) -> bool {
-        let g = self.shared.lock().unwrap();
+        let g = self.pty.state();
         let n = needle.as_bytes();
-        g.buf.len() >= from && g.buf[from..].windows(n.len()).any(|w| w == n)
+        g.raw.len() >= from && g.raw[from..].windows(n.len()).any(|w| w == n)
     }
 
     /// The screen rows, trailing blanks removed.
     pub fn rows(&self) -> Vec<String> {
-        let g = self.shared.lock().unwrap();
+        let g = self.pty.state();
         let cols = g.parser.screen().size().1.get();
         g.parser
             .screen()
@@ -468,7 +408,7 @@ impl Client {
 
     /// Reads the emulator.
     pub fn with_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
-        f(self.shared.lock().unwrap().parser.screen())
+        f(self.pty.state().parser.screen())
     }
 
     pub fn alt(&self) -> bool {
@@ -655,7 +595,7 @@ impl Client {
     /// CR to NL, output processing): what a shell expects, and what the client must leave behind.
     pub fn cooked(&self) -> Option<bool> {
         use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
-        let t = self.master.get_termios()?;
+        let t = self.pty.master().get_termios()?;
         Some(
             t.local_flags
                 .contains(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG)
@@ -689,7 +629,7 @@ impl Drop for Client {
         if self.exit_code().is_none() {
             // A stopped client would never see the hangup.
             signal_group(self.pid, "CONT");
-            let _ = self.killer.kill();
+            self.pty.hangup();
         }
     }
 }

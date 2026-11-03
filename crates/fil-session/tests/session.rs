@@ -64,7 +64,7 @@ async fn the_attach_reply_carries_the_hosts_direct_details() {
     .await
     .unwrap();
     let c = Client::attach(&h, Connect::new(&h, key(1))).await;
-    let r = c.reply.unwrap();
+    let r = c.reply.clone().unwrap();
     assert_eq!(r.udp_port, Some(4433));
     assert_eq!(r.fingerprint.unwrap().as_bytes(), &[9; 32]);
     let _ = h.kill(Duration::from_secs(5)).await;

@@ -82,6 +82,14 @@ fc_wait_raw() {
   fi
 }
 
+# fc_not_raw NAME PATTERN: PATTERN is nowhere in everything received so far (escapes and all).
+fc_not_raw() {
+  if fc "$1" raw | grep -aqF -- "$2"; then
+    fail "$1: the output contains '$2': $(fc_screen "$1")"
+  fi
+  ok "$1: output never contains '$2'"
+}
+
 # fc_gone NAME PATTERN [SECONDS]: PATTERN must leave the screen.
 fc_gone() {
   local out

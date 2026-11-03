@@ -132,7 +132,7 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
     // The flood comes from other processes, as a local user's would: only the daemon's side of
     // each connection is in this process.
     let script = format!(
-        "import socket,time\nss=[]\nfor i in range({}):\n  try: ss.append(socket.create_connection(('127.0.0.1',{port}),timeout=5))\n  except OSError: break\nprint('held',len(ss),flush=True)\ntime.sleep(60)\n",
+        "import socket,time\nss=[]\nend=time.time()+30\nwhile len(ss)<{} and time.time()<end:\n  try: ss.append(socket.create_connection(('127.0.0.1',{port}),timeout=5))\n  except OSError: time.sleep(0.01)\nprint('held',len(ss),flush=True)\ntime.sleep(60)\n",
         FLOOD / 2
     );
     let mut flooders = Vec::new();
@@ -149,8 +149,8 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
             }
         }
     }
-    // Each says how many connections it holds, once it has made them all (or the daemon stopped
-    // taking them).
+    // Each says how many connections it holds, once it has made them all (or gave up after 30 s:
+    // a connection the kernel's full listen queue resets on a loaded machine is tried again).
     let mut total = 0;
     for k in &mut flooders {
         use std::io::BufRead;

@@ -11,13 +11,13 @@
 //! - query answering while no terminal is attached, the PTY mode and the echo acknowledgements.
 //!
 //! **Nothing is released mid-sequence.** The emulator, and every subscriber, only go as far as
-//! the last place the terminal's parser is at rest ([`crate::boundary`]); the bytes of a half
+//! the last place the terminal's parser is at rest ([`fil_term::Boundary`]); the bytes of a half
 //! sequence wait in `tail`. That makes a snapshot always correct for the offset it is announced at,
 //! and a snapshot is never taken mid-escape. [`Progress::ready`] is that offset.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fil_proto::chan::RecvChannel;
@@ -27,19 +27,19 @@ use fil_proto::epoch::{
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::log::{OutputLog, StartDecision, decide_start};
 use fil_proto::msg::{
-    Attach, AttachRefusal, AttachReply, ErrorCode, HostLabel, SessionName, SnapshotInfo,
-    SnapshotReason, StartPoint, TakenOver, TermName, TermSize,
+    Attach, AttachRefusal, AttachReply, ErrorCode, HostLabel, ResumeRequest, SessionName,
+    SnapshotInfo, SnapshotReason, StartPoint, TakenOver, TermName, TermSize,
 };
 use fil_term::Emulator;
 use fil_term::snapshot::snapshot;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::boundary::Boundary;
 use crate::config::{SessionConfig, SessionHost};
 use crate::echo::EchoTracker;
 use crate::proc::{self, ProcRow, Scope, Tracker};
 use crate::pty::{Pty, SpawnError, Spawned};
 use crate::queries::{QueryScanner, ReplyScanner, Terminal};
+use fil_term::Boundary;
 
 /// Names a transport attached to the session. A resumed subscriber gets a new one.
 pub(crate) type ConnId = u64;
@@ -49,14 +49,123 @@ pub(crate) type ConnId = u64;
 const MAX_TAIL: usize = 1024 * 1024;
 /// How often the process tree is recorded (Tree scope only).
 const TRACK_INTERVAL: Duration = Duration::from_secs(5);
-/// Entries of PTY mode history kept, for subscribers that resume a little behind.
-const MODE_HISTORY: usize = 64;
+/// Most entries of PTY mode history kept. The history is pruned to the log's range first (a
+/// resume further back gets a snapshot, which states the mode itself), so this only bounds a
+/// program that flips its mode between nearly every byte. Known limit: past the cap the oldest
+/// entry goes even if the log still reaches back that far, and a resume from before the oldest
+/// kept entry is told that entry's mode (`mode_at`'s fallback), which can be wrong for the
+/// replayed stretch until the next change. Reaching it takes 4096 mode changes inside one log
+/// (8 MiB) of output.
+const MODE_HISTORY_MAX: usize = 4096;
 /// Input waiting for a child that is not reading it, beyond which the client is not acknowledged.
 const INPUT_BACKLOG: usize = 64 * 1024;
-/// While input waits for the PTY to take it, how often that is looked at.
-const ECHO_POLL: Duration = Duration::from_millis(5);
 /// Capacity of the command channel.
 const CMD_CAPACITY: usize = 256;
+/// How long after the last input or output the PTY mode is polled at `mode_poll`. Mode changes
+/// follow a program's input or output, and both re-read the mode themselves; the poll is a net
+/// for the rest, so it slows to [`IDLE_POLL_FACTOR`] times `mode_poll` once things are quiet.
+/// Not for a client that predicts (`Attach::echo_ack`): a program that turns echo off after a
+/// silence (a password prompt) must reach it within `mode_poll`, or its first keystroke is
+/// painted before it knows.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
+const IDLE_POLL_FACTOR: u32 = 10;
+/// Reads of PTY output closer together than this follow each other in a flood.
+const BUSY_GAP: Duration = Duration::from_millis(2);
+/// A read this big found the kernel's PTY buffer nearly full: the producer was waiting for us.
+const BULK_READ: usize = 512;
+/// The reader's pause grows by this much after each small read in a flood, up to the maximum.
+const PAUSE_STEP_US: u64 = 10;
+const PAUSE_MAX_US: u64 = 200;
+
+/// Decides when the PTY reader pauses.
+///
+/// A PTY hands a fast reader a few bytes per read (12 to 19 for line-buffered output such as
+/// `seq`; 76 for `yes` on macOS, whose PTY holds 1 KiB), and every read costs a system call and
+/// a trip through the core: a 21 MB `seq` took 2.2 million reads. A short pause lets the next
+/// read find more. It is a controller: small reads in a flood lengthen the pause a little, and a
+/// read that finds the buffer nearly full (the producer was waiting for us, so the pause is now
+/// costing throughput) halves it. The first read after a quiet period, a keystroke's echo, never
+/// waits.
+struct ReadPacer {
+    pause_us: u64,
+}
+
+impl ReadPacer {
+    fn new() -> Self {
+        Self { pause_us: 0 }
+    }
+
+    /// The pause after a read of `n` bytes that came `since_last` after the reader was last
+    /// busy.
+    fn after_read(&mut self, n: usize, since_last: Duration) -> Duration {
+        if since_last >= BUSY_GAP {
+            self.pause_us = 0;
+        } else if n >= BULK_READ {
+            self.pause_us /= 2;
+        } else {
+            self.pause_us = (self.pause_us + PAUSE_STEP_US).min(PAUSE_MAX_US);
+        }
+        Duration::from_micros(self.pause_us)
+    }
+}
+
+/// Output the PTY reader may have queued for the core before it waits for the core to catch up.
+const OUTPUT_BATCH_LIMIT: usize = 256 * 1024;
+
+/// Output the PTY reader thread has read and the core has not taken yet.
+///
+/// The reader appends, and wakes the core only when the buffer goes from empty to non-empty; the
+/// core takes everything at once. A flood of tiny reads (a PTY hands out 12 to 19 bytes at a time
+/// for line-buffered output) is then handled in a few large batches rather than one trip through
+/// the core per read, while a lone keystroke's echo still goes straight through: there is no
+/// timer, the batch is whatever accumulated while the core was busy.
+struct OutputBatch {
+    data: Mutex<Vec<u8>>,
+    taken: Condvar,
+}
+
+impl OutputBatch {
+    fn new() -> Self {
+        Self {
+            data: Mutex::new(Vec::new()),
+            taken: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.data.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues `bytes` and wakes the core if it was not already told there is output. Waits while
+    /// the core is [`OUTPUT_BATCH_LIMIT`] behind, which is what pushes back on the PTY. Returns
+    /// false when the core is gone.
+    fn push(&self, bytes: &[u8], wake: &mpsc::Sender<Cmd>) -> bool {
+        let was_empty = {
+            let mut data = self.lock();
+            while data.len() >= OUTPUT_BATCH_LIMIT {
+                if wake.is_closed() {
+                    return false;
+                }
+                data = self
+                    .taken
+                    .wait_timeout(data, Duration::from_millis(100))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            let was_empty = data.is_empty();
+            data.extend_from_slice(bytes);
+            was_empty
+        };
+        !was_empty || wake.blocking_send(Cmd::PtyOutput).is_ok()
+    }
+
+    /// Moves everything queued into `into` (which should be empty, and keeps its capacity for
+    /// the next round).
+    fn take_into(&self, into: &mut Vec<u8>) {
+        std::mem::swap(&mut *self.lock(), into);
+        self.taken.notify_one();
+    }
+}
 
 /// How a session ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,8 +346,8 @@ pub(crate) struct CatchUp {
 }
 
 pub(crate) enum Cmd {
-    // From the PTY threads.
-    PtyOutput(Vec<u8>),
+    // From the PTY threads. Output is queued in the core's `OutputBatch`; this says it is there.
+    PtyOutput,
     PtyEof,
     ChildExited(ExitInfo),
     // From the host.
@@ -307,6 +416,8 @@ struct Live {
     epoch: u64,
     events: mpsc::UnboundedSender<ConnEvent>,
     kicked: Arc<AtomicBool>,
+    /// The client asked for `EchoAck`s (`Attach::echo_ack`).
+    echo_ack: bool,
 }
 
 impl Live {
@@ -359,6 +470,13 @@ pub(crate) struct Core {
     /// PTY mode changes `(at, canonical, echo)`, oldest first; never empty.
     modes: VecDeque<(u64, bool, bool)>,
     next_mode_poll: Option<Instant>,
+    /// When a client last typed or the shell last printed: the poll of the PTY mode is slow
+    /// once this is [`ACTIVE_WINDOW`] ago.
+    last_io: Instant,
+    /// Output from the reader thread, not yet taken.
+    batch: Arc<OutputBatch>,
+    /// The buffer batches are taken into, kept for its capacity.
+    scratch: Vec<u8>,
 
     exit: Option<ExitInfo>,
     eof: bool,
@@ -413,20 +531,26 @@ pub(crate) fn start(
     // The reader reports output and end of file; the waiter reports the exit status. Blocking
     // calls on threads of their own.
     let out_tx = tx.clone();
+    let batch = Arc::new(OutputBatch::new());
+    let read_batch = batch.clone();
     std::thread::Builder::new()
         .name("fil-pty-read".into())
         .spawn(move || {
             let mut buf = vec![0u8; 16 * 1024];
+            let mut last_read = Instant::now() - BUSY_GAP;
+            let mut pacer = ReadPacer::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if out_tx
-                            .blocking_send(Cmd::PtyOutput(buf[..n].to_vec()))
-                            .is_err()
-                        {
+                        if !read_batch.push(&buf[..n], &out_tx) {
                             return;
                         }
+                        let pause = pacer.after_read(n, last_read.elapsed());
+                        if !pause.is_zero() {
+                            std::thread::sleep(pause);
+                        }
+                        last_read = Instant::now();
                     }
                 }
             }
@@ -484,6 +608,9 @@ pub(crate) fn start(
         echo_wait: VecDeque::new(),
         modes: VecDeque::from([(0, initial_mode.0, initial_mode.1)]),
         next_mode_poll: None,
+        last_io: Instant::now(),
+        batch,
+        scratch: Vec::new(),
         exit: None,
         eof: false,
         exit_deadline: None,
@@ -501,17 +628,33 @@ pub(crate) fn start(
 
 impl Core {
     async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
+        let written = self.pty.written_signal.clone();
         loop {
             let deadline = self.next_deadline();
+            let mut passed_output = false;
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(cmd) => self.handle(cmd),
+                    Some(cmd) => {
+                        passed_output = matches!(cmd, Cmd::PtyOutput | Cmd::PtyEof);
+                        self.handle(cmd);
+                    }
                     None => break,
                 },
                 () = sleep_until(deadline) => self.on_tick(Instant::now()),
+                // The PTY took input the child was not reading before: its echo window starts.
+                () = written.notified(), if !self.echo_wait.is_empty() => {
+                    self.pump_echo(Instant::now());
+                }
             }
             if self.finished() {
                 break;
+            }
+            // A batch of output is milliseconds of work, and the subscribers it wakes are woken
+            // onto this worker's own queue: without a yield they wait for the runtime's
+            // cooperative budget (128 operations, over a second of batches), and nothing is sent.
+            // Other work is too short to need it.
+            if passed_output {
+                tokio::task::yield_now().await;
             }
         }
         self.finish();
@@ -526,9 +669,10 @@ impl Core {
         self.log_end() - self.tail.len() as u64
     }
 
-    fn publish(&self) {
+    /// Publishes the released offset, given the log's end (the caller holds it already).
+    fn publish_at(&self, log_end: u64) {
         self.shared.progress.send_replace(Progress {
-            ready: self.ready(),
+            ready: log_end - self.tail.len() as u64,
             exited: false,
         });
     }
@@ -547,7 +691,6 @@ impl Core {
             self.next_mode_poll,
             self.next_track,
             self.exit_deadline,
-            (!self.echo_wait.is_empty()).then(|| Instant::now() + ECHO_POLL),
         ]
         .into_iter()
         .flatten()
@@ -559,8 +702,12 @@ impl Core {
             // Whether anyone is there to answer a query is decided while handling output, so a
             // connection whose task is gone must already have been dropped by then: its
             // `ConnGone` is in the queue behind its own commands (`serve::GoneGuard`).
-            Cmd::PtyOutput(chunk) => self.on_output(chunk),
-            Cmd::PtyEof => self.eof = true,
+            Cmd::PtyOutput => self.on_output(),
+            Cmd::PtyEof => {
+                // Its output was queued before this was sent; it is taken first.
+                self.on_output();
+                self.eof = true;
+            }
             Cmd::ChildExited(info) => {
                 tracing::info!(code = info.code, "the shell exited");
                 tracing::debug!(session = %self.name, "the shell exited in");
@@ -613,6 +760,11 @@ impl Core {
     fn on_tick(&mut self, now: Instant) {
         self.pump_echo(now);
         if let Some(upto) = self.echo.due(now) {
+            // The input acknowledgement goes with it: they would otherwise follow each other
+            // by the ack delay, as separate frames.
+            if self.input_ack_due.is_some() {
+                self.ack_input(now);
+            }
             let output_at = self.log_end();
             self.send(ConnEvent::EchoAck {
                 input_upto: upto,
@@ -625,7 +777,10 @@ impl Core {
         }
         if self.next_mode_poll.is_some_and(|t| t <= now) {
             self.sample_mode();
-            self.next_mode_poll = self.live.is_some().then(|| now + self.cfg.mode_poll);
+            self.next_mode_poll = self
+                .live
+                .is_some()
+                .then(|| now + self.mode_poll_interval(now));
         }
         if self.next_track.is_some_and(|t| t <= now) {
             self.next_track = Some(now + TRACK_INTERVAL);
@@ -636,17 +791,38 @@ impl Core {
         }
     }
 
+    /// How long until the PTY mode is polled again: `mode_poll` shortly after input or output,
+    /// slower once things have been quiet for [`ACTIVE_WINDOW`].
+    fn mode_poll_interval(&self, now: Instant) -> Duration {
+        poll_interval(
+            now.saturating_duration_since(self.last_io),
+            self.cfg.mode_poll,
+            self.live.as_ref().is_some_and(|l| l.echo_ack),
+        )
+    }
+
+    /// Records input or output, and brings a slow mode poll forward to the fast one.
+    fn note_io(&mut self, now: Instant) {
+        self.last_io = now;
+        if let Some(t) = self.next_mode_poll.as_mut() {
+            *t = (*t).min(now + self.cfg.mode_poll);
+        }
+    }
+
     /// Starts the echo window for input the PTY has now taken, and looks at the mode again,
     /// since a program that has just read a key may have changed it.
     fn pump_echo(&mut self, now: Instant) {
         let written = self.pty.written();
+        let wants_echo_ack = self.live.as_ref().is_some_and(|l| l.echo_ack);
         let mut any = false;
         while let Some(&(end, ticket)) = self.echo_wait.front() {
             if ticket > written {
                 break;
             }
             self.echo_wait.pop_front();
-            self.echo.on_input(end, now);
+            if wants_echo_ack {
+                self.echo.on_input(end, now);
+            }
             any = true;
         }
         if any {
@@ -662,34 +838,62 @@ impl Core {
 
     // --- output ---
 
-    fn on_output(&mut self, chunk: Vec<u8>) {
+    /// Takes everything the reader thread has queued and handles it as one chunk: one mode
+    /// sample, one pass through the log, the boundary scanner and the emulator, and one wake-up
+    /// of the subscribers, however many reads it took to get here.
+    fn on_output(&mut self) {
+        let mut chunk = std::mem::take(&mut self.scratch);
+        self.batch.take_into(&mut chunk);
+        if !chunk.is_empty() {
+            self.release_output(&chunk);
+            chunk.clear();
+        }
+        self.scratch = chunk;
+    }
+
+    fn release_output(&mut self, chunk: &[u8]) {
+        let now = Instant::now();
         self.last_output_unix_ms = Some(now_unix_ms());
+        self.note_io(now);
         // The mode is read before the bytes are logged, so a change is recorded at the offset of
         // the first byte that may have been written under it.
         self.sample_mode();
-        self.shared.lock_log().append(&chunk);
+        let log_end = {
+            let mut log = self.shared.lock_log();
+            log.append(chunk);
+            log.end()
+        };
         // `scan` returns 0 both when the chunk starts a sequence it does not finish and when
         // it never reaches a boundary; only the first case moves the old tail on.
         let was_at_rest = self.boundary.at_rest();
-        let k = self.boundary.scan(&chunk);
-        let mut feed = Vec::new();
+        let k = self.boundary.scan(chunk);
+        // What is released: usually the chunk up to the boundary as it is; behind an old tail,
+        // the two joined.
+        let mut joined = Vec::new();
+        let mut direct: &[u8] = &[];
         if k == 0 && !was_at_rest {
-            self.tail.extend_from_slice(&chunk);
+            self.tail.extend_from_slice(chunk);
+        } else if self.tail.is_empty() {
+            direct = &chunk[..k];
+            self.tail = chunk[k..].to_vec();
         } else {
-            feed = std::mem::take(&mut self.tail);
-            feed.extend_from_slice(&chunk[..k]);
+            joined = std::mem::take(&mut self.tail);
+            joined.extend_from_slice(&chunk[..k]);
             self.tail = chunk[k..].to_vec();
         }
         if self.tail.len() > MAX_TAIL {
             // The bytes go on; the tracker stays where it is, in step with the emulator's own
             // parser, which is still inside the string.
             tracing::debug!(session = %self.name, "releasing an unfinished sequence");
-            feed.append(&mut self.tail);
+            joined.append(&mut self.tail);
         }
-        if !feed.is_empty() {
-            self.feed_emulator(&feed);
+        if !direct.is_empty() {
+            self.feed_emulator(direct);
         }
-        self.publish();
+        if !joined.is_empty() {
+            self.feed_emulator(&joined);
+        }
+        self.publish_at(log_end);
     }
 
     fn feed_emulator(&mut self, bytes: &[u8]) {
@@ -719,9 +923,22 @@ impl Core {
         if (c, e) == (canonical, echo) {
             return;
         }
-        let at = self.log_end();
+        let (at, log_start) = {
+            let log = self.shared.lock_log();
+            (log.end(), log.start())
+        };
+        // Two changes at one offset: only the later one is in force for any byte.
+        if self.modes.back().is_some_and(|m| m.0 == at) && self.modes.len() > 1 {
+            self.modes.pop_back();
+        }
         self.modes.push_back((at, canonical, echo));
-        if self.modes.len() > MODE_HISTORY {
+        // History is kept for the offsets a resume can still ask for. The entry in force at the
+        // log's start stays; anything older is no longer reachable (a resume behind the log gets
+        // a snapshot, which states the mode itself).
+        while self.modes.len() > 1 && self.modes[1].0 <= log_start {
+            self.modes.pop_front();
+        }
+        if self.modes.len() > MODE_HISTORY_MAX {
             self.modes.pop_front();
         }
         self.send(ConnEvent::Mode {
@@ -779,6 +996,11 @@ impl Core {
     // --- subscribers ---
 
     fn apply_resize(&mut self, size: TermSize) {
+        // `TermSize` cannot hold an oversized value today (its constructor and decoder refuse
+        // one), but the emulator allocates the whole grid, so this is checked again where the
+        // grid is made: a size that gets past the wire check some other way must not take every
+        // session on the host down with an allocation failure.
+        let size = TermSize::clamped(size.cols(), size.rows());
         if size == self.size {
             return;
         }
@@ -820,6 +1042,7 @@ impl Core {
             return AttachAnswer::Refused(AttachRefusal::SessionGone);
         }
         self.sample_mode();
+        let echo_ack = a.echo_ack;
         let outcome = self.epoch.attach(AttachInput {
             key: a.key.clone(),
             host: a.host.clone(),
@@ -852,7 +1075,7 @@ impl Core {
         let ready = self.ready();
         let (start, snapshot_bytes, start_seq) = match mode {
             AttachMode::Fresh => self.snapshot_start(ready, 0, SnapshotReason::NewClient),
-            AttachMode::Resumed(r) => self.resume_start(r.seq, ready),
+            AttachMode::Resumed(r) => self.resume_start(r, ready),
         };
 
         self.next_conn += 1;
@@ -878,8 +1101,10 @@ impl Core {
             epoch,
             events: events_tx,
             kicked: kicked.clone(),
+            echo_ack,
         });
-        self.next_mode_poll = Some(Instant::now() + self.cfg.mode_poll);
+        self.last_io = Instant::now();
+        self.next_mode_poll = Some(self.last_io + self.cfg.mode_poll);
 
         let direct = self.host.direct_info();
         AttachAnswer::Accepted(Box::new(Accepted {
@@ -917,8 +1142,20 @@ impl Core {
         (StartPoint::Snapshot(info), Some(bytes), at)
     }
 
-    /// Resume where the client left off, or a snapshot if it cannot.
-    fn resume_start(&mut self, seq: u64, ready: u64) -> (StartPoint, Option<Vec<u8>>, u64) {
+    /// Resume where the client left off, or a snapshot if it cannot (or the client asked for
+    /// one: its screen no longer matches its byte position, so it needs a repaint, not a replay).
+    fn resume_start(&mut self, r: ResumeRequest, ready: u64) -> (StartPoint, Option<Vec<u8>>, u64) {
+        let seq = r.seq;
+        if r.want_snapshot {
+            // The client may not have seen `seq..ready` (it was disconnected), and what it did
+            // see no longer matches its screen: repaint, with the gap marker for what it missed
+            // (a client that is current has `seq == ready` and gets no marker).
+            return self.snapshot_start(
+                ready,
+                ready.saturating_sub(seq),
+                SnapshotReason::Requested,
+            );
+        }
         let decision = {
             let log = self.shared.lock_log();
             decide_start(&log, Some(seq), &self.cfg.catch_up)
@@ -969,6 +1206,7 @@ impl Core {
         for r in self.rscan.scan(&fresh) {
             self.terminal.learn(r, self.size.cols(), self.size.rows());
         }
+        self.note_io(Instant::now());
         let ticket = self.pty.write(fresh);
         self.echo_wait.push_back((self.input.received(), ticket));
         self.pump_echo(Instant::now());
@@ -1050,6 +1288,8 @@ impl Core {
     // --- the end ---
 
     fn finish(&mut self) {
+        // Output still queued from the reader thread is part of what the shell printed.
+        self.on_output();
         // Let out whatever was held back, so subscribers send everything the shell printed.
         if !self.tail.is_empty() {
             let rest = std::mem::take(&mut self.tail);
@@ -1066,6 +1306,15 @@ impl Core {
         });
         self.exit_tx.send_replace(Some(info));
         self.live = None;
+    }
+}
+
+/// The mode poll's period `quiet` after the last input or output.
+fn poll_interval(quiet: Duration, mode_poll: Duration, predicting: bool) -> Duration {
+    if predicting || quiet < ACTIVE_WINDOW {
+        mode_poll
+    } else {
+        mode_poll * IDLE_POLL_FACTOR
     }
 }
 
@@ -1125,6 +1374,107 @@ pub(crate) fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many small reads are one wake-up and one batch (efficiency #1): the core is told once
+    /// while output is waiting, and takes it all, in order, in one go.
+    #[test]
+    fn small_reads_are_one_wakeup_and_one_batch() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let batch = OutputBatch::new();
+        for i in 0..100u8 {
+            assert!(batch.push(&[i, i], &tx));
+        }
+        assert!(matches!(rx.try_recv(), Ok(Cmd::PtyOutput)));
+        assert!(rx.try_recv().is_err(), "one wake-up for the whole batch");
+        let mut got = Vec::new();
+        batch.take_into(&mut got);
+        let want: Vec<u8> = (0..100u8).flat_map(|i| [i, i]).collect();
+        assert_eq!(got, want);
+        // After the core has taken it, the next read wakes it again.
+        assert!(batch.push(b"x", &tx));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::PtyOutput)));
+        // A core that is gone ends the reader.
+        drop(rx);
+        let mut got = Vec::new();
+        batch.take_into(&mut got);
+        assert!(!batch.push(b"y", &tx));
+    }
+
+    /// A core that does not take output stops the reader (which stops the PTY) at the limit,
+    /// instead of letting the queue grow without bound.
+    #[test]
+    fn a_reader_waits_when_the_core_is_far_behind() {
+        let (tx, _rx) = mpsc::channel(8);
+        let batch = Arc::new(OutputBatch::new());
+        let chunk = vec![0u8; 64 * 1024];
+        let reader = {
+            let (batch, tx) = (batch.clone(), tx.clone());
+            std::thread::spawn(move || {
+                for _ in 0..8 {
+                    batch.push(&chunk, &tx);
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!reader.is_finished(), "the reader ran past the limit");
+        assert!(batch.lock().len() <= OUTPUT_BATCH_LIMIT);
+        let mut got = Vec::new();
+        batch.take_into(&mut got);
+        // Draining lets it go on to the end.
+        while !reader.is_finished() {
+            let mut more = Vec::new();
+            batch.take_into(&mut more);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn the_reader_pauses_only_in_a_flood_of_small_reads() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let mut p = ReadPacer::new();
+        // A keystroke's echo, or the first read of a burst, never waits.
+        assert_eq!(p.after_read(3, ms(500)), Duration::ZERO);
+        // Tiny reads close together: a flood, and the pause grows to its maximum.
+        let mut last = Duration::ZERO;
+        for _ in 0..100 {
+            let now = p.after_read(15, us(50));
+            assert!(now >= last);
+            last = now;
+        }
+        assert_eq!(last, us(PAUSE_MAX_US));
+        // A read that found the buffer nearly full means the pause costs throughput: it shrinks
+        // fast, to nothing.
+        for _ in 0..10 {
+            last = p.after_read(1024, us(20));
+        }
+        assert_eq!(last, Duration::ZERO);
+        // Quiet again: the next read goes at once, and the ramp starts over.
+        p.after_read(15, us(50));
+        assert_eq!(p.after_read(15, ms(5)), Duration::ZERO);
+        assert_eq!(p.after_read(15, us(50)), us(PAUSE_STEP_US));
+    }
+
+    /// The PTY mode is polled at `mode_poll` only shortly after input or output (efficiency #5).
+    #[test]
+    fn the_mode_poll_slows_down_when_idle() {
+        let fast = Duration::from_millis(50);
+        assert_eq!(poll_interval(Duration::ZERO, fast, false), fast);
+        assert_eq!(
+            poll_interval(Duration::from_millis(1999), fast, false),
+            fast
+        );
+        assert_eq!(
+            poll_interval(ACTIVE_WINDOW, fast, false),
+            fast * IDLE_POLL_FACTOR
+        );
+        assert!(
+            poll_interval(Duration::from_secs(3600), fast, false) >= Duration::from_millis(500)
+        );
+        // A predicting client is never left to the slow poll.
+        assert_eq!(poll_interval(Duration::from_secs(3600), fast, true), fast);
+    }
 
     #[test]
     fn byte_counts_for_the_marker() {

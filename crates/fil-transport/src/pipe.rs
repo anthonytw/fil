@@ -212,14 +212,14 @@ impl PipeError {
         }
     }
 
-    /// The captured stderr, safe to show: see [`sanitize_banner`].
+    /// The captured stderr, safe to show: see [`fil_proto::text::sanitize`].
     pub fn stderr_text(&self) -> String {
-        sanitize_banner(&self.stderr)
+        fil_proto::text::sanitize(&self.stderr)
     }
 
-    /// What was read before the failure, safe to show: see [`sanitize_banner`].
+    /// What was read before the failure, safe to show: see [`fil_proto::text::sanitize`].
     pub fn skipped_text(&self) -> String {
-        sanitize_banner(&self.skipped)
+        fil_proto::text::sanitize(&self.skipped)
     }
 
     /// The reason a link built from this attempt would have been down.
@@ -250,44 +250,6 @@ impl std::error::Error for PipeError {
     }
 }
 
-/// Makes untrusted text safe to show: lossy UTF-8, with control characters (escape sequences
-/// included), carriage returns, line and paragraph separators, and every invisible Unicode
-/// format character (bidirectional controls, zero-width characters, byte order marks, tags)
-/// removed. Newlines and tabs stay. DESIGN.md §8.5 requires this for the preamble's skipped text.
-pub fn sanitize_banner(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !(c.is_control() || is_invisible(*c)))
-        .collect()
-}
-
-/// Unicode general category Cf (format), plus Zl and Zp. `std` has no category lookup, so the
-/// ranges are listed (Unicode 16).
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'
-        | '\u{0600}'..='\u{0605}'
-        | '\u{061C}'
-        | '\u{06DD}'
-        | '\u{070F}'
-        | '\u{0890}'..='\u{0891}'
-        | '\u{08E2}'
-        | '\u{180E}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206F}'
-        | '\u{FEFF}'
-        | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{110BD}'
-        | '\u{110CD}'
-        | '\u{13430}'..='\u{1343F}'
-        | '\u{1BCA0}'..='\u{1BCA3}'
-        | '\u{1D173}'..='\u{1D17A}'
-        | '\u{E0001}'
-        | '\u{E0020}'..='\u{E007F}')
-}
-
 /// The tail of a command's stderr, filled by a task until the stream ends.
 pub(crate) struct StderrCapture {
     buf: std::sync::Mutex<Vec<u8>>,
@@ -310,10 +272,9 @@ const TEE_STOP_WAIT: Duration = Duration::from_millis(100);
 
 /// Writes one chunk of the command's stderr to ours: control characters, escape sequences
 /// included, are removed (the text can come from a remote host's rc files or banner).
-// TODO(S2): use the shared text sanitizer (`fil_proto::text`) once it has landed.
 fn show_on_terminal(text: &[u8]) {
     use std::io::Write;
-    let clean = sanitize_banner(text);
+    let clean = fil_proto::text::sanitize(text);
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(clean.as_bytes()).and_then(|()| err.flush());
 }
@@ -602,7 +563,7 @@ impl PipeLink {
     /// The banner with control characters removed, ready to show with a warning such as "your
     /// shell printed this before fil started; check your shell's startup files".
     pub fn banner_text(&self) -> String {
-        sanitize_banner(&self.banner)
+        fil_proto::text::sanitize(&self.banner)
     }
 
     /// What the command wrote to stderr so far (the last few KiB), safe to show, with
@@ -611,7 +572,7 @@ impl PipeLink {
     pub fn stderr_text(&self) -> String {
         self.stderr
             .as_ref()
-            .map(|c| sanitize_banner(&c.bytes()))
+            .map(|c| fil_proto::text::sanitize(&c.bytes()))
             .unwrap_or_default()
     }
 

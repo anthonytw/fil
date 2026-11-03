@@ -154,11 +154,6 @@ impl SessionHandle {
         let _ = self.inner.tx.send(Cmd::ForceDetach).await;
     }
 
-    /// The exit status once the session has ended; a receiver that sees the change.
-    pub fn exit_status(&self) -> watch::Receiver<Option<ExitInfo>> {
-        self.inner.exit.clone()
-    }
-
     /// Waits for the session to end.
     pub async fn wait_exit(&self) -> ExitInfo {
         let mut rx = self.inner.exit.clone();

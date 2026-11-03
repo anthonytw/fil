@@ -6,18 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use fil_term::Size;
 use fil_transport::DownReason;
-
-fn reference(output: &[u8], cols: u16, rows: u16) -> fil_term::TermState {
-    let mut r = fil_term::create(fil_term::DEFAULT_BACKEND, Size { cols, rows }, 1000).unwrap();
-    r.feed(output);
-    r.state(1000)
-}
-
-fn lines(range: std::ops::Range<usize>) -> Vec<u8> {
-    range.flat_map(|i| numbered(i).into_bytes()).collect()
-}
 
 /// Cuts the link and keeps it cut (every dial fails) until `reconnect` is called.
 async fn go_offline(rig: &Rig) {
@@ -60,7 +49,7 @@ async fn the_status_line_comes_and_goes_leaving_the_screen_exactly_as_it_was() {
     let status_row = during
         .screen
         .iter()
-        .position(|l| common::term::line_text(l).contains("fil: disconnected"))
+        .position(|l| l.text().contains("fil: disconnected"))
         .unwrap();
     assert!(during.screen[status_row].cells[1].attrs.inverse);
     // The cursor row is not covered (the cursor is at row 10, so the bottom edge is used).
@@ -75,7 +64,7 @@ async fn the_status_line_comes_and_goes_leaving_the_screen_exactly_as_it_was() {
         before,
         "gone without a trace: screen, scrollback, cursor, modes"
     );
-    assert_eq!(rig.term.state(), reference(&all, 80, 24));
+    assert_eq!(rig.term.state(), reference_sized(&all, 80, 24));
 }
 
 #[tokio::test(start_paused = true)]
@@ -111,7 +100,7 @@ async fn a_full_screen_puts_the_line_at_the_top_and_the_scrollback_stays_clean()
     assert_eq!(before.cursor.row, 23);
     go_offline(&rig).await;
     let during = rig.term.state();
-    assert!(common::term::line_text(&during.screen[0]).contains("fil: disconnected"));
+    assert!(during.screen[0].text().contains("fil: disconnected"));
     assert_eq!(
         during.history, before.history,
         "nothing drawn reached the scrollback"
@@ -129,12 +118,12 @@ async fn a_full_screen_puts_the_line_at_the_top_and_the_scrollback_stays_clean()
     // Mid-way: the scrolled-off lines went to the scrollback as the program wrote them, not
     // as the status line left them, and the line is back on the (new) top row.
     let mid = rig.term.state();
-    let ref_mid = reference(&want, 80, 24);
+    let ref_mid = reference_sized(&want, 80, 24);
     assert_eq!(
         mid.history, ref_mid.history,
         "scrollback identical to the program's output"
     );
-    assert!(common::term::line_text(&mid.screen[0]).contains("no reply"));
+    assert!(mid.screen[0].text().contains("no reply"));
     rig.daemon.recover_link().await;
     settle().await;
     assert_eq!(rig.term.state(), ref_mid);
@@ -176,7 +165,7 @@ async fn a_full_screen_program_is_not_disturbed() {
     assert!(rig.term.text().contains("fil: disconnected"));
     reconnect(&rig, 2).await;
     assert_eq!(rig.term.state(), before);
-    assert_eq!(rig.term.state(), reference(&all, 80, 24));
+    assert_eq!(rig.term.state(), reference_sized(&all, 80, 24));
 }
 
 #[tokio::test(start_paused = true)]
@@ -208,15 +197,12 @@ async fn wide_characters_under_the_line_make_it_move_or_stay_away_but_never_spli
     go_offline(&rig).await;
     let during = rig.term.state();
     assert!(
-        common::term::line_text(&during.screen[0]).contains("fil: disconnected")
-            || common::term::line_text(&during.screen[1]).contains("fil: disconnected"),
+        during.screen[0].text().contains("fil: disconnected")
+            || during.screen[1].text().contains("fil: disconnected"),
         "{:?}",
         rig.term.rows()
     );
-    assert_eq!(
-        common::term::line_text(&during.screen[23]),
-        "日本語のテキスト"
-    );
+    assert_eq!(during.screen[23].text(), "日本語のテキスト");
     reconnect(&rig, 2).await;
     assert_eq!(rig.term.state(), before);
 }
@@ -238,8 +224,8 @@ async fn when_nothing_is_safe_nothing_is_drawn() {
     // The line stayed off the multi-line fallback too? It may use a single line at an edge...
     // either way, no wide character was ever cut: the wide rows are intact.
     let during = rig.term.state();
-    assert_eq!(common::term::line_text(&during.screen[0]), "日本語");
-    assert_eq!(common::term::line_text(&during.screen[23]), "日本語");
+    assert_eq!(during.screen[0].text(), "日本語");
+    assert_eq!(during.screen[23].text(), "日本語");
     rig.dial.fail_all(false);
     until_async("the resume", 30, || async {
         rig.daemon.attaches().await.len() == 2
@@ -275,7 +261,7 @@ async fn it_waits_for_the_terminal_parser_to_be_at_rest() {
     settle().await;
     assert_eq!(
         rig.term.state(),
-        reference(b"abc\x1b[31mred\x1b[0m done\r\n", 80, 24)
+        reference_sized(b"abc\x1b[31mred\x1b[0m done\r\n", 80, 24)
     );
 }
 
@@ -308,7 +294,7 @@ async fn it_waits_for_a_pending_wrap_to_clear() {
     settle().await;
     assert_eq!(
         rig.term.state(),
-        reference(format!("{eighty}y").as_bytes(), 80, 24)
+        reference_sized(format!("{eighty}y").as_bytes(), 80, 24)
     );
 }
 
@@ -344,11 +330,44 @@ async fn a_resize_while_offline_redraws_the_line_at_the_new_size() {
     let row = st
         .screen
         .iter()
-        .find(|l| common::term::line_text(l).contains("fil: disconnected"))
+        .find(|l| l.text().contains("fil: disconnected"))
         .unwrap();
     assert!(!row.cells[60].attrs.inverse);
     rig.type_str("\r~.");
     let _ = rig.finish().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pty_mode_from_before_a_reconnect_is_not_applied_after_it() {
+    // A report for an offset the client has not reached waits in the queue. If the link dies
+    // first, the daemon restates the mode in force after the next `AttachReply`, so what waited
+    // is stale and must not land when the resent output reaches its offset (sweep bugs #12).
+    let mut cfg = config();
+    cfg.offline.confirm_after = Some(Duration::from_secs(1));
+    let rig = start(cfg);
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    // The daemon reports a password prompt at an offset whose output is still on its way.
+    rig.daemon.output_unsent(b"Password: ").await;
+    rig.daemon.pty_mode(true, false).await;
+    settle().await;
+    go_offline(&rig).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The resume replays "Password: ", reaching the stale report's offset. This daemon (like
+    // the real one) states the mode in force after the reply: here, none.
+    reconnect(&rig, 2).await;
+    assert!(rig.term.text().contains("Password:"));
+    go_offline(&rig).await;
+    rig.type_str("ls\r");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    reconnect(&rig, 3).await;
+    let text = rig.term.text();
+    assert!(
+        text.contains("\"ls^M\""),
+        "keys were masked as a password: {text}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

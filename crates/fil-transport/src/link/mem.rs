@@ -1,10 +1,17 @@
 //! An in-memory [`Link`] pair, for testing the layers above the transport (sessions, the
 //! client's reconnect loop) without a pipe or QUIC.
 //!
-//! Simplifications, compared with the real links: one queue per direction rather than one per
-//! channel (so backpressure is not per channel), no heartbeats (health changes only when the
-//! test says so, through [`MemControl`]), and no RTT unless the test sets one. [`Link::flush`]
-//! waits until the peer has read everything sent.
+//! Simplifications, compared with the real links: at most two queues per direction rather than
+//! one per channel (so backpressure is not per channel), no heartbeats (health changes only when
+//! the test says so, through [`MemControl`]), and no RTT unless the test sets one.
+//! [`Link::flush`] waits until the peer has read everything sent.
+//!
+//! **Delivery order.** [`pair`] delivers everything in the order it was sent, which neither real
+//! link does. The pipe's scheduler sends control frames strictly ahead of queued terminal data,
+//! and on QUIC control is a stream of its own that can overtake the data streams. Code that
+//! assumes "the announcement arrives before the data it announces" passes against an in-order
+//! pair and breaks on both transports. [`pair_with`] with [`Delivery::ControlFirst`] keeps
+//! control on its own queue and hands it up ahead of any data that is waiting.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +22,76 @@ use tokio::sync::{Mutex, mpsc, watch};
 
 use super::{DownReason, Link, LinkError, LinkKind, LinkState, LinkStatus};
 
+type Msg = (ChannelId, Bytes);
+
+/// In what order a pair hands payloads up (see the module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// Exactly the order they were sent, across channels.
+    #[default]
+    InOrder,
+    /// Per-channel order only: whenever control payloads and data are both waiting, `recv`
+    /// returns the control ones first, as the pipe scheduler and QUIC's separate streams do.
+    ControlFirst,
+}
+
+/// The sending side of one direction: data, and control when it has a queue of its own.
+struct Tx {
+    data: mpsc::Sender<Msg>,
+    control: Option<mpsc::Sender<Msg>>,
+}
+
+/// The receiving side of one direction.
+struct Rx {
+    data: mpsc::Receiver<Msg>,
+    control: Option<mpsc::Receiver<Msg>>,
+}
+
+impl Tx {
+    fn queue(&self, channel: ChannelId) -> &mpsc::Sender<Msg> {
+        match &self.control {
+            Some(c) if channel == ChannelId::CONTROL => c,
+            _ => &self.data,
+        }
+    }
+}
+
+impl Rx {
+    async fn recv(&mut self) -> Option<Msg> {
+        match &mut self.control {
+            Some(c) => tokio::select! {
+                biased;
+                m = c.recv() => m,
+                m = self.data.recv() => m,
+            },
+            None => self.data.recv().await,
+        }
+    }
+}
+
+fn queues(capacity: usize, delivery: Delivery) -> (Tx, Rx) {
+    let (data, data_rx) = mpsc::channel(capacity.max(1));
+    let (control, control_rx) = match delivery {
+        Delivery::InOrder => (None, None),
+        Delivery::ControlFirst => {
+            let (t, r) = mpsc::channel(capacity.max(1));
+            (Some(t), Some(r))
+        }
+    };
+    (
+        Tx { data, control },
+        Rx {
+            data: data_rx,
+            control: control_rx,
+        },
+    )
+}
+
 /// One end of an in-memory link.
 pub struct MemLink {
     kind: LinkKind,
-    tx: mpsc::Sender<(ChannelId, Bytes)>,
-    rx: Mutex<mpsc::Receiver<(ChannelId, Bytes)>>,
+    tx: Tx,
+    rx: Mutex<Rx>,
     status: Arc<watch::Sender<LinkStatus>>,
     peer_status: Arc<watch::Sender<LinkStatus>>,
 }
@@ -31,11 +103,21 @@ pub struct MemControl {
     b: Arc<watch::Sender<LinkStatus>>,
 }
 
-/// A connected pair that reports `kind` and holds up to `capacity` payloads per direction.
-/// Both ends start [`LinkState::Up`].
+/// A connected pair that reports `kind` and holds up to `capacity` payloads per direction, in
+/// send order ([`Delivery::InOrder`]). Both ends start [`LinkState::Up`].
 pub fn pair(kind: LinkKind, capacity: usize) -> (MemLink, MemLink, MemControl) {
-    let (tx_ab, rx_ab) = mpsc::channel(capacity.max(1));
-    let (tx_ba, rx_ba) = mpsc::channel(capacity.max(1));
+    pair_with(kind, capacity, Delivery::InOrder)
+}
+
+/// Like [`pair`], with a choice of delivery order. `capacity` applies to the control and the
+/// data queue of a direction separately.
+pub fn pair_with(
+    kind: LinkKind,
+    capacity: usize,
+    delivery: Delivery,
+) -> (MemLink, MemLink, MemControl) {
+    let (tx_ab, rx_ab) = queues(capacity, delivery);
+    let (tx_ba, rx_ba) = queues(capacity, delivery);
     let a_status = Arc::new(watch::Sender::new(LinkStatus::new(LinkState::Up)));
     let b_status = Arc::new(watch::Sender::new(LinkStatus::new(LinkState::Up)));
     let a = MemLink {
@@ -126,7 +208,7 @@ impl Link for MemLink {
             return Err(LinkError(r));
         }
         tokio::select! {
-            sent = self.tx.send((channel, payload)) => {
+            sent = self.tx.queue(channel).send((channel, payload)) => {
                 sent.map_err(|_| LinkError(DownReason::Closed))
             }
             r = self.wait_down() => Err(LinkError(r)),
@@ -152,11 +234,16 @@ impl Link for MemLink {
             return Err(LinkError(r));
         }
         // Every slot of the queue free means nothing is waiting in it.
-        let all = self.tx.max_capacity();
+        let empty = async {
+            let all = self.tx.data.max_capacity();
+            self.tx.data.reserve_many(all).await.map(drop)?;
+            if let Some(c) = &self.tx.control {
+                c.reserve_many(c.max_capacity()).await.map(drop)?;
+            }
+            Ok::<(), mpsc::error::SendError<()>>(())
+        };
         tokio::select! {
-            slots = self.tx.reserve_many(all) => slots
-                .map(drop)
-                .map_err(|_| LinkError(DownReason::Closed)),
+            done = empty => done.map_err(|_| LinkError(DownReason::Closed)),
             r = self.wait_down() => Err(LinkError(r)),
         }
     }
@@ -191,6 +278,42 @@ mod tests {
             a.recv().await.unwrap(),
             (ChannelId::TERMINAL, bytes("back"))
         );
+    }
+
+    #[tokio::test]
+    async fn control_first_hands_control_up_ahead_of_waiting_data() {
+        let (a, b, _) = pair_with(LinkKind::Direct, 8, Delivery::ControlFirst);
+        a.send(ChannelId::TERMINAL, bytes("data 1")).await.unwrap();
+        a.send(ChannelId::SNAPSHOT, bytes("data 2")).await.unwrap();
+        a.send(ChannelId::CONTROL, bytes("control")).await.unwrap();
+        assert_eq!(b.recv().await.unwrap().1, bytes("control"));
+        // Within a queue the order is kept.
+        assert_eq!(b.recv().await.unwrap().1, bytes("data 1"));
+        assert_eq!(b.recv().await.unwrap().1, bytes("data 2"));
+        // The in-order pair keeps the send order across channels.
+        let (a, b, _) = pair(LinkKind::Direct, 8);
+        a.send(ChannelId::TERMINAL, bytes("data")).await.unwrap();
+        a.send(ChannelId::CONTROL, bytes("control")).await.unwrap();
+        assert_eq!(b.recv().await.unwrap().1, bytes("data"));
+    }
+
+    #[tokio::test]
+    async fn control_first_flush_waits_for_both_queues() {
+        let (a, b, _) = pair_with(LinkKind::Pipe, 4, Delivery::ControlFirst);
+        a.send(ChannelId::TERMINAL, bytes("d")).await.unwrap();
+        a.send(ChannelId::CONTROL, bytes("c")).await.unwrap();
+        let a = Arc::new(a);
+        let flushing = tokio::spawn({
+            let a = a.clone();
+            async move { a.flush().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished());
+        b.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished(), "one payload is still waiting");
+        b.recv().await.unwrap();
+        assert_eq!(flushing.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]

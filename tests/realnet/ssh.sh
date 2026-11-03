@@ -746,7 +746,7 @@ f_ls_kill_detach() {
   out=$(cx fil detach direct lkd)
   [[ $out == *'detached session "lkd"'* ]] || fail "fil detach said: $out"
   fc_wait a 'was detached from elsewhere' 20
-  fc_type a n
+  fc_answer a n
   fc_expect_exit a 1
   out=$(cx fil ls direct)
   awk '$1 == "lkd" && $3 == "-" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls after detach: $out"
@@ -783,7 +783,7 @@ f_takeover() {
   local out
   out=$(cx fil ls viajumps)
   awk '$1 == "tk" && $3 == "client2" { f = 1 } END { exit !f }' <<< "$out" || fail "fil ls should show client2 as attached: $out"
-  fc_type a n
+  fc_answer a n
   fc_expect_exit a 1
   fc_has a 'taken over by client2' || fail "no final message on the first client: $(fc_screen a)"
   fc_line b 'echo OWNER-$((3+4))'
@@ -807,7 +807,7 @@ f_takeover_back() {
   fc_line b 'echo SECOND-$((5*5))'
   fc_wait b SECOND-25
   fc_wait a 'Take it back' 20
-  fc_type a y
+  fc_answer a y
   fc_wait b 'was taken over' 20
   # The prompt has "by NAME" on a line of its own, so \n tells client from client2.
   fc_wait b 'by client\n' 5
@@ -815,7 +815,7 @@ f_takeover_back() {
   fc_has a FIRST-42 || fail "the first client lost the earlier output after taking the session back: $(fc_screen a)"
   fc_line a 'echo BACK-$((2*8))'
   fc_wait a BACK-16 20
-  fc_type b n
+  fc_answer b n
   fc_expect_exit b 1
   fc_has b 'taken over by client at' || fail "no final message on the second client: $(fc_screen b)"
   fc_detach a
@@ -865,7 +865,7 @@ f_daemon_restart() {
   docker exec rn-target kill -9 "$dpid"
   fc_wait a 'is a different session now' 60
   note "replaced_message_ms=$(($(now_ms) - t0))"
-  fc_type a n
+  fc_answer a n
   fc_expect_exit a 1
   fc_has a 'daemon restarted' || fail "no final message: $(fc_screen a)"
 
@@ -876,7 +876,7 @@ f_daemon_restart() {
   dpid=$(docker exec rn-target pgrep -u fil -f 'fil server --daemon' | head -n 1 || true)
   docker exec rn-target kill -9 "$dpid"
   fc_wait c 'Start a fresh attach' 60
-  fc_type c y
+  fc_answer c y
   fc_show_pid c
   local new
   new=$(shell_pid c)

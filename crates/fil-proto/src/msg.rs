@@ -344,6 +344,8 @@ pub enum SnapshotReason {
     TooFarBehind,
     /// The client claimed a position the log has never reached.
     BadResumePoint,
+    /// The client asked for one (`ResumeRequest::want_snapshot`).
+    Requested,
 }
 
 /// A snapshot is coming on [`ChannelId::SNAPSHOT`]: exactly `len` bytes, then the terminal

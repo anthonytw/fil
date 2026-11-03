@@ -239,7 +239,7 @@ model; I did not evaluate its restore quality.
   behind the alternate screen. The probe shows all three.
 
 *Update (M1, `fil-session`):* the session holds back the unfinished end of the output so a snapshot is always taken
-at a sequence boundary (`fil-session/src/boundary.rs`). `fil-term` now carries tab stops and charsets (G0-G3, the
+at a sequence boundary (`fil-term/src/boundary.rs`, shared with the prediction overlay). `fil-term` now carries tab stops and charsets (G0-G3, the
 invoked set, and the ones DECSC saved) in `TermState` and the writer, for alacritty; the probe passes for it
 (`just fidelity`: alacritty 899/0/29). vt100 does not report them (`Capabilities::tab_stops` and `charsets` are
 false). alacritty keeps a program's synchronized-update batch (`?2026`) until it ends, so `Emulator::apply_pending`

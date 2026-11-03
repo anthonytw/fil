@@ -10,6 +10,7 @@
 //! pipe's scheduler, DESIGN.md §8.5).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
@@ -231,8 +232,9 @@ impl Queues {
         let next = self
             .forward_cursor
             .and_then(|c| {
+                // (An exclusive bound, not `c.0 + 1`: a peer may use channel `u32::MAX`.)
                 self.forward
-                    .range(ChannelId(c.0 + 1)..)
+                    .range((Bound::Excluded(c), Bound::Unbounded))
                     .next()
                     .map(|(k, _)| *k)
             })
@@ -336,6 +338,21 @@ mod tests {
             inbox.register(ChannelId(2)).is_none(),
             "no new streams after close"
         );
+    }
+
+    /// The round-robin cursor used to compute `ChannelId(c.0 + 1)`, which overflows (and panics
+    /// in debug builds) when a peer uses forward channel `u32::MAX`.
+    #[tokio::test]
+    async fn the_highest_channel_id_does_not_overflow_the_round_robin() {
+        let inbox = Inbox::new();
+        let top = inbox.register(ChannelId(u32::MAX)).unwrap();
+        let low = inbox.register(ChannelId(16)).unwrap();
+        for _ in 0..2 {
+            push(&inbox, &top, u32::MAX, 10).await;
+            push(&inbox, &low, 16, 10).await;
+        }
+        let order: Vec<_> = std::iter::from_fn(|| pop_ch(&inbox)).collect();
+        assert_eq!(order, [16, u32::MAX, 16, u32::MAX]);
     }
 
     #[test]

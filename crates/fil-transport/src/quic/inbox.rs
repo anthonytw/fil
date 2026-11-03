@@ -145,8 +145,15 @@ impl Inbox {
             q.total -= payload.len();
             let chan = q.chans.get_mut(channel).expect("registered");
             let was_full = chan.queued >= CHANNEL_BUDGET;
+            let was_held = chan.queued >= CHANNEL_GUARANTEE;
             chan.queued -= payload.len();
             if was_full && chan.queued < CHANNEL_BUDGET {
+                chan.wake.notify_one();
+            }
+            // While the connection is over its budget a reader parks at the much smaller
+            // guarantee, so wake it when its channel drops below that. Without this a terminal
+            // parked behind a pile of forwards would wait for the forwards to drain.
+            if was_over_total && was_held && chan.queued < CHANNEL_GUARANTEE {
                 chan.wake.notify_one();
             }
             if was_over_total && q.total < CONNECTION_BUDGET {
@@ -327,5 +334,49 @@ mod tests {
         let inbox = Inbox::new();
         assert!(inbox.register(ChannelId(5)).is_some());
         assert!(inbox.register(ChannelId(5)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_parked_by_the_connection_cap_wakes_when_it_drains() {
+        use std::time::Duration;
+        let inbox = Arc::new(Inbox::new());
+        let term = inbox.register(ChannelId(1)).unwrap();
+        // The terminal holds 64 KiB (the connection is far from its cap, so this is allowed).
+        for _ in 0..4 {
+            push(&inbox, &term, 1, 16 * 1024).await;
+        }
+        // Forwards then take the connection past its budget.
+        let mut ch = 100;
+        // (Well past it, so that reading the terminal's backlog does not by itself bring the
+        // connection back under the budget.)
+        while inbox.unread_bytes() < CONNECTION_BUDGET + 512 * 1024 {
+            let wake = inbox.register(ChannelId(ch)).unwrap();
+            while tokio::time::timeout(
+                Duration::from_millis(1),
+                inbox.push(ChannelId(ch), b(16 * 1024), &wake),
+            )
+            .await
+            .is_ok()
+            {}
+            ch += 1;
+        }
+        // Another terminal payload now parks: the channel holds more than the guarantee.
+        let pushed = {
+            let (inbox, term) = (inbox.clone(), term.clone());
+            tokio::spawn(async move { inbox.push(ChannelId(1), b(10), &term).await.ok() })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!pushed.is_finished(), "should be parked on the cap");
+        // Reading the terminal's backlog (interactive goes first) frees it as soon as it is
+        // below the guarantee, long before the forwards have drained.
+        for _ in 0..4 {
+            assert_eq!(pop_ch(&inbox), Some(1));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(pushed.is_finished(), "the terminal reader was not woken");
+        assert!(
+            inbox.unread_bytes() >= CONNECTION_BUDGET,
+            "the forwards are still held"
+        );
     }
 }

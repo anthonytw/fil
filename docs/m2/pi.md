@@ -7,20 +7,21 @@ The M2 forward scenarios (`docs/m2/plan.md` §5.2 and §5.3) need a TCP peer tha
 The `install` verb takes any binary: `install NAME SHA256 < file` stores `~/.local/bin/NAME`, verified and atomic. `fwdprobe` goes through it the same way `fil` does:
 
 ```sh
-SHA=$(shasum -a 256 out/fwdprobe | cut -d' ' -f1)
+SHA=$(cut -d' ' -f1 out/fwdprobe.sha256)
 ssh -o BatchMode=yes fil-test@HOST install fwdprobe "$SHA" < out/fwdprobe
 ssh -o BatchMode=yes fil-test@HOST run fwdprobe digest 1024      # BYTES=1024 / SHA256=...
 ```
 
 `run` is only for this smoke check. The scenarios start `fwdprobe` from the shell of a fil session, which is the point: the process then belongs to the session, and `fil ports` can attribute it. Use the full path, `~/.local/bin/fwdprobe`, in case the session's `PATH` lacks `~/.local/bin`.
 
-The binary is the `aarch64-unknown-linux-musl` build of `fil-testbins`:
+The binary is the `aarch64-unknown-linux-musl` build of `fil-testbins`. The `aarch64` job in `.github/workflows/linux-check.yml` builds it after `fil` and uploads it, with `fwdprobe.sha256`, in the same `fil-aarch64-musl` artifact:
 
 ```sh
-cross build --locked --release -p fil-testbins --bin fwdprobe --target aarch64-unknown-linux-musl
+gh workflow run linux-check -f ref=BRANCH -f suite=aarch64
+gh run download RUN_ID -n fil-aarch64-musl -D out      # fil, fwdprobe and their .sha256 files
 ```
 
-`fil-testbins` pulls in `ring` (also used here for sha256), so this needs the same cross compiler as `fil` and does not build on the Mac. The `aarch64` job in `.github/workflows/linux-check.yml` builds only `-p fil` today; it needs `-p fil-testbins --bin fwdprobe` added and the binary uploaded next to `fil` before the Pi runs can fetch it from the artifact. That workflow change, and a local build (`just pi-build`, plan OD-11), are separate follow-ups: the repo is public now, so Actions minutes are no longer the constraint that made the local build urgent.
+The job runs `cross build --locked --release -p fil-testbins --bin fwdprobe --target aarch64-unknown-linux-musl` and fails unless `file` reports a static aarch64 ELF. `fil-testbins` pulls in `ring`, so the build needs the same cross compiler as `fil` and does not work on the Mac. A local build (`just pi-build`, plan OD-11) is a possible follow-up; the repo is public now, so Actions minutes are no longer the constraint that made it urgent. For realnet, `tests/realnet/build.sh` builds `fwdprobe` as a static x86_64 musl binary with the other test programs.
 
 For the Mac end (the client side of a `-L`, the server side of a `-R`), build it natively: `cargo build --release -p fil-testbins --bin fwdprobe`.
 
@@ -64,7 +65,7 @@ fwdprobe connect 127.0.0.1:18080 recv      # IN_SHA256= must equal: fwdprobe dig
 | `fwd_remote_detached` | none | `connect ... recv` after `~.`: `CONNECT=refused` with a small `CONNECT_MS`, or `IN_END=reset` through the forward |
 | `fwd_ports_view` | `serve 0.0.0.0:P hold` and `serve 127.0.0.1:Q hold` | none (read `fil ports`) |
 | `fwd_takeover`, `f_fwd_roam` | `serve ... hold` or `source ... --rate R` | `connect ... hold SECS`: `IN_END=timeout` means the connection was still open, `eof` or `reset` means it ended |
-| `f_fwd_cable_pull` in realnet | the static x86_64 binary in `rn-server` (`tests/realnet/build.sh` builds `fil-testbins`; add `fwdprobe` to its copy list) | in `rn-client` |
+| `f_fwd_cable_pull` in realnet | the static x86_64 binary (`tests/realnet/build.sh`) in `rn-server` | in `rn-client` |
 
 For exact examples with every option, read the header of the source file, and `crates/fil-testbins/tests/fwdprobe.rs` for each mode driven over loopback.
 

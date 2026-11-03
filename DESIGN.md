@@ -207,6 +207,7 @@ The client writes those bytes straight to the local terminal. That is why native
   2. the current screen
   3. the terminal modes: alternate screen, cursor position and style, mouse, bracketed paste, focus and keypad modes, kitty keyboard flags, scroll region, title, tab stops (always cleared and set again, whatever the client's terminal had) and character sets (G0 to G3, the invoked one, and the ones the saved cursor holds)
 - **Catch-up rule:** if the subscriber falls behind by more than a threshold (default 1 MiB or 2 s of output), the daemon jumps to a snapshot instead of replaying the backlog. On a slow link, `cat hugefile` followed by Ctrl-C stays responsive, which is mosh's main advantage. The cost is a gap in native scrollback. The gap is visible: a marker line such as `── fil: skipped 48 MB of output ──` goes into the scrollback.
+- **One snapshot at a time:** the daemon announces no further snapshot (catch-up) until the client has acknowledged output at or past the previous one, or the link has flushed it. `Snapshot` goes on the control channel, which every transport delivers ahead of data, and every snapshot numbers its bytes from 0; a second announcement would overtake the first snapshot's unsent bytes and the client would mistake the old bytes for the new snapshot, or see a gap and reconnect.
 
 Details the session implements (`fil-session`):
 

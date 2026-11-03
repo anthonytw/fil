@@ -1151,6 +1151,7 @@ impl Core {
         }
         self.sample_mode();
         let echo_ack = a.echo_ack;
+        let agent = a.agent;
         let outcome = self.epoch.attach(AttachInput {
             key: a.key.clone(),
             host: a.host.clone(),
@@ -1220,9 +1221,9 @@ impl Core {
         // (the old subscriber's channels are dropped), a resume goes on with this link.
         let fresh = matches!(mode, AttachMode::Fresh);
         if fresh {
-            self.forwards.fresh_attach(conn, events_tx.clone());
+            self.forwards.fresh_attach(conn, events_tx.clone(), agent);
         } else {
-            self.forwards.resumed_attach(conn, events_tx.clone());
+            self.forwards.resumed_attach(conn, events_tx.clone(), agent);
         }
         let kicked = Arc::new(AtomicBool::new(false));
         self.live = Some(Live {

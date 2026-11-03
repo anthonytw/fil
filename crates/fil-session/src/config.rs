@@ -52,9 +52,10 @@ pub struct SessionConfig {
     /// `systemd-run --user` can reach the user manager.
     pub clear_env: bool,
     /// The stable `SSH_AUTH_SOCK` for the session (DESIGN.md section 10), such as
-    /// `/tmp/fil-$UID/agent/<session>.sock`. M2's agent relay listens there; M1 only reserves the
-    /// slot. `None` removes any inherited `SSH_AUTH_SOCK`, so the session never points at the
-    /// agent of the SSH login that happened to start the daemon.
+    /// `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`. The agent relay listens there while the subscriber
+    /// relays its agent; the directory is created (mode 0700) and checked when it first does.
+    /// `None` removes any inherited `SSH_AUTH_SOCK`, so the session never points at the agent of
+    /// the SSH login that happened to start the daemon.
     pub agent_socket: Option<PathBuf>,
     pub scope: ScopeMode,
 

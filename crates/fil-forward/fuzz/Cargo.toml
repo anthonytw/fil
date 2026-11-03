@@ -1,5 +1,6 @@
 # The cargo-fuzz targets of fil-forward. Not part of the workspace and not run by `just ci`:
 #   cargo +nightly fuzz run socks        (from crates/fil-forward)
+#   cargo +nightly fuzz run agent_filter
 [package]
 name = "fil-forward-fuzz"
 version = "0.0.0"
@@ -17,6 +18,13 @@ fil-forward = { path = ".." }
 # Its own workspace, so the main workspace's `crates/*` does not claim it.
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "agent_filter"
+path = "fuzz_targets/agent_filter.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "socks"

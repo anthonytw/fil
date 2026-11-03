@@ -11,7 +11,9 @@
 //! - [`listen`]: listeners on loopback in both families.
 //! - [`socks`]: a pure SOCKS5 and SOCKS4a CONNECT handshake.
 //! - [`stream`]: the local socket a channel carries, and its reset.
+//! - [`agent`]: the agent relay's message filter and its two ends.
 
+pub mod agent;
 pub mod connect;
 mod endpoint;
 pub mod listen;

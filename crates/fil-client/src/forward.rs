@@ -64,6 +64,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+use crate::agent::ClientAgent;
 use crate::config::{ForwardFailure, ForwardSet, RemoteRequests};
 use crate::consent::{self, Decision, Grants, describe};
 
@@ -166,6 +167,20 @@ pub(crate) struct Question {
     pub(crate) id: ForwardId,
     pub(crate) token: u64,
     pub(crate) lines: Vec<String>,
+    /// A `confirm`-mode signature ([`crate::agent`]), not a forward: `id` means nothing then.
+    pub(crate) agent: bool,
+}
+
+impl Question {
+    /// A question about a signature, answered to the agent relay.
+    pub(crate) fn agent(token: u64, lines: Vec<String>) -> Self {
+        Self {
+            id: ForwardId(0),
+            token,
+            lines,
+            agent: true,
+        }
+    }
 }
 
 /// What the forwards tell the client loop.
@@ -189,10 +204,20 @@ pub(crate) enum Note {
 pub(crate) struct ForwardHandle {
     to_manager: mpsc::UnboundedSender<ToManager>,
     summary: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// The agent relay, when this run relays its agent.
+    agent: Option<Arc<ClientAgent>>,
 }
 
 impl ForwardHandle {
     pub(crate) fn answer(&self, q: &Question, yes: bool) {
+        if q.agent {
+            if let Some(a) = &self.agent
+                && ClientAgent::is_agent_token(q.token)
+            {
+                a.answer(q.token, yes);
+            }
+            return;
+        }
         let _ = self.to_manager.send(ToManager::Answer {
             id: q.id,
             token: q.token,
@@ -200,9 +225,22 @@ impl ForwardHandle {
         });
     }
 
-    /// Two lines of at most 40 columns for `~#`.
+    /// Two lines of at most 40 columns for `~#`, and the agent's (its key use) when this run
+    /// relays it.
     pub(crate) fn summary(&self) -> Vec<String> {
-        (self.summary)()
+        let mut v = (self.summary)();
+        if let Some(a) = &self.agent {
+            v.extend(crate::agent::summary_lines(
+                &a.uses(),
+                std::time::Instant::now(),
+            ));
+        }
+        v
+    }
+
+    /// This run relays its agent (`Attach.agent`).
+    pub(crate) fn agent_on(&self) -> bool {
+        self.agent.is_some()
     }
 }
 
@@ -236,7 +274,8 @@ impl Policy for ClientPolicy {
     }
 }
 
-struct ClientConnector(Arc<Mutex<Grants>>);
+/// The grants, and the agent relay when this run relays its agent.
+struct ClientConnector(Arc<Mutex<Grants>>, Option<Arc<ClientAgent>>);
 
 impl Connector for ClientConnector {
     fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
@@ -251,8 +290,12 @@ impl Connector for ClientConnector {
                     Ok(Box::new(s) as BoxStream)
                 })
             }
-            // The relay is A1's; until then there is no agent to reach.
-            OpenKind::Agent => Box::pin(async { Err(OpenFailure::AgentUnavailable) }),
+            // Reached only when the grants allow the agent (this run turned it on): the local
+            // agent through the filter (`crate::agent`).
+            OpenKind::Agent => match &self.1 {
+                Some(a) => a.connect(),
+                None => Box::pin(async { Err(OpenFailure::AgentUnavailable) }),
+            },
             OpenKind::Local { .. } | OpenKind::Dynamic { .. } => {
                 Box::pin(async { Err(OpenFailure::NotPermitted) })
             }
@@ -274,15 +317,19 @@ impl<L: Link> Forwards<L> {
         mut set: ForwardSet,
     ) -> (Self, ForwardHandle, mpsc::UnboundedReceiver<Note>) {
         let grants = Arc::new(Mutex::new(Grants::default()));
-        lock(&grants).set_agent(set.agent);
+        lock(&grants).set_agent(set.agent.is_some());
+        let (notes, notes_rx) = mpsc::unbounded_channel();
+        let agent = set
+            .agent
+            .take()
+            .map(|relay| ClientAgent::new(relay, notes.clone()));
         let (ep, events) = Endpoint::<L>::new(
             Side::Client,
             set.mux.clone(),
-            Arc::new(ClientConnector(grants.clone())),
+            Arc::new(ClientConnector(grants.clone(), agent.clone())),
             Arc::new(ClientPolicy(grants.clone())),
         );
         let (to_manager, from_router) = mpsc::unbounded_channel();
-        let (notes, notes_rx) = mpsc::unbounded_channel();
         let view = Arc::new(Mutex::new(View::default()));
         // At most `MAX_FORWARDS` own specs (the plan refuses more; the daemon would too), which
         // also keeps `private_id` inside its range.
@@ -344,6 +391,7 @@ impl<L: Link> Forwards<L> {
         let handle = ForwardHandle {
             to_manager: to_manager.clone(),
             summary: Box::new(move || summary_lines(&lock(&view), &summary_ep)),
+            agent,
         };
         let router = Router {
             ep,
@@ -1163,7 +1211,12 @@ impl<L: Link> Manager<L> {
                 o.token = token;
                 self.entries.insert(id, o);
                 self.busy_noted = false;
-                self.note(Note::Ask(Question { id, token, lines }));
+                self.note(Note::Ask(Question {
+                    id,
+                    token,
+                    lines,
+                    agent: false,
+                }));
             }
             Decision::Refuse(why) => {
                 self.refuse(id, &spec, why);
@@ -1480,7 +1533,7 @@ mod tests {
         let (ep, _events) = Endpoint::<MemLink>::new(
             Side::Client,
             Default::default(),
-            Arc::new(ClientConnector(grants.clone())),
+            Arc::new(ClientConnector(grants.clone(), None)),
             Arc::new(ClientPolicy(grants.clone())),
         );
         let (notes, rx) = mpsc::unbounded_channel();

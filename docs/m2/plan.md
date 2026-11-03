@@ -503,7 +503,7 @@ Every package keeps M1's rules:
 - Comes after F2 and F3, so its small edits to `engine.rs`, `serve.rs` and `pty.rs` do not conflict.
 - **Owns:** `fil-forward/src/agent/{filter,relay}.rs`, `fil-session/src/agent.rs` (new), `fil-client/src/agent.rs` (new), those hooks, DESIGN §10 and §11.
 - **Builds:**
-  - **Remote socket:** `/tmp/fil-$UID/agent/` (0700, checked with `lstat` for owner and mode, like the socket directory) and `<session>.sock` (0600). The socket exists only while the current subscriber has `Attach.agent`. Every accept gets a peer-UID check. An accept opens an `Agent` channel right away when attached, waits at most `agent_wait` when disconnected, and is closed at once when detached.
+  - **Remote socket:** `/tmp/fil-$UID/a-<major>-<rev>/` (0700, checked with `lstat` for owner and mode, like the socket directory; the wire revision keeps two builds' same-named sessions apart, as in the PR #74 review) and `<session>.sock` (0600). The socket exists only while the current subscriber has `Attach.agent`. Every accept gets a peer-UID check. An accept opens an `Agent` channel right away when attached, waits at most `agent_wait` when disconnected, and is closed at once when detached.
   - **Client:** connects to the local `SSH_AUTH_SOCK` as it was at start.
   - **Filter** (on the client, the trusted end): allow `REQUEST_IDENTITIES`(11), `SIGN_REQUEST`(13), and `EXTENSION`(27) only for `session-bind@openssh.com` and `query`. Every other type gets `SSH_AGENT_FAILURE`, among them add, remove, remove-all, lock, unlock, smartcard and constrained add. Messages are at most 256 KiB.
   - **`agent_keys` allowlist:** SHA256 fingerprints; the list answer is filtered and other signatures are refused.
@@ -577,9 +577,9 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
   - an optional per-signature confirm and a key allowlist;
   - signature counts are visible in `fil ports` and `~#`.
 - **Worse than, or different from, ssh:**
-  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. fil's relay is an ordinary local agent client, so a key constrained to `-h github.com` (meaning "only from this laptop") becomes usable from the remote, and a key constrained to `orin>github.com` fails. This is true of any non-ssh relay. **OD-5.**
+  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `orin>github.com` still fails. **OD-5** stays with the owner for accepting that "broken" half.
   - `ssh-add` on the remote can no longer load keys into the laptop agent (the filter, OD-3).
-- **Socket path:** `/tmp/fil-$UID/agent/<session>.sock`. The session name sits inside a 0700 directory and the child's own environment, which other users cannot read. That is consistent with §11.1.4.
+- **Socket path:** `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`. The session name sits inside a 0700 directory and the child's own environment, which other users cannot read. That is consistent with §11.1.4.
 
 ### 4.4 Privacy (§11.1, decided: targets, ports and agent use are user data)
 
@@ -618,7 +618,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-2 | The consent rule (§4.1) for management-origin forwards and for takeover adoption | §7.2 (takeover routing), §7.3 ("works from inside the session"), §11 | Yes. `remote_requests = "ask"` by default, `deny` available. |
 | OD-3 | The agent message filter (no add, remove or lock from the remote), with no off switch | §10 | Yes. |
 | OD-4 | `agent = off/on/confirm` and `agent_keys` in M2; default off | §10, §14 | Yes. |
-| OD-5 | Accept that destination-constrained keys are bypassed or broken through fil's relay | §10, §11 | Accept; document it in §10 and the §11 table, and point users at `agent_keys`. |
+| OD-5 | Accept that destination-constrained keys are refused through fil's relay (the client's own forwarding `session-bind` makes them fail closed; they are no longer bypassed) | §10, §11 | Accept; document it in §10 and the §11 table, and point users at `agent_keys`. |
 | OD-6 | `SSH_AUTH_SOCK` always set to the stable path in every session | §10, §11.1.4 | Yes. Opt out with `daemon.toml agent_socket = false`. |
 | OD-7 | Honour an explicit non-loopback `-R` bind with no daemon-side switch | §7.1, §11 | Honour it from own CLI or config with an exposure warning; refuse it from management. |
 | OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. |
@@ -632,7 +632,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 
 - **Adopted as recommended:** OD-1, OD-2, OD-3, OD-4, OD-6, OD-9, OD-10 (on L1's data) and OD-12. Each keeps or strengthens the §11 invariants, or is a scope call inside the milestone.
 - **OWNER, open:**
-  - **OD-5** (destination-constrained keys through the relay). Interim: the agent stays off by default, and the limitation is documented. A1 must not turn the agent on anywhere by default.
+  - **OD-5** (destination-constrained keys through the relay). Since the PR #74 review the relay binds each connection as a forwarding hop, so such keys fail closed rather than being bypassed (adopted by the coordinator: it strengthens §11). Open for the owner: accepting that they cannot be used through fil at all. The agent stays off by default, and A1 must not turn it on anywhere by default.
   - **OD-7** (non-loopback `-R` bind). Interim: refused, with a message naming the decision, until the owner rules.
   - **OD-8** (bypassing sshd's forwarding and agent switches). Interim: documented in §11 as a known property; no policy file.
   - **OD-11** (infrastructure): decided, the repo is public (see the table).

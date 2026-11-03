@@ -73,11 +73,9 @@ fn free_port() -> u16 {
 /// What a run without a terminal says once it is past the forwards (it would attach next).
 const PAST_FORWARDS: &str = "needs a terminal";
 
-/// Forwards on the command line are carried to the attach; `-A` is refused before
-/// anything is dialed until the agent relay is connected: never accepted and silently dropped.
-/// A bad spec is a usage error.
+/// Forwards and `-A` on the command line are carried to the attach. A bad spec is a usage error.
 #[test]
-fn forward_flags_reach_the_attach_the_agent_is_refused_and_bad_ones_are_usage_errors() {
+fn forward_flags_and_the_agent_reach_the_attach_and_bad_ones_are_usage_errors() {
     let home = home_with_pipe("fwd", "echo dialed >&2; exit 1");
     let run = |args: &[&str]| {
         Command::new(FIL)
@@ -93,17 +91,16 @@ fn forward_flags_reach_the_attach_the_agent_is_refused_and_bad_ones_are_usage_er
         &["-L", l.as_str(), "probe"][..],
         &["-R", "9000:localhost:9000", "probe"][..],
         &["-D", d.as_str(), "probe"][..],
+        &["-A", "probe"][..],
     ] {
         let out = run(args);
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!err.contains("not connected yet"), "{args:?}: {err}");
         assert!(err.contains(PAST_FORWARDS), "{args:?} stopped early: {err}");
     }
-    let out = run(&["-A", "probe"]);
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("not connected yet"), "{err}");
-    assert!(!err.contains("dialed"), "-A dialed: {err}");
+    // `-A` with no local agent says so, and goes on.
+    let err = String::from_utf8_lossy(&run(&["-A", "probe"]).stderr).to_string();
+    assert!(err.contains("no local agent"), "{err}");
     for args in [
         &["-L", "0:h:80", "probe"][..],
         &["-R", "*:9000:h:80", "probe"][..],

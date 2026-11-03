@@ -404,7 +404,7 @@ pub enum Action {
         host: String,
         session: SessionName,
         transport: Option<TransportSetting>,
-        /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked. Carried; not connected yet.
+        /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked, for the run's plan.
         forwards: CliForwards,
     },
     List {

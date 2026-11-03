@@ -4,6 +4,11 @@
 //!
 //! Both tests change this process's limits, so they are in a binary of their own, and both start
 //! from the same state: a soft limit of 1,024 (Linux's stock one), then `raise`.
+//!
+//! A program the session starts waits for a line before it prints. What it prints before the
+//! client attaches is in the attach's snapshot, not in the output stream `wait_out` reads, so a
+//! program that printed at once would be found by the test or not by the race between the spawn
+//! and the attach.
 
 mod common;
 
@@ -63,10 +68,11 @@ async fn children_start_with_the_original_limit() {
     let h = spawn_plain(sh_config(
         &s,
         "limit",
-        "echo \"limit=$(ulimit -Sn).\"; exec cat",
+        "read go; echo \"limit=$(ulimit -Sn).\"; exec cat",
     ))
     .await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.type_bytes(b"\n").await;
     c.wait_out(&format!("limit={STOCK}.")).await;
     assert!(soft() > STOCK, "still raised here: {}", soft());
     // The login shell keeps its `-` in `argv[0]` through the trampoline.
@@ -183,10 +189,11 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
     let h2 = spawn_plain(sh_config(
         &s2,
         "another",
-        "echo \"limit=$(ulimit -Sn).\"; exec cat",
+        "read go; echo \"limit=$(ulimit -Sn).\"; exec cat",
     ))
     .await;
     let mut c2 = Client::attach(&h2, Connect::new(&h2, key(2))).await;
+    c2.type_bytes(b"\n").await;
     c2.wait_out(&format!("limit={STOCK}.")).await;
     assert_eq!(total, FLOOD, "every connection of the flood was taken");
 
@@ -214,7 +221,7 @@ async fn the_trampoline_finds_programs_where_portable_pty_does() {
         let p = s.path(file);
         std::fs::write(
             &p,
-            format!("#!/bin/sh\necho \"{word}=$(ulimit -Sn).\"\nexec cat\n"),
+            format!("#!/bin/sh\nread go\necho \"{word}=$(ulimit -Sn).\"\nexec cat\n"),
         )
         .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -230,6 +237,7 @@ async fn the_trampoline_finds_programs_where_portable_pty_does() {
         ];
         let h = spawn_plain(cfg).await;
         let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+        c.type_bytes(b"\n").await;
         c.wait_out(&format!("{word}={STOCK}.")).await;
         let _ = h.kill(Duration::from_secs(5)).await;
     }

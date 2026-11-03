@@ -229,3 +229,68 @@ async fn another_users_connection_is_refused() {
     list_and_sign(&dir.socket(), &agent, b"ok").await;
     end(&h).await;
 }
+
+/// Two daemons of different wire revisions (an upgrade, side by side), each with a session
+/// `main`: the daemon puts the revision in the agent directory (`a-<major>-<rev>`, as
+/// `fil_daemon::Paths::agent_socket`), so each session's processes reach their own client's
+/// agent, and one client detaching leaves the other's relay alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_named_sessions_of_two_revisions_keep_their_own_agents() {
+    let dir = Short::new("rev");
+    let (agent_old, agent_new) = (
+        MiniAgent::start(&dir.0.join("old.sock"), 1),
+        MiniAgent::start(&dir.0.join("new.sock"), 1),
+    );
+    let start = |rev: u16| {
+        let path = dir.0.join(format!("a-1-{rev}")).join("main.sock");
+        async move {
+            let scratch = Scratch::new();
+            let mut cfg = sh_config(&scratch, "main", "cat");
+            cfg.agent_socket = Some(path.clone());
+            (scratch, spawn_plain(cfg).await, path)
+        }
+    };
+    let (_s1, old, old_sock) = start(6).await;
+    let (_s2, new, new_sock) = start(7).await;
+    let _c_old = FwdClient::attach_agent(&old, key(1), "laptop-a", agent_old.path()).await;
+    let c_new = FwdClient::attach_agent(&new, key(2), "laptop-b", agent_new.path()).await;
+    wait_for("both sockets", || old_sock.exists() && new_sock.exists()).await;
+    let lists = |sock: PathBuf| async move {
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        let a = tokio::time::timeout(WAIT, request(&mut s, &[REQUEST_IDENTITIES]))
+            .await
+            .unwrap()
+            .unwrap();
+        listed(&a).unwrap()
+    };
+    assert_eq!(lists(old_sock.clone()).await, [agent_old.blob(0)]);
+    assert_eq!(lists(new_sock.clone()).await, [agent_new.blob(0)]);
+    assert_eq!((agent_old.connects(), agent_new.connects()), (1, 1));
+
+    c_new.detach().await;
+    wait_for("the new session's socket to go", || !new_sock.exists()).await;
+    assert!(!new.agent_relayed());
+    assert!(old.agent_relayed(), "the other session's relay stays");
+    assert_eq!(lists(old_sock).await, [agent_old.blob(0)]);
+    end(&old).await;
+    end(&new).await;
+}
+
+/// A socket file that went (removed by hand, or replaced) is not reported as relayed, and the
+/// next link change binds it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_socket_is_not_relayed_and_is_bound_again() {
+    let dir = Short::new("lost");
+    let agent = MiniAgent::start(&dir.0.join("mini.sock"), 1);
+    let (_scratch, h) = session(&dir).await;
+    let mut c = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
+    wait_for("the socket", || dir.socket().exists()).await;
+    std::fs::remove_file(dir.socket()).unwrap();
+    assert!(!h.agent_relayed(), "a removed socket relays nothing");
+    assert!(h.agent_row().is_none());
+    c.reconnect(&h).await;
+    wait_for("the socket again", || dir.socket().exists()).await;
+    assert!(h.agent_relayed());
+    list_and_sign(&dir.socket(), &agent, b"again").await;
+    end(&h).await;
+}

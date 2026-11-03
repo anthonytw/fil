@@ -151,12 +151,17 @@ impl Paths {
         }
     }
 
-    /// `agent/<session>.sock`: the session's stable `SSH_AUTH_SOCK` (DESIGN.md section 10). The
-    /// session creates and checks `agent/` (mode 0700) when a client first relays its agent. The
-    /// name is the session's own and needs no revision: one session per name relays at a time,
-    /// and a session removes only the socket it bound.
+    /// `a-<major>-<rev>/<session>.sock`: the session's stable `SSH_AUTH_SOCK` (DESIGN.md section
+    /// 10). The session creates and checks the directory (mode 0700) when a client first relays
+    /// its agent. The wire revision is in it, as in the daemon's socket, so daemons of two builds
+    /// with a session of the same name (an upgrade, side by side: `main` in both) each have their
+    /// own; a session never moves to another daemon, so its path stays the same for its life. The
+    /// directory's name is short so the longest path fits `sockaddr_un`: a 10-digit uid, a
+    /// 64-byte session name and a revision up to 9999 make 98 bytes.
     pub fn agent_socket(&self, session: &fil_proto::msg::SessionName) -> PathBuf {
-        self.dir.join("agent").join(format!("{session}.sock"))
+        self.dir
+            .join(format!("a-{}-{}", self.major, self.revision))
+            .join(format!("{session}.sock"))
     }
 
     /// `fil-<major>-<rev>.lock`: held by the running daemon.
@@ -385,18 +390,26 @@ mod tests {
         }
     }
 
-    /// The agent socket of the longest session name and uid still fits a socket path.
+    /// The agent socket of the longest session name and uid still fits a socket path, up to
+    /// revision 9999; and two revisions never share one.
     #[test]
-    fn the_agent_socket_path_fits() {
+    fn the_agent_socket_path_fits_and_is_the_revisions_own() {
         let p = Paths::in_dir(format!("/tmp/fil-{}", u32::MAX));
         let name: fil_proto::msg::SessionName = "x".repeat(64).parse().unwrap();
-        let sock = p.agent_socket(&name);
-        assert_eq!(sock.parent().unwrap(), p.dir.join("agent"));
+        let sock = p.clone().with_revision(9999).agent_socket(&name);
         assert!(
             sock.as_os_str().len() <= MAX_SOCKET_PATH,
             "{}",
             sock.display()
         );
+        assert_eq!(sock.as_os_str().len(), 98);
+        let main: fil_proto::msg::SessionName = "main".parse().unwrap();
+        let (a, b) = (
+            p.clone().with_revision(6).agent_socket(&main),
+            p.clone().with_revision(7).agent_socket(&main),
+        );
+        assert_ne!(a.parent(), b.parent());
+        assert_eq!(a, p.dir.join(format!("a-{PROTOCOL_MAJOR}-6/main.sock")));
     }
 
     /// `fil ls` probes other daemons' lock files; one that is a FIFO (or a link) must neither block

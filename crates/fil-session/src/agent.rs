@@ -1,14 +1,16 @@
 //! The session's agent socket (DESIGN.md section 10, `docs/m2/plan.md` A1): the stable
-//! `SSH_AUTH_SOCK` of the session, `/tmp/fil-$UID/agent/<session>.sock`, whose connections the
-//! daemon relays to the attached client's agent over `Agent` channels.
+//! `SSH_AUTH_SOCK` of the session, `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock` (the daemon
+//! picks it), whose connections the daemon relays to the attached client's agent over `Agent`
+//! channels.
 //!
-//! - **The directory** (`agent/` in the socket directory) is created with mode 0700 and checked
-//!   with `lstat` like the socket directory: a real directory, owned by us, mode exactly 0700.
-//!   Anything else is refused and the relay stays off.
+//! - **The directory** (`a-<major>-<rev>/` in the socket directory) is created with mode 0700
+//!   and checked with `lstat` like the socket directory: a real directory, owned by us, mode
+//!   exactly 0700. Anything else is refused and the relay stays off.
 //! - **The socket** (mode 0600) exists only while the current subscriber relays its agent
 //!   (`Attach.agent`): it is bound when such a subscriber attaches and removed when it detaches,
 //!   is taken over by a client that does not relay, or the session ends. While nobody holds the
-//!   session, connecting fails at once (there is no socket).
+//!   session, connecting fails at once (there is no socket). A socket file that is gone or
+//!   replaced is not counted as bound, and the next link change binds it again.
 //! - **Every accept** is checked ([`check_open`]): the peer's uid must be ours, by the kernel's
 //!   credentials (a peer without them is refused). Then the connection opens an `Agent` channel
 //!   at once when the subscriber's link is up, waits at most [`AGENT_WAIT`] when it is between
@@ -150,15 +152,31 @@ impl AgentSocket {
         }
     }
 
+    /// Bound, and the socket file at the path is still the one bound (a socket somebody
+    /// removed, or replaced, relays nothing).
     pub(crate) fn is_bound(&self) -> bool {
-        self.bound.is_some()
+        self.bound.as_ref().is_some_and(|b| self.is_ours(b))
     }
 
-    /// Binds the socket if it is not bound. Must run inside a tokio runtime. A failure leaves the
-    /// relay off (connections to the path fail, as when detached).
+    fn is_ours(&self, b: &Bound) -> bool {
+        std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.dev() == b.dev && m.ino() == b.ino)
+    }
+
+    /// Binds the socket if it is not bound, or binds it again if the file at the path is no
+    /// longer the one bound. Must run inside a tokio runtime. A failure leaves the relay off
+    /// (connections to the path fail, as when detached).
     pub(crate) fn open(&mut self, admit: std::sync::Weak<dyn Admit>) {
-        if self.bound.is_some() {
-            return;
+        match &self.bound {
+            Some(b) if self.is_ours(b) => return,
+            Some(_) => {
+                // Gone or replaced: the old listener goes, and nothing at the path is removed
+                // (it is not ours).
+                if let Some(b) = self.bound.take() {
+                    b.task.abort();
+                }
+                debug!("agent socket lost; binding again");
+            }
+            None => {}
         }
         match self.bind() {
             Ok((listener, dev, ino)) => {

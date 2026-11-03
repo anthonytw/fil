@@ -13,9 +13,14 @@
 //! **The question never holds up the forwards.** It is asked from the relay task of the one
 //! connection that wants the signature: the endpoint's event drain and the manager go on, and the
 //! client loop shows it as it shows a forward's question (one at a time, only on a live session,
-//! answered by the quiet rule, refused after 30 s). Its text is built only from what the filter
-//! validated: the key's type and fingerprint, and its comment sanitized
-//! (`fil_proto::text::sanitize`).
+//! answered by the quiet rule, refused after 30 s). Its text is built only from the agent's own
+//! list: a signature is passed only for a key blob the agent listed byte for byte, and the
+//! question shows that key's type (and whether it is a certificate), its fingerprint as `ssh-add
+//! -l` shows it, and its comment sanitized (`fil_proto::text::sanitize`). Nothing the host wrote.
+//!
+//! **Destination-constrained keys fail closed** (OD-5): each connection to the local agent is
+//! first bound, with `session-bind@openssh.com`, to a key made for this run, as a forwarding
+//! hop. A key added with `ssh-add -h` names no such hop, so the agent refuses it through fil.
 //!
 //! **Privacy:** key use is user data. Counts and last use per key are kept in memory for `~#`;
 //! logs carry counts only, at debug.
@@ -85,9 +90,12 @@ impl ClientAgent {
         });
         Arc::new(ClientAgent {
             socket: relay.socket,
+            // The run's own bind key comes with the defaults: every connection is bound to it
+            // first, so destination-constrained keys fail closed (OD-5).
             rules: Arc::new(Rules {
                 keys: relay.keys,
                 confirm: asker.clone().map(|a| Arc::new(a) as Arc<dyn Confirm>),
+                ..Rules::default()
             }),
             uses: Arc::new(KeyUses::default()),
             asker,
@@ -179,11 +187,17 @@ impl Confirm for Asker {
     }
 }
 
-/// The question, in lines of at most 40 columns, from validated parts only.
+/// The question, in lines of at most 40 columns, from validated parts only: the key is one the
+/// agent itself listed, byte for byte, and its type, fingerprint and comment come from that list.
 pub(crate) fn prompt_lines(key: &KeyInfo) -> Vec<String> {
     let mut v = vec!["fil: the host asks for a signature".to_string()];
     let ty = key.key_type.strip_prefix("ssh-").unwrap_or(&key.key_type);
-    v.push(format!("{ty} key").chars().take(40).collect());
+    let what = if key.certificate {
+        "certificate"
+    } else {
+        "key"
+    };
+    v.push(format!("{ty} {what}").chars().take(40).collect());
     // Whole, over two lines: a fingerprint is compared, not read.
     v.extend(crate::text::wrap(&key.fingerprint, 38));
     if !key.comment.is_empty() {
@@ -239,6 +253,7 @@ mod tests {
         KeyInfo {
             fingerprint: "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU".into(),
             key_type: "ssh-ed25519".into(),
+            certificate: false,
             comment: comment.into(),
         }
     }
@@ -252,6 +267,11 @@ mod tests {
         assert!(lines.iter().any(|l| l == "me@laptop"));
         assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:?}");
         assert_eq!(prompt_lines(&info("")).len(), lines.len() - 1);
+        let cert = KeyInfo {
+            certificate: true,
+            ..info("")
+        };
+        assert_eq!(prompt_lines(&cert)[1], "ed25519 certificate");
     }
 
     #[test]

@@ -80,6 +80,8 @@ async fn the_filter_in_front_of_an_agent() {
     query.extend(string(b"query"));
     assert_eq!(ask(&mut s, &query).await, [SUCCESS]);
     assert_eq!(agent.types(), [REQUEST_IDENTITIES, SIGN_REQUEST, 27]);
+    // The relay bound the connection first, as a forwarding hop (OD-5).
+    assert_eq!(agent.binds(), [(0, true)]);
 
     let u = uses.snapshot();
     assert_eq!((u.lists, u.signs), (1, 1));
@@ -99,6 +101,7 @@ async fn the_allowlist() {
     let rules = Rules {
         keys: vec![fingerprint(&agent.blob(1))],
         confirm: None,
+        ..Rules::default()
     };
     let (mut s, _) = relayed(&agent, rules).await;
     let list = ask(&mut s, &[REQUEST_IDENTITIES]).await;
@@ -142,6 +145,7 @@ async fn confirm_yes_and_no() {
         let rules = Rules {
             keys: Vec::new(),
             confirm: Some(c.clone()),
+            ..Rules::default()
         };
         let (mut s, uses) = relayed(&agent, rules).await;
         // Lists are not asked about; the list teaches the relay the key's comment.
@@ -201,6 +205,7 @@ async fn confirm_withdrawn_and_timed_out() {
     let rules = Rules {
         keys: Vec::new(),
         confirm: Some(never.clone()),
+        ..Rules::default()
     };
     let (mut s, _) = relayed(&agent, rules).await;
     s.write_all(&framed(&sign_request(&agent.blob(0), b"m")))
@@ -214,21 +219,49 @@ async fn confirm_withdrawn_and_timed_out() {
         assert!(t0.elapsed() < Duration::from_secs(5), "not withdrawn");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(agent.types().is_empty());
+    // The relay's own list (the key was not known yet), and no signature.
+    assert_eq!(agent.types(), [REQUEST_IDENTITIES]);
+}
+
+/// A request sent ahead of the hang-up does not keep a question up: the relay keeps reading
+/// while it asks, and sees the end of the stream behind it.
+#[tokio::test]
+async fn a_request_sent_ahead_does_not_keep_a_question_up() {
+    let agent = MiniAgent::start(&sock("ahead"), 1);
+    let never = Arc::new(Never::default());
+    let rules = Rules {
+        confirm: Some(never.clone()),
+        ..Rules::default()
+    };
+    let (mut s, _) = relayed(&agent, rules).await;
+    ask(&mut s, &[REQUEST_IDENTITIES]).await;
+    let mut both = framed(&sign_request(&agent.blob(0), b"m"));
+    both.extend(framed(&[REQUEST_IDENTITIES]));
+    s.write_all(&both).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(s);
+    let t0 = std::time::Instant::now();
+    while never.withdrawn.load(Ordering::SeqCst) == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "not withdrawn");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(agent.types(), [REQUEST_IDENTITIES], "no signature was made");
 }
 
 #[tokio::test(start_paused = true)]
 async fn confirm_times_out_as_no() {
+    let key = ed25519_blob(&[7; 32]);
     let (near, far) = tokio::io::duplex(1 << 16);
-    let (agent_near, mut agent_far) = tokio::io::duplex(1 << 16);
+    let script = Script::start(vec![key.clone()]);
     let never = Arc::new(Never::default());
     let rules = Arc::new(Rules {
-        keys: Vec::new(),
         confirm: Some(never.clone()),
+        bind: None,
+        ..Rules::default()
     });
-    let task = tokio::spawn(relay(far, agent_near, rules, Arc::new(KeyUses::default())));
+    let task = tokio::spawn(relay(far, script.end, rules, Arc::new(KeyUses::default())));
     let mut near = near;
-    near.write_all(&framed(&sign_request(&[1, 2, 3], b"m")))
+    near.write_all(&framed(&sign_request(&key, b"m")))
         .await
         .unwrap();
     let got = tokio::time::timeout(Duration::from_secs(60), read_answer(&mut near))
@@ -239,10 +272,108 @@ async fn confirm_times_out_as_no() {
     assert_eq!(never.withdrawn.load(Ordering::SeqCst), 1);
     drop(near);
     task.await.unwrap();
-    // The agent end saw nothing.
-    let mut rest = Vec::new();
-    agent_far.read_to_end(&mut rest).await.unwrap();
-    assert!(rest.is_empty());
+    // The relay's own list, and no signature.
+    assert_eq!(*script.types.lock().unwrap(), [REQUEST_IDENTITIES]);
+}
+
+fn ed25519_blob(pk: &[u8]) -> Vec<u8> {
+    let mut b = string(b"ssh-ed25519");
+    b.extend(string(pk));
+    b
+}
+
+/// A scripted stand-in agent on an in-memory pipe: it lists `keys`, and signs **anything** it is
+/// asked to (as an agent that matches keys by value, not by bytes, signs a re-encoded blob of a
+/// key it holds). It records the types it got.
+struct Script {
+    end: tokio::io::DuplexStream,
+    types: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Script {
+    fn start(keys: Vec<Vec<u8>>) -> Script {
+        let (end, mut far) = tokio::io::duplex(1 << 16);
+        let types = Arc::new(Mutex::new(Vec::new()));
+        let t = types.clone();
+        tokio::spawn(async move {
+            while let Ok(msg) = read_answer(&mut far).await {
+                t.lock().unwrap().push(msg[0]);
+                let reply = match msg[0] {
+                    REQUEST_IDENTITIES => {
+                        let mut r = vec![IDENTITIES_ANSWER];
+                        r.extend((keys.len() as u32).to_be_bytes());
+                        for k in &keys {
+                            r.extend(string(k));
+                            r.extend(string(b"listed"));
+                        }
+                        r
+                    }
+                    SIGN_REQUEST => {
+                        let mut r = vec![14];
+                        r.extend(string(b"a signature"));
+                        r
+                    }
+                    _ => vec![SUCCESS],
+                };
+                if far.write_all(&framed(&reply)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Script { end, types }
+    }
+}
+
+/// A signature names its key by the exact bytes the agent listed. An RSA key re-encoded with a
+/// leading zero in `e` (an agent that parses keys still signs with it), a blob with a type the
+/// host wrote, and a listed blob with a byte after it are refused without reaching the agent,
+/// after the relay asked the agent for a fresh list, and count under no key. The canonical blob
+/// signs and counts.
+#[tokio::test]
+async fn a_signature_names_only_a_listed_blob() {
+    let mut rsa = string(b"ssh-rsa");
+    rsa.extend(string(&[1, 0, 1]));
+    rsa.extend(string(&[0xc5; 64]));
+    let mut odd = string(b"ssh-rsa");
+    odd.extend(string(&[0, 1, 0, 1]));
+    odd.extend(string(&[0xc5; 64]));
+    let script = Script::start(vec![rsa.clone()]);
+    let (mut near, far) = tokio::io::duplex(1 << 16);
+    let uses = Arc::new(KeyUses::default());
+    let rules = Arc::new(Rules {
+        bind: None,
+        ..Rules::default()
+    });
+    tokio::spawn(relay(far, script.end, rules, uses.clone()));
+    near.write_all(&framed(&[REQUEST_IDENTITIES]))
+        .await
+        .unwrap();
+    read_answer(&mut near).await.unwrap();
+    let mut forged = string(b"ssh-ed25519 (your usual github key, ok)");
+    forged.extend(string(&[1; 32]));
+    for bad in [odd, forged, [rsa.clone(), vec![0]].concat()] {
+        near.write_all(&framed(&sign_request(&bad, b"x")))
+            .await
+            .unwrap();
+        assert_eq!(read_answer(&mut near).await.unwrap(), [FAILURE]);
+    }
+    assert!(
+        !script.types.lock().unwrap().contains(&SIGN_REQUEST),
+        "an unlisted blob reached the agent"
+    );
+    let u = uses.snapshot();
+    assert_eq!(u.signs, 0);
+    assert!(u.keys.iter().all(|k| k.signs == 0));
+    assert_eq!(u.keys.len(), 1, "no key was made up from the host's bytes");
+    assert_eq!(u.keys[0].info.fingerprint, fingerprint(&rsa));
+    // Each miss asked the agent again, unseen by the remote.
+    assert_eq!(*script.types.lock().unwrap(), [REQUEST_IDENTITIES; 4]);
+    near.write_all(&framed(&sign_request(&rsa, b"x")))
+        .await
+        .unwrap();
+    assert_eq!(read_answer(&mut near).await.unwrap()[0], 14);
+    let u = uses.snapshot();
+    assert_eq!((u.signs, u.keys[0].signs), (1, 1));
 }
 
 /// A length beyond 256 KiB is refused and ends the connection; the largest allowed one passes
@@ -293,7 +424,10 @@ async fn random_bytes_never_panic_the_relay() {
         let task = tokio::spawn(relay(
             far,
             agent_near,
-            Arc::new(Rules::default()),
+            Arc::new(Rules {
+                bind: None,
+                ..Rules::default()
+            }),
             Arc::new(KeyUses::default()),
         ));
         let mut junk = Vec::new();

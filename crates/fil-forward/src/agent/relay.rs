@@ -25,10 +25,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fil_proto::limits::MAX_AGENT_MSG;
 use fil_proto::mux::OpenFailure;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
-};
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
 
 use super::filter::{
@@ -54,13 +55,27 @@ pub trait Confirm: Send + Sync + 'static {
 }
 
 /// What the client's relay allows beyond the filter.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Rules {
     /// `agent_keys`: the fingerprints (`SHA256:...`) the relay lists and signs with. Empty is
     /// every key.
     pub keys: Vec<String>,
     /// `agent = "confirm"`: every signature is asked about.
     pub confirm: Option<Arc<dyn Confirm>>,
+    /// The run's key for the `session-bind@openssh.com` each connection starts with
+    /// ([`BindKey`]). Set by default; `None` only in tests whose stand-in agent cannot answer it.
+    pub bind: Option<Arc<BindKey>>,
+}
+
+/// Every key, no question, and a bind key of its own.
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            confirm: None,
+            bind: BindKey::generate(),
+        }
+    }
 }
 
 impl Rules {
@@ -75,6 +90,7 @@ impl std::fmt::Debug for Rules {
         f.debug_struct("Rules")
             .field("keys", &self.keys.len())
             .field("confirm", &self.confirm.is_some())
+            .field("bind", &self.bind.is_some())
             .finish()
     }
 }
@@ -110,6 +126,8 @@ pub struct KeyUses(Mutex<Uses>);
 struct Uses {
     total: AgentUse,
     by_fp: HashMap<String, usize>,
+    /// The agent's own last list: each key's blob, as it sent it, and what it shows.
+    agent_keys: Vec<(Vec<u8>, KeyInfo)>,
 }
 
 /// Counts only.
@@ -166,22 +184,34 @@ impl KeyUses {
         debug!(lists = u.total.lists, "agent list answered");
     }
 
-    /// What is known of the key with `blob`: its comment from an earlier list answer.
-    fn known(&self, blob: &[u8]) -> KeyInfo {
-        let info = filter::key_info(blob, b"");
-        let u = self.lock();
-        match u.by_fp.get(&info.fingerprint) {
-            Some(&i) => u.total.keys[i].info.clone(),
-            None => info,
-        }
+    /// The agent's list answer `msg` (all of it, before the allowlist): the keys a signature
+    /// may name. A malformed or failed answer changes nothing.
+    fn remember(&self, msg: &[u8]) {
+        let Some(keys) = filter::parse_identities(msg) else {
+            return;
+        };
+        let keys = keys
+            .into_iter()
+            .map(|(blob, comment)| (blob.to_vec(), filter::key_info(blob, comment)))
+            .collect();
+        self.lock().agent_keys = keys;
     }
 
-    fn signed(&self, blob: &[u8]) {
+    /// The listed key whose blob is exactly `blob`.
+    fn lookup(&self, blob: &[u8]) -> Option<KeyInfo> {
+        self.lock()
+            .agent_keys
+            .iter()
+            .find(|(b, _)| b == blob)
+            .map(|(_, info)| info.clone())
+    }
+
+    fn signed(&self, info: KeyInfo) {
         let now = Instant::now();
         let mut u = self.lock();
         u.total.signs += 1;
         u.total.last = Some(now);
-        if let Some(k) = Self::entry(&mut u, filter::key_info(blob, b"")) {
+        if let Some(k) = Self::entry(&mut u, info) {
             k.signs += 1;
             k.last = Some(now);
         }
@@ -206,6 +236,7 @@ enum Msg {
     Eof,
 }
 
+/// Reads one message from the agent.
 async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Msg> {
     let mut head = [0u8; 4];
     match s.read_exact(&mut head).await {
@@ -232,29 +263,166 @@ fn framed(msg: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Most the relay holds of what the remote sent ahead: one whole message and its length.
+const AHEAD: usize = 4 + MAX_AGENT_MSG;
+
+/// The remote end, read through a buffer of our own, so the relay can keep reading (and see the
+/// remote hang up) while a `confirm` question is up, without losing what was sent ahead.
+struct Inbound<R> {
+    s: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + AsyncWrite + Unpin> Inbound<R> {
+    /// Reads more into the buffer; `false` at the end of the stream. Cancel-safe: a read that is
+    /// dropped took nothing.
+    async fn fill(&mut self) -> io::Result<bool> {
+        let mut chunk = [0u8; 16 * 1024];
+        let room = AHEAD.saturating_sub(self.buf.len()).min(chunk.len());
+        if room == 0 {
+            return Ok(true);
+        }
+        let n = self.s.read(&mut chunk[..room]).await?;
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(n > 0)
+    }
+
+    async fn read_msg(&mut self) -> io::Result<Msg> {
+        while self.buf.len() < 4 {
+            if !self.fill().await? {
+                return Ok(Msg::Eof);
+            }
+        }
+        let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+        if len == 0 {
+            self.buf.drain(..4);
+            return Ok(Msg::Empty);
+        }
+        if !length_ok(len) {
+            return Ok(Msg::Oversize);
+        }
+        let end = 4 + len as usize;
+        while self.buf.len() < end {
+            if !self.fill().await? {
+                return Ok(Msg::Eof);
+            }
+        }
+        let msg = self.buf[4..end].to_vec();
+        self.buf.drain(..end);
+        Ok(Msg::One(msg))
+    }
+
+    /// Waits until the remote hangs up (`true`), or until the buffer is full or reading fails
+    /// (`false`: nothing more can be seen). What arrives meanwhile is kept for later.
+    async fn closed(&mut self) -> bool {
+        loop {
+            if self.buf.len() >= AHEAD {
+                return std::future::pending().await;
+            }
+            match self.fill().await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return true,
+            }
+        }
+    }
+}
+
+/// The client's own host key for the `session-bind@openssh.com` it sends first on every agent
+/// connection (DESIGN.md section 10, OD-5): an Ed25519 key made for this run, in memory only.
+pub struct BindKey {
+    pair: Ed25519KeyPair,
+    blob: Vec<u8>,
+}
+
+/// Names no key.
+impl std::fmt::Debug for BindKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BindKey(..)")
+    }
+}
+
+impl BindKey {
+    /// A new key from the system's random source.
+    pub fn generate() -> Option<Arc<Self>> {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).ok()?;
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).ok()?;
+        let mut blob = ssh_string(b"ssh-ed25519");
+        blob.extend(ssh_string(pair.public_key().as_ref()));
+        Some(Arc::new(BindKey { pair, blob }))
+    }
+
+    /// The `session-bind@openssh.com` request for one connection: this key, a fresh random
+    /// session id signed by it, and `is_forwarding = 1`. The agent records the hop "this
+    /// machine to a forwarding host": a key constrained with `ssh-add -h` names no such hop, so
+    /// it refuses such a key from then on, whatever the remote binds after it.
+    fn request(&self) -> Option<Vec<u8>> {
+        let mut sid = [0u8; 32];
+        SystemRandom::new().fill(&mut sid).ok()?;
+        let sig = self.pair.sign(&sid);
+        let mut sig_blob = ssh_string(b"ssh-ed25519");
+        sig_blob.extend(ssh_string(sig.as_ref()));
+        let mut m = vec![filter::EXTENSION];
+        m.extend(ssh_string(b"session-bind@openssh.com"));
+        m.extend(ssh_string(&self.blob));
+        m.extend(ssh_string(&sid));
+        m.extend(ssh_string(&sig_blob));
+        m.push(1);
+        Some(m)
+    }
+}
+
+fn ssh_string(b: &[u8]) -> Vec<u8> {
+    let mut v = (b.len() as u32).to_be_bytes().to_vec();
+    v.extend_from_slice(b);
+    v
+}
+
 /// Relays one connection: requests from `remote` (the channel) through the filter and `rules`
-/// to `agent`, and the agent's answers back, checked. Ends when either side ends, an oversize
-/// message arrives from either, or an IO error occurs.
+/// to `agent`, and the agent's answers back, checked. First, when `rules.bind` is set, the
+/// connection is bound ([`BindKey`]); an agent that does not know the extension (gpg-agent and
+/// others enforce no destination constraints either) answers `FAILURE`, which is ignored. Ends
+/// when either side ends, an oversize message arrives from either, or an IO error occurs.
 pub async fn relay<R, A>(remote: R, mut agent: A, rules: Arc<Rules>, uses: Arc<KeyUses>)
 where
     R: AsyncRead + AsyncWrite + Unpin,
     A: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut remote = BufReader::new(remote);
+    if let Some(key) = &rules.bind {
+        let Some(bind) = key.request() else {
+            return;
+        };
+        if agent.write_all(&framed(&bind)).await.is_err() {
+            return;
+        }
+        match read_msg(&mut agent).await {
+            Ok(Msg::One(a)) => {
+                debug!(
+                    bound = a.first() == Some(&filter::SUCCESS),
+                    "agent connection bound"
+                )
+            }
+            _ => return,
+        }
+    }
+    let mut remote = Inbound {
+        s: remote,
+        buf: Vec::new(),
+    };
     loop {
-        let msg = match read_msg(&mut remote).await {
+        let msg = match remote.read_msg().await {
             Ok(Msg::One(m)) => m,
             Ok(Msg::Empty) => {
                 uses.refused();
-                if remote.write_all(&FAILURE_MSG).await.is_err() {
+                if remote.s.write_all(&FAILURE_MSG).await.is_err() {
                     return;
                 }
                 continue;
             }
             Ok(Msg::Oversize) => {
                 uses.refused();
-                let _ = remote.write_all(&FAILURE_MSG).await;
-                let _ = remote.shutdown().await;
+                let _ = remote.s.write_all(&FAILURE_MSG).await;
+                let _ = remote.s.shutdown().await;
                 return;
             }
             Ok(Msg::Eof) | Err(_) => return,
@@ -269,9 +437,25 @@ where
                 None => return,
             },
         };
-        if remote.write_all(&reply).await.is_err() {
+        if remote.s.write_all(&reply).await.is_err() {
             return;
         }
+    }
+}
+
+/// Asks the agent for its keys itself (the remote sees nothing of it) and remembers them.
+/// `None` when the agent failed.
+async fn refresh<A: AsyncRead + AsyncWrite + Unpin>(agent: &mut A, uses: &KeyUses) -> Option<()> {
+    agent
+        .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+        .await
+        .ok()?;
+    match read_msg(agent).await.ok()? {
+        Msg::One(a) => {
+            uses.remember(&a);
+            Some(())
+        }
+        Msg::Empty | Msg::Oversize | Msg::Eof => None,
     }
 }
 
@@ -281,7 +465,7 @@ where
 async fn pass<R, A>(
     req: &Request<'_>,
     msg: &[u8],
-    remote: &mut BufReader<R>,
+    remote: &mut Inbound<R>,
     agent: &mut A,
     rules: &Rules,
     uses: &KeyUses,
@@ -290,14 +474,29 @@ where
     R: AsyncRead + AsyncWrite + Unpin,
     A: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut signer = None;
     if let Request::Sign { key } = req {
-        let info = uses.known(key);
+        // Only a key the agent itself listed, byte for byte: the fingerprint, the allowlist, the
+        // question and the counts then all come from the agent's bytes, never the host's.
+        let info = match uses.lookup(key) {
+            Some(info) => info,
+            None => {
+                refresh(agent, uses).await?;
+                match uses.lookup(key) {
+                    Some(info) => info,
+                    None => {
+                        uses.refused();
+                        return Some(FAILURE_MSG.to_vec());
+                    }
+                }
+            }
+        };
         if !rules.allows(&info.fingerprint) {
             uses.refused();
             return Some(FAILURE_MSG.to_vec());
         }
         if let Some(c) = &rules.confirm {
-            match ask(c.as_ref(), info, remote).await {
+            match ask(c.as_ref(), info.clone(), remote).await {
                 Some(true) => {}
                 Some(false) => {
                     uses.refused();
@@ -306,6 +505,7 @@ where
                 None => return None,
             }
         }
+        signer = Some(info);
     }
     agent.write_all(&framed(msg)).await.ok()?;
     let answer = match read_msg(agent).await.ok()? {
@@ -319,6 +519,7 @@ where
     }
     match req {
         Request::Identities if answer[0] == IDENTITIES_ANSWER => {
+            uses.remember(&answer);
             match filter_identities(&answer, |fp| rules.allows(fp)) {
                 Some((out, infos)) => {
                     uses.listed(infos);
@@ -330,8 +531,10 @@ where
                 }
             }
         }
-        Request::Sign { key } if answer[0] == SIGN_RESPONSE => {
-            uses.signed(key);
+        Request::Sign { .. } if answer[0] == SIGN_RESPONSE => {
+            if let Some(info) = signer {
+                uses.signed(info);
+            }
             Some(framed(&answer))
         }
         _ => Some(framed(&answer)),
@@ -339,25 +542,18 @@ where
 }
 
 /// The `confirm` question, at most [`CONFIRM_TIMEOUT`] (no answer is `no`). `None` when the
-/// remote end closed meanwhile: the question is withdrawn (dropped) and the connection ends.
-async fn ask<R: AsyncRead + Unpin>(
+/// remote end hung up meanwhile, even with requests sent ahead: the question is withdrawn
+/// (dropped) and the connection ends.
+async fn ask<R: AsyncRead + AsyncWrite + Unpin>(
     c: &dyn Confirm,
     info: KeyInfo,
-    remote: &mut BufReader<R>,
+    remote: &mut Inbound<R>,
 ) -> Option<bool> {
     let answer = tokio::time::timeout(CONFIRM_TIMEOUT, c.confirm(info));
     tokio::pin!(answer);
-    let mut watching = true;
-    loop {
-        tokio::select! {
-            r = &mut answer => return Some(r.unwrap_or(false)),
-            // Looks at the remote without taking anything from it: an end of stream withdraws
-            // the question; a request sent ahead waits for this answer.
-            b = remote.fill_buf(), if watching => match b {
-                Ok([]) | Err(_) => return None,
-                Ok(_) => watching = false,
-            },
-        }
+    tokio::select! {
+        r = &mut answer => Some(r.unwrap_or(false)),
+        _ = remote.closed() => None,
     }
 }
 

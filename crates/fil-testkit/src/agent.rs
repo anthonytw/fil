@@ -5,7 +5,9 @@
 //!
 //! It answers `REQUEST_IDENTITIES` (11) and `SIGN_REQUEST` (13) as an agent does, and every other
 //! type with `SSH_AGENT_SUCCESS`, so a message that should not have arrived is visible both here
-//! and in what the client got back.
+//! and in what the client got back. A `session-bind@openssh.com` is checked as OpenSSH's agent
+//! checks it (the host key's signature over the session id) and recorded apart from the other
+//! types ([`MiniAgent::binds`]); it does not enforce destination constraints.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +50,8 @@ struct Key {
 struct Seen {
     types: Mutex<Vec<u8>>,
     connects: AtomicUsize,
+    /// Each valid session-bind: (the connection's number, `is_forwarding`).
+    binds: Mutex<Vec<(usize, bool)>>,
 }
 
 /// The agent. Dropping it stops it and removes its socket.
@@ -84,8 +88,8 @@ impl MiniAgent {
             let (keys, seen) = (keys.clone(), seen.clone());
             tokio::spawn(async move {
                 while let Ok((s, _)) = listener.accept().await {
-                    seen.connects.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(serve(s, keys.clone(), seen.clone()));
+                    let n = seen.connects.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve(s, n, keys.clone(), seen.clone()));
                 }
             })
         };
@@ -111,7 +115,13 @@ impl MiniAgent {
         self.seen.connects.load(Ordering::SeqCst)
     }
 
-    /// Every message type received so far, in order.
+    /// The valid session-binds so far: (connection number from 0, `is_forwarding`). An invalid
+    /// one is answered `FAILURE` and not recorded.
+    pub fn binds(&self) -> Vec<(usize, bool)> {
+        self.seen.binds.lock().unwrap().clone()
+    }
+
+    /// Every message type received so far, in order (session-binds aside).
     pub fn types(&self) -> Vec<u8> {
         self.seen.types.lock().unwrap().clone()
     }
@@ -151,7 +161,36 @@ fn field(b: &[u8]) -> Option<(&[u8], &[u8])> {
     (len <= rest.len()).then(|| rest.split_at(len))
 }
 
-async fn serve(mut s: UnixStream, keys: Arc<Vec<Key>>, seen: Arc<Seen>) {
+/// A `session-bind@openssh.com` body (after the type byte): `None` for another extension,
+/// `Some(Some(is_forwarding))` for a bind whose signature checks out, `Some(None)` for a bad one.
+fn session_bind(body: &[u8]) -> Option<Option<bool>> {
+    let (name, rest) = field(body)?;
+    if name != b"session-bind@openssh.com" {
+        return None;
+    }
+    let check = || {
+        let (key, rest) = field(rest)?;
+        let (sid, rest) = field(rest)?;
+        let (sig, rest) = field(rest)?;
+        let (&fwd, rest) = rest.split_first()?;
+        if !rest.is_empty() || sid.len() > 128 {
+            return None;
+        }
+        let (alg, k) = field(key)?;
+        let (pk, _) = field(k)?;
+        let (salg, s) = field(sig)?;
+        let (sbytes, _) = field(s)?;
+        (alg == b"ssh-ed25519"
+            && salg == b"ssh-ed25519"
+            && UnparsedPublicKey::new(&ED25519, pk)
+                .verify(sid, sbytes)
+                .is_ok())
+        .then_some(fwd == 1)
+    };
+    Some(check())
+}
+
+async fn serve(mut s: UnixStream, conn: usize, keys: Arc<Vec<Key>>, seen: Arc<Seen>) {
     loop {
         let mut head = [0u8; 4];
         if s.read_exact(&mut head).await.is_err() {
@@ -164,6 +203,21 @@ async fn serve(mut s: UnixStream, keys: Arc<Vec<Key>>, seen: Arc<Seen>) {
         let mut msg = vec![0u8; len];
         if s.read_exact(&mut msg).await.is_err() {
             return;
+        }
+        if msg[0] == 27
+            && let Some(bind) = session_bind(&msg[1..])
+        {
+            let reply = match bind {
+                Some(fwd) => {
+                    seen.binds.lock().unwrap().push((conn, fwd));
+                    vec![SUCCESS]
+                }
+                None => vec![FAILURE],
+            };
+            if s.write_all(&framed(&reply)).await.is_err() {
+                return;
+            }
+            continue;
         }
         seen.types.lock().unwrap().push(msg[0]);
         let reply = match msg[0] {

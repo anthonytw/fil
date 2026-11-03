@@ -165,10 +165,14 @@ pub fn check_answer(req: &Request<'_>, msg: &[u8]) -> bool {
 /// One key of a list answer, as the relay shows and counts it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyInfo {
-    /// `SHA256:` and the unpadded base64 of the blob's SHA-256, as `ssh-keygen -l` prints it.
+    /// As `ssh-keygen -l` and `ssh-add -l` print it ([`fingerprint`]): a certificate by the
+    /// plain key inside it.
     pub fingerprint: String,
-    /// The key's type (`ssh-ed25519`), sanitized and at most [`MAX_SHOWN`] characters.
+    /// The key's type (`ssh-ed25519`), sanitized and at most [`MAX_SHOWN`] characters; for a
+    /// certificate, the type of the key it certifies.
     pub key_type: String,
+    /// An OpenSSH certificate (`*-cert-v01@openssh.com`).
+    pub certificate: bool,
     /// The agent's comment, sanitized to one line of at most [`MAX_SHOWN`] characters.
     pub comment: String,
 }
@@ -187,30 +191,14 @@ pub fn filter_identities(
     msg: &[u8],
     allow: impl Fn(&str) -> bool,
 ) -> Option<(Vec<u8>, Vec<KeyInfo>)> {
-    let (&ty, body) = msg.split_first()?;
-    if ty != IDENTITIES_ANSWER {
-        return None;
-    }
-    let mut f = Fields(body);
-    let n = f.u32()?;
-    // Each key takes at least two lengths: a count beyond that is a lie, refused before any
-    // allocation follows it.
-    if u64::from(n) > (f.0.len() / 8) as u64 {
-        return None;
-    }
     let mut kept: Vec<(&[u8], &[u8])> = Vec::new();
     let mut infos = Vec::new();
-    for _ in 0..n {
-        let blob = f.string()?;
-        let comment = f.string()?;
+    for (blob, comment) in parse_identities(msg)? {
         let info = key_info(blob, comment);
         if allow(&info.fingerprint) {
             kept.push((blob, comment));
             infos.push(info);
         }
-    }
-    if !f.is_empty() {
-        return None;
     }
     let mut out = Vec::with_capacity(msg.len());
     out.push(IDENTITIES_ANSWER);
@@ -224,15 +212,81 @@ pub fn filter_identities(
     Some((out, infos))
 }
 
-/// What a prompt and a summary show of a key: its fingerprint, its type from the blob, and the
-/// comment, sanitized.
+/// The keys of an `IDENTITIES_ANSWER` (blob and comment, in the agent's order). `None` when it
+/// is not a well-formed one.
+pub fn parse_identities(msg: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    let (&ty, body) = msg.split_first()?;
+    if ty != IDENTITIES_ANSWER {
+        return None;
+    }
+    let mut f = Fields(body);
+    let n = f.u32()?;
+    // Each key takes at least two lengths: a count beyond that is a lie, refused before any
+    // allocation follows it.
+    if u64::from(n) > (f.0.len() / 8) as u64 {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let blob = f.string()?;
+        let comment = f.string()?;
+        keys.push((blob, comment));
+    }
+    f.is_empty().then_some(keys)
+}
+
+/// What a prompt and a summary show of a key: its fingerprint, its type, whether it is a
+/// certificate, and the comment, sanitized. Call it only on blobs the agent listed: the relay
+/// never shows or counts a key by bytes the host sent.
 pub fn key_info(blob: &[u8], comment: &[u8]) -> KeyInfo {
-    let key_type = Fields(blob).string().map(shown).unwrap_or_default();
+    let ty = Fields(blob).string().unwrap_or_default();
+    let (key_type, certificate) = match cert_type(ty) {
+        Some((plain, _)) => (plain.as_bytes(), true),
+        None => (ty, ty.ends_with(CERT_SUFFIX.as_bytes())),
+    };
     KeyInfo {
         fingerprint: fingerprint(blob),
-        key_type,
+        key_type: shown(key_type),
+        certificate,
         comment: shown(comment),
     }
+}
+
+/// The suffix of OpenSSH certificate types.
+const CERT_SUFFIX: &str = "-cert-v01@openssh.com";
+
+/// An OpenSSH certificate type: the plain key type it certifies, and how many public fields
+/// follow its nonce.
+fn cert_type(ty: &[u8]) -> Option<(&'static str, usize)> {
+    Some(match ty {
+        b"ssh-ed25519-cert-v01@openssh.com" => ("ssh-ed25519", 1),
+        b"ssh-rsa-cert-v01@openssh.com" => ("ssh-rsa", 2),
+        b"ssh-dss-cert-v01@openssh.com" => ("ssh-dss", 4),
+        b"ecdsa-sha2-nistp256-cert-v01@openssh.com" => ("ecdsa-sha2-nistp256", 2),
+        b"ecdsa-sha2-nistp384-cert-v01@openssh.com" => ("ecdsa-sha2-nistp384", 2),
+        b"ecdsa-sha2-nistp521-cert-v01@openssh.com" => ("ecdsa-sha2-nistp521", 2),
+        b"sk-ssh-ed25519-cert-v01@openssh.com" => ("sk-ssh-ed25519@openssh.com", 2),
+        b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com" => ("sk-ecdsa-sha2-nistp256@openssh.com", 3),
+        _ => return None,
+    })
+}
+
+/// The plain key a certificate blob certifies (its type, then the public fields after the
+/// nonce), as OpenSSH fingerprints a certificate. `None` for a blob that is not a certificate of
+/// a known type, or does not parse.
+pub fn plain_key(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut f = Fields(blob);
+    let (plain, n) = cert_type(f.string()?)?;
+    f.string()?; // the nonce
+    let mut out = Vec::with_capacity(blob.len());
+    out.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+    out.extend_from_slice(plain.as_bytes());
+    for _ in 0..n {
+        let field = f.string()?;
+        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    Some(out)
 }
 
 /// Untrusted text as one short, inert line (`fil_proto::text::sanitize`, newlines and tabs as
@@ -248,10 +302,13 @@ fn shown(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// The ssh fingerprint of a public key blob: `SHA256:` and the unpadded standard base64 of its
-/// SHA-256.
+/// The ssh fingerprint of a public key blob, as `ssh-keygen -l` and `ssh-add -l` print it:
+/// `SHA256:` and the unpadded standard base64 of its SHA-256. A certificate is fingerprinted by
+/// the plain key inside it ([`plain_key`]), as OpenSSH does; an unknown certificate type by its
+/// whole blob.
 pub fn fingerprint(blob: &[u8]) -> String {
-    let d = ring::digest::digest(&ring::digest::SHA256, blob);
+    let plain = plain_key(blob);
+    let d = ring::digest::digest(&ring::digest::SHA256, plain.as_deref().unwrap_or(blob));
     format!("SHA256:{}", base64_unpadded(d.as_ref()))
 }
 
@@ -407,6 +464,123 @@ mod tests {
         let mut b = string(ty.as_bytes());
         b.extend(string(key));
         b
+    }
+
+    /// A certificate of each known type is fingerprinted by the plain key inside it.
+    #[test]
+    fn certificates_are_fingerprinted_by_their_plain_key() {
+        for (cert, plain, fields) in [
+            ("ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519", 1),
+            ("ssh-rsa-cert-v01@openssh.com", "ssh-rsa", 2),
+            ("ssh-dss-cert-v01@openssh.com", "ssh-dss", 4),
+            (
+                "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+                "ecdsa-sha2-nistp256",
+                2,
+            ),
+            (
+                "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+                "ecdsa-sha2-nistp521",
+                2,
+            ),
+            (
+                "sk-ssh-ed25519-cert-v01@openssh.com",
+                "sk-ssh-ed25519@openssh.com",
+                2,
+            ),
+            (
+                "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+                "sk-ecdsa-sha2-nistp256@openssh.com",
+                3,
+            ),
+        ] {
+            let public: Vec<Vec<u8>> = (0..fields).map(|i| vec![i as u8 + 1; 7 + i]).collect();
+            let mut p = string(plain.as_bytes());
+            let mut c = string(cert.as_bytes());
+            c.extend(string(b"nonce-nonce"));
+            for f in &public {
+                p.extend(string(f));
+                c.extend(string(f));
+            }
+            // What follows the public fields (serial, principals, the CA's signature...).
+            c.extend(string(b"the rest of the certificate"));
+            assert_eq!(fingerprint(&c), fingerprint(&p), "{cert}");
+            let info = key_info(&c, b"me");
+            assert!(info.certificate);
+            assert_eq!(info.key_type, plain);
+            assert!(!key_info(&p, b"").certificate);
+        }
+        // A short certificate falls back to its whole blob; an unknown one too.
+        let short = [string(b"ssh-ed25519-cert-v01@openssh.com"), string(b"n")].concat();
+        assert_eq!(fingerprint(&short), {
+            let d = ring::digest::digest(&ring::digest::SHA256, &short);
+            format!("SHA256:{}", base64_unpadded(d.as_ref()))
+        });
+        let unknown = blob("x-cert-v01@openssh.com", b"k");
+        assert!(key_info(&unknown, b"").certificate);
+    }
+
+    /// Against `ssh-keygen` itself, when it is installed: a throwaway key and a certificate of
+    /// it, both made now, have the fingerprint `ssh-keygen -l` prints.
+    #[test]
+    fn fingerprints_match_ssh_keygen_for_a_certificate() {
+        let dir = std::env::temp_dir().join(format!("fil-a1-cert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keygen = |args: &[&str]| {
+            std::process::Command::new("ssh-keygen")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+        };
+        let Ok(out) = keygen(&["-q", "-t", "ed25519", "-N", "", "-f", "user"]) else {
+            eprintln!("no ssh-keygen: skipped");
+            return;
+        };
+        assert!(out.status.success());
+        assert!(
+            keygen(&["-q", "-t", "ed25519", "-N", "", "-f", "ca"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let signed = keygen(&["-q", "-s", "ca", "-I", "test", "-n", "nobody", "user.pub"]).unwrap();
+        assert!(signed.status.success(), "{signed:?}");
+        let printed = |file: &str| {
+            let o = keygen(&["-l", "-E", "sha256", "-f", file]).unwrap();
+            String::from_utf8(o.stdout)
+                .unwrap()
+                .split(' ')
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        let blob_of = |file: &str| {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap();
+            base64_decode(text.split(' ').nth(1).unwrap())
+        };
+        let (plain, cert) = (blob_of("user.pub"), blob_of("user-cert.pub"));
+        assert_eq!(fingerprint(&plain), printed("user.pub"));
+        assert_eq!(fingerprint(&cert), printed("user-cert.pub"));
+        assert_eq!(fingerprint(&cert), fingerprint(&plain));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn base64_decode(s: &str) -> Vec<u8> {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = 0u32;
+        let mut n = 0;
+        let mut out = Vec::new();
+        for c in s.trim().bytes().take_while(|&c| c != b'=') {
+            let v = A.iter().position(|&a| a == c).unwrap() as u32;
+            bits = (bits << 6) | v;
+            n += 6;
+            if n >= 8 {
+                n -= 8;
+                out.push((bits >> n) as u8);
+            }
+        }
+        out
     }
 
     #[test]

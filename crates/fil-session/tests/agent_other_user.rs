@@ -7,7 +7,8 @@
 //! limactl shell fil -- sudo BINARY --ignored --exact f_agent_other_user --nocapture
 //! ```
 //!
-//! The test (as root) copies its own binary where an unprivileged user can run it and starts it
+//! The test (as root) copies its own binary where an unprivileged user can run it (a fresh
+//! directory with an unpredictable name, removed with the child's directory on any exit) and starts it
 //! as `nobody` ([`f_agent_other_user_child`]): that child runs a session whose subscriber relays a
 //! mini agent, in a directory of its own, and prints the socket's path. Root then connects. Root
 //! is the one other user a 0700 directory does not keep out, so it is the case the peer-UID
@@ -17,7 +18,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -41,11 +42,9 @@ fn f_agent_other_user() {
         0,
         "run as root: limactl shell fil -- sudo BINARY --ignored --exact f_agent_other_user"
     );
-    // A copy of this binary that `nobody` can run.
-    let bin = PathBuf::from(format!("/tmp/fil-a1-ou-bin-{}", std::process::id()));
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = Command::new(&bin)
+    let mut guard = Cleanup::default();
+    let bin = guard.copy_of_self();
+    let child = Command::new(&bin)
         .args([
             "--ignored",
             "--exact",
@@ -63,6 +62,9 @@ fn f_agent_other_user() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    // The child's directory, named by its pid: removed with everything else, pass or fail.
+    guard.dirs.push(child_dir(child.id()));
+    let child = guard.child.insert(child);
     let mut to_child = child.stdin.take().unwrap();
     let mut from_child = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
@@ -80,30 +82,91 @@ fn f_agent_other_user() {
     };
     let sock = PathBuf::from(expect(&mut from_child, &mut line, "SOCK "));
 
-    // Root connects (the directory's 0700 does not keep root out): closed, unanswered.
+    // Root connects (the directories' 0700 does not keep root out). It must be closed with no
+    // answer: one byte back is an answer, and no end within 5 s is a connection left open.
     let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("root reaches the socket");
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let _ = s.write_all(&framed(&[REQUEST_IDENTITIES]));
-    let mut got = Vec::new();
-    match s.read_to_end(&mut got) {
+    let mut got = [0u8; 64];
+    let outcome = match s.read(&mut got) {
         // Closed: at its end, or reset because the request was never read.
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Ok(_) => panic!("another user's connection was answered"),
-        Err(e) => panic!("another user's connection was left open ({e})"),
-    }
-
+        Ok(0) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => None,
+        Ok(n) => Some(format!("answered ({n} bytes)")),
+        Err(e) => Some(format!("left open ({e})")),
+    };
+    // What the client's agent saw is the real result, whatever the socket did.
     writeln!(to_child, "CHECK").unwrap();
     let connects = expect(&mut from_child, &mut line, "CONNECTS ");
     assert_eq!(
-        connects, "0",
-        "the client's agent was reached for another user"
+        (outcome.as_deref(), connects.as_str()),
+        (None, "0"),
+        "another user's connection: (what root saw, connections the client's agent got)"
     );
     let own = expect(&mut from_child, &mut line, "OWN ");
     assert_eq!(own, "ok", "the session's own user is still answered");
     drop(to_child);
-    assert!(child.wait().unwrap().success());
-    let _ = std::fs::remove_file(&bin);
+    assert!(guard.child.take().unwrap().wait().unwrap().success());
+}
+
+/// The child's directory (it makes it, as `nobody`, mode 0700).
+fn child_dir(pid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/fil-a1-ou-{pid}"))
+}
+
+/// What the root half leaves behind, removed on every exit (a failed assertion included): the
+/// copy of the binary, the child's directory, the child.
+#[derive(Default)]
+struct Cleanup {
+    dirs: Vec<PathBuf>,
+    child: Option<std::process::Child>,
+}
+
+impl Cleanup {
+    /// A copy of this binary that `nobody` can run, in a directory made for it with an
+    /// unpredictable name: `mkdir` fails on anything already there, and the file is created
+    /// with `O_EXCL`, so nothing planted in `/tmp` is followed or reused.
+    fn copy_of_self(&mut self) -> PathBuf {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = loop {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            let d = PathBuf::from(format!(
+                "/tmp/fil-a1-ou-bin-{}-{nanos:09}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o755).create(&d) {
+                Ok(()) => break d,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("cannot make the binary's directory: {e}"),
+            }
+        };
+        self.dirs.push(dir.clone());
+        let bin = dir.join("test");
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&bin)
+            .unwrap();
+        let mut me = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        std::io::copy(&mut me, &mut out).unwrap();
+        bin
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }
 
 /// The unprivileged half (see the module docs): only runs when started by
@@ -114,7 +177,7 @@ async fn f_agent_other_user_child() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/fil-a1-ou-{}", std::process::id()));
+    let dir = child_dir(std::process::id());
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
     let scratch = Scratch::new();

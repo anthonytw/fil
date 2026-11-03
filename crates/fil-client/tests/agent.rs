@@ -90,6 +90,8 @@ async fn list_and_sign_across_a_swap_and_a_reconnect() -> Test {
     assert!(agent.verify(0, b"four", &sig), "after the reconnect");
     assert!(rig.daemon.attaches().await.iter().all(|a| a.agent));
     assert_eq!(agent.connects(), 2, "one local connection per channel");
+    // Each bound first, as a forwarding hop (OD-5).
+    assert_eq!(agent.binds(), [(0, true), (1, true)]);
 
     // `~#` counts the signatures (never names a key in the logs; on screen only).
     rig.type_str("\r~#");

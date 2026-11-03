@@ -73,6 +73,7 @@
 mod config;
 mod core;
 pub mod echo;
+pub mod env;
 mod handle;
 pub mod proc;
 mod pty;

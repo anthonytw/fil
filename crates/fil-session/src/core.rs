@@ -1526,6 +1526,84 @@ mod tests {
         assert!(p.contains("skipped 2 KB of output"));
         assert_eq!(p.matches("\r\n").count(), 1 + 5);
     }
+
+    /// Input that a connection sends after it lost the session (a takeover is in the core's queue
+    /// ahead of it) must not reach the program: only the live connection's input does.
+    #[tokio::test]
+    async fn input_from_a_connection_that_lost_the_session_is_ignored() {
+        use crate::handle::SessionHandle;
+        use fil_proto::msg::{Attach, PublicKey, TermSize};
+
+        let out = std::env::temp_dir().join(format!("fil-stale-input-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let mut cfg = SessionConfig::new(
+            "stale".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            9,
+        );
+        cfg.scope = crate::config::ScopeMode::Tree;
+        cfg.clear_env = true;
+        cfg.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        cfg.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "stty -echo; while read l; do echo \"$l\" >> {}; done",
+                out.display()
+            ),
+        ]);
+        let handle = SessionHandle::spawn(cfg, Arc::new(crate::config::NoHost))
+            .await
+            .unwrap();
+        let attach = |n: u8, host: &str| Attach {
+            name: "stale".parse().unwrap(),
+            size: TermSize::new(80, 24).unwrap(),
+            term: "xterm".parse().unwrap(),
+            host: host.parse().unwrap(),
+            key: PublicKey::new(vec![n; 32]).unwrap(),
+            resume: None,
+            echo_ack: false,
+        };
+        let accepted = |answer: AttachAnswer| match answer {
+            AttachAnswer::Accepted(a) => a,
+            AttachAnswer::Refused(r) => panic!("refused: {r:?}"),
+        };
+        let first = accepted(handle.attach(attach(1, "laptop")).await.ok().unwrap());
+        // The second attach takes the session over: the first connection is not live any more.
+        let second = accepted(handle.attach(attach(2, "desktop")).await.ok().unwrap());
+        assert_ne!(first.conn, second.conn);
+        handle
+            .send(Cmd::Input {
+                conn: first.conn,
+                seq: 0,
+                data: b"stale\n".to_vec(),
+            })
+            .await;
+        handle
+            .send(Cmd::Input {
+                conn: second.conn,
+                seq: 0,
+                data: b"live\n".to_vec(),
+            })
+            .await;
+        // The core handles its queue in order, so once the live line has got through, the stale
+        // one would have.
+        let end = Instant::now() + Duration::from_secs(20);
+        let got = loop {
+            let got = std::fs::read_to_string(&out).unwrap_or_default();
+            if !got.is_empty() {
+                break got;
+            }
+            assert!(Instant::now() < end, "the live input never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = std::fs::read_to_string(&out).unwrap_or(got);
+        let _ = handle.kill(Duration::from_secs(5)).await;
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(got, "live\n", "only the live connection's input is applied");
+    }
 }
 
 #[cfg(test)]

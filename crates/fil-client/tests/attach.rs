@@ -353,7 +353,8 @@ async fn another_wire_revision_is_reported_at_once_with_both_numbers() {
             assert!(
                 text.contains(&format!("wire rev {}", ours + 5))
                     && text.contains(&format!("wire rev {ours}"))
-                    && text.contains("install the same fil"),
+                    && text.contains("newer")
+                    && text.contains("upgrade this fil"),
                 "{text}"
             );
         }

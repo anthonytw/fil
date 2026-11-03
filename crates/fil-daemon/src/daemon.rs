@@ -16,10 +16,12 @@
 //!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
 //!   last look for a connection that raced it, and exits. A relay that arrives later starts a
 //!   new one. A session counts as long as its shell runs, attached or not.
-//! - **Upgrades.** The protocol major is in the socket path, so daemons of different versions
-//!   run side by side. New sessions go to the newest (the client dials the path of its own
-//!   major); old sessions stay on the old daemon until they end, and the old daemon then idles
-//!   out. [`list_sockets`](crate::list_sockets) finds them all for `fil ls`.
+//! - **Upgrades.** The protocol major and the wire revision are in the socket path, so daemons
+//!   of different builds run side by side. New sessions go to the daemon of the client's own
+//!   wire (the relay routes by the client's hello and starts only its own); old sessions stay on
+//!   the old daemon until they end, reachable by a client of the old wire through any relay on
+//!   the host, and the old daemon then idles out. The daemon's answer to `ListSessions` names the
+//!   others it finds ([`other_daemons`](crate::other_daemons)) for `fil ls` to mention.
 //! - **Stopping.** SIGTERM and SIGINT stop the daemon after hanging up every session (as
 //!   closing their terminals would). SIGHUP is ignored.
 //!

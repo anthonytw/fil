@@ -107,7 +107,10 @@ pub mod pinned {
             out.push((format!("quic/stream-header-{channel}"), header));
         }
         for id in [1u32, 0x0102_0304, u32::MAX] {
-            out.push((format!("quic/flush-marker-{id}"), wire::flush_marker(id).to_vec()));
+            out.push((
+                format!("quic/flush-marker-{id}"),
+                wire::flush_marker(id).to_vec(),
+            ));
         }
         out
     }

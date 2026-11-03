@@ -385,8 +385,9 @@ where
             }
             return;
         }
-        // An undecodable control message is passed up like any other: a newer minor version may
-        // have added a variant that we do not know, and that is the layer above's call.
+        // An undecodable control message is passed up like any other: it is the layer above's
+        // call (a peer of another wire revision is refused at the hello, so in practice this is
+        // a bug or a hostile peer, and the layer above ends the run).
         self.shared
             .push_inbound(frame.channel, Bytes::from(frame.payload));
     }

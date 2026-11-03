@@ -31,7 +31,7 @@ pub enum MgmtError {
     #[error("{}", .0.explain(Peer::RemoteHost))]
     Version(VersionMismatch),
     #[error(
-        "the fil on the remote host refused this fil's version (a different wire revision): install the same fil version there"
+        "the fil on the remote host refused this fil's version (a different wire revision): upgrade whichever fil is older"
     )]
     VersionRefused,
     #[error("the daemon refused the request: {0}")]
@@ -422,7 +422,9 @@ mod tests {
         assert!(matches!(err, MgmtError::Version(_)), "{err}");
         let text = err.to_string();
         assert!(
-            text.contains("wire rev") && text.contains("install the same fil"),
+            text.contains("wire rev")
+                && text.contains("newer")
+                && text.contains("upgrade this fil"),
             "{text}"
         );
         d.abort();

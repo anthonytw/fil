@@ -504,11 +504,12 @@ mod tests {
         // The version line names the wire: `fil 0.0.0 (wire 1.1)`.
         let shown = Cli::command().render_version();
         assert!(
-            shown.starts_with("fil ") && shown.contains(&format!(
-                "(wire {}.{})",
-                fil_proto::limits::PROTOCOL_MAJOR,
-                fil_proto::version::wire_revision()
-            )),
+            shown.starts_with("fil ")
+                && shown.contains(&format!(
+                    "(wire {}.{})",
+                    fil_proto::limits::PROTOCOL_MAJOR,
+                    fil_proto::version::wire_revision()
+                )),
             "{shown}"
         );
         let help = Cli::command().render_long_help().to_string();

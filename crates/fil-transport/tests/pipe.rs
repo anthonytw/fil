@@ -755,7 +755,8 @@ async fn a_bad_frame_from_the_peer_ends_the_link() {
 
 #[tokio::test(start_paused = true)]
 async fn unknown_control_messages_pass_up_untouched() {
-    // A newer minor version may add a variant; the layer above decides what to do with it.
+    // A control message this link cannot decode is not its business; the layer above decides what
+    // to do with it (a different wire revision is refused at the hello, before any of this).
     let (link, mut raw) = client_vs_raw(cfg(), b"", ControlMsg::Detach).await;
     assert_eq!(link.recv().await.unwrap().0, ChannelId::CONTROL);
     raw.put_frame(ChannelId::CONTROL, &[0xFE, 0x01, 0x02]).await;

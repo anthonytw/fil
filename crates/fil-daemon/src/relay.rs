@@ -259,10 +259,7 @@ fn read_opening<W: Write>(
 fn write_control<W: Write>(output: &mut W, msg: &ControlMsg) -> Result<(), RelayError> {
     let frame = msg
         .to_frame()
-        .and_then(|f| {
-            f.encode()
-                .map_err(|_| fil_proto::msg::MsgError::Malformed)
-        })
+        .and_then(|f| f.encode().map_err(|_| fil_proto::msg::MsgError::Malformed))
         .map_err(|e| RelayError::Io(std::io::Error::other(e.to_string())))?;
     output
         .write_all(&frame)

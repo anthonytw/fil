@@ -671,7 +671,7 @@ fn handshake_failure(err: &ConnectionError) -> String {
     if let ConnectionError::ConnectionClosed(close) = err
         && u64::from(close.error_code) == CRYPTO_NO_APPLICATION_PROTOCOL
     {
-        return "handshake failed: the daemon speaks a different wire revision of fil than this one; install the same fil version there".to_string();
+        return "handshake failed: the daemon speaks a different wire revision of fil than this one; upgrade whichever fil is older".to_string();
     }
     format!("handshake failed: {err}")
 }

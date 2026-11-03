@@ -349,7 +349,10 @@ async fn a_client_of_a_wire_with_no_daemon_is_refused_and_nothing_is_started() {
         matches!(seen.first(), Some(ControlMsg::Hello(h)) if h.revision == rev_new()),
         "{seen:?}"
     );
-    assert_eq!(seen.get(1), Some(&ControlMsg::Error(ErrorCode::VersionMismatch)));
+    assert_eq!(
+        seen.get(1),
+        Some(&ControlMsg::Error(ErrorCode::VersionMismatch))
+    );
     assert!(!newer.socket().exists() && !newer.lock().exists() && !newer.start_lock().exists());
     assert!(
         fil_daemon::list_sockets(&s.dir).is_empty(),

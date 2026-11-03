@@ -108,6 +108,10 @@ fn concurrent_starts_of_two_revisions_each_start_exactly_one_daemon() {
     write_config(&s, "");
     let rev_a = fil_proto::version::wire_revision();
     let rev_b = rev_a + 1;
+    // `Scratch` stops revision A's daemon (the one in its own lock file); this stops revision B's
+    // whatever the test does, by the pid in B's lock file (a private directory: ours alone), so a
+    // failed assertion leaves nothing running. Declared after `s`: dropped before the files go.
+    let _stop_b = KillDaemonOnDrop(s.paths().with_revision(rev_b).lock());
     let launcher_for = |rev: u16| {
         DaemonLauncher::new(
             BIN,
@@ -160,12 +164,21 @@ fn concurrent_starts_of_two_revisions_each_start_exactly_one_daemon() {
     // Each connection reached the daemon of its own revision: the socket named for it.
     assert!(UnixStream::connect(s.paths().with_revision(rev_b).socket()).is_ok());
     assert!(UnixStream::connect(s.paths().with_revision(rev_a).socket()).is_ok());
-    // Scratch removes revision A's daemon; revision B's is ours to stop.
-    let pid_b: u32 = pb.trim().parse().unwrap();
-    std::process::Command::new("kill")
-        .args(["-KILL", &pid_b.to_string()])
-        .status()
-        .unwrap();
+}
+
+/// Kills the daemon whose pid is in `lock`, when dropped.
+struct KillDaemonOnDrop(std::path::PathBuf);
+
+impl Drop for KillDaemonOnDrop {
+    fn drop(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(&self.0)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
 }
 
 fn session_of(pid: u32) -> u32 {

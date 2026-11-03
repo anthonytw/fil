@@ -131,7 +131,9 @@ local transport="pipe" session=("local-" + transport):
 # installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
 # Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
 pi-e2e *args:
-    cargo build --release -p fil --bins --example pi_e2e
+    cargo build --release -p fil --bins
+    cargo build --release -p fil --example pi_e2e
+    just no-test-hooks target/release/fil
     target/release/examples/pi_e2e {{args}}
 
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
@@ -141,6 +143,23 @@ pi-e2e *args:
 # targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a missing tool
 # fails the run unless allowed. Never part of `ci`.
 dropin *args:
-    cargo build -q --release -p fil --bins --example dropin
+    cargo build -q --release -p fil --bins
+    cargo build -q --release -p fil --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
+    just no-test-hooks target/release/fil target/release/fil-daemon-dev
     target/release/examples/dropin {{args}}
+
+# Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
+# environment to change what wire it speaks and where its sockets are, and must never be the fil
+# that is installed or released. Building an example or a test with `-p fil` unifies the dev-
+# dependencies' `test-hooks` features into every target of that invocation, which is why the
+# recipes that install `target/release/fil` build the binary in an invocation of its own.
+no-test-hooks +binaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for b in {{binaries}}; do
+      if grep -aq 'FIL_TEST_' "$b"; then
+        echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
+        exit 1
+      fi
+    done

@@ -407,6 +407,7 @@ dependencies = [
  "fil-session",
  "fil-term",
  "fil-transport",
+ "nix",
  "portable-pty",
  "rustix",
  "serde",

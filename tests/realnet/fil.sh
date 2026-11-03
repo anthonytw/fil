@@ -32,7 +32,8 @@ known_bug() {
 
 # fc_start NAME [-- FIL_ARGS...]: the client `fil FIL_ARGS...` in a PTY of 200 rows by 100
 # columns, with debug logging into its own state directory (so its client.log is only its own).
-# Extra environment for it: FC_ENV=(K=V ...). It runs on FC_HOST.
+# Extra environment for it: FC_ENV=(K=V ...). It runs on FC_HOST. FC_PROG=ssh runs `ssh ARGS...`
+# in the same kind of terminal instead (the like-for-like comparison, tests/realnet/dropin.sh).
 fc_start() {
   local name=$1 e
   shift
@@ -42,7 +43,7 @@ fc_start() {
   trap fc_finish EXIT
   local envargs=(--env FIL_LOG=debug --env "XDG_STATE_HOME=$PD/state-${SCENARIO:-x}-$name")
   for e in ${FC_ENV[@]+"${FC_ENV[@]}"}; do envargs+=(--env "$e"); done
-  client_bg_on "$FC_HOST" ptydrive serve --dir "$PD" "${envargs[@]}" "$name" -- fil "$@"
+  client_bg_on "$FC_HOST" ptydrive serve --dir "$PD" "${envargs[@]}" "$name" -- "${FC_PROG:-fil}" "$@"
   # `ctl` retries the connection for 5 s by itself: a server that is not up by then never will be
   # (a missing binary, a bad directory).
   fc "$name" status > /dev/null 2>&1 || fail "ptydrive for $name did not start within 5 s"
@@ -96,7 +97,9 @@ fc_type() { fc "$1" send "$2" > /dev/null || fail "$1: could not type"; }
 fc_line() { fc_type "$1" "$2\\r"; }
 # fc_answer NAME KEY: the answer to a yes/no question on the screen. The client ignores the
 # keyboard until the typing has paused for 300 ms (a word typed ahead must not answer for the user).
-fc_answer() { sleep 0.5; fc_type "$1" "$2"; }
+# A prompt takes a lone key as its answer only after 300 ms with nothing else typed (DESIGN §4.2),
+# so wait before the key and again after it, before typing anything more.
+fc_answer() { sleep 0.5; fc_type "$1" "$2"; sleep 0.6; }
 
 # fc_ready NAME [SECONDS]: the session's shell answers. (The typed text never contains the
 # answer, so the echo of the keystrokes cannot satisfy it.)

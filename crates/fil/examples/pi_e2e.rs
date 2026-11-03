@@ -13,22 +13,22 @@
 //! pi_e2e [--hosts pi1,pi2] [--only NAME[,NAME]] [--fil PATH] [--verbose] [--list]
 //! ```
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[path = "support/harness.rs"]
+mod harness;
+use harness::{Client, Spawn, Targets, ensure, ms, toml_str};
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(25);
 
 struct Ctx {
     fil: PathBuf,
     work: PathBuf,
-    targets: BTreeMap<String, String>,
+    targets: Targets,
     verbose: bool,
 }
 
@@ -60,10 +60,7 @@ impl Ctx {
     /// The ssh target of a host label. `main` has checked that every label in use is a key of
     /// `FIL_PI_TARGETS`, so there is no default to fall back on.
     fn target(&self, host: &str) -> String {
-        self.targets
-            .get(host)
-            .unwrap_or_else(|| panic!("host label {host} is not in FIL_PI_TARGETS"))
-            .clone()
+        self.targets.target(host)
     }
 
     /// While this file exists, a `Gated` client cannot start ssh.
@@ -114,36 +111,25 @@ impl Ctx {
         path
     }
 
-    /// One gate verb (`status`, `logs 100`, `reset`...); returns stdout and stderr together.
-    fn gate(&self, host: &str, verb: &str) -> String {
-        let out = Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
-            .arg(self.target(host))
-            .arg(verb)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run ssh");
-        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-        s.push_str(&String::from_utf8_lossy(&out.stderr));
-        s
+    /// One gate verb (`status`, `logs 100`...): stdout and stderr together. An ssh that fails is
+    /// an error, never an empty answer.
+    fn gate(&self, host: &str, verb: &str) -> Result<String, String> {
+        self.targets.gate(host, verb)
     }
 
     /// Ends this driver's sessions with `fil kill`, then runs the gate's `reset`. The kill comes
     /// first because `reset` stops the daemon's systemd scope with SIGTERM, which an interactive
     /// bash ignores: with a live shell it takes the unit's whole 90 s stop timeout.
-    fn reset(&self, host: &str) {
+    fn reset(&self, host: &str) -> Result<(), String> {
         let (_, ls) = self.fil_cmd(host, Variant::Auto, &["ls", host]);
-        for name in ls
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter(|n| n.starts_with("e2e-"))
-        {
-            self.fil_cmd(host, Variant::Auto, &["kill", host, name]);
+        for name in harness::sessions_with_prefix(&ls, "e2e-") {
+            self.fil_cmd(host, Variant::Auto, &["kill", host, &name]);
         }
-        let out = self.gate(host, "reset");
+        let out = self.targets.gate_reset(host)?;
         if self.verbose {
             eprintln!("[{host}] {}", out.trim());
         }
+        Ok(())
     }
 
     /// `fil ARGS` without a terminal (ls, kill, detach); returns (status, stdout+stderr).
@@ -161,310 +147,38 @@ impl Ctx {
     }
 }
 
-/// A TOML basic string.
-fn toml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-/// A host label: lower-case letters, digits and dashes. It becomes a TOML key and a file name.
-fn label_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.starts_with(|c: char| c.is_ascii_lowercase())
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// An ssh target (`user@host`): no spaces, quotes or shell characters, and not an option.
-fn target_ok(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('-')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-'))
-}
-
-/// A client on a pseudo-terminal, its output collected by a thread.
-struct Client {
-    child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    _master: Box<dyn MasterPty + Send>,
-    buf: Arc<Mutex<Vec<u8>>>,
-    started: Instant,
-    state: PathBuf,
-    done: Option<(Duration, u32)>,
-}
-
 static SEQ: Mutex<u32> = Mutex::new(0);
 
 impl Client {
+    /// A client for a host and variant, on a 30 by 100 terminal, with a state directory of its own.
     fn spawn(ctx: &Ctx, host: &str, variant: Variant, session: &str) -> Client {
         let n = {
             let mut s = SEQ.lock().unwrap();
             *s += 1;
             *s
         };
-        let state = ctx.work.join("state").join(format!("{n}-{host}-{session}"));
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("state dir");
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: 30,
-                cols: 100,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        let mut cmd = CommandBuilder::new(&ctx.fil);
-        cmd.arg("--config");
-        cmd.arg(ctx.config(host, variant));
-        cmd.arg(host);
-        cmd.arg(session);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("XDG_STATE_HOME", &state);
-        cmd.env("FIL_LOG", "debug");
-        let started = Instant::now();
-        let child = pty.slave.spawn_command(cmd).expect("spawn fil");
-        drop(pty.slave);
-        let mut reader = pty.master.try_clone_reader().expect("reader");
-        let writer = pty.master.take_writer().expect("writer");
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let b = buf.clone();
-        thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                b.lock().unwrap().extend_from_slice(&chunk[..n]);
-            }
+        let mut c = Client::start(Spawn {
+            fil: &ctx.fil,
+            config: &ctx.config(host, variant),
+            host,
+            session,
+            rows: 30,
+            cols: 100,
+            state: ctx.work.join("state").join(format!("{n}-{host}-{session}")),
+            env: Vec::new(),
         });
-        Client {
-            child,
-            writer,
-            _master: pty.master,
-            buf,
-            started,
-            state,
-            done: None,
-        }
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.process_id().unwrap_or(0)
-    }
-
-    fn send(&mut self, s: &str) {
-        self.writer.write_all(s.as_bytes()).expect("write to pty");
-        self.writer.flush().ok();
+        c.set_scrub(ctx.targets.clone());
+        c
     }
 
     /// Answers a yes/no question on the screen. The client ignores the keyboard until the typing
-    /// has paused for 300 ms, so that a word typed ahead cannot answer for the user.
+    /// has paused for 300 ms, so that a word typed ahead cannot answer for the user: wait, send
+    /// the key alone, and type nothing for a moment after it.
     fn answer(&mut self, key: &str) {
         std::thread::sleep(Duration::from_millis(500));
         self.send(key);
+        std::thread::sleep(Duration::from_millis(400));
     }
-
-    /// The output with terminal escapes removed. The status line is painted one character at a
-    /// time with cursor moves between, so a message reads straight once those are gone.
-    fn plain(&self) -> Vec<u8> {
-        strip_escapes(&self.buf.lock().unwrap())
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.plain()).into_owned()
-    }
-
-    /// What a terminal would show now (the status line is drawn by cursor moves, one changed
-    /// cell at a time, so only an emulator reads it right).
-    fn screen(&self) -> String {
-        let mut p = vt100::Parser::new(
-            std::num::NonZeroU16::new(30).unwrap(),
-            std::num::NonZeroU16::new(100).unwrap(),
-            0,
-        );
-        p.process(&self.buf.lock().unwrap());
-        p.screen().contents()
-    }
-
-    /// Waits until `needle` is on the screen (spaces are folded: the status line wraps).
-    fn expect_screen(&self, needle: &str, timeout: Duration) -> Option<Duration> {
-        let t0 = Instant::now();
-        let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-        let needle = fold(needle);
-        loop {
-            if fold(&self.screen()).contains(&needle) {
-                return Some(t0.elapsed());
-            }
-            if t0.elapsed() > timeout {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// The length of `plain()`, to mark a point to search from.
-    fn len(&self) -> usize {
-        self.plain().len()
-    }
-
-    /// Waits until `needle` is in the output (searching from byte `from`). Returns how long it
-    /// took and where the match ends.
-    fn expect_from(
-        &self,
-        needle: &str,
-        from: usize,
-        timeout: Duration,
-    ) -> Option<(Duration, usize)> {
-        let t0 = Instant::now();
-        loop {
-            let b = self.plain();
-            if b.len() >= from
-                && let Some(i) = b[from..]
-                    .windows(needle.len())
-                    .position(|w| w == needle.as_bytes())
-            {
-                return Some((t0.elapsed(), from + i + needle.len()));
-            }
-            if t0.elapsed() > timeout {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// Anywhere in the output so far, or later.
-    fn expect(&self, needle: &str, timeout: Duration) -> Option<Duration> {
-        self.expect_from(needle, 0, timeout).map(|(d, _)| d)
-    }
-
-    /// Types `echo TAG-$((A*B))` and waits for the product to come back; the typed echo contains
-    /// the arithmetic, never the result. Returns the round trip.
-    fn roundtrip(&mut self, tag: &str, timeout: Duration) -> Result<Duration, String> {
-        let from = self.len();
-        self.send(&format!("echo {tag}-$((6*7))\r"));
-        let t0 = Instant::now();
-        self.expect_from(&format!("{tag}-42"), from, timeout)
-            .map(|_| t0.elapsed())
-            .ok_or_else(|| format!("no {tag}-42 within {timeout:?}\n{}", self.tail()))
-    }
-
-    fn tail(&self) -> String {
-        let t = self.text();
-        let start = t.len().saturating_sub(1200);
-        let start = (start..t.len())
-            .find(|&i| t.is_char_boundary(i))
-            .unwrap_or(0);
-        format!(
-            "--- client output (tail, escapes removed) ---\n{:?}",
-            &t[start..]
-        )
-    }
-
-    /// Polls for the exit. Returns (time since the call, exit code).
-    fn wait_exit(&mut self, timeout: Duration) -> Option<(Duration, u32)> {
-        if let Some(d) = self.done {
-            return Some(d);
-        }
-        let t0 = Instant::now();
-        loop {
-            if let Ok(Some(st)) = self.child.try_wait() {
-                let r = (t0.elapsed(), st.exit_code());
-                self.done = Some(r);
-                return Some(r);
-            }
-            if t0.elapsed() > timeout {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// `~.` after an Enter (the escape works at the start of a line).
-    fn detach(&mut self) -> Result<Duration, String> {
-        self.send("\r");
-        thread::sleep(Duration::from_millis(300));
-        self.send("~.");
-        match self.wait_exit(Duration::from_secs(10)) {
-            Some((d, 0)) => Ok(d),
-            Some((_, c)) => Err(format!("detach exited {c}\n{}", self.tail())),
-            None => Err(format!("detach: client did not exit\n{}", self.tail())),
-        }
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.state.join("fil/client.log")).unwrap_or_default()
-    }
-
-    /// The pids of the ssh processes this client started.
-    fn ssh_children(&self) -> Vec<u32> {
-        let out = Command::new("pgrep")
-            .args(["-P", &self.pid().to_string(), "-x", "ssh"])
-            .output()
-            .expect("pgrep");
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        if self.done.is_none() && !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-/// Drops CSI, OSC and other escape sequences and carriage returns.
-fn strip_escapes(b: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            0x1b => {
-                i += 1;
-                match b.get(i) {
-                    Some(b'[') => {
-                        i += 1;
-                        while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
-                            i += 1;
-                        }
-                    }
-                    Some(b']') => {
-                        i += 1;
-                        while i < b.len()
-                            && b[i] != 0x07
-                            && !(b[i] == 0x1b && b.get(i + 1) == Some(&b'\\'))
-                        {
-                            i += 1;
-                        }
-                        if b.get(i) == Some(&0x1b) {
-                            i += 1;
-                        }
-                    }
-                    Some(b'(' | b')' | b'*' | b'+') => i += 1,
-                    _ => {}
-                }
-                i += 1;
-            }
-            b'\r' | 0x07 | 0x0e | 0x0f => i += 1,
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-fn ms(d: Duration) -> String {
-    format!("{} ms", d.as_millis())
-}
-
-fn ensure(cond: bool, msg: impl FnOnce() -> String) -> Result<(), String> {
-    if cond { Ok(()) } else { Err(msg()) }
 }
 
 type Res = Result<Vec<String>, String>;
@@ -547,7 +261,7 @@ fn ls_detach_kill(ctx: &Ctx, host: &str) -> Res {
         format!("detached-elsewhere client exited {code}, expected 1")
     })?;
     // The session keeps running; attach again, then kill it.
-    let mut c2 = Client::spawn(ctx, host, Variant::Auto, "e2e-lk");
+    let c2 = Client::spawn(ctx, host, Variant::Auto, "e2e-lk");
     c2.expect("LK-42", ATTACH_TIMEOUT)
         .ok_or_else(|| format!("session lost after detach\n{}", c2.tail()))?;
     let (st, out) = ctx.fil_cmd(host, Variant::Auto, &["kill", host, "e2e-lk"]);
@@ -723,9 +437,10 @@ fn daemon_restart(ctx: &Ctx, host: &str) -> Res {
         .status();
     thread::sleep(Duration::from_secs(2));
     let t_reset = Instant::now();
-    let out = ctx.gate(host, "reset");
+    let out = ctx.targets.gate_reset(host);
     let _ = std::fs::remove_file(ctx.flag());
     let t0 = Instant::now();
+    let out = out?;
     ensure(out.contains("reset done"), || format!("reset: {out}"))?;
     let mut notes = vec![format!("gate `reset` call {}", ms(t_reset.elapsed()))];
     let deadline = Duration::from_secs(90);
@@ -805,16 +520,16 @@ fn lingering(ctx: &Ctx, host: &str) -> Res {
     c.detach()?;
     drop(c);
     let t0 = Instant::now();
-    let early = ctx.gate(host, "status");
+    let early = ctx.gate(host, "status")?;
     ensure(early.contains("server --daemon"), || {
         format!("no fil daemon right after the client left\n{early}")
     })?;
     thread::sleep(Duration::from_secs(40));
-    let late = ctx.gate(host, "status");
+    let late = ctx.gate(host, "status")?;
     ensure(late.contains("server --daemon"), || {
         format!("daemon gone after the login ended\n{late}")
     })?;
-    let journal = ctx.gate(host, "logs 800");
+    let journal = ctx.gate(host, "logs 800")?;
     ensure(journal.contains(&format!("{scope} - fil session")), || {
         format!("no `{scope} - fil session` line in the user journal")
     })?;
@@ -863,20 +578,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn timestamps_across_midnight_utc_stay_ordered() {
-        let a = log_seconds(r#"{"timestamp":"2026-11-02T23:59:59.900000Z"}"#).unwrap();
-        let b = log_seconds(r#"{"timestamp":"2026-11-03T00:00:00.100000Z"}"#).unwrap();
-        assert!((b - a - 0.2).abs() < 1e-6, "{}", b - a);
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-    }
 }
 
 /// The time of the first log line containing `needle`.
@@ -942,18 +643,20 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
         "the ssh pipe was still open 5 s after the switch to direct".to_string()
     })?;
     let rt = c.roundtrip("DM1", Duration::from_secs(20))?;
-    let pi_logs = ctx.gate(host, "logs 200");
+    let pi_logs = ctx.gate(host, "logs 200")?;
     if ctx.verbose {
         eprintln!("--- client log (auto) ---\n{log}\n--- pi logs ---\n{pi_logs}");
     }
+    // This client's attach only: the journal keeps earlier scenarios' lines too, and the daemon's
+    // log no longer names the session (privacy, S4), so go by time: a direct attach after this
+    // client started (a second of slack for the clocks).
     ensure(
         pi_logs.lines().any(|l| {
-            // This session's attach only: the journal keeps earlier scenarios' lines too.
             l.contains("\"message\":\"attach\"")
                 && l.contains("\"direct\":true")
-                && l.contains("\"session\":\"e2e-dm\"")
+                && log_seconds(l).is_some_and(|t| t >= start - 1.0)
         }),
-        || "the Pi's daemon log has no direct attach".to_string(),
+        || "the Pi's daemon log has no direct attach after this client started".to_string(),
     )?;
     notes.push(format!(
         "UPGRADED to QUIC: attach reply {} after start (the ssh login is most of it), QUIC up {} later, switched {} after that; {} from start to carrying the session; pipe closed; round trip over QUIC {}; the Pi's log shows the direct attach (first prompt {})",
@@ -965,7 +668,7 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
         ms(prompt)
     ));
     c.detach()?;
-    ctx.reset(host);
+    ctx.reset(host)?;
 
     // 2. UDP blackholed: stay on the pipe.
     let mut c = Client::spawn(ctx, host, Variant::Blackhole, "e2e-dm");
@@ -991,7 +694,7 @@ fn direct_mode(ctx: &Ctx, host: &str) -> Res {
         last_dial_failure(&log)
     ));
     c.detach()?;
-    ctx.reset(host);
+    ctx.reset(host)?;
     Ok(notes)
 }
 
@@ -1055,29 +758,19 @@ fn main() {
         }
     }
     // The targets are required and are the whole list of hosts this program may touch.
-    let mut targets = BTreeMap::new();
     let raw = std::env::var("FIL_PI_TARGETS").unwrap_or_default();
-    for kv in raw.split(',').filter(|s| !s.is_empty()) {
-        let Some((k, t)) = kv.split_once('=') else {
-            eprintln!("FIL_PI_TARGETS: \"{kv}\" is not LABEL=USER@HOST");
-            std::process::exit(2);
-        };
-        if !label_ok(k) || !target_ok(t) {
-            eprintln!(
-                "FIL_PI_TARGETS: label \"{k}\" must be lower-case letters, digits and dashes, and the target a plain user@host"
-            );
-            std::process::exit(2);
-        }
-        targets.insert(k.to_string(), t.to_string());
-    }
+    let targets = Targets::parse(&raw, &[]).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
     if targets.is_empty() {
         eprintln!(
             "FIL_PI_TARGETS is required, e.g. pi1=fil-test@HOST,pi2=fil-test@HOST (docs/m1/pi.md). The driver runs the gate's `reset` on every host it uses, so it never guesses one."
         );
         std::process::exit(2);
     }
-    let hosts = hosts.unwrap_or_else(|| targets.keys().cloned().collect());
-    if let Some(bad) = hosts.iter().find(|h| !targets.contains_key(*h)) {
+    let hosts = hosts.unwrap_or_else(|| targets.labels());
+    if let Some(bad) = hosts.iter().find(|h| !targets.contains(h)) {
         eprintln!("--hosts: \"{bad}\" is not a label in FIL_PI_TARGETS");
         std::process::exit(2);
     }
@@ -1103,7 +796,10 @@ fn main() {
     let mut failures = 0;
     let mut table = Vec::new();
     for host in &hosts {
-        let version = ctx.gate(host, "run fil --version");
+        let version = ctx.gate(host, "run fil --version").unwrap_or_else(|e| {
+            eprintln!("{}", ctx.targets.scrub(&e));
+            std::process::exit(2);
+        });
         println!("== {host}: {}", version.trim());
         for (name, f) in scenarios() {
             if let Some(o) = &only
@@ -1111,7 +807,17 @@ fn main() {
             {
                 continue;
             }
-            ctx.reset(host);
+            if let Err(e) = ctx.reset(host) {
+                failures += 1;
+                println!(
+                    "FAIL {host} {name}: cleanup before it failed: {}",
+                    ctx.targets.scrub(&e)
+                );
+                table.push(format!(
+                    "| {host} | {name} | FAIL | cleanup before it failed |"
+                ));
+                continue;
+            }
             let t = Instant::now();
             // A panic (a write to a dead client, a bug here) is a failure of this scenario, and
             // the cleanup below still runs.
@@ -1125,7 +831,10 @@ fn main() {
                     Err(format!("the driver panicked: {what}"))
                 });
             let took = t.elapsed();
-            ctx.reset(host);
+            let r = match (r, ctx.reset(host)) {
+                (Ok(_), Err(e)) => Err(format!("cleanup after it failed: {e}")),
+                (r, _) => r,
+            };
             match r {
                 Ok(notes) => {
                     println!("PASS {host} {name} ({:.1} s)", took.as_secs_f64());
@@ -1136,7 +845,11 @@ fn main() {
                 }
                 Err(e) => {
                     failures += 1;
-                    println!("FAIL {host} {name} ({:.1} s)\n{e}", took.as_secs_f64());
+                    println!(
+                        "FAIL {host} {name} ({:.1} s)\n{}",
+                        took.as_secs_f64(),
+                        ctx.targets.scrub(&e)
+                    );
                     table.push(format!(
                         "| {host} | {name} | FAIL | {} |",
                         e.lines().next().unwrap_or("")
@@ -1144,15 +857,30 @@ fn main() {
                 }
             }
         }
-        let status = ctx.gate(host, "status");
-        if status.contains("server --daemon") || status.contains(".sock") {
-            failures += 1;
-            println!("FAIL {host}: a fil daemon or socket is left after the final reset\n{status}");
-            table.push(format!(
-                "| {host} | cleanup | FAIL | a daemon is left after reset |"
-            ));
-        } else {
-            println!("   after the final reset on {host}: no daemon left");
+        match ctx.targets.gate_status(host) {
+            Ok(status) if !Targets::leftover(&status) => {
+                println!("   after the final reset on {host}: no daemon left");
+            }
+            Ok(status) => {
+                failures += 1;
+                println!(
+                    "FAIL {host}: a fil daemon or socket is left after the final reset\n{}",
+                    ctx.targets.scrub(&status)
+                );
+                table.push(format!(
+                    "| {host} | cleanup | FAIL | a daemon is left after reset |"
+                ));
+            }
+            Err(e) => {
+                failures += 1;
+                println!(
+                    "FAIL {host}: cannot check for a leftover daemon: {}",
+                    ctx.targets.scrub(&e)
+                );
+                table.push(format!(
+                    "| {host} | cleanup | FAIL | the final status check failed |"
+                ));
+            }
         }
     }
     println!("\n| host | scenario | result | details |\n|---|---|---|---|");
@@ -1161,5 +889,19 @@ fn main() {
     }
     if failures > 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_across_midnight_utc_stay_ordered() {
+        let a = log_seconds(r#"{"timestamp":"2026-11-02T23:59:59.900000Z"}"#).unwrap();
+        let b = log_seconds(r#"{"timestamp":"2026-11-03T00:00:00.100000Z"}"#).unwrap();
+        assert!((b - a - 0.2).abs() < 1e-6, "{}", b - a);
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
     }
 }

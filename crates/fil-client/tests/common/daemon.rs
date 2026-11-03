@@ -1270,10 +1270,7 @@ impl FakeFwd {
         me
     }
 
-    async fn serve(
-        me: std::sync::Weak<Self>,
-        mut events: tokio::sync::mpsc::Receiver<EndpointEvent>,
-    ) {
+    async fn serve(me: std::sync::Weak<Self>, mut events: fil_forward::EventReceiver) {
         while let Some(ev) = events.recv().await {
             let Some(me) = me.upgrade() else { return };
             if let EndpointEvent::Table(m) = ev {

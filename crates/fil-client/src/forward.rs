@@ -50,7 +50,8 @@ use bytes::Bytes;
 use fil_forward::connect::connect_tcp;
 use fil_forward::listen::{self, Bound};
 use fil_forward::{
-    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, LocalPeer, Policy,
+    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, EndpointEvent, EventReceiver,
+    LocalPeer, Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::ControlMsg;
@@ -660,7 +661,7 @@ impl<L: Link> Manager<L> {
     async fn run(
         mut self,
         mut from_router: mpsc::UnboundedReceiver<ToManager>,
-        mut events: mpsc::Receiver<EndpointEvent>,
+        mut events: EventReceiver,
     ) {
         loop {
             tokio::select! {

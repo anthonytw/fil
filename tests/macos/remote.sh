@@ -499,7 +499,7 @@ EOF
   for p in $(daemon_pids); do kill "$p" 2> /dev/null; done
   sleep 1
   CLOCK0=$(date +%s)
-  CLOCK_SECONDS0=$SECONDS
+  MONO0=$(mono)
   log "tmp_cleaner: $(date -u) on $(sw_vers -productVersion); the clock will move at most a day at a time and be put back"
   # Network time would fight the steps; best effort (it needs privileges the image may not grant).
   sudo -n systemsetup -setusingnetworktime off > /dev/null 2>&1 || true
@@ -508,8 +508,12 @@ EOF
   clock_restore
 }
 
+# Seconds on a clock that moving the wall clock cannot move (not bash's $SECONDS, which is wall
+# time: it jumped with the clock and made the first version of this step jump 2, 3 and 4 days).
+mono() { python3 -c 'import time; print(int(time.monotonic()))'; }
+
 # The clock as it would be had it not been moved, plus DAYS days.
-clock_target() { echo $((CLOCK0 + (SECONDS - CLOCK_SECONDS0) + $1 * 86400)); }
+clock_target() { echo $((CLOCK0 + $(mono) - MONO0 + $1 * 86400)); }
 
 clock_set() {
   local want=$1 now

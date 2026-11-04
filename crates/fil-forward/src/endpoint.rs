@@ -782,13 +782,18 @@ impl<L: Link> State<L> {
     }
 
     /// Takes the acks and MUX records the mux has to send, never data (the control sender).
-    fn pull_control(&mut self) {
+    /// Returns whether it took a MUX record: that moves the MUX stream on, which can let data go
+    /// (an acceptor's first payload waits for its `OpenOk`), so the data sender must look again.
+    fn pull_control(&mut self) -> bool {
         if self.link.is_none() {
-            return;
+            return false;
         }
+        let mut mux = false;
         while let Some(t) = self.mux.poll_transmit_control() {
+            mux |= t.0 == ChannelId::MUX;
             self.ctl_out.push_back(t);
         }
+        mux
     }
 
     /// The next item the data sender may hand to the current link: the queue's head if the pacer
@@ -2217,7 +2222,10 @@ impl<L: Link> Inner<L> {
                     st.tick(t);
                     self.drain(&mut st);
                 }
-                st.pull_control();
+                // A MUX record taken (an `OpenOk` among them) can let data go that the data sender
+                // found held a moment ago (a server that speaks first): wake it then too, not only
+                // when it has a queue.
+                let took_mux = st.pull_control();
                 let item = match st.link.clone() {
                     Some(link) => {
                         let generation = st.generation;
@@ -2230,7 +2238,7 @@ impl<L: Link> Inner<L> {
                 } else {
                     None
                 };
-                (item, wake, !st.data_out.is_empty())
+                (item, wake, took_mux || !st.data_out.is_empty())
             };
             if data_ready {
                 self.data_kick.notify_one();

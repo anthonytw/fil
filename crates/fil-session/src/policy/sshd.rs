@@ -7,7 +7,9 @@
 //!   `keyword=value`, a word starting with `#` ends the line; quotes and escapes are read as
 //!   every OpenSSH release reads them, and where releases differ (single quotes, a quote inside
 //!   a word, backslashes) a value is one fil does not know, a `Match` might apply and an
-//!   `Include` cannot be evaluated; the first value of a setting wins; `Include` takes globs,
+//!   `Include` cannot be evaluated; a keyword sshd reads differently (`"Match"`, which
+//!   `strdelim` unquotes) cannot either, where it is one fil mirrors; the first value of a
+//!   setting wins; `Include` takes globs,
 //!   relative to the main config's directory (`/etc/ssh`), in sorted order, at most 16 deep,
 //!   and a file included from a `Match` block is inside it.
 //! - **Two pattern languages** ([`super::pattern`]): `Match` criteria use OpenSSH's `match_pattern`
@@ -485,8 +487,15 @@ impl Parser<'_> {
             let Some(l) = split_line(raw) else {
                 continue;
             };
-            let args = l.args();
             let line = u32::try_from(n + 1).unwrap_or(u32::MAX);
+            if !l.keyword_agreed {
+                // sshd reads another keyword here than fil does, and one of the two is a
+                // keyword fil mirrors (`"Match" User x` is a `Match` to sshd): what the line
+                // does is not known.
+                self.cannot_evaluate(path, line);
+                continue;
+            }
+            let args = l.args();
             let not_utf8 = invalid.get(n).copied().unwrap_or(false);
             let src = |maybe: bool| Src::Line {
                 file: path.to_path_buf(),
@@ -738,6 +747,9 @@ fn gateway(args: &[String]) -> Gateway {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Line {
     keyword: String,
+    /// sshd's reading of the keyword (`strdelim`, [`sshd_keyword`]) is fil's, or neither is a
+    /// keyword fil mirrors ([`mirrored`]).
+    keyword_agreed: bool,
     /// `argv_split`'s words; `None` for an unclosed quote (sshd refuses the config).
     argv: Option<Vec<String>>,
     /// `strdelim`'s words; `None` for an unclosed double quote.
@@ -764,10 +776,15 @@ impl Line {
 /// sshd's `WHITESPACE` (`misc.h`).
 const WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 
-/// A config line as sshd splits it: the keyword (ended by whitespace or `=`, as `strdelim`
-/// ends it), then the rest, after one optional `=`, split both ways ([`Line`]). Trailing
-/// whitespace and form feeds are dropped first, as sshd drops them. `None` for a blank or
-/// comment line.
+/// A config line as sshd splits it: the keyword (ended by whitespace or `=`), then the rest,
+/// after one optional `=`, split both ways ([`Line`]). Trailing whitespace and form feeds are
+/// dropped first, as sshd drops them. `None` for a blank or comment line, and for one without a
+/// keyword that sshd does not read as a mirrored one either.
+///
+/// Every release reads the keyword with `strdelim`, which also ends a word at `"` and reads a
+/// quoted word: `"Match" User x` is a `Match` line to sshd. fil does not follow that reading;
+/// where it gives another keyword than fil's and either is one fil mirrors, the line is marked
+/// ([`Line::keyword_agreed`]) and the config is unevaluable.
 fn split_line(raw: &str) -> Option<Line> {
     let s = raw
         .trim_start_matches([' ', '\t', '\r', '\n', '\x0b', '\x0c'])
@@ -779,7 +796,8 @@ fn split_line(raw: &str) -> Option<Line> {
         .find(|c: char| c.is_ascii_whitespace() || c == '=')
         .unwrap_or(s.len());
     let keyword = s[..end].to_string();
-    if keyword.is_empty() {
+    let keyword_agreed = keyword_agrees(&keyword, sshd_keyword(s).as_deref());
+    if keyword.is_empty() && keyword_agreed {
         return None;
     }
     let mut rest = s[end..].trim_start_matches(WHITESPACE);
@@ -788,9 +806,68 @@ fn split_line(raw: &str) -> Option<Line> {
     }
     Some(Line {
         keyword,
+        keyword_agreed,
         argv: argv_split(rest),
         legacy: strdelim_split(rest),
     })
+}
+
+/// The keywords fil mirrors (sshd compares keywords case-insensitively).
+fn mirrored(keyword: &str) -> bool {
+    [
+        "match",
+        "include",
+        "disableforwarding",
+        "allowagentforwarding",
+        "allowtcpforwarding",
+        "gatewayports",
+        "permitopen",
+        "permitlisten",
+    ]
+    .iter()
+    .any(|k| keyword.eq_ignore_ascii_case(k))
+}
+
+/// fil's keyword is sshd's, or neither is one fil mirrors (both skip the line, or sshd refuses
+/// a keyword it does not know). `sshd`: `None` where sshd reads no keyword.
+fn keyword_agrees(fil: &str, sshd: Option<&str>) -> bool {
+    sshd == Some(fil) || (!mirrored(fil) && sshd.is_none_or(|k| !mirrored(k)))
+}
+
+/// The keyword as sshd reads it: the first word `strdelim` gives (which ends at whitespace, a
+/// `"` or one `=`, and reads a `"` as opening a word that runs to the next `"`), or, when that
+/// word is empty (a line that starts with `=`), the next one. `None` for an unclosed quote,
+/// which reads no keyword.
+fn sshd_keyword(s: &str) -> Option<String> {
+    let ws = |c: char| WHITESPACE.contains(&c);
+    let mut rest: Vec<char> = s.chars().collect();
+    for _ in 0..2 {
+        let (word, next) = match rest.iter().position(|&c| ws(c) || c == '"' || c == '=') {
+            None => (rest.iter().collect::<String>(), Vec::new()),
+            Some(q) if rest[q] == '"' => {
+                rest.remove(q);
+                let close = (q..rest.len()).find(|&i| rest[i] == '"')?;
+                let after = rest[close + 1..].iter().skip_while(|c| ws(**c)).copied();
+                (rest[..close].iter().collect(), after.collect())
+            }
+            Some(d) => {
+                let mut after: Vec<char> = rest[d + 1..]
+                    .iter()
+                    .skip_while(|c| ws(**c))
+                    .copied()
+                    .collect();
+                if rest[d] != '=' && after.first() == Some(&'=') {
+                    after = after[1..].iter().skip_while(|c| ws(**c)).copied().collect();
+                }
+                (rest[..d].iter().collect(), after)
+            }
+        };
+        if !word.is_empty() {
+            return Some(word);
+        }
+        rest = next;
+    }
+    Some(String::new())
 }
 
 /// OpenSSH's `argv_split(s, .., terminate_on_comment = 1)` (`misc.c`, 8.7 and later): words
@@ -965,11 +1042,9 @@ fn glob(pattern: &Path) -> Globbed {
     };
     let raw = pattern.as_os_str().as_bytes();
     if raw.len() >= PATH_MAX {
-        // OpenBSD's glob finds nothing here, but the answer this close to the limit hangs on
-        // what fil cannot see: the directory sshd puts a relative pattern in is its build's
-        // `SSHDIR` (fil uses the main file's), and a glob without this check, or one that
-        // fails another way (which stops sshd from starting), answers differently. Not
-        // guessed at.
+        // Globs disagree at this length: OpenBSD's finds nothing (`GLOB_NOMATCH`), one
+        // without that check globs it anyway, and one that fails another way stops sshd from
+        // starting. Not guessed at.
         g.unevaluable = true;
         return g;
     }
@@ -1760,6 +1835,66 @@ mod tests {
         );
     }
 
+    /// sshd reads the keyword with `strdelim`, which reads a quoted word: `"Match" User x` is a
+    /// `Match` to sshd, where fil would skip a line whose keyword is `"Match"` (with the
+    /// quotes). The probe: a `Match` for another user and then `GatewayPorts yes` read as a
+    /// global `GatewayPorts yes` by fil, allowing a wide `-R` that sshd keeps on loopback.
+    /// Where the two readings differ and either is a keyword fil mirrors, the config is
+    /// unevaluable, naming the line.
+    #[test]
+    fn a_keyword_sshd_reads_differently_makes_the_mirror_unevaluable() {
+        let t = scratch(&[("a.conf", "AllowTcpForwarding no\n")]);
+        let d = t.path();
+        // The review's probe.
+        let s = write_main(d, b"\"Match\" User someoneelse\n    GatewayPorts yes\n");
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)));
+        for text in [
+            "\"Include\" conf.d/a.conf\n",
+            "\"AllowTcpForwarding\" no\n",
+            "\"GatewayPorts\" yes\n",
+            "\"match\" all\n",
+            "\"PERMITOPEN\" none\n",
+            // A line that starts with `=`: fil reads no keyword, sshd the next word.
+            "=Match User someoneelse\n",
+            "= AllowAgentForwarding no\n",
+        ] {
+            let s = write_main(d, format!("# x\n{text}").as_bytes());
+            assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 2)), "{text:?}");
+        }
+        // Where the readings agree, or neither is mirrored, the line is read as before.
+        for (text, tcp) in [
+            ("AllowTcpForwarding no\n", Tcp::No),
+            ("AllowTcpForwarding=no\n", Tcp::No),
+            ("AllowTcpForwarding = no\n", Tcp::No),
+            ("allowtcpforwarding\tno\n", Tcp::No),
+            ("\"Banner\" /etc/issue\nAllowTcpForwarding no\n", Tcp::No),
+            ("\"Banner /etc/issue\nAllowTcpForwarding no\n", Tcp::No),
+            ("=\nAllowTcpForwarding no\n", Tcp::No),
+        ] {
+            let s = write_main(d, text.as_bytes());
+            assert_eq!(s.unevaluable, None, "{text:?}");
+            assert_eq!(s.tcp.values[0].0, tcp, "{text:?}");
+        }
+    }
+
+    /// `strdelim`'s first word, as sshd reads a keyword.
+    #[test]
+    fn the_keyword_is_read_as_strdelim_reads_it() {
+        for (line, want) in [
+            ("Match User x", Some("Match")),
+            ("Match=User x", Some("Match")),
+            ("Match\tUser", Some("Match")),
+            ("\"Match\" User x", Some("Match")),
+            ("Mat\"ch x\" y", Some("Match x")),
+            ("=Match User x", Some("Match")),
+            ("= Match", Some("Match")),
+            ("=", Some("")),
+            ("\"Match User x", None),
+        ] {
+            assert_eq!(sshd_keyword(line).as_deref(), want, "{line:?}");
+        }
+    }
+
     /// An include directory the daemon may not list (sshd, as root, can) is reported like an
     /// include file it cannot read: the mirror is incomplete. A missing one is not.
     #[test]
@@ -2034,10 +2169,9 @@ mod tests {
         assert!(names("conf.d/*/").is_empty());
     }
 
-    /// A pattern as long as the host's `PATH_MAX` or longer finds nothing in OpenBSD's glob
-    /// (`GLOB_NOMATCH`), but the answer that close to the limit depends on what fil cannot see
-    /// (sshd's `SSHDIR`, which glob it was built with): unevaluable, naming the line, and no
-    /// directory is listed. One byte shorter, the glob is run.
+    /// A pattern as long as the host's `PATH_MAX` or longer is one globs disagree on (OpenBSD's
+    /// finds nothing, `GLOB_NOMATCH`; others glob it or fail): unevaluable, naming the line,
+    /// and no directory is listed. One byte shorter, the glob is run.
     #[test]
     fn a_pattern_of_path_max_bytes_or_more_is_unevaluable() {
         let t = scratch(&[("a.conf", "AllowTcpForwarding no\n")]);

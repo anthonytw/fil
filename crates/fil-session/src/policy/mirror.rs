@@ -355,10 +355,13 @@ impl Policy {
                 }
                 // A line fil cannot evaluate: everything the policy file does not set itself is
                 // refused. One line for all of it, which the client words as leaving the
-                // policy file's keys standing (it is not told which are set).
+                // policy file's keys standing (it is not told which are set). Not when the
+                // policy file cannot be used (unsafe or unparsable): it sets nothing, its own
+                // line below refuses everything, and the exception would be one that is not.
                 if let Sshd::Mirrored(s) = &l.sshd
                     && let Err(why) = evaluable(s)
                     && !matches!(&l.file, FilePolicy::Keys(k) if k.sets_every_mirrored_key())
+                    && !matches!(&l.file, FilePolicy::Unsafe(_))
                 {
                     v.push(PolicyLine::DenyAll(why));
                 }

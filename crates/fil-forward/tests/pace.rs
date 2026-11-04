@@ -484,9 +484,12 @@ per_transport!(
 /// **A server that speaks first** (sshd, SMTP, MySQL: a banner on accept; B-new-2 of the second
 /// re-check). The acceptor's first payload may go only once its `OpenOk` is out, which the control
 /// sender takes; the data sender, which found nothing sendable a moment before, must be woken
-/// then. When it was not, about 1 connection in 10 waited for the peer's timer-driven ack
-/// (100 to 250 ms), paced or not. 150 connects, each timed to its banner.
+/// then. When it was not, some connections waited for the peer's timer-driven ack (85 to 250 ms),
+/// paced or not: 1 in 10 at first, 2 to 5% (3 to 8 in 150) with the kick dropped from the
+/// control sender's loop. 200 connects (fewer than a side may have open at once, since the target
+/// holds each for 5 s), each timed to its banner.
 async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
+    const CONNECTS: usize = 200;
     let server = serve(|mut s| async move {
         let _ = s.write_all(b"220 hello\r\n").await;
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -495,7 +498,7 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
     let mut lat = Vec::new();
-    for _ in 0..150 {
+    for _ in 0..CONNECTS {
         let t0 = std::time::Instant::now();
         let mut c = connect(port).await;
         let mut b = [0u8; 11];
@@ -507,17 +510,22 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
         drop(c);
     }
     lat.sort();
+    let p99 = lat[CONNECTS * 99 / 100];
     let slow = lat
         .iter()
-        .filter(|d| **d > Duration::from_millis(50))
+        .filter(|d| **d > Duration::from_millis(75))
         .count();
     eprintln!(
-        "{t:?}: connect to banner p50 {:?} p99 {:?} max {:?}, {slow} of 150 over 50 ms",
-        lat[75], lat[148], lat[149]
+        "{t:?}: connect to banner p50 {:?} p99 {p99:?} max {:?}, {slow} of {CONNECTS} over 75 ms",
+        lat[CONNECTS / 2],
+        lat[CONNECTS - 1]
     );
-    // About a millisecond each on these links; one that waits for a timer is 100 ms or more.
-    assert!(lat[148] <= Duration::from_millis(30), "p99 {:?}", lat[148]);
-    assert!(slow <= 1, "{slow} of 150 over 50 ms");
+    // About a millisecond each on these links; one that waits for a timer is 85 ms or more. A
+    // loaded machine (a load average of 70) delays some connects by tens of milliseconds (a p99 of
+    // 38 ms was seen), so the bounds sit between that and the bug, which the sample size makes
+    // sure to catch.
+    assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}");
+    assert!(slow <= 1, "{slow} of {CONNECTS} over 75 ms");
 }
 
 /// **A reader that stopped, written to in small chunks** (B-new-1 of the re-check): an

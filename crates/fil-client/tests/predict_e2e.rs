@@ -3,8 +3,9 @@
 //! on simulated networks, the user's terminal an emulator that reflows.
 //!
 //! The big runs (the whole resize matrix, the baseline at several round-trip times) are the
-//! `predict_e2e` example (`just predict-e2e`). One test here is `#[ignore]`d on purpose: it
-//! reproduces the resize damage that W1 repairs, so it only passes while the damage is there.
+//! `predict_e2e` example (`just predict-e2e`). The resize damage T1 reproduced is repaired by
+//! W1's in-band repaint: the true-order cases below end equal to the shadow and, once repainted,
+//! to a fresh snapshot of the session.
 //!
 //! Real time, real PTYs: each test takes a few seconds.
 
@@ -184,7 +185,18 @@ fn resize_case(
     to: (u16, u16),
     seed: u64,
 ) -> ResizeCase {
-    let mut s = Spec::new(Transport::Pipe, Program::Cat);
+    resize_case_of(Program::Cat, predict, order, from, to, seed)
+}
+
+fn resize_case_of(
+    program: Program,
+    predict: Predict,
+    order: Order,
+    from: (u16, u16),
+    to: (u16, u16),
+    seed: u64,
+) -> ResizeCase {
+    let mut s = Spec::new(Transport::Pipe, program);
     s.one_way = Duration::from_millis(75);
     s.predict = predict;
     s.size = from;
@@ -233,17 +245,15 @@ async fn the_resize_controls_are_clean() {
     assert!(c.clean(), "guesses, M0's order:\n{}", c.side_by_side());
 }
 
-/// **The reproduction (W1's gate).** The same case as the second control, in the true order:
-/// the terminal reflows its screen, guesses included, and the client then erases them where
-/// they were, on a geometry that is gone. The screen ends different from the shadow.
-///
-/// Ignored because it passes only while the damage exists: W1 flips it (the repaint repairs
-/// the screen), and the case then moves to the clean list.
+/// **The reproduction (W1's gate), repaired.** The same case as the second control, in the true
+/// order: the terminal reflows its screen, guesses included, and the client then erases them
+/// where they were, on a geometry that is gone. Before W1 the screen ended different from the
+/// shadow in most of these runs (`docs/m3/harness.md` §3). Now the client, which had something
+/// drawn at the resize, asks for a repaint after the resize record: the screen ends equal to the
+/// shadow, and, the repaint having made it the daemon's, to a fresh snapshot too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces the resize damage that W1 repairs: passes only while it exists"]
-async fn a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order() {
-    let mut damaged = 0;
-    for seed in 1..=6 {
+async fn a_narrowing_resize_with_guesses_on_screen_is_repaired_in_the_true_order() {
+    for seed in 1..=3 {
         let out = resize_trial(resize_case(
             Predict::MoshAlways,
             Order::True,
@@ -252,9 +262,49 @@ async fn a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order(
             seed,
         ))
         .await;
-        if out.guesses_on_screen > 0 && !out.shadow.as_ref().expect("shadow").clean() {
-            damaged += 1;
-        }
+        assert_repaired(&out, seed);
     }
-    assert!(damaged > 0, "no damage in six runs");
+}
+
+/// The widening case T1 found: eight long lines wrapped at 30 columns, joined by the widening,
+/// move everything below them up, and the erase leaves the terminal's cursor on another row than
+/// the shadow's. A rule that only stops further guesses cannot fix that; the repaint does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_widening_resize_that_joins_wrapped_rows_is_repaired_in_the_true_order() {
+    for seed in 1..=2 {
+        let mut case = resize_case_of(
+            Program::Fill(8),
+            Predict::MoshAlways,
+            Order::True,
+            (30, 24),
+            (80, 24),
+            seed,
+        );
+        // Shorter than the 30 columns, so the guesses are on the screen at the resize (the
+        // predictor stops before the last column), as in the matrix (`just predict-e2e resize`).
+        case.typed_before = 14 + (seed as usize % 5) * 6;
+        let out = resize_trial(case).await;
+        assert_repaired(&out, seed);
+    }
+}
+
+fn assert_repaired(out: &ResizeOutcome, seed: u64) {
+    assert!(
+        out.guesses_on_screen > 0,
+        "seed {seed}: guesses were on the screen at the resize"
+    );
+    assert!(out.repaints > 0, "seed {seed}: no repaint was asked for");
+    let c = out.shadow.as_ref().expect("shadow");
+    assert!(
+        c.clean(),
+        "seed {seed}, vs the shadow:\n{}",
+        c.side_by_side()
+    );
+    let c = &out.comparison;
+    assert!(
+        c.clean(),
+        "seed {seed}, vs a fresh snapshot after the repaint:\n{}\n{:?}",
+        c.side_by_side(),
+        c.screen_diffs
+    );
 }

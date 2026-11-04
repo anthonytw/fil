@@ -95,6 +95,7 @@ fn snapshot_reasons() -> Vec<SnapshotReason> {
         SnapshotReason::TooFarBehind,
         SnapshotReason::BadResumePoint,
         SnapshotReason::Requested,
+        SnapshotReason::Repaint,
     ];
     for c in &all {
         match c {
@@ -102,7 +103,8 @@ fn snapshot_reasons() -> Vec<SnapshotReason> {
             | SnapshotReason::LogWrapped
             | SnapshotReason::TooFarBehind
             | SnapshotReason::BadResumePoint
-            | SnapshotReason::Requested => {}
+            | SnapshotReason::Requested
+            | SnapshotReason::Repaint => {}
         }
     }
     all
@@ -122,6 +124,7 @@ fn snapshot_info(reason: SnapshotReason) -> SnapshotInfo {
         len: 1234,
         skipped: 5,
         reason,
+        size_gen: 3,
     }
 }
 
@@ -1430,6 +1433,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                 len: u64::MAX,
                 skipped: u64::MAX,
                 reason: SnapshotReason::Requested,
+                size_gen: u64::MAX,
             }),
             udp_port: Some(u16::MAX),
             fingerprint: Some(Fingerprint::new(vec![0xFF; MAX_FINGERPRINT]).unwrap()),
@@ -1470,6 +1474,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             len: u64::MAX,
             skipped: u64::MAX,
             reason: SnapshotReason::BadResumePoint,
+            size_gen: u64::MAX,
         }),
     );
     for (label, code, signal) in [
@@ -1610,10 +1615,11 @@ fn input_records() -> Vec<(String, InputRecord)> {
                 size: TermSize::new(1000, TermSize::MAX_ROWS).unwrap(),
             },
         ),
+        ("repaint".to_string(), InputRecord::Repaint),
     ];
     for (_, r) in &all {
         match r {
-            InputRecord::Resize { .. } => {}
+            InputRecord::Resize { .. } | InputRecord::Repaint => {}
         }
     }
     all
@@ -2099,7 +2105,11 @@ fn revisioned() -> Entries {
     ));
     e.push((
         "decode/input-record-unknown-kind".into(),
-        parsed(&record_wire(&[1, 1, 1, 80, 24])),
+        parsed(&record_wire(&[2, 1, 1, 80, 24])),
+    ));
+    e.push((
+        "decode/input-record-repaint-trailing-byte".into(),
+        parsed(&record_wire(&[1, 0])),
     ));
     let mut zero_size = resize_body.clone();
     let n = zero_size.len();
@@ -2201,12 +2211,12 @@ fn revisioned() -> Entries {
     e.push(("decode/error-code-3".into(), outcome::<ErrorCode>(&past(3))));
     e.push(("decode/error-code-4".into(), outcome::<ErrorCode>(&past(4))));
     e.push((
-        "decode/snapshot-reason-4".into(),
-        outcome::<SnapshotReason>(&past(4)),
-    ));
-    e.push((
         "decode/snapshot-reason-5".into(),
         outcome::<SnapshotReason>(&past(5)),
+    ));
+    e.push((
+        "decode/snapshot-reason-6".into(),
+        outcome::<SnapshotReason>(&past(6)),
     ));
     e.push((
         "decode/attach-refusal-5".into(),

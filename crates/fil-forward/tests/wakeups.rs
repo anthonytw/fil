@@ -1,6 +1,7 @@
 //! How often the endpoint's tasks wake (sweep M2, efficiency). The mux's timers run at their
 //! deadlines, not on a period; an event wakes the sender task that has work for it and not the
-//! other. Counts, not times: they hold on a loaded machine, within wide margins.
+//! other. Counts, not times, and none that depends on the load: the tasks with no work for an
+//! event are checked against a constant, the others against the number of events.
 
 mod support;
 
@@ -117,21 +118,35 @@ async fn each_event_wakes_only_the_task_that_has_work_body() {
     .await;
     let (c1, d1) = total(&w);
     let segments = mib * 64;
-    // The receiving side's data sender has nothing to send: it ran for the connection's
-    // setup and a few acks, not for each of the `segments` payloads that arrived.
+    // The two tasks that have no work for this transfer ran for its setup and a few records, not
+    // for each of the `segments` payloads: the sending side's control sender (the peer's acks
+    // reach the mux as `on_ack`, which wakes the data sender alone) and the receiving side's data
+    // sender (it has nothing to send). Zero when the machine is quiet; the bound is what no event
+    // per payload can stay under, and it does not depend on the load.
+    let tx_ctl = c1.ctl - c0.ctl;
     let rx_data = d1.data - d0.data;
     assert!(
-        rx_data * 8 <= segments,
+        tx_ctl <= IDLE_RUNS,
+        "the sender's control sender ran {tx_ctl} times for {segments} segments"
+    );
+    assert!(
+        rx_data <= IDLE_RUNS,
         "the receiver's data sender ran {rx_data} times for {segments} segments"
     );
-    // Acks are batched (one per quarter window or a drain); the control senders run for
-    // those, not for every chunk.
-    let ctl = (c1.ctl - c0.ctl) + (d1.ctl - d0.ctl);
+    // The tasks that have work run once for an event at most (a wakeup is a permit that comes
+    // to one run, however many events it covers). How many events there are depends on the
+    // load, since a quicker local socket drains between payloads and acks at once (the
+    // receiver acknowledges on drain): 90 to 600 runs for the 1,024 payloads, so no bound
+    // tighter than one per payload holds on a loaded machine.
+    let rx_ctl = d1.ctl - d0.ctl;
     assert!(
-        ctl * 4 <= segments,
-        "the control senders ran {ctl} times for {segments} segments"
+        rx_ctl <= segments + IDLE_RUNS,
+        "the receiver's control sender ran {rx_ctl} times for {segments} segments"
     );
 }
+
+/// Runs of a task with no work in the transfer above: its setup, a record or two.
+const IDLE_RUNS: u64 = 8;
 
 /// A peer's violation is answered with a `Close(Violation)` record, and on an idle endpoint
 /// nothing but the ack handler can wake the control sender to send it: the peer never closes (it

@@ -2,7 +2,7 @@
 # The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
 # topology, network namespaces and root for the UDP/NAT topology.
 #
-#   run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|install|latency|all] [SCENARIO...]
+#   run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|install|latency|predict|all] [SCENARIO...]
 #
 # Exit status: 0 if every scenario that ran passed, 1 if any failed, 2 if the host cannot run it.
 # A part that chose not to run (policy, outside CI and the VM) is listed as SKIPPED, not passed.
@@ -24,9 +24,10 @@ case $part in
   agent) parts=(agent) ;; # the M2 agent scenarios
   install) parts=(install) ;; # M4 U1: getting fil onto a host, docs/m4/plan.md §3 U1
   latency) parts=(latency) ;; # not in `all`: the latency lab, docs/m2/latency.md
+  predict) parts=(predict) ;; # not in `all`: M3's prediction cells, docs/m3/plan.md §5.5
   all) parts=(ssh udp sysd policy fwd agent install) ;;
   *)
-    echo "usage: run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|install|latency|all] [SCENARIO...]" >&2
+    echo "usage: run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|install|latency|predict|all] [SCENARIO...]" >&2
     exit 2
     ;;
 esac

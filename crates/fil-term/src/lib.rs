@@ -13,6 +13,7 @@ mod model_impls;
 pub mod snapshot;
 #[cfg(any(feature = "alacritty", feature = "vt100"))]
 mod sniff;
+pub mod view;
 
 #[cfg(feature = "alacritty")]
 mod be_alacritty;
@@ -21,6 +22,7 @@ mod be_vt100;
 
 pub use boundary::Boundary;
 pub use model::{Size, TermState};
+pub use view::{CellView, Screen};
 
 /// Which parts of [`TermState`] a backend can report. The fidelity suite scores a field
 /// a backend cannot see as unsupported, not as wrong.
@@ -94,8 +96,14 @@ pub trait Emulator: Send {
     fn apply_pending(&mut self) {}
 
     /// The current state, with at most `history_lines` of scrollback. Pass 0 for the
-    /// screen alone, which is what the prediction shadow screen reads.
+    /// screen alone. It converts the whole grid: for snapshots and harnesses, not per keystroke
+    /// (the prediction shadow reads [`Emulator::screen`]).
     fn state(&self, history_lines: usize) -> TermState;
+
+    /// A borrowed view of the visible screen: what the prediction shadow reads per keystroke and
+    /// per output chunk, with no [`TermState`] built (`docs/m3/plan.md` §2.10). It borrows the
+    /// emulator: drop it before the next `feed`, `resize` or [`Emulator::state`].
+    fn screen(&self) -> Box<dyn Screen + '_>;
 }
 
 /// A compiled-in backend.

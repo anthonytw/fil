@@ -513,6 +513,9 @@ struct Signals {
     /// The channel is over locally, and how: `Done` closes the socket normally, anything else
     /// resets it.
     end: watch::Sender<Option<CloseReason>>,
+    /// What the pump's two halves are doing ([`PumpPhase`], as `u8`; `up` then `down`).
+    #[cfg(feature = "test-hooks")]
+    phase: [std::sync::atomic::AtomicU8; 2],
 }
 
 impl Signals {
@@ -523,6 +526,8 @@ impl Signals {
             opened: Notify::new(),
             answer: Mutex::new(None),
             end: watch::Sender::new(None),
+            #[cfg(feature = "test-hooks")]
+            phase: Default::default(),
         })
     }
 
@@ -1071,10 +1076,102 @@ pub struct Wakeups {
     pub ctl_sent: u64,
 }
 
+/// What one half of a channel's pump is doing ([`Endpoint::pumps`], feature `test-hooks`): where
+/// a stalled forward waits. `Up` is local socket to channel, `down` channel to local socket.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PumpPhase {
+    /// Not started (or waiting for the SOCKS answer).
+    Starting = 0,
+    /// Up: the send buffer is full, waiting for `Writable`.
+    WaitRoom,
+    /// Up: in a read of the local socket.
+    Reading,
+    /// Down: nothing to write, waiting for data or the peer's `Eof`.
+    WaitData,
+    /// Down: in a write to the local socket.
+    Writing,
+    /// Waiting out a failure for want of kernel memory before trying again.
+    NoMemory,
+    /// Down: shutting the socket's write side down.
+    ShuttingDown,
+    /// Returned.
+    Done,
+}
+
+#[cfg(feature = "test-hooks")]
+impl PumpPhase {
+    fn from_u8(v: u8) -> Self {
+        use PumpPhase::*;
+        [
+            Starting,
+            WaitRoom,
+            Reading,
+            WaitData,
+            Writing,
+            NoMemory,
+            ShuttingDown,
+            Done,
+        ]
+        .get(v as usize)
+        .copied()
+        .unwrap_or(Done)
+    }
+}
+
+/// Records what a pump half is doing (`0` up, `1` down), with feature `test-hooks`; nothing
+/// otherwise.
+macro_rules! phase {
+    ($sig:expr, $half:expr, $p:ident) => {
+        #[cfg(feature = "test-hooks")]
+        $sig.phase[$half].store(PumpPhase::$p as u8, Ordering::Relaxed);
+    };
+}
+
+/// A pump's state for a report ([`Endpoint::pumps`], feature `test-hooks`): counts and phases
+/// only, no addresses or bytes (DESIGN.md §11.1).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct PumpReport {
+    pub channel: u32,
+    pub up: PumpPhase,
+    pub down: PumpPhase,
+    /// How the channel ended locally, if it did.
+    pub end: Option<CloseReason>,
+    /// The channel in the mux, if it is still there.
+    pub info: Option<fil_proto::mux::ChannelInfo>,
+}
+
+/// A local socket call that failed and ended its channel ([`Endpoint::local_errors`], feature
+/// `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct LocalError {
+    pub channel: u32,
+    /// The write (channel to socket) failed, not the read.
+    pub write: bool,
+    pub kind: std::io::ErrorKind,
+    pub errno: Option<i32>,
+    /// It was a shortage of kernel memory that lasted too long to wait out.
+    pub gave_up: bool,
+}
+
+/// The most [`LocalError`]s kept (the first ones).
+#[cfg(feature = "test-hooks")]
+const LOCAL_ERRORS_KEPT: usize = 64;
+
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
 #[cfg(feature = "test-hooks")]
 #[derive(Default)]
 struct TestHooks {
+    /// The pumps alive, by a serial of their own (a pump outlives its slot while it unwinds).
+    pumps: Mutex<HashMap<u64, (u32, Arc<Signals>)>>,
+    next_pump: std::sync::atomic::AtomicU64,
+    /// The local socket errors that ended channels, the first [`LOCAL_ERRORS_KEPT`].
+    local_errors: Mutex<Vec<LocalError>>,
+    /// How many there were in all.
+    local_errors_seen: std::sync::atomic::AtomicU64,
     /// Runs in `open_local` between the policy check and the open, without the lock.
     after_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// How often each sender task went round its loop, and how often the mux's timers ran.
@@ -1086,6 +1183,20 @@ struct TestHooks {
 
 #[cfg(feature = "test-hooks")]
 impl TestHooks {
+    fn local_error(&self, channel: u32, write: bool, e: Option<&std::io::Error>, gave_up: bool) {
+        self.local_errors_seen.fetch_add(1, Ordering::Relaxed);
+        let mut v = lock(&self.local_errors);
+        if v.len() < LOCAL_ERRORS_KEPT {
+            v.push(LocalError {
+                channel,
+                write,
+                kind: e.map_or(std::io::ErrorKind::WriteZero, std::io::Error::kind),
+                errno: e.and_then(std::io::Error::raw_os_error),
+                gave_up,
+            });
+        }
+    }
+
     fn after_check(&self) {
         let hook = lock(&self.after_check).clone();
         if let Some(h) = hook {
@@ -1783,6 +1894,42 @@ impl<L: Link> Endpoint<L> {
     /// The channels the mux holds.
     pub fn channels(&self) -> Vec<ChannelId> {
         lock(&self.inner().state).mux.channels().collect()
+    }
+
+    /// Every pump alive and what its halves are doing, with its channel's state (feature
+    /// `test-hooks`): for the report of a test that stalled.
+    #[cfg(feature = "test-hooks")]
+    pub fn pumps(&self) -> Vec<PumpReport> {
+        let inner = self.inner();
+        let pumps: Vec<_> = lock(&inner.hooks.pumps).values().cloned().collect();
+        let st = lock(&inner.state);
+        let mut v: Vec<_> = pumps
+            .into_iter()
+            .map(|(ch, sig)| PumpReport {
+                channel: ch,
+                up: PumpPhase::from_u8(sig.phase[0].load(Ordering::Relaxed)),
+                down: PumpPhase::from_u8(sig.phase[1].load(Ordering::Relaxed)),
+                end: *sig.end.borrow(),
+                info: st
+                    .slots
+                    .get(&ch)
+                    .filter(|s| Arc::ptr_eq(&s.sig, &sig))
+                    .and_then(|_| st.mux.info(ChannelId(ch))),
+            })
+            .collect();
+        v.sort_by_key(|r| r.channel);
+        v
+    }
+
+    /// The local socket errors that ended channels (the first 64) and how many there were in
+    /// all (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn local_errors(&self) -> (Vec<LocalError>, u64) {
+        let h = &self.inner().hooks;
+        (
+            lock(&h.local_errors).clone(),
+            h.local_errors_seen.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -2529,6 +2676,12 @@ impl<L: Link> Inner<L> {
         socks: Option<socks::Version>,
     ) {
         let _alive = PumpGuard(&self.pumps);
+        #[cfg(feature = "test-hooks")]
+        let _registered = {
+            let id = self.hooks.next_pump.fetch_add(1, Ordering::Relaxed);
+            lock(&self.hooks.pumps).insert(id, (ch.0, sig.clone()));
+            Registered(&self.hooks, id)
+        };
         let mut end = sig.end.subscribe();
         if let Some(version) = socks {
             let answer = self.wait_opened(&sig).await;
@@ -2543,8 +2696,14 @@ impl<L: Link> Inner<L> {
         {
             let work = async {
                 tokio::join!(
-                    self.up(ch, &mut rd, &sig, retry),
-                    self.down(ch, &mut wr, &sig, retry)
+                    async {
+                        self.up(ch, &mut rd, &sig, retry).await;
+                        phase!(sig, 0, Done);
+                    },
+                    async {
+                        self.down(ch, &mut wr, &sig, retry).await;
+                        phase!(sig, 1, Done);
+                    }
                 );
             };
             tokio::pin!(work);
@@ -2609,9 +2768,11 @@ impl<L: Link> Inner<L> {
                 room
             };
             if room == 0 {
+                phase!(sig, 0, WaitRoom);
                 notified.await;
                 continue;
             }
+            phase!(sig, 0, Reading);
             let max = room.min(READ_CHUNK);
             // The read lands on this poll's stack and goes into the send buffer within the same
             // poll: no buffer per channel while it waits.
@@ -2673,13 +2834,18 @@ impl<L: Link> Inner<L> {
                             channel = ch.0,
                             "forward socket read: out of memory for too long"
                         );
+                        #[cfg(feature = "test-hooks")]
+                        self.hooks.local_error(ch.0, false, Some(&e), true);
                         self.abort(ch, sig, CloseReason::Reset);
                         return;
                     };
+                    phase!(sig, 0, NoMemory);
                     tokio::time::sleep(wait).await;
                 }
                 Err(e) => {
                     debug!(channel = ch.0, kind = ?e.kind(), "forward socket read failed");
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks.local_error(ch.0, false, Some(&e), false);
                     self.abort(ch, sig, CloseReason::Reset);
                     return;
                 }
@@ -2720,14 +2886,19 @@ impl<L: Link> Inner<L> {
                 }
             };
             match next {
-                Next::Wait => notified.await,
+                Next::Wait => {
+                    phase!(sig, 1, WaitData);
+                    notified.await;
+                }
                 Next::Eof => {
+                    phase!(sig, 1, ShuttingDown);
                     let _ = wr.shutdown().await;
                     return;
                 }
                 Next::Data(data) => {
                     let mut off = 0;
                     while off < data.len() {
+                        phase!(sig, 1, Writing);
                         match wr.write(&data[off..]).await {
                             Ok(n) if n > 0 => {
                                 nomem.succeeded();
@@ -2747,26 +2918,33 @@ impl<L: Link> Inner<L> {
                                 self.kick_ctl();
                             }
                             Err(e) if retry && is_no_memory(&e) => {
-                                // The kernel is out of socket memory, for now, and the
-                                // failed write took nothing (`retry`). The rest of `data` stays here, unacknowledged (`consumed` is not called),
-                                // so the peer's window stays shut behind it: nothing is lost,
-                                // reordered or let in past the budget. The wait is a timer, not
-                                // a `Notify`: whatever arrives meanwhile is found by the next
-                                // turn of the outer loop, which takes a fresh `notified` before
-                                // it reads the mux. A channel that ends drops this future with
-                                // the pump's `work`.
+                                // The kernel is out of socket memory, for now, and the failed
+                                // write took nothing (`retry`). The rest of `data` stays here,
+                                // unacknowledged (`consumed` is not called), so the peer's
+                                // window stays shut behind it: nothing is lost, reordered or let
+                                // in past the budget. The wait is a timer, not a `Notify`:
+                                // whatever arrives meanwhile is found by the next turn of the
+                                // outer loop, which takes a fresh `notified` before it reads the
+                                // mux. A channel that ends drops this future with the pump's
+                                // `work`.
                                 let Some(wait) = nomem.failed(tokio::time::Instant::now()) else {
                                     debug!(
                                         channel = ch.0,
                                         "forward socket write: out of memory for too long"
                                     );
+                                    #[cfg(feature = "test-hooks")]
+                                    self.hooks.local_error(ch.0, true, Some(&e), true);
                                     self.abort(ch, sig, CloseReason::Reset);
                                     return;
                                 };
+                                phase!(sig, 1, NoMemory);
                                 tokio::time::sleep(wait).await;
                             }
-                            Ok(_) | Err(_) => {
+                            r => {
                                 debug!(channel = ch.0, "forward socket write failed");
+                                #[cfg(feature = "test-hooks")]
+                                self.hooks.local_error(ch.0, true, r.as_ref().err(), false);
+                                let _ = r;
                                 self.abort(ch, sig, CloseReason::Reset);
                                 return;
                             }
@@ -2830,6 +3008,17 @@ struct PumpGuard<'a>(&'a AtomicUsize);
 impl Drop for PumpGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A pump's entry in [`TestHooks::pumps`], taken out when the pump returns.
+#[cfg(feature = "test-hooks")]
+struct Registered<'a>(&'a TestHooks, u64);
+
+#[cfg(feature = "test-hooks")]
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.pumps).remove(&self.1);
     }
 }
 

@@ -578,6 +578,17 @@ pub struct World {
     pub link: Option<LinkPair>,
 }
 
+impl World {
+    /// Both endpoints' [`endpoint_report_timed`], for a failure message.
+    pub fn report(&self) -> String {
+        format!(
+            "\n  client: {}\n  daemon: {}",
+            endpoint_report_timed(&self.client.ep),
+            endpoint_report_timed(&self.daemon.ep)
+        )
+    }
+}
+
 /// Raises this process's soft `RLIMIT_NOFILE` toward its hard limit, once: a test holds
 /// thousands of loopback sockets (both ends of every connection live in this process), more than
 /// the default soft limits (256 on macOS, 1,024 on Linux) allow.
@@ -1193,29 +1204,112 @@ pub fn test_limit() -> Duration {
 /// `multi_thread` tests, which cannot pause the clock, are wrapped.
 pub async fn bounded<F: Future>(body: F) -> F::Output {
     let limit = test_limit();
+    let denied = mbufs_denied();
     let mut body = std::pin::pin!(body);
     tokio::select! {
         v = &mut body => v,
         () = tokio::time::sleep(limit) => {
             // The body is still alive here, so its endpoints are in `WATCHED`. The name goes out
-            // first: a snapshot takes the endpoint's state lock, and if that is what the test is
-            // stuck on, the report never comes. The endpoints are cloned out of `WATCHED` so that
-            // a panic in a snapshot leaves the list unheld.
+            // first, in case the report never comes. Everything else goes in the panic message,
+            // which the test harness keeps (it captures what is printed).
             let name = thread_name();
-            eprintln!("{name}: still running after {limit:?}; taking the endpoints' snapshots");
-            let mine: Vec<_> = watched()
+            eprintln!("{name}: still running after {limit:?}; taking the endpoints' reports");
+            let (mine, others): (Vec<_>, Vec<_>) = watched()
                 .iter()
-                .filter(|(_, who, ..)| *who == name)
-                .map(|(_, _, side, ep)| (*side, ep.clone()))
-                .collect();
+                .filter(|(_, who, ..)| *who == name || !is_test_thread(who))
+                .map(|(_, who, side, ep)| (*who == name, *side, ep.clone()))
+                .partition(|(m, ..)| *m);
             let mut report = String::new();
-            for (side, ep) in mine {
-                report.push_str(&format!("\n  {side:?}: {:?}", ep.snapshot()));
+            for (title, eps) in [("endpoints", &mine), ("endpoints built off a test thread (maybe another test's)", &others)] {
+                if eps.is_empty() {
+                    continue;
+                }
+                report.push_str(&format!("\n{title}:"));
+                for (_, side, ep) in eps.iter() {
+                    report.push_str(&format!("\n  {side:?}: {}", endpoint_report_timed(ep)));
+                }
             }
-            if report.is_empty() {
-                report.push_str("\n  (no endpoint to report)");
+            if mine.is_empty() {
+                report.push_str("\n(no endpoint built on this test's thread)");
             }
-            panic!("{name}: still running after {limit:?}; endpoints:{report}");
+            report.push_str(&format!("\n{}", mbufs_note(denied)));
+            panic!("{name}: still running after {limit:?}{report}");
         }
+    }
+}
+
+/// Whether a thread is a test's own (named after the test) rather than a runtime's worker.
+fn is_test_thread(name: &str) -> bool {
+    !(name.starts_with("tokio-") || name == "?" || name == "main")
+}
+
+/// Where an endpoint stands, for a test's failure: its snapshot, its pacer, every pump alive with
+/// what its halves are doing and its channel's state, and the local socket errors that ended
+/// channels (with their errnos). Counts and states only.
+pub fn endpoint_report(ep: &Endpoint<TestLink>) -> String {
+    let (errors, seen) = ep.local_errors();
+    let mut r = format!(
+        "{:?}\n    pace {:?}\n    wakeups {:?}\n    local socket errors that ended channels: {seen}",
+        ep.snapshot(),
+        ep.pace_state(),
+        ep.wakeups(),
+    );
+    for e in &errors {
+        r.push_str(&format!("\n      {e:?}"));
+    }
+    let pumps = ep.pumps();
+    r.push_str(&format!("\n    pumps alive: {}", pumps.len()));
+    for p in &pumps {
+        r.push_str(&format!(
+            "\n      ch {} up {:?} down {:?} end {:?} {:?}",
+            p.channel, p.up, p.down, p.end, p.info
+        ));
+    }
+    r
+}
+
+/// [`endpoint_report`] on a thread of its own, given 10 s: an endpoint whose state lock is held
+/// for good (a deadlock) is reported as such instead of hanging the report.
+pub fn endpoint_report_timed(ep: &Endpoint<TestLink>) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ep = ep.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(endpoint_report(&ep));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            format!("(no report in 10 s: {e}; the endpoint's state lock is held, a deadlock?)")
+        })
+}
+
+/// The kernel's count of mbuf requests it denied, ever (`netstat -m`, macOS): what rises when
+/// the mbuf pool runs out and loopback sends fail with `ENOBUFS` or, inside TCP, are dropped and
+/// retransmitted on a timer. `None` elsewhere, or if it cannot be read.
+pub fn mbufs_denied() -> Option<u64> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("netstat")
+        .arg("-m")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.contains("requests for memory denied"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A line for a failure message: the mbuf requests the kernel denied since `before` (from
+/// [`mbufs_denied`]), machine-wide, so other tests running at the same time count too.
+pub fn mbufs_note(before: Option<u64>) -> String {
+    match (before, mbufs_denied()) {
+        (Some(b), Some(a)) => format!(
+            "kernel mbuf requests denied since the test began: {} (machine-wide)",
+            a.saturating_sub(b)
+        ),
+        _ => "kernel mbuf denials: not measured on this OS".to_string(),
     }
 }

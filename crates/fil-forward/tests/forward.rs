@@ -10,8 +10,8 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fil_forward::LocalPeer;
@@ -535,6 +535,11 @@ async fn stuck_consumer(t: Transport) {
 /// Buffered bytes stay within the budget, whatever the applications do: here every connection
 /// is stuck both ways (the application and the server write and never read). The listener
 /// pauses at the open cap, and nothing beyond the configured budget is ever held.
+///
+/// Nothing may end while the buffers fill: every application and server writes for ever. A
+/// connection that ends (its socket failed: on macOS, `ENOBUFS` when the mbuf pool runs out
+/// resets the channel) leaves fewer than 16 open once more than 8 have, and the fill would
+/// never finish; the test fails at once instead, with the error and the endpoints' state.
 async fn budget(t: Transport) {
     let budget = 4 << 20;
     let cfg = MuxConfig {
@@ -542,13 +547,25 @@ async fn budget(t: Transport) {
         max_open: 16,
         ..mux_config()
     };
+    let denied = mbufs_denied();
+    // Why each writer that stopped stopped: none may, until the end.
+    let ended = Arc::new(Mutex::new(Vec::<String>::new()));
     // Every socket that is never read has small kernel buffers: the test is about the endpoint's
     // budget, and the OS's autotuning (4 MiB each on macOS) across some 80 loopback sockets
     // can take a small runner's whole mbuf pool.
-    let server = serve(|mut s| async move {
-        shrink_buffers(&s);
-        let buf = vec![1u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
+    let server_ended = ended.clone();
+    let server = serve(move |mut s| {
+        let ended = server_ended.clone();
+        async move {
+            shrink_buffers(&s);
+            let buf = vec![1u8; 64 * 1024];
+            let e = loop {
+                if let Err(e) = write_all_retry(&mut s, &buf).await {
+                    break e;
+                }
+            };
+            ended.lock().unwrap().push(format!("a server's write: {e}"));
+        }
     })
     .await;
     let w = World::new(t, cfg).await;
@@ -562,13 +579,30 @@ async fn budget(t: Transport) {
     w.daemon.ep.set_pacing(off);
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
-    for _ in 0..24 {
+    for i in 0..24 {
         let mut s = connect_small(port).await;
+        let ended = ended.clone();
         apps.push(tokio::spawn(async move {
             let buf = vec![2u8; 64 * 1024];
-            while write_all_retry(&mut s, &buf).await.is_ok() {}
+            let e = loop {
+                if let Err(e) = write_all_retry(&mut s, &buf).await {
+                    break e;
+                }
+            };
+            ended
+                .lock()
+                .unwrap()
+                .push(format!("application {i}'s write: {e}"));
         }));
     }
+    let failure = |what: &str| -> String {
+        format!(
+            "{t:?}: {what}; writers that stopped: {:?}{}\n{}",
+            ended.lock().unwrap(),
+            w.report(),
+            mbufs_note(denied)
+        )
+    };
     let check = || {
         for (who, ep) in [("client", &w.client.ep), ("daemon", &w.daemon.ep)] {
             let s = ep.snapshot();
@@ -576,20 +610,35 @@ async fn budget(t: Transport) {
             assert!(s.reserved <= budget, "{who}: {s:?}");
             assert!(s.channels <= 16, "{who}: {s:?}");
         }
+        let stopped = !ended.lock().unwrap().is_empty();
+        let errors = w.client.ep.local_errors().1 + w.daemon.ep.local_errors().1;
+        if stopped || errors > 0 {
+            panic!(
+                "{}",
+                failure("a connection ended while the buffers filled (none may)")
+            );
+        }
     };
-    // Fill up: both sides end up holding (nearly) all they reserved.
+    // Fill up: both sides end up holding (nearly) all they reserved. Seconds on any machine; the
+    // deadline is below the test's limit so that this failure, with its report, comes first.
     let full = || {
         let s = w.client.ep.snapshot();
         check();
         s.channels == 16 && s.buffered * 10 >= s.reserved * 9
     };
-    eventually(Duration::from_secs(120), full).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while !full() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{}", failure("the buffers did not fill within 90 s"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     for _ in 0..50 {
         check();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (c, d) = (w.client.ep.snapshot(), w.daemon.ep.snapshot());
-    eprintln!("{t:?}: client {c:?}, daemon {d:?}");
+    eprintln!("{t:?}: client {c:?}, daemon {d:?}; {}", mbufs_note(denied));
     for a in &apps {
         a.abort();
     }

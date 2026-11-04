@@ -202,7 +202,7 @@ fn policy_line(p: &PolicyLine) -> String {
 /// What a session's refused row was for.
 fn refused_what(r: &RefusedRow) -> String {
     match &r.what {
-        RefusedWhat::Forward(spec) => sanitize_inline(&forward_spec::format_flag(spec)),
+        RefusedWhat::Forward(spec) => sanitize_inline(forward_spec::format_flag(spec)),
         RefusedWhat::Agent => "agent forwarding".to_string(),
     }
 }
@@ -426,10 +426,10 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         (ForwardKind::Local, Some(t)) => (
             own,
             "→",
-            host_port(&sanitize_inline(&t.host.to_string()), t.port.get()),
+            host_port(&sanitize_inline(t.host.to_string()), t.port.get()),
         ),
         (ForwardKind::Remote, Some(t)) => (
-            host_port(&sanitize_inline(&t.host.to_string()), t.port.get()),
+            host_port(&sanitize_inline(t.host.to_string()), t.port.get()),
             "←",
             own,
         ),
@@ -1028,7 +1028,7 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
                     .map(|r| JsonRefused {
                         what: match &r.what {
                             RefusedWhat::Forward(spec) => {
-                                sanitize_inline(&forward_spec::format_flag(spec))
+                                sanitize_inline(forward_spec::format_flag(spec))
                             }
                             RefusedWhat::Agent => "agent".to_string(),
                         },

@@ -880,3 +880,36 @@ async fn a_third_snapshot_announced_behind_an_incomplete_one_reconnects() {
     let a = &rig.daemon.attaches().await[1];
     assert!(a.resume.is_some(), "a resume: {a:?}");
 }
+
+/// W1 (F4): a repaint held for its position (output below its `at` still on its way) is
+/// complete when a second snapshot is announced, and the second one's bytes arrive while the
+/// first still waits. They are the second snapshot's, not more of the first's: the first applies
+/// once the output has, then the second, with no reconnect and every line once.
+#[tokio::test(start_paused = true)]
+async fn the_next_snapshots_bytes_wait_while_a_complete_repaint_is_held() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_tail(&lines(0..40)).await;
+    rig.daemon.set_repaint_twice().await;
+    rig.term.resize(60, 24);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
+    let mut all = rig.term.history();
+    all.extend(rig.term.rows());
+    for i in 0..40 {
+        let want = numbered(i);
+        let n = all
+            .iter()
+            .filter(|l| l.trim_end() == want.trim_end())
+            .count();
+        assert_eq!(n, 1, "{want:?} appears {n} times: {all:?}");
+    }
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text()
+    );
+}

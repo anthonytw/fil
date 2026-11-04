@@ -168,6 +168,9 @@ pub struct DState {
     /// client sent before it saw the announcement), and the catch-up's announcement (control)
     /// overtook the repaint's bytes on channel 2.
     repaint_then_catch_ups: Vec<Vec<u8>>,
+    /// After the next repaint is announced, a second repaint at the same point is announced too,
+    /// before any snapshot bytes; both snapshots' bytes go before the tail below their `at`.
+    repaint_twice: bool,
     /// Repaint snapshots sent, with the generation each was rendered at.
     pub repaints: Vec<u64>,
 }
@@ -257,6 +260,7 @@ impl FakeDaemon {
                 repaint_straddle: None,
                 repaint_kill: false,
                 repaint_then_catch_ups: Vec::new(),
+                repaint_twice: false,
                 repaints: Vec::new(),
             }),
         })
@@ -714,6 +718,36 @@ impl FakeDaemon {
             st.sent = tail_at + tail.len() as u64;
         }
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        if std::mem::take(&mut st.repaint_twice) {
+            st.snapshots += 1;
+            st.repaints.push(size_gen);
+            let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for _ in 0..2 {
+                let mut off = 0u64;
+                for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+                let seg = Segment {
+                    seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                    data: chunk.to_vec(),
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
+            return;
+        }
         let catch_ups = std::mem::take(&mut st.repaint_then_catch_ups);
         if !catch_ups.is_empty() {
             let mut all = vec![bytes];
@@ -804,6 +838,12 @@ impl FakeDaemon {
     /// ahead of the snapshot bytes (see `DState::repaint_then_catch_ups`).
     pub async fn set_repaint_then_catch_ups(&self, skips: Vec<Vec<u8>>) {
         self.st.lock().await.repaint_then_catch_ups = skips;
+    }
+
+    /// The next repaint is announced twice (the second confirmed early, as for a catch-up), both
+    /// ahead of their bytes, and the tail below their `at` comes last.
+    pub async fn set_repaint_twice(&self) {
+        self.st.lock().await.repaint_twice = true;
     }
 
     /// The link dies after the next repaint's snapshot, before its tail is sent.

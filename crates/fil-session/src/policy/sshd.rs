@@ -6,16 +6,19 @@
 //! - **Parsing as sshd does:** keywords are case-insensitive, `keyword value` or
 //!   `keyword=value`, a word starting with `#` ends the line; quotes and escapes are read as
 //!   every OpenSSH release reads them, and where releases differ (single quotes, a quote inside
-//!   a word, backslashes) a value is one fil does not know and a `Match` might apply; the first value
-//!   of a setting wins; `Include` takes globs, relative to the main config's directory
-//!   (`/etc/ssh`), in sorted order, at most 16 deep, and a file included from a `Match` block
-//!   is inside it.
+//!   a word, backslashes) a value is one fil does not know, a `Match` might apply and an
+//!   `Include` cannot be evaluated; the first value of a setting wins; `Include` takes globs,
+//!   relative to the main config's directory (`/etc/ssh`), in sorted order, at most 16 deep,
+//!   and a file included from a `Match` block is inside it.
 //! - **Two pattern languages** ([`super::pattern`]): `Match` criteria use OpenSSH's `match_pattern`
 //!   (`*`, `?` one byte, `!` in comma lists; no brackets), `Include` uses `glob(3)` (brackets, escapes).
 //!   A `Match` list fil cannot read as sshd does might apply. A line fil cannot evaluate as sshd
-//!   would (an `Include` glob whose meaning differs between `glob(3)` implementations, one with a
+//!   would (an `Include` glob whose meaning differs between `glob(3)` implementations or that is
+//!   `PATH_MAX` bytes or longer, an `Include` line OpenSSH releases split differently, one with a
 //!   byte that is not UTF-8, a file with a NUL byte) makes the settings unknown
 //!   ([`Settings::unevaluable`]): the mirror refuses everything unless fil's policy file says.
+//!   A `PermitOpen` or `PermitListen` entry with a byte that is not UTF-8 is one fil cannot
+//!   read: the list permits nothing.
 //! - **`Match`:** `User` and `Group` (pattern lists with `*`, `?` and `!`) are evaluated against
 //!   the daemon's user. Every other criterion (`Address`, `Host`, `LocalAddress`, `LocalPort`,
 //!   `RDomain`, `all`, ...) and every line fil cannot read **might apply**: its value is one of
@@ -330,13 +333,14 @@ pub struct Settings {
     pub permit_listen: Outcomes<PermitList>,
     pub gateway: Outcomes<Gateway>,
     /// Included files, and directories an include glob had to list, that could not be read (in
-    /// the order met), and files whose `Include` lines fil could not split: skipped.
+    /// the order met): skipped.
     pub unreadable: Vec<PathBuf>,
     /// The first line (file, line number) fil could not evaluate as sshd would: an `Include`
-    /// pattern whose meaning differs between `glob(3)` implementations, or that is not valid
-    /// UTF-8, or a file with a NUL byte (which sshd reads as gluing two lines together). What
-    /// the config says is then not known, and unlike an unreadable include (skipped, the rest
-    /// enforced) the mirror refuses everything unless fil's own policy file sets the key.
+    /// pattern whose meaning differs between `glob(3)` implementations, or that is `PATH_MAX`
+    /// bytes or longer, or not valid UTF-8; an `Include` line OpenSSH releases split
+    /// differently; or a file with a NUL byte (which sshd reads as gluing two lines together).
+    /// What the config says is then not known, and unlike an unreadable include (skipped, the
+    /// rest enforced) the mirror refuses everything unless fil's own policy file sets the key.
     pub unevaluable: Option<(PathBuf, u32)>,
 }
 
@@ -509,9 +513,12 @@ impl Parser<'_> {
                     let cap = cap.and(ctx.applies());
                     match l.agreed() {
                         Some(args) => self.include(args, path, line, ctx, cap, depth),
-                        // sshd releases would include different files: fil reads none of
-                        // them, and says the mirror is incomplete.
-                        None => self.unreadable.push(path.to_path_buf()),
+                        // sshd releases would include different files (8.7 and later split
+                        // the line with `argv_split`, earlier ones with `strdelim`), or one
+                        // cannot split it: which files sshd reads is not known, so neither is
+                        // what the config says. Not skip-and-mark: that is for a file fil
+                        // cannot read, and this one it read.
+                        None => self.cannot_evaluate(path, line),
                     }
                 }
                 "disableforwarding" => self.acc.disable.set(c, flag(args), src(maybe)),
@@ -521,12 +528,12 @@ impl Parser<'_> {
                 "permitopen" => {
                     self.acc
                         .permit_open
-                        .set(c, PermitList::parse(args, false, true), src(maybe))
+                        .set(c, permit_list(args, not_utf8, false), src(maybe))
                 }
                 "permitlisten" => {
                     self.acc
                         .permit_listen
-                        .set(c, PermitList::parse(args, true, true), src(maybe))
+                        .set(c, permit_list(args, not_utf8, true), src(maybe))
                 }
                 _ => {}
             }
@@ -672,6 +679,18 @@ impl Parser<'_> {
         }
         out
     }
+}
+
+/// A `PermitOpen` or `PermitListen` line of the sshd config (`listen`: `PermitListen`). An
+/// entry with a byte that is not UTF-8 (`not_utf8`: the line has one, and the text fil reads
+/// has the replacement character in its place, which is no byte of the file) is not the entry
+/// sshd compares: the list is one fil cannot read, and permits nothing (strict). A byte that
+/// is not UTF-8 elsewhere on the line (a comment) does not touch the entries.
+fn permit_list(args: &[String], not_utf8: bool, listen: bool) -> PermitList {
+    if not_utf8 && args.iter().any(|a| a.contains(char::REPLACEMENT_CHARACTER)) {
+        return PermitList::Unrecognized;
+    }
+    PermitList::parse(args, listen, true)
 }
 
 fn yes_no(b: bool) -> Applies {
@@ -913,14 +932,15 @@ struct Globbed {
     /// It named more than [`MAX_FILES`]; the rest were dropped.
     truncated: bool,
     /// The pattern uses a construct fil cannot evaluate as sshd's `glob(3)` does (see
-    /// `pattern::compile`), or a name it cannot match identically by bytes and by characters:
-    /// the config's settings are not known.
+    /// `pattern::compile`), is [`PATH_MAX`] bytes or longer, or meets a name it cannot match
+    /// identically by bytes and by characters: the config's settings are not known.
     unevaluable: bool,
 }
 
-/// The longest path `glob(3)` takes: a pattern this long or longer finds nothing (OpenBSD's
-/// `glob()` returns `GLOB_NOMATCH` for `strnlen(pattern, PATH_MAX) == PATH_MAX`). It is the
-/// host's own limit (4096 on Linux, 1024 on macOS and the BSDs): the daemon runs where sshd does.
+/// The longest path `glob(3)` takes: a pattern this long or longer finds nothing in OpenBSD's
+/// `glob()` (`GLOB_NOMATCH` for `strnlen(pattern, PATH_MAX) == PATH_MAX`), and fil does not
+/// evaluate it ([`Globbed::unevaluable`]). It is the host's own limit (4096 on Linux, 1024 on
+/// macOS and the BSDs): the daemon runs where sshd does.
 const PATH_MAX: usize = nix::libc::PATH_MAX as usize;
 
 /// The files a glob names, as sshd's `glob(3)` (called with no flags) does: `*`, `?`, `[...]` and
@@ -945,6 +965,12 @@ fn glob(pattern: &Path) -> Globbed {
     };
     let raw = pattern.as_os_str().as_bytes();
     if raw.len() >= PATH_MAX {
+        // OpenBSD's glob finds nothing here, but the answer this close to the limit hangs on
+        // what fil cannot see: the directory sshd puts a relative pattern in is its build's
+        // `SSHDIR` (fil uses the main file's), and a glob without this check, or one that
+        // fails another way (which stops sshd from starting), answers differently. Not
+        // guessed at.
+        g.unevaluable = true;
         return g;
     }
     let comps: Result<Vec<GlobComp>, Unevaluable> =
@@ -1688,21 +1714,50 @@ mod tests {
         }
     }
 
-    /// An `Include` line releases split differently includes nothing, and the mirror says it
-    /// is incomplete.
+    /// An `Include` line OpenSSH releases split differently (`argv_split` since 8.7, `strdelim`
+    /// before), or that one of them cannot split, is a line fil cannot evaluate: which files
+    /// sshd reads is not known. It includes nothing, and the mirror is unevaluable (naming the
+    /// line), not merely incomplete: fil read the file, it cannot tell what the line means. The
+    /// twins every release splits alike are read.
     #[test]
-    fn an_include_releases_split_differently_marks_the_mirror_incomplete() {
-        let dir_tmp = tempfile::tempdir().unwrap();
-        let dir = dir_tmp.path().to_path_buf();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a b.conf"), "AllowTcpForwarding yes\n").unwrap();
-        std::fs::write(dir.join("sshd_config"), "Include 'a b.conf'\n").unwrap();
-        let (r, _) = read(&dir.join("sshd_config"), &me());
-        let Sshd::Mirrored(s) = r else {
-            panic!("{r:?}")
-        };
-        assert_eq!(s.unreadable, vec![dir.join("sshd_config")]);
-        assert_eq!(s.tcp.values, vec![(Tcp::All, Src::Default)]);
+    fn an_include_releases_split_differently_makes_the_mirror_unevaluable() {
+        let t = scratch(&[
+            ("a b.conf", "AllowTcpForwarding no\n"),
+            ("ab cd.conf", "AllowTcpForwarding no\n"),
+            ("a.conf", "AllowTcpForwarding no\n"),
+        ]);
+        let d = t.path();
+        for pattern in [
+            // `a b.conf` to 8.7 and later, `'a` and `b.conf'` before.
+            "'conf.d/a b.conf'",
+            // A backslash before a space: one word to `argv_split`, two to `strdelim`.
+            "conf.d/a\\ b.conf",
+            // A quote inside a word: `ab cd.conf` to one, `ab c` and `d.conf` to the other.
+            "conf.d/a\"b c\"d.conf",
+            // A single quote kept by `strdelim` and dropped by `argv_split`.
+            "conf.d/'a.conf'",
+            // Unclosed: `argv_split` cannot split it (and sshd refuses the config).
+            "'conf.d/a.conf",
+            "\"conf.d/a.conf",
+        ] {
+            let s = include_settings(d, pattern);
+            assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)), "{pattern}");
+            assert!(s.unreadable.is_empty(), "{pattern}: {:?}", s.unreadable);
+            // Nothing was included: the value is the main file's.
+            assert_eq!(
+                s.tcp.values.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                [Tcp::Local],
+                "{pattern}"
+            );
+        }
+        // Double quotes around a whole word: every release reads them alike, and it is read.
+        let s = include_settings(d, "\"conf.d/a b.conf\"");
+        assert_eq!(s.unevaluable, None);
+        assert!(s.unreadable.is_empty());
+        assert_eq!(
+            s.tcp.values.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            [Tcp::No]
+        );
     }
 
     /// An include directory the daemon may not list (sshd, as root, can) is reported like an
@@ -1979,30 +2034,34 @@ mod tests {
         assert!(names("conf.d/*/").is_empty());
     }
 
-    /// A pattern as long as the host's `PATH_MAX` or longer finds nothing in sshd's glob
-    /// (`GLOB_NOMATCH`): it is not unreadable and not unevaluable, and no directory is listed.
+    /// A pattern as long as the host's `PATH_MAX` or longer finds nothing in OpenBSD's glob
+    /// (`GLOB_NOMATCH`), but the answer that close to the limit depends on what fil cannot see
+    /// (sshd's `SSHDIR`, which glob it was built with): unevaluable, naming the line, and no
+    /// directory is listed. One byte shorter, the glob is run.
     #[test]
-    fn a_pattern_of_path_max_bytes_or_more_includes_nothing() {
+    fn a_pattern_of_path_max_bytes_or_more_is_unevaluable() {
         let t = scratch(&[("a.conf", "AllowTcpForwarding no\n")]);
         let d = t.path();
         let prefix = d.join("conf.d/").display().to_string().len();
         for tail in ["*.conf", "a.conf"] {
-            // Total length PATH_MAX: nothing; one shorter is not cut off by the length check
-            // (and finds nothing here only because that name does not exist).
-            for (len, cut) in [(PATH_MAX, true), (PATH_MAX + 50, true)] {
+            for len in [PATH_MAX, PATH_MAX + 50] {
                 let pad = "x".repeat(len - prefix - tail.len());
                 let pattern = format!("conf.d/{pad}{tail}");
                 let g = glob(&d.join(&pattern));
                 assert!(
-                    g.files.is_empty() && g.dirs.is_empty() && !g.unevaluable,
+                    g.files.is_empty() && g.dirs.is_empty() && g.unevaluable,
                     "{len}"
                 );
                 let s = include_settings(d, &pattern);
-                assert!(
-                    s.unreadable.is_empty() && s.unevaluable.is_none() == cut,
-                    "{len}"
-                );
+                assert!(s.unreadable.is_empty(), "{len}");
+                assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)), "{len}");
             }
+            // One byte under the limit: evaluated (and finds nothing here only because that
+            // name does not exist).
+            let pad = "x".repeat(PATH_MAX - 1 - prefix - tail.len());
+            let pattern = format!("conf.d/{pad}{tail}");
+            assert!(!glob(&d.join(&pattern)).unevaluable);
+            assert_eq!(include_settings(d, &pattern).unevaluable, None);
         }
         // Just under the limit the glob is run (a wildcard lists the directory).
         let pad = "x".repeat(PATH_MAX - 1 - prefix - 1);
@@ -2069,6 +2128,60 @@ mod tests {
         assert_eq!(s.unevaluable, None);
     }
 
+    /// A `PermitOpen` or `PermitListen` entry with a byte that is not UTF-8 is not the entry
+    /// fil would compare (the text has the replacement character in its place): the list is one
+    /// fil cannot read and permits nothing, not a list whose other entries still permit. A byte
+    /// that is not UTF-8 in a comment on the line does not touch the entries.
+    #[test]
+    fn a_permit_entry_with_a_byte_that_is_not_utf8_is_unrecognized() {
+        let t = scratch(&[]);
+        let d = t.path();
+        for text in [
+            &b"PermitOpen db:5432 caf\xe9:80\n"[..],
+            b"PermitOpen \xff:5432\n",
+            b"PermitOpen db:5432 [fe80::1%\xff]:22\n",
+        ] {
+            let s = write_main(d, text);
+            assert_eq!(
+                s.permit_open.values[0].0,
+                PermitList::Unrecognized,
+                "{:?}",
+                String::from_utf8_lossy(text)
+            );
+            assert_eq!(
+                s.permit_open.values[0].0.permits_open("db", 5432),
+                Err(Permit::Unrecognized)
+            );
+        }
+        for text in [
+            &b"PermitListen localhost:9000 caf\xe9:80\n"[..],
+            b"PermitListen *\xff*:9000\n",
+        ] {
+            let s = write_main(d, text);
+            assert_eq!(
+                s.permit_listen.values[0].0,
+                PermitList::Unrecognized,
+                "{:?}",
+                String::from_utf8_lossy(text)
+            );
+            assert_eq!(
+                s.permit_listen.values[0]
+                    .0
+                    .permits_listen("localhost", 9000),
+                Err(Permit::Unrecognized)
+            );
+        }
+        // In a comment: the entries are read.
+        let s = write_main(d, b"PermitOpen db:5432 # caf\xe9\n");
+        assert_eq!(s.permit_open.values[0].0.permits_open("db", 5432), Ok(()));
+        // Valid UTF-8 outside ASCII is an entry like any other.
+        let s = write_main(d, "PermitOpen db:5432 café:80\n".as_bytes());
+        assert_eq!(s.permit_open.values[0].0.permits_open("db", 5432), Ok(()));
+        // Nothing of this is unevaluable: the setting is one fil cannot read, on its own.
+        let s = write_main(d, b"PermitOpen \xff:5432\n");
+        assert_eq!(s.unevaluable, None);
+    }
+
     /// The review's probe (F2) end to end: a run of `[` in an `Include` line is read in time
     /// linear in its length.
     #[test]
@@ -2077,8 +2190,11 @@ mod tests {
         let d = t.path();
         let started = std::time::Instant::now();
         for n in [900, 3_000] {
-            let s = include_settings(d, &format!("conf.d/{}", "[".repeat(n)));
-            assert_eq!(s.unevaluable, None);
+            let pattern = format!("conf.d/{}", "[".repeat(n));
+            let s = include_settings(d, &pattern);
+            // (Past the host's `PATH_MAX` it is unevaluable for its length alone.)
+            let long = d.join(&pattern).as_os_str().len() >= PATH_MAX;
+            assert_eq!(s.unevaluable.is_some(), long, "{n}");
             let s = include_settings(d, &format!("conf.d/{}]", "[".repeat(n)));
             let _ = s;
         }

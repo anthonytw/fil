@@ -128,12 +128,14 @@ impl RegionTracker {
     /// after the sequence it follows, in order.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, Action)> {
         let mut actions = Vec::new();
-        // One byte at a time, to know where in the chunk a sequence ends.
-        for (i, byte) in bytes.iter().enumerate() {
-            self.parser
-                .advance(&mut self.st, std::slice::from_ref(byte));
+        // `advance_until_terminated` stops right after the byte that set an action (see
+        // `State::terminated`), so the offset is known without feeding byte by byte; plain
+        // text still goes through the parser's fast path.
+        let mut i = 0;
+        while i < bytes.len() {
+            i += self.parser.advance_until_terminated(&mut self.st, &bytes[i..]);
             if let Some(a) = self.st.action.take() {
-                actions.push((i + 1, a));
+                actions.push((i, a));
             }
         }
         actions
@@ -160,6 +162,10 @@ impl RegionTracker {
 }
 
 impl Perform for State {
+    fn terminated(&self) -> bool {
+        self.action.is_some()
+    }
+
     fn execute(&mut self, byte: u8) {
         match byte {
             0x0e => self.active_charset = 1,

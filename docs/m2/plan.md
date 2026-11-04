@@ -155,9 +155,9 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 - `AttachRefusal::SessionGone { exit: Option<ExitStatus> }`, with `ExitStatus { code: Option<i32>, signal: Option<i32> }` as in `SessionExited`. The tombstone keeps it.
 - `SessionSummary` gains `forwards: u16` and `agent: bool`.
 - `Request::Forward { session, op: ForwardOp }`, where `ForwardOp` is `Add(ForwardSpec)` or `Remove { kind: Option<ForwardKind>, port: u16 }`.
-- `Request::Ports { session: Option<SessionName> }`.
+- `Request::Ports { session: Option<SessionName>, probe_other: bool }` (`probe_other`, `fil ports --probe`, since wire revision 8).
 - `Response::Forward(ForwardResult)`, either `Added(ForwardId)` or `Refused(ForwardRefusal)`.
-- `Response::Ports { part: PortsPart, more: bool }`. It is chunked: one control message is capped at 4 KiB, there are at most 256 rows, and every string field is capped (process name 32 B, path 128 B, probe label 64 B). Strings are sanitized on display, never trusted. Since wire revision 6 (P1): every part carries `incomplete: Option<PortsIncomplete>` (`NoSocketTable`, `Bounded`, `TimedOut`, `Unsupported`; a reason only), and `ForwardRow.target_other_user` marks a `-L` target that another user's listener takes (no owner, no probe).
+- `Response::Ports { part: PortsPart, more: bool }`. It is chunked: one control message is capped at 4 KiB, there are at most 256 rows, and every string field is capped (process name 32 B, path 128 B, probe label 64 B). Strings are sanitized on display, never trusted. Since wire revision 6 (P1): every part carries `incomplete: Option<PortsIncomplete>` (`NoSocketTable`, `Bounded`, `TimedOut`, `Unsupported`; a reason only), and `ForwardRow.target_other_user` marks a `-L` target that another user's listener takes (no owner, no probe). Since wire revision 8 (the M2 sweep): every part carries `cut` (the daemon cut rows past the cap; the server-policy rows go first), a `-D` row carries `socks_refused` (a count and the latest refusal, no target) instead of marking the whole entry refused, and a `-L` row carries `target_unknown` (the scan was cut, so who holds the target cannot be told).
 - `ControlMsg::Reset` removed.
 - Since wire revision 7 (S1, server policy, DESIGN §11.2): `PolicyRefusal` (the deciding setting, as enums, and its source: OpenSSH's default, a line of an sshd config file, or fil's policy file, with the path capped like a `fil ports` path), carried in `ForwardRefusal::Policy`, `AttachReply.agent_refused` and `ForwardRow.policy`; `BindFailure::Policy` and `OpenFailure::Policy`; `PortsRow::Policy` (host-wide lines) and `PortsRow::Refused` (a session's refused adds and agent).
 
@@ -491,7 +491,7 @@ Every package keeps M1's rules:
   - session membership by the scope's `cgroup.procs`, or by the process tree (`SessionHandle::pids()`);
   - the owner of each `-L` target;
   - exposure classification;
-  - the probe, on loopback only, for own listeners only, on demand, 300 ms per port, 1 s in all, 8 at a time: a TLS sniff, **HTTP `HEAD`** (status and `Server`; titles only with `ports.probe = "full"`, because a `GET` has side effects; see §6 Q4), a Postgres `SSLRequest`, a Redis `PING`;
+  - the probe, on loopback only, for own listeners only (by default the `-L` targets and the sessions' listeners, §6 Q4), on demand, 300 ms per port, 1 s in all, 8 at a time: a TLS sniff, **HTTP `HEAD`** (status and `Server`; titles only with `ports.probe = "full"`, because a `GET` has side effects; see §6 Q4), a Postgres `SSLRequest`, a Redis `PING`;
   - `ports.probe = "off"` turns it off.
 - **Tests:**
   - a fixture-based parser (IPv4, IPv6, mapped, malformed lines never panic, another uid's rows filtered out);
@@ -587,7 +587,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Agent | **off** (`agent = "off"`; `-A` or per-host config turns it on) | `confirm` mode prompts per signature |
 | Agent while detached | the socket file is removed; refused at once | |
 | `-R` peers | any local user (ssh parity) | `forward.remote_peers = "same-user"` checks the peer socket's uid through `/proc/net/tcp`, using P1's parser (OD-9) |
-| Probe | own loopback listeners, `HEAD` | `ports.probe = "off"` or `"full"` |
+| Probe | `HEAD`, on loopback, the `-L` targets and the sessions' listeners only; never a known forwarder | `ports.probe = "off"` or `"full"`; the user's other listeners with `fil ports --probe` or `ports.probe_other = true` |
 
 ### 4.3 The agent
 
@@ -776,7 +776,7 @@ Five independent read-only audits of the whole tree, each with an M2 focus list,
 1. **Window and budget defaults** (1 MiB and 64 MiB). These are §16.7 values to tune with `f_fwd_vs_ssh` data.
 2. **Should `open_wait` for `-R` while disconnected be shorter than 30 s?** Applications behind `-R` may have their own shorter connect timeouts.
 3. **`fil ports` from the laptop when no client is attached:** should it show "would bind" for `-L` entries? Proposed: yes, marked "not attached".
-4. **`fil ports` probe:** DESIGN's mockup shows an HTML title, but titles need a `GET`. Proposed: `HEAD` by default, titles only with `"full"`. The owner may prefer the mockup as drawn.
+4. **`fil ports` probe:** DESIGN's mockup shows an HTML title, but titles need a `GET`. Proposed: `HEAD` by default, titles only with `"full"`. The owner may prefer the mockup as drawn. **What is probed (coordinator, 2026-11-03, after the M2 privacy sweep; the owner may veto):** by default only the `-L` targets and the listeners started in a session. The user's other listeners are often tunnels, and a probe reaches whatever they lead to (a third party logs `User-Agent: fil-ports`); they are probed only with `fil ports --probe` or `[ports] probe_other = true`. A listener held by a known forwarder (`ssh`, `kubectl`, `cloud-sql-proxy`, `socat` and a few more, DESIGN §7.4) is never probed.
 5. **Unix-socket forwards** (`docker.sock`, Postgres sockets) are common in dev workflows. They are a good M3 or M4 candidate on the same channel design (`OpenKind::LocalUnix`).
 
 ### Critical files for implementation

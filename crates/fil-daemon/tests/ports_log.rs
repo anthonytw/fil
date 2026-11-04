@@ -162,6 +162,8 @@ async fn nothing_ports_finds_reaches_the_log() {
         q.uid = uid;
         q.proc_root = Some(root.clone());
         q.scan = scan;
+        // These are the user's listeners outside any session: probed only when asked.
+        q.probe_other = true;
         q
     };
     let rows = ports::ports(query(&dir, ProbeMode::Full, ScanLimits::default()))

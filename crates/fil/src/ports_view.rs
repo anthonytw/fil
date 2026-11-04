@@ -52,7 +52,9 @@ pub enum ViewError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortsAnswer {
     pub rows: Vec<PortsRow>,
-    /// More rows came than the protocol allows ([`MAX_PORTS_ROWS`]); the rest were dropped.
+    /// The list is cut: the daemon had more rows than an answer holds ([`MAX_PORTS_ROWS`]) and
+    /// said so (`PortsPart::cut`), or more rows came than the protocol allows and the rest were
+    /// dropped here.
     pub truncated: bool,
     /// The last part said no more were coming.
     pub complete: bool,
@@ -77,6 +79,7 @@ impl PortsAnswer {
                 return Err(ViewError::NotPorts(variant_name(p).to_string()));
             };
             incomplete = incomplete.or(part.incomplete);
+            truncated |= part.cut;
             for row in &part.rows {
                 if rows.len() == MAX_PORTS_ROWS {
                     truncated = true;
@@ -443,6 +446,7 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     };
     let owner = match spec.kind() {
         ForwardKind::Local if f.target_other_user => "another user ⚠".to_string(),
+        ForwardKind::Local if f.target_unknown => "unknown (scan incomplete)".to_string(),
         ForwardKind::Local => f.owner.as_ref().map_or("—".to_string(), process),
         ForwardKind::Remote => "your laptop".to_string(),
         ForwardKind::Dynamic => "—".to_string(),
@@ -461,6 +465,12 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     if f.target_other_user {
         detail.push(
             "⚠ another user's listener holds this target on the host: connections through this forward reach them"
+                .to_string(),
+        );
+    }
+    if f.target_unknown {
+        detail.push(
+            "owner unknown: the host's socket table was not read to its end, so fil cannot tell who listens on this target"
                 .to_string(),
         );
     }
@@ -493,6 +503,15 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     }
     if let Some(r) = &f.policy {
         detail.push(format!("⚠ refused by server policy: {r}"));
+    }
+    if let Some(s) = &f.socks_refused {
+        // A count and the setting: the targets are not named (DESIGN.md section 11.2).
+        detail.push(format!(
+            "⚠ server policy refused {} SOCKS connection{} through it (latest: {})",
+            s.count,
+            if s.count == 1 { "" } else { "s" },
+            s.last
+        ));
     }
     if f.waiting > 0 {
         detail.push(format!(
@@ -811,8 +830,19 @@ struct JsonForward {
     probe: Option<JsonProbe>,
     /// Another user's listener takes the `-L` target on the host (a port squat).
     target_other_user: bool,
+    /// Who holds the `-L` target could not be told: the host's scan was incomplete.
+    target_unknown: bool,
     /// Server policy refuses this forward now: the deciding setting and its source.
     policy: Option<String>,
+    /// A `-D`: the SOCKS connections server policy refused in this client's run.
+    socks_refused: Option<JsonSocksRefused>,
+}
+
+#[derive(Serialize)]
+struct JsonSocksRefused {
+    count: u32,
+    /// The latest one's deciding setting and its source (sanitized); no target.
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -932,7 +962,12 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         owner: f.owner.as_ref().map(json_process),
         probe: f.probe.as_ref().map(json_probe),
         target_other_user: f.target_other_user,
+        target_unknown: f.target_unknown,
         policy: f.policy.as_ref().map(|r| r.to_string()),
+        socks_refused: f.socks_refused.as_ref().map(|s| JsonSocksRefused {
+            count: s.count,
+            reason: s.last.to_string(),
+        }),
     }
 }
 

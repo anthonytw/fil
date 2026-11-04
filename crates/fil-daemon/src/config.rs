@@ -35,8 +35,13 @@
 //! # listeners only: "head" (TLS, HTTP `HEAD` for the status and `Server`, Postgres, Redis),
 //! # "full" (HTTP `GET`, for the page title too) or "off". A probe is a real connection: most
 //! # web frameworks run the `GET` handler for a `HEAD` too, a one-shot listener (`nc -l`) is
-//! # used up, and Postgres logs a line. "off" if that matters.
+//! # used up, and Postgres logs a line. "off" if that matters; it also turns `--probe` off.
 //! probe = "head"
+//! # What is probed: the -L targets and the listeners started in a session. With `true`, also
+//! # the user's other listeners (as `fil ports --probe` asks for one answer). They are often
+//! # tunnels (`ssh -L`, `kubectl port-forward`), and a probe through one reaches whatever it
+//! # leads to, another host included. A listener a known forwarder holds is never probed.
+//! probe_other = false
 //! ```
 //!
 //! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file
@@ -91,6 +96,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct PortsFile {
     probe: Option<String>,
+    probe_other: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +141,9 @@ pub struct DaemonConfig {
     pub scope: ScopeMode,
     /// The `fil ports` probe (`[ports] probe`, default `head`).
     pub ports_probe: ProbeMode,
+    /// Probe the user's listeners outside the sessions too (`[ports] probe_other`, default
+    /// false; `fil ports --probe` asks for it once).
+    pub ports_probe_other: bool,
     /// Sessions get the stable `SSH_AUTH_SOCK` and can relay an agent (`agent_socket`, default
     /// true; OD-6).
     pub agent_socket: bool,
@@ -171,6 +180,7 @@ impl Default for DaemonConfig {
             idle_exit: Some(DEFAULT_IDLE_EXIT),
             scope: ScopeMode::Auto,
             ports_probe: ProbeMode::Head,
+            ports_probe_other: false,
             agent_socket: true,
             allowed_uid: current_uid(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -244,10 +254,14 @@ impl DaemonConfig {
         if let Some(a) = file.agent_socket {
             cfg.agent_socket = a;
         }
-        if let Some(p) = file.ports.and_then(|p| p.probe) {
+        let ports = file.ports.unwrap_or_default();
+        if let Some(p) = ports.probe {
             cfg.ports_probe = ProbeMode::parse(&p).ok_or_else(|| {
                 format!("ports.probe = {p:?}: expected \"head\", \"full\" or \"off\"")
             })?;
+        }
+        if let Some(o) = ports.probe_other {
+            cfg.ports_probe_other = o;
         }
         Ok(cfg)
     }
@@ -266,6 +280,10 @@ mod tests {
         assert_eq!(c.scope, ScopeMode::Auto);
         assert_eq!(c.history_lines, 1000);
         assert_eq!(c.ports_probe, ProbeMode::Head);
+        assert!(
+            !c.ports_probe_other,
+            "only the -L targets and the sessions' listeners by default"
+        );
         assert!(c.agent_socket, "the stable SSH_AUTH_SOCK by default (OD-6)");
         assert!(
             !DaemonConfig::parse("agent_socket = false")
@@ -295,8 +313,9 @@ mod tests {
         assert_eq!(c.scope, ScopeMode::Tree);
         assert_eq!(c.history_lines, 250);
         assert_eq!(c.ports_probe, ProbeMode::Off);
-        let c = DaemonConfig::parse("[ports]\nprobe = \"full\"\n").unwrap();
+        let c = DaemonConfig::parse("[ports]\nprobe = \"full\"\nprobe_other = true\n").unwrap();
         assert_eq!(c.ports_probe, ProbeMode::Full);
+        assert!(c.ports_probe_other);
     }
 
     #[test]
@@ -314,6 +333,7 @@ mod tests {
             "idle_exit_secs = -1",
             "[ports]\nprobe = \"get\"",
             "[ports]\nprob = \"off\"",
+            "[ports]\nprobe_other = \"yes\"",
         ] {
             assert!(DaemonConfig::parse(bad).is_err(), "{bad}");
         }

@@ -42,7 +42,10 @@
 //! the epoch are acknowledged (`CoreView::prior_acked`; the core treats that chunk as neutral)
 //! makes it withdraw the epoch's unwritten guesses: the next echo could confirm it one key off.
 //!
-//! Its `Debug` output and state hold no typed character (`docs/m3/plan.md` §4.3).
+//! Its `Debug` output shows no typed character (`docs/m3/plan.md` §4.3). Its state does hold
+//! them, as the core's does: each pending guess's glyph until the core settles it (at most the
+//! 10 s expiry and a second), and the cells an `EchoAck` found unechoed, for a second, to see a
+//! late echo. Nothing of it is logged or kept past that.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -923,7 +926,8 @@ impl Predictor for MoshPredictor {
             }
             self.unacked.pop_front();
             // A glitch is measured from the acknowledgement, not the echo: a program that
-            // echoes late on a fast link is not one.
+            // echoes late on a fast link is not one. The 250 ms runs from the key's send to its
+            // acknowledgement, the 50 ms echo window included (`docs/m3/plan.md` §2.7).
             if now.saturating_sub(sent) > self.cfg.glitch {
                 self.glitch_until = Some(now + self.cfg.glitch_window);
             }

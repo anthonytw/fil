@@ -53,6 +53,9 @@ fn scenario(sc: Scenario) {
                 cfg.keys = if sc == Scenario::Mixed { 150 } else { 50 };
                 if hostile {
                     cfg.run.kind = PredictorKind::hostile(seed);
+                } else if sc.category() == Category::Adversarial {
+                    // At most one written run per misprediction (the driver checks it).
+                    cfg.run.bar = Some(Category::Adversarial);
                 } else if barred {
                     let cut = run(&cfg);
                     if let Some(f) = &cut.failure {
@@ -263,17 +266,8 @@ fn the_prior_ack_rule_only_withholds_confirmations() {
                             son.written <= soff.written,
                             "{what}: wrote more with the rule"
                         );
-                        // A guess kept from an ended epoch is not the rule's: it settles by its
-                        // glyph, and the run without the rule may settle it on another chunk. Such
-                        // a cell left painted shows what the shadow shows (a blank over a blank).
-                        let invisible = |c: &fil_predict::overlay::PaintedCell| {
-                            on.shadow.screen[usize::from(c.row)].cells[usize::from(c.col)].text
-                                == c.text
-                        };
                         assert!(
-                            on.painted
-                                .iter()
-                                .all(|c| offv.painted.contains(c) || invisible(c)),
+                            on.painted.iter().all(|c| offv.painted.contains(c)),
                             "{what}: painted something the run without the rule did not"
                         );
                         acted += 1;
@@ -284,4 +278,32 @@ fn the_prior_ack_rule_only_withholds_confirmations() {
         }
     }
     assert!(acted > 0, "the rule never acted");
+}
+
+/// The adversarial bar is checked, not only reported: with the core's tentative epochs off, a
+/// program that echoes something else gets guesses written right after a misprediction, and the
+/// driver fails the run.
+#[test]
+fn the_adversarial_bar_catches_writing_after_a_misprediction() {
+    use fil_predict::overlay::Guards;
+    let mut caught = 0;
+    for seed in 0..10 {
+        let mut cfg = SimConfig::new(Scenario::Upcase, seed, "alacritty");
+        cfg.run.bar = Some(Category::Adversarial);
+        let out = run(&cfg);
+        assert!(out.failure.is_none(), "seed {seed} with every guard on");
+        cfg.run.guards.disable("tentative");
+        let out = run(&cfg);
+        if out
+            .failure
+            .is_some_and(|f| f.violation.kind == fil_predict::oracle::Kind::Mispredict)
+        {
+            caught += 1;
+        }
+    }
+    let _ = Guards::ALL;
+    assert!(
+        caught > 0,
+        "nothing written after a misprediction with `tentative` off"
+    );
 }

@@ -54,7 +54,8 @@ pub enum Blocker {
     /// and by the alacritty backend's shadow (which buffers them until `?2026 l`), so the
     /// shadow screen is stale and anything restored from it would be wrong.
     ProgramSync,
-    /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown, or a cursor restore
+    /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown,
+    /// a cursor restore after it left the cursor's position in dispute, or a cursor restore
     /// left the open hyperlink unknown: terminals disagree on all of them. Cleared when the
     /// program sets the mode, the region or the link.
     Uncertain,
@@ -371,6 +372,9 @@ impl Tracker {
             // The region only matters where an origin-mode cursor is placed.
             || (self.modes.region_unknown && (self.modes.origin || self.modes.origin_unknown))
             || self.modes.link_unknown
+            // A cursor restored after a soft reset: terminals put it in different places
+            // (`docs/m3/terminals.md` finding 2).
+            || self.modes.cursor_disputed
     }
 
     /// The program has synchronized output (`?2026`) on.

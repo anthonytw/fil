@@ -866,3 +866,111 @@ fn accounting() {
         + s.withdrawn.total();
     assert_eq!(ended, s.guessed, "{s:?}");
 }
+
+// ---- P1 review (#120) -------------------------------------------------------------------------
+
+/// Rule 2's cursor clause (`Guards::cursor_clause`): a chunk that shows the first guess's glyph
+/// but leaves the cursor several columns on, where no guess of the epoch leaves it, does not
+/// confirm the epoch.
+#[test]
+fn the_first_confirmation_needs_the_cursor_where_the_core_computed_it() {
+    let run = |g: Guards| {
+        let mut t = T::with(
+            Box::new(FixedPredictor::new(vec![(0, 2), (0, 3)])),
+            g,
+            Size { cols: 40, rows: 10 },
+        );
+        t.server(b"$ ", 0);
+        t.key(b"a", 10);
+        t.key(b"b", 20);
+        t.server(b"a\x1b[5C", 120);
+        t.o.epoch_confirmed()
+    };
+    assert!(!run(Guards::ALL), "confirmed with the cursor elsewhere");
+    let mut g = Guards::ALL;
+    assert!(g.disable("cursor_clause"));
+    assert!(run(g), "the guard made no difference");
+}
+
+/// An echo in two pieces at a sequence boundary (readline's `g ` then `CSI 1 D`, inserting before
+/// a trailing space): the second piece puts the cursor back where the confirmed `g` left it. That
+/// is explained, so the written guess after it stays and nothing blinks out.
+#[test]
+fn an_echo_in_two_pieces_keeps_the_guesses_after_it() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"g", 200);
+    t.key(b"h", 210);
+    assert!(t.painted());
+    t.server(b"g ", 300);
+    t.server(b"\x1b[1D", 301);
+    assert!(t.painted(), "the guess for `h` was taken off");
+    t.server(b"h \x1b[1D", 320);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
+/// A cursor restored after a soft reset with nothing saved since is in dispute (kitty and tmux
+/// keep the old saved cursor, xterm and WezTerm go home): the core paints nothing there, whatever
+/// the predictor wants, until an absolute position settles it.
+#[test]
+fn nothing_is_painted_on_a_cursor_restored_after_a_soft_reset() {
+    // The predictor guesses where the shadow has the cursor: home, after the restore.
+    let run = |g: Guards| {
+        let mut t = T::with(
+            Box::new(FixedPredictor::new(vec![
+                (0, 2),
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+            ])),
+            g,
+            Size { cols: 40, rows: 10 },
+        );
+        t.server(b"$ ", 0);
+        t.key(b"a", 10);
+        t.server(b"a", 100);
+        t.o.on_echo_ack(t.at, ms(105));
+        t.server(b"\x1b7\x1b[!p\x1b[4l\x1b[?6l\x1b8\x1b(B", 110);
+        t.key(b"b", 200);
+        t.server(b"b", 300);
+        t.o.on_echo_ack(t.at, ms(310));
+        let mut painted = false;
+        for (i, c) in "cde".chars().enumerate() {
+            painted |= !t
+                .key(c.to_string().as_bytes(), 320 + 10 * i as u64)
+                .paint
+                .is_empty();
+        }
+        painted
+    };
+    assert!(!run(Guards::ALL), "painted on a disputed cursor");
+    let mut g = Guards::ALL;
+    assert!(g.disable("other_blockers"));
+    assert!(run(g), "the guard made no difference");
+    // A hostile predictor gets nothing painted there either.
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    for seed in 0..16 {
+        let mut t = T::with(
+            Box::new(HostilePredictor::new(HostileCfg::noisy(seed))),
+            Guards::ALL,
+            Size { cols: 40, rows: 10 },
+        );
+        t.server(b"$ ", 0);
+        t.key(b"a", 10);
+        t.server(b"a", 100);
+        t.o.on_echo_ack(t.at, ms(105));
+        t.server(b"\x1b7\x1b[!p\x1b[4l\x1b[?6l\x1b8\x1b(B", 110);
+        for (i, c) in "bcdef".chars().enumerate() {
+            let f = t.key(c.to_string().as_bytes(), 200 + 40 * i as u64);
+            t.server(c.to_string().as_bytes(), 220 + 40 * i as u64);
+            t.o.on_echo_ack(t.at, ms(230 + 40 * i as u64));
+            assert!(
+                !t.painted(),
+                "seed {seed}: painted on a disputed cursor ({:?})",
+                f.paint
+            );
+        }
+    }
+}

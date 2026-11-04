@@ -59,6 +59,12 @@
    - the full-stack harness (T1) on real PTYs on macOS and on Linux, over the pipe and QUIC (§12's transport matrix), at 50, 150 and 400 ms RTT, with jitter and with 2 % loss on QUIC;
    - the real-network latency cells (§5.5);
    - the Pi drop-in suite with prediction on (§5.6).
+
+   **Open, blocks the M3 close (P1 review, #120):** the faithful zero-misprediction bar holds in the soak only with each program write delivered whole (`SimConfig::split_writes = false`). With writes cut at arbitrary bytes, faithful programs show 0.02 to 0.12 visible mispredictions per 1,000 keys at 1,000 seeds (vi-mode 0.12, fish 0.10, offline, paste and zsh 0.04, echo 0.02; 0.2 to 0.8 before #120's core fix), and the reviewer measured the same with cuts only at sequence boundaries, as the daemon releases output. Two kinds:
+   - **`ended`** (vi-mode, `\b \b`, an insert's shifted rest): correct guesses blink out and come back with their echo; no wrong glyph is shown. #120 fixed the main case (an echo's second piece leaving the cursor where the epoch's latest confirmed guess left it is explained); the residue is open for P2 (`overlay/epochs.rs`).
+   - **`contradicted`** (fish): a suggestion drawn in a later write than the echo contradicts a written guess ahead of the cursor, and a wrong glyph shows. It needs an owner decision: class fish's after-echo suggestion as "echoes something else" (the adversarial bar), or change rule 3's redraw exemption so a cell ahead of the echo is contradicted only by `EchoAck` (which moves OQ-1 case 4's end from the prompt's chunk to the ack).
+
+   The close gate: the soak passes the faithful bar with splits at sequence boundaries at least (a delivery model the sim still has to gain), or the owner accepts a named residual, as for OQ-1.
 3. **Prediction helps.** With `adaptive` at 150 ms RTT and above, the p50 time from a printable key to its glyph on the screen, over the keys whose guesses were written, is under 5 ms (it is about one RTT without prediction), measured by `keyprobe --screen`. The p50 over all printable keys is reported next to it.
 4. **Adaptive is quiet when it should be.** With `adaptive` at a 5 ms RTT, nothing is painted in the shell scenarios (glitches are measured from `EchoAck`, so a slow program does not count as a slow link: §2.7).
 5. **Nothing regresses.** Every M1 and M2 drop-in and realnet scenario passes with prediction on (`always`, and `adaptive` with injected latency).

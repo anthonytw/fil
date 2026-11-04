@@ -186,7 +186,9 @@ pub struct CoreView {
     pub confirmed: bool,
     /// Every key typed before the current epoch's first key has been covered by an `EchoAck`
     /// (rule 2's condition for the epoch's first confirmation). Until then a chunk that shows a
-    /// guess's glyph can be an earlier key's late echo.
+    /// guess's glyph can be an earlier key's late echo. The raw condition, whether or not
+    /// `Guards::prior_acked` enforces it: the default predictor acts on it itself, which is why
+    /// that guard is shown needed with another predictor (`tests/sim.rs`).
     pub prior_acked: bool,
     /// Origin mode (DECOM) is on, or may be: in the shadow, or unknown to the tracker after a
     /// soft reset or a cursor restore. WezTerm intermittently loses origin mode across the

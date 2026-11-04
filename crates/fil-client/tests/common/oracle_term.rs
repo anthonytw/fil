@@ -15,8 +15,8 @@
 //!    here (`serve_side`): `Hello`, the client's `Attach`, then `SessionHandle::serve`.
 //! 3. **The adapter** ([`Predict`], [`Adapter`]): how the harness reaches the predictor. It is the
 //!    only place that names `fil_predict`'s predictor API, so a change to the trait is one edit
-//!    here. It also keeps the predictor's side of the accounting (what was shown, confirmed,
-//!    retracted), read from the shadow screen the predictor is given.
+//!    here. It also keeps the predictor's side of the accounting (what it declared, and what the
+//!    core told it it confirmed, contradicted or withdrew).
 //!
 //! The authoritative screen is a **fresh snapshot of the session** ([`Rig::compare_to_snapshot`]):
 //! once the run is quiet the harness attaches a second client, takes the snapshot the daemon
@@ -42,7 +42,10 @@ use fil_client::{
 };
 use fil_netsim::{Net, StreamConfig, StreamControl, stream_pair};
 use fil_predict::sim::Rng;
-use fil_predict::{CellStyle, Ctx, KeyEvent, MoshConfig, MoshPredictor, OverlayEdit, Predictor};
+use fil_predict::{
+    Ctx, InputPos, KeyEvent, LinkView, MoshConfig, MoshPredictor, Outcome as Settlement,
+    OverlayEdit, Predictor, Settled, Show,
+};
 use fil_proto::ChannelId;
 use fil_proto::limits::PROTOCOL_MAJOR;
 use fil_proto::msg::{Agent, Attach, ControlMsg, Hello, PublicKey, SnapshotReason, TermSize};
@@ -416,123 +419,111 @@ pub enum Predict {
     /// The M0 predictor with the threshold at zero: it predicts at any RTT.
     MoshAlways,
     /// A hostile predictor: it shows a guess for every printable key at once, with no epochs. The
-    /// core must stop it (the password rule), which makes it the full-stack mutation: with the
-    /// daemon's `PtyMode` withheld the core cannot, and the secret shows.
+    /// core must stop it: the password rule, and since C1 its epochs (a guess is written only in
+    /// an epoch the core has confirmed), which hold even with the daemon's `PtyMode` withheld.
     Eager,
 }
 
-/// What the predictor side saw: counted from the edits it returned and the shadow screen it was
-/// given, so independent of what the core finally wrote.
+/// What the predictor side saw: counted from the edits it returned and from what the core told
+/// it it settled (`Predictor::on_settled`), so independent of what the oracle terminal saw.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdapterStats {
+    /// Keys the core gave the predictor. At a password prompt the core does not ask it at all.
     pub keys: u64,
-    /// Guesses the predictor showed (a new cell and glyph in its edits).
+    /// Guesses the predictor declared (`OverlayEdit::Guess`): what it asked the core to show.
+    /// The core decides what is written.
     pub shown: u64,
-    /// Shown guesses that the shadow screen later held, when the predictor let go of them.
+    /// Guesses the core settled as confirmed (or restyled) by the shadow screen.
     pub confirmed: u64,
-    /// Shown guesses the predictor let go of (retracted, expired) while the shadow did not hold
-    /// the glyph.
+    /// Guesses the core settled as contradicted.
     pub mispredicted: u64,
-    /// Shown guesses the predictor took back on a key (a predicted backspace).
-    pub withdrawn_on_key: u64,
+    /// Guesses the core withdrew (a boundary, a backspace over one, a lifecycle event).
+    pub withdrawn: u64,
 }
 
-/// The M0 trait's `Predictor`, wrapped: it gives the inner predictor the link's RTT (the stock
-/// client passes none) and keeps [`AdapterStats`].
+/// The `Predictor`, wrapped: it gives the inner predictor the link's RTT (the stock client passes
+/// none yet, E1a's) and keeps [`AdapterStats`].
 struct Adapter {
     inner: Box<dyn Predictor>,
     rtt: Duration,
     stats: Arc<Mutex<AdapterStats>>,
     /// The shadow screen as the last call saw it.
     shadow: Arc<Mutex<Option<TermState>>>,
-    shown: BTreeMap<(u16, u16), char>,
 }
 
 impl Adapter {
-    fn apply(&mut self, edits: &[OverlayEdit], ctx: &Ctx<'_>, on_key: bool) {
-        let before = self.shown.clone();
-        for e in edits {
-            match e {
-                OverlayEdit::Put { row, col, ch, .. } => {
-                    self.shown.insert((*row, *col), *ch);
-                }
-                OverlayEdit::Remove { row, col } => {
-                    self.shown.remove(&(*row, *col));
-                }
-                OverlayEdit::Clear => self.shown.clear(),
-                OverlayEdit::Cursor(_) => {}
-            }
-        }
-        let mut st = self.stats.lock().unwrap();
-        for (pos, ch) in &self.shown {
-            if before.get(pos) != Some(ch) {
-                st.shown += 1;
-            }
-        }
-        for (pos, ch) in &before {
-            if self.shown.get(pos) == Some(ch) {
-                continue;
-            }
-            if on_key {
-                st.withdrawn_on_key += 1;
-                continue;
-            }
-            let text = ctx
-                .screen
-                .screen
-                .get(usize::from(pos.0))
-                .and_then(|l| l.cells.get(usize::from(pos.1)))
-                .map(|c| c.text.as_str())
-                .unwrap_or("");
-            let want = if *ch == ' ' {
-                String::new()
-            } else {
-                ch.to_string()
-            };
-            if text == want {
-                st.confirmed += 1;
-            } else {
-                st.mispredicted += 1;
-            }
-        }
+    fn count(&self, edits: &[OverlayEdit]) {
+        let n = edits
+            .iter()
+            .filter(|e| matches!(e, OverlayEdit::Guess { .. }))
+            .count();
+        self.stats.lock().unwrap().shown += n as u64;
     }
 
+    /// The context with the RTT the harness knows, and the shadow kept for
+    /// [`Rig::compare_to_shadow`] (the test-only `ScreenView::test_state`).
     fn with_rtt<'a>(&self, ctx: &Ctx<'a>) -> Ctx<'a> {
-        *self.shadow.lock().unwrap() = Some(ctx.screen.clone());
+        if let Some(st) = ctx.screen.test_state() {
+            *self.shadow.lock().unwrap() = Some(st.clone());
+        }
         Ctx {
             screen: ctx.screen,
-            rtt: self.rtt,
+            link: LinkView {
+                rtt_hint: Some(self.rtt),
+                ..ctx.link
+            },
+            pty: ctx.pty,
             now: ctx.now,
         }
     }
 }
 
 impl Predictor for Adapter {
-    fn on_key(&mut self, key: &KeyEvent, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
         self.stats.lock().unwrap().keys += 1;
         let c = self.with_rtt(ctx);
-        let edits = self.inner.on_key(key, &c);
-        self.apply(&edits, &c, true);
+        let edits = self.inner.on_key(key, at, &c);
+        self.count(&edits);
         edits
     }
     fn on_output(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
         let c = self.with_rtt(ctx);
         let edits = self.inner.on_output(&c);
-        self.apply(&edits, &c, false);
+        self.count(&edits);
         edits
+    }
+    fn on_settled(&mut self, settled: &[Settled], ctx: &Ctx<'_>) {
+        {
+            let mut st = self.stats.lock().unwrap();
+            for s in settled {
+                match s.outcome {
+                    Settlement::Confirmed | Settlement::Restyled => st.confirmed += 1,
+                    Settlement::Contradicted => st.mispredicted += 1,
+                    Settlement::Withdrawn(_) => st.withdrawn += 1,
+                }
+            }
+        }
+        let c = self.with_rtt(ctx);
+        self.inner.on_settled(settled, &c);
+    }
+    fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>) {
+        let c = self.with_rtt(ctx);
+        self.inner.on_echo_ack(input_upto, &c);
     }
     fn on_tick(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
         let c = self.with_rtt(ctx);
         let edits = self.inner.on_tick(&c);
-        self.apply(&edits, &c, false);
+        self.count(&edits);
         edits
     }
     fn next_deadline(&self) -> Option<fil_predict::Time> {
         self.inner.next_deadline()
     }
+    fn show(&self, ctx: &Ctx<'_>) -> Show {
+        self.inner.show(&self.with_rtt(ctx))
+    }
     fn reset(&mut self) {
         self.inner.reset();
-        self.shown.clear();
     }
     fn has_outstanding(&self) -> bool {
         self.inner.has_outstanding()
@@ -546,17 +537,22 @@ impl Predictor for Adapter {
 struct Passive;
 
 impl Predictor for Passive {
-    fn on_key(&mut self, _: &KeyEvent, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+    fn on_key(&mut self, _: &KeyEvent, _: InputPos, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
     fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
+    fn on_settled(&mut self, _: &[Settled], _: &Ctx<'_>) {}
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
     fn on_tick(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
     fn next_deadline(&self) -> Option<fil_predict::Time> {
         None
+    }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        Show::Hide
     }
     fn reset(&mut self) {}
     fn has_outstanding(&self) -> bool {
@@ -564,58 +560,49 @@ impl Predictor for Passive {
     }
 }
 
-/// The hostile predictor behind [`Predict::Eager`]: a guess for every printable key, shown at
-/// once, wherever the cursor is, and retracted when output arrives.
+/// The hostile predictor behind [`Predict::Eager`]: a guess for every printable key, at its own
+/// idea of the cursor, always asking to be shown, and withdrawn when output arrives. The core
+/// decides what is written: since C1 a guess is written only in an epoch the core has confirmed.
 #[derive(Default)]
 struct EagerPredictor {
-    cells: BTreeMap<(u16, u16), char>,
     next: Option<(u16, u16)>,
-}
-
-impl EagerPredictor {
-    fn edits(&self) -> Vec<OverlayEdit> {
-        let mut v = vec![OverlayEdit::Clear];
-        for (&(row, col), &ch) in &self.cells {
-            v.push(OverlayEdit::Put {
-                row,
-                col,
-                ch,
-                style: CellStyle::Underline,
-            });
-        }
-        v.push(OverlayEdit::Cursor(self.next));
-        v
-    }
+    outstanding: usize,
 }
 
 impl Predictor for EagerPredictor {
-    fn on_key(&mut self, key: &KeyEvent, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
-        if let KeyEvent::Char(c) = key {
-            let cur = self
-                .next
-                .unwrap_or((ctx.screen.cursor.row, ctx.screen.cursor.col));
-            self.cells.insert(cur, *c);
-            self.next = Some((cur.0, cur.1 + 1));
-        }
-        self.edits()
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let KeyEvent::Char(_) = key else {
+            return Vec::new();
+        };
+        let c = ctx.screen.cursor();
+        let (row, col) = self.next.unwrap_or((c.row, c.col));
+        self.next = Some((row, col + 1));
+        self.outstanding += 1;
+        vec![OverlayEdit::Guess { row, col, at }]
     }
     fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
-        self.cells.clear();
         self.next = None;
-        self.edits()
+        vec![OverlayEdit::Clear]
     }
+    fn on_settled(&mut self, settled: &[Settled], _: &Ctx<'_>) {
+        self.outstanding = self.outstanding.saturating_sub(settled.len());
+    }
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
     fn on_tick(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
     fn next_deadline(&self) -> Option<fil_predict::Time> {
         None
     }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        Show::Underline
+    }
     fn reset(&mut self) {
-        self.cells.clear();
         self.next = None;
+        self.outstanding = 0;
     }
     fn has_outstanding(&self) -> bool {
-        !self.cells.is_empty()
+        self.outstanding > 0
     }
 }
 
@@ -646,7 +633,6 @@ pub fn predictor_factory(
             rtt,
             stats: stats.clone(),
             shadow: shadow.clone(),
-            shown: BTreeMap::new(),
         })
     }))
 }
@@ -657,8 +643,8 @@ pub fn predictor_factory(
 /// What the rig can do to the daemon's messages, and what it saw of them.
 #[derive(Default)]
 pub struct Faults {
-    /// Drop every `PtyMode` the daemon sends (a lossy or hostile daemon): the mutation that
-    /// makes the full stack leak a secret.
+    /// Drop every `PtyMode` the daemon sends (a lossy or hostile daemon). Before C1 this made the
+    /// full stack leak a secret; since C1 the core's epochs stop it without the report too.
     pub drop_pty_mode: AtomicBool,
     pub pty_modes: AtomicU64,
     pub echo_acks: AtomicU64,
@@ -1269,6 +1255,7 @@ impl Rig {
     pub async fn compare_to_shadow(&self) -> Option<ShadowComparison> {
         *self.shadow.lock().unwrap() = None;
         let user = self.term.state();
+        let guesses_shown = self.term.underlined_now();
         self.type_str("z");
         let end = Instant::now() + Duration::from_secs(5);
         let shadow = loop {
@@ -1297,6 +1284,7 @@ impl Rig {
             shadow: st,
             user_cursor: (user.cursor.row, user.cursor.col),
             shadow_cursor: (shadow.cursor.row, shadow.cursor.col),
+            guesses_shown,
         })
     }
 
@@ -1420,6 +1408,9 @@ pub struct ShadowComparison {
     pub shadow: Vec<String>,
     pub user_cursor: (u16, u16),
     pub shadow_cursor: (u16, u16),
+    /// Guesses still drawn on the user's terminal when it was compared (underlined glyphs): a
+    /// difference there is a guess the engine never ticked away, not resize damage.
+    pub guesses_shown: usize,
 }
 
 impl ShadowComparison {

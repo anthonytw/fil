@@ -117,32 +117,53 @@ async fn typing_ends_equal_to_the_shadow_and_the_snapshot_over_quic() {
 // ---------------------------------------------------------------------------------------------
 // Secrets
 
-/// The core's password rule through the whole stack: a predictor that shows every key at once
-/// is stopped once the daemon has said echo is off.
+/// The core's password rule through the whole stack: once the daemon has said echo is off, the
+/// core does not even ask a predictor (one that shows every key at once) about the keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hostile_predictor_is_stopped_at_a_password_prompt() {
     let r = secret_trial(spec(Transport::Pipe, Program::ReadS, Predict::Eager), false).await;
     assert_eq!(r.leaked, 0, "{r:?}");
+    assert_eq!(r.adapter.keys, 0, "the core asked the predictor: {r:?}");
     assert!(
         r.pty_modes >= 2,
         "the daemon reported the mode change: {r:?}"
     );
 }
 
-/// The mutation: the same run with the daemon's `PtyMode` withheld from the client. The
-/// secret is written, and the harness sees it. This is what `--guard-off password` would
-/// show; the engine gives the harness no way to switch a guard off, so the information the
-/// guard needs is taken away instead.
+/// The same hostile predictor with the daemon's `PtyMode` withheld from the client, so the
+/// password rule never applies: the core asks the predictor about every key and gets a guess
+/// for each, and its epochs still write none (the prompt is unexplained output, and nothing
+/// echoes the keys). Before C1 this was the leak the harness had to see; the oracle terminal's
+/// own test above shows it would see one. A full-stack mutation that leaks needs a guard switch
+/// in the engine (E1a's seam).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_harness_sees_a_secret_leak_when_the_mode_report_is_withheld() {
+async fn the_core_stops_a_hostile_predictor_with_the_mode_report_withheld() {
     let mut s = spec(Transport::Pipe, Program::ReadS, Predict::Eager);
     s.drop_pty_mode = true;
     let r = secret_trial(s, false).await;
-    assert!(r.leaked > 0, "the leak should have been seen: {r:?}");
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
+    assert!(
+        r.adapter.shown > 0,
+        "the predictor declared no guess: {r:?}"
+    );
+    assert_eq!(r.leaked, 0, "{r:?}");
 }
 
-/// Keys typed the moment echo goes off, before the report can have reached the client: the
-/// M0 predictor's epochs keep them off the screen.
+/// Keys typed the moment echo goes off, before the report can have reached the client (the
+/// `sudo` typed-ahead case), with the hostile predictor: it is asked and guesses every key, and
+/// the core writes none (before C1 this leaked 3 to 6 characters, `docs/m3/harness.md` §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_predictor_writes_no_secret_typed_ahead_of_the_report() {
+    let r = secret_trial(spec(Transport::Pipe, Program::ReadS, Predict::Eager), true).await;
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
+    assert!(
+        r.adapter.shown > 0,
+        "the predictor declared no guess: {r:?}"
+    );
+    assert_eq!(r.leaked, 0, "{r:?}");
+}
+
+/// The same with the default predictor, over QUIC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mosh_predictor_writes_no_secret_typed_ahead_of_the_report() {
     let r = secret_trial(
@@ -150,6 +171,7 @@ async fn the_mosh_predictor_writes_no_secret_typed_ahead_of_the_report() {
         true,
     )
     .await;
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
     assert_eq!(r.leaked, 0, "{r:?}");
 }
 

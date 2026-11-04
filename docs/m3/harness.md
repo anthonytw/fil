@@ -1,6 +1,6 @@
 # M3 T1 part 1: the full-stack prediction harness, and resize in the true order
 
-> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `c16606b` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this.
+> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this.
 
 ## 1. What it is
 
@@ -40,7 +40,7 @@ flowchart LR
 | File | What |
 |---|---|
 | `crates/fil-client/tests/common/oracle_term.rs` | the oracle terminal, the rig, the adapter, the trials. Self-contained, so the test and the example both include it |
-| `crates/fil-client/tests/predict_e2e.rs` | the small cases that run in `just ci`; two reproductions are `#[ignore]`d |
+| `crates/fil-client/tests/predict_e2e.rs` | the small cases that run in `just ci`; one reproduction is `#[ignore]`d |
 | `crates/fil-client/examples/predict_e2e.rs` | the on-demand runs: `just predict-e2e resize\|baseline\|secret\|all` |
 | `crates/fil-client/tests/common/mod.rs` | one line: `pub mod oracle_term;` |
 
@@ -263,6 +263,17 @@ Everything that names the predictor API is in `oracle_term.rs`, in the "adapter"
 - `fil_predict::sim::Rng` (the seeded typist) and `fil_predict::oracle::diffs` / `Capabilities` (the comparison) are used as public functions: keep them public or tell this file's owner.
 - `CellStyle::Underline` is how the oracle terminal recognizes a written guess. If P1 stops underlining (plan §2.7 underlines only above 80 ms or in a glitch window), the `paints` and `flashes` counts go to zero at low RTT by design; use the adapter's `shown`, or have the harness count the style P1 uses. The C1 tests of the password rule and the resize damage do not depend on it for `Eager` and `MoshAlways` at 150 ms.
 - The tests that must still hold after C1: `the_resize_controls_are_clean`, the three secret tests, the two typing tests. The `#[ignore]`d reproduction should *keep* passing until W1.
+
+**Done in C1 (PR #98).**
+
+- The adapter is on the new trait. `ctx.screen` is a `&dyn ScreenView`; the shadow for `compare_to_shadow` comes from the test-only `ScreenView::test_state` (the `testkit` feature of `fil-predict`, a dev-dependency here).
+- `AdapterStats` counts the keys the core gave the predictor, the guesses it declared (`shown`: what it asked to be shown; the core decides what is written), and what the core settled (`confirmed`, `mispredicted`, `withdrawn`).
+- `compare_to_shadow` reports `guesses_shown`, the underlined glyphs still on the user's terminal, so that a guess the engine never ticked away is not read as resize damage.
+- **The secret tests against the core:**
+  - After the report, the core does not ask the predictor at all (`keys == 0`, `leaked == 0`).
+  - Typed ahead of the report, the hostile predictor is asked and guesses every key (`keys > 0`, `shown > 0`), and nothing is written (`leaked == 0`, down from 3 to 6).
+  - With `PtyMode` withheld, the core's epochs now stop the hostile predictor too (`keys > 0`, `shown > 0`, `leaked == 0`), so that run is no longer a leak. A full-stack mutation that leaks needs a guard seam in the engine (finding 2, E1a). The oracle terminal's own test still shows it sees a leak.
+- **Until E1a routes `EchoAck`**, only an epoch that starts the session can be confirmed through the full stack: rule 2 makes every later epoch's first confirmation wait for an `EchoAck` covering the keys before it. The cases here type into a fresh session, so they still show guesses.
 
 ## 7. Findings about the plan
 

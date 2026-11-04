@@ -26,8 +26,9 @@ impl Size {
     /// The narrowest grid fil keeps, in columns: two cells hold a fullwidth character.
     ///
     /// `alacritty_terminal` documents the same floor (`term::MIN_COLUMNS`) but leaves enforcing
-    /// it to its embedder, and below it a wide character written to a one-column grid makes it
-    /// allocate without bound (20 GB found by fuzzing, DESIGN.md section 6.5). Every backend
+    /// it to its embedder. Below it, resizing a grid that already holds a wide character down to
+    /// one column allocates without bound inside `resize` (20 GB found by fuzzing), and writing
+    /// a wide character into a one-column grid panics (DESIGN.md section 6.5). Every backend
     /// clamps to it, and the session gives the PTY the same width so the program and the
     /// emulator agree.
     pub const MIN_COLS: u16 = 2;

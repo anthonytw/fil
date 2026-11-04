@@ -124,6 +124,12 @@ pub fn run_child(test_name: &str, scenario: &str, limit: Duration) {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             );
+            // `--exact` with a name that matches no test runs nothing and exits 0.
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "child run {scenario:?} of {test_name} ran no test (is the name right?)\n{}",
+                String::from_utf8_lossy(&out.stdout),
+            );
             return;
         }
         if start.elapsed() > limit {

@@ -1,8 +1,10 @@
 //! Degenerate sizes (DESIGN.md section 6.5, `Size::MIN_COLS`).
 //!
-//! `alacritty_terminal` 0.26 allocates without bound when a one-column grid is handed a
-//! fullwidth character (`TermSize::new(1, n)` is valid, and a client with a one-column window
-//! gets there over the wire). Found by fuzzing: 20 GB of RSS from `e5 ad a8` (U+5B68).
+//! `alacritty_terminal` 0.26 allocates without bound when a grid that already holds a fullwidth
+//! character is resized to one column (`TermSize::new(1, n)` is valid, and a client with a
+//! one-column window, or a user dragging one that narrow, gets there over the wire). Found by
+//! fuzzing: 20 GB of RSS from `e5 ad a8` (U+5B68) printed and then a resize to one column.
+//! Writing a fullwidth character into a grid that is already one column wide panics instead.
 //! Every backend now raises the width to two columns, and these tests keep it so.
 //!
 //! The scenarios that could eat the machine without the clamp run in a child process of this
@@ -56,7 +58,33 @@ fn a_wide_character_on_one_column_stays_bounded() {
     assert_eq!(scenario, "repro");
     arm(BUDGET);
     for b in names() {
-        // Resize down, then the character.
+        // The unbounded allocation (20 GB in the fuzzer): a grid that already holds the
+        // character, resized down to one column. It happens inside `resize`. Also at one row,
+        // at the corner and at zero.
+        for (c, r) in [(1u16, 24u16), (1, 1), (0, 0), (1, 0)] {
+            let mut e = new(b, 80, 24);
+            e.feed(CJK);
+            e.feed(b"\r\n");
+            e.feed(CJK);
+            e.resize(Size { cols: c, rows: r });
+            let st = e.state(1000);
+            assert_eq!(st.size, Size { cols: c, rows: r }.clamped(), "{b}: {c}x{r}");
+            let _ = snapshot(&st);
+        }
+        // A grid with history, and a small one.
+        let mut e = new(b, 80, 3);
+        for _ in 0..50 {
+            e.feed(CJK);
+            e.feed(b"\r\n");
+        }
+        e.resize(Size { cols: 1, rows: 3 });
+        assert_eq!(e.state(1000).size.cols, Size::MIN_COLS, "{b}");
+        let mut e = new(b, 2, 2);
+        e.feed(CJK);
+        e.resize(Size { cols: 1, rows: 2 });
+        assert_eq!(e.state(0).size.cols, Size::MIN_COLS, "{b}");
+
+        // Resize down first, then the character (panics unclamped).
         let mut e = new(b, 80, 24);
         e.resize(Size { cols: 1, rows: 24 });
         e.feed(CJK);

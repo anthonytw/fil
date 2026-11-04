@@ -50,8 +50,9 @@ pub(crate) struct Spawned {
 
 /// The size the session actually runs at: the client's, raised to the emulator's floor
 /// (`fil_term::Size::MIN_COLS`, two columns). A one-column window is accepted on the wire, but
-/// the emulator cannot hold a wide character in it (alacritty_terminal then allocates without
-/// bound), so the PTY gets the same width the emulator keeps and the program wraps where the
+/// the emulator cannot hold a wide character there (alacritty_terminal allocates without bound
+/// resizing a grid that holds one to one column, and panics writing one into a one-column
+/// grid), so the PTY gets the same width the emulator keeps and the program wraps where the
 /// snapshot does. DESIGN.md section 6.5.
 pub(crate) fn effective_size(s: TermSize) -> TermSize {
     // The floor only ever raises a dimension that was at least 1, so this stays inside the

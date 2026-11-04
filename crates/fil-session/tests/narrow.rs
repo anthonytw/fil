@@ -1,9 +1,10 @@
 //! A one-column window (DESIGN.md section 6.5, `Size::MIN_COLS`).
 //!
-//! `alacritty_terminal` allocates without bound when a one-column grid gets a fullwidth
-//! character, and a one-column size is valid on the wire. The session raises the width to two
+//! `alacritty_terminal` allocates without bound when a grid that holds a fullwidth character is
+//! resized to one column (and panics when one is written into a one-column grid), and a
+//! one-column size is valid on the wire. The session raises the width to two
 //! columns for the emulator and for the PTY, so the program and the emulator agree. These run a
-//! real shell that prints U+5B68 after a resize to one column, in a child process of this test
+//! real shell that prints U+5B68 before and after a resize to one column, in a child process of this test
 //! binary under a byte budget: a regression aborts the child at its first oversized allocation
 //! and fails the parent, instead of taking the host down.
 
@@ -60,16 +61,23 @@ fn a_resize_to_one_column_then_wide_output_is_bounded() {
             let h = spawn_plain(sh_config(&sc, "main", WIDE_AND_SIZE)).await;
             let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
 
-            // Down to one column (valid on the wire), then output.
+            // Output at the normal width first, so the emulator's grid holds the character: it
+            // is the resize of such a grid to one column that allocates without bound.
+            c.type_bytes(b"\n").await;
+            c.wait("a round at 80 columns", |c| lines(c).len() >= 2)
+                .await;
+            assert_eq!(lines(&c)[1], "24 80");
+
+            // Down to one column (valid on the wire), then more output.
             c.resize(size(1, 24)).await;
             for _ in 0..20 {
                 c.type_bytes(b"\n").await;
             }
-            c.wait("twenty rounds of output", |c| lines(c).len() >= 40)
+            c.wait("twenty rounds of output", |c| lines(c).len() >= 42)
                 .await;
             let l = lines(&c);
-            assert_eq!(l[0], "\u{5b68}");
-            assert_eq!(l[1], "24 2", "the PTY has the emulator's width, not 1");
+            assert_eq!(l[2], "\u{5b68}");
+            assert_eq!(l[3], "24 2", "the PTY has the emulator's width, not 1");
             assert_eq!(h.info().await.unwrap().size, size(2, 24));
 
             // A client arriving now, also one column wide, is given a snapshot rendered from the
@@ -120,6 +128,8 @@ fn a_session_created_one_column_wide_is_bounded() {
             let mut cfg = sh_config(&sc, "main", WIDE_AND_SIZE);
             cfg.size = size(1, 5);
             let h = spawn_plain(cfg).await;
+            // Before any client attaches: the session itself started at the floor.
+            assert_eq!(h.info().await.unwrap().size, size(2, 5));
             let mut c = Client::attach(&h, {
                 let mut a = Connect::new(&h, key(1));
                 a.size = size(1, 5);

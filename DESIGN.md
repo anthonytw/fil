@@ -288,7 +288,7 @@ Forwards must stay open across reconnects **(decided)**.
 - **Long disconnects:** after a configurable timeout (proposed default: 10 min), open connections close. The listeners stay.
 - **Takeover:**
   - `-R` listeners stay and route to the new subscriber.
-  - `-L` connections that started on the old machine end, because their applications live there.
+  - `-L` connections that started on the old machine end, because their applications live there. They end when the old machine is asked whether to take the session back (as after a replaced session or a detach from elsewhere), not when it answers. Until the answer its `-L` and `-D` listeners stay bound and refuse new connections; a take-back serves them again.
   - The new client recreates the session's `-L` listeners, warning about any port already in use locally.
 - **The table** (daemon memory only, nothing on disk) is the daemon's, at most 64 entries. Each entry has an id the daemon assigns, never reused for the session's life, and an origin: the attached client, or a management request (§7.3).
   - A spec's identity is `(kind, bind, port)`, except that an ephemeral `-R` (port 0) has none: every `-R 0` is a listener of its own, as with ssh, and never clashes. An add equal to an entry is answered with that entry; an equal add from the attached client also makes a management-origin entry the client's own. An add from the attached client with an entry's identity and another target **replaces** it under a new id; the old entry's open connections run until they close. From a management request that is a `Conflict`.

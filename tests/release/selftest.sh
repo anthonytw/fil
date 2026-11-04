@@ -90,6 +90,13 @@ mutate_wf "publish's if: loses its event check" "s/github.event_name == 'push' &
 mutate_wf "an expression in a one-line run:" 's/run: tests\/release\/prepare.sh/run: tests\/release\/prepare.sh \$\{\{ github.ref_name \}\}/'
 mutate_wf "an expression inside a run: block" 's/(          set -euo pipefail\n          for set in a b)/          echo \$\{\{ github.ref_name \}\}\n$1/'
 mutate_wf "workflow_dispatch takes inputs" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch:\n    inputs:\n      ref:\n        required: false\n/'
+mutate_wf "crates-io runs outside its environment" 's/(  crates-io:.*?)    environment: crates-io\n/$1/s'
+mutate_wf "crates-io runs in another environment" 's/    environment: crates-io\n/    environment: release\n/'
+mutate_wf "crates-io stops requiring a tag" 's/(  crates-io:.*?    if: github.event_name == .push.) && startsWith\(github.ref, .refs\/tags\/v.\)/$1/s'
+mutate_wf "crates-io gets attestations: write" 's/(      id-token: write # trusted publishing only\n)/$1      attestations: write\n/'
+mutate_wf "crates-io gets contents: write" 's/(  crates-io:.*?    permissions:\n      contents: )read/${1}write/s'
+mutate_wf "another job names the crates-io environment" 's/(  packages-arm64:\n.*?    runs-on: ubuntu-24.04-arm\n)/$1    environment: crates-io\n/s'
+mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -282,9 +289,41 @@ pack_release() { # uses $tree $stage $rel $VER
     # shellcheck disable=SC2086
     (cd "$stage" && tar $tar_flags -czf "$rel/fil-$VER-$lbl.tar.gz" "fil-$VER-$lbl" $extra)
   done
+  pack_packages
   write_sums
 }
-write_sums() { (cd "$rel" && for f in $(printf '%s\n' fil-"$VER"-*.tar.gz | LC_ALL=C sort); do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS); }
+# The four packages, from the staged Linux trees (selftest_pkg.py; the real ones come from nfpm).
+# Mutations, as files in the stage: .pkg-owner (a uid for every entry), .pkg-extra (one more file in
+# every package), .pkg-bin (a different bin/fil in every package), .pkg-version (another version).
+pack_packages() {
+  local lbl kind arch d m f dst mode owner=0 pv=$VER
+  [ -f "$stage/.pkg-owner" ] && owner=$(cat "$stage/.pkg-owner")
+  [ -f "$stage/.pkg-version" ] && pv=$(cat "$stage/.pkg-version")
+  pv=$(printf '%s' "$pv" | sed 's/-/~/')
+  for lbl in x86_64-linux-musl aarch64-linux-musl; do
+    d=$stage/fil-$VER-$lbl
+    for kind in deb rpm; do
+      m=$tmp/manifest
+      : > "$m"
+      while IFS= read -r f; do
+        dst=$(package_path "$kind" "$f")
+        if [ -x "$d/$f" ]; then mode=755; else mode=644; fi
+        src=$d/$f
+        [ "$f" = bin/fil ] && [ -f "$stage/.pkg-bin" ] && src=$stage/.pkg-bin
+        printf '%s\t%s\t%s\n' "$src" "$dst" "$mode" >> "$m"
+      done < <(cd "$d" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+      [ -f "$stage/.pkg-extra" ] && printf '%s\t%s\t%s\n' "$stage/.pkg-extra" /usr/bin/extra 755 >> "$m"
+      case $lbl-$kind in
+        x86_64*-deb) arch=amd64 f=fil-shell_${VER}_amd64.deb ;;
+        aarch64*-deb) arch=arm64 f=fil-shell_${VER}_arm64.deb ;;
+        x86_64*-rpm) arch=x86_64 f=fil-shell-$VER-1.x86_64.rpm ;;
+        aarch64*-rpm) arch=aarch64 f=fil-shell-$VER-1.aarch64.rpm ;;
+      esac
+      python3 -I "$RELEASE_DIR/selftest_pkg.py" "$kind" "$rel/$f" fil-shell "$pv" 1 "$arch" "$owner" "$m"
+    done
+  done
+}
+write_sums() { (cd "$rel" && for f in $({ printf '%s\n' fil-"$VER"-*.tar.gz; package_names "$VER"; } | LC_ALL=C sort); do if [ -f "$f" ]; then printf '%s  %s\n' "$(sha256 "$f")" "$f"; fi; done > SHA256SUMS); }
 
 case_n=0
 new_case() { # VER: a tree, a stage and the packed release; sets $tree $stage $rel $VER
@@ -378,6 +417,26 @@ mutated_msg "an archive's notices are not the source archive's" "differs from th
   "echo '- stale' >> fil-0.9.0-universal-apple-darwin/share/doc/fil/THIRD-PARTY-NOTICES.md"
 mutated_msg "the source archive lacks the notices" "fil-0.9.0-source.tar.gz lacks THIRD-PARTY-NOTICES.md" "touch .source-drop-notices"
 mutated "the binary is not static" "perl -pi -e 's/FAKE-ELF-X86/FAKE-DYNAMIC/' fil-0.9.0-x86_64-linux-musl/bin/fil"
+# the .deb and .rpm packages
+mutated_msg "a package's files are not root's" "not those of" "echo 1000 > .pkg-owner"
+mutated_msg "a package holds a file its archive does not" "not those of" "echo x > .pkg-extra"
+mutated_msg "a package's bin/fil is not the archive's" "files differ from the archive's" "cp fil-0.9.0-x86_64-linux-musl/bin/fil .pkg-bin && echo '# other' >> .pkg-bin"
+mutated_msg "a package says another version" "not 'fil-shell 0.9.0-1" "echo 0.9.1 > .pkg-version"
+new_case 0.9.0-rc.1
+expect_pass "a pre-release's packages carry the version 0.9.0~rc.1-1" check --dry-run --no-tree "$rel"
+new_case 0.9.0
+rm "$rel/fil-shell_0.9.0_arm64.deb"
+write_sums
+expect_fail "mutation: a package is missing" check --dry-run --no-tree "$rel"
+new_case 0.9.0
+cp "$rel/fil-shell_0.9.0_amd64.deb" "$rel/fil-shell_0.9.0_arm64.deb"
+write_sums
+mutated_check_msg() { if check --dry-run --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "$1 (it should have failed)"; elif grep -qF -- "$2" "$tmp/out.log"; then pass "$1"; else flunk "$1 (failed, but not with '$2')"; sed 's/^/       | /' "$tmp/out.log" | tail -5; fi; }
+mutated_check_msg "mutation: the arm64 .deb is the amd64 one" "not 'fil-shell 0.9.0-1 arm64'"
+new_case 0.9.0
+printf 'not a package' > "$rel/fil-shell-0.9.0-1.x86_64.rpm"
+write_sums
+mutated_check_msg "mutation: an rpm that is not one" "cannot be read"
 
 # --no-exec: nothing from the download runs. The source archive's own cargo config names a rustc
 # wrapper; `cargo metadata` runs it (so the fixture is sensitive), --no-exec must not.
@@ -614,6 +673,43 @@ expect_pass "reserve-crate-names: any other failure is not retried" test "$(rc_r
 expect_pass "reserve-crate-names: a bare 429 in the text is not a rate limit" test "$(rc_retry 2 'error: crate size 4290 bytes exceeds')" = "1 101"
 expect_pass "reserve-crate-names: a 429 that does not clear gives up" test "$(rc_retry 99 'status 429 Too Many Requests')" = "4 101"
 
+# ============================================================== 4d. the published crates (publish-crates.sh)
+echo "== publish-crates.sh"
+pc=$RELEASE_DIR/publish-crates.sh
+pc_order=$("$pc" --list)
+expect_pass "publish-crates: the crates with publish = [\"crates-io\"] are the nine reserved names" \
+  test "$(printf '%s\n' $pc_order | LC_ALL=C sort | tr '\n' ' ')" = "$(printf '%s\n' $rc_names | LC_ALL=C sort | tr '\n' ' ')"
+expect_pass "publish-crates: fil-proto first, fil-shell last" sh -c 'case "$1" in "fil-proto "*" fil-shell") exit 0 ;; *) exit 1 ;; esac' sh "$pc_order"
+for c in fil-netsim fil-testkit fil-testbins; do
+  expect_pass "publish-crates: $c is publish = false" grep -qx 'publish = false' "$REPO_ROOT/crates/$c/Cargo.toml"
+done
+wsv=$(cargo_version)
+expect_pass "every [workspace.dependencies] version is the workspace's, exactly (=$wsv)" \
+  sh -c '! awk "/^\[workspace.dependencies\]/ { p = 1; next } /^\[/ { p = 0 } p && /version/" "$1" | grep -v "version = \"=$2\"" | grep -q .' sh "$REPO_ROOT/Cargo.toml" "$wsv"
+# --publish on fakes: fil-proto's version is already there, fil-term's lookup fails.
+mkdir -p "$tmp/pc"
+cat > "$tmp/pc/curl" << 'EOF2'
+#!/bin/sh
+for a; do u=$a; done
+case $u in
+  */crates/fil-proto/*) printf 200 ;;
+  */crates/"${FAKE_PC_500:-none}"/*) printf 503 ;;
+  *) printf 404 ;;
+esac
+EOF2
+printf '#!/bin/sh\necho "$*" >> "$FAKE_PC_LOG"\n' > "$tmp/pc/cargo"
+chmod +x "$tmp/pc/curl" "$tmp/pc/cargo"
+pc_run() { env FIL_PUBLISH_CARGO="$tmp/pc/cargo" FIL_PUBLISH_CURL="$tmp/pc/curl" FAKE_PC_LOG="$tmp/pc/log" "$@" "$pc" --publish; }
+: > "$tmp/pc/log"
+expect_fail "publish-crates: --publish without a token stops" pc_run -u CARGO_REGISTRY_TOKEN
+expect_pass "publish-crates: ...and calls no cargo" test ! -s "$tmp/pc/log"
+expect_pass "publish-crates: --publish skips a version already on crates.io and publishes the other eight" pc_run CARGO_REGISTRY_TOKEN=fake
+expect_pass "publish-crates: ...one at a time, in order" test "$(cut -d' ' -f4 "$tmp/pc/log" | tr '\n' ' ')" = "$(printf '%s\n' $pc_order | grep -v '^fil-proto$' | tr '\n' ' ')"
+: > "$tmp/pc/log"
+expect_fail "publish-crates: an unexpected answer from crates.io stops the run" pc_run CARGO_REGISTRY_TOKEN=fake FAKE_PC_500=fil-forward
+expect_pass "publish-crates: ...after the crates before fil-forward" grep -qE ' fil-transport$' "$tmp/pc/log"
+expect_fail "publish-crates: ...and before fil-forward and what depends on it" grep -qE ' (fil-forward|fil-client|fil-shell)$' "$tmp/pc/log"
+
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"
@@ -641,6 +737,18 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   PK="$RELEASE_DIR/.package-mutant.sh" pk "$tmp/m2" > /dev/null 2>&1 || true
   rm -f "$RELEASE_DIR/.package-mutant.sh"
   expect_fail "mutation: tar mtimes left alone, and the two assemblies' SHA256SUMS then differ" cmp "$tmp/m1/SHA256SUMS" "$tmp/m2/SHA256SUMS"
+  expect_pass "the assembly writes the four packages too" test "$(grep -c 'fil-shell' "$tmp/r1/SHA256SUMS")" = 4
+  # mutation: nfpm without the fixed mtime (and without SOURCE_DATE_EPOCH, which it also reads) stamps the packages with the time of the run
+  sed -e '/mtime: /d' -e 's/-e SOURCE_DATE_EPOCH //' "$RELEASE_DIR/linux-packages.sh" > "$RELEASE_DIR/.pkg-mutant.sh"
+  chmod +x "$RELEASE_DIR/.pkg-mutant.sh"
+  trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh" "$RELEASE_DIR/.pkg-mutant.sh"' EXIT INT TERM
+  if cmp -s "$RELEASE_DIR/linux-packages.sh" "$RELEASE_DIR/.pkg-mutant.sh"; then flunk "mutation 'package mtime' did not change linux-packages.sh (the test is stale)"; fi
+  mkdir -p "$tmp/p1" "$tmp/p2"
+  env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p1" > /dev/null 2>&1 || true
+  sleep 2
+  env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p2" > /dev/null 2>&1 || true
+  rm -f "$RELEASE_DIR/.pkg-mutant.sh"
+  expect_fail "mutation: packages without the fixed mtime, and two builds then differ" cmp "$tmp/p1/fil-shell_0.9.0_amd64.deb" "$tmp/p2/fil-shell_0.9.0_amd64.deb"
 else
   echo "== reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
 fi

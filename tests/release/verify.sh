@@ -20,11 +20,11 @@
 #   4. `release-check --no-exec` passes on the files (--tag v<VERSION> --complete): the files are
 #      unpacked, hashed, grepped and inspected, and NOTHING that came from the download is run
 #      (no `cargo` in the source archive, no `--version` of a binary);
-#   5. the Linux VM rebuilds the Linux binaries and the four archives from that commit in the
-#      digest-pinned images, and the hashes are compared with the release's. The rebuild judges the
-#      source archive byte for byte. Three archives (x86_64, aarch64, source) are reproduced from the
-#      source; the macOS archive is only REASSEMBLED around the released macOS binary, which is not
-#      rebuilt and is ad-hoc signed.
+#   5. the Linux VM rebuilds the Linux binaries, the four archives and the four .deb and .rpm
+#      packages from that commit in the digest-pinned images, and the hashes are compared with the
+#      release's. The rebuild judges the source archive byte for byte. Three archives (x86_64,
+#      aarch64, source) and the four packages are reproduced from the source; the macOS archive is
+#      only REASSEMBLED around the released macOS binary, which is not rebuilt and is ad-hoc signed.
 #
 # --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
 # or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (a commit SHA: the run's
@@ -120,7 +120,7 @@ if [ "$dry" = 0 ]; then
   # ---- 3. attestations: this repository, this exact workflow identity at this tag, this commit
   # (--source-digest is the commit that was built, --signer-digest the commit of the workflow file),
   # and no self-hosted runner.
-  for a in "$dl"/fil-"$version"-*.tar.gz; do
+  for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|"); do
     if gh attestation verify "$a" --repo "$repo" \
       --cert-identity "https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag" \
       --source-ref "refs/tags/$tag" --source-digest "$commit" --signer-digest "$commit" \
@@ -164,13 +164,12 @@ if [ "$rebuild" = 1 ]; then
   limactl shell --workdir / "$vm" -- bash -c 'cd "$HOME/$1/out" && tar -cf - .' vm-sh "$vwork" | tar -xf - -C "$rb" || fail "could not copy the rebuilt files out of the VM"
   if [ -f "$rb/SHA256SUMS" ]; then
     echo "release-verify: rebuilt vs. released SHA256SUMS:" >&2
-    for kind in x86_64-linux-musl aarch64-linux-musl source universal-apple-darwin; do
-      n=fil-$version-$kind.tar.gz
+    for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz $(package_names "$version"); do
       h1=$(grep -F "  $n" "$dl/SHA256SUMS" | cut -d' ' -f1)
       h2=$(grep -F "  $n" "$rb/SHA256SUMS" | cut -d' ' -f1)
       if [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
         fail "$n: released $h1, rebuilt $h2"
-      elif [ "$kind" = universal-apple-darwin ]; then
+      elif [ "$n" = "fil-$version-universal-apple-darwin.tar.gz" ]; then
         ok "$n is REASSEMBLED identically around the released macOS binary (that binary was not rebuilt)"
       else
         ok "$n is REPRODUCED from source byte for byte ($h1)"

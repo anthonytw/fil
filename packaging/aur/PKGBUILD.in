@@ -1,0 +1,34 @@
+# The AUR package fil-shell-bin (`fil` is taken on the AUR): the release's static binary, unpacked
+# from its signed archive. GENERATED from packaging/aur/PKGBUILD.in by `just aur-pkgbuild VERSION`
+# (packaging/render.sh), with the checksums of the release's SHA256SUMS. Not published yet: the
+# AUR is not taking new accounts (docs/m4/packaging.md).
+pkgname=fil-shell-bin
+_ver=@VERSION@
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Remote shell for development over SSH that keeps your place: sessions survive reconnects, forwards outlive the link'
+arch=('x86_64' 'aarch64')
+url='https://github.com/anthonytw/fil'
+license=('GPL-3.0-or-later')
+provides=('fil-shell')
+conflicts=('fil-shell')
+# A static binary, already stripped, whose bytes the release's checksums pin.
+options=('!strip' '!debug')
+source_x86_64=("@URL_BASE@/fil-${_ver}-x86_64-linux-musl.tar.gz")
+source_aarch64=("@URL_BASE@/fil-${_ver}-aarch64-linux-musl.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64_LINUX_MUSL@')
+sha256sums_aarch64=('@SHA256_AARCH64_LINUX_MUSL@')
+
+package() {
+  cd "fil-${_ver}-${CARCH}-linux-musl"
+  install -Dm755 bin/fil "$pkgdir/usr/bin/fil"
+  # The remote bundle stays at ../libexec/fil/remote from the binary: the client looks for it there.
+  local f
+  while IFS= read -r f; do
+    if [ -x "$f" ]; then install -Dm755 "$f" "$pkgdir/usr/$f"; else install -Dm644 "$f" "$pkgdir/usr/$f"; fi
+  done < <(find libexec share -type f ! -path 'share/doc/*' | LC_ALL=C sort)
+  while IFS= read -r f; do
+    install -Dm644 "$f" "$pkgdir/usr/share/doc/$pkgname/${f#share/doc/fil/}"
+  done < <(find share/doc/fil -type f | LC_ALL=C sort)
+  install -Dm644 share/doc/fil/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

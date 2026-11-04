@@ -17,7 +17,11 @@
 #   - no secret, no cache, no `pull_request_target`; `--locked` on every cargo and cross build;
 #     checkout leaves no token in .git/config;
 #   - only the `publish` job has `contents: write`, `id-token: write` and `attestations: write`, and
-#     it runs only on a `v*` tag push.
+#     it runs only on a `v*` tag push;
+#   - the `crates-io` job (crates.io by trusted publishing, N8) also runs only on a `v*` tag push,
+#     with `id-token: write` and nothing else, in the `crates-io` environment, which waits for the
+#     owner's approval. Approve it after publishing the GitHub Release: it refuses a release that
+#     is still a draft or has no SHA256SUMS.sig.
 # A workflow file on some other branch could still ask for an `id-token`. The attestation's real
 # check is the narrow one in `just release-verify` (`gh attestation verify --signer-workflow
 # --source-ref`), plus the tag ruleset that keeps anyone else from creating a `v*` tag. The tag
@@ -74,6 +78,8 @@ jobs:
         run: shellcheck -x -S warning tests/release/*.sh
       - name: The release scripts' own tests (workflow lint, tag signers, release-check)
         run: just release-test
+      - name: The nine crates package and build for crates.io (a dry run; nothing is uploaded)
+        run: just crates-check
 
   build-linux:
     needs: prepare
@@ -190,7 +196,7 @@ jobs:
           else
             echo "::warning::the two macOS builds differ (best effort, not gated): $(sha256sum sets/a/universal-apple-darwin/fil sets/b/universal-apple-darwin/fil | tr '\n' ' ')"
           fi
-      - name: Archives, source archive and SHA256SUMS (assembled in the pinned image), twice
+      - name: Archives, source archive, .deb and .rpm packages and SHA256SUMS (in the pinned images), twice
         env:
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
         run: |
@@ -202,9 +208,9 @@ jobs:
             tests/release/package.sh --bins sets/a --out out
             tests/release/package.sh --bins sets/b --out out-b
           } 2>&1 | tee info/build-info.txt
-          # The archives must not depend on which job built the binaries. The macOS archive differs
-          # when the two macOS builds do (best effort); the others are gated.
-          for f in $(cd out && ls fil-*-x86_64-linux-musl.tar.gz fil-*-aarch64-linux-musl.tar.gz fil-*-source.tar.gz); do
+          # The archives and packages must not depend on which job built the binaries. The macOS
+          # archive differs when the two macOS builds do (best effort); the others are gated.
+          for f in $(cd out && ls fil-*-x86_64-linux-musl.tar.gz fil-*-aarch64-linux-musl.tar.gz fil-*-source.tar.gz fil-shell*.deb fil-shell*.rpm); do
             cmp "out/$f" "out-b/$f" || { echo "::error::$f differs between the two assemblies"; exit 1; }
           done
           cmp out/fil-*-universal-apple-darwin.tar.gz out-b/fil-*-universal-apple-darwin.tar.gz \
@@ -219,6 +225,8 @@ jobs:
           else
             tests/release/check.sh --dry-run out
           fi
+      - name: The amd64 .deb and .rpm install, run and remove cleanly (Debian and Fedora containers)
+        run: tests/release/install-packages.sh --arch amd64 out
       - name: Summary
         run: |
           {
@@ -283,10 +291,28 @@ jobs:
             tests/release/check.sh --dry-run --no-tree out
           fi
 
+  packages-arm64:
+    # The arm64 .deb and .rpm, installed natively on an arm64 runner (package tested the amd64 ones).
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: out
+      - name: The arm64 .deb and .rpm install, run and remove cleanly (Debian and Fedora containers)
+        run: tests/release/install-packages.sh --arch arm64 out
+
   publish:
     # The only job with write permissions, and only on a tag push. It makes a DRAFT.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [prepare, package, smoke-macos]
+    needs: [prepare, package, smoke-macos, packages-arm64]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -305,7 +331,10 @@ jobs:
         run: (cd out && sha256sum -c SHA256SUMS)
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: out/fil-*.tar.gz
+          subject-path: |
+            out/fil-*.tar.gz
+            out/fil-shell*.deb
+            out/fil-shell*.rpm
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -315,4 +344,47 @@ jobs:
           set -euo pipefail
           tests/release/notes.sh "$VERSION" "$GITHUB_REPOSITORY" > notes.md
           gh release create "$TAG" --draft --verify-tag --title "fil $VERSION" --notes-file notes.md \
-            out/fil-*.tar.gz out/SHA256SUMS
+            out/fil-*.tar.gz out/fil-shell*.deb out/fil-shell*.rpm out/SHA256SUMS
+
+  crates-io:
+    # The nine crates on crates.io by trusted publishing (N8; docs/m4/release.md section 10.1,
+    # docs/m4/packaging.md): GitHub's OIDC identity of this job is exchanged for a crates.io token
+    # that lives as long as the job, and no long-lived token exists anywhere. The job waits in the
+    # `crates-io` environment, which only the owner can approve; approve it only after publishing
+    # the GitHub Release (docs/m4/release.md section 9.2), because it refuses a draft and a release
+    # without SHA256SUMS.sig. It publishes from the signed tag's own commit, in dependency order, and
+    # skips a crate whose version is already there, so a re-run resumes.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # trusted publishing only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: The GitHub Release is published and signed (the owner's steps of section 9.2 are done)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets --jq '"\(.isDraft) \([.assets[].name] | index("SHA256SUMS.sig") != null)"')
+          if [ "$state" != "false true" ]; then
+            echo "::error::$TAG is not a published release with SHA256SUMS.sig (draft, signature: $state); publish it first (docs/m4/release.md section 9.2), then re-run this job"
+            exit 1
+          fi
+      - name: The tag is v<version>, annotated, on main and signed by the release key
+        run: tests/release/prepare.sh
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - name: Publish the nine crates, in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: tests/release/publish-crates.sh --publish

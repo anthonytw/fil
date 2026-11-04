@@ -117,6 +117,30 @@ cross_image() {
 }
 # The image the archives are assembled in: the x86_64 image (section 4.4).
 tools_image() { cross_image x86_64-unknown-linux-musl; }
+# The image the .deb and .rpm packages are built in (linux-packages.sh): nfpm 2.48.0 (MIT, a build
+# tool in no binary), pinned by the digest of its multi-architecture index, so that the package job
+# (amd64) and the VM's rebuild (arm64) run the same nfpm. To bump it: resolve the new tag's index
+# digest (`docker image inspect --format '{{json .RepoDigests}}'` after a pull), change both here,
+# and re-run a release dry run and `just release-verify`.
+NFPM_VERSION=2.48.0
+NFPM_IMAGE=docker.io/goreleaser/nfpm@sha256:d57a1452e7a019896b355f7b1ec67262278f6c503631f652d4fce7aef9ac8df7
+# package_path KIND PATH: where a file at PATH in a Linux archive (bin/fil, libexec/..., share/...)
+# is installed by the package of KIND (deb or rpm); nothing, with status 1, for a path that has no
+# place. linux-packages.sh builds by it and release-check checks by it.
+package_path() {
+  case $2 in
+    bin/fil) echo /usr/bin/fil ;;
+    libexec/fil/*) echo "/usr/$2" ;;
+    share/doc/fil/*) echo "/usr/share/doc/fil-shell/${2#share/doc/fil/}" ;;
+    share/zsh/site-functions/*) if [ "$1" = deb ]; then echo "/usr/share/zsh/vendor-completions/${2#share/zsh/site-functions/}"; else echo "/usr/$2"; fi ;;
+    share/*) echo "/usr/$2" ;;
+    *) return 1 ;;
+  esac
+}
+# The four package files of version $1 (section 4.1), sorted bytewise.
+package_names() {
+  printf '%s\n' "fil-shell-$1-1.aarch64.rpm" "fil-shell-$1-1.x86_64.rpm" "fil-shell_$1_amd64.deb" "fil-shell_$1_arm64.deb" | LC_ALL=C sort
+}
 
 # The committer time of REF (default HEAD): the SOURCE_DATE_EPOCH of a release (section 4.4).
 source_date_epoch() { git -C "$ROOT" log -1 --format=%ct "${1:-HEAD}"; }

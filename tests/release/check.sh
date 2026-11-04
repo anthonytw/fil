@@ -4,7 +4,8 @@
 #
 #   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR
 #
-#   DIR         the four archives and SHA256SUMS that package.sh wrote (or a downloaded release)
+#   DIR         the four archives, the four .deb and .rpm packages and SHA256SUMS that package.sh
+#               wrote (or a downloaded release)
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
 #   --tag TAG   the tag being released: it must be v<Cargo.toml version>, CHANGELOG.md must have a
 #               section for the version, and a patch release must keep its minor's wire
@@ -123,7 +124,8 @@ fi
 
 # ---- SHA256SUMS (section 4.2)
 sums=$dir/SHA256SUMS
-names="fil-$V-aarch64-linux-musl.tar.gz fil-$V-source.tar.gz fil-$V-universal-apple-darwin.tar.gz fil-$V-x86_64-linux-musl.tar.gz"
+packages=$(package_names "$V" | tr '\n' ' ')
+names=$(printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "fil-$V-x86_64-linux-musl.tar.gz" $packages | LC_ALL=C sort | tr '\n' ' ')
 if [ ! -f "$sums" ]; then
   fail "no SHA256SUMS in $dir"
 else
@@ -132,9 +134,9 @@ else
       [ -f "$dir/$n" ] && printf '%s  %s\n' "$(sha256 "$dir/$n")" "$n"
     done
   )" ]; then
-    ok "SHA256SUMS lists exactly the four archives, sorted, in sha256sum format"
+    ok "SHA256SUMS lists exactly the four archives and the four packages, sorted, in sha256sum format"
   else
-    fail "SHA256SUMS is not exactly the four archives ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
+    fail "SHA256SUMS is not exactly the four archives and the four packages ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
   fi
   if sums_check "$dir" SHA256SUMS; then ok "sha256sum -c SHA256SUMS"; else fail "sha256sum -c SHA256SUMS"; fi
   [ -z "$(tail -c 1 "$sums")" ] || fail "SHA256SUMS does not end with a newline"
@@ -330,6 +332,59 @@ if [ -n "$x86_bin" ] && [ -n "$aarch_bin" ]; then
       || fail "fil-$V-$label: the remote bundle differs from the Linux archives' bin/fil"
   done
 fi
+
+# ---- the .deb and .rpm packages (section 4.1; docs/m4/packaging.md): read by pkg_inspect.py, which
+# runs nothing from them. Each holds exactly the files of its Linux archive, byte for byte, at the
+# places package_path gives, owned by root, 0755 or 0644, under the name fil-shell, the version and
+# the architecture its file name says.
+# The packages' version: a pre-release's `-` is `~` (sorts before the release), then release 1.
+pkg_version=$(printf '%s' "$V" | sed 's/-/~/')-1
+for p in $packages; do
+  case $p in
+    *_amd64.deb) label=x86_64-linux-musl arch=amd64 kind=deb ;;
+    *_arm64.deb) label=aarch64-linux-musl arch=arm64 kind=deb ;;
+    *.x86_64.rpm) label=x86_64-linux-musl arch=x86_64 kind=rpm ;;
+    *.aarch64.rpm) label=aarch64-linux-musl arch=aarch64 kind=rpm ;;
+  esac
+  if [ ! -f "$dir/$p" ]; then
+    fail "missing package $p"
+    continue
+  fi
+  px=$work/p-$p
+  if ! python3 -I "$RELEASE_DIR/pkg_inspect.py" "$dir/$p" "$px" > "$work/p.list" 2> "$work/p.err"; then
+    fail "$p cannot be read: $(cat "$work/p.err")"
+    continue
+  fi
+  meta="$(sed -n 's/^name //p' "$work/p.list") $(sed -n 's/^version //p' "$work/p.list") $(sed -n 's/^arch //p' "$work/p.list")"
+  if [ "$meta" = "fil-shell $pkg_version $arch" ]; then ok "$p is fil-shell $pkg_version for $arch"; else fail "$p says '$meta', not 'fil-shell $pkg_version $arch'"; fi
+  aroot=$work/x-$label/fil-$V-$label
+  if [ ! -d "$aroot" ]; then
+    fail "$p: no archive fil-$V-$label to compare it with"
+    continue
+  fi
+  want=$(
+    cd "$aroot"
+    find . -type f | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do
+      dst=$(package_path "$kind" "$f") || dst="(no place for $f)"
+      if [ -x "$f" ]; then m=755; else m=644; fi
+      echo "file $m root:root $dst"
+    done | LC_ALL=C sort
+  )
+  have=$(grep '^file ' "$work/p.list" | LC_ALL=C sort)
+  if [ "$have" = "$want" ]; then
+    ok "$p holds exactly the files of fil-$V-$label.tar.gz, root-owned, at their places"
+  else
+    fail "$p's files are not those of fil-$V-$label.tar.gz (< package, > archive): $(diff <(printf '%s\n' "$have") <(printf '%s\n' "$want") | grep '^[<>]' | head -n 6 | tr '\n' ' ')"
+  fi
+  bad=$({ grep "^dir " "$work/p.list" || true; } | awk '$2 != "755" || $3 != "root:root"' | head -n 3)
+  [ -z "$bad" ] || fail "$p has a directory that is not 0755 root:root: $bad"
+  differ=
+  while IFS= read -r f; do
+    dst=$(package_path "$kind" "$f") || continue
+    cmp -s "$aroot/$f" "$px$dst" || differ="$differ $f"
+  done < <(cd "$aroot" && find . -type f | sed 's|^\./||')
+  if [ -z "$differ" ]; then ok "$p: every file is byte for byte the archive's"; else fail "$p: files differ from the archive's:$differ"; fi
+done
 
 # ---- run the binary where it can run (section 2): the first line is FROZEN
 smoke() {

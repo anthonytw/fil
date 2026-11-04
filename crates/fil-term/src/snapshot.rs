@@ -31,8 +31,6 @@
 //! Known gap, rare: the pending-wrap flag of the primary cursor behind the alternate screen
 //! is not restored.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::model::{
     Attrs, Cell, Charset, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking,
     TermState, Underline, default_tab_stops,
@@ -61,13 +59,6 @@ impl WriteCaps {
     pub const PLAIN: WriteCaps = WriteCaps {
         underline_styles: false,
     };
-
-    /// The process-wide setting of [`set_underline_styles`].
-    pub fn current() -> Self {
-        WriteCaps {
-            underline_styles: UNDERLINE_STYLES.load(Ordering::Relaxed),
-        }
-    }
 }
 
 impl Default for WriteCaps {
@@ -76,21 +67,12 @@ impl Default for WriteCaps {
     }
 }
 
-/// The capabilities [`snapshot`] and [`sgr`] write for.
-static UNDERLINE_STYLES: AtomicBool = AtomicBool::new(true);
-
-/// Sets whether [`snapshot`] and [`sgr`] write underline styles (see [`WriteCaps`]). This is
-/// for a process that learns once that its terminal lacks them (terminfo has no `Smulx`, or
-/// the capability report says so); code that has the capabilities per call uses
-/// [`snapshot_with`] and [`sgr_with`].
-pub fn set_underline_styles(on: bool) {
-    UNDERLINE_STYLES.store(on, Ordering::Relaxed);
-}
-
 /// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`, for a terminal
-/// with the capabilities of [`WriteCaps::current`].
+/// that understands everything ([`WriteCaps::ALL`]). One daemon renders snapshots for every
+/// client on every terminal, so what a client lacks has to be passed per call, to
+/// [`snapshot_with`].
 pub fn snapshot(state: &TermState) -> Vec<u8> {
-    snapshot_with(state, WriteCaps::current())
+    snapshot_with(state, WriteCaps::ALL)
 }
 
 /// [`snapshot`] for a terminal with the given capabilities.
@@ -463,9 +445,9 @@ pub fn clear_screen(out: &mut Vec<u8>, rows: u16) {
 }
 
 /// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`), for a
-/// terminal with the capabilities of [`WriteCaps::current`].
+/// terminal that understands everything ([`WriteCaps::ALL`]).
 pub fn sgr(a: &Attrs) -> String {
-    sgr_with(a, WriteCaps::current())
+    sgr_with(a, WriteCaps::ALL)
 }
 
 /// [`sgr`] for a terminal with the given capabilities.

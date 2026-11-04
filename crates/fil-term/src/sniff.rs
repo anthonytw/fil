@@ -133,7 +133,9 @@ impl RegionTracker {
         // text still goes through the parser's fast path.
         let mut i = 0;
         while i < bytes.len() {
-            i += self.parser.advance_until_terminated(&mut self.st, &bytes[i..]);
+            i += self
+                .parser
+                .advance_until_terminated(&mut self.st, &bytes[i..]);
             if let Some(a) = self.st.action.take() {
                 actions.push((i, a));
             }

@@ -365,7 +365,7 @@ flowchart LR
   T1a["T1 part 1: full-stack harness,<br/>true-order resize"] --> W1["W1: in-band Repaint"]
   T2["T2: real terminals"] --> W1
   T2 -.-> P1
-  E1a --> E1b["E1b: fil config and flag<br/>(slot after M4's U1)"]
+  E1a --> E1b["E1b: fil config and flag<br/>(0.2.0: after M4's CFG)"]
   W1 --> K1["K1: catch-up while healthy<br/>(optional)"]
   T1a --> T1b["T1 part 2: prediction suites"]
   P1 --> T1b

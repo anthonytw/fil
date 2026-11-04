@@ -877,7 +877,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 - `crates/fil-transport/src/pipe/command.rs`: the remote commands and their golden.
 - `crates/fil/src/{connect.rs, dialer.rs, app.rs, server.rs}` and `crates/fil/src/install/` (new): the fallback, the offer, the upload.
 - `crates/fil-daemon/src/{logging.rs, paths.rs, daemon.rs}`: LOG and TMP.
-- `crates/fil-session/src/nofile.rs`: the trampoline on macOS (a finding for in a coordinator-serialized slot before RC (after K1), if MAC's test fails).
+- `crates/fil-session/src/nofile.rs`: the trampoline on macOS (a finding to fix in a coordinator-serialized slot before RC (after K1), if MAC's test fails).
 - `.github/workflows/release.yml` and `macos-check.yml` (new); `linux-check.yml` (one-line additions).
 - The root `Cargo.toml` (`[profile.release]`, `rust-version`), `Cross.toml`, `deny.toml`, and `about.toml` (new).
 - `docs/m4/release.md` (new, R0) and `docs/user/` (new, DOC).

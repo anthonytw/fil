@@ -147,7 +147,7 @@ async fn a_takeover_starts_the_agent_counts_over() {
 }
 
 /// A stand-in local agent on `path`: answers the session-bind, then the first request with an
-/// empty key list when `answers`, or never. Each connection reports when it got its request and
+/// empty key list 300 ms later when `answers`, or never. Each connection reports when it got its request and
 /// when its end came (the relay closed it).
 fn stand_in_agent(
     path: &Path,
@@ -168,6 +168,9 @@ fn stand_in_agent(
                 };
                 let _ = tx.send(("request", Instant::now()));
                 if answers {
+                    // After the host program has ended its side: the grace is what gets the
+                    // answer through.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
                     let _ = s.write_all(&framed(&[12, 0, 0, 0, 0])).await;
                 }
                 let mut rest = Vec::new();

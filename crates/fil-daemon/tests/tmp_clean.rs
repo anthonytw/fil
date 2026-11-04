@@ -599,6 +599,9 @@ async fn a_predecessor_does_not_bind_a_missing_socket_it_has_no_lock_for() {
 async fn a_hung_home_directory_does_not_stop_the_daemon() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+    // Outside tokio, whose timers a blocked worker can stop: ends the whole test binary, naming
+    // the test, instead of leaving `cargo test` to hang.
+    let _watchdog = Watchdog::start("a_hung_home_directory_does_not_stop_the_daemon", WATCHDOG);
     let tree = Tree::new();
     let home = tree.parent.join("home");
     let installed = home.join(".local/share/fil/0.1.0-w1.12");
@@ -647,6 +650,80 @@ async fn a_hung_home_directory_does_not_stop_the_daemon() {
         .await
         .expect("the daemon did not stop");
     drop(release);
+}
+
+/// How long the hung-home test may run before the watchdog ends the process (the test takes a few
+/// seconds).
+const WATCHDOG: Duration = Duration::from_secs(30);
+
+/// A thread of its own, not a tokio task, that ends the process with status 101 (as a failed test
+/// would) after `limit` unless the guard is dropped first. The tests that block a worker thread on
+/// purpose cannot rely on a tokio timeout: a blocked worker can hold the timer driver, so none
+/// fires.
+struct Watchdog(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Watchdog {
+    fn start(name: &'static str, limit: Duration) -> Self {
+        Self::start_with(limit, move || {
+            // Straight to stderr: `eprintln!` is captured by the test harness, and the process
+            // ends before the captured text would be shown.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "{name}: still running after {limit:?}: stopped by its watchdog"
+            );
+            std::process::exit(101);
+        })
+    }
+
+    /// `on_expiry` runs on the watchdog's thread instead of the exit, for the test of the dog.
+    fn start_with(limit: Duration, on_expiry: impl FnOnce() + Send + 'static) -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + limit;
+            while std::time::Instant::now() < deadline {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                on_expiry();
+            }
+        });
+        Self(done)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn the_watchdog_fires_after_its_limit_and_not_once_dropped() {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let _dog = Watchdog::start_with(Duration::from_millis(100), move || {
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "it never fired"
+    );
+    let (tx, rx) = mpsc::channel();
+    drop(Watchdog::start_with(
+        Duration::from_millis(100),
+        move || {
+            let _ = tx.send(());
+        },
+    ));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "it fired after being dropped"
+    );
 }
 
 /// Whether something holds a shared lock on the directory (an exclusive try fails), which is what

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::*;
 use fil_proto::log::CatchUpParams;
-use fil_proto::msg::SnapshotReason;
+use fil_proto::msg::{SnapshotReason, StartPoint};
 
 /// 58 columns: never wraps on the test client's 80.
 const PAD: &str = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmn";
@@ -202,5 +202,51 @@ async fn output_in_flight_at_a_catch_up_is_shown_once() {
     );
     let nums: Vec<u32> = seen.iter().flatten().copied().collect();
     assert_eq!(nums, (1..=3000).collect::<Vec<_>>());
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
+/// A resume too far behind for a replay gets a snapshot; the client's terminal is exactly at its
+/// resume point (a catch-up the old link was waiting on moved nothing), so the snapshot brings
+/// only the history it never received, as a catch-up does: every line once, across both links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_snapshot_never_repeats_what_the_client_has() {
+    let sc = Scratch::new();
+    let script = format!(
+        "stty -echo; echo READY; read go; seq -f 'L%06g {PAD}' 1 100; sleep 1; \
+         seq -f 'L%06g {PAD}' 101 1500; echo END; sleep 30"
+    );
+    let mut cfg = sh_config(&sc, "main", &script);
+    cfg.catch_up = CatchUpParams {
+        max_bytes: 16 * 1024,
+        ..CatchUpParams::default()
+    };
+    cfg.history_lines = 5000;
+    let h = spawn_plain(cfg).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_screen("READY").await;
+    c.type_bytes(b"\n").await;
+    c.wait_out(&format!("L000100 {PAD}\r\n")).await;
+    let resume = c.resume_request();
+    c.hang_up();
+    let _ = c.serve_end().await;
+    wait_log_end(&h, 1500 * 59).await;
+
+    // The same terminal: what the first link put on it, then the second link.
+    let mut c2 = Client::connect(&h, Connect::new(&h, key(1)).resume(resume));
+    for b in &c.snapshot_bytes {
+        c2.emu.feed(b);
+    }
+    c2.emu.feed(&c.out);
+    c2.wait_screen("END").await;
+    let r = c2.reply.clone().unwrap();
+    assert!(
+        matches!(r.start, StartPoint::Snapshot(i) if i.reason == SnapshotReason::TooFarBehind),
+        "{:?}",
+        r.start
+    );
+    let seen = shown(&c2);
+    assert_eq!(seen.iter().filter(|n| n.is_none()).count(), 1, "{seen:?}");
+    let nums: Vec<u32> = seen.iter().flatten().copied().collect();
+    assert_eq!(nums, (1..=1500).collect::<Vec<_>>());
     let _ = h.kill(Duration::from_secs(5)).await;
 }

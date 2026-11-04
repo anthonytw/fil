@@ -1277,7 +1277,7 @@ impl Core {
 
         let ready = self.ready();
         let (start, snapshot_bytes, start_seq) = match mode {
-            AttachMode::Fresh => self.snapshot_start(ready, 0, SnapshotReason::NewClient),
+            AttachMode::Fresh => self.snapshot_start(ready, 0, SnapshotReason::NewClient, None),
             AttachMode::Resumed(r) => self.resume_start(r, ready),
         };
 
@@ -1343,13 +1343,25 @@ impl Core {
         }))
     }
 
+    /// `client_at`: where a resuming client's terminal stream is, if that is a real position
+    /// (not past the log's end). Its scrollback has everything before it, so the snapshot renders
+    /// only the history it never received (`unseen_history`), as a catch-up does; otherwise the
+    /// full N lines.
     fn snapshot_start(
         &mut self,
         at: u64,
         skipped: u64,
         reason: SnapshotReason,
+        client_at: Option<u64>,
     ) -> (StartPoint, Option<Vec<u8>>, u64) {
-        let bytes = self.render_snapshot(skipped, self.cfg.history_lines);
+        let history = match client_at {
+            Some(seq) => {
+                let log = self.shared.lock_log();
+                unseen_history(&log, seq, at, self.size.rows(), self.cfg.history_lines)
+            }
+            None => self.cfg.history_lines,
+        };
+        let bytes = self.render_snapshot(skipped, history);
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
@@ -1374,6 +1386,7 @@ impl Core {
                 ready,
                 ready.saturating_sub(seq),
                 SnapshotReason::Requested,
+                (seq <= ready).then_some(seq),
             );
         }
         let decision = {
@@ -1382,18 +1395,21 @@ impl Core {
         };
         // `decide_start` judges against the end of the log, which includes bytes not released.
         if seq > ready {
-            return self.snapshot_start(ready, 0, SnapshotReason::BadResumePoint);
+            return self.snapshot_start(ready, 0, SnapshotReason::BadResumePoint, None);
         }
         match decision {
             StartDecision::Resume { from } if from >= self.poison_end => {
                 (StartPoint::Resume { from }, None, from)
             }
             // The output the client missed holds a query the emulator answered for it.
-            StartDecision::Resume { from } => {
-                self.snapshot_start(ready, ready - from, SnapshotReason::TooFarBehind)
-            }
+            StartDecision::Resume { from } => self.snapshot_start(
+                ready,
+                ready - from,
+                SnapshotReason::TooFarBehind,
+                Some(from),
+            ),
             StartDecision::Snapshot { reason, .. } => {
-                self.snapshot_start(ready, ready.saturating_sub(seq), reason)
+                self.snapshot_start(ready, ready.saturating_sub(seq), reason, Some(seq))
             }
         }
     }
@@ -1550,8 +1566,8 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-/// How many lines of scrollback a catch-up snapshot at `at` renders for a client that was sent
-/// the output up to `sent`, on a screen of `rows` rows: the lines that scrolled off the
+/// How many lines of scrollback a snapshot at `at` renders for a client that was sent the
+/// output up to `sent` (a catch-up's, or a resume's from that point), on a screen of `rows` rows: the lines that scrolled off the
 /// emulator's screen since `sent` and were never on the client's, at most `max`.
 ///
 /// The client has everything before `sent` in its scrollback or on its screen (what is still on

@@ -344,8 +344,9 @@ release-build out="target/release-dist":
 # no builder path (/Users/, /home/) or FIL_TEST_ string in a binary, the path remap applied,
 # `no-test-hooks` and `release-deps`, static Linux binaries, `fil --version` where it can run, the tag,
 # the changelog and the wire. See tests/release/check.sh.
+[positional-arguments]
 release-check *args:
-    tests/release/check.sh {{args}}
+    tests/release/check.sh "$@"
 
 # The owner's check before signing, and anyone's afterwards: `just release-verify 0.1.0`. Tag and
 # SHA256SUMS.sig against .github/release-signers on main, the attestations (narrowly), release-check,

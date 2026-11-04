@@ -28,9 +28,13 @@ Download the archive for your system, \`SHA256SUMS\` and \`SHA256SUMS.sig\`, the
 sha256sum -c SHA256SUMS --ignore-missing      # or: shasum -a 256 -c SHA256SUMS --ignore-missing
 gh attestation verify fil-$v-x86_64-linux-musl.tar.gz --repo $repo \\
   --signer-workflow $repo/.github/workflows/release.yml --source-ref refs/tags/v$v
+# the signature: SIGNERS is .github/release-signers as it is on main (never the tag's copy)
+ssh-keygen -Y verify -f SIGNERS -I release -n fil-release -s SHA256SUMS.sig < SHA256SUMS
 \`\`\`
 
-\`SHA256SUMS.sig\` is an SSH signature (\`ssh-keygen -Y verify -n fil-release\`) by the release key
-listed in \`.github/release-signers\` **on main**. \`fil-$v-source.tar.gz\` is the Corresponding Source
-with every dependency vendored; it builds offline.
+\`SHA256SUMS.sig\` is an SSH signature by the release key listed in \`.github/release-signers\`
+**on main**. \`fil-$v-source.tar.gz\` is the Corresponding Source with every dependency vendored; it
+builds offline. The Linux binaries and archives are reproducible (\`just release-verify\` rebuilds
+them in a pinned image). The macOS binary is **ad-hoc signed** (no Developer ID, not notarized) and is
+not independently reproduced; the macOS archive is checked only around that binary.
 EOT

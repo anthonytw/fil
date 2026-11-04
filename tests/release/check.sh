@@ -2,7 +2,7 @@
 # `just release-check`: everything a release candidate must satisfy before anyone signs it
 # (docs/m4/release.md; docs/m4/plan.md, REL).
 #
-#   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] DIR
+#   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR
 #
 #   DIR         the four archives and SHA256SUMS that package.sh wrote (or a downloaded release)
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
@@ -11,24 +11,29 @@
 #   --complete  every file of the section 4.3 layout must be present. Without it, the files that
 #               LIC and DOC add later are listed as pending (a dry run before they land)
 #   --no-tree   skip the checks that read the dependency graph (`just release-deps`)
+#   --no-exec   run NOTHING that came from DIR: no `cargo metadata` in the extracted source archive
+#               (its .cargo/config.toml can name a rustc wrapper, which cargo runs) and no
+#               `--version` of a downloaded binary. The files are only unpacked, hashed, grepped and
+#               inspected with file(1). `release-verify` uses this mode on the owner's machine.
 #
 # Exit status 0 only if every check passed.
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-dry=0 tag='' complete=0 tree=1 dir=''
+dry=0 tag='' complete=0 tree=1 exec=1 dir=''
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;
     --tag) tag=$2; shift 2 ;;
     --complete) complete=1; shift ;;
     --no-tree) tree=0; shift ;;
+    --no-exec) exec=0; shift ;;
     -*) die "unknown option: $1" ;;
     *) dir=$1; shift ;;
   esac
 done
-[ -n "$dir" ] || die "usage: check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] DIR"
+[ -n "$dir" ] || die "usage: check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR"
 if [ "$dry" = 0 ] && [ -z "$tag" ]; then
   die "name the release with --tag vX.Y.Z (or pass --dry-run for a build that is not a release)"
 fi
@@ -162,6 +167,30 @@ share/bash-completion/completions/fil
 share/zsh/site-functions/_fil
 share/fish/vendor_completions.d/fil.fish"
 
+# Host names and addresses that appear in the tree's test directories. A release binary must carry
+# none of them (docs/m4/plan.md, REL). Loopback, the unspecified address, broadcast and multicast
+# are real defaults and are skipped; so is tests/release (its own scratch values).
+fixture_dirs=
+for d in "$ROOT"/crates/*/tests "$ROOT"/crates/*/fuzz "$ROOT"/crates/*/examples "$ROOT"/tests/realnet "$ROOT"/tests/macos; do
+  if [ -d "$d" ]; then fixture_dirs="$fixture_dirs $d"; fi
+done
+fixtures=
+if [ -n "$fixture_dirs" ]; then
+  # shellcheck disable=SC2086
+  fixtures=$(
+    {
+      grep -rhIoE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' $fixture_dirs 2> /dev/null | grep -vE '^(127\.|0\.0\.0\.0$|255\.255\.255\.255$|22[4-9]\.|23[0-9]\.)' || true
+      grep -rhIoE '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.(example|test|invalid|local|lab|home|lan|internal)|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.example\.(com|net|org)' $fixture_dirs 2> /dev/null
+      true
+    } | LC_ALL=C sort -u
+  )
+fi
+fixture_leaks() { # BINARY: the fixture strings found in it, as whole tokens (a token is [A-Za-z0-9.-]+)
+  [ -n "$fixtures" ] || return 0
+  LC_ALL=C grep -aoE '[A-Za-z0-9.-]{4,}' "$1" | sed 's/[.-]*$//' | LC_ALL=C sort -u > "$work/tokens"
+  printf '%s\n' "$fixtures" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$work/tokens" | tr '\n' ' '
+}
+
 is_gnu_tar() { tar --version 2> /dev/null | grep -q 'GNU tar'; }
 
 x86_bin='' aarch_bin=''
@@ -188,7 +217,9 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
     for f in Cargo.toml Cargo.lock .cargo/config.toml vendor LICENSE; do
       [ -e "$root/$f" ] || fail "$name.tar.gz lacks $f"
     done
-    if [ -d "$root/vendor" ] && [ -f "$root/Cargo.lock" ]; then
+    if [ "$exec" = 0 ]; then
+      note "--no-exec: $name.tar.gz is not resolved with cargo (the rebuild compares it byte for byte)"
+    elif [ -d "$root/vendor" ] && [ -f "$root/Cargo.lock" ]; then
       # Builds offline: every package of the lock resolves from vendor/ alone.
       if (cd "$root" && cargo metadata --locked --offline --format-version 1 > /dev/null 2> "$work/meta.log"); then
         ok "$name.tar.gz resolves every dependency from vendor/, offline"
@@ -231,12 +262,25 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
       hit=1
     fi
   done
+  # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
+  if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
+  # The install bootstrap's sending side is gated on M4 OQ-1 (feature `install-bootstrap`; `release-deps`
+  # checks the graph). Its help text is in the binary only if it was built in. Drop this when the
+  # owner approves the feature and the release is meant to carry it.
+  if grep -aqF 'Remove the copies fil installed on HOST' "$b"; then fail "$name: bin/fil was built with the install-bootstrap feature (gated on M4 OQ-1)"; fi
+  # Fixture hosts and addresses (the list is derived from the test directories of the tree).
+  leak=$(fixture_leaks "$b")
+  if [ -n "$leak" ]; then fail "$name: bin/fil contains test-fixture host names or addresses: $leak"; else ok "$name: bin/fil has none of the $(printf '%s\n' "$fixtures" | grep -c .) test-fixture host names and addresses"; fi
   # The remap must have been applied: a dependency's panic location is always in the binary and
   # must read $REMAP_CARGO_HOME/registry/..., never the builder's cargo home.
   if grep -aqF -- "$REMAP_CARGO_HOME/registry/src/" "$b"; then ok "$name: bin/fil carries remapped source paths ($REMAP_CARGO_HOME/registry/...)"; else fail "$name: bin/fil has no $REMAP_CARGO_HOME/registry/src/ path: the path remap was not applied"; fi
   [ "$hit" = 0 ] && ok "$name: bin/fil has no builder path and no FIL_TEST_ string"
   if (cd "$ROOT" && just no-test-hooks "$b") > "$work/nth.log" 2>&1; then ok "$name: no-test-hooks"; else cat "$work/nth.log" >&2; fail "$name: no-test-hooks"; fi
   desc=$(file "$b")
+  case $label in
+    x86_64-linux-musl | aarch64-linux-musl)
+      if grep -q 'not stripped' <<< "$desc" || ! grep -q 'stripped' <<< "$desc"; then fail "$name: bin/fil is not stripped (debug info or symbols): $desc"; fi ;;
+  esac
   case $label in
     x86_64-linux-musl) grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' <<< "$desc" && ok "$name: bin/fil is a static x86_64 ELF" || fail "$name: bin/fil is not a static x86_64 ELF: $desc" ;;
     aarch64-linux-musl) grep -Eq 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)' <<< "$desc" && ok "$name: bin/fil is a static aarch64 ELF" || fail "$name: bin/fil is not a static aarch64 ELF: $desc" ;;
@@ -264,11 +308,15 @@ smoke() {
   if [ "$first" = "$expect" ]; then ok "$b --version: $first"; else fail "$b --version printed '$first', not '$expect'"; fi
   if "$b" --version 2> /dev/null | tail -n +2 | grep -qF '(wire '; then fail "$b --version: a line after the first contains '(wire '"; fi
 }
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) [ -n "$x86_bin" ] && smoke "$x86_bin" ;;
-  Linux-aarch64) [ -n "$aarch_bin" ] && smoke "$aarch_bin" ;;
-esac
-if [ "$(uname -s)" = Darwin ] && [ -f "$work/x-universal-apple-darwin/fil-$V-universal-apple-darwin/bin/fil" ]; then
+if [ "$exec" = 0 ]; then
+  note "--no-exec: no downloaded binary was run"
+else
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) [ -n "$x86_bin" ] && smoke "$x86_bin" ;;
+    Linux-aarch64) [ -n "$aarch_bin" ] && smoke "$aarch_bin" ;;
+  esac
+fi
+if [ "$exec" = 1 ] && [ "$(uname -s)" = Darwin ] && [ -f "$work/x-universal-apple-darwin/fil-$V-universal-apple-darwin/bin/fil" ]; then
   smoke "$work/x-universal-apple-darwin/fil-$V-universal-apple-darwin/bin/fil"
 fi
 

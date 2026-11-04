@@ -9,11 +9,15 @@
 #   1. the workflow's own `permissions:` is `contents: read` and nothing else;
 #   2. every job declares `permissions:`; only the job `publish` may have `id-token`, `attestations`
 #      or `contents: write`;
-#   3. `publish` runs only for a push of a `v*` tag (its `if:` names both);
+#   3. `publish` runs only for a push of a `v*` tag: its `if:` is EXACTLY
+#      `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')` (an `||` or any other
+#      edit fails); a job's `permissions:` is a block, never `write-all` or an inline { ... };
 #   4. every `uses:` is pinned by a full 40-hex commit SHA;
 #   5. no `secrets.`, no cache of any kind, no `pull_request_target`;
 #   6. every checkout sets `persist-credentials: false`;
-#   7. the only triggers are a tag push (no branches) and workflow_dispatch;
+#   7. the only triggers are a tag push (no branches) and workflow_dispatch, and workflow_dispatch
+#      takes no `inputs:` (an input that reached a step would be attacker-chosen text);
+#      no `${{ }}` expression inside a `run:` (values reach the shell through `env:`);
 #   8. every `cargo`/`cross` build, install, vendor or metadata command, in the workflow and in
 #      tests/release/*.sh, passes `--locked`.
 set -euo pipefail
@@ -31,6 +35,18 @@ awk '
   }
   {
     raw = $0
+    # `run:` steps: an expression in the script is text pasted into the shell
+    if (in_run && raw !~ /^[ \t]*$/) {
+      match(raw, /^ */)
+      if (RLENGTH <= run_indent) in_run = 0
+      else if (raw ~ /\$\{\{/) bad("expression inside a run: script (pass it through env:): " raw)
+    }
+    if (!in_run && raw ~ /^ *(- )?run:/) {
+      match(raw, /^ *(- )?/); run_indent = RLENGTH
+      val = raw; sub(/^ *(- )?run:[ ]*/, "", val)
+      if (val ~ /^[|>]/) in_run = 1
+      else if (val ~ /\$\{\{/) bad("expression inside a run: command: " raw)
+    }
     line = $0
     sub(/[ \t]+#.*$/, "", line)          # trailing comment
     if (line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/) next
@@ -55,6 +71,7 @@ awk '
       if (key != "push" && key != "workflow_dispatch") bad("trigger " key " is not allowed (only a tag push and workflow_dispatch)")
       cur_trigger = key
     }
+    if (section == "on" && indent > 2 && cur_trigger == "workflow_dispatch" && line ~ /^ *inputs:/) bad("workflow_dispatch takes inputs: " line)
     if (section == "on" && indent > 2 && cur_trigger == "push") {
       if (line ~ /branches/ || line ~ /paths/) bad("the push trigger may name tags only: " line)
       if (line ~ /tags:/ ) tags_seen = 1
@@ -65,7 +82,11 @@ awk '
       next
     }
     if (in_jobs && job != "") {
-      if (indent == 4 && line ~ /^    permissions:/) { in_perm = 1; has_perm[job] = 1; next }
+      if (indent == 4 && line ~ /^    permissions:/) {
+        in_perm = 1; has_perm[job] = 1
+        if (line !~ /^    permissions:[ ]*$/) bad("job " job " permissions must be a block, not: " line)
+        next
+      }
       if (indent == 4) in_perm = 0
       if (in_perm && indent == 6) {
         k = line; sub(/^ */, "", k); v = k; sub(/:.*/, "", k); sub(/^[^:]*:[ ]*/, "", v)
@@ -95,7 +116,7 @@ awk '
     if (!tags_seen) bad("no tag push trigger")
     for (j in jobs) if (!has_perm[j]) bad("job " j " declares no permissions")
     if (!("publish" in jobs)) bad("no publish job")
-    else if (job_if["publish"] !~ /github\.event_name == .push./ || job_if["publish"] !~ /refs\/tags\/v/) bad("publish does not run only for a push of a v* tag: " job_if["publish"])
+    else if (job_if["publish"] != "    if: github.event_name == '"'"'push'"'"' && startsWith(github.ref, '"'"'refs/tags/v'"'"')") bad("publish does not run only for a push of a v* tag: " job_if["publish"])
     exit fails ? 1 : 0
   }
 ' "$wf"

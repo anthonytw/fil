@@ -48,13 +48,24 @@ sha256() {
   fi
 }
 
-# sums_check DIR FILE: `sha256sum -c` (or shasum) of FILE inside DIR.
+# sums_check DIR FILE: every line of FILE (inside DIR) is "<64 lowercase hex>  <name>", at least one
+# line, and each named file there has that digest. Not `sha256sum -c`: some builds of it (macOS's
+# /sbin/sha256sum) exit 0 for a file with no well-formed line at all.
 sums_check() {
-  if command -v sha256sum > /dev/null; then
-    (cd "$1" && sha256sum -c "$2" > /dev/null 2>&1)
-  else
-    (cd "$1" && shasum -a 256 -c "$2" > /dev/null 2>&1)
-  fi
+  local dir=$1 file=$2 h n count=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"  "*) ;;
+      *) return 1 ;;
+    esac
+    h=${line%%  *}
+    n=${line#*  }
+    case $n in "" | /* | .. | ../* | */../* | */..) return 1 ;; esac
+    [ -f "$dir/$n" ] || return 1
+    [ "$(sha256 "$dir/$n")" = "$h" ] || return 1
+    count=$((count + 1))
+  done < "$dir/$file"
+  [ "$count" -gt 0 ]
 }
 
 # The one package version: [workspace.package] version in the root Cargo.toml (section 1).

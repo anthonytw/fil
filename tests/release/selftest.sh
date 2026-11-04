@@ -83,6 +83,13 @@ mutate_wf "a cache step is added" 's/(      - name: Toolchain \(from rust-toolch
 mutate_wf "checkout keeps its token" 's/(  build-macos:.*?    steps:\n      - uses: actions\/checkout\@[0-9a-f]{40} # v7.0.1\n        with:\n)          persist-credentials: false\n/$1          fetch-depth: 1\n/s'
 mutate_wf "a pull_request_target trigger" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch:\n  pull_request_target:\n/'
 mutate_wf "the push trigger takes branches" 's/(    tags: \["v\*"\]\n)/$1    branches: [main]\n/'
+mutate_wf "a non-publish job has permissions: write-all" 's/(  build-linux:.*?    permissions:)\n      contents: read\n/$1 write-all\n/s'
+mutate_wf "a non-publish job has flow-form permissions" 's/(  build-linux:.*?    permissions:)\n      contents: read\n/$1 { contents: write, id-token: write }\n/s'
+mutate_wf "publish's if: uses || instead of &&" 's/ && startsWith\(github.ref/ || startsWith\(github.ref/'
+mutate_wf "publish's if: loses its event check" "s/github.event_name == 'push' && //"
+mutate_wf "an expression in a one-line run:" 's/run: tests\/release\/prepare.sh/run: tests\/release\/prepare.sh \$\{\{ github.ref_name \}\}/'
+mutate_wf "an expression inside a run: block" 's/(          set -euo pipefail\n          for set in a b)/          echo \$\{\{ github.ref_name \}\}\n$1/'
+mutate_wf "workflow_dispatch takes inputs" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch:\n    inputs:\n      ref:\n        required: false\n/'
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -167,6 +174,27 @@ echo "abd  file" > "$tmp/SHA256SUMS.altered"
 expect_fail "an altered SHA256SUMS does not verify" bash -c "ssh-keygen -Y verify -f '$allowed' -I release -n fil-release -s '$tmp/SHA256SUMS.sig' < '$tmp/SHA256SUMS.altered'"
 expect_fail "a signature in another namespace does not verify as fil-release" bash -c "ssh-keygen -Y verify -f '$allowed' -I release -n git -s '$tmp/SHA256SUMS.sig' < '$tmp/SHA256SUMS'"
 
+# release-verify STOPS at the first failure of tag, signature or attestation: nothing from the
+# download is looked at (release-check would print "release-check:" lines if it ran).
+mkdir -p "$tmp/dl"
+cp "$tmp/SHA256SUMS" "$tmp/dl/SHA256SUMS"
+rv() { env FIL_RELEASE_REPO_URL="$tmp/origin" "$RELEASE_DIR/verify.sh" "$@" --from-dir "$tmp/dl" --no-rebuild --work "$tmp/vwork"; }
+expect_fail "release-verify stops on a tag the main signers do not list" rv 5
+grep -q 'STOP: tag v5 does not verify' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
+  && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+expect_fail "release-verify stops when SHA256SUMS.sig is missing" rv 1
+grep -q 'STOP: no SHA256SUMS.sig' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
+  && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+cp "$tmp/SHA256SUMS.altered" "$tmp/dl/SHA256SUMS"
+cp "$tmp/SHA256SUMS.sig" "$tmp/dl/SHA256SUMS.sig"
+expect_fail "release-verify stops on a SHA256SUMS.sig that does not match SHA256SUMS" rv 1
+grep -q 'STOP: SHA256SUMS.sig does not verify' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
+  && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+cp "$tmp/SHA256SUMS" "$tmp/dl/SHA256SUMS"
+expect_fail "release-verify stops when the files do not match the signed SHA256SUMS" rv 1
+grep -q 'STOP: the files do not match' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
+  && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+
 # ============================================================== 4. release-check on synthetic releases
 echo "== release-check"
 # A scratch tree (a git repository holding the files check.sh reads), stand-in binaries (shell
@@ -200,8 +228,9 @@ cat > "$tmp/shim/file" << 'EOT'
 #!/bin/sh
 # Test shim for file(1): the real one cannot tell a shell script from a static ELF.
 f=$1
-if grep -q FAKE-ELF-X86 "$f" 2> /dev/null; then echo "$f: ELF 64-bit LSB executable, x86-64, statically linked"
-elif grep -q FAKE-ELF-AARCH64 "$f" 2> /dev/null; then echo "$f: ELF 64-bit LSB executable, ARM aarch64, statically linked"
+if grep -q FAKE-ELF-X86 "$f" 2> /dev/null; then echo "$f: ELF 64-bit LSB executable, x86-64, statically linked, stripped"
+elif grep -q FAKE-ELF-AARCH64 "$f" 2> /dev/null; then echo "$f: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped"
+elif grep -q FAKE-NOTSTRIPPED "$f" 2> /dev/null; then echo "$f: ELF 64-bit LSB executable, x86-64, statically linked, with debug_info, not stripped"
 elif grep -q FAKE-MACHO "$f" 2> /dev/null; then echo "$f: Mach-O universal binary with 2 architectures: [x86_64] [arm64]"
 else /usr/bin/file "$@"; fi
 EOT
@@ -239,6 +268,7 @@ pack_release() { # uses $tree $stage $rel $VER
   echo 'fn main() {}' > "$src/crates/x/src/main.rs"
   (cd "$src" && cargo generate-lockfile --offline > /dev/null 2>&1)
   : > "$src/.cargo/config.toml"
+  [ -d "$stage/.source-extra" ] && cp -R "$stage/.source-extra/." "$src/"
   for d in "$stage"/fil-*; do
     lbl=${d##*/}
     lbl=${lbl#fil-"$VER"-}
@@ -272,6 +302,18 @@ mutated() {
   expect_fail "mutation: $name" check --dry-run --no-tree "$rel"
 }
 
+# mutated_msg NAME PATTERN COMMAND...: as `mutated`, and the failure output must say PATTERN
+mutated_msg() {
+  local name=$1 pat=$2
+  shift 2
+  new_case 0.9.0
+  (cd "$stage" && eval "$*")
+  pack_release
+  if check --dry-run --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "mutation: $name (it should have failed)"
+  elif grep -qF -- "$pat" "$tmp/out.log"; then pass "mutation: $name"
+  else flunk "mutation: $name (failed, but not with '$pat')"; sed 's/^/       | /' "$tmp/out.log" | tail -5; fi
+}
+
 new_case 0.9.0
 expect_pass "a clean dry run passes" check --dry-run --no-tree "$rel"
 expect_pass "a clean tag run passes (changelog, tag, wire)" check --tag v0.9.0 --no-tree "$rel"
@@ -296,9 +338,61 @@ mutated "a bundled copy differs from the target's own binary" \
   "echo '# changed' >> fil-0.9.0-universal-apple-darwin/libexec/fil/remote/aarch64-linux/fil; (cd fil-0.9.0-universal-apple-darwin/libexec/fil/remote && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' \"\$(shasum -a 256 \$f | cut -d' ' -f1)\" \$f; done > SHA256SUMS)"
 mutated "the bundle's SHA256SUMS is wrong" \
   "echo 'deadbeef  x86_64-linux/fil' > fil-0.9.0-x86_64-linux-musl/libexec/fil/remote/SHA256SUMS"
+mutated_msg "a vt100 source path is in bin/fil" "vt100" \
+  "echo '# /cargo-home/registry/src/index.crates.io-0/vt100-0.18.0/src/lib.rs' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "the install-bootstrap feature is in bin/fil" "install-bootstrap" \
+  "echo '# Remove the copies fil installed on HOST' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "an ELF is not stripped" "is not stripped" "perl -pi -e 's/FAKE-ELF-X86/FAKE-NOTSTRIPPED/' fil-0.9.0-x86_64-linux-musl/bin/fil"
+# test-fixture host names and addresses: the list comes from the tree's test directories
+new_case 0.9.0
+mkdir -p "$tree/crates/x/tests"
+printf 'host = "box.example.net"\naddr = "198.51.100.7"\nloop = "127.0.0.1"\n' > "$tree/crates/x/tests/fixture.toml"
+expect_pass "fixtures that are not in the binaries pass" check --dry-run --no-tree "$rel"
+echo '# connects to box.example.net' >> "$stage/fil-0.9.0-x86_64-linux-musl/bin/fil"
+pack_release
+expect_fail "mutation: a fixture host name is in bin/fil" check --dry-run --no-tree "$rel"
+grep -qF 'box.example.net' "$tmp/out.log" && pass "...and the failure names it" || flunk "...and the failure names it"
+stage_release
+echo '# 198.51.100.7:22' >> "$stage/fil-0.9.0-aarch64-linux-musl/bin/fil"
+pack_release
+expect_fail "mutation: a fixture address is in bin/fil" check --dry-run --no-tree "$rel"
+stage_release
+echo '# 127.0.0.1 and 198.51.100.77 and sub.box.example.net.invalid' >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
+pack_release
+expect_pass "loopback, a longer address and a different name are not the fixtures" check --dry-run --no-tree "$rel"
 mutated "bin/fil is missing" "rm fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated "the license is missing" "rm fil-0.9.0-x86_64-linux-musl/share/doc/fil/LICENSE"
 mutated "the binary is not static" "perl -pi -e 's/FAKE-ELF-X86/FAKE-DYNAMIC/' fil-0.9.0-x86_64-linux-musl/bin/fil"
+
+# --no-exec: nothing from the download runs. The source archive's own cargo config names a rustc
+# wrapper; `cargo metadata` runs it (so the fixture is sensitive), --no-exec must not.
+new_case 0.9.0
+mkdir -p "$stage/.source-extra"
+printf '#!/bin/sh\ntouch "%s"\nexec "$@"\n' "$tmp/wrapper-ran" > "$stage/.source-extra/w.sh"
+chmod 755 "$stage/.source-extra/w.sh"
+printf '[build]\nrustc-wrapper = "%s"\n' "$stage/.source-extra/w.sh" > "$stage/.source-extra/.cargo-config"
+mkdir -p "$stage/.source-extra/.cargo"
+mv "$stage/.source-extra/.cargo-config" "$stage/.source-extra/.cargo/config.toml"
+pack_release
+rm -f "$tmp/wrapper-ran"
+check --no-exec --dry-run --no-tree "$rel" > /dev/null 2>&1 || true
+[ ! -e "$tmp/wrapper-ran" ] && pass "--no-exec: the source archive's rustc wrapper did not run" || flunk "--no-exec: the source archive's rustc wrapper ran"
+check --dry-run --no-tree "$rel" > /dev/null 2>&1 || true
+[ -e "$tmp/wrapper-ran" ] && pass "(without --no-exec the same wrapper does run: the hazard is real)" || flunk "(without --no-exec the wrapper did not run: the test is stale)"
+# and a downloaded binary is not run: a binary that leaves a mark when run
+new_case 0.9.0
+for d in "$stage"/fil-0.9.0-x86_64-linux-musl "$stage"/fil-0.9.0-aarch64-linux-musl "$stage"/fil-0.9.0-universal-apple-darwin; do
+  for b in "$d/bin/fil" "$d"/libexec/fil/remote/*/fil; do
+    perl -pi -e 's|^echo "fil|touch "'"$tmp"'/binary-ran"\necho "fil|' "$b"
+  done
+  (cd "$d/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS)
+done
+pack_release
+rm -f "$tmp/binary-ran"
+check --no-exec --dry-run --no-tree "$rel" > /dev/null 2>&1 || true
+[ ! -e "$tmp/binary-ran" ] && pass "--no-exec: no downloaded binary was run" || flunk "--no-exec: a downloaded binary was run"
+check --dry-run --no-tree "$rel" > /dev/null 2>&1 || true
+[ -e "$tmp/binary-ran" ] && pass "(without --no-exec a binary of this machine's kind is run: the hazard is real)" || flunk "(without --no-exec nothing ran: the test is stale)"
 
 # SHA256SUMS
 new_case 0.9.0
@@ -333,6 +427,20 @@ git -C "$tree" commit -q -am "wire bump"
 stage_release
 pack_release
 expect_fail "mutation: a patch release changes the wire" check --tag v0.9.1 --no-tree "$rel"
+
+# sums_check must not be fooled by a checksum file with no well-formed line (macOS's sha256sum -c exits 0)
+mkdir -p "$tmp/sc"
+echo data > "$tmp/sc/f"
+printf '%s  f\n' "$(sha256 "$tmp/sc/f")" > "$tmp/sc/good"
+expect_pass "sums_check accepts a correct file" sums_check "$tmp/sc" good
+echo "abc  f" > "$tmp/sc/short"
+expect_fail "mutation: a checksum file with a malformed line passes sums_check" sums_check "$tmp/sc" short
+: > "$tmp/sc/empty"
+expect_fail "mutation: an empty checksum file passes sums_check" sums_check "$tmp/sc" empty
+printf '%s  missing\n' "$(sha256 "$tmp/sc/f")" > "$tmp/sc/missing"
+expect_fail "mutation: a listed file that does not exist passes sums_check" sums_check "$tmp/sc" missing
+printf '%s  f\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$tmp/sc/wrong"
+expect_fail "mutation: a wrong digest passes sums_check" sums_check "$tmp/sc" wrong
 
 # ============================================================== 4b. the in-workflow tag checks (prepare.sh)
 echo "== prepare.sh (the tag checks that are NOT the gate)"
@@ -381,6 +489,7 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   pk "$tmp/r2" > /dev/null 2>&1
   expect_pass "two assemblies of the same inputs give byte-identical SHA256SUMS" cmp "$tmp/r1/SHA256SUMS" "$tmp/r2/SHA256SUMS"
   # mutation: leave the tar mtimes alone
+  trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh"' EXIT INT TERM
   sed 's/--mtime="@\$SOURCE_DATE_EPOCH" //' "$RELEASE_DIR/package.sh" > "$RELEASE_DIR/.package-mutant.sh"
   chmod +x "$RELEASE_DIR/.package-mutant.sh"
   if cmp -s "$RELEASE_DIR/package.sh" "$RELEASE_DIR/.package-mutant.sh"; then flunk "mutation 'mtimes' did not change package.sh (the test is stale)"; fi

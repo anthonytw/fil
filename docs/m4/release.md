@@ -286,27 +286,28 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 ### 9.2 The owner's steps for one release
 
-1. **Candidate.** Run the dry run from `main` (`gh workflow run release.yml --ref main`), then rebuild it in the VM: `just release-verify VERSION --dry-run --from-run RUN --ref SHA` (§9.3).
-2. **Tag.** On a clean `main` at the release commit, with the version and `CHANGELOG.md` already merged, make an annotated, SSH-signed tag with the release key (`git config gpg.format ssh`, `user.signingkey` naming the key) and push that one tag:
+**The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
+
+0. **Once: the key goes into the repository.** Before the first release, a PR adds the key's public half to `.github/release-signers` on `main`, two lines (`namespaces="git"` for the tag and `namespaces="fil-release"` for the checksums; the file shows the form), reviewed by a code owner (`.github/CODEOWNERS`, with the "require review from Code Owners" ruleset setting). Until then the file is a placeholder with no key: `release-verify` stops at the tag, and the workflow warns. Publish the key's fingerprint out of band (README, site) so that verifiers can check `.github/release-signers` against it; a verifier may keep its own copy and name it in `FIL_RELEASE_SIGNERS`.
+1. **Candidate.** Run the dry run from `main` (`gh workflow run release.yml --ref main`), then rebuild it in the VM: `just release-verify VERSION --dry-run --from-run RUN --ref SHA` (a commit SHA; §9.3). Nothing from the download is run on the owner's machine in this mode either.
+2. **Tag.** On a clean `main` at the release commit, with the version and `CHANGELOG.md` already merged, make an annotated tag signed with the release key and push that one tag:
 
    ```sh
-   git tag -s vX.Y.Z -m "fil X.Y.Z"
+   git -c gpg.format=ssh -c user.signingkey=~/.ssh/fil-release.pub tag -s vX.Y.Z -m "fil X.Y.Z"
    git push origin vX.Y.Z
    ```
 
-   The workflow builds the draft.
-3. **Verify.** `just release-verify X.Y.Z`. It downloads the draft, verifies the tag against `.github/release-signers` **on main**, verifies the attestations (`gh attestation verify FILE --repo anthonytw/fil --signer-workflow anthonytw/fil/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z`), runs `release-check --tag vX.Y.Z --complete`, and rebuilds every Linux binary and all four archives in the VM and compares hashes with the draft's. Before step 4 it reports the missing `SHA256SUMS.sig` as its one expected failure.
-4. **Sign, offline.** Download `SHA256SUMS` from the draft (`gh release download vX.Y.Z -p SHA256SUMS`), and on the machine that holds the key:
+   The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
+3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries and the four archives from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
+4. **Sign the verified file.** Sign the copy that step 3 verified (`target/release-verify/X.Y.Z/files/SHA256SUMS`), not a fresh download, because any writer can replace draft assets in between:
 
    ```sh
-   ssh-keygen -Y sign -f ~/.ssh/fil-release -n fil-release SHA256SUMS      # writes SHA256SUMS.sig
-   gh release upload vX.Y.Z SHA256SUMS.sig
-   just release-verify X.Y.Z                                              # now everything passes
-   gh release edit vX.Y.Z --draft=false                                   # publish
+   ssh-keygen -Y sign -f ~/.ssh/fil-release -n fil-release target/release-verify/X.Y.Z/files/SHA256SUMS
+   gh release upload vX.Y.Z target/release-verify/X.Y.Z/files/SHA256SUMS.sig
+   just release-verify X.Y.Z                       # now the signature is checked too
+   gh release edit vX.Y.Z --draft=false            # publish
+   just release-verify X.Y.Z --no-rebuild          # once more, on what is published
    ```
-
-   The key never leaves that machine; CI has no signing key and no secret.
-5. **The key (OQ-2).** The release key's public half goes into `.github/release-signers` on `main` as two lines (`namespaces="git"` for the tag and `namespaces="fil-release"` for the checksums; see the file) in a PR. Until then the file is a placeholder with no key: `release-verify` fails on the tag and the signature, and the workflow says so in a warning.
 
 ### 9.3 The rebuild VM
 

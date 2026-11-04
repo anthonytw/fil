@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # The rebuild half of `just release-verify`. It runs INSIDE the Linux VM and is piped there by
-# verify.sh (so the script that judges a release is the verifier's own, not the tag's):
+# verify.sh. The COMPARISON with the release is the verifier's own (verify.sh runs on the owner's
+# machine); the BUILD RECIPE is not: build-binary.sh, package.sh and Cross.toml's image pins come
+# from the commit that is rebuilt. That is acceptable because release-verify has first checked that
+# the commit is on main (reviewed code), and because a recipe that built something else would not
+# reproduce what CI attested for that same commit.
 #
-#   bash -s -- REPO_URL REF WORKDIR_UNDER_HOME < rebuild.sh
+#   bash -s -- REPO_URL COMMIT WORKDIR_UNDER_HOME < rebuild.sh
 #
-# It clones REPO_URL at REF into WORKDIR/src, builds both Linux binaries in the digest-pinned
-# `cross` images with the tree's own build-binary.sh, takes the macOS binary from
+# It clones REPO_URL, checks out the COMMIT (a SHA: never a name that can move), builds both Linux
+# binaries in the digest-pinned `cross` images, takes the macOS binary from
 # WORKDIR/in/universal-apple-darwin/fil (sent by verify.sh: it comes from the release, so the
-# macOS binary is the one input not rebuilt) and assembles the archives with the tree's package.sh.
-# The result is in WORKDIR/out. Written for Ubuntu on aarch64 with Docker, rustup and amd64
-# emulation (Rosetta: docs/m4/release.md section 9.3).
+# macOS binary is the one input not rebuilt) and assembles the four archives. The result is in
+# WORKDIR/out. Written for Ubuntu on aarch64 with Docker, rustup and amd64 emulation (Rosetta:
+# docs/m4/release.md section 9.3).
 set -euo pipefail
 
 repo=$1 ref=$2

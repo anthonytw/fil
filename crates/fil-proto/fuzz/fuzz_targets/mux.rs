@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         if let Some(e) = &failed {
-            // No resynchronisation: it answers the same error to anything more.
+            // No resynchronization: it answers the same error to anything more.
             assert_eq!(dec.push(&mut &[0u8, 1][..]).unwrap_err(), *e);
             break;
         }

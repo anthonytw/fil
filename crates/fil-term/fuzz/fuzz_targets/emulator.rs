@@ -5,12 +5,15 @@
 //! no control characters other than the escape sequences it is made of (it is sent to the
 //! client's terminal).
 //!
-//! The snapshot is not required to restore the state exactly: the writer has known gaps (see
-//! the end of the module comment of `fil_term::snapshot`) that arbitrary input finds at once,
-//! and the fidelity suite owns that comparison. What is checked is the shape of the restored
-//! state: its size and the number of its rows.
+//! The snapshot is not required to restore the state of the first emulator exactly: the writer
+//! has known gaps (see the end of the module comment of `fil_term::snapshot`) that arbitrary
+//! input finds at once, and the fidelity suite owns that comparison. So the first generation is
+//! checked for shape only (its size and the number of its rows). The second generation is
+//! checked exactly: a snapshot of the restored state, fed to another fresh emulator, must give
+//! that same state (`TermState` equality). A state the writer can restore once, it must restore
+//! the same way again.
 //!
-//! Why two columns at least: a terminal of ONE column and a wide character (the three bytes of
+//! Why the sizes are two columns wide at least: a terminal of ONE column and a wide character (the three bytes of
 //! "\u{5b66}" after a resize to one column are enough) make alacritty_terminal 0.26 allocate
 //! without end (20 GB resident in a release build within a minute). `TermSize::new(1, n)` is a
 //! valid size on the wire, so a client that asks for it can do that to the daemon; this was
@@ -18,8 +21,8 @@
 //! take the floor out and the target covers one column again.
 //!
 //! Input: `cols rows history resize_cols resize_rows split` then the bytes. The sizes are small
-//! (the grid is the cost) and at least two columns wide (see below); `split` is where the second feed starts, as a
-//! fraction of the bytes.
+//! (the grid is the cost) and never under two columns (see above); `split` is where the second
+//! feed starts, as a fraction of the bytes.
 
 #![no_main]
 
@@ -74,4 +77,15 @@ fuzz_target!(|data: &[u8]| {
     let back = fresh.state(history);
     assert_eq!(back.size, state.size);
     assert_eq!(back.screen.len(), state.screen.len());
+
+    // The second generation, exactly.
+    let snap2 = snapshot(&back);
+    let mut again = create("alacritty", resized, history).unwrap();
+    again.feed(&snap2);
+    again.apply_pending();
+    assert_eq!(
+        again.state(history),
+        back,
+        "a snapshot of a restored state restores differently"
+    );
 });

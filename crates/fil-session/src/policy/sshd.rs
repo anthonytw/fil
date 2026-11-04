@@ -501,6 +501,14 @@ impl Parser<'_> {
             } else {
                 self.base.join(pattern)
             };
+            if self.files >= MAX_FILES {
+                // The cap is reached: fil reads no more files, so it does not list the
+                // directories for them either (every further `Include` would cost a glob and a
+                // stamp for each directory, and a config can hold thousands of them). The
+                // pattern is reported as not read, which marks the mirror incomplete.
+                self.unreadable.push(pattern);
+                continue;
+            }
             let g = glob(&pattern);
             self.watched.extend(g.dirs);
             self.unreadable.extend(g.unlistable);
@@ -1712,6 +1720,36 @@ mod tests {
             panic!("{r:?}")
         };
         assert_eq!(s.unreadable, vec![dir.join("conf.d")]);
+    }
+
+    /// The fuzzer's finding on the file cap: past it, each `Include` line still globbed and
+    /// stamped the directories, so a short config of `Include` lines cost seconds. Now the
+    /// patterns past the cap are reported as unread and nothing is listed for them.
+    #[test]
+    fn includes_past_the_file_cap_cost_nothing_and_mark_the_mirror_incomplete() {
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("conf.d")).unwrap();
+        for i in 0..=MAX_FILES + 10 {
+            std::fs::write(dir.join(format!("conf.d/{i:04}.conf")), "# nothing\n").unwrap();
+        }
+        let lines = 3000;
+        let mut text = String::new();
+        for _ in 0..lines {
+            text.push_str("Include conf.d/*.conf\n");
+        }
+        text.push_str("AllowTcpForwarding no\n");
+        std::fs::write(dir.join("sshd_config"), text).unwrap();
+        let (r, watched) = read(&dir.join("sshd_config"), &me());
+        let Sshd::Mirrored(s) = r else {
+            panic!("{r:?}")
+        };
+        // The first glob truncates at the cap (reported), and the other lines are reported
+        // without a listing: the directory is watched once and each file once.
+        assert!(s.unreadable.len() >= lines, "{}", s.unreadable.len());
+        assert!(watched.len() <= MAX_FILES + 8, "{} stamps", watched.len());
+        // What fil could read is still enforced.
+        assert!(s.tcp.values.iter().any(|(t, _)| *t == Tcp::No));
     }
 
     /// The recursive matchers this module had: exponential in the stars, and the reference the

@@ -2,7 +2,7 @@
 # (it needs a nightly toolchain):
 #   just fuzz TARGET SECONDS             (from the repository root; `just fuzz` lists the targets)
 #   cargo +nightly fuzz run TARGET fuzz/corpus/TARGET fuzz/seeds/TARGET   (from crates/fil-proto)
-# The seeds in seeds/ are derived from tests/golden/wire.txt by seed-corpus.sh.
+# The seeds in seeds/ are derived from tests/golden/wire.txt by seed-corpus.py.
 [package]
 name = "fil-proto-fuzz"
 version = "0.0.0"

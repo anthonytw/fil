@@ -17,6 +17,8 @@ use fil_session::policy::sshd::{self, Sshd};
 use libfuzzer_sys::fuzz_target;
 
 /// The scratch directory, made once per process: the main config, and files for it to include.
+/// Removed when the process exits normally (a time limit, a stop); after a crash it stays, in
+/// the temporary directory (`just fuzz` gives the run one of its own and removes it).
 fn scratch() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -37,8 +39,15 @@ fn scratch() -> &'static Path {
             "PermitListen 8080 [::1]:9090\nDisableForwarding no\n",
         );
         w("conf.d/.hidden.conf", "DisableForwarding yes\n");
+        // SAFETY: `remove_scratch` only removes a directory; registering it is the one call.
+        unsafe { libc::atexit(remove_scratch) };
         dir
     })
+}
+
+extern "C" fn remove_scratch() {
+    let dir = std::env::temp_dir().join(format!("fil-fuzz-sshd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// `text` with the parts of `Include` lines that could leave the scratch directory made inert.

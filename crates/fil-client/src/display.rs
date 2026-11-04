@@ -5,20 +5,35 @@
 //! and returns what to write: erase what the overlay drew, the server's bytes **unchanged**,
 //! then redraw the overlay. With nothing drawn, the result is exactly the server's bytes.
 //!
-//! Prediction is M3 and is not enabled: the overlay gets a predictor that never predicts. The
-//! hooks it will need are wired already: [`Display::input`] (keystrokes) and
-//! [`Display::set_pty_mode`] (`PtyMode`, applied in order with the output). `EchoAck` is not
-//! asked for until M3 (the attach says `echo_ack: false`).
+//! The overlay core is also where the predictor sits (`docs/m3/plan.md` §2.2). The engine gives
+//! the display everything prediction is ordered by: keystrokes with the input offsets the session
+//! gives them and where they came from ([`Display::input`]), `PtyMode` and `EchoAck` once the
+//! output below their offsets has been applied ([`Display::set_pty_mode`],
+//! [`Display::echo_ack`]), the link's status ([`Display::set_link`]), the lifecycle
+//! ([`Display::resumed`], [`Display::withdraw`], [`Display::reset`],
+//! [`Display::rebase_input`]) and the clock ([`Display::tick`] at [`Display::next_deadline`]).
 
 use std::time::Duration;
 
 use fil_predict::{
-    Config, Ctx, InputKind, InputPos, KeyEvent, Overlay, OverlayEdit, Placement, Predictor,
-    PtyMode, Settled, Show, Status, Time,
+    Config, Ctx, InputKind, InputPos, KeyEvent, LinkView, MoshConfig, MoshPredictor, Overlay,
+    OverlayEdit, Placement, PredictStats, Predictor, PtyMode, Settled, Show, Status, Time,
+    WithdrawReason,
 };
 use fil_term::model::{CursorShape, MouseEncoding, MouseTracking};
 use fil_term::{Backend, Size, TermState};
 use tokio::time::Instant;
+
+use crate::config::Predict;
+
+/// The marker a build with the test-only guards seam carries (`ClientConfig::predict_guards`):
+/// `just no-test-hooks` fails on any `FIL_TEST_` string in a binary.
+#[cfg(feature = "test-hooks")]
+pub const TEST_GUARDS_MARKER: &str = "FIL_TEST_PREDICT_GUARDS";
+
+/// The shortest wait between two ticks: a deadline the overlay has already passed (a predictor's
+/// own, which the core does not check) does not spin the loop.
+const MIN_TICK: Duration = Duration::from_millis(5);
 
 /// A predictor that never predicts: M1's stand-in for the real one.
 #[derive(Debug, Default)]
@@ -48,13 +63,27 @@ impl Predictor for NoPrediction {
     }
 }
 
-/// Makes a predictor for each new shadow screen (a snapshot starts a new one).
+/// Makes the predictor for a display. (A snapshot resets it, `Predictor::reset`.)
 pub type PredictorFactory = Box<dyn Fn() -> Box<dyn Predictor> + Send>;
+
+/// The predictor factory for a setting: none for [`Predict::Off`], the default predictor
+/// otherwise. `Adaptive` shows guesses only above the predictor's round-trip threshold; `Always`
+/// at any round-trip time.
+pub fn predictor_factory(predict: Predict) -> Option<PredictorFactory> {
+    let cfg = match predict {
+        Predict::Off => return None,
+        Predict::Adaptive => MoshConfig::default(),
+        Predict::Always => MoshConfig {
+            rtt_threshold: Duration::ZERO,
+            ..MoshConfig::default()
+        },
+    };
+    Some(Box::new(move || Box::new(MoshPredictor::new(cfg))))
+}
 
 pub struct Display {
     overlay: Overlay,
     backend: Backend,
-    make_predictor: PredictorFactory,
     predicting: bool,
     placement: Placement,
     size: Size,
@@ -66,9 +95,8 @@ pub struct Display {
     kitty_used: bool,
     /// The last bytes of the stream, so a sequence cut between two reads is still seen.
     kitty_tail: Vec<u8>,
-    /// The input offset of the next keystroke given to the overlay. A stand-in until the engine
-    /// passes the session's own offsets (`docs/m3/plan.md` §3 E1a).
-    input_at: InputPos,
+    /// When the overlay was last ticked.
+    last_tick: Time,
 }
 
 impl Display {
@@ -78,14 +106,28 @@ impl Display {
         placement: Placement,
         make_predictor: Option<PredictorFactory>,
     ) -> Self {
+        Self::with_config(backend, size, placement, make_predictor, Config::default())
+    }
+
+    /// [`Display::new`] with the overlay core's configuration. Only tests change its guards.
+    pub fn with_config(
+        backend: Backend,
+        size: Size,
+        placement: Placement,
+        make_predictor: Option<PredictorFactory>,
+        cfg: Config,
+    ) -> Self {
         let predicting = make_predictor.is_some();
-        let make_predictor: PredictorFactory =
-            make_predictor.unwrap_or_else(|| Box::new(|| Box::new(NoPrediction)));
-        let overlay = Self::overlay_for(&backend, size, &make_predictor);
+        let predictor: Box<dyn Predictor> = match &make_predictor {
+            Some(make) => make(),
+            None => Box::new(NoPrediction),
+        };
+        // No history: the shadow only needs the screen. Synchronized output stays on: a terminal
+        // that does not know the mode ignores it, and one that does never shows a half state.
+        let overlay = Overlay::with_backend(&backend, size, 0, predictor, cfg);
         Self {
             overlay,
             backend,
-            make_predictor,
             predicting,
             placement,
             size,
@@ -93,30 +135,45 @@ impl Display {
             pty: PtyMode::default(),
             kitty_used: false,
             kitty_tail: Vec::new(),
-            input_at: 0,
+            last_tick: Duration::ZERO,
         }
-    }
-
-    fn overlay_for(backend: &Backend, size: Size, make: &PredictorFactory) -> Overlay {
-        // No history: the shadow only needs the screen. Synchronized output stays on: a terminal
-        // that does not know the mode ignores it, and one that does never shows a half state.
-        Overlay::with_backend(backend, size, 0, make(), Config::default())
     }
 
     fn now(&self) -> Time {
         self.start.elapsed()
     }
 
+    /// True when a predictor runs (the attach asks for `EchoAck`).
+    pub fn predicting(&self) -> bool {
+        self.predicting
+    }
+
     /// Starts again with a blank shadow screen: a snapshot is about to be written, and it
     /// begins by clearing the screen, so the terminal and the shadow agree again once it lands.
     /// Anything the overlay had drawn must have been erased first (the caller does not need to:
-    /// the snapshot clears the screen).
+    /// the snapshot clears the screen, the status lines with it; the caller draws them again).
     ///
-    /// The PTY's mode is not a property of the screen, so it is kept (a password prompt stays a
-    /// password prompt across a snapshot).
+    /// For prediction it is a `Snapshot` boundary (`docs/m3/plan.md` §2.4 rule 3): no epoch
+    /// survives it, what was written is classified once the snapshot has landed, and the
+    /// predictor is reset. The input offsets, the acknowledgements, the link and the trust in the
+    /// screen after a resize are not properties of the screen, and are kept; a fresh attach
+    /// rebases the offsets with [`Display::rebase_input`].
+    ///
+    /// The PTY's mode is not a property of the screen either, so it is kept (a password prompt
+    /// stays a password prompt across a snapshot).
     pub fn reset(&mut self) {
-        self.overlay = Self::overlay_for(&self.backend, self.size, &self.make_predictor);
+        // The snapshot clears what was drawn; nothing is erased first.
+        let _ = self.overlay.set_status(None);
+        let now = self.now();
+        let shadow = (self.backend.create)(self.size, 0);
+        self.overlay.reset(shadow, now);
         let _ = self.overlay.set_pty_mode(self.pty);
+    }
+
+    /// A fresh attach: the session's input offsets start again at 0 (DESIGN.md §8.5). Call it
+    /// right after [`Display::reset`] for the attach's snapshot.
+    pub fn rebase_input(&mut self) {
+        self.overlay.rebase_input();
     }
 
     /// True once after the core held a guess it would have written on a screen a resize left
@@ -217,17 +274,89 @@ impl Display {
         self.overlay.on_server(bytes, now).to_bytes()
     }
 
-    /// Keystrokes the user typed (prediction hook; a no-op while nothing predicts).
-    pub fn input(&mut self, bytes: &[u8]) -> Vec<u8> {
+    /// Bytes for the session's input stream at input offset `at` (the offset the bytes get in the
+    /// terminal channel, DESIGN.md §8.5), and where they came from: only typed, live input is
+    /// predicted (`docs/m3/plan.md` §2.4 rule 6). Returns what to write.
+    ///
+    /// Bytes that never reach the session (an answer to the client's own question, an escape)
+    /// are given as [`InputKind::Answer`] at the offset the next byte will have: they are a
+    /// boundary, and the next byte the session does get realigns the offsets.
+    pub fn input(&mut self, bytes: &[u8], at: InputPos, kind: InputKind) -> Vec<u8> {
         if !self.predicting {
             return Vec::new();
         }
         let now = self.now();
-        let at = self.input_at;
-        self.input_at += bytes.len() as u64;
-        self.overlay
-            .on_input(bytes, at, InputKind::Typed, now)
-            .to_bytes()
+        self.overlay.on_input(bytes, at, kind, now).to_bytes()
+    }
+
+    /// An `EchoAck` (DESIGN.md §8.5), once the output below its `output_at` has been applied.
+    /// The caller has checked that `input_upto` is within the input sent.
+    pub fn echo_ack(&mut self, input_upto: InputPos) -> Vec<u8> {
+        if !self.predicting {
+            return Vec::new();
+        }
+        let now = self.now();
+        self.overlay.on_echo_ack(input_upto, now).to_bytes()
+    }
+
+    /// The link's status (`LinkStatus`): the predictor's round-trip hint, and whether a guess
+    /// that does not settle is withdrawn by the backstop (link down) or expired.
+    pub fn set_link(&mut self, link: LinkView) {
+        self.overlay.set_link(link);
+    }
+
+    /// A resume or a swap: the next key is a `Resumed` boundary. Input offsets continue.
+    pub fn resumed(&mut self) {
+        self.overlay.resumed();
+    }
+
+    /// Withdraws every guess at once, for a lifecycle event (`docs/m3/plan.md` §2.6), before any
+    /// question or message is drawn. Returns what to write.
+    pub fn withdraw(&mut self, reason: WithdrawReason) -> Vec<u8> {
+        self.overlay.withdraw(reason).to_bytes()
+    }
+
+    /// When [`Display::tick`] should next be called, if ever.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let t = self.overlay.next_deadline()?;
+        Some(self.start + t.max(self.last_tick + MIN_TICK))
+    }
+
+    /// Time passed: the core settles what is due (the late-echo grace, the backstop) and the
+    /// predictor's timers run. Returns what to write.
+    pub fn tick(&mut self) -> Vec<u8> {
+        let now = self.now();
+        let due = self.overlay.next_deadline().is_some_and(|t| t <= now);
+        if !due {
+            return Vec::new();
+        }
+        self.last_tick = now;
+        self.overlay.on_tick(now).to_bytes()
+    }
+
+    /// A snapshot rendered at the client's current size has landed (after [`Display::reset`] and
+    /// its bytes): the screen can be trusted again. A request for a repaint that it answers is
+    /// dropped.
+    pub fn repainted(&mut self) {
+        self.overlay.repainted();
+        let _ = self.overlay.take_repaint_request();
+    }
+
+    /// A snapshot rendered at an older size than the client's has landed: it drew a whole
+    /// screen at a size the terminal no longer has, so the screen is not trusted until one at
+    /// the current size lands (nothing is written meanwhile). Returns what to write.
+    pub fn untrusted(&mut self) -> Vec<u8> {
+        self.overlay.resize(self.size).to_bytes()
+    }
+
+    /// True while a resize has left the screen untrusted for the overlay.
+    pub fn trusted(&self) -> bool {
+        self.overlay.trusted()
+    }
+
+    /// What the prediction core has counted (counts only, `docs/m3/plan.md` §2.5, §4.3).
+    pub fn stats(&self) -> PredictStats {
+        self.overlay.stats()
     }
 
     /// The user's terminal changed size.

@@ -21,7 +21,9 @@
 //!   [`consent`] holds the rules for what the remote host may ask of this machine.
 //! - [`Display`]: the server's bytes plus the client's own text (the disconnect status line,
 //!   notices and prompts), drawn on `fil-predict`'s overlay core so it never corrupts the screen
-//!   or the scrollback. It is also where a predictor will sit (M3).
+//!   or the scrollback, and where the predictor sits (M3): [`ClientConfig::predict`] picks it
+//!   ([`predictor_factory`]), and the engine gives it the input offsets, `PtyMode`, `EchoAck`,
+//!   the link and the lifecycle in order with the output.
 //!
 //! What the loop expects of the daemon, beyond `fil-proto`, is in [`engine`]'s module docs.
 
@@ -41,11 +43,11 @@ pub mod tty;
 
 pub use agent::AgentRelay;
 pub use config::{
-    Backoff, ClientConfig, ClientError, ForwardFailure, ForwardSet, Outcome, Reconnect,
+    Backoff, ClientConfig, ClientError, ForwardFailure, ForwardSet, Outcome, Predict, Reconnect,
     RemoteRequests,
 };
 pub use dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
-pub use display::{Display, NoPrediction, PredictorFactory};
+pub use display::{Display, NoPrediction, PredictorFactory, predictor_factory};
 pub use escape::{Action, EscapeFilter};
 pub use forward::BindReport;
 pub use offline::{OfflineBuffer, OfflineInput, OfflineLog, parse_byte_size, parse_confirm};
@@ -66,7 +68,8 @@ where
     run_with(dialer, term, cfg, None).await
 }
 
-/// [`run`] with a predictor for the shadow screen. M1 passes none; M3 passes the real one.
+/// [`run`] with a predictor for the shadow screen. With `None` the predictor is the one
+/// [`ClientConfig::predict`] names ([`predictor_factory`]: none for `Off`).
 pub async fn run_with<D, I, O>(
     mut dialer: D,
     term: Terminal<I, O>,
@@ -78,6 +81,7 @@ where
     I: TermInput,
     O: TermOutput,
 {
+    let predictor = predictor.or_else(|| predictor_factory(cfg.predict));
     let mut core = engine::Core::new(term, cfg, predictor)?;
     core.run(&mut dialer).await
 }

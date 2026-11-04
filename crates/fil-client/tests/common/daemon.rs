@@ -92,6 +92,21 @@ struct Conn {
     control: MemControl,
 }
 
+/// What the scripted program does with the keys it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    /// Nothing (the tests script the output themselves).
+    Off,
+    /// Echoes them, then the daemon sends the `EchoAck` that covers them.
+    Faithful,
+    /// The `EchoAck` is sent ahead of the echo: QUIC, where control overtakes data.
+    AckFirst,
+    /// Echoes nothing (a silent read), and still acknowledges them.
+    Silent,
+    /// Echoes them and sends no `EchoAck` (not yet).
+    NoAck,
+}
+
 pub struct DState {
     epoch: SessionEpoch,
     log: OutputLog,
@@ -131,6 +146,15 @@ pub struct DState {
     /// Keystrokes are taken in but not acknowledged (a slow PTY reader): the client's send window
     /// fills. The acknowledgement goes out with the next keystroke after this is cleared.
     withhold_input_acks: bool,
+    /// The program echoes every key it is given (a CR as CR LF, a DEL as `\b \b`), and the
+    /// daemon sends an `EchoAck` for it after the output, as the real one does an echo window
+    /// after the PTY took the keys (DESIGN.md section 8.5).
+    echo: Echo,
+    /// Every `EchoAck` sent: `(input_upto, output_at)`.
+    pub echo_acks: Vec<(u64, u64)>,
+    /// An attach answered with a snapshot sends an `EchoAck` at the snapshot's point ahead of the
+    /// snapshot's bytes (control overtakes channel 2).
+    echo_ack_in_attach_snapshot: bool,
     /// Direct-mode details for the reply.
     direct: Option<(u16, Vec<u8>)>,
     /// The reply says server policy refuses the agent.
@@ -269,6 +293,9 @@ impl FakeDaemon {
                 cut_snapshot: None,
                 lose_input: false,
                 withhold_input_acks: false,
+                echo: Echo::Off,
+                echo_acks: Vec::new(),
+                echo_ack_in_attach_snapshot: false,
                 direct: None,
                 agent_refused: None,
                 data_before_reply: false,
@@ -459,6 +486,9 @@ impl FakeDaemon {
                         });
                     }
                     st.input_all.extend_from_slice(&fresh);
+                    if st.echo != Echo::Off && !fresh.is_empty() {
+                        me.echo(&mut st, &fresh).await;
+                    }
                     let upto = st.input_rx.received();
                     if st.withhold_input_acks {
                         continue;
@@ -648,6 +678,10 @@ impl FakeDaemon {
             resume_sent = true;
         }
         if let Some(mut bytes) = snapshot_bytes {
+            if st.echo_ack_in_attach_snapshot {
+                let ack = (st.input_rx.received(), st.log.end());
+                self.send_echo_ack(st, ack).await;
+            }
             if let Some(d) = st.snapshot_delay {
                 tokio::time::sleep(d).await;
             }
@@ -1736,6 +1770,191 @@ impl FakeDaemon {
 
     pub async fn set_send_input_resume(&self, on: bool) {
         self.st.lock().await.send_input_resume = on;
+    }
+
+    // ---- echo and `EchoAck` (prediction) -------------------------------------------------------
+
+    /// What the program does with the keys from now on.
+    pub async fn set_echo(&self, echo: Echo) {
+        self.st.lock().await.echo = echo;
+    }
+
+    /// The program's echo of `keys`, and the daemon's `EchoAck` for them.
+    async fn echo(&self, st: &mut DState, keys: &[u8]) {
+        let mut out = Vec::new();
+        if st.echo != Echo::Silent {
+            for &b in keys {
+                match b {
+                    b'\r' => out.extend_from_slice(b"\r\n"),
+                    0x7f => out.extend_from_slice(b"\x08 \x08"),
+                    _ => out.push(b),
+                }
+            }
+        }
+        st.log.append(&out);
+        st.emu.feed(&out);
+        let ack = (st.input_rx.received(), st.log.end());
+        if st.echo == Echo::NoAck {
+            self.pump(st).await;
+        } else if st.echo == Echo::AckFirst {
+            self.send_echo_ack(st, ack).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.pump(st).await;
+        } else {
+            self.pump(st).await;
+            self.send_echo_ack(st, ack).await;
+        }
+    }
+
+    async fn send_echo_ack(&self, st: &mut DState, (input_upto, output_at): (u64, u64)) {
+        st.echo_acks.push((input_upto, output_at));
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(
+                &c.link,
+                &ControlMsg::EchoAck {
+                    input_upto,
+                    output_at,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Attaches answered with a snapshot send an `EchoAck` at its point ahead of its bytes.
+    pub async fn set_echo_ack_in_attach_snapshot(&self, on: bool) {
+        self.st.lock().await.echo_ack_in_attach_snapshot = on;
+    }
+
+    /// Sends an `EchoAck` as given: a hostile or broken daemon.
+    pub async fn echo_ack(&self, input_upto: u64, output_at: u64) {
+        let mut st = self.st.lock().await;
+        self.send_echo_ack(&mut st, (input_upto, output_at)).await;
+    }
+
+    /// The `EchoAck`s sent so far.
+    pub async fn echo_acks(&self) -> Vec<(u64, u64)> {
+        self.st.lock().await.echo_acks.clone()
+    }
+
+    /// The input offset the current subscriber's stream has reached (what `EchoAck` counts).
+    pub async fn input_received(&self) -> u64 {
+        self.st.lock().await.input_rx.received()
+    }
+
+    /// The end of the output log (the offset the next output byte gets).
+    pub async fn output_end(&self) -> u64 {
+        self.st.lock().await.log.end()
+    }
+
+    /// A `PtyMode` at an output offset of the test's choosing (one the output may never reach).
+    pub async fn pty_mode_at(&self, canonical: bool, echo: bool, at: u64) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let msg = ControlMsg::PtyMode {
+                canonical,
+                echo,
+                at,
+            };
+            let _ = send(&c.link, &msg).await;
+        }
+    }
+
+    /// A catch-up over `skip` announced now, its bytes returned to be sent later with
+    /// [`FakeDaemon::send_snapshot`]: a snapshot still on its way over a slow link. With `gap`,
+    /// the announcement is not sent either: `gap` is sent past the skip on the terminal channel
+    /// first (QUIC, the announcement overtaken), and [`FakeDaemon::announce`] sends it later.
+    pub async fn catch_up_staged(
+        &self,
+        skip: &[u8],
+        gap: Option<&[u8]>,
+    ) -> (SnapshotInfo, Vec<u8>) {
+        let mut st = self.st.lock().await;
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let link = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+            .expect("a link");
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+        let at = st.log.end();
+        st.flows.insert(key_of(&link), at);
+        st.pending_jump = Some(at);
+        st.sent = at;
+        st.snapshots += 1;
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: skip.len() as u64,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
+        };
+        match gap {
+            Some(after) => {
+                st.log.append(after);
+                st.emu.feed(after);
+                self.pump(&mut st).await;
+            }
+            None => {
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            }
+        }
+        (info, bytes)
+    }
+
+    /// Sends `data` as a terminal segment at `seq`, whatever the log holds there: a daemon that
+    /// lies about its output.
+    pub async fn send_segment(&self, seq: u64, data: &[u8]) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let seg = Segment {
+                seq,
+                data: data.to_vec(),
+            };
+            let _ = c
+                .link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    /// Sends a staged catch-up's announcement.
+    pub async fn announce(&self, info: SnapshotInfo) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(&c.link, &ControlMsg::Snapshot(info)).await;
+        }
+    }
+
+    /// Sends a staged catch-up's bytes.
+    pub async fn send_snapshot(&self, bytes: &[u8]) {
+        let st = self.st.lock().await;
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    /// The current link reports this round-trip time (`LinkStatus.rtt`).
+    pub async fn set_rtt(&self, rtt: Duration) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            c.control.set_rtt(rtt);
+        }
     }
 }
 

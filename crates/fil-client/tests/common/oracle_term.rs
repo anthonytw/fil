@@ -422,6 +422,10 @@ pub enum Predict {
     /// core must stop it: the password rule, and since C1 its epochs (a guess is written only in
     /// an epoch the core has confirmed), which hold even with the daemon's `PtyMode` withheld.
     Eager,
+    /// A hostile predictor that hides each written guess from the `EchoAck` that would show it
+    /// unechoed: it appends a guess for every printable key and withdraws it 20 ms later, before
+    /// the ack can come (review B2a of C1). The core makes the epoch tentative on the withdrawal.
+    Withdrawing,
 }
 
 /// What the predictor side saw: counted from the edits it returned and from what the core told
@@ -439,6 +443,9 @@ pub struct AdapterStats {
     pub mispredicted: u64,
     /// Guesses the core withdrew (a boundary, a backspace over one, a lifecycle event).
     pub withdrawn: u64,
+    /// Calls whose context carried a round-trip estimate from the link itself (before the
+    /// adapter puts in its own): the engine passes `LinkStatus.rtt` on (E1a).
+    pub link_rtt_seen: u64,
 }
 
 /// The `Predictor`, wrapped: it gives the inner predictor the link's RTT (the stock client passes
@@ -463,6 +470,9 @@ impl Adapter {
     /// The context with the RTT the harness knows, and the shadow kept for
     /// [`Rig::compare_to_shadow`] (the test-only `ScreenView::test_state`).
     fn with_rtt<'a>(&self, ctx: &Ctx<'a>) -> Ctx<'a> {
+        if ctx.link.rtt_hint.is_some() {
+            self.stats.lock().unwrap().link_rtt_seen += 1;
+        }
         if let Some(st) = ctx.screen.test_state() {
             *self.shadow.lock().unwrap() = Some(st.clone());
         }
@@ -607,6 +617,78 @@ impl Predictor for EagerPredictor {
     }
 }
 
+/// The hostile predictor behind [`Predict::Withdrawing`]. Honest until the core has confirmed two
+/// guesses (an epoch is confirmed, and its guesses are written and echoed); from then on every
+/// guess is withdrawn 20 ms after it is made.
+#[derive(Default)]
+struct WithdrawingPredictor {
+    next: Option<(u16, u16)>,
+    /// The last guess, and when it is withdrawn.
+    last: Option<((u16, u16), fil_predict::Time)>,
+    confirmed: usize,
+}
+
+impl Predictor for WithdrawingPredictor {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let KeyEvent::Char(_) = key else {
+            self.next = None;
+            return Vec::new();
+        };
+        let c = ctx.screen.cursor();
+        let (row, col) = self.next.unwrap_or((c.row, c.col));
+        if col + 2 > ctx.screen.size().cols {
+            return Vec::new();
+        }
+        self.next = Some((row, col + 1));
+        let mut edits = Vec::new();
+        if let Some((cell, _)) = self.last.take() {
+            edits.push(OverlayEdit::Withdraw {
+                row: cell.0,
+                col: cell.1,
+            });
+        }
+        if self.confirmed >= 2 {
+            self.last = Some(((row, col), ctx.now + Duration::from_millis(20)));
+        }
+        edits.push(OverlayEdit::Guess { row, col, at });
+        edits
+    }
+    fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+    fn on_settled(&mut self, settled: &[Settled], _: &Ctx<'_>) {
+        self.confirmed += settled
+            .iter()
+            .filter(|s| s.outcome == Settlement::Confirmed)
+            .count();
+    }
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
+    fn on_tick(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        match self.last {
+            Some((cell, when)) if ctx.now >= when => {
+                self.last = None;
+                vec![OverlayEdit::Withdraw {
+                    row: cell.0,
+                    col: cell.1,
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+    fn next_deadline(&self) -> Option<fil_predict::Time> {
+        self.last.map(|l| l.1)
+    }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        Show::Underline
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn has_outstanding(&self) -> bool {
+        self.last.is_some()
+    }
+}
+
 /// The factory `run_with` takes: a new predictor for every shadow screen (a snapshot starts a
 /// new one), all feeding the same stats.
 pub fn predictor_factory(
@@ -629,6 +711,7 @@ pub fn predictor_factory(
             }))
         }),
         Predict::Eager => Box::new(|| Box::new(EagerPredictor::default())),
+        Predict::Withdrawing => Box::new(|| Box::new(WithdrawingPredictor::default())),
     };
     Some(Box::new(move || {
         Box::new(Adapter {
@@ -651,6 +734,8 @@ pub struct Faults {
     pub drop_pty_mode: AtomicBool,
     pub pty_modes: AtomicU64,
     pub echo_acks: AtomicU64,
+    /// The highest `EchoAck.input_upto` the daemon sent: its count of the input it took.
+    pub last_echo_ack: AtomicU64,
     /// Mid-stream repaint snapshots the daemon sent (W1's in-band `Repaint` answered).
     pub repaints: AtomicU64,
     /// Dials fail while set (a link that cannot be remade).
@@ -683,8 +768,11 @@ impl<L: Link> Link for FaultLink<L> {
                             continue;
                         }
                     }
-                    ControlMsg::EchoAck { .. } => {
+                    ControlMsg::EchoAck { input_upto, .. } => {
                         self.faults.echo_acks.fetch_add(1, Ordering::SeqCst);
+                        self.faults
+                            .last_echo_ack
+                            .fetch_max(input_upto, Ordering::SeqCst);
                     }
                     ControlMsg::Snapshot(i) if i.reason == SnapshotReason::Repaint => {
                         self.faults.repaints.fetch_add(1, Ordering::SeqCst);
@@ -889,6 +977,17 @@ pub enum Program {
     /// Fills the screen with `n` long lines, then `cat`: rows with content for the overlay and
     /// the reflow to act on.
     Fill(usize),
+    /// A line-reading loop (`$ `, a canonical read with echo); a line starting with `sudo` turns
+    /// echo off (touching `ready` once it is off), says `Password: ` and reads one silently. The
+    /// `sudo` typed-ahead case: a secret typed the moment after Enter.
+    Sudo,
+    /// A raw-mode password prompt with an asterisk mask: `*` for every byte, `\b \b` for a DEL
+    /// (`sudo` with `pwfeedback`, review B1 of C1). `ready` once raw mode is on.
+    Masked,
+    /// A raw-mode line editor that echoes every key itself until an `s`, then reads silently with
+    /// no output and no mode change (a raw-mode secret read, review B2a of C1). `ready` once raw
+    /// mode is on.
+    SilentRead,
 }
 
 impl Program {
@@ -898,6 +997,9 @@ impl Program {
             Program::Bash => "bash".into(),
             Program::ReadS => "read-s".into(),
             Program::Fill(n) => format!("fill{n}"),
+            Program::Sudo => "sudo".into(),
+            Program::Masked => "masked".into(),
+            Program::SilentRead => "silent-read".into(),
         }
     }
 
@@ -906,7 +1008,8 @@ impl Program {
         match self {
             Program::Cat | Program::Fill(_) => "READY",
             Program::Bash => "$",
-            Program::ReadS => "Password:",
+            Program::ReadS | Program::Masked => "Password:",
+            Program::Sudo | Program::SilentRead => "$",
         }
     }
 
@@ -924,6 +1027,20 @@ impl Program {
                 "printf 'Password: '; sleep 1; stty -echo; : > \"$T/ready\"; read x; stty echo; \
                  printf '\\ndone\\n'; exec sleep 600",
             ),
+            Program::Sudo => sh(
+                "while :; do printf '$ '; read cmd; case \"$cmd\" in sudo*) stty -echo; \
+                 : > \"$T/ready\"; printf 'Password: '; read pw; stty echo; printf '\\n';; esac; \
+                 done",
+            ),
+            Program::Masked => sh(
+                "printf 'Password: '; sleep 1; stty raw -echo; : > \"$T/ready\"; \
+                 del=$(printf '\\177'); \
+                 while :; do c=$(dd bs=1 count=1 2>/dev/null); \
+                 if [ \"$c\" = \"$del\" ]; then printf '\\b \\b'; else printf '*'; fi; done",
+            ),
+            Program::SilentRead => sh("sleep 1; stty raw -echo; : > \"$T/ready\"; printf '$ '; \
+                 while :; do c=$(dd bs=1 count=1 2>/dev/null); printf '%s' \"$c\"; \
+                 [ \"$c\" = s ] && break; done; exec cat >/dev/null"),
             Program::Fill(n) => sh(&format!(
                 "i=0; while [ $i -lt {n} ]; do i=$((i+1)); \
                  echo \"row $i 0123456789 abcdefghij ABCDEFGHIJ klmnopqrst\"; done; \
@@ -947,6 +1064,9 @@ pub struct Spec {
     pub predict: Predict,
     /// Withhold the daemon's `PtyMode` messages from the client from the start.
     pub drop_pty_mode: bool,
+    /// Guards of the prediction core switched off for the run (`Guards::disable` names), through
+    /// the client's test-only seam (`ClientConfig::predict_guards`): a full-stack mutation.
+    pub guards_off: Vec<&'static str>,
 }
 
 impl Spec {
@@ -961,6 +1081,7 @@ impl Spec {
             seed: 1,
             predict: Predict::MoshAlways,
             drop_pty_mode: false,
+            guards_off: Vec::new(),
         }
     }
 
@@ -1064,6 +1185,13 @@ impl Rig {
         let (terminal, term) = oracle_terminal(spec.size.0, spec.size.1, "xterm-256color");
         let mut cfg = ClientConfig::new("main".parse().unwrap(), "e2e".parse().unwrap());
         cfg.preserve_screen = false;
+        if !spec.guards_off.is_empty() {
+            let mut g = fil_predict::Guards::ALL;
+            for name in &spec.guards_off {
+                assert!(g.disable(name), "no guard named {name}");
+            }
+            cfg.predict_guards = Some(g);
+        }
         let shadow: Arc<Mutex<Option<TermState>>> = Arc::default();
         let factory = predictor_factory(spec.predict, spec.rtt(), &stats, &shadow);
         let ctls: Arc<Mutex<Vec<StreamControl>>> = Arc::default();
@@ -1369,6 +1497,7 @@ impl Rig {
             adapter: *self.stats.lock().unwrap(),
             pty_modes: self.faults.pty_modes.load(Ordering::SeqCst),
             echo_acks: self.faults.echo_acks.load(Ordering::SeqCst),
+            last_echo_ack: self.faults.last_echo_ack.load(Ordering::SeqCst),
         }
     }
 
@@ -1520,6 +1649,8 @@ pub struct Report {
     pub adapter: AdapterStats,
     pub pty_modes: u64,
     pub echo_acks: u64,
+    /// The highest `EchoAck.input_upto` seen.
+    pub last_echo_ack: u64,
 }
 
 // ---------------------------------------------------------------------------------------------

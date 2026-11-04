@@ -73,6 +73,27 @@ pub struct ClientConfig {
     pub max_held_output: usize,
     /// Port forwards: this run's own specs and the rules for the rest (DESIGN.md section 7).
     pub forwards: ForwardSet,
+    /// Predictive echo (DESIGN.md sections 9 and 14, `docs/m3/plan.md` §2.7). [`Predict::Off`] by
+    /// default here: the `fil` binary maps the user's setting onto it (M3's E1b). A predictor
+    /// passed to [`crate::run_with`] takes its place.
+    pub predict: Predict,
+    /// **Test only** (`test-hooks`): the prediction core's guards, so a full-stack test can show
+    /// that each one is needed. A build with it is not a release build: the feature compiles in
+    /// the marker [`crate::display::TEST_GUARDS_MARKER`], which `just no-test-hooks` refuses.
+    #[cfg(feature = "test-hooks")]
+    pub predict_guards: Option<fil_predict::Guards>,
+}
+
+/// Whether, and when, the client paints its guesses of the echo (DESIGN.md section 9).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Predict {
+    /// No predictor: the attach asks for no `EchoAck`, and nothing is painted.
+    #[default]
+    Off,
+    /// The default predictor, shown only when the link is slow enough for it to help.
+    Adaptive,
+    /// The default predictor, shown at any round-trip time.
+    Always,
 }
 
 /// What the client does with a forward that a process on the host asked for (`fil forward`), or
@@ -146,6 +167,9 @@ impl ClientConfig {
             input_window: 256 * 1024,
             max_held_output: 4 * 1024 * 1024,
             forwards: ForwardSet::default(),
+            predict: Predict::Off,
+            #[cfg(feature = "test-hooks")]
+            predict_guards: None,
         }
     }
 }

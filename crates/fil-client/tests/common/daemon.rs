@@ -77,6 +77,21 @@ struct Conn {
     control: MemControl,
 }
 
+/// What the scripted program does with the keys it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    /// Nothing (the tests script the output themselves).
+    Off,
+    /// Echoes them, then the daemon sends the `EchoAck` that covers them.
+    Faithful,
+    /// The `EchoAck` is sent ahead of the echo: QUIC, where control overtakes data.
+    AckFirst,
+    /// Echoes nothing (a silent read), and still acknowledges them.
+    Silent,
+    /// Echoes them and sends no `EchoAck` (not yet).
+    NoAck,
+}
+
 pub struct DState {
     epoch: SessionEpoch,
     log: OutputLog,
@@ -116,6 +131,12 @@ pub struct DState {
     /// Keystrokes are taken in but not acknowledged (a slow PTY reader): the client's send window
     /// fills. The acknowledgement goes out with the next keystroke after this is cleared.
     withhold_input_acks: bool,
+    /// The program echoes every key it is given (a CR as CR LF, a DEL as `\b \b`), and the
+    /// daemon sends an `EchoAck` for it after the output, as the real one does an echo window
+    /// after the PTY took the keys (DESIGN.md section 8.5).
+    echo: Echo,
+    /// Every `EchoAck` sent: `(input_upto, output_at)`.
+    pub echo_acks: Vec<(u64, u64)>,
     /// Direct-mode details for the reply.
     direct: Option<(u16, Vec<u8>)>,
     /// The reply says server policy refuses the agent.
@@ -213,6 +234,8 @@ impl FakeDaemon {
                 cut_snapshot: None,
                 lose_input: false,
                 withhold_input_acks: false,
+                echo: Echo::Off,
+                echo_acks: Vec::new(),
                 direct: None,
                 agent_refused: None,
                 data_before_reply: false,
@@ -382,6 +405,9 @@ impl FakeDaemon {
                         });
                     }
                     st.input_all.extend_from_slice(&fresh);
+                    if st.echo != Echo::Off && !fresh.is_empty() {
+                        me.echo(&mut st, &fresh).await;
+                    }
                     let upto = st.input_rx.received();
                     if st.withhold_input_acks {
                         continue;
@@ -1163,6 +1189,96 @@ impl FakeDaemon {
 
     pub async fn set_send_input_resume(&self, on: bool) {
         self.st.lock().await.send_input_resume = on;
+    }
+
+    // ---- echo and `EchoAck` (prediction) -------------------------------------------------------
+
+    /// What the program does with the keys from now on.
+    pub async fn set_echo(&self, echo: Echo) {
+        self.st.lock().await.echo = echo;
+    }
+
+    /// The program's echo of `keys`, and the daemon's `EchoAck` for them.
+    async fn echo(&self, st: &mut DState, keys: &[u8]) {
+        let mut out = Vec::new();
+        if st.echo != Echo::Silent {
+            for &b in keys {
+                match b {
+                    b'\r' => out.extend_from_slice(b"\r\n"),
+                    0x7f => out.extend_from_slice(b"\x08 \x08"),
+                    _ => out.push(b),
+                }
+            }
+        }
+        st.log.append(&out);
+        st.emu.feed(&out);
+        let ack = (st.input_rx.received(), st.log.end());
+        if st.echo == Echo::NoAck {
+            self.pump(st).await;
+        } else if st.echo == Echo::AckFirst {
+            self.send_echo_ack(st, ack).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.pump(st).await;
+        } else {
+            self.pump(st).await;
+            self.send_echo_ack(st, ack).await;
+        }
+    }
+
+    async fn send_echo_ack(&self, st: &mut DState, (input_upto, output_at): (u64, u64)) {
+        st.echo_acks.push((input_upto, output_at));
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(
+                &c.link,
+                &ControlMsg::EchoAck {
+                    input_upto,
+                    output_at,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Sends an `EchoAck` as given: a hostile or broken daemon.
+    pub async fn echo_ack(&self, input_upto: u64, output_at: u64) {
+        let mut st = self.st.lock().await;
+        self.send_echo_ack(&mut st, (input_upto, output_at)).await;
+    }
+
+    /// The `EchoAck`s sent so far.
+    pub async fn echo_acks(&self) -> Vec<(u64, u64)> {
+        self.st.lock().await.echo_acks.clone()
+    }
+
+    /// The input offset the current subscriber's stream has reached (what `EchoAck` counts).
+    pub async fn input_received(&self) -> u64 {
+        self.st.lock().await.input_rx.received()
+    }
+
+    /// The end of the output log (the offset the next output byte gets).
+    pub async fn output_end(&self) -> u64 {
+        self.st.lock().await.log.end()
+    }
+
+    /// A `PtyMode` at an output offset of the test's choosing (one the output may never reach).
+    pub async fn pty_mode_at(&self, canonical: bool, echo: bool, at: u64) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let msg = ControlMsg::PtyMode {
+                canonical,
+                echo,
+                at,
+            };
+            let _ = send(&c.link, &msg).await;
+        }
+    }
+
+    /// The current link reports this round-trip time (`LinkStatus.rtt`).
+    pub async fn set_rtt(&self, rtt: Duration) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            c.control.set_rtt(rtt);
+        }
     }
 }
 

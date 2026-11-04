@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use fil_predict::{InputKind, LinkView, WithdrawReason};
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
 use fil_proto::frame::DataSegment;
@@ -127,8 +128,9 @@ struct Session {
     /// snapshot instead of a replay from `recv`. Epoch, key and input stream are kept, so it is
     /// still a resume, and a swap or a reconnect over QUIC needs no ssh login.
     want_snapshot: bool,
-    /// `PtyMode` reports waiting for the output to reach their offset: (at, canonical, echo).
-    modes: VecDeque<(u64, bool, bool)>,
+    /// `PtyMode` reports and `EchoAck`s waiting for the output to reach their offset, in the
+    /// order they came: each is applied once the output below its offset has been.
+    modes: VecDeque<(u64, Ordered)>,
     /// The daemon said the shell exited: `(code, signal, when to stop waiting for the link to
     /// close)`. The run ends when the link goes down, so the output that was still on its way
     /// (QUIC hands control messages up ahead of data) is not dropped.
@@ -209,6 +211,16 @@ impl Session {
             want_snapshot: self.want_snapshot,
         })
     }
+}
+
+/// What the daemon says in order with the output (`docs/m3/plan.md` §2.1: everything ordered
+/// with the output stays ordered with the output, whichever way the transport delivered it).
+#[derive(Clone, Copy, Debug)]
+enum Ordered {
+    /// `PtyMode`: the line discipline's flags.
+    Mode { canonical: bool, echo: bool },
+    /// `EchoAck`: the PTY took the input below `input_upto` an echo window ago.
+    EchoAck { input_upto: u64 },
 }
 
 /// Per-link protocol state.
@@ -571,6 +583,13 @@ pub(crate) struct Core<I, O> {
     raw: bool,
     display: Option<Display>,
     make_predictor: Option<PredictorFactory>,
+    /// A predictor runs: every attach asks for `EchoAck` (`docs/m3/plan.md` §2.7).
+    predicting: bool,
+    /// The fresh attach's input stream starts at 0: the display rebases its offsets when the
+    /// attach's snapshot lands (DESIGN.md §8.5).
+    rebase_input: bool,
+    /// What the client knows of the current link, for the predictor (`docs/m3/plan.md` §2.2).
+    link_view: LinkView,
     esc: EscapeFilter,
     buf: OfflineBuffer,
     log: Option<LogSink>,
@@ -656,7 +675,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             told_gen: 0,
             raw: false,
             display: None,
+            predicting: make_predictor.is_some(),
             make_predictor,
+            rebase_input: false,
+            link_view: LinkView {
+                down: true,
+                ..LinkView::default()
+            },
             esc: EscapeFilter::new(),
             buf,
             log,
@@ -848,8 +873,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.raw = false;
         }
         let mut bytes = Vec::new();
-        // Take our drawing off the screen first; the screen is the user's again.
+        // Take our drawing off the screen first; the screen is the user's again. The guesses go
+        // before the terminal restore (`docs/m3/plan.md` §2.6, `~.` and exit).
         if let Some(d) = self.display.as_mut() {
+            if d.predicting() {
+                bytes.extend_from_slice(&d.withdraw(WithdrawReason::Exit));
+                // Counts only (§4.3): what the core decided over the run.
+                tracing::debug!(stats = ?d.stats(), "prediction");
+            }
             bytes.extend_from_slice(&d.set_lines(Vec::new()));
         }
         // Give the terminal back as it was: whatever the session's programs left on (the
@@ -982,6 +1013,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     ) -> Result<Served, ClientError> {
         let resume = self.sess.resume_request();
         let mut primary = LinkCtx::open(dialed.link, resume.is_some(), fwd.router());
+        self.set_link_view(Self::link_view_of(&primary.status.borrow()));
         self.last_kind = Some(primary.kind);
         self.sess.input_ready = false;
         self.sess.link_changed();
@@ -1035,7 +1067,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         if changed.is_err() {
                             primary.down = true;
                         } else {
-                            let state = primary.status.borrow_and_update().state.clone();
+                            let status = primary.status.borrow_and_update().clone();
+                            self.set_link_view(Self::link_view_of(&status));
+                            let state = status.state;
                             match state {
                                 LinkState::Up => self.link_recovered(&primary.conn)?,
                                 // `Degraded` means the peer has been silent (the link contract,
@@ -1327,6 +1361,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn take_over_tx<L: Link>(&mut self, primary: &LinkCtx<L>) {
         self.tx = Some(primary.tx.clone());
         self.last_kind = Some(primary.kind);
+        self.set_link_view(Self::link_view_of(&primary.status.borrow()));
         // What the new link's daemon knows of our size is what its own attach said; a resize
         // since (told to the old link only) goes to it after its `Resume`.
         self.told_gen = primary.attach_gen;
@@ -1370,7 +1405,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 term: self.local_term_name(),
                 host: self.cfg.host_label.clone(),
                 key,
-                echo_ack: false,
+                // Only a predicting client reads them (`docs/m3/plan.md` §2.7).
+                echo_ack: self.predicting,
                 // The session's agent socket exists while this subscriber relays (section 10).
                 agent: self.fwd.as_ref().is_some_and(ForwardHandle::agent_on),
                 resume,
@@ -1440,9 +1476,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             ControlMsg::AttachRefused(r) => return self.on_refusal(r),
             ControlMsg::TakenOver(t) => {
+                // The old client's guesses are not the session's: off before the question.
+                self.withdraw_guesses(WithdrawReason::Takeover)?;
                 return Ok(Flow::End(Served::Refused(Prompt::TakeBack(t))));
             }
-            ControlMsg::Detach => return Ok(Flow::End(Served::Refused(Prompt::DetachedElsewhere))),
+            ControlMsg::Detach => {
+                self.withdraw_guesses(WithdrawReason::Detached)?;
+                return Ok(Flow::End(Served::Refused(Prompt::DetachedElsewhere)));
+            }
             ControlMsg::Ack { channel, upto } if channel == ChannelId::TERMINAL => {
                 if let Err(e) = self.sess.input.ack(upto) {
                     return Self::reconnect(&e.to_string());
@@ -1462,13 +1503,29 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 echo,
                 at,
             } => {
-                self.sess.modes.push_back((at, canonical, echo));
+                self.sess
+                    .modes
+                    .push_back((at, Ordered::Mode { canonical, echo }));
                 // A report for an offset already written applies now.
                 self.apply_modes(self.sess.recv.received())?;
             }
-            // Only sent to a client that asked (`Attach::echo_ack`, which M1 never does); the
-            // predictor will read it in M3.
-            ControlMsg::EchoAck { .. } => {}
+            // Only sent to a client that asked (`Attach::echo_ack`, a predicting one). Queued by
+            // its output offset like `PtyMode`, so it settles guesses only once the output it
+            // covers is on the screen (on QUIC it can arrive ahead of that output). One that
+            // claims more input than was sent is the daemon's mistake, and settles nothing.
+            ControlMsg::EchoAck {
+                input_upto,
+                output_at,
+            } => {
+                if self.predicting && self.echo_ack_credible(input_upto) {
+                    self.sess
+                        .modes
+                        .push_back((output_at, Ordered::EchoAck { input_upto }));
+                    self.apply_modes(self.sess.recv.received())?;
+                } else {
+                    tracing::debug!("ignoring an EchoAck beyond the input sent");
+                }
+            }
             ControlMsg::Error(code) => {
                 return Err(match code {
                     fil_proto::msg::ErrorCode::VersionMismatch => ClientError::VersionRefused,
@@ -1484,6 +1541,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             // QUIC), so the run goes on, reading and acknowledging terminal data, until the link
             // goes down; `serve` then ends it with this status instead of reconnecting.
             ControlMsg::SessionExited { code, signal } => {
+                self.withdraw_guesses(WithdrawReason::Exit)?;
                 self.sess
                     .exited
                     .get_or_insert((code, signal, Instant::now() + EXIT_DRAIN));
@@ -1506,6 +1564,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let name = self.cfg.session.to_string();
         // A refused resume leaves nothing to resume: whatever happens next is a fresh attach.
         self.sess.established = false;
+        // Whatever comes next, the guesses on the screen are not this session's any more.
+        let reason = match r {
+            AttachRefusal::TakenOver(_) => WithdrawReason::Takeover,
+            AttachRefusal::Detached => WithdrawReason::Detached,
+            _ => WithdrawReason::Refusal,
+        };
+        self.withdraw_guesses(reason)?;
         match r {
             AttachRefusal::TakenOver(t) => Ok(Flow::End(Served::Refused(Prompt::TakeBack(t)))),
             AttachRefusal::SessionReplaced => Ok(Flow::End(Served::Refused(Prompt::Replaced))),
@@ -1535,6 +1600,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.sess.established = true;
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;
+        if conn.resumed
+            && let Some(d) = self.display.as_mut()
+        {
+            // A resume or a swap: the next key is a boundary; the offsets continue.
+            d.resumed();
+        }
         self.term_warning(&r.term);
         self.agent_policy(r.agent_refused.as_ref());
         self.attached = Some(AttachInfo {
@@ -1581,6 +1652,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     let window = self.cfg.input_window;
                     self.sess.input = SendChannel::new(window);
                     self.sess.input_ready = true;
+                    // The display's offsets follow once the snapshot lands.
+                    self.rebase_input = true;
                 } else {
                     self.sess.input_ready = false;
                 }
@@ -1701,8 +1774,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // The snapshot begins by clearing the screen, so a fresh shadow matches the terminal
         // once it lands. What the overlay had drawn is cleared with it.
         let (cols, rows) = self.size;
+        let rebase = std::mem::take(&mut self.rebase_input);
         let d = self.display_mut(cols, rows)?;
         d.reset();
+        if rebase {
+            d.rebase_input();
+        }
         let bytes = d.server(&snap.buf);
         self.write(&bytes)?;
         // The PTY mode in force at the snapshot's point (the last report below it).
@@ -1768,7 +1845,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     /// Writes terminal output (already accepted by `recv`) starting at offset `start`, applying
-    /// `PtyMode` reports at their offsets.
+    /// `PtyMode` reports and `EchoAck`s at their offsets.
     fn apply_output(&mut self, start: u64, data: &[u8]) -> Result<(), ClientError> {
         let (cols, rows) = self.size;
         let mut pos = start;
@@ -1794,19 +1871,88 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(())
     }
 
-    /// Applies the reports whose offset is at or below `pos`.
+    /// Applies the `PtyMode` reports and `EchoAck`s whose offset is at or below `pos`, in the
+    /// order they came. One at an offset the output never reaches waits for good, and so does
+    /// everything behind it: a daemon's mistake that can only hold settling back.
     fn apply_modes(&mut self, pos: u64) -> Result<(), ClientError> {
-        while let Some(&(at, canonical, echo)) = self.sess.modes.front() {
+        while let Some(&(at, what)) = self.sess.modes.front() {
             if at > pos {
                 break;
             }
             self.sess.modes.pop_front();
+            let credible = match what {
+                Ordered::EchoAck { input_upto } => self.echo_ack_credible(input_upto),
+                Ordered::Mode { .. } => true,
+            };
             if let Some(d) = self.display.as_mut() {
-                let bytes = d.set_pty_mode(canonical, echo);
+                let bytes = match what {
+                    Ordered::Mode { canonical, echo } => d.set_pty_mode(canonical, echo),
+                    Ordered::EchoAck { input_upto } if credible => d.echo_ack(input_upto),
+                    Ordered::EchoAck { .. } => Vec::new(),
+                };
                 self.write(&bytes)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether an `EchoAck` claims no more input than this client has put on the wire. The
+    /// display has been given more (keys still queued behind the send window, answers that never
+    /// go out), so its own check is not enough: a hostile daemon would settle guesses of keys the
+    /// session has not even seen (`docs/m3/plan.md` §3 E1a, the hostile daemon).
+    fn echo_ack_credible(&self, input_upto: u64) -> bool {
+        input_upto <= self.sess.input.next_seq()
+    }
+
+    /// The input offset the next byte handed to the session gets: past what is in the send window
+    /// and what waits for room in it (DESIGN.md §8.5; records take no space).
+    fn next_input_at(&self) -> u64 {
+        self.sess.input.acked() + self.sess.input.buffered() as u64 + self.pending.len() as u64
+    }
+
+    /// Withdraws every guess before anything is shown for a lifecycle event (`docs/m3/plan.md`
+    /// §2.6).
+    fn withdraw_guesses(&mut self, reason: WithdrawReason) -> Result<(), ClientError> {
+        if let Some(d) = self.display.as_mut()
+            && d.predicting()
+        {
+            let bytes = d.withdraw(reason);
+            self.write(&bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Input that never reaches the session (an answer to the client's own question, an escape):
+    /// a boundary for the predictor, at no offset of its own.
+    fn mark_answer(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let at = self.next_input_at();
+        if let Some(d) = self.display.as_mut() {
+            let out = d.input(bytes, at, InputKind::Answer);
+            self.write(&out)?;
+        }
+        Ok(())
+    }
+
+    /// The link's status as the predictor sees it.
+    fn set_link_view(&mut self, view: LinkView) {
+        if self.link_view == view {
+            return;
+        }
+        self.link_view = view;
+        if let Some(d) = self.display.as_mut() {
+            d.set_link(view);
+        }
+    }
+
+    fn link_view_of(status: &LinkStatus) -> LinkView {
+        LinkView {
+            rtt_hint: status.rtt,
+            degraded: matches!(status.state, LinkState::Degraded),
+            down: matches!(status.state, LinkState::Down(_)),
+        }
     }
 
     /// Acks, when due, after output was applied.
@@ -1825,6 +1971,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     // ---- link health -------------------------------------------------------------------
 
     fn mark_disconnected(&mut self) {
+        // What was written stays until it settles or the backstop withdraws it (§2.6).
+        self.set_link_view(LinkView {
+            down: true,
+            ..self.link_view
+        });
         self.link_ok = false;
         self.quiet = false;
         self.confirm = None;
@@ -1907,6 +2058,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn release_offline(&mut self) {
         let all = self.buf.take_all();
         self.buf.reset();
+        // Typed against a screen that may be gone: sent, never predicted (§2.4 rule 6).
+        let at = self.next_input_at();
+        if let Some(d) = self.display.as_mut() {
+            let out = d.input(&all, at, InputKind::Offline);
+            if let Err(e) = self.write(&out) {
+                tracing::debug!(error = %e, "could not write to the terminal");
+            }
+        }
         self.pending.extend_from_slice(&all);
     }
 
@@ -2027,6 +2186,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             && Instant::now() < until
             && classify(bytes) == Chunk::Enter
         {
+            self.mark_answer(bytes)?;
             return Ok(Ev::Continue);
         }
         // A confirmation that output has since let the overlay draw is entered now, so the key
@@ -2036,6 +2196,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         // The `~#` summary goes with the next key (which is not eaten).
         self.ports = None;
+        if matches!(self.confirm, Some(Confirm::Typed { .. })) {
+            // The keys answer the client's question: the session never sees them.
+            self.mark_answer(bytes)?;
+        }
         if let Some(Confirm::Typed { answer, .. }) = &mut self.confirm {
             if let Some(yes) = answer.input(bytes) {
                 let enter_seen = answer.enter_seen;
@@ -2049,6 +2213,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             // The host asked this question, not the user: the escapes still work (`~.` detaches),
             // and only what would have been typed into the session goes to the answer.
             for action in self.esc.feed(bytes) {
+                if matches!(action, Action::Send(_) | Action::Help | Action::Ports) {
+                    // An answer, or an escape: the session never sees either.
+                    let b = match &action {
+                        Action::Send(b) => b.clone(),
+                        _ => b"~".to_vec(),
+                    };
+                    self.mark_answer(&b)?;
+                }
                 match action {
                     Action::Send(b) => {
                         if let Some(c) = &mut self.fwd_confirm
@@ -2076,6 +2248,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             return Ok(Ev::Continue);
         }
         for action in self.esc.feed(bytes) {
+            if matches!(action, Action::Help | Action::Ports) {
+                // An escape never reaches the session (§2.4 rule 6).
+                self.mark_answer(b"~")?;
+            }
             match action {
                 Action::Send(b) => self.user_bytes(&b)?,
                 Action::Help => {
@@ -2101,8 +2277,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn user_bytes(&mut self, b: &[u8]) -> Result<(), ClientError> {
         // Order matters: once anything is held offline, everything after it is too.
         if self.link_ok && self.buf.is_empty() {
+            let at = self.next_input_at();
             if let Some(d) = self.display.as_mut() {
-                let out = d.input(b);
+                let out = d.input(b, at, InputKind::Typed);
                 self.write(&out)?;
             }
             self.pending.extend_from_slice(b);
@@ -2292,12 +2469,25 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 .ok_or_else(|| {
                     ClientError::Config(format!("no terminal emulator backend named {name:?}"))
                 })?;
-            self.display = Some(Display::new(
+            #[allow(unused_mut)]
+            let mut cfg = fil_predict::Config::default();
+            #[cfg(feature = "test-hooks")]
+            if let Some(g) = self.cfg.predict_guards {
+                tracing::warn!(
+                    "{}: the prediction core's guards are overridden (a test build)",
+                    crate::display::TEST_GUARDS_MARKER
+                );
+                cfg.guards = g;
+            }
+            let mut d = Display::with_config(
                 backend,
                 Size { cols, rows },
                 self.cfg.status_placement,
                 self.make_predictor.take(),
-            ));
+                cfg,
+            );
+            d.set_link(self.link_view);
+            self.display = Some(d);
         }
         Ok(self.display.as_mut().expect("just created"))
     }
@@ -2457,6 +2647,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             min(c.answer.deadline());
             min(Some(c.until));
         }
+        // The prediction core's own clock: the late-echo grace, the backstop, the predictor's.
+        min(self.display.as_ref().and_then(Display::next_deadline));
         if self.display.is_some()
             && ((!self.link_ok && self.disconnected_since.is_some())
                 || self.confirm_pending.is_some())
@@ -2468,6 +2660,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     }
 
     fn on_tick(&mut self) -> Result<(), ClientError> {
+        if let Some(d) = self.display.as_mut() {
+            let bytes = d.tick();
+            self.write(&bytes)?;
+        }
         if let Some(due) = self.ack_due
             && Instant::now() >= due
         {

@@ -30,14 +30,71 @@
 //! Known gap, rare: the pending-wrap flag of the primary cursor behind the alternate screen
 //! is not restored.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::model::{
     Attrs, Cell, Charset, Color, Cursor, CursorShape, Line, MouseEncoding, MouseTracking,
     TermState, Underline, default_tab_stops,
 };
 
-/// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
+/// What the terminal that will read the bytes is known to understand, as far as it changes the
+/// bytes written. [`WriteCaps::default`] is the program's own choice: a terminal that was sent
+/// `4:3` by the program is a terminal the program (which chose by terminfo, `Smulx`) believes
+/// has it, and the snapshot and the overlay's pen restore only ever repeat what a program sent.
+/// A caller that knows its terminal lacks a feature says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteCaps {
+    /// Underline styles (`4:2`, `4:3`, `4:4` and `4:5`) and the underline color (`58`). Terminals
+    /// that do not know the colon sub-parameters misread them (xterm 390 turns `4:3` and
+    /// `58:5:9` into a black foreground), so without this every underline is the plain `4`,
+    /// in the text color.
+    pub underline_styles: bool,
+}
+
+impl WriteCaps {
+    /// Everything is understood.
+    pub const ALL: WriteCaps = WriteCaps {
+        underline_styles: true,
+    };
+    /// Only what every terminal understands: a plain underline in the text color.
+    pub const PLAIN: WriteCaps = WriteCaps {
+        underline_styles: false,
+    };
+
+    /// The process-wide setting of [`set_underline_styles`].
+    pub fn current() -> Self {
+        WriteCaps {
+            underline_styles: UNDERLINE_STYLES.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for WriteCaps {
+    fn default() -> Self {
+        WriteCaps::ALL
+    }
+}
+
+/// The capabilities [`snapshot`] and [`sgr`] write for.
+static UNDERLINE_STYLES: AtomicBool = AtomicBool::new(true);
+
+/// Sets whether [`snapshot`] and [`sgr`] write underline styles (see [`WriteCaps`]). This is
+/// for a process that learns once that its terminal lacks them (terminfo has no `Smulx`, or
+/// the capability report says so); code that has the capabilities per call uses
+/// [`snapshot_with`] and [`sgr_with`].
+pub fn set_underline_styles(on: bool) {
+    UNDERLINE_STYLES.store(on, Ordering::Relaxed);
+}
+
+/// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`, for a terminal
+/// with the capabilities of [`WriteCaps::current`].
 pub fn snapshot(state: &TermState) -> Vec<u8> {
-    let mut w = Writer::new(state);
+    snapshot_with(state, WriteCaps::current())
+}
+
+/// [`snapshot`] for a terminal with the given capabilities.
+pub fn snapshot_with(state: &TermState, caps: WriteCaps) -> Vec<u8> {
+    let mut w = Writer::new(state, caps);
     w.run();
     w.out
 }
@@ -45,14 +102,16 @@ pub fn snapshot(state: &TermState) -> Vec<u8> {
 struct Writer<'a> {
     st: &'a TermState,
     out: Vec<u8>,
+    caps: WriteCaps,
     pen: Attrs,
     link: Option<u32>,
 }
 
 impl<'a> Writer<'a> {
-    fn new(st: &'a TermState) -> Self {
+    fn new(st: &'a TermState, caps: WriteCaps) -> Self {
         Writer {
             st,
+            caps,
             out: Vec::with_capacity(4096),
             pen: Attrs::default(),
             link: None,
@@ -358,14 +417,26 @@ impl<'a> Writer<'a> {
         if a == self.pen {
             return;
         }
-        let s = sgr(&a);
+        let s = sgr_with(&a, self.caps);
         self.put(&s);
         self.pen = a;
     }
 }
 
-/// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`).
+/// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`), for a
+/// terminal with the capabilities of [`WriteCaps::current`].
 pub fn sgr(a: &Attrs) -> String {
+    sgr_with(a, WriteCaps::current())
+}
+
+/// [`sgr`] for a terminal with the given capabilities.
+///
+/// The underline color is written in the colon form (`58:5:N`, `58:2::R:G:B`, with the color
+/// space left empty as ITU T.416 allows), which is what programs that use it send and what the
+/// terminals that know SGR 58 (kitty, WezTerm, alacritty, foot, VTE) accept. The semicolon form
+/// (`58;5;N`) is the unsafe one: a terminal that does not know 58 reads its 5 and 9 as blink and
+/// strikethrough. A terminal that does not know 58 gets no underline color (`caps`).
+pub fn sgr_with(a: &Attrs, caps: WriteCaps) -> String {
     let mut s = String::from("\x1b[0");
     if a.bold {
         s.push_str(";1");
@@ -376,13 +447,13 @@ pub fn sgr(a: &Attrs) -> String {
     if a.italic {
         s.push_str(";3");
     }
-    match a.underline {
-        Underline::None => {}
-        Underline::Single => s.push_str(";4"),
-        Underline::Double => s.push_str(";4:2"),
-        Underline::Curly => s.push_str(";4:3"),
-        Underline::Dotted => s.push_str(";4:4"),
-        Underline::Dashed => s.push_str(";4:5"),
+    match (a.underline, caps.underline_styles) {
+        (Underline::None, _) => {}
+        (Underline::Single, _) | (_, false) => s.push_str(";4"),
+        (Underline::Double, true) => s.push_str(";4:2"),
+        (Underline::Curly, true) => s.push_str(";4:3"),
+        (Underline::Dotted, true) => s.push_str(";4:4"),
+        (Underline::Dashed, true) => s.push_str(";4:5"),
     }
     if a.blink {
         s.push_str(";5");
@@ -398,7 +469,16 @@ pub fn sgr(a: &Attrs) -> String {
     }
     color(&mut s, 38, a.fg);
     color(&mut s, 48, a.bg);
-    color(&mut s, 58, a.underline_color);
+    // The underline color is for the terminals that have SGR 58, and those are the ones that
+    // have the underline styles (`Smulx` and `Setulc` come together). xterm 390 reads even the
+    // colon form as a black foreground.
+    if caps.underline_styles {
+        match a.underline_color {
+            Color::Default => {}
+            Color::Indexed(n) => s.push_str(&format!(";58:5:{n}")),
+            Color::Rgb(r, g, b) => s.push_str(&format!(";58:2::{r}:{g}:{b}")),
+        }
+    }
     s.push('m');
     s
 }
@@ -508,10 +588,8 @@ mod tests {
         assert!(out.contains("abcdef"), "{out:?}");
     }
 
-    #[test]
-    fn sgr_underline_style_and_colors() {
-        let mut st = state(10, 1);
-        st.screen[0].cells[0] = Cell {
+    fn styled_cell() -> Cell {
+        Cell {
             text: "x".into(),
             attrs: Attrs {
                 bold: true,
@@ -522,12 +600,69 @@ mod tests {
                 ..Attrs::default()
             },
             ..Cell::blank()
-        };
-        let out = s(&snapshot(&st));
+        }
+    }
+
+    #[test]
+    fn sgr_underline_style_and_colors() {
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = styled_cell();
+        let out = s(&snapshot_with(&st, WriteCaps::ALL));
         assert!(
-            out.contains("\x1b[0;1;4:3;38;5;200;48;2;9;8;7;58;2;1;2;3mx"),
+            out.contains("\x1b[0;1;4:3;38;5;200;48;2;9;8;7;58:2::1:2:3mx"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn underline_color_is_written_in_the_colon_form() {
+        // `58;5;9` is read by a terminal that does not know SGR 58 as blink (5) and
+        // strikethrough (9). A terminal that has 58 takes the colon form; one that does not
+        // gets no underline color at all.
+        for (color, want) in [
+            (Color::Indexed(9), "\x1b[0;4;58:5:9m"),
+            (Color::Rgb(1, 2, 3), "\x1b[0;4;58:2::1:2:3m"),
+        ] {
+            let a = Attrs {
+                underline: Underline::Single,
+                underline_color: color,
+                ..Attrs::default()
+            };
+            assert_eq!(sgr_with(&a, WriteCaps::ALL), want);
+            assert!(!sgr(&a).contains("58;"));
+            assert_eq!(sgr_with(&a, WriteCaps::PLAIN), "\x1b[0;4m");
+        }
+    }
+
+    #[test]
+    fn underline_styles_are_written_only_for_a_terminal_that_has_them() {
+        let styles = [
+            (Underline::Double, ";4:2"),
+            (Underline::Curly, ";4:3"),
+            (Underline::Dotted, ";4:4"),
+            (Underline::Dashed, ";4:5"),
+        ];
+        for (underline, colon) in styles {
+            let a = Attrs {
+                underline,
+                ..Attrs::default()
+            };
+            assert_eq!(sgr_with(&a, WriteCaps::ALL), format!("\x1b[0{colon}m"));
+            assert_eq!(sgr_with(&a, WriteCaps::PLAIN), "\x1b[0;4m");
+        }
+        let single = Attrs {
+            underline: Underline::Single,
+            ..Attrs::default()
+        };
+        assert_eq!(sgr_with(&single, WriteCaps::PLAIN), "\x1b[0;4m");
+        let none = Attrs::default();
+        assert_eq!(sgr_with(&none, WriteCaps::PLAIN), "\x1b[0m");
+        // A snapshot passes the capabilities on to every SGR it writes.
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = styled_cell();
+        let plain = s(&snapshot_with(&st, WriteCaps::PLAIN));
+        assert!(plain.contains("\x1b[0;1;4;38;5;200;48;2;9;8;7mx"));
+        assert!(!plain.contains("4:3") && !plain.contains("58"));
     }
 
     #[test]

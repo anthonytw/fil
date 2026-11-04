@@ -1019,15 +1019,28 @@ pub fn shrink_buffers(s: &TcpStream) {
     rustix::net::sockopt::set_socket_send_buffer_size(s, STUCK_BUFFER as usize).unwrap();
 }
 
+/// The kernel buffers of a socket that carries data, bounded ([`bounded_buffers`],
+/// [`endless_source`]). Not [`STUCK_BUFFER`]: on Linux a receive buffer below loopback's MSS
+/// (65,483 bytes) leaves a window smaller than one segment, and the sender then waits for the
+/// 40 ms delayed ack each time (linux-check run 41905536060: 54 KB/s through the pace tests'
+/// downloads, against the 2.5 MB/s link). 128 KiB (Linux doubles it) keeps two segments in
+/// flight, and on macOS 32 downloads hold 8 MiB this way, not the 187 MiB of the defaults.
+pub const SOURCE_BUFFER: u32 = 128 * 1024;
+
+fn bound_buffers(s: &TcpStream) {
+    rustix::net::sockopt::set_socket_recv_buffer_size(s, SOURCE_BUFFER as usize).unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(s, SOURCE_BUFFER as usize).unwrap();
+}
+
 /// A [`Wrap`] that bounds the kernel buffers of every stream the endpoint connects to a target
-/// ([`shrink_buffers`]). For a forward whose target writes without end while the endpoint reads
+/// ([`SOURCE_BUFFER`]). For a forward whose target writes without end while the endpoint reads
 /// only as its window allows: the default (autotuned to 4 MiB a side on macOS) parks megabytes
 /// per connection in the kernel, which the tests never count, and a few dozen such connections
 /// take a small runner's whole mbuf pool (macOS: `parallel_downloads_keep_the_link_full` held
 /// 187 MiB on its own, beside tests whose sends then failed with `ENOBUFS`).
 pub fn bounded_buffers() -> Wrap {
     Arc::new(|s| {
-        shrink_buffers(&s);
+        bound_buffers(&s);
         Box::new(s)
     })
 }
@@ -1036,7 +1049,7 @@ pub fn bounded_buffers() -> Wrap {
 /// bounded (see [`bounded_buffers`]).
 pub async fn endless_source() -> Server {
     serve(|mut s| async move {
-        shrink_buffers(&s);
+        bound_buffers(&s);
         let buf = vec![9u8; 64 * 1024];
         while write_all_retry(&mut s, &buf).await.is_ok() {}
     })

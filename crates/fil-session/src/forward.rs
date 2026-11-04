@@ -195,7 +195,7 @@ struct State {
     agent_refused: Option<PolicyRefusal>,
     /// Withheld client-origin entries whose run is not the current subscriber's, since when
     /// (DESIGN.md section 7.2): only the run that named one knows its target or bind, and its
-    /// tags match no other run's. Removed once their run has been gone for `linger`.
+    /// tags match no other run's. Removed once their run has been gone for `orphan_life` (`linger`, at least 30 s).
     orphaned: HashMap<ForwardId, tokio::time::Instant>,
     /// `-R` connections `remote_peers = "same-user"` refused, per entry (a count only: whose they
     /// were is never kept).
@@ -299,8 +299,9 @@ pub(crate) struct Forwards {
     agent_sock: Mutex<Option<AgentSocket>>,
     /// Where the agent relay is, for connections waiting on it.
     agent_gate: watch::Sender<Gate>,
-    /// How long a withheld entry outlives its run ([`State::orphaned`]): the mux `linger`.
-    linger: std::time::Duration,
+    /// How long a withheld entry outlives its run ([`State::orphaned`]): the mux `linger`, but
+    /// not less than [`crate::config::WITHHELD_MIN_LIFE`].
+    orphan_life: std::time::Duration,
     /// Wakes the sweep of [`State::orphaned`] when it changes.
     sweep_wake: Arc<tokio::sync::Notify>,
     sweeper: Mutex<Option<JoinHandle<()>>>,
@@ -331,6 +332,7 @@ impl Forwards {
     pub(crate) fn new(
         name: SessionName,
         cfg: MuxConfig,
+        withheld_min_life: std::time::Duration,
         agent_socket: Option<PathBuf>,
         policy: Arc<dyn ServerPolicy>,
         remote_peers: RemotePeers,
@@ -367,7 +369,7 @@ impl Forwards {
         });
         let connector = Arc::new(SessionConnector { st: st.clone() });
         let table_room = cfg.mux_buffer / 4 * 3;
-        let linger = cfg.linger;
+        let orphan_life = cfg.linger.max(withheld_min_life);
         let (ep, events) = Endpoint::new(Side::Daemon, cfg, connector, policy);
         let fw = Arc::new_cyclic(|me| Forwards {
             name,
@@ -379,7 +381,7 @@ impl Forwards {
             agent_sock: Mutex::new(agent_socket.map(AgentSocket::new)),
             agent_gate: watch::Sender::new(Gate::Off),
             agent_counts: Mutex::new(Arc::new(RequestCounts::default())),
-            linger,
+            orphan_life,
             sweep_wake: Arc::new(tokio::sync::Notify::new()),
             sweeper: Mutex::new(None),
             me: me.clone(),
@@ -616,7 +618,7 @@ impl Forwards {
         st.fatal = None;
         st.consented.clear();
         // The new subscriber's run (or nobody's) is another: what the old run withheld waits
-        // for that run to come back (a take-back re-adds it) for `linger`.
+        // for that run to come back (a take-back re-adds it) for `orphan_life`.
         let now = tokio::time::Instant::now();
         for e in st.table.iter() {
             if e.origin == Origin::Client && e.spec.is_withheld() {
@@ -1017,7 +1019,7 @@ impl Forwards {
         }
     }
 
-    /// Removes the withheld entries whose run has been gone for `linger` ([`State::orphaned`])
+    /// Removes the withheld entries whose run has been gone for `orphan_life` ([`State::orphaned`])
     /// and returns when the next one is due.
     fn sweep(&self) -> Option<tokio::time::Instant> {
         let mut st = self.lock();
@@ -1028,14 +1030,17 @@ impl Forwards {
         let due: Vec<ForwardId> = st
             .orphaned
             .iter()
-            .filter(|(_, since)| now >= **since + self.linger)
+            .filter(|(_, since)| now >= **since + self.orphan_life)
             .map(|(id, _)| *id)
             .collect();
         for id in due {
             debug!("a withheld forward outlived its run; removed");
             self.remove(&mut st, id);
         }
-        st.orphaned.values().map(|since| *since + self.linger).min()
+        st.orphaned
+            .values()
+            .map(|since| *since + self.orphan_life)
+            .min()
     }
 
     fn remove(&self, st: &mut State, id: ForwardId) {

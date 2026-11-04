@@ -6,7 +6,8 @@
 //! window = "1MiB"     # 16KiB to 4MiB: the receive window this side advertises per channel
 //! buffer = "1MiB"     # 16KiB to 16MiB: what a channel's sender keeps until the peer consumed it
 //! open_wait = "30s"   # 0 to 1h: how long a new connection waits for a link
-//! linger = "10m"      # 0 to 24h: how long open connections outlive a disconnect
+//! linger = "10m"      # 0 to 24h: how long open connections outlive a disconnect, and how long
+//!                     # the daemon keeps a withheld entry after its run (at least 30 s)
 //! ```
 //!
 //! A size is a number of bytes or text (`"64KiB"`, `"1 MiB"`, `"8k"`; powers of 1024); a duration

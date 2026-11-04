@@ -55,7 +55,8 @@
 //! # window = "1MiB"         # 16KiB to 4MiB: the receive window per channel
 //! # buffer = "1MiB"         # 16KiB to 16MiB: what a channel's sender keeps unacknowledged
 //! # open_wait = "30s"       # 0 to 1h: how long an -R connection waits for a link
-//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect
+//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect, and how
+//! #                         # long a withheld entry outlives its run (at least 30 s)
 //! ```
 //!
 //! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file

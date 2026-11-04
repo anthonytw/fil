@@ -57,7 +57,7 @@ use fil_proto::ChannelId;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
     BindFailure, CloseReason, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState,
-    MuxMsg, OpenFailure, OpenKind, Origin, Side,
+    MuxMsg, OpenFailure, OpenKind, Side,
 };
 use fil_transport::{Link, LinkError, LinkState};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -1171,24 +1171,21 @@ impl<L: Link> Manager<L> {
             MuxMsg::Forward {
                 id,
                 spec,
-                origin,
                 req: Some(req),
-            } => {
-                let _ = origin;
-                match self.own.iter().position(|o| o.req == Some(req)) {
-                    Some(i) => {
-                        self.own_answer(i, id, &spec);
-                        self.all_answered();
-                    }
-                    None => debug!("an answer to no request of ours"),
+                ..
+            } => match self.own.iter().position(|o| o.req == Some(req)) {
+                Some(i) => {
+                    self.own_answer(i, id, &spec);
+                    self.all_answered();
                 }
-            }
+                None => debug!("an answer to no request of ours"),
+            },
             MuxMsg::Forward {
                 id,
                 spec,
-                origin,
                 req: None,
-            } => self.other(id, spec, origin),
+                ..
+            } => self.other(id, spec),
             MuxMsg::ForwardRefused { req, why } => {
                 if let Some(i) = self.own.iter().position(|o| o.req == Some(req)) {
                     self.own[i].req = None;
@@ -1333,8 +1330,7 @@ impl<L: Link> Manager<L> {
     }
 
     /// An entry the run did not name: a management request, or one left by another client.
-    fn other(&mut self, id: ForwardId, spec: ForwardSpec, origin: Origin) {
-        let _ = origin;
+    fn other(&mut self, id: ForwardId, spec: ForwardSpec) {
         if self.entries.contains_key(&id) || self.own_index(id).is_some() {
             // Ids are never reused: a restatement, not a new entry.
             return;
@@ -1724,7 +1720,7 @@ impl Asks {
 mod tests {
     use super::*;
 
-    use fil_proto::mux::{BindAddr, Target, TargetHost};
+    use fil_proto::mux::{BindAddr, Origin, Target, TargetHost};
     use fil_transport::link::mem::MemLink;
 
     /// A manager with no own forwards, not running: the tests call its handlers.
@@ -1794,7 +1790,7 @@ mod tests {
     async fn an_answer_to_an_older_question_grants_nothing() {
         let (mut m, mut rx) = manager();
         let x = ForwardId(7);
-        m.other(x, rspec(8000), Origin::Request);
+        m.other(x, rspec(8000));
         let first = asked(&mut rx).pop().expect("asked");
         // The entry is asked about again under a new question (whatever the host did to get
         // there), with another target.
@@ -1813,7 +1809,7 @@ mod tests {
     async fn refusals_close_the_queue() {
         let (mut m, mut rx) = manager();
         for i in 0..MAX_QUESTIONS as u32 {
-            m.other(ForwardId(i), rspec(8000), Origin::Request);
+            m.other(ForwardId(i), rspec(8000));
         }
         let qs = asked(&mut rx);
         assert_eq!(qs.len(), MAX_QUESTIONS);
@@ -1824,7 +1820,7 @@ mod tests {
             m.entries.values().all(|o| o.state == State::Refused),
             "a question outlived the rule"
         );
-        m.other(ForwardId(100), rspec(8000), Origin::Request);
+        m.other(ForwardId(100), rspec(8000));
         assert!(asked(&mut rx).is_empty());
     }
 
@@ -1834,16 +1830,16 @@ mod tests {
     async fn past_the_gone_ids_nothing_new_is_taken() {
         let (mut m, mut rx) = manager();
         for i in 0..MAX_GONE as u32 + 10 {
-            m.other(ForwardId(i), rspec(8000), Origin::Request);
+            m.other(ForwardId(i), rspec(8000));
             m.gone(ForwardId(i));
         }
         assert!(!m.failed);
         assert!(m.gone_ids.len() <= MAX_GONE);
         let _ = asked(&mut rx);
-        m.other(ForwardId(1_000_000), rspec(8000), Origin::Request);
+        m.other(ForwardId(1_000_000), rspec(8000));
         assert!(asked(&mut rx).is_empty(), "asked while saturated");
         m.fresh();
-        m.other(ForwardId(2_000_000), rspec(8000), Origin::Request);
+        m.other(ForwardId(2_000_000), rspec(8000));
         assert_eq!(
             asked(&mut rx).len(),
             1,
@@ -1896,7 +1892,7 @@ mod tests {
     async fn the_entries_kept_are_bounded() {
         let (mut m, _rx) = manager();
         for i in 0..10 * MAX_OTHERS as u32 {
-            m.other(ForwardId(i), rspec(8000), Origin::Request);
+            m.other(ForwardId(i), rspec(8000));
         }
         assert!(m.entries.len() <= MAX_OTHERS);
         for i in 0..10 * MAX_OTHERS as u32 {
@@ -1945,12 +1941,12 @@ mod tests {
         m.gone(x);
         let _ = asked(&mut rx);
         let y = ForwardId(4);
-        m.other(y, rspec_on(9000, 80), Origin::Request);
+        m.other(y, rspec_on(9000, 80));
         assert_eq!(m.entries[&y].state, State::Asking, "kept as superseded");
         assert_eq!(asked(&mut rx).len(), 1);
         // While the own add's answer is on its way, the same entry is that answer's.
         m.own[0].req = Some(1);
-        m.other(ForwardId(5), rspec_on(9000, 80), Origin::Request);
+        m.other(ForwardId(5), rspec_on(9000, 80));
         assert_eq!(m.entries[&ForwardId(5)].state, State::Superseded);
     }
 
@@ -1974,9 +1970,9 @@ mod tests {
             postcard::from_bytes(&[vec![1u8, 0, 0, 1, 1], tag.to_vec()].concat()).unwrap();
         let r9: ForwardSpec =
             postcard::from_bytes(&[vec![1u8, 0, 0xa8, 0x46, 1, 1], tag.to_vec()].concat()).unwrap();
-        m.other(ForwardId(1), l, Origin::Client);
-        m.other(ForwardId(2), r0, Origin::Client);
-        m.other(ForwardId(3), r9, Origin::Client);
+        m.other(ForwardId(1), l);
+        m.other(ForwardId(2), r0);
+        m.other(ForwardId(3), r9);
         for i in 1..=3 {
             assert_eq!(m.entries[&ForwardId(i)].state, State::Refused, "{i}");
         }

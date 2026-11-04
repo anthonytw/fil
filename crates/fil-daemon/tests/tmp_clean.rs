@@ -563,10 +563,38 @@ async fn a_predecessor_that_looks_does_not_bind_over_its_successor() {
     a_predecessor_leaves_its_successor_alone(Duration::from_millis(400)).await;
 }
 
+/// The socket path belongs to the daemon that holds the lock on the lock file at its path. When
+/// the successor's socket is gone, the predecessor (which lost the lock) does not bind one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_predecessor_does_not_bind_a_missing_socket_it_has_no_lock_for() {
+    let tree = Tree::new();
+    let a = run(&tree, keeping_every(Duration::from_millis(300))).await;
+    let paths = a.paths.clone();
+    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.socket()).unwrap();
+    let b = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("the successor starts");
+    let b_handle = b.handle();
+    let b_task = tokio::spawn(b.run());
+    std::fs::remove_file(paths.socket()).unwrap();
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(
+        !paths.socket().exists(),
+        "A bound a socket without holding the lock"
+    );
+    a.stop().await;
+    b_handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, b_task).await;
+}
+
 /// The look that touches the user's home runs on a thread of its own: with that part hung (a
 /// home directory on a mount that does not answer, stood in for by a hook that blocks), the
 /// daemon still accepts and answers connections and still stops, and the hourly looks do not
 /// pile up behind the hung one.
+///
+/// With the look run on the accept loop instead this test does not fail cleanly: the blocked worker
+/// holds tokio's timer driver, so no timeout fires and the run is stopped by the harness's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hung_home_directory_does_not_stop_the_daemon() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -577,7 +605,15 @@ async fn a_hung_home_directory_does_not_stop_the_daemon() {
     std::fs::create_dir_all(&installed).unwrap();
     std::fs::write(installed.join("fil"), b"").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            // A failing test must not leave the stand-in blocked: the runtime waits for it.
+            let _ = self.0.send(());
+        }
+    }
     let (release, blocked) = mpsc::channel::<()>();
+    let release = Release(release);
     let blocked = Arc::new(Mutex::new(blocked));
     let hook: Arc<dyn Fn() + Send + Sync> = {
         let (calls, blocked) = (calls.clone(), blocked.clone());
@@ -587,23 +623,30 @@ async fn a_hung_home_directory_does_not_stop_the_daemon() {
         })
     };
     let exe = installed.join("fil");
-    let d = run_with(&tree, keeping(true, true), |daemon| {
-        daemon.set_install(exe, home);
-        daemon.set_install_hook(hook);
-    })
-    .await;
+    let d = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_with(&tree, keeping(true, true), |daemon| {
+            daemon.set_install(exe, home);
+            daemon.set_install_hook(hook);
+        }),
+    )
+    .await
+    .expect("the daemon did not start serving");
     wait_until("the look reaches the install directory", || {
         calls.load(Ordering::SeqCst) == 1
     });
     // Several more intervals pass: the daemon serves, and no second look starts.
     for _ in 0..5 {
         tokio::time::sleep(EVERY).await;
-        assert!(has_the_session(&d).await, "the daemon stopped serving");
+        let served = tokio::time::timeout(Duration::from_secs(3), has_the_session(&d)).await;
+        assert!(served == Ok(true), "the daemon stopped serving");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "looks piled up");
     // And it stops while the look is still hung.
-    d.stop().await;
-    let _ = release.send(());
+    tokio::time::timeout(WAIT, d.stop())
+        .await
+        .expect("the daemon did not stop");
+    drop(release);
 }
 
 /// Whether something holds a shared lock on the directory (an exclusive try fails), which is what

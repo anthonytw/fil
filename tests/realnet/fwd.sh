@@ -18,6 +18,10 @@
 #                        daemon's socket
 #   f_fwd_vs_ssh         keystroke latency and throughput under a bulk forward, fil (pipe, QUIC) against
 #                        ssh -L, under the latency lab's conditions (docs/m2/latency.md): H1's data
+#   f_fwd_parallel       0 to 32 bulk downloads at once through one -L, and on QUIC a request-and-
+#                        response forward beside one, paced and unpaced (FIL_FORWARD_PACING=off): H1
+#   f_fwd_stuck          a live 1 MiB echo beside 8 forwards whose target never reads, paced and
+#                        unpaced: H1
 #
 # Measurements go to the results table (notes); f_fwd_vs_ssh's keystroke cells also go to
 # $OUT/results-fwd-cells.tsv and the job summary. Knobs (environment):
@@ -911,9 +915,260 @@ f_fwd_vs_ssh() {
   fwd_verdict
 }
 
+
+# ---------------------------------------------------------------------------------------------
+# H1 with several channels (the review of PR #83): parallel bulk downloads, readers that stopped,
+# and on QUIC a request-and-response forward beside a bulk one. Every cell runs paced and unpaced:
+# FIL_FORWARD_PACING=off in the client's environment, and in a daemon started with it.
+
+# Clients of the forwards in the client namespace (and a server that never reads):
+#   read PORT N OUT    N connections reading as fast as they can; the bytes so far into OUT
+#   rr PORT OUT        1 KiB and its echo every 50 ms on one connection; each round trip (ms) to OUT
+#   echo PORT N        N bytes out and back; prints MS= (the time it took)
+#   stuff PORT K       K connections writing forever
+#   deaf PORT          a server that accepts and never reads
+FWD_H1_PY=$(
+  cat << 'EOF'
+import os, selectors, socket, sys, threading, time
+mode = sys.argv[1]
+def put(path, text):
+    with open(path + ".t", "w") as f:
+        f.write(text)
+    os.replace(path + ".t", path)
+if mode == "read":
+    port, n, out = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+    sel = selectors.DefaultSelector()
+    for _ in range(n):
+        s = socket.create_connection(("127.0.0.1", port))
+        s.setblocking(False)
+        sel.register(s, selectors.EVENT_READ)
+    total, last = 0, 0.0
+    while True:
+        for k, _ in sel.select(0.05):
+            try:
+                b = k.fileobj.recv(1 << 20)
+            except BlockingIOError:
+                continue
+            if not b:
+                sel.unregister(k.fileobj)
+                continue
+            total += len(b)
+        t = time.monotonic()
+        if t - last >= 0.05:
+            last = t
+            put(out, str(total))
+elif mode == "rr":
+    port, out = int(sys.argv[2]), sys.argv[3]
+    s = socket.create_connection(("127.0.0.1", port))
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    req, lat = b"r" * 1024, []
+    while True:
+        t0 = time.monotonic()
+        s.sendall(req)
+        got = 0
+        while got < len(req):
+            b = s.recv(len(req) - got)
+            if not b:
+                sys.exit(0)
+            got += len(b)
+        lat.append((time.monotonic() - t0) * 1000)
+        put(out, " ".join("%.1f" % x for x in lat[-400:]))
+        time.sleep(0.05)
+elif mode == "echo":
+    port, n = int(sys.argv[2]), int(sys.argv[3])
+    s = socket.create_connection(("127.0.0.1", port))
+    t0 = time.monotonic()
+    def send():
+        buf, left = b"e" * 65536, n
+        while left > 0:
+            k = min(left, len(buf))
+            s.sendall(buf[:k])
+            left -= k
+    threading.Thread(target=send, daemon=True).start()
+    got = 0
+    while got < n:
+        b = s.recv(1 << 20)
+        if not b:
+            break
+        got += len(b)
+    print("MS=%.0f GOT=%d" % ((time.monotonic() - t0) * 1000, got))
+elif mode == "stuff":
+    port, k = int(sys.argv[2]), int(sys.argv[3])
+    def stuff():
+        s = socket.create_connection(("127.0.0.1", port))
+        buf = b"s" * 65536
+        while True:
+            s.sendall(buf)
+    for _ in range(k):
+        threading.Thread(target=stuff, daemon=True).start()
+    while True:
+        time.sleep(60)
+elif mode == "deaf":
+    port = int(sys.argv[2])
+    l = socket.socket()
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("127.0.0.1", port))
+    l.listen(64)
+    held = []
+    while True:
+        c, _ = l.accept()
+        held.append(c)
+EOF
+)
+FWD_H1_ECHO=19102   # server side: an echo server (fwdprobe)
+FWD_H1_DEAF=19103   # server side: accepts, never reads
+FWD_H1_RR=19002     # client side: -L to the echo server
+FWD_H1_STUCK=19003  # client side: -L to the deaf server
+
+# fwd_pacing on|off: the server's daemon (one per user) restarted with FIL_FORWARD_PACING=$1, so
+# the sessions of the next attaches pace or not; the client takes the same from its command.
+fwd_pacing() {
+  local pid i
+  pid=$(fwd_daemon_pid)
+  [[ -z $pid ]] || as_root kill "$pid" 2> /dev/null || true
+  for ((i = 0; i < 100; i++)); do
+    [[ -z $(fwd_daemon_pid) ]] && break
+    sleep 0.1
+  done
+  nsx "$NS_S" runuser -u rnfil -- env -i HOME=/home/rnfil USER=rnfil LOGNAME=rnfil "PATH=$UDP_PATH" \
+    "FIL_FORWARD_PACING=$1" setsid "$UDP_BIN/fil" server --daemon < /dev/null > /dev/null 2>&1 &
+  for ((i = 0; i < 100; i++)); do
+    [[ -n $(fwd_daemon_pid) ]] && break
+    sleep 0.1
+  done
+  [[ -n $(fwd_daemon_pid) ]] || fail "the daemon did not start (FIL_FORWARD_PACING=$1)"
+}
+
+# fwd_h1_servers: the bulk source (LAT_PY), the echo and the deaf server, in the server namespace.
+fwd_h1_servers() {
+  lat_need python3
+  client_exec_on x mkdir -p "$PD"
+  trap 'lat_bulk_cleanup; lat_stop_listener "$NS_S" "$FWD_H1_ECHO"; lat_stop_listener "$NS_S" "$FWD_H1_DEAF"' EXIT
+  nsx "$NS_S" runuser -u rnfil -- python3 -c "$LAT_PY" "$LAT_SINK_PORT" "$LAT_SOURCE_PORT" > "$OUT/run/$SCENARIO-bulk-server.log" 2>&1 &
+  nsx "$NS_S" runuser -u rnfil -- "$UDP_BIN/fwdprobe" serve "127.0.0.1:$FWD_H1_ECHO" echo > "$OUT/run/$SCENARIO-echo.log" 2>&1 &
+  nsx "$NS_S" runuser -u rnfil -- python3 -c "$FWD_H1_PY" deaf "$FWD_H1_DEAF" > /dev/null 2>&1 &
+  lat_wait_listen "$NS_S" "$LAT_SOURCE_PORT"
+  lat_wait_listen "$NS_S" "$FWD_H1_ECHO"
+  lat_wait_listen "$NS_S" "$FWD_H1_DEAF"
+}
+
+# fwd_h1_start TAG KIND PACE: keyprobe at 20 keys/s typing into fil (KIND pipe or quic, PACE on or
+# off) with -L for the bulk source, the echo server and the deaf one; waits until the client
+# listens (and, on QUIC, has moved there). Sets FWD_KP.
+fwd_h1_start() {
+  local tag=$1 kind=$2 pace=$3 t=pipe
+  [[ $kind == quic ]] && t=direct
+  local cmd=(env "FIL_FORWARD_PACING=$pace" fil --transport "$t"
+    -L "127.0.0.1:$LAT_FWD_DOWN:127.0.0.1:$LAT_SOURCE_PORT"
+    -L "127.0.0.1:$FWD_H1_RR:127.0.0.1:$FWD_H1_ECHO"
+    -L "127.0.0.1:$FWD_H1_STUCK:127.0.0.1:$FWD_H1_DEAF" srv "h1$tag")
+  lat_kp "$tag" 20 6000 -- "${cmd[@]}" &
+  FWD_KP=$!
+  lat_wait_listen "$NS_C" "$LAT_FWD_DOWN"
+  if [[ $kind == quic ]]; then
+    printf -v "FC_WHERE_$tag" x
+    wait_log "$tag" 'Switched(Direct)' 20
+  fi
+}
+
+# fwd_h1_end TAG KIND: waits for keyprobe, records the cell (LAT_P50, LAT_P99), checks the path.
+fwd_h1_end() {
+  local tag=$1 kind=$2 rc=0
+  wait "$FWD_KP" || rc=$?
+  [[ $rc -eq 0 ]] || fail "$tag: keyprobe failed: $(tail -n 3 "$OUT/run/$SCENARIO-$tag.err" 2> /dev/null)"
+  lat_finish "$kind" "$tag" h1 20
+  lat_save_log "$tag"
+  lat_check_path "$tag" "$kind" "$(lat_cell_field "$tag" first_key_ms)"
+  cx_fk "h1$tag"
+}
+
+# f_fwd_parallel: N bulk downloads at once through one -L (N = 0, 1, 4, 16, 32), with keystrokes,
+# on V1's bottleneck, pipe and QUIC, paced and unpaced; on QUIC also one download beside a
+# request-and-response forward (1 KiB every 50 ms: the review's S1, QUIC's streams are not in
+# order across each other). Notes goodput, keystroke p50/p99, and the request round trips.
+f_fwd_parallel() {
+  lat_net bottleneck
+  fwd_h1_servers
+  local kind pace n tag out a0 a1 t0 t1 rr
+  for kind in pipe quic; do
+    for pace in off on; do
+      fwd_pacing "$pace"
+      for n in 0 1 4 16 32 rr; do
+        [[ $n == rr && $kind != quic ]] && continue
+        tag=par$kind$pace$n
+        log "=== cell $tag"
+        fwd_h1_start "$tag" "$kind" "$pace"
+        out=$PD/h1-$tag.count
+        rr=$PD/h1-$tag.rr
+        local readers=0
+        [[ $n == rr ]] && readers=1
+        [[ $n =~ ^[0-9]+$ ]] && readers=$n
+        if [[ $readers -gt 0 ]]; then
+          client_bg_on x timeout 120 python3 -c "$FWD_H1_PY" read "$LAT_FWD_DOWN" "$readers" "$out"
+        fi
+        [[ $n == rr ]] && client_bg_on x timeout 120 python3 -c "$FWD_H1_PY" rr "$FWD_H1_RR" "$rr"
+        sleep 5
+        a0=$(client_exec_on x cat "$out" 2> /dev/null || echo 0)
+        t0=$(now_ms)
+        sleep 12
+        a1=$(client_exec_on x cat "$out" 2> /dev/null || echo 0)
+        t1=$(now_ms)
+        fwd_h1_end "$tag" "$kind"
+        local mbit
+        mbit=$(awk -v b0="${a0:-0}" -v b1="${a1:-0}" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.2f", (b1 - b0) * 8 / ((t1 - t0) / 1000) / 1e6 }')
+        local rrp50=n/a
+        if [[ $n == rr ]]; then
+          rrp50=$(client_exec_on x cat "$rr" 2> /dev/null | tr ' ' '\n' | sort -n | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)]; else print "n/a" }')
+        fi
+        note "H1PAR kind=$kind pacing=$pace flows=$n p50_ms=$LAT_P50 p99_ms=$LAT_P99 goodput_mbit=$mbit rr_p50_ms=$rrp50"
+        printf -v "FWD_H1_$tag" '%s %s %s' "$LAT_P50" "$mbit" "$rrp50"
+      done
+    done
+  done
+  fwd_pacing on
+  # The verdicts: goodput paced within 10 % of unpaced; keystroke p50 under H1's line (2 x the
+  # paced idle + 10 ms) on every loaded cell; QUIC's request round trips beside a bulk one.
+  local v p u idle
+  for kind in pipe quic; do
+    v="FWD_H1_par${kind}on0"
+    idle=$(cut -d' ' -f1 <<< "${!v}")
+    for n in 1 4 16 32 rr; do
+      [[ $n == rr && $kind != quic ]] && continue
+      v="FWD_H1_par${kind}on$n"
+      p=${!v}
+      v="FWD_H1_par${kind}off$n"
+      u=${!v}
+      note "H1PAR verdict kind=$kind flows=$n paced_p50=$(cut -d' ' -f1 <<< "$p") line=$(awk -v i="$idle" 'BEGIN { printf "%.1f", 2 * i + 10 }') unpaced_p50=$(cut -d' ' -f1 <<< "$u") goodput_ratio=$(awk -v a="$(cut -d' ' -f2 <<< "$p")" -v b="$(cut -d' ' -f2 <<< "$u")" 'BEGIN { if (b > 0) printf "%.3f", a / b; else print "n/a" }') rr_p50=$(cut -d' ' -f3 <<< "$p")/$(cut -d' ' -f3 <<< "$u")"
+    done
+  done
+}
+
+# f_fwd_stuck: 8 uploads into a -L whose target never reads, then (once they are stuck) a live
+# 1 MiB echo through another -L, with keystrokes, pipe and QUIC, paced and unpaced. A channel whose
+# reader stopped must stop only itself (DESIGN §8.5 "Memory").
+f_fwd_stuck() {
+  lat_net bottleneck
+  fwd_h1_servers
+  local kind pace tag res
+  for kind in pipe quic; do
+    for pace in off on; do
+      fwd_pacing "$pace"
+      tag=stuck$kind$pace
+      log "=== cell $tag"
+      fwd_h1_start "$tag" "$kind" "$pace"
+      client_bg_on x timeout 120 python3 -c "$FWD_H1_PY" stuff "$FWD_H1_STUCK" 8
+      sleep 10
+      res=$(client_exec_on x timeout 60 python3 -c "$FWD_H1_PY" echo "$FWD_H1_RR" 1048576 2>&1 | tail -n 1)
+      fwd_h1_end "$tag" "$kind"
+      note "H1STUCK kind=$kind pacing=$pace echo_1MiB=$res p50_ms=$LAT_P50 p99_ms=$LAT_P99"
+    done
+  done
+  fwd_pacing on
+}
+
 FWD_SCENARIOS=(
   f_fwd_cable_pull f_fwd_reconnect f_fwd_swap f_fwd_sleep f_fwd_roam
-  f_fwd_many_short f_fwd_ending_stress f_fwd_other_user f_fwd_vs_ssh
+  f_fwd_many_short f_fwd_ending_stress f_fwd_other_user f_fwd_vs_ssh f_fwd_parallel f_fwd_stuck
 )
 
 # Sourced by agent.sh for the topology and the helpers; run directly, it is the fwd part.

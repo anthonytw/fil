@@ -10,6 +10,8 @@
 #   f_agent_other_user   another user of the host cannot reach the session's agent socket: not
 #                        through its 0700 directories, and with them opened not past the relay's
 #                        peer-UID check; the session's SSH_AUTH_SOCK is that socket
+#   f_agent_beside_stuck the agent's requests beside 8 forwards whose target never reads, paced
+#                        and unpaced (H1)
 set -uo pipefail
 # shellcheck source=fwd.sh
 source "$(dirname "${BASH_SOURCE[0]}")/fwd.sh"
@@ -151,6 +153,43 @@ f_agent_other_user() {
   fwd_verdict
 }
 
-AGENT_SCENARIOS=(f_agent_ssh_hop f_agent_other_user)
+# The agent beside 8 forwards whose target never reads (the review of PR #83, B2), on V1's
+# bottleneck over QUIC, paced and unpaced: 20 `ssh-add -l` from the session's agent socket, each
+# a request and an answer through the relay. With pacing they must not wait behind the stuck
+# forwards (the agent has a reserve of its own beside the cap).
+f_agent_beside_stuck() {
+  lat_net bottleneck
+  ag_start
+  nsx "$NS_S" runuser -u rnfil -- python3 -c "$FWD_H1_PY" deaf "$FWD_H1_DEAF" > /dev/null 2>&1 &
+  lat_wait_listen "$NS_S" "$FWD_H1_DEAF"
+  local pace fuid sock ms
+  fuid=$(id -u rnfil)
+  for pace in off on; do
+    fwd_pacing "$pace"
+    FWD_SESSION=agstuck$pace
+    # shellcheck disable=SC2034 # FC_ENV is read by fc_start (fil.sh)
+    FC_ENV=("SSH_AUTH_SOCK=$AG_SOCK" "FIL_FORWARD_PACING=$pace")
+    fc_start a -- -A -L "127.0.0.1:$FWD_H1_STUCK:127.0.0.1:$FWD_H1_DEAF" srv "$FWD_SESSION"
+    # shellcheck disable=SC2034
+    FC_ENV=()
+    fc_ready a
+    wait_log a 'Switched(Direct)' 15
+    client_bg_on x timeout 90 python3 -c "$FWD_H1_PY" stuff "$FWD_H1_STUCK" 8
+    sleep 10
+    sock=$(as_root find "/tmp/fil-$fuid" -mindepth 2 -maxdepth 2 -path "*/a-*/$FWD_SESSION.sock" | head -n 1)
+    [[ -n $sock ]] || fail "no agent socket for $FWD_SESSION"
+    ms=$(nsx "$NS_S" runuser -u rnfil -- env "SSH_AUTH_SOCK=$sock" bash -c \
+      'for i in $(seq 20); do s=$(date +%s%N); ssh-add -l > /dev/null || echo FAIL; e=$(date +%s%N); echo $(((e - s) / 1000000)); done' 2>&1)
+    grep -q FAIL <<< "$ms" && fwd_miss "ssh-add -l beside stuck forwards failed (pacing $pace)"
+    note "H1AGENT pacing=$pace ssh_add_ms_p50=$(grep -v FAIL <<< "$ms" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }') max=$(grep -v FAIL <<< "$ms" | sort -n | tail -n 1)"
+    fc_detach a
+    cx_fk "$FWD_SESSION"
+  done
+  fwd_pacing on
+  lat_stop_listener "$NS_S" "$FWD_H1_DEAF"
+  fwd_verdict
+}
+
+AGENT_SCENARIOS=(f_agent_ssh_hop f_agent_other_user f_agent_beside_stuck)
 
 part_main agent agent_setup fwd_teardown "${AGENT_SCENARIOS[@]}" -- "$@"

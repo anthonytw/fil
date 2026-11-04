@@ -195,13 +195,10 @@ impl fmt::Display for PolicySetting {
 }
 
 /// The path on one line, inert: it came from the remote host. Control and invisible characters
-/// are dropped (`text::sanitize`), and the line breaks and tabs it keeps become spaces, so a
-/// hostile host cannot start a line of its own in an overlay, a shell or `fil ports`.
+/// are dropped and the line breaks and tabs become spaces ([`crate::text::sanitize_inline`]), so
+/// a hostile host cannot start a line of its own in an overlay, a shell or `fil ports`.
 fn path(p: &PortsPath) -> String {
-    crate::text::sanitize(p.as_str().as_bytes())
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    crate::text::sanitize_inline(p.as_str())
 }
 
 impl fmt::Display for PolicySource {

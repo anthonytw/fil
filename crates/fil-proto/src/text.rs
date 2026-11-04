@@ -17,6 +17,16 @@ pub fn sanitize(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Untrusted text as one inert line: [`sanitize`], then every newline and tab turned into a
+/// space, so a hostile peer cannot start a line of its own in an overlay, a shell or a table.
+/// Every place that shows a peer's text on one line uses this.
+pub fn sanitize_inline(text: impl AsRef<[u8]>) -> String {
+    sanitize(text.as_ref())
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
+        .collect()
+}
+
 /// Characters that are invisible or reorder text: Unicode general category Cf (format), Zl and
 /// Zp (`std` has no category lookup, so the ranges are listed, Unicode 16), and the ones outside
 /// those categories that still render as nothing or change what follows: filler and combining
@@ -60,6 +70,12 @@ mod tests {
             sanitize(b"a\x1b[31mred\x1b[0m\tb\r\nc\x07\x7f\xc2\x9b"),
             "a[31mred[0m\tb\nc"
         );
+    }
+
+    #[test]
+    fn inline_text_has_no_line_breaks_or_tabs() {
+        assert_eq!(sanitize_inline("a\tb\r\nc\x1b[0m\u{202E}d"), "a b c[0md");
+        assert_eq!(sanitize_inline(b"x\ny\xff"), "x y\u{fffd}");
     }
 
     #[test]

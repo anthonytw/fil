@@ -3,14 +3,14 @@
 //! Everything in an answer that came from the host is untrusted: process names, working
 //! directories and probe labels are chosen by whatever listens, and the host label of the
 //! attached client by another client. Every such string goes through [`fil_proto::text`] before it
-//! is shown or put in JSON ([`clean`]), so no escape sequence or invisible character reaches the
+//! is shown or put in JSON ([`sanitize_inline`]), so no escape sequence or invisible character reaches the
 //! terminal. The wire caps their length; the view does not rely on it.
 //!
 //! The renderers are pure: the clock and the time zone come in with [`ViewOptions`].
 
 use std::collections::BTreeMap;
 
-use fil_client::text::format_utc;
+use fil_client::text::{format_utc, sanitize_inline};
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
     AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsRow,
@@ -108,15 +108,6 @@ fn variant_name(r: &Response) -> &'static str {
     }
 }
 
-/// Untrusted text made safe to show on one line: control and invisible characters removed
-/// ([`fil_proto::text::sanitize`]), line breaks and tabs turned into spaces.
-fn clean(s: &str) -> String {
-    fil_proto::text::sanitize(s.as_bytes())
-        .chars()
-        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
-        .collect()
-}
-
 // ---- grouping ---------------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -192,15 +183,15 @@ fn policy_line(p: &PolicyLine) -> String {
     match p {
         PolicyLine::Unreadable { file } => format!(
             "fil cannot read {} (some systems keep it root's alone): OpenSSH's defaults apply instead, so a -R beyond loopback is refused",
-            clean(file.as_str())
+            sanitize_inline(file.as_str())
         ),
         PolicyLine::Partial { file, more: 0 } => format!(
             "the sshd mirror is incomplete: fil cannot read {}, which the sshd config includes",
-            clean(file.as_str())
+            sanitize_inline(file.as_str())
         ),
         PolicyLine::Partial { file, more } => format!(
             "the sshd mirror is incomplete: fil cannot read {} and {more} more file{} the sshd config includes",
-            clean(file.as_str()),
+            sanitize_inline(file.as_str()),
             if *more == 1 { "" } else { "s" }
         ),
         PolicyLine::DenyAll(r) => format!("every forward and the agent are refused: {r}"),
@@ -211,7 +202,7 @@ fn policy_line(p: &PolicyLine) -> String {
 /// What a session's refused row was for.
 fn refused_what(r: &RefusedRow) -> String {
     match &r.what {
-        RefusedWhat::Forward(spec) => clean(&forward_spec::format_flag(spec)),
+        RefusedWhat::Forward(spec) => sanitize_inline(&forward_spec::format_flag(spec)),
         RefusedWhat::Agent => "agent forwarding".to_string(),
     }
 }
@@ -274,13 +265,13 @@ fn traffic(f: &ForwardRow) -> String {
 }
 
 fn process(p: &ProcessInfo) -> String {
-    let name = clean(p.name.as_str());
+    let name = sanitize_inline(p.name.as_str());
     let name = if name.trim().is_empty() {
         "(unnamed)".to_string()
     } else {
         name
     };
-    match p.cwd.as_ref().map(|c| clean(c.as_str())) {
+    match p.cwd.as_ref().map(|c| sanitize_inline(c.as_str())) {
         Some(cwd) if !cwd.is_empty() => format!("{name} (pid {}, {cwd})", p.pid),
         _ => format!("{name} (pid {})", p.pid),
     }
@@ -299,7 +290,7 @@ fn probe_kind(k: &ProbeKind) -> String {
 /// `HTTP 200 "Vite + React"`.
 fn probe_text(p: &fil_proto::msg::Probe) -> String {
     let mut out = probe_kind(&p.kind);
-    if let Some(label) = p.label.as_ref().map(|l| clean(l.as_str()))
+    if let Some(label) = p.label.as_ref().map(|l| sanitize_inline(l.as_str()))
         && !label.is_empty()
     {
         out.push_str(&format!(" \"{label}\""));
@@ -392,7 +383,7 @@ fn widths(head: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
 /// the host, outside any session, it names the session through `$FIL_SESSION`. The host is what
 /// the user typed, the session a validated name, and both are cleaned and quoted for a shell.
 fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
-    let session = clean(session);
+    let session = sanitize_inline(session);
     match (o.host, o.current_session) {
         (Some(host), _) => {
             // A session name may start with `-`, which the command line would read as an option
@@ -402,9 +393,9 @@ fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
             } else {
                 format!("{} -L {port}", shell_word(&session))
             };
-            format!("fil forward {} {tail}", shell_word(&clean(host)))
+            format!("fil forward {} {tail}", shell_word(&sanitize_inline(host)))
         }
-        (None, Some(current)) if clean(current) == session => format!("fil forward -L {port}"),
+        (None, Some(current)) if sanitize_inline(current) == session => format!("fil forward -L {port}"),
         (None, _) => format!("FIL_SESSION={} fil forward -L {port}", shell_word(&session)),
     }
 }
@@ -433,10 +424,10 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         (ForwardKind::Local, Some(t)) => (
             own,
             "→",
-            host_port(&clean(&target_host_bare(&t.host)), t.port.get()),
+            host_port(&sanitize_inline(&target_host_bare(&t.host)), t.port.get()),
         ),
         (ForwardKind::Remote, Some(t)) => (
-            host_port(&clean(&target_host_bare(&t.host)), t.port.get()),
+            host_port(&sanitize_inline(&target_host_bare(&t.host)), t.port.get()),
             "←",
             own,
         ),
@@ -629,14 +620,14 @@ fn host_listener_lines<'a>(
 }
 
 fn header(s: &SessionView<'_>, o: &ViewOptions<'_>) -> String {
-    let mut out = format!("SESSION {}", clean(&s.name));
+    let mut out = format!("SESSION {}", sanitize_inline(&s.name));
     if let Some(h) = o.host {
-        out.push_str(&format!(" on {}", clean(h)));
+        out.push_str(&format!(" on {}", sanitize_inline(h)));
     }
     match s.summary.map(|s| &s.attached) {
         Some(Some(a)) => out.push_str(&format!(
             " — attached from {} since {}",
-            clean(a.host.as_str()),
+            sanitize_inline(a.host.as_str()),
             when(a.since_unix_ms, o)
         )),
         Some(None) => out.push_str(" — not attached"),
@@ -901,8 +892,8 @@ fn nonzero(ms: u64) -> Option<u64> {
 fn json_process(p: &ProcessInfo) -> JsonProcess {
     JsonProcess {
         pid: p.pid,
-        name: clean(p.name.as_str()),
-        cwd: p.cwd.as_ref().map(|c| clean(c.as_str())),
+        name: sanitize_inline(p.name.as_str()),
+        cwd: p.cwd.as_ref().map(|c| sanitize_inline(c.as_str())),
     }
 }
 
@@ -917,7 +908,7 @@ fn json_probe(p: &fil_proto::msg::Probe) -> JsonProbe {
     JsonProbe {
         kind,
         http_status,
-        label: p.label.as_ref().map(|l| clean(l.as_str())),
+        label: p.label.as_ref().map(|l| sanitize_inline(l.as_str())),
     }
 }
 
@@ -1005,7 +996,7 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
     let view = group(&answer.rows);
     let out = JsonOut {
         schema: JSON_SCHEMA,
-        host: o.host.map(clean),
+        host: o.host.map(sanitize_inline),
         truncated: answer.truncated,
         complete: answer.complete,
         incomplete: answer.incomplete.map(incomplete_json),
@@ -1013,13 +1004,13 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
             .sessions
             .iter()
             .map(|s| JsonSession {
-                name: clean(&s.name),
-                term: s.summary.map(|s| clean(s.term.as_str())),
+                name: sanitize_inline(&s.name),
+                term: s.summary.map(|s| sanitize_inline(s.term.as_str())),
                 attached: s
                     .summary
                     .and_then(|s| s.attached.as_ref())
                     .map(|a| JsonAttached {
-                        host: clean(a.host.as_str()),
+                        host: sanitize_inline(a.host.as_str()),
                         since_unix_ms: a.since_unix_ms,
                     }),
                 agent: s.agent.map(|a| JsonAgent {
@@ -1034,7 +1025,7 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
                     .iter()
                     .map(|r| JsonRefused {
                         what: match &r.what {
-                            RefusedWhat::Forward(spec) => clean(&forward_spec::format_flag(spec)),
+                            RefusedWhat::Forward(spec) => sanitize_inline(&forward_spec::format_flag(spec)),
                             RefusedWhat::Agent => "agent".to_string(),
                         },
                         reason: r.why.to_string(),

@@ -31,10 +31,9 @@ pub fn sanitize_lines(raw: &[u8], max_lines: usize, max_cols: usize) -> (Vec<Str
     (lines, truncated)
 }
 
-/// One short, safe string from untrusted text (a host label in a message, say).
-pub fn sanitize_inline(s: &str) -> String {
-    clean(s.as_bytes()).replace('\n', " ")
-}
+/// One short, safe string from untrusted text (a host label in a message, say): the one
+/// definition is in fil-proto.
+pub use fil_proto::text::sanitize_inline;
 
 /// Splits `line` into pieces of at most `width` characters, at spaces where possible. Status text
 /// is kept short on purpose: a terminal that reflows on a width change re-wraps anything wider

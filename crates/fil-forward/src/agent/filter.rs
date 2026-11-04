@@ -289,13 +289,11 @@ pub fn plain_key(blob: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Untrusted text as one short, inert line (`fil_proto::text::sanitize`, newlines and tabs as
-/// spaces, at most [`MAX_SHOWN`] characters).
+/// Untrusted text as one short, inert line (`fil_proto::text::sanitize_inline`, at most
+/// [`MAX_SHOWN`] characters).
 fn shown(bytes: &[u8]) -> String {
-    let clean = fil_proto::text::sanitize(&bytes[..bytes.len().min(4 * MAX_SHOWN)]);
-    clean
+    fil_proto::text::sanitize_inline(&bytes[..bytes.len().min(4 * MAX_SHOWN)])
         .chars()
-        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
         .take(MAX_SHOWN)
         .collect::<String>()
         .trim()

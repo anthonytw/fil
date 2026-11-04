@@ -560,6 +560,7 @@ pub const MAX_PENDING: usize = 1024;
 /// flood of clients that never send their request holds this many places, not the whole queue.
 pub const MAX_HANDSHAKES: usize = 64;
 
+/// What the data sender hands to the link next.
 enum Out {
     Data(ChannelId, Bytes),
     Finish(ChannelId),
@@ -574,8 +575,12 @@ struct State<L> {
     /// The mux epoch, counted: a policy answer given in one epoch is not used in another.
     epoch: u64,
     ctl_out: VecDeque<(ChannelId, Bytes)>,
-    data_out: VecDeque<Out>,
+    /// Payloads taken from the mux for the data sender, waiting for the pacer.
+    data_out: VecDeque<(ChannelId, Bytes)>,
     data_out_bytes: usize,
+    /// Released channels whose link stream is to be finished. Not behind `data_out`: a finish is
+    /// never paced and never waits for payloads (a released channel has none left to send).
+    finish_out: VecDeque<ChannelId>,
     /// The current link's forward pacing (H1, [`crate::pace`]): what the data sender may hand to
     /// the link. A new one with every link.
     pacer: Pacer,
@@ -661,6 +666,7 @@ impl<L: Link> State<L> {
         self.ctl_out.clear();
         self.data_out.clear();
         self.data_out_bytes = 0;
+        self.finish_out.clear();
         self.queued.clear();
 
         // Never fed, so never acknowledged: the peer sends them again on the next link.
@@ -777,58 +783,75 @@ impl<L: Link> State<L> {
         mux
     }
 
-    /// The next item the data sender may hand to the current link: the queue's head if the pacer
-    /// admits it (a `Finish` always goes), otherwise the first payload of a channel that has
+    /// A channel was released: its link stream is finished at once, ahead of the queue. Whatever
+    /// of its payloads is still queued is stale (a released channel has nothing the peer wants,
+    /// and sending on a finished stream would fail the link), so it goes.
+    fn finish_channel(&mut self, ch: ChannelId) {
+        let mut freed = 0;
+        self.data_out.retain(|(c, p)| {
+            let stale = *c == ch;
+            if stale {
+                freed += p.len();
+            }
+            !stale
+        });
+        self.data_out_bytes -= freed;
+        self.queued.remove(&ch.0);
+        self.finish_out.push_back(ch);
+    }
+
+    /// The next item the data sender may hand to the current link: a `Finish` (never held), then
+    /// the queue's head if the pacer admits it, otherwise the first payload of a channel that has
     /// nothing earlier in the queue and that the pacer lets through anyway (nothing in flight).
     /// What it takes is recorded with the pacer. `None` with a non-empty queue: held.
     fn next_out(&mut self, t: std::time::Instant) -> Option<Out> {
         let path = self.link.as_ref()?.status().borrow().path_generation;
         self.pacer.path_changed(path);
+        if let Some(ch) = self.finish_out.pop_front() {
+            self.pacer.forget(ch);
+            return Some(Out::Finish(ch));
+        }
         let idx = match self.data_out.front() {
             // `pull` found nothing the pacer lets go: nor will `pass_from_mux`.
             None => return None,
-            Some(Out::Finish(_)) => 0,
-            Some(Out::Data(ch, _)) if self.pacer.admit(*ch, self.is_agent(*ch), t) => 0,
-            Some(Out::Data(..)) => match self.pass_index() {
+            Some((ch, _)) if self.pacer.admit(*ch, self.is_agent(*ch), t) => 0,
+            Some(_) => match self.pass_index() {
                 Some(i) => i,
                 None => return self.pass_from_mux(t),
             },
         };
-        let item = self.data_out.remove(idx).expect("an index into the queue");
-        match &item {
-            Out::Data(ch, p) => {
-                self.data_out_bytes -= p.len();
-                if let Some(n) = self.queued.get_mut(&ch.0) {
-                    *n -= 1;
-                    if *n == 0 {
-                        self.queued.remove(&ch.0);
-                    }
-                }
-                let seg = DataSegment::parse(p);
-                debug_assert!(seg.is_ok(), "the mux built this payload");
-                if let Ok(seg) = seg {
-                    let start = seg.seq;
-                    let agent = self.is_agent(*ch);
-                    self.pacer
-                        .on_sent(*ch, start, start + seg.data.len() as u64, agent, t);
-                }
+        let (ch, p) = self.data_out.remove(idx).expect("an index into the queue");
+        self.data_out_bytes -= p.len();
+        if let Some(n) = self.queued.get_mut(&ch.0) {
+            *n -= 1;
+            if *n == 0 {
+                self.queued.remove(&ch.0);
             }
-            Out::Finish(ch) => self.pacer.forget(*ch),
         }
-        Some(item)
+        self.sent(ch, &p, t);
+        Some(Out::Data(ch, p))
     }
 
-    /// Where in the data queue (all of it: at most [`PASS_SCAN`] items) the first item is that may go although
-    /// the pacer holds the head: the first item of its channel in the queue (per-channel order
-    /// holds), and either a `Finish` (it frees the link's stream, and is never paced) or a payload
-    /// the pacer lets go (under the cap, or a pass: the head may be a channel whose reader stopped).
+    /// Records with the pacer that `payload` of `ch` goes on the link now.
+    fn sent(&mut self, ch: ChannelId, payload: &Bytes, t: std::time::Instant) {
+        let seg = DataSegment::parse(payload);
+        debug_assert!(seg.is_ok(), "the mux built this payload");
+        if let Ok(seg) = seg {
+            let start = seg.seq;
+            let agent = self.is_agent(ch);
+            self.pacer
+                .on_sent(ch, start, start + seg.data.len() as u64, agent, t);
+        }
+    }
+
+    /// Where in the data queue (all of it: at most [`PASS_SCAN`] items) the first item is that
+    /// may go although the pacer holds the head: the first item of its channel in the queue
+    /// (per-channel order holds) that the pacer lets go (under the cap, or a pass: the head may
+    /// be a channel whose reader stopped).
     fn pass_index(&self) -> Option<usize> {
         let mut seen = [0u32; PASS_SCAN];
-        for (i, o) in self.data_out.iter().enumerate().take(PASS_SCAN) {
-            let (ch, may) = match o {
-                Out::Data(ch, _) => (*ch, self.pacer.may_go(*ch, self.is_agent(*ch))),
-                Out::Finish(ch) => (*ch, true),
-            };
+        for (i, (ch, _)) in self.data_out.iter().enumerate().take(PASS_SCAN) {
+            let may = self.pacer.may_go(*ch, self.is_agent(*ch));
             if i > 0 && may && !seen[..i].contains(&ch.0) {
                 return Some(i);
             }
@@ -852,14 +875,7 @@ impl<L: Link> State<L> {
             return None;
         }
         let (ch, payload) = self.next_from_mux()?;
-        let agent = self.is_agent(ch);
-        let seg = DataSegment::parse(&payload);
-        debug_assert!(seg.is_ok(), "the mux built this payload");
-        if let Ok(seg) = seg {
-            let start = seg.seq;
-            self.pacer
-                .on_sent(ch, start, start + seg.data.len() as u64, agent, t);
-        }
+        self.sent(ch, &payload, t);
         Some(Out::Data(ch, payload))
     }
 
@@ -936,7 +952,7 @@ impl<L: Link> State<L> {
             self.pass_rr = id;
             self.data_out_bytes += payload.len();
             *self.queued.entry(ch.0).or_default() += 1;
-            self.data_out.push_back(Out::Data(ch, payload));
+            self.data_out.push_back((ch, payload));
         }
         self.scratch_ids = ids;
     }
@@ -1061,6 +1077,7 @@ impl<L: Link> Endpoint<L> {
                 ctl_out: VecDeque::new(),
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
+                finish_out: VecDeque::new(),
                 pacer: Pacer::new(PaceConfig::from_env(), now()),
                 pace_cfg: PaceConfig::from_env(),
                 queued: HashMap::new(),
@@ -1658,7 +1675,7 @@ impl<L: Link> Endpoint<L> {
             buffered: st.mux.buffered(),
             reserved: st.mux.reserved(),
             mux_buffered: st.mux_buffered(),
-            queued: st.ctl_out.len() + st.data_out.len(),
+            queued: st.ctl_out.len() + st.data_out.len() + st.finish_out.len(),
             attached: st.link.is_some(),
             listeners: st.listeners.len(),
             failed: st.mux.failed().is_some(),
@@ -1796,7 +1813,7 @@ impl<L: Link> Inner<L> {
                     st.end_slot(channel, why);
                 }
                 MuxEvent::Released { channel } => {
-                    st.data_out.push_back(Out::Finish(channel));
+                    st.finish_channel(channel);
                     st.end_slot(channel, CloseReason::Reset);
                     st.slots.remove(&channel.0);
                     st.touch(now());
@@ -2305,7 +2322,11 @@ impl<L: Link> Inner<L> {
                 } else {
                     None
                 };
-                (item, wake, took_mux || (ticked && !st.data_out.is_empty()))
+                (
+                    item,
+                    wake,
+                    took_mux || (ticked && (!st.data_out.is_empty() || !st.finish_out.is_empty())),
+                )
             };
             if data_ready {
                 self.data_kick.notify_one();

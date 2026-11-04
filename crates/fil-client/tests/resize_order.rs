@@ -726,13 +726,17 @@ async fn output_in_flight_before_a_repaint_is_applied_before_it() {
     rig.term.resize(60, 24);
     settle().await;
     assert_eq!(rig.daemon.repaints().await, vec![1]);
-    let history = rig.term.history().join("\n");
-    for i in [0, 10, 15] {
+    // Every line of the output is in the scrollback or on the screen exactly once: applied
+    // before the snapshot, not skipped (a catch-up's jump) and not applied again after it.
+    let mut all = rig.term.history();
+    all.extend(rig.term.rows());
+    for i in 0..40 {
         let want = numbered(i);
-        assert!(
-            history.contains(want.trim_end()),
-            "{want:?} scrolled off before the repaint and must be in the scrollback: {history}"
-        );
+        let n = all
+            .iter()
+            .filter(|l| l.trim_end() == want.trim_end())
+            .count();
+        assert_eq!(n, 1, "{want:?} appears {n} times: {all:?}");
     }
     assert_eq!(
         rig.term.state().screen_text(),

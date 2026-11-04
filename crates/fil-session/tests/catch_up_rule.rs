@@ -250,3 +250,51 @@ async fn a_resume_snapshot_never_repeats_what_the_client_has() {
     assert_eq!(nums, (1..=1500).collect::<Vec<_>>());
     let _ = h.kill(Duration::from_secs(5)).await;
 }
+
+/// A resume with `want_snapshot` (its screen untrusted, typically after a resize during an
+/// outage) and output it missed: the snapshot brings one screen more than the unseen history,
+/// so the rows that were on the client's screen come back whole after the marker (a terminal
+/// that truncates rows on a shrink has lost their tails); before the marker, every line once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_resume_snapshot_redraws_the_clients_screen_rows() {
+    let sc = Scratch::new();
+    let script = format!(
+        "stty -echo; echo READY; read go; seq -f 'L%06g {PAD}' 1 100; sleep 1; \
+         seq -f 'L%06g {PAD}' 101 400; echo END; sleep 30"
+    );
+    let mut cfg = sh_config(&sc, "main", &script);
+    cfg.history_lines = 5000;
+    let h = spawn_plain(cfg).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_screen("READY").await;
+    c.type_bytes(b"\n").await;
+    c.wait_out(&format!("L000100 {PAD}\r\n")).await;
+    let mut resume = c.resume_request();
+    resume.want_snapshot = true;
+    c.hang_up();
+    let _ = c.serve_end().await;
+    wait_log_end(&h, 400 * 59).await;
+
+    let mut c2 = Client::connect(&h, Connect::new(&h, key(1)).resume(resume));
+    for b in &c.snapshot_bytes {
+        c2.emu.feed(b);
+    }
+    c2.emu.feed(&c.out);
+    c2.wait_screen("END").await;
+    let r = c2.reply.clone().unwrap();
+    assert!(
+        matches!(r.start, StartPoint::Snapshot(i) if i.reason == SnapshotReason::Requested),
+        "{:?}",
+        r.start
+    );
+    let seen = shown(&c2);
+    let marker = seen.iter().position(Option::is_none).expect("the marker");
+    let before: Vec<u32> = seen[..marker].iter().flatten().copied().collect();
+    let after: Vec<u32> = seen[marker + 1..].iter().flatten().copied().collect();
+    assert_eq!(before, (1..=100).collect::<Vec<_>>());
+    // The client's 24 rows held lines 78..=100 and the cursor's row: they are drawn again.
+    let first = after[0];
+    assert!(first <= 78, "{after:?}");
+    assert_eq!(after, (first..=400).collect::<Vec<_>>());
+    let _ = h.kill(Duration::from_secs(5)).await;
+}

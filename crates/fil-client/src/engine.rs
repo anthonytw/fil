@@ -76,10 +76,12 @@ const MAX_PENDING_INPUT: usize = 64 * 1024;
 const GAP_PATIENCE: Duration = Duration::from_secs(5);
 /// How long a mid-stream snapshot may be held with no progress at all, neither in the terminal
 /// stream below its position nor in its own bytes, before the link is given up on (DESIGN.md
-/// section 6.2). A live link always makes progress, however slow: at 256 kbit/s a 16 KiB segment
-/// takes half a second. A dead one goes `Down` long before this (`dead_after`, 5 s, is not
-/// configurable). So this only catches a link that stays up but has lost what it accepted, and a
-/// resume from a held snapshot is exact. Six times `dead_after`, for margin.
+/// section 6.2). Progress comes a segment (up to 16 KiB) at a time, so a live link trips this
+/// only below about 4.4 kbit/s of terminal and snapshot data combined (reachable when many busy
+/// forwards share a slow QUIC link); a dead one goes `Down` long before (`dead_after`, 5 s, is
+/// not configurable). It is meant for a link that stays up but has lost what it accepted, and a
+/// false trip costs one exact resume (a held snapshot has not moved the position). Six times
+/// `dead_after`, for margin.
 const SNAPSHOT_PATIENCE: Duration = Duration::from_secs(30);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.

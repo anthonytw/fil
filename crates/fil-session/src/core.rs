@@ -1354,12 +1354,23 @@ impl Core {
         reason: SnapshotReason,
         client_at: Option<u64>,
     ) -> (StartPoint, Option<Vec<u8>>, u64) {
+        let max = self.cfg.history_lines;
+        let rows = self.size.rows();
         let history = match client_at {
             Some(seq) => {
                 let log = self.shared.lock_log();
-                unseen_history(&log, seq, at, self.size.rows(), self.cfg.history_lines)
+                let unseen = unseen_history(&log, seq, at, rows, max);
+                if reason == SnapshotReason::Requested && skipped > 0 {
+                    // The client's screen is untrusted (typically a resize during an outage): a
+                    // terminal that truncates rows on a shrink (xterm) has lost their tails, and
+                    // the prologue scrolls that screen into the scrollback as it is. One screen
+                    // more of history brings those rows back whole.
+                    (unseen + usize::from(rows)).min(max)
+                } else {
+                    unseen
+                }
             }
-            None => self.cfg.history_lines,
+            None => max,
         };
         let bytes = self.render_snapshot(skipped, history);
         let info = SnapshotInfo {
@@ -1582,8 +1593,9 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// only part of is shown whole after the marker; a whole line is not shown twice.
 ///
 /// Line feeds are a lower bound on the lines scrolled (a line wider than the screen wraps onto
-/// rows of its own; output the log no longer holds is not counted), so this errs towards
-/// showing too few of the skipped lines, never lines the client has. The exceptions are output
+/// rows of its own), so this errs towards showing too few of the skipped lines, never lines the
+/// client has. When the log has wrapped past `sent`, the missing line feeds cannot be counted and
+/// this is `max`: the full history, which may repeat lines the client has. The exceptions are output
 /// whose line feeds do not scroll the primary screen's history, and each can bring back up to
 /// `max` lines the client has:
 /// - multi-line redraws in place on the primary screen, the common one: a cursor-up and a few
@@ -1596,10 +1608,15 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// rows in fil-term would end the exceptions.)
 pub(crate) fn unseen_history(log: &OutputLog, sent: u64, at: u64, rows: u16, max: usize) -> usize {
     const CHUNK: usize = 64 * 1024;
-    let lo = sent.max(log.start());
-    if lo >= at || max == 0 {
+    if sent >= at || max == 0 {
         return 0;
     }
+    if sent < log.start() {
+        // The log no longer holds where the client is: the line feeds it is missing cannot be
+        // counted, so the full history, rather than an undercount.
+        return max;
+    }
+    let lo = sent;
     let enough = max + usize::from(rows);
     let mut feeds = 0;
     let mut end = at;
@@ -1609,9 +1626,8 @@ pub(crate) fn unseen_history(log: &OutputLog, sent: u64, at: u64, rows: u16, max
         feeds += chunk.iter().filter(|&&b| b == b'\n').count();
         end = from;
     }
-    // Does the skipped output start by ending the client's last row? Only knowable when the log
-    // still has the byte at `sent`.
-    let ends_row = sent >= log.start() && {
+    // Does the skipped output start by ending the client's last row?
+    let ends_row = {
         // The cut can fall inside a CSI sequence (sends are cut at any byte): its start, from
         // before `sent`, goes with it.
         let back = (sent - log.start()).min(32);
@@ -2070,23 +2086,37 @@ mod tests {
         }
     }
 
-    /// When the log no longer holds the start of the skipped output, the line feeds it does hold
-    /// are a lower bound: some skipped lines may be missing, none the client has comes back.
+    /// When the log no longer holds the client's position, the line feeds it is missing cannot
+    /// be counted: the full history, never an undercount (no skipped line is left out, though
+    /// some the client has may come back). From the log's start on, the count is exact again.
     #[test]
-    fn a_wrapped_log_errs_towards_fewer_lines() {
+    fn a_log_wrapped_past_the_client_gives_the_full_history() {
         let out = numbered_lines(60);
         let mut log = OutputLog::new(200);
         log.append(&out);
-        let start = log.start() as usize;
+        let start = log.start();
+        let end = out.len() as u64;
         for sent in 0..start {
-            let seen = after_catch_up(&out, &log, sent, 1000);
-            let nums: Vec<u32> = seen.iter().flatten().copied().collect();
-            assert!(
-                nums.windows(2).all(|w| w[1] > w[0]),
-                "cut at {sent}: {nums:?}"
+            assert_eq!(
+                unseen_history(&log, sent, end, 8, 1000),
+                1000,
+                "cut at {sent}"
             );
-            assert_eq!(nums.last(), Some(&60));
+            let seen = after_catch_up(&out, &log, sent as usize, 1000);
+            let nums: Vec<u32> = seen.iter().flatten().copied().collect();
+            // Every line the client never got is shown (here the emulator has them all).
+            let last_sent = seen.iter().position(Option::is_none).unwrap();
+            let had = seen[..last_sent]
+                .iter()
+                .flatten()
+                .max()
+                .copied()
+                .unwrap_or(0);
+            for n in had + 1..=60 {
+                assert!(nums.contains(&n), "cut at {sent}: {n} missing: {nums:?}");
+            }
         }
+        assert!(unseen_history(&log, start, end, 8, 1000) < 1000);
     }
 
     #[test]

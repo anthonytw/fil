@@ -979,3 +979,97 @@ fn a_slow_reader_gets_what_it_reads() {
     assert!(bulk >= 0.9 * ubulk, "{bulk} against {ubulk}");
     assert!(q <= TARGET + Duration::from_millis(15), "{q:?}");
 }
+
+/// One payload out at `at` on `c` from `off`, acknowledged `rtt_ms` later.
+fn exchange(p: &mut Pacer, c: ChannelId, off: &mut u64, at: Instant, rtt_ms: u64, agent: bool) {
+    p.on_sent(c, *off, *off + PAYLOAD, agent, at);
+    *off += PAYLOAD;
+    p.on_ack(c, *off, ACK_AFTER, at + Duration::from_millis(rtt_ms));
+}
+
+/// A small ack that came back late enough to have waited for the peer's timer is a bound, not a
+/// sample: it does not move the base or the current delay. Once the peer has shown it acks on
+/// drain, its small acks are samples again.
+#[test]
+fn an_ack_that_may_have_waited_for_the_timer_is_not_a_sample() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let c = ch(16);
+    let mut off = 0;
+    // A threshold-sized ack: a sample, at 40 ms.
+    p.on_sent(c, 0, ACK_AFTER, false, t0);
+    off += ACK_AFTER;
+    p.on_ack(c, off, ACK_AFTER, t0 + Duration::from_millis(40));
+    assert_eq!(p.state().samples, 1);
+    // A small one 160 ms after its first byte left: may be the timer's.
+    let t = t0 + Duration::from_millis(100);
+    exchange(&mut p, c, &mut off, t, 160, false);
+    let st = p.state();
+    assert_eq!((st.samples, st.bounded), (1, 1), "{st:?}");
+    assert_eq!(st.base, Some(Duration::from_millis(40)));
+    assert_eq!(st.current, Some(Duration::from_millis(40)));
+    // Three small acks well inside the timer's reach: the peer acks on drain.
+    let mut t = t + Duration::from_millis(200);
+    for _ in 0..DRAIN_PROOFS {
+        exchange(&mut p, c, &mut off, t, 42, false);
+        t += Duration::from_millis(50);
+    }
+    exchange(&mut p, c, &mut off, t, 160, false);
+    let st = p.state();
+    assert_eq!(st.bounded, 1, "{st:?}");
+    assert_eq!(st.samples, 2 + u64::from(DRAIN_PROOFS), "{st:?}");
+}
+
+/// A parked channel (bytes presumed delivered, its reader not keeping up) gives no samples: its
+/// acks measure its reader.
+#[test]
+fn a_parked_channel_gives_no_samples() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let (slow, live) = (ch(16), ch(18));
+    p.on_sent(slow, 0, PAYLOAD, false, t0);
+    let mut off = 0;
+    // The live channel's acks come; the slow one's do not.
+    let mut t = t0 + Duration::from_millis(5);
+    for _ in 0..10 {
+        exchange(&mut p, live, &mut off, t, 40, false);
+        t += Duration::from_millis(40);
+    }
+    p.advance(t);
+    assert_eq!(
+        p.state().in_flight,
+        0,
+        "the slow channel's payload is presumed delivered"
+    );
+    // One more payload of it, then its reader takes both, seconds later.
+    p.on_sent(slow, PAYLOAD, 2 * PAYLOAD, false, t);
+    let before = p.state();
+    p.on_ack(slow, 2 * PAYLOAD, ACK_AFTER, t + Duration::from_secs(3));
+    let after = p.state();
+    assert_eq!(after.samples, before.samples, "{after:?}");
+    assert_eq!(after.current, before.current);
+    assert_eq!(after.parked_acks, before.parked_acks + 1);
+}
+
+/// The agent's reserve is its own: with the forward passes spent, an agent request still goes.
+#[test]
+fn the_agent_reserve_is_beside_the_pass_budget() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(
+        PaceConfig {
+            enabled: true,
+            fixed_cap: Some(MIN_CAP),
+        },
+        t0,
+    );
+    let mut n = 16;
+    while p.admit(ch(n), false, t0) {
+        p.on_sent(ch(n), 0, PAYLOAD, false, t0);
+        n += 2;
+    }
+    assert!(p.state().passes >= PASS_BUDGET);
+    assert!(
+        p.admit(ch(n + 1), true, t0),
+        "the agent waits for forwards' passes"
+    );
+}

@@ -1398,11 +1398,13 @@ impl Core {
                 }
             }
         }
-        // A written guess the predictor superseded (another key guessed on its cell) is checked
-        // like a pending one when the ack covers it and no covered later guess holds its cell
+        // A guess the predictor superseded (another key guessed on its cell) is checked like a
+        // pending one when the ack covers it and no covered later guess holds its cell
         // (`Guards::superseded_acked`): otherwise a predictor that guesses each key on the
         // previous key's cell keeps every covered key superseded, and the ack never sees one
-        // unechoed (review B3).
+        // unechoed (review B3). Written or not, and a withdrawn guess is no holder: a hidden or
+        // withdrawn superseder is checked by nothing else, so it cannot vouch for the guess it
+        // replaced (review B4).
         if self.g.superseded_acked {
             for i in 0..self.keys.len() {
                 let k = &self.keys[i];
@@ -1412,7 +1414,6 @@ impl Core {
                             row, col, glyph, ..
                         },
                     state: GState::Superseded,
-                    written: true,
                     ..
                 }) = &k.guess
                 else {
@@ -1426,8 +1427,9 @@ impl Core {
                     l.end <= input_upto
                         && matches!(&l.guess, Some(Guess {
                             kind: GKind::Glyph { row: r, col: c, .. },
+                            state,
                             ..
-                        }) if (*r, *c) == cell)
+                        }) if (*r, *c) == cell && *state != GState::Withdrawn)
                 });
                 if !held_later && v.cell(cell.0, cell.1).map_or("", |c| c.text) != text_of(*glyph) {
                     late = true;

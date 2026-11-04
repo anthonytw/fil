@@ -447,6 +447,142 @@ fn b3_a_superseding_chain_left_of_the_cursor_is_caught_by_the_ack() {
     assert!(got.len() > 2, "superseded_acked off: {got:?}");
 }
 
+// ---- B4: an unchecked holder for the superseded check (re-check 2) -------------------------
+
+/// Chains every key after the first (honest) one on one cell, and makes every second secret key
+/// a holder nothing checks: hidden (`Show::Hide` while it is the latest key, so it is never
+/// written), and optionally withdrawn at the next tick.
+struct Holder {
+    cell: Option<(u16, u16)>,
+    withdraw: bool,
+    n: u64,
+    last: Option<(u16, u16)>,
+}
+
+impl Holder {
+    /// The latest key is a holder: every second secret key (the first key is `s`).
+    fn holding(&self) -> bool {
+        self.n > 1 && self.n % 2 == 1
+    }
+}
+
+impl Predictor for Holder {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let KeyEvent::Char(_) = key else {
+            return Vec::new();
+        };
+        let c = ctx.screen.cursor();
+        self.n += 1;
+        let cell = if self.n == 1 {
+            (c.row, c.col)
+        } else {
+            self.cell.unwrap_or((c.row, c.col.saturating_sub(1)))
+        };
+        self.last = Some(cell);
+        vec![OverlayEdit::Guess {
+            row: cell.0,
+            col: cell.1,
+            at,
+        }]
+    }
+    fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+    fn on_settled(&mut self, _: &[Settled], _: &Ctx<'_>) {}
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
+    fn on_tick(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+        if self.withdraw
+            && self.holding()
+            && let Some((row, col)) = self.last.take()
+        {
+            return vec![OverlayEdit::Withdraw { row, col }];
+        }
+        Vec::new()
+    }
+    fn next_deadline(&self) -> Option<Time> {
+        None
+    }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        if self.holding() {
+            Show::Hide
+        } else {
+            Show::Plain
+        }
+    }
+    fn reset(&mut self) {}
+    fn has_outstanding(&self) -> bool {
+        false
+    }
+}
+
+/// Confirmed at `$ s`, then a silent raw read: the secret typed in pairs (20 ms apart, pairs
+/// 100 ms apart), one ack 150 ms after each pair covering it (a 50 ms coalescing window and a
+/// fast typist). OQ-1 case 1's bound at this cadence is the four keys typed before the first ack.
+fn pair_acked(cell: Option<(u16, u16)>, withdraw: bool, guards: Guards) -> Vec<char> {
+    let mut t = T::new(
+        Box::new(Holder {
+            cell,
+            withdraw,
+            n: 0,
+            last: None,
+        }),
+        guards,
+    );
+    t.server(b"abcdef\r\n$ ", 0);
+    t.key(b"s", 10);
+    t.server(b"s", 120);
+    t.ack(1, 125);
+    assert!(t.o.epoch_confirmed());
+    let secret = ["Ø", "Ñ", "Ü", "Å", "Ç", "È", "É", "Ê"];
+    let mut acks: Vec<(u64, u64)> = Vec::new();
+    for (i, s) in secret.iter().enumerate() {
+        let t0 = 200 + 100 * (i as u64 / 2) + 20 * (i as u64 % 2);
+        acks.retain(|&(due, upto)| {
+            if due <= t0 {
+                t.ack(upto, due);
+                false
+            } else {
+                true
+            }
+        });
+        t.key(s.as_bytes(), t0);
+        t.tick(t0 + 5);
+        if i % 2 == 1 {
+            acks.push((t0 + 150, t.at));
+        }
+    }
+    for (due, upto) in acks {
+        t.ack(upto, due);
+    }
+    t.secrets()
+}
+
+/// Keys written past the bound (the first four of the secret).
+fn past_the_bound(written: &[char]) -> Vec<char> {
+    let bound = ['Ø', 'Ñ', 'Ü', 'Å'];
+    written
+        .iter()
+        .copied()
+        .filter(|c| !bound.contains(c))
+        .collect()
+}
+
+#[test]
+fn b4_a_hidden_holder_does_not_shield_a_superseded_guess() {
+    for cell in [Some((0, 2)), None] {
+        let got = pair_acked(cell, false, Guards::ALL);
+        assert!(past_the_bound(&got).is_empty(), "{cell:?}: written {got:?}");
+    }
+}
+
+#[test]
+fn b4_a_withdrawn_holder_does_not_shield_a_superseded_guess() {
+    for cell in [Some((0, 2)), None] {
+        let got = pair_acked(cell, true, Guards::ALL);
+        assert!(past_the_bound(&got).is_empty(), "{cell:?}: written {got:?}");
+    }
+}
+
 // ---- S1: the unexplained-output checks, one by one ------------------------------------------
 
 fn confirmed_mosh() -> T {

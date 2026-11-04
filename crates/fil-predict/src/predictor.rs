@@ -77,7 +77,9 @@ impl std::fmt::Debug for CellRef<'_> {
     }
 }
 
-/// A read-only view of the shadow screen. C1 implements it over [`TermState`]; P2 makes it cheap.
+/// A read-only view of the shadow screen. The overlay's is borrowed from the shadow emulator
+/// ([`fil_term::Emulator::screen`]): no [`TermState`] is built to answer it (P2). [`TermState`]
+/// implements it too, for tests.
 pub trait ScreenView {
     fn size(&self) -> Size;
     /// Row, column, pending wrap, visibility, pen.
@@ -87,16 +89,17 @@ pub trait ScreenView {
     /// `None` off the screen.
     fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>>;
     /// A value that changes whenever a glyph on `row` changes (`docs/m3/plan.md` §2.4 rule 3). It
-    /// may also change when nothing visible did (stricter is allowed). C1's implementation (for
-    /// [`TermState`]) is a 64-bit hash of the row's glyphs, so it stays the same across a glyph
-    /// change only by an accidental collision (about 2^-64 per row and key), and it cannot see a
-    /// change undone before it is read; P2's is a write counter or damage tracking in the backend,
-    /// which sees every write. Off the screen: 0.
+    /// may also change when nothing visible did (stricter is allowed). The overlay's is the
+    /// backend's per-row write counter ([`fil_term::Screen::row_stamp`]: damage tracking on
+    /// `alacritty_terminal`, a classifier of the stream on `vt100`), which sees every write, also
+    /// a change drawn and undone before it is read. [`TermState`]'s (C1's, kept for tests) is a
+    /// 64-bit hash of the row's glyphs, which cannot see that. Off the screen: 0.
     fn row_stamp(&self, row: u16) -> u64;
     /// **Test only** (the `testkit` feature; not part of the contract a predictor may rely on):
-    /// the whole shadow state, when the view is backed by one. `None` by default; `Some` for
-    /// C1's [`TermState`]-backed view. For harnesses that compare the shadow with an oracle
-    /// terminal from inside a predictor (T1's adapter).
+    /// the whole shadow state, when the view has one. `None` by default; `Some` for the overlay's
+    /// view (the visible screen, copied once per event when first asked for: no history, the
+    /// default tab stops) and for [`TermState`]. For harnesses that compare the shadow with an
+    /// oracle terminal from inside a predictor (T1's adapter).
     #[cfg(feature = "testkit")]
     fn test_state(&self) -> Option<&TermState> {
         None

@@ -12,8 +12,9 @@ default:
     @just --list
 
 # The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
-# failure (the advisory database) shows up at once, not after the whole test suite.
-ci: deny fmt-check clippy check-default release-deps release-test test
+# failure (the advisory database) shows up at once, not after the whole test suite. `notices` needs
+# cargo-about (the Notices section below).
+ci: deny fmt-check clippy check-default release-deps notices release-test test
 
 fmt-check:
     cargo fmt --all --check
@@ -356,3 +357,75 @@ release-check *args:
 [positional-arguments]
 release-verify version *args:
     tests/release/verify.sh "$@"
+
+# ---- Notices (docs/m4/release.md section 7) ----
+
+# The cargo-about that renders THIRD-PARTY-NOTICES.md. Pinned: another version can render other
+# bytes, and `notices` fails on it. The workflows install exactly this version (install-action);
+# locally: cargo install cargo-about --locked --version 0.9.3 --features cli
+about_version := "0.9.3"
+
+# THIRD-PARTY-NOTICES.md is current: re-rendered from about.hbs and about.toml for the release graph
+# (`-p fil`, default features, normal and build edges, every target), it is byte for byte the
+# committed file. Fails if a crate in that graph has a license outside the allowed list, if
+# about.toml's list is not deny.toml's, or if the notices miss a crate of `cargo tree`'s release
+# graph (the one `release-deps` checks). Part of `ci`; needs cargo-about (above).
+notices: (_notices "check")
+
+# Rewrite THIRD-PARTY-NOTICES.md after a dependency change (then review the diff and commit it).
+notices-update: (_notices "update")
+
+_notices mode:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{source_directory()}}"
+    want={{about_version}}
+    have=$(cargo about --version 2>/dev/null | awk '{ print $2 }' || true)
+    if [[ "$have" != "$want" ]]; then
+      echo "notices: needs cargo-about $want (found '${have:-none}'): cargo install cargo-about --locked --version $want --features cli" >&2
+      exit 1
+    fi
+    # The allowed licenses: about.toml's `accepted` must be deny.toml's `[licenses] allow`, as sets.
+    list() { awk -v key="$2" '$0 ~ "^"key" = \\[" { on = 1; next } on && /^\]/ { exit } on' "$1" | sed 's/#.*//' | grep -o '"[^"]*"' | tr -d '"' | LC_ALL=C sort; }
+    if ! diff <(list deny.toml allow) <(list about.toml accepted) > /dev/null; then
+      echo "notices: about.toml's accepted list differs from deny.toml's allow list (< deny.toml, > about.toml):" >&2
+      diff <(list deny.toml allow) <(list about.toml accepted) >&2 || true
+      exit 1
+    fi
+    if [[ -z "$(list deny.toml allow)" ]]; then echo "notices: found no allow list in deny.toml" >&2; exit 1; fi
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    # cargo-about runs offline (--frozen), so that no license text comes from the network and the
+    # output depends only on the lock file and the crates' own files; fetch the crates first.
+    cargo fetch --locked -q
+    # --fail: a crate whose license is outside the list, or cannot be read, fails the render.
+    if ! cargo about generate --frozen --fail -m crates/fil/Cargo.toml -c about.toml about.hbs -o "$scratch/raw.md" 2> "$scratch/about.log"; then
+      cat "$scratch/about.log" >&2
+      echo "notices: cargo-about failed: a crate in the release graph has a license outside the allowed list (deny.toml, about.toml), or one it cannot read" >&2
+      exit 1
+    fi
+    toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+    [[ -n "$toolchain" ]] || { echo "notices: no channel in rust-toolchain.toml" >&2; exit 1; }
+    sed "s/@RUST_TOOLCHAIN@/$toolchain/g" "$scratch/raw.md" | tr -d '\r' > "$scratch/notices.md"
+    # Nothing of this machine may reach the file: it ships in every archive.
+    for p in "$PWD" "${CARGO_HOME:-$HOME/.cargo}" "$HOME" /Users/ /home/; do
+      if grep -qF -- "$p" "$scratch/notices.md"; then echo "notices: the rendered file contains a local path ($p)" >&2; exit 1; fi
+    done
+    # Coverage: the crate table is exactly the registry crates of the release graph `cargo tree` sees.
+    sed -n '/^| Crate | Version | License |$/,/^$/p' "$scratch/notices.md" | tail -n +3 | awk -F' [|] ' 'NF >= 3 { sub(/^[|] /, "", $1); print $1 " v" $2 }' | LC_ALL=C sort -u > "$scratch/listed"
+    cargo tree -q --locked -p fil -e normal,build --target all --prefix none --format '{p}' | grep -v ' (/' | sed -E 's/( \((\*|proc-macro)\))+$//' | LC_ALL=C sort -u > "$scratch/graph"
+    if [[ ! -s "$scratch/graph" ]] || ! diff "$scratch/graph" "$scratch/listed" > "$scratch/cover.diff"; then
+      echo "notices: the notices' crates are not the release graph's (< cargo tree, > notices):" >&2
+      cat "$scratch/cover.diff" >&2
+      exit 1
+    fi
+    if [[ "{{mode}}" == update ]]; then
+      cp "$scratch/notices.md" THIRD-PARTY-NOTICES.md
+      echo "notices: wrote THIRD-PARTY-NOTICES.md ($(wc -l < "$scratch/listed" | tr -d ' ') crates); review the diff and commit it" >&2
+    elif cmp -s "$scratch/notices.md" THIRD-PARTY-NOTICES.md; then
+      echo "notices: THIRD-PARTY-NOTICES.md is current ($(wc -l < "$scratch/listed" | tr -d ' ') crates)" >&2
+    else
+      echo "notices: THIRD-PARTY-NOTICES.md is stale or edited by hand; run 'just notices-update' and commit it. The difference:" >&2
+      diff -u -L THIRD-PARTY-NOTICES.md -L rendered THIRD-PARTY-NOTICES.md "$scratch/notices.md" | head -n 40 >&2 || true
+      exit 1
+    fi

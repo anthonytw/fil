@@ -1,0 +1,33 @@
+# cargo-about's config for THIRD-PARTY-NOTICES.md (docs/m4/release.md section 7). `just notices`
+# checks the committed file and `just notices-update` rewrites it; never edit the file by hand.
+#
+# The graph is the release binary's: `-p fil` with its default features (the recipe passes the
+# manifest), normal and build edges, every target (no `targets` list means all of them).
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# The same list as `[licenses] allow` in deny.toml (`just notices` fails if the two differ), in
+# priority order: for a crate that offers a choice (`MIT OR Apache-2.0`), the first one listed here
+# is the license fil takes it under, and the one whose text the notices carry.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "NCSA",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+]
+
+# The workspace's own crates are fil, under the root LICENSE (every one is `publish = false`).
+[private]
+ignore = true

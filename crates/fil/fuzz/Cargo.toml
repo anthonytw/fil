@@ -1,0 +1,29 @@
+# The cargo-fuzz target of the client's `config.toml` parser (`fil::config::Config::parse`). Not
+# part of the workspace and not run by `just ci` (it needs a nightly toolchain):
+#   just fuzz config SECONDS             (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run config fuzz/corpus/config fuzz/seeds/config   (from crates/fil)
+# The seeds in seeds/ are sample configurations, written by hand.
+[package]
+name = "fil-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil = { path = ".." }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

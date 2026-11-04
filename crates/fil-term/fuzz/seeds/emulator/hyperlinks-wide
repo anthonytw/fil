@@ -1,0 +1,4 @@
+&ú:@see ]8;;https://example.com/a\link A]8;;\ and ]8;id=x1;https://example.com/b\[1;34mbold B[0m]8;;
+]8;id=x1;https://example.com/bsame id again]8;;
+]8;;https://example.com/long/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\wrapping link text that is long enough to wrap]8;;\
+plain after

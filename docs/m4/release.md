@@ -54,16 +54,18 @@ Each release carries exactly these files:
 | `fil-<ver>-aarch64-linux-musl.tar.gz` | the Linux aarch64 archive |
 | `fil-<ver>-universal-apple-darwin.tar.gz` | the macOS archive |
 | `fil-<ver>-source.tar.gz` | the tagged tree with every dependency vendored (`cargo vendor`), which builds offline. It is the Corresponding Source for the binaries (LIC) |
-| `SHA256SUMS` | the checksums of the four files above it: the three binary archives and the source archive |
+| `fil-shell_<ver>_amd64.deb`, `fil-shell-<ver>-1.x86_64.rpm` | the x86_64 Linux archive's files as a Debian and an RPM package (PKG, `docs/m4/packaging.md` §2) |
+| `fil-shell_<ver>_arm64.deb`, `fil-shell-<ver>-1.aarch64.rpm` | the same for aarch64 |
+| `SHA256SUMS` | the checksums of the eight files above it: the three binary archives, the source archive and the four packages |
 | `SHA256SUMS.sig` | an SSH signature over `SHA256SUMS`, made with `ssh-keygen -Y sign -n fil-release` by the release identity, the owner's own SSH key (M4 OQ-2; decided, owner 2026-11-04) |
 
-The GitHub build-provenance attestation for each archive is attached to the release by the workflow. It is not a file in the list.
+The GitHub build-provenance attestation for each archive and each package is attached to the release by the workflow. It is not a file in the list.
 
 ### 4.2 `SHA256SUMS`
 
 - **Format:** the output of GNU `sha256sum`: 64 lowercase hex digits, two spaces, then the file name with no directory part, one line per file, LF line endings.
 - **Order:** sorted by file name, bytewise (`LC_ALL=C sort`).
-- **Coverage:** exactly four files: the three binary archives and the source archive of §4.1. Not `SHA256SUMS` or `SHA256SUMS.sig`.
+- **Coverage:** exactly eight files: the three binary archives, the source archive and the four packages of §4.1. Not `SHA256SUMS` or `SHA256SUMS.sig`.
 - **Check:** `sha256sum -c SHA256SUMS` (or `shasum -a 256 -c SHA256SUMS`) in the download directory. The signature is checked with `ssh-keygen -Y verify -n fil-release` against the allowed-signers file from `main`, never from the tag (REL's `release-verify`).
 
 ### 4.3 The archive layout
@@ -115,6 +117,7 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
   - `SOURCE_DATE_EPOCH` is the tagged commit's committer time.
 - **Pinned tools:** the tools that generate content are pinned by version and installed the way `linux-check` installs its tools (install-action with a version): `cargo-about` (LIC; it runs in `just notices`, never while packaging, §7) and pandoc (DOC).
 - **The Linux binaries and archives must reproduce:** the two CI builds of a candidate give identical SHA-256s, and the owner's independent rebuild (`just release-verify`, in the VM) reproduces the binaries. macOS is best effort.
+- **The .deb and .rpm packages** are made from the two Linux archives by nfpm 2.48.0 in its digest-pinned image (`tests/release/linux-packages.sh`), with every time set to `SOURCE_DATE_EPOCH`, and must reproduce like the archives: identical in the two assemblies, and in the rebuild (`docs/m4/packaging.md` §2).
 
 ## 5. The remote install layout
 
@@ -302,8 +305,8 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 ### 9.1 What the workflow does
 
-- **A tag push `v*`** builds the files of §4.1 and opens a **draft** GitHub Release with the five files (the four archives and `SHA256SUMS`) and a build-provenance attestation for each archive. It never publishes. **A dry run** (`gh workflow run release.yml --ref BRANCH`) does the same builds and checks, uploads the files to the run (artifact `release-files`) and does nothing else: its jobs have no `id-token` or `attestations` permission.
-- **Jobs:** `prepare` (version, `SOURCE_DATE_EPOCH`, the tag checks, `release-deps`, `notices`, `release-test`), `build-linux` (each Linux target twice, in two jobs), `build-macos` (twice, best effort), `package` (identical-binaries gate, archives assembled twice in the pinned image, identical-archives gate, `release-check`), `smoke-macos` (runs the macOS archive and `release-check` on macOS) and `publish` (tag push only: the only job with `contents: write`, `id-token: write` and `attestations: write`).
+- **A tag push `v*`** builds the files of §4.1 and opens a **draft** GitHub Release with the nine files (the four archives, the four packages and `SHA256SUMS`) and a build-provenance attestation for each archive and package. It never publishes. **A dry run** (`gh workflow run release.yml --ref BRANCH`) does the same builds and checks, uploads the files to the run (artifact `release-files`) and does nothing else: its jobs have no `id-token` or `attestations` permission.
+- **Jobs:** `prepare` (version, `SOURCE_DATE_EPOCH`, the tag checks, `release-deps`, `notices`, `release-test`, `crates-check`), `build-linux` (each Linux target twice, in two jobs), `build-macos` (twice, best effort), `package` (identical-binaries gate, archives and packages assembled twice in the pinned images, identical-files gate, `release-check`, the amd64 packages' install test), `smoke-macos` (runs the macOS archive and `release-check` on macOS), `packages-arm64` (the arm64 packages' install test, on an arm64 runner), `publish` (tag push only: the only job with `contents: write`, `id-token: write` and `attestations: write`) and `crates-io` (tag push only, after `publish`: the nine crates by trusted publishing, in the `crates-io` environment that the owner approves, with `id-token: write` and nothing else; §10.1, `docs/m4/packaging.md` §3).
 - **The tag checks in `prepare` are not the gate.** On a tag push Actions runs the workflow file of the tagged commit, so whoever can push a `v*` tag controls it. The gates are the tag ruleset (OQ-2), the draft that a person publishes and the owner's `release-verify` and signature.
 - **A release needs the complete layout.** `release-check --complete` (what a tag push runs) fails until every file of §4.3 is in the archives. A dry run lists the files that DOC has yet to add (and `CHANGELOG.md`) as pending. DOC adds its files by producing them into a directory laid out like an archive and passing it to `package.sh --extra`. LIC's `THIRD-PARTY-NOTICES.md` is committed and comes from the tree, like `LICENSE` (§7), and is required in every archive already.
 - **Version and tag:** the archive names carry the version in `Cargo.toml`; a dry run of a branch is named after it (`0.0.0` before the first release). `release-check` (non-dry) requires the tag to be `v<version>`, a `CHANGELOG.md` section for it and, for a patch release, the wire of the previous tag of the same minor.
@@ -327,7 +330,7 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
    ```
 
    The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
-3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries and the four archives from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
+3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries, the four archives and the four packages from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
 4. **Sign the verified file.** Sign the copy that step 3 verified (`target/release-verify/X.Y.Z/files/SHA256SUMS`), not a fresh download, because any writer can replace draft assets in between:
 
    ```sh
@@ -337,6 +340,9 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
    gh release edit vX.Y.Z --draft=false            # publish
    just release-verify X.Y.Z --no-rebuild          # once more, on what is published
    ```
+
+5. **crates.io.** Approve the waiting `crates-io` deployment of the tag's run (Actions, the run, "Review deployments"). The job refuses to run before the release is published with `SHA256SUMS.sig`, then publishes the nine crates in dependency order (`docs/m4/packaging.md` §3).
+6. **Homebrew and the rest.** `just brew-formula X.Y.Z` and `just aur-pkgbuild X.Y.Z` render the formula and the PKGBUILD from the `SHA256SUMS` that step 3 verified; the formula goes to the tap as a PR (`docs/m4/packaging.md` §4).
 
 ### 9.3 The rebuild VM
 
@@ -359,11 +365,13 @@ Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or
 
 **Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name. (Round 2 also said "no crates.io token goes to CI"; N8 below replaces that, as the coordinator's choice on the owner's delegation: trusted publishing puts a short-lived OIDC token in CI, and there is no long-lived token anywhere.) The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
 
+**The rename (built by PKG).** `crates/fil` is the package `fil-shell`; its binary and its library are still `fil`, and the directory is unchanged, so `cargo build -p fil-shell` builds `target/*/fil`. The test-only crates are `publish = false`; the nine published ones are `publish = ["crates-io"]` and depend on each other with exact versions (`docs/m4/packaging.md` §3).
+
 **The names.** The owner's list began with `fil` and eight `fil-*` libraries (`fil-proto`, `fil-transport`, `fil-session`, `fil-daemon`, `fil-client`, `fil-term`, `fil-predict`, `fil-forward`). **`fil` is unavailable on crates.io:** an unrelated crate (a random-number helper) took it on 2026-11-04 at 08:24 ET. The user-facing crate is therefore **`fil-shell`** (`cargo install fil-shell` installs the `fil` binary, matching `fil-shell-bin` on the AUR), reserved by the coordinator. **The name is not marked decided:** the owner can pick another. The workspace's `crates/fil` package must be renamed to match before it is published; the binary stays `fil`. Until then no document may suggest `cargo install fil`, which installs the wrong crate.
 
 **Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. That account's token has since been revoked and removed.
 
-**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag:** create the `crates-io` environment (required reviewer: the owner), and add a trusted publisher (this repository, the release workflow, the `crates-io` environment) on each of the nine crates: `fil-shell` and the eight `fil-*`.
+**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag:** create the `crates-io` environment (required reviewer: the owner; deployments limited to `v*` tags), and add a trusted publisher (this repository, the workflow `release.yml`, the environment `crates-io`) on each of the nine crates: `fil-shell` and the eight `fil-*`. The job is release.yml's `crates-io` (built by PKG, `docs/m4/packaging.md` §3).
 
 **The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
 
@@ -385,6 +393,7 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 - `.deb` and `.rpm` for x86_64 and arm64, built by CI and attached to the release;
 - the AUR package `fil-shell-bin`;
 - a Nix flake in the repository, plus a nixpkgs PR;
+- how each channel is built, checked and updated: `docs/m4/packaging.md` (PKG);
 - the start of the official distro submissions: Debian (an ITP, then an RFS; Ubuntu inherits Debian's package) and Fedora (a package review). These need owner accounts and a sponsor and finish whenever the distros finish. **v1 does not wait on their acceptance** (coordinator's reading, not the owner's words).
 
 ### 10.3 macOS: signed and notarized on the owner's Mac

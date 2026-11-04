@@ -710,6 +710,24 @@ expect_fail "publish-crates: an unexpected answer from crates.io stops the run" 
 expect_pass "publish-crates: ...after the crates before fil-forward" grep -qE ' fil-transport$' "$tmp/pc/log"
 expect_fail "publish-crates: ...and before fil-forward and what depends on it" grep -qE ' (fil-forward|fil-client|fil-shell)$' "$tmp/pc/log"
 
+# ============================================================== 4e. the packaging templates (packaging/render.sh)
+echo "== packaging/render.sh (Homebrew formula, AUR PKGBUILD)"
+render=$REPO_ROOT/packaging/render.sh
+mkdir -p "$tmp/render"
+h() { printf '%064d' "$1"; }
+printf '%s  %s\n' "$(h 1)" fil-0.9.0-rc.1-aarch64-linux-musl.tar.gz "$(h 2)" fil-0.9.0-rc.1-source.tar.gz \
+  "$(h 3)" fil-0.9.0-rc.1-universal-apple-darwin.tar.gz "$(h 4)" fil-0.9.0-rc.1-x86_64-linux-musl.tar.gz > "$tmp/render/SUMS"
+expect_pass "render: the formula" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS" "$tmp/render/out"
+expect_pass "render: ...takes each archive's checksum from SHA256SUMS" sh -c 'grep -q "sha256 \"$2\"" "$1" && grep -q "sha256 \"$3\"" "$1" && grep -q "sha256 \"$4\"" "$1" && grep -q "/v0.9.0-rc.1/fil-0.9.0-rc.1-universal-apple-darwin.tar.gz" "$1"' sh "$tmp/render/out/fil.rb" "$(h 1)" "$(h 3)" "$(h 4)"
+if command -v ruby > /dev/null; then expect_pass "render: the formula is valid Ruby" ruby -c "$tmp/render/out/fil.rb"; fi
+expect_pass "render: the PKGBUILD and .SRCINFO" "$render" aur 0.9.0-rc.1 "$tmp/render/SUMS" "$tmp/render/out"
+expect_pass "render: ...pkgver has no '-' (0.9.0rc.1), _ver is the release's" sh -c 'grep -qx "pkgver=0.9.0rc.1" "$1/PKGBUILD" && grep -qx "_ver=0.9.0-rc.1" "$1/PKGBUILD" && grep -q "pkgver = 0.9.0rc.1" "$1/.SRCINFO"' sh "$tmp/render/out"
+expect_pass "render: ...the x86_64 and aarch64 checksums in both files" sh -c 'grep -q "sha256sums_x86_64=(.$2.)" "$1/PKGBUILD" && grep -q "sha256sums_aarch64=(.$3.)" "$1/PKGBUILD" && grep -q "sha256sums_x86_64 = $2" "$1/.SRCINFO"' sh "$tmp/render/out" "$(h 4)" "$(h 1)"
+expect_pass "render: the PKGBUILD is valid bash" bash -n "$tmp/render/out/PKGBUILD"
+grep -v x86_64 "$tmp/render/SUMS" > "$tmp/render/SUMS.short"
+expect_fail "render: a release without one of the archives is refused" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS.short" "$tmp/render/o2"
+expect_fail "render: a version that is not a release version is refused" "$render" brew '0.9.0+x' "$tmp/render/SUMS" "$tmp/render/o3"
+
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"

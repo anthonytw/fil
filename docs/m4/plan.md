@@ -533,6 +533,7 @@ Every package keeps M2's rules:
 - **Done when:** the archives carry the notices, and `--version` carries the legal lines.
 
 **PKG: packaging channels** (after REL; the v1 channels are decided, owner 2026-11-04, round 2: goal 3 and `docs/m4/release.md` §10; the work below was written for the Homebrew formula, `cargo install --git` and GitHub Releases, and the other channels are added to it)
+- **Built** (PKG's PR): the rename to `fil-shell`, the nine crates' metadata and `just crates-check`, the .deb and .rpm in release.yml, the `crates-io` trusted-publishing job, the formula template and `just brew-formula`, the AUR PKGBUILD and `just aur-pkgbuild`, `flake.nix` and the nixpkgs draft. What each does, how it is tested and what is left: `docs/m4/packaging.md`.
 - **Owns:**
   - `packaging/homebrew/fil.rb.in` (new, a template);
   - the `brew-formula` recipe, which fills the template from a release's `SHA256SUMS`;
@@ -540,7 +541,7 @@ Every package keeps M2's rules:
   - the install section of `docs/user/install.md`, after DOC's skeleton of that page.
 - **Builds:**
   - **The Homebrew formula.** Binary downloads from the GitHub Release, one URL for each OS and architecture. It installs `bin/fil`, `libexec/fil/remote/` (so that `fil install` works), the man pages and the completions, plus a `test do` block that runs `fil --version` and a local pipe attach in a temporary `HOME`. For each release, the coordinator opens the tap PR with `gh`, so there is no token in CI.
-  - **`cargo install --locked --git https://github.com/anthonytw/fil --tag vX.Y.Z fil`,** documented with its limits (the package is named `fil-shell` once `crates/fil` is renamed, `docs/m4/release.md` §10.1):
+  - **`cargo install --locked --git https://github.com/anthonytw/fil --tag vX.Y.Z fil-shell`,** documented with its limits (the package is named `fil-shell` once `crates/fil` is renamed, `docs/m4/release.md` §10.1):
     - it installs a client and a remote for the same machine only;
     - there is no bundle for `fil install`, and `--binary` with a release binary stands in for it;
     - there are no man pages and no completions.

@@ -315,8 +315,10 @@ no-test-hooks +binaries:
 
 # The release scripts' own tests: the workflow lint (permissions, pins, no secrets or caches) with a
 # mutation for each rule, tag verification (the signers come from main, never from the tag),
-# release-check on synthetic releases, and the checksums. Part of `ci`. With FIL_RELEASE_TEST_DOCKER=1
-# it also assembles archives twice in the pinned image and requires identical hashes (pulls the image).
+# release-check on synthetic releases (archives and .deb and .rpm packages), the checksums, the crate
+# publishing script on fakes, and the packaging templates. Part of `ci`. With FIL_RELEASE_TEST_DOCKER=1
+# it also assembles archives and packages twice in the pinned images and requires identical hashes
+# (pulls the images).
 release-test:
     tests/release/selftest.sh
 
@@ -347,7 +349,8 @@ release-build out="target/release-dist":
 
 # Everything a release candidate must satisfy: `just release-check --dry-run DIR` for a build of a
 # branch, `just release-check --tag vX.Y.Z --complete DIR` for a release. One top-level entry per
-# archive, the section 4.3 layout, byte-identical bundle copies, SHA256SUMS exactly the four archives,
+# archive, the section 4.3 layout, byte-identical bundle copies, the .deb and .rpm packages (exactly
+# their archive's files), SHA256SUMS exactly the four archives and the four packages,
 # no builder path (/Users/, /home/) or FIL_TEST_ string in a binary, the path remap applied,
 # `no-test-hooks` and `release-deps`, static Linux binaries, `fil --version` where it can run, the tag,
 # the changelog and the wire. See tests/release/check.sh.
@@ -371,6 +374,33 @@ release-verify version *args:
 [positional-arguments]
 reserve-crate-names *args:
     tests/release/reserve-crate-names.sh "$@"
+
+# ---- Packaging channels (docs/m4/packaging.md) ----
+
+# The nine published crates package and build for crates.io, in dependency order against a local
+# overlay of each other (`cargo publish --workspace --dry-run`); the packaged fil-shell must build.
+# Nothing is uploaded and no token is needed (needs network for the crates.io index). Real releases
+# are published by release.yml's `crates-io` job, by trusted publishing (N8).
+crates-check:
+    tests/release/publish-crates.sh --dry-run
+
+# Install-test the .deb and .rpm packages in DIR (a release's files, or `release-build`'s) in Debian
+# and Fedora containers: install, `fil --version`, the bundle, the package manager's verify, remove.
+# `--arch all` also runs the other architecture where Docker can (Rosetta).
+[positional-arguments]
+packages-install *args:
+    tests/release/install-packages.sh "$@"
+
+# The Homebrew formula for VERSION, from the release's SHA256SUMS: by default the copy that
+# `just release-verify VERSION` verified (and the owner signed). Writes OUT/homebrew/fil.rb, for the
+# tap anthonytw/homebrew-tap (docs/m4/packaging.md says how it gets there).
+brew-formula version sums=("target/release-verify/" + version + "/files/SHA256SUMS") out="target/packaging":
+    packaging/render.sh brew "{{version}}" "{{sums}}" "{{out}}/homebrew"
+
+# The AUR package fil-shell-bin for VERSION: OUT/aur/PKGBUILD and .SRCINFO, from the same verified
+# SHA256SUMS. Prepared, not published (docs/m4/packaging.md).
+aur-pkgbuild version sums=("target/release-verify/" + version + "/files/SHA256SUMS") out="target/packaging":
+    packaging/render.sh aur "{{version}}" "{{sums}}" "{{out}}/aur"
 
 # ---- Notices (docs/m4/release.md section 7) ----
 

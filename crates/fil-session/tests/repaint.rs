@@ -137,6 +137,9 @@ async fn a_repaint_waits_for_the_snapshot_in_flight_and_renders_at_the_new_size(
         max_bytes: 64 * 1024,
         ..CatchUpParams::default()
     };
+    // Unpaced: the client acknowledges nothing, and the pacer would hold the output after the
+    // catch-up (the snapshot, unconfirmed, counts as in flight) where this test reads it.
+    cfg.terminal_pacing = false;
     let h = spawn_plain(cfg).await;
     // A tiny link, so the serve task blocks as soon as the client stops reading.
     let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 2);

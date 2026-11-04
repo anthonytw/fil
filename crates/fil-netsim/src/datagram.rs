@@ -45,6 +45,12 @@ pub struct Conditions {
     pub reorder_delay: Duration,
     /// Probability a datagram is delivered twice (the copy has its own jitter).
     pub duplicate: f64,
+    /// A bottleneck per (source, destination) path: datagrams leave it one after another at
+    /// this many bytes a second, before the latency. `None`: no limit.
+    pub rate: Option<u64>,
+    /// The bottleneck's queue, in bytes: a datagram that finds more than this waiting ahead of
+    /// it is dropped (a drop-tail router queue). Only with `rate`; 0 means no limit.
+    pub queue: usize,
 }
 
 /// Counters, for asserting that an impairment actually happened.
@@ -64,6 +70,8 @@ pub struct NetStats {
     pub duplicated: u64,
     /// Datagrams given the extra `reorder_delay`.
     pub reordered: u64,
+    /// Dropped because the bottleneck's queue was full (`Conditions::queue`).
+    pub overflowed: u64,
 }
 
 struct Packet {
@@ -109,6 +117,8 @@ struct NetState {
     next_port: u16,
     /// Due time of the last in-order datagram per (source, destination) path.
     last_due: HashMap<(SocketAddr, SocketAddr), Instant>,
+    /// When the bottleneck of each path has sent everything queued so far (`Conditions::rate`).
+    busy_until: HashMap<(SocketAddr, SocketAddr), Instant>,
 }
 
 /// The simulated network and its control handle. Cheap to clone; all clones share state.
@@ -137,6 +147,7 @@ impl Net {
                 seq: 0,
                 next_port: 40000,
                 last_due: HashMap::new(),
+                busy_until: HashMap::new(),
             })),
         }
     }
@@ -249,14 +260,44 @@ impl NetState {
     /// When a datagram sent now on `path` is due. In-order datagrams are clamped to the path's
     /// last due time; deliberately reordered ones and (opt-in) free jitter are not, and do not
     /// move the clamp.
-    fn due(&mut self, c: &Conditions, path: (SocketAddr, SocketAddr), reorder: bool) -> Instant {
-        let due = Instant::now() + self.delay(c, reorder);
+    /// `left` is when it leaves the path's bottleneck (now, without one).
+    fn due(
+        &mut self,
+        c: &Conditions,
+        path: (SocketAddr, SocketAddr),
+        reorder: bool,
+        left: Instant,
+    ) -> Instant {
+        let due = left + self.delay(c, reorder);
         if reorder || c.jitter_reorders {
             return due;
         }
         let last = self.last_due.entry(path).or_insert(due);
         *last = due.max(*last);
         *last
+    }
+
+    /// Passes a datagram of `len` bytes through the path's bottleneck: when it has left it, or
+    /// `None` if the queue is full. Without a rate, now.
+    fn bottleneck(
+        &mut self,
+        c: &Conditions,
+        path: (SocketAddr, SocketAddr),
+        len: usize,
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        let Some(rate) = c.rate.filter(|&r| r > 0) else {
+            return Some(now);
+        };
+        let busy = self.busy_until.get(&path).copied().unwrap_or(now).max(now);
+        let waiting = (busy - now).as_secs_f64() * rate as f64;
+        if c.queue > 0 && waiting > c.queue as f64 {
+            self.stats.overflowed += 1;
+            return None;
+        }
+        let done = busy + Duration::from_secs_f64(len as f64 / rate as f64);
+        self.busy_until.insert(path, done);
+        Some(done)
     }
 
     fn enqueue(&mut self, dest: &SharedInbox, from: SocketAddr, data: &[u8], at: Instant) {
@@ -345,8 +386,12 @@ impl AsyncUdpSocket for SimSocket {
             st.stats.lost += 1;
             return Ok(());
         }
+        let path = (from, transmit.destination);
+        let Some(left) = st.bottleneck(&c, path, transmit.contents.len()) else {
+            return Ok(());
+        };
         let reorder = st.rng.random_bool(c.reorder.clamp(0.0, 1.0));
-        let at = st.due(&c, (from, transmit.destination), reorder);
+        let at = st.due(&c, path, reorder, left);
         st.enqueue(&dest, from, transmit.contents, at);
         if st.rng.random_bool(c.duplicate.clamp(0.0, 1.0)) {
             st.stats.duplicated += 1;

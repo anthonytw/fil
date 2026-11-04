@@ -74,6 +74,13 @@ pub struct Client<L: Link> {
     input_sent: u64,
     /// Acknowledge what arrives (terminal output and snapshots), as the real client does.
     pub auto_ack: bool,
+    /// With `auto_ack`, acknowledge terminal output as the real client does (`fil-client`'s
+    /// engine): once `ACK_AFTER_BYTES` are unacknowledged, or `ACK_DELAY` after the first byte
+    /// that is not, instead of every segment. A snapshot is acknowledged at once either way.
+    pub client_acks: bool,
+    /// The terminal position last acknowledged, and when an ack of the rest is due.
+    ack_sent: u64,
+    ack_due: Option<tokio::time::Instant>,
     pub emu: Box<dyn Emulator>,
     /// The size generation of this client's window: up by one with every `resize`.
     pub size_gen: u64,
@@ -123,6 +130,9 @@ impl<L: Link> Client<L> {
             forward_traffic: 0,
             input_sent: 0,
             auto_ack: true,
+            client_acks: false,
+            ack_sent: 0,
+            ack_due: None,
             emu,
             size_gen: 0,
             held: None,
@@ -254,11 +264,28 @@ impl<L: Link> Client<L> {
             if self.down {
                 return false;
             }
-            match tokio::time::timeout_at(end, self.link.recv()).await {
+            let wake = self.ack_due.map_or(end, |t| t.min(end));
+            match tokio::time::timeout_at(wake, self.link.recv()).await {
                 Ok(Ok((ch, payload))) => self.apply(ch, payload).await,
                 Ok(Err(_)) => self.down = true,
+                Err(_) if wake < end => {
+                    self.ack_due = None;
+                    self.ack_terminal().await;
+                }
                 Err(_) => return pred(self),
             }
+        }
+    }
+
+    /// Acknowledges the terminal up to where it is, if that is news.
+    async fn ack_terminal(&mut self) {
+        if self.auto_ack && self.next > self.ack_sent {
+            self.ack_sent = self.next;
+            self.send_ctl(ControlMsg::Ack {
+                channel: ChannelId::TERMINAL,
+                upto: self.next,
+            })
+            .await;
         }
     }
 
@@ -322,6 +349,13 @@ impl<L: Link> Client<L> {
                         return;
                     }
                 }
+                if self.snap_info.is_none() && seg.seq > self.recv.received() {
+                    // Past a gap with no snapshot announced: on QUIC the output after a jump
+                    // can overtake its announcement (a lost control packet). It waits for it,
+                    // as the real client's does (`GAP_PATIENCE`).
+                    self.term_waiting.push((seg.seq, seg.data.to_vec()));
+                    return;
+                }
                 self.apply_terminal(seg.seq, seg.data).await;
                 // A mid-stream snapshot waiting for the output before it.
                 self.finish_snapshot().await;
@@ -342,11 +376,14 @@ impl<L: Link> Client<L> {
         self.emu.feed(&fresh);
         self.next = self.recv.received();
         if self.auto_ack && !fresh.is_empty() {
-            self.send_ctl(ControlMsg::Ack {
-                channel: ChannelId::TERMINAL,
-                upto: self.next,
-            })
-            .await;
+            if !self.client_acks
+                || self.next.saturating_sub(self.ack_sent) >= fil_proto::limits::ACK_AFTER_BYTES
+            {
+                self.ack_due = None;
+                self.ack_terminal().await;
+            } else if self.ack_due.is_none() {
+                self.ack_due = Some(tokio::time::Instant::now() + fil_proto::limits::ACK_DELAY);
+            }
         }
     }
 
@@ -396,6 +433,8 @@ impl<L: Link> Client<L> {
         self.next = info.at;
         self.snap_info = None;
         self.snap_until = None;
+        self.ack_sent = info.at;
+        self.ack_due = None;
         if self.auto_ack {
             self.send_ctl(ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
@@ -422,6 +461,7 @@ impl<L: Link> Client<L> {
                     StartPoint::Resume { from } => {
                         self.recv = RecvChannel::starting_at(from);
                         self.next = from;
+                        self.ack_sent = from;
                     }
                     StartPoint::Snapshot(info) => self.expect_snapshot(info, false).await,
                 }

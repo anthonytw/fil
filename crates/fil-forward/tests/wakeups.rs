@@ -162,3 +162,43 @@ async fn a_violation_on_an_idle_endpoint_is_answered_at_once_body() {
         "the connection was not closed: {r:?}"
     );
 }
+
+/// The pacer takes a sample from an ack the mux takes, not from one it refuses: an ack beyond
+/// what was sent is a violation (the mux answers `Ok` and closes the channel), and used to count
+/// as a sample of the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pacer_takes_no_sample_from_a_violating_ack() {
+    bounded(the_pacer_takes_no_sample_from_a_violating_ack_body()).await
+}
+
+async fn the_pacer_takes_no_sample_from_a_violating_ack_body() {
+    use fil_proto::ChannelId;
+    // A target that takes the connection and never reads: what the client sends stays unacknowledged.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(2048).unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = sock.listen(4).unwrap();
+    let port_t = l.local_addr().unwrap().port();
+    let _deaf = tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            keep.push(s);
+        }
+    });
+    let w = World::new(Transport::Mem, mux_config()).await;
+    let port = w.local_forward(1, port_t);
+    let mut s = connect(port).await;
+    let _writer = tokio::spawn(async move {
+        let buf = vec![1u8; 16 * 1024];
+        while s.write_all(&buf).await.is_ok() {}
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let samples = |w: &World| {
+        let p = w.client.ep.pace_state();
+        p.samples + p.bounded
+    };
+    let before = samples(&w);
+    // An ack for a billion bytes the client never sent.
+    w.client.ep.on_ack(ChannelId(16), 1 << 30).unwrap();
+    assert_eq!(samples(&w), before, "a violating ack was taken as a sample");
+}

@@ -214,6 +214,8 @@ pub struct ChannelInfo {
     pub peer_window: u32,
     /// Bytes this side put on the wire, ever (the end of the highest segment sent).
     pub sent_high: u64,
+    /// Bytes of the channel the peer has acknowledged (consumed), ever.
+    pub acked: u64,
 }
 
 // ---- the sending half -------------------------------------------------------------------------
@@ -325,6 +327,13 @@ const KEEP_SLICE_FROM: usize = 512;
 /// ring is: a burst of small segments grows it (by doubling), and what it grew to stays allocated
 /// for as long as any view of it lives, an empty one included.
 const KEEP_TAIL: usize = 16 * 1024;
+
+/// How many consumed-and-unacknowledged bytes make a receiver whose window is `window` acknowledge
+/// at once rather than after the delay: `min(ACK_AFTER_BYTES, window / 4)`. The sender's pacer
+/// reads acks against it, so both use this one.
+pub fn ack_threshold(window: u64) -> u64 {
+    ACK_AFTER_BYTES.min(window / 4)
+}
 
 /// Its `Debug` shows counts, never the bytes.
 #[derive(Default)]
@@ -808,7 +817,7 @@ impl Mux {
             return;
         }
         c.recv.consumed += n;
-        let threshold = ACK_AFTER_BYTES.min(c.window / 4);
+        let threshold = ack_threshold(c.window);
         // Acknowledged at once when a threshold's worth is unacknowledged, or when the local
         // socket has taken everything received (ack on drain): an ack that waits for the timer
         // tells the sender's pacer a round trip 100 ms longer than the path's, which with many
@@ -1281,6 +1290,7 @@ impl Mux {
             send_capacity: c.send.cap,
             peer_window: c.peer_window as u32,
             sent_high: c.send.high,
+            acked: c.peer_consumed,
         })
     }
 

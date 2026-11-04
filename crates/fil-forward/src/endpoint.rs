@@ -1344,12 +1344,18 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         st.touch(now());
+        // Only an ack the mux takes is a sample for the pacer: one for a channel that is closing
+        // or gone, below what the peer already acknowledged, or beyond what was sent (a
+        // violation, which the mux also answers with `Ok`) says nothing about the path.
+        let before = st.mux.info(ch);
         let r = st.mux.on_ack(ch, upto);
-        if r.is_ok() && st.link.is_some() {
-            let threshold = st
-                .mux
-                .info(ch)
-                .map_or(u64::MAX, |i| crate::pace::ack_threshold(i.peer_window));
+        let taken = before.is_some_and(|i| {
+            i.state != ChannelState::Closing && upto > i.acked && upto <= i.sent_high
+        });
+        if r.is_ok() && taken && st.link.is_some() {
+            let threshold = st.mux.info(ch).map_or(u64::MAX, |i| {
+                fil_proto::mux::ack_threshold(u64::from(i.peer_window))
+            });
             st.pacer.on_ack(ch, upto, threshold, now());
         }
         inner.drain(&mut st);

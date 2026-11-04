@@ -127,3 +127,125 @@ fn a_snapshot_saves_the_cursor_with_its_origin_mode() {
         assert_eq!(marker_row(&now), Some(2));
     }
 }
+
+// DECSTR (`CSI ! p`): neither emulator handles it, and the real terminals that do (xterm,
+// WezTerm) reset these.
+
+fn text_at(st: &TermState, row: usize, col: usize) -> &str {
+    &st.screen[row].cells[col].text
+}
+
+#[test]
+fn decstr_resets_the_scroll_region_the_model_reports_and_the_emulator_uses() {
+    for b in fil_term::backends()
+        .into_iter()
+        .filter(|b| b.capabilities.scroll_region)
+    {
+        let mut e = (b.create)(SIZE, 100);
+        // A region on rows 3 to 5, DECSTR, then a line feed on the last row. The reported region
+        // is gone, and so is the real one: the screen scrolls.
+        e.feed(b"A\x1b[3;5r\x1b[!p\x1b[8;1H\n");
+        let st = e.state(100);
+        assert_eq!(st.modes.scroll_region, None, "{}", b.name);
+        assert_eq!(st.history.len(), 1, "{}: the screen scrolled", b.name);
+        assert_eq!(st.history[0].cells[0].text, "A", "{}", b.name);
+    }
+}
+
+#[test]
+fn decstr_resets_insert_mode_origin_mode_and_the_pen() {
+    let st = state_after(b"\x1b[3;1Habc\x1b[3;1H\x1b[4h\x1b[1;31m\x1b[!pXY");
+    assert!(!st.modes.insert);
+    assert_eq!(
+        [text_at(&st, 2, 0), text_at(&st, 2, 1), text_at(&st, 2, 2)],
+        ["X", "Y", "c"],
+        "insert mode on would shift `abc` right"
+    );
+    assert_eq!(
+        st.screen[2].cells[0].attrs,
+        Default::default(),
+        "the pen is normal"
+    );
+    let st = state_after(b"\x1b[3;6r\x1b[?6h\x1b[!p\x1b[1;1HZ");
+    assert!(!st.modes.origin);
+    assert_eq!(
+        text_at(&st, 0, 0),
+        "Z",
+        "origin mode on would put `Z` on row 3"
+    );
+}
+
+#[test]
+fn decstr_turns_autowrap_back_on() {
+    // xterm and WezTerm wrap after DECSTR whatever the mode was before.
+    let st = state_after(b"\x1b[?7l\x1b[!p\x1b[1;30Hab");
+    assert!(st.modes.autowrap);
+    assert_eq!(text_at(&st, 0, 29), "a");
+    assert_eq!(text_at(&st, 1, 0), "b", "the line wrapped");
+}
+
+#[test]
+fn decstr_resets_the_character_sets() {
+    // `q` in DEC graphics is a line; after the reset it is `q`.
+    for bytes in [
+        &b"\x1b(0\x1b[!pq"[..],
+        b"\x0e\x1b)0\x1b[!pq",
+        b"\x1b*0\x1bn\x1b[!pq",
+    ] {
+        let st = state_after(bytes);
+        assert_eq!(text_at(&st, 0, 0), "q", "{bytes:?}");
+        assert_eq!(st.charsets, Default::default(), "{bytes:?}");
+    }
+}
+
+#[test]
+fn decstr_forgets_the_saved_cursor_but_not_the_cursor() {
+    let st = state_after(b"\x1b[5;5H\x1b(0\x1b7\x1b[!p\x1b[3;6H\x1b8");
+    assert_eq!(st.saved_cursor, None);
+    // A restore after DECSTR lands at home (xterm and WezTerm).
+    assert_eq!((st.cursor.row, st.cursor.col), (0, 0));
+    // DECSTR itself moves nothing, whatever it resets, and a pending wrap stays.
+    let st = state_after(b"\x1b[3;6r\x1b[?6h\x1b[2;4Hxyz\x1b[!p");
+    assert_eq!((st.cursor.row, st.cursor.col), (3, 6));
+    let full = "x".repeat(usize::from(SIZE.cols));
+    let st = state_after(format!("{full}\x1b[4h\x1b[!p").as_bytes());
+    assert!(st.cursor.pending_wrap);
+    assert_eq!((st.cursor.row, st.cursor.col), (0, SIZE.cols - 1));
+}
+
+#[test]
+fn decstr_inside_a_synchronized_update_applies_in_order() {
+    let body = &b"\x1b[3;5r\x1b[4h\x1b(0ab\x1b[!pcd\x1b[1;1Hq"[..];
+    let plain = state_after(body);
+    let mut bracketed = b"\x1b[?2026h".to_vec();
+    bracketed.extend_from_slice(body);
+    bracketed.extend_from_slice(b"\x1b[?2026l");
+    assert_eq!(state_after(&bracketed), plain);
+    assert_eq!(plain.modes.scroll_region, None);
+    assert!(!plain.modes.insert);
+}
+
+#[test]
+fn a_snapshot_after_decstr_writes_nothing_the_reset_cleared() {
+    let st =
+        state_after(b"\x1b[3;5r\x1b[?6h\x1b[4h\x1b(0\x0e\x1b[2;3H\x1b7\x1b[1;4;31m\x1b[!pplain");
+    let snap = String::from_utf8(snapshot(&st)).unwrap();
+    // The writer's own opening resets are fine; what it must not write is the state DECSTR
+    // cleared, set again.
+    for stale in [
+        "\x1b[4h",
+        "\x1b[?6h",
+        "\x1b(0",
+        "\x1b)0",
+        "\x1b[3;5r",
+        "\x0e",
+        "\x1b7",
+    ] {
+        assert!(!snap.contains(stale), "{stale:?} in {snap:?}");
+    }
+    assert!(snap.contains("plain"));
+    // And the receiver of it agrees with the source.
+    let after = restored(&st, WriteCaps::ALL);
+    assert_eq!(after.modes, st.modes);
+    assert_eq!(after.charsets, st.charsets);
+}

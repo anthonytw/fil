@@ -22,7 +22,7 @@ use crate::model::{
     Attrs, Cell, Charsets, Color, Cursor, CursorShape, Line, Modes, MouseEncoding, MouseTracking,
     Size, TermState,
 };
-use crate::sniff::RegionTracker;
+use crate::sniff::{Action, RegionTracker};
 use crate::{Backend, Capabilities, Emulator};
 
 pub(crate) const BACKEND: Backend = Backend {
@@ -126,6 +126,17 @@ impl Callbacks for Hooks {
     }
 }
 
+/// DECSTR for the part of it `vt100` keeps: a normal pen, absolute origin mode and the
+/// full-screen scroll region. Setting the region homes the cursor, so it is put back (a pending
+/// wrap is lost: `vt100` has no way to say it).
+fn soft_reset(parser: &mut vt100::Parser<Hooks>) {
+    let (row, col) = parser.screen().cursor_position();
+    let cols = parser.screen().size().1.get();
+    parser.process(b"\x1b[0m\x1b[?6l\x1b[r");
+    let back = format!("\x1b[{};{}H", row + 1, col.min(cols.saturating_sub(1)) + 1);
+    parser.process(back.as_bytes());
+}
+
 struct Vt100 {
     parser: RefCell<vt100::Parser<Hooks>>,
     region: RegionTracker,
@@ -162,9 +173,18 @@ impl Emulator for Vt100 {
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        self.parser.get_mut().process(bytes);
-        // `vt100` is not asked to follow the origin mode, so there is nothing to put right.
-        let _ = self.region.feed(bytes);
+        let mut done = 0;
+        for (end, action) in self.region.feed(bytes) {
+            let parser = self.parser.get_mut();
+            parser.process(&bytes[done..end]);
+            done = end;
+            match action {
+                Action::Decstr => soft_reset(parser),
+                // `vt100` is not asked to follow the origin mode.
+                Action::SetOrigin(_) => {}
+            }
+        }
+        self.parser.get_mut().process(&bytes[done..]);
     }
 
     fn resize(&mut self, size: Size) {

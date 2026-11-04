@@ -7,19 +7,25 @@
 //! stream, and it must mirror each backend's rules for what counts as a valid region and
 //! what resets one.
 //!
-//! The same pass finds what the backends get wrong about origin mode, and returns it from
-//! [`RegionTracker::feed`] as an [`Action`] at the byte where it takes effect, for the backend
-//! to put right in the emulator (so the emulator and the model agree with real terminals).
-//! xterm saves the origin mode with the cursor (DECSC) and DECRC brings it back;
-//! `alacritty_terminal` saves the cursor without it. The tracker keeps the mode and the saved
-//! bit (one per screen, as the cursor save is), and reports a restore after which the
-//! emulator's mode differs from the saved one.
+//! The same pass finds what the backends get wrong, and returns it from
+//! [`RegionTracker::feed`] as [`Action`]s at the byte where each takes effect, for the backend
+//! to put right in the emulator (so the emulator and the model agree with real terminals):
+//!
+//! - **Origin mode across DECSC and DECRC.** xterm saves the origin mode with the cursor and
+//!   DECRC brings it back; `alacritty_terminal` saves the cursor without it. The tracker keeps
+//!   the mode and the saved bit (one per screen, as the cursor save is), and reports a restore
+//!   after which the emulator's mode differs from the saved one.
+//! - **DECSTR** (`CSI ! p`), the soft reset. Neither emulator has a handler for it. The tracker
+//!   applies it to what it follows itself (region, invoked character set, origin mode and its
+//!   save) and reports it, for the backend to reset the rest.
 
 use vte::{Params, Parser, Perform};
 
 /// Something a backend has to do to its emulator at a byte offset of the fed stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
+    /// DECSTR has just been parsed: reset what the emulator keeps (see `be_alacritty`).
+    Decstr,
     /// A restore (DECRC, or leaving the alternate screen) has just been parsed and the origin
     /// mode it should have brought back differs from the emulator's: set it to this.
     SetOrigin(bool),
@@ -50,6 +56,14 @@ struct State {
 }
 
 impl State {
+    fn decstr(&mut self) {
+        self.region = None;
+        self.active_charset = 0;
+        self.origin = false;
+        self.saved_origin[usize::from(self.alt)] = false;
+        self.action = Some(Action::Decstr);
+    }
+
     fn save_cursor(&mut self) {
         if self.track_origin {
             self.saved_origin[usize::from(self.alt)] = self.origin;
@@ -169,7 +183,7 @@ impl Perform for State {
                 }
             }
             // DECSTR, soft terminal reset.
-            ([b'!'], 'p') => self.region = None,
+            ([b'!'], 'p') => self.decstr(),
             // The ANSI.SYS forms of DECSC and DECRC (both emulators take any parameters).
             ([], 's') => self.save_cursor(),
             ([], 'u') => self.restore_origin(self.alt),
@@ -287,6 +301,27 @@ mod tests {
         t.feed(b"\x1bc");
         assert!(!t.saved_origin(false));
         assert_eq!(t.feed(b"\x1b8"), vec![]);
+    }
+
+    #[test]
+    fn decstr_resets_what_the_tracker_follows_and_is_reported() {
+        let mut t = RegionTracker::new(24, false, true);
+        t.feed(b"\x1b[3;8r\x0e\x1b[?6h\x1b7");
+        assert_eq!(t.region(), Some((2, 7)));
+        assert_eq!(t.active_charset(), 1);
+        assert!(t.saved_origin(false));
+        // The report is at the byte that ends the sequence, also when the chunk is split.
+        assert_eq!(t.feed(b"ab\x1b[!"), vec![]);
+        assert_eq!(t.feed(b"pcd"), vec![(1, Action::Decstr)]);
+        assert_eq!(t.region(), None);
+        assert_eq!(t.active_charset(), 0);
+        assert!(!t.saved_origin(false));
+        // Without origin tracking it is reported as well.
+        let mut t = RegionTracker::new(24, true, false);
+        assert_eq!(t.feed(b"\x1b[2;5r\x1b[!p"), vec![(10, Action::Decstr)]);
+        assert_eq!(t.region(), None);
+        // Text that merely contains the letters is not a sequence.
+        assert_eq!(t.feed(b"hello!p \x1b]0;a!p\x07"), vec![]);
     }
 
     #[test]

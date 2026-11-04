@@ -69,6 +69,9 @@ use crate::text::{sanitize_inline, sanitize_lines};
 mod repair;
 use repair::Repair;
 
+/// `PtyMode` reports and `EchoAck`s waiting for their output, past which the link is given up
+/// on (an honest daemon has a handful waiting at most; one `EchoAck` per 50 ms of typing).
+const MAX_QUEUED_REPORTS: usize = 4096;
 /// A snapshot bigger than this is a protocol error, not something to buffer.
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 /// Keystrokes waiting for room in the send window; past this the terminal is not read.
@@ -611,6 +614,10 @@ pub(crate) struct Core<I, O> {
     rebase_input: bool,
     /// What the client knows of the current link, for the predictor (`docs/m3/plan.md` §2.2).
     link_view: LinkView,
+    /// Output the core will never see is being skipped (a catch-up was announced, or terminal
+    /// data arrived past a gap that one will explain): the guesses were withdrawn and the core
+    /// writes none until the snapshot lands, or a resume replays the stream instead.
+    skip_held: bool,
     esc: EscapeFilter,
     buf: OfflineBuffer,
     log: Option<LogSink>,
@@ -701,6 +708,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             predicting: make_predictor.is_some(),
             make_predictor,
             rebase_input: false,
+            skip_held: false,
             link_view: LinkView {
                 down: true,
                 ..LinkView::default()
@@ -1544,11 +1552,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 echo,
                 at,
             } => {
-                self.sess
-                    .modes
-                    .push_back((at, Ordered::Mode { canonical, echo }));
-                // A report for an offset already written applies now.
-                self.apply_modes(self.sess.recv.received())?;
+                if let Flow::End(s) =
+                    self.queue_report(conn, at, Ordered::Mode { canonical, echo })?
+                {
+                    return Ok(Flow::End(s));
+                }
             }
             // Only sent to a client that asked (`Attach::echo_ack`, a predicting one). Queued by
             // its output offset like `PtyMode`, so it settles guesses only once the output it
@@ -1558,13 +1566,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 input_upto,
                 output_at,
             } => {
-                if self.predicting && self.echo_ack_credible(input_upto) {
-                    self.sess
-                        .modes
-                        .push_back((output_at, Ordered::EchoAck { input_upto }));
-                    self.apply_modes(self.sess.recv.received())?;
-                } else {
+                if !self.predicting {
+                    tracing::debug!("ignoring an EchoAck this client did not ask for");
+                } else if !self.echo_ack_credible(input_upto) {
                     tracing::debug!("ignoring an EchoAck beyond the input sent");
+                } else if let Flow::End(s) =
+                    self.queue_report(conn, output_at, Ordered::EchoAck { input_upto })?
+                {
+                    return Ok(Flow::End(s));
                 }
             }
             ControlMsg::Error(code) => {
@@ -1660,6 +1669,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         });
         match r.start {
             StartPoint::Resume { from } => {
+                if std::mem::take(&mut self.skip_held)
+                    && self.repair.trusted(self.size_gen)
+                    && let Some(d) = self.display.as_mut()
+                {
+                    // The skip never came (the link was given up on): the stream is replayed from
+                    // the terminal's position, so the shadow says what the terminal shows.
+                    d.repainted();
+                }
                 if !conn.resumed {
                     self.sess.established = false;
                     return Self::reconnect("a fresh attach was answered with a resume");
@@ -1720,6 +1737,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         if info.len > MAX_SNAPSHOT {
             return Err(ClientError::Protocol("snapshot too large".into()));
+        }
+        if info.reason != SnapshotReason::Repaint {
+            // A catch-up skips output the core never sees (a secret prompt among it, maybe): the
+            // epoch ends at the announcement, not when the bytes land, which on the slow link
+            // that made the daemon jump can take long. Keys typed meanwhile are written nowhere,
+            // whatever output below the jump is still applied (`docs/m3/plan.md` §2.4 rule 3).
+            self.hold_for_skip()?;
         }
         if let Some(cur) = conn.snap.as_mut() {
             // The current snapshot's bytes are not all in, or it is a repaint held for its
@@ -1901,6 +1925,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let Some(snap) = conn.snap.take() else {
             return Ok(Flow::Continue);
         };
+        // The skip has landed: trust follows the snapshot's size generation (below).
+        self.skip_held = false;
         let first = !self.first_attached;
         if first {
             self.enter_session_screen()?;
@@ -1950,6 +1976,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         });
         if let Flow::End(s) = self.drain_terminal(conn)? {
             return Ok(Flow::End(s));
+        }
+        if !Self::screen_behind_position(conn) {
+            // Reports that arrived while the snapshot was on its way, for output the screen now
+            // shows (`queue_report` held them).
+            self.apply_modes(self.sess.recv.received())?;
         }
         if conn.snap_next.is_some() {
             return self.begin_next_snapshot(conn);
@@ -2016,11 +2047,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.apply_output(pos, &fresh)?;
             }
         }
+        let opened = conn.gap_since.is_none() && !conn.term_held.is_empty();
         conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
             (true, _) => None,
             (false, None) => Some(Instant::now()),
             (false, since) => since,
         };
+        if opened && Self::repaint_at(conn).is_none() {
+            // Data past a gap: a catch-up whose announcement has not arrived yet (QUIC). The skip
+            // is coming; hold the guesses now.
+            self.hold_for_skip()?;
+        }
         // Also when nothing was new: a resend of what the terminal already has (a swap's) is
         // still owed an ack on this link.
         self.after_output();
@@ -2057,9 +2094,38 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(())
     }
 
+    /// Queues a `PtyMode` report or an `EchoAck` at output offset `at`, and applies what the
+    /// screen has reached. While a catch-up or an attach's snapshot is on its way the terminal
+    /// position has already moved to the snapshot's point but the screen has not: nothing is
+    /// applied until the snapshot lands (`finish_snapshot` applies the queue up to its point,
+    /// then the output after it). More than [`MAX_QUEUED_REPORTS`] waiting is a daemon that
+    /// reports offsets its output never reaches: the link is given up on, as for held output.
+    fn queue_report(&mut self, conn: &Conn, at: u64, what: Ordered) -> Result<Flow, ClientError> {
+        if self.sess.modes.len() >= MAX_QUEUED_REPORTS {
+            return Self::reconnect("too many reports waiting for their output");
+        }
+        self.sess.modes.push_back((at, what));
+        if Self::screen_behind_position(conn) {
+            return Ok(Flow::Continue);
+        }
+        // A report for an offset already written applies now.
+        self.apply_modes(self.sess.recv.received())?;
+        Ok(Flow::Continue)
+    }
+
+    /// The terminal position is past what the screen shows: a snapshot that moved it (a catch-up,
+    /// an attach's) has not landed yet. A repaint moves no position.
+    fn screen_behind_position(conn: &Conn) -> bool {
+        conn.snap
+            .as_ref()
+            .is_some_and(|s| s.info.reason != SnapshotReason::Repaint && !s.stale)
+    }
+
     /// Applies the `PtyMode` reports and `EchoAck`s whose offset is at or below `pos`, in the
     /// order they came. One at an offset the output never reaches waits for good, and so does
-    /// everything behind it: a daemon's mistake that can only hold settling back.
+    /// everything behind it, later mode reports included: a daemon's mistake that can only hold
+    /// settling and mode changes back (an honest daemon sends a report only once the output
+    /// below it has been sent).
     fn apply_modes(&mut self, pos: u64) -> Result<(), ClientError> {
         while let Some(&(at, what)) = self.sess.modes.front() {
             if at > pos {
@@ -2106,6 +2172,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.write(&bytes)?;
         }
         Ok(())
+    }
+
+    /// Output is being skipped: withdraw the guesses, and leave the core's screen untrusted so it
+    /// writes none until the snapshot that covers the skip lands (`finish_snapshot` trusts it
+    /// again by the snapshot's size generation).
+    fn hold_for_skip(&mut self) -> Result<(), ClientError> {
+        let Some(d) = self.display.as_mut().filter(|d| d.predicting()) else {
+            return Ok(());
+        };
+        let mut bytes = d.withdraw(WithdrawReason::Snapshot);
+        bytes.extend_from_slice(&d.untrusted());
+        self.skip_held = true;
+        self.write(&bytes)
     }
 
     /// Input that never reaches the session (an answer to the client's own question, an escape):
@@ -2499,8 +2578,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // Order matters: once anything is held offline, everything after it is too.
         if self.link_ok && self.buf.is_empty() {
             let at = self.next_input_at();
+            // Once the shell has exited, keys typed while the link drains are for no program on
+            // a live screen: sent, never predicted.
+            let kind = if self.sess.exited.is_some() {
+                InputKind::Offline
+            } else {
+                InputKind::Typed
+            };
             if let Some(d) = self.display.as_mut() {
-                let out = d.input(b, at, InputKind::Typed);
+                let out = d.input(b, at, kind);
                 self.write(&out)?;
             }
             self.pending.extend_from_slice(b);

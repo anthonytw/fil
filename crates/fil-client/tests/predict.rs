@@ -747,3 +747,150 @@ async fn a_snapshot_from_an_older_size_leaves_the_screen_untrusted() {
     settle().await;
     assert_eq!(shown(&rig), 1, "trusted again after the repaint");
 }
+
+// ---------------------------------------------------------------------------------------------
+// A catch-up on its way (review of #118, B1)
+
+/// A prompt the core must never write into, then a silent read; a clock on another row keeps the
+/// output moving, so every `EchoAck`'s `output_at` is past the skip and waits behind the snapshot.
+/// `how`: the prompt as ordinary output, skipped by a catch-up whose bytes are on their way, or
+/// skipped by one whose announcement is overtaken by the output past it (QUIC).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prompt {
+    Output,
+    CatchUp,
+    Gap,
+}
+
+async fn secret_during(how: Prompt) -> usize {
+    let (rig, _) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.daemon.set_echo(Echo::Silent).await;
+    let prompt = b"\r\nPassword: ";
+    let staged = match how {
+        Prompt::Output => {
+            rig.daemon.output(prompt).await;
+            None
+        }
+        Prompt::CatchUp => Some(rig.daemon.catch_up_staged(prompt, None).await),
+        Prompt::Gap => Some(
+            rig.daemon
+                .catch_up_staged(prompt, Some(b"\x1b7\x1b8"))
+                .await,
+        ),
+    };
+    settle().await;
+    let from = rig.term.writes().len();
+    for (i, k) in ["h", "u", "n", "t", "e", "r", "2"].iter().enumerate() {
+        rig.daemon
+            .output(format!("\x1b7\x1b[2;70H({}s)\x1b8", 30 - i).as_bytes())
+            .await;
+        rig.type_str(k);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let during = drawn_since(&rig, from);
+    if let Some((info, bytes)) = staged {
+        if how == Prompt::Gap {
+            rig.daemon.announce(info).await;
+        }
+        rig.daemon.send_snapshot(&bytes).await;
+        settle().await;
+        // The snapshot landed: the session goes on.
+        until("the catch-up", 5, || rig.term.text().contains("Password:")).await;
+    }
+    during
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_prompt_as_output_ends_the_epoch() {
+    assert_eq!(secret_during(Prompt::Output).await, 0);
+}
+
+/// The epoch ends at the announcement, not when the bytes land: without that, all seven keys
+/// were written (the review's trace), and no `EchoAck` could stop them.
+#[tokio::test(start_paused = true)]
+async fn nothing_is_written_while_a_catch_up_is_on_its_way() {
+    assert_eq!(secret_during(Prompt::CatchUp).await, 0);
+}
+
+/// Data past a gap means a catch-up is coming: the guesses are held from then on.
+#[tokio::test(start_paused = true)]
+async fn nothing_is_written_while_data_past_a_gap_waits_for_its_announcement() {
+    assert_eq!(secret_during(Prompt::Gap).await, 0);
+}
+
+/// An `EchoAck` is applied at its own output offset, also when the data segment that carries its
+/// output goes on past it: here the key's echo comes after `output_at` in the same segment, so
+/// the ack must find the key unechoed (the cursor before the echo).
+#[tokio::test(start_paused = true)]
+async fn an_echo_ack_inside_a_chunk_is_applied_at_its_offset() {
+    let (rig, seen) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.daemon.set_echo(Echo::Off).await;
+    rig.type_str("b");
+    settle().await;
+    let end = rig.daemon.output_end().await;
+    // A pen change (no glyph) then the echo, in one segment; the ack at the end of the pen change.
+    rig.daemon.echo_ack(2, end + 4).await;
+    settle().await;
+    rig.daemon.output(b"\x1b[0mb").await;
+    settle().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.acks.last(), Some(&(2, 1)), "{:?}", seen.acks);
+}
+
+/// A daemon that reports offsets its output never reaches is given up on once too many wait.
+#[tokio::test(start_paused = true)]
+async fn too_many_reports_waiting_for_their_output_end_the_link() {
+    let (rig, _) = start_predicting(predicting());
+    rig.attached().await;
+    let end = rig.daemon.output_end().await;
+    for _ in 0..4100 {
+        rig.daemon.echo_ack(0, end + 1_000_000).await;
+    }
+    until_async("the reconnect", 10, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+}
+
+/// A report that arrives while a catch-up's bytes are on their way, for an offset the jump has
+/// passed, waits for the snapshot: the terminal position has moved, the screen has not.
+#[tokio::test(start_paused = true)]
+async fn a_report_during_a_catch_up_waits_for_its_snapshot() {
+    let (rig, seen) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    let (info, bytes) = rig.daemon.catch_up_staged(b"skipped\r\n", None).await;
+    settle().await;
+    rig.daemon.echo_ack(1, info.at).await;
+    settle().await;
+    assert_eq!(
+        seen.lock().unwrap().acks.len(),
+        1,
+        "applied before the snapshot landed"
+    );
+    rig.daemon.send_snapshot(&bytes).await;
+    settle().await;
+    assert_eq!(seen.lock().unwrap().acks.len(), 2, "applied once it did");
+}
+
+/// Keys typed after the session's exit status, while the link drains, are sent and not
+/// predicted.
+#[tokio::test(start_paused = true)]
+async fn keys_after_the_exit_status_are_not_predicted() {
+    let (rig, seen) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.daemon.send_status_only(Some(0), None).await;
+    settle().await;
+    rig.type_str("xy");
+    settle().await;
+    assert_eq!(
+        seen.lock().unwrap().keys,
+        [0],
+        "keys after the exit reached the predictor"
+    );
+}

@@ -1715,6 +1715,80 @@ impl FakeDaemon {
         }
     }
 
+    /// A catch-up over `skip` announced now, its bytes returned to be sent later with
+    /// [`FakeDaemon::send_snapshot`]: a snapshot still on its way over a slow link. With `gap`,
+    /// the announcement is not sent either: `gap` is sent past the skip on the terminal channel
+    /// first (QUIC, the announcement overtaken), and [`FakeDaemon::announce`] sends it later.
+    pub async fn catch_up_staged(
+        &self,
+        skip: &[u8],
+        gap: Option<&[u8]>,
+    ) -> (SnapshotInfo, Vec<u8>) {
+        let mut st = self.st.lock().await;
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let link = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+            .expect("a link");
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
+        let at = st.log.end();
+        st.flows.insert(key_of(&link), at);
+        st.pending_jump = Some(at);
+        st.sent = at;
+        st.snapshots += 1;
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: skip.len() as u64,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
+        };
+        match gap {
+            Some(after) => {
+                st.log.append(after);
+                st.emu.feed(after);
+                self.pump(&mut st).await;
+            }
+            None => {
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            }
+        }
+        (info, bytes)
+    }
+
+    /// Sends a staged catch-up's announcement.
+    pub async fn announce(&self, info: SnapshotInfo) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let _ = send(&c.link, &ControlMsg::Snapshot(info)).await;
+        }
+    }
+
+    /// Sends a staged catch-up's bytes.
+    pub async fn send_snapshot(&self, bytes: &[u8]) {
+        let st = self.st.lock().await;
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
     /// The current link reports this round-trip time (`LinkStatus.rtt`).
     pub async fn set_rtt(&self, rtt: Duration) {
         let st = self.st.lock().await;

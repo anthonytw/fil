@@ -1,12 +1,12 @@
 # M3 plan: prediction
 
-> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
+> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **M3's close targets 0.2.0 (decided, owner 2026-11-04, 10:28 ET: N9):** 0.1.0 ships without prediction, M3 continues in parallel and its code keeps merging, dormant; 0.1.0 exposes no `predict` key and no `--predict` flag, and the §2.7 default (adaptive, on above 30 ms, underlined above 80 ms or after a glitch) applies from 0.2.0. K1 (terminal-channel pacing) stays required for 0.1.0. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
 
 ## 0. Preconditions and the overlap with M2 and M4
 
 - **M2 is in its sweep.** Its fix PRs edit `crates/fil-forward/**` and `crates/fil-proto/src/{mux.rs, mux/*, ring.rs}`. **No M3 package touches those files until the M2 sweep is closed.** Nothing in this plan needs them.
-- **M4 runs beside M3.** M4 does not touch `crates/fil-predict/**` or `crates/fil-client/**` until M3 closes (its §0). The files both milestones need are serialized by the coordinator (§3, "File ownership"):
-  - `crates/fil/src/{cli.rs, config.rs, app.rs}`, the `crates/fil/tests/*` files named below, and `DESIGN.md` §14: M4's U1 first, then M3's **E1b** (only E1's `crates/fil` part), then M4's LIC, then M4's CFG. The coordinator opens each slot; each later PR merges main first.
+- **M4 runs beside M3.** M4 does not touch `crates/fil-predict/**` or `crates/fil-client/**` until M3 closes (its §0); M3's file hold no longer outlasts 0.1.0, which ships without prediction (N9), and M4's later edits to those files go in a coordinator-serialized slot before RC (after K1). The files both milestones need are serialized by the coordinator (§3, "File ownership"):
+  - `crates/fil/src/{cli.rs, config.rs, app.rs}`, the `crates/fil/tests/*` files named below, and `DESIGN.md` §14: M4's U1 first, then M4's LIC, then M4's CFG for 0.1.0; M3's **E1b** (only E1's `crates/fil` part) is 0.2.0 work (N9), after CFG has made `predict` an unknown key. The coordinator opens each slot; each later PR merges main first.
   - **The catch-up rule** (§6.2, `fil-proto/src/log.rs`, the catch-up decision in `fil-session/src/core.rs`) is M3's K1. M4's CFG comes after K1 and does not touch it.
   - `crates/fil-proto/src/limits.rs` is W1's while W1 is open.
   - `.github/workflows/linux-check.yml` and `tests/realnet/**`: each package adds its own suite or part file. The shared suite list in the workflow and the part list in `tests/realnet/run.sh` take one-line additions, merged by whichever PR lands second.
@@ -279,7 +279,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 | **Resume** (same epoch, replay) | Kept. Input offsets continue (§8.5), so outstanding guesses are settled by the replayed output and later `EchoAck`s. `EchoAck`s lost with the old link are not needed: they are cumulative. The next key is a `Resumed` boundary. |
 | **Swap** (pipe and QUIC) | A resume at the commit point: as above. |
 | **Snapshot** (attach, catch-up, `want_snapshot`, W1's repaint) | `Display::reset` builds a new shadow and predictor (as today); written guesses are classified, then dropped. A `Snapshot` boundary: the new overlay starts tentative (§2.4 rule 3). Keys sent but not yet echoed are echoed after the snapshot, unpredicted. |
-| **Link `Degraded`** | Keys still go out and are predicted: a slow link is the case prediction is for. The status line and predictions share the overlay (M1). |
+| **Link `Degraded`** | A *slow* link is the case prediction is for, and stays `Up`: its keys go out and are predicted. `Degraded` means the peer has gone silent (the link contract, DESIGN §8.1), and the engine treats it as disconnected until it speaks again (M1's `link_quiet`): keys typed meanwhile are offline input (§4.3), never predicted, as for `Down`. What was written stays until it settles or the backstop withdraws it. The status line and predictions share the overlay (M1). |
 | **Link `Down`** | Keys are offline input (§4.3), never predicted. What was written stays until it is settled or the backstop (10 s, or the next snapshot) withdraws it, so a key typed just before a drop still shows. |
 | **Takeover, `fil detach` from elsewhere, refusal, `SessionExited`** | Withdrawn at once, before any question or message is drawn. The old client's later keys are not the session's. |
 | **Fresh attach after a take-back** | New predictor; input offsets rebase to 0 (§8.5). |
@@ -290,7 +290,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 
 ### 2.7 Configuration and the adaptive switch
 
-- `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed today; default `adaptive` (decided, owner 2026-11-04: PC-1).
+- **From 0.2.0 (decided, owner 2026-11-04, 10:28 ET: N9); 0.1.0 has no `predict` key and no `--predict` flag.** `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed in the code today, but rejected as unknown by M4's CFG for 0.1.0, so E1b brings it back; default `adaptive` (decided, owner 2026-11-04: PC-1).
 - **`--predict off|adaptive|always`** overrides it for one run, like `--transport` (E1b; proposed).
 - `off`: no predictor, `Attach.echo_ack = false` (no `EchoAck`, the M1 mode poll). `adaptive` and `always`: `echo_ack = true` for the whole attach, so turning on mid-session needs no message.
 - **The adaptive switch (P1, proposed, mosh's values, §16.7 "to tune"):**
@@ -365,7 +365,7 @@ flowchart LR
   T1a["T1 part 1: full-stack harness,<br/>true-order resize"] --> W1["W1: in-band Repaint"]
   T2["T2: real terminals"] --> W1
   T2 -.-> P1
-  E1a --> E1b["E1b: fil config and flag<br/>(slot after M4's U1)"]
+  E1a --> E1b["E1b: fil config and flag<br/>(0.2.0: after M4's CFG)"]
   W1 --> K1["K1: catch-up while healthy<br/>(optional)"]
   T1a --> T1b["T1 part 2: prediction suites"]
   P1 --> T1b
@@ -468,7 +468,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Mutation:** apply `EchoAck` on arrival (the overtaking test mispredicts); no rebase on a take-back (the wrong guess is settled); predict offline bytes (the offline test fails); keep guesses on takeover (the question test sees them); trust `input_upto` (the hostile test settles a guess).
 - **Done when:** the above pass and `run_with` predicts with a factory from `ClientConfig`.
 
-**E1b: the `fil` binary's configuration and flag** (after E1a; in the slot after M4's U1 and before M4's LIC; the coordinator opens it, and it merges main first)
+**E1b: the `fil` binary's configuration and flag** (0.2.0 work, N9: after E1a and after M4's CFG, which makes `predict` an unknown key for 0.1.0; the coordinator opens it, and it merges main first)
 - **Owns:** `crates/fil/src/{config.rs (the `predict` mapping), cli.rs (`--predict`), app.rs (pass it to the client)}`, `crates/fil/tests/predict_flag.rs` (new), the `predict` lines of `DESIGN.md` §14, `docs/m3/binary.md` (new, the flag and the key, as `docs/m2/binary.md` does for M2), and §14's pointer to it.
 - **Tests:** the flag over the host's setting over `[defaults]` over the default; `--predict maybe` refused with the valid values; `off` attaches with `echo_ack = false` (a debug log line).
 - **Mutation:** ignore the flag (the precedence test fails).
@@ -523,7 +523,7 @@ Owned in sequence, never in parallel:
 - `crates/fil-client/tests/common/mod.rs`: one-line registrations by T1 and E1a, merged by the second.
 - `crates/fil-session/src/core.rs`: C1 (`poll_interval`), then W1, then K1.
 - `crates/fil-proto/src/limits.rs` and the golden: W1 only, while it is open.
-- `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/predict_flag.rs`, `DESIGN.md` §14: M4's U1, then M3's E1b, then M4's LIC, then M4's CFG (§0).
+- `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/predict_flag.rs`, `DESIGN.md` §14: M4's U1, then M4's LIC, then M4's CFG for 0.1.0; M3's E1b is 0.2.0 work (N9; §0).
 - `crates/fil/examples/dropin/netcut.rs`, `tests/realnet/predict.sh`: T3, then V1.
 - `.github/workflows/linux-check.yml`, `tests/realnet/run.sh`: each package's own job or part, plus one-line list entries merged by the second to land.
 - `DESIGN.md`: each package its own sections (§0); the coordinator resolves overlaps with M2's and M4's.

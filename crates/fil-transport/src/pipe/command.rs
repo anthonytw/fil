@@ -20,7 +20,8 @@
 //! **Approved by the owner (M4 OQ-1, 2026-11-04):** fil's remote commands are exactly two,
 //! [`REMOTE_COMMAND`] and [`BOOTSTRAP`] (DESIGN.md §8.2, decided). [`PipeCommand::ssh`] and
 //! [`PipeCommand::bootstrap`] are the only constructors of either; both take a host and nothing
-//! else. What each check proves:
+//! else. ([`PipeCommand::for_background`] adds its fixed ssh options in front of the host, for a
+//! background run, and never touches the remote part.) What each check proves:
 //!
 //! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
 //!   (a change to it needs the owner's sign-off again);
@@ -92,7 +93,7 @@ const BOOT_TAIL: &str = concat!(
     r#"pre() { [ -e "$1" ] || [ -h "$1" ] || return 0; "$2" "$1"; }; "#,
     r#"undo() { [ -n "$n" ] && rm -rf "$n"; [ -n "$k3" ] && rmdir "$b"; [ -n "$k2" ] && rmdir "$HOME/.local/share"; [ -n "$k1" ] && rmdir "$HOME/.local"; exit 1; }; "#,
     r#"IFS= read -r m || exit 1; "#,
-    r#"if [ "$m" = check ]; then if chain; then for d in "$b"/*; do own "$d" && exe "$d/fil" && say FIL-HAVE "${d##*/}"; done; fi; command -v fil >/dev/null && say FIL-PATH "$(fil --version </dev/null | head -n 1)"; lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; exit 0; fi; "#,
+    r#"if [ "$m" = check ]; then if chain; then for d in "$b"/*; do own "$d" && exe "$d/fil" && say FIL-HAVE "${d##*/}"; done; fi; command -v fil >/dev/null && say FIL-PATH "$(fil --version </dev/null | head -n 1)"; lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; say FIL-CHECK-END; exit 0; fi; "#,
     r#"if [ "$m" = remove ]; then if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 gc; exec "$b/$v/fil" server --install-gc; fi; say FIL-BOOT1 none; exit 1; fi; "#,
     r#"[ "$m" = attach ] || exit 1; "#,
     r#"if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 exec; exec "$b/$v/fil" server --stdio; fi; "#,
@@ -281,6 +282,10 @@ fn host_is_acceptable(host: &str) -> bool {
 pub struct PipeCommand {
     argv: Vec<OsString>,
     ssh_keepalive: bool,
+    /// Made by [`PipeCommand::bootstrap`], and by nothing else: the pipe writes the bootstrap's
+    /// mode line (`attach`) first and reads its answer before fil's preamble
+    /// ([`PipeLink::start`](super::PipeLink::start)).
+    bootstrap: bool,
 }
 
 impl PipeCommand {
@@ -298,6 +303,7 @@ impl PipeCommand {
         Ok(Self {
             argv,
             ssh_keepalive: true,
+            bootstrap: false,
         })
     }
 
@@ -338,6 +344,7 @@ impl PipeCommand {
                 BOOTSTRAP.into(),
             ],
             ssh_keepalive: true,
+            bootstrap: true,
         })
     }
 
@@ -356,7 +363,56 @@ impl PipeCommand {
         Ok(Self {
             argv,
             ssh_keepalive: true,
+            bootstrap: false,
         })
+    }
+
+    /// A local stand-in for the bootstrap's login, for the pipe's own tests: `argv` runs with the
+    /// bootstrap's handling (the mode line, the answer before the preamble).
+    #[cfg(test)]
+    pub(crate) fn bootstrap_for_test(argv: &[&str]) -> Self {
+        Self {
+            argv: argv.iter().map(OsString::from).collect(),
+            ssh_keepalive: false,
+            bootstrap: true,
+        }
+    }
+
+    /// Whether this is the install bootstrap ([`bootstrap`](Self::bootstrap)), whose run starts
+    /// with its mode line on stdin and its answer before fil's preamble.
+    pub fn is_bootstrap(&self) -> bool {
+        self.bootstrap
+    }
+
+    /// The same command for a run nobody is watching (every run after the first attach). When
+    /// its program is `ssh`, whether the default command or one from `pipe = [...]`: never ask
+    /// for a password, a passphrase or a host-key decision (no one can answer, and the terminal
+    /// belongs to the session), give up on an unreachable host in ten seconds, and say only
+    /// errors. That is exactly [`BACKGROUND_OPTIONS`], right after the program; one the command
+    /// line already sets (as `-o Key=...` or `-oKey=...` among the options before the host) is
+    /// left alone. Nothing else changes: the remote part, whether this is the bootstrap, the
+    /// keepalive setting. Any other program runs as given (it may prompt on a reconnect).
+    ///
+    /// The options are fixed here so that no caller can put other words in front of the host of
+    /// a command that is the bootstrap.
+    pub fn for_background(&self) -> Self {
+        if !self
+            .argv
+            .first()
+            .is_some_and(|p| Path::new(p).file_name().is_some_and(|n| n == "ssh"))
+        {
+            return self.clone();
+        }
+        let set = ssh_option_keys(&self.argv);
+        let mut extra: Vec<OsString> = Vec::new();
+        for (key, value) in BACKGROUND_OPTIONS {
+            if !set.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+                extra.extend(["-o".into(), format!("{key}={value}").into()]);
+            }
+        }
+        let mut c = self.clone();
+        c.argv.splice(1..1, extra);
+        c
     }
 
     /// Whether to add `ServerAliveInterval` and `ServerAliveCountMax` when the program is `ssh`
@@ -398,6 +454,55 @@ impl PipeCommand {
     }
 }
 
+/// The ssh options [`PipeCommand::for_background`] adds, as `-o KEY=VALUE`.
+pub const BACKGROUND_OPTIONS: [(&str, &str); 3] = [
+    ("BatchMode", "yes"),
+    ("ConnectTimeout", "10"),
+    ("LogLevel", "ERROR"),
+];
+
+/// The keys of the `-o` options on an ssh command line, as `-o Key=Value`, `-o "Key Value"` or
+/// `-oKey=Value`, among the arguments before the first that is not an option (the host) or
+/// `--`. Options that take a value of their own (`-J host`, `-p 22`, ...) are skipped with it, so
+/// a host alias or a remote command is never read as an option.
+fn ssh_option_keys(argv: &[OsString]) -> Vec<String> {
+    // ssh(1)'s options that take an argument.
+    const WITH_ARG: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+    let key = |v: &str| {
+        v.split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut keys = Vec::new();
+    let mut it = argv
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned());
+    while let Some(a) = it.next() {
+        if a == "--" || !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        // A cluster of flags, the last of which may take an argument (`-Tq`, `-p22`, `-oX=y`).
+        let flags = &a.as_bytes()[1..];
+        for (i, &f) in flags.iter().enumerate() {
+            if WITH_ARG.contains(&f) {
+                let attached = &a[i + 2..];
+                let value = if attached.is_empty() {
+                    it.next().unwrap_or_default()
+                } else {
+                    attached.to_string()
+                };
+                if f == b'o' {
+                    keys.push(key(&value));
+                }
+                break;
+            }
+        }
+    }
+    keys
+}
+
 fn mentions(argv: &[OsString], option: &str) -> bool {
     argv.iter()
         .any(|a| a.to_string_lossy().to_ascii_lowercase().contains(option))
@@ -426,6 +531,77 @@ mod tests {
             REMOTE_COMMAND.join(" "),
             render_bootstrap("0.1.0", 1, 12)
         )
+    }
+
+    fn words(c: &PipeCommand) -> Vec<String> {
+        c.argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A background run gets exactly the three options, in front of the host; the remote part,
+    /// the bootstrap flag and the keepalive setting are kept.
+    #[test]
+    fn a_background_run_adds_only_its_fixed_options_before_the_host() {
+        for c in [
+            PipeCommand::ssh("box").unwrap(),
+            PipeCommand::bootstrap("box").unwrap(),
+        ] {
+            let bg = c.for_background();
+            assert_eq!(bg.is_bootstrap(), c.is_bootstrap());
+            let w = words(&bg);
+            assert_eq!(
+                &w[..7],
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "LogLevel=ERROR"
+                ]
+            );
+            assert_eq!(&w[7..], &words(&c)[1..], "the rest is as it was");
+        }
+        // Options the line already sets are left alone, in any of ssh's spellings.
+        let own = PipeCommand::custom([
+            "ssh",
+            "-o",
+            "batchmode no",
+            "-oConnectTimeout=3",
+            "-Tq",
+            "-o",
+            "LogLevel=INFO",
+            "box",
+            "fil",
+            "server",
+            "--stdio",
+        ])
+        .unwrap();
+        assert_eq!(words(&own.for_background()), words(&own));
+        // A host or a remote command that mentions an option's name is not an option.
+        let alias = PipeCommand::ssh("batchmode-loglevel.example").unwrap();
+        assert!(words(&alias.for_background()).contains(&"BatchMode=yes".to_string()));
+        let jump = PipeCommand::custom([
+            "ssh",
+            "-J",
+            "batchmode",
+            "-p",
+            "22",
+            "box",
+            "-o",
+            "BatchMode=no",
+        ])
+        .unwrap();
+        assert!(
+            words(&jump.for_background()).contains(&"BatchMode=yes".to_string()),
+            "-J's host and what follows the host are not options"
+        );
+        // Other programs run as given.
+        let k = PipeCommand::custom(["kubectl", "exec", "-i", "pod", "--", "fil"]).unwrap();
+        assert_eq!(k.for_background(), k);
     }
 
     #[test]
@@ -470,8 +646,17 @@ mod tests {
         r#"z=$(wc -c < "$n/fil") || undo; [ "$(($z))" -eq "$s" ] || undo; "#,
     );
 
-    /// The text the owner approved in M4 OQ-1 (2026-11-04), as `docs/m4/plan.md` section 7
-    /// holds it, byte for byte: any other change to the script goes back to the owner.
+    /// The second change the owner approved (N6, 2026-11-04): `check` mode ends with one fixed
+    /// line, so that `fil install --check` can tell a complete report from a host that answered
+    /// nothing (a forced `/bin/true`). Inserted before `check`'s `exit 0`; nothing else changed.
+    const CHECK_END: (&str, &str) = (
+        r#"lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; exit 0; fi; "#,
+        r#"lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; say FIL-CHECK-END; exit 0; fi; "#,
+    );
+
+    /// The text the owner approved in M4 OQ-1 (2026-11-04), with N6 (the same day), as
+    /// `docs/m4/plan.md` section 7 holds it, byte for byte: any other change to the script goes
+    /// back to the owner.
     #[test]
     fn the_bootstrap_is_the_text_the_owner_approved() {
         let plan = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/m4/plan.md");
@@ -488,6 +673,11 @@ mod tests {
         let (was, is) = DASH_FIX;
         assert_eq!(ours.matches(is).count(), 1);
         assert!(!ours.contains(was));
+        // And N6: the end marker once, as the last thing `check` says, and nowhere else.
+        let (was, is) = CHECK_END;
+        assert_eq!(ours.matches(is).count(), 1);
+        assert!(!ours.contains(was));
+        assert_eq!(ours.matches("FIL-CHECK-END").count(), 1);
     }
 
     /// The rest of §2.5's checks, on the text itself: nothing the script hands on is changed

@@ -20,7 +20,15 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "process", "io-util"] }
 tracing = "0.1"
 
+[features]
+# A test-only seam: `ClientConfig::predict_guards` sets the prediction core's guards, so a
+# full-stack test can switch one off. It compiles in the `FIL_TEST_` marker that
+# `just no-test-hooks` refuses in a binary that is installed or released.
+test-hooks = []
+
 [dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-client = { path = ".", features = ["test-hooks"] }
 # The harness of the prediction tests (fil_predict::sim::Rng, fil_predict::oracle::diffs, the
 # test-only ScreenView::test_state).
 fil-predict = { path = "../fil-predict", features = ["testkit"] }

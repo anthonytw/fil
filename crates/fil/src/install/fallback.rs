@@ -13,10 +13,9 @@
 //!   Whichever worked is used for the run's later connections. It is remembered in memory only:
 //!   nothing about the host is written to disk.
 //!
-//! The owner approved the bootstrap (M4 OQ-1, 2026-11-04), but nothing consults this yet: every
-//! attach and management connection still runs the plain command. The attach path needs one
-//! more piece first (the pipe must send the bootstrap's mode line and stop at its greeting, in
-//! `fil-transport`'s pipe); `fil install` runs the bootstrap on its own.
+//! The owner approved the bootstrap (M4 OQ-1, 2026-11-04). [`Run`] is the one choice of a run,
+//! shared by the attach's connector (`crate::connect::Connect`), `app.rs` (which sees a version
+//! mismatch at the hello) and the management commands (`crate::cmds`).
 
 /// The `remote` setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
@@ -66,17 +65,21 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// A failed pipe run, as an outcome. The pipe reports a stream that ended before fil's
-    /// preamble as `Closed` (and one with too much before it as `NoPreamble`); `Closed` also
-    /// covers a relay that wrote its preamble and then failed, which this cannot tell apart, so
-    /// it counts as a missing fil when the command exited nonzero. (A flag from the pipe for
-    /// "the preamble never came" would make this exact: requested with the attach wiring.)
+    /// A failed pipe run, as an outcome: the stream ended before fil's preamble
+    /// (`PipeError::ended_before_preamble`; a relay that wrote its preamble and then failed is
+    /// not a missing fil), or more came before it than the preamble's bound
+    /// (`PipeErrorKind::NoPreamble`); either with how the command exited. ssh's own failure,
+    /// status 255 (a host it cannot reach, a refused login), is not a missing fil: a second
+    /// login would fail the same way.
     pub fn of_pipe_error(e: &fil_transport::pipe::PipeError) -> Outcome {
         use fil_transport::pipe::PipeErrorKind;
+        let nonzero = e
+            .exit
+            .as_deref()
+            .is_some_and(|x| exit_was_nonzero(x) && !exit_was(x, 255));
         match e.kind {
-            PipeErrorKind::NoPreamble { .. } | PipeErrorKind::Closed => Outcome::NoPreamble {
-                nonzero: e.exit.as_deref().is_some_and(exit_was_nonzero),
-            },
+            PipeErrorKind::NoPreamble { .. } => Outcome::NoPreamble { nonzero },
+            PipeErrorKind::Closed if e.ended_before_preamble => Outcome::NoPreamble { nonzero },
             PipeErrorKind::Version { .. } => Outcome::VersionMismatch,
             _ => Outcome::Other,
         }
@@ -86,7 +89,14 @@ impl Outcome {
 /// Whether the pipe's description of how its command ended (`exited: exit status: N`, or a
 /// signal) is anything but a status of 0.
 pub fn exit_was_nonzero(exit: &str) -> bool {
-    !exit.trim_end().ends_with("exit status: 0")
+    !exit_was(exit, 0)
+}
+
+/// Whether the pipe's description of how its command ended is exit status `code`.
+pub fn exit_was(exit: &str, code: i32) -> bool {
+    exit.trim_end()
+        .strip_suffix(&code.to_string())
+        .is_some_and(|x| x.ends_with("exit status: "))
 }
 
 /// What to do after a connection failed.
@@ -159,6 +169,95 @@ impl Choice {
             return Next::Retry(Command::Bootstrap);
         }
         Next::Fail
+    }
+}
+
+/// The choice for one run, shared by everything that connects in it (the attach's connector,
+/// the print site that sees a version mismatch, a management command). Memory only.
+///
+/// A connection's outcome is known in two steps: the pipe comes up ([`Run::came_up`]), and then
+/// either a session starts on it ([`Run::session_started`]), the hello shows another wire
+/// ([`Run::version_mismatch`]), or neither happens before the next connection (it counts as
+/// [`Outcome::Other`]). A pipe that fails is recorded at once ([`Run::failed`]).
+#[derive(Clone, Debug)]
+pub struct Run(std::sync::Arc<std::sync::Mutex<RunState>>);
+
+#[derive(Debug)]
+struct RunState {
+    choice: Choice,
+    /// The command of a pipe that came up and whose outcome is not known yet.
+    pending: Option<Command>,
+    /// Why the run fell back to the bootstrap, when that is worth saying if it fails too (the
+    /// relay was of another wire).
+    trigger: Option<String>,
+}
+
+impl Run {
+    pub fn new(mode: RemoteMode, custom_pipe: bool) -> Run {
+        Run(std::sync::Arc::new(std::sync::Mutex::new(RunState {
+            choice: Choice::new(mode, custom_pipe),
+            pending: None,
+            trigger: None,
+        })))
+    }
+
+    /// The `remote` setting the run was made with.
+    pub fn mode(&self) -> RemoteMode {
+        self.state().choice.mode
+    }
+
+    /// Keeps why the run fell back (`take_trigger` gives it to the bootstrap's failure).
+    pub fn set_trigger(&self, why: String) {
+        self.state().trigger = Some(why);
+    }
+
+    /// Why the run fell back, once.
+    pub fn take_trigger(&self) -> Option<String> {
+        self.state().trigger.take()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RunState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The command for the next connection. A pipe that came up earlier and led nowhere (no
+    /// session, no mismatch) is recorded as `Other` first.
+    pub fn next(&self) -> Command {
+        let mut s = self.state();
+        if let Some(c) = s.pending.take() {
+            s.choice.record(c, Outcome::Other);
+        }
+        s.choice.next()
+    }
+
+    /// A pipe run with `command` came up.
+    pub fn came_up(&self, command: Command) {
+        self.state().pending = Some(command);
+    }
+
+    /// A pipe run with `command` failed: what to do now.
+    pub fn failed(&self, command: Command, outcome: Outcome) -> Next {
+        let mut s = self.state();
+        s.pending = None;
+        s.choice.record(command, outcome)
+    }
+
+    /// A session started (or a daemon of this wire answered) on the pipe that came up last.
+    pub fn session_started(&self) {
+        let mut s = self.state();
+        if let Some(c) = s.pending.take() {
+            s.choice.record(c, Outcome::Up);
+        }
+    }
+
+    /// The pipe that came up last reached a relay of another wire with no daemon of ours: what
+    /// to do now. `Fail` if no pipe is pending (the mismatch came later in the run).
+    pub fn version_mismatch(&self) -> Next {
+        let mut s = self.state();
+        match s.pending.take() {
+            Some(c) => s.choice.record(c, Outcome::VersionMismatch),
+            None => Next::Fail,
+        }
     }
 }
 
@@ -240,7 +339,84 @@ mod tests {
     }
 
     #[test]
+    fn the_run_records_a_connection_when_its_outcome_is_known() {
+        // The plain pipe came up, then the hello showed another wire: the one fallback.
+        let r = Run::new(RemoteMode::Auto, false);
+        assert_eq!(r.next(), Command::Plain);
+        r.came_up(Command::Plain);
+        assert_eq!(r.version_mismatch(), Next::Retry(Command::Bootstrap));
+        assert_eq!(r.next(), Command::Bootstrap);
+        r.came_up(Command::Bootstrap);
+        r.session_started();
+        assert_eq!(r.next(), Command::Bootstrap, "the run remembers");
+        assert_eq!(r.version_mismatch(), Next::Fail, "nothing pending");
+        // A session started on the plain command: a mismatch later in the run is not a trigger.
+        let r = Run::new(RemoteMode::Auto, false);
+        r.next();
+        r.came_up(Command::Plain);
+        r.session_started();
+        r.next();
+        r.came_up(Command::Plain);
+        assert_eq!(r.version_mismatch(), Next::Fail);
+        // A pipe that came up and led nowhere is the first connection, done: no fallback after.
+        let r = Run::new(RemoteMode::Auto, false);
+        r.next();
+        r.came_up(Command::Plain);
+        assert_eq!(r.next(), Command::Plain);
+        assert_eq!(
+            r.failed(Command::Plain, Outcome::NoPreamble { nonzero: true }),
+            Next::Fail
+        );
+        // The first pipe failing is the trigger.
+        let r = Run::new(RemoteMode::Auto, false);
+        r.next();
+        assert_eq!(
+            r.failed(Command::Plain, Outcome::NoPreamble { nonzero: true }),
+            Next::Retry(Command::Bootstrap)
+        );
+    }
+
+    #[test]
+    fn ssh_failing_itself_is_not_a_missing_fil() {
+        use fil_transport::pipe::{PipeError, PipeErrorKind};
+        let e = |kind, exit: &str, before: bool| PipeError {
+            kind,
+            skipped: Vec::new(),
+            exit: Some(exit.into()),
+            stderr: Vec::new(),
+            ended_before_preamble: before,
+        };
+        let o = |e: PipeError| Outcome::of_pipe_error(&e);
+        assert_eq!(
+            o(e(PipeErrorKind::Closed, "exited: exit status: 127", true)),
+            Outcome::NoPreamble { nonzero: true }
+        );
+        assert_eq!(
+            o(e(PipeErrorKind::Closed, "exited: exit status: 1", true)),
+            Outcome::NoPreamble { nonzero: true },
+            "csh and tcsh"
+        );
+        assert_eq!(
+            o(e(PipeErrorKind::Closed, "exited: exit status: 255", true)),
+            Outcome::NoPreamble { nonzero: false },
+            "ssh's own failure"
+        );
+        assert_eq!(
+            o(e(PipeErrorKind::Closed, "exited: exit status: 127", false)),
+            Outcome::Other,
+            "a relay that wrote its preamble and then failed"
+        );
+        assert_eq!(
+            o(e(PipeErrorKind::Forced, "exited: exit status: 0", false)),
+            Outcome::Other
+        );
+    }
+
+    #[test]
     fn exit_descriptions() {
+        assert!(exit_was(" exited: exit status: 255", 255));
+        assert!(!exit_was("exited: exit status: 1255", 255));
+        assert!(!exit_was("exited: exit status: 25", 255));
         assert!(exit_was_nonzero("exited: exit status: 127"));
         assert!(exit_was_nonzero("exited: exit status: 1"));
         assert!(exit_was_nonzero(

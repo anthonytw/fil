@@ -277,6 +277,45 @@ pub struct DelayLink {
     pending: Arc<tokio::sync::watch::Sender<usize>>,
     delay: Duration,
     slots: usize,
+    gate: Arc<DelayGate>,
+}
+
+/// A test's hand on a `DelayLink`: how many data payloads were sent, and a gate on their delivery
+/// to the client's end. Open (every payload goes after its delay) unless a test holds it.
+pub struct DelayGate {
+    sent: std::sync::atomic::AtomicUsize,
+    delivered: std::sync::atomic::AtomicUsize,
+    /// Payloads up to this many (counting from the first) may be delivered.
+    allowed: tokio::sync::watch::Sender<usize>,
+}
+
+impl DelayGate {
+    /// Data payloads the daemon has sent over the link so far (control messages are not
+    /// counted), whether or not they have reached the client's end.
+    pub fn sent(&self) -> usize {
+        self.sent.load(Ordering::SeqCst)
+    }
+
+    /// Data payloads that have reached the client's end.
+    pub fn delivered(&self) -> usize {
+        self.delivered.load(Ordering::SeqCst)
+    }
+
+    /// From now on nothing more is delivered, until released. What was already delivered stays.
+    pub fn hold(&self) {
+        let d = self.delivered.load(Ordering::SeqCst);
+        self.allowed.send_replace(d);
+    }
+
+    /// Lets the next payload through (the one after the last delivered), however long it waits.
+    pub fn release_one(&self) {
+        let d = self.delivered.load(Ordering::SeqCst);
+        self.allowed.send_replace(d + 1);
+    }
+
+    pub fn release_all(&self) {
+        self.allowed.send_replace(usize::MAX);
+    }
 }
 
 impl DelayLink {
@@ -287,16 +326,30 @@ impl DelayLink {
         }
     }
 
+    pub fn gate(&self) -> Arc<DelayGate> {
+        self.gate.clone()
+    }
+
     pub fn new(inner: MemLink, delay: Duration) -> Self {
         let inner = Arc::new(inner);
         let (held, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<(ChannelId, Bytes, tokio::time::Instant)>();
         let pending = Arc::new(tokio::sync::watch::Sender::new(0usize));
-        let (i, p) = (inner.clone(), pending.clone());
+        let gate = Arc::new(DelayGate {
+            sent: Default::default(),
+            delivered: Default::default(),
+            allowed: tokio::sync::watch::Sender::new(usize::MAX),
+        });
+        let (i, p, g) = (inner.clone(), pending.clone(), gate.clone());
         tokio::spawn(async move {
             while let Some((ch, payload, due)) = rx.recv().await {
                 tokio::time::sleep_until(due).await;
+                let mut allowed = g.allowed.subscribe();
+                let _ = allowed
+                    .wait_for(|&a| a > g.delivered.load(Ordering::SeqCst))
+                    .await;
                 let _ = i.send(ch, payload).await;
+                g.delivered.fetch_add(1, Ordering::SeqCst);
                 p.send_modify(|n| *n -= 1);
             }
         });
@@ -306,6 +359,7 @@ impl DelayLink {
             pending,
             delay,
             slots: usize::MAX,
+            gate,
         }
     }
 }
@@ -330,6 +384,7 @@ impl Link for DelayLink {
             return Err(fil_transport::LinkError(r));
         }
         self.pending.send_modify(|n| *n += 1);
+        self.gate.sent.fetch_add(1, Ordering::SeqCst);
         let due = tokio::time::Instant::now() + self.delay;
         let _ = self.held.send((channel, payload, due));
         Ok(())

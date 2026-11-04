@@ -114,11 +114,6 @@ impl Display {
         self.set_pty_mode(true, true)
     }
 
-    /// True while the shadow screen (and so the terminal) is on the alternate screen.
-    pub fn in_alt_screen(&self) -> bool {
-        self.overlay.view(0).shadow.modes.alt_screen
-    }
-
     /// True while the overlay has something drawn.
     pub fn is_painted(&self) -> bool {
         self.overlay.has_painted()

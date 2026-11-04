@@ -23,7 +23,7 @@ pub const STAGGER: Duration = Duration::from_millis(250);
 /// resolver that never answers holds a blocking thread until it gives up by itself, so without
 /// a bound a peer opening channels to such names could fill tokio's blocking pool, which the
 /// daemon also needs to start sessions.
-pub const MAX_RESOLVING: usize = 32;
+pub(crate) const MAX_RESOLVING: usize = 32;
 
 /// Most addresses of one name that are tried (after the checks): each attempt is a socket.
 pub const MAX_ADDRESSES: usize = 16;
@@ -221,7 +221,7 @@ fn prefer(a: Option<OpenFailure>, b: OpenFailure) -> OpenFailure {
 }
 
 /// What a failed `connect` means on the wire.
-pub fn connect_failure(e: &io::Error) -> OpenFailure {
+pub(crate) fn connect_failure(e: &io::Error) -> OpenFailure {
     match e.kind() {
         io::ErrorKind::ConnectionRefused => OpenFailure::Refused,
         io::ErrorKind::HostUnreachable

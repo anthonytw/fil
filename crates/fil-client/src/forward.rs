@@ -118,7 +118,7 @@ pub fn bind_text(f: BindFailure) -> &'static str {
 
 /// Why the host refused a forward, after "SPEC: ". A server-policy refusal names the setting and
 /// its source (`AllowTcpForwarding no (/etc/ssh/sshd_config:42)`), sanitized.
-pub fn refusal_text(why: &ForwardRefusal) -> String {
+pub(crate) fn refusal_text(why: &ForwardRefusal) -> String {
     let short = match why {
         ForwardRefusal::Conflict => "it conflicts with another forward",
         ForwardRefusal::TooMany => "the session has too many forwards",
@@ -843,12 +843,13 @@ impl Other {
 }
 
 /// Most questions about forwards waiting for the user at once. Entries past it are refused
-/// without asking and count as refusals, so a host cannot queue questions without end.
+/// without asking and count as refusals, so a host cannot queue questions without end. (Agent
+/// signature questions have their own queue and their own cap, `crate::agent::MAX_QUESTIONS`.)
 pub const MAX_QUESTIONS: usize = 4;
 /// Most entries the client keeps of those it did not name. An honest daemon has at most
 /// [`fil_proto::limits::MAX_FORWARDS`] in all; past this every further one is refused without
 /// being kept.
-pub const MAX_OTHERS: usize = 2 * fil_proto::limits::MAX_FORWARDS;
+pub(crate) const MAX_OTHERS: usize = 2 * fil_proto::limits::MAX_FORWARDS;
 /// Most ids remembered as gone in one epoch (an id never comes back: section 2.4). Past it, no
 /// new entry is taken until the next fresh attach.
 const MAX_GONE: usize = 4096;

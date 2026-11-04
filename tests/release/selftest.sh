@@ -488,6 +488,94 @@ tree=$main_tree
 expect_pass "a workflow_dispatch run is a dry run (release=false)" bash -c "cd '$tmp' && : > gho && FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/x GITHUB_OUTPUT='$tmp/gho' '$RELEASE_DIR/prepare.sh' && grep -q '^release=false' gho"
 expect_fail "a push that is not a v* tag is refused" bash -c "FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main '$RELEASE_DIR/prepare.sh'"
 
+# ============================================================== 4c. crates.io name reservation
+echo "== reserve-crate-names.sh"
+rc_script=$RELEASE_DIR/reserve-crate-names.sh
+expect_pass "reserve-crate-names: --help works" bash "$rc_script" --help
+expect_fail "reserve-crate-names: an unknown argument is refused" bash "$rc_script" --bogus
+rc_names=$(sed -n 's/^CRATES="\(.*\)"$/\1/p' "$rc_script")
+expect_pass "reserve-crate-names: the nine published crates, in order" test "$rc_names" = "fil-shell fil-proto fil-transport fil-session fil-daemon fil-client fil-term fil-predict fil-forward"
+# fil-shell is the published name of the user-facing crate, which crates/fil is today.
+for n in $rc_names; do
+  d=$n
+  [ "$n" != fil-shell ] || d=fil
+  expect_pass "reserve-crate-names: $n has a crate in the workspace" test -f "$REPO_ROOT/crates/$d/Cargo.toml"
+done
+# The fakes stand in for cargo and curl, so no network is used and nothing is published.
+mkdir -p "$tmp/rc"
+cat > "$tmp/rc/curl" << 'EOF'
+#!/bin/sh
+# the last argument is the URL: "fil-term" is taken, the rest are free; fil-term's owners are alice
+for a; do u=$a; done
+case $u in
+  */owners) printf '{"users":[{"kind":"user","id":1,"login":"alice"}]}' ;;
+  */crates/fil-term) printf 200 ;;
+  *) printf 404 ;;
+esac
+EOF
+cat > "$tmp/rc/cargo" << 'EOF'
+#!/bin/sh
+echo "$*" >> "$FAKE_CARGO_LOG"
+if [ "$1" = owner ]; then
+  [ -z "${FAKE_OWNER_MSG:-}" ] || echo "$FAKE_OWNER_MSG"
+  exit "${FAKE_OWNER_RC:-0}"
+fi
+n=$(sed -n 's/^name = "\(.*\)"$/\1/p' Cargo.toml)
+mkdir -p "$FAKE_CARGO_SEEN" && cp Cargo.toml "$FAKE_CARGO_SEEN/$n.Cargo.toml" && cp src/lib.rs "$FAKE_CARGO_SEEN/$n.lib.rs"
+EOF
+chmod +x "$tmp/rc/curl" "$tmp/rc/cargo"
+rc_run() { env FIL_RESERVE_CARGO="$tmp/rc/cargo" FIL_RESERVE_CURL="$tmp/rc/curl" FAKE_CARGO_LOG="$tmp/rc/log" FAKE_CARGO_SEEN="$tmp/rc/seen" TMPDIR="$tmp" bash "$rc_script" "$@"; }
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: a run with no flag is a dry run, and a taken name is skipped" rc_run
+expect_pass "reserve-crate-names: cargo was called eight times, always with --dry-run" test "$(grep -c -- '^publish --dry-run' "$tmp/rc/log")" = 8 -a "$(grep -vc -- '--dry-run' "$tmp/rc/log")" = 0
+expect_fail "reserve-crate-names: no placeholder for the taken name" test -e "$tmp/rc/seen/fil-term.Cargo.toml"
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: --dry-run --invite runs no cargo owner" rc_run --dry-run --invite bob
+expect_fail "reserve-crate-names: --invite takes a login" rc_run --invite
+expect_fail "reserve-crate-names: --invite refuses a malformed login" rc_run --invite 'a b;c'
+expect_fail "reserve-crate-names: cargo owner was never run by a dry run" grep -q '^owner' "$tmp/rc/log"
+expect_pass "reserve-crate-names: placeholder manifest (version, license, repository, no authors, no email)" \
+  sh -c 'f=$1/fil-proto.Cargo.toml; grep -q "^version = \"0.0.1\"" "$f" && grep -q "^license = \"GPL-3.0-or-later\"" "$f" && grep -q "^repository = \"https://github.com/anthonytw/fil\"" "$f" && ! grep -q "authors" "$f" && ! grep -q "@" "$f"' sh "$tmp/rc/seen"
+expect_pass "reserve-crate-names: placeholder lib.rs is only a doc comment" \
+  sh -c '! grep -v "^//!" "$1/fil-proto.lib.rs" | grep -q .' sh "$tmp/rc/seen"
+expect_pass "reserve-crate-names: the scratch directory is removed" sh -c '! ls "$1" | grep -q fil-reserve' sh "$tmp"
+# The invitation step, on the fakes (sourcing the script runs nothing).
+rc_invite() { # rc_invite OWNER CRATE [CARGO_OUTPUT [CARGO_STATUS]]: prints the outcome
+  (
+    export FIL_RESERVE_CARGO="$tmp/rc/cargo" FIL_RESERVE_CURL="$tmp/rc/curl" FAKE_CARGO_LOG="$tmp/rc/log" FAKE_OWNER_MSG="${3:-}" FAKE_OWNER_RC="${4:-0}"
+    # shellcheck source=tests/release/reserve-crate-names.sh
+    source "$rc_script"
+    work=$tmp/rc/work
+    mkdir -p "$work"
+    invite_owner "$1" "$2"
+  )
+}
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: an invitation is sent with cargo owner --add" test "$(rc_invite bob fil-proto)" = invited
+expect_pass "reserve-crate-names: ...as 'owner --add bob fil-proto'" grep -qx 'owner --add bob fil-proto' "$tmp/rc/log"
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: an owner already on the public list is not invited again" test "$(rc_invite alice fil-term)" = already
+expect_fail "reserve-crate-names: ...and cargo owner was not run" grep -q '^owner' "$tmp/rc/log"
+expect_pass "reserve-crate-names: a pending invitation counts as done" test "$(rc_invite bob fil-proto 'error: user bob already has a pending invitation' 101)" = already
+expect_pass "reserve-crate-names: a crate this account does not own is left alone" test "$(rc_invite bob fil-proto 'error: you must already be an owner to modify owners (403 Forbidden)' 101)" = notours
+expect_pass "reserve-crate-names: any other failure is reported" test "$(rc_invite bob fil-proto 'error: could not resolve host' 101)" = failed
+# The 429 retry, on a fake command (sourcing the script runs nothing).
+rc_retry() { # rc_retry FAILS_BEFORE_SUCCESS OUTPUT: prints the number of calls and the status
+  (
+    export FIL_RESERVE_RETRY_SECS=0 FIL_RESERVE_MAX_RETRIES=3
+    # shellcheck source=tests/release/reserve-crate-names.sh
+    source "$rc_script"
+    calls=0
+    fake() { calls=$((calls + 1)); if [ "$calls" -le "$1" ]; then echo "$2"; return 101; fi; }
+    st=0
+    run_retry_429 "$tmp/rc/retry.log" fake "$1" "$2" 2> /dev/null || st=$?
+    echo "$calls $st"
+  )
+}
+expect_pass "reserve-crate-names: a 429 is waited out and retried" test "$(rc_retry 2 'the remote server responded with an error (status 429 Too Many Requests): too many new crates')" = "3 0"
+expect_pass "reserve-crate-names: any other failure is not retried" test "$(rc_retry 2 'error: the remote server responded with an error (status 400 Bad Request)')" = "1 101"
+expect_pass "reserve-crate-names: a 429 that does not clear gives up" test "$(rc_retry 99 'status 429 Too Many Requests')" = "4 101"
+
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"

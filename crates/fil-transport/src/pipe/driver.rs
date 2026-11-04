@@ -72,6 +72,13 @@ pub(super) struct Driver<R, W> {
     pub finished: tokio::sync::watch::Sender<bool>,
 }
 
+/// A timer that ended the link.
+enum Expired {
+    Down(DownReason),
+    /// A write failed and the grace for reading the peer's last words is over (the reason).
+    WriteGrace(String),
+}
+
 enum Event {
     Read(io::Result<usize>),
     Wrote(usize),
@@ -204,11 +211,13 @@ where
                 Event::WriteError(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Event::WriteError(e) => self.write_failed(st, format!("write failed: {e}")),
                 Event::Wake => {}
-                Event::Timer => {
-                    if let Some(reason) = self.on_timer(st, heartbeat) {
-                        return reason;
-                    }
-                }
+                Event::Timer => match self.on_timer(st, heartbeat) {
+                    Some(Expired::Down(reason)) => return reason,
+                    // The peer's last words did not come: a child that exited (the usual cause
+                    // of the failed write) is the reason worth reporting, as at the end of stream.
+                    Some(Expired::WriteGrace(why)) => return self.stream_ended(why).await,
+                    None => {}
+                },
             }
         }
     }
@@ -273,16 +282,16 @@ where
         d
     }
 
-    /// Handles whatever timer is due. Returns the reason if the link is over.
-    fn on_timer(&mut self, st: &mut State, heartbeat: Duration) -> Option<DownReason> {
+    /// Handles whatever timer is due. Returns what ended, if the link is over.
+    fn on_timer(&mut self, st: &mut State, heartbeat: Duration) -> Option<Expired> {
         let now = Instant::now();
         if now >= st.last_rx + self.params.dead_after {
-            return Some(DownReason::Dead);
+            return Some(Expired::Down(DownReason::Dead));
         }
         if let Some((why, since)) = &st.write_failed
             && now >= *since + self.grace
         {
-            return Some(DownReason::Io(why.clone()));
+            return Some(Expired::WriteGrace(why.clone()));
         }
         if !st.degraded && now >= st.last_rx + self.params.degraded_after {
             st.degraded = true;

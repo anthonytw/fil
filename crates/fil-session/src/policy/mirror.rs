@@ -353,6 +353,14 @@ impl Policy {
                     }
                     _ => {}
                 }
+                // A line fil cannot evaluate: everything the policy file does not set itself is
+                // refused (the line says so for all of it, as for an unusable policy file).
+                if let Sshd::Mirrored(s) = &l.sshd
+                    && let Err(why) = evaluable(s)
+                    && !matches!(&l.file, FilePolicy::Keys(k) if k.sets_every_mirrored_key())
+                {
+                    v.push(PolicyLine::DenyAll(why));
+                }
                 match &l.file {
                     FilePolicy::Unsafe(why) => v.push(PolicyLine::DenyAll(self.unsafe_file(*why))),
                     f => {
@@ -414,6 +422,7 @@ impl Policy {
             None => {}
         }
         let Some(s) = s else { return Ok(()) };
+        evaluable(s)?;
         disabled(&s.disable)?;
         refuse(
             &s.tcp,
@@ -436,6 +445,7 @@ impl Policy {
                 .map_err(|_| self.file_key(FileKey::PermitOpen));
         }
         let Some(s) = s else { return Ok(()) };
+        evaluable(s)?;
         refuse(
             &s.permit_open,
             |l| l.permits_open(host, port),
@@ -465,15 +475,18 @@ impl Policy {
                             Err(self.file_key(FileKey::PermitOpen))
                         }
                         (Some(_), _) | (None, None) => Ok(()),
-                        (None, Some(s)) => refuse(
-                            &s.permit_open,
-                            |l| match l {
-                                sshd::PermitList::None => Err(Permit::None),
-                                sshd::PermitList::Unrecognized => Err(Permit::Unrecognized),
-                                _ => Ok(()),
-                            },
-                            PolicySetting::PermitOpen,
-                        ),
+                        (None, Some(s)) => {
+                            evaluable(s)?;
+                            refuse(
+                                &s.permit_open,
+                                |l| match l {
+                                    sshd::PermitList::None => Err(Permit::None),
+                                    sshd::PermitList::Unrecognized => Err(Permit::Unrecognized),
+                                    _ => Ok(()),
+                                },
+                                PolicySetting::PermitOpen,
+                            )
+                        }
                     },
                 }
             }
@@ -485,6 +498,7 @@ impl Policy {
                     l.permits_listen(&host, port)
                         .map_err(|_| self.file_key(FileKey::PermitListen))?;
                 } else if let Some(s) = s {
+                    evaluable(s)?;
                     refuse(
                         &s.permit_listen,
                         |l| l.permits_listen(&host, port),
@@ -498,6 +512,7 @@ impl Policy {
                     (Some(true), _) | (None, None) => Ok(()),
                     (Some(false), _) => Err(self.file_key(FileKey::GatewayPorts)),
                     (None, Some(s)) => {
+                        evaluable(s)?;
                         refuse(&s.gateway, |g| g.allows_wide(), PolicySetting::GatewayPorts)
                     }
                 }
@@ -541,6 +556,7 @@ impl ServerPolicy for Policy {
             let Some(s) = s else {
                 return Ok(());
             };
+            evaluable(s)?;
             disabled(&s.disable)?;
             refuse(
                 &s.agent,
@@ -621,6 +637,26 @@ fn source(src: &Src) -> PolicySource {
             line: *line,
             maybe: *maybe,
         },
+    }
+}
+
+/// An sshd config with a line fil cannot evaluate as sshd would (an `Include` pattern whose
+/// meaning differs between globs, one that is not UTF-8, a NUL byte) says nothing fil can trust:
+/// the mirror refuses, naming that line (never what it says). It is asked wherever the mirror
+/// would decide, after fil's own policy file had its say, so a key of `/etc/fil/policy.toml`
+/// that sets the thing explicitly still stands. (An include fil merely could not *read* is
+/// different: it is skipped and the rest enforced, [`Settings::unreadable`].)
+fn evaluable(s: &Settings) -> Result<(), PolicyRefusal> {
+    match &s.unevaluable {
+        None => Ok(()),
+        Some((file, line)) => Err(PolicyRefusal {
+            setting: PolicySetting::Unevaluable,
+            source: PolicySource::Sshd {
+                file: ports_path(file),
+                line: *line,
+                maybe: false,
+            },
+        }),
     }
 }
 

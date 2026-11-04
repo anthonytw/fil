@@ -36,9 +36,9 @@ use std::time::Instant;
 use fil_forward::ConnectFuture;
 use fil_forward::agent::{self, AgentUse, Confirm, KeyInfo, KeyUses, Rules};
 use fil_proto::mux::OpenFailure;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-use crate::forward::{Note, Question};
+use crate::forward::{Note, NotesTx, Question};
 
 /// How this run relays its agent (`ForwardSet::agent`).
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -70,6 +70,19 @@ const AGENT_TOKEN: u64 = 1 << 63;
 /// cannot keep the keyboard busy by opening many agent connections.
 pub(crate) const MAX_QUESTIONS: usize = 4;
 
+/// After this many signature questions in a row that end without a yes (a "n", the 30 s
+/// timeout, or the host withdrawing one), signatures are refused without asking for
+/// [`DENIAL_COOLDOWN`]: the forward questions' rule ([`crate::consent::MAX_DENIALS`]), so a
+/// process on the host cannot keep the keyboard busy, or wear the user down until a "y" slips
+/// out, by asking again and again. The questions still waiting are refused too, and the user is
+/// told once.
+pub(crate) const MAX_DENIALS: u32 = crate::consent::MAX_DENIALS;
+
+/// How long signatures are refused without asking once [`MAX_DENIALS`] tripped. Then questions
+/// are asked again (a forward's rule lasts the run; a user who needs the agent would otherwise
+/// have to start over).
+pub(crate) const DENIAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The run's relay: what each `Open Agent` connects through, and the key use for `~#`.
 pub(crate) struct ClientAgent {
     socket: Option<PathBuf>,
@@ -84,7 +97,7 @@ impl ClientAgent {
     /// it unbound (destination-constrained keys must fail closed, OD-5).
     fn new(
         relay: AgentRelay,
-        notes: mpsc::UnboundedSender<Note>,
+        notes: NotesTx,
         bind: Option<Arc<agent::BindKey>>,
     ) -> Option<Arc<Self>> {
         let bind = bind?;
@@ -93,6 +106,7 @@ impl ClientAgent {
                 notes,
                 waiting: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(0),
+                denials: Mutex::new(Denials::default()),
             }))
         });
         Some(Arc::new(ClientAgent {
@@ -143,14 +157,14 @@ impl ClientAgent {
 /// instead of relayed unbound (OD-5).
 pub(crate) fn for_run(
     relay: Option<AgentRelay>,
-    notes: &mpsc::UnboundedSender<Note>,
+    notes: &NotesTx,
     bind: impl FnOnce() -> Option<Arc<agent::BindKey>>,
 ) -> Option<Arc<ClientAgent>> {
     let relay = relay?;
     let agent = ClientAgent::new(relay, notes.clone(), bind());
     if agent.is_none() {
         tracing::debug!("the agent relay is off: no session-bind key");
-        let _ = notes.send(Note::Notice(crate::text::wrap(
+        notes.send(Note::Notice(crate::text::wrap(
             "fil: agent forwarding is off for this run: no key for its session-bind could be made",
             38,
         )));
@@ -163,34 +177,101 @@ pub(crate) fn for_run(
 pub(crate) struct Asker(Arc<Asking>);
 
 pub(crate) struct Asking {
-    notes: mpsc::UnboundedSender<Note>,
+    notes: NotesTx,
     waiting: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     next: AtomicU64,
+    denials: Mutex<Denials>,
+}
+
+/// The refusal rule's state ([`MAX_DENIALS`]).
+#[derive(Default)]
+struct Denials {
+    /// Questions in a row that ended without a yes.
+    in_row: u32,
+    /// Signatures are refused without asking until then.
+    until: Option<tokio::time::Instant>,
 }
 
 impl Asking {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<bool>>> {
         self.waiting.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn denials(&self) -> std::sync::MutexGuard<'_, Denials> {
+        self.denials.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the rule refuses now. A cooldown that is over starts the count afresh.
+    fn cooling(&self) -> bool {
+        let mut d = self.denials();
+        match d.until {
+            Some(t) if tokio::time::Instant::now() < t => true,
+            Some(_) => {
+                *d = Denials::default();
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// A question ended: `yes`, or not (a "n", the timeout, a withdrawal).
+    fn ended(&self, yes: bool) {
+        let mut d = self.denials();
+        if d.until.is_some() {
+            // Refused by the rule itself (the questions waiting when it tripped).
+            return;
+        }
+        if yes {
+            d.in_row = 0;
+            return;
+        }
+        d.in_row += 1;
+        if d.in_row < MAX_DENIALS {
+            return;
+        }
+        d.until = Some(tokio::time::Instant::now() + DENIAL_COOLDOWN);
+        drop(d);
+        tracing::debug!("agent questions refused too often; refusing signatures for a while");
+        let waiting: Vec<_> = self.lock().drain().collect();
+        for (token, tx) in waiting {
+            let _ = tx.send(false);
+            self.notes.send(Note::Cancel { token });
+        }
+        self.notes.send(Note::Notice(crate::text::wrap(
+            &format!(
+                "fil: refusing signatures for {} s: too many were refused",
+                DENIAL_COOLDOWN.as_secs()
+            ),
+            38,
+        )));
+    }
 }
 
-/// Withdraws a question whose future was dropped (its connection ended, or it timed out).
+/// Withdraws a question whose future was dropped (its connection ended, or it timed out), and
+/// counts how every question ended toward the refusal rule.
 struct Withdraw {
     asker: Arc<Asking>,
     token: u64,
+    /// The answer, once there is one: none (dropped first) counts as a refusal.
+    yes: bool,
 }
 
 impl Drop for Withdraw {
     fn drop(&mut self) {
         if self.asker.lock().remove(&self.token).is_some() {
-            let _ = self.asker.notes.send(Note::Cancel { token: self.token });
+            self.asker.notes.send(Note::Cancel { token: self.token });
         }
+        self.asker.ended(self.yes);
     }
 }
 
 impl Confirm for Asker {
     fn confirm(&self, key: KeyInfo) -> Pin<Box<dyn Future<Output = bool> + Send>> {
         let a = &self.0;
+        if a.cooling() {
+            tracing::debug!("agent question refused: too many refused");
+            return Box::pin(async { false });
+        }
         let token = AGENT_TOKEN | a.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -202,14 +283,17 @@ impl Confirm for Asker {
             waiting.insert(token, tx);
         }
         let q = Question::agent(token, prompt_lines(&key));
-        let sent = a.notes.send(Note::Ask(q)).is_ok();
+        let sent = a.notes.send(Note::Ask(q));
         let guard = Withdraw {
             asker: a.clone(),
             token,
+            yes: false,
         };
         Box::pin(async move {
-            let _guard = guard;
-            sent && rx.await.unwrap_or(false)
+            let mut guard = guard;
+            let yes = sent && rx.await.unwrap_or(false);
+            guard.yes = yes;
+            yes
         })
     }
 }
@@ -365,7 +449,7 @@ mod tests {
     /// No session-bind key, no agent: refused for the run, with a notice, never relayed unbound.
     #[test]
     fn no_bind_key_means_no_agent_for_the_run() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::forward::notes_channel();
         let relay = || {
             Some(AgentRelay {
                 socket: None,
@@ -375,7 +459,7 @@ mod tests {
         };
         assert!(for_run(relay(), &tx, || None).is_none());
         match rx.try_recv() {
-            Ok(Note::Notice(lines)) => {
+            Some(Note::Notice(lines)) => {
                 assert!(
                     lines.concat().contains("agent forwarding is off"),
                     "{lines:?}"
@@ -385,14 +469,82 @@ mod tests {
         }
         assert!(for_run(relay(), &tx, agent::BindKey::generate).is_some());
         assert!(for_run(None, &tx, agent::BindKey::generate).is_none());
-        assert!(rx.try_recv().is_err(), "a notice only for the failure");
+        assert!(rx.try_recv().is_none(), "a notice only for the failure");
+    }
+
+    /// The refusal rule: [`MAX_DENIALS`] questions in a row without a yes (here a "n", a
+    /// withdrawal and a "n") refuse the one still waiting and every signature after without
+    /// asking, with one notice, for [`DENIAL_COOLDOWN`]; then questions come again. A yes in
+    /// between starts the count over.
+    #[tokio::test(start_paused = true)]
+    async fn too_many_refusals_stop_the_questions_for_a_while() {
+        let (tx, mut rx) = crate::forward::notes_channel();
+        let agent = ClientAgent::new(
+            AgentRelay {
+                socket: None,
+                keys: vec![],
+                confirm: true,
+            },
+            tx,
+            agent::BindKey::generate(),
+        )
+        .expect("a bind key");
+        let asker = agent.asker.clone().unwrap();
+        let ask = |rx: &mut crate::forward::NotesRx| match rx.try_recv() {
+            Some(Note::Ask(q)) => q.token,
+            other => panic!("a question, not {other:?}"),
+        };
+
+        // n, n, y, n: a yes in between, so nothing trips.
+        for yes in [false, false, true, false] {
+            let fut = asker.confirm(info("k"));
+            agent.answer(ask(&mut rx), yes);
+            assert_eq!(fut.await, yes);
+        }
+        let fut = asker.confirm(info("k"));
+        agent.answer(ask(&mut rx), true);
+        assert!(fut.await, "a yes resets the count");
+
+        // n, a withdrawal, then a "n" with another question waiting.
+        let fut = asker.confirm(info("k"));
+        agent.answer(ask(&mut rx), false);
+        assert!(!fut.await);
+        let fut = asker.confirm(info("k"));
+        let gone = ask(&mut rx);
+        drop(fut);
+        assert!(matches!(rx.try_recv(), Some(Note::Cancel { token }) if token == gone));
+        let third = asker.confirm(info("k"));
+        let third_token = ask(&mut rx);
+        let waiting = asker.confirm(info("k"));
+        let waiting_token = ask(&mut rx);
+        agent.answer(third_token, false);
+        assert!(!third.await);
+        assert!(!waiting.await, "the question waiting was refused too");
+        assert!(matches!(rx.try_recv(), Some(Note::Cancel { token }) if token == waiting_token));
+        match rx.try_recv() {
+            Some(Note::Notice(lines)) => {
+                assert!(lines.concat().contains("refusing signatures"), "{lines:?}")
+            }
+            other => panic!("one notice, not {other:?}"),
+        }
+        // Refused without asking, and said once.
+        for _ in 0..10 {
+            assert!(!asker.confirm(info("k")).await);
+        }
+        assert!(rx.try_recv().is_none(), "asked, or told again");
+
+        // After the cooldown questions come again.
+        tokio::time::advance(DENIAL_COOLDOWN).await;
+        let fut = asker.confirm(info("k"));
+        agent.answer(ask(&mut rx), true);
+        assert!(fut.await);
     }
 
     /// A question that is answered reaches its relay; one whose future is dropped is withdrawn
     /// from the client loop.
     #[tokio::test]
     async fn answers_and_withdrawals() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::forward::notes_channel();
         let agent = ClientAgent::new(
             AgentRelay {
                 socket: None,
@@ -412,7 +564,7 @@ mod tests {
         agent.answer(q.token, true);
         assert!(fut.await);
         // Answered: nothing to withdraw.
-        assert!(rx.try_recv().is_err());
+        assert!(rx.try_recv().is_none());
 
         let fut = asker.confirm(info("k"));
         let Some(Note::Ask(q)) = rx.recv().await else {
@@ -434,7 +586,7 @@ mod tests {
             assert!(matches!(rx.recv().await, Some(Note::Ask(_))));
         }
         assert!(!asker.confirm(info("k")).await, "refused at once");
-        assert!(rx.try_recv().is_err(), "and not asked");
+        assert!(rx.try_recv().is_none(), "and not asked");
         drop(waiting);
     }
 }

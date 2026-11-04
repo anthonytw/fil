@@ -436,6 +436,8 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
             "←",
             own,
         ),
+        // The client kept a target beyond loopback to itself.
+        (ForwardKind::Remote, None) => (fil_proto::mux::WITHHELD_TARGET.to_string(), "←", own),
         _ => (own, "→", "(SOCKS)".to_string()),
     };
     let owner = match spec.kind() {

@@ -319,7 +319,9 @@ pub fn target_host_bare(host: &TargetHost) -> String {
 }
 
 /// The spec in its full form, which [`parse`] reads back to the same value: `5173:localhost:5173`,
-/// `*:8080:db:5432`, `[::1]:1080`. Loopback is written by leaving the bind out.
+/// `*:8080:db:5432`, `[::1]:1080`. Loopback is written by leaving the bind out. A withheld `-R`
+/// target (another client's, beyond loopback) is written `9000:(client network)`, which does not
+/// parse.
 pub fn format_spec(spec: &ForwardSpec) -> String {
     let bind = match spec.bind() {
         BindAddr::Loopback => String::new(),
@@ -333,6 +335,10 @@ pub fn format_spec(spec: &ForwardSpec) -> String {
             target_host(&t.host),
             t.port.get()
         ),
+        // Withheld by the client that named it: shown, never parsed back.
+        None if spec.is_withheld() => {
+            format!("{bind}{}:{}", spec.port(), fil_proto::mux::WITHHELD_TARGET)
+        }
         None => format!("{bind}{}", spec.port()),
     }
 }

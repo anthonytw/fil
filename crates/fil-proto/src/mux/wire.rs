@@ -162,13 +162,27 @@ pub struct Target {
     pub port: NonZeroU16,
 }
 
+/// How a withheld `-R` target ([`ForwardSpec::is_withheld`]) is shown on the remote: in the
+/// prompt, `fil ports` and `fil forward`.
+pub const WITHHELD_TARGET: &str = "(client network)";
+
 /// One forward as the user asked for it.
 ///
 /// - `Local` and `Remote` have a target, `Dynamic` has none (the SOCKS client names one per
 ///   connection);
 /// - the port is 0 only for `Remote` (ephemeral: the actual port comes in `Listening`).
 ///
-/// Checked by [`ForwardSpec::new`] and while decoding, so an invalid spec cannot exist.
+/// **A `-R` target beyond loopback never leaves the client** (DESIGN.md sections 7.2 and 11.1):
+/// only the client connects a `-R`, to its own copy of the spec, so the host needs the target
+/// for display alone, and a name or address on the laptop's network is user data. Encoding a
+/// spec writes [`ForwardSpec::on_wire`]: a `Remote` whose target is not loopback (`localhost`,
+/// 127.0.0.0/8, `::1`) goes with no target, and decodes as *withheld*. Decoding refuses a
+/// `Remote` with a target beyond loopback, which no peer of this revision sends. So no path (the
+/// own adds, the table, `fil ports`, `fil forward`, a takeover) can carry one: the daemon never
+/// has it. Two withheld `-R`s of one bind and port are equal.
+///
+/// Checked by [`ForwardSpec::new`] and while decoding, so an invalid spec cannot exist. `new`
+/// always wants a target for `Remote`: only decoding makes a withheld spec.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "RawSpec", into = "RawSpec")]
 pub struct ForwardSpec {
@@ -230,11 +244,46 @@ impl ForwardSpec {
     pub fn identity(&self) -> (ForwardKind, BindAddr, u16) {
         (self.kind, self.bind, self.port)
     }
+    /// A `-R` whose target the client withheld (it is beyond loopback): what the host has of
+    /// one. [`ForwardSpec::target`] is `None` then.
+    pub fn is_withheld(&self) -> bool {
+        self.kind == ForwardKind::Remote && self.target.is_none()
+    }
+    /// The spec as it goes on the wire: a `-R` target beyond loopback withheld, anything else
+    /// as it is. What the client compares the host's entries with.
+    pub fn on_wire(&self) -> ForwardSpec {
+        ForwardSpec {
+            target: wire_target(self.kind, self.target.clone()),
+            ..self.clone()
+        }
+    }
 }
+
+/// The target a spec of `kind` carries on the wire: a `-R` one only when it is loopback.
+fn wire_target(kind: ForwardKind, target: Option<Target>) -> Option<Target> {
+    match kind {
+        ForwardKind::Remote => target.filter(|t| t.host.is_loopback()),
+        ForwardKind::Local | ForwardKind::Dynamic => target,
+    }
+}
+
 impl TryFrom<RawSpec> for ForwardSpec {
     type Error = MsgError;
     fn try_from(r: RawSpec) -> Result<Self, MsgError> {
-        Self::new(r.kind, r.bind, r.port, r.target)
+        match (r.kind, &r.target) {
+            // Withheld: valid on the wire only.
+            (ForwardKind::Remote, None) => Ok(Self {
+                kind: r.kind,
+                bind: r.bind,
+                port: r.port,
+                target: None,
+            }),
+            (ForwardKind::Remote, Some(t)) if !t.host.is_loopback() => Err(invalid(
+                "forward",
+                "a -R target beyond loopback is never sent",
+            )),
+            _ => Self::new(r.kind, r.bind, r.port, r.target),
+        }
     }
 }
 impl From<ForwardSpec> for RawSpec {
@@ -243,7 +292,7 @@ impl From<ForwardSpec> for RawSpec {
             kind: s.kind,
             bind: s.bind,
             port: s.port,
-            target: s.target,
+            target: wire_target(s.kind, s.target),
         }
     }
 }
@@ -652,5 +701,116 @@ mod tests {
         };
         assert!(!c.is_table());
         assert_eq!(c.channel(), Some(ChannelId(16)));
+    }
+
+    fn remote_to(host: TargetHost) -> ForwardSpec {
+        ForwardSpec::new(
+            ForwardKind::Remote,
+            BindAddr::Loopback,
+            9000,
+            Some(Target {
+                host,
+                port: NonZeroU16::new(443).unwrap(),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn name(s: &str) -> TargetHost {
+        TargetHost::Name(s.parse().unwrap())
+    }
+
+    fn ip(s: &str) -> TargetHost {
+        TargetHost::Ip(s.parse().unwrap())
+    }
+
+    /// A `-R` target beyond loopback is never encoded: what decodes is withheld, and no byte of
+    /// the name or the address is on the wire. A loopback one (`localhost`, 127.0.0.0/8, `::1`),
+    /// and every `-L` target, goes as it is.
+    #[test]
+    fn a_remote_target_beyond_loopback_is_never_encoded() {
+        for host in [
+            name("intranet-wiki.example"),
+            ip("192.0.2.20"),
+            ip("2001:db8::7"),
+            // A mapped loopback address is not `::1`: withheld, which is the strict side.
+            ip("::ffff:127.0.0.1"),
+            name("db.localhost"),
+        ] {
+            let spec = remote_to(host.clone());
+            let bytes = postcard::to_allocvec(&spec).unwrap();
+            let back: ForwardSpec = postcard::from_bytes(&bytes).unwrap();
+            assert!(back.is_withheld(), "{host:?}");
+            assert_eq!(back, spec.on_wire());
+            assert_eq!(back.identity(), spec.identity());
+            assert_eq!(bytes, postcard::to_allocvec(&back).unwrap());
+            let text = match &host {
+                TargetHost::Name(n) => n.as_str().as_bytes().to_vec(),
+                TargetHost::Ip(IpAddr::V4(a)) => a.octets().to_vec(),
+                TargetHost::Ip(IpAddr::V6(a)) => a.octets().to_vec(),
+            };
+            assert!(
+                !bytes.windows(text.len()).any(|w| w == text),
+                "{host:?} is on the wire"
+            );
+            // The client's own copy still has it.
+            assert_eq!(spec.target().unwrap().host, host);
+        }
+        for host in [
+            name("localhost"),
+            name("LocalHost"),
+            ip("127.0.0.5"),
+            ip("::1"),
+        ] {
+            let spec = remote_to(host.clone());
+            let bytes = postcard::to_allocvec(&spec).unwrap();
+            let back: ForwardSpec = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back, spec, "{host:?}");
+            assert!(!back.is_withheld());
+        }
+        let l = ForwardSpec::new(
+            ForwardKind::Local,
+            BindAddr::Loopback,
+            5432,
+            Some(Target {
+                host: name("db.example"),
+                port: NonZeroU16::new(5432).unwrap(),
+            }),
+        )
+        .unwrap();
+        let back: ForwardSpec = postcard::from_bytes(&postcard::to_allocvec(&l).unwrap()).unwrap();
+        assert_eq!(back, l);
+    }
+
+    /// No peer of this revision sends a `-R` target beyond loopback, so one does not decode; and
+    /// a withheld `-R` from a management request is one beyond loopback: `NotPermitted`.
+    #[test]
+    fn a_remote_target_beyond_loopback_does_not_decode() {
+        let l = ForwardSpec::new(
+            ForwardKind::Local,
+            BindAddr::Loopback,
+            9000,
+            Some(Target {
+                host: name("intranet.example"),
+                port: NonZeroU16::new(443).unwrap(),
+            }),
+        )
+        .unwrap();
+        let mut bytes = postcard::to_allocvec(&l).unwrap();
+        assert_eq!(bytes[0], 0, "the kind comes first");
+        bytes[0] = 1;
+        assert!(postcard::from_bytes::<ForwardSpec>(&bytes).is_err());
+
+        let withheld: ForwardSpec =
+            postcard::from_bytes(&postcard::to_allocvec(&remote_to(ip("192.0.2.20"))).unwrap())
+                .unwrap();
+        assert_eq!(
+            crate::mux::ForwardTable::permitted(&withheld, Origin::Request),
+            Err(ForwardRefusal::NotPermitted)
+        );
+        assert_eq!(
+            crate::mux::ForwardTable::permitted(&withheld, Origin::Client),
+            Ok(())
+        );
     }
 }

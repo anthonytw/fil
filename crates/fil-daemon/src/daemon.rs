@@ -573,6 +573,11 @@ impl Daemon {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io(sock)(e)),
         }
+        // A crashed daemon of this revision may have left agent sockets (each names a session).
+        let stale = paths.clean_stale_agent_sockets();
+        if stale > 0 {
+            tracing::debug!(stale, "removed stale agent sockets");
+        }
         let unix = UnixListener::bind(&sock).map_err(io(sock.clone()))?;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
             .map_err(io(sock.clone()))?;
@@ -694,6 +699,8 @@ impl Daemon {
         if let Some(t) = quic_task {
             t.abort();
         }
+        // Still holding the lock, the sessions gone: an empty agent directory goes too.
+        self.paths.remove_agent_dir();
         clean_up_files(&self.paths, &self.lock);
         tracing::info!(?exit, "daemon stopping");
         exit

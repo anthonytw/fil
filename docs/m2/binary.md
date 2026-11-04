@@ -34,7 +34,7 @@ Part 1 is the pure half of F4: parsing, validating, carrying and rendering. Noth
 
 | fil | OpenSSH | Why |
 |---|---|---|
-| `-L PORT` and `-R PORT` are the same port on the other side's `localhost` | `-L` needs host and port; `-R PORT` alone is a SOCKS proxy on the remote | DESIGN §7.3 writes `fil orin -L 5173 -R 9000`. A remote SOCKS proxy is not in M2; `-R PORT:x` (two fields) is refused with a message that says so. |
+| `-L PORT` and `-R PORT` are the same port on the other side's `localhost` | `-L` needs host and port; `-R PORT` alone is a SOCKS proxy on the remote | DESIGN §7.3 writes `fil devbox -L 5173 -R 9000`. A remote SOCKS proxy is not in M2; `-R PORT:x` (two fields) is refused with a message that says so. |
 | No Unix-socket forms (`-L /path:…`, `-R …:/path`) | supported | Non-goal for M2 (plan open question 5). A `/` in a spec gets its own message. |
 | Port 0 only for a `-R` listener | `0` is accepted in more places | The wire's rule (`ForwardSpec`): the host reports the port it got, and nothing reports one for `-L`/`-D`. A target port is never 0. |
 | A bind is an IP address, `localhost`, `*` or empty | any host name, resolved | `BindAddr` has no name. A name would also make the bind depend on the resolver. `localhost` is loopback on both families. |

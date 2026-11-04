@@ -7,6 +7,6 @@ pub mod relay;
 
 pub use filter::KeyInfo;
 pub use relay::{
-    AgentUse, Bind, BindKey, CONFIRM_TIMEOUT, Confirm, CountingStream, KeyUse, KeyUses,
-    RequestCounts, Rules, connect_local, relay,
+    AGENT_ANSWER_TIMEOUT, AgentUse, Bind, BindKey, CONFIRM_TIMEOUT, Confirm, CountingStream,
+    KeyUse, KeyUses, RequestCounts, Rules, connect_local, relay,
 };

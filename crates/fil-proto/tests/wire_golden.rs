@@ -232,10 +232,11 @@ fn longest_name() -> DnsName {
     DnsName::new(format!("{l}.{l}.{l}.{}", "b".repeat(61))).unwrap()
 }
 
-/// Every field of a spec at its widest: an IPv6 bind, the longest name, the top port.
+/// Every field of a spec at its widest: an IPv6 bind, the longest name, the top port. A `-L`:
+/// a `-R` target that is a name beyond loopback is never on the wire.
 fn spec_widest() -> ForwardSpec {
     ForwardSpec::new(
-        ForwardKind::Remote,
+        ForwardKind::Local,
         BindAddr::Ip(IpAddr::V6(Ipv6Addr::new(
             0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
         ))),
@@ -612,6 +613,23 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
             },
         );
     }
+    // A `-R` target beyond loopback: encoded without it (withheld).
+    add(
+        "add-forward-remote-withheld".into(),
+        MuxMsg::AddForward {
+            req: 1,
+            spec: ForwardSpec::new(
+                ForwardKind::Remote,
+                BindAddr::Loopback,
+                9000,
+                Some(Target {
+                    host: TargetHost::Name("db.example.com".parse().unwrap()),
+                    port: port(5432),
+                }),
+            )
+            .unwrap(),
+        },
+    );
     for (i, bind) in bind_addrs().into_iter().enumerate() {
         add(
             format!("add-forward-bind-{i}"),
@@ -2251,7 +2269,17 @@ fn forward_probes() -> Entries {
     ));
     e.push(("decode/spec-dynamic-port-0".into(), spec(2, 0, None)));
     e.push(("decode/spec-local-no-target".into(), spec(0, 1, None)));
+    // Withheld: the client kept a target beyond loopback to itself.
     e.push(("decode/spec-remote-no-target".into(), spec(1, 1, None)));
+    let wide = |p: u64| [vec![1u8], vec![1], counted_str("db.example"), varint(p)].concat();
+    e.push((
+        "decode/spec-remote-wide-target".into(),
+        spec(1, 1, Some(wide(80))),
+    ));
+    e.push((
+        "decode/spec-local-wide-target".into(),
+        spec(0, 1, Some(wide(80))),
+    ));
     e.push((
         "decode/spec-dynamic-target".into(),
         spec(2, 1, Some(target(80))),

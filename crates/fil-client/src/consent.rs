@@ -20,6 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use fil_proto::mux::{
     BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Target, TargetHost,
+    WITHHELD_TARGET,
 };
 
 use crate::config::RemoteRequests;
@@ -246,6 +247,8 @@ pub fn describe(spec: &ForwardSpec) -> String {
             host_text(&t.host),
             t.port
         ),
+        // A `-R` another client named, whose target that client kept to itself.
+        None if spec.is_withheld() => format!("-R {listen} -> {WITHHELD_TARGET}"),
         None => format!("{} {listen}", flag(spec.kind())),
     };
     debug_assert!(
@@ -281,6 +284,7 @@ pub fn refusal_lines(spec: &ForwardSpec, why: Refusal) -> Vec<String> {
         match why {
             Refusal::Denied => "(remote_requests = \"deny\")",
             Refusal::WideBind => "(it would listen beyond localhost)",
+            Refusal::WideTarget if spec.is_withheld() => "(its target stayed with its client)",
             Refusal::WideTarget => "(its target is not this machine)",
             Refusal::WideRemoteBind => "(a wide -R: only from your config)",
             Refusal::TooMany => "(too many requests; refusing all)",

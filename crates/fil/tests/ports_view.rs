@@ -357,19 +357,19 @@ fn golden(file: &str, actual: &str) {
 fn the_text_table_matches_the_golden() {
     golden(
         "ports.txt",
-        &render_text(&fixed_answer(), &opts(Some("orin"))),
+        &render_text(&fixed_answer(), &opts(Some("devbox"))),
     );
 }
 
 #[test]
 fn the_json_matches_the_golden_and_keeps_its_layout() {
-    let text = render_json(&fixed_answer(), &opts(Some("orin")));
+    let text = render_json(&fixed_answer(), &opts(Some("devbox")));
     golden("ports.json", &text);
 
     // The layout scripts rely on: these keys, with these types, in schema 1.
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["schema"], JSON_SCHEMA);
-    assert_eq!(v["host"], "orin");
+    assert_eq!(v["host"], "devbox");
     assert_eq!(v["truncated"], false);
     assert_eq!(v["complete"], true);
     assert_eq!(v["incomplete"], "bounded");
@@ -490,11 +490,11 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
 
 #[test]
 fn the_json_is_the_same_whatever_the_clock_and_the_zone() {
-    let a = render_json(&answer(fixed_rows()), &opts(Some("orin")));
+    let a = render_json(&answer(fixed_rows()), &opts(Some("devbox")));
     let b = render_json(
         &answer(fixed_rows()),
         &ViewOptions {
-            host: Some("orin"),
+            host: Some("devbox"),
             now_unix_ms: 0,
             utc_offset_secs: -5 * 3600,
             zone: None,
@@ -592,7 +592,7 @@ fn assert_inert(shown: &str, allow_newline: bool) {
 #[test]
 fn escape_sequences_from_the_host_are_rendered_inert() {
     let a = answer(hostile_rows());
-    let text = render_text(&a, &opts(Some("orin\x1b[2J")));
+    let text = render_text(&a, &opts(Some("devbox\x1b[2J")));
     assert_inert(&text, true);
     // The visible words survive; the escapes do not.
     for word in [
@@ -604,7 +604,7 @@ fn escape_sequences_from_the_host_are_rendered_inert() {
     // Every line of output is one line: no injected newline made a fake row.
     assert!(!text.contains("\n\ttab"), "{text}");
 
-    let json = render_json(&a, &opts(Some("orin\x1b[2J")));
+    let json = render_json(&a, &opts(Some("devbox\x1b[2J")));
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     fn walk(v: &serde_json::Value) {
         match v {
@@ -739,7 +739,7 @@ fn an_incomplete_answer_says_why() {
 /// A squatted `-L` target is flagged on its row and names no process.
 #[test]
 fn a_target_another_user_holds_is_flagged_on_its_row() {
-    let text = render_text(&fixed_answer(), &opts(Some("orin")));
+    let text = render_text(&fixed_answer(), &opts(Some("devbox")));
     let row = text
         .lines()
         .find(|l| l.contains("localhost:6379 →"))
@@ -761,7 +761,7 @@ fn anything_but_ports_is_an_error_that_names_no_text() {
 
 #[test]
 fn an_empty_answer_says_so() {
-    let text = render_text(&answer(vec![]), &opts(Some("orin")));
+    let text = render_text(&answer(vec![]), &opts(Some("devbox")));
     assert_eq!(text, "no sessions\n");
     let v: serde_json::Value =
         serde_json::from_str(&render_json(&answer(vec![]), &opts(None))).unwrap();
@@ -780,14 +780,14 @@ fn a_forward_with_no_session_row_still_shows_under_its_session() {
         Origin::Client,
         true,
     ))];
-    let text = render_text(&answer(rows), &opts(Some("orin")));
-    assert!(text.starts_with("SESSION orphan on orin\n"), "{text}");
+    let text = render_text(&answer(rows), &opts(Some("devbox")));
+    assert!(text.starts_with("SESSION orphan on devbox\n"), "{text}");
     assert!(text.contains("-L"), "{text}");
 }
 
 #[test]
 fn ipv6_is_bracketed_once_in_the_table() {
-    let text = render_text(&answer(fixed_rows()), &opts(Some("orin")));
+    let text = render_text(&answer(fixed_rows()), &opts(Some("devbox")));
     assert!(!text.contains("[["), "{text}");
     for want in [
         "localhost:9443 →",
@@ -824,10 +824,10 @@ fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
         render_text(&answer(rows.clone()), &o)
     };
     // From the laptop: the host and the session.
-    assert!(hint(Some("orin"), None).contains("fil forward orin main -L 8000"));
+    assert!(hint(Some("devbox"), None).contains("fil forward devbox main -L 8000"));
     assert!(
-        hint(Some("me@orin.example.net"), None)
-            .contains("fil forward me@orin.example.net main -L 8000")
+        hint(Some("me@devbox.example.net"), None)
+            .contains("fil forward me@devbox.example.net main -L 8000")
     );
     // A host the shell would take apart is quoted, and escapes in it are gone.
     let t = hint(Some("or in;$x\x1b[2J"), None);
@@ -848,9 +848,9 @@ fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
                 probe: None,
             }),
         ];
-        let t = render_text(&answer(rows.clone()), &opts(Some("orin")));
+        let t = render_text(&answer(rows.clone()), &opts(Some("devbox")));
         assert!(
-            t.contains(&format!("fil forward orin -L 8000 -- {odd}")),
+            t.contains(&format!("fil forward devbox -L 8000 -- {odd}")),
             "{t}"
         );
         // Inside that very session the hint needs no name, and it never starts with the name.

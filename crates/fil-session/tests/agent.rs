@@ -118,6 +118,34 @@ async fn list_and_sign_across_a_reconnect() {
     end(&h).await;
 }
 
+/// Agent use is per client: after a takeover `fil ports` counts only the new client's requests,
+/// never the previous client's (which would show its key use as this one's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_starts_the_agent_counts_over() {
+    let dir = Short::new("cnt");
+    let agent_a = MiniAgent::start(&dir.0.join("mini-a.sock"), 1);
+    let agent_b = MiniAgent::start(&dir.0.join("mini-b.sock"), 1);
+    let (_scratch, h) = session(&dir).await;
+    let _a = FwdClient::attach_agent(&h, key(1), "laptop", agent_a.path()).await;
+    wait_for("the socket", || dir.socket().exists()).await;
+    list_and_sign(&dir.socket(), &agent_a, b"a").await;
+    let row = h.agent_row().expect("an agent row");
+    assert_eq!(row.requests, 2);
+    assert!(row.last_unix_ms > 0);
+
+    let _b = FwdClient::attach_agent(&h, key(2), "desk", agent_b.path()).await;
+    wait_for("the new client's row", || {
+        h.agent_row()
+            .is_some_and(|r| r.requests == 0 && r.last_unix_ms == 0)
+    })
+    .await;
+    wait_for("the socket", || dir.socket().exists() && h.agent_relayed()).await;
+    list_and_sign(&dir.socket(), &agent_b, b"b").await;
+    let row = h.agent_row().expect("an agent row");
+    assert_eq!(row.requests, 2, "only the new client's requests");
+    end(&h).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_permissions() {
     let dir = Short::new("perm");

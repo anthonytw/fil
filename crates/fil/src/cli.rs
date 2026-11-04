@@ -15,7 +15,7 @@
 //! With no HOST, `forward`, `ports` and `detach` talk to the daemon on this machine and work on
 //! the session named by `$FIL_SESSION` (set inside every session). A host or session named like
 //! a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`) is attached with `--`:
-//! `fil -- ls`, `fil orin -- ls`.
+//! `fil -- ls`, `fil devbox -- ls`.
 
 use std::path::PathBuf;
 
@@ -48,11 +48,11 @@ pub fn version_string() -> &'static str {
 
 const AFTER_HELP: &str = "\
 Examples:
-  fil orin                 attach to (or create) session \"main\" on orin
-  fil orin build           attach to session \"build\"
-  fil ls orin              list the sessions on orin
-  fil kill orin build      end session \"build\"
-  fil detach orin build    detach whoever is attached to \"build\"
+  fil devbox                 attach to (or create) session \"main\" on devbox
+  fil devbox build           attach to session \"build\"
+  fil ls devbox              list the sessions on devbox
+  fil kill devbox build      end session \"build\"
+  fil detach devbox build    detach whoever is attached to \"build\"
 
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 
@@ -447,7 +447,7 @@ pub enum Target {
 
 impl Cli {
     /// Rejects what clap lets through but would be dropped silently: a command together with the
-    /// arguments for attaching (`fil orin ls box` would list `box` and ignore `orin`; `fil -L 80
+    /// arguments for attaching (`fil devbox ls box` would list `box` and ignore `devbox`; `fil -L 80
     /// ls box` would ignore the forward). Returns a usage error (exit status 2).
     pub fn validate(&self) -> Result<(), clap::Error> {
         let Some(command) = &self.command else {
@@ -593,18 +593,18 @@ mod tests {
     #[test]
     fn attach_defaults_to_main() {
         assert_eq!(
-            action(&["orin"]),
+            action(&["devbox"]),
             Action::Attach {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: name("main"),
                 transport: None,
                 forwards: Default::default()
             }
         );
         assert_eq!(
-            action(&["me@orin", "build"]),
+            action(&["me@devbox", "build"]),
             Action::Attach {
-                host: "me@orin".into(),
+                host: "me@devbox".into(),
                 session: name("build"),
                 transport: None,
                 forwards: Default::default()
@@ -620,9 +620,9 @@ mod tests {
             ("direct", TransportSetting::Direct),
         ] {
             assert_eq!(
-                action(&["--transport", arg, "orin"]),
+                action(&["--transport", arg, "devbox"]),
                 Action::Attach {
-                    host: "orin".into(),
+                    host: "devbox".into(),
                     session: name("main"),
                     transport: Some(want),
                     forwards: Default::default()
@@ -630,7 +630,7 @@ mod tests {
             );
         }
         assert_eq!(
-            parse(&["--transport", "carrier-pigeon", "orin"])
+            parse(&["--transport", "carrier-pigeon", "devbox"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::InvalidValue
@@ -640,22 +640,22 @@ mod tests {
     #[test]
     fn management_commands() {
         assert_eq!(
-            action(&["ls", "orin"]),
+            action(&["ls", "devbox"]),
             Action::List {
-                host: "orin".into()
+                host: "devbox".into()
             }
         );
         assert_eq!(
-            action(&["kill", "orin", "build"]),
+            action(&["kill", "devbox", "build"]),
             Action::Kill {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: name("build")
             }
         );
         assert_eq!(
-            action(&["detach", "orin", "build"]),
+            action(&["detach", "devbox", "build"]),
             Action::Detach {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: name("build")
             }
         );
@@ -665,7 +665,7 @@ mod tests {
     fn detach_without_arguments_is_the_session_this_runs_in() {
         assert_eq!(action(&["detach"]), Action::DetachHere);
         // A host without a session names nothing to detach.
-        let err = parse(&["detach", "orin"]).unwrap().action().unwrap_err();
+        let err = parse(&["detach", "devbox"]).unwrap().action().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
         assert!(err.to_string().contains("fil detach HOST SESSION"), "{err}");
     }
@@ -685,7 +685,7 @@ mod tests {
     fn forward_flags_are_parsed_into_the_run() {
         let f = forwards(&[
             "-L5173",
-            "orin",
+            "devbox",
             "-R",
             "9000:db:5432",
             "-D",
@@ -708,32 +708,35 @@ mod tests {
             ]
         );
         assert_eq!(f.agent, None);
-        assert_eq!(forwards(&["orin"]), CliForwards::default());
+        assert_eq!(forwards(&["devbox"]), CliForwards::default());
     }
 
     #[test]
     fn agent_flags_last_one_wins_as_in_ssh() {
-        assert_eq!(forwards(&["-A", "orin"]).agent, Some(AgentFlag::On));
-        assert_eq!(forwards(&["-a", "orin"]).agent, Some(AgentFlag::Off));
-        assert_eq!(forwards(&["-A", "-a", "orin"]).agent, Some(AgentFlag::Off));
-        assert_eq!(forwards(&["-a", "-A", "orin"]).agent, Some(AgentFlag::On));
+        assert_eq!(forwards(&["-A", "devbox"]).agent, Some(AgentFlag::On));
+        assert_eq!(forwards(&["-a", "devbox"]).agent, Some(AgentFlag::Off));
+        assert_eq!(
+            forwards(&["-A", "-a", "devbox"]).agent,
+            Some(AgentFlag::Off)
+        );
+        assert_eq!(forwards(&["-a", "-A", "devbox"]).agent, Some(AgentFlag::On));
     }
 
     /// OD-7: a wide `-R` from the command line is the host's call (server policy), not refused
     /// here.
     #[test]
     fn a_wide_remote_bind_parses() {
-        assert_eq!(forwards(&["-R", "*:80:h:80", "orin"]).specs.len(), 1);
+        assert_eq!(forwards(&["-R", "*:80:h:80", "devbox"]).specs.len(), 1);
     }
 
     #[test]
     fn a_bad_forward_spec_is_a_usage_error_that_says_why() {
         for (args, why) in [
-            (&["-L", "0:h:80", "orin"][..], "cannot be 0"),
-            (&["-D", "0", "orin"][..], "cannot be 0"),
-            (&["-L", "80:h:99999", "orin"][..], "not a port"),
-            (&["-L", "[::1:80:h:80", "orin"][..], "bracket"),
-            (&["-L", "8080:h:80\x1b[2J", "orin"][..], "outside"),
+            (&["-L", "0:h:80", "devbox"][..], "cannot be 0"),
+            (&["-D", "0", "devbox"][..], "cannot be 0"),
+            (&["-L", "80:h:99999", "devbox"][..], "not a port"),
+            (&["-L", "[::1:80:h:80", "devbox"][..], "bracket"),
+            (&["-L", "8080:h:80\x1b[2J", "devbox"][..], "outside"),
         ] {
             let e = parse(args).expect_err(&format!("{args:?}"));
             assert_eq!(e.kind(), ErrorKind::ValueValidation, "{args:?}: {e}");
@@ -750,11 +753,11 @@ mod tests {
         // A flag in the place of a spec is not taken for the spec: clap reads it as an option,
         // and nothing runs. Joined to the flag it reaches the parser, which refuses it.
         for args in [
-            &["-L", "-oProxyCommand=sh", "orin"][..],
-            &["-D", "-oProxyCommand=sh", "orin"][..],
-            &["-R", "-oProxyCommand=sh", "orin"][..],
-            &["-L-oProxyCommand=sh", "orin"][..],
-            &["-Doproxy", "orin"][..],
+            &["-L", "-oProxyCommand=sh", "devbox"][..],
+            &["-D", "-oProxyCommand=sh", "devbox"][..],
+            &["-R", "-oProxyCommand=sh", "devbox"][..],
+            &["-L-oProxyCommand=sh", "devbox"][..],
+            &["-Doproxy", "devbox"][..],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
@@ -780,26 +783,26 @@ mod tests {
         assert_eq!(t, Target::Here);
         assert_eq!(add_flag(&op), "-L 5173:localhost:5173");
         // With a host: the session is main unless named.
-        let (t, op) = forward_op(&["forward", "orin", "-R", "9000:db:5432"]);
+        let (t, op) = forward_op(&["forward", "devbox", "-R", "9000:db:5432"]);
         assert_eq!(
             t,
             Target::Host {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: Some(name("main"))
             }
         );
         assert_eq!(add_flag(&op), "-R 9000:db:5432");
-        let (t, op) = forward_op(&["forward", "orin", "build", "-D", "1080"]);
+        let (t, op) = forward_op(&["forward", "devbox", "build", "-D", "1080"]);
         assert_eq!(
             t,
             Target::Host {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: Some(name("build"))
             }
         );
         assert_eq!(add_flag(&op), "-D 1080");
         // The flags may come first.
-        let (t, _) = forward_op(&["forward", "-L5173", "orin"]);
+        let (t, _) = forward_op(&["forward", "-L5173", "devbox"]);
         assert!(matches!(t, Target::Host { .. }));
     }
 
@@ -822,7 +825,7 @@ mod tests {
         );
         // The spec's listening port names the forward, whatever else it says.
         assert_eq!(
-            rm(&["forward", "orin", "main", "--rm", "-R", "9000:db:5432"]),
+            rm(&["forward", "devbox", "main", "--rm", "-R", "9000:db:5432"]),
             ForwardOp::Remove {
                 kind: Some(ForwardKind::Remote),
                 port: 9000
@@ -836,7 +839,7 @@ mod tests {
             }
         );
         // The port after --rm is the port; the host and session come before it.
-        let (t, op) = forward_op(&["forward", "orin", "--rm", "80"]);
+        let (t, op) = forward_op(&["forward", "devbox", "--rm", "80"]);
         assert!(matches!(t, Target::Host { .. }));
         assert_eq!(
             op,
@@ -860,7 +863,7 @@ mod tests {
         // And these pass clap and fail the command's own check, in its own words (exit 2).
         for (args, words) in [
             (&["forward"][..], "say what to forward"),
-            (&["forward", "orin"][..], "say what to forward"),
+            (&["forward", "devbox"][..], "say what to forward"),
             (&["forward", "--rm"][..], "needs the port to remove"),
             (&["forward", "--rm", "5173", "-L", "5173"][..], "not both"),
             (&["forward", "--rm", "-R", "0:localhost:80"][..], "not 0"),
@@ -873,13 +876,13 @@ mod tests {
         // A bad port, session or spec is quoted ASCII-escaped, never raw.
         for args in [
             &["forward", "--rm", "80\x1b[2J\u{202e}"][..],
-            &["forward", "orin", "a\x1b[2Jb", "-L", "80"][..],
+            &["forward", "devbox", "a\x1b[2Jb", "-L", "80"][..],
             &["forward", "--rm", "0"][..],
             &["forward", "--rm", "99999"][..],
-            &["forward", "--rm", "orin"][..],
-            &["ports", "orin", "a\x1b[2J\u{202e}"][..],
-            &["kill", "orin", "a\x1b[2J\u{202e}"][..],
-            &["orin", "a\x1b[2J\u{202e}"][..],
+            &["forward", "--rm", "devbox"][..],
+            &["ports", "devbox", "a\x1b[2J\u{202e}"][..],
+            &["kill", "devbox", "a\x1b[2J\u{202e}"][..],
+            &["devbox", "a\x1b[2J\u{202e}"][..],
         ] {
             let e = parse(args).expect_err(&format!("{args:?}"));
             assert_eq!(e.kind(), ErrorKind::ValueValidation, "{args:?}: {e}");
@@ -895,7 +898,7 @@ mod tests {
     #[test]
     fn usage_errors_show_the_usage_of_their_own_command() {
         for (args, usage) in [
-            (&["forward", "orin"][..], "Usage: fil forward"),
+            (&["forward", "devbox"][..], "Usage: fil forward"),
             (
                 &["forward", "--rm", "80", "-L", "80"][..],
                 "Usage: fil forward",
@@ -908,7 +911,7 @@ mod tests {
                 .expect_err(&format!("{args:?}"));
             assert!(e.to_string().contains(usage), "{args:?}: {e}");
         }
-        let e = parse(&["detach", "orin"]).unwrap().action().unwrap_err();
+        let e = parse(&["detach", "devbox"]).unwrap().action().unwrap_err();
         assert!(e.to_string().contains("Usage: fil detach"), "{e}");
     }
 
@@ -917,44 +920,44 @@ mod tests {
     fn a_session_named_like_an_option_is_given_after_the_double_dash() {
         let s = name("--rm");
         assert_eq!(
-            action(&["kill", "orin", "--", "--rm"]),
+            action(&["kill", "devbox", "--", "--rm"]),
             Action::Kill {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: s.clone()
             }
         );
         assert_eq!(
-            action(&["detach", "orin", "--", "--rm"]),
+            action(&["detach", "devbox", "--", "--rm"]),
             Action::Detach {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: s.clone()
             }
         );
         assert_eq!(
-            action(&["orin", "-L", "80", "--", "--rm"]),
+            action(&["devbox", "-L", "80", "--", "--rm"]),
             Action::Attach {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: s.clone(),
                 transport: None,
-                forwards: forwards(&["orin", "-L", "80"]),
+                forwards: forwards(&["devbox", "-L", "80"]),
             }
         );
         assert_eq!(
-            action(&["ports", "orin", "--json", "--", "--rm"]),
+            action(&["ports", "devbox", "--json", "--", "--rm"]),
             Action::Ports {
                 target: Target::Host {
-                    host: "orin".into(),
+                    host: "devbox".into(),
                     session: Some(s.clone())
                 },
                 json: true
             }
         );
         // The form the forward hint prints.
-        let (t, op) = forward_op(&["forward", "orin", "-L", "8000", "--", "--rm"]);
+        let (t, op) = forward_op(&["forward", "devbox", "-L", "8000", "--", "--rm"]);
         assert_eq!(
             t,
             Target::Host {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: Some(s)
             }
         );
@@ -978,20 +981,20 @@ mod tests {
             }
         );
         assert_eq!(
-            action(&["ports", "orin"]),
+            action(&["ports", "devbox"]),
             Action::Ports {
                 target: Target::Host {
-                    host: "orin".into(),
+                    host: "devbox".into(),
                     session: None
                 },
                 json: false
             }
         );
         assert_eq!(
-            action(&["ports", "orin", "build", "--json"]),
+            action(&["ports", "devbox", "build", "--json"]),
             Action::Ports {
                 target: Target::Host {
-                    host: "orin".into(),
+                    host: "devbox".into(),
                     session: Some(name("build"))
                 },
                 json: true
@@ -1005,8 +1008,8 @@ mod tests {
     fn attach_arguments_before_forward_and_ports_are_not_dropped() {
         for args in [
             &["-L", "80", "forward", "-L", "81"][..],
-            &["orin", "ports"][..],
-            &["--transport", "pipe", "ports", "orin"][..],
+            &["devbox", "ports"][..],
+            &["--transport", "pipe", "ports", "devbox"][..],
         ] {
             let cli = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             assert!(cli.validate().is_err(), "{args:?}");
@@ -1025,9 +1028,9 @@ mod tests {
     #[test]
     fn bad_session_names_are_usage_errors() {
         for bad in ["a b", "a/b", "$(x)", &"x".repeat(65)] {
-            let e = parse(&["orin", bad]).unwrap_err();
+            let e = parse(&["devbox", bad]).unwrap_err();
             assert_eq!(e.kind(), ErrorKind::ValueValidation, "{bad}");
-            assert!(parse(&["kill", "orin", bad]).is_err());
+            assert!(parse(&["kill", "devbox", bad]).is_err());
         }
     }
 
@@ -1038,23 +1041,23 @@ mod tests {
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
         assert!(parse(&["ls"]).is_err());
-        assert!(parse(&["kill", "orin"]).is_err());
+        assert!(parse(&["kill", "devbox"]).is_err());
     }
 
     #[test]
     fn options_before_the_command_do_not_hide_it() {
         let want = Action::List {
-            host: "orin".into(),
+            host: "devbox".into(),
         };
-        assert_eq!(action(&["--config", "/tmp/c.toml", "ls", "orin"]), want);
-        assert_eq!(action(&["ls", "orin", "--config", "/tmp/c.toml"]), want);
-        assert_eq!(action(&["ls", "--config", "/tmp/c.toml", "orin"]), want);
+        assert_eq!(action(&["--config", "/tmp/c.toml", "ls", "devbox"]), want);
+        assert_eq!(action(&["ls", "devbox", "--config", "/tmp/c.toml"]), want);
+        assert_eq!(action(&["ls", "--config", "/tmp/c.toml", "devbox"]), want);
     }
 
     #[test]
     fn attach_arguments_with_a_command_are_a_usage_error_not_dropped() {
         for args in [
-            &["orin", "ls", "box"][..],
+            &["devbox", "ls", "box"][..],
             &["-L", "5173", "ls", "box"][..],
             &["-R", "9000", "kill", "box", "main"][..],
             &["-D", "1080", "ls", "box"][..],
@@ -1072,8 +1075,8 @@ mod tests {
         for args in [
             &["ls", "box"][..],
             &["--config", "/tmp/c.toml", "ls", "box"][..],
-            &["orin"][..],
-            &["--transport", "pipe", "-L", "1", "orin", "main"][..],
+            &["devbox"][..],
+            &["--transport", "pipe", "-L", "1", "devbox", "main"][..],
             &["server", "--stdio"][..],
         ] {
             parse(args)
@@ -1085,12 +1088,12 @@ mod tests {
 
     #[test]
     fn a_session_named_like_a_command_needs_the_double_dash() {
-        // Without it `fil orin ls` reads as the command, and fails loudly (it wants a host).
-        assert!(parse(&["orin", "ls"]).is_err());
+        // Without it `fil devbox ls` reads as the command, and fails loudly (it wants a host).
+        assert!(parse(&["devbox", "ls"]).is_err());
         assert_eq!(
-            action(&["orin", "--", "ls"]),
+            action(&["devbox", "--", "ls"]),
             Action::Attach {
-                host: "orin".into(),
+                host: "devbox".into(),
                 session: name("ls"),
                 transport: None,
                 forwards: Default::default()
@@ -1113,12 +1116,12 @@ mod tests {
 
     #[test]
     fn the_config_option_works_anywhere() {
-        let cli = parse(&["--config", "/tmp/x.toml", "orin"]).unwrap();
+        let cli = parse(&["--config", "/tmp/x.toml", "devbox"]).unwrap();
         assert_eq!(
             cli.config.as_deref(),
             Some(std::path::Path::new("/tmp/x.toml"))
         );
-        let cli = parse(&["ls", "orin", "--config", "/tmp/y.toml"]).unwrap();
+        let cli = parse(&["ls", "devbox", "--config", "/tmp/y.toml"]).unwrap();
         assert_eq!(
             cli.config.as_deref(),
             Some(std::path::Path::new("/tmp/y.toml"))

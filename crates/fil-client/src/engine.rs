@@ -59,7 +59,7 @@ use crate::config::{Backoff, ClientConfig, ClientError, Outcome};
 use crate::dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 use crate::display::{Display, PredictorFactory};
 use crate::escape::{Action, EscapeFilter};
-use crate::forward::{Asks, ForwardHandle, Forwards, Inbox, Note, Question, Router};
+use crate::forward::{Asks, ForwardHandle, Forwards, Inbox, Note, NotesRx, Question, Router};
 use crate::offline::{LogSink, OfflineBuffer};
 use crate::status::{self, Connection};
 use crate::terminal::{TermEvent, TermInput, TermOutput, Terminal};
@@ -618,7 +618,7 @@ pub(crate) struct Core<I, O> {
     banner_shown: bool,
     /// The forwards: answers and the `~#` summary. Set for the run in [`Core::run`].
     fwd: Option<ForwardHandle>,
-    fwd_notes: Option<mpsc::UnboundedReceiver<Note>>,
+    fwd_notes: Option<NotesRx>,
     /// Questions about forwards the host asked for, waiting to be shown (one at a time, while
     /// the session is live and no other question is up).
     fwd_asks: Asks,
@@ -2706,7 +2706,7 @@ fn csi_key(rest: &[u8]) -> Option<(Tok, usize)> {
 }
 
 /// The next note from the forwards, or never.
-async fn next_note(rx: &mut Option<mpsc::UnboundedReceiver<Note>>) -> Note {
+async fn next_note(rx: &mut Option<NotesRx>) -> Note {
     match rx {
         Some(rx) => match rx.recv().await {
             Some(n) => n,

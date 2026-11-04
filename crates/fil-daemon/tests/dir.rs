@@ -108,6 +108,37 @@ async fn a_stale_socket_is_replaced_and_the_socket_is_private() {
     assert!(!s.paths().socket().exists(), "removed on the way out");
 }
 
+/// The agent directory (DESIGN.md section 5.3): a crashed daemon's agent socket (it names a
+/// session) is removed when the next daemon of the revision starts, a live one is not, and a
+/// clean exit removes the directory once it is empty. One with anything else in it stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_agent_sockets_go_at_start_and_the_empty_directory_at_exit() {
+    use std::os::unix::fs::DirBuilderExt;
+    let s = Scratch::new();
+    ensure_socket_dir(&s.dir).unwrap();
+    let dir = s.paths().agent_dir();
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    {
+        let _crashed = std::os::unix::net::UnixListener::bind(dir.join("old.sock")).unwrap();
+    }
+    let live = std::os::unix::net::UnixListener::bind(dir.join("live.sock")).unwrap();
+    let d = start(&s, config(CAT)).await;
+    assert!(!dir.join("old.sock").exists(), "the stale socket stayed");
+    assert!(dir.join("live.sock").exists(), "a live socket was removed");
+    drop(live);
+    std::fs::remove_file(dir.join("live.sock")).unwrap();
+    d.stop().await;
+    assert!(!dir.exists(), "the empty agent directory stayed");
+    assert!(s.dir.exists(), "the socket directory stays, as with tmux");
+
+    // Not empty: it stays, and so does what is in it.
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(dir.join("keep"), b"").unwrap();
+    let d = start(&s, config(CAT)).await;
+    d.stop().await;
+    assert!(dir.join("keep").exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_daemon_for_the_same_major_does_not_start() {
     let s = Scratch::new();

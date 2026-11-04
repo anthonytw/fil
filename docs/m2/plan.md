@@ -595,12 +595,13 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 - **Better than ssh:**
   - nothing is relayed while detached; the socket file does not exist then;
   - the filter means the remote cannot add, remove or lock keys;
-  - an optional per-signature confirm and a key allowlist;
-  - signature counts are visible in `fil ports` and `~#`.
+  - an optional per-signature confirm and a key allowlist; the confirm questions stop for 60 s after three in a row end without a yes (M2 sweep), so a host cannot wear the user down;
+  - signature counts are visible in `fil ports` (the current client's only: they start over at every fresh attach) and `~#`;
+  - a local agent that does not answer holds a connection for at most 60 s per request, and not at all once the host has hung up (M2 sweep).
 - **Worse than, or different from, ssh:**
-  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `orin>github.com` still fails; **OD-5 accepted by the owner (2026-11-03)**: such keys are refused through fil, and users limit an unconstrained key with `agent_keys` instead.
+  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `devbox>github.com` still fails; **OD-5 accepted by the owner (2026-11-03)**: such keys are refused through fil, and users limit an unconstrained key with `agent_keys` instead.
   - `ssh-add` on the remote can no longer load keys into the laptop agent (the filter, OD-3).
-- **Socket path:** `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`. The session name sits inside a 0700 directory and the child's own environment, which other users cannot read. That is consistent with §11.1.4.
+- **Socket path:** `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`. The session name sits inside a 0700 directory and the child's own environment, which other users cannot read. That is consistent with §11.1.4. `FIL_SESSION` carries the same name, so a tool that uploads its environment learns nothing more from the path (noted in DESIGN §11.1). The daemon removes the empty directory at a clean exit, and a crashed daemon's sockets at the next start (DESIGN §5.3).
 
 ### 4.4 Privacy (§11.1, decided: targets, ports and agent use are user data)
 
@@ -608,6 +609,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 - **No per-connection lines at info.**
 - **Probe results and agent key comments are never logged** at any level.
 - **The forward table lives in daemon memory only**, nothing on disk.
+- **A `-R` target beyond loopback never leaves the client** (M2 sweep, coordinator's proposal, owner veto-able; DESIGN §7.2): the host has the bind and port, and shows `(client network)`.
 - **`fil ports`** shows another user's listener rows by port and address only. It never reads their processes (it cannot).
 - **Error enums only on the wire** (§2.4).
 - **The sweep's privacy audit** gets this list as its checklist.
@@ -620,11 +622,13 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Local bind | loopback (`GatewayPorts no`) | loopback |
 | Remote wide bind | sshd `GatewayPorts` must allow it | explicit address honoured from own CLI or config where the mirrored `GatewayPorts` (or `gateway_ports`) allows it (OD-7, OD-8) |
 | Client checks remote opens | rejects `forwarded-tcpip` for an unrequested listen | forward id plus consent plus own target |
+| `-R` target sent to the server | never: `tcpip-forward` carries the bind address and port only | a loopback target only; one beyond loopback is withheld, and the host shows `(client network)` (M2 sweep; before it, every target was sent, worse than ssh) |
 | Server side adding forwards | impossible | possible (`fil forward`), gated by on-screen consent |
 | Admin switches (`DisableForwarding`, `AllowTcpForwarding`, `PermitOpen`, `PermitListen`, `GatewayPorts`, `AllowAgentForwarding`) | enforced by sshd | **mirrored** by the daemon from the host's `sshd_config` (`Match User`/`Group` evaluated, other criteria strict), under the admin's `/etc/fil/policy.toml`; refusals name the setting (S1, OD-8). A courtesy, not a boundary: a user with a shell can run any relay |
 | Agent default | `ForwardAgent no` | off |
 | Agent mutations from the remote | allowed | filtered |
-| Per-use confirm | agent-side (`ssh-add -c`) | agent-side passes through, plus fil's `confirm` |
+| Per-use confirm | agent-side (`ssh-add -c`) | agent-side passes through, plus fil's `confirm`, which stops asking for 60 s after three refusals in a row |
+| Agent that does not answer | the channel waits | 60 s per request, and the request ends when the remote hangs up |
 | Agent while not connected | n/a | the socket is removed; refused at once |
 | Forwards across reconnects or roaming | die | survive (the selling point) |
 | `ExitOnForwardFailure` | yes | `forward_failure = "exit"` |
@@ -775,8 +779,8 @@ Five independent read-only audits of the whole tree, each with an M2 focus list,
 
 ### Critical files for implementation
 
-- /Users/claude/dev/fil/crates/fil-proto/src/msg.rs (plus a new /Users/claude/dev/fil/crates/fil-proto/src/mux.rs)
-- /Users/claude/dev/fil/crates/fil-transport/src/quic/link.rs (and /Users/claude/dev/fil/crates/fil-transport/src/quic/inbox.rs, /Users/claude/dev/fil/crates/fil-transport/src/pipe/shared.rs)
-- /Users/claude/dev/fil/crates/fil-session/src/serve.rs
-- /Users/claude/dev/fil/crates/fil-client/src/engine.rs
-- /Users/claude/dev/fil/DESIGN.md (§7, §8.5, §10, §11, §14)
+- `crates/fil-proto/src/msg.rs` (plus a new `crates/fil-proto/src/mux.rs`)
+- `crates/fil-transport/src/quic/link.rs` (and `crates/fil-transport/src/quic/inbox.rs`, `crates/fil-transport/src/pipe/shared.rs`)
+- `crates/fil-session/src/serve.rs`
+- `crates/fil-client/src/engine.rs`
+- DESIGN.md (§7, §8.5, §10, §11, §14)

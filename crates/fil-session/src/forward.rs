@@ -262,7 +262,7 @@ impl fmt::Debug for State {
 
 type Shared = Arc<Mutex<State>>;
 
-fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -278,8 +278,11 @@ pub(crate) struct Forwards {
     agent_sock: Mutex<Option<AgentSocket>>,
     /// Where the agent relay is, for connections waiting on it.
     agent_gate: watch::Sender<Gate>,
-    /// Agent requests relayed, for `fil ports`.
-    agent_counts: Arc<RequestCounts>,
+    /// Agent requests relayed to the current subscriber, for `fil ports`: new at every fresh
+    /// attach, so a takeover never shows the previous client's use as this one's (agent use is
+    /// user data, DESIGN.md section 11.1). A connection of an earlier subscriber's counts into
+    /// the counts it started with, which nobody reads any more.
+    agent_counts: Mutex<Arc<RequestCounts>>,
     me: Weak<Forwards>,
     #[cfg(feature = "test-hooks")]
     gate: Arc<Mutex<Option<Arc<crate::handle::SyncGate>>>>,
@@ -339,7 +342,7 @@ impl Forwards {
             table_room,
             agent_sock: Mutex::new(agent_socket.map(AgentSocket::new)),
             agent_gate: watch::Sender::new(Gate::Off),
-            agent_counts: Arc::new(RequestCounts::default()),
+            agent_counts: Mutex::new(Arc::new(RequestCounts::default())),
             me: me.clone(),
             #[cfg(feature = "test-hooks")]
             gate,
@@ -376,6 +379,7 @@ impl Forwards {
         st.fatal = Some(events);
         st.agent = agent;
         st.refused.clear();
+        *lock(&self.agent_counts) = Arc::new(RequestCounts::default());
         self.sync_agent(&mut st);
         // The table is re-established for the new subscriber: what server policy refuses now is
         // closed, what it allows again is bound again (no records: the table follows).
@@ -676,11 +680,12 @@ impl Forwards {
         if !self.agent_on() {
             return None;
         }
+        let counts = lock(&self.agent_counts).clone();
         Some(AgentRow {
             session: self.name.clone(),
             conns: self.ep.agent_stats().open,
-            requests: self.agent_counts.requests(),
-            last_unix_ms: self.agent_counts.last_unix_ms(),
+            requests: counts.requests(),
+            last_unix_ms: counts.last_unix_ms(),
         })
     }
 
@@ -1163,7 +1168,7 @@ impl agent::Admit for Forwards {
     }
 
     fn open(&self, stream: tokio::net::UnixStream, peer: LocalPeer) {
-        let s = CountingStream::new(stream, self.agent_counts.clone());
+        let s = CountingStream::new(stream, lock(&self.agent_counts).clone());
         if let Err(why) = self.ep.open_stream(OpenKind::Agent, Box::new(s), peer) {
             debug!(why = ?why, "agent channel not opened");
         }

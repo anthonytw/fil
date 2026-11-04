@@ -844,9 +844,9 @@ predict = "adaptive"
 buffer = "4KiB"
 confirm = "off"
 
-[host.orin]
+[host.devbox]
 forward = ["-L 5173", "-R 9000"]
-direct.address = "orin.example.net"
+direct.address = "devbox.example.net"
 
 [host.k8s-dev]
 transport = "pipe"
@@ -854,12 +854,16 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 "#,
         )
         .unwrap();
-        let orin = cfg.for_host("orin");
-        let flags: Vec<String> = orin.forward.iter().map(forward_spec::format_flag).collect();
+        let devbox = cfg.for_host("devbox");
+        let flags: Vec<String> = devbox
+            .forward
+            .iter()
+            .map(forward_spec::format_flag)
+            .collect();
         assert_eq!(flags, ["-L 5173:localhost:5173", "-R 9000:localhost:9000"]);
-        assert_eq!(orin.transport, TransportSetting::Auto);
-        assert_eq!(orin.host_label.as_deref(), Some("laptop"));
-        assert_eq!(orin.direct_address.as_deref(), Some("orin.example.net"));
+        assert_eq!(devbox.transport, TransportSetting::Auto);
+        assert_eq!(devbox.host_label.as_deref(), Some("laptop"));
+        assert_eq!(devbox.direct_address.as_deref(), Some("devbox.example.net"));
         let k = cfg.for_host("k8s-dev");
         assert_eq!(k.transport, TransportSetting::Pipe);
         assert_eq!(k.pipe.unwrap()[0], "kubectl");

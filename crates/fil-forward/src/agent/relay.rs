@@ -41,6 +41,14 @@ use crate::stream::{BoxStream, ForwardStream};
 /// How long a `confirm` question waits for the user before the signature is refused.
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the relay waits for the local agent to answer one request (the session-bind, a list,
+/// a signature). Generous, because a signature may wait on the user: a hardware key to touch, a
+/// pinentry, an agent's own confirmation. Past it the remote is answered `SSH_AGENT_FAILURE` and
+/// the connection ends (a late answer would be taken for the next one's), so a wedged agent
+/// holds no channel for longer. The wait also ends, with the connection, when the remote hangs
+/// up.
+pub const AGENT_ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Keys whose use is counted; past this, signatures still count in the totals.
 pub const MAX_KEYS: usize = 64;
 
@@ -416,27 +424,29 @@ where
         #[cfg(feature = "test-hooks")]
         Bind::Unbound => None,
     };
+    let mut remote = Inbound {
+        s: remote,
+        buf: Vec::new(),
+    };
     if let Some(key) = key {
         let Some(bind) = key.request() else {
             return;
         };
-        if agent.write_all(&framed(&bind)).await.is_err() {
-            return;
-        }
-        match read_msg(&mut agent).await {
-            Ok(Msg::One(a)) => {
+        match exchange(&mut agent, &bind, &mut remote).await {
+            Exchange::Answer(Msg::One(a)) => {
                 debug!(
                     bound = a.first() == Some(&filter::SUCCESS),
                     "agent connection bound"
                 )
             }
+            Exchange::TimedOut => {
+                // Whatever the remote sent ahead is answered once, and the connection ends.
+                let _ = remote.s.write_all(&FAILURE_MSG).await;
+                return;
+            }
             _ => return,
         }
     }
-    let mut remote = Inbound {
-        s: remote,
-        buf: Vec::new(),
-    };
     loop {
         let msg = match remote.read_msg().await {
             Ok(Msg::One(m)) => m,
@@ -471,25 +481,77 @@ where
     }
 }
 
+/// How one request to the local agent ended.
+enum Exchange {
+    Answer(Msg),
+    /// The agent failed (a write or a read).
+    Failed,
+    /// The remote hung up meanwhile: the request is dropped with the connection.
+    Gone,
+    /// No answer within [`AGENT_ANSWER_TIMEOUT`].
+    TimedOut,
+}
+
+/// Sends one request to the local agent and reads its answer, within [`AGENT_ANSWER_TIMEOUT`]
+/// and only while the remote is there (what it sends meanwhile is kept for later).
+async fn exchange<R, A>(agent: &mut A, msg: &[u8], remote: &mut Inbound<R>) -> Exchange
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    let talk = async {
+        agent.write_all(&framed(msg)).await?;
+        read_msg(agent).await
+    };
+    let bounded = tokio::time::timeout(AGENT_ANSWER_TIMEOUT, talk);
+    tokio::pin!(bounded);
+    tokio::select! {
+        r = &mut bounded => match r {
+            Ok(Ok(m)) => Exchange::Answer(m),
+            Ok(Err(_)) => Exchange::Failed,
+            Err(_) => {
+                debug!("the local agent did not answer in time");
+                Exchange::TimedOut
+            }
+        },
+        true = remote.closed() => {
+            debug!("the remote hung up while the local agent was asked");
+            Exchange::Gone
+        }
+    }
+}
+
+/// What [`pass`] makes of an exchange that did not answer: the connection ends, and a request
+/// the agent left unanswered is answered `FAILURE` first.
+async fn unanswered<R: AsyncRead + AsyncWrite + Unpin>(e: Exchange, remote: &mut Inbound<R>) {
+    if matches!(e, Exchange::TimedOut) {
+        let _ = remote.s.write_all(&FAILURE_MSG).await;
+    }
+}
+
 /// Asks the agent for its keys itself (the remote sees nothing of it) and remembers them.
-/// `None` when the agent failed.
-async fn refresh<A: AsyncRead + AsyncWrite + Unpin>(agent: &mut A, uses: &KeyUses) -> Option<()> {
-    agent
-        .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
-        .await
-        .ok()?;
-    match read_msg(agent).await.ok()? {
-        Msg::One(a) => {
+/// `None` when the agent failed (or did not answer, or the remote went).
+async fn refresh<R, A>(agent: &mut A, uses: &KeyUses, remote: &mut Inbound<R>) -> Option<()>
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    match exchange(agent, &[filter::REQUEST_IDENTITIES], remote).await {
+        Exchange::Answer(Msg::One(a)) => {
             uses.remember(&a);
             Some(())
         }
-        Msg::Empty | Msg::Oversize | Msg::Eof => None,
+        Exchange::Answer(_) | Exchange::Failed | Exchange::Gone => None,
+        e @ Exchange::TimedOut => {
+            unanswered(e, remote).await;
+            None
+        }
     }
 }
 
 /// One request that passed the filter: the allowlist and the question first, then the agent.
-/// `None` ends the connection (the remote went away while the question was up, or the agent
-/// failed).
+/// `None` ends the connection (the remote went away while the question was up or the agent was
+/// asked, the agent failed, or it did not answer within [`AGENT_ANSWER_TIMEOUT`]).
 async fn pass<R, A>(
     req: &Request<'_>,
     msg: &[u8],
@@ -509,7 +571,7 @@ where
         let info = match uses.lookup(key) {
             Some(info) => info,
             None => {
-                refresh(agent, uses).await?;
+                refresh(agent, uses, remote).await?;
                 match uses.lookup(key) {
                     Some(info) => info,
                     None => {
@@ -535,11 +597,14 @@ where
         }
         signer = Some(info);
     }
-    agent.write_all(&framed(msg)).await.ok()?;
-    let answer = match read_msg(agent).await.ok()? {
-        Msg::One(a) => a,
+    let answer = match exchange(agent, msg, remote).await {
+        Exchange::Answer(Msg::One(a)) => a,
         // An agent that breaks its protocol is not passed on.
-        Msg::Empty | Msg::Oversize | Msg::Eof => return None,
+        Exchange::Answer(_) | Exchange::Failed | Exchange::Gone => return None,
+        e @ Exchange::TimedOut => {
+            unanswered(e, remote).await;
+            return None;
+        }
     };
     if !check_answer(req, &answer) {
         uses.refused();
@@ -743,6 +808,96 @@ mod tests {
             0,
             "the connection ended"
         );
+    }
+
+    /// A stand-in agent that answers the session-bind and then never answers again (a wedged
+    /// gpg-agent, a hardware key nobody touches). Returns how many bytes of requests it read
+    /// after the bind, once its connection ends.
+    fn silent_agent(mut far: tokio::io::DuplexStream) -> tokio::task::JoinHandle<usize> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let Ok(Msg::One(_bind)) = read_msg(&mut far).await else {
+                return 0;
+            };
+            far.write_all(&framed(&[filter::SUCCESS])).await.unwrap();
+            let mut n = 0;
+            let mut b = [0u8; 256];
+            while let Ok(k) = far.read(&mut b).await {
+                if k == 0 {
+                    break;
+                }
+                n += k;
+            }
+            n
+        })
+    }
+
+    /// An agent that never answers holds the relay for [`AGENT_ANSWER_TIMEOUT`], no longer: the
+    /// remote is answered `FAILURE` and the connection ends, the agent's with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_agent_is_given_up_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut remote, far) = tokio::io::duplex(1 << 12);
+        let (agent, agent_far) = tokio::io::duplex(1 << 12);
+        let heard = silent_agent(agent_far);
+        let t0 = tokio::time::Instant::now();
+        let task = tokio::spawn(relay(
+            far,
+            agent,
+            Arc::new(Rules::default()),
+            Arc::new(KeyUses::default()),
+        ));
+        remote
+            .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(2 * AGENT_ANSWER_TIMEOUT, remote.read_to_end(&mut answer))
+            .await
+            .expect("the relay gave up on the agent")
+            .unwrap();
+        assert_eq!(answer, FAILURE_MSG, "answered FAILURE, then ended");
+        assert!(t0.elapsed() >= AGENT_ANSWER_TIMEOUT, "not before the bound");
+        task.await.unwrap();
+        assert_eq!(
+            heard.await.unwrap(),
+            5,
+            "the agent saw the request, then its end"
+        );
+    }
+
+    /// The remote hanging up while the agent is asked ends the request and the connection at
+    /// once: the relay does not wait for the agent.
+    #[tokio::test(start_paused = true)]
+    async fn the_remote_hanging_up_ends_the_wait_on_the_agent() {
+        use tokio::io::AsyncWriteExt;
+        let (mut remote, far) = tokio::io::duplex(1 << 12);
+        let (agent, agent_far) = tokio::io::duplex(1 << 12);
+        let heard = silent_agent(agent_far);
+        let t0 = tokio::time::Instant::now();
+        let task = tokio::spawn(relay(
+            far,
+            agent,
+            Arc::new(Rules::default()),
+            Arc::new(KeyUses::default()),
+        ));
+        remote
+            .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+            .await
+            .unwrap();
+        // The request reaches the agent, which says nothing; then the remote goes.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(remote);
+        tokio::time::timeout(2 * AGENT_ANSWER_TIMEOUT, task)
+            .await
+            .expect("the relay ended")
+            .unwrap();
+        assert!(
+            t0.elapsed() < AGENT_ANSWER_TIMEOUT / 2,
+            "waited {:?} on an agent for a remote that was gone",
+            t0.elapsed()
+        );
+        assert_eq!(heard.await.unwrap(), 5);
     }
 
     /// A key and its certificate share `ssh-add -l`'s fingerprint, and are counted apart.

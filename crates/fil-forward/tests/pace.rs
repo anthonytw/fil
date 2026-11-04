@@ -229,24 +229,44 @@ async fn parallel_downloads_keep_the_link_full_body() {
             }));
         }
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
-        let mut rtts = Vec::new();
-        for i in 0..15 {
-            rtts.push(probe(&mut w, i).await);
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
+        // The rate is measured over a window; a window across which the process itself stood
+        // still (`StallWatch`: 100 ms or more, which only the machine causes) is measured once
+        // more, up to twice, and every window's figures are in the failure.
+        let mut windows = Vec::new();
+        let (rate, p50) = loop {
+            let stalls = StallWatch::start();
+            let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
+            let mut rtts = Vec::new();
+            for i in 0..15 {
+                rtts.push(probe(&mut w, i).await);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
+            let stalled = stalls.worst();
+            drop(stalls);
+            rtts.sort();
+            let p50 = rtts[rtts.len() / 2];
+            windows.push(format!(
+                "{:.0} KB/s, probe p50 {p50:?}, the process stood still {stalled:?} at most",
+                rate / 1e3
+            ));
+            if rate >= 0.9 * RATE as f64
+                || stalled < Duration::from_millis(100)
+                || windows.len() == 3
+            {
+                break (rate, p50);
+            }
+        };
         readers.iter().for_each(|r| r.abort());
-        rtts.sort();
-        let p50 = rtts[rtts.len() / 2];
         eprintln!(
-            "{n} parallel downloads: {:.0} KB/s, probe p50 {p50:?}, daemon {:?}",
-            rate / 1e3,
+            "{n} parallel downloads: {}, daemon {:?}",
+            windows.join("; then "),
             w.daemon.ep.pace_state()
         );
         assert!(
             rate >= 0.9 * RATE as f64,
-            "{n}: {rate}; {}",
+            "{n}: {rate}; windows: {}; {}",
+            windows.join("; "),
             mbufs_note(&denied)
         );
         assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");

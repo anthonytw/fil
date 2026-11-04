@@ -1231,6 +1231,52 @@ pub async fn probe(w: &mut World, i: u64) -> Duration {
     }
 }
 
+/// How late an OS thread of its own wakes from 5 ms sleeps, at worst, while it runs: a stall of
+/// the whole process or of the machine (a CI runner's VM descheduled), which no tokio task can
+/// cause, since the thread is not one of the runtime's. A rate measured across a stall of a few
+/// hundred milliseconds measures the runner: the simulated links lose the time no one sent in.
+pub struct StallWatch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worst: Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StallWatch {
+    pub fn start() -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, w) = (stop.clone(), worst.clone());
+        let thread = std::thread::spawn(move || {
+            let tick = Duration::from_millis(5);
+            while !s.load(Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                std::thread::sleep(tick);
+                let late = t.elapsed().saturating_sub(tick).as_micros() as u64;
+                w.fetch_max(late, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            worst,
+            thread: Some(thread),
+        }
+    }
+
+    /// The worst lateness so far.
+    pub fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for StallWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The scale knobs: heavy runs set them (`just forward-soak`).
 pub fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)

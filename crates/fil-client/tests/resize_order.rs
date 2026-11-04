@@ -1002,3 +1002,41 @@ async fn a_catch_up_superseding_a_complete_held_repaint_begins() {
     settle().await;
     assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
 }
+
+/// W1 (F5), the held case: the first repaint's bytes and the second's both arrive early, and
+/// output below the first one's position is still on its way, so the first is complete but held
+/// when it is announced. The second one's bytes are not more of the first's: both land in turn,
+/// every line once, no reconnect.
+#[tokio::test(start_paused = true)]
+async fn early_bytes_of_the_next_snapshot_are_not_fed_to_a_held_complete_one() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_tail(&lines(0..20)).await;
+    rig.daemon.set_repaint_bytes_first(false).await;
+    rig.term.resize(60, 24);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
+    assert_eq!(
+        snapshots_written(&rig),
+        3,
+        "the attach's and the two repaints"
+    );
+    let mut all = rig.term.history();
+    all.extend(rig.term.rows());
+    for i in 0..20 {
+        let want = numbered(i);
+        let n = all
+            .iter()
+            .filter(|l| l.trim_end() == want.trim_end())
+            .count();
+        assert_eq!(n, 1, "{want:?} appears {n} times: {all:?}");
+    }
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text()
+    );
+}

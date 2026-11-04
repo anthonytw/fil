@@ -774,6 +774,16 @@ impl FakeDaemon {
             let _ = send(&link, &ControlMsg::Snapshot(info)).await;
             let _ = send(&link, &ControlMsg::Snapshot(info2)).await;
             tokio::time::sleep(Duration::from_millis(5)).await;
+            // Output below the first one's position, if any, still on its way (it is held).
+            for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+                let seg = Segment {
+                    seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                    data: chunk.to_vec(),
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
             if !catch_up {
                 let seg = Segment {
                     seq: at,

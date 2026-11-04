@@ -85,7 +85,8 @@ pub struct MoshConfig {
     pub show_above: Duration,
     /// ...and stop once it is below this.
     pub hide_below: Duration,
-    /// Underline written guesses while the estimate is above this.
+    /// Underline written guesses while the estimate is above this (zero: always, with no
+    /// estimate yet too; for harnesses that read guesses off the screen by their underline).
     pub underline_above: Duration,
     /// A key whose `EchoAck` comes more than this after it was sent is a glitch...
     pub glitch: Duration,
@@ -996,7 +997,9 @@ impl Predictor for MoshPredictor {
         }
         // Underlined above 80 ms, or for the glitch window after a glitch (decided, owner
         // 2026-11-04: an echo more than 250 ms late, as in mosh).
-        let slow = glitch || est.is_some_and(|e| e > self.cfg.underline_above);
+        let slow = glitch
+            || (self.cfg.underline_above.is_zero()
+                || est.is_some_and(|e| e > self.cfg.underline_above));
         if slow && self.cfg.underline {
             Show::Underline
         } else {

@@ -73,10 +73,7 @@ pub fn predictor_factory(predict: Predict) -> Option<PredictorFactory> {
     let cfg = match predict {
         Predict::Off => return None,
         Predict::Adaptive => MoshConfig::default(),
-        Predict::Always => MoshConfig {
-            rtt_threshold: Duration::ZERO,
-            ..MoshConfig::default()
-        },
+        Predict::Always => MoshConfig::always(),
     };
     Some(Box::new(move || Box::new(MoshPredictor::new(cfg))))
 }

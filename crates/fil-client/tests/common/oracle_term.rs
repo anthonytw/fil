@@ -414,10 +414,14 @@ pub enum Predict {
     /// every key and output) and the predictor never guesses. The control for the resize
     /// reproduction: whatever differs from the shadow here is not the overlay's doing.
     Passive,
-    /// The M0 predictor with its own RTT threshold (20 ms), given the link's real RTT.
+    /// The default predictor (P1), adaptive, given the link's real RTT.
     Mosh,
-    /// The M0 predictor with the threshold at zero: it predicts at any RTT.
+    /// The default predictor shown at any RTT, and always underlined.
     MoshAlways,
+    /// A predictor without the default one's care (fil-predict's quiet hostile predictor): it
+    /// appends a guess for every printable key and a blank for every Backspace at its own idea of
+    /// the cursor, always shown. Only the core stands between it and the screen.
+    Plain,
     /// A hostile predictor: it shows a guess for every printable key at once, with no epochs. The
     /// core must stop it: the password rule, and since C1 its epochs (a guess is written only in
     /// an epoch the core has confirmed), which hold even with the daemon's `PtyMode` withheld.
@@ -712,6 +716,11 @@ pub fn predictor_factory(
         }),
         Predict::Eager => Box::new(|| Box::new(EagerPredictor::default())),
         Predict::Withdrawing => Box::new(|| Box::new(WithdrawingPredictor::default())),
+        Predict::Plain => Box::new(|| {
+            Box::new(fil_predict::sim::HostilePredictor::new(
+                fil_predict::sim::HostileCfg::quiet(1),
+            ))
+        }),
     };
     Some(Box::new(move || {
         Box::new(Adapter {

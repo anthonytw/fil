@@ -36,9 +36,9 @@ mod epochs;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use fil_term::model::{Attrs, Underline};
+use fil_term::model::{Attrs, Cursor, Modes, Underline};
 use fil_term::snapshot::{sanitize, sgr};
-use fil_term::{Backend, Capabilities, Emulator, Size, TermState};
+use fil_term::{Backend, Capabilities, Emulator, Screen, Size, TermState};
 use unicode_width::UnicodeWidthChar;
 
 use epochs::{Cells, Core, Why};
@@ -51,7 +51,8 @@ pub use epochs::{
 
 use crate::keys::{KeyClass, KeyDecoder, classify};
 use crate::predictor::{
-    CellStyle, Ctx, InputPos, KeyEvent, LinkView, Predictor, Show, Time, WithdrawReason,
+    CellRef, CellStyle, Ctx, InputPos, KeyEvent, LinkView, Predictor, ScreenView, Show, Time,
+    WithdrawReason,
 };
 use crate::tracker::{Blocker, Link, Tracker};
 
@@ -516,6 +517,59 @@ pub struct View {
 
 // ---------------------------------------------------------------------------------------
 
+/// The shadow screen as the core and the predictor read it: borrowed from the emulator
+/// ([`Emulator::screen`]), so no [`TermState`] is built per keystroke or per output chunk
+/// (`docs/m3/plan.md` §2.10), and each row's stamp is the backend's write counter. It lives for
+/// one event; the emulator is fed or resized only after it is dropped.
+pub(crate) struct Shadow<'a> {
+    screen: Box<dyn Screen + 'a>,
+    /// The test-only copy behind [`ScreenView::test_state`], made when first asked for.
+    #[cfg(feature = "testkit")]
+    state: std::cell::OnceCell<TermState>,
+}
+
+impl<'a> Shadow<'a> {
+    fn new(emulator: &'a dyn Emulator) -> Self {
+        Shadow {
+            screen: emulator.screen(),
+            #[cfg(feature = "testkit")]
+            state: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl ScreenView for Shadow<'_> {
+    fn size(&self) -> Size {
+        self.screen.size()
+    }
+
+    fn cursor(&self) -> Cursor {
+        self.screen.cursor()
+    }
+
+    fn modes(&self) -> &Modes {
+        self.screen.modes()
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
+        self.screen.cell(row, col).map(|c| CellRef {
+            text: c.text,
+            width: c.width,
+            attrs: c.attrs,
+        })
+    }
+
+    fn row_stamp(&self, row: u16) -> u64 {
+        self.screen.row_stamp(row)
+    }
+
+    /// The visible screen, copied once per event when a harness asks (T1's `compare_to_shadow`).
+    #[cfg(feature = "testkit")]
+    fn test_state(&self) -> Option<&TermState> {
+        Some(self.state.get_or_init(|| self.screen.screen_state()))
+    }
+}
+
 /// What a cell held before we painted over it. No `Debug` here or below: they hold cell text and
 /// guessed glyphs (docs/m3/plan.md §4.3).
 #[derive(Clone)]
@@ -560,6 +614,11 @@ struct Plan {
 
 pub struct Overlay {
     shadow: Box<dyn Emulator>,
+    o: Inner,
+}
+
+/// Everything but the shadow emulator, so the core can work while a [`Shadow`] borrows it.
+struct Inner {
     caps: Capabilities,
     tracker: Tracker,
     predictor: Box<dyn Predictor>,
@@ -597,23 +656,25 @@ impl Overlay {
     ) -> Self {
         Overlay {
             shadow,
-            caps,
-            tracker: Tracker::new(),
-            predictor,
-            decoder: KeyDecoder::default(),
-            core: Core::new(cfg.guards),
-            cfg,
-            size,
-            pty: PtyMode::default(),
-            link: LinkView::default(),
-            status: None,
-            on_screen: None,
-            input_end: 0,
-            in_paste: false,
-            paste_until: None,
-            trusted: true,
-            repaint_wanted: false,
-            status_on_untrusted: false,
+            o: Inner {
+                caps,
+                tracker: Tracker::new(),
+                predictor,
+                decoder: KeyDecoder::default(),
+                core: Core::new(cfg.guards),
+                cfg,
+                size,
+                pty: PtyMode::default(),
+                link: LinkView::default(),
+                status: None,
+                on_screen: None,
+                input_end: 0,
+                in_paste: false,
+                paste_until: None,
+                trusted: true,
+                repaint_wanted: false,
+                status_on_untrusted: false,
+            },
         }
     }
 
@@ -635,28 +696,31 @@ impl Overlay {
     }
 
     pub fn capabilities(&self) -> &Capabilities {
-        &self.caps
+        &self.o.caps
     }
 
     pub fn size(&self) -> Size {
-        self.size
+        self.o.size
     }
 
     /// The link's status (`LinkStatus`): the predictor's RTT hint, and whether the backstop or
     /// the expiry removes an unsettled guess.
     pub fn set_link(&mut self, link: LinkView) {
-        self.link = link;
-        self.core.link_down = link.down;
+        self.o.link = link;
+        self.o.core.link_down = link.down;
     }
 
     /// True while anything is painted on the user's terminal.
     pub fn has_painted(&self) -> bool {
-        self.on_screen.is_some()
+        self.o.on_screen.is_some()
     }
 
     /// The earliest time [`Overlay::on_tick`] could change anything.
     pub fn next_deadline(&self) -> Option<Time> {
-        match (self.predictor.next_deadline(), self.core.next_deadline()) {
+        match (
+            self.o.predictor.next_deadline(),
+            self.o.core.next_deadline(),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -664,18 +728,18 @@ impl Overlay {
 
     /// What the core has counted (`docs/m3/plan.md` §2.5).
     pub fn stats(&self) -> PredictStats {
-        self.core.stats
+        self.o.core.stats
     }
 
     /// **Test only:** whether the current epoch is confirmed.
     #[cfg(feature = "testkit")]
     pub fn epoch_confirmed(&self) -> bool {
-        self.core.epoch_confirmed()
+        self.o.core.epoch_confirmed()
     }
 
     /// Guesses the core holds that are not settled yet.
     pub fn outstanding(&self) -> usize {
-        self.core.pending()
+        self.o.core.pending()
     }
 
     /// True once after the core needs a repaint (rule 9): it had a guess to write on an
@@ -683,29 +747,29 @@ impl Overlay {
     /// asks for one (W1's in-band `Repaint`), and calls [`Overlay::repainted`] once a snapshot at
     /// the current size has landed.
     pub fn take_repaint_request(&mut self) -> bool {
-        std::mem::take(&mut self.repaint_wanted)
+        std::mem::take(&mut self.o.repaint_wanted)
     }
 
     /// True while a resize has left the screen untrusted.
     pub fn trusted(&self) -> bool {
-        self.trusted
+        self.o.trusted
     }
 
     /// A snapshot rendered at the client's current size has landed: the shadow says what the
     /// terminal shows again. Call it after [`Overlay::reset`] and the snapshot's bytes.
     pub fn repainted(&mut self) {
-        self.trusted = true;
+        self.o.trusted = true;
     }
 
     /// A resume or a swap: the next key is a boundary (rule 3, `Resumed`). Input offsets continue.
     pub fn resumed(&mut self) {
-        self.core.resumed = true;
+        self.o.core.resumed = true;
     }
 
     /// The shadow and the overlay, for the oracle. Reads the emulator.
     pub fn view(&self, history: usize) -> View {
         let shadow = self.shadow.state(history);
-        let painted = match &self.on_screen {
+        let painted = match &self.o.on_screen {
             Some(os) => os
                 .cells
                 .iter()
@@ -725,7 +789,7 @@ impl Overlay {
         View {
             shadow,
             painted,
-            cursor: self.on_screen.as_ref().map(|o| o.cursor),
+            cursor: self.o.on_screen.as_ref().map(|o| o.cursor),
         }
     }
 
@@ -733,46 +797,47 @@ impl Overlay {
 
     /// Authoritative bytes from the server.
     pub fn on_server(&mut self, bytes: &[u8], now: Time) -> Flush {
-        let mut f = self.new_flush();
+        let Overlay { shadow, o } = self;
+        let mut f = o.new_flush();
         // 1. Erase: put the terminal back to exactly the shadow's state.
-        f.erase = self.apply(None);
+        f.erase = o.apply(None);
         // 2. Server bytes, to the terminal (unchanged) and to everything that mirrors it.
         f.server = bytes.to_vec();
-        let sync_before = self.tracker.sync_output();
-        let rest_before = self.tracker.at_rest();
-        self.shadow.feed(bytes);
-        let _ = self.shadow.take_replies(); // the user's terminal answers queries
-        self.tracker.feed(bytes);
-        self.core.last_activity = Some(now);
+        let sync_before = o.tracker.sync_output();
+        let rest_before = o.tracker.at_rest();
+        shadow.feed(bytes);
+        let _ = shadow.take_replies(); // the user's terminal answers queries
+        o.tracker.feed(bytes);
+        o.core.last_activity = Some(now);
         // 3. The core confirms, contradicts or ends the epoch; the predictor re-plans; what may
         //    be written is painted again. With nothing outstanding, no screen read: the core
         //    notes the output and checks it at the next key.
-        let pending = self.core.has_pending();
+        let pending = o.core.has_pending();
         if !pending {
-            self.core.dirty = true;
+            o.core.dirty = true;
         }
-        if pending || self.status.is_some() || self.on_screen.is_some() {
-            let st = self.shadow.state(0);
+        if pending || o.status.is_some() || o.on_screen.is_some() {
+            let st = Shadow::new(&**shadow);
             if pending {
-                self.core.expire(&st, now);
-                self.core.check_skipped(&st, now);
-                self.core.on_chunk(&st, now);
-                if self.core.has_pending() {
-                    let edits = self.predictor.on_output(&self.ctx(&st, now));
-                    self.core.apply_edits(edits, &st, now);
+                o.core.expire(&st, now);
+                o.core.check_skipped(&st, now);
+                o.core.on_chunk(&st, now);
+                if o.core.has_pending() {
+                    let edits = o.predictor.on_output(&o.ctx(&st, now));
+                    o.core.apply_edits(edits, &st, now);
                 }
             }
-            self.core.classify_deferred(&st, now);
-            self.report(&st, now);
-            f.paint = self.paint(&st, now);
+            o.core.classify_deferred(&st, now);
+            o.report(&st, now);
+            f.paint = o.paint(&st, now);
         } else {
             // A snapshot's classification needs the shadow it landed in.
-            self.classify_deferred_now(now);
+            o.classify_deferred_now(&**shadow, now);
         }
         // Don't end a synchronized-output batch the program started (or ends) itself.
-        if sync_before || self.tracker.sync_output() || !self.cfg.sync_output {
+        if sync_before || o.tracker.sync_output() || !o.cfg.sync_output {
             f.bracket = Bracket::None;
-        } else if rest_before && self.tracker.at_rest() {
+        } else if rest_before && o.tracker.at_rest() {
             f.bracket = Bracket::Whole;
         } else {
             f.bracket = Bracket::Parts;
@@ -780,66 +845,59 @@ impl Overlay {
         f
     }
 
-    fn classify_deferred_now(&mut self, now: Time) {
-        if self.core.has_deferred() {
-            let st = self.shadow.state(0);
-            self.core.classify_deferred(&st, now);
-            self.report(&st, now);
-        }
-    }
-
     /// Bytes for the session's input, at input offset `at` (DESIGN.md §8.5), of this kind. The
     /// caller still sends them. Only typed, live input is predicted (rule 6).
     pub fn on_input(&mut self, bytes: &[u8], at: InputPos, kind: InputKind, now: Time) -> Flush {
+        let Overlay { shadow, o } = self;
         if bytes.is_empty() {
             return Flush::default();
         }
-        let g = self.cfg.guards;
-        let st = self.shadow.state(0);
-        self.core.expire(&st, now);
-        self.hidden(&st, now);
+        let g = o.cfg.guards;
+        let st = Shadow::new(&**shadow);
+        o.core.expire(&st, now);
+        o.hidden(&st, now);
         let end = at + bytes.len() as u64;
-        if at != self.input_end {
+        if at != o.input_end {
             // A gap or an overlap in the offsets: no key can be placed across it.
-            self.decoder.clear();
-            self.core.boundary(Why::Unpredicted, Some(&st), now);
+            o.decoder.clear();
+            o.core.boundary(Why::Unpredicted, Some(&st), now);
         }
-        self.input_end = end;
+        o.input_end = end;
         let mut kind = kind;
         if g.paste && kind == InputKind::Typed {
-            let tail = self.paste_until.is_some_and(|t| now <= t);
+            let tail = o.paste_until.is_some_and(|t| now <= t);
             if bytes.len() >= PASTE_READ || tail {
                 kind = InputKind::Pasted;
-                self.paste_until = Some(now + PASTE_FOLLOW);
+                o.paste_until = Some(now + PASTE_FOLLOW);
             }
         }
         if kind != InputKind::Typed && g.untyped {
             // Not decoded: a pasted or released byte is never a key the core predicts.
-            self.decoder.clear();
-            self.core.end(Why::Unpredicted, Some(&st), now);
-            self.core.last_activity = Some(now);
-            self.core.rebase(&st);
-            self.report(&st, now);
-            return self.flush_paint(&st, now);
+            o.decoder.clear();
+            o.core.end(Why::Unpredicted, Some(&st), now);
+            o.core.last_activity = Some(now);
+            o.core.rebase(&st);
+            o.report(&st, now);
+            return o.flush_paint(&st, now);
         }
-        let allowed = self.prediction_allowed(&st);
-        let held = self.decoder.pending() as u64;
+        let allowed = o.prediction_allowed(&st);
+        let held = o.decoder.pending() as u64;
         let mut pos = at.saturating_sub(held);
-        for (key, len) in self.decoder.decode_sized(bytes) {
+        for (key, len) in o.decoder.decode_sized(bytes) {
             let (kat, kend) = (pos, pos + len as u64);
             pos = kend;
             let class = classify(&key);
             if g.paste {
-                if self.in_paste {
+                if o.in_paste {
                     if class == KeyClass::PasteEnd {
-                        self.in_paste = false;
-                        self.core.end(Why::Unpredicted, Some(&st), now);
+                        o.in_paste = false;
+                        o.core.end(Why::Unpredicted, Some(&st), now);
                     }
                     continue;
                 }
                 if class == KeyClass::PasteStart {
-                    self.in_paste = true;
-                    self.core.end(Why::Unpredicted, Some(&st), now);
+                    o.in_paste = true;
+                    o.core.end(Why::Unpredicted, Some(&st), now);
                     continue;
                 }
             } else if matches!(class, KeyClass::PasteStart | KeyClass::PasteEnd) {
@@ -848,11 +906,11 @@ impl Overlay {
             if class == KeyClass::Release {
                 continue;
             }
-            self.core.before_key(&st, now);
-            self.core.last_activity = Some(now);
+            o.core.before_key(&st, now);
+            o.core.last_activity = Some(now);
             if !allowed {
                 // The password rule or the alternate screen: the key is not predicted.
-                self.core.end(Why::Unpredicted, Some(&st), now);
+                o.core.end(Why::Unpredicted, Some(&st), now);
                 continue;
             }
             // The predictor sees the key as the core decoded it (a kitty press as its char).
@@ -861,78 +919,82 @@ impl Overlay {
                 _ => key,
             };
             if class == KeyClass::Boundary {
-                self.core.boundary(Why::Key, Some(&st), now);
+                o.core.boundary(Why::Key, Some(&st), now);
             } else {
-                if g.cap && self.core.held() >= MAX_OUTSTANDING {
-                    self.core.end(Why::Unpredicted, Some(&st), now);
+                if g.cap && o.core.held() >= MAX_OUTSTANDING {
+                    o.core.end(Why::Unpredicted, Some(&st), now);
                     continue;
                 }
-                self.core.push_key(kat, kend, class, now);
+                o.core.push_key(kat, kend, class, now);
             }
-            let edits = self.predictor.on_key(&key, kat, &self.ctx(&st, now));
+            let edits = o.predictor.on_key(&key, kat, &o.ctx(&st, now));
             // The baseline is taken once, after every key of this read.
-            self.core.apply_edits_only(edits, &st, now);
+            o.core.apply_edits_only(edits, &st, now);
         }
-        self.core.last_activity = Some(now);
-        self.core.rebase(&st);
-        self.report(&st, now);
-        self.flush_paint(&st, now)
+        o.core.last_activity = Some(now);
+        o.core.rebase(&st);
+        o.report(&st, now);
+        o.flush_paint(&st, now)
     }
 
     /// An `EchoAck` (DESIGN.md §8.5): the caller has applied the output below its `output_at`.
     /// One whose `input_upto` is beyond the input sent is ignored.
     pub fn on_echo_ack(&mut self, input_upto: InputPos, now: Time) -> Flush {
-        let st = self.shadow.state(0);
-        self.core.expire(&st, now);
-        self.core.check_skipped(&st, now);
-        self.core.sync(&st, now);
-        self.core.on_echo_ack(input_upto, self.input_end, &st, now);
-        if input_upto <= self.input_end {
-            self.predictor.on_echo_ack(input_upto, &self.ctx(&st, now));
+        let Overlay { shadow, o } = self;
+        let st = Shadow::new(&**shadow);
+        o.core.expire(&st, now);
+        o.core.check_skipped(&st, now);
+        o.core.sync(&st, now);
+        o.core.on_echo_ack(input_upto, o.input_end, &st, now);
+        if input_upto <= o.input_end {
+            o.predictor.on_echo_ack(input_upto, &o.ctx(&st, now));
         }
-        self.report(&st, now);
-        self.flush_paint(&st, now)
+        o.report(&st, now);
+        o.flush_paint(&st, now)
     }
 
     /// Time passed. Call at [`Overlay::next_deadline`], or periodically.
     pub fn on_tick(&mut self, now: Time) -> Flush {
-        if !self.core.has_pending() && !self.predictor.has_outstanding() {
+        let Overlay { shadow, o } = self;
+        if !o.core.has_pending() && !o.predictor.has_outstanding() {
             return Flush::default();
         }
-        let st = self.shadow.state(0);
-        self.core.expire(&st, now);
-        let edits = self.predictor.on_tick(&self.ctx(&st, now));
-        self.core.apply_edits(edits, &st, now);
-        self.report(&st, now);
-        self.flush_paint(&st, now)
+        let st = Shadow::new(&**shadow);
+        o.core.expire(&st, now);
+        let edits = o.predictor.on_tick(&o.ctx(&st, now));
+        o.core.apply_edits(edits, &st, now);
+        o.report(&st, now);
+        o.flush_paint(&st, now)
     }
 
     /// The daemon's report of the PTY's line discipline. Every change is a boundary (rule 3);
     /// canonical with echo off retracts everything (rule 1).
     pub fn set_pty_mode(&mut self, mode: PtyMode) -> Flush {
-        let changed = mode != self.pty;
-        self.pty = mode;
-        let st = self.shadow.state(0);
-        let now = self.core.last_activity.unwrap_or_default();
-        self.hidden(&st, now);
-        if self.cfg.guards.password && mode.is_password() {
-            self.core.end(Why::Password, Some(&st), now);
+        let Overlay { shadow, o } = self;
+        let changed = mode != o.pty;
+        o.pty = mode;
+        let st = Shadow::new(&**shadow);
+        let now = o.core.last_activity.unwrap_or_default();
+        o.hidden(&st, now);
+        if o.cfg.guards.password && mode.is_password() {
+            o.core.end(Why::Password, Some(&st), now);
         }
         if changed {
-            self.core.boundary(Why::ModeChange, Some(&st), now);
+            o.core.boundary(Why::ModeChange, Some(&st), now);
         }
-        self.report(&st, now);
-        self.retract_flush(&st, now)
+        o.report(&st, now);
+        o.retract_flush(&st, now)
     }
 
     /// Withdraws every guess at once, for a lifecycle event (a takeover, a detach from elsewhere,
     /// a refusal, the session's exit), before any question or message is drawn.
     pub fn withdraw(&mut self, reason: WithdrawReason) -> Flush {
-        let st = self.shadow.state(0);
-        let now = self.core.last_activity.unwrap_or_default();
-        self.core.end(Why::Lifecycle(reason), Some(&st), now);
-        self.report(&st, now);
-        self.retract_flush(&st, now)
+        let Overlay { shadow, o } = self;
+        let st = Shadow::new(&**shadow);
+        let now = o.core.last_activity.unwrap_or_default();
+        o.core.end(Why::Lifecycle(reason), Some(&st), now);
+        o.report(&st, now);
+        o.retract_flush(&st, now)
     }
 
     /// A snapshot is about to be written (attach, catch-up, `want_snapshot`, a repaint): the
@@ -940,16 +1002,17 @@ impl Overlay {
     /// boundary: no epoch survives it (rule 3). What was written is classified once the snapshot
     /// has landed. The snapshot clears the screen, so nothing is erased first; a pinned status is
     /// drawn again after it. The PTY mode is kept.
-    pub fn reset(&mut self, shadow: Box<dyn Emulator>, now: Time) {
-        self.shadow = shadow;
-        self.tracker = Tracker::new();
-        self.on_screen = None;
-        self.core.snapshot(now);
-        if self.cfg.guards.snapshot {
-            self.predictor.reset();
+    pub fn reset(&mut self, fresh: Box<dyn Emulator>, now: Time) {
+        let Overlay { shadow, o } = self;
+        *shadow = fresh;
+        o.tracker = Tracker::new();
+        o.on_screen = None;
+        o.core.snapshot(now);
+        if o.cfg.guards.snapshot {
+            o.predictor.reset();
         }
-        let st = self.shadow.state(0);
-        self.report(&st, now);
+        let st = Shadow::new(&**shadow);
+        o.report(&st, now);
     }
 
     /// A fresh attach (after a take-back) rebases the input offsets to 0 (DESIGN.md §8.5): forget
@@ -957,27 +1020,28 @@ impl Overlay {
     /// [`Overlay::reset`] when the new attach's input starts again at 0 (E1a). Without it an old
     /// attach's acknowledgement would satisfy the prior-ack rule for the new one's keys.
     pub fn rebase_input(&mut self) {
-        self.input_end = 0;
-        self.in_paste = false;
-        self.paste_until = None;
-        self.decoder.clear();
-        self.core.rebase_input();
+        self.o.input_end = 0;
+        self.o.in_paste = false;
+        self.o.paste_until = None;
+        self.o.decoder.clear();
+        self.o.core.rebase_input();
     }
 
     /// Shows, replaces or (with `None`) removes the pinned [`Status`]. Returns what to write to
     /// the terminal: only the difference from what is already drawn.
     pub fn set_status(&mut self, status: Option<Status>) -> Flush {
-        if self.status == status && (status.is_none() || self.on_screen.is_some()) {
+        let Overlay { shadow, o } = self;
+        if o.status == status && (status.is_none() || o.on_screen.is_some()) {
             return Flush::default();
         }
-        if status.is_none() && !self.trusted && std::mem::take(&mut self.status_on_untrusted) {
+        if status.is_none() && !o.trusted && std::mem::take(&mut o.status_on_untrusted) {
             // A status drawn on an untrusted screen is gone: the screen under it needs a repaint.
-            self.repaint_wanted = true;
+            o.repaint_wanted = true;
         }
-        self.status = status;
-        let st = self.shadow.state(0);
-        let now = self.core.last_activity.unwrap_or_default();
-        self.flush_paint(&st, now)
+        o.status = status;
+        let st = Shadow::new(&**shadow);
+        let now = o.core.last_activity.unwrap_or_default();
+        o.flush_paint(&st, now)
     }
 
     /// The user's terminal changed size. Best effort: the erase runs against the old
@@ -985,34 +1049,46 @@ impl Overlay {
     /// withdrawn, and the screen is untrusted until a snapshot at the new size lands (rule 9). A
     /// pinned [`Status`] is redrawn at the new size.
     pub fn resize(&mut self, size: Size) -> Flush {
-        let drawn = self.on_screen.is_some();
-        let st = self.shadow.state(0);
-        let now = self.core.last_activity.unwrap_or_default();
+        let Overlay { shadow, o } = self;
+        let drawn = o.on_screen.is_some();
+        let st = Shadow::new(&**shadow);
+        let now = o.core.last_activity.unwrap_or_default();
         // Output since the last key is checked before the new geometry becomes the baseline.
-        self.core.sync(&st, now);
-        self.core.withdraw_all(WithdrawReason::Resize, &st, now);
-        self.report(&st, now);
-        let mut f = self.new_flush();
-        f.erase = self.apply(None);
-        self.shadow.resize(size);
-        self.size = size;
-        if self.cfg.guards.untrusted {
-            self.trusted = false;
+        o.core.sync(&st, now);
+        o.core.withdraw_all(WithdrawReason::Resize, &st, now);
+        o.report(&st, now);
+        let mut f = o.new_flush();
+        f.erase = o.apply(None);
+        drop(st);
+        shadow.resize(size);
+        o.size = size;
+        if o.cfg.guards.untrusted {
+            o.trusted = false;
             if drawn {
-                self.repaint_wanted = true;
+                o.repaint_wanted = true;
             }
         }
-        let st = self.shadow.state(0);
-        self.core.rebase(&st);
-        if self.status.is_some() {
-            f.paint = self.paint(&st, now);
+        let st = Shadow::new(&**shadow);
+        o.core.rebase(&st);
+        if o.status.is_some() {
+            f.paint = o.paint(&st, now);
         }
         f
     }
+}
 
+impl Inner {
     // ---- internals ------------------------------------------------------------------
 
-    fn ctx<'a>(&self, st: &'a TermState, now: Time) -> Ctx<'a> {
+    fn classify_deferred_now(&mut self, shadow: &dyn Emulator, now: Time) {
+        if self.core.has_deferred() {
+            let st = Shadow::new(shadow);
+            self.core.classify_deferred(&st, now);
+            self.report(&st, now);
+        }
+    }
+
+    fn ctx<'a>(&self, st: &'a Shadow<'_>, now: Time) -> Ctx<'a> {
         Ctx {
             screen: st,
             link: self.link,
@@ -1022,24 +1098,24 @@ impl Overlay {
     }
 
     /// Tells the core whether the predictor shows anything now (`quiet_boundaries`).
-    fn hidden(&mut self, st: &TermState, now: Time) {
+    fn hidden(&mut self, st: &Shadow<'_>, now: Time) {
         self.core.hidden = self.predictor.show(&self.ctx(st, now)) == Show::Hide;
     }
 
     /// Tells the predictor what the core settled.
-    fn report(&mut self, st: &TermState, now: Time) {
+    fn report(&mut self, st: &Shadow<'_>, now: Time) {
         if !self.core.settled.is_empty() {
             let settled = std::mem::take(&mut self.core.settled);
             self.predictor.on_settled(&settled, &self.ctx(st, now));
         }
     }
 
-    fn prediction_allowed(&self, st: &TermState) -> bool {
+    fn prediction_allowed(&self, st: &Shadow<'_>) -> bool {
         let g = &self.cfg.guards;
         if g.password && self.pty.is_password() {
             return false;
         }
-        if g.alt_screen && st.modes.alt_screen && !self.predictor.wants_alt_screen() {
+        if g.alt_screen && st.modes().alt_screen && !self.predictor.wants_alt_screen() {
             return false;
         }
         true
@@ -1057,7 +1133,7 @@ impl Overlay {
         }
     }
 
-    fn flush_paint(&mut self, st: &TermState, now: Time) -> Flush {
+    fn flush_paint(&mut self, st: &Shadow<'_>, now: Time) -> Flush {
         let mut f = self.new_flush();
         // `paint` diffs against what is on screen, so one pass both retracts and draws.
         f.paint = self.paint(st, now);
@@ -1066,7 +1142,7 @@ impl Overlay {
 
     /// As [`Overlay::flush_paint`], after a retraction: when nothing is left drawn, the bytes
     /// are the erase (as M0's retraction wrote them).
-    fn retract_flush(&mut self, st: &TermState, now: Time) -> Flush {
+    fn retract_flush(&mut self, st: &Shadow<'_>, now: Time) -> Flush {
         let mut f = self.flush_paint(st, now);
         if self.on_screen.is_none() {
             f.erase = std::mem::take(&mut f.paint);
@@ -1075,15 +1151,16 @@ impl Overlay {
     }
 
     /// Why painting is unsafe right now, if it is.
-    fn gate(&self, st: &TermState) -> Option<&'static str> {
+    fn gate(&self, st: &Shadow<'_>) -> Option<&'static str> {
         let g = &self.cfg.guards;
-        if st.size.cols < 3 || st.size.rows < 1 {
+        let size = st.size();
+        if size.cols < 3 || size.rows < 1 {
             return Some("tiny screen");
         }
-        if g.pending_wrap && st.cursor.pending_wrap {
+        if g.pending_wrap && st.cursor().pending_wrap {
             return Some("pending wrap");
         }
-        if g.insert && st.modes.insert {
+        if g.insert && st.modes().insert {
             return Some("insert mode");
         }
         // A backend that does not implement origin mode or DECAWM (vt100) has a shadow that
@@ -1113,15 +1190,12 @@ impl Overlay {
         None
     }
 
-    fn cell_ok(&self, st: &TermState, row: u16, col: u16, ch: char) -> bool {
+    fn cell_ok(&self, st: &Shadow<'_>, row: u16, col: u16, ch: char) -> bool {
         let g = &self.cfg.guards;
-        let Some(line) = st.screen.get(usize::from(row)) else {
+        let Some(cell) = st.cell(row, col) else {
             return false;
         };
-        let Some(cell) = line.cells.get(usize::from(col)) else {
-            return false;
-        };
-        if g.last_column && usize::from(col) + 2 > line.cells.len() {
+        if g.last_column && usize::from(col) + 2 > usize::from(st.size().cols) {
             return false;
         }
         if g.wide && (cell.width != 1 || !predictable(ch)) {
@@ -1132,11 +1206,13 @@ impl Overlay {
 
     /// The cells of the pinned status, placed and validated (see [`Status`]); empty if there is
     /// no status or nowhere safe to draw it.
-    fn status_cells(&self, st: &TermState) -> BTreeMap<(u16, u16), (char, CellStyle)> {
+    fn status_cells(&self, st: &Shadow<'_>) -> BTreeMap<(u16, u16), (char, CellStyle)> {
         let Some(s) = &self.status else {
             return BTreeMap::new();
         };
-        let (rows, cols) = (st.size.rows, st.size.cols);
+        let size = st.size();
+        let (rows, cols) = (size.rows, size.cols);
+        let cursor_row = st.cursor().row;
         if rows < 2 || cols < 3 || s.lines.is_empty() {
             return BTreeMap::new();
         }
@@ -1153,7 +1229,7 @@ impl Overlay {
             })
             .collect();
         let placement = match s.placement {
-            Placement::Auto if u32::from(st.cursor.row) * 2 < u32::from(rows) => Placement::Bottom,
+            Placement::Auto if u32::from(cursor_row) * 2 < u32::from(rows) => Placement::Bottom,
             Placement::Auto => Placement::Top,
             p => p,
         };
@@ -1168,7 +1244,7 @@ impl Overlay {
                     _ => 0,
                 };
                 let used = first..first + n as u16;
-                if used.contains(&st.cursor.row) {
+                if used.contains(&cursor_row) {
                     continue;
                 }
                 let mut cells = BTreeMap::new();
@@ -1192,7 +1268,7 @@ impl Overlay {
     }
 
     /// The guesses to draw now, in the predictor's style or less, and the cursor they leave.
-    fn guesses(&mut self, st: &TermState, now: Time) -> (Cells<Wanted>, Option<(u16, u16)>) {
+    fn guesses(&mut self, st: &Shadow<'_>, now: Time) -> (Cells<Wanted>, Option<(u16, u16)>) {
         if !self.prediction_allowed(st) {
             return (BTreeMap::new(), None);
         }
@@ -1212,12 +1288,12 @@ impl Overlay {
         }
         let cells = cells.into_iter().map(|(p, ch)| (p, (ch, style))).collect();
         // The cursor the latest written guess leaves; in the last column it stays there.
-        let cursor = cursor.map(|(r, c)| (r, c.min(st.size.cols.saturating_sub(1))));
+        let cursor = cursor.map(|(r, c)| (r, c.min(st.size().cols.saturating_sub(1))));
         (cells, cursor)
     }
 
     /// The validated plan for what to show, or `None` to show nothing.
-    fn plan(&mut self, st: &TermState, now: Time) -> Option<Plan> {
+    fn plan(&mut self, st: &Shadow<'_>, now: Time) -> Option<Plan> {
         if self.gate(st).is_some() {
             return None;
         }
@@ -1228,13 +1304,15 @@ impl Overlay {
             self.status_on_untrusted = true;
         }
         want.extend(status);
-        let origin = self.tracker.origin() || st.modes.origin;
-        let region = st.modes.scroll_region;
+        let modes = st.modes();
+        let origin = self.tracker.origin() || modes.origin;
+        let region = modes.scroll_region;
+        let cur = st.cursor();
         let ctx = RestoreCtx {
-            row: st.cursor.row,
-            col: st.cursor.col,
-            pen: st.cursor.pen,
-            visible: st.cursor.visible,
+            row: cur.row,
+            col: cur.col,
+            pen: cur.pen,
+            visible: cur.visible,
             origin: origin && self.cfg.guards.origin,
             region_top: region.map_or(0, |(t, _)| t),
             link: self.tracker.link().cloned(),
@@ -1246,21 +1324,21 @@ impl Overlay {
                 continue;
             }
             any_guess |= style != CellStyle::Reverse;
-            let cell = &st.screen[usize::from(row)].cells[usize::from(col)];
-            let link = cell
-                .hyperlink
-                .and_then(|i| st.hyperlinks.get(i as usize))
-                .map(|h| Link {
-                    params: h.id.as_ref().map(|i| format!("id={i}")).unwrap_or_default(),
-                    uri: h.uri.clone(),
-                });
+            // `cell_ok` found the cell on the screen.
+            let Some(cell) = st.cell(row, col) else {
+                continue;
+            };
+            let link = st.screen.hyperlink(row, col).map(|h| Link {
+                params: h.id.map(|i| format!("id={i}")).unwrap_or_default(),
+                uri: h.uri,
+            });
             cells.insert(
                 (row, col),
                 Shown {
                     ch,
                     style,
                     orig: Restore {
-                        text: cell.text.clone(),
+                        text: cell.text.to_owned(),
                         attrs: cell.attrs,
                         link,
                     },
@@ -1272,16 +1350,15 @@ impl Overlay {
         }
         let cursor = match guess_cursor {
             Some(c) if any_guess => c,
-            _ => (st.cursor.row, st.cursor.col),
+            _ => (cur.row, cur.col),
         };
         let (crow, ccol) = cursor;
-        let line = st.screen.get(usize::from(crow))?;
-        let under = line.cells.get(usize::from(ccol))?;
+        let under = st.cell(crow, ccol)?;
         if under.width == 0 {
             return None; // the second half of a wide character
         }
         if origin {
-            let (top, bottom) = region.unwrap_or((0, st.size.rows - 1));
+            let (top, bottom) = region.unwrap_or((0, st.size().rows - 1));
             if crow < top || crow > bottom {
                 return None; // not addressable with DECOM on
             }
@@ -1289,7 +1366,7 @@ impl Overlay {
         Some(Plan { cells, cursor, ctx })
     }
 
-    fn paint(&mut self, st: &TermState, now: Time) -> Vec<u8> {
+    fn paint(&mut self, st: &Shadow<'_>, now: Time) -> Vec<u8> {
         let plan = self.plan(st, now);
         let bytes = self.apply(plan);
         if let Some(os) = &self.on_screen {

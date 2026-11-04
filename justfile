@@ -170,9 +170,11 @@ predict-e2e *args:
 predict-demo *args:
     cargo run --release -p fil-predict --features harness --example predict_demo -- {{args}}
 
-# Scripted prediction scenarios at scale (no PTY): many seeds, release build.
+# Scripted prediction scenarios at scale (no PTY): many seeds, release build. Also the shadow's row
+# stamps against a byte-by-byte reference (crates/fil-predict/tests/screen_view.rs).
 predict-soak seeds="200":
     FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim
+    FIL_STAMP_SEEDS={{seeds}} cargo test --release -p fil-predict --test screen_view every_row
 
 # Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
 predict-mutants:

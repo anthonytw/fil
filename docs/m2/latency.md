@@ -115,7 +115,7 @@ Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-
 1. Build the client and the probe in separate invocations (the `fil` that is used must not have the test hooks, `just no-test-hooks target/release/fil`):
 
    ```bash
-   cargo build --release -p fil --bins
+   cargo build --release -p fil-shell --bins
    just no-test-hooks target/release/fil
    cargo build --release -p fil-testbins --bin keyprobe
    ```

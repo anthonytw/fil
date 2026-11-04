@@ -34,7 +34,7 @@ export RUSTFLAGS
 cd "$ROOT"
 log "cross $(cross --version | head -n 1 | tr '\n' ' ')for $target; image $(cross_image "$target")"
 log "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH RUSTFLAGS=$RUSTFLAGS"
-cross build --locked --release -p fil --target "$target"
+cross build --locked --release -p fil-shell --target "$target"
 
 bin=$CARGO_TARGET_DIR/$target/release/fil
 [ -f "$bin" ] || die "cross did not produce $bin"

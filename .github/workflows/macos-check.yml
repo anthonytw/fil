@@ -95,7 +95,7 @@ jobs:
       - name: The release binary has no test hooks
         if: ${{ !cancelled() }}
         run: |
-          cargo build --release -p fil --bins
+          cargo build --release -p fil-shell --bins
           just no-test-hooks target/release/fil
           target/release/fil --version
       - name: Client terminal tests (raw mode, signals and window size on a macOS PTY)

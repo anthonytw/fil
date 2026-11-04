@@ -16,7 +16,7 @@ esac
 TARGET_DIR=${CARGO_TARGET_DIR:-$REPO_ROOT/target}
 
 log "building fil and fil-testbins for $TARGET"
-(cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil -p fil-testbins)
+(cd "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" -p fil-shell -p fil-testbins)
 
 mkdir -p "$BIN_DIR"
 for b in fil pipe-echo pipe-probe quic-echo quiclink-probe ptydrive sockprobe fwdprobe keyprobe; do

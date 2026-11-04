@@ -25,7 +25,7 @@ clippy:
 # Default-feature build of `fil`, as released. The other recipes use --all-features, which also
 # compiles the vt100 backend and the test hooks; this proves `fil` builds without them.
 check-default:
-    cargo check -p fil
+    cargo check -p fil-shell
 
 # The vt100 emulator backend must stay out of the release binary (only alacritty ships; DESIGN.md
 # §6.5). `cargo tree -i` exits 0 even when it prints "nothing to print" to stderr, so test its
@@ -33,13 +33,13 @@ check-default:
 release-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=$(cargo tree -q -p fil -e normal,build --target all -i vt100)
+    out=$(cargo tree -q -p fil-shell -e normal,build --target all -i vt100)
     test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
     # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
     # production fil must never honor an environment variable that changes what wire it speaks.
     # fil-forward is checked once fil depends on it (until then `cargo tree -i` finds no such package).
     for c in fil-proto fil-daemon fil-transport fil-session fil-forward; do
-      if ! tree=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" 2>&1); then
+      if ! tree=$(cargo tree -q -p fil-shell -e normal,build,features --target all -i "$c" 2>&1); then
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
@@ -238,7 +238,7 @@ local transport="pipe" session=("local-" + transport):
       pipe | auto | direct) ;;
       *) echo "usage: just local [pipe|auto|direct] [session]" >&2; exit 2 ;;
     esac
-    cargo build -q -p fil
+    cargo build -q -p fil-shell
     mkdir -p target/local
     config=target/local/config-{{transport}}.toml
     {
@@ -254,8 +254,8 @@ local transport="pipe" session=("local-" + transport):
 # installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
 # Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
 pi-e2e *args:
-    cargo build --release -p fil --bins
-    cargo build --release -p fil --example pi_e2e
+    cargo build --release -p fil-shell --bins
+    cargo build --release -p fil-shell --example pi_e2e
     just no-test-hooks "{{target_dir}}/release/fil"
     "{{target_dir}}/release/examples/pi_e2e" {{args}}
 
@@ -268,8 +268,8 @@ pi-e2e *args:
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
 # this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
 dropin *args:
-    cargo build -q --release -p fil --bins
-    cargo build -q --release -p fil --example dropin
+    cargo build -q --release -p fil-shell --bins
+    cargo build -q --release -p fil-shell --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
     cargo build -q --release -p fil-testbins --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
@@ -282,14 +282,14 @@ dropin *args:
 # `fil` daemon of its own and refuses to run beside one of yours (tests/macos/remote.sh). macOS
 # only; never part of `ci`. `fil` is built in an invocation of its own, so it has no test hooks.
 macos-remote *args:
-    cargo build -q --release -p fil --bins
+    cargo build -q --release -p fil-shell --bins
     cargo build -q --release -p fil-testbins --bin ptydrive --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil"
     FIL_BIN_DIR="{{target_dir}}/release" tests/macos/remote.sh {{args}}
 
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil
-# that is installed or released. Building an example or a test with `-p fil` unifies the dev-
+# that is installed or released. Building an example or a test with `-p fil-shell` unifies the dev-
 # dependencies' `test-hooks` features into every target of that invocation, which is why the
 # recipes that install `target/release/fil` build the binary in an invocation of its own.
 no-test-hooks +binaries:
@@ -303,7 +303,7 @@ no-test-hooks +binaries:
       grep -aq 'FIL_TEST_' "$b" || rc=$?
       case $rc in
         0)
-          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
+          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil-shell --bins'" >&2
           exit 1
           ;;
         1) ;;
@@ -380,7 +380,7 @@ reserve-crate-names *args:
 about_version := "0.9.3"
 
 # THIRD-PARTY-NOTICES.md is current: re-rendered from about.hbs and about.toml for the release graph
-# (`-p fil`, default features, normal and build edges, the four release targets of about.toml), it
+# (`-p fil-shell`, default features, normal and build edges, the four release targets of about.toml), it
 # is byte for byte the committed file. Fails if a crate in that graph has a license outside the
 # allowed list, if about.toml's list is not deny.toml's, if cargo-about warns (a clarify checksum
 # that no longer matches) or falls back to a template text ("<year> <copyright holders>"), if a
@@ -429,6 +429,11 @@ _notices mode:
       echo "notices: cargo-about warned (a [CRATE.clarify] in about.toml that no longer matches its file?); fix it before rendering" >&2
       exit 1
     fi
+    # The workspace's published crates are in cargo-about's data (about.toml, [private]); about.hbs
+    # leaves out each crate and license entry without a registry source. That is exact only if no
+    # license entry, and no license kind, holds both workspace crates and registry crates.
+    cargo about generate --frozen --format json -m crates/fil/Cargo.toml -c about.toml -o "$scratch/about.json" 2> /dev/null
+    python3 -I tests/release/notice_workspace.py "$scratch/about.json"
     # A license file it does not recognize gets the canonical text, with its template fields.
     if grep -nE '<year>|<copyright holders>|<owner>|<name of author>' "$scratch/raw.md" > "$scratch/placeholders"; then
       echo "notices: a license text is a template, not the crate's own notice (add a [CRATE.clarify] to about.toml):" >&2
@@ -452,7 +457,7 @@ _notices mode:
     sed -n '/^| Crate | Version | License |$/,/^$/p' "$scratch/notices.md" | tail -n +3 | awk -F' [|] ' 'NF >= 3 { sub(/^[|] /, "", $1); print $1 " v" $2 }' | LC_ALL=C sort -u > "$scratch/listed"
     tflags=$(for t in $targets; do printf -- '--target %s ' "$t"; done)
     # shellcheck disable=SC2086
-    cargo tree -q --locked -p fil -e normal,build $tflags --prefix none --format '{p}' | grep -v ' (/' | sed -E 's/( \((\*|proc-macro)\))+$//' | sed '/^$/d' | LC_ALL=C sort -u > "$scratch/graph"
+    cargo tree -q --locked -p fil-shell -e normal,build $tflags --prefix none --format '{p}' | grep -v ' (/' | sed -E 's/( \((\*|proc-macro)\))+$//' | sed '/^$/d' | LC_ALL=C sort -u > "$scratch/graph"
     if [[ ! -s "$scratch/graph" ]] || ! diff "$scratch/graph" "$scratch/listed" > "$scratch/cover.diff"; then
       echo "notices: the notices' crates are not the release graph's (< cargo tree, > notices):" >&2
       cat "$scratch/cover.diff" >&2

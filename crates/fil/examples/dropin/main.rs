@@ -578,7 +578,7 @@ fn main() {
     }
     let fil = std::fs::canonicalize(&fil).unwrap_or_else(|_| {
         eprintln!(
-            "no fil client at {}: run `cargo build --release -p fil`",
+            "no fil client at {}: run `cargo build --release -p fil-shell`",
             fil.display()
         );
         std::process::exit(2);

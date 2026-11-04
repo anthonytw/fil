@@ -1,7 +1,7 @@
 //! `fil ports` rendering (`fil::ports_view`): a golden for a fixed answer, the JSON layout, and
 //! that nothing the host says reaches the terminal as anything but inert text.
 //!
-//! Regenerate the goldens with `FIL_UPDATE_GOLDEN=1 cargo test -p fil --test ports_view` and
+//! Regenerate the goldens with `FIL_UPDATE_GOLDEN=1 cargo test -p fil-shell --test ports_view` and
 //! read the diff.
 
 use std::net::IpAddr;

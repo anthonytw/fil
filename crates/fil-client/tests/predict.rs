@@ -894,3 +894,33 @@ async fn keys_after_the_exit_status_are_not_predicted() {
         "keys after the exit reached the predictor"
     );
 }
+
+/// While a catch-up is on its way the core writes nothing, not only what it had written: output
+/// below the snapshot's point is still applied as it arrives, and here a daemon that lies puts an
+/// "echo" of a key typed after the announcement there, which would confirm a new epoch.
+#[tokio::test(start_paused = true)]
+async fn the_screen_stays_untrusted_until_the_catch_up_lands() {
+    let (rig, _) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.daemon.set_echo(Echo::Off).await;
+    // Output below the snapshot's point, not sent yet: two bytes the daemon will "send" later.
+    let below = rig.daemon.output_end().await;
+    rig.daemon.output_unsent(b"  ").await;
+    let (_, bytes) = rig.daemon.catch_up_staged(b"\r\nPassword: ", None).await;
+    settle().await;
+    rig.type_str("c");
+    settle().await;
+    rig.daemon.send_segment(below, b"c").await;
+    settle().await;
+    let from = rig.term.writes().len();
+    rig.type_str("d");
+    settle().await;
+    assert_eq!(
+        drawn_since(&rig, from),
+        0,
+        "a guess written while the catch-up was on its way"
+    );
+    rig.daemon.send_snapshot(&bytes).await;
+    settle().await;
+}

@@ -1758,6 +1758,22 @@ impl FakeDaemon {
         (info, bytes)
     }
 
+    /// Sends `data` as a terminal segment at `seq`, whatever the log holds there: a daemon that
+    /// lies about its output.
+    pub async fn send_segment(&self, seq: u64, data: &[u8]) {
+        let st = self.st.lock().await;
+        if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+            let seg = Segment {
+                seq,
+                data: data.to_vec(),
+            };
+            let _ = c
+                .link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
     /// Sends a staged catch-up's announcement.
     pub async fn announce(&self, info: SnapshotInfo) {
         let st = self.st.lock().await;

@@ -2053,7 +2053,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             (false, None) => Some(Instant::now()),
             (false, since) => since,
         };
-        if opened && Self::repaint_at(conn).is_none() {
+        if opened && conn.snap.is_none() {
             // Data past a gap: a catch-up whose announcement has not arrived yet (QUIC). The skip
             // is coming; hold the guesses now.
             self.hold_for_skip()?;

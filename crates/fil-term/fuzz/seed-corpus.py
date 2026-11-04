@@ -11,8 +11,8 @@ import shutil
 here = pathlib.Path(__file__).resolve().parent
 fixtures = here.parent / "tests" / "fixtures"
 out = here / "seeds" / "emulator"
-if out.parent.exists():
-    shutil.rmtree(out.parent)
+if out.exists():
+    shutil.rmtree(out)
 out.mkdir(parents=True)
 
 for raw in sorted(fixtures.glob("*.raw")):

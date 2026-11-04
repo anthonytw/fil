@@ -3,7 +3,7 @@
 //! what it skipped, then the magic line, then the rest.
 //!
 //! The first byte picks the piece size; the one after it picks the scanner's limit (0 means the
-//! default, so a long skip is reachable too).
+//! default of 64 KiB, so a long skip is reachable too: `just fuzz` passes `-max_len` above it).
 
 #![no_main]
 

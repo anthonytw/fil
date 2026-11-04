@@ -73,7 +73,7 @@ mux-soak seeds="5000":
 # flags are nightly-only) and cargo-fuzz:
 #   rustup toolchain install nightly --profile minimal && cargo install cargo-fuzz --locked
 # Not part of `ci`: the fuzz crates are workspaces of their own (crates/*/fuzz) that the stable build
-# never sees; `fuzz-deny` (run first) holds them to the same licence policy. `just fuzz` alone lists the targets. The seeds are committed (fuzz/seeds/TARGET); what
+# never sees; `fuzz-deny` (run first) holds them to the same license policy. `just fuzz` alone lists the targets. The seeds are committed (fuzz/seeds/TARGET); what
 # the run finds goes to the git-ignored fuzz/corpus/TARGET, a crash to fuzz/artifacts/TARGET. To
 # replay a crash on stable: put its bytes in a regression test of the owning crate.
 fuzz target="" seconds="60":
@@ -97,19 +97,26 @@ fuzz target="" seconds="60":
     if ! cargo fuzz --version >/dev/null 2>&1; then
       echo "fuzz: needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1
     fi
+    if ! cargo deny --version >/dev/null 2>&1; then
+      echo "fuzz: needs cargo-deny (for fuzz-deny): cargo install cargo-deny --locked" >&2; exit 1
+    fi
     just fuzz-deny
     cd "$crate"
     dirs=("fuzz/corpus/{{target}}")
     if [[ -d "fuzz/seeds/{{target}}" ]]; then dirs+=("fuzz/seeds/{{target}}"); fi
     mkdir -p "fuzz/corpus/{{target}}"
-    # -timeout: an input that takes 20 s is a hang, which is a bug; -max_len: past a frame's body limit.
+    # -timeout: an input that takes 20 s is a hang, which is a bug. -max_len: past a frame's body
+    # limit (16 KiB), and for the preamble scanner past its default skip limit (64 KiB).
+    max_len=17000
+    if [[ "{{target}}" == preamble ]]; then max_len=70000; fi
     # The sshd target makes a scratch directory in $TMPDIR; give it one to throw away.
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' EXIT
-    TMPDIR=$scratch cargo +nightly fuzz run "{{target}}" "${dirs[@]}" -- -max_total_time={{seconds}} -timeout=20 -max_len=17000
+    TMPDIR=$scratch cargo +nightly fuzz run "{{target}}" "${dirs[@]}" -- -max_total_time={{seconds}} -timeout=20 -max_len=$max_len
 
-# The licence, ban and source policy (deny.toml) on each fuzz crate, which `deny` does not see (they
+# The license, ban and source policy (deny.toml) on each fuzz crate, which `deny` does not see (they
 # are workspaces of their own). The advisory database is not consulted: the fuzz crates ship nothing.
+# Resolving a fuzz crate that has no lock file yet needs network access (the registry index).
 fuzz-deny:
     #!/usr/bin/env bash
     set -euo pipefail

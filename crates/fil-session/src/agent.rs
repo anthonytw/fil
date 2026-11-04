@@ -1,4 +1,4 @@
-//! The session's agent socket (DESIGN.md section 10, `docs/m2/plan.md` A1): the stable
+//! The session's agent socket (DESIGN.md section 10): the stable
 //! `SSH_AUTH_SOCK` of the session, `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock` (the daemon
 //! picks it), whose connections the daemon relays to the attached client's agent over `Agent`
 //! channels.

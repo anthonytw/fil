@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `remote_peers = "same-user"` on the real network (OD-9, docs/m2/plan.md section 4.2): the real
+# `remote_peers = "same-user"` on the real network (OD-9, DESIGN.md §7.2): the real
 # daemon, configured with `[forward] remote_peers = "same-user"` in its daemon.toml, looks each
 # -R connection's peer up in the real /proc/net/tcp and resets one from another Unix user before
 # a byte reaches the client. Sourced by udp.sh, whose topology it runs in (the -R port is on the

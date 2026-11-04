@@ -97,7 +97,7 @@ pub enum ForwardFailure {
     Exit,
 }
 
-/// The forwards of one run (DESIGN.md section 7, `docs/m2/plan.md` F3).
+/// The forwards of one run (DESIGN.md section 7).
 ///
 /// - `specs` are this run's own (its command line and config): the only forwards the client
 ///   sets up without asking, and the only ones that may bind beyond loopback or aim `-R` beyond

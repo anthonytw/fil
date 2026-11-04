@@ -1,5 +1,5 @@
 //! fil-forward: port forwards and the agent relay above the link (DESIGN.md sections 7, 8.5 and
-//! 10; `docs/m2/plan.md`, package F1).
+//! 10).
 //!
 //! - [`Endpoint`]: the async actor that drives [`fil_proto::mux::Mux`] for either side over the
 //!   current [`fil_transport::Link`], with a pump per forwarded connection, listeners, the

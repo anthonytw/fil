@@ -709,7 +709,7 @@ pub struct PortsPart {
 }
 
 /// Why a `fil ports` answer may be missing listeners. A reason only: no counts, paths or other
-/// data (M2 plan section 4.4).
+/// data (DESIGN.md section 11.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortsIncomplete {
     /// The host's socket table could not be read (no `/proc/net/tcp`: a `/proc` mounted with

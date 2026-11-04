@@ -73,7 +73,7 @@ mux-soak seeds="5000":
 # flags are nightly-only) and cargo-fuzz:
 #   rustup toolchain install nightly --profile minimal && cargo install cargo-fuzz --locked
 # Not part of `ci`: the fuzz crates are workspaces of their own (crates/*/fuzz) that the stable build
-# never sees. `just fuzz` alone lists the targets. The seeds are committed (fuzz/seeds/TARGET); what
+# never sees; `fuzz-deny` (run first) holds them to the same licence policy. `just fuzz` alone lists the targets. The seeds are committed (fuzz/seeds/TARGET); what
 # the run finds goes to the git-ignored fuzz/corpus/TARGET, a crash to fuzz/artifacts/TARGET. To
 # replay a crash on stable: put its bytes in a regression test of the owning crate.
 fuzz target="" seconds="60":
@@ -97,6 +97,7 @@ fuzz target="" seconds="60":
     if ! cargo fuzz --version >/dev/null 2>&1; then
       echo "fuzz: needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1
     fi
+    just fuzz-deny
     cd "$crate"
     dirs=("fuzz/corpus/{{target}}")
     if [[ -d "fuzz/seeds/{{target}}" ]]; then dirs+=("fuzz/seeds/{{target}}"); fi
@@ -106,6 +107,16 @@ fuzz target="" seconds="60":
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' EXIT
     TMPDIR=$scratch cargo +nightly fuzz run "{{target}}" "${dirs[@]}" -- -max_total_time={{seconds}} -timeout=20 -max_len=17000
+
+# The licence, ban and source policy (deny.toml) on each fuzz crate, which `deny` does not see (they
+# are workspaces of their own). The advisory database is not consulted: the fuzz crates ship nothing.
+fuzz-deny:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{source_directory()}}"
+    for m in crates/*/fuzz/Cargo.toml; do
+      cargo deny --manifest-path "$m" check licenses bans sources
+    done
 
 # The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
 # forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same

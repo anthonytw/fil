@@ -17,9 +17,14 @@ fuzz_target!(|data: &[u8]| {
         // The encoding is canonical: encoding the re-decoded message gives the same bytes.
         assert_eq!(back.encode().unwrap(), wire);
         let _ = msg.to_frame();
-        // `hello_of` reads the canonical encoding only, and postcard's decoder also takes a
-        // variant index or a length written in more bytes than it needs (`80 00` for 0), so
-        // the two agree on `wire` and not necessarily on `data`.
+        // The relaxed assertion, on purpose. `hello_of` (the relay's frozen reader) takes the
+        // canonical encoding only, while postcard's decoder, and so `ControlMsg::decode`, also
+        // takes a variant index, length or integer written in more bytes than it needs (`80 00`
+        // for 0): `80 00 10 03 80 00` is a `Hello` to one and not to the other. Honest builds
+        // never send such bytes. Rejecting them in `ControlMsg::decode` is a decoder rule, so a
+        // wire change (a `PROTOCOL_REVISION` bump); it is recorded for the pre-release sweep and
+        // the next revision bump. Until then the two readers are required to agree on the
+        // canonical `wire`, and on `data` only when it starts with the canonical index byte.
         if let ControlMsg::Hello(h) = &msg {
             assert_eq!(opening::hello_of(&wire).as_ref(), Some(h));
             if data[0] == 0 {

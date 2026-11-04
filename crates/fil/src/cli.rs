@@ -10,6 +10,8 @@
 //! fil forward [HOST [SESSION]] --rm [-L|-R|-D] PORT   remove one
 //! fil ports [HOST [SESSION]] [--json] [--probe]  listeners, forwards and the agent
 //! fil server --stdio                             the remote side of the pipe (not for people)
+//! fil install [--check|--remove] HOST            install fil on HOST (only with the gated
+//!                                                `install-bootstrap` feature, M4 OQ-1)
 //! ```
 //!
 //! With no HOST, `forward`, `ports` and `detach` talk to the daemon on this machine and work on
@@ -174,6 +176,32 @@ pub enum Command {
     Ports(PortsArgs),
     /// The remote side: run by the pipe command on the host, not by people
     Server(ServerArgs),
+    /// Install this fil on HOST over ssh, into ~/.local/share/fil (or check what is there, or
+    /// remove what fil installed)
+    #[cfg(feature = "install-bootstrap")]
+    Install(InstallArgs),
+}
+
+/// `fil install` (gated on M4 OQ-1: only with the `install-bootstrap` feature).
+#[cfg(feature = "install-bootstrap")]
+#[derive(Args, Debug)]
+pub struct InstallArgs {
+    /// The host: a name or alias for ssh, or user@name
+    #[arg(value_name = "HOST")]
+    pub host: String,
+
+    /// Show what is installed on HOST, and the fil on its PATH; change nothing
+    #[arg(long, conflicts_with_all = ["remove", "binary"])]
+    pub check: bool,
+
+    /// Remove the copies fil installed on HOST (not one in use by a running daemon)
+    #[arg(long, conflicts_with = "binary")]
+    pub remove: bool,
+
+    /// Upload this file instead of the bundled or this fil's own binary (it must be a release
+    /// build for the host)
+    #[arg(long, value_name = "FILE")]
+    pub binary: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -186,6 +214,16 @@ pub struct ServerArgs {
     /// Run the daemon in this process (started by the relay; not for people)
     #[arg(long, hide = true)]
     pub daemon: bool,
+
+    /// Finish an install the bootstrap received: check it, put it in place, collect old copies
+    /// (run by the bootstrap; not for people)
+    #[arg(long, hide = true, num_args = 3, value_names = ["DIR", "SHA256", "CREATED"])]
+    pub install_finish: Option<Vec<std::ffi::OsString>>,
+
+    /// Remove the copies fil installed here, except any a running daemon needs (run by the
+    /// bootstrap's `remove`; not for people)
+    #[arg(long, hide = true)]
+    pub install_gc: bool,
 }
 
 #[derive(Args, Debug)]
@@ -437,6 +475,16 @@ pub enum Action {
     },
     ServerStdio,
     ServerDaemon,
+    /// `fil server --install-finish DIR SHA256 CREATED`, as the bootstrap runs it.
+    ServerInstallFinish(Vec<std::ffi::OsString>),
+    /// `fil server --install-gc`.
+    ServerInstallGc,
+    /// `fil install` (gated on M4 OQ-1).
+    #[cfg(feature = "install-bootstrap")]
+    Install {
+        host: String,
+        request: crate::install::client::Request,
+    },
 }
 
 /// Where `fil forward` and `fil ports` reach the daemon.
@@ -502,6 +550,8 @@ impl Cli {
             Command::Forward(_) => "forward",
             Command::Ports(_) => "ports",
             Command::Server(_) => "server",
+            #[cfg(feature = "install-bootstrap")]
+            Command::Install(_) => "install",
         };
         Err(usage_error(
             name,
@@ -557,9 +607,28 @@ impl Cli {
             }),
             Some(Command::Server(s)) => Ok(if s.daemon {
                 Action::ServerDaemon
+            } else if let Some(args) = s.install_finish {
+                Action::ServerInstallFinish(args)
+            } else if s.install_gc {
+                Action::ServerInstallGc
             } else {
                 Action::ServerStdio
             }),
+            #[cfg(feature = "install-bootstrap")]
+            Some(Command::Install(i)) => {
+                use crate::install::client::Request;
+                let request = if i.check {
+                    Request::Check
+                } else if i.remove {
+                    Request::Remove
+                } else {
+                    Request::Install { binary: i.binary }
+                };
+                Ok(Action::Install {
+                    host: i.host,
+                    request,
+                })
+            }
             None => {
                 let a = self.attach;
                 let forwards = a.forwards();
@@ -1048,6 +1117,79 @@ mod tests {
         // Exactly one.
         assert!(parse(&["server"]).is_err());
         assert!(parse(&["server", "--stdio", "--daemon"]).is_err());
+    }
+
+    /// The two commands only the install bootstrap runs, spelled exactly as it spells them:
+    /// `--install-finish "$v" "$h" "$k1$k2$k3"` (the last may be empty) and a bare `--install-gc`.
+    #[test]
+    fn the_bootstraps_server_commands() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            action(&["server", "--install-finish", "0.1.0-w1.12", "ab", ""]),
+            Action::ServerInstallFinish(os(&["0.1.0-w1.12", "ab", ""]))
+        );
+        assert_eq!(
+            action(&["server", "--install-finish", "v", "h", "111"]),
+            Action::ServerInstallFinish(os(&["v", "h", "111"]))
+        );
+        assert_eq!(action(&["server", "--install-gc"]), Action::ServerInstallGc);
+        assert!(parse(&["server", "--install-finish", "v", "h"]).is_err());
+        assert!(parse(&["server", "--install-gc", "--stdio"]).is_err());
+        assert!(parse(&["server", "--install-gc", "x"]).is_err());
+        // Hidden: not for people.
+        let help = Cli::command()
+            .find_subcommand_mut("server")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !help.contains("Finish an install") && !help.contains("Remove the copies"),
+            "{help}"
+        );
+    }
+
+    /// The gate on M4 OQ-1: the code that sends the bootstrap is a feature that no default
+    /// build has. Flipping it on by default is the owner's decision, and changes this test.
+    #[test]
+    fn the_install_bootstrap_is_off_by_default() {
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default"))
+            .unwrap_or("");
+        assert!(!default.contains("install-bootstrap"), "{default}");
+        assert!(manifest.contains("install-bootstrap = [\"fil-transport/install-bootstrap\"]"));
+    }
+
+    #[cfg(feature = "install-bootstrap")]
+    #[test]
+    fn install_modes() {
+        use crate::install::client::Request;
+        let install = |args: &[&str]| match action(args) {
+            Action::Install { host, request } => (host, request),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            install(&["install", "devbox"]),
+            ("devbox".into(), Request::Install { binary: None })
+        );
+        assert_eq!(
+            install(&["install", "--binary", "/tmp/fil", "devbox"]),
+            (
+                "devbox".into(),
+                Request::Install {
+                    binary: Some("/tmp/fil".into())
+                }
+            )
+        );
+        assert_eq!(install(&["install", "--check", "devbox"]).1, Request::Check);
+        assert_eq!(
+            install(&["install", "--remove", "devbox"]).1,
+            Request::Remove
+        );
+        assert!(parse(&["install", "--check", "--remove", "devbox"]).is_err());
+        assert!(parse(&["install", "--remove", "--binary", "f", "devbox"]).is_err());
+        assert!(parse(&["install"]).is_err());
     }
 
     #[test]

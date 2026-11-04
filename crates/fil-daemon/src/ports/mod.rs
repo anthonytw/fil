@@ -33,6 +33,8 @@
 //! the sessions, forwards and agent rows, with no listeners and no probes.
 
 pub mod attribute;
+#[cfg(target_os = "linux")]
+mod diag;
 pub mod probe;
 pub mod procnet;
 
@@ -114,6 +116,16 @@ impl PortsQuery {
 /// `/proc` on Linux; `None` elsewhere (no discovery: macOS would need libproc).
 pub fn system_proc_root() -> Option<PathBuf> {
     cfg!(target_os = "linux").then(|| PathBuf::from("/proc"))
+}
+
+/// The lookup `remote_peers = "same-user"` uses: `/proc/net/tcp{,6}` on Linux
+/// ([`procnet::peer_owner`]); elsewhere one that never knows, so every `-R` connection is refused
+/// (strict).
+pub fn system_peer_owner() -> std::sync::Arc<dyn fil_session::peers::PeerOwner> {
+    match system_proc_root() {
+        Some(root) => std::sync::Arc::new(procnet::ProcPeers::new(root)),
+        None => std::sync::Arc::new(fil_session::peers::Unknown),
+    }
 }
 
 /// How far a listener's address reaches.
@@ -652,6 +664,7 @@ mod tests {
             probe: None,
             target_other_user: false,
             policy: None,
+            peers_refused: 0,
         }
     }
 

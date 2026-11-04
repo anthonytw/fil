@@ -832,7 +832,7 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
                     forward: ForwardId(1),
                 },
                 Box::new(acc),
-                LocalPeer::Tcp(peer),
+                LocalPeer::Tcp { peer, local: None },
             )
             .unwrap();
         assert_eq!(ch.0, 16);
@@ -879,7 +879,14 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
     })
     .await;
     match *w.client.policy.last_peer.lock().unwrap() {
-        Some(LocalPeer::Tcp(addr)) => assert!(addr.ip().is_loopback(), "{addr}"),
+        // The listener's accept gives both ends: the application's and the accepted socket's.
+        Some(LocalPeer::Tcp {
+            peer,
+            local: Some(local),
+        }) => {
+            assert!(peer.ip().is_loopback(), "{peer}");
+            assert_eq!(local.port(), port, "the accepted socket's own address");
+        }
         other => panic!("the policy saw {other:?}"),
     }
     *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);

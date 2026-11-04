@@ -121,6 +121,7 @@ impl SessionHandle {
             config.forward.clone(),
             agent_socket.clone(),
             config.policy.clone(),
+            config.remote_peers.clone(),
         );
         let fw = forwards.clone();
         // Deciding the scope may run `loginctl` and `systemd-run`, opening the PTY and starting

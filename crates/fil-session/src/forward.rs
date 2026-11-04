@@ -27,7 +27,9 @@
 //! that kind, and opens `Remote` channels only toward a subscriber that is attached or
 //! disconnected (never detached: refused at once) and consented to that entry in its own run
 //! (an entry from the client's own `AddForward`, or a `Consent { accepted: true }`). This is for
-//! the user's experience; the client's own check is the security boundary (section 7.2).
+//! the user's experience; the client's own check is the security boundary (section 7.2). With
+//! `remote_peers = "same-user"` an `-R` connection is also refused unless its peer socket is the
+//! daemon's uid's ([`crate::peers`]), after server policy, which still decides first.
 //!
 //! **Privacy** (section 11.1): targets, ports and addresses are user data. Nothing here logs them
 //! at any level; logs name the kind and the wire's enum reasons, at debug. `Debug` is counts only.
@@ -63,6 +65,7 @@ use tracing::debug;
 
 use crate::agent::{self, AgentSocket, Gate};
 use crate::core::{ConnEvent, ConnId};
+use crate::peers::RemotePeers;
 use crate::policy::ServerPolicy;
 
 /// Refusals by server policy a session keeps for `fil ports` (the newest; one per spec).
@@ -182,6 +185,9 @@ struct State {
     refused: VecDeque<(ForwardSpec, PolicyRefusal)>,
     /// The subscriber asked for the agent and server policy refused it.
     agent_refused: Option<PolicyRefusal>,
+    /// `-R` connections `remote_peers = "same-user"` refused, per entry (a count only: whose they
+    /// were is never kept).
+    peers_refused: HashMap<ForwardId, u32>,
 }
 
 impl State {
@@ -255,6 +261,7 @@ impl fmt::Debug for State {
             .field("consented", &self.consented.len())
             .field("agent", &self.agent)
             .field("blocked", &self.blocked.len())
+            .field("peers_refused", &self.peers_refused.values().sum::<u32>())
             .field("ended", &self.ended)
             .finish()
     }
@@ -304,6 +311,7 @@ impl Forwards {
         cfg: MuxConfig,
         agent_socket: Option<PathBuf>,
         policy: Arc<dyn ServerPolicy>,
+        remote_peers: RemotePeers,
     ) -> Arc<Self> {
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
@@ -320,11 +328,14 @@ impl Forwards {
             blocked: HashMap::new(),
             refused: VecDeque::new(),
             agent_refused: None,
+            peers_refused: HashMap::new(),
         }));
         #[cfg(feature = "test-hooks")]
         let gate = Arc::new(Mutex::new(None));
         let policy = Arc::new(SessionPolicy {
             st: st.clone(),
+            remote_peers,
+            uid: agent::our_uid(),
             #[cfg(feature = "test-hooks")]
             gate: gate.clone(),
         });
@@ -779,6 +790,7 @@ impl Forwards {
                     probe: None,
                     target_other_user: false,
                     policy: st.blocked.get(&e.id).cloned(),
+                    peers_refused: st.peers_refused.get(&e.id).copied().unwrap_or(0),
                 }
             })
             .collect()
@@ -804,6 +816,8 @@ impl Forwards {
                 self.ep.forget_stats(old);
             }
             st.consented.remove(&old);
+            st.blocked.remove(&old);
+            st.peers_refused.remove(&old);
             self.tell(st, MuxMsg::ForwardGone { id: old });
         }
         let e = st.table.get(id).cloned().expect("just added");
@@ -892,6 +906,7 @@ impl Forwards {
         st.listen.remove(&id);
         st.consented.remove(&id);
         st.blocked.remove(&id);
+        st.peers_refused.remove(&id);
         // Its open connections run until they close; then it has nothing left to count.
         self.ep.forget_stats(id);
         self.tell(st, MuxMsg::ForwardGone { id });
@@ -1057,6 +1072,10 @@ fn find_port(
 /// The daemon's checks (see the module docs).
 struct SessionPolicy {
     st: Shared,
+    /// Who may connect to the `-R` ports ([`crate::peers`]).
+    remote_peers: RemotePeers,
+    /// The daemon's uid, the one `same-user` admits.
+    uid: u32,
     /// Test hook: holds an `-R` accept right after its check passed (see
     /// [`Forwards::gate_outgoing`]).
     #[cfg(feature = "test-hooks")]
@@ -1089,8 +1108,9 @@ impl Policy for SessionPolicy {
         Ok(())
     }
 
-    /// `peer` is who connected: the seam for OD-9's `forward.remote_peers = "same-user"` (the
-    /// peer socket's owner, from `/proc/net/tcp`). The default, `any`, is ssh's: not checked.
+    /// `peer` is who connected. With `remote_peers = "same-user"` (OD-9, [`crate::peers`]) its
+    /// socket's owner must be the daemon's uid, looked up last, after the cheap checks and server
+    /// policy, and without the lock. The default, `any`, is ssh's: not checked.
     fn check_outgoing(&self, kind: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure> {
         let st = lock(&self.st);
         let forward = match kind {
@@ -1111,8 +1131,31 @@ impl Policy for SessionPolicy {
             return Err(OpenFailure::NotPermitted);
         }
         let mut st = st;
+        // Server policy first: `same-user` only ever narrows what it allows.
         st.still_allowed(*forward)?;
         drop(st);
+        if let RemotePeers::SameUser(owner) = &self.remote_peers {
+            let theirs = match *peer {
+                LocalPeer::Tcp {
+                    peer,
+                    local: Some(local),
+                } => owner.owner(peer, local),
+                _ => None,
+            };
+            if theirs != Some(self.uid) {
+                // Whose it was stays out of the log, and out of the count.
+                debug!(
+                    known = theirs.is_some(),
+                    "-R connection refused: its peer is not this user (remote_peers = same-user)"
+                );
+                let mut st = lock(&self.st);
+                if st.table.get(*forward).is_some() {
+                    let n = st.peers_refused.entry(*forward).or_default();
+                    *n = n.saturating_add(1);
+                }
+                return Err(OpenFailure::NotPermitted);
+            }
+        }
         #[cfg(feature = "test-hooks")]
         {
             let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone();

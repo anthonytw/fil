@@ -491,6 +491,14 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     if let Some(r) = &f.policy {
         detail.push(format!("⚠ refused by server policy: {r}"));
     }
+    if f.peers_refused > 0 {
+        // A count only: the daemon never says whose they were.
+        detail.push(format!(
+            "{} connection{} refused: not from your user on the host (remote_peers = same-user)",
+            f.peers_refused,
+            if f.peers_refused == 1 { "" } else { "s" }
+        ));
+    }
     if f.waiting > 0 {
         detail.push(format!(
             "{} connection{} waiting for the link",
@@ -810,6 +818,8 @@ struct JsonForward {
     target_other_user: bool,
     /// Server policy refuses this forward now: the deciding setting and its source.
     policy: Option<String>,
+    /// `-R` connections refused under `remote_peers = "same-user"` (a count only).
+    peers_refused: u32,
 }
 
 #[derive(Serialize)]
@@ -929,6 +939,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         probe: f.probe.as_ref().map(json_probe),
         target_other_user: f.target_other_user,
         policy: f.policy.as_ref().map(|r| r.to_string()),
+        peers_refused: f.peers_refused,
     }
 }
 

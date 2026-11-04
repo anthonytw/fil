@@ -47,14 +47,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use std::time::Duration;
-
 use fil_client::{OfflineInput, OfflineLog, parse_byte_size, parse_confirm};
-use fil_proto::limits::{
-    DEFAULT_FORWARD_BUFFER, FORWARD_BUDGET, LINGER, MAX_FORWARDS, MAX_HOST_LABEL, MIN_WINDOW,
-    OPEN_WAIT,
-};
-use fil_proto::mux::{ForwardSpec, MuxConfig, Window};
+use fil_proto::limits::{MAX_FORWARDS, MAX_HOST_LABEL};
+use fil_proto::mux::ForwardSpec;
 use fil_transport::path::TransportSetting;
 use serde::Deserialize;
 
@@ -174,38 +169,10 @@ pub enum ForwardFailure {
     Exit,
 }
 
-/// The `[defaults.forward]` tunables (`docs/m2/plan.md` section 2.9), checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForwardTunables {
-    pub window: Window,
-    pub buffer: usize,
-    pub open_wait: Duration,
-    pub linger: Duration,
-}
-
-impl Default for ForwardTunables {
-    fn default() -> Self {
-        Self {
-            window: Window::DEFAULT,
-            buffer: DEFAULT_FORWARD_BUFFER,
-            open_wait: OPEN_WAIT,
-            linger: LINGER,
-        }
-    }
-}
-
-impl ForwardTunables {
-    /// The MUX configuration with these tunables over the defaults.
-    pub fn mux_config(&self) -> MuxConfig {
-        MuxConfig {
-            window: self.window,
-            buffer: self.buffer,
-            open_wait: self.open_wait,
-            linger: self.linger,
-            ..MuxConfig::default()
-        }
-    }
-}
+/// The `[defaults.forward]` tunables (`docs/m2/plan.md` section 2.9), checked: the same keys and
+/// bounds as the daemon's `[forward]` (`fil_forward::tunables`).
+pub use fil_forward::tunables::ForwardTunables;
+use fil_forward::tunables::Value as TunableValue;
 
 /// `forward` as written: a list of specs, or a table that has the list as `specs` next to the
 /// tunables (a key cannot be both a list and a table).
@@ -213,10 +180,10 @@ impl ForwardTunables {
 #[serde(deny_unknown_fields)]
 struct RawForward {
     specs: Option<Vec<String>>,
-    window: Option<SizeValue>,
-    buffer: Option<SizeValue>,
-    open_wait: Option<DurationValue>,
-    linger: Option<DurationValue>,
+    window: Option<TunableValue>,
+    buffer: Option<TunableValue>,
+    open_wait: Option<TunableValue>,
+    linger: Option<TunableValue>,
 }
 
 #[derive(Clone, Debug)]
@@ -262,52 +229,6 @@ impl ForwardValue {
             },
             ForwardValue::Table(t) => t,
         }
-    }
-}
-
-/// A duration written as seconds (`open_wait = 30`) or text (`"30s"`, `"10m"`, `"1500ms"`).
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-enum DurationValue {
-    Secs(u64),
-    Text(String),
-}
-
-fn parse_duration(v: &DurationValue) -> Result<Duration, String> {
-    let text = match v {
-        DurationValue::Secs(n) => return Ok(Duration::from_secs(*n)),
-        DurationValue::Text(t) => t.trim(),
-    };
-    let split = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (num, unit) = text.split_at(split);
-    let n: u64 = num.parse().map_err(|_| {
-        format!("not a duration: {text:?} (whole numbers; examples: \"30s\", \"10m\")")
-    })?;
-    let secs = |mult: u64| {
-        n.checked_mul(mult)
-            .map(Duration::from_secs)
-            .ok_or_else(|| format!("duration too large: {text:?}"))
-    };
-    match unit.trim() {
-        "ms" => Ok(Duration::from_millis(n)),
-        "s" | "" => secs(1),
-        "m" => secs(60),
-        "h" => secs(3600),
-        _ => Err(format!(
-            "unknown duration unit in {text:?} (use ms, s, m or h)"
-        )),
-    }
-}
-
-fn size_value(key: &str, v: &SizeValue) -> Result<usize, String> {
-    match v {
-        SizeValue::Int(n) => {
-            usize::try_from(*n).map_err(|_| format!("forward.{key} = {n}: too large"))
-        }
-        SizeValue::Text(t) => parse_byte_size(t)
-            .map_err(|e| format!("forward.{key}: {e} (examples: \"1MiB\", \"64KiB\")")),
     }
 }
 
@@ -685,37 +606,12 @@ fn resolve_forward(f: &RawForward, out: &mut HostSettings) -> Result<(), String>
             forward_spec::add_spec(&mut out.forward, spec);
         }
     }
-    let t = &mut out.forward_tunables;
-    if let Some(v) = &f.window {
-        let n = size_value("window", v)?;
-        t.window = u32::try_from(n)
-            .ok()
-            .and_then(|n| Window::new(n).ok())
-            .ok_or_else(|| format!("forward.window = {n}: expected 16KiB to 4MiB"))?;
-    }
-    if let Some(v) = &f.buffer {
-        let n = size_value("buffer", v)?;
-        let (lo, hi) = (MIN_WINDOW as usize, FORWARD_BUDGET / 4);
-        if !(lo..=hi).contains(&n) {
-            return Err(format!("forward.buffer = {n}: expected 16KiB to 16MiB"));
-        }
-        t.buffer = n;
-    }
-    if let Some(v) = &f.open_wait {
-        let d = parse_duration(v).map_err(|e| format!("forward.open_wait: {e}"))?;
-        if d > Duration::from_secs(3600) {
-            return Err("forward.open_wait: expected 0 to 1h".to_string());
-        }
-        t.open_wait = d;
-    }
-    if let Some(v) = &f.linger {
-        let d = parse_duration(v).map_err(|e| format!("forward.linger: {e}"))?;
-        if d > Duration::from_secs(24 * 3600) {
-            return Err("forward.linger: expected 0 to 24h".to_string());
-        }
-        t.linger = d;
-    }
-    Ok(())
+    out.forward_tunables.apply(
+        f.window.as_ref(),
+        f.buffer.as_ref(),
+        f.open_wait.as_ref(),
+        f.linger.as_ref(),
+    )
 }
 
 fn check_argv(key: &str, argv: &[String]) -> Result<Vec<String>, String> {
@@ -790,6 +686,9 @@ const DAEMON_SETTING: &str = "KEY is a setting of the daemon, not of the client:
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use fil_proto::limits::LINGER;
+    use fil_proto::mux::Window;
 
     use super::*;
 

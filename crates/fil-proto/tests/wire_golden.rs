@@ -920,6 +920,7 @@ fn ports_rows() -> Vec<PortsRow> {
             probe: Some(probes()[1].clone()),
             target_other_user: false,
             policy: None,
+            peers_refused: 0,
         }),
         // A `-L` whose target another user's listener takes: no owner, no probe.
         PortsRow::Forward(ForwardRow {
@@ -938,6 +939,7 @@ fn ports_rows() -> Vec<PortsRow> {
             probe: None,
             target_other_user: true,
             policy: Some(policy_refusals()[1].clone()),
+            peers_refused: 3,
         }),
         PortsRow::Agent(AgentRow {
             session: name("main"),
@@ -1055,6 +1057,7 @@ fn widest_forward_row() -> PortsRow {
         }),
         target_other_user: true,
         policy: Some(widest_policy_refusal()),
+        peers_refused: u32::MAX,
     })
 }
 

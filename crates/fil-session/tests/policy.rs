@@ -145,7 +145,10 @@ async fn through_local(c: &FwdClient, id: ForwardId) -> Option<Vec<u8>> {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
     let (inner, _) = l.accept().await.unwrap();
-    let peer = fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap());
+    let peer = fil_forward::LocalPeer::Tcp {
+        peer: "127.0.0.1:1".parse().unwrap(),
+        local: None,
+    };
     c.ep.open_stream(OpenKind::Local { forward: id }, Box::new(inner), peer)
         .unwrap();
     app.write_all(b"hi").await.ok()?;

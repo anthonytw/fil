@@ -112,6 +112,7 @@ fn fwd(
         probe: None,
         target_other_user: false,
         policy: None,
+        peers_refused: 0,
     }
 }
 
@@ -154,6 +155,8 @@ fn fixed_rows() -> Vec<PortsRow> {
     );
     back.waiting = 1;
     back.last_unix_ms = at(10, 40);
+    // `remote_peers = "same-user"` refused two connections to it: a count, nobody named.
+    back.peers_refused = 2;
 
     let socks = fwd(
         "main",
@@ -429,6 +432,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "listen",
             "origin",
             "owner",
+            "peers_refused",
             "policy",
             "port",
             "probe",

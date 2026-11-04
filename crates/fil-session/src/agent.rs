@@ -320,7 +320,10 @@ mod tests {
                 check_open(gate, false, &LocalPeer::Unix(None), 1000),
                 Err(OpenFailure::NotPermitted)
             );
-            let tcp = LocalPeer::Tcp("127.0.0.1:1".parse().unwrap());
+            let tcp = LocalPeer::Tcp {
+                peer: "127.0.0.1:1".parse().unwrap(),
+                local: None,
+            };
             assert_eq!(
                 check_open(gate, false, &tcp, 1000),
                 Err(OpenFailure::NotPermitted)

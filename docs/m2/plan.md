@@ -244,7 +244,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 | `MAX_PORTS_ROWS` | 256 | |
 | `DnsName` | ≤ 253 bytes | |
 
-The tunables (`window`, `buffer`, `open_wait`, `linger`) go in config under `[defaults.forward]` (client) and `daemon.toml` `[forward]`. They join §16.7's "defaults to tune".
+The tunables (`window`, `buffer`, `open_wait`, `linger`) go in config under `[defaults.forward]` (client) and `daemon.toml` `[forward]` (built in the M2 sweep, SW2: both parse them with one module, `fil_forward::tunables`). They join §16.7's "defaults to tune".
 
 ### 2.10 Link contract change (C3)
 
@@ -586,7 +586,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Takeover | the table survives; the new client adopts entries matching its own specs and asks about the rest | |
 | Agent | **off** (`agent = "off"`; `-A` or per-host config turns it on) | `confirm` mode prompts per signature |
 | Agent while detached | the socket file is removed; refused at once | |
-| `-R` peers | any local user (ssh parity) | `forward.remote_peers = "same-user"` checks the peer socket's uid through `/proc/net/tcp`, using P1's parser (OD-9) |
+| `-R` peers | any local user (ssh parity) | `daemon.toml` `[forward] remote_peers = "same-user"` checks the peer socket's uid, by a `sock_diag` request for that socket, or with P1's `/proc/net/tcp` parser where netlink cannot answer; unknown is refused (OD-9, built in SW2) |
 | Probe | own loopback listeners, `HEAD` | `ports.probe = "off"` or `"full"` |
 
 ### 4.3 The agent
@@ -643,7 +643,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-6 | `SSH_AUTH_SOCK` always set to the stable path in every session | §10, §11.1.4 | Yes. Opt out with `daemon.toml agent_socket = false`. |
 | OD-7 | Honour an explicit non-loopback `-R` bind with no daemon-side switch | §7.1, §11 | Honour it from own CLI or config with an exposure warning; refuse it from management. **Settled (owner, 2026-11-03) by `GatewayPorts`:** honoured only where the effective server policy allows it (S1). |
 | OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. **Decided (owner, 2026-11-03):** fil respects the admin's intent in M2, in two layers: the sshd mirror and `/etc/fil/policy.toml` (DESIGN §11.2; S1). |
-| OD-9 | The `-R` peer check (`same-user`) | §11 table row "`-R` ports on 127.0.0.1" | Ship it as an option, default `any` (ssh parity). |
+| OD-9 | The `-R` peer check (`same-user`) | §11 table row "`-R` ports on 127.0.0.1" | Ship it as an option, default `any` (ssh parity). **Built** (M2 sweep, SW2): `daemon.toml` `[forward] remote_peers`, after server policy; DESIGN §7.2. |
 | OD-10 | The NODELAY remedy, if L1 finds Nagle (for example `ssh -tt` with the relay setting raw mode before the preamble: a pty, utmp entries, stderr merged into the stream), and forward pacing (H1) | §8.2 (the pipe invocation; the remote command itself stays fixed) | Decide on L1's data; avoid `-tt` unless p50 improves by more than 20 ms. |
 | OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. **Decided 2026-11-03:** the owner made the repo public, so Actions minutes are no longer scarce; T1 skipped the local cross build (the CI `aarch64` job builds `fil` and `fwdprobe`), and a seat-owned Lima VM runs realnet locally. |
 | OD-12 | `-N` tunnel-only mode | §2 non-goal | Not in M2; consider it for M4 ("autossh replacement"). |
@@ -710,7 +710,7 @@ These rely on `ssh-add` and `ssh-keygen` being on the Pis; `tools` reports them,
   The same done with `ssh -L` is recorded; ssh is expected to fail, as a comparison.
 - **`f_fwd_roam`.** Three NAT moves during a transfer: no reconnect, and the largest stall is measured.
 - **`f_fwd_vs_ssh`.** Throughput and keystroke latency under bulk load, fil against `ssh -L`. The target: within 2× ssh's throughput, and keystroke p99 no worse than ssh's.
-- **`f_fwd_other_user`.** `mallory` can reach a 127.0.0.1 `-R` port (documented; with `same-user` it is refused), but cannot reach the agent socket or the daemon socket.
+- **`f_fwd_other_user`.** `mallory` can reach a 127.0.0.1 `-R` port (documented; with `same-user` it is refused: `f_fwd_same_user`, `tests/realnet/peers.sh`, in the udp part), but cannot reach the agent socket or the daemon socket.
 - **`f_agent_ssh_hop`.** From the fil session on `target`, a real `ssh jump2` authenticates with the key in `client`'s agent through fil.
 - **`f_first_login_prompts`** (from the M1 planned list). Host key and password prompts pass through before the attach, without `BatchMode`.
 - **`f_fwd_ports_scope`** (sysd). A `setsid`'d listener in the scope is still attributed to the session.

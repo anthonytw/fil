@@ -788,6 +788,10 @@ pub struct ForwardRow {
     /// listener is closed, or its connections are refused (DESIGN.md section 11.2). For a `-D`,
     /// also the last SOCKS target the policy refused.
     pub policy: Option<PolicyRefusal>,
+    /// `-R` connections refused because their peer socket was not the user's, or its owner could
+    /// not be told (`daemon.toml` `[forward] remote_peers = "same-user"`, OD-9). A count only:
+    /// who connected is never sent.
+    pub peers_refused: u32,
 }
 
 /// A TCP listener on the remote host that no forward owns.

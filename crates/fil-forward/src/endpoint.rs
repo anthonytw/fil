@@ -165,9 +165,13 @@ pub trait Policy: Send + Sync + 'static {
 /// [`Policy::check_outgoing`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LocalPeer {
-    /// A TCP connection accepted on a forward's listener: the application's address (OD-9's
-    /// `remote_peers = "same-user"` looks its owner up by it).
-    Tcp(SocketAddr),
+    /// A TCP connection accepted on a forward's listener: the application's address (`peer`) and
+    /// the accepted socket's own (`local`; `None` if the kernel would not say). OD-9's
+    /// `remote_peers = "same-user"` looks the peer socket's owner up by the pair.
+    Tcp {
+        peer: SocketAddr,
+        local: Option<SocketAddr>,
+    },
     /// A Unix-socket connection (the agent socket), with the peer's credentials where the
     /// platform gives them.
     Unix(Option<PeerCred>),
@@ -196,7 +200,7 @@ impl LocalPeer {
 impl fmt::Debug for LocalPeer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LocalPeer::Tcp(_) => f.write_str("Tcp(..)"),
+            LocalPeer::Tcp { .. } => f.write_str("Tcp(..)"),
             LocalPeer::Unix(c) => f.debug_tuple("Unix").field(c).finish(),
         }
     }
@@ -1723,7 +1727,8 @@ impl<L: Link> Inner<L> {
                 None => return,
                 Some(Ok((stream, addr))) => {
                     let _ = stream.set_nodelay(true);
-                    self.local_accept(&l, stream, LocalPeer::Tcp(addr));
+                    let local = stream.local_addr().ok();
+                    self.local_accept(&l, stream, LocalPeer::Tcp { peer: addr, local });
                 }
                 Some(Err(e)) => {
                     // Out of descriptors and the like: try again shortly rather than spin.

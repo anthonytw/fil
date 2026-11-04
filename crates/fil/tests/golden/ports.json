@@ -51,7 +51,8 @@
             "label": "Vite + React"
           },
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         },
         {
           "id": 2,
@@ -78,7 +79,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 2
         },
         {
           "id": 3,
@@ -102,7 +104,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         },
         {
           "id": 4,
@@ -129,7 +132,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": "AllowTcpForwarding local (/etc/ssh/sshd_config:3)"
+          "policy": "AllowTcpForwarding local (/etc/ssh/sshd_config:3)",
+          "peers_refused": 0
         },
         {
           "id": 5,
@@ -153,7 +157,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         },
         {
           "id": 6,
@@ -180,7 +185,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         },
         {
           "id": 7,
@@ -207,7 +213,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         },
         {
           "id": 8,
@@ -234,7 +241,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         }
       ],
       "listeners": [
@@ -324,7 +332,8 @@
           "owner": null,
           "probe": null,
           "target_other_user": true,
-          "policy": null
+          "policy": null,
+          "peers_refused": 0
         }
       ],
       "listeners": [],

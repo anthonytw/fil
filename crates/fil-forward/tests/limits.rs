@@ -42,6 +42,10 @@ fn held_by_endpoint(before: usize, clients: usize) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_endpoint_holds_at_most_max_pending_connections() {
+    bounded(the_endpoint_holds_at_most_max_pending_connections_body()).await
+}
+
+async fn the_endpoint_holds_at_most_max_pending_connections_body() {
     raise_fd_limit();
     let base = open_fds();
     socks_handshakes_count_against_the_bound().await;

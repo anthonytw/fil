@@ -425,6 +425,12 @@ impl World {
         for i in [C, D] {
             let r = self.sides[i].mux.tick(self.now);
             self.ok(r, "tick");
+            // A tick leaves no timer due: a caller sleeps until `next_deadline`, so one still due
+            // after the tick would be slept through.
+            let due = self.sides[i].mux.next_deadline(self.now);
+            if due.is_some_and(|d| d <= self.now) {
+                self.fail(format!("a deadline is still due after a tick: {due:?}"));
+            }
             self.events(i);
         }
     }

@@ -1,0 +1,9 @@
+# the usual
+Include /etc/ssh/sshd_config.d/*.conf
+Port 22
+PermitRootLogin prohibit-password
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+GatewayPorts no
+X11Forwarding no
+Subsystem sftp /usr/lib/openssh/sftp-server

@@ -75,6 +75,9 @@ pub fn main() -> ExitCode {
     // Dropping the runtime stops what is left (an ssh being closed, a watcher): the terminal was
     // handed back inside `run`.
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    // Last, so that what the winding-down tasks logged is written too: the log's writer gets a
+    // moment (a second at most) to write what is queued.
+    fil_daemon::logging::flush_now();
     ExitCode::from(code)
 }
 

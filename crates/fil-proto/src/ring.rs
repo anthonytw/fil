@@ -11,8 +11,11 @@ use std::collections::VecDeque;
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// A drained ring keeps at most this much of its buffer for the next burst; the rest goes back to
-/// the allocator (see [`ByteRing::drop_to`]).
-const KEEP_WHEN_DRAINED: usize = 4 * 1024;
+/// the allocator (see [`ByteRing::drop_to`]). Large enough for a request/response forward that
+/// moves a segment or two per round trip: shrinking after every exchange reallocated the ring on
+/// every one (a 16 KiB response cost 24 KiB allocated and freed each time), while a megabyte
+/// moved in one burst still goes back.
+const KEEP_WHEN_DRAINED: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ByteRing {
@@ -87,9 +90,10 @@ impl ByteRing {
 
     /// Discard everything below `seq` (clamped to the retained range).
     ///
-    /// A ring that this empties keeps at most 4 KiB of its buffer: a forward that moved a
+    /// A ring that this empties keeps at most 32 KiB of its buffer: a forward that moved a
     /// megabyte and went idle must not pin the megabyte until the connection ends (the buffer
-    /// regrows on the next write).
+    /// regrows on the next write), but one that moves a segment or two per exchange keeps its
+    /// buffer between exchanges.
     pub fn drop_to(&mut self, seq: u64) {
         let seq = seq.clamp(self.start, self.end());
         let n = (seq - self.start) as usize;
@@ -227,6 +231,26 @@ mod tests {
         let cap = r.buf.capacity();
         r.drop_to(1);
         assert_eq!(r.buf.capacity(), cap);
+    }
+
+    /// A forward that moves one segment (or a few) per round trip keeps its buffer between the
+    /// exchanges: shrinking after each reallocated the ring every time.
+    #[test]
+    fn a_request_response_ring_does_not_reallocate_per_exchange() {
+        let mut r = ByteRing::new(1 << 20, 0);
+        let seg = vec![9u8; 16 * 1024];
+        let mut end = 0u64;
+        r.push(&seg);
+        end += seg.len() as u64;
+        r.drop_to(end);
+        let cap = r.buf.capacity();
+        assert!(cap >= seg.len(), "the first exchange sized it");
+        for _ in 0..20 {
+            assert_eq!(r.push(&seg), seg.len());
+            end += seg.len() as u64;
+            r.drop_to(end);
+            assert_eq!(r.buf.capacity(), cap, "kept between exchanges");
+        }
     }
 
     #[test]

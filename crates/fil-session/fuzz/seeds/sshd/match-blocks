@@ -1,0 +1,9 @@
+AllowTcpForwarding local
+Match User alice,!bob Group staff,dev*
+    DisableForwarding no
+    PermitOpen localhost:5432 [::1]:* 192.0.2.1:22
+Match Address 10.0.0.0/8 User *
+    AllowAgentForwarding no
+    PermitListen 8080
+Match all
+    GatewayPorts clientspecified

@@ -66,9 +66,12 @@ const CMD_CAPACITY: usize = 256;
 /// How long after the last input or output the PTY mode is polled at `mode_poll`. Mode changes
 /// follow a program's input or output, and both re-read the mode themselves; the poll is a net
 /// for the rest, so it slows to [`IDLE_POLL_FACTOR`] times `mode_poll` once things are quiet.
-/// Not for a client that predicts (`Attach::echo_ack`): a program that turns echo off after a
-/// silence (a password prompt) must reach it within `mode_poll`, or its first keystroke is
-/// painted before it knows.
+/// The same for a client that predicts (`Attach::echo_ack`): a program that turns echo off after
+/// a silence (a password prompt) may reach it a slow poll late, but the client's prediction core
+/// makes the first key after a second of silence tentative (its `Idle` boundary,
+/// `docs/m3/plan.md` §2.4 rule 3), and a tentative key is never written. That second is shorter
+/// than this window, so one-way delay cannot leave the poll slow while the client still counts the
+/// session as active.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_POLL_FACTOR: u32 = 10;
 /// Reads of PTY output closer together than this follow each other in a flood.
@@ -860,7 +863,6 @@ impl Core {
         poll_interval(
             now.saturating_duration_since(self.last_io),
             self.cfg.mode_poll,
-            self.live.as_ref().is_some_and(|l| l.echo_ack),
         )
     }
 
@@ -1453,9 +1455,10 @@ impl Core {
     }
 }
 
-/// The mode poll's period `quiet` after the last input or output.
-fn poll_interval(quiet: Duration, mode_poll: Duration, predicting: bool) -> Duration {
-    if predicting || quiet < ACTIVE_WINDOW {
+/// The mode poll's period `quiet` after the last input or output, for every client, predicting
+/// or not (`docs/m3/plan.md` §2.10).
+fn poll_interval(quiet: Duration, mode_poll: Duration) -> Duration {
+    if quiet < ACTIVE_WINDOW {
         mode_poll
     } else {
         mode_poll * IDLE_POLL_FACTOR
@@ -1623,20 +1626,74 @@ mod tests {
     #[test]
     fn the_mode_poll_slows_down_when_idle() {
         let fast = Duration::from_millis(50);
-        assert_eq!(poll_interval(Duration::ZERO, fast, false), fast);
-        assert_eq!(
-            poll_interval(Duration::from_millis(1999), fast, false),
-            fast
+        assert_eq!(poll_interval(Duration::ZERO, fast), fast);
+        assert_eq!(poll_interval(Duration::from_millis(1999), fast), fast);
+        assert_eq!(poll_interval(ACTIVE_WINDOW, fast), fast * IDLE_POLL_FACTOR);
+        // At most 2 wakeups a second for an idle session (docs/m3/plan.md §2.10).
+        assert!(poll_interval(Duration::from_secs(3600), fast) >= Duration::from_millis(500));
+    }
+
+    /// A predicting client's idle session (`Attach::echo_ack`) is polled at the slow rate after
+    /// the active window, like any other (`docs/m3/plan.md` §2.10, C1): a mode change after a
+    /// silence reaches it at the next slow poll, not within `mode_poll`.
+    #[tokio::test]
+    async fn a_predicting_clients_idle_session_polls_at_the_slow_rate() {
+        use crate::handle::SessionHandle;
+        use fil_proto::msg::{Attach, PublicKey, TermSize};
+
+        let mut cfg = SessionConfig::new(
+            "idle".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            9,
         );
-        assert_eq!(
-            poll_interval(ACTIVE_WINDOW, fast, false),
-            fast * IDLE_POLL_FACTOR
-        );
+        // Fast 300 ms, slow 3 s. The program turns echo off 2.5 s in, printing nothing: the fast
+        // poll would see it within about 2.8 s; the slow one not before its next poll, 3 s after
+        // the window closed.
+        cfg.mode_poll = Duration::from_millis(300);
+        cfg.scope = crate::config::ScopeMode::Tree;
+        cfg.clear_env = true;
+        cfg.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        cfg.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 2.5; stty -echo; sleep 30".into(),
+        ]);
+        let handle = SessionHandle::spawn(cfg, Arc::new(crate::config::NoHost))
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let attach = Attach {
+            name: "idle".parse().unwrap(),
+            size: TermSize::new(80, 24).unwrap(),
+            term: "xterm".parse().unwrap(),
+            host: "laptop".parse().unwrap(),
+            key: PublicKey::new(vec![1; 32]).unwrap(),
+            resume: None,
+            echo_ack: true,
+            agent: false,
+            size_gen: 0,
+        };
+        let mut a = match handle.attach(attach).await.ok().unwrap() {
+            AttachAnswer::Accepted(a) => a,
+            AttachAnswer::Refused(r) => panic!("refused: {r:?}"),
+        };
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match a.events.recv().await {
+                    Some(ConnEvent::Mode { echo: false, .. }) => return start.elapsed(),
+                    Some(_) => {}
+                    None => panic!("the session went away"),
+                }
+            }
+        })
+        .await
+        .expect("the echo-off report never came");
+        let _ = handle.kill(Duration::from_secs(5)).await;
         assert!(
-            poll_interval(Duration::from_secs(3600), fast, false) >= Duration::from_millis(500)
+            seen >= Duration::from_millis(4000),
+            "seen after {seen:?}: the idle session was still polled fast"
         );
-        // A predicting client is never left to the slow poll.
-        assert_eq!(poll_interval(Duration::from_secs(3600), fast, true), fast);
     }
 
     #[test]

@@ -21,6 +21,9 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "
 tracing = "0.1"
 
 [dev-dependencies]
+# The harness of the prediction tests (fil_predict::sim::Rng, fil_predict::oracle::diffs, the
+# test-only ScreenView::test_state).
+fil-predict = { path = "../fil-predict", features = ["testkit"] }
 # The test-only mini ssh-agent, and the scripted client the full-stack harness takes snapshots with.
 fil-testkit = { path = "../fil-testkit" }
 # The full-stack prediction harness (tests/predict_e2e.rs, examples/predict_e2e.rs): the real session

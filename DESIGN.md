@@ -785,7 +785,7 @@ Everything below that is not marked **(decided)** is proposed: the implementatio
   - take over in the middle of output
   - sleep past the QUIC idle timeout
   - fill the forward buffers
-- **Fuzzing** (`cargo-fuzz`): the frame parser, control messages and the emulator's input path.
+- **Fuzzing** (`cargo-fuzz`, libFuzzer; nightly toolchain, so outside `just ci`; `just fuzz TARGET SECONDS` runs one target). One target for each parser of bytes or text from a peer or a file: the preamble scanner, the frame decoder (with the payload parsers behind it), `ControlMsg` and `Hello`, the opening, `InputRecord`, MUX records (`MuxMsg`), the emulator's input path (bytes into the shipped backend, a resize, then the snapshot and a fresh emulator fed it), the SOCKS handshake, the agent message filter, the `sshd_config` mirror, `policy.toml` and the client's `config.toml`. They are in `crates/fil-proto/fuzz`, `crates/fil-session/fuzz`, `crates/fil-term/fuzz`, `crates/fil/fuzz` and `crates/fil-forward/fuzz`, with seed corpora taken from the wire golden, the recorded terminal fixtures and sample configurations. `just fuzz` also holds the fuzz crates to the license policy of `deny.toml`. A decoder target also checks that what decodes re-encodes to the same value. A release candidate gets an hour of each target (SWEEP); a crash becomes a regression test in the owning crate.
 - **Prediction:** a scripted latency harness compares what the user saw with the authoritative screen. Any mismatch left after confirmation is a failure.
 
 ## 13. Implementation

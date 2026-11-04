@@ -1,0 +1,30 @@
+# The cargo-fuzz target of fil-term's emulator input path. Not part of the workspace and not run
+# by `just ci` (it needs a nightly toolchain):
+#   just fuzz emulator SECONDS           (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run emulator fuzz/corpus/emulator fuzz/seeds/emulator   (from crates/fil-term)
+# The seeds in seeds/ are the recorded fixtures of tests/fixtures, shaped by seed-corpus.py.
+[package]
+name = "fil-term-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Only the shipped backend, as fil-session takes it.
+fil-term = { path = "..", default-features = false, features = ["alacritty"] }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "emulator"
+path = "fuzz_targets/emulator.rs"
+test = false
+doc = false
+bench = false

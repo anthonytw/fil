@@ -194,34 +194,42 @@ The PR #83 review found two failures that only appear with several channels. Wit
 
 These cells measure them on V1's bottleneck, paced against unpaced on the same build. `FIL_FORWARD_PACING=off` is set in the client's command and in a daemon the harness restarts with it. Keystrokes run at 20 keys/s for 20 s; goodput is what the application received. The Lima VM, aarch64. Times in ms are p50 / p99 unless marked otherwise.
 
-**Parallel downloads through one `-L`** (`f_fwd_parallel`). Goodput is paced against unpaced:
+**Parallel downloads through one `-L`** (`f_fwd_parallel`, the final build). Goodput is paced against unpaced:
 
 | Path | flows | keystrokes, unpaced | keystrokes, paced (H1 line) | goodput, paced / unpaced |
 |---|---|---|---|---|
-| pipe | 1 | 436 / 702 | 84 / 94 (105) | 0.998 |
-| pipe | 4 | 969 / 1216 | 81 / 92 | 0.995 |
-| pipe | 16 | 969 / 1224 | 82 / 97 | 0.993 |
-| pipe | 32 | 964 / 1236 | 82 / 97 | 0.992 |
-| QUIC | 1 | 284 / 322 | 77 / 86 (109) | 0.995 |
-| QUIC | 4 | 282 / 323 | 77 / 86 | 0.994 |
-| QUIC | 16 | 331 / 709 | 75 / 85 | 0.996 |
-| QUIC | 32 | 349 / 881 | 82 / 92 | 0.997 |
+| pipe | 1 | 436 / 674 | 75 / 85 (110) | 0.996 |
+| pipe | 4 | 967 / 1232 | 73 / 90 | 0.996 |
+| pipe | 16 | 965 / 1204 | 78 / 90 | 0.999 |
+| pipe | 32 | 968 / 1245 | 80 / 92 | 0.995 |
+| QUIC | 1 | 292 / 322 | 81 / 88 (110) | 0.990 |
+| QUIC | 4 | 286 / 323 | 77 / 85 | 0.993 |
+| QUIC | 16 | 334 / 990 | 78 / 91 | 0.995 |
+| QUIC | 32 | 347 / 684 | 79 / 92 | 0.998 |
 
 **A request-and-response forward beside a bulk download, on QUIC** (the review's S1: QUIC streams are not delivered in order across each other):
 
 | | keystrokes | request p50 | goodput |
 |---|---|---|---|
-| unpaced | 292 / 321 | 274 | 18.92 |
-| paced | 75 / 80 | 75 | 18.85 |
+| unpaced | 293 / 324 | 274 | 18.98 |
+| paced | 75 / 86 | 74 | 18.82 |
 
 The request is 1 KiB, echoed, every 50 ms, on its own forward.
+
+**This cell found a bug.** Before the last fix it held about 137 ms in the VM and 144 ms on GitHub, against a line of 94 to 110 ms:
+
+1. The bulk channel's records outlived the presumption age while the slow-start queue lasted.
+2. The request's acks then presumed them delivered, and the bulk channel was parked.
+3. Parked channels gave no samples, so the current delay froze. The age stayed short, and the channel was parked again at every ack.
+
+Now a parked channel's acks of records still counted unpark it and give samples (DESIGN §8.5, "Parked channels").
 
 **A live 1 MiB echo beside 8 uploads whose target never reads** (`f_fwd_stuck`, after a 10 s settle):
 
 | Path | echo, unpaced | echo, paced | keystrokes, unpaced | keystrokes, paced |
 |---|---|---|---|---|
-| pipe | 4.30 s | 1.45 s | 53 / 1076 | 52 / 139 |
-| QUIC | 3.54 s | 0.77 s | 54 / 319 | 51 / 88 |
+| pipe | 4.33 s | 1.40 s | 54 / 990 | 52 / 191 |
+| QUIC | 3.53 s | 0.78 s | 54 / 331 | 51 / 128 |
 
 Paced is faster here because unpaced, the stuck channels' windows sit in the router's queue in front of the echo.
 

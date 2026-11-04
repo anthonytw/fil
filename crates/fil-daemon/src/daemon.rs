@@ -145,15 +145,20 @@ impl Host {
         self.registry.revoke(key);
     }
 
-    /// Server policy refuses the direct transport now (`direct = false`, or a read too old to
-    /// decide on): `true`, and `peer`'s key goes, binding and all, as at a revoke. A QUIC attach
-    /// with it is then dropped, and the client falls back to the pipe.
+    /// Server policy refuses the direct transport now: `true`, and a QUIC attach with `peer` is
+    /// dropped, so the client falls back to the pipe. Under `direct = false` the key goes,
+    /// binding and all, as at a revoke. Under a read too old to decide on
+    /// ([`PolicySetting::Pending`](fil_proto::mux::PolicySetting::Pending)) it stays: the next
+    /// resume may succeed once the re-read is in.
     pub(crate) fn refuses_direct(&self, peer: &TransportKey) -> bool {
-        if self.policy.direct().is_ok() {
-            return false;
+        match self.policy.direct() {
+            Ok(()) => false,
+            Err(why) if why.setting == fil_proto::mux::PolicySetting::Pending => true,
+            Err(_) => {
+                self.revoke(peer);
+                true
+            }
         }
-        self.revoke(peer);
-        true
     }
 
     fn direct_now(&self) -> Option<DirectInfo> {
@@ -576,6 +581,10 @@ impl Inner {
                 tracing::info!("direct mode off: server policy refuses it; the UDP port is closed");
                 self.host.set_direct(None);
                 *slot = None;
+                // No key registered for the closed port may authenticate on one opened later
+                // (it shares the registry). The pipe-side bindings stay: they go with their
+                // sessions, and keys bound to nothing registered cannot be used.
+                self.registry.revoke_all();
             }
             _ => {}
         }
@@ -586,6 +595,9 @@ impl Inner {
     /// and at every read swapped in, the QUIC port follows it ([`Inner::sync_direct`]).
     async fn follow_policy(self: Arc<Self>) {
         let mut reads = self.host.policy.reads();
+        reads.borrow_and_update();
+        // A read swapped in between `start` and `run` was seen by no one yet.
+        self.sync_direct();
         let period = self.cfg.policy.full_reload.max(Duration::from_millis(10));
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1285,6 +1297,50 @@ mod tests {
             name: name.parse().unwrap(),
             incarnation,
         }
+    }
+
+    /// A QUIC attach while the last read of the policy is too old to decide on is dropped (the
+    /// client falls back to the pipe), but the key and its binding stay: the next resume may
+    /// succeed once the re-read is in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_read_drops_a_quic_attach_but_keeps_its_key() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HANG: AtomicBool = AtomicBool::new(false);
+        fn lookup() -> fil_session::policy::Account {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fil_session::policy::Account::default()
+        }
+        let src = fil_session::policy::PolicySources {
+            account: None,
+            lookup,
+            recheck: Duration::ZERO,
+            full_reload: Duration::ZERO,
+            max_age: Duration::from_millis(200),
+            ..fil_session::policy::PolicySources::none()
+        };
+        let policy = tokio::task::spawn_blocking(move || fil_session::policy::Policy::new(src))
+            .await
+            .unwrap();
+        let registry = KeyRegistry::new();
+        let mut host = host(&registry, None);
+        host.policy = Arc::new(policy);
+        let k = TransportKey::from_spki_der(vec![8]);
+        registry.register(k.clone());
+        assert!(host.bind(&k, binding("main", 1)));
+        assert!(
+            !host.refuses_direct(&k),
+            "allowed while the read is current"
+        );
+        HANG.store(true, Ordering::SeqCst);
+        let _ = host.policy.direct();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(host.refuses_direct(&k), "dropped while stale");
+        assert!(registry.contains(&k), "the key stays");
+        assert_eq!(host.bound(), 1, "and its binding");
+        HANG.store(false, Ordering::SeqCst);
     }
 
     /// A QUIC attach refused by server policy (`direct = false`) takes the key's binding with

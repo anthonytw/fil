@@ -54,7 +54,8 @@ use fil_proto::msg::{
 };
 use fil_proto::mux::{
     Added, BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable,
-    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, PolicyRefusal, Side,
+    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, PolicyRefusal,
+    PolicySetting, Side,
 };
 use fil_transport::{Link, LinkError, LinkKind, LinkStatus};
 use tokio::sync::{mpsc, watch};
@@ -279,6 +280,8 @@ pub(crate) struct Forwards {
     ep: Endpoint<SessionLink>,
     st: Shared,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Follows the reads of server policy ([`Forwards::policy_read`]).
+    policy_task: Mutex<Option<JoinHandle<()>>>,
     /// Where the MUX send buffer stops taking table records (three quarters of it).
     table_room: usize,
     /// The agent socket, when the session has a path for it.
@@ -315,6 +318,7 @@ impl Forwards {
         agent_socket: Option<PathBuf>,
         policy: Arc<dyn ServerPolicy>,
     ) -> Arc<Self> {
+        let reads = policy.reads();
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
             sub: Sub::Detached,
@@ -348,6 +352,7 @@ impl Forwards {
             ep,
             st,
             task: Mutex::new(None),
+            policy_task: Mutex::new(None),
             table_room,
             agent_sock: Mutex::new(agent_socket.map(AgentSocket::new)),
             agent_gate: watch::Sender::new(Gate::Off),
@@ -360,7 +365,34 @@ impl Forwards {
         });
         let task = tokio::spawn(fw.clone().drain_events(events));
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        if let Some(mut reads) = reads {
+            let me = Arc::downgrade(&fw);
+            let t = tokio::spawn(async move {
+                while reads.changed().await.is_ok() {
+                    let Some(fw) = me.upgrade() else { return };
+                    fw.policy_read();
+                }
+            });
+            *fw.policy_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+        }
         fw
+    }
+
+    /// A new read of server policy is in: the table and the agent are checked again, as at a
+    /// re-establish. So a policy change closes an `-R` listener (or binds it again) and the
+    /// agent socket once its read is in, without waiting for a link change, and a stale read
+    /// at the last re-establish leaves nothing behind once a current one is in.
+    fn policy_read(&self) {
+        let mut st = self.lock();
+        if st.ended {
+            return;
+        }
+        self.sync_agent(&mut st);
+        for id in self.recheck(&mut st) {
+            if let Some(state) = st.listen.get(&id) {
+                self.tell(&st, MuxMsg::Listening { id, state: *state });
+            }
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -448,15 +480,20 @@ impl Forwards {
         }
     }
 
-    /// Server policy over the whole table (a re-establish): an entry it refuses now is marked
-    /// blocked and its `-R` listener closed (`Failed(Policy)`); one it allows again is unmarked,
-    /// and its `-R` bound again. Returns the `-R` entries whose listen state changed.
+    /// Server policy over the whole table (a re-establish, or a new read of the policy): an
+    /// entry it refuses now is marked blocked and its `-R` listener closed (`Failed(Policy)`);
+    /// one it allows again is unmarked, and its `-R` bound again. A policy that cannot decide
+    /// now ([`PolicySetting::Pending`]: its read is too old and a re-read is running) changes
+    /// nothing: the connections through the entry are refused meanwhile, each checked as it
+    /// comes, and the read, once in, checks the table again. Returns the `-R` entries whose
+    /// listen state changed.
     fn recheck(&self, st: &mut State) -> Vec<ForwardId> {
         let mut changed = Vec::new();
         let entries: Vec<_> = st.table.iter().cloned().collect();
         for e in entries {
             let remote = e.spec.kind() == ForwardKind::Remote;
             match st.policy.forward(&e.spec) {
+                Err(why) if why.setting == PolicySetting::Pending => {}
                 Err(why) => {
                     if st.blocked.insert(e.id, why).is_none() {
                         debug!(kind = ?e.spec.kind(), "forward blocked by server policy");
@@ -478,13 +515,18 @@ impl Forwards {
                             || st.rebind.contains(&e.id))
                     {
                         debug!("forward allowed again by server policy");
+                        let before = st.listen.get(&e.id).copied();
                         self.bind_remote(st, e.id, &e.spec);
-                        if matches!(st.listen.get(&e.id), Some(ListenState::Failed(_))) {
+                        let after = st.listen.get(&e.id).copied();
+                        if matches!(after, Some(ListenState::Failed(_))) {
                             st.rebind.insert(e.id);
                         } else {
                             st.rebind.remove(&e.id);
                         }
-                        changed.push(e.id);
+                        // A retry that failed as before is not news to the client.
+                        if after != before {
+                            changed.push(e.id);
+                        }
                     }
                 }
             }
@@ -521,6 +563,14 @@ impl Forwards {
         drop(st);
         self.ep.shutdown();
         if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            t.abort();
+        }
+        if let Some(t) = self
+            .policy_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             t.abort();
         }
     }
@@ -628,12 +678,21 @@ impl Forwards {
     /// the relay is, and binds or removes the socket (it exists only while the relay is on, and
     /// only where server policy allows it: asked before the socket is created).
     fn sync_agent(&self, st: &mut State) {
-        st.agent_refused = None;
         if st.agent && !st.ended && st.sub == Sub::Held {
-            st.agent_refused = st.policy.agent().err();
-            if st.agent_refused.is_some() {
-                debug!("agent relay refused by server policy");
+            match st.policy.agent() {
+                Ok(()) => st.agent_refused = None,
+                // A policy that cannot decide now (its read is too old, a re-read is running)
+                // changes nothing, as in `recheck`: the agent stays as it was, and no refusal
+                // is reported. Each agent connection is still checked as it comes (refused
+                // meanwhile), and the read, once in, syncs the agent again.
+                Err(why) if why.setting == PolicySetting::Pending => {}
+                Err(why) => {
+                    debug!("agent relay refused by server policy");
+                    st.agent_refused = Some(why);
+                }
             }
+        } else {
+            st.agent_refused = None;
         }
         let g = st.agent_gate();
         self.agent_gate.send_if_modified(|v| {

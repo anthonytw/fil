@@ -494,6 +494,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Mutation:** keep the byte rule while healthy (the fast test snapshots); drop the time rule (the slow test never snapshots).
 - **Done when:** the tests pass, L1's `l_catchup` cells show no marker on the clean network, and §6.2 says the new rule.
 - **Visible behavior:** the owner may veto it; it is not a done-when item.
+- **Carried from PR #110** (which changed the rule to unsent bytes and made the client apply the output sent before a jump, `DESIGN.md` §6.2): a jump now waits for what the transport holds, so on QUIC Ctrl-C's prompt after a flood takes about W/R (W about 1.6 MB: about 13 s at 1 Mbit/s, about 50 s at 256 kbit/s). The bytes the transport buffers should count: pace the terminal channel as the forwards are paced (§8.5 "Pacing"), so the backlog stays in the daemon, where a jump skips it. If K1 is dropped, this is an M3 sweep item (efficiency).
 
 ### Wave 2
 

@@ -3,9 +3,6 @@
 //! build as the upload, so `fil server --install-finish` and `--install-gc` run for real. No ssh,
 //! no other machine. The socket directory is a private one (`FIL_TEST_SOCKET_DIR`, a test hook of
 //! this build only), never the real `/tmp/fil-$UID`.
-//!
-//! The parts that send the bootstrap are gated on M4 OQ-1 (the `install-bootstrap` feature,
-//! which `just ci` enables for its tests and no release build has).
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
@@ -110,8 +107,9 @@ impl Drop for World {
     }
 }
 
-#[cfg(feature = "install-bootstrap")]
-mod gated {
+/// The client's half of the exchange (`fil::install::boot`, `fil install`) against the real
+/// script.
+mod bootstrap {
     use super::*;
     use fil::install::boot::{self, BootError, Greeted, Lines, Mode, Then};
     use fil::install::upload::{Source, Upload};

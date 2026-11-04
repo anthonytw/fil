@@ -60,12 +60,16 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: just@1.59.0
+          # cargo-about renders the notices; the version is pinned in the justfile too, and
+          # `just notices` refuses any other.
+          tool: just@1.59.0,cargo-about@0.9.3
       - name: Version, source date and tag checks
         id: prepare
         run: tests/release/prepare.sh
       - name: The release tree's dependency graph
         run: just release-deps
+      - name: Notices (THIRD-PARTY-NOTICES.md is current for the release graph; package.sh ships it)
+        run: just notices
       - name: Lint the release scripts
         run: shellcheck -x -S warning tests/release/*.sh
       - name: The release scripts' own tests (workflow lint, tag signers, release-check)

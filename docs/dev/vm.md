@@ -6,7 +6,7 @@ The real-network harness (`docs/m1/realnet.md`) needs Linux, Docker and root: ne
 
 ## What the VM is
 
-One Lima instance, `fil` (override the name with `FIL_VM`): Ubuntu 24.04, `vz` virtualization, 6 CPUs, 12 GiB, 40 GiB disk, with Docker, iproute2, iptables, the `sch_netem` module, `musl-tools`, `strace`, `shellcheck`, git and rustup. `just vm-setup` adds what the image lacks: the `conntrack` package, then (through rustup and `cargo install --locked`) the toolchain pinned in `rust-toolchain.toml`, `just` and `cargo-deny`, at the versions `linux-check` pins. The Mac needs `limactl` and an `rsync`; macOS's own is enough (the recipes use no option it lacks, and say so if yours is too old).
+One Lima instance, `fil` (override the name with `FIL_VM`): Ubuntu 24.04, `vz` virtualization, 6 CPUs, 12 GiB, 40 GiB disk, with Docker, iproute2, iptables, the `sch_netem` module, `musl-tools`, `strace`, `shellcheck`, git and rustup. `just vm-setup` adds what the image lacks: the `conntrack` package, then (through rustup and `cargo install --locked`) the toolchain pinned in `rust-toolchain.toml`, `just`, `cargo-deny` and `cargo-about`, at the versions `linux-check` pins. The Mac needs `limactl` and an `rsync`; macOS's own is enough (the recipes use no option it lacks, and say so if yours is too old).
 
 ## Isolation
 
@@ -94,7 +94,7 @@ All of them are in the `justfile`, run on the Mac, and call `tests/realnet/vm.sh
 
 | Recipe | What it does |
 |---|---|
-| `just vm-setup` | Installs `conntrack`, the toolchain from `rust-toolchain.toml`, `just` and `cargo-deny` in the VM. Run once after creating it. |
+| `just vm-setup` | Installs `conntrack`, the toolchain from `rust-toolchain.toml`, `just`, `cargo-deny` and `cargo-about` in the VM. Run once after creating it. |
 | `just vm-sync` | `rsync` of this worktree to `~/src/<name>` in the VM. It skips `.git`, `.claude`, `target/` and everything `.gitignore` ignores, and deletes files you deleted, so uncommitted work and untracked files arrive and a stale file does not linger. Unchanged files keep their modification time, so cargo rebuilds only what changed. |
 | `just vm-run CMD...` | Sync, then run `CMD` in that directory in the VM with the pinned toolchain (installed on first use). `just vm-run just ci` is the merge gate on Linux; `just vm-run cargo test -p fil-transport` works too. |
 | `just vm-realnet [PART] [SCENARIO...]` | Sync, then `just realnet ...` in the VM. Arguments as for `just realnet`: `udp`, `sysd`, `ssh` or none for all three, and scenario names. |

@@ -16,10 +16,9 @@
 #   i_not_a_binary     `--binary` with a file that is not a binary for the host: refused, nothing
 #                      sent
 #
-# GATED ON M4 OQ-1: `fil install` exists only in a build with the `install-bootstrap` feature,
-# which this part builds for itself: a release build with the builder's paths remapped and marked
+# This part builds fil for itself: a release build with the builder's paths remapped and marked
 # with FIL_RELEASE_BUILD=1, standing in for the release workflow, so it passes the eligibility
-# checks. No release build has the feature until the owner says yes.
+# checks.
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -41,12 +40,12 @@ install_setup() {
     *) echo "realnet: unsupported architecture $(uname -m)" >&2; exit 2 ;;
   esac
   # A build of its own (its own target directory, so the other parts' cache is untouched): the
-  # feature on, the builder's paths remapped, marked as a release build, no test hooks.
+  # builder's paths remapped, marked as a release build, no test hooks.
   local tdir=${CARGO_TARGET_DIR:-$REPO_ROOT/target}/install-boot
-  log "building fil with the install-bootstrap feature for $target"
+  log "building a release-marked fil for $target"
   (cd "$REPO_ROOT" && CARGO_TARGET_DIR=$tdir FIL_RELEASE_BUILD=1 \
     RUSTFLAGS="--remap-path-prefix=$HOME=/build-home --remap-path-prefix=$REPO_ROOT=/src" \
-    cargo build --release --locked --target "$target" -p fil --features install-bootstrap) || exit 1
+    cargo build --release --locked --target "$target" -p fil) || exit 1
   cp "$tdir/$target/release/fil" "$IN_DIR/fil"
   if grep -aqE 'FIL_TEST_|/home/|/Users/' "$IN_DIR/fil"; then
     echo "realnet: the install build still has test hooks or builder paths in it" >&2

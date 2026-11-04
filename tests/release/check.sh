@@ -148,15 +148,16 @@ done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
 # ---- the archives
-# Layout (section 4.3). `pending` are files LIC and DOC add; they are required with --complete.
+# Layout (section 4.3). `pending` are files DOC adds (and the changelog, which a release needs);
+# they are required with --complete.
 required="bin/fil
 libexec/fil/remote/x86_64-linux/fil
 libexec/fil/remote/aarch64-linux/fil
 libexec/fil/remote/SHA256SUMS
 share/doc/fil/README.md
-share/doc/fil/LICENSE"
+share/doc/fil/LICENSE
+share/doc/fil/THIRD-PARTY-NOTICES.md"
 pending="share/doc/fil/CHANGELOG.md
-share/doc/fil/THIRD-PARTY-NOTICES.md
 share/doc/fil/config.example.toml
 share/doc/fil/daemon.example.toml
 share/doc/fil/policy.example.toml
@@ -194,6 +195,8 @@ fixture_leaks() { # BINARY: the fixture strings found in it, as whole tokens (a 
 is_gnu_tar() { tar --version 2> /dev/null | grep -q 'GNU tar'; }
 
 x86_bin='' aarch_bin=''
+# The install bootstrap this release's binaries must hold (common.sh, from the golden).
+boot=$(release_bootstrap "$V" "$major" "$rev")
 for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source; do
   name=fil-$V-$label
   arc=$dir/$name.tar.gz
@@ -214,7 +217,7 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   tar -xzf "$arc" -C "$ex"
   root=$ex/$name
   if [ "$label" = source ]; then
-    for f in Cargo.toml Cargo.lock .cargo/config.toml vendor LICENSE; do
+    for f in Cargo.toml Cargo.lock .cargo/config.toml vendor LICENSE THIRD-PARTY-NOTICES.md; do
       [ -e "$root/$f" ] || fail "$name.tar.gz lacks $f"
     done
     if [ "$exec" = 0 ]; then
@@ -239,7 +242,7 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
       if [ "$complete" = 1 ]; then fail "$name.tar.gz lacks $f"; else missing="$missing $f"; fi
     fi
   done
-  [ -z "$missing" ] || note "$name.tar.gz: pending (LIC or DOC), not yet in the archive:$missing"
+  [ -z "$missing" ] || note "$name.tar.gz: pending (DOC), not yet in the archive:$missing"
   # The bundle's list is the sha256sum of its two binaries, sorted, relative paths.
   if [ -f "$root/libexec/fil/remote/SHA256SUMS" ]; then
     if [ "$(cat "$root/libexec/fil/remote/SHA256SUMS")" = "$(cd "$root/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done)" ] && sums_check "$root/libexec/fil/remote" SHA256SUMS; then
@@ -264,10 +267,26 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   done
   # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
   if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
-  # The install bootstrap's sending side is gated on M4 OQ-1 (feature `install-bootstrap`; `release-deps`
-  # checks the graph). Its help text is in the binary only if it was built in. Drop this when the
-  # owner approves the feature and the release is meant to carry it.
-  if grep -aqF 'Remove the copies fil installed on HOST' "$b"; then fail "$name: bin/fil was built with the install-bootstrap feature (gated on M4 OQ-1)"; fi
+  # A tripwire on the remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner
+  # 2026-11-04): the install bootstrap is in the binary, byte for byte as the golden pins it for
+  # this version and wire, and every `sh -c` in the binary (which also catches `bash -c`, `zsh -c`
+  # and the like) is the start of that text. A universal binary holds one per architecture. This
+  # finds a second shell-wrapped literal only: a command built from separate argv words has no
+  # such text, which is why crates/fil/tests/remote_commands.rs checks the behavior (every
+  # subcommand against a recording fake ssh).
+  if [ -z "$boot" ]; then
+    fail "$name: no install bootstrap to compare with (crates/fil-transport/src/pipe/remote-commands.txt)"
+  else
+    n_boot=$({ grep -aoF -- "$boot" "$b" || true; } | wc -l | tr -d ' ')
+    n_sh=$({ grep -aoF -- 'sh -c' "$b" || true; } | wc -l | tr -d ' ')
+    if [ "$n_boot" -ge 1 ] && [ "$n_sh" = "$n_boot" ]; then
+      ok "$name: bin/fil holds the approved install bootstrap ($n_boot) and no other shell command line"
+    elif [ "$n_boot" -lt 1 ]; then
+      fail "$name: bin/fil does not hold the approved install bootstrap for $V on wire $major.$rev (remote-commands.txt)"
+    else
+      fail "$name: bin/fil has $n_sh 'sh -c' texts but $n_boot copies of the approved install bootstrap: a remote command line other than the pinned one (first: $({ grep -aoE '[ -~]{0,30}sh -c[ -~]{0,30}' "$b" || true; } | head -n 3 | tr '\n' ' '))"
+    fi
+  fi
   # Fixture hosts and addresses (the list is derived from the test directories of the tree).
   leak=$(fixture_leaks "$b")
   if [ -n "$leak" ]; then fail "$name: bin/fil contains test-fixture host names or addresses: $leak"; else ok "$name: bin/fil has none of the $(printf '%s\n' "$fixtures" | grep -c .) test-fixture host names and addresses"; fi
@@ -287,6 +306,18 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
     universal-apple-darwin) grep -Eq 'Mach-O universal binary with 2 architectures.*x86_64.*arm64|Mach-O universal binary with 2 architectures.*arm64.*x86_64' <<< "$desc" && ok "$name: bin/fil is a universal Mach-O (x86_64, arm64)" || fail "$name: bin/fil is not a two-architecture Mach-O: $desc" ;;
   esac
 done
+
+# The notices (section 7): every binary archive carries the THIRD-PARTY-NOTICES.md of the tree it
+# was built from, which is the one in the source archive (`just notices` checked it is current).
+src_notices=$work/x-source/fil-$V-source/THIRD-PARTY-NOTICES.md
+if [ -f "$src_notices" ]; then
+  for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin; do
+    n=$work/x-$label/fil-$V-$label/share/doc/fil/THIRD-PARTY-NOTICES.md
+    [ -f "$n" ] || continue
+    cmp -s "$n" "$src_notices" && ok "fil-$V-$label: THIRD-PARTY-NOTICES.md is the source archive's" \
+      || fail "fil-$V-$label: share/doc/fil/THIRD-PARTY-NOTICES.md differs from the source archive's THIRD-PARTY-NOTICES.md"
+  done
+fi
 
 # Byte-identical bundle (section 4.3): in every binary archive, each remote copy is the binary of
 # its target as it appears in that target's own archive.

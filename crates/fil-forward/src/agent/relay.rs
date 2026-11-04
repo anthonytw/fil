@@ -852,12 +852,14 @@ mod tests {
             .await
             .unwrap();
         let mut answer = Vec::new();
-        tokio::time::timeout(2 * AGENT_ANSWER_TIMEOUT, remote.read_to_end(&mut answer))
+        // Documented as 60 s: a minute and a bit, and not before.
+        tokio::time::timeout(Duration::from_secs(65), remote.read_to_end(&mut answer))
             .await
-            .expect("the relay gave up on the agent")
+            .expect("the relay gave up on the agent within a minute")
             .unwrap();
         assert_eq!(answer, FAILURE_MSG, "answered FAILURE, then ended");
         assert!(t0.elapsed() >= AGENT_ANSWER_TIMEOUT, "not before the bound");
+        assert_eq!(AGENT_ANSWER_TIMEOUT, Duration::from_secs(60));
         task.await.unwrap();
         assert_eq!(
             heard.await.unwrap(),

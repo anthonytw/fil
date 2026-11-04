@@ -1862,15 +1862,18 @@ mod tests {
         let x = ForwardId(3);
         m.own[0].id = Some(x);
         let failed = ListenState::Failed(BindFailure::AddrInUse);
-        for _ in 0..10_000 {
-            m.listening(x, failed);
-        }
         let notices = |rx: &mut NotesRx| {
             std::iter::from_fn(|| rx.try_recv())
                 .filter(|n| matches!(n, Note::Notice(_)))
                 .count()
         };
-        assert_eq!(notices(&mut rx), 1);
+        // Taken as they come, so the notes' own coalescing does not hide a repeat.
+        let mut said = 0;
+        for _ in 0..100 {
+            m.listening(x, failed);
+            said += notices(&mut rx);
+        }
+        assert_eq!(said, 1);
         m.listening(
             x,
             ListenState::Listening {

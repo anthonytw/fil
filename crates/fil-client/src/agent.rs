@@ -519,7 +519,12 @@ mod tests {
         let waiting_token = ask(&mut rx);
         agent.answer(third_token, false);
         assert!(!third.await);
-        assert!(!waiting.await, "the question waiting was refused too");
+        let quick = std::time::Duration::from_secs(1);
+        assert_eq!(
+            tokio::time::timeout(quick, waiting).await,
+            Ok(false),
+            "the question waiting was refused too"
+        );
         assert!(matches!(rx.try_recv(), Some(Note::Cancel { token }) if token == waiting_token));
         match rx.try_recv() {
             Some(Note::Notice(lines)) => {
@@ -529,7 +534,10 @@ mod tests {
         }
         // Refused without asking, and said once.
         for _ in 0..10 {
-            assert!(!asker.confirm(info("k")).await);
+            assert_eq!(
+                tokio::time::timeout(quick, asker.confirm(info("k"))).await,
+                Ok(false)
+            );
         }
         assert!(rx.try_recv().is_none(), "asked, or told again");
 

@@ -51,8 +51,8 @@ pub use epochs::{
 
 use crate::keys::{KeyClass, KeyDecoder, classify};
 use crate::predictor::{
-    CellRef, CellStyle, Ctx, InputPos, KeyEvent, LinkView, Predictor, ScreenView, Show, Time,
-    WithdrawReason,
+    CellRef, CellStyle, CoreView, Ctx, InputPos, KeyEvent, LinkView, Predictor, ScreenView, Show,
+    Time, WithdrawReason,
 };
 use crate::tracker::{Blocker, Link, Tracker};
 
@@ -236,6 +236,9 @@ pub struct Guards {
     pub cap: bool,
     /// Nothing is written on a screen a resize made untrusted (rule 9).
     pub untrusted: bool,
+    /// The first confirmation needs the cursor where the core computed it, after one of the
+    /// guesses the chunk confirms (rule 2's cursor clause).
+    pub cursor_clause: bool,
     /// **Off by default** (a proposed hardening, rule 5): an epoch's first write also waits for
     /// the `EchoAck` that covers the key that confirmed it.
     pub ack_before_write: bool,
@@ -285,6 +288,7 @@ impl Guards {
             "paste" => &mut self.paste,
             "cap" => &mut self.cap,
             "untrusted" => &mut self.untrusted,
+            "cursor_clause" => &mut self.cursor_clause,
             "ack_before_write" => &mut self.ack_before_write,
             _ => return None,
         })
@@ -343,6 +347,7 @@ impl Guards {
         paste: true,
         cap: true,
         untrusted: true,
+        cursor_clause: true,
         ack_before_write: false,
     };
 
@@ -406,6 +411,7 @@ impl Guards {
         "paste",
         "cap",
         "untrusted",
+        "cursor_clause",
     ];
 }
 
@@ -1094,6 +1100,13 @@ impl Inner {
             link: self.link,
             pty: self.pty,
             now,
+            core: CoreView {
+                epoch: self.core.epoch,
+                confirmed: self.core.epoch_confirmed(),
+                prior_acked: self.core.prior_acked(),
+                origin: st.modes().origin || self.tracker.origin_maybe(),
+                cursor_disputed: self.tracker.cursor_disputed(),
+            },
         }
     }
 

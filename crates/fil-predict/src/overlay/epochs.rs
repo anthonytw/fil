@@ -319,6 +319,13 @@ pub(crate) struct Core {
     /// Settled since the predictor was last told.
     pub settled: Vec<Settled>,
     pub stats: PredictStats,
+    /// Where the cursor was left by the current epoch's latest confirmed guess: in a confirmed
+    /// epoch, a chunk that leaves the cursor there is explained (the second piece of an echo cut
+    /// after the glyph, `g ` then `\x1b[1D`, or a `\b \b` in pieces).
+    echoed_at: Option<(u16, u16)>,
+    /// Counts the epochs: changes whenever one ends or the keys are forgotten (`CoreView::epoch`,
+    /// for the predictor; nothing here reads it).
+    pub epoch: u64,
 }
 
 impl Core {
@@ -339,6 +346,8 @@ impl Core {
             deferred: Vec::new(),
             settled: Vec::new(),
             stats: PredictStats::default(),
+            echoed_at: None,
+            epoch: 0,
         }
     }
 
@@ -348,7 +357,6 @@ impl Core {
         self.state == State::Confirmed || !self.g.tentative
     }
 
-    #[cfg(feature = "testkit")]
     pub fn epoch_confirmed(&self) -> bool {
         self.state == State::Confirmed
     }
@@ -787,6 +795,7 @@ impl Core {
         if why.is_boundary() && self.hidden && !self.g.quiet_boundaries {
             return; // the mutation: M0's predictor skipped its epochs while it showed nothing
         }
+        self.epoch += 1;
         if why.is_boundary() && !self.g.ended_epoch {
             // The mutation: the ended epoch's guesses stay, and are drawn.
             for k in &mut self.keys {
@@ -823,6 +832,7 @@ impl Core {
         });
         self.state = State::Tentative;
         self.confirmed_once = false;
+        self.echoed_at = None;
         self.awaiting_ack = None;
     }
 
@@ -832,6 +842,11 @@ impl Core {
             .iter()
             .find(|k| !k.guess.as_ref().is_some_and(|g| g.kept))
             .map(|k| k.at)
+    }
+
+    /// Every key before the current epoch's first key is acknowledged (`CoreView::prior_acked`).
+    pub fn prior_acked(&self) -> bool {
+        self.first_key_at().is_none_or(|a| self.acked >= a)
     }
 
     fn is_kept(&self, i: usize) -> bool {
@@ -848,11 +863,15 @@ impl Core {
             }
         }
         self.keys.clear();
+        self.epoch += 1;
+        // The geometry changed: no cursor an earlier echo left is evidence of anything now.
+        self.echoed_at = None;
     }
 
     /// A snapshot replaces the shadow: the epoch ends (unless `Guards::snapshot` is off), and
     /// what was written is classified once the snapshot has landed ([`Core::classify_deferred`]).
     pub fn snapshot(&mut self, now: Time) {
+        self.epoch += 1;
         if !self.g.snapshot {
             // The mutation: the epoch survives the reset; the snapshot becomes the new baseline.
             for k in &mut self.keys {
@@ -886,6 +905,7 @@ impl Core {
         self.keys.clear();
         self.state = State::Tentative;
         self.confirmed_once = false;
+        self.echoed_at = None;
         self.awaiting_ack = None;
         self.baseline = None;
         self.dirty = false;
@@ -896,9 +916,11 @@ impl Core {
     /// them; a key left here would bind a new offset to an old guess).
     pub fn rebase_input(&mut self) {
         debug_assert!(self.keys.is_empty(), "rebase_input without a reset");
+        self.epoch += 1;
         self.keys.clear();
         self.state = State::Tentative;
         self.confirmed_once = false;
+        self.echoed_at = None;
         self.awaiting_ack = None;
         self.acked = 0;
     }
@@ -1023,6 +1045,12 @@ impl Core {
 
     /// Confirms key `i`'s guess, and the moves before it (the program handles keys in order).
     fn confirm(&mut self, i: usize, v: &dyn ScreenView, now: Time) {
+        if let Some(g) = self.keys[i].guess.as_ref()
+            && !g.kept
+            && matches!(g.kind, GKind::Glyph { .. })
+        {
+            self.echoed_at = Some(g.after);
+        }
         for j in 0..i {
             if self.is_pending(j)
                 && matches!(
@@ -1144,6 +1172,7 @@ impl Core {
                 return self.rebase(v);
             }
             let allowed = !moved
+                || self.echoed_at == Some(cur)
                 || self.keys.iter().any(|k| {
                     k.guess
                         .as_ref()
@@ -1199,16 +1228,17 @@ impl Core {
                 )
         })
         .collect();
-        let cursor_ok = self.cursor_clause(&confirming, cur, v);
+        let cursor_ok = !self.g.cursor_clause || self.cursor_clause(&confirming, cur, v);
         // Rule 2 (coordinator's call): the first confirmation also needs an `EchoAck` covering
         // every key typed before the epoch's first key. Until then a chunk that matches can be
         // the late echo of an earlier key that happens to be the same character (typing ahead
         // of a prompt), so it confirms nothing: it is neutral, like a chunk that changes nothing.
         // An extra condition only: it can delay or prevent a confirmation, never cause one.
-        let prior_acked = !self.g.prior_acked
-            || self.confirmed_once
-            || self.first_key_at().is_none_or(|a| self.acked >= a);
+        let prior_acked = !self.g.prior_acked || self.confirmed_once || self.prior_acked();
         if explained && !confirming.is_empty() && cursor_ok && !prior_acked {
+            // Neutral for the new epoch, but a kept guess of the ended one settles by its glyph
+            // as on any other chunk (it is not the rule's to delay).
+            self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
             return self.rebase(v);
         }
         if explained && !confirming.is_empty() && cursor_ok {

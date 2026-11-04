@@ -146,8 +146,11 @@ impl Trace {
 /// Which predictor a run uses.
 #[derive(Clone, Debug)]
 pub enum PredictorKind {
-    /// The default predictor.
+    /// The default predictor, configured by [`RunConfig::predictor`] (adaptive by default).
     Mosh,
+    /// The default predictor with `Mode::Always`: its guesses shown whatever its echo-time
+    /// estimate says, for traces whose synthetic timing would keep the adaptive switch off.
+    MoshAlways,
     /// A predictor that tries everything the core must refuse ([`HostilePredictor`]).
     Hostile(HostileCfg),
     /// Guesses the n-th printable key or Backspace at the n-th of these cells
@@ -256,6 +259,13 @@ pub struct Driver {
     /// The next input byte's offset.
     input_end: InputPos,
     link: LinkView,
+    /// The adversarial bar (`docs/m3/plan.md` §2.5): after a visible misprediction nothing is
+    /// written until the core has confirmed a new epoch. Set at a misprediction; `seen_tentative`
+    /// once the epoch has been seen tentative since; cleared when it is confirmed again.
+    after_mispredict: bool,
+    seen_tentative: bool,
+    last_mispredicted: u64,
+    last_written: u64,
 }
 
 impl Driver {
@@ -264,6 +274,10 @@ impl Driver {
         let ob = backend(cfg.oracle_backend);
         let predictor: Box<dyn crate::predictor::Predictor> = match &cfg.kind {
             PredictorKind::Mosh => Box::new(MoshPredictor::new(cfg.predictor)),
+            PredictorKind::MoshAlways => Box::new(MoshPredictor::new(MoshConfig {
+                mode: crate::mosh::Mode::Always,
+                ..cfg.predictor
+            })),
             PredictorKind::Hostile(h) => Box::new(HostilePredictor::new(h.clone())),
             PredictorKind::Fixed { cells } => Box::new(FixedPredictor::new(cells.clone())),
         };
@@ -291,6 +305,10 @@ impl Driver {
             password: false,
             input_end: 0,
             link: LinkView::default(),
+            after_mispredict: false,
+            seen_tentative: false,
+            last_mispredicted: 0,
+            last_written: 0,
         }
     }
 
@@ -391,7 +409,38 @@ impl Driver {
         }
     }
 
+    /// The adversarial bar, checked after every event: at most one written run per misprediction.
+    fn one_run_per_misprediction(&mut self) {
+        let s = self.overlay.stats();
+        let (mis, written) = (s.mispredicted.total(), s.written);
+        let confirmed = self.overlay.epoch_confirmed();
+        if mis > self.last_mispredicted {
+            self.after_mispredict = true;
+            self.seen_tentative = !confirmed;
+        } else if self.after_mispredict {
+            if !confirmed {
+                self.seen_tentative = true;
+            } else if self.seen_tentative {
+                self.after_mispredict = false;
+            }
+            if self.after_mispredict
+                && written > self.last_written
+                && self.cfg.bar == Some(Category::Adversarial)
+            {
+                self.fail(Violation {
+                    kind: Kind::Mispredict,
+                    detail: "a guess was written after a misprediction, before the core \
+                             confirmed a new epoch"
+                        .into(),
+                });
+            }
+        }
+        self.last_mispredicted = mis;
+        self.last_written = written;
+    }
+
     fn flushed(&mut self, f: crate::overlay::Flush, pre: Option<TermState>) {
+        self.one_run_per_misprediction();
         if self.failure.is_some() {
             return;
         }

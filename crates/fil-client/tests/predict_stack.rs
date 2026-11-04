@@ -141,15 +141,10 @@ async fn sudo_typed_ahead_is_stopped_by_the_enter_boundary() {
 /// `*` for every key, `\b \b` for a Backspace. The erase changes one cell to exactly the blank
 /// the core computed, which is no evidence that the program echoes what is typed: a blank guess
 /// never gives an epoch its first confirmation, so the key typed after the Backspace is not
-/// written. With that guard off it is.
-async fn masked_trial(guards_off: &[&'static str]) -> Report {
-    let rig = Rig::start(spec(
-        Transport::Pipe,
-        Program::Masked,
-        Predict::MoshAlways,
-        guards_off,
-    ))
-    .await;
+/// written. With that guard off it is, by a predictor that guesses the Backspace (the default
+/// one never guesses a Backspace over text it did not type, the prompt's `*`).
+async fn masked_trial(predict: Predict, guards_off: &[&'static str]) -> Report {
+    let rig = Rig::start(spec(Transport::Pipe, Program::Masked, predict, guards_off)).await;
     mode_reported(&rig).await;
     rig.term.clear_counts();
     let secret = secret_chars();
@@ -166,9 +161,11 @@ async fn masked_trial(guards_off: &[&'static str]) -> Report {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_masked_prompts_backspace_confirms_nothing() {
-    let on = masked_trial(&[]).await;
-    assert_eq!(on.leaked, 0, "{on:?}");
-    let off = masked_trial(&["nonblank_first"]).await;
+    for predict in [Predict::MoshAlways, Predict::Plain] {
+        let on = masked_trial(predict, &[]).await;
+        assert_eq!(on.leaked, 0, "{predict:?}: {on:?}");
+    }
+    let off = masked_trial(Predict::Plain, &["nonblank_first"]).await;
     assert!(off.leaked > 0, "{off:?}");
 }
 

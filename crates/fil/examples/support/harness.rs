@@ -748,9 +748,9 @@ mod tests {
 
     #[test]
     fn real_host_names_are_scrubbed_to_labels() {
-        let t = Targets::parse("pi1=fil-test@alpha.lab.example", &[]).unwrap();
-        let s = t.scrub("fil-test@alpha-pi:~ $ and alpha.lab.example");
-        assert!(!s.contains("alpha"), "{s}");
+        let t = Targets::parse("pi1=fil-test@devbox.example", &[]).unwrap();
+        let s = t.scrub("fil-test@devbox-pi:~ $ and devbox.example");
+        assert!(!s.contains("devbox"), "{s}");
         assert!(s.contains("pi1"));
     }
 

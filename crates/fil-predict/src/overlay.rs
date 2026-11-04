@@ -51,7 +51,7 @@ pub use epochs::{
 
 use crate::keys::{KeyClass, KeyDecoder, classify};
 use crate::predictor::{
-    CellStyle, Ctx, InputPos, KeyEvent, LinkView, Predictor, Show, Time, WithdrawReason,
+    CellStyle, CoreView, Ctx, InputPos, KeyEvent, LinkView, Predictor, Show, Time, WithdrawReason,
 };
 use crate::tracker::{Blocker, Link, Tracker};
 
@@ -1018,6 +1018,12 @@ impl Overlay {
             link: self.link,
             pty: self.pty,
             now,
+            core: CoreView {
+                epoch: self.core.epoch,
+                confirmed: self.core.epoch_confirmed(),
+                origin: st.modes.origin || self.tracker.origin_maybe(),
+                cursor_disputed: self.tracker.cursor_disputed(),
+            },
         }
     }
 

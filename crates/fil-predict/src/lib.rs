@@ -30,13 +30,13 @@ pub mod sim;
 #[cfg(feature = "harness")]
 pub mod pty;
 
-pub use mosh::{MoshConfig, MoshPredictor};
+pub use mosh::{Mode, MoshConfig, MoshPredictor, UnderlineAfter};
 pub use overlay::{
     Bracket, Config, Flush, Guards, InputKind, Mispredicted, Overlay, Placement, PredictStats,
     PtyMode, Status, View, Withdrawn,
 };
 pub use predictor::{
-    CellRef, CellStyle, Ctx, InputPos, KeyEvent, LinkView, Outcome, OverlayEdit, Predictor,
-    ScreenView, Settled, Show, Time, WithdrawReason,
+    CellRef, CellStyle, CoreView, Ctx, InputPos, KeyEvent, LinkView, Outcome, OverlayEdit,
+    Predictor, ScreenView, Settled, Show, Time, WithdrawReason,
 };
 pub use tracker::{Blocker, Tracker};

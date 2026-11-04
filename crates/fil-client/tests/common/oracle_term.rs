@@ -474,6 +474,7 @@ impl Adapter {
             },
             pty: ctx.pty,
             now: ctx.now,
+            core: ctx.core,
         }
     }
 }
@@ -619,12 +620,7 @@ fn predictor_factory(
         Predict::Off => return None,
         Predict::Passive => Box::new(|| Box::new(Passive)),
         Predict::Mosh => Box::new(|| Box::new(MoshPredictor::new(MoshConfig::default()))),
-        Predict::MoshAlways => Box::new(|| {
-            Box::new(MoshPredictor::new(MoshConfig {
-                rtt_threshold: Duration::ZERO,
-                ..MoshConfig::default()
-            }))
-        }),
+        Predict::MoshAlways => Box::new(|| Box::new(MoshPredictor::new(MoshConfig::always()))),
         Predict::Eager => Box::new(|| Box::new(EagerPredictor::default())),
     };
     Some(Box::new(move || {

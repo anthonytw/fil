@@ -146,8 +146,11 @@ impl Trace {
 /// Which predictor a run uses.
 #[derive(Clone, Debug)]
 pub enum PredictorKind {
-    /// The default predictor.
+    /// The default predictor, configured by [`RunConfig::predictor`] (adaptive by default).
     Mosh,
+    /// The default predictor with `Mode::Always`: its guesses shown whatever its echo-time
+    /// estimate says, for traces whose synthetic timing would keep the adaptive switch off.
+    MoshAlways,
     /// A predictor that tries everything the core must refuse ([`HostilePredictor`]).
     Hostile(HostileCfg),
     /// Guesses the n-th printable key or Backspace at the n-th of these cells
@@ -264,6 +267,10 @@ impl Driver {
         let ob = backend(cfg.oracle_backend);
         let predictor: Box<dyn crate::predictor::Predictor> = match &cfg.kind {
             PredictorKind::Mosh => Box::new(MoshPredictor::new(cfg.predictor)),
+            PredictorKind::MoshAlways => Box::new(MoshPredictor::new(MoshConfig {
+                mode: crate::mosh::Mode::Always,
+                ..cfg.predictor
+            })),
             PredictorKind::Hostile(h) => Box::new(HostilePredictor::new(h.clone())),
             PredictorKind::Fixed { cells } => Box::new(FixedPredictor::new(cells.clone())),
         };

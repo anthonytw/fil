@@ -319,6 +319,9 @@ pub(crate) struct Core {
     /// Settled since the predictor was last told.
     pub settled: Vec<Settled>,
     pub stats: PredictStats,
+    /// Counts the epochs: changes whenever one ends or the keys are forgotten (`CoreView::epoch`,
+    /// for the predictor; nothing here reads it).
+    pub epoch: u64,
 }
 
 impl Core {
@@ -339,6 +342,7 @@ impl Core {
             deferred: Vec::new(),
             settled: Vec::new(),
             stats: PredictStats::default(),
+            epoch: 0,
         }
     }
 
@@ -348,7 +352,6 @@ impl Core {
         self.state == State::Confirmed || !self.g.tentative
     }
 
-    #[cfg(feature = "testkit")]
     pub fn epoch_confirmed(&self) -> bool {
         self.state == State::Confirmed
     }
@@ -787,6 +790,7 @@ impl Core {
         if why.is_boundary() && self.hidden && !self.g.quiet_boundaries {
             return; // the mutation: M0's predictor skipped its epochs while it showed nothing
         }
+        self.epoch += 1;
         if why.is_boundary() && !self.g.ended_epoch {
             // The mutation: the ended epoch's guesses stay, and are drawn.
             for k in &mut self.keys {
@@ -848,11 +852,13 @@ impl Core {
             }
         }
         self.keys.clear();
+        self.epoch += 1;
     }
 
     /// A snapshot replaces the shadow: the epoch ends (unless `Guards::snapshot` is off), and
     /// what was written is classified once the snapshot has landed ([`Core::classify_deferred`]).
     pub fn snapshot(&mut self, now: Time) {
+        self.epoch += 1;
         if !self.g.snapshot {
             // The mutation: the epoch survives the reset; the snapshot becomes the new baseline.
             for k in &mut self.keys {
@@ -896,6 +902,7 @@ impl Core {
     /// them; a key left here would bind a new offset to an old guess).
     pub fn rebase_input(&mut self) {
         debug_assert!(self.keys.is_empty(), "rebase_input without a reset");
+        self.epoch += 1;
         self.keys.clear();
         self.state = State::Tentative;
         self.confirmed_once = false;

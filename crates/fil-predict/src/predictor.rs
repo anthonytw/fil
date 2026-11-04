@@ -170,6 +170,28 @@ pub struct LinkView {
     pub down: bool,
 }
 
+/// What the core knows that the shadow screen does not show (added by P1 to §2.3's `Ctx`). Read
+/// only: nothing here lets a predictor change what the core decides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreView {
+    /// Changes whenever the core starts a new epoch or forgets the epoch's keys (a boundary, a
+    /// contradiction, a snapshot, a resize). A predictor that follows the core's cursor chain
+    /// (§2.3: in a tentative epoch, the first key's guess is at the shadow cursor) starts again
+    /// from the shadow cursor when it changes.
+    pub epoch: u64,
+    /// The current epoch is confirmed: the core accepts more than the plain forms (§2.3).
+    pub confirmed: bool,
+    /// Origin mode (DECOM) is on, or may be: in the shadow, or unknown to the tracker after a
+    /// soft reset or a cursor restore. WezTerm intermittently loses origin mode across the
+    /// overlay's `?6l`/`?6h` toggling (`docs/m3/terminals.md`, finding 8).
+    pub origin: bool,
+    /// The cursor's position comes from a cursor restore (DECRC, `CSI u`, `?1049 l`) after a
+    /// soft reset (DECSTR) with nothing saved since: the shadow lands at home, as xterm and
+    /// WezTerm do, while kitty and tmux keep the old saved cursor (`docs/m3/terminals.md`,
+    /// finding 2). Cleared by an absolute cursor position (`CUP`, `HVP`) or a full reset.
+    pub cursor_disputed: bool,
+}
+
 /// What a predictor sees when it is called.
 pub struct Ctx<'a> {
     /// The shadow screen: authoritative, with no history.
@@ -177,6 +199,8 @@ pub struct Ctx<'a> {
     pub link: LinkView,
     pub pty: PtyMode,
     pub now: Time,
+    /// The core's epoch and the tracker's doubts.
+    pub core: CoreView,
 }
 
 /// What a predictor proposes. Nothing here is written by itself: the core checks every guess,

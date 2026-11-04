@@ -338,7 +338,9 @@ fn the_prior_ack_rule_counts_from_the_new_epochs_first_key() {
 /// the new epoch's tentative guess goes with it.
 #[test]
 fn a_kept_guess_echoed_with_the_cursor_elsewhere_ends_the_new_epoch() {
-    let mut t = T::trusted(); // `$ a`, cursor (0, 3)
+    // The cells fixed: the default predictor keeps a Backspace alone in flight on its row.
+    let mut t = fixed(vec![(0, 2), (0, 2), (0, 3)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
     t.key(b"\x7f", 200); // a blank at (0, 2), written
     t.key(b"\r", 210); // kept
     t.key(b"y", 220); // the new epoch's guess at the shadow cursor (0, 3)
@@ -821,7 +823,9 @@ fn accounting() {
     }
 
     // A Backspace over a written guess replaces it: the user's correction, not a misprediction.
-    let mut t = T::trusted();
+    // (The default predictor waits for the echo before a Backspace; a fixed one does not.)
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 3)]);
+    t.confirm();
     t.key(b"b", 200);
     t.key(b"\x7f", 210);
     t.server(b"b\x08 \x08", 300);

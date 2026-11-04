@@ -92,11 +92,15 @@ fn b1_a_masked_prompt_backspace_confirms_nothing() {
                     "{name} {kind:?} on {}",
                     b.name
                 );
-                assert!(
-                    leaks(&trace, b.name, kind.clone(), off("nonblank_first")),
-                    "{name} {kind:?} on {}: no leak with nonblank_first off",
-                    b.name
-                );
+                // The default predictor never guesses a Backspace over text it did not type (the
+                // prompt's `*`), so only the hostile one shows the rule is needed.
+                if matches!(kind, PredictorKind::Hostile(_)) {
+                    assert!(
+                        leaks(&trace, b.name, kind.clone(), off("nonblank_first")),
+                        "{name} {kind:?} on {}: no leak with nonblank_first off",
+                        b.name
+                    );
+                }
             }
         }
     }

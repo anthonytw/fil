@@ -1,6 +1,6 @@
 # M3 plan: prediction
 
-> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
+> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **M3's close targets 0.2.0 (decided, owner 2026-11-04, 10:28 ET: N9):** 0.1.0 ships without prediction, M3 continues in parallel and its code keeps merging, dormant; 0.1.0 exposes no `predict` key and no `--predict` flag, and the §2.7 default (adaptive, on above 30 ms, underlined above 80 ms or after a glitch) applies from 0.2.0. K1 (terminal-channel pacing) stays required for 0.1.0. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
 
 ## 0. Preconditions and the overlap with M2 and M4
 
@@ -290,7 +290,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 
 ### 2.7 Configuration and the adaptive switch
 
-- `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed today; default `adaptive` (decided, owner 2026-11-04: PC-1).
+- **From 0.2.0 (decided, owner 2026-11-04, 10:28 ET: N9); 0.1.0 has no `predict` key and no `--predict` flag.** `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed today; default `adaptive` (decided, owner 2026-11-04: PC-1).
 - **`--predict off|adaptive|always`** overrides it for one run, like `--transport` (E1b; proposed).
 - `off`: no predictor, `Attach.echo_ack = false` (no `EchoAck`, the M1 mode poll). `adaptive` and `always`: `echo_ack = true` for the whole attach, so turning on mid-session needs no message.
 - **The adaptive switch (P1, proposed, mosh's values, §16.7 "to tune"):**

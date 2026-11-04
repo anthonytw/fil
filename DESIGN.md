@@ -714,7 +714,7 @@ enum OverlayEdit { Guess { row, col, at }, Move { at }, Withdraw { row, col }, C
 **The default build** ships a conservative predictor modeled on mosh's:
 
 - It predicts printable characters and backspace at the cursor, on the normal screen only.
-- It is on by default, as `predict = "adaptive"`: it shows guesses while its RTT estimate is above 30 ms (decided, owner 2026-11-04: `docs/m3/plan.md` PC-1). Where it switches off again, and the glitch window, still need tuning (§16.7).
+- From 0.2.0 (decided, owner 2026-11-04, 10:28 ET: N9); 0.1.0 has no prediction, no `predict` key and no flag. It is on by default, as `predict = "adaptive"`: it shows guesses while its RTT estimate is above 30 ms (decided, owner 2026-11-04: `docs/m3/plan.md` PC-1). Where it switches off again, and the glitch window, still need tuning (§16.7).
 - Unconfirmed predictions are underlined while the estimate is above 80 ms (decided, owner 2026-11-04: `docs/m3/plan.md` PC-1, §2.7), and after a glitch, an echo more than 250 ms late (mosh's rule; decided, owner 2026-11-04, round 2: not "after a wrong guess"); plain otherwise.
 
 Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and WezTerm's local echo.
@@ -917,7 +917,7 @@ It can only narrow what `/etc/fil/policy.toml` and the sshd mirror allow, never 
 [defaults]
 transport = "auto"        # auto | pipe | direct
 host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
-predict = "adaptive"      # off | adaptive | always
+predict = "adaptive"      # off | adaptive | always; from 0.2.0, not in 0.1.0 (N9)
 
 [defaults.offline_input]  # keystrokes typed while disconnected (§4.3)
 buffer = "4KiB"           # 0 drops them
@@ -952,7 +952,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | **M0: spikes** | the link simulator; the prediction overlay with erase-before-write over a local PTY with injected latency; an emulator restore-fidelity comparison across the modular backends (§6.5) | the default emulator is chosen, and the overlay never corrupts the screen in the harness | done (M0) |
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed | done (M1), closed 2026-11-03: the sweep's fixes are merged and verified; the drop-in suite passes 60 of 60 on both Pis with no expected failures, and `linux-check` passes every suite on main |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed | done (M2), closed 2026-11-04: forwards survive a pulled cable byte-exact, in the real-network harness and on both Pis; the five audits are done, their fix PRs are merged, and a verification pass found every finding closed or explicitly deferred with a home (51 findings, 37 closed, 14 deferred, 0 open; its two later fixes are merged too); the drop-in M2 set passes 25 of 25 on both Pis, with the host's `/etc/fil/policy.toml` allowing fil (`docs/m2/dropin.md`) |
-| **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, at the split bar of `docs/m3/plan.md` §2.5 (decided, owner 2026-11-04), and the sweep is closed | planning: the work order is `docs/m3/plan.md`; its two owner questions (OQ-1, OQ-2) and PC-1 were answered on 2026-11-04; started 2026-11-04, beside the M2 sweep's last PRs and M4, on files they do not touch or that the coordinator serializes |
+| **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, at the split bar of `docs/m3/plan.md` §2.5 (decided, owner 2026-11-04), and the sweep is closed | **M3's close targets 0.2.0, not 0.1.0** (decided, owner 2026-11-04, 10:28 ET: N9): M3's code keeps merging, dormant, while 0.1.0 ships without prediction. Planning: the work order is `docs/m3/plan.md`; its two owner questions (OQ-1, OQ-2) and PC-1 were answered on 2026-11-04; started 2026-11-04, beside the M2 sweep's last PRs and M4, on files they do not touch or that the coordinator serializes |
 | **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | planning: the work order is `docs/m4/plan.md` (proposed; the owner answered M4 OQ-1, yes, and OQ-2, OQ-3 and OQ-4 on 2026-11-04, its §7; round 2 the same day settled the first version, the crates.io names, the v1 channels and macOS notarization, `docs/m4/release.md` §10; OQ-5 is not recorded as answered), started 2026-11-04 in parallel with M3 by the owner's decision |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
@@ -968,6 +968,8 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 - **Closing:** a verification pass closes the sweep.
 
 M4 adds a **deeper pre-release sweep** of the code, the git history, the docs and CI before the first release (`docs/m4/plan.md` §6.4). The repository went public early; the recreate with a single initial commit (decided, owner 2026-11-03 and 2026-11-04), before the first release tag, takes care of most of the history.
+
+**0.1.0 ships without prediction (decided, owner 2026-11-04, 10:28 ET: N9).** It is an ssh/et drop-in: sessions that survive reconnects, roaming and sleep, forwarding, server policy. Prediction (M3) continues in parallel and is 0.2.0's headline; M3 no longer gates the release. 0.1.0 exposes no `predict` config key and no `--predict` flag, so there is no option that 0.2.0 would have to change; §9's default below applies from 0.2.0. The terminal-channel pacing fix (M3's K1: a fast Ctrl-C on a slow QUIC link after the catch-up) stays required for 0.1.0, because it affects every user.
 
 M4's release contract (versioning and the wire, targets, artifact names and layout, `SHA256SUMS`, the remote install layout, the version string and the frozen `--install-gc` contract) is `docs/m4/release.md`.
 

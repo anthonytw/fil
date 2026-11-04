@@ -8,7 +8,7 @@ Examples use package version `0.1.0` and wire `1.12`. The wire on `main` at the 
 
 ## 1. Versioning and the wire
 
-- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
+- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, an ssh/et drop-in without prediction (decided, owner 2026-11-04, 10:28 ET: N9; it has no `predict` key and no `--predict` flag, and prediction is 0.2.0's headline), then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
 - **The wire** is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION` (`crates/fil-proto/src/limits.rs`). It is independent of the package version. Two builds talk only when their wires are equal (`DESIGN.md` §5.3, §8.5).
 - **A patch release never changes the wire.** REL's `release-check` compares the revision on the last line of the golden's `[history]` with that of the previous tag of the same minor.
 - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Daemons of different wires coexist on a host, so this is an upgrade, not a breakage.
@@ -313,7 +313,7 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 **Repository settings** (the `v*` tag ruleset that only the owner passes, immutable releases, the code-owner review below, and the others of `docs/m4/plan.md` §5): the owner sets them before the first tag (owner, 2026-11-04).
 
-**Once, before the first release: the crates.io names are reserved** (published by the coordinator; `just reserve-crate-names` is the script, §10.1), and, for v1, sign the macOS binary (`just release-sign-macos`, §10.3, not built yet).
+**Once, before the first release: the crates.io names are reserved** (published by the coordinator; `just reserve-crate-names` is the script, §10.1), the `crates-io` environment exists and each of the nine crates has a trusted publisher (N8, §10.1), and, for v1, sign the macOS binary (`just release-sign-macos`, §10.3, not built yet).
 
 **The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
 
@@ -357,11 +357,13 @@ Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or
 
 ### 10.1 Reserving the crates.io names
 
-**Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name; no crates.io token goes to CI. The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
+**Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name. (Round 2 also said no crates.io token goes to CI; that stands, in the sense of N8 below: no long-lived token anywhere.) The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
 
 **The names.** The owner's list began with `fil` and eight `fil-*` libraries (`fil-proto`, `fil-transport`, `fil-session`, `fil-daemon`, `fil-client`, `fil-term`, `fil-predict`, `fil-forward`). **`fil` is unavailable on crates.io:** an unrelated crate (a random-number helper) took it on 2026-11-04 at 08:24 ET. The user-facing crate is therefore **`fil-shell`** (`cargo install fil-shell` installs the `fil` binary, matching `fil-shell-bin` on the AUR), reserved by the coordinator. **The name is not marked decided:** the owner can pick another. The workspace's `crates/fil` package must be renamed to match before it is published; the binary stays `fil`. Until then no document may suggest `cargo install fil`, which installs the wrong crate.
 
-**Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. How v1 itself is published is not recorded yet.
+**Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. The placeholders were published by the coordinator from the `splarg-bot` account, and that account's token has since been revoked and removed.
+
+**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag:** create the `crates-io` environment (required reviewer: the owner), and add a trusted publisher (this repository, the release workflow, the `crates-io` environment) on each of the nine crates: `fil-shell` and the eight `fil-*`.
 
 **The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
 
@@ -379,7 +381,7 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 **Decided (owner 2026-11-04, round 2), superseding the narrower recommendation of `docs/m4/plan.md` OQ-3** (the owner's note: "Reserve names and prep packages everywhere for v1"). The channels, as the owner chose them:
 
 - GitHub Releases and the Homebrew tap `anthonytw/homebrew-tap` (as recommended);
-- crates.io, nine crates: `fil-shell` and eight libraries (§10.1);
+- crates.io, nine crates: `fil-shell` and eight libraries (§10.1), published by trusted publishing (N8);
 - `.deb` and `.rpm` for x86_64 and arm64, built by CI and attached to the release;
 - the AUR package `fil-shell-bin`;
 - a Nix flake in the repository, plus a nixpkgs PR;

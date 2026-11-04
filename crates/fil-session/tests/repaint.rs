@@ -186,6 +186,34 @@ async fn a_repaint_waits_for_the_snapshot_in_flight_and_renders_at_the_new_size(
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 
+/// The same with the attach snapshot, which counts as one (DESIGN.md section 6.2), and nothing
+/// after it: everything sent is "acknowledged" (the stream starts at the snapshot's offset), but
+/// the snapshot itself is not, so the repaint still waits for its ack.
+#[tokio::test]
+async fn a_repaint_waits_for_the_attach_snapshots_ack() {
+    let sc = Scratch::new();
+    let h = spawn_plain(sh_config(&sc, "main", "exec sleep 60")).await;
+    let mut c = Client::connect(&h, Connect::new(&h, key(1)));
+    c.auto_ack = false;
+    c.wait("the attach snapshot", |c| {
+        c.reply.is_some() && !c.snapshot_bytes.is_empty()
+    })
+    .await;
+    c.resize(size(50, 15)).await;
+    c.repaint().await;
+    c.drain(Duration::from_millis(1500)).await;
+    assert!(c.mid_snapshots.is_empty(), "{:?}", c.mid_snapshots);
+    let upto = c.next;
+    c.send_ctl(ControlMsg::Ack {
+        channel: ChannelId::TERMINAL,
+        upto,
+    })
+    .await;
+    c.wait("the repaint", |c| !repaints(c).is_empty()).await;
+    assert_eq!(repaints(&c)[0].size_gen, 1);
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
 /// A connection that lost the session (taken over) asks for a repaint: nothing happens, to it or
 /// to the new subscriber.
 #[tokio::test]

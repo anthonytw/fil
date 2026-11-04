@@ -715,13 +715,14 @@ async fn a_snapshot_from_an_older_size_leaves_the_screen_untrusted() {
         .await;
     daemon.hold_repaints(true).await;
     let (rig, _) = start_predicting_with(daemon, predicting());
-    until_async("the attach", 5, || async {
-        rig.daemon.attaches().await.len() == 1
-    })
-    .await;
+    // The attach is out (the daemon holds its lock while it delays the snapshot, so it cannot
+    // be asked); the window changes before the snapshot lands.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.resize_quietly(100, 30);
     rig.attached().await;
-    assert_eq!(rig.daemon.attaches().await[0].size_gen, 0);
+    let a = rig.daemon.attaches().await;
+    assert_eq!((a[0].size_gen, a[0].size.cols()), (0, 80), "the attach was at the old size");
+    assert_eq!(rig.daemon.repaints().await.len(), 0, "the repaint is held");
     warm(&rig).await;
     // Acknowledged and not echoed, so the next epoch's prior-ack rule is met.
     rig.daemon.set_echo(Echo::Silent).await;

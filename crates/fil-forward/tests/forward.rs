@@ -242,9 +242,11 @@ async fn concurrent_connections(t: Transport) {
     // the open cap at once), and on a loaded macOS the server's listen queue (128) can overflow:
     // the kernel completes such a handshake and then resets it at the first read or write. fil
     // passes that reset on, as it should, so the application sees it before any byte came back.
-    // Such a connection is made again, as a client library would, a bounded number of times, and
-    // the retries are counted and bounded below: a fil that reset connections itself would
-    // exceed them.
+    // Such a connection is made again, as a client library would. Both kernel causes (a handshake
+    // dropped from the server's queue, or from fil's own `-L` queue) leave the server's `accept`
+    // count alone, so it must still be exactly `n`: a connection the server accepted and that
+    // was reset anyway is fil's doing, and fails the test at the first one. The retries are also
+    // capped (`MAX_RESETS`), and printed.
     let all = Arc::new(tokio::sync::Barrier::new(n as usize));
     let mut set = tokio::task::JoinSet::new();
     for i in 0..n {
@@ -301,10 +303,8 @@ async fn concurrent_connections(t: Transport) {
          {retries} made again after a reset",
         t0.elapsed()
     );
-    assert!(
-        u64::from(retries) <= n / 10,
-        "{retries} connections were reset"
-    );
+    const MAX_RESETS: u32 = 10;
+    assert!(retries <= MAX_RESETS, "{retries} connections were reset");
     assert!(peak <= fil_proto::limits::MAX_OPEN_CHANNELS, "{peak}");
     let live_peak = live_peak.load(Ordering::SeqCst);
     assert!(
@@ -312,11 +312,11 @@ async fn concurrent_connections(t: Transport) {
         "{live_peak} connections at once, wanted {hold}"
     );
     w.settled().await;
-    // A connection reset in the server's listen queue never reached it.
-    let accepted = server.accepted.load(Ordering::SeqCst);
-    assert!(
-        (n as usize..=n as usize + retries as usize).contains(&accepted),
-        "{accepted} accepted for {n} connections and {retries} retries"
+    // A connection reset in a listen queue never reached the server.
+    assert_eq!(
+        server.accepted.load(Ordering::SeqCst),
+        n as usize,
+        "{retries} connections were made again"
     );
 }
 

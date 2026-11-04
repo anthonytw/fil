@@ -1,6 +1,6 @@
 # fil — design
 
-> **Status: draft for discussion, 2026-11-03.** M0 and M1 are done, the M1 sweep included (§15); M2 is in progress.
+> **Status: draft for discussion, 2026-11-04.** M0 and M1 are done, the M1 sweep included (§15); M2 is in its sweep; M3 and M4 are being planned, in parallel with M2's tail.
 > Items marked **(decided)** are the owner's decisions. Everything else is a proposal.
 
 *fil* is French for thread or wire. *Reprendre le fil*: to pick up the thread where you left off.
@@ -896,7 +896,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed | done (M1), closed 2026-11-03: the sweep's fixes are merged and verified; the drop-in suite passes 60 of 60 on both Pis with no expected failures, and `linux-check` passes every suite on main |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed | in progress, in its sweep: the forwards, `fil forward`, `fil ports`, the agent relay and the server policy are on main (built from the work order in `docs/m2/plan.md`, now historical); the sweep's fix PRs are landing, and its verification pass is next |
 | **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, and the sweep is closed | not started |
-| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | not started |
+| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | planning: the work order is `docs/m4/plan.md` (proposed; its owner questions OQ-1 to OQ-5 are open), started 2026-11-04 in parallel with M3 by the owner's decision |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
 
@@ -910,7 +910,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 - **Fixing:** findings become fix PRs, reviewed like any other.
 - **Closing:** a verification pass closes the sweep.
 
-M4 adds a **deeper pre-public sweep** of the code, the git history, the docs and CI before the repo goes public.
+M4 adds a **deeper pre-release sweep** of the code, the git history, the docs and CI before the first release (`docs/m4/plan.md` §6.4). The repository went public early; the owner's planned recreate with a single initial commit, before the first release tag, takes care of most of the history.
 
 **Project site (M4).** fil.anthonywertz.com, set up the same way as Sempere's site: the site source lives in its own repository, `fil-site`, and its deploy script pushes the built output to a public GitHub Pages repository. The site hosts the docs, install instructions and release notes.
 
@@ -920,7 +920,7 @@ M4 adds a **deeper pre-public sweep** of the code, the git history, the docs and
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
 4. ~~**Terminal-query replies in flight during a takeover**~~ Resolved for M1 (proposed, not decided): the reply is lost and nothing is repaired; the program's own timeout ends the wait. See §6.3.
-5. **Server binary:** manual install, or upload by the client (§11)?
+5. **Server binary:** manual install, or upload by the client (§11)? Planned in `docs/m4/plan.md` (U1): manual install always, and an upload over the pipe if the owner allows a second fixed remote command (OQ-1).
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**
    - heartbeat interval and dead-link timeout
@@ -930,6 +930,6 @@ M4 adds a **deeper pre-public sweep** of the code, the git history, the docs and
    - how long forwarded connections survive a disconnect
    - prediction RTT threshold
 8. **More forward kinds:** Unix sockets, SOCKS (`-D`) and UDP.
-9. **macOS as a remote host:** fully supported, or best effort? It can't be tested on hosted runners until the repo is public (M4), so it waits until then.
+9. **macOS as a remote host:** fully supported, or best effort? The repo is public now, so hosted macOS runners can test it. Proposed in `docs/m4/plan.md` (MAC): supported, with `fil ports` showing forwards only.
 10. ~~**Keystrokes typed while disconnected**~~ Resolved: a configurable buffer, an optional confirmation on resume, and an optional log **(decided)**. See §4.3.
 11. ~~**Wire format**~~ Resolved: postcard **(decided)**. See §13.

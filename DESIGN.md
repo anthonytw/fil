@@ -223,7 +223,7 @@ The client writes those bytes straight to the local terminal. That is why native
 
 - **Resume** applies when the same client reconnects and its terminal is still open. The client acknowledges the bytes it has written. On reconnect it sends its last sequence number, and if that point is still in the log, the daemon sends the rest. Native scrollback has no gap.
 - **Snapshot** applies to a new client, or when the log has wrapped. The daemon renders from its emulator:
-  1. the last N history lines (default 1000), as text with SGR attributes, reflowed to the new width
+  1. a clear of the client's screen, then the last N history lines (default 1000), as text with SGR attributes, reflowed to the new width. The clear is one `CSI 2 K` per row and then home, never `CSI J`: tmux copies the screen into its history for that, so each attach would add a screen of scrollback (`fil_term::snapshot::clear_screen` writes it, for the snapshot and for any repaint)
   2. the current screen
   3. the terminal modes: alternate screen, cursor position and style, mouse, bracketed paste, focus and keypad modes, kitty keyboard flags, scroll region, title, tab stops (always cleared and set again, whatever the client's terminal had) and character sets (G0 to G3, the invoked one, and the ones the saved cursor holds)
 - **Catch-up rule:** if the subscriber falls behind by more than a threshold (default 1 MiB or 2 s of output), the daemon jumps to a snapshot instead of replaying the backlog. On a slow link, `cat hugefile` followed by Ctrl-C stays responsive, which is mosh's main advantage. The cost is a gap in native scrollback. The gap is visible: a marker line such as `── fil: skipped 48 MB of output ──` goes into the scrollback.

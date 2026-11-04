@@ -6,9 +6,10 @@
 //!
 //! The order is chosen so that nothing depends on state a later step sets:
 //!
-//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen, and put
-//!    all four character sets back to ASCII with G0 invoked (the receiver may be mid-way
-//!    through line drawing);
+//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen with
+//!    [`clear_screen`] (one `CSI 2 K` per row, not `CSI J`: see there), and put all four
+//!    character sets back to ASCII with G0 invoked (the receiver may be mid-way through line
+//!    drawing);
 //! 2. history and the primary screen, written as ordinary text with line feeds, so that
 //!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
 //!    are written without a newline and left to autowrap, which restores the wrap flag;
@@ -126,7 +127,8 @@ impl<'a> Writer<'a> {
         let st = self.st;
         // 1. Known starting point. Not a full reset: that would drop the receiver's own
         // scrollback, which is the point of fil.
-        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r\x1b[H\x1b[J");
+        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r");
+        clear_screen(&mut self.out, st.size.rows);
         self.designate([Charset::Ascii; 4]);
         self.put("\x0f");
         // 2. History and the primary screen.
@@ -423,6 +425,25 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// Appends a clear of a `rows`-row screen that leaves the cursor at the home position and does
+/// not push the screen into the receiver's scrollback.
+///
+/// `CSI H CSI J` is the textbook clear, but tmux (3.4) copies the visible screen into its history
+/// for it, so every snapshot would add a screen of scrollback to a local tmux. Erasing each row
+/// with `CSI 2 K` and then homing pushes nothing on xterm, kitty, WezTerm or tmux, and leaves the
+/// same cells (the real-terminal suite, `cl-rows*`, docs/m3/terminals.md finding 3). `CSI 2 J`
+/// is no substitute: tmux pushes on it too. The cost is a short sequence per row.
+///
+/// The caller has put the terminal in a state where `CUP` is absolute: origin mode off. A scroll
+/// region does not matter, `CUP` and `EL` ignore it. The pen should be reset first, so the erased
+/// cells get the default background (the snapshot writer's own first step does that).
+pub fn clear_screen(out: &mut Vec<u8>, rows: u16) {
+    for row in 1..=u32::from(rows) {
+        out.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[H");
+}
+
 /// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`), for a
 /// terminal with the capabilities of [`WriteCaps::current`].
 pub fn sgr(a: &Attrs) -> String {
@@ -539,6 +560,46 @@ mod tests {
         assert!(out.contains("\x1b[?2004l"));
         assert!(out.ends_with("\x1b[0 q\x1b[?25h"));
         assert!(!out.contains("1049"));
+    }
+
+    /// Every erase-in-display (`CSI Ps J`) in `bytes`, by parameter.
+    fn erase_in_display(bytes: &[u8]) -> Vec<u16> {
+        use vte::{Params, Parser, Perform};
+        #[derive(Default)]
+        struct Seen(Vec<u16>);
+        impl Perform for Seen {
+            fn csi_dispatch(&mut self, p: &Params, _: &[u8], _: bool, action: char) {
+                if action == 'J' {
+                    self.0.push(p.iter().next().map_or(0, |x| x[0]));
+                }
+            }
+        }
+        let (mut parser, mut seen) = (Parser::new(), Seen::default());
+        parser.advance(&mut seen, bytes);
+        seen.0
+    }
+
+    #[test]
+    fn the_clear_erases_row_by_row_and_never_with_ed() {
+        // tmux pushes the screen into its history for `CSI H CSI J` and for `CSI 2 J`.
+        let mut out = Vec::new();
+        clear_screen(&mut out, 3);
+        assert_eq!(
+            s(&out),
+            "\x1b[1;1H\x1b[2K\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H"
+        );
+        assert_eq!(erase_in_display(&out), Vec::<u16>::new());
+        // The snapshot's clear is the same function, for the state's own height.
+        for (cols, rows) in [(10, 3), (80, 24)] {
+            let snap = snapshot(&state(cols, rows));
+            let mut want = Vec::new();
+            clear_screen(&mut want, rows);
+            assert!(
+                snap.windows(want.len()).any(|w| w == &want[..]),
+                "{rows} rows"
+            );
+            assert_eq!(erase_in_display(&snap), Vec::<u16>::new(), "{rows} rows");
+        }
     }
 
     #[test]

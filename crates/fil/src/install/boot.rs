@@ -15,18 +15,13 @@
 
 use std::time::Duration;
 
-use fil_proto::limits::{MAX_PREAMBLE_SKIP, PROTOCOL_MAJOR, PROTOCOL_REVISION};
+use fil_proto::limits::{PROTOCOL_MAJOR, PROTOCOL_REVISION};
+use fil_transport::pipe::answer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::gc::Report;
 use super::upload::Upload;
 
-/// The line a marker starts with.
-const MARK: &str = "FIL-BOOT1 ";
-/// The start of fil's pipe preamble (`fil_proto::preamble`).
-const PREAMBLE: &[u8] = b"\x1bFIL-CONNECT ";
-/// The longest line read; longer ones are noise and are cut.
-const MAX_LINE: usize = 4096;
 /// How long `fil install --check` may take, its login included (a wrapper on `PATH` may hang).
 pub const CHECK_LIMIT: Duration = Duration::from_secs(120);
 /// How long `fil install --remove` may take, its login included: the login (which may wait for a
@@ -87,6 +82,12 @@ pub enum BootError {
     Ended(String),
     #[error("the host printed too much before fil's install command answered")]
     TooMuchNoise,
+    /// `check`'s report ended without its end marker (`FIL-CHECK-END`, owner's N6): the host
+    /// ran something other than the bootstrap (a forced `/bin/true`), or the report was cut.
+    #[error(
+        "no answer from the host: its report ended without fil's end marker (a forced command that runs something else, or a cut connection), so nothing was checked"
+    )]
+    NoAnswer,
     #[error("timed out waiting for the host")]
     Timeout,
     #[error("the pipe failed: {0}")]
@@ -106,11 +107,14 @@ pub struct Lines<R> {
     noise: usize,
 }
 
-/// One thing the script said.
+/// One thing the script said (its lines are read by the pipe's classifier of the answer,
+/// `fil_transport::pipe::answer`, the same as an attach reads them).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Said {
-    /// A `FIL-BOOT1 ...` line, without the prefix.
+    /// A `FIL-BOOT1 ...` line, without the prefix (`exec` included).
     Mark(String),
+    /// `FIL-BOOT1 attach <uname -s> <uname -m>`, the names sanitized and cut short.
+    Greeting { sys: String, machine: String },
     /// A `FIL-GC ...` or `FIL-HAVE ...` (or other `FIL-`) line, whole.
     Fil(String),
     /// fil's pipe preamble began.
@@ -137,36 +141,35 @@ impl<R: AsyncRead + Unpin> Lines<R> {
 
     async fn next(&mut self) -> Result<Said, BootError> {
         loop {
-            if let Some(at) = find(&self.buf, PREAMBLE) {
-                let before_nl = self.buf[..at].iter().rposition(|&b| b == b'\n');
-                // A complete line before the preamble is read first; the preamble itself is not
-                // consumed (it belongs to the pipe).
-                if before_nl.is_none() {
-                    return Ok(Said::Preamble);
-                }
+            let nl = self.buf.iter().position(|&b| b == b'\n');
+            // The preamble on the line being read: it is not consumed (it belongs to the pipe).
+            if answer::has_preamble(&self.buf[..nl.unwrap_or(self.buf.len())]) {
+                return Ok(Said::Preamble);
             }
-            if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            if let Some(nl) = nl {
                 let line: Vec<u8> = self.buf.drain(..=nl).collect();
-                let text = String::from_utf8_lossy(&line[..nl]).into_owned();
-                let text = text.strip_suffix('\r').unwrap_or(&text).to_string();
-                if let Some(rest) = text.strip_prefix(MARK) {
-                    return Ok(Said::Mark(rest.to_string()));
-                }
-                if text.starts_with("FIL-") {
-                    return Ok(Said::Fil(text));
+                match answer::classify(&line[..nl]) {
+                    answer::Line::Exec => return Ok(Said::Mark("exec".into())),
+                    answer::Line::Attach { sys, machine } => {
+                        return Ok(Said::Greeting { sys, machine });
+                    }
+                    answer::Line::Mark(m) => return Ok(Said::Mark(m)),
+                    answer::Line::Fil(l) => return Ok(Said::Fil(l)),
+                    answer::Line::Noise => {}
                 }
                 self.noise += line.len();
-                if self.noise > MAX_PREAMBLE_SKIP {
+                if self.noise > answer::NOISE_MAX {
                     return Err(BootError::TooMuchNoise);
                 }
                 return Ok(Said::Noise);
             }
-            if self.buf.len() > MAX_LINE {
+            if self.buf.len() > answer::LINE_MAX {
                 // A line too long to be ours: noise; keep its tail in case a marker follows.
-                let cut = self.buf.len() - PREAMBLE.len();
+                let cut =
+                    self.buf.len() - answer::PREAMBLE_MAGIC.len().max(answer::MARK.len() + 64);
                 self.noise += cut;
                 self.buf.drain(..cut);
-                if self.noise > MAX_PREAMBLE_SKIP {
+                if self.noise > answer::NOISE_MAX {
                     return Err(BootError::TooMuchNoise);
                 }
             }
@@ -178,10 +181,6 @@ impl<R: AsyncRead + Unpin> Lines<R> {
             self.buf.extend_from_slice(&chunk[..n]);
         }
     }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// What the script answered to `attach`.
@@ -204,15 +203,7 @@ pub async fn read_greeting<R: AsyncRead + Unpin>(r: &mut Lines<R>) -> Result<Gre
     loop {
         match r.next().await? {
             Said::Mark(m) if m == "exec" => return Ok(Greeted::Exec),
-            Said::Mark(m) if m.starts_with("attach ") => {
-                let mut parts = m.split(' ').skip(1);
-                let sys = parts.next().unwrap_or_default();
-                let machine = parts.next().unwrap_or_default();
-                return Ok(Greeted::Greeting {
-                    sys: fil_proto::text::sanitize_inline(sys),
-                    machine: fil_proto::text::sanitize_inline(machine),
-                });
-            }
+            Said::Greeting { sys, machine } => return Ok(Greeted::Greeting { sys, machine }),
             Said::Preamble => return Err(BootError::Forced),
             Said::End => return Err(BootError::Ended(String::new())),
             Said::Mark(_) | Said::Fil(_) | Said::Noise => {}
@@ -304,7 +295,7 @@ where
                 };
                 return Err(BootError::Ended(why));
             }
-            Said::Fil(_) | Said::Noise => {}
+            Said::Greeting { .. } | Said::Fil(_) | Said::Noise => {}
         }
     }
 }
@@ -350,13 +341,18 @@ fn clean(text: &str) -> String {
         .collect()
 }
 
-/// Reads `check`'s answer to the end.
+/// The last line of `check`'s report (N6, owner 2026-11-04).
+const CHECK_END: &str = "FIL-CHECK-END";
+
+/// Reads `check`'s answer, up to its end marker. A report that ends without it is no answer at
+/// all ([`BootError::NoAnswer`]), never "nothing installed".
 pub async fn read_check<R: AsyncRead + Unpin>(r: &mut Lines<R>) -> Result<CheckReport, BootError> {
     let mut report = CheckReport::default();
     let mut lines = 0;
     loop {
         match r.next().await? {
-            Said::End => return Ok(report),
+            Said::End => return Err(BootError::NoAnswer),
+            Said::Fil(l) if l == CHECK_END => return Ok(report),
             Said::Preamble => return Err(BootError::Forced),
             Said::Fil(l) => {
                 lines += 1;
@@ -371,7 +367,7 @@ pub async fn read_check<R: AsyncRead + Unpin>(r: &mut Lines<R>) -> Result<CheckR
                     report.local_bin = Some(clean(v));
                 }
             }
-            Said::Mark(_) | Said::Noise => {}
+            Said::Mark(_) | Said::Greeting { .. } | Said::Noise => {}
         }
     }
 }
@@ -442,7 +438,7 @@ mod tests {
             panic!()
         };
         assert!(!sys.contains('\x1b') && !sys.contains('\x07'), "{sys:?}");
-        let noise = vec![b'x'; MAX_PREAMBLE_SKIP + 10_000];
+        let noise = vec![b'x'; answer::NOISE_MAX + 10_000];
         assert_eq!(
             read_greeting(&mut lines(&noise)).await,
             Err(BootError::TooMuchNoise)
@@ -512,13 +508,26 @@ mod tests {
 
     #[tokio::test]
     async fn check_and_remove_answers() {
-        let mut r = lines(
-            b"rc noise\nFIL-HAVE 0.1.0-w1.12\nFIL-HAVE x\x1b[2Jy\nFIL-PATH fil 0.0.9 (wire 1.3)\n",
-        );
-        let c = read_check(&mut r).await.unwrap();
+        let report =
+            b"rc noise\nFIL-HAVE 0.1.0-w1.12\nFIL-HAVE x\x1b[2Jy\nFIL-PATH fil 0.0.9 (wire 1.3)\n";
+        let mut whole = report.to_vec();
+        whole.extend_from_slice(b"FIL-CHECK-END\n");
+        let c = read_check(&mut lines(&whole)).await.unwrap();
         assert_eq!(c.installed, ["0.1.0-w1.12", "x[2Jy"]);
         assert_eq!(c.on_path.as_deref(), Some("fil 0.0.9 (wire 1.3)"));
         assert_eq!(c.local_bin, None);
+        // N6: without the end marker it is no answer, whatever came before it (a cut report),
+        // and nothing at all is no answer either (a forced `/bin/true`).
+        assert_eq!(
+            read_check(&mut lines(report)).await,
+            Err(BootError::NoAnswer)
+        );
+        assert_eq!(read_check(&mut lines(b"")).await, Err(BootError::NoAnswer));
+        assert_eq!(
+            read_check(&mut lines(b"FIL-CHECK-END-NOT\n")).await,
+            Err(BootError::NoAnswer),
+            "only the exact line"
+        );
 
         let mut r =
             lines(b"FIL-BOOT1 gc\nFIL-GC removed=1 failed=0 recent=0 far-future=0 in-use=1\n");

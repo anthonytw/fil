@@ -231,7 +231,7 @@ pack_release() { # uses $tree $stage $rel $VER
   local d src="$stage/fil-$VER-source" lbl
   rm -rf "$rel" "$src"
   mkdir -p "$rel" "$src/vendor" "$src/.cargo"
-  cp "$tree/LICENSE" "$src/"
+  cp "$tree/LICENSE" "$tree/rust-toolchain.toml" "$src/"
   # A workspace of one dependency-free crate: `cargo metadata --offline` resolves it from nothing.
   printf '[workspace]\nresolver = "3"\nmembers = ["crates/x"]\n' > "$src/Cargo.toml"
   mkdir -p "$src/crates/x/src"

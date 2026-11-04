@@ -81,7 +81,11 @@ git -C "$ROOT" archive --format=tar --prefix="$name/" HEAD | tar -x -C "$stage"
   # `cargo vendor` prints the source-replacement config on stdout and progress on stderr.
   cargo vendor --locked vendor > .cargo/config.toml
 )
-[ -s "$stage/$name/.cargo/config.toml" ] || die "the vendoring step wrote no source-replacement config"
+if [ ! -s "$stage/$name/.cargo/config.toml" ]; then
+  # Nothing to replace is right only for a tree with no dependency from a registry or git at all.
+  ! grep -q '^source = ' "$stage/$name/Cargo.lock" || die "the vendoring step wrote no source-replacement config"
+  log "the tree has no external dependency: nothing vendored"
+fi
 
 # ---- tar and gzip, inside the image
 # The container sees the stage read-only and no network; the files it writes belong to the caller.

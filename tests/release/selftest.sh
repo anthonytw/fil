@@ -96,6 +96,8 @@ mutate_wf "crates-io stops requiring a tag" 's/(  crates-io:.*?    if: github.ev
 mutate_wf "crates-io gets attestations: write" 's/(      id-token: write # trusted publishing only\n)/$1      attestations: write\n/'
 mutate_wf "crates-io gets contents: write" 's/(  crates-io:.*?    permissions:\n      contents: )read/${1}write/s'
 mutate_wf "another job names the crates-io environment" 's/(  packages-arm64:\n.*?    runs-on: ubuntu-24.04-arm\n)/$1    environment: crates-io\n/s'
+mutate_wf "crates-io's actions: read becomes write" 's/(  crates-io:.*?      actions: )read/${1}write/s'
+mutate_wf "prepare's actions: read becomes write" 's/(  prepare:.*?      actions: )read/${1}write/s'
 mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
@@ -659,10 +661,10 @@ echo "sums" > "$gt/files/SHA256SUMS"
 ssh-keygen -q -Y sign -f "$keys/release" -n fil-release "$gt/files/SHA256SUMS"
 cat > "$gt/gh" << 'EOF2'
 #!/bin/sh
-# FAKE_ENV: the environment's answer (reviewers, none, missing); FAKE_DRAFT: true or false or missing
+# FAKE_ENV: the environment's user reviewers (owner, bot, none, missing); FAKE_DRAFT: true, false or missing
 case "$1 $2" in
   "api repos/"*)
-    case $FAKE_ENV in reviewers) echo 1 ;; none) echo 0 ;; *) exit 1 ;; esac ;;
+    case $FAKE_ENV in owner) echo "splarg-bot anthonytw" ;; bot) echo splarg-bot ;; none) echo ;; *) echo "HTTP 403" >&2; exit 1 ;; esac ;;
   "release view")
     [ "$FAKE_DRAFT" = missing ] && exit 1
     echo "$FAKE_DRAFT" ;;
@@ -674,21 +676,27 @@ esac
 EOF2
 chmod +x "$gt/gh"
 g_run() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY=o/r FAKE_FILES="$gt/files" "$@" "$gate" v0.9.0; }
-expect_pass "gate: a protected environment, a published release, a valid signature" g_run FAKE_ENV=reviewers FAKE_DRAFT=false
+expect_pass "gate: a protected environment, a published release, a valid signature" g_run FAKE_ENV=owner FAKE_DRAFT=false
 expect_fail "gate: an environment with no required reviewer is refused" g_run FAKE_ENV=none FAKE_DRAFT=false
+expect_fail "gate: an environment whose only reviewer is not the owner is refused" g_run FAKE_ENV=bot FAKE_DRAFT=false
+g_env() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY=o/r "$@"; }
+expect_pass "gate --environment-only: the owner reviews" g_env FAKE_ENV=owner "$gate" --environment-only
+expect_fail "gate --environment-only: an environment the token cannot read is an error on a tag push" g_env FAKE_ENV=missing "$gate" --environment-only
+expect_pass "gate --environment-only --warn: ...and a warning on a dry run" g_env FAKE_ENV=missing "$gate" --environment-only --warn
+grep -q '::warning::cannot read the crates-io environment' "$tmp/out.log" && pass "...which says so" || { flunk "...which says so"; sed 's/^/       | /' "$tmp/out.log"; }
 expect_fail "gate: an environment that cannot be read is refused" g_run FAKE_ENV=missing FAKE_DRAFT=false
-expect_fail "gate: a draft is refused" g_run FAKE_ENV=reviewers FAKE_DRAFT=true
-expect_fail "gate: a release the job cannot see is refused" g_run FAKE_ENV=reviewers FAKE_DRAFT=missing
+expect_fail "gate: a draft is refused" g_run FAKE_ENV=owner FAKE_DRAFT=true
+expect_fail "gate: a release the job cannot see is refused" g_run FAKE_ENV=owner FAKE_DRAFT=missing
 cp "$gt/files/SHA256SUMS.sig" "$gt/good.sig"
 echo "other" > "$gt/files/SHA256SUMS"
-expect_fail "gate: a SHA256SUMS.sig that does not match SHA256SUMS is refused" g_run FAKE_ENV=reviewers FAKE_DRAFT=false
+expect_fail "gate: a SHA256SUMS.sig that does not match SHA256SUMS is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false
 echo "sums" > "$gt/files/SHA256SUMS"
 rm "$gt/files/SHA256SUMS.sig"
 ssh-keygen -q -Y sign -f "$keys/attacker" -n fil-release "$gt/files/SHA256SUMS"
-expect_fail "gate: a signature by a key that main does not list is refused" g_run FAKE_ENV=reviewers FAKE_DRAFT=false
+expect_fail "gate: a signature by a key that main does not list is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false
 rm -f "$gt/files/SHA256SUMS.sig"
 cp "$gt/good.sig" "$gt/files/SHA256SUMS.sig"
-expect_pass "gate: (the good signature again passes)" g_run FAKE_ENV=reviewers FAKE_DRAFT=false
+expect_pass "gate: (the good signature again passes)" g_run FAKE_ENV=owner FAKE_DRAFT=false
 
 # ============================================================== 4c. crates.io name reservation
 echo "== reserve-crate-names.sh"

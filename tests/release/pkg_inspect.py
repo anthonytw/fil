@@ -10,10 +10,13 @@ prints, one per line:
     arch <architecture>
     script <what>              for every maintainer script or trigger the package has
     depends <what>             for every dependency (an rpm's `rpmlib(...)` features are not ones)
-    signed yes|no              an rpm: whether its signature header holds an OpenPGP signature
+    signed yes|no              an rpm: whether its signature header holds a v4 header signature
+                               (RSA, tag 268, or DSA, 267), the one the rpm 4.14 of RHEL 8 and
+                               openSUSE Leap 15 checks; rpm 6's OpenPGP tag (278) alone is `no`
                                (a .deb: always no; dpkg verifies no signature inside a .deb)
-    body <sha256>              an rpm: the digest of everything after its signature header (the
-                               header and the payload), which signing leaves alone; a .deb: of the file
+    body <sha256>              an rpm: the digest of its lead and of everything after its signature
+                               header (the header and the payload), which signing leaves alone; a
+                               .deb: of the file
     file <mode in octal> <owner>:<group> <path>      for every regular file
     dir <mode in octal> <owner>:<group> <path>       for every directory the package lists
 
@@ -158,9 +161,10 @@ def rpm(path: str, out: str) -> None:
     for req in tags.get(1049, []):
         if not req.startswith("rpmlib("):
             print(f"depends {req}")
-    # RSA (268) or DSA (267) over the header, or rpm 6's OpenPGP signatures (278).
-    print("signed " + ("yes" if any(t in sig for t in (267, 268, 278)) else "no"))
-    print(f"body {hashlib.sha256(blob[body:]).hexdigest()}")
+    # RSA (268) or DSA (267) over the header: what every rpm in use verifies. rpm 6.1's --addsign
+    # writes it beside its OpenPGP tag (278), which older rpms do not read.
+    print("signed " + ("yes" if any(t in sig for t in (267, 268)) else "no"))
+    print(f"body {hashlib.sha256(blob[:96] + blob[body:]).hexdigest()}")
     dirnames, basenames, dirindexes = tags.get(1118, []), tags.get(1117, []), tags.get(1116, [])
     users, groups = tags.get(1039, []), tags.get(1040, [])
     owner_of = {}

@@ -121,7 +121,10 @@ if [ "$dry" = 0 ]; then
   # main. --pre-sign checks neither: the draft's rpms are not signed yet.
   if [ "$presign" = 0 ]; then
     pkey=$work/package-signing-key.asc
-    if [ -n "${FIL_PACKAGE_KEY_FILE:-}" ]; then cp "$FIL_PACKAGE_KEY_FILE" "$pkey"; else git -C "$tagrepo" show "refs/remotes/origin/main:.github/package-signing-key.asc" > "$pkey" 2> /dev/null || : > "$pkey"; fi
+    if [ -n "${FIL_PACKAGE_KEY_FILE:-}" ]; then
+      echo "release-verify: NOTE: FIL_PACKAGE_KEY_FILE is set: the rpm and SHA256SUMS.asc signatures are checked against $FIL_PACKAGE_KEY_FILE, NOT against .github/package-signing-key.asc on main" >&2
+      cp "$FIL_PACKAGE_KEY_FILE" "$pkey"
+    else git -C "$tagrepo" show "refs/remotes/origin/main:.github/package-signing-key.asc" > "$pkey" 2> /dev/null || : > "$pkey"; fi
     grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pkey" || die "STOP: .github/package-signing-key.asc on main holds no key: the rpm signatures cannot be verified"
     command -v rpmkeys > /dev/null || die "STOP: rpmkeys is needed to verify the rpm signatures (macOS: brew install rpm)"
     rm -rf "$work/rpmdb" && mkdir -m 700 "$work/rpmdb"
@@ -196,8 +199,10 @@ if [ "$rebuild" = 1 ]; then
     for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz $(package_names "$version"); do
       h1=$(grep -F "  $n" "$dl/SHA256SUMS" | cut -d' ' -f1)
       h2=$(grep -F "  $n" "$rb/SHA256SUMS" | cut -d' ' -f1)
-      if [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "${n%.rpm}" != "$n" ] && [ -f "$dl/$n" ] && [ -f "$rb/$n" ]; then
-        # A signed rpm: the rebuild is unsigned. Everything after the signature header must match.
+      if [ "$presign" = 0 ] && [ "$dry" = 0 ] && [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "${n%.rpm}" != "$n" ] && [ -f "$dl/$n" ] && [ -f "$rb/$n" ]; then
+        # A signed rpm (after the owner's signing step only; before it, and in a dry run, an rpm must
+        # be the rebuild byte for byte): the rebuild is unsigned, so its lead and everything after the
+        # signature header must match.
         b1=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$dl/$n" "$work/px1" | sed -n 's/^body //p')
         b2=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$rb/$n" "$work/px2" | sed -n 's/^body //p')
         if [ -n "$b1" ] && [ "$b1" = "$b2" ]; then ok "$n is REPRODUCED from source byte for byte apart from its signature header ($b1)"; else fail "$n: released body $b1, rebuilt body $b2"; fi

@@ -50,6 +50,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      actions: read # reading the crates-io environment's protection (crates-io-gate.sh)
     outputs:
       version: ${{ steps.prepare.outputs.version }}
       epoch: ${{ steps.prepare.outputs.epoch }}
@@ -70,6 +71,16 @@ jobs:
       - name: Version, source date and tag checks
         id: prepare
         run: tests/release/prepare.sh
+      - name: The crates-io environment requires the owner's review (a warning on a dry run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.prepare.outputs.release }}
+        run: |
+          if [ "$RELEASE" = true ]; then
+            tests/release/crates-io-gate.sh --environment-only
+          else
+            tests/release/crates-io-gate.sh --environment-only --warn
+          fi
       - name: The release tree's dependency graph
         run: just release-deps
       - name: Notices (THIRD-PARTY-NOTICES.md is current for the release graph; package.sh ships it)
@@ -364,6 +375,7 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
+      actions: read # reading the crates-io environment's protection (crates-io-gate.sh)
       id-token: write # trusted publishing only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

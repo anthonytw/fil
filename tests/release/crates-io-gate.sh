@@ -4,8 +4,10 @@
 # (v<version>, annotated, on main, signed, and still this run's commit) and fetched main.
 #
 #   crates-io-gate.sh TAG
+#   crates-io-gate.sh --environment-only [--warn]
 #
-#   1. the `crates-io` environment has a required reviewer. GitHub creates an environment that a
+#   1. the `crates-io` environment's required reviewers include the owner (the user OWNER, below).
+#      GitHub creates an environment that a
 #      workflow names and that does not exist, with no protection at all; trusted publishing pins
 #      the workflow file and the environment, not the ref, so an unprotected environment would let
 #      any writer's branch mint a token. A misconfiguration fails here, loudly;
@@ -13,21 +15,47 @@
 #   3. its SHA256SUMS.sig is a valid fil-release signature of its SHA256SUMS by a key in
 #      .github/release-signers as it is on main (ssh-keygen -Y verify).
 #
-# Environment: GITHUB_REPOSITORY, GH_TOKEN (the job's read-only token). FIL_GATE_GH replaces `gh`
-# in the tests.
+# --environment-only runs 1 alone: release.yml's `prepare` job runs it on every run, so a dry run
+# proves that a job token with `actions: read` can read the environment before any tag exists.
+# --warn (a dry run) makes a failure of 1 a warning, while the environment may not exist yet.
+#
+# Environment: GITHUB_REPOSITORY, GH_TOKEN (the job's token, which needs `actions: read` for the
+# environment). FIL_GATE_GH replaces `gh` in the tests.
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-[ $# -eq 1 ] || die "usage: crates-io-gate.sh TAG"
-tag=$1
+# The one person who may approve a crates.io release (decided, owner: OQ-2, the release identity).
+OWNER=anthonytw
+
+env_only=0 warn=0 tag=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --environment-only) env_only=1; shift ;;
+    --warn) warn=1; shift ;;
+    -*) die "unknown option: $1" ;;
+    *) tag=$1; shift ;;
+  esac
+done
+[ "$env_only" = 1 ] || [ -n "$tag" ] || die "usage: crates-io-gate.sh TAG | --environment-only [--warn]"
 repo=${GITHUB_REPOSITORY:?}
 gh=${FIL_GATE_GH:-gh}
 
-reviewers=$("$gh" api "repos/$repo/environments/crates-io" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2> /dev/null) \
-  || die "cannot read the crates-io environment of $repo; it must exist with a required reviewer (docs/m4/release.md section 10.1)"
-[ "${reviewers:-0}" -ge 1 ] 2> /dev/null || die "the crates-io environment has no required reviewer: protect it first (docs/m4/release.md section 10.1)"
-log "the crates-io environment has a required reviewer"
+env_fail() {
+  if [ "$warn" = 1 ]; then
+    echo "::warning::$*" >&2
+    exit 0
+  fi
+  die "$*"
+}
+reviewers=$("$gh" api "repos/$repo/environments/crates-io" --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | select(.type == "User") | .reviewer.login] | join(" ")' 2> "${TMPDIR:-/tmp}/crates-io-gate.$$") \
+  || { e=$(head -c 300 "${TMPDIR:-/tmp}/crates-io-gate.$$" 2> /dev/null); rm -f "${TMPDIR:-/tmp}/crates-io-gate.$$"; env_fail "cannot read the crates-io environment of $repo ($e); it must exist with $OWNER as a required reviewer, and the job needs actions: read (docs/m4/release.md section 10.1)"; }
+rm -f "${TMPDIR:-/tmp}/crates-io-gate.$$"
+case " $reviewers " in
+  *" $OWNER "*) log "the crates-io environment requires $OWNER's review" ;;
+  *) env_fail "the crates-io environment's required reviewers ('$reviewers') do not include $OWNER: protect it first (docs/m4/release.md section 10.1)" ;;
+esac
+[ "$env_only" = 0 ] || exit 0
 
 draft=$("$gh" release view "$tag" --repo "$repo" --json isDraft --jq .isDraft 2> /dev/null) \
   || die "$tag has no GitHub Release this job can see (a draft is invisible to it): publish it first (docs/m4/release.md section 9.2), then re-run this job"

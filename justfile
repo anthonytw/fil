@@ -43,10 +43,11 @@ release-deps:
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
-      # Nor the install bootstrap's sending side (`install-bootstrap`, gated on M4 OQ-1,
-      # docs/m4/install.md): until the owner approves it, no release build may send it.
-      hooks=$(grep -E 'feature "(test-hooks|install-bootstrap)"' <<<"$tree" || true)
-      test -z "$hooks" || { echo "release-deps: $c has a test-only or gated feature in the release build of fil: $hooks" >&2; exit 1; }
+      # (The install bootstrap is in every build since the owner approved it, M4 OQ-1, 2026-11-04;
+      # crates/fil/tests/remote_commands.rs checks what reaches ssh; release-check's `sh -c` scan is
+      # a tripwire.)
+      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
+      test -z "$hooks" || { echo "release-deps: $c has a test-only feature in the release build of fil: $hooks" >&2; exit 1; }
     done
 
 test:

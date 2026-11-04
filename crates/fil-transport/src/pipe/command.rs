@@ -17,11 +17,19 @@
 //! pattern (`docs/m4/release.md` §6.2), so no build can install a directory that garbage
 //! collection never recognizes. `remote-commands.txt` beside this file pins its exact bytes.
 //!
-//! **Gated on M4 OQ-1.** The owner has not yet approved a second remote command, so the
-//! constant is data only: the one function that puts it on a command line,
-//! `PipeCommand::bootstrap`, exists only with the `install-bootstrap` feature, which is off by
-//! default and never in a release build. Until then the remote command is always exactly
-//! [`REMOTE_COMMAND`].
+//! **Approved by the owner (M4 OQ-1, 2026-11-04):** fil's remote commands are exactly two,
+//! [`REMOTE_COMMAND`] and [`BOOTSTRAP`] (DESIGN.md §8.2, decided). [`PipeCommand::ssh`] and
+//! [`PipeCommand::bootstrap`] are the only constructors of either; both take a host and nothing
+//! else. What each check proves:
+//!
+//! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
+//!   (a change to it needs the owner's sign-off again);
+//! - `crates/fil/tests/remote_commands.rs` runs every subcommand that reaches ssh with a
+//!   recording fake `ssh` and requires each remote part to be exactly one of the two: that is
+//!   the check of **behavior**, however a command line is built;
+//! - the release check (`tests/release/check.sh`) requires every `sh -c` in a release binary to
+//!   be the start of this text: a **tripwire** for a second shell-wrapped literal only (it cannot
+//!   see a command built from separate argv words).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -64,7 +72,7 @@ const BOOT_HEAD: &str = "sh -c 'v=";
 const BOOT_MID: &str = "; w=\"(wire ";
 /// The rest, one statement per piece (the pieces have no separators of their own: the text is
 /// their concatenation). The plan's §7 holds the same text for 0.1.0 on wire 1.12, and the test
-/// `the_bootstrap_is_the_text_the_owner_reviews` keeps the two equal.
+/// `the_bootstrap_is_the_text_the_owner_approved` keeps the two equal.
 const BOOT_TAIL: &str = concat!(
     r#")"; "#,
     r#"u=$(id -u); "#,
@@ -178,8 +186,8 @@ const BOOT_BYTES: [u8; BOOT_LEN] = {
     b
 };
 
-/// The install bootstrap for this build (see the module docs). Data only until M4 OQ-1 is
-/// answered: nothing but the gated `PipeCommand::bootstrap` puts it on a command line.
+/// The install bootstrap for this build (see the module docs): nothing but
+/// [`PipeCommand::bootstrap`] puts it on a command line.
 pub const BOOTSTRAP: &str = match core::str::from_utf8(&BOOT_BYTES) {
     Ok(s) => s,
     Err(_) => panic!("the bootstrap is ASCII"),
@@ -230,7 +238,9 @@ const _: () = assert!(
 );
 
 /// The bootstrap for any version and wire, at run time: the same pieces as [`BOOTSTRAP`], for
-/// the tests that compare it with the text the owner reviews and with the golden.
+/// the tests that compare it with the text the owner approved and with the golden. Not for
+/// building a command line: [`PipeCommand::bootstrap`] is the only one, with [`BOOTSTRAP`].
+#[doc(hidden)]
 pub fn render_bootstrap(version: &str, major: u16, revision: u16) -> String {
     format!("{BOOT_HEAD}{version}-w{major}.{revision}{BOOT_MID}{major}.{revision}{BOOT_TAIL}")
 }
@@ -294,8 +304,7 @@ impl PipeCommand {
     /// The remote command a pipe runs by default: [`REMOTE_COMMAND`], `fil server --stdio`.
     pub const PLAIN: [&'static str; 3] = REMOTE_COMMAND;
 
-    /// This build's install bootstrap, as data ([`BOOTSTRAP`]). Gated on M4 OQ-1: see the
-    /// module docs.
+    /// This build's install bootstrap ([`BOOTSTRAP`]): see the module docs.
     pub const BOOTSTRAP: &'static str = BOOTSTRAP;
 
     /// This build's install directory name, `<ver>-w<major>.<rev>` ([`INSTALL_DIR_NAME`]).
@@ -307,14 +316,13 @@ impl PipeCommand {
     }
 
     /// The bootstrap for any version and wire ([`render_bootstrap`]), for tests.
+    #[doc(hidden)]
     pub fn render_bootstrap(version: &str, major: u16, revision: u16) -> String {
         render_bootstrap(version, major, revision)
     }
 
     /// `ssh -T -- HOST <BOOTSTRAP>`: the install bootstrap as the remote command, checked like
-    /// [`ssh`](Self::ssh)'s host. **Gated on M4 OQ-1**: only with the `install-bootstrap`
-    /// feature, which no release build has.
-    #[cfg(feature = "install-bootstrap")]
+    /// [`ssh`](Self::ssh)'s host (approved by the owner, M4 OQ-1, 2026-11-04).
     pub fn bootstrap(host: &str) -> Result<Self, PipeError> {
         if !host_is_acceptable(host) {
             return Err(PipeError::new(PipeErrorKind::InvalidCommand(format!(
@@ -451,38 +459,35 @@ mod tests {
         )));
     }
 
-    /// The bug fixes U1's tests found in the text of `docs/m4/plan.md` section 7 (the plan
-    /// allows exactly these: "U1 may change this text only to fix a bug that its tests find"),
-    /// each as (the plan's words, the fixed words). Nothing else may differ.
-    ///
-    /// 1. dash (Debian's and Ubuntu's `/bin/sh`) exits a script on an arithmetic expansion of
-    ///    nothing, `$(( ))`: when an upload's file has vanished (garbage collection of a
-    ///    `.new-*` on a host with a wrong clock), `wc` prints nothing, and the script died before
-    ///    `undo`, leaving the directories it had made (`docs/m4/release.md` §6.4, 3 requires a
-    ///    clean failure). Test: `install_shells::an_upload_whose_directory_vanishes_fails_cleanly`.
-    const FIXES: &[(&str, &str)] = &[(
+    /// The one statement of the plan's first text that U1's tests changed, as the owner
+    /// approved it with the script (M4 OQ-1, 2026-11-04): dash (Debian's and Ubuntu's `/bin/sh`)
+    /// exits a script on an arithmetic expansion of nothing, `$(( ))`, so when an upload's file
+    /// had vanished (garbage collection of a `.new-*` on a host with a wrong clock) the script
+    /// died before `undo`, leaving the directories it had made (`docs/m4/release.md` §6.4, 3).
+    /// Test: `install_shells::an_upload_whose_directory_vanishes_fails_cleanly`.
+    const DASH_FIX: (&str, &str) = (
         r#"[ "$(($(wc -c < "$n/fil")))" -eq "$s" ] || undo; "#,
         r#"z=$(wc -c < "$n/fil") || undo; [ "$(($z))" -eq "$s" ] || undo; "#,
-    )];
+    );
 
-    /// The text M4 OQ-1 asks the owner to approve (`docs/m4/plan.md` section 7), word for word
-    /// but for [`FIXES`].
+    /// The text the owner approved in M4 OQ-1 (2026-11-04), as `docs/m4/plan.md` section 7
+    /// holds it, byte for byte: any other change to the script goes back to the owner.
     #[test]
-    fn the_bootstrap_is_the_text_the_owner_reviews() {
+    fn the_bootstrap_is_the_text_the_owner_approved() {
         let plan = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/m4/plan.md");
         let plan = std::fs::read_to_string(plan).unwrap();
-        let reviewed: Vec<&str> = plan
+        let approved: Vec<&str> = plan
             .lines()
             .map(str::trim_start)
             .filter(|l| l.starts_with("sh -c 'v=0.1.0-w1.12;"))
             .collect();
-        assert_eq!(reviewed.len(), 1, "the plan holds the bootstrap once");
-        let mut fixed = reviewed[0].to_string();
-        for (was, is) in FIXES {
-            assert_eq!(fixed.matches(was).count(), 1, "{was}");
-            fixed = fixed.replace(was, is);
-        }
-        assert_eq!(render_bootstrap("0.1.0", 1, 12), fixed);
+        assert_eq!(approved.len(), 1, "the plan holds the bootstrap once");
+        let ours = render_bootstrap("0.1.0", 1, 12);
+        assert_eq!(ours, approved[0]);
+        // The approved text carries the dash fix, once, and not the statement it replaced.
+        let (was, is) = DASH_FIX;
+        assert_eq!(ours.matches(is).count(), 1);
+        assert!(!ours.contains(was));
     }
 
     /// The rest of §2.5's checks, on the text itself: nothing the script hands on is changed
@@ -585,7 +590,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "install-bootstrap")]
     #[test]
     fn the_bootstrap_command_line_is_ssh_and_the_constant() {
         let cmd = PipeCommand::bootstrap("alice@box").unwrap();

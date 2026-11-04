@@ -26,9 +26,6 @@ tracing = "0.1"
 [features]
 # Hooks for tests of the listener. Not for daemon code: only the test targets enable it.
 test-hooks = []
-# `PipeCommand::bootstrap`, the install bootstrap as a remote command (docs/m4/plan.md §3 U1).
-# Gated on M4 OQ-1: off by default, enabled only by `fil`'s feature of the same name.
-install-bootstrap = []
 
 [dev-dependencies]
 # Enables `test-hooks` for this crate's own tests.

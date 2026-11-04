@@ -13,10 +13,10 @@
 //!   Whichever worked is used for the run's later connections. It is remembered in memory only:
 //!   nothing about the host is written to disk.
 //!
-//! **Gated on M4 OQ-1.** Nothing in a release build consults this yet: every connection runs
-//! the plain command. The attach path needs one more piece before it can (the pipe must send the
-//! bootstrap's mode line and stop at its greeting, in `fil-transport`'s pipe), and the owner's
-//! approval of the second remote command.
+//! The owner approved the bootstrap (M4 OQ-1, 2026-11-04), but nothing consults this yet: every
+//! attach and management connection still runs the plain command. The attach path needs one
+//! more piece first (the pipe must send the bootstrap's mode line and stop at its greeting, in
+//! `fil-transport`'s pipe); `fil install` runs the bootstrap on its own.
 
 /// The `remote` setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]

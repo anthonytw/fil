@@ -43,12 +43,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 toml = "0.9"
 tracing = "0.1"
 
-[features]
-# The install bootstrap's client side: `fil install`, and the code that sends the bootstrap
-# (docs/m4/plan.md §3 U1). Gated on M4 OQ-1: off by default and never in a release build until
-# the owner approves the second remote command; `just ci` builds and tests it (--all-features).
-install-bootstrap = ["fil-transport/install-bootstrap"]
-
 [dev-dependencies]
 # The test hooks (FIL_TEST_WIRE_REVISION, FIL_TEST_SOCKET_DIR) for the `fil` binary the integration
 # tests run. Dev-dependencies are not in the released build: `just release-deps` checks.

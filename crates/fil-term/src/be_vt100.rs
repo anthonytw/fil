@@ -139,6 +139,8 @@ fn nz(n: u16) -> std::num::NonZeroU16 {
 
 impl Vt100 {
     fn new(size: Size, history: usize) -> Self {
+        // The same floor as every backend (`Size::MIN_COLS`), so they agree on the grid.
+        let size = size.clamped();
         let parser = vt100::Parser::new_with_callbacks(
             nz(size.rows),
             nz(size.cols),
@@ -165,6 +167,7 @@ impl Emulator for Vt100 {
     }
 
     fn resize(&mut self, size: Size) {
+        let size = size.clamped();
         self.size = size;
         self.parser.get_mut().set_size(nz(size.rows), nz(size.cols));
         self.region.resize(size.rows);

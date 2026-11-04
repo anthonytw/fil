@@ -1,0 +1,4 @@
+PermitOpen none
+PermitListen any
+PermitOpen any host:1
+PermitOpen host:0

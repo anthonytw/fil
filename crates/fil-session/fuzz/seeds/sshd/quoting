@@ -1,0 +1,6 @@
+allowtcpforwarding=no
+PermitOpen "host one:22" 'x:1' a\ b:2
+Match User "alice" # comment
+  AllowAgentForwarding "no"
+Match User alice"x"
+  DisableForwarding yes

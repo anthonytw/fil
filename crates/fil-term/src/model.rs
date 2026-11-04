@@ -22,6 +22,36 @@ pub struct Size {
     pub rows: u16,
 }
 
+impl Size {
+    /// The narrowest grid fil keeps, in columns: two cells hold a fullwidth character.
+    ///
+    /// `alacritty_terminal` documents the same floor (`term::MIN_COLUMNS`) but leaves enforcing
+    /// it to its embedder. Below it, resizing a grid that already holds a wide character down to
+    /// one column allocates without bound inside `resize` (20 GB found by fuzzing), and writing
+    /// a wide character into a one-column grid panics (DESIGN.md section 6.5). Every backend
+    /// clamps to it, and the session gives the PTY the same width so the program and the
+    /// emulator agree.
+    pub const MIN_COLS: u16 = 2;
+    /// The shortest grid fil keeps, in rows.
+    pub const MIN_ROWS: u16 = 1;
+
+    /// This size raised to the floor: at least [`Size::MIN_COLS`] by [`Size::MIN_ROWS`].
+    pub const fn clamped(self) -> Size {
+        Size {
+            cols: if self.cols < Self::MIN_COLS {
+                Self::MIN_COLS
+            } else {
+                self.cols
+            },
+            rows: if self.rows < Self::MIN_ROWS {
+                Self::MIN_ROWS
+            } else {
+                self.rows
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Color {
     #[default]

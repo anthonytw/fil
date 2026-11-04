@@ -1,0 +1,5 @@
+local = true
+remote = true
+agent = true
+direct = true
+gateway_ports = false

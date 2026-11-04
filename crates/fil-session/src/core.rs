@@ -545,6 +545,9 @@ pub(crate) fn start(
     host: Arc<dyn SessionHost>,
     forwards: Arc<Forwards>,
 ) -> Result<Started, SpawnError> {
+    // The PTY, the emulator and the size the session reports all use the floored size.
+    let mut cfg = cfg;
+    cfg.size = crate::pty::effective_size(cfg.size);
     let size = fil_term::Size {
         cols: cfg.size.cols(),
         rows: cfg.size.rows(),
@@ -1060,7 +1063,7 @@ impl Core {
         // one), but the emulator allocates the whole grid, so this is checked again where the
         // grid is made: a size that gets past the wire check some other way must not take every
         // session on the host down with an allocation failure.
-        let size = TermSize::clamped(size.cols(), size.rows());
+        let size = crate::pty::effective_size(TermSize::clamped(size.cols(), size.rows()));
         if size == self.size {
             return;
         }

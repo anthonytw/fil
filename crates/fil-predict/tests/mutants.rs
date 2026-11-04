@@ -12,7 +12,8 @@
 //! (`other_blockers`) are not here: neither backend implements those features, so the
 //! oracle cannot see the damage (see the hazard table). `cap` (rule 8) is shown needed in
 //! `tests/overlay.rs` (`at_most_1024_guesses_are_outstanding`): no adversary fits 1,024 guesses
-//! on a scenario's screen.
+//! on a scenario's screen. `keep_on_boundary` keeps what is already written, so it is no secrecy
+//! rule: it is shown needed by the faithful bar (`tests/sim.rs`) and in `tests/overlay.rs`.
 
 mod support;
 
@@ -162,6 +163,15 @@ fn every_c1_guard_is_needed() {
         let rules: Vec<_> = RULES.iter().filter(|r| r.guard == Some(*name)).collect();
         if *name == "cap" {
             println!("{name:<20} caught: tests/overlay.rs at_most_1024_guesses_are_outstanding");
+            continue;
+        }
+        if *name == "keep_on_boundary" {
+            // Not a secrecy rule: it keeps what is already written, so it is shown needed by the
+            // faithful bar, not by a secret.
+            println!(
+                "{name:<20} caught: tests/sim.rs faithful_commands_at_150_ms_show_no_visible_misprediction, \
+                 tests/overlay.rs without_keep_on_boundary_enter_erases_the_written_guess"
+            );
             continue;
         }
         assert!(!rules.is_empty(), "guard {name} has no rule trace");

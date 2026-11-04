@@ -91,4 +91,49 @@ scenarios! {
     paste => Scenario::Paste,
     offline => Scenario::Offline,
     raw_secret => Scenario::RawSecret,
+    commands => Scenario::Commands,
+}
+
+/// The faithful bar (`docs/m3/plan.md` §2.5) at 150 ms RTT: commands typed faster than the echo
+/// comes back, Enter included, show no visible misprediction. With `keep_on_boundary` off, the
+/// guesses still waiting for their echo at each Enter are erased (and come back with the echo):
+/// visible mispredictions.
+#[test]
+fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
+    use fil_predict::overlay::Guards;
+    use fil_predict::sim::Category;
+    let run_all = |guards: Guards| {
+        let mut failures = 0;
+        let mut written = 0;
+        for b in backends() {
+            for seed in base()..base() + seeds().max(4) {
+                let mut cfg = SimConfig::new(Scenario::Commands, seed, b.name);
+                cfg.keys = 80;
+                cfg.one_way = std::time::Duration::from_millis(75);
+                cfg.jitter = std::time::Duration::from_millis(5);
+                cfg.run.bar = Some(Category::Faithful);
+                cfg.run.guards = guards;
+                let out = run(&cfg);
+                written += out.stats.painted_flushes;
+                if let Some(f) = out.failure {
+                    assert_eq!(
+                        f.violation.kind,
+                        fil_predict::oracle::Kind::Mispredict,
+                        "{} seed {seed}: {}",
+                        b.name,
+                        f.violation.detail
+                    );
+                    failures += 1;
+                }
+            }
+        }
+        (failures, written)
+    };
+    let (failures, written) = run_all(Guards::ALL);
+    assert_eq!(failures, 0, "visible mispredictions with every guard on");
+    assert!(written > 0, "nothing was ever written");
+    let mut g = Guards::ALL;
+    g.disable("keep_on_boundary");
+    let (failures, _) = run_all(g);
+    assert!(failures > 0, "keep_on_boundary off made no difference");
 }

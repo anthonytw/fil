@@ -174,6 +174,11 @@ pub struct Guards {
     pub tentative: bool,
     /// An epoch that has ended is never written (rule 2).
     pub ended_epoch: bool,
+    /// What an epoch ended by a `Key`, `Idle`, `Resumed` or `Unpredicted` boundary had written
+    /// stays until it settles, instead of being erased (rule 3, coordinator's call 2026-11-04):
+    /// a written guess is already shown, so erasing it adds no secrecy and only flickers.
+    /// Nothing new is written for the ended epoch.
+    pub keep_on_boundary: bool,
     /// A tentative epoch's key with no guess is a boundary (rule 2: every key is guessed).
     pub every_key: bool,
     /// A tentative epoch accepts only the plain forms: append at the cursor, a Backspace one
@@ -238,6 +243,7 @@ impl Guards {
             "program_sync" => &mut self.program_sync,
             "tentative" => &mut self.tentative,
             "ended_epoch" => &mut self.ended_epoch,
+            "keep_on_boundary" => &mut self.keep_on_boundary,
             "every_key" => &mut self.every_key,
             "plain_form" => &mut self.plain_form,
             "key_glyph" => &mut self.key_glyph,
@@ -290,6 +296,7 @@ impl Guards {
         program_sync: true,
         tentative: true,
         ended_epoch: true,
+        keep_on_boundary: true,
         every_key: true,
         plain_form: true,
         key_glyph: true,
@@ -342,6 +349,7 @@ impl Guards {
     pub const C1: &'static [&'static str] = &[
         "tentative",
         "ended_epoch",
+        "keep_on_boundary",
         "every_key",
         "plain_form",
         "key_glyph",

@@ -114,10 +114,13 @@ pub enum Scenario {
     /// After Enter, a raw-mode program draws a prompt (on its line, or on another row with the
     /// cursor put back) and reads a secret, echoing an asterisk per key or nothing.
     RawSecret,
+    /// Short commands and Enter at a shell that echoes faithfully: the faithful bar's own case
+    /// (`docs/m3/plan.md` §2.5), with no key the default predictor cannot follow.
+    Commands,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 19] = [
+    pub const ALL: [Scenario; 20] = [
         Scenario::Echo,
         Scenario::Password,
         Scenario::Async,
@@ -137,15 +140,18 @@ impl Scenario {
         Scenario::Paste,
         Scenario::Offline,
         Scenario::RawSecret,
+        Scenario::Commands,
     ];
 
     /// The bar a run of this scenario is held to (`docs/m3/plan.md` §2.5). The M0 scenarios
     /// besides plain echo and passwords write out of the blue while the user types.
     pub fn category(self) -> Category {
         match self {
-            Scenario::Echo | Scenario::Password | Scenario::Paste | Scenario::Offline => {
-                Category::Faithful
-            }
+            Scenario::Echo
+            | Scenario::Password
+            | Scenario::Paste
+            | Scenario::Offline
+            | Scenario::Commands => Category::Faithful,
             Scenario::SlowEcho => Category::Slow,
             _ => Category::Adversarial,
         }
@@ -172,6 +178,7 @@ impl Scenario {
             Scenario::Paste => "paste",
             Scenario::Offline => "offline",
             Scenario::RawSecret => "raw-secret",
+            Scenario::Commands => "commands",
         }
     }
 
@@ -215,7 +222,8 @@ impl Scenario {
             | Scenario::SlowEcho
             | Scenario::Paste
             | Scenario::Offline
-            | Scenario::RawSecret => Vec::new(),
+            | Scenario::RawSecret
+            | Scenario::Commands => Vec::new(),
             Scenario::Async => vec![
                 p(b"\r\n[bg] job 1 done\r\n"),
                 b(b"\x07"),
@@ -593,6 +601,23 @@ fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Item> {
             for _ in 0..rng.range(2, 7) {
                 let c = *rng.pick(&secret);
                 items.push(Item::key(c.to_string().into_bytes()));
+            }
+            items.push(Item::key(b"\r".to_vec()));
+        }
+        items.truncate(keys);
+        return items;
+    }
+    if sc == Scenario::Commands {
+        // Typed faster than the echo comes back, then Enter; the next command starts once the
+        // prompt is back. (Typing ahead of the prompt is a case of its own: an earlier key's
+        // late echo can match a new epoch's first guess, `docs/m3/plan.md` OQ-1 case 3.)
+        while items.len() < keys {
+            for i in 0..rng.range(2, 8) {
+                let mut it = Item::key(vec![*rng.pick(b"abcdefghijklmnopqrstuvwxyz")]);
+                if i == 0 {
+                    it.gap_us = Some(rng.range(400_000, 600_000));
+                }
+                items.push(it);
             }
             items.push(Item::key(b"\r".to_vec()));
         }

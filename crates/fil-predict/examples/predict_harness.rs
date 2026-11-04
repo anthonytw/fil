@@ -139,7 +139,9 @@ async fn session(prog: &'static Program, backend: &'static str, seed: u64, o: &O
     let mut eof = false;
 
     loop {
-        if d.failure.is_some() || Instant::now() > deadline {
+        // At EOF the program is gone: `remote.next()` would return at once on every poll, and
+        // the keys left would go nowhere.
+        if d.failure.is_some() || eof || Instant::now() > deadline {
             break;
         }
         if keys.peek().is_none() {

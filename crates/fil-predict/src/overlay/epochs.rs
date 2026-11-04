@@ -143,6 +143,17 @@ pub(crate) enum Why {
 }
 
 impl Why {
+    /// A boundary after which the ended epoch's written guesses are kept until they settle: it
+    /// says nothing about the screen (coordinator, 2026-11-04: `Key`, `Idle`, `Resumed`,
+    /// `Unpredicted`; and `Skipped`, a key the predictor declined, for the same reason). The
+    /// others (unexplained output, a mode change, a snapshot, a contradiction) withdraw them.
+    fn keeps(self) -> bool {
+        matches!(
+            self,
+            Why::Key | Why::Idle | Why::Resumed | Why::Unpredicted | Why::Skipped
+        )
+    }
+
     /// A rule-3 boundary (kept while the predictor shows nothing, `Guards::quiet_boundaries`).
     fn is_boundary(self) -> bool {
         matches!(
@@ -202,6 +213,10 @@ pub(crate) struct Guess {
     grace: Option<Time>,
     /// `Guards::ended_epoch` off only: kept drawn after its epoch ended.
     carried: bool,
+    /// Written in an epoch that then ended at a `Key`, `Idle`, `Resumed` or `Unpredicted`
+    /// boundary: it stays drawn until it settles, but belongs to no epoch the core is confirming
+    /// (`Guards::keep_on_boundary`).
+    kept: bool,
 }
 
 // No `Debug`: it holds guessed glyphs (docs/m3/plan.md §4.3).
@@ -499,12 +514,13 @@ impl Core {
     }
 
     /// Where the cursor is before key `i`, as the core computes it: after the nearest earlier
-    /// key with an edit, or the shadow cursor for the first.
+    /// key of the epoch with an edit, or the shadow cursor for the first (a kept guess belongs
+    /// to an ended epoch).
     fn chain(&self, i: usize, v: &dyn ScreenView) -> (u16, u16) {
         self.keys[..i]
             .iter()
             .rev()
-            .find_map(|k| k.guess.as_ref().map(|g| g.after))
+            .find_map(|k| k.guess.as_ref().filter(|g| !g.kept).map(|g| g.after))
             .unwrap_or_else(|| cursor_of(v))
     }
 
@@ -618,6 +634,18 @@ impl Core {
             KeyClass::Backspace => (row, col),
             _ => (row, col + 1),
         };
+        // A kept guess's cell is not the new epoch's to take.
+        let kept_there = self.keys.iter().any(|k| {
+            matches!(&k.guess, Some(Guess {
+                kind: GKind::Glyph { row: r, col: c, .. },
+                state: GState::Pending,
+                kept: true,
+                ..
+            }) if (*r, *c) == (row, col))
+        });
+        if kept_there {
+            return self.reject();
+        }
         // A later guess for a cell supersedes the epoch's earlier one.
         let earlier = self.keys.iter().position(|k| {
             matches!(&k.guess, Some(Guess {
@@ -661,6 +689,7 @@ impl Core {
             pen: None,
             grace: None,
             carried: false,
+            kept: false,
         });
         self.stats.guessed += 1;
     }
@@ -684,6 +713,7 @@ impl Core {
             pen: None,
             grace: None,
             carried: false,
+            kept: false,
         });
     }
 
@@ -721,18 +751,36 @@ impl Core {
             self.state = State::Tentative;
             return;
         }
+        // A written guess is already shown: erasing it at a boundary that says nothing about
+        // the screen adds no secrecy and only flickers. It stays until it settles; nothing new
+        // is written for the ended epoch.
+        let keep = self.g.keep_on_boundary && why.keeps();
         for i in 0..self.keys.len() {
-            if self.is_pending(i) {
-                let r = match why {
-                    Why::Lifecycle(_) | Why::Password | Why::Expired => why,
-                    _ => Why::Lifecycle(WithdrawReason::Ended),
-                };
-                self.retire(i, r, v, now);
+            if !self.is_pending(i) {
+                continue;
             }
+            let g = self.keys[i].guess.as_mut().expect("pending");
+            if keep && g.written && matches!(g.kind, GKind::Glyph { .. }) {
+                g.kept = true;
+                continue;
+            }
+            let r = match why {
+                Why::Lifecycle(_) | Why::Password | Why::Expired => why,
+                _ => Why::Lifecycle(WithdrawReason::Ended),
+            };
+            self.retire(i, r, v, now);
         }
-        self.keys.clear();
+        self.keys.retain(|k| {
+            k.guess
+                .as_ref()
+                .is_some_and(|g| g.kept && g.state == GState::Pending)
+        });
         self.state = State::Tentative;
         self.awaiting_ack = None;
+    }
+
+    fn is_kept(&self, i: usize) -> bool {
+        self.keys[i].guess.as_ref().is_some_and(|g| g.kept)
     }
 
     /// Withdraws every guess for `reason` and forgets the epoch's keys, but keeps whether it is
@@ -1057,11 +1105,20 @@ impl Core {
             return self.rebase(v);
         }
         let explained = !self.g.explained_chunk || (!unexplained && !stray);
-        let confirming = if self.g.changed_glyph {
+        // A kept guess settles by its glyph, but never confirms the new epoch.
+        let kept_matched: Vec<usize> = matched
+            .iter()
+            .copied()
+            .filter(|&i| self.is_kept(i))
+            .collect();
+        let confirming: Vec<usize> = if self.g.changed_glyph {
             matched_changed
         } else {
             matched.clone()
-        };
+        }
+        .into_iter()
+        .filter(|&i| !self.is_kept(i))
+        .collect();
         let cursor_ok = self.cursor_clause(&confirming, cur, v);
         if explained && !confirming.is_empty() && cursor_ok {
             let first_write = !self
@@ -1082,6 +1139,26 @@ impl Core {
             }
             // With `contradiction_first` on, nothing was contradicted. Off (the mutation), the
             // contradicted guess is left pending, in a confirmed epoch.
+            return self.rebase(v);
+        }
+        // The echo of kept guesses alone (the line typed before an Enter): they are confirmed,
+        // and the new epoch is still tentative.
+        let kept_cursor = !moved
+            || self.keys.iter().any(|k| {
+                k.guess
+                    .as_ref()
+                    .is_some_and(|g| g.kept && g.state == GState::Pending && g.after == cur)
+            });
+        if !kept_matched.is_empty()
+            && contradicted.is_empty()
+            && !unexplained
+            && !stray
+            && confirming.is_empty()
+            && kept_cursor
+        {
+            for i in kept_matched {
+                self.confirm(i, v, now);
+            }
             return self.rebase(v);
         }
         // Anything else breaks rule 2: the tentative epoch ends unwritten.
@@ -1169,7 +1246,7 @@ impl Core {
                     ..
                 } => {
                     let text = v.cell(*row, *col).map_or("", |c| c.text).to_owned();
-                    if text == text_of(*glyph) && self.confirmed() {
+                    if text == text_of(*glyph) && (self.confirmed() || g.kept) {
                         self.confirm(i, v, now);
                     } else if text != text_of(*glyph) && !seen.contains(&text) {
                         self.retire_as(i, Why::Contradiction, Some(v), now, true);

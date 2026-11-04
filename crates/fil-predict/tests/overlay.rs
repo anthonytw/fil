@@ -406,14 +406,79 @@ fn the_first_key_after_a_second_of_silence_is_tentative() {
     assert!(t.key(b"b", 120 + 1000).paint.is_empty());
 }
 
+/// Enter ends the epoch, but what it had written stays until it settles (rule 3, coordinator's
+/// call): confirmed by its echo, it counts as confirmed.
 #[test]
-fn enter_ends_the_epoch() {
+fn enter_ends_the_epoch_and_keeps_what_it_wrote_until_the_echo() {
     let mut t = T::trusted();
     t.key(b"b", 200);
     assert!(t.painted());
     t.key(b"\r", 210);
-    assert!(!t.painted(), "a boundary withdraws what is written");
-    assert!(t.key(b"c", 220).paint.is_empty());
+    assert!(t.painted(), "a written guess was erased at the Enter");
+    // Nothing new is written: the next key is in a new, tentative epoch.
+    assert!(!t.key(b"c", 220).paint.contains(&b'c'));
+    t.server(b"b", 300);
+    assert!(!t.painted());
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (1, 0), "{s:?}");
+}
+
+/// With `keep_on_boundary` off, the Enter erases the guess that was still waiting for its echo:
+/// a visible misprediction.
+#[test]
+fn without_keep_on_boundary_enter_erases_the_written_guess() {
+    let mut g = Guards::ALL;
+    g.disable("keep_on_boundary");
+    let mut t = T::guarded(g);
+    t.confirm();
+    t.key(b"b", 200);
+    t.key(b"\r", 210);
+    assert!(!t.painted());
+    t.server(b"b", 300);
+    assert_eq!(t.o.stats().mispredicted.ended, 1);
+}
+
+/// A kept guess is still settled by contradiction, and withdrawn.
+#[test]
+fn a_contradiction_after_the_boundary_still_withdraws_the_kept_guess() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.key(b"\r", 210);
+    assert!(t.painted());
+    let f = t.server(b"X", 300);
+    assert!(!f.erase.is_empty());
+    assert!(!t.painted());
+    assert_eq!(t.o.stats().mispredicted.contradicted, 1);
+}
+
+/// Unexplained output, a mode change and a snapshot still withdraw at once.
+#[test]
+fn unexplained_output_and_mode_changes_withdraw_the_kept_guess() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.key(b"\r", 210);
+    t.server(b"\x1b7\x1b[5;1Hnote\x1b8", 300);
+    assert!(!t.painted(), "unexplained output left a kept guess drawn");
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.key(b"\r", 210);
+    t.o.set_pty_mode(PtyMode {
+        canonical: false,
+        echo: false,
+    });
+    assert!(!t.painted(), "a mode change left a kept guess drawn");
+}
+
+/// A kept guess never confirms the next epoch: its echo settles it, and the key typed after the
+/// boundary is still not written.
+#[test]
+fn a_kept_guess_does_not_confirm_the_next_epoch() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.key(b"\x1b[A", 210); // up arrow: a Key boundary
+    t.server(b"b", 300);
+    assert!(!t.painted());
+    assert!(t.key(b"c", 310).paint.is_empty());
 }
 
 #[test]
@@ -527,8 +592,10 @@ fn at_most_1024_guesses_are_outstanding() {
             max = max.max(t.o.outstanding());
         }
         if guard {
+            // Past the cap the keys are unpredicted until guesses settle (the written ones are
+            // kept across that boundary, so the count stays at the cap).
             assert_eq!(max, 1024);
-            assert!(t.o.outstanding() < 1024, "the cap is a boundary");
+            assert!(t.o.stats().guessed <= 1025, "{:?}", t.o.stats());
         } else {
             assert!(max > 1024);
         }

@@ -245,12 +245,20 @@ async fn ctrl_c_cell(t: Transport, path: Path, paced: bool) -> CtrlC {
     }
 }
 
+/// How long the flood runs before the Ctrl-C: 3 s, or `FIL_PACING_FLOOD_SECS` (a knob for
+/// the measurements of `just pacing`).
+fn flood_time() -> Duration {
+    Duration::from_secs(
+        std::env::var("FIL_PACING_FLOOD_SECS").map_or(3, |v| v.parse().expect("seconds")),
+    )
+}
+
 async fn run_ctrl_c<L: Link>(h: &SessionHandle, mut c: fil_testkit::Client<L>) -> CtrlC {
     c.wait_screen("READY").await;
     c.type_bytes(b"\n").await;
     // The flood: reading all along, as a terminal does.
     assert!(
-        !c.try_wait(Duration::from_secs(3), |c| c.screen().contains("ALIVE"))
+        !c.try_wait(flood_time(), |c| c.screen().contains("ALIVE"))
             .await
     );
     let flood_bytes = log_end(h).await;
@@ -340,7 +348,10 @@ async fn ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement: just pacing"]
 async fn ctrl_c_over_round_trips() {
-    for rtt in [10u64, 40, 200, 600] {
+    let rtts: Vec<u64> = std::env::var("FIL_PACING_RTTS").map_or(vec![10, 40, 200, 600], |v| {
+        v.split(',').map(|x| x.parse().expect("ms")).collect()
+    });
+    for rtt in rtts {
         for t in [Transport::Quic, Transport::Pipe] {
             for paced in [true, false] {
                 let r = ctrl_c_cell(t, slow_path(rtt), paced).await;

@@ -139,7 +139,11 @@ async fn exchange(
             let canonical = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
             let up = upload::choose(remote, binary.as_deref(), &canonical, upload::RELEASE_BUILD)
                 .map_err(|e| format!("{host}: not uploading: {e}"))?;
-            tracing::info!(arch = remote.describe(), source = ?up.source, "install: uploading");
+            tracing::info!(
+                arch = remote.describe(),
+                source = up.source.kind(),
+                "install: uploading"
+            );
             let report = boot::upload(lines, stdin, &up, Then::Done)
                 .await
                 .map_err(|e| {

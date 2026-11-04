@@ -175,6 +175,17 @@ pub struct Upload {
     pub source: Source,
 }
 
+impl Source {
+    /// The kind only, for the log: a `--binary` path is the user's own and stays out of it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Source::Named(_) => "named",
+            Source::Bundle(_) => "bundle",
+            Source::Itself => "itself",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     /// `--binary FILE`.
@@ -194,7 +205,12 @@ fn read(path: &Path) -> Result<Vec<u8>, Refusal> {
     if meta.len() > MAX_UPLOAD {
         return Err(Refusal::TooLarge);
     }
-    std::fs::read(path).map_err(|e| Refusal::Read(e.to_string()))
+    let bytes = std::fs::read(path).map_err(|e| Refusal::Read(e.to_string()))?;
+    // The bytes that would be sent, not what the metadata said a moment ago (a file can grow).
+    if bytes.len() as u64 > MAX_UPLOAD {
+        return Err(Refusal::TooLarge);
+    }
+    Ok(bytes)
 }
 
 /// `libexec/fil/remote` beside an executable at `exe` (canonical: `bin/fil`'s `../libexec`), so
@@ -462,6 +478,24 @@ mod tests {
         assert!(
             scan(&me).is_err(),
             "a test binary carries the builder's paths or the hooks"
+        );
+    }
+
+    #[test]
+    fn more_than_128_mib_is_refused_before_it_is_read() {
+        let l = Layout::new("big", &elf(62), &elf(62));
+        let big = l.root.join("big");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_UPLOAD + 1).unwrap(); // sparse: no 128 MiB written
+        assert_eq!(
+            choose(Remote::LinuxX86_64, Some(&big), &l.exe(), true),
+            Err(Refusal::TooLarge)
+        );
+        f.set_len(MAX_UPLOAD).unwrap();
+        assert_eq!(
+            choose(Remote::LinuxX86_64, Some(&big), &l.exe(), true),
+            Err(Refusal::WrongTarget("x86_64 Linux")),
+            "exactly the cap is read (and then is not a binary)"
         );
     }
 

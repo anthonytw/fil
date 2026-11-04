@@ -42,8 +42,10 @@ release-deps:
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
-      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
-      test -z "$hooks" || { echo "release-deps: $c has its test-hooks feature in the release build of fil" >&2; exit 1; }
+      # Nor the install bootstrap's sending side (`install-bootstrap`, gated on M4 OQ-1,
+      # docs/m4/install.md): until the owner approves it, no release build may send it.
+      hooks=$(grep -E 'feature "(test-hooks|install-bootstrap)"' <<<"$tree" || true)
+      test -z "$hooks" || { echo "release-deps: $c has a test-only or gated feature in the release build of fil: $hooks" >&2; exit 1; }
     done
 
 test:

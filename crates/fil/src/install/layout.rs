@@ -152,12 +152,15 @@ pub enum ChainFault {
     Parent(PathBuf),
     #[error("{0} is not a real directory of yours with mode 0700")]
     Own(PathBuf),
+    #[error("{0} has an ACL that allows someone access (macOS); install through fil refuses it")]
+    Acl(PathBuf),
     #[error("cannot examine {0}: {1}")]
     Io(PathBuf, io::Error),
 }
 
 /// The bootstrap's `chain`, with `lstat`: `$HOME`, `~/.local` and `~/.local/share` pass
-/// [`Facts::is_ok_parent`], and the install root passes [`Facts::is_own_dir`].
+/// [`Facts::is_ok_parent`], the install root passes [`Facts::is_own_dir`], and on macOS none of
+/// them has an `allow` ACL entry ([`has_allow_acl`]).
 pub fn check_chain(home: &Path, ours: u32) -> Result<(), ChainFault> {
     for p in [
         home.to_path_buf(),
@@ -168,13 +171,55 @@ pub fn check_chain(home: &Path, ours: u32) -> Result<(), ChainFault> {
         if !f.is_ok_parent(ours) {
             return Err(ChainFault::Parent(p));
         }
+        if has_allow_acl(&p) {
+            return Err(ChainFault::Acl(p));
+        }
     }
     let root = install_root(home);
     let f = Facts::lstat(&root).map_err(|e| ChainFault::Io(root.clone(), e))?;
     if !f.is_own_dir(ours) {
         return Err(ChainFault::Own(root));
     }
+    if has_allow_acl(&root) {
+        return Err(ChainFault::Acl(root));
+    }
     Ok(())
+}
+
+/// The bootstrap's `mac`: on macOS, whether `path` (itself, not what a link points to) has an
+/// ACL entry that allows anything. macOS can grant another user write through an ACL without
+/// changing the mode bits, and `ls -l` shows `@`, not `+`, when an entry has an extended
+/// attribute too, so the mode checks alone would miss it. A home's usual `group:everyone deny
+/// delete` only denies, and passes.
+///
+/// Read with `/bin/ls -lde`, as the bootstrap reads it: neither std nor rustix binds the ACL
+/// calls, and `acl_get_link_np` through `libc` would need `unsafe` and the `acl_t` API for one
+/// yes or no. An `ls` that cannot run or fails counts as an ACL (refuse when unsure).
+///
+/// On Linux it is always false: a POSIX ACL that grants anything shows in the group bits, which
+/// the mode checks already refuse.
+pub fn has_allow_acl(path: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let out = std::process::Command::new("/bin/ls")
+        .args(["-lde", "--"])
+        .arg(path)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => acl_lines_allow(&String::from_utf8_lossy(&o.stdout)),
+        _ => true,
+    }
+}
+
+/// Whether `ls -lde` output has an `allow` entry: the lines after the first (the entry itself,
+/// whose name could hold any text) are the ACL, ` 0: user:nobody allow write`.
+pub fn acl_lines_allow(ls_lde: &str) -> bool {
+    ls_lde.lines().skip(1).any(|l| l.contains(" allow "))
 }
 
 #[cfg(test)]
@@ -191,6 +236,19 @@ mod tests {
         for no in [".new-", ".new", "new-1", "x.new-1", ".NEW-1"] {
             assert!(!is_fresh_name(no), "{no}");
         }
+    }
+
+    #[test]
+    fn only_an_allow_entry_counts() {
+        let entry = "drwx------+ 3 me staff 96 Nov  4 12:00 /Users/me/x allow y\n";
+        assert!(!acl_lines_allow(entry), "the name line is not an entry");
+        assert!(!acl_lines_allow(&format!(
+            "{entry} 0: group:everyone deny delete\n"
+        )));
+        assert!(acl_lines_allow(&format!(
+            "{entry} 0: group:everyone deny delete\n 1: user:nobody allow write,append\n"
+        )));
+        assert!(!acl_lines_allow(""));
     }
 
     #[test]

@@ -447,6 +447,15 @@ fn each_keep_rule_alone() {
 
 static N: AtomicU32 = AtomicU32::new(0);
 
+/// Held by the tests that hold a lock file and by the one that starts a process: a child forked
+/// while a lock's descriptor is open shares it until its `exec` closes it, and a probe in that
+/// moment would see the lock still held. (Test-harness threads only; GC itself starts nothing.)
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A scratch `HOME` with an install root, and a socket directory (mode 0700), both removed on
 /// drop.
 struct World {
@@ -547,6 +556,7 @@ const OLD: u64 = 30 * 86_400;
 
 #[test]
 fn a_held_lock_keeps_every_directory_of_its_wire() {
+    let _serial = serial();
     let w = World::new("lock");
     w.copy("0.1.0-w1.12", OLD);
     w.copy("0.1.1-w1.12", OLD);
@@ -587,6 +597,7 @@ fn an_unheld_or_missing_lock_and_a_missing_socket_directory_are_no_daemon() {
 
 #[test]
 fn a_lock_that_is_not_a_regular_file_keeps_its_wire() {
+    let _serial = serial();
     let w = World::new("odd");
     w.copy("0.1.0-w1.12", OLD);
     w.copy("0.1.0-w1.13", OLD);
@@ -717,6 +728,7 @@ fn nothing_else_is_touched_and_links_are_never_followed() {
 
 #[test]
 fn only_install_gc_removes_the_root_and_only_when_empty() {
+    let _serial = serial();
     let w = World::new("root");
     w.copy("0.1.0-w1.12", OLD);
     let ours = fil_daemon::current_uid();
@@ -733,7 +745,7 @@ fn only_install_gc_removes_the_root_and_only_when_empty() {
     );
     drop(held);
     let r = remote::gc_forced(&w.home, &w.sock, SystemTime::now(), ours);
-    assert_eq!(r.removed, 1);
+    assert_eq!(r.removed, 1, "{r:?}");
     assert!(!w.root().exists(), "--install-gc removes the emptied root");
     assert!(w.home.join(".local/share").is_dir(), "never its parents");
 }

@@ -221,3 +221,78 @@ fn the_running_program_must_be_the_upload() {
     .unwrap();
     assert!(matches!(w.run(&w.args("")), Finished::Refused("baddir", _)));
 }
+
+/// macOS: an `allow` ACL can grant another user write with the mode bits unchanged, and the
+/// bootstrap refuses such an entry (`mac()`). `--install-finish` must refuse it too: never adopt,
+/// and so never run on `go`, a same-version copy the bootstrap refused, nor use a chain or an
+/// upload with one. A home's usual deny entry passes.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_an_allow_acl_is_refused_like_the_bootstrap_refuses_it() {
+    let acl = |p: &Path, entry: &str| {
+        let ok = std::process::Command::new("chmod")
+            .args(["+a", entry])
+            .arg(p)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "chmod +a {}", p.display());
+    };
+    let xattr = |p: &Path| {
+        let ok = std::process::Command::new("xattr")
+            .args(["-w", "org.example.fil-test", "1"])
+            .arg(p)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    };
+    const PLANTED: &[u8] = b"#!/bin/sh\necho MALLORY\n";
+    for on_binary in [false, true] {
+        let w = World::new();
+        std::fs::create_dir(w.target()).unwrap();
+        std::fs::set_permissions(w.target(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(w.target().join("fil"), PLANTED).unwrap();
+        std::fs::set_permissions(
+            w.target().join("fil"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let p = if on_binary {
+            w.target().join("fil")
+        } else {
+            w.target()
+        };
+        // With an extended attribute too, `ls -l` shows `@` and no `+`.
+        xattr(&p);
+        acl(&p, "user:nobody allow write,append");
+        let r = w.run(&w.args(""));
+        assert!(
+            matches!(r, Finished::Refused("baddir", _)),
+            "{}: {r:?}",
+            p.display()
+        );
+        assert_eq!(
+            std::fs::read(w.target().join("fil")).unwrap(),
+            PLANTED,
+            "untouched"
+        );
+        assert!(!w.fresh().exists(), "the upload is undone");
+    }
+    // In the chain, and on the upload itself.
+    for p in [
+        ".local/share",
+        ".local/share/fil",
+        ".local/share/fil/.new-4242/fil",
+    ] {
+        let w = World::new();
+        acl(&w.home.join(p), "user:nobody allow write");
+        let r = w.run(&w.args(""));
+        assert!(matches!(r, Finished::Refused("baddir", _)), "{p}: {r:?}");
+        assert!(!w.target().exists(), "{p}");
+    }
+    // A deny entry only denies.
+    let w = World::new();
+    acl(&w.home, "group:everyone deny delete");
+    assert_eq!(w.run(&w.args("")), Finished::Installed(w.target()));
+}

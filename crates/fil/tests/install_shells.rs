@@ -307,6 +307,10 @@ fn wait_with_timeout(mut child: std::process::Child, limit: Duration) -> (String
     }
 }
 
+fn rustix_euid_is_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
 fn uname(flag: &str) -> String {
     let o = Command::new("uname").arg(flag).output().unwrap();
     String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -788,6 +792,72 @@ fn cases() -> Vec<Case> {
             )
         }),
         (
+            "a $HOME that is a symbolic link: refused, nothing created behind it",
+            |w| {
+                let real = w.base.join("realhome");
+                std::fs::rename(&w.home, &real).unwrap();
+                symlink(&real, &w.home).unwrap();
+                w.install_copy(&canary(&wire()));
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    !w.canary_ran() && out.starts_with("FIL-BOOT1 attach "),
+                    "attach: not run",
+                    &out,
+                )?;
+                std::fs::remove_dir_all(real.join(".local")).unwrap();
+                let (out, _) = w.run(&put(fake_fil(&wire()).as_bytes()));
+                expect(
+                    out.contains("FIL-BOOT1 baddir") && !out.contains("FINISH"),
+                    "upload: baddir",
+                    &out,
+                )?;
+                expect(
+                    std::fs::read_dir(&real).unwrap().next().is_none(),
+                    "nothing in the real home",
+                    &out,
+                )
+            },
+        ),
+        ("a read-only HOME: a clean failure, nothing created", |w| {
+            if rustix_euid_is_root() {
+                return Ok(()); // root writes anyway
+            }
+            std::fs::set_permissions(&w.home, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let (out, code) = w.run(&put(fake_fil(&wire()).as_bytes()));
+            std::fs::set_permissions(&w.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            expect(
+                code == 1 && !out.contains("FINISH") && w.tree().is_empty(),
+                "exit 1, nothing made",
+                &out,
+            )
+        }),
+        (
+            "an old wire's fil on PATH is never tried: the exact version or an upload wins",
+            |w| {
+                let bin = w.base.join("pathbin");
+                mkdir(&bin, 0o755);
+                write_exe(&bin.join("fil"), &canary("1.1"), 0o755);
+                w.path = Some(format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ));
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    !w.canary_ran() && out.starts_with("FIL-BOOT1 attach "),
+                    "PATH not tried",
+                    &out,
+                )?;
+                w.install_copy(&fake_fil(&wire()));
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    !w.canary_ran() && out.contains("STDIO") && out.contains(dir_name()),
+                    "the exact version",
+                    &out,
+                )
+            },
+        ),
+        (
             "an unknown mode or a missing mode line ends the script",
             |w| {
                 for input in [&b"install\n"[..], b"", b"ATTACH\n"] {
@@ -890,6 +960,72 @@ fn an_existing_fresh_directory_is_never_reused() {
     assert!(code == 1 && !out.contains("FINISH"), "{out}");
     assert!(!fresh.join("fil").exists(), "nothing written into it");
     assert!(fresh.join("planted").exists(), "and nothing of it removed");
+}
+
+/// A client killed mid-upload (here the script itself is killed, as a dropped ssh would end it):
+/// no binary under the version's name, its `.new-*` left for GC, which collects it once it is more
+/// than 24 hours old (`docs/m4/release.md` §5.1, §6.3 item 3).
+#[test]
+fn an_interrupted_upload_leaves_nothing_runnable_and_gc_collects_it() {
+    let outer = Outer {
+        name: "sh".into(),
+        argv: vec![],
+    };
+    let w = World::new(&outer, &None);
+    let body = BOOT
+        .strip_prefix("sh -c '")
+        .unwrap()
+        .strip_suffix('\'')
+        .unwrap();
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(body)
+        .env_clear()
+        .env("HOME", &w.home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let fil = fake_fil(&wire());
+    let input = put(fil.as_bytes());
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(&input[..input.len() - fil.len() / 2])
+        .unwrap();
+    stdin.flush().unwrap();
+    let start = std::time::Instant::now();
+    while !std::fs::read_dir(w.b()).is_ok_and(|mut rd| {
+        rd.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with(".new-")))
+    }) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no upload directory"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(stdin);
+    let names: Vec<String> = std::fs::read_dir(w.b())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.iter().any(|n| n == dir_name()), "{names:?}");
+    assert_eq!(names.len(), 1, "{names:?}");
+    let ours = rustix::process::geteuid().as_raw();
+    let none = w.base.join("no-socket-dir");
+    let now = std::time::SystemTime::now();
+    let young =
+        fil::install::gc::collect(&w.b(), &none, &fil::install::gc::Pass::Forced, now, ours);
+    assert_eq!(young.removed, 0, "not within 24 hours");
+    let later = now + Duration::from_secs(86_401);
+    let old =
+        fil::install::gc::collect(&w.b(), &none, &fil::install::gc::Pass::Forced, later, ours);
+    assert_eq!(old.removed, 1);
 }
 
 /// GC may remove an upload's directory while the upload is in flight (it is not, within 24

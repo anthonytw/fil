@@ -74,11 +74,10 @@ fn say(line: &str) {
     let _ = out.flush();
 }
 
-/// One line from stdin, read a byte at a time straight from the descriptor (std's `Stdin` reads
-/// ahead into its buffer, and those bytes would be lost to the `exec`). At most `max` bytes.
-fn read_line_unbuffered(max: usize) -> Option<String> {
-    let stdin = std::io::stdin();
-    let fd = stdin.as_fd();
+/// One line from `fd`, read a byte at a time straight from the descriptor, never past its line
+/// end: std's `Stdin` reads ahead into its buffer, and those bytes would be lost to the `exec`
+/// that follows `go` (they are the client's protocol, for the relay). At most `max` bytes.
+pub fn read_line_unbuffered(fd: std::os::fd::BorrowedFd<'_>, max: usize) -> Option<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -153,10 +152,14 @@ fn stamp(dir: &Path, now: SystemTime) -> std::io::Result<()> {
 }
 
 /// Whether `dir` holds an installed copy the bootstrap would run: the bootstrap's `own` on the
-/// directory and `exe` on its `fil`.
+/// directory and `exe` on its `fil`, each with its macOS ACL rule ([`layout::has_allow_acl`]).
+/// A copy the bootstrap refused is never adopted or run here either.
 fn usable_copy(dir: &Path, ours: u32) -> bool {
+    let bin = dir.join("fil");
     Facts::lstat(dir).is_ok_and(|f| f.is_own_dir(ours))
-        && Facts::lstat(&dir.join("fil")).is_ok_and(|f| f.is_own_exe(ours))
+        && Facts::lstat(&bin).is_ok_and(|f| f.is_own_exe(ours))
+        && !layout::has_allow_acl(dir)
+        && !layout::has_allow_acl(&bin)
 }
 
 /// What `--install-finish` decided, before the line it reads from the client.
@@ -194,9 +197,11 @@ pub fn finish(
         return refuse("baddir", e.to_string(), Some(&fresh));
     }
     let binary = fresh.join("fil");
-    let fresh_ok = Facts::lstat(&fresh).is_ok_and(|f| f.is_own_dir(ours));
+    let fresh_ok =
+        Facts::lstat(&fresh).is_ok_and(|f| f.is_own_dir(ours)) && !layout::has_allow_acl(&fresh);
     let binary_ok = Facts::lstat(&binary)
-        .is_ok_and(|f| f.kind == layout::Kind::File && f.uid == ours && f.mode == 0o700);
+        .is_ok_and(|f| f.kind == layout::Kind::File && f.uid == ours && f.mode == 0o700)
+        && !layout::has_allow_acl(&binary);
     if !fresh_ok || !binary_ok {
         return refuse(
             "baddir",
@@ -316,7 +321,8 @@ pub fn run_finish(args: &[OsString]) -> ExitCode {
     say(&format!(
         "FIL-BOOT1 ok {PROTOCOL_MAJOR}.{PROTOCOL_REVISION}"
     ));
-    match read_line_unbuffered(16).as_deref() {
+    let stdin = std::io::stdin();
+    match read_line_unbuffered(stdin.as_fd(), 16).as_deref() {
         Some("go") => {
             say("FIL-BOOT1 exec");
             let e = std::process::Command::new(target.join("fil"))
@@ -353,4 +359,42 @@ pub fn gc_forced(home: &Path, sock_dir: &Path, now: SystemTime, ours: u32) -> gc
     let report = gc::collect(&root, sock_dir, &Pass::Forced, now, ours);
     let _ = std::fs::remove_dir(&root);
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// The answer line is read and nothing after it: what follows `go` in the same write is the
+    /// protocol, and must still be there for the program the `exec` starts.
+    #[test]
+    fn the_answer_is_read_without_reading_ahead() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.write_all(b"go\n\x1bFIL-REST of the stream").unwrap();
+        drop(client);
+        assert_eq!(
+            read_line_unbuffered(server.as_fd(), 16).as_deref(),
+            Some("go")
+        );
+        let mut rest = Vec::new();
+        (&server).read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"\x1bFIL-REST of the stream");
+    }
+
+    #[test]
+    fn a_long_or_unfinished_line_is_no_answer() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.write_all(&[b'g'; 40]).unwrap();
+        drop(client);
+        assert_eq!(read_line_unbuffered(server.as_fd(), 16), None);
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.write_all(b"done").unwrap();
+        drop(client);
+        assert_eq!(
+            read_line_unbuffered(server.as_fd(), 16),
+            None,
+            "EOF before the line end"
+        );
+    }
 }

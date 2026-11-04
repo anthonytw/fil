@@ -76,7 +76,9 @@ pub enum BootError {
         super::layout::this_version_dir()
     )]
     NotInstalled,
-    #[error("the host ended the install without a result{0}")]
+    #[error(
+        "the host ended the install without a result{0}: its home may be read-only or mounted noexec, or the login ended (ssh's message, if any, is above)"
+    )]
     Ended(String),
     #[error("the host printed too much before fil's install command answered")]
     TooMuchNoise,

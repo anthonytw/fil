@@ -338,9 +338,10 @@ def cursor_ok(exp, cur):
         return True
     row, col = exp["cursor"]
     pending = exp.get("pending_wrap")
-    if TERM == "tmux":
-        # A pending wrap is reported one column past the edge; origin mode, absolute.
-        return (pending and cur == (row, col + 1)) or list(cur) == exp.get("cursor_absolute")
+    if TERM in ("tmux", "wezterm"):
+        # tmux reports a pending wrap one column past the edge. In origin mode tmux reports the
+        # cursor absolute, and WezTerm does so in some runs (the screen shows where it is).
+        return (TERM == "tmux" and pending and cur == (row, col + 1)) or list(cur) == exp.get("cursor_absolute")
     if TERM == "kitty":
         # A pending wrap is reported at the start of the next row. In origin mode the report
         # is wrong (by a constant that depends on the region), so the cursor is not compared.

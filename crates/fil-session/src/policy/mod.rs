@@ -40,6 +40,7 @@
 
 pub mod file;
 mod mirror;
+mod pattern;
 pub mod sshd;
 mod stamp;
 

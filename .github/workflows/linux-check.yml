@@ -1,5 +1,5 @@
 # Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
-# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|all`),
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|terminals|all`),
 # then `gh run watch`.
 #
 # Supply chain: every action is pinned by full commit SHA (the comment names the release tag), the
@@ -16,9 +16,9 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem; one job, never part of the others) or all (check, realnet and aarch64)"
+        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem; one job, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
         type: choice
-        options: [check, realnet, aarch64, latency, all]
+        options: [check, realnet, aarch64, latency, terminals, all]
         default: check
       strict:
         description: "realnet: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   check:
-    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'latency'
+    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'latency' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -77,7 +77,7 @@ jobs:
     # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
     # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or lab
     # runner.
-    if: inputs.suite != 'check' && inputs.suite != 'aarch64'
+    if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
     # Each part its own limit: about twice its usual time.
     timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45}')[matrix.part] }}
@@ -163,4 +163,70 @@ jobs:
         with:
           name: fil-aarch64-musl
           path: out/
+          retention-days: 14
+
+  terminals:
+    # T2 (docs/m3/plan.md, docs/m3/terminals.md): fil's terminal writes (snapshots, the overlay's
+    # erase and paint, status lines, resizes) replayed into real terminals under Xvfb and read
+    # back by each terminal's own command, compared with the shadow model (alacritty_terminal).
+    # xterm, kitty and tmux come from Ubuntu; WezTerm is the upstream release, pinned by its
+    # SHA-256. Nothing here is privileged and nothing needs a secret.
+    if: inputs.suite == 'terminals' || inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Packages (Xvfb, the terminals, software OpenGL for kitty)
+        run: sudo apt-get update && sudo apt-get install -y xvfb xterm kitty tmux xdotool libgl1-mesa-dri libegl1 libgl1 fonts-dejavu-core python3 shellcheck
+      - name: WezTerm 20240203-110809-5046fc22 (pinned by hash)
+        env:
+          WEZTERM_DEB: wezterm-20240203-110809-5046fc22.Ubuntu22.04.deb
+          WEZTERM_SHA256: 86358dab5794a4fb63f7c91dd68d4fdc3da58faad648a58fc77d2bd51c7b0686
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wezterm.deb" "https://github.com/wez/wezterm/releases/download/20240203-110809-5046fc22/$WEZTERM_DEB"
+          echo "$WEZTERM_SHA256  $RUNNER_TEMP/wezterm.deb" | sha256sum -c -
+          sudo apt-get install -y "$RUNNER_TEMP/wezterm.deb"
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The exporter is its own workspace (tests/terminals/exporter). Restore always, save
+          # only from main (see the check job).
+          workspaces: tests/terminals/exporter
+          save-if: ${{ inputs.ref == 'main' }}
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Lint the harness (the exporter is outside the workspace, so `just ci` never sees it)
+        run: |
+          shellcheck -x -S warning tests/terminals/run.sh
+          python3 -I -m py_compile tests/terminals/ansi.py tests/terminals/player.py tests/terminals/run.py tests/terminals/report.py tests/terminals/mutants.py
+          cargo fmt --check --manifest-path tests/terminals/exporter/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path tests/terminals/exporter/Cargo.toml -- -D warnings
+          cargo deny --manifest-path tests/terminals/exporter/Cargo.toml --config deny.toml check advisories licenses bans sources
+      - name: Real terminals
+        run: tests/terminals/run.sh
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Terminal versions'
+            echo '```'
+            xterm -version
+            kitty --version
+            wezterm --version
+            tmux -V
+            echo '```'
+            python3 -I tests/terminals/report.py target/terminals
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminals
+          path: target/terminals/*.jsonl
+          if-no-files-found: ignore
           retention-days: 14

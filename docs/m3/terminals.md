@@ -152,9 +152,9 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 - kitty's cursor position report is wrong in origin mode (above), and it supports `?2026` (it logs a "pending mode stop" when a bracket is closed after its timeout, which the `as-sync-output` trace provokes on purpose).
 - WezTerm 20240203 puts the cursor one column past the right edge for `CSI 999;999 H` (the character lands outside the grid and stays in `get-text`); fil's writers never move the cursor past the edge.
 
-### 8. tmux saves lines scrolled out of a partial scroll region; its scrollback is not the model's
+### 8. Partial scroll regions: tmux's history, and WezTerm's intermittent behavior
 
-`ov-scroll-region`. The screen is identical; tmux's history gains the lines. Only a test that compares scrollback sees it.
+`ov-scroll-region`. tmux saves lines scrolled out of a partial scroll region into its history; the screen is identical, so only a test that compares scrollback sees it. **WezTerm 20240203 is not deterministic here**: a line feed at the bottom margin of the region sometimes moves the cursor out of the region instead of scrolling it (the same bytes, run after run, give either answer; a settle delay before the trace does not change it), and a line feed below the region scrolls the whole screen where the model and the other terminals scroll nothing. The cause was not isolated (whether the overlay's cursor hide and paint around the line feeds matter, or WezTerm alone), so the trace is listed as known for WezTerm; it is the only intermittent one in six full runs, and the first thing to look at if it is ever worth knowing.
 
 ## What to do with the findings
 

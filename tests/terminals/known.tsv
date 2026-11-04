@@ -11,6 +11,7 @@
 # TMUX-REGION-HISTORY: tmux saves lines scrolled out of a partial scroll region into its history; the other terminals do not. The screen is the same.
 # WIDTH: this terminal measures the string's width differently from alacritty_terminal (VS16 sequences, ZWJ, skin tones, soft hyphen, a lone regional indicator); docs/m3/terminals.md, the width table.
 # SGR-EXT: xterm 390 does not understand SGR colon sub-parameters or SGR 58 (it reads `4:3;58;5;9` as blink and strikethrough), so the curly or colored underline of a snapshot or of the program's own pen is wrong; WezTerm's `get-text --escapes` prints no curly underline, so it cannot be read back.
+# WEZTERM-REGION: WezTerm's handling of a partial scroll region varies from run to run: a line feed at the region's bottom margin sometimes moves the cursor out of the region instead of scrolling it, and a line feed below the region scrolls the whole screen (the alacritty model and the others scroll nothing there).
 # REFLOW: this terminal reflows (or, for xterm, does not reflow) differently from alacritty_terminal; the shadow screen no longer says what the terminal shows after a resize (docs/m3/terminals.md, finding 1: W1's second trigger).
 #
 kitty	cl-ed2-short/after	ED2-NO-PUSH
@@ -201,3 +202,5 @@ xterm	sn-styles/snapshot	SGR-EXT
 xterm	sn-wide/probe	WIDTH
 xterm	sn-wide/snapshot	WIDTH
 xterm	wd-widths/soft-hyphen	WIDTH
+wezterm	ov-scroll-region/*	WEZTERM-REGION
+wezterm	ov-scroll-region-nosync/*	WEZTERM-REGION

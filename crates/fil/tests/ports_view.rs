@@ -14,10 +14,10 @@ use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
     AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsPart,
     PortsPath, PortsRow, Probe, ProbeKind, ProbeLabel, ProcessInfo, ProcessName, RefusedRow,
-    RefusedWhat, Response, SessionName, SessionSummary, SubscriberSummary, TermName,
+    RefusedWhat, Response, SessionName, SessionSummary, SocksRefused, SubscriberSummary, TermName,
 };
 use fil_proto::mux::{
-    BindFailure, ForwardId, ForwardKind, ListenState, Origin, PolicyRefusal, PolicySetting,
+    BindFailure, ForwardId, ForwardKind, ListenState, Origin, Permit, PolicyRefusal, PolicySetting,
     PolicySource, TcpForwarding, Toggle,
 };
 
@@ -111,8 +111,10 @@ fn fwd(
         owner: None,
         probe: None,
         target_other_user: false,
+        target_unknown: false,
         policy: None,
         peers_refused: 0,
+        socks_refused: None,
     }
 }
 
@@ -436,9 +438,11 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "policy",
             "port",
             "probe",
+            "socks_refused",
             "spec",
             "target",
             "target_other_user",
+            "target_unknown",
             "waiting"
         ]
     );
@@ -681,6 +685,7 @@ fn an_answer_in_parts_is_one_table() {
         part: PortsPart {
             rows: rows[..5].to_vec(),
             incomplete: None,
+            cut: false,
         },
         more: false,
     };
@@ -872,4 +877,97 @@ fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
     );
     assert!(hint(None, Some("other")).contains("FIL_SESSION=main fil forward -L 8000"));
     assert!(hint(None, None).contains("FIL_SESSION=main fil forward -L 8000"));
+}
+
+/// SW4 (security sweep, finding 9): an answer the daemon cut at its row cap says so, though
+/// it holds no more rows than the protocol allows (mutation: ignore `PortsPart::cut`, and the
+/// cut is silent).
+#[test]
+fn an_answer_the_daemon_cut_says_so() {
+    let row = |i: u16| {
+        PortsRow::Listener(ListenerRow {
+            addr: ip("127.0.0.1"),
+            port: port(1000 + i),
+            owner: ListenerOwner::Other,
+            since_unix_ms: 0,
+            probe: None,
+        })
+    };
+    let mut rows = vec![PortsRow::Policy(PolicyLine::Unreadable {
+        file: PortsPath::new("/etc/ssh/sshd_config").unwrap(),
+    })];
+    rows.extend((0..MAX_PORTS_ROWS as u16 + 30).map(row));
+    let a = PortsAnswer::from_parts(&Response::ports_with(rows, None)).unwrap();
+    assert_eq!(a.rows.len(), MAX_PORTS_ROWS);
+    assert!(a.truncated && a.complete);
+    let text = render_text(&a, &opts(None));
+    assert!(text.contains("cut at 256 rows"), "{text}");
+    assert!(
+        text.contains("SERVER POLICY"),
+        "the policy line survives the cut: {text}"
+    );
+    assert!(render_json(&a, &opts(None)).contains("\"truncated\": true"));
+    // A whole answer is not.
+    let a = answer((0..10).map(row).collect());
+    assert!(!a.truncated);
+}
+
+/// SW4 (security sweep, finding 13): SOCKS connections policy refused are a count on the `-D`
+/// row, with the latest setting, never a target, and the entry is not shown as refused.
+#[test]
+fn refused_socks_connections_are_a_count_on_the_d_row() {
+    let mut d = fwd(
+        "main",
+        1,
+        ForwardKind::Dynamic,
+        "1080",
+        listening(1080),
+        Origin::Client,
+        true,
+    );
+    d.socks_refused = Some(SocksRefused {
+        count: 3,
+        last: PolicyRefusal {
+            setting: PolicySetting::PermitOpen(Permit::NotListed),
+            source: sshd_line(7),
+        },
+    });
+    let a = answer(vec![
+        PortsRow::Session(summary("main", None, 1, false)),
+        PortsRow::Forward(d),
+    ]);
+    let text = render_text(&a, &opts(None));
+    assert!(
+        text.contains("server policy refused 3 SOCKS connections through it (latest: PermitOpen"),
+        "{text}"
+    );
+    assert!(!text.contains("refused by server policy:"), "{text}");
+    let json = render_json(&a, &opts(None));
+    assert!(json.contains("\"socks_refused\": {"), "{json}");
+    assert!(json.contains("\"count\": 3"), "{json}");
+    assert!(json.contains("\"policy\": null"), "{json}");
+}
+
+/// Review of #79, S2: a `-L` whose target's holder could not be told (the scan was cut) says
+/// so on its row, instead of looking clean (mutation: drop the line, and it looks clean).
+#[test]
+fn a_target_whose_owner_is_unknown_says_so() {
+    let mut f = fwd(
+        "main",
+        1,
+        ForwardKind::Local,
+        "5432:127.0.0.1:5432",
+        listening(5432),
+        Origin::Client,
+        true,
+    );
+    f.target_unknown = true;
+    let a = answer(vec![
+        PortsRow::Session(summary("main", None, 1, false)),
+        PortsRow::Forward(f),
+    ]);
+    let text = render_text(&a, &opts(None));
+    assert!(text.contains("unknown (scan incomplete)"), "{text}");
+    assert!(text.contains("owner unknown: the host's socket table was not read to its end"));
+    assert!(render_json(&a, &opts(None)).contains("\"target_unknown\": true"));
 }

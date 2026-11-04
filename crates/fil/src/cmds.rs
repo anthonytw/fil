@@ -403,8 +403,8 @@ async fn other_revisions_note(conn: &Conn) -> String {
     )
 }
 
-/// `fil ports [HOST [SESSION]] [--json]`.
-pub async fn ports(target: Target, json: bool, config: &Config) -> u8 {
+/// `fil ports [HOST [SESSION]] [--json] [--probe]`.
+pub async fn ports(target: Target, json: bool, probe_other: bool, config: &Config) -> u8 {
     let (place, focus, current) = match &target {
         Target::Host { host, session } => (Place::Host(host), session.clone(), None),
         Target::Here => match session_from_env() {
@@ -422,6 +422,7 @@ pub async fn ports(target: Target, json: bool, config: &Config) -> u8 {
     };
     let request = Request::Ports {
         session: focus.clone(),
+        probe_other,
     };
     let answer = mgmt::ask(&conn.link, request.clone()).await;
     let code = match &answer {

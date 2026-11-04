@@ -52,7 +52,7 @@ use fil_forward::{
 use fil_proto::ChannelId;
 use fil_proto::msg::{
     AgentRow, ControlMsg, ErrorCode, ForwardOp, ForwardResult, ForwardRow, RefusedRow, RefusedWhat,
-    SessionName,
+    SessionName, SocksRefused,
 };
 use fil_proto::mux::{
     Added, BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable,
@@ -181,6 +181,9 @@ struct State {
     /// Entries server policy refuses now, though it allowed them when they were added: their
     /// `-R` listener is closed and their connections are refused.
     blocked: HashMap<ForwardId, PolicyRefusal>,
+    /// `-D` entries' SOCKS connections server policy refused in this subscriber's run (per
+    /// target, not the entry: the entry stays allowed), for `fil ports`.
+    socks_refused: HashMap<ForwardId, SocksRefused>,
     /// `-R` entries server policy allowed again whose bind then failed (the port was taken while
     /// they were blocked): bound again at every re-establish until one succeeds, as a
     /// `Failed(Policy)` entry is.
@@ -330,6 +333,7 @@ impl Forwards {
             ended: false,
             policy,
             blocked: HashMap::new(),
+            socks_refused: HashMap::new(),
             rebind: HashSet::new(),
             refused: VecDeque::new(),
             agent_refused: None,
@@ -392,6 +396,7 @@ impl Forwards {
         st.fatal = Some(events);
         st.agent = agent;
         st.refused.clear();
+        st.socks_refused.clear();
         self.sync_agent(&mut st);
         // The table is re-established for the new subscriber: what server policy refuses now is
         // closed, what it allows again is bound again (no records: the table follows).
@@ -808,8 +813,10 @@ impl Forwards {
                     owner: None,
                     probe: None,
                     target_other_user: false,
+                    target_unknown: false,
                     policy: st.blocked.get(&e.id).cloned(),
                     peers_refused: st.peers_refused.get(&e.id).copied().unwrap_or(0),
+                    socks_refused: st.socks_refused.get(&e.id).cloned(),
                 }
             })
             .collect()
@@ -927,6 +934,7 @@ impl Forwards {
         st.consented.remove(&id);
         st.blocked.remove(&id);
         st.peers_refused.remove(&id);
+        st.socks_refused.remove(&id);
         st.rebind.remove(&id);
         // Its open connections run until they close; then it has nothing left to count.
         self.ep.forget_stats(id);
@@ -1118,12 +1126,25 @@ impl Policy for SessionPolicy {
         }
         let mut st = st;
         st.still_allowed(*forward)?;
-        // After the entry's check, which clears what an earlier target was refused for.
+        // A refused target is counted for the entry's row; the entry itself stays allowed (one
+        // refused target says nothing about the next).
         if let OpenKind::Dynamic { target, .. } = kind
             && let Err(why) = st.policy.dynamic_target(target)
         {
             debug!("SOCKS target refused by server policy");
-            st.blocked.insert(*forward, why);
+            match st.socks_refused.entry(*forward) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let r = o.get_mut();
+                    r.count = r.count.saturating_add(1);
+                    r.last = why;
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(SocksRefused {
+                        count: 1,
+                        last: why,
+                    });
+                }
+            }
             return Err(OpenFailure::Policy);
         }
         Ok(())

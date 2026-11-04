@@ -606,9 +606,12 @@ pub enum Request {
         session: SessionName,
         op: ForwardOp,
     },
-    /// `fil ports`: one session, or all of them.
+    /// `fil ports`: one session, or all of them. `probe_other` (`fil ports --probe`) asks the
+    /// daemon to probe the user's listeners that no session started too; by default only the
+    /// `-L` targets and the listeners started in a session are probed (DESIGN.md section 7.4).
     Ports {
         session: Option<SessionName>,
+        probe_other: bool,
     },
 }
 
@@ -692,6 +695,9 @@ pub struct PortsPart {
     /// found: the answer may be missing listeners, or have some without an owner. Forward,
     /// session and agent rows are complete either way.
     pub incomplete: Option<PortsIncomplete>,
+    /// Set (the same on every part) when the daemon had more rows than an answer holds
+    /// ([`MAX_PORTS_ROWS`]) and cut the rest: the receiver says the list is cut.
+    pub cut: bool,
 }
 
 /// Why a `fil ports` answer may be missing listeners. A reason only: no counts, paths or other
@@ -784,14 +790,31 @@ pub struct ForwardRow {
     /// client warns. `owner` and `probe` are `None` then: fil neither reads nor probes another
     /// user's process.
     pub target_other_user: bool,
+    /// The `-L` target is on the remote host, but its socket table was not read to its end (a
+    /// bound of the scan, a timeout, no table): who holds it cannot be told, so `owner`,
+    /// `probe` and `target_other_user` say nothing either way. The client says so.
+    pub target_unknown: bool,
     /// Server policy refuses this entry, though it allowed it when it was added: its `-R`
-    /// listener is closed, or its connections are refused (DESIGN.md section 11.2). For a `-D`,
-    /// also the last SOCKS target the policy refused.
+    /// listener is closed, or its connections are refused (DESIGN.md section 11.2).
     pub policy: Option<PolicyRefusal>,
     /// `-R` connections refused because their peer socket was not the user's, or its owner could
     /// not be told (`daemon.toml` `[forward] remote_peers = "same-user"`, OD-9). A count only:
     /// who connected is never sent.
     pub peers_refused: u32,
+    /// A `-D` only: the SOCKS connections server policy refused in the current client's run,
+    /// counted, with the setting of the latest. The entry itself stays allowed, and the targets
+    /// are not named.
+    pub socks_refused: Option<SocksRefused>,
+}
+
+/// SOCKS connections of a `-D` that server policy refused (`PermitOpen`): how many, and the
+/// deciding setting of the latest. No target: only the setting leaves the host (DESIGN.md
+/// section 11.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocksRefused {
+    /// At least 1; saturates.
+    pub count: u32,
+    pub last: PolicyRefusal,
 }
 
 /// A TCP listener on the remote host that no forward owns.
@@ -929,11 +952,13 @@ impl Response {
         Self::ports_with(rows, None)
     }
 
-    /// [`Response::ports`], with `incomplete` on every part.
+    /// [`Response::ports`], with `incomplete` on every part. Rows past [`MAX_PORTS_ROWS`] are cut,
+    /// and every part then says so (`cut`): put what must not be cut first.
     pub fn ports_with(
         mut rows: Vec<PortsRow>,
         incomplete: Option<PortsIncomplete>,
     ) -> Vec<Response> {
+        let mut cut = rows.len() > MAX_PORTS_ROWS;
         rows.truncate(MAX_PORTS_ROWS);
         let mut parts = Vec::new();
         let mut part: Vec<PortsRow> = Vec::new();
@@ -942,6 +967,7 @@ impl Response {
                 part: PortsPart {
                     rows: rows.to_vec(),
                     incomplete,
+                    cut: true,
                 },
                 more: true,
             })
@@ -959,6 +985,7 @@ impl Response {
                 if !fits(&part) {
                     // One row that cannot fit alone (not possible with the string caps): drop it.
                     part.clear();
+                    cut = true;
                 }
             }
         }
@@ -970,7 +997,11 @@ impl Response {
             .into_iter()
             .enumerate()
             .map(|(i, rows)| Response::Ports {
-                part: PortsPart { rows, incomplete },
+                part: PortsPart {
+                    rows,
+                    incomplete,
+                    cut,
+                },
                 more: i + 1 < n,
             })
             .collect()

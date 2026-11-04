@@ -138,8 +138,11 @@ async fn each_event_wakes_only_the_task_that_has_work_body() {
     // load, since a quicker local socket drains between payloads and acks at once (the
     // receiver acknowledges on drain): 90 to 600 runs for the 1,024 payloads, so no bound on
     // the runs alone holds on a loaded machine. Relative to what the control sender sent they
-    // do: it takes about 3 runs for each item (3.0 to 3.5 measured, 24 copies at once), and a
-    // wakeup that finds no work (the payload path always kicking it) makes that 4.4 to 5.3.
+    // do: it takes about 3 runs for each item (2.9 to 3.5 measured, up to 24 copies at once). A
+    // wakeup that finds no work (the payload path always kicking it) raises that to 3.2 to 3.7 on
+    // a quiet machine, where the extra kick coalesces into a permit already left, and to 4.4 to
+    // 5.3 under load: so this bound is a tripwire that catches that narrowing only under load,
+    // while kicking both senders is caught every time by the idle-task bounds above.
     let rx_ctl = d1.ctl - d0.ctl;
     let items = d1.ctl_sent - d0.ctl_sent;
     assert!(

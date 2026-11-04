@@ -524,6 +524,8 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     // loaded machine (a load average of 70) delays some connects by tens of milliseconds (a p99 of
     // 38 ms was seen), so the bounds sit between that and the bug, which the sample size makes
     // sure to catch.
+    // (With 200 connects, at most one over 75 ms already implies the p99 bound; kept for the
+    // message that names it.)
     assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}");
     assert!(slow <= 1, "{slow} of {CONNECTS} over 75 ms");
 }

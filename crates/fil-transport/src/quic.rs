@@ -70,9 +70,9 @@
 //!   quinn's connection migration follows. A change of the port alone (a NAT rebinding)
 //!   is not counted, whether the peer is IPv4, v4-mapped (the daemon's dual-stack socket) or IPv6:
 //!   the path is the same, so the layers above keep what they measured on it. Only a new IP
-//!   address is, and a client that went to another IP and back between two looks is not seen. A client cannot see its NAT rebind at all, and sees a
-//!   change of its own local IP only where the OS reports it to quinn (not on the simulated
-//!   socket).
+//!   address is, and a client that went to another IP and back between two looks is not seen.
+//!   A client cannot see its NAT rebind at all, and sees a change of its own local IP only where
+//!   the OS reports it to quinn (not on the simulated socket).
 //!
 //! [`connect`]: QuicLink::connect
 

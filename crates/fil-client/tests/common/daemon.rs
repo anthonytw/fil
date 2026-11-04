@@ -168,8 +168,9 @@ pub struct DState {
     /// client sent before it saw the announcement), and the catch-up's announcement (control)
     /// overtook the repaint's bytes on channel 2.
     repaint_then_catch_ups: Vec<Vec<u8>>,
-    /// After the next repaint is announced, a second repaint at the same point is announced too,
-    /// before any snapshot bytes; both snapshots' bytes go before the tail below their `at`.
+    /// After the next repaint is announced, a second repaint (after a line more of output) is
+    /// announced too, before any snapshot bytes; both snapshots' bytes go before the output below
+    /// their positions.
     repaint_twice: bool,
     /// Repaint snapshots sent, with the generation each was rendered at.
     pub repaints: Vec<u64>,
@@ -719,13 +720,27 @@ impl FakeDaemon {
         }
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
         if std::mem::take(&mut st.repaint_twice) {
+            // The second repaint comes after a little more output, so its bytes differ.
+            let extra = b"more output\r\n".to_vec();
+            st.log.append(&extra);
+            st.emu.feed(&extra);
+            let b2 = fil_term::snapshot::snapshot(&st.emu.state(0));
+            let at2 = st.log.end();
+            st.flows.insert(key_of(&link), at2);
+            st.pending_jump = Some(at2);
+            st.sent = at2;
             st.snapshots += 1;
             st.repaints.push(size_gen);
-            let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            let info2 = SnapshotInfo {
+                at: at2,
+                len: b2.len() as u64,
+                ..info
+            };
+            let _ = send(&link, &ControlMsg::Snapshot(info2)).await;
             tokio::time::sleep(Duration::from_millis(5)).await;
-            for _ in 0..2 {
+            for snap in [&bytes, &b2] {
                 let mut off = 0u64;
-                for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+                for chunk in snap.chunks(MAX_DATA_PAYLOAD) {
                     let seg = Segment {
                         seq: off,
                         data: chunk.to_vec(),
@@ -746,6 +761,13 @@ impl FakeDaemon {
                     .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
                     .await;
             }
+            let seg = Segment {
+                seq: at,
+                data: extra,
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
             return;
         }
         let catch_ups = std::mem::take(&mut st.repaint_then_catch_ups);

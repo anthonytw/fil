@@ -909,6 +909,11 @@ async fn the_next_snapshots_bytes_wait_while_a_complete_repaint_is_held() {
         assert_eq!(n, 1, "{want:?} appears {n} times: {all:?}");
     }
     assert_eq!(
+        all.iter().filter(|l| l.trim_end() == "more output").count(),
+        1
+    );
+    assert_eq!(rig.daemon.repaints().await.len(), 2);
+    assert_eq!(
         rig.term.state().screen_text(),
         rig.daemon.screen(0).await.screen_text()
     );

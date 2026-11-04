@@ -42,8 +42,10 @@ release-deps:
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
-      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
-      test -z "$hooks" || { echo "release-deps: $c has its test-hooks feature in the release build of fil" >&2; exit 1; }
+      # Nor the install bootstrap's sending side (`install-bootstrap`, gated on M4 OQ-1,
+      # docs/m4/install.md): until the owner approves it, no release build may send it.
+      hooks=$(grep -E 'feature "(test-hooks|install-bootstrap)"' <<<"$tree" || true)
+      test -z "$hooks" || { echo "release-deps: $c has a test-only or gated feature in the release build of fil: $hooks" >&2; exit 1; }
     done
 
 test:
@@ -131,7 +133,7 @@ fuzz-deny:
 # table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
 # tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports.
 forward-soak mib="256" seq="20000":
-    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
+    FIL_FORWARD_TEST_LIMIT=3600 FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:

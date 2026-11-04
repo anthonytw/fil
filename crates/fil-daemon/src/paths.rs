@@ -418,8 +418,8 @@ pub(crate) fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64,
 /// connect, hung up at once. A connect that would block (a live listener whose backlog is full)
 /// counts as an answer, so a busy daemon is never mistaken for a stale socket. (macOS refuses a
 /// connect to a full backlog instead, which this cannot tell from a dead socket.) Anything that
-/// is neither an answer nor a plain refusal or absence (no permission, say) also counts: the
-/// caller then leaves the socket alone, which is the safe side.
+/// is neither an answer nor a plain refusal, absence or non-socket (no permission, say) also
+/// counts: the caller then leaves the socket alone, which is the safe side.
 pub(crate) fn something_answers(sock: &Path) -> bool {
     use rustix::io::Errno;
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
@@ -435,7 +435,9 @@ pub(crate) fn something_answers(sock: &Path) -> bool {
     let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC);
     match connect(&fd, &addr) {
         Ok(()) => true,
-        Err(Errno::CONNREFUSED | Errno::NOENT | Errno::NOTDIR) => false,
+        // Not a socket (a regular file left at the path: Linux says refused, macOS this): nothing
+        // answers there either.
+        Err(Errno::CONNREFUSED | Errno::NOENT | Errno::NOTDIR | Errno::NOTSOCK) => false,
         Err(_) => true,
     }
 }
@@ -644,6 +646,27 @@ mod tests {
         );
         assert_ne!(a.parent(), b.parent());
         assert_eq!(a, p.dir.join(format!("a-{PROTOCOL_MAJOR}-6/main.sock")));
+    }
+
+    #[test]
+    fn something_answers_only_on_a_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        // Nothing at the path.
+        assert!(!something_answers(&sock));
+        // A regular file at the path (a cleaner's leftover, a mistake): not a socket, so nothing
+        // answers. macOS reports ENOTSOCK for the connect, which used to count as an answer and
+        // stop a daemon from starting.
+        std::fs::write(&sock, b"not a socket").unwrap();
+        assert!(!something_answers(&sock));
+        std::fs::remove_file(&sock).unwrap();
+        // A dead socket file (bound, then closed): refused.
+        dead_socket(&sock);
+        assert!(!something_answers(&sock));
+        std::fs::remove_file(&sock).unwrap();
+        // A live listener answers.
+        let _live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(something_answers(&sock));
     }
 
     /// A socket file nobody listens on, as a crashed daemon leaves one: bound and never

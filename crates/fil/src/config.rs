@@ -18,8 +18,9 @@
 //! # window = "1MiB"           #   16KiB to 4MiB
 //! # buffer = "1MiB"           #   16KiB to 16MiB
 //! # open_wait = "30s"         #   0 to 1h; how long a connection waits for a link
-//! # linger = "10m"            #   0 to 24h; how long open connections outlive a disconnect,
-//! #                             and how long a withheld entry outlives its run (at least 30 s)
+//! # linger = "10m"            #   0 to 24h; how long open connections outlive a disconnect
+//! #                           #   (the host's own `linger`, in its daemon.toml, also sets how long
+//! #                           #   it keeps a withheld entry after its run: at least 30 s)
 //!
 //! [defaults.offline_input]    # keystrokes typed while disconnected (section 4.3)
 //! buffer = "4KiB"             # 0 drops them

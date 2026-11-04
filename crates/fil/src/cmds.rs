@@ -16,7 +16,6 @@
 //! door and nothing else.
 
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -153,16 +152,8 @@ fn check_socket_dir(dir: &Path) -> Result<(), LocalError> {
         }
         Err(e) => return Err(LocalError::Io(e.kind().to_string())),
     };
-    check_dir(
-        dir,
-        DirFacts {
-            is_real_dir: meta.file_type().is_dir(),
-            uid: meta.uid(),
-            mode: meta.mode() & 0o777,
-        },
-        current_uid(),
-    )
-    .map_err(|e| LocalError::Unsafe(e.to_string()))
+    check_dir(dir, DirFacts::of(&meta), current_uid())
+        .map_err(|e| LocalError::Unsafe(e.to_string()))
 }
 
 /// `$FIL_SESSION`, as a session name. `Ok(None)` when it is not set (or empty).

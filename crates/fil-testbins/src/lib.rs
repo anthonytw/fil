@@ -2,7 +2,8 @@
 //!
 //! Nine programs live here, all test-only and never shipped. The two drivers for the real `fil`
 //! binary (`ptydrive`, a terminal; `sockprobe`, a stranger at a Unix socket) have their own docs;
-//! the rest stand in for one end of a link:
+//! `fwdprobe` and `keyprobe` are test ends of their own (below); the rest stand in for one end
+//! of a link:
 //!
 //! - `pipe-echo`: stands in for `fil server --stdio` (server mode, the default) and for the
 //!   client side of the pipe (`pipe-echo client`). Real preamble and frame code from `fil-proto`.

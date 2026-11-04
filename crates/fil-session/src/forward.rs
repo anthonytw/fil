@@ -195,7 +195,8 @@ struct State {
     agent_refused: Option<PolicyRefusal>,
     /// Withheld client-origin entries whose run is not the current subscriber's, since when
     /// (DESIGN.md section 7.2): only the run that named one knows its target or bind, and its
-    /// tags match no other run's. Removed once their run has been gone for `orphan_life` (`linger`, at least 30 s).
+    /// tags match no other run's. Removed once their run has been gone for `orphan_life`
+    /// (`linger`, at least 30 s).
     orphaned: HashMap<ForwardId, tokio::time::Instant>,
     /// `-R` connections `remote_peers = "same-user"` refused, per entry (a count only: whose they
     /// were is never kept).

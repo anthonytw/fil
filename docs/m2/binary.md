@@ -66,7 +66,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
 | `window` | `"16KiB"` to `"4MiB"` | 1 MiB |
 | `buffer` | `"16KiB"` to `"16MiB"` | 1 MiB |
 | `open_wait` | `"0s"` to `"1h"` (`"30s"`, `"1500ms"`, a number is seconds) | 30 s |
-| `linger` | `"0s"` to `"24h"` (how long open connections outlive a disconnect; also how long a withheld entry outlives its run, but never less than 30 s, so `"0s"` cannot make a take-back lose its id and port) | 10 min |
+| `linger` | `"0s"` to `"24h"` (how long open connections outlive a disconnect. The host's clock for a withheld entry is the `linger` of the host's own `daemon.toml`, never this file's, and it is at least 30 s, so `"0s"` there cannot make a take-back lose its id and port) | 10 min |
 
 `HostSettings` holds them parsed (`forward: Vec<ForwardSpec>`, `forward_tunables`, `agent`, `agent_keys`, `remote_requests`, `forward_failure`); `ForwardTunables::mux_config()` is the `MuxConfig` they make. Specs are checked (grammar and policy) when the file is read, and an error names the section, the key and the index.
 

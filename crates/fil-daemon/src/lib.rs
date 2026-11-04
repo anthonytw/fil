@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `fil server --stdio` | [`run_relay`]`(&`[`RelayOptions::new`]`(`[`DaemonLauncher::fil`]`(current_exe)))` |
 //! | `fil server --daemon` | [`run_daemon`]`(&`[`Paths::for_current_user`]`())` |
-//! | `fil ls`, `kill`, `detach`, `forward`, `ports` (local pipe command) | the client side is `fil-transport`'s `PipeLink` talking to the relay; [`other_daemons`] finds the daemons of other wire revisions, which `fil ls` mentions |
+//! | `fil ls`, `kill`, `detach`, `forward`, `ports` | with a host, the client side is `fil-transport`'s `PipeLink` talking to the relay; without one, they reach the daemon's socket on this machine through the same `PipeLink`; [`other_daemons`] finds the daemons of other wire revisions, which `fil ls` mentions |
 //!
 //! Both functions take over the process: call them from `main` and exit with the result. The
 //! launcher's arguments are what makes the same binary start as a daemon; `server --daemon` is

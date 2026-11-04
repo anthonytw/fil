@@ -73,7 +73,7 @@ pub(crate) fn check_open(
 fn ensure_dir(dir: &Path) -> io::Result<()> {
     ensure_private_dir(dir).map_err(|fault| match fault {
         DirFault::Io(e) => e,
-        other => io::Error::other(format!("the agent directory {other}")),
+        other => io::Error::other(format!("the agent directory is unsafe: {other}")),
     })
 }
 

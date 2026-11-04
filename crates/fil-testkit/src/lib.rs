@@ -5,8 +5,8 @@
 //! [`Link`], speaking the real protocol with a real emulator behind it. It used to be written
 //! twice, once for the session tests (over `link::mem`) and once for the daemon tests (over a pipe
 //! through a relay), and the two copies had drifted apart. The fil-client and fil-forward tests
-//! use the mini ssh-agent ([`agent`]); every crate's tests use the wait helpers ([`eventually`]
-//! and friends).
+//! use the mini ssh-agent ([`agent`]); most crates' tests use the wait helpers ([`eventually`]
+//! and friends; fil-transport cannot, as this crate depends on it).
 
 use std::time::Duration;
 

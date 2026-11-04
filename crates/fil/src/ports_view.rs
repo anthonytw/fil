@@ -3,8 +3,8 @@
 //! Everything in an answer that came from the host is untrusted: process names, working
 //! directories and probe labels are chosen by whatever listens, and the host label of the
 //! attached client by another client. Every such string goes through [`fil_proto::text`] before it
-//! is shown or put in JSON ([`sanitize_inline`]), so no escape sequence or invisible character reaches the
-//! terminal. The wire caps their length; the view does not rely on it.
+//! is shown or put in JSON ([`sanitize_inline`]), so no escape sequence or invisible character
+//! reaches the terminal. The wire caps their length; the view does not rely on it.
 //!
 //! The renderers are pure: the clock and the time zone come in with [`ViewOptions`].
 

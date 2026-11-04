@@ -1,0 +1,12 @@
+[defaults]
+agent = "on"
+agent_keys = ["SHA256:abcdef"]
+remote_requests = "ask"
+forward_failure = "warn"
+forward = ["-D 1080", "-L 8080:localhost:80", "-R *:9000:localhost:3000"]
+
+[host."me@box"]
+forward = "-L 5432"
+transport = "direct"
+[host."me@box".direct]
+address = "192.0.2.7"

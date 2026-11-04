@@ -1,0 +1,4 @@
+local = true
+remote = false
+permit_open = ["localhost:5432", "db.example.test:*"]
+permit_listen = ["8080", "[::1]:9090"]

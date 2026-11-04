@@ -1,0 +1,18 @@
+Núv@[?1034h$ PS1='$ '
+$ ls -G -F
+data.tar.gz  fizz.py      Makefile     photo.png    [31mrun.sh[39;49m[0m*
+[34mdocs[39;49m[0m/        [35mlatest[39;49m[0m@      notes.txt    README.md    [34msrc[39;49m[0m/
+$ printf '\033[1;31mred\033[0m \033[4mul\033[0m \033[38;5;208morange\033[0m\n'
+[1;31mred[0m [4mul[0m [38;5;208morange[0m
+$ ls -G -F src docs README.md
+README.md
+
+docs:
+guide.md
+
+src:
+lib.rs   main.rs
+$ echo done
+done
+$ exit
+exit

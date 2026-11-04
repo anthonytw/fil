@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # the variables are used by the scripts that source this file
 # Shared by the release scripts in this directory (docs/m4/release.md). Source it; it sets nothing
 # but functions and the variables below. Written for bash 3.2 (the Mac's /bin/bash) and GNU bash.
 #
@@ -11,9 +12,7 @@ RELEASE_DIR=$REPO_ROOT/tests/release
 
 # The target names. `LINUX_TARGETS` are built by `cross`; the macOS pair is built natively and
 # joined with lipo (docs/m4/release.md section 3).
-# shellcheck disable=SC2034 # used by the scripts that source this file
 LINUX_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
-# shellcheck disable=SC2034
 DARWIN_TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
 UNIVERSAL=universal-apple-darwin
 # The archive label of each binary target (section 4.1).

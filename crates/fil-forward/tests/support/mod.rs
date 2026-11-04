@@ -782,8 +782,13 @@ pub fn with_errno(e: io::Error, what: &str) -> io::Error {
 /// between, before the failure is the test's: the shortage is not passing.
 const NO_BUFFERS_LIMIT: Duration = Duration::from_secs(60);
 
+/// How many times the tests' own socket calls were tried again for want of kernel memory, in
+/// this process: for failure messages (macOS's mbuf pool running short shows here first).
+pub static NO_BUFFERS_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The wait before the `k`th retry of a call that failed with `ENOBUFS`: 1 ms doubling to 50 ms.
 async fn no_buffers_wait(since: &mut Option<tokio::time::Instant>, wait: &mut Duration) -> bool {
+    NO_BUFFERS_RETRIES.fetch_add(1, Ordering::Relaxed);
     let t0 = *since.get_or_insert_with(tokio::time::Instant::now);
     if t0.elapsed() >= NO_BUFFERS_LIMIT {
         return false;
@@ -820,6 +825,25 @@ pub async fn read_retry<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::
             r => return r,
         }
     }
+}
+
+/// One request and its answer of `back.len()` bytes, as an application asks: [`write_all_retry`]
+/// and [`read_retry`], so a test's own socket rides out a moment's `ENOBUFS` as the endpoint's
+/// do (the time it takes still counts in what the caller measures).
+pub async fn ask<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    req: &[u8],
+    back: &mut [u8],
+) -> io::Result<()> {
+    write_all_retry(s, req).await?;
+    let mut got = 0;
+    while got < back.len() {
+        match read_retry(s, &mut back[got..]).await? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            k => got += k,
+        }
+    }
+    Ok(())
 }
 
 /// Writes `n` deterministic bytes of stream `seed` to `w`, returning their SHA-256. A write
@@ -1338,12 +1362,17 @@ pub fn mbufs_denied() -> Result<u64, String> {
 /// A line for a failure message: the mbuf requests the kernel denied since `before` (from
 /// [`mbufs_denied`]), machine-wide, so other tests running at the same time count too.
 pub fn mbufs_note(before: &Result<u64, String>) -> String {
-    match (before, mbufs_denied()) {
+    let retried = NO_BUFFERS_RETRIES.load(Ordering::Relaxed);
+    let denied = match (before, mbufs_denied()) {
         (Ok(b), Ok(a)) => format!(
             "kernel mbuf requests denied since the test began: {} (machine-wide; {a} ever)",
             a.saturating_sub(*b)
         ),
         (Err(e), _) => format!("kernel mbuf denials: {e}"),
         (_, Err(e)) => format!("kernel mbuf denials: {e}"),
-    }
+    };
+    format!(
+        "{denied}; the tests' own socket calls in this process were retried {retried} times \
+         for want of kernel memory"
+    )
 }

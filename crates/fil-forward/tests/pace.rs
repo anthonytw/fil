@@ -385,6 +385,7 @@ const STUCK_BUFFER: u32 = 4096;
 
 /// (the live forward's 1 MiB echo, the agent's median request-and-answer).
 async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
+    let denied = mbufs_denied();
     let (deaf_port, deaf) = deaf_target().await;
     let source = endless_source().await;
     let echo = echo_server().await;
@@ -459,11 +460,10 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     let mut back = vec![0u8; 1024];
     for _ in 0..20 {
         let t = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(10), asker.read_exact(&mut back))
+        timeout(Duration::from_secs(10), ask(&mut asker, &req, &mut back))
             .await
             .expect("the agent answered beside stuck forwards")
-            .unwrap();
+            .unwrap_or_else(|e| panic!("an agent request: {e}; {}", mbufs_note(&denied)));
         rtts.push(t.elapsed());
     }
     rtts.sort();
@@ -545,6 +545,7 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
 async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent(
     t: Transport,
 ) {
+    let denied = mbufs_denied();
     // A deaf target with a tiny receive buffer, so the channel is stuck within a second.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(2048).unwrap();
@@ -606,11 +607,10 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     let mut worst = Duration::ZERO;
     for _ in 0..10 {
         let t1 = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+        timeout(Duration::from_secs(5), ask(&mut asker, &req, &mut back))
             .await
             .expect("the agent answered beside the trickling channel")
-            .unwrap();
+            .unwrap_or_else(|e| panic!("an agent request: {e}; {}", mbufs_note(&denied)));
         worst = worst.max(t1.elapsed());
     }
     eprintln!(
@@ -671,8 +671,7 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
     let mut worst = Duration::ZERO;
     for i in 0..16 {
         let t1 = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+        timeout(Duration::from_secs(5), ask(&mut asker, &req, &mut back))
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -681,7 +680,7 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
                     w.client.ep.snapshot()
                 )
             })
-            .unwrap();
+            .unwrap_or_else(|e| panic!("{t:?}: agent request #{i}: {e}; {}", mbufs_note(&denied)));
         worst = worst.max(t1.elapsed());
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

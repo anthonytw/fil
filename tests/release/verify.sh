@@ -22,7 +22,7 @@
 # --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
 # or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (default: the run's
 # commit). The VM needs Docker and amd64 emulation that can run rustc (Rosetta; qemu-user does not):
-# docs/dev/vm.md, "release-verify".
+# docs/m4/release.md section 9.3.
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -124,7 +124,7 @@ fi
 
 # ---- 5. the independent rebuild in the Linux VM
 if [ "$rebuild" = 1 ]; then
-  command -v limactl > /dev/null || die "limactl not found; the rebuild needs the Linux VM (docs/dev/vm.md)"
+  command -v limactl > /dev/null || die "limactl not found; the rebuild needs the Linux VM (docs/dev/vm.md, docs/m4/release.md section 9.3)"
   [ "$(limactl list --format '{{.Status}}' "$vm" 2> /dev/null)" = Running ] || die "Lima instance '$vm' is not running (limactl start $vm)"
   if [ -z "$ref" ]; then
     if [ "$dry" = 0 ]; then ref=refs/tags/$tag; else die "--dry-run needs --ref (the commit the run built)"; fi

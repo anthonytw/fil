@@ -333,11 +333,20 @@ pub struct Client {
 
 impl Client {
     pub fn start(s: Spawn<'_>) -> Client {
+        Self::start_with(s, &[])
+    }
+
+    /// `fil --config C ARGS... HOST SESSION`: the same client with options before the host (the
+    /// forward flags, `-L`, `-R`, `-D`, `--transport`).
+    pub fn start_with(s: Spawn<'_>, args: &[String]) -> Client {
         let _ = std::fs::remove_dir_all(&s.state);
         std::fs::create_dir_all(&s.state).expect("state dir");
         let mut cmd = CommandBuilder::new(s.fil);
         cmd.arg("--config");
         cmd.arg(s.config);
+        for a in args {
+            cmd.arg(a);
+        }
         cmd.arg(s.host);
         cmd.arg(s.session);
         cmd.env("TERM", "xterm-256color");

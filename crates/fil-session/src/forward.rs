@@ -178,6 +178,10 @@ struct State {
     /// Entries server policy refuses now, though it allowed them when they were added: their
     /// `-R` listener is closed and their connections are refused.
     blocked: HashMap<ForwardId, PolicyRefusal>,
+    /// `-R` entries server policy allowed again whose bind then failed (the port was taken while
+    /// they were blocked): bound again at every re-establish until one succeeds, as a
+    /// `Failed(Policy)` entry is.
+    rebind: HashSet<ForwardId>,
     /// Adds server policy refused in this subscriber's run, for `fil ports` (newest last).
     refused: VecDeque<(ForwardSpec, PolicyRefusal)>,
     /// The subscriber asked for the agent and server policy refused it.
@@ -321,6 +325,7 @@ impl Forwards {
             ended: false,
             policy,
             blocked: HashMap::new(),
+            rebind: HashSet::new(),
             refused: VecDeque::new(),
             agent_refused: None,
         }));
@@ -451,6 +456,7 @@ impl Forwards {
                     if st.blocked.insert(e.id, why).is_none() {
                         debug!(kind = ?e.spec.kind(), "forward blocked by server policy");
                     }
+                    st.rebind.remove(&e.id);
                     if remote
                         && st.listen.get(&e.id) != Some(&ListenState::Failed(BindFailure::Policy))
                     {
@@ -463,10 +469,16 @@ impl Forwards {
                 Ok(()) => {
                     st.blocked.remove(&e.id);
                     if remote
-                        && st.listen.get(&e.id) == Some(&ListenState::Failed(BindFailure::Policy))
+                        && (st.listen.get(&e.id) == Some(&ListenState::Failed(BindFailure::Policy))
+                            || st.rebind.contains(&e.id))
                     {
                         debug!("forward allowed again by server policy");
                         self.bind_remote(st, e.id, &e.spec);
+                        if matches!(st.listen.get(&e.id), Some(ListenState::Failed(_))) {
+                            st.rebind.insert(e.id);
+                        } else {
+                            st.rebind.remove(&e.id);
+                        }
                         changed.push(e.id);
                     }
                 }
@@ -696,6 +708,13 @@ impl Forwards {
         self.lock().agent_uid = uid;
     }
 
+    /// Test hook: how many entries are marked blocked by server policy, whether or not they are
+    /// still in the table.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn blocked_count(&self) -> usize {
+        self.lock().blocked.len()
+    }
+
     // ---- management (`fil forward`, `fil ports`, `fil ls`) --------------------------------------
 
     /// `Request::Forward`: an entry of `Origin::Request` (anyone of the user's uid), which the
@@ -809,6 +828,8 @@ impl Forwards {
                 self.ep.forget_stats(old);
             }
             st.consented.remove(&old);
+            st.blocked.remove(&old);
+            st.rebind.remove(&old);
             self.tell(st, MuxMsg::ForwardGone { id: old });
         }
         let e = st.table.get(id).cloned().expect("just added");
@@ -897,6 +918,7 @@ impl Forwards {
         st.listen.remove(&id);
         st.consented.remove(&id);
         st.blocked.remove(&id);
+        st.rebind.remove(&id);
         // Its open connections run until they close; then it has nothing left to count.
         self.ep.forget_stats(id);
         self.tell(st, MuxMsg::ForwardGone { id });

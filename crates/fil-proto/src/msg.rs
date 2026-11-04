@@ -481,6 +481,10 @@ pub enum SnapshotReason {
     BadResumePoint,
     /// The client asked for one (`ResumeRequest::want_snapshot`).
     Requested,
+    /// The client asked for a repaint in band ([`crate::input::InputRecord::Repaint`]): the
+    /// screen and the modes, rendered at the size it has told the daemon, with no history lines
+    /// (its native scrollback holds them) and `skipped` 0 (no marker).
+    Repaint,
 }
 
 /// A snapshot is coming on [`ChannelId::SNAPSHOT`]: exactly `len` bytes, then the terminal
@@ -492,6 +496,10 @@ pub struct SnapshotInfo {
     /// Terminal bytes the client never saw (for the "skipped N bytes" marker). 0 for a new client.
     pub skipped: u64,
     pub reason: SnapshotReason,
+    /// The size generation the snapshot was rendered at (DESIGN.md section 8.5), on every
+    /// snapshot. A client whose screen a resize left untrusted trusts it again after applying a
+    /// snapshot at its current generation, whatever the reason.
+    pub size_gen: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1242,6 +1250,7 @@ mod tests {
             len: 1234,
             skipped: 5,
             reason: SnapshotReason::TooFarBehind,
+            size_gen: 4,
         };
         let msgs = vec![
             ControlMsg::Hello(Hello::ours("fil test".parse().unwrap())),

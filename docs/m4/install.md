@@ -85,7 +85,7 @@ fil install --remove HOST        remove what fil installed, except a running dae
 
 **Refused before any login:** a host whose config names its own `pipe` (a custom pipe is never rewritten), and a host with `remote = "plain"` (there fil runs only `fil server --stdio`, DESIGN §8.2).
 
-**Time limits, the login included** (a login may wait for a password, and the client cannot tell when it ends): `--check` and `--remove` 120 s, an install 30 minutes (the upload is at most 128 MiB, about 18 minutes at 1 Mbit/s). A run that ends with ssh's exit status other than 0 is a failure, even when its output looked complete: `--check`'s output has no end marker, so a failed login would otherwise read as "nothing installed".
+**Time limits, the login included** (a login may wait for a password, and the client cannot tell when it ends): `--check` and `--remove` 120 s, an install 30 minutes (the upload is at most 128 MiB, about 18 minutes at 1 Mbit/s). A run that ends with ssh's exit status other than 0 is a failure, even when its output looked complete: `--check`'s output has no end marker, so a failed login would otherwise read as "nothing installed". **A known gap:** a forced command (`ForceCommand`, or `command=` in `authorized_keys`) that prints nothing and exits 0 makes `--check` report nothing installed, since the approved script prints no end marker. Adding one changes the script, so the owner is being asked.
 
 **A host or ssh alias named `install`** is attached with `fil -- install` now that `install` is a subcommand, as for the other subcommand names.
 

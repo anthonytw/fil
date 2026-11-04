@@ -203,7 +203,7 @@ echo "== release-check"
 mk_tree() { # DIR VER
   local d=$1
   mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden" "$d/crates/fil-transport/src/pipe"
-  cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/justfile" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$d/"
+  cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/justfile" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$d/"
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
   cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
@@ -254,16 +254,17 @@ stage_release() { # uses $tree $stage $VER
     fake_bin "$d/libexec/fil/remote/x86_64-linux/fil" ELF-X86
     fake_bin "$d/libexec/fil/remote/aarch64-linux/fil" ELF-AARCH64
     (cd "$d/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS)
-    cp "$tree/README.md" "$tree/LICENSE" "$d/share/doc/fil/"
+    cp "$tree/README.md" "$tree/LICENSE" "$tree/THIRD-PARTY-NOTICES.md" "$d/share/doc/fil/"
   done
   ROOT=$saved
 }
 # A file named .second-top-LABEL in the stage becomes a second top-level entry of that archive.
+# A file named .source-drop-notices in the stage leaves THIRD-PARTY-NOTICES.md out of the source archive.
 pack_release() { # uses $tree $stage $rel $VER
   local d src="$stage/fil-$VER-source" lbl
   rm -rf "$rel" "$src"
   mkdir -p "$rel" "$src/vendor" "$src/.cargo"
-  cp "$tree/LICENSE" "$tree/rust-toolchain.toml" "$src/"
+  cp "$tree/LICENSE" "$tree/THIRD-PARTY-NOTICES.md" "$tree/rust-toolchain.toml" "$src/"
   # A workspace of one dependency-free crate: `cargo metadata --offline` resolves it from nothing.
   printf '[workspace]\nresolver = "3"\nmembers = ["crates/x"]\n' > "$src/Cargo.toml"
   mkdir -p "$src/crates/x/src"
@@ -272,6 +273,7 @@ pack_release() { # uses $tree $stage $rel $VER
   (cd "$src" && cargo generate-lockfile --offline > /dev/null 2>&1)
   : > "$src/.cargo/config.toml"
   [ -d "$stage/.source-extra" ] && cp -R "$stage/.source-extra/." "$src/"
+  [ -e "$stage/.source-drop-notices" ] && rm "$src/THIRD-PARTY-NOTICES.md"
   for d in "$stage"/fil-*; do
     lbl=${d##*/}
     lbl=${lbl#fil-"$VER"-}
@@ -320,7 +322,7 @@ mutated_msg() {
 new_case 0.9.0
 expect_pass "a clean dry run passes" check --dry-run --no-tree "$rel"
 expect_pass "a clean tag run passes (changelog, tag, wire)" check --tag v0.9.0 --no-tree "$rel"
-expect_fail "--complete fails while LIC and DOC files are pending" check --tag v0.9.0 --complete --no-tree "$rel"
+expect_fail "--complete fails while DOC's files are pending" check --tag v0.9.0 --complete --no-tree "$rel"
 expect_fail "a real release needs a tag (neither --tag nor --dry-run)" check --no-tree "$rel"
 expect_fail "mutation: the tag is not the Cargo.toml version" check --tag v0.9.1 --no-tree "$rel"
 printf '# Changelog\n\n## [0.0.1]\n' > "$tree/CHANGELOG.md"
@@ -371,6 +373,10 @@ pack_release
 expect_pass "loopback, a longer address and a different name are not the fixtures" check --dry-run --no-tree "$rel"
 mutated "bin/fil is missing" "rm fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated "the license is missing" "rm fil-0.9.0-x86_64-linux-musl/share/doc/fil/LICENSE"
+mutated "the notices are missing" "rm fil-0.9.0-aarch64-linux-musl/share/doc/fil/THIRD-PARTY-NOTICES.md"
+mutated_msg "an archive's notices are not the source archive's" "differs from the source archive's THIRD-PARTY-NOTICES.md" \
+  "echo '- stale' >> fil-0.9.0-universal-apple-darwin/share/doc/fil/THIRD-PARTY-NOTICES.md"
+mutated_msg "the source archive lacks the notices" "fil-0.9.0-source.tar.gz lacks THIRD-PARTY-NOTICES.md" "touch .source-drop-notices"
 mutated "the binary is not static" "perl -pi -e 's/FAKE-ELF-X86/FAKE-DYNAMIC/' fil-0.9.0-x86_64-linux-musl/bin/fil"
 
 # --no-exec: nothing from the download runs. The source archive's own cargo config names a rustc
@@ -487,7 +493,7 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"
   rt=$tmp/repro
   mkdir -p "$rt/tree/crates/x/src" "$rt/bins"
-  cp "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$rt/tree/"
+  cp "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$rt/tree/"
   printf '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n[workspace.package]\nversion = "0.9.0"\nedition = "2024"\n' > "$rt/tree/Cargo.toml"
   printf '[package]\nname = "x"\nversion.workspace = true\nedition.workspace = true\n' > "$rt/tree/crates/x/Cargo.toml"
   echo 'fn main() {}' > "$rt/tree/crates/x/src/main.rs"

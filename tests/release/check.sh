@@ -148,15 +148,16 @@ done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
 # ---- the archives
-# Layout (section 4.3). `pending` are files LIC and DOC add; they are required with --complete.
+# Layout (section 4.3). `pending` are files DOC adds (and the changelog, which a release needs);
+# they are required with --complete.
 required="bin/fil
 libexec/fil/remote/x86_64-linux/fil
 libexec/fil/remote/aarch64-linux/fil
 libexec/fil/remote/SHA256SUMS
 share/doc/fil/README.md
-share/doc/fil/LICENSE"
+share/doc/fil/LICENSE
+share/doc/fil/THIRD-PARTY-NOTICES.md"
 pending="share/doc/fil/CHANGELOG.md
-share/doc/fil/THIRD-PARTY-NOTICES.md
 share/doc/fil/config.example.toml
 share/doc/fil/daemon.example.toml
 share/doc/fil/policy.example.toml
@@ -216,7 +217,7 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   tar -xzf "$arc" -C "$ex"
   root=$ex/$name
   if [ "$label" = source ]; then
-    for f in Cargo.toml Cargo.lock .cargo/config.toml vendor LICENSE; do
+    for f in Cargo.toml Cargo.lock .cargo/config.toml vendor LICENSE THIRD-PARTY-NOTICES.md; do
       [ -e "$root/$f" ] || fail "$name.tar.gz lacks $f"
     done
     if [ "$exec" = 0 ]; then
@@ -241,7 +242,7 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
       if [ "$complete" = 1 ]; then fail "$name.tar.gz lacks $f"; else missing="$missing $f"; fi
     fi
   done
-  [ -z "$missing" ] || note "$name.tar.gz: pending (LIC or DOC), not yet in the archive:$missing"
+  [ -z "$missing" ] || note "$name.tar.gz: pending (DOC), not yet in the archive:$missing"
   # The bundle's list is the sha256sum of its two binaries, sorted, relative paths.
   if [ -f "$root/libexec/fil/remote/SHA256SUMS" ]; then
     if [ "$(cat "$root/libexec/fil/remote/SHA256SUMS")" = "$(cd "$root/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done)" ] && sums_check "$root/libexec/fil/remote" SHA256SUMS; then
@@ -305,6 +306,18 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
     universal-apple-darwin) grep -Eq 'Mach-O universal binary with 2 architectures.*x86_64.*arm64|Mach-O universal binary with 2 architectures.*arm64.*x86_64' <<< "$desc" && ok "$name: bin/fil is a universal Mach-O (x86_64, arm64)" || fail "$name: bin/fil is not a two-architecture Mach-O: $desc" ;;
   esac
 done
+
+# The notices (section 7): every binary archive carries the THIRD-PARTY-NOTICES.md of the tree it
+# was built from, which is the one in the source archive (`just notices` checked it is current).
+src_notices=$work/x-source/fil-$V-source/THIRD-PARTY-NOTICES.md
+if [ -f "$src_notices" ]; then
+  for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin; do
+    n=$work/x-$label/fil-$V-$label/share/doc/fil/THIRD-PARTY-NOTICES.md
+    [ -f "$n" ] || continue
+    cmp -s "$n" "$src_notices" && ok "fil-$V-$label: THIRD-PARTY-NOTICES.md is the source archive's" \
+      || fail "fil-$V-$label: share/doc/fil/THIRD-PARTY-NOTICES.md differs from the source archive's THIRD-PARTY-NOTICES.md"
+  done
+fi
 
 # Byte-identical bundle (section 4.3): in every binary archive, each remote copy is the binary of
 # its target as it appears in that target's own archive.

@@ -387,7 +387,7 @@ impl Core {
     // ---- the lazy unexplained-output check and the baseline --------------------------
 
     /// Takes the baseline again: the cursor, the glyphs of the rows the core watches, and every
-    /// row's stamp. Cheap enough per key and per checked chunk for C1 (P2 replaces the reads).
+    /// row's stamp. Reads one row's cells and every row's stamp through the borrowed view.
     pub fn rebase(&mut self, v: &dyn ScreenView) {
         let size = v.size();
         let cursor = cursor_of(v);

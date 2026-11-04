@@ -1,6 +1,6 @@
 # The release contract
 
-> **Status: written by M4's package R0 (2026-11-04) from `docs/m4/plan.md` §2.** This is the reference that the release workflow (REL), the installer (U1), the packaging (PKG), the notices (LIC) and the docs (DOC) build on and cite. `docs/m4/plan.md` says why; this file says what. If the two disagree, this file wins for the values below, and the plan is corrected. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **FROZEN** are a contract between versions of fil: once a release carries them, they change only by the rule in "Changing a frozen item". Everything about the remote install layout and the `--install-gc` contract depends on the owner's answer to M4 OQ-1; if the answer is no, no install directory is ever created, and sections 5 and 6 are unused.
+> **Status: written by M4's package R0 (2026-11-04) from `docs/m4/plan.md` §2.** This is the reference that the release workflow (REL), the installer (U1), the packaging (PKG), the notices (LIC) and the docs (DOC) build on and cite. `docs/m4/plan.md` says why; this file says what. If the two disagree, this file wins for the values below, and the plan is corrected. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **FROZEN** are a contract between versions of fil: once a release carries them, they change only by the rule in "Changing a frozen item". Everything about the remote install layout and the `--install-gc` contract rested on the owner's answer to M4 OQ-1, which is yes (owner, 2026-11-04).
 >
 > `DESIGN.md` stays the source of truth. A package that changes a decision here updates this file and `DESIGN.md` in the same PR.
 
@@ -8,7 +8,7 @@ Examples use package version `0.1.0` and wire `1.12`. The wire on `main` at the 
 
 ## 1. Versioning and the wire
 
-- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**: fil is new, and 0.x tells users that the config and the CLI may still change.
+- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
 - **The wire** is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION` (`crates/fil-proto/src/limits.rs`). It is independent of the package version. Two builds talk only when their wires are equal (`DESIGN.md` §5.3, §8.5).
 - **A patch release never changes the wire.** REL's `release-check` compares the revision on the last line of the golden's `[history]` with that of the previous tag of the same minor.
 - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Daemons of different wires coexist on a host, so this is an upgrade, not a breakage.
@@ -123,7 +123,7 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
 - **The path:** `$HOME/.local/share/fil/<ver>-w<major>.<rev>/fil`. For example, `~/.local/share/fil/0.1.0-w1.12/fil`. The version directory is mode 0700 and the file 0700.
 - **The name carries the wire**, so garbage collection can tell which daemons still need a copy without running any binary.
 - **`$HOME`-based, not `$XDG_DATA_HOME`.** A non-interactive login may see a different environment from an interactive one, and the path must not move between them. The state directory `~/.local/state/fil` follows the same rule.
-- **A third place where fil writes on the remote.** `DESIGN.md` §11.1.5 (decided, owner 2026-11-02) says fil writes nothing beyond its state directory and its socket directory. `~/.local/share/fil` is part of what the owner approves in M4 OQ-1; U1 changes §11.1.5 only as OQ-1 decides. (`DESIGN.md` §11, "Server binary distribution", names an earlier form of the path, `~/.local/share/fil/<version>/`. U1 rewrites that paragraph to this section.)
+- **A third place where fil writes on the remote.** The owner approved `~/.local/share/fil` in M4 OQ-1 (2026-11-04), and `DESIGN.md` §11.1.5 names it: fil creates nothing on the host beyond its state directory, its socket directory and, when the user installs fil through fil, its install directory. `DESIGN.md` §11, "Server binary distribution", describes the upload into this section's layout.
 - **Never replaced in place.** A version is installed once, by a rename from a fresh directory. A new version gets a new directory. fil never modifies, replaces or removes a `fil` it did not install, such as one on `PATH` or one from a package manager.
 - **Stamped when installed:** `--install-finish` sets the version directory's modification time when it puts it in place, because a rename does not change the moved directory's own time. GC reads that time (§6.3, "recently used").
 - **Fresh directories:** an upload goes into `~/.local/share/fil/.new-<pid>` (the shell's `$$`), created with `mkdir -m 700` and renamed to its final name only after the size and SHA-256 are verified.
@@ -313,6 +313,8 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 **Repository settings** (the `v*` tag ruleset that only the owner passes, immutable releases, the code-owner review below, and the others of `docs/m4/plan.md` §5): the owner sets them before the first tag (owner, 2026-11-04).
 
+**Once, before the first release: the crates.io names are reserved** (published by the coordinator; `just reserve-crate-names` is the script, §10.1), and, for v1, sign the macOS binary (`just release-sign-macos`, §10.3, not built yet).
+
 **The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
 
 0. **Once: the key goes into the repository.** Before the first release, a PR adds the key's public half to `.github/release-signers` on `main`, two lines (`namespaces="git"` for the tag and `namespaces="fil-release"` for the checksums; the file shows the form), reviewed by a code owner (`.github/CODEOWNERS`, with the "require review from Code Owners" ruleset setting). Until then the file is a placeholder with no key: `release-verify` stops at the tag, and the workflow warns. Publish the key's fingerprint out of band (README, site) so that verifiers can check `.github/release-signers` against it; a verifier may keep its own copy and name it in `FIL_RELEASE_SIGNERS`.
@@ -350,3 +352,45 @@ vmOpts:
 ```
 
 Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or create a second instance for the rebuilds and name it with `--vm`. The rebuild installs, in the VM, `cross` 0.2.5 and `just` (`cargo install --locked`) and the pinned toolchain for `x86_64-unknown-linux-gnu` (`rustup toolchain install --force-non-host`; `cross` mounts it into the amd64 image) the first time, and clones the repository over HTTPS: the VM needs the network and nothing from the Mac. The macOS binary is the one input that is not rebuilt: the macOS archive is reassembled around the release's own `bin/fil`.
+
+## 10. Names, channels and macOS notarization
+
+### 10.1 Reserving the crates.io names
+
+**Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name; no crates.io token goes to CI. The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
+
+**The names.** The owner's list began with `fil` and eight `fil-*` libraries (`fil-proto`, `fil-transport`, `fil-session`, `fil-daemon`, `fil-client`, `fil-term`, `fil-predict`, `fil-forward`). **`fil` is unavailable on crates.io:** an unrelated crate (a random-number helper) took it on 2026-11-04 at 08:24 ET. The user-facing crate is therefore **`fil-shell`** (`cargo install fil-shell` installs the `fil` binary, matching `fil-shell-bin` on the AUR), reserved by the coordinator. **The name is not marked decided:** the owner can pick another. The workspace's `crates/fil` package must be renamed to match before it is published; the binary stays `fil`. Until then no document may suggest `cargo install fil`, which installs the wrong crate.
+
+**Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. How v1 itself is published is not recorded yet.
+
+**The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
+
+1. After `cargo login`, `just reserve-crate-names` is a dry run, the default: it checks which names are free (a GET on `https://crates.io/api/v1/crates/<name>`, with a descriptive User-Agent) and runs `cargo publish --dry-run` for each placeholder. Nothing is uploaded.
+2. `just reserve-crate-names --publish` asks for a "yes", then publishes. A name that is already registered is skipped with a message, not a failure.
+3. `--account LOGIN` names the publishing account. With it, a taken name whose owners do not include LOGIN is reported as "taken by others", with its owners, in a list of its own, and the run exits 1.
+4. `--invite OWNER` runs `cargo owner --add OWNER CRATE` after each publish, and for the crates already published, unless OWNER already owns the crate or was invited. A crate that the publishing account does not own is never invited to.
+
+Each placeholder is built in a fresh temporary directory outside the repository (a `Cargo.toml` with the version 0.0.1, `GPL-3.0-or-later` and the repository URL; a `src/lib.rs` that is one doc comment; a `README.md`; no author, no email). The real workspace crates are never published by this script.
+
+**Pacing.** crates.io limits new crates per account to a burst of 5, then one more every 10 minutes (crates.io source, `src/rate_limiter.rs`, `LimitedAction::PublishNew`: `default_burst` 5, `default_rate_seconds` 10 * 60; the answer is HTTP 429, "You have published too many new crates in a short period of time"). Nine names take about 40 minutes: the script publishes five at once, then waits 10 minutes before each of the rest, and on a 429 it waits and retries instead of failing.
+
+### 10.2 The v1 channels
+
+**Decided (owner 2026-11-04, round 2), superseding the narrower recommendation of `docs/m4/plan.md` OQ-3** (the owner's note: "Reserve names and prep packages everywhere for v1"). The channels, as the owner chose them:
+
+- GitHub Releases and the Homebrew tap `anthonytw/homebrew-tap` (as recommended);
+- crates.io, nine crates: `fil-shell` and eight libraries (§10.1);
+- `.deb` and `.rpm` for x86_64 and arm64, built by CI and attached to the release;
+- the AUR package `fil-shell-bin`;
+- a Nix flake in the repository, plus a nixpkgs PR;
+- the start of the official distro submissions: Debian (an ITP, then an RFS; Ubuntu inherits Debian's package) and Fedora (a package review). These need owner accounts and a sponsor and finish whenever the distros finish. **v1 does not wait on their acceptance** (coordinator's reading, not the owner's words).
+
+### 10.3 macOS: signed and notarized on the owner's Mac
+
+**Decided (owner 2026-11-04, round 2):** v1 is signed and notarized on the owner's Mac, and Apple keys are never in CI. **Everything below that sentence is proposed by the coordinator**, as the design only; the recipe is a work item, built later.
+
+1. **CI** (proposed, coordinator) builds the macOS binary unsigned and reproducibly (§9) into a draft release, as for any release.
+2. **The owner runs `just release-sign-macos vX.Y.Z`** (proposed, coordinator). It downloads the draft and verifies it (as `release-verify` does before signing), signs the macOS binary with the Developer ID (hardened runtime, secure timestamp), submits it with `notarytool`, rebuilds the macOS archive and `SHA256SUMS` around the signed binary, signs those with the release key (§9.2) and uploads them to the draft. The owner then publishes as in §9.2.
+3. **Verifiability** (proposed, coordinator). Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
+4. **Stapling** (proposed, coordinator). A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
+5. **The release key** (proposed, coordinator) on a hardware token is optional, not chosen (§9.2).

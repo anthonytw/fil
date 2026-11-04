@@ -298,7 +298,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
   - Show guesses when the estimate is above 30 ms (decided, owner 2026-11-04: PC-1); stop below 20 ms.
   - Also show them for the next 30 s after a **glitch**: a key whose `EchoAck` came more than 250 ms after it was sent (measured from the ack, so a program that echoes late on a fast link is not a glitch).
   - `always` shows them at any RTT.
-- **Underline (PC-1):** a written guess is underlined while the estimate is above 80 ms (decided, owner 2026-11-04), and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise (mosh's rule). DESIGN §9 says the same.
+- **Underline (PC-1):** a written guess is underlined while the estimate is above 80 ms (decided, owner 2026-11-04), and after a glitch, an echo more than 250 ms late (decided, owner 2026-11-04, round 2: not "after a wrong guess"); plain otherwise (mosh's rule). DESIGN §9 says the same.
 - Tunables (the thresholds, the glitch window, the grace, the backstop) are constants in `MoshConfig` and the core's config, not config keys, until V1's data says a user needs them. Proposed.
 
 ### 2.8 Wire changes
@@ -494,6 +494,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Mutation:** keep the byte rule while healthy (the fast test snapshots); drop the time rule (the slow test never snapshots).
 - **Done when:** the tests pass, L1's `l_catchup` cells show no marker on the clean network, and §6.2 says the new rule.
 - **Visible behavior:** the owner may veto it; it is not a done-when item.
+- **Carried from PR #110** (which changed the rule to unsent bytes and made the client apply the output sent before a jump, `DESIGN.md` §6.2): a jump now waits for what the transport holds, so on QUIC Ctrl-C's prompt after a flood takes about W/R (W about 1.6 MB: about 13 s at 1 Mbit/s, about 50 s at 256 kbit/s). The bytes the transport buffers should count: pace the terminal channel as the forwards are paced (§8.5 "Pacing"), so the backlog stays in the daemon, where a jump skips it. If K1 is dropped, this is an M3 sweep item (efficiency).
 
 ### Wave 2
 
@@ -569,11 +570,11 @@ In every case a guess once written is written: how long it stays on the screen d
 - **Recommendation:** the split bar of §2.5.
 - **Decided (owner 2026-11-04):** the split bar: everywhere, zero corruption and zero secrets shown; on faithful programs, late echo included, zero visible mispredictions; on programs that echo something else or share the screen, at most one shown run of wrong guesses per contradiction; withdrawals from takeover, exit, snapshot, resize or a link drop counted apart.
 
-### 4.5 Proposed calls (not the owner's, except PC-1, which the owner confirmed but for its glitch trigger; review may change the rest)
+### 4.5 Proposed calls (not the owner's, except PC-1, which the owner confirmed in full on 2026-11-04; review may change the rest)
 
 | # | Call |
 |---|---|
-| PC-1 | **The default and the look** (decided, owner 2026-11-04, but for the glitch trigger): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined above 80 ms, and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). DESIGN §9 records it. |
+| PC-1 | **The default and the look** (decided, owner 2026-11-04; round 2 settled the glitch trigger): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined above 80 ms, and after a glitch, an echo more than 250 ms late (not "after a wrong guess"); plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). DESIGN §9 records it. |
 | PC-2 | The trait of §2.3, replacing the §9 sketch: declared guesses, the core decides. |
 | PC-3 | The core's boundaries and the strict first confirmation (§2.4). |
 | PC-4 | Visible misprediction is by glyph, not attributes; lifecycle withdrawals counted apart (§2.5). |

@@ -1,6 +1,9 @@
 //! What the scenarios share: a shell with a scratch directory, commands with a marker, exact
 //! sequence and file checks, vim helpers, the client's prompts, and stopping a process group.
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -238,6 +241,14 @@ pub fn answer(c: &mut Client, key: &str) {
 /// The numbers a program printed, in order: whole lines of digits (`prefix` empty) or lines
 /// `PREFIX<digits>...`.
 pub fn numbers(plain: &[u8], prefix: &str) -> Vec<u64> {
+    numbered(plain, prefix)
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect()
+}
+
+/// [`numbers`], each with the index of the line it is on.
+fn numbered(plain: &[u8], prefix: &str) -> Vec<(usize, u64)> {
     let text = String::from_utf8_lossy(plain);
     let lines: Vec<&str> = text.lines().collect();
     lines
@@ -262,10 +273,13 @@ pub fn numbers(plain: &[u8], prefix: &str) -> Vec<u64> {
             if digits.is_empty() || (prefix.is_empty() && digits.len() != rest.len()) {
                 return None;
             }
-            digits.parse().ok()
+            Some((i, digits.parse().ok()?))
         })
         .collect()
 }
+
+/// Where `check_seq` writes the transcript of a client whose sequence failed (`--dump DIR`).
+pub static DUMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Gap {
@@ -287,7 +301,30 @@ pub fn check_seq(
     last: u64,
     gap: Gap,
 ) -> Result<String, String> {
-    check_text(&c.text_from(from), prefix, first, last, gap)
+    check_text(&c.text_from(from), prefix, first, last, gap).map_err(|e| match dump(c, from) {
+        Some(path) => format!("{e}\n(the transcript is in {})", path.display()),
+        None => e,
+    })
+}
+
+/// Writes the client's whole plain and raw output to `--dump DIR`, if given: `.plain` and `.raw`
+/// files named for this process and a counter, both with real host names and addresses scrubbed
+/// out (`Targets::scrub`). The first line of the `.plain` file says at which of its bytes the
+/// check started (byte `from` of the plain output).
+fn dump(c: &Client, from: usize) -> Option<PathBuf> {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = DUMP_DIR.get()?;
+    let base = dir.join(format!(
+        "dropin-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let (plain, at) = c.plain_text(from);
+    let plain = format!("(the check starts at byte {at})\n{plain}");
+    let ok = std::fs::create_dir_all(dir).is_ok()
+        && std::fs::write(base.with_extension("plain"), plain).is_ok()
+        && std::fs::write(base.with_extension("raw"), c.raw_text()).is_ok();
+    ok.then_some(base)
 }
 
 /// `check_seq` on text (so that it can be tested without a client).
@@ -340,8 +377,13 @@ pub fn check_text(
     if nums.first() != Some(&first) {
         return fail("the first line is not where it should be");
     }
-    if !nums.windows(2).all(|w| w[1] > w[0]) {
-        return fail("repeated or reordered lines");
+    if let Some(i) = nums.windows(2).position(|w| w[1] <= w[0]) {
+        return fail(&format!(
+            "repeated or reordered lines; the first not above the one before it is {} after {}\n--- around it ---\n{}",
+            nums[i + 1],
+            nums[i],
+            window(tail, prefix, i + 1, 20)
+        ));
     }
     let jumps = nums.windows(2).filter(|w| w[1] != w[0] + 1).count();
     if jumps > markers {
@@ -360,6 +402,21 @@ pub fn check_text(
         "{markers} gap marker(s): {} of {total} lines kept, in order, no repeats; the last {run} are contiguous up to {last}",
         nums.len()
     ))
+}
+
+/// The lines of `tail` from `context` before the `k`th number's line to `context` after it, each
+/// with its index and escaped, the number's own line marked.
+fn window(tail: &str, prefix: &str, k: usize, context: usize) -> String {
+    let Some(&(at, _)) = numbered(tail.as_bytes(), prefix).get(k) else {
+        return String::new();
+    };
+    tail.lines()
+        .enumerate()
+        .skip(at.saturating_sub(context))
+        .take(2 * context + 1)
+        .map(|(i, l)| format!("{}{i:6} {l:?}", if i == at { ">" } else { " " }))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The text just after the line before the first difference (escaped), and whatever the output
@@ -591,6 +648,27 @@ mod tests {
             ticks(40..=45)
         );
         assert_eq!(numbers(t.as_bytes(), "TICK-").len(), 9 + 6);
+    }
+
+    #[test]
+    fn a_repeat_is_shown_with_the_lines_around_it() {
+        let t = format!("{}{GAP}{}{}", ticks(1..=12), ticks(40..=50), ticks(49..=60));
+        let e = check_text(&t, "TICK-", 1, 60, Gap::Allowed).unwrap_err();
+        assert!(e.contains("is 49 after 50"), "{e}");
+        assert!(e.contains(">"), "{e}");
+        assert!(
+            e.contains("\"TICK-30\"") || e.contains("\"TICK-50\""),
+            "{e}"
+        );
+    }
+
+    /// A catch-up just after the space that follows the number: the snapshot leaves the space as
+    /// an empty cell and the transcript has none (`output::flood`).
+    #[test]
+    fn a_number_glued_to_letters_is_still_read() {
+        let t =
+            "LINE-029406 abcdefghij0123\nLINE-029407abcdefghij0123\nLINE-029408 abcdefghij0123\n";
+        assert_eq!(numbers(t.as_bytes(), "LINE-"), [29406, 29407, 29408]);
     }
 
     #[test]

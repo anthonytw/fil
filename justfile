@@ -43,10 +43,11 @@ release-deps:
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
-      # Nor the install bootstrap's sending side (`install-bootstrap`, gated on M4 OQ-1,
-      # docs/m4/install.md): until the owner approves it, no release build may send it.
-      hooks=$(grep -E 'feature "(test-hooks|install-bootstrap)"' <<<"$tree" || true)
-      test -z "$hooks" || { echo "release-deps: $c has a test-only or gated feature in the release build of fil: $hooks" >&2; exit 1; }
+      # (The install bootstrap is in every build since the owner approved it, M4 OQ-1, 2026-11-04;
+      # crates/fil/tests/remote_commands.rs checks what reaches ssh; release-check's `sh -c` scan is
+      # a tripwire.)
+      hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
+      test -z "$hooks" || { echo "release-deps: $c has a test-only feature in the release build of fil: $hooks" >&2; exit 1; }
     done
 
 test:
@@ -169,9 +170,11 @@ predict-e2e *args:
 predict-demo *args:
     cargo run --release -p fil-predict --features harness --example predict_demo -- {{args}}
 
-# Scripted prediction scenarios at scale (no PTY): many seeds, release build.
+# Scripted prediction scenarios at scale (no PTY): many seeds, release build. Also the shadow's row
+# stamps against a byte-by-byte reference (crates/fil-predict/tests/screen_view.rs).
 predict-soak seeds="200":
     FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim
+    FIL_STAMP_SEEDS={{seeds}} cargo test --release -p fil-predict --test screen_view every_row
 
 # Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
 predict-mutants:
@@ -192,7 +195,8 @@ client-pty:
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd`, `policy`, `fwd` (the M2
 # forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
-# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
+# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run;
+# nor is `just realnet predict`, M3's prediction cells (docs/m3/plan.md §5.5).
 realnet *args:
     tests/realnet/run.sh {{args}}
 
@@ -258,8 +262,9 @@ pi-e2e *args:
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
 # real client on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
-# --allow-missing, --allow-skip, --strict. `--local` runs against a private daemon on this machine
-# instead (no targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
+# --allow-missing, --allow-skip, --strict, --dump DIR (where the transcript of a client whose output
+# check fails goes). `--local` runs against a private daemon on this machine instead (no targets
+# needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
 # this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
 dropin *args:
@@ -358,6 +363,14 @@ release-check *args:
 [positional-arguments]
 release-verify version *args:
     tests/release/verify.sh "$@"
+
+# Reserve the crates.io names of the nine published crates with a 0.0.1 placeholder each. Whoever holds the
+# publishing account runs it, after `cargo login`; the placeholders are built outside the repository, paced
+# for the new-crate limit, and names already registered are skipped (docs/m4/release.md section 10.1).
+# Dry run by default; `--publish` really publishes.
+[positional-arguments]
+reserve-crate-names *args:
+    tests/release/reserve-crate-names.sh "$@"
 
 # ---- Notices (docs/m4/release.md section 7) ----
 

@@ -1,9 +1,10 @@
-//! `keyprobe`: keystroke-to-echo latency through a pseudo-terminal, for the latency lab
-//! (`docs/m2/latency.md`, `tests/realnet/latency.sh`).
+//! `keyprobe`: keystroke-to-echo (or key-to-glyph) latency through a pseudo-terminal, for the
+//! latency lab (`docs/m2/latency.md`, `tests/realnet/latency.sh`, `tests/realnet/predict.sh`).
 //!
 //! ```text
 //! keyprobe keys  [--rate 20] [--count 200] [--warmup 10] [--shell | --setup LINE] [--ready TEXT]
-//!                [--settle-ms 500] [--ready-timeout 60] [--drain-ms 5000] -- COMMAND [ARG]...
+//!                [--settle-ms 500] [--ready-timeout 60] [--drain-ms 5000] [--screen [--fast-ms MS]]
+//!                [--quit TEXT] -- COMMAND [ARG]...
 //! keyprobe drain [--shell | --setup LINE] [--ready TEXT] [--settle-ms 500] [--ready-timeout 60]
 //!                --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat 1]
 //!                [--timeout 180] [--quiet-ms 500] -- COMMAND [ARG]...
@@ -33,6 +34,40 @@
 //! (`sent`, `echoed`, `lost` count the measured keys, not the warm-up.) Exit status: 0 if any key
 //! was echoed, 1 if the program never got ready or no key came back, 2 for usage.
 //!
+//! **`keys --screen`** times each key by its glyph on a screen instead of its byte, so that a guess
+//! the client's prediction writes counts (`docs/m3/plan.md` §5.5). Everything the program prints,
+//! from the start, goes through a headless emulator (`fil-term`'s alacritty backend, the one the
+//! client ships). Key i belongs i cells after where the cursor was when the typing started,
+//! wrapping at the right margin (a scroll is followed through the scrollback), and it counts at the
+//! first read after which its cell holds its glyph, having not held it before: a written guess
+//! counts when it is written, and a wrong guess does not count at all. Once the echoes are in and
+//! the output has been quiet for 300 ms the final screen is checked: `final_wrong` keys whose cell
+//! does not hold their glyph, `final_extra` glyphs after the last key (on its row and every row
+//! below), `final_cursor=1` if the cursor is right after the last key. A key stays watched after
+//! it counts: `vanished` is the measured keys whose glyph later went away (a guess taken back and
+//! drawn again by the echo); their time is still the first appearance. The byte matcher still runs
+//! on the same reads; its line comes first, and `vs_bytes_max_ms` is the largest difference between
+//! the two times of a measured key that both saw. **Both mean an echo time only with prediction
+//! off:** the client writes a guess's glyph as a plain byte, so with prediction on the bytes line
+//! times the guess (and the digits of its escape sequences can match keys):
+//!
+//! ```text
+//! KEYPROBE-BYTES rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=..
+//! KEYPROBE mode=screen rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=.. vs_bytes_max_ms=.. vanished=0 final_wrong=0 final_extra=0 final_cursor=1
+//! ```
+//!
+//! `--fast-ms MS` adds `fast=N fast_p50_ms=.. fast_p99_ms=..`: the measured keys whose glyph
+//! appeared within MS (`-` when none). At half the round trip, they are the keys a guess showed,
+//! as no echo can come back that soon. `unexpected` is the byte matcher's in both lines. The
+//! emulator answers no query (neither mode writes anything but the keys). A key whose echo never
+//! comes moves the glyphs after it one cell to the left, so the keys after it count as lost on the
+//! screen too: the bytes line has the true count.
+//!
+//! **`--quit TEXT`** types TEXT once the keys are measured (and the final screen read) and waits up
+//! to 10 s for the program to end by itself before hanging it up; `quit=1` on the line if it did.
+//! `$'\r~.'` detaches fil (or ssh) cleanly, so the client writes what it logs when it ends (the
+//! prediction counts, at debug).
+//!
 //! **`drain`** is the fast discarding consumer: it types `--run LINE` and reads and throws away
 //! everything until `--end TEXT` is seen, counting bytes and occurrences of `--mark` (default
 //! `fil: skipped`, the catch-up marker, DESIGN.md section 6.2) and of `--tally`, without parsing
@@ -51,12 +86,27 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use fil_term::model::Line;
+use fil_term::{Emulator, Size, TermState};
 use fil_testbins::{Args, epoch_ms, sanitize};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// What `--shell` types into the shell: a raw terminal, no echo by the tty, and `cat` to echo.
 const SHELL_SETUP: &str = "stty raw -echo; echo KP-READY-$((6*7)); exec cat";
 const SHELL_READY: &str = "KP-READY-42";
+
+/// The terminal's size.
+const ROWS: u16 = 30;
+const COLS: u16 = 100;
+
+/// Scrollback the `--screen` emulator keeps, so the keys' cells can be followed through a scroll.
+const HISTORY: usize = 10_000;
+
+/// How long the output must be quiet before `--screen` reads the final screen.
+const FINAL_QUIET: Duration = Duration::from_millis(300);
+
+/// How long `--quit` waits for the program to end.
+const QUIT_WAIT: Duration = Duration::from_secs(10);
 
 type Chunk = (Instant, Vec<u8>);
 
@@ -66,7 +116,7 @@ fn main() -> ExitCode {
         return usage("a mode is required");
     }
     let mode = args.remove(0);
-    let parsed = match Args::parse(args, &["shell"]) {
+    let parsed = match Args::parse(args, &["shell", "screen"]) {
         Ok(a) => a,
         Err(e) => return usage(&e),
     };
@@ -98,7 +148,7 @@ impl From<String> for Fail {
 
 fn usage(msg: &str) -> ExitCode {
     eprintln!(
-        "keyprobe: {msg}\nusage: keyprobe keys [--rate N] [--count N] [--warmup N] [--shell | --setup LINE] [--ready TEXT] [--settle-ms MS] [--ready-timeout S] [--drain-ms MS] -- COMMAND...\n       keyprobe drain [--shell | --setup LINE] [--ready TEXT] --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat N] [--timeout S] [--quiet-ms MS] -- COMMAND..."
+        "keyprobe: {msg}\nusage: keyprobe keys [--rate N] [--count N] [--warmup N] [--shell | --setup LINE] [--ready TEXT] [--settle-ms MS] [--ready-timeout S] [--drain-ms MS] [--screen [--fast-ms MS]] [--quit TEXT] -- COMMAND...\n       keyprobe drain [--shell | --setup LINE] [--ready TEXT] --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat N] [--timeout S] [--quiet-ms MS] -- COMMAND..."
     );
     ExitCode::from(2)
 }
@@ -111,15 +161,29 @@ struct Term {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
+    /// `--screen`: everything read so far, through an emulator.
+    screen: Option<Box<dyn Emulator>>,
 }
 
 impl Term {
-    fn spawn(argv: &[String]) -> Result<Term, String> {
+    fn spawn(argv: &[String], screen: bool) -> Result<Term, String> {
         let (prog, rest) = argv.split_first().ok_or("a command after -- is required")?;
+        let screen = if screen {
+            let size = Size {
+                rows: ROWS,
+                cols: COLS,
+            };
+            Some(
+                fil_term::create(fil_term::DEFAULT_BACKEND, size, HISTORY)
+                    .ok_or("no emulator backend in this build")?,
+            )
+        } else {
+            None
+        };
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 30,
-                cols: 100,
+                rows: ROWS,
+                cols: COLS,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -158,7 +222,29 @@ impl Term {
             writer,
             child,
             _master: pair.master,
+            screen,
         })
+    }
+
+    /// The next chunk read, within `limit`. Every chunk taken from the reader goes through here
+    /// (or [`Term::discard`]), so the screen sees all of the output, in order.
+    fn recv(&mut self, limit: Duration) -> Result<Chunk, RecvTimeoutError> {
+        let chunk = self.rx.recv_timeout(limit)?;
+        self.show(&chunk.1);
+        Ok(chunk)
+    }
+
+    fn show(&mut self, bytes: &[u8]) {
+        if let Some(s) = self.screen.as_mut() {
+            s.feed(bytes);
+            // A terminal would answer; this one types nothing but the keys, in both modes.
+            let _ = s.take_replies();
+        }
+    }
+
+    /// What the screen shows now, with the scrollback (`--screen` only).
+    fn state(&self) -> Option<TermState> {
+        self.screen.as_ref().map(|s| s.state(HISTORY))
     }
 
     fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -168,11 +254,11 @@ impl Term {
 
     /// Hands every chunk to `f` until it returns true. Errors on the timeout, or when the program
     /// ended and its output with it.
-    fn pump(&self, limit: Duration, mut f: impl FnMut(&[u8]) -> bool) -> Result<(), PumpEnd> {
+    fn pump(&mut self, limit: Duration, mut f: impl FnMut(&[u8]) -> bool) -> Result<(), PumpEnd> {
         let end = Instant::now() + limit;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
+            match self.recv(left) {
                 Ok((_, bytes)) => {
                     if f(&bytes) {
                         return Ok(());
@@ -185,13 +271,29 @@ impl Term {
     }
 
     /// Throws away what is already waiting.
-    fn discard(&self) {
-        while self.rx.try_recv().is_ok() {}
+    fn discard(&mut self) {
+        while let Ok((_, bytes)) = self.rx.try_recv() {
+            self.show(&bytes);
+        }
     }
 
     /// Throws away output until none has come for `quiet`.
-    fn discard_until_quiet(&self, quiet: Duration) {
-        while self.rx.recv_timeout(quiet).is_ok() {}
+    fn discard_until_quiet(&mut self, quiet: Duration) {
+        while self.recv(quiet).is_ok() {}
+    }
+
+    /// Waits up to `limit` for the program to end by itself, reading what it prints meanwhile.
+    fn wait_exit(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if let Err(RecvTimeoutError::Disconnected) = self.recv(Duration::from_millis(50)) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        false
     }
 
     /// Hangs up the program and waits (briefly) for it.
@@ -366,6 +468,162 @@ impl Matcher {
     }
 }
 
+/// Matches keys to glyphs on the screen (`--screen`). Key `j` belongs `j` cells after where the
+/// cursor was when the typing started, wrapping at the right margin, and counts at the first read
+/// after which its cell holds its glyph, having not held it at the read before.
+struct ScreenMatcher {
+    /// Key 0's cell: an absolute line (the scrollback above the screen counts) and a column.
+    line0: usize,
+    col0: usize,
+    cols: usize,
+    lat: Vec<Option<Duration>>,
+    /// Whether each key's cell held its glyph at the last look.
+    held: Vec<bool>,
+    /// Every key below this has its time.
+    lo: usize,
+    /// Keys whose cell lost their glyph after they were counted (a guess taken back, then drawn
+    /// again by the echo, say): their time is the first appearance, which the user saw go.
+    vanished: Vec<bool>,
+    /// The scrollback filled up, so lines can no longer be counted from the top.
+    overflow: bool,
+}
+
+/// The final screen (`--screen`).
+#[derive(Debug, PartialEq, Eq)]
+struct Final {
+    /// Keys whose cell does not hold their glyph.
+    wrong: usize,
+    /// Glyphs after the last key: on its row and every row below.
+    extra: usize,
+    /// The cursor is right after the last key (at the last column, with a wrap pending, when the
+    /// last key filled a row).
+    cursor: bool,
+}
+
+/// Line `line` counted from the top of the scrollback: the scrollback, oldest first, then the
+/// screen.
+fn line_at(s: &TermState, line: usize) -> Option<&Line> {
+    let h = s.history.len();
+    if line < h {
+        s.history.get(line)
+    } else {
+        s.screen.get(line - h)
+    }
+}
+
+fn glyph_at(s: &TermState, line: usize, col: usize) -> &str {
+    line_at(s, line)
+        .and_then(|l| l.cells.get(col))
+        .map_or("", |c| c.text.as_str())
+}
+
+/// The cursor's absolute line and column.
+fn cursor_at(s: &TermState) -> (usize, usize) {
+    (
+        s.history.len() + usize::from(s.cursor.row),
+        usize::from(s.cursor.col),
+    )
+}
+
+impl ScreenMatcher {
+    /// From the screen before the first key.
+    fn new(s: &TermState, keys: usize) -> Self {
+        let (mut line0, mut col0) = cursor_at(s);
+        // At the last column with a wrap pending, the next glyph starts the next line.
+        if s.cursor.pending_wrap {
+            line0 += 1;
+            col0 = 0;
+        }
+        let mut m = ScreenMatcher {
+            line0,
+            col0,
+            cols: usize::from(s.size.cols),
+            lat: vec![None; keys],
+            held: vec![false; keys],
+            lo: 0,
+            vanished: vec![false; keys],
+            overflow: false,
+        };
+        for j in 0..keys {
+            m.held[j] = m.shows(s, j);
+        }
+        m
+    }
+
+    fn cell(&self, j: usize) -> (usize, usize) {
+        let p = self.col0 + j;
+        (self.line0 + p / self.cols, p % self.cols)
+    }
+
+    fn shows(&self, s: &TermState, j: usize) -> bool {
+        let (line, col) = self.cell(j);
+        glyph_at(s, line, col).as_bytes() == [key_for(j)]
+    }
+
+    /// The screen `s` after the read at `at`. Looks at every key up to one cycle of the alphabet
+    /// past the last key sent by then: a later key's cell cannot have changed to its glyph unless
+    /// something else drew it there, and that would show the next time the key is looked at. A
+    /// counted key is still looked at, so a glyph that goes away is seen (`vanished`).
+    fn feed(&mut self, sent: &[(u8, Instant)], at: Instant, s: &TermState) {
+        if s.history.len() >= HISTORY {
+            self.overflow = true;
+        }
+        while self.lo < self.lat.len() && self.lat[self.lo].is_some() {
+            self.lo += 1;
+        }
+        let typed = sent.partition_point(|k| k.1 <= at);
+        let end = (typed + ALPHABET.len()).min(self.lat.len());
+        for j in 0..end {
+            let now = self.shows(s, j);
+            if self.lat[j].is_some() {
+                if self.held[j] && !now {
+                    self.vanished[j] = true;
+                }
+                self.held[j] = now;
+                continue;
+            }
+            if now && !self.held[j] && j < typed {
+                self.lat[j] = Some(at - sent.get(j).map_or(at, |k| k.1));
+            }
+            self.held[j] = now;
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.lat[self.lo..].iter().all(Option::is_some)
+    }
+
+    fn final_check(&self, s: &TermState) -> Final {
+        let n = self.lat.len();
+        let wrong = (0..n).filter(|&j| !self.shows(s, j)).count();
+        let (end_line, end_col) = self.cell(n);
+        let lines = s.history.len() + s.screen.len();
+        let extra = (end_line..lines)
+            .filter_map(|l| line_at(s, l).map(|line| (l, line)))
+            .map(|(l, line)| {
+                let from = if l == end_line { end_col } else { 0 };
+                line.cells
+                    .iter()
+                    .skip(from)
+                    .filter(|c| !c.text.is_empty())
+                    .count()
+            })
+            .sum();
+        let want = match n.checked_sub(1) {
+            None => (self.line0, self.col0),
+            Some(last) => {
+                let (l, c) = self.cell(last);
+                (l, (c + 1).min(self.cols - 1))
+            }
+        };
+        Final {
+            wrong,
+            extra,
+            cursor: cursor_at(s) == want,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Stats {
     min: f64,
@@ -398,22 +656,41 @@ fn stats(ms: &[f64]) -> Option<Stats> {
     })
 }
 
+/// The measured keys' times in milliseconds (the warm-up left out).
+fn measured_ms(lat: &[Option<Duration>], warmup: usize) -> Vec<f64> {
+    lat[warmup..]
+        .iter()
+        .flatten()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect()
+}
+
 fn keys(a: &Args) -> Result<u8, Fail> {
     let rate: f64 = a.num("rate", 20.0)?;
     let count: usize = a.num("count", 200)?;
     let warmup: usize = a.num("warmup", 10)?;
     let drain = Duration::from_millis(a.num("drain-ms", 5000u64)?);
+    let screen = a.flag("screen");
+    let fast_ms: Option<f64> = a
+        .get("fast-ms")
+        .map(|_| a.num("fast-ms", 0.0))
+        .transpose()?;
+    if fast_ms.is_some() && !screen {
+        return Err(Fail::Usage("--fast-ms needs --screen".into()));
+    }
     if !(rate > 0.0 && rate <= 1000.0) || count == 0 {
         return Err(Fail::Usage(
             "--rate must be in (0, 1000] and --count at least 1".into(),
         ));
     }
     let prep = prep_from(a)?;
-    let mut term = Term::spawn(&a.rest)?;
+    let mut term = Term::spawn(&a.rest, screen)?;
     prepare(&mut term, &prep).map_err(Fail::Run)?;
 
     let period = Duration::from_secs_f64(1.0 / rate);
     let total = warmup + count;
+    // Where the keys go: the screen as it is before the first one.
+    let mut on_screen = term.state().map(|s| ScreenMatcher::new(&s, total));
     let mut sent: Vec<(u8, Instant)> = Vec::with_capacity(total);
     let start = Instant::now();
     let first_key_ms = epoch_ms();
@@ -437,39 +714,103 @@ fn keys(a: &Args) -> Result<u8, Fail> {
     // "until as many bytes as keys": strays would end it early.)
     let mut m = Matcher::new(total);
     let mut quiet_since = Instant::now();
-    while m.next < total && quiet_since.elapsed() < drain {
-        match term.rx.recv_timeout(Duration::from_millis(50)) {
+    while (m.next < total || on_screen.as_ref().is_some_and(|sm| !sm.done()))
+        && quiet_since.elapsed() < drain
+    {
+        match term.recv(Duration::from_millis(50)) {
             Ok((at, bytes)) => {
                 m.feed(&sent, at, &bytes);
+                if let (Some(sm), Some(s)) = (on_screen.as_mut(), term.state()) {
+                    sm.feed(&sent, at, &s);
+                }
                 quiet_since = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    // The final screen, once whatever follows the echoes (a guess taken back, a redraw) is in.
+    let fin = on_screen.as_ref().map(|sm| {
+        term.discard_until_quiet(FINAL_QUIET);
+        let s = term.state().expect("the screen");
+        sm.final_check(&s)
+    });
+    let quit = a
+        .get("quit")
+        .map(|text| term.send(text.as_bytes()).is_ok() && term.wait_exit(QUIT_WAIT));
     term.finish();
 
-    let (lat, unexpected) = (m.lat, m.unexpected);
-    let measured: Vec<f64> = lat[warmup..]
-        .iter()
-        .flatten()
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .collect();
-    let lost = count - measured.len();
-    let Some(s) = stats(&measured) else {
+    let bytes_ms = measured_ms(&m.lat, warmup);
+    let unexpected = m.unexpected;
+    let line = |ms: &[f64], s: &Stats| {
+        format!(
+            "rate={rate} warmup={warmup} sent={count} echoed={} lost={} unexpected={unexpected} first_key_ms={first_key_ms} min_ms={:.2} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} max_ms={:.2} mean_ms={:.2}",
+            ms.len(),
+            count - ms.len(),
+            s.min,
+            s.p50,
+            s.p90,
+            s.p99,
+            s.max,
+            s.mean
+        )
+    };
+    let quit_field = quit.map_or(String::new(), |q| format!(" quit={}", u8::from(q)));
+    let Some(sm) = on_screen else {
+        let Some(s) = stats(&bytes_ms) else {
+            return Err(Fail::Run(format!(
+                "no key came back ({total} sent, {unexpected} other bytes read)"
+            )));
+        };
+        println!("KEYPROBE {}{quit_field}", line(&bytes_ms, &s));
+        return Ok(0);
+    };
+    if let Some(s) = stats(&bytes_ms) {
+        println!("KEYPROBE-BYTES {}", line(&bytes_ms, &s));
+    }
+    if sm.overflow {
         return Err(Fail::Run(format!(
-            "no key came back ({total} sent, {unexpected} other bytes read)"
+            "more than {HISTORY} lines of output: the keys' cells cannot be followed"
+        )));
+    }
+    let screen_ms = measured_ms(&sm.lat, warmup);
+    let Some(s) = stats(&screen_ms) else {
+        return Err(Fail::Run(format!(
+            "no key's glyph appeared on the screen ({total} sent, {} echoed as bytes)",
+            bytes_ms.len()
         )));
     };
+    // The largest difference between the two times of a measured key that both saw.
+    let vs_bytes = sm.lat[warmup..]
+        .iter()
+        .zip(&m.lat[warmup..])
+        .filter_map(|(a, b)| Some(a.as_ref()?.abs_diff(*b.as_ref()?)))
+        .max()
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+    let fin = fin.expect("read with the screen");
+    let vanished = sm.vanished[warmup..].iter().filter(|v| **v).count();
+    let fast_field = fast_ms.map_or(String::new(), |limit| {
+        let fast: Vec<f64> = screen_ms
+            .iter()
+            .copied()
+            .filter(|&ms| ms <= limit)
+            .collect();
+        match stats(&fast) {
+            Some(f) => format!(
+                " fast={} fast_p50_ms={:.2} fast_p99_ms={:.2}",
+                fast.len(),
+                f.p50,
+                f.p99
+            ),
+            None => " fast=0 fast_p50_ms=- fast_p99_ms=-".to_string(),
+        }
+    });
     println!(
-        "KEYPROBE rate={rate} warmup={warmup} sent={count} echoed={} lost={lost} unexpected={unexpected} first_key_ms={first_key_ms} min_ms={:.2} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} max_ms={:.2} mean_ms={:.2}",
-        measured.len(),
-        s.min,
-        s.p50,
-        s.p90,
-        s.p99,
-        s.max,
-        s.mean
+        "KEYPROBE mode=screen {} vs_bytes_max_ms={vs_bytes:.2} vanished={vanished} final_wrong={} final_extra={} final_cursor={}{fast_field}{quit_field}",
+        line(&screen_ms, &s),
+        fin.wrong,
+        fin.extra,
+        u8::from(fin.cursor)
     );
     Ok(0)
 }
@@ -486,7 +827,7 @@ fn drain(a: &Args) -> Result<u8, Fail> {
     let limit = Duration::from_secs(a.num("timeout", 180u64)?);
     let quiet = Duration::from_millis(a.num("quiet-ms", 500u64)?);
     let prep = prep_from(a)?;
-    let mut term = Term::spawn(&a.rest)?;
+    let mut term = Term::spawn(&a.rest, false)?;
     prepare(&mut term, &prep).map_err(Fail::Run)?;
 
     let (mut ended_runs, mut runs_with_marks, mut marks_total) = (0, 0, 0);
@@ -625,6 +966,159 @@ mod tests {
         let (lat, unexpected) = match_echoes(&sent, &[(t(b, 0), b"x".to_vec())]);
         assert_eq!(lat, vec![None, None]);
         assert_eq!(unexpected, 1);
+    }
+
+    /// An emulator of `rows` x `cols` that has been shown `before`.
+    fn screen(rows: u16, cols: u16, before: &[u8]) -> Box<dyn Emulator> {
+        let mut e =
+            fil_term::create(fil_term::DEFAULT_BACKEND, Size { rows, cols }, HISTORY).unwrap();
+        e.feed(before);
+        e
+    }
+
+    /// The keys `key_for(0..n)`, sent 10 ms apart from `base`.
+    fn sent_every_10ms(base: Instant, n: usize) -> Vec<(u8, Instant)> {
+        (0..n)
+            .map(|i| (key_for(i), t(base, 10 * i as u64)))
+            .collect()
+    }
+
+    /// Shows each chunk to `e` and the matcher, as `keys` does.
+    fn show_all(
+        e: &mut Box<dyn Emulator>,
+        sm: &mut ScreenMatcher,
+        sent: &[(u8, Instant)],
+        chunks: &[(Instant, &[u8])],
+    ) {
+        for (at, bytes) in chunks {
+            e.feed(bytes);
+            sm.feed(sent, *at, &e.state(HISTORY));
+        }
+    }
+
+    #[test]
+    fn glyphs_are_timed_at_their_cells_through_wraps_and_scrolls() {
+        let b = Instant::now();
+        // Three rows of ten, the prompt on the last: 20 keys from column 2 wrap twice, and each
+        // wrap scrolls the screen.
+        let mut e = screen(3, 10, b"\r\n\r\n$ ");
+        let sent = sent_every_10ms(b, 20);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 20);
+        let echoes: Vec<(Instant, Vec<u8>)> = (0..20)
+            .map(|i| (t(b, 10 * i as u64 + 4), vec![key_for(i)]))
+            .collect();
+        let chunks: Vec<(Instant, &[u8])> = echoes.iter().map(|(a, v)| (*a, &v[..])).collect();
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        assert!(sm.done());
+        assert!(
+            sm.lat.iter().all(|l| *l == Some(Duration::from_millis(4))),
+            "{:?}",
+            sm.lat
+        );
+        let s = e.state(HISTORY);
+        assert_eq!(s.history.len(), 2, "two scrolls");
+        assert_eq!(
+            sm.final_check(&s),
+            Final {
+                wrong: 0,
+                extra: 0,
+                cursor: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_written_guess_counts_when_written_and_a_wrong_one_not_at_all() {
+        let b = Instant::now();
+        let mut e = screen(5, 20, b"");
+        let sent = sent_every_10ms(b, 3);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        let chunks: [(Instant, &[u8]); 3] = [
+            // A guess for `a`, underlined, the cursor put back: counts.
+            (t(b, 3), b"\x1b[4ma\x1b[24m\x1b[1;1H"),
+            // A wrong guess for `b` (an `x` in its cell): does not.
+            (t(b, 13), b"\x1b[1;2Hx\x1b[1;1H"),
+            // The echo of all three, 40 ms in.
+            (t(b, 40), b"abc"),
+        ];
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        assert_eq!(
+            sm.lat,
+            [3, 30, 20].map(|ms| Some(Duration::from_millis(ms)))
+        );
+        assert!(sm.final_check(&e.state(HISTORY)).cursor);
+    }
+
+    #[test]
+    fn a_guess_taken_back_and_drawn_again_by_the_echo_has_vanished() {
+        let b = Instant::now();
+        let mut e = screen(5, 20, b"");
+        let sent = sent_every_10ms(b, 2);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        let chunks: [(Instant, &[u8]); 3] = [
+            // A guess for `a`, then the overlay erases it (a withdrawal), then the echo.
+            (t(b, 1), b"a\x1b[1;1H"),
+            (t(b, 20), b" \x1b[1;1H"),
+            (t(b, 40), b"ab"),
+        ];
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        // Counted at the guess, and seen to go: `b` was never taken back.
+        assert_eq!(sm.lat, [1, 30].map(|ms| Some(Duration::from_millis(ms))));
+        assert_eq!(sm.vanished, [true, false]);
+        assert!(sm.final_check(&e.state(HISTORY)).cursor);
+    }
+
+    #[test]
+    fn a_glyph_drawn_before_its_key_was_typed_never_counts_for_it() {
+        let b = Instant::now();
+        let mut e = screen(5, 20, b"");
+        let sent = sent_every_10ms(b, 2);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        // `b` drawn in its cell at 5 ms, before it is typed at 10 ms; the echo of both at 30 ms
+        // leaves that cell as it was, so the screen cannot time `b`.
+        let chunks: [(Instant, &[u8]); 2] = [(t(b, 5), b"\x1b[1;2Hb\x1b[1;1H"), (t(b, 30), b"ab")];
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        assert_eq!(sm.lat, [Some(Duration::from_millis(30)), None]);
+        assert!(!sm.done());
+        // A cell that showed the glyph before the typing started is the same.
+        let e = screen(5, 20, b"\x1b[1;2Hb\x1b[1;1H");
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        assert_eq!(sm.held, [false, true]);
+    }
+
+    #[test]
+    fn a_pending_wrap_puts_the_first_key_on_the_next_line() {
+        let e = screen(3, 10, b"0123456789");
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        assert_eq!((sm.cell(0), sm.cell(2)), ((1, 0), (1, 2)));
+    }
+
+    #[test]
+    fn the_final_screen_counts_wrong_cells_extra_glyphs_and_a_misplaced_cursor() {
+        let mut e = screen(5, 10, b"");
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        // `c`'s cell shows `x`, two glyphs below the line, the cursor at the top left.
+        e.feed(b"abx\r\nzz\x1b[H");
+        assert_eq!(
+            sm.final_check(&e.state(HISTORY)),
+            Final {
+                wrong: 1,
+                extra: 2,
+                cursor: false
+            }
+        );
+        // Three keys that fill a row from column 7 leave the cursor on its last column.
+        let mut e = screen(5, 10, b"\x1b[1;8H");
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        e.feed(b"abc");
+        assert_eq!(
+            sm.final_check(&e.state(HISTORY)),
+            Final {
+                wrong: 0,
+                extra: 0,
+                cursor: true
+            }
+        );
     }
 
     #[test]

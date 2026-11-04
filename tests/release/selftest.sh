@@ -202,10 +202,11 @@ echo "== release-check"
 # and archives made with whatever tar the machine has.
 mk_tree() { # DIR VER
   local d=$1
-  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden"
+  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden" "$d/crates/fil-transport/src/pipe"
   cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/justfile" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$d/"
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
+  cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
   git init -q -b main "$d"
   set_version "$d" "$2"
   git -C "$d" add -A
@@ -221,6 +222,8 @@ fake_bin() { # FILE KIND
 # FAKE-$2 /cargo-home/registry/src/index.crates.io-0/dep-1/src/lib.rs
 echo "fil $VER (wire $(wire_major).$(wire_revision))"
 EOT
+  # The install bootstrap, as a real build holds it (release-check requires it, and no other `sh -c`).
+  printf '# %s\n' "$(release_bootstrap "$VER" "$(wire_major)" "$(wire_revision)")" >> "$1"
   chmod 755 "$1"
 }
 mkdir -p "$tmp/shim"
@@ -342,8 +345,14 @@ mutated "the bundle's SHA256SUMS is wrong" \
   "echo 'deadbeef  x86_64-linux/fil' > fil-0.9.0-x86_64-linux-musl/libexec/fil/remote/SHA256SUMS"
 mutated_msg "a vt100 source path is in bin/fil" "vt100" \
   "echo '# /cargo-home/registry/src/index.crates.io-0/vt100-0.18.0/src/lib.rs' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
-mutated_msg "the install-bootstrap feature is in bin/fil" "install-bootstrap" \
-  "echo '# Remove the copies fil installed on HOST' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "bin/fil has no install bootstrap" "does not hold the approved install bootstrap" \
+  "perl -ni -e 'print unless /^# sh -c /' fil-0.9.0-x86_64-linux-musl/bin/fil"
+mutated_msg "bin/fil's install bootstrap is altered" "does not hold the approved install bootstrap" \
+  "perl -pi -e 's/rm -rf/rm -fr/ if /^# sh -c /' fil-0.9.0-universal-apple-darwin/bin/fil"
+mutated_msg "bin/fil's install bootstrap is for another wire" "does not hold the approved install bootstrap" \
+  "perl -pi -e 's/\\(wire (\\d+)\\.(\\d+)\\)/(wire \$1.9\$2)/ if /^# sh -c /' fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "bin/fil holds a second remote command line" "other than the pinned one" \
+  "echo \"# bash -c 'fil server --stdio'\" >> fil-0.9.0-universal-apple-darwin/bin/fil"
 mutated_msg "an ELF is not stripped" "is not stripped" "perl -pi -e 's/FAKE-ELF-X86/FAKE-NOTSTRIPPED/' fil-0.9.0-x86_64-linux-musl/bin/fil"
 # test-fixture host names and addresses: the list comes from the tree's test directories
 new_case 0.9.0
@@ -478,6 +487,132 @@ expect_fail "a v<version> tag whose commit is not on main is refused" prep v0.9.
 tree=$main_tree
 expect_pass "a workflow_dispatch run is a dry run (release=false)" bash -c "cd '$tmp' && : > gho && FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/x GITHUB_OUTPUT='$tmp/gho' '$RELEASE_DIR/prepare.sh' && grep -q '^release=false' gho"
 expect_fail "a push that is not a v* tag is refused" bash -c "FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main '$RELEASE_DIR/prepare.sh'"
+
+# ============================================================== 4c. crates.io name reservation
+echo "== reserve-crate-names.sh"
+rc_script=$RELEASE_DIR/reserve-crate-names.sh
+expect_pass "reserve-crate-names: --help works" bash "$rc_script" --help
+rc_names=$(sed -n 's/^CRATES="\(.*\)"$/\1/p' "$rc_script")
+expect_pass "reserve-crate-names: the nine published crates, in order" test "$rc_names" = "fil-shell fil-proto fil-transport fil-session fil-daemon fil-client fil-term fil-predict fil-forward"
+# fil-shell is the published name of the user-facing crate, which crates/fil is today.
+for n in $rc_names; do
+  d=$n
+  [ "$n" != fil-shell ] || d=fil
+  expect_pass "reserve-crate-names: $n has a crate in the workspace" test -f "$REPO_ROOT/crates/$d/Cargo.toml"
+done
+# The fakes stand in for cargo and curl, so no network is used and nothing is published.
+mkdir -p "$tmp/rc"
+cat > "$tmp/rc/curl" << 'EOF'
+#!/bin/sh
+# the last argument is the URL: "fil-term" is taken, the rest are free; fil-term's owners are alice;
+# FAKE_CURL_500 names a crate whose lookup fails with a server error
+for a; do u=$a; done
+case $u in
+  */crates/"${FAKE_CURL_500:-none}") printf 500 ;;
+  */owners) printf '{"users":[{"kind":"user","id":1,"login":"alice"}]}' ;;
+  */crates/fil-term) printf 200 ;;
+  *) printf 404 ;;
+esac
+EOF
+cat > "$tmp/rc/cargo" << 'EOF'
+#!/bin/sh
+echo "$*" >> "$FAKE_CARGO_LOG"
+if [ "$1" = owner ]; then
+  [ -z "${FAKE_OWNER_MSG:-}" ] || echo "$FAKE_OWNER_MSG"
+  exit "${FAKE_OWNER_RC:-0}"
+fi
+n=$(sed -n 's/^name = "\(.*\)"$/\1/p' Cargo.toml)
+mkdir -p "$FAKE_CARGO_SEEN" && cp Cargo.toml "$FAKE_CARGO_SEEN/$n.Cargo.toml" && cp src/lib.rs "$FAKE_CARGO_SEEN/$n.lib.rs"
+EOF
+chmod +x "$tmp/rc/curl" "$tmp/rc/cargo"
+# No token in the environment or in the (empty) CARGO_HOME, so the login check is the script's own.
+mkdir -p "$tmp/empty"
+rc_run() { env -u CARGO_REGISTRY_TOKEN CARGO_HOME="$tmp/empty" FIL_RESERVE_CARGO="$tmp/rc/cargo" FIL_RESERVE_CURL="$tmp/rc/curl" FIL_RESERVE_PACE_SECS=0 FAKE_CARGO_LOG="$tmp/rc/log" FAKE_CARGO_SEEN="$tmp/rc/seen" TMPDIR="$tmp" bash "$rc_script" "$@"; }
+# rc_status CMD...: the command's exit status, whatever it prints.
+rc_status() { "$@" > /dev/null 2>&1 && echo 0 || echo $?; }
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: a run with no flag is a dry run, and a taken name is skipped" rc_run
+expect_pass "reserve-crate-names: cargo was called eight times, always with --dry-run" test "$(grep -c -- '^publish --dry-run' "$tmp/rc/log")" = 8 -a "$(grep -vc -- '--dry-run' "$tmp/rc/log")" = 0
+expect_fail "reserve-crate-names: no placeholder for the taken name" test -e "$tmp/rc/seen/fil-term.Cargo.toml"
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: --dry-run --invite runs no cargo owner" rc_run --dry-run --invite bob
+expect_pass "reserve-crate-names: --invite takes a login (exit 2)" test "$(rc_status rc_run --invite)" = 2
+expect_pass "reserve-crate-names: --invite refuses a malformed login (exit 2)" test "$(rc_status rc_run --invite 'a b;c')" = 2
+expect_pass "reserve-crate-names: --account takes a login (exit 2)" test "$(rc_status rc_run --account)" = 2
+expect_pass "reserve-crate-names: an unknown argument is refused with exit 2" test "$(rc_status bash "$rc_script" --bogus)" = 2
+expect_fail "reserve-crate-names: cargo owner was never run by a dry run" grep -q '^owner' "$tmp/rc/log"
+expect_pass "reserve-crate-names: placeholder manifest (version, license, repository, no authors, no email)" \
+  sh -c 'f=$1/fil-proto.Cargo.toml; grep -q "^version = \"0.0.1\"" "$f" && grep -q "^license = \"GPL-3.0-or-later\"" "$f" && grep -q "^repository = \"https://github.com/anthonytw/fil\"" "$f" && ! grep -q "authors" "$f" && ! grep -q "@" "$f"' sh "$tmp/rc/seen"
+expect_pass "reserve-crate-names: placeholder lib.rs is only a doc comment" \
+  sh -c '! grep -v "^//!" "$1/fil-proto.lib.rs" | grep -q .' sh "$tmp/rc/seen"
+expect_pass "reserve-crate-names: the scratch directory is removed" sh -c '! ls "$1" | grep -q fil-reserve' sh "$tmp"
+# --account: fil-term is taken, and alice owns it.
+expect_pass "reserve-crate-names: --account alice owns the taken name, so the run passes" rc_run --account alice
+rc_run --account bob > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: a name taken by others exits 1" test "$st" = 1
+expect_pass "reserve-crate-names: ...and is listed with its owners" grep -q 'taken by others: fil-term(alice)' "$tmp/rc/out"
+# The publish path, on the fake cargo: nothing is published, nothing real is run.
+: > "$tmp/rc/log"
+rc_run --publish --yes --skip-login-check > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: --publish publishes the eight free names" test "$st" = 0 -a "$(grep -c '^publish ' "$tmp/rc/log")" = 8
+expect_fail "reserve-crate-names: ...none of them as a dry run" grep -q -- '--dry-run' "$tmp/rc/log"
+# 8 publishes, a burst of 5: each of the last three waits (PACE_SECS is 0 here).
+expect_pass "reserve-crate-names: ...and the burst wait comes before the sixth, seventh and eighth only" test "$(grep -c 'burst (5) is used up' "$tmp/rc/out")" = 3
+: > "$tmp/rc/log"
+rc_run --publish --yes > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: without a token --publish stops (exit 1), and cargo is not called" test "$st" = 1 -a ! -s "$tmp/rc/log"
+expect_pass "reserve-crate-names: ...with a cargo login message" grep -q 'cargo login' "$tmp/rc/out"
+: > "$tmp/rc/log"
+echo no | rc_run --publish --skip-login-check > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: a typed 'no' aborts, and cargo is not called" test "$st" = 1 -a ! -s "$tmp/rc/log"
+rm -rf "$tmp/rc/seen"
+: > "$tmp/rc/log"
+FAKE_CURL_500=fil-daemon rc_run --publish --yes --skip-login-check > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: a server error on one name exits 1 and nothing is published for it" test "$st" = 1 -a ! -e "$tmp/rc/seen/fil-daemon.Cargo.toml" -a -e "$tmp/rc/seen/fil-proto.Cargo.toml"
+# --invite with --account: no invitation for the crate that bob does not own (fil-term), carol for the rest.
+: > "$tmp/rc/log"
+rc_run --publish --yes --skip-login-check --account bob --invite carol > "$tmp/rc/out" 2>&1 && st=0 || st=$?
+expect_pass "reserve-crate-names: invitations are sent for the new crates" test "$(grep -c '^owner --add carol ' "$tmp/rc/log")" = 8
+expect_fail "reserve-crate-names: ...none for the crate that others own" grep -q '^owner --add carol fil-term' "$tmp/rc/log"
+expect_pass "reserve-crate-names: ...and the run still exits 1 for it" test "$st" = 1
+# The invitation step, on the fakes (sourcing the script runs nothing).
+rc_invite() { # rc_invite OWNER CRATE [CARGO_OUTPUT [CARGO_STATUS]]: prints the outcome
+  (
+    export FIL_RESERVE_CARGO="$tmp/rc/cargo" FIL_RESERVE_CURL="$tmp/rc/curl" FAKE_CARGO_LOG="$tmp/rc/log" FAKE_OWNER_MSG="${3:-}" FAKE_OWNER_RC="${4:-0}"
+    # shellcheck source=tests/release/reserve-crate-names.sh
+    source "$rc_script"
+    work=$tmp/rc/work
+    mkdir -p "$work"
+    invite_owner "$1" "$2"
+  )
+}
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: an invitation is sent with cargo owner --add" test "$(rc_invite bob fil-proto)" = invited
+expect_pass "reserve-crate-names: ...as 'owner --add bob fil-proto'" grep -qx 'owner --add bob fil-proto' "$tmp/rc/log"
+: > "$tmp/rc/log"
+expect_pass "reserve-crate-names: an owner already on the public list is not invited again" test "$(rc_invite alice fil-term)" = already
+expect_fail "reserve-crate-names: ...and cargo owner was not run" grep -q '^owner' "$tmp/rc/log"
+expect_pass "reserve-crate-names: a pending invitation (a success answer) counts as done" test "$(rc_invite bob fil-proto 'user bob already has a pending invitation' 0)" = already
+expect_pass "reserve-crate-names: a crate this account does not own is left alone" test "$(rc_invite bob fil-proto 'error: only owners have permission to modify owners' 101)" = notours
+expect_pass "reserve-crate-names: other permission errors are failures, not 'not ours'" test "$(rc_invite bob fil-proto 'error: 403 Forbidden: token lacks the change-owners scope' 101)" = failed
+expect_pass "reserve-crate-names: any other failure is reported" test "$(rc_invite bob fil-proto 'error: could not resolve host' 101)" = failed
+# The 429 retry, on a fake command (sourcing the script runs nothing).
+rc_retry() { # rc_retry FAILS_BEFORE_SUCCESS OUTPUT: prints the number of calls and the status
+  (
+    export FIL_RESERVE_RETRY_SECS=0 FIL_RESERVE_MAX_RETRIES=3
+    # shellcheck source=tests/release/reserve-crate-names.sh
+    source "$rc_script"
+    calls=0
+    fake() { calls=$((calls + 1)); if [ "$calls" -le "$1" ]; then echo "$2"; return 101; fi; }
+    st=0
+    run_retry_429 "$tmp/rc/retry.log" fake "$1" "$2" 2> /dev/null || st=$?
+    echo "$calls $st"
+  )
+}
+expect_pass "reserve-crate-names: a 429 is waited out and retried" test "$(rc_retry 2 'the remote server responded with an error (status 429 Too Many Requests): too many new crates')" = "3 0"
+expect_pass "reserve-crate-names: any other failure is not retried" test "$(rc_retry 2 'error: the remote server responded with an error (status 400 Bad Request)')" = "1 101"
+expect_pass "reserve-crate-names: a bare 429 in the text is not a rate limit" test "$(rc_retry 2 'error: crate size 4290 bytes exceeds')" = "1 101"
+expect_pass "reserve-crate-names: a 429 that does not clear gives up" test "$(rc_retry 99 'status 429 Too Many Requests')" = "4 101"
 
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then

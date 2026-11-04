@@ -1,11 +1,12 @@
 //! `fil install HOST`, `fil install --check HOST` and `fil install --remove HOST`: the bootstrap
 //! over ssh, in its three modes (`docs/m4/plan.md` §3 U1).
 //!
-//! **Gated on M4 OQ-1**: compiled only with the `install-bootstrap` feature.
-//!
-//! The remote command is the constant bootstrap and nothing else (`PipeCommand::bootstrap`); a
-//! host whose config names its own `pipe` is refused, since a custom pipe is never rewritten.
-//! Nothing about the host is written on this machine.
+//! The remote command is the constant bootstrap and nothing else (`PipeCommand::bootstrap`). Two
+//! kinds of host are refused before anything runs: one whose config names its own `pipe` (a
+//! custom pipe is never rewritten), and one with `remote = "plain"` (there fil runs only
+//! `fil server --stdio`: DESIGN.md §8.2). Each mode has an overall time limit, its login
+//! included, and an exchange whose ssh exited with a status other than 0 is a failure even when
+//! its output looked complete. Nothing about the host is written on this machine.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use fil_transport::pipe::PipeCommand;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use super::boot::{self, BootError, Greeted, Lines, Mode, Then};
+use super::fallback::RemoteMode;
 use super::layout::this_version_dir;
 use super::upload::{self, Remote};
 
@@ -59,10 +61,49 @@ pub async fn run_with(argv: &[OsString], host: &str, request: &Request, exe: &Pa
     let (mut child, mut stdin, mut lines) =
         spawn(argv).map_err(|e| format!("cannot run ssh: {e}"))?;
     let shown = fil_proto::text::sanitize_inline(host);
-    let result = exchange(&mut stdin, &mut lines, &shown, request, exe).await;
+    let limit = match request {
+        Request::Check => boot::CHECK_LIMIT,
+        Request::Remove => boot::REMOVE_LIMIT,
+        Request::Install { .. } => boot::INSTALL_LIMIT,
+    };
+    // The whole exchange, login included, gets the mode's limit: a login may wait for a
+    // password, and the client cannot tell when it ends. A timeout drops the exchange, and the
+    // child is killed on drop.
+    let result = tokio::time::timeout(
+        limit,
+        exchange(&mut stdin, &mut lines, &shown, request, exe),
+    )
+    .await
+    .unwrap_or_else(|_| Err(format!("{shown}: {}", BootError::Timeout)));
     drop(stdin);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
-    result
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok);
+    judge(result, status, &shown)
+}
+
+/// The outcome, given how ssh ended. `check` mode's output has no end marker (the approved script
+/// prints its findings and exits 0), so a login that failed (ssh exits 255 with nothing printed)
+/// or a shell that could not run the script would otherwise read as "nothing installed": success
+/// needs ssh's exit status 0. A failure says ssh's status when it was not 0.
+pub fn judge(result: Said, status: Option<std::process::ExitStatus>, host: &str) -> Said {
+    let failed = match status {
+        Some(s) if s.success() => None,
+        Some(s) => Some(match s.code() {
+            Some(c) => format!("ssh exited with status {c}"),
+            None => "ssh was ended by a signal".to_string(),
+        }),
+        None => Some("ssh did not exit".to_string()),
+    };
+    match (result, failed) {
+        (Ok(words), None) => Ok(words),
+        (Ok(_), Some(why)) => Err(format!(
+            "{host}: the login or the remote shell failed ({why}; ssh's message, if any, is above): nothing was checked or changed"
+        )),
+        (Err(e), Some(why)) if !e.contains("ssh exited") => Err(format!("{e} ({why})")),
+        (Err(e), _) => Err(e),
+    }
 }
 
 async fn exchange(
@@ -78,11 +119,9 @@ async fn exchange(
         Request::Check => {
             boot::send_mode(stdin, Mode::Check).await.map_err(fail)?;
             // The plan's 10 s is for the host's answer, but the login before it may wait for a
-            // password: the whole exchange gets CHECK_LIMIT, which also cuts a hung wrapper.
-            let report = tokio::time::timeout(boot::CHECK_LIMIT, boot::read_check(lines))
-                .await
-                .map_err(|_| fail(BootError::Timeout))?
-                .map_err(fail)?;
+            // password: the whole exchange gets CHECK_LIMIT (`run_with`), which also cuts a hung
+            // wrapper.
+            let report = boot::read_check(lines).await.map_err(fail)?;
             let mut out = format!("{host}:\n");
             if report.installed.is_empty() {
                 out.push_str("  installed by fil: none\n");
@@ -165,10 +204,8 @@ async fn exchange(
 
 /// `fil install ...` against `host`, with the config's settings for it.
 pub async fn run(host: &str, request: &Request, settings: &crate::config::HostSettings) -> u8 {
-    if settings.pipe.is_some() {
-        eprintln!(
-            "fil: install: this host has its own `pipe` command in the config, which fil never rewrites: install fil there by hand"
-        );
+    if let Some(refusal) = refusal(settings) {
+        eprintln!("fil: install: {refusal}");
         return 1;
     }
     let argv = match PipeCommand::bootstrap(host) {
@@ -196,5 +233,74 @@ pub async fn run(host: &str, request: &Request, settings: &crate::config::HostSe
             eprintln!("fil: install: {words}");
             1
         }
+    }
+}
+
+/// Why `fil install` will not run the bootstrap for a host with these settings, if it will not:
+/// a custom `pipe` is never rewritten, and `remote = "plain"` means `fil server --stdio` is the
+/// only remote command fil runs there (DESIGN.md §8.2, decided).
+pub fn refusal(settings: &crate::config::HostSettings) -> Option<&'static str> {
+    if settings.pipe.is_some() {
+        return Some(
+            "this host has its own `pipe` command in the config, which fil never rewrites: install fil there by hand",
+        );
+    }
+    if settings.remote == RemoteMode::Plain {
+        return Some(
+            "this host has remote = \"plain\" in the config, so fil runs only `fil server --stdio` there: install fil by hand, or drop that line",
+        );
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    use super::*;
+
+    fn exited(code: i32) -> Option<ExitStatus> {
+        Some(ExitStatus::from_raw(code << 8))
+    }
+
+    /// A report that looked complete counts only if ssh exited 0: `check` has no end marker, so a
+    /// failed login (255, nothing printed) would otherwise read as "nothing installed".
+    #[test]
+    fn success_needs_ssh_to_exit_0() {
+        let ok: Said = Ok("devbox: fine".into());
+        assert_eq!(judge(ok.clone(), exited(0), "devbox"), ok);
+        let e = judge(ok.clone(), exited(255), "devbox").unwrap_err();
+        assert!(
+            e.contains("status 255") && e.contains("nothing was checked"),
+            "{e}"
+        );
+        assert!(judge(ok.clone(), Some(ExitStatus::from_raw(9)), "devbox").is_err());
+        assert!(judge(ok, None, "devbox").is_err());
+        // A failure keeps its words and gains ssh's status.
+        let e = judge(Err("devbox: ended".into()), exited(255), "devbox").unwrap_err();
+        assert_eq!(e, "devbox: ended (ssh exited with status 255)");
+        assert_eq!(
+            judge(Err("devbox: refused".into()), exited(0), "devbox"),
+            Err("devbox: refused".into())
+        );
+    }
+
+    #[test]
+    fn a_plain_or_custom_host_is_refused() {
+        let cfg = |toml: &str| {
+            crate::config::Config::parse(toml, "test")
+                .unwrap()
+                .for_host("devbox")
+        };
+        assert!(refusal(&cfg("")).is_none());
+        assert!(refusal(&cfg("[host.devbox]\nremote = \"auto\"\n")).is_none());
+        let plain = refusal(&cfg("[host.devbox]\nremote = \"plain\"\n")).unwrap();
+        assert!(plain.contains("remote = \"plain\""), "{plain}");
+        assert!(refusal(&cfg("[defaults]\nremote = \"plain\"\n")).is_some());
+        let custom = refusal(&cfg(
+            "[host.devbox]\npipe = [\"docker\", \"exec\", \"-i\", \"c\", \"fil\", \"server\", \"--stdio\"]\n",
+        ));
+        assert!(custom.unwrap().contains("pipe"));
     }
 }

@@ -197,22 +197,16 @@ fn dec_graphics_is_not_painted_into() {
 
 #[test]
 fn soft_reset_leaves_the_charset_unknown() {
-    // alacritty keeps DEC graphics through DECSTR; xterm resets it. Found by the harness.
+    // xterm resets DEC graphics through DECSTR; alacritty used to keep them, which this trace
+    // caught (found by the harness). `fil-term` now applies DECSTR in the shadow, so the trace
+    // holds without the guard; the guard stays for the terminals that ignore DECSTR or reset
+    // less (kitty, tmux), so it is still exercised, with nothing to prove it.
     let t = Trace::new()
         .server(0, b"\x1b)0")
         .server(5, b"\x0e")
         .server(10, b"\x1b[!p")
         .input(20, b"x");
-    hazard(
-        "decstr",
-        &t,
-        &[(2, 2, 'q')],
-        None,
-        Some(|g| {
-            g.charset = false;
-            g.other_blockers = false;
-        }),
-    );
+    hazard("decstr", &t, &[(2, 2, 'q')], None, None);
 }
 
 #[test]

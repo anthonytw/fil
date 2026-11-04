@@ -910,7 +910,7 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 - **Fixing:** findings become fix PRs, reviewed like any other.
 - **Closing:** a verification pass closes the sweep.
 
-M4 adds a **deeper pre-release sweep** of the code, the git history, the docs and CI before the first release (`docs/m4/plan.md` §6.4). The repository went public early; the owner's planned recreate with a single initial commit, before the first release tag, takes care of most of the history.
+M4 adds a **deeper pre-release sweep** of the code, the git history, the docs and CI before the first release (`docs/m4/plan.md` §6.4). The repository went public early; the recreate with a single initial commit (decided, owner 2026-11-03 and 2026-11-04), before the first release tag, takes care of most of the history.
 
 **Project site (M4).** fil.anthonywertz.com, set up the same way as Sempere's site: the site source lives in its own repository, `fil-site`, and its deploy script pushes the built output to a public GitHub Pages repository. The site hosts the docs, install instructions and release notes.
 
@@ -920,7 +920,7 @@ M4 adds a **deeper pre-release sweep** of the code, the git history, the docs an
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
 4. ~~**Terminal-query replies in flight during a takeover**~~ Resolved for M1 (proposed, not decided): the reply is lost and nothing is repaired; the program's own timeout ends the wait. See §6.3.
-5. **Server binary:** manual install, or upload by the client (§11)? Planned in `docs/m4/plan.md` (U1): manual install always, and an upload over the pipe if the owner allows a second fixed remote command (OQ-1).
+5. **Server binary:** manual install, or upload by the client (§11)? Planned in `docs/m4/plan.md` (U1): manual install always, and an upload over the pipe if the owner allows one more fixed remote command, a constant bootstrap, and the install directory `~/.local/share/fil` (OQ-1).
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**
    - heartbeat interval and dead-link timeout

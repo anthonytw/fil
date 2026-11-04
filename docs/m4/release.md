@@ -55,7 +55,7 @@ Each release carries exactly these files:
 | `fil-<ver>-universal-apple-darwin.tar.gz` | the macOS archive |
 | `fil-<ver>-source.tar.gz` | the tagged tree with every dependency vendored (`cargo vendor`), which builds offline. It is the Corresponding Source for the binaries (LIC) |
 | `SHA256SUMS` | the checksums of the four files above it: the three binary archives and the source archive |
-| `SHA256SUMS.sig` | an SSH signature over `SHA256SUMS`, made with `ssh-keygen -Y sign -n fil-release` by the release identity (OQ-2) |
+| `SHA256SUMS.sig` | an SSH signature over `SHA256SUMS`, made with `ssh-keygen -Y sign -n fil-release` by the release identity, the owner's own SSH key (M4 OQ-2; decided, owner 2026-11-04) |
 
 The GitHub build-provenance attestation for each archive is attached to the release by the workflow. It is not a file in the list.
 
@@ -285,6 +285,8 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 - **Paths.** `trim-paths` is not stable in the pinned cargo, so the builds pass `--remap-path-prefix` flags (`tests/release/common.sh`): the workspace becomes `/build`, `CARGO_HOME` `/cargo-home` and the rustup home `/rustup-home`. `release-check` requires `/cargo-home/registry/src/` to appear in each binary, as proof that the remap was applied. When the pinned cargo stabilizes `trim-paths`, set it in `[profile.release]` and drop the flags.
 
 ### 9.2 The owner's steps for one release
+
+**Repository settings** (the `v*` tag ruleset that only the owner passes, immutable releases, the code-owner review below, and the others of `docs/m4/plan.md` §5): the owner sets them before the first tag (owner, 2026-11-04).
 
 **The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
 

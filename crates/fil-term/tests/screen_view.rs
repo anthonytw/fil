@@ -356,3 +356,59 @@ fn two_emulators_never_share_a_stamp() {
     let (sa, sc) = (stamps(&*a), stamps(&*c));
     assert!(sa.iter().all(|s| !sc.contains(s)));
 }
+
+/// Review S1 (PR #117): on alacritty, overwriting a wide character at column 0 clears the
+/// leading-spacer flag at the end of the row above, which alacritty does not damage. With a
+/// combining mark parked on the spacer, that row's text changes ("" to " \u{301}").
+#[test]
+fn a_wide_char_overwritten_at_column_0_moves_the_stamp_of_the_row_above() {
+    for b in backends() {
+        let size = Size { cols: 10, rows: 5 };
+        let mut emu = (b.create)(size, 0);
+        // A wide character at the last column: a leading spacer at (1,9), 日 at (2,0).
+        emu.feed("\x1b[2;10H日".as_bytes());
+        // Autowrap off: a wide character that does not fit writes nothing, and the combining
+        // mark after it lands on the spacer.
+        emu.feed("\x1b[?7l\x1b[2;10H日\u{301}\x1b[?7h".as_bytes());
+        emu.feed(b"\x1b[5;1H");
+        let (text, before) = (emu.state(0).screen_text(), stamps(&*emu));
+        // Between two keys: overwrite 日 at (2,0), go back.
+        emu.feed(b"\x1b[3;1Hx\x1b[5;1H");
+        let changed = emu.state(0).screen_text()[1] != text[1];
+        let moved = moved(&before, &stamps(&*emu));
+        assert!(
+            !changed || moved.contains(&1),
+            "{}: row 1 changed unseen",
+            b.name
+        );
+        if b.name == "alacritty" {
+            assert!(changed, "the repro still shows alacritty's behavior");
+        }
+    }
+}
+
+/// A program's synchronized-update batch (`?2026h`) is held by alacritty until it ends, or until
+/// `apply_pending` (the daemon's, before a snapshot) applies it: the stamps move then. (`vt100`
+/// does not hold it: they move at the feed.)
+#[test]
+fn a_held_sync_batch_moves_the_stamps_when_applied() {
+    for b in backends() {
+        let mut emu = at_prompt(&b);
+        let before = stamps(&*emu);
+        emu.feed(b"\x1b[?2026h\x1b7\x1b[2;1HXYZ\x1b8");
+        let fed = stamps(&*emu);
+        if b.name == "alacritty" {
+            assert!(
+                !moved(&before, &fed).contains(&1),
+                "alacritty holds the batch"
+            );
+        }
+        emu.apply_pending();
+        assert_eq!(emu.state(0).screen_text()[1], "XYZond line", "{}", b.name);
+        assert!(
+            moved(&before, &stamps(&*emu)).contains(&1),
+            "{}: the batch's row",
+            b.name
+        );
+    }
+}

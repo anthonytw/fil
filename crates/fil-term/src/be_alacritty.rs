@@ -21,7 +21,9 @@
 //!   damage on its line either directly (erase, delete, insert, clear) or through the cursor:
 //!   `Term::damage` damages the cursor's line and the line it was on at the last read, and every
 //!   move between lines (`goto`, a line feed, a wrap, a restore) damages both lines, so a line
-//!   the cursor wrote on is damaged even if the cursor left it again. Damage is per line and
+//!   the cursor wrote on is damaged even if the cursor left it again. The one write off the
+//!   cursor's line that is not damaged (a wide character overwritten at column 0 or 1 clears the
+//!   leading-spacer flag at the end of the line above) is covered in `harvest`. Damage is per line and
 //!   also covers attribute-only writes and lines the cursor only passed through, which makes the
 //!   stamp stricter than the glyphs, as the contract allows (the cost: a program that moves the
 //!   cursor through another row and back, writing nothing, makes the next key tentative).
@@ -204,11 +206,37 @@ impl Alacritty {
     /// Turns the damage since the last call into new row stamps, and resets it.
     fn harvest(&mut self) {
         let term = self.term.get_mut();
-        match term.damage() {
-            TermDamage::Full => self.stamps.bump_all(),
+        let mark = self.stamps.mark();
+        let partial = match term.damage() {
+            TermDamage::Full => {
+                self.stamps.bump_all();
+                false
+            }
             TermDamage::Partial(lines) => {
                 for d in lines {
                     self.stamps.bump(d.line);
+                }
+                true
+            }
+        };
+        if partial {
+            // The one write off the cursor's line that alacritty does not damage: overwriting a
+            // wide character at column 0 or 1 clears the leading-spacer flag on the last cell of
+            // the line above (`Term::write_at_cursor`). Shown as a blank, that changes nothing,
+            // unless a zero-width character sits on the spacer (a combining mark typed after a
+            // wide character that did not fit with autowrap off): then its text goes from "" to
+            // " \u{301}". So a damaged line also stamps the line above when that line's last
+            // cell carries zero-width characters (rare; stricter, never wrong). Lines stamped in
+            // this harvest are the ones whose stamp is past `mark`: no list is kept.
+            let grid = term.grid();
+            let last = Column(grid.columns() - 1);
+            for l in 1..grid.screen_lines() {
+                if self.stamps.since(mark, l)
+                    && grid[GLine(l as i32 - 1)][last]
+                        .zerowidth()
+                        .is_some_and(|z| !z.is_empty())
+                {
+                    self.stamps.bump(l - 1);
                 }
             }
         }

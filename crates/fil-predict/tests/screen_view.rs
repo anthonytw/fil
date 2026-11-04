@@ -1,9 +1,9 @@
 //! P2 (`docs/m3/plan.md` §3): the core reads the shadow through the backend's borrowed view.
 //!
 //! - **Stamps.** On both backends `ScreenView::row_stamp` is the backend's per-row write counter,
-//!   and it changes on every glyph change of its row: random streams checked against C1's hash of
-//!   the row's glyphs (`ScreenView for TermState`), which it replaced. A hash cannot see a change
-//!   drawn and undone between two reads; the counter does, and this counts how often.
+//!   and it changes on every glyph change of its row, drawn and undone included: adversarial
+//!   streams checked against C1's hash of the row's glyphs (`ScreenView for TermState`), which it
+//!   replaced, taken after every byte on a reference emulator.
 //! - **No `TermState` per key or chunk.** While predicting, with guesses outstanding, no
 //!   `Emulator::state` call is made at all (a counting emulator).
 //! - **`test_state`** is `Some` for the overlay's view, so T1's `compare_to_shadow` has a shadow.
@@ -31,14 +31,27 @@ impl Rng {
     }
 }
 
-/// Output pieces. Many write somewhere and put the cursor back; some draw and undo.
+/// Output pieces, adversarial: every editing, scrolling and screen sequence both backends know,
+/// odd parameters, cut and invalid sequences, wide and combining characters, C1 controls.
 const POOL: &[&str] = &[
     "hello ",
     "\r\n",
+    "\n",
+    "\x0b",
+    "\x0c",
+    "\r",
+    "\x08",
+    "\t",
     "\x1b[K",
     "\x1b[1K",
     "\x1b[2K",
+    "\x1b[?K",
+    "\x1b[?1K",
     "\x1b[J",
+    "\x1b[1J",
+    "\x1b[2J",
+    "\x1b[3J",
+    "\x1b[?2J",
     "\x1b[2P",
     "\x1b[3@",
     "\x1b[2X",
@@ -46,39 +59,103 @@ const POOL: &[&str] = &[
     "\x1b[1M",
     "\x1b[S",
     "\x1b[T",
+    "\x1b[9S",
+    "\x1b[9T",
     "\x1bM",
-    "\x08",
-    "\t",
+    "\x1bD",
+    "\x1bE",
+    "\x1bH",
+    "\x1b#8",
     "\x1b7",
     "\x1b8",
+    "\x1b[s",
+    "\x1b[u",
     "\x1b[2;6r",
+    "\x1b[3;4r",
     "\x1b[r",
     "\x1b[?1049h",
     "\x1b[?1049l",
+    "\x1b[?47h",
+    "\x1b[?47l",
+    "\x1b[?1047h",
+    "\x1b[?1047l",
+    "\x1b[?1048h",
+    "\x1b[?1048l",
     "\x1b[4h",
     "\x1b[4l",
+    "\x1b[20h",
+    "\x1b[20l",
     "\x1b[?7l",
     "\x1b[?7h",
     "\x1b[?6h",
     "\x1b[?6l",
+    "\x1b[?3h",
+    "\x1b[?3l",
     "\x1b[!p",
+    "\x1bc",
     "\x1b(0qx\x1b(B",
+    "\x0e",
+    "\x0f",
+    "\x1b)0",
     "日本",
+    "日",
     "e\u{301}",
+    "\u{301}",
+    "\u{200d}",
+    "\u{1f600}",
+    "\u{fffd}",
+    "\u{85}",
+    "\u{8d}",
+    "\u{84}",
+    "\u{9b}2J",
     "\x1b[31mred\x1b[m",
     "\x1b[3b",
-    "\x1bc",
+    "\x1b[2b",
+    "\x1b[5A",
+    "\x1b[5B",
+    "\x1b[3C",
+    "\x1b[3D",
+    "\x1b[2E",
+    "\x1b[2F",
+    "\x1b[3d",
+    "\x1b[10G",
+    "\x1b[5`",
+    "\x1b[0;0H",
+    "\x1b[99999;99999H",
+    "\x1b[65535A",
+    "\x1b[;5H",
+    "\x1b[5;H",
+    "\x1b[1:2H",
+    "\x1b[?1049:1h",
+    "\x1b[2I",
+    "\x1b[2Z",
+    "\x1b[g",
+    "\x1b[3g",
+    "\x1b[2 q",
+    "\x1b[8;5;20t",
+    "\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\",
+    "\x1b]0;title\x07",
+    "\x1bP1$qm\x1b\\",
+    "\x1b[?2026h",
+    "\x1b[?2026l",
+    "\x1b[>1u",
+    "\x1b[<u",
     "0123456789012345678901234567890123456789",
+    "\x1b[",
+    "\x1b",
+    "\x1b[1;",
 ];
 
-/// A chunk of output: pool pieces, writes to random cells with the cursor put back, a glyph
-/// drawn and undone on another row.
-fn chunk(rng: &mut Rng, size: Size) -> Vec<u8> {
+/// `alacritty` only: `vt100` 0.18 panics on VS16 widening a character at a row's end.
+const ALA_ONLY: &[&str] = &["a\u{fe0f}", "\u{2764}\u{fe0f}", "\u{fe0f}"];
+
+fn chunk(rng: &mut Rng, size: Size, ala: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    for _ in 0..1 + rng.below(6) {
-        let r = rng.below(usize::from(size.rows)) + 1;
-        let c = rng.below(usize::from(size.cols)) + 1;
-        match rng.below(8) {
+    let (rows, cols) = (usize::from(size.rows), usize::from(size.cols));
+    for _ in 0..1 + rng.below(8) {
+        let r = rng.below(rows) + 1;
+        let c = rng.below(cols) + 1;
+        match rng.below(16) {
             0 => {
                 let n = 1 + rng.below(3);
                 out.extend_from_slice(format!("\x1b7\x1b[{r};{c}H{}\x1b8", &"xyz"[..n]).as_bytes());
@@ -92,6 +169,19 @@ fn chunk(rng: &mut Rng, size: Size) -> Vec<u8> {
                     out.push(rng.next() as u8);
                 }
             }
+            // A wide char at the last column (a leading spacer and a wrap).
+            4 => out.extend_from_slice(format!("\x1b[{r};{cols}H日").as_bytes()),
+            // A combining mark onto the last column with autowrap off.
+            5 => out
+                .extend_from_slice(format!("\x1b[?7l\x1b[{r};{cols}H日\u{301}\x1b[?7h").as_bytes()),
+            // Overwrite column 1 or 2 of a row (the wide-char cleanup reaches the row above).
+            6 => out.extend_from_slice(format!("\x1b[{r};{}Hx", 1 + rng.below(2)).as_bytes()),
+            // Move away by relative moves, write, move back.
+            7 => out.extend_from_slice(b"\x1b[3AQ\x1b[3B"),
+            8 => out.extend_from_slice(b"\x1bMZ\x1b[B"),
+            10 => out.extend_from_slice(&[0xe6, 0x97][..1 + rng.below(2)]),
+            11 => out.push(0x97),
+            9 if ala => out.extend_from_slice(ALA_ONLY[rng.below(ALA_ONLY.len())].as_bytes()),
             _ => out.extend_from_slice(POOL[rng.below(POOL.len())].as_bytes()),
         }
     }
@@ -110,49 +200,79 @@ fn stamps(emu: &dyn Emulator) -> Vec<u64> {
     (0..v.size().rows).map(|r| v.row_stamp(r)).collect()
 }
 
+/// A differential run (review of PR #117). A reference emulator is fed each chunk byte by byte,
+/// and C1's hash of every row is taken after every byte: a row whose glyphs differ at any byte
+/// boundary was written, drawn and undone within the chunk included. The emulator under test is
+/// fed the chunk whole (or in two pieces at a random cut) and is never asked for `state` (which
+/// on alacritty swaps the alternate screen and so damages everything). Every row the reference
+/// saw written must have a new stamp. Returns the rows written and the ones missed.
+fn differential(b: &Backend, seeds: u64, split: bool) -> (u64, u64) {
+    let ala = b.name == "alacritty";
+    let (mut changes, mut misses) = (0u64, 0u64);
+    for seed in 1..=seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let size = Size {
+            cols: 10 + rng.below(30) as u16,
+            rows: 3 + rng.below(8) as u16,
+        };
+        let mut reference = (b.create)(size, 0);
+        let mut subject = (b.create)(size, 0);
+        let mut stamp = stamps(&*subject);
+        for step in 0..80 {
+            let bytes = chunk(&mut rng, size, ala);
+            let mut written = vec![false; usize::from(size.rows)];
+            let mut h = hashes(&reference.state(0));
+            for &byte in &bytes {
+                reference.feed(&[byte]);
+                let next = hashes(&reference.state(0));
+                for r in 0..h.len() {
+                    written[r] |= next[r] != h[r];
+                }
+                h = next;
+            }
+            if split && bytes.len() > 1 {
+                let cut = 1 + rng.below(bytes.len() - 1);
+                subject.feed(&bytes[..cut]);
+                subject.feed(&bytes[cut..]);
+            } else {
+                subject.feed(&bytes);
+            }
+            let s = stamps(&*subject);
+            for r in 0..s.len() {
+                if written[r] {
+                    changes += 1;
+                    if s[r] == stamp[r] {
+                        misses += 1;
+                        eprintln!(
+                            "{} seed {seed} step {step} split {split}: row {r} written, stamp unchanged",
+                            b.name
+                        );
+                    }
+                }
+            }
+            stamp = s;
+        }
+    }
+    (changes, misses)
+}
+
 #[test]
-fn row_stamps_change_on_every_glyph_change_on_both_backends() {
+fn every_row_written_inside_a_chunk_moves_its_stamp_on_both_backends() {
+    // `just predict-soak` runs more.
     let seeds: u64 = std::env::var("FIL_STAMP_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(12);
     for b in backends() {
-        let (mut changes, mut unseen_by_hash) = (0u64, 0u64);
-        for seed in 1..=seeds {
-            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let size = Size {
-                cols: 10 + rng.below(30) as u16,
-                rows: 3 + rng.below(8) as u16,
-            };
-            let mut emu = (b.create)(size, 0);
-            let mut hash = hashes(&emu.state(0));
-            let mut stamp = stamps(&*emu);
-            for step in 0..60 {
-                let bytes = chunk(&mut rng, size);
-                emu.feed(&bytes);
-                let (h, s) = (hashes(&emu.state(0)), stamps(&*emu));
-                for r in 0..h.len() {
-                    if h[r] != hash[r] {
-                        changes += 1;
-                        assert_ne!(
-                            s[r], stamp[r],
-                            "{} seed {seed} step {step}: row {r}'s glyphs changed, its stamp did not",
-                            b.name
-                        );
-                    } else if s[r] != stamp[r] {
-                        unseen_by_hash += 1;
-                    }
-                }
-                (hash, stamp) = (h, s);
-            }
+        for split in [false, true] {
+            let (changes, misses) = differential(&b, seeds, split);
+            eprintln!(
+                "{} split {split}: {changes} rows written, {misses} unseen",
+                b.name
+            );
+            assert!(changes > 100 * seeds, "{}: the streams write rows", b.name);
+            assert_eq!(misses, 0, "{} split {split}: rows written unseen", b.name);
         }
-        assert!(changes > 1000, "{}: the streams change glyphs", b.name);
-        // Stricter is allowed; the drawn-and-undone writes are among these.
-        assert!(
-            unseen_by_hash > 0,
-            "{}: a write the hash cannot see",
-            b.name
-        );
     }
 }
 

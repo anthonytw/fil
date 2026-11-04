@@ -118,6 +118,18 @@ impl Stamps {
         self.bump_all();
     }
 
+    /// A mark to compare later stamps with ([`Stamps::since`]).
+    pub(crate) fn mark(&self) -> u64 {
+        self.next
+    }
+
+    /// True if `row` was stamped after `mark` was taken.
+    pub(crate) fn since(&self, mark: u64, row: usize) -> bool {
+        self.rows
+            .get(row)
+            .is_some_and(|&s| s.wrapping_sub(mark).wrapping_sub(1) < STAMP_RANGE)
+    }
+
     pub(crate) fn get(&self, row: u16) -> u64 {
         self.rows.get(usize::from(row)).copied().unwrap_or(0)
     }

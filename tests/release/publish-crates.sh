@@ -58,7 +58,13 @@ case $mode in
       "$cargo" package --list --locked --allow-dirty -p "$c" 2> /dev/null | grep -qx LICENSE || die "$c's package has no LICENSE (link crates/<dir>/LICENSE to ../../LICENSE)"
     done
     log "every crate's package carries LICENSE"
-    "$cargo" publish --workspace --dry-run --locked
+    # A target directory of its own, emptied first. cargo treats a registry crate's build as done
+    # once its name and version have been built, and the overlay's crates are always the workspace's
+    # version: in a shared target directory a crate changed since an earlier dry run (a merge
+    # changed fil-predict at 0.0.0) was not rebuilt, and fil-client was verified against the old one.
+    tdir=${CARGO_TARGET_DIR:-$ROOT/target}/crates-check
+    rm -rf "$tdir"
+    CARGO_TARGET_DIR=$tdir "$cargo" publish --workspace --dry-run --locked
     ;;
   --publish)
     [ -n "${CARGO_REGISTRY_TOKEN:-}" ] || die "no CARGO_REGISTRY_TOKEN (release.yml's crates-io job gets one by trusted publishing)"

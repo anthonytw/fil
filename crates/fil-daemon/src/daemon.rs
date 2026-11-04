@@ -112,7 +112,9 @@ pub(crate) struct Binding {
 /// lost it neither reads from nor writes to the old connection.
 pub(crate) struct Host {
     registry: KeyRegistry,
-    direct: Option<DirectInfo>,
+    /// The QUIC port and certificate while the port is open: not while server policy refuses
+    /// the direct transport (`direct = false`), so it changes as the policy is read again.
+    direct: Mutex<Option<DirectInfo>>,
     /// The host's server policy, shared by every session (DESIGN.md section 11.2).
     pub(crate) policy: Arc<fil_session::policy::Policy>,
     bindings: Mutex<HashMap<TransportKey, Binding>>,
@@ -143,6 +145,28 @@ impl Host {
         self.registry.revoke(key);
     }
 
+    /// Server policy refuses the direct transport now (`direct = false`, or a read too old to
+    /// decide on): `true`, and `peer`'s key goes, binding and all, as at a revoke. A QUIC attach
+    /// with it is then dropped, and the client falls back to the pipe.
+    pub(crate) fn refuses_direct(&self, peer: &TransportKey) -> bool {
+        if self.policy.direct().is_ok() {
+            return false;
+        }
+        self.revoke(peer);
+        true
+    }
+
+    fn direct_now(&self) -> Option<DirectInfo> {
+        self.direct
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_direct(&self, d: Option<DirectInfo>) {
+        *self.direct.lock().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
     /// Revokes every key bound to the session `(name, incarnation)`: it has ended.
     fn revoke_session(&self, name: &SessionName, incarnation: u128) {
         let keys: Vec<TransportKey> = self
@@ -170,7 +194,7 @@ impl SessionHost for Host {
     /// Not offered where server policy refuses the direct transport (`direct = false`): the
     /// client stays on the pipe, and `fil ports` says why.
     fn direct_info(&self) -> Option<DirectInfo> {
-        let d = self.direct.clone()?;
+        let d = self.direct_now()?;
         match self.policy.direct() {
             Ok(()) => Some(d),
             Err(_) => {
@@ -224,6 +248,23 @@ pub(crate) struct Inner {
     /// One lock per session name while it is being looked up or created, so two attaches to a
     /// new name make one session and an attach to one name never waits for another's.
     name_locks: Mutex<HashMap<SessionName, Arc<tokio::sync::Mutex<()>>>>,
+    /// The QUIC port while it is open, and the task accepting on it once [`Daemon::run`] runs.
+    quic: Mutex<Option<Served>>,
+}
+
+/// The open QUIC port.
+struct Served {
+    listener: QuicListener,
+    accept: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        // The accept task holds a clone of the listener: the port closes once it is gone.
+        if let Some(t) = &self.accept {
+            t.abort();
+        }
+    }
 }
 
 /// Keeps the daemon from idling out while a connection is being served.
@@ -484,6 +525,86 @@ impl Inner {
         });
     }
 
+    fn quic_slot(&self) -> MutexGuard<'_, Option<Served>> {
+        self.quic.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Accepts on the QUIC port in `served`, if nothing does yet.
+    fn serve_quic(self: &Arc<Self>, served: &mut Served) {
+        if served.accept.is_some() {
+            return;
+        }
+        let l = served.listener.clone();
+        let inner = self.clone();
+        served.accept = Some(
+            tokio::spawn(async move {
+                while let Some(link) = l.accept().await {
+                    inner.spawn_quic(link);
+                }
+            })
+            .abort_handle(),
+        );
+    }
+
+    /// Opens or closes the QUIC port to follow server policy, as last read (DESIGN.md section
+    /// 11.2): closed while `direct = false` refuses the direct transport, opened again (a new
+    /// port and certificate, which the next pipe attach offers) once the policy allows it. Only
+    /// with `direct` in the configuration; a port that cannot be opened is logged and left
+    /// closed until the next read. Runs at each read swapped in.
+    fn sync_direct(self: &Arc<Self>) {
+        if !self.cfg.direct {
+            return;
+        }
+        let want = self.host.policy.direct_as_read().is_ok();
+        let mut slot = self.quic_slot();
+        match (want, slot.is_some()) {
+            (true, false) => match bind_direct(&self.cfg, &self.registry) {
+                Ok((Some(listener), Some(info))) => {
+                    tracing::info!(
+                        udp_port = info.udp_port,
+                        "direct mode on: server policy allows it"
+                    );
+                    self.host.set_direct(Some(info));
+                    let mut served = Served {
+                        listener,
+                        accept: None,
+                    };
+                    self.serve_quic(&mut served);
+                    *slot = Some(served);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "direct mode could not start"),
+            },
+            (false, true) => {
+                tracing::info!("direct mode off: server policy refuses it; the UDP port is closed");
+                self.host.set_direct(None);
+                *slot = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Follows server policy while the daemon runs: every [`fil_session::policy::FULL_RELOAD`]
+    /// it is read again in the background, so the last read stays current while nothing asks;
+    /// and at every read swapped in, the QUIC port follows it ([`Inner::sync_direct`]).
+    async fn follow_policy(self: Arc<Self>) {
+        let mut reads = self.host.policy.reads();
+        let period = self.cfg.policy.full_reload.max(Duration::from_millis(10));
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => self.host.policy.reread_soon(),
+                changed = reads.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    self.sync_direct();
+                }
+            }
+        }
+    }
+
     /// Resolves after the daemon has had nothing to do for `idle`.
     async fn idle_for(&self, idle: Option<Duration>) {
         let Some(idle) = idle else {
@@ -519,10 +640,21 @@ fn random_incarnation() -> Result<u128, String> {
 /// Stops a running [`Daemon`]. Cheap to clone.
 #[derive(Clone)]
 pub struct DaemonHandle {
+    host: Arc<Host>,
     stop: watch::Sender<Option<bool>>,
 }
 
 impl DaemonHandle {
+    /// The UDP port now, when direct mode is on: it opens and closes as server policy is read.
+    pub fn udp_port(&self) -> Option<u16> {
+        self.host.direct_now().map(|d| d.udp_port)
+    }
+
+    /// The daemon's server policy.
+    pub fn policy(&self) -> Arc<fil_session::policy::Policy> {
+        self.host.policy.clone()
+    }
+
     /// Stops the daemon. With `kill_sessions` it hangs up every session first, as closing their
     /// terminals would; without, the sessions are left running with nobody to serve them (for
     /// tests).
@@ -536,16 +668,16 @@ pub struct Daemon {
     inner: Arc<Inner>,
     paths: Paths,
     unix: UnixListener,
-    quic: Option<QuicListener>,
     /// Held for the daemon's life.
     lock: File,
     stop: watch::Sender<Option<bool>>,
 }
 
 impl Daemon {
-    /// Takes the lock, removes a stale socket, binds the Unix socket and, when `cfg.direct`, the
-    /// UDP port. Direct mode that cannot start (no free port) is logged and left off: the pipe
-    /// still works. Must be called inside a tokio runtime.
+    /// Takes the lock, removes a stale socket, reads the server policy, binds the Unix socket
+    /// and, when `cfg.direct` and the policy allows the direct transport, the UDP port. Direct
+    /// mode that cannot start (no free port) is logged and left off: the pipe still works. Must be
+    /// called inside a tokio runtime.
     pub async fn start(paths: Paths, cfg: DaemonConfig) -> Result<Daemon, StartError> {
         paths.check_socket_len()?;
         ensure_socket_dir(&paths.dir)?;
@@ -581,15 +713,26 @@ impl Daemon {
             .map_err(io(sock.clone()))?;
 
         let registry = KeyRegistry::new();
-        let (quic, direct) = if cfg.direct {
-            bind_direct(&cfg, &registry)?
-        } else {
+        // The first read of the policy, off the async workers: it may wait on NSS.
+        let sources = cfg.policy.clone();
+        let policy = tokio::task::spawn_blocking(move || fil_session::policy::Policy::new(sources))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        // No UDP port where the policy refuses the direct transport (`direct = false`): it is
+        // the attack surface direct mode adds (DESIGN.md section 11). It opens once a read allows
+        // it ([`Inner::sync_direct`]).
+        let (quic, direct) = if !cfg.direct {
             (None, None)
+        } else if policy.direct_as_read().is_err() {
+            tracing::info!("direct mode off: server policy refuses it");
+            (None, None)
+        } else {
+            bind_direct(&cfg, &registry)?
         };
         let host = Arc::new(Host {
             registry: registry.clone(),
-            direct,
-            policy: Arc::new(fil_session::policy::Policy::new(cfg.policy.clone())),
+            direct: Mutex::new(direct),
+            policy: Arc::new(policy),
             bindings: Mutex::default(),
         });
         let (busy, _) = watch::channel(0);
@@ -602,18 +745,21 @@ impl Daemon {
             busy,
             late: Mutex::default(),
             name_locks: Mutex::default(),
+            quic: Mutex::new(quic.map(|listener| Served {
+                listener,
+                accept: None,
+            })),
         });
         let (stop, _) = watch::channel(None);
         tracing::info!(
             socket = %sock.display(),
-            udp_port = inner.host.direct.as_ref().map_or(0, |d| d.udp_port),
+            udp_port = inner.host.direct_now().map_or(0, |d| d.udp_port),
             "daemon started"
         );
         Ok(Daemon {
             inner,
             paths,
             unix,
-            quic,
             lock,
             stop,
         })
@@ -626,16 +772,12 @@ impl Daemon {
 
     /// The UDP port, when direct mode is on.
     pub fn udp_port(&self) -> Option<u16> {
-        self.inner.host.direct.as_ref().map(|d| d.udp_port)
+        self.inner.host.direct_now().map(|d| d.udp_port)
     }
 
     /// The certificate fingerprint clients pin, when direct mode is on.
     pub fn fingerprint(&self) -> Option<msg::Fingerprint> {
-        self.inner
-            .host
-            .direct
-            .as_ref()
-            .map(|d| d.fingerprint.clone())
+        self.inner.host.direct_now().map(|d| d.fingerprint)
     }
 
     /// The registry of accepted client keys (the QUIC listener's).
@@ -646,6 +788,7 @@ impl Daemon {
     /// A handle that stops [`run`](Self::run).
     pub fn handle(&self) -> DaemonHandle {
         DaemonHandle {
+            host: self.inner.host.clone(),
             stop: self.stop.clone(),
         }
     }
@@ -657,14 +800,10 @@ impl Daemon {
 
     /// Serves connections until the daemon is idle for `idle_exit` or is stopped.
     pub async fn run(mut self) -> Exit {
-        let quic_task = self.quic.take().map(|l| {
-            let inner = self.inner.clone();
-            tokio::spawn(async move {
-                while let Some(link) = l.accept().await {
-                    inner.spawn_quic(link);
-                }
-            })
-        });
+        if let Some(served) = self.inner.quic_slot().as_mut() {
+            self.inner.serve_quic(served);
+        }
+        let policy_task = tokio::spawn(self.inner.clone().follow_policy());
         let mut stop = self.stop.subscribe();
         let exit = loop {
             tokio::select! {
@@ -694,9 +833,8 @@ impl Daemon {
             // and hear `SessionReplaced` instead of "killed by signal".
             self.drain_connections().await;
         }
-        if let Some(t) = quic_task {
-            t.abort();
-        }
+        policy_task.abort();
+        *self.inner.quic_slot() = None;
         clean_up_files(&self.paths, &self.lock);
         tracing::info!(?exit, "daemon stopping");
         exit
@@ -1133,7 +1271,7 @@ mod tests {
     fn host(registry: &KeyRegistry, direct: Option<DirectInfo>) -> Host {
         Host {
             registry: registry.clone(),
-            direct,
+            direct: Mutex::new(direct),
             policy: Arc::new(fil_session::policy::Policy::new(
                 fil_session::policy::PolicySources::none(),
             )),
@@ -1146,6 +1284,41 @@ mod tests {
             name: name.parse().unwrap(),
             incarnation,
         }
+    }
+
+    /// A QUIC attach refused by server policy (`direct = false`) takes the key's binding with
+    /// it, as every other revoke does, not only its registration.
+    #[test]
+    fn a_direct_refusal_revokes_the_key_and_its_binding() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("fil-dref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("etc/fil")).unwrap();
+        for d in ["", "etc", "etc/fil"] {
+            std::fs::set_permissions(base.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let f = base.join("etc/fil/policy.toml");
+        std::fs::write(&f, "direct = false\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let src = fil_session::policy::PolicySources {
+            sshd_config: None,
+            policy_file: Some(f),
+            trust: fil_session::policy::file::Trust {
+                root_uid: rustix::process::geteuid().as_raw(),
+                top: base.clone(),
+            },
+            ..fil_session::policy::PolicySources::none()
+        };
+        let registry = KeyRegistry::new();
+        let mut host = host(&registry, None);
+        host.policy = Arc::new(fil_session::policy::Policy::new(src));
+        let k = TransportKey::from_spki_der(vec![9]);
+        registry.register(k.clone());
+        assert!(host.bind(&k, binding("main", 1)));
+        assert!(host.refuses_direct(&k));
+        assert!(!registry.contains(&k), "the key is revoked");
+        assert_eq!(host.bound(), 0, "and its binding is gone");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

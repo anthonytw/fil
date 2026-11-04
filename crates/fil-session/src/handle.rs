@@ -206,6 +206,13 @@ impl SessionHandle {
         self.inner.forwards.set_agent_uid(uid);
     }
 
+    /// Test hook: how many entries server policy has marked blocked (a replaced or removed entry
+    /// must not stay among them).
+    #[cfg(feature = "test-hooks")]
+    pub fn policy_blocked_count(&self) -> usize {
+        self.inner.forwards.blocked_count()
+    }
+
     /// The session has not ended.
     pub fn is_alive(&self) -> bool {
         self.inner.exit.borrow().is_none()

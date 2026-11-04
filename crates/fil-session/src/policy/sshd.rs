@@ -4,7 +4,9 @@
 //! - **Settings:** `DisableForwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`,
 //!   `PermitOpen`, `PermitListen`, `GatewayPorts`. Every other keyword is skipped.
 //! - **Parsing as sshd does:** keywords are case-insensitive, `keyword value` or
-//!   `keyword=value`, double quotes group, a word starting with `#` ends the line; the first value
+//!   `keyword=value`, a word starting with `#` ends the line; quotes and escapes are read as
+//!   every OpenSSH release reads them, and where releases differ (single quotes, a quote inside
+//!   a word, backslashes) a value is one fil does not know and a `Match` might apply; the first value
 //!   of a setting wins; `Include` takes globs, relative to the main config's directory
 //!   (`/etc/ssh`), in sorted order, at most 16 deep, and a file included from a `Match` block
 //!   is inside it.
@@ -15,8 +17,9 @@
 //! - **Defaults** are OpenSSH's: forwarding and the agent allowed, `PermitOpen` and
 //!   `PermitListen` `any`, `GatewayPorts no`.
 //! - **A value fil does not know** is read as the strict one.
-//! - **An included file that cannot be read** is skipped and reported ([`Settings::unreadable`]):
-//!   what fil can read is still enforced. The main file unreadable is [`Sshd::Unknown`].
+//! - **An included file that cannot be read,** or a directory an include glob must list and
+//!   cannot, is skipped and reported ([`Settings::unreadable`]): what fil can read is still
+//!   enforced. The main file unreadable is [`Sshd::Unknown`].
 //!
 //! Never logged: the config is the admin's, and what fil found in it is said only as the one
 //! deciding setting of a refusal.
@@ -317,7 +320,8 @@ pub struct Settings {
     pub permit_open: Outcomes<PermitList>,
     pub permit_listen: Outcomes<PermitList>,
     pub gateway: Outcomes<Gateway>,
-    /// Included files that could not be read (in the order met): skipped.
+    /// Included files, and directories an include glob had to list, that could not be read (in
+    /// the order met), and files whose `Include` lines fil could not split: skipped.
     pub unreadable: Vec<PathBuf>,
 }
 
@@ -443,9 +447,10 @@ impl Parser<'_> {
     /// side for one that might.
     fn file(&mut self, path: &Path, text: &str, ctx: &mut Ctx, cap: Applies, depth: usize) {
         for (n, raw) in text.lines().enumerate() {
-            let Some((keyword, args)) = split_line(raw) else {
+            let Some(l) = split_line(raw) else {
                 continue;
             };
+            let args = l.args();
             let line = u32::try_from(n + 1).unwrap_or(u32::MAX);
             let src = |maybe: bool| Src::Line {
                 file: path.to_path_buf(),
@@ -454,28 +459,33 @@ impl Parser<'_> {
             };
             let maybe = matches!(ctx, Ctx::Match(_, Applies::Maybe));
             let c = *ctx;
-            match keyword.to_ascii_lowercase().as_str() {
+            match l.keyword.to_ascii_lowercase().as_str() {
                 "match" => {
                     self.blocks += 1;
-                    *ctx = Ctx::Match(self.blocks, cap.and(self.applies(&args)));
+                    *ctx = Ctx::Match(self.blocks, cap.and(self.match_line(&l)));
                 }
                 "include" => {
                     let cap = cap.and(ctx.applies());
-                    self.include(&args, path, ctx, cap, depth)
+                    match l.agreed() {
+                        Some(args) => self.include(args, path, ctx, cap, depth),
+                        // sshd releases would include different files: fil reads none of
+                        // them, and says the mirror is incomplete.
+                        None => self.unreadable.push(path.to_path_buf()),
+                    }
                 }
-                "disableforwarding" => self.acc.disable.set(c, flag(&args), src(maybe)),
-                "allowagentforwarding" => self.acc.agent.set(c, flag(&args), src(maybe)),
-                "allowtcpforwarding" => self.acc.tcp.set(c, tcp(&args), src(maybe)),
-                "gatewayports" => self.acc.gateway.set(c, gateway(&args), src(maybe)),
+                "disableforwarding" => self.acc.disable.set(c, flag(args), src(maybe)),
+                "allowagentforwarding" => self.acc.agent.set(c, flag(args), src(maybe)),
+                "allowtcpforwarding" => self.acc.tcp.set(c, tcp(args), src(maybe)),
+                "gatewayports" => self.acc.gateway.set(c, gateway(args), src(maybe)),
                 "permitopen" => {
                     self.acc
                         .permit_open
-                        .set(c, PermitList::parse(&args, false, true), src(maybe))
+                        .set(c, PermitList::parse(args, false, true), src(maybe))
                 }
                 "permitlisten" => {
                     self.acc
                         .permit_listen
-                        .set(c, PermitList::parse(&args, true, true), src(maybe))
+                        .set(c, PermitList::parse(args, true, true), src(maybe))
                 }
                 _ => {}
             }
@@ -500,6 +510,7 @@ impl Parser<'_> {
             };
             let g = glob(&pattern);
             self.watched.extend(g.dirs);
+            self.unreadable.extend(g.unlistable);
             if g.truncated {
                 // More than fil reads: what it did not read is reported as not read.
                 self.unreadable.push(pattern.clone());
@@ -525,12 +536,32 @@ impl Parser<'_> {
         }
     }
 
-    /// A `Match` line, for the daemon's user. All criteria must hold; one that surely fails
+    /// A `Match` line, for the daemon's user: its criteria as OpenSSH 9.9 and later split them
+    /// (`argv_split`) and as earlier releases do (`strdelim`). Where the two disagree (a quote
+    /// or an escape that one release reads and the other keeps), or either cannot split the
+    /// line, the block might apply.
+    fn match_line(&self, l: &Line) -> Applies {
+        match (&l.argv, &l.legacy) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (self.applies(a), self.applies(b));
+                if a == b { a } else { Applies::Maybe }
+            }
+            _ => Applies::Maybe,
+        }
+    }
+
+    /// `Match` criteria, for the daemon's user. All criteria must hold; one that surely fails
     /// makes the block not apply, one fil cannot evaluate makes it one that might.
     ///
     /// Tokens are paired as sshd's `match_cfg_line` does: `crit=arg` is one criterion, `all`
-    /// and `invalid-user` take no argument, every other criterion takes the next token.
+    /// and `invalid-user` take no argument, every other criterion takes the next token; a token
+    /// starting with `#` ends the line. A criterion whose argument is missing, empty or starts
+    /// with `#` is one sshd refuses ("Missing Match criteria"): it might apply.
     fn applies(&self, args: &[String]) -> Applies {
+        let args = match args.iter().position(|a| a.starts_with('#')) {
+            Some(n) => &args[..n],
+            None => args,
+        };
         if args.is_empty() {
             return Applies::Maybe;
         }
@@ -552,6 +583,8 @@ impl Parser<'_> {
                 ("all", None) => Applies::Maybe,
                 // For logins of no account: never the daemon's own user.
                 ("invalid-user", None) => Applies::No,
+                // Missing, as sshd reads it: a config it refuses.
+                (_, Some(a)) if a.is_empty() => Applies::Maybe,
                 ("user", Some(a)) => match &self.account.user {
                     Some(u) => yes_no(match_pattern_list(u, &a) == Some(true)),
                     None => Applies::Maybe,
@@ -611,13 +644,48 @@ fn gateway(args: &[String]) -> Gateway {
     }
 }
 
-/// A config line as sshd splits it: the keyword (ended by whitespace or `=`), then the
-/// arguments, with an optional `=` before them, double quotes grouping, and a word starting
-/// with `#` ending the line. `None` for a blank or comment line. A line fil cannot split
-/// (an unclosed quote) gives its keyword with no arguments, which every setting reads as a value
-/// it does not know.
-fn split_line(raw: &str) -> Option<(String, Vec<String>)> {
-    let s = raw.trim_start_matches([' ', '\t', '\r', '\n', '\x0b', '\x0c']);
+/// A config line's arguments, split as each OpenSSH release would split them. Since 8.7 the
+/// values are split with `argv_split` (single and double quotes anywhere in a word, backslash
+/// escapes), and since 9.9 the `Match` criteria are too; before that both went through
+/// `strdelim` (a double quote only, and a single `=` also ends a word). fil cannot tell which
+/// sshd the host runs, so it uses a line's arguments only where the two agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Line {
+    keyword: String,
+    /// `argv_split`'s words; `None` for an unclosed quote (sshd refuses the config).
+    argv: Option<Vec<String>>,
+    /// `strdelim`'s words; `None` for an unclosed double quote.
+    legacy: Option<Vec<String>>,
+}
+
+impl Line {
+    /// The arguments where every release reads them the same; `None` where they differ or a
+    /// release cannot split them.
+    fn agreed(&self) -> Option<&[String]> {
+        match (&self.argv, &self.legacy) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The arguments for a setting: those every release agrees on, or none, which every setting
+    /// reads as a value it does not know (the strict side).
+    fn args(&self) -> &[String] {
+        self.agreed().unwrap_or(&[])
+    }
+}
+
+/// sshd's `WHITESPACE` (`misc.h`).
+const WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// A config line as sshd splits it: the keyword (ended by whitespace or `=`, as `strdelim`
+/// ends it), then the rest, after one optional `=`, split both ways ([`Line`]). Trailing
+/// whitespace and form feeds are dropped first, as sshd drops them. `None` for a blank or
+/// comment line.
+fn split_line(raw: &str) -> Option<Line> {
+    let s = raw
+        .trim_start_matches([' ', '\t', '\r', '\n', '\x0b', '\x0c'])
+        .trim_end_matches([' ', '\t', '\r', '\n', '\x0c']);
     if s.is_empty() || s.starts_with('#') {
         return None;
     }
@@ -628,46 +696,110 @@ fn split_line(raw: &str) -> Option<(String, Vec<String>)> {
     if keyword.is_empty() {
         return None;
     }
-    let mut rest = s[end..].trim_start();
+    let mut rest = s[end..].trim_start_matches(WHITESPACE);
     if let Some(r) = rest.strip_prefix('=') {
-        rest = r.trim_start();
+        rest = r.trim_start_matches(WHITESPACE);
     }
-    let mut args = Vec::new();
-    let mut chars = rest.chars().peekable();
-    loop {
-        while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
-            chars.next();
+    Some(Line {
+        keyword,
+        argv: argv_split(rest),
+        legacy: strdelim_split(rest),
+    })
+}
+
+/// OpenSSH's `argv_split(s, .., terminate_on_comment = 1)` (`misc.c`, 8.7 and later): words
+/// separated by spaces and tabs; a `'` or `"` outside quotes opens a quote that the same
+/// character closes, anywhere in a word; a backslash before `'`, `"`, `\` (or, outside quotes,
+/// a space) makes that character literal, before anything else it stays; an unquoted `#` at the
+/// start of a word ends the line. `None` for an unclosed quote.
+fn argv_split(s: &str) -> Option<Vec<String>> {
+    let s: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == ' ' || s[i] == '\t' {
+            i += 1;
+            continue;
         }
-        let Some(&c) = chars.peek() else { break };
-        if c == '#' {
+        if s[i] == '#' {
             break;
         }
+        let mut quote = None;
         let mut word = String::new();
-        if c == '"' {
-            chars.next();
-            let mut closed = false;
-            for c in chars.by_ref() {
-                if c == '"' {
-                    closed = true;
-                    break;
+        while i < s.len() {
+            let c = s[i];
+            let next = s.get(i + 1).copied();
+            if c == '\\' {
+                if matches!(next, Some('\'' | '"' | '\\')) || (quote.is_none() && next == Some(' '))
+                {
+                    i += 1;
+                    word.push(s[i]);
+                } else {
+                    word.push(c);
                 }
+            } else if quote.is_none() && (c == ' ' || c == '\t') {
+                break;
+            } else if quote.is_none() && (c == '"' || c == '\'') {
+                quote = Some(c);
+            } else if quote == Some(c) {
+                quote = None;
+            } else {
                 word.push(c);
             }
-            if !closed {
-                return Some((keyword, Vec::new()));
+            i += 1;
+        }
+        if quote.is_some() {
+            return None;
+        }
+        out.push(word);
+    }
+    Some(out)
+}
+
+/// The words OpenSSH's `strdelim` gives, called until it gives none (`misc.c`, before 8.7 for
+/// values and before 9.9 for `Match`): a word ends at whitespace, a `"` or one `=`; a `"`
+/// is dropped and the word runs to the next `"`, which ends it. An empty word, or one starting
+/// with `#`, ends the line (the callers stop there). `None` for an unclosed quote.
+fn strdelim_split(s: &str) -> Option<Vec<String>> {
+    let mut b: Vec<char> = s.chars().collect();
+    let ws = |c: char| WHITESPACE.contains(&c);
+    let skip_ws = |b: &[char], from: usize| {
+        from + b[from.min(b.len())..]
+            .iter()
+            .take_while(|c| ws(**c))
+            .count()
+    };
+    let mut out = Vec::new();
+    let mut at = Some(0);
+    while let Some(old) = at {
+        let word: String;
+        match (old..b.len()).find(|&i| ws(b[i]) || b[i] == '"' || b[i] == '=') {
+            None => {
+                word = b[old..].iter().collect();
+                at = None;
             }
-        } else {
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_whitespace() {
-                    break;
+            Some(q) if b[q] == '"' => {
+                b.remove(q);
+                let close = (q..b.len()).find(|&i| b[i] == '"')?;
+                word = b[old..close].iter().collect();
+                at = Some(skip_ws(&b, close + 1));
+            }
+            Some(d) => {
+                let equals = b[d] == '=';
+                word = b[old..d].iter().collect();
+                let mut next = skip_ws(&b, d + 1);
+                if !equals && b.get(next) == Some(&'=') {
+                    next = skip_ws(&b, next + 1);
                 }
-                word.push(c);
-                chars.next();
+                at = Some(next);
             }
         }
-        args.push(word);
+        if word.is_empty() || word.starts_with('#') {
+            break;
+        }
+        out.push(word);
     }
-    Some((keyword, args))
+    Some(out)
 }
 
 /// OpenSSH's `match_pattern`: `*` any run, `?` any one character, the rest literally.
@@ -723,6 +855,8 @@ struct Globbed {
     files: Vec<PathBuf>,
     /// The directories it listed, stamped before they were listed.
     dirs: Vec<Stamp>,
+    /// Directories it had to list and could not (not a missing one): what they hold is unknown.
+    unlistable: Vec<PathBuf>,
     /// It named more than [`MAX_FILES`]; the rest were dropped.
     truncated: bool,
 }
@@ -732,6 +866,7 @@ struct Globbed {
 /// itself, whether or not it exists.
 fn glob(pattern: &Path) -> Globbed {
     let mut dirs = Vec::new();
+    let mut unlistable = Vec::new();
     let mut truncated = false;
     let mut paths = vec![PathBuf::from("/")];
     let comps: Vec<_> = pattern
@@ -751,8 +886,23 @@ fn glob(pattern: &Path) -> Globbed {
                 continue;
             }
             dirs.push(Stamp::of(base));
-            let Ok(rd) = std::fs::read_dir(base) else {
-                continue;
+            let rd = match std::fs::read_dir(base) {
+                Ok(rd) => rd,
+                // Nothing there: sshd's glob finds nothing either.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                // There, but fil may not list it (sshd, as root, can): what it holds is not
+                // mirrored, and the mirror says so.
+                Err(_) => {
+                    unlistable.push(base.clone());
+                    continue;
+                }
             };
             let mut names: Vec<String> = rd
                 .filter_map(|e| e.ok())
@@ -776,6 +926,7 @@ fn glob(pattern: &Path) -> Globbed {
     Globbed {
         files,
         dirs,
+        unlistable,
         truncated,
     }
 }
@@ -1367,6 +1518,160 @@ mod tests {
             PermitList::parse(&["ANY".to_string()], false, false),
             PermitList::Any
         );
+    }
+
+    fn words(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|w| w.to_string()).collect())
+    }
+
+    /// `argv_split` (OpenSSH 8.7 and later) and `strdelim` (before), word for word.
+    #[test]
+    fn lines_split_as_each_openssh_release_splits_them() {
+        for (rest, argv, legacy) in [
+            ("dev", words(&["dev"]), words(&["dev"])),
+            ("'dev'", words(&["dev"]), words(&["'dev'"])),
+            ("de\"v\"", words(&["dev"]), words(&["dev"])),
+            ("\"a b\" c", words(&["a b", "c"]), words(&["a b", "c"])),
+            ("a\"b c\"d", words(&["ab cd"]), words(&["ab c", "d"])),
+            ("d\\'v", words(&["d'v"]), words(&["d\\'v"])),
+            ("d\\ev", words(&["d\\ev"]), words(&["d\\ev"])),
+            ("a\\ b", words(&["a b"]), words(&["a\\", "b"])),
+            ("a # c", words(&["a"]), words(&["a"])),
+            ("a=b", words(&["a=b"]), words(&["a", "b"])),
+            ("''", words(&[""]), words(&["''"])),
+            ("\"\" x", words(&["", "x"]), words(&[])),
+            ("'dev", None, words(&["'dev"])),
+            ("\"dev", None, None),
+        ] {
+            assert_eq!(argv_split(rest), argv, "argv {rest:?}");
+            assert_eq!(strdelim_split(rest), legacy, "strdelim {rest:?}");
+        }
+    }
+
+    /// Quoted `Match` arguments: what every OpenSSH release reads alike is evaluated; where
+    /// releases differ (`'dev'` is `dev` to 9.9 and later, a literal `'dev'` before), or a line
+    /// cannot be split, the block might apply. Never "does not apply" where sshd may apply it.
+    #[test]
+    fn quoted_match_arguments_are_read_as_sshd_reads_them() {
+        let surely = vec![(Tcp::No, 2, false)];
+        let maybe = vec![(Tcp::No, 2, true), (Tcp::All, 0, false)];
+        let not = vec![(Tcp::All, 0, false)];
+        let cases: &[(&str, &Vec<Outcome>)] = &[
+            ("Match User 'dev'", &maybe),
+            ("Match User de\"v\"", &surely),
+            ("Match User \"dev\"", &surely),
+            ("Match User \"d*\"", &surely),
+            ("Match Group 'staff'", &maybe),
+            ("Match Group st\"aff\"", &surely),
+            ("Match User d\\ev", &not),
+            ("Match User 'alice'", &not),
+            ("Match User 'dev", &maybe),
+            ("Match User \"dev", &maybe),
+            ("Match 'User' dev", &maybe),
+            ("Match User=", &maybe),
+            ("Match User \"\"", &maybe),
+            ("Match User '#dev'", &maybe),
+            ("Match User dev # a comment", &surely),
+        ];
+        for (m, want) in cases {
+            assert_eq!(
+                &tcp_of(&format!("{m}\n AllowTcpForwarding no\n")),
+                *want,
+                "{m:?}"
+            );
+        }
+    }
+
+    /// A criterion with an empty argument (`User=`, `User ""`) is one sshd refuses ("Missing
+    /// Match criteria"): it might apply, never "does not".
+    #[test]
+    fn an_empty_match_argument_might_apply() {
+        let account = me();
+        let p = Parser {
+            account: &account,
+            base: PathBuf::from("/"),
+            acc: Default::default(),
+            blocks: 0,
+            files: 0,
+            unreadable: Vec::new(),
+            watched: Vec::new(),
+        };
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for args in [
+            w(&["User="]),
+            w(&["User", ""]),
+            w(&["Group="]),
+            w(&["user=dev", "group="]),
+        ] {
+            assert_eq!(p.applies(&args), Applies::Maybe, "{args:?}");
+        }
+        assert_eq!(p.applies(&w(&["User=dev"])), Applies::Yes);
+    }
+
+    /// A value releases read differently is one fil does not know (strict); one they all read
+    /// alike is read.
+    #[test]
+    fn quoted_values_are_read_only_where_every_release_agrees() {
+        for (t, want) in [
+            ("AllowTcpForwarding \"no\"\n", Tcp::No),
+            ("AllowTcpForwarding n\"o\"\n", Tcp::No),
+            ("AllowTcpForwarding 'no'\n", Tcp::Unrecognized),
+            ("AllowTcpForwarding 'yes'\n", Tcp::Unrecognized),
+            ("AllowTcpForwarding y\\es\n", Tcp::Unrecognized),
+        ] {
+            assert_eq!(tcp_of(t), vec![(want, 1, false)], "{t:?}");
+        }
+    }
+
+    /// An `Include` line releases split differently includes nothing, and the mirror says it
+    /// is incomplete.
+    #[test]
+    fn an_include_releases_split_differently_marks_the_mirror_incomplete() {
+        let dir = std::env::temp_dir().join(format!("fil-incq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a b.conf"), "AllowTcpForwarding yes\n").unwrap();
+        std::fs::write(dir.join("sshd_config"), "Include 'a b.conf'\n").unwrap();
+        let (r, _) = read(&dir.join("sshd_config"), &me());
+        let Sshd::Mirrored(s) = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(s.unreadable, vec![dir.join("sshd_config")]);
+        assert_eq!(s.tcp.values, vec![(Tcp::All, Src::Default)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An include directory the daemon may not list (sshd, as root, can) is reported like an
+    /// include file it cannot read: the mirror is incomplete. A missing one is not.
+    #[test]
+    fn an_include_directory_that_cannot_be_listed_marks_the_mirror_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return; // root lists it anyway
+        }
+        let dir = std::env::temp_dir().join(format!("fil-incd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("conf.d")).unwrap();
+        std::fs::write(
+            dir.join("conf.d/10-hardening.conf"),
+            "AllowTcpForwarding no\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sshd_config"),
+            "Include conf.d/*.conf\nInclude missing.d/*.conf\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(dir.join("conf.d"), std::fs::Permissions::from_mode(0o300))
+            .unwrap();
+        let (r, _) = read(&dir.join("sshd_config"), &me());
+        std::fs::set_permissions(dir.join("conf.d"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let Sshd::Mirrored(s) = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(s.unreadable, vec![dir.join("conf.d")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

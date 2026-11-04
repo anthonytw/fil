@@ -720,15 +720,16 @@ These rely on `ssh-add` and `ssh-keygen` being on the Pis; `tools` reports them,
 | Run | When | Suite | Minutes (about) |
 |---|---|---|---|
 | A | after C3 plus L1 | `check` plus realnet `udp` and `ssh` (latency lab) | 60 |
-| B | after V1 | `all` (check, realnet three parts, aarch64) | 70 |
-| C | sweep close | `all` | 70 |
+| B | after V1 | `all` (check, realnet seven jobs with S1's `policy`, aarch64) | 115 |
+| C | sweep close | `all` | 115 |
 
 - Pi binaries come from the CI `aarch64` artifact (OD-11 decided: the repo is public, so the minutes here no longer bind; batch runs anyway).
 - Pi runs are free, so they are the main end-to-end check:
   - after Wave 2: the forward subset;
   - after V1: the full M2 suite, both Pis;
   - at sweep close: the full M1 and M2 suites.
-- Total about 200 minutes. Anything more needs the coordinator's sign-off.
+- V1 added the `fwd-cable`, `fwd-rest` and `agent` jobs to every `realnet` and `all` run: about 16, 20 and 5 runner-minutes with the build, so `suite=realnet` is about 55 runner-minutes (60 with S1's `policy` job) and `all` about 115. The jobs run in parallel, so the wall clock of a realnet run is the longest job, about 20 minutes. Each job has a time limit of its own.
+- Total about 280 minutes. Anything more needs the coordinator's sign-off. (OD-11: the repo is public, so this is wall clock and sign-off, not money.)
 
 ### 5.5 The M2 sweep (§15)
 

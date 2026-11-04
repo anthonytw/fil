@@ -24,9 +24,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A scratch "host": its `sshd_config` and its `etc/fil/policy.toml`, trusted as root's (the
-/// test seam), read again on every check.
+/// test seam). An edit through [`Host::sshd`] is read again before it returns: a check reads
+/// nothing itself (its re-read runs in the background), and these tests are about what the next
+/// check decides.
 struct Host {
     base: PathBuf,
+    policy: std::sync::OnceLock<Arc<Policy>>,
 }
 
 impl Host {
@@ -37,7 +40,10 @@ impl Host {
         for d in ["", "etc", "etc/fil"] {
             std::fs::set_permissions(base.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        Host { base }
+        Host {
+            base,
+            policy: std::sync::OnceLock::new(),
+        }
     }
 
     fn sshd_config(&self) -> PathBuf {
@@ -50,9 +56,16 @@ impl Host {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::fs::write(self.sshd_config(), format!("{text}#{}\n", "x".repeat(n))).unwrap();
+        if let Some(p) = self.policy.get() {
+            p.reread_now();
+        }
     }
 
     fn policy(&self) -> Arc<Policy> {
+        self.policy.get_or_init(|| self.read()).clone()
+    }
+
+    fn read(&self) -> Arc<Policy> {
         Arc::new(Policy::new(PolicySources {
             sshd_config: Some(self.sshd_config()),
             policy_file: Some(self.base.join("etc/fil/policy.toml")),
@@ -61,6 +74,8 @@ impl Host {
                 top: self.base.clone(),
             },
             recheck: Duration::ZERO,
+            full_reload: fil_session::policy::FULL_RELOAD,
+            max_age: fil_session::policy::MAX_AGE,
             account: Some(Account {
                 user: Some("dev".into()),
                 groups: Some(vec!["dev".into()]),
@@ -435,4 +450,133 @@ async fn each_agent_connection_is_checked_while_attached() {
     assert_eq!(ask(sock.clone()).await, None, "refused at its accept");
     h.kill(WAIT).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A loopback port to try for a fixed-port `-R`, below every OS's ephemeral range (a port the
+/// kernel hands out to other tests' connections could be taken between two steps of a test
+/// that lets it go and binds it again). Not probed: a probe socket, inherited by another test's
+/// child between its fork and exec, would hold the port for a moment after it is closed. A
+/// caller whose bind fails takes the next one ([`add_bound`]).
+fn next_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    21000
+        + (std::process::id() % 5000) as u16
+        + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5000
+}
+
+/// Adds a loopback `-R` on a fixed port that it could bind: its port and id.
+async fn add_bound(c: &mut FwdClient, h: &fil_session::SessionHandle) -> (u16, ForwardId) {
+    for _ in 0..20 {
+        let port = next_port();
+        let id = add(c, remote_on(port, 9)).await.unwrap();
+        let state = || {
+            h.forward_rows()
+                .into_iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.listen)
+        };
+        until("the -R bind is reported", || state().is_some()).await;
+        if matches!(state(), Some(ListenState::Listening { .. })) {
+            return (port, id);
+        }
+        h.forward(ForwardOp::Remove {
+            kind: Some(ForwardKind::Remote),
+            port,
+        });
+    }
+    panic!("no free port to bind");
+}
+
+fn remote_on(port: u16, to: u16) -> ForwardSpec {
+    ForwardSpec::new(ForwardKind::Remote, BindAddr::Loopback, port, Some(tgt(to))).unwrap()
+}
+
+/// Waits until `f` holds.
+async fn until(what: &str, f: impl Fn() -> bool) {
+    let end = Instant::now() + WAIT;
+    while !f() {
+        assert!(Instant::now() < end, "{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// An entry server policy blocked, then replaced (same identity, another target) once the
+/// policy allows it again: its mark goes with it, as with a removed entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_entry_leaves_no_policy_mark_behind() {
+    let host = Host::new("repl");
+    host.sshd("Port 22\n");
+    let (_s, h) = session(&host, None).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let (port, old) = add_bound(&mut a, &h).await;
+    host.sshd("AllowTcpForwarding local\n");
+    let mut b = FwdClient::attach(&h, key(2), "desk").await;
+    until("blocked at the takeover", || h.policy_blocked_count() == 1).await;
+    host.sshd("Port 22\n");
+    let new = add(&mut b, remote_on(port, 10)).await.unwrap();
+    assert_ne!(new, old, "replaced under a new id");
+    assert_eq!(
+        h.policy_blocked_count(),
+        0,
+        "the old id's mark went with it"
+    );
+    h.kill(WAIT).await;
+}
+
+/// An `-R` allowed again whose bind then fails (its port was taken while it was blocked) is
+/// bound again at the next re-establish, as a `Failed(Policy)` one is, until it succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
+    let host = Host::new("rebind");
+    host.sshd("Port 22\n");
+    let (_s, h) = session(&host, None).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let (port, id) = add_bound(&mut a, &h).await;
+    let state = |h: &fil_session::SessionHandle| {
+        h.forward_rows()
+            .into_iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.listen)
+    };
+    until("bound", || {
+        matches!(state(&h), Some(ListenState::Listening { .. }))
+    })
+    .await;
+    host.sshd("AllowTcpForwarding local\n");
+    let mut b = FwdClient::attach(&h, key(2), "desk").await;
+    until("closed by policy", || {
+        state(&h) == Some(ListenState::Failed(BindFailure::Policy))
+    })
+    .await;
+    // Someone takes the port meanwhile (once a forked child no longer holds a copy of the
+    // closed listener); the policy allows the entry again.
+    let end = Instant::now() + WAIT;
+    let squat = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => break l,
+            Err(e) => assert!(Instant::now() < end, "the port stays taken: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    host.sshd("Port 22\n");
+    b.reconnect(&h).await;
+    until(
+        "the rebind failed",
+        || matches!(state(&h), Some(ListenState::Failed(f)) if f != BindFailure::Policy),
+    )
+    .await;
+    // The port is free again: a re-establish binds it. Each one tries, so this reconnects
+    // until one has: another test's child, forked before its exec, can hold a copy of the
+    // squatter's socket for a moment after it is dropped here.
+    drop(squat);
+    let end = Instant::now() + WAIT;
+    loop {
+        b.reconnect(&h).await;
+        if matches!(state(&h), Some(ListenState::Listening { .. })) {
+            break;
+        }
+        assert!(Instant::now() < end, "bound again: {:?}", state(&h));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.kill(WAIT).await;
 }

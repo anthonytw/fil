@@ -2,7 +2,7 @@
 
 > **Status: proposed by the coordinator on 2026-11-04 and revised after its review; nothing here is built yet.** The owner asked (2026-11-04) for M4 to start now, in parallel with M3 (prediction, planned separately in `docs/m3/plan.md`) and with M2's last sweep PRs. `DESIGN.md` stays the source of truth; when a package changes a decision, it updates `DESIGN.md` in the same PR. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **OWNER** wait for the owner (§7). **The owner answered OQ-1 (yes), OQ-2, OQ-3 and OQ-4 on 2026-11-04** (§7; OQ-3 and OQ-4 differ from the recommendations), and in a second round the same day the first version, the crates.io names, the v1 channels and macOS notarization (§7, `docs/m4/release.md` §10); OQ-5 is not recorded as answered. Written on `origin/main` at `12f974d`.
 
-M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com; macOS target tests on GitHub's macOS runners. It is done when **the pre-release sweep is closed before the first release**.
+M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com; macOS target tests on GitHub's macOS runners. It is done when **the pre-release sweep is closed before the first release**. **v0.1.0 ships without prediction (decided, owner 2026-11-04, 10:28 ET: N9)**: it is an ssh/et drop-in (sessions that survive reconnects, roaming and sleep, forwarding, server policy). M3 continues in parallel and is 0.2.0's headline, so M3 no longer gates M4; M3's K1 (terminal-channel pacing) still does, because it affects every user. 0.1.0 exposes no `predict` key and no `--predict` flag.
 
 ## 0. Preconditions and boundaries
 
@@ -59,14 +59,15 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 | **M1-A2: synchronous log writes.** `fil_daemon::logging::RotatingLog` writes each line behind one `Mutex`, and rotation (rename, reopen, prune) runs inside that lock (`crates/fil-daemon/src/logging.rs`: the `State` mutex, `maintain` and `rotate`). The client uses the same module (`crates/fil/src/logging.rs`). There is no M2 regression at `info`, but a log directory on a hung NFS home would freeze every thread that logs, the daemon's included. | yes | **Include, LOG**: a non-blocking writer with a bounded queue, drop and count on overflow, rotation off the hot path, and a test with a writer that blocks. |
 | **§16.5: manual install or upload.** | open (resolved since: both, M4 OQ-1 yes, owner 2026-11-04) | **U1**, under OQ-1. |
 | **§16.9: macOS as a remote host.** | open | **Proposed: supported**, with sessions, forwards and the agent; `fil ports` shows forwards only. MAC tests it on every release candidate. |
-| **The macOS trampoline after an in-place upgrade.** On Linux, a session's child starts through `/proc/self/exe`, which stays the daemon's own image after the file is replaced (`fil_session::nofile::own_executable`). On macOS it starts through `current_exe()`, which is a *path*: after a package upgrade replaces the file, a running old daemon starts its new sessions through the *new* binary's `__fil-exec-nofile` trampoline. | yes (found while reading) | **MAC tests it** (the upgrade-in-place scenario, §6.2). Proposed remedy if it fails: freeze the trampoline's argument contract within a `PROTOCOL_MAJOR`, pinned by a test. That remedy lands in `fil-session` after M3 closes. U1's versioned install directories avoid the case for fil-installed copies, because those are never replaced in place. |
+| **The macOS trampoline after an in-place upgrade.** On Linux, a session's child starts through `/proc/self/exe`, which stays the daemon's own image after the file is replaced (`fil_session::nofile::own_executable`). On macOS it starts through `current_exe()`, which is a *path*: after a package upgrade replaces the file, a running old daemon starts its new sessions through the *new* binary's `__fil-exec-nofile` trampoline. | yes (found while reading) | **MAC tests it** (the upgrade-in-place scenario, §6.2). Proposed remedy if it fails: freeze the trampoline's argument contract within a `PROTOCOL_MAJOR`, pinned by a test. That remedy lands in `fil-session` in a coordinator-serialized slot before RC (after K1); M3's file hold no longer outlasts 0.1.0 (N9). U1's versioned install directories avoid the case for fil-installed copies, because those are never replaced in place. |
 | **Temporary-file cleaners and a long-lived daemon.** `/tmp/fil-$UID/` holds the socket, the lock and start files and the agent sockets. Some systems age `/tmp`: systemd-tmpfiles' `10d` rule on Fedora-like hosts, and macOS's periodic `clean-tmps`. Both look at access, modification **and change** times (the last cannot be set back), so a test that only sets the cleaner's age to zero deletes nothing and passes whatever the daemon does. The failure that matters: once the lock and start files are aged out, the next relay takes a fresh lock, believes no daemon runs, and the new daemon removes the old one's "stale" socket. That strands every live session. U1's garbage collection reads the same lock files. | the mechanism yes; the cleaners' effect on a live daemon unverified | **Include, TMP** (Wave 1): design the remedy now and test the mechanism (§3). |
 | **`DESIGN.md` §13 "Builds"** names macOS aarch64 only. | yes | **REL adds macOS x86_64** in a universal binary (§2.2) and updates §13. |
+| **Prediction (M3) is not in 0.1.0** (decided, owner 2026-11-04, 10:28 ET: N9). | from the owner | 0.1.0 has no `predict` key and no `--predict` flag; M3's code merges dormant and the feature is 0.2.0's headline. K1 stays required. |
 | **M3's hand-offs:** an ended session's output tail, and Unix-socket forwards. | from the M3 plan | Non-goals for v0.1.0, with reasons (above). |
 
 ### Done when
 
-1. **The pre-release sweep is closed** (§6.4): five whole-tree audits plus the release audits, every finding fixed or accepted by the owner, and a verification pass **on the release-candidate artifacts themselves**, not on a development build.
+1. **The pre-release sweep is closed** (§6.4; M3 is not part of it, N9): five whole-tree audits plus the release audits, every finding fixed or accepted by the owner, and a verification pass **on the release-candidate artifacts themselves**, not on a development build.
 2. **The release candidate passes:**
    - `linux-check -f suite=all`;
    - `macos-check`, on both architectures, with the macOS-remote job;
@@ -189,14 +190,12 @@ flowchart LR
   FUZZ["FUZZ: fuzz targets"]
   LOG["LOG: non-blocking log writer"]
   TMP["TMP: survive /tmp cleaners"]
-  E1b(["M3 E1b"])
   K1(["M3 K1"])
   LIC["LIC: license and notices"]
   PKG["PKG: Homebrew tap, cargo install,<br/>crates.io, deb/rpm, AUR, Nix,<br/>distro submissions"]
   CFG["CFG: defaults and fil config show"]
   DOC["DOC: guide, man pages, completions"]
   M2C(["M2 closed"])
-  M3C(["M3 closed"])
   SWEEP["SWEEP: pre-release sweep"]
   RC["release candidate"]
   RECREATE["RECREATE (owner)"]
@@ -205,17 +204,16 @@ flowchart LR
 
   OQ --> U1
   R0 --> U1 & REL
-  U1 --> E1b --> LIC --> CFG
+  U1 --> LIC --> CFG
   REL --> LIC & PKG
-  K1 --> CFG
+  K1 --> CFG & DOC
   M2C --> CFG
   CFG --> DOC
   U1 --> DOC
-  M3C --> DOC
   MAC -.-> SWEEP
   FUZZ -.-> SWEEP
   LOG & TMP --> SWEEP
-  REL & PKG & DOC & M2C & M3C --> SWEEP
+  REL & PKG & DOC & M2C --> SWEEP
   SWEEP --> RC --> RECREATE --> SHIP
   OQ --> SITE
   DOC -.-> SITE
@@ -513,7 +511,7 @@ Every package keeps M2's rules:
 
 ### Wave 2 (after their inputs)
 
-**LIC: license and notices** (after REL's layout; `cli.rs` after M3's E1b, per the hot-spot table)
+**LIC: license and notices** (after REL's layout; `cli.rs` after U1, per the hot-spot table; M3's E1b is 0.2.0 work, N9)
 - **Owns:**
   - `about.toml` and `about.hbs` (new): cargo-about's config and template;
   - `deny.toml`: any `[[licenses.clarify]]` that cargo-about needs too;
@@ -546,7 +544,7 @@ Every package keeps M2's rules:
     - it installs a client and a remote for the same machine only;
     - there is no bundle for `fil install`, and `--binary` with a release binary stands in for it;
     - there are no man pages and no completions.
-  - **The other v1 channels (decided, owner 2026-11-04, round 2; work items, not yet built):** `.deb` and `.rpm` for x86_64 and arm64, built by CI from the release binaries and attached to the release; the AUR package `fil-shell-bin` (`fil` is taken there); a Nix flake in the repo and a nixpkgs PR; crates.io, never from CI (`docs/m4/release.md` §10.1); and the start of the Debian and Fedora submissions (an owner step: accounts and a sponsor).
+  - **The other v1 channels (decided, owner 2026-11-04, round 2; work items, not yet built):** `.deb` and `.rpm` for x86_64 and arm64, built by CI from the release binaries and attached to the release; the AUR package `fil-shell-bin` (`fil` is taken there); a Nix flake in the repo and a nixpkgs PR; crates.io by trusted publishing from the release workflow, with no long-lived token (N8; `docs/m4/release.md` §10.1); and the start of the Debian and Fedora submissions (an owner step: accounts and a sponsor).
   - **GitHub Releases,** for everyone else: download, check `SHA256SUMS` and its signature (and the attestation, with the narrow command of REL), unpack, and copy `bin/fil` into `~/.local/bin`. Copy it, don't symlink it: the bootstrap refuses a symbolic link there.
 - **Tests:**
   - on the macOS runner, against a dry run's artifacts: `brew install --formula ./fil.rb`, then `brew test` and `brew audit --strict`;
@@ -574,9 +572,10 @@ Every package keeps M2's rules:
   - the example files parse;
   - `config show` over the DESIGN §14 sketch;
   - a test that every key the parsers accept appears in `docs/user/config.md`. A list kept beside the parser is checked both ways.
-- **Done when:** §16.7 is resolved for v1 within CFG's scope, and the examples ship.
+  - **For 0.1.0 the config parser rejects `predict` as an unknown key** (N9; `crates/fil/src/config.rs` accepts it today: the `Predict` enum and its field), with a test, and the key is removed from the sample and DESIGN §14's sketch. DOC's `docs_sync` has no `predict` entry. M3's E1b brings the key back for 0.2.0.
+- **Done when:** §16.7 is resolved for v1 within CFG's scope, the examples ship, and `predict` is an unknown key with its test (N9).
 
-### Wave 3 (after M3 closes)
+### Wave 3 (after U1, CFG and M3's K1; M3's close is not a gate, N9)
 
 **DOC: the guide, man pages, completions and README**
 - **Owns:**
@@ -585,7 +584,7 @@ Every package keeps M2's rules:
   - `crates/fil/examples/gen_docs.rs` (new). It generates the man pages and completions with `clap_mangen` and `clap_complete`, MIT or Apache-2.0, as dev-dependencies only, so they are not in the release graph (`just release-deps` keeps checking);
   - `crates/fil/tests/docs_sync.rs` (new), which is in the serialized `crates/fil/tests/*`. It lands after CFG, or is merged into CFG's turn by the coordinator;
   - the `docs` recipe, and a `docs` step in `release.yml`.
-- **Starts early:** the skeleton (with `install.md`'s outline) and the manual-install page can be written in Wave 1. The pages on prediction, install and config are finished after U1, CFG and M3 merge.
+- **Starts early:** the skeleton (with `install.md`'s outline) and the manual-install page can be written in Wave 1. The pages on install and config are finished after U1 and CFG merge; prediction has no page in 0.1.0 (N9) and gets one with 0.2.0.
 - **Builds:**
   - **The guide** (`docs/user/`): plain Markdown that renders on GitHub, with relative links only and nothing GitHub-only besides Mermaid, so that SITE's sync script can copy it. It has these pages:
     - install;
@@ -632,7 +631,7 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 
 | Files | Order |
 |---|---|
-| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **LOG** (M4, #92, in flight: one exit-flush line in `app.rs`) → **U1** (M4, Wave 1) → **E1b** (M3's small config-and-flag PR, which follows M3's E1a) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). DOC's `docs_sync.rs` comes after CFG. |
+| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **LOG** (M4, #92, in flight: one exit-flush line in `app.rs`) → **U1** (M4, Wave 1) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). M3's E1b (the `predict` key and flag) is 0.2.0 work and is not in this chain (N9). DOC's `docs_sync.rs` comes after CFG. |
 | `crates/fil-proto/src/limits.rs` and the wire golden | M3's **W1** while it is open; CFG edits only defaults the golden does not pin, after W1 merges; a golden-pinned default is a wire change of its own (§0). |
 | The catch-up rule (`crates/fil-proto/src/log.rs`, `crates/fil-session/src/core.rs` `on_catch_up`), DESIGN §6.2 | M3's **K1** only. |
 | `.github/workflows/linux-check.yml` | Each package adds its own suite or part (U1: the realnet `install` part and its timeout; M3's T2: a `terminals` suite). Each addition to the suite list, matrix or timeout map is one line, and whoever lands second merges it. |
@@ -690,7 +689,7 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 
 Prerequisites:
 
-1. **The work is closed.** M2, M3 and the pre-release sweep are closed and their fixes are merged. Proposed: the recreate comes after SWEEP's verification pass, so that the initial commit is the audited tree.
+1. **The work is closed.** M2 and the pre-release sweep are closed (M3's close targets 0.2.0, N9) and their fixes are merged. Proposed: the recreate comes after SWEEP's verification pass, so that the initial commit is the audited tree.
 2. **No open PRs.** Their branches and `refs/pull/*` stay with the old repository.
 3. **The tree scan is clean** (§6.4, audit 6). R0's history scan has already gone to the owner (Wave 0).
 4. **The workflows work.** REL's dry run passes on main, so the workflows are known to work before they move.
@@ -752,7 +751,7 @@ The repository is public, so the hosted runners cost nothing. Runs are still bat
 
 ### 6.4 SWEEP: the pre-release sweep (§15 of DESIGN)
 
-It starts when M2 and M3 are closed and every M4 package (U1, MAC, REL, TMP, FUZZ, LOG, LIC, PKG, CFG and DOC) is merged. **Independent, read-only auditors** cover the whole tree, each with one question in mind:
+It starts when M2 is closed, M3's K1 is merged (M3 itself targets 0.2.0, N9) and every M4 package (U1, MAC, REL, TMP, FUZZ, LOG, LIC, PKG, CFG and DOC) is merged. **Independent, read-only auditors** cover the whole tree, each with one question in mind:
 
 1. **Redundancy:** code and docs, now that three milestones' plans are history. Historical plans are labeled as such, as `docs/m2/plan.md` is.
 2. **Efficiency:** as in M2, plus the release binary's size and start-up time, and the idle cost of a daemon left for days.
@@ -835,7 +834,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 | # | Question | Recommendation |
 |---|---|---|
 | **OQ-2** | **The release identity:** who signs release tags and `SHA256SUMS`, who may create `v*` tags (the tag ruleset), and the copyright holder named in `fil --version` and the notices. | **The owner's own SSH signing key** for tags and checksums (the bot account signs commits, never releases). A tag ruleset that only the owner passes, and GitHub attestations on. The owner's legal name as the copyright holder (the domain already carries it), or "the fil authors" if the owner prefers. **Answer (decided, owner 2026-11-04):** as recommended: the owner's own SSH key signs release tags and `SHA256SUMS`; a `v*` tag ruleset that only the owner passes; GitHub attestations on; the copyright holder is the owner's own name, Anthony Wertz. The owner sets the repository settings (`docs/m4/release.md` §9) before the first tag. |
-| **OQ-3** | **Distribution channels that need accounts:** a Homebrew tap repository, crates.io, distro packages. | **A tap at `anthonytw/homebrew-tap`** (`brew install anthonytw/tap/fil`), a general name that leaves room for other tools. **No crates.io in v1:** publishing would mean about a dozen internal crates, each a permanent public API, and `cargo install --git` covers Rust users. The name `fil` is unclaimed today, so the risk of waiting is a squatter, which is accepted. **No distro packages in v1:** the static binaries make them easy for packagers later. **Answer (decided, owner 2026-11-04), changed from the recommendation:** reserve the names and prepare packages "everywhere" for v1. crates.io and distro packages are in scope, not non-goals (§1). **Round 2 (decided, owner 2026-11-04):** nine crates each get a 0.0.1 placeholder now (the names are listed in `docs/m4/release.md` §10.1); no crates.io token goes to CI; the test-only crates stay unpublished; the AUR package is `fil-shell-bin`. The owner first meant to publish them from their own account; later the same day they changed that: the coordinator publishes the placeholders from the `splarg-bot` crates.io account and invites `anthonytw` as an owner of each. How v1 is published is not recorded yet. The v1 channels are in goal 3. This supersedes the narrower recommendation above. **Found the same day:** the crates.io name `fil` is unavailable (an unrelated crate took it at 08:24 ET); the user-facing crate is `fil-shell`, reserved by the coordinator (not marked decided: the owner can pick another name; `docs/m4/release.md` §10.1). |
+| **OQ-3** | **Distribution channels that need accounts:** a Homebrew tap repository, crates.io, distro packages. | **A tap at `anthonytw/homebrew-tap`** (`brew install anthonytw/tap/fil`), a general name that leaves room for other tools. **No crates.io in v1:** publishing would mean about a dozen internal crates, each a permanent public API, and `cargo install --git` covers Rust users. The name `fil` is unclaimed today, so the risk of waiting is a squatter, which is accepted. **No distro packages in v1:** the static binaries make them easy for packagers later. **Answer (decided, owner 2026-11-04), changed from the recommendation:** reserve the names and prepare packages "everywhere" for v1. crates.io and distro packages are in scope, not non-goals (§1). **Round 2 (decided, owner 2026-11-04):** nine crates each get a 0.0.1 placeholder now (the names are listed in `docs/m4/release.md` §10.1); "no crates.io token goes to CI" is replaced by N8, below; the test-only crates stay unpublished; the AUR package is `fil-shell-bin`. The owner first meant to publish them from their own account; later the same day they changed that: the coordinator publishes the placeholders from the `splarg-bot` crates.io account and invites `anthonytw` as an owner of each. **N8 replaces round 2's "no crates.io token goes to CI" (owner delegated the choice, 2026-11-04; coordinator chose trusted publishing):** crates.io releases use trusted publishing, which puts a short-lived OIDC-derived token in CI, with no long-lived token anywhere: a publish job in the release workflow exchanges GitHub OIDC for a short-lived token, behind a `crates-io` environment that only the owner approves, from the signed `v*` tag. No long-lived crates.io token exists anywhere (`docs/m4/release.md` §10.1). This replaces the N2 wording "v1 is published the same way, from the owner's Mac"; N2's other parts stand. The v1 channels are in goal 3. This supersedes the narrower recommendation above. **Found the same day:** the crates.io name `fil` is unavailable (an unrelated crate took it at 08:24 ET); the user-facing crate is `fil-shell`, reserved by the coordinator (not marked decided: the owner can pick another name; `docs/m4/release.md` §10.1). |
 | **OQ-4** | **macOS signing and notarization** with the Apple Developer membership. Gatekeeper quarantines a browser download of an unsigned binary. Homebrew formulae and `curl` downloads are not quarantined. | **Not in v1.** Homebrew is the main macOS channel, the install page explains `xattr -d com.apple.quarantine` for a browser download, and the release stays fully automated, with no Apple secret in CI. Signing would also put the Developer ID name in the binary and break the bit-for-bit comparison. Revisit if users ask. **Answer (decided, owner 2026-11-04), changed from the recommendation:** notarize in v1, "with the most trust" (the owner: "Figure out how to do this with the most trust. Other apps do it, so should we"). **Round 2:** signed and notarized **on the owner's Mac**, Apple keys never in CI (decided, owner 2026-11-04); the proposed flow is `docs/m4/release.md` §10.3. |
 | **OQ-5** | **The site:** create the private `fil-site` repository (Astro source, like Sempere's site) and the public `anthonytw/fil-site` repository for GitHub Pages; point `fil.anthonywertz.com` at GitHub Pages in DNS; set the custom domain with HTTPS enforced; and say when it launches. | **Yes, launch with v0.1.0.** Until then the domain can stay unpointed, so that it shows no "coming soon" page. The site task (scope in §3, SITE) runs as soon as the repositories exist, and shows the docs from a release tag only. Not recorded as answered. The version it was waiting on is decided: 0.1.0 (§2.1; owner 2026-11-04, round 2). |
 
@@ -865,8 +864,8 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
    *Mitigations:* the plain command first and by default; a constant pinned by a golden, with a compile-time character check; path and hash checks before anything runs; the realnet shell matrix and failure cases; the printed `remote = "installed"` line; the owner's sign-off.
 2. **The release supply chain:** a compromised action, image or dependency; a tag pushed by someone else; attestations minted from a branch. *Mitigations:* pins; no caches or secrets; attestation permissions on the tag job only, and narrow verification; a draft that a person publishes; a tag ruleset and immutable releases; reproducible Linux builds checked by an independent rebuild; `cargo deny`; the vendored source.
 3. **Temporary-file cleaners could strand every session** on a long-lived daemon (§1, carried items). *Mitigation:* TMP in Wave 1, tested against both real cleaners.
-4. **macOS as a remote is untested until MAC runs:** the trampoline after an in-place upgrade, launchd and login-session behavior. *Mitigation:* MAC early (Wave 1), with those exact scenarios. Its findings may need fixes in files M3 holds until it closes.
-5. **The release date depends on M3.** The sweep cannot start before M3 closes, and the serialized files tie U1, E1b, LIC and CFG together. *Mitigation:* everything but DOC's last pages, LIC's and CFG's turns, and SWEEP runs now, so M4's own work stays off the critical path.
+4. **macOS as a remote is untested until MAC runs:** the trampoline after an in-place upgrade, launchd and login-session behavior. *Mitigation:* MAC early (Wave 1), with those exact scenarios. Its findings may need fixes in files M3 holds; those land in a coordinator-serialized slot before RC (after K1), and M3's file hold no longer outlasts 0.1.0 (N9).
+5. **The release date depends on M3's K1 only** (N9: 0.1.0 ships without prediction, so M3's close no longer gates it). The sweep cannot start before K1 merges, and the serialized files tie U1, LIC and CFG together. *Mitigation:* everything but DOC's last pages, LIC's and CFG's turns, and SWEEP runs now, so M4's own work stays off the critical path.
 6. **Reproducibility may not hold** for C code (ring) or macOS's linker, and the independent rebuild depends on amd64 emulation in the VM. *Mitigation:* Linux only is guaranteed (digest-pinned images); macOS is best effort, with the build environment recorded; REL runs `release-verify` once before the first tag.
 7. **GPL compliance gaps:** a missing notice (the standard library, musl) or missing Corresponding Source. *Mitigation:* LIC's generated notices with a staleness check, and the vendored source archive in every release.
 8. **The recreate disrupts work:** PR links, Actions history, rulesets, the collaborator. *Mitigation:* §5's prerequisites and checklist, and no release tag before it.
@@ -878,7 +877,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 - `crates/fil-transport/src/pipe/command.rs`: the remote commands and their golden.
 - `crates/fil/src/{connect.rs, dialer.rs, app.rs, server.rs}` and `crates/fil/src/install/` (new): the fallback, the offer, the upload.
 - `crates/fil-daemon/src/{logging.rs, paths.rs, daemon.rs}`: LOG and TMP.
-- `crates/fil-session/src/nofile.rs`: the trampoline on macOS (a finding for after M3, if MAC's test fails).
+- `crates/fil-session/src/nofile.rs`: the trampoline on macOS (a finding to fix in a coordinator-serialized slot before RC (after K1), if MAC's test fails).
 - `.github/workflows/release.yml` and `macos-check.yml` (new); `linux-check.yml` (one-line additions).
 - The root `Cargo.toml` (`[profile.release]`, `rust-version`), `Cross.toml`, `deny.toml`, and `about.toml` (new).
 - `docs/m4/release.md` (new, R0) and `docs/user/` (new, DOC).

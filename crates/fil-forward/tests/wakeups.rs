@@ -208,10 +208,10 @@ async fn the_pacer_takes_no_sample_from_a_violating_ack_body() {
     });
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, port_t);
-    let mut s = connect(port).await;
+    let mut s = connect_small(port).await;
     let _writer = tokio::spawn(async move {
         let buf = vec![1u8; 16 * 1024];
-        while s.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
     let samples = |w: &World| {

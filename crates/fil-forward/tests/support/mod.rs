@@ -10,15 +10,20 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use fil_forward::connect::connect_tcp;
-use fil_forward::{AddressCheck, ConnectFuture, Connector, Endpoint, LocalPeer, Policy};
+use fil_forward::{
+    AddressCheck, BoxStream, ConnectFuture, Connector, Endpoint, ForwardStream, LocalPeer, Policy,
+};
 use fil_netsim::stream::{StreamConfig, StreamControl, stream_pair};
 use fil_netsim::{Net, SimSocket};
 use fil_proto::frame::DataSegment;
@@ -30,7 +35,7 @@ use fil_transport::link::mem::{self, MemControl, MemLink};
 use fil_transport::pipe::{PipeConfig, PipeLink};
 use fil_transport::quic::{self, ListenerConfig, QuicLink, QuicListener};
 use fil_transport::{DownReason, Link, LinkError, LinkKind, LinkParams, LinkStatus};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -290,8 +295,13 @@ pub struct Targets {
     map: Mutex<HashMap<ForwardId, Target>>,
     /// Where an `Agent` open connects (a stand-in for the local ssh-agent).
     agent: Mutex<Option<Target>>,
+    /// Wraps every stream this side connects (a [`Flaky`] one, say) before the endpoint gets it.
+    pub wrap: Mutex<Option<Wrap>>,
     pub asked: AtomicUsize,
 }
+
+/// See [`Targets::wrap`].
+pub type Wrap = Arc<dyn Fn(TcpStream) -> BoxStream + Send + Sync>;
 
 impl Targets {
     pub fn set(&self, id: ForwardId, port: u16) {
@@ -325,10 +335,14 @@ impl Connector for Targets {
             OpenKind::Dynamic { target, .. } => Some(target.clone()),
             OpenKind::Agent => self.agent.lock().unwrap().clone(),
         };
+        let wrap = self.wrap.lock().unwrap().clone();
         Box::pin(async move {
             let target = target.ok_or(OpenFailure::NoSuchForward)?;
             let s = connect_tcp(&target, &check).await?;
-            Ok(Box::new(s) as fil_forward::BoxStream)
+            Ok(match wrap {
+                Some(w) => w(s),
+                None => Box::new(s) as BoxStream,
+            })
         })
     }
 }
@@ -380,6 +394,20 @@ pub struct End {
     events: Option<JoinHandle<()>>,
     /// The endpoint's events, when the test drains them itself ([`End::new_with`]).
     pub events_rx: Option<fil_forward::EventReceiver>,
+    /// Its place in [`WATCHED`].
+    watch_id: u64,
+}
+
+/// The endpoints of the tests running now, by the thread that built them (a `#[tokio::test]`'s
+/// body runs on the test thread, named after the test), so that [`bounded`] can print where a
+/// test that ran out of time stood. Taken out again when the [`End`] is dropped.
+static WATCHED: Mutex<Vec<Watched>> = Mutex::new(Vec::new());
+
+/// An [`End`]'s id, the thread that built it, its side and its endpoint.
+type Watched = (u64, String, Side, Endpoint<TestLink>);
+
+fn thread_name() -> String {
+    std::thread::current().name().unwrap_or("?").to_string()
 }
 
 impl End {
@@ -418,6 +446,12 @@ impl End {
             }
         });
         let (probes, probes_rx) = mpsc::unbounded_channel();
+        static NEXT_WATCH: AtomicUsize = AtomicUsize::new(0);
+        let watch_id = NEXT_WATCH.fetch_add(1, Ordering::Relaxed) as u64;
+        WATCHED
+            .lock()
+            .unwrap()
+            .push((watch_id, thread_name(), side, ep.clone()));
         Self {
             ep,
             targets,
@@ -431,6 +465,7 @@ impl End {
             probes_rx: Some(probes_rx),
             events: Some(events),
             events_rx,
+            watch_id,
         }
     }
 
@@ -473,6 +508,8 @@ impl End {
 
 impl Drop for End {
     fn drop(&mut self) {
+        let mine = self.watch_id;
+        WATCHED.lock().unwrap().retain(|w| w.0 != mine);
         self.stop_recv();
         if let Some(t) = self.events.take() {
             t.abort();
@@ -700,7 +737,73 @@ pub fn sha256() -> ring::digest::Context {
     ring::digest::Context::new(&ring::digest::SHA256)
 }
 
-/// Writes `n` deterministic bytes of stream `seed` to `w`, returning their SHA-256.
+/// Whether `e` is the kernel running short of socket memory (`ENOBUFS`, `ENOMEM`): a transient
+/// failure that a small CI runner's mbuf pool gives to a send when many loopback sockets hold
+/// data. The tests' own socket calls try again, as the endpoint's do; any other error ends them.
+pub fn is_no_buffers(e: &io::Error) -> bool {
+    use rustix::io::Errno;
+    matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
+}
+
+/// `e` with its errno in the message (the kind is kept, so `is_reset` and the like still see it).
+pub fn with_errno(e: io::Error, what: &str) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{what}: {e} (kind {:?}, errno {:?})",
+            e.kind(),
+            e.raw_os_error()
+        ),
+    )
+}
+
+/// How long a test's socket call may fail for want of kernel memory, with nothing succeeding
+/// between, before the failure is the test's: the shortage is not passing.
+const NO_BUFFERS_LIMIT: Duration = Duration::from_secs(60);
+
+/// The wait before the `k`th retry of a call that failed with `ENOBUFS`: 1 ms doubling to 50 ms.
+async fn no_buffers_wait(since: &mut Option<tokio::time::Instant>, wait: &mut Duration) -> bool {
+    let t0 = *since.get_or_insert_with(tokio::time::Instant::now);
+    if t0.elapsed() >= NO_BUFFERS_LIMIT {
+        return false;
+    }
+    tokio::time::sleep(*wait).await;
+    *wait = (*wait * 2).min(Duration::from_millis(50));
+    true
+}
+
+/// `write_all` that tries again when the kernel is out of socket memory ([`is_no_buffers`]),
+/// from where the failed call left off. Any other error comes back with its errno in the text.
+pub async fn write_all_retry<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> io::Result<()> {
+    let (mut since, mut wait) = (None, Duration::from_millis(1));
+    while !buf.is_empty() {
+        match w.write(buf).await {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                (since, wait) = (None, Duration::from_millis(1));
+            }
+            Err(e) if is_no_buffers(&e) && no_buffers_wait(&mut since, &mut wait).await => {}
+            Err(e) => return Err(with_errno(e, "write")),
+        }
+    }
+    Ok(())
+}
+
+/// `read` that tries again on `ENOBUFS`.
+pub async fn read_retry<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let (mut since, mut wait) = (None, Duration::from_millis(1));
+    loop {
+        match r.read(buf).await {
+            Err(e) if is_no_buffers(&e) && no_buffers_wait(&mut since, &mut wait).await => {}
+            r => return r,
+        }
+    }
+}
+
+/// Writes `n` deterministic bytes of stream `seed` to `w`, returning their SHA-256. A write
+/// that fails for want of kernel memory is tried again; any other failure says where, with its
+/// errno.
 pub async fn write_stream<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     seed: u64,
@@ -714,7 +817,9 @@ pub async fn write_stream<W: AsyncWriteExt + Unpin>(
         let len = ((n - off) as usize).min(buf.len());
         fill(seed, off, &mut buf[..len]);
         h.update(&buf[..len]);
-        w.write_all(&buf[..len]).await?;
+        write_all_retry(w, &buf[..len])
+            .await
+            .map_err(|e| with_errno(e, &format!("write_stream at byte {off} of {n}")))?;
         off += len as u64;
         if let Some(p) = progress {
             p.store(off as usize, Ordering::Relaxed);
@@ -732,7 +837,9 @@ pub async fn read_stream<R: AsyncReadExt + Unpin>(
     let mut buf = vec![0u8; 64 * 1024];
     let mut n = 0u64;
     loop {
-        let k = r.read(&mut buf).await?;
+        let k = read_retry(r, &mut buf)
+            .await
+            .map_err(|e| with_errno(e, &format!("read_stream after {n} bytes")))?;
         if k == 0 {
             return Ok((h.finish().as_ref().to_vec(), n));
         }
@@ -812,9 +919,34 @@ pub async fn oneshot_echo_server(n: usize) -> Server {
 /// accepts it is the kernel's listen queue overflowing (128 on macOS, on a machine busy with
 /// other work), not fil's answer: tried again, as a client library would.
 pub async fn connect(port: u16) -> TcpStream {
+    connect_with(port, None).await
+}
+
+/// What a never-read socket's kernel buffer holds at most, about (the OS rounds it up: Linux
+/// doubles it and has a floor of a few KiB). The default is OS policy: macOS and Linux grow the
+/// buffers (to 4 MiB and 6 MiB) as data arrives even when nobody reads, and a test with dozens
+/// of such sockets then takes megabytes of a small CI runner's mbuf pool each, where `send`
+/// starts to fail with `ENOBUFS` (VF2, and the macOS runners).
+pub const STUCK_BUFFER: u32 = 4096;
+
+/// [`connect`] with the socket's buffers bounded to [`STUCK_BUFFER`], for an application that
+/// writes without bound and reads nothing.
+pub async fn connect_small(port: u16) -> TcpStream {
+    connect_with(port, Some(STUCK_BUFFER)).await
+}
+
+async fn connect_with(port: u16, buffers: Option<u32>) -> TcpStream {
+    let attempt = || async move {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        if let Some(n) = buffers {
+            sock.set_recv_buffer_size(n).unwrap();
+            sock.set_send_buffer_size(n).unwrap();
+        }
+        sock.connect(([127, 0, 0, 1], port).into()).await
+    };
     let mut backoff = Duration::from_millis(20);
     for _ in 0..6 {
-        match TcpStream::connect(("127.0.0.1", port)).await {
+        match attempt().await {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                 tokio::time::sleep(backoff).await;
                 backoff *= 2;
@@ -822,7 +954,96 @@ pub async fn connect(port: u16) -> TcpStream {
             r => return r.unwrap(),
         }
     }
-    TcpStream::connect(("127.0.0.1", port)).await.unwrap()
+    attempt().await.unwrap()
+}
+
+/// Bounds an accepted socket's kernel buffers to [`STUCK_BUFFER`] (see there), for a server that
+/// never reads what it is sent or writes without bound.
+pub fn shrink_buffers(s: &TcpStream) {
+    rustix::net::sockopt::set_socket_recv_buffer_size(s, STUCK_BUFFER as usize).unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(s, STUCK_BUFFER as usize).unwrap();
+}
+
+// ---- a local socket that runs out of memory -----------------------------------------------------
+
+/// A local stream whose reads and writes fail with `ENOBUFS` when told to (before reaching the
+/// socket, so nothing is read or written by the failed call), as a kernel short of mbufs does.
+/// `fail_write(n)` and `fail_read(n)` are asked with the number of the call (every poll counts,
+/// from 0); `injected` counts the failures given.
+pub struct Flaky {
+    inner: TcpStream,
+    polls: [u64; 2],
+    fail: [Arc<dyn Fn(u64) -> bool + Send + Sync>; 2],
+    pub injected: Arc<AtomicUsize>,
+}
+
+impl Flaky {
+    /// A [`Wrap`] making [`Flaky`] streams that all count into `injected`.
+    pub fn wrap(
+        fail_read: impl Fn(u64) -> bool + Send + Sync + 'static,
+        fail_write: impl Fn(u64) -> bool + Send + Sync + 'static,
+        injected: Arc<AtomicUsize>,
+    ) -> Wrap {
+        let (fail_read, fail_write): (Arc<dyn Fn(u64) -> bool + Send + Sync>, _) =
+            (Arc::new(fail_read), Arc::new(fail_write));
+        Arc::new(move |inner| {
+            Box::new(Flaky {
+                inner,
+                polls: [0; 2],
+                fail: [fail_read.clone(), fail_write.clone()],
+                injected: injected.clone(),
+            })
+        })
+    }
+
+    fn enobufs(&self) -> io::Error {
+        self.injected.fetch_add(1, Ordering::SeqCst);
+        io::Error::from_raw_os_error(rustix::io::Errno::NOBUFS.raw_os_error())
+    }
+}
+
+impl AsyncRead for Flaky {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let n = self.polls[0];
+        self.polls[0] += 1;
+        if (self.fail[0])(n) {
+            return Poll::Ready(Err(self.enobufs()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Flaky {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let n = self.polls[1];
+        self.polls[1] += 1;
+        if (self.fail[1])(n) {
+            return Poll::Ready(Err(self.enobufs()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl ForwardStream for Flaky {
+    fn set_reset(&self) -> io::Result<()> {
+        fil_forward::stream::set_zero_linger(&self.inner)
+    }
 }
 
 /// A connection through `port` that fil refuses: it is reset, at the connect already (the reset
@@ -906,7 +1127,11 @@ pub fn test_limit() -> Duration {
     Duration::from_secs(env_or("FIL_FORWARD_TEST_LIMIT", TEST_LIMIT.as_secs()))
 }
 
-/// Runs a test's body under [`test_limit`]; the panic names the test.
+/// Runs a test's body under [`test_limit`]; the panic names the test and, when the body built
+/// endpoints, prints where each stood (the [`Snapshot`](fil_forward::Snapshot)).
+///
+/// A test that outlives the limit is stalled, or lost a wakeup, or its machine ran out of
+/// something (kernel socket memory, say): the message does not say which, the snapshots help.
 ///
 /// **Never wrap a test with a paused clock** (`start_paused`): the timeout is a timer on that
 /// clock, and tokio advances a paused clock to the next timer as soon as everything waits, which
@@ -914,14 +1139,22 @@ pub fn test_limit() -> Duration {
 /// `multi_thread` tests, which cannot pause the clock, are wrapped.
 pub async fn bounded<F: Future>(body: F) -> F::Output {
     let limit = test_limit();
-    match tokio::time::timeout(limit, body).await {
-        Ok(v) => v,
-        Err(_) => {
-            let t = std::thread::current();
-            panic!(
-                "{}: still running after {limit:?}: a lost wakeup or a stalled forward",
-                t.name().unwrap_or("test")
-            );
+    let mut body = std::pin::pin!(body);
+    tokio::select! {
+        v = &mut body => v,
+        () = tokio::time::sleep(limit) => {
+            // The body is still alive here, so its endpoints are in `WATCHED`.
+            let name = thread_name();
+            let mut report = String::new();
+            for (_, who, side, ep) in WATCHED.lock().unwrap().iter() {
+                if *who == name {
+                    report.push_str(&format!("\n  {side:?}: {:?}", ep.snapshot()));
+                }
+            }
+            if report.is_empty() {
+                report.push_str("\n  (no endpoint to report)");
+            }
+            panic!("{name}: still running after {limit:?}; endpoints:{report}");
         }
     }
 }

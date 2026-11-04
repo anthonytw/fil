@@ -189,9 +189,38 @@ On the pipe the path coming back is a new link and a resume, and the resume's sn
 
 What W1's tests should assert, using this harness:
 
-- `a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order` (`#[ignore]`d, in `predict_e2e.rs`) passes today and must be flipped to assert the opposite when W1 lands (its six seeds then end with `compare_to_shadow` clean, or the terminal equal to a fresh snapshot once the repair has landed);
+- `a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order` (`#[ignore]`d, in `predict_e2e.rs`) passed then and was to be flipped to assert the opposite when W1 landed (done: see "After W1" below) (its six seeds then end with `compare_to_shadow` clean, or the terminal equal to a fresh snapshot once the repair has landed);
 - add the widening fill case, which needs W1's repaint, not just a no-write rule: the terminal's cursor is on the wrong row;
 - `the_resize_controls_are_clean` stays as it is.
+
+### After W1: the repaint repairs it
+
+W1 (wire revision 12, `DESIGN.md` §4.2 and §8.5 `InputRecord::Repaint`) lands the repair. The same matrix, `just predict-e2e resize --seeds 5`, 75 ms each way, `MoshAlways`, macOS, both transports, run as six processes (one per transport and program, under 4 minutes each). `repainted` is the runs in which the daemon sent a repaint snapshot; `after rp` the repainted runs that do not end equal to a fresh snapshot.
+
+| Program, direction | order | painted | **predict vs shadow** | predict vs snapshot | repainted | after rp | control vs shadow | control vs snapshot |
+|---|---|---|---|---|---|---|---|---|
+| `cat`, `fill`, bash, 80 to 30 | true, live | 5 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 1 / 5 |
+| | true, frozen | 5 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 0 to 1 / 5 |
+| | M0, frozen | 5 | 0 / 5 | 0 / 5 | 5 | 0 | 0 / 5 (QUIC bash: 1 / 5) | 0 to 1 / 5 |
+| `cat`, `fill`, bash, 30 to 80 | true, live | 4 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 0 / 5 |
+| | true, frozen | 4 | **0 / 5** | 0 / 5 | 4 | 0 | 0 / 5 | 0 / 5 |
+| | M0, frozen | 4 | 0 / 5 | 0 / 5 | 4 | 0 | 0 / 5 | 0 / 5 |
+
+Every row is the same for the three programs and the two transports, bar what the cells say.
+
+- **The predicting runs end equal to the shadow, and equal to a fresh snapshot**, in every case: the client had guesses on the screen at the resize, asked for a repaint after the resize record, and the repaint made the terminal the daemon's. That includes the widening `fill` case (4 of 5 damaged before), whose cursor ended on another row: a rule that only stops guesses could not have fixed it.
+- `repainted` is 5 where `painted` is 4 in the live widening rows: the fifth run had nothing drawn at the resize but wrote a guess afterwards, on the untrusted screen, which asks too (with C1's rule 9 the core holds that guess instead of writing it).
+- **The controls do not ask** (nothing is drawn, so nothing is repainted: the lazy rule), and they are where the stream-point skew of §1 still shows against a fresh snapshot (1 run in 5, as before). Against the shadow they stay clean, bar the QUIC bash M0-order row that was noise before too.
+
+The status line, the same `fill narrow` case as above:
+
+| | pipe | QUIC |
+|---|---|---|
+| true order, while disconnected | no difference outside the status rows | row 1 differs (nothing can be repaired while the link is down) |
+| true order, after the path is back | clean | **clean** (was: rows 0 and 1 still differ) |
+| M0 order, after the path is back | clean | one cell of the status line differs: the harness compared before the link had come back (its "the client wrote" wait was met by the status line's clock ticking), a timing artifact of `status_trial` and not damage |
+
+On QUIC the client now asks for the repaint when the quiet link recovers by itself: the status line had been drawn at the resize, and the request goes out after the resize record once the link is up. The small tests in `just ci`: `a_narrowing_resize_with_guesses_on_screen_is_repaired_in_the_true_order` (three seeds) and `a_widening_resize_that_joins_wrapped_rows_is_repaired_in_the_true_order` (two), in `predict_e2e.rs`.
 
 ## 4. The baseline, with `EchoAck` off
 

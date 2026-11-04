@@ -340,6 +340,11 @@ impl Core {
         self.state == State::Confirmed || !self.g.tentative
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn epoch_confirmed(&self) -> bool {
+        self.state == State::Confirmed
+    }
+
     /// Guesses (and moves) not yet settled.
     pub fn pending(&self) -> usize {
         self.keys

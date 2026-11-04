@@ -639,6 +639,12 @@ impl Overlay {
         self.core.stats
     }
 
+    /// **Test only:** whether the current epoch is confirmed.
+    #[cfg(feature = "testkit")]
+    pub fn epoch_confirmed(&self) -> bool {
+        self.core.epoch_confirmed()
+    }
+
     /// Guesses the core holds that are not settled yet.
     pub fn outstanding(&self) -> usize {
         self.core.pending()

@@ -244,6 +244,26 @@ fn a_space_over_a_blank_waits_for_its_echo() {
     assert!(!t.key(b"d", 340).paint.is_empty(), "the epoch ended");
 }
 
+/// Rule 2's prior-ack condition: a new epoch's first confirmation waits for an `EchoAck` that
+/// covers the keys before it. Before the ack a matching echo confirms nothing (and ends
+/// nothing); the next echo after the ack does.
+#[test]
+fn a_new_epoch_confirms_only_after_the_keys_before_it_are_acknowledged() {
+    let mut t = T::trusted();
+    t.key(b"\r", 200);
+    t.server(b"\r\n$ ", 280);
+    t.key(b"l", 300);
+    t.key(b"s", 310);
+    t.server(b"l", 400);
+    assert!(!t.painted(), "confirmed before the ack");
+    t.o.on_echo_ack(2, ms(405));
+    t.server(b"s", 410);
+    assert!(
+        !t.key(b"x", 420).paint.is_empty(),
+        "not confirmed after the ack"
+    );
+}
+
 // ---- settling by EchoAck (rule 5) ----------------------------------------------------
 
 #[test]
@@ -377,6 +397,8 @@ fn a_read_after_the_paste_window_is_typed_again() {
     t.key(&[b'p'; 64], 200);
     t.server(&[b'p'; 64], 260);
     t.key(b"x", 400);
+    // The paste acknowledged (rule 2), then the echo of `x` confirms the new epoch.
+    t.o.on_echo_ack(65, ms(440));
     t.server(b"x", 450);
     assert!(!t.key(b"y", 460).paint.is_empty());
 }
@@ -539,6 +561,8 @@ fn a_repaint_is_asked_for_only_when_a_guess_would_be_written() {
     t.server(b"$ ab", 310);
     t.o.repainted();
     assert!(t.key(b"c", 320).paint.is_empty());
+    // The ack for the keys before `c` (rule 2: before the new epoch's first confirmation).
+    t.o.on_echo_ack(2, ms(390));
     t.server(b"c", 400);
     assert!(!t.key(b"d", 410).paint.is_empty());
     assert!(!t.o.take_repaint_request());

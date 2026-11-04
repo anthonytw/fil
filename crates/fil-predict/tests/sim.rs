@@ -144,24 +144,18 @@ fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
     }
 }
 
-/// The prior-ack rule only adds a condition to the first confirmation: it never makes anything
-/// writable earlier. Over every scenario, with both predictors, the first write with the rule on
-/// never comes before the first write with it off, and the secrets stay off the screen.
+/// The prior-ack rule only adds a condition to the first confirmation: it never grants one. Run
+/// every scenario's trace with the rule on and off, side by side: the two runs are the same until
+/// the rule first acts, and that first difference must be the rule *withholding* a confirmation
+/// (the run without it confirmed, the run with it did not, and has written and painted nothing
+/// the other has not). After that the runs diverge legitimately: the run without the rule may
+/// confirm against a late echo, be contradicted and end its epoch, while the run with it
+/// confirms properly later, so "the first write is never earlier" is not an invariant.
 #[test]
-fn the_prior_ack_rule_never_writes_earlier() {
-    use fil_predict::driver::{Driver, Ev};
+fn the_prior_ack_rule_only_withholds_confirmations() {
+    use fil_predict::driver::Driver;
     use fil_predict::overlay::Guards;
-    let first_write = |trace: &fil_predict::driver::Trace, run: &fil_predict::driver::RunConfig| {
-        let mut d = Driver::new(run);
-        for (i, e) in trace.events.iter().enumerate() {
-            d.apply(e.at, e.ev.clone());
-            if d.overlay.stats().written > 0 {
-                return Some(i);
-            }
-            if let Ev::Tick = e.ev {}
-        }
-        None
-    };
+    let mut acted = 0;
     for sc in Scenario::ALL {
         for b in backends() {
             for hostile in [false, true] {
@@ -174,26 +168,43 @@ fn the_prior_ack_rule_never_writes_earlier() {
                     let out = run(&cfg);
                     assert!(out.failure.is_none(), "{} {}", sc.name(), b.name);
                     let mut off = cfg.run.clone();
-                    off.guards = Guards::ALL;
                     off.guards.disable("prior_acked");
-                    let on_at = first_write(&out.trace, &cfg.run);
-                    let off_at = first_write(&out.trace, &off);
-                    match (on_at, off_at) {
-                        (Some(a), Some(b)) => assert!(
-                            a >= b,
-                            "{} seed {seed}: written at event {a} with the rule, {b} without",
-                            sc.name()
-                        ),
-                        (Some(a), None) => {
-                            panic!(
-                                "{} seed {seed}: written at {a} only with the rule",
-                                sc.name()
-                            )
+                    let (mut on_d, mut off_d) = (Driver::new(&cfg.run), Driver::new(&off));
+                    let _ = Guards::ALL;
+                    for (i, e) in out.trace.events.iter().enumerate() {
+                        on_d.apply(e.at, e.ev.clone());
+                        off_d.apply(e.at, e.ev.clone());
+                        let (on, offv) = (on_d.overlay.view(0), off_d.overlay.view(0));
+                        let (son, soff) = (on_d.overlay.stats(), off_d.overlay.stats());
+                        let same = on.painted == offv.painted
+                            && son == soff
+                            && on_d.overlay.epoch_confirmed() == off_d.overlay.epoch_confirmed();
+                        if same {
+                            continue;
                         }
-                        _ => {}
+                        let what = format!(
+                            "{} {} hostile={hostile} seed {seed} event {i}",
+                            sc.name(),
+                            b.name
+                        );
+                        assert!(
+                            off_d.overlay.epoch_confirmed() && !on_d.overlay.epoch_confirmed(),
+                            "{what}: the first difference is not a withheld confirmation"
+                        );
+                        assert!(
+                            son.written <= soff.written,
+                            "{what}: wrote more with the rule"
+                        );
+                        assert!(
+                            on.painted.iter().all(|c| offv.painted.contains(c)),
+                            "{what}: painted something the run without the rule did not"
+                        );
+                        acted += 1;
+                        break;
                     }
                 }
             }
         }
     }
+    assert!(acted > 0, "the rule never acted");
 }

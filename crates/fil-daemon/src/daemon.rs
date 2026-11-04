@@ -11,7 +11,12 @@
 //!   whole life (its pid is written there). A second daemon for the same major waits briefly,
 //!   for one on its way out, then reports [`StartError::AlreadyRunning`] and exits cleanly. The
 //!   lock dies with the process, so a socket file that exists while the lock is free is stale
-//!   and is removed by the daemon that takes the lock.
+//!   and is removed by the daemon that takes the lock, unless something answers on it: a lock
+//!   file that a cleaner or a person removed makes a free lock under a live daemon.
+//! - **Temporary-file cleaners.** The files live in `/tmp`, which some systems age. The daemon
+//!   holds a shared `flock` on its socket directory, sets fresh times on its files every hour
+//!   ([`Keeping`]) and, at each of those looks, repairs what is missing: the directory, its lock
+//!   on it, the lock file and the socket (DESIGN.md section 5.3).
 //! - **Idle exit.** With no session and no connection for `idle_exit` (five minutes by default,
 //!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
 //!   last look for a connection that raced it, and exits. A relay that arrives later starts a
@@ -53,7 +58,7 @@ use tokio::sync::watch;
 use crate::config::{ConfigError, DaemonConfig};
 use crate::conn::Origin;
 use crate::linger;
-use crate::paths::{DirError, Paths, ensure_socket_dir};
+use crate::paths::{DirError, Keeping, Paths, dir_lock_is_current, ensure_socket_dir};
 use crate::start::{LockStep, clean_up_files, lock_step, open_lock_file};
 
 /// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
@@ -682,6 +687,9 @@ pub struct Daemon {
     unix: UnixListener,
     /// Held for the daemon's life.
     lock: File,
+    /// The shared lock on the socket directory, which systemd-tmpfiles honors by skipping it.
+    dir_lock: Option<File>,
+    keeping: Keeping,
     stop: watch::Sender<Option<bool>>,
 }
 
@@ -714,7 +722,15 @@ impl Daemon {
         writeln!(lock, "{}", std::process::id()).map_err(io(lock_path.clone()))?;
 
         // Holding the lock, nothing else is serving this socket: whatever is there is stale.
+        // Unless something answers on it. The lock file is not proof that nobody runs: if it
+        // was removed (by a cleaner, or by hand) a daemon that is alive holds a lock on a file
+        // nobody can see, and this one took a fresh file. Taking the socket from that daemon
+        // would strand every session on it. The check is a connect and a hang-up, as a relay's.
         let sock = paths.socket();
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            tracing::warn!(path = %sock.display(), "a daemon answers on the socket without holding the lock file; not starting");
+            return Err(StartError::AlreadyRunning(lock_path));
+        }
         match std::fs::remove_file(&sock) {
             Ok(()) => tracing::info!(path = %sock.display(), "removed a stale socket"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -768,6 +784,8 @@ impl Daemon {
             })),
         });
         let (stop, _) = watch::channel(None);
+        let keeping = Keeping::default();
+        let dir_lock = hold_dir_lock(&paths);
         tracing::info!(
             socket = %sock.display(),
             udp_port = inner.host.direct_now().map_or(0, |d| d.udp_port),
@@ -778,8 +796,82 @@ impl Daemon {
             paths,
             unix,
             lock,
+            dir_lock,
+            keeping,
             stop,
         })
+    }
+
+    /// Changes how the daemon looks after its files (see [`Keeping`]); call before [`run`](Self::run).
+    /// For tests, which shorten the interval or switch one defense off.
+    pub fn set_keeping(&mut self, keeping: Keeping) {
+        if !keeping.dir_lock {
+            self.dir_lock = None;
+        } else if self.dir_lock.is_none() {
+            self.dir_lock = hold_dir_lock(&self.paths);
+        }
+        self.keeping = keeping;
+    }
+
+    /// One look after the daemon's files: repairs what is missing or was replaced, then sets
+    /// fresh times (see [`Keeping`]). Never fatal: a problem is logged, and the daemon keeps
+    /// serving what it has.
+    fn keep_files(&mut self) {
+        // The directory first. One that is now somebody else's or the wrong mode is not ours to
+        // touch: leave everything (the sessions still run, their clients still hold connections).
+        if let Err(e) = ensure_socket_dir(&self.paths.dir) {
+            tracing::error!(error = %e, "the socket directory cannot be used; leaving it alone");
+            return;
+        }
+        if self.keeping.dir_lock
+            && !self
+                .dir_lock
+                .as_ref()
+                .is_some_and(|d| dir_lock_is_current(d, &self.paths.dir))
+        {
+            tracing::warn!("the socket directory was replaced or not locked; locking it again");
+            self.dir_lock = hold_dir_lock(&self.paths);
+        }
+        // The lock file: if it is gone from the path, our lock is on a file nobody can find. Take
+        // a new file and its lock before anything else can (a daemon that starts meanwhile
+        // finds this one answering and leaves, see `start`), and write the pid again.
+        let lock_path = self.paths.lock();
+        if !crate::start::is_current(&self.lock, &lock_path) {
+            match open_lock_file(&lock_path).and_then(|f| {
+                rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+                Ok(f)
+            }) {
+                Ok(mut f) => {
+                    let _ = f.set_len(0);
+                    let _ = writeln!(f, "{}", std::process::id());
+                    self.lock = f;
+                    tracing::warn!(path = %lock_path.display(), "the lock file was removed; made it again");
+                }
+                Err(e) => tracing::error!(
+                    error = %e, path = %lock_path.display(),
+                    "the lock file was removed and cannot be made again"
+                ),
+            }
+        }
+        // The socket: gone from the path means no new connection can reach this daemon.
+        let sock = self.paths.socket();
+        if std::fs::symlink_metadata(&sock).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            match UnixListener::bind(&sock) {
+                Ok(l) => {
+                    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+                    self.unix = l;
+                    tracing::warn!(path = %sock.display(), "the socket was removed; bound it again");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "the socket was removed and cannot be bound again")
+                }
+            }
+        }
+        if self.keeping.refresh {
+            let n = self.paths.refresh_times();
+            tracing::debug!(files = n, "refreshed the times of the daemon's files");
+        }
     }
 
     /// The Unix socket path.
@@ -822,8 +914,12 @@ impl Daemon {
         }
         let policy_task = tokio::spawn(self.inner.clone().follow_policy());
         let mut stop = self.stop.subscribe();
+        let every = self.keeping.every.max(Duration::from_millis(10));
+        let mut keep = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let exit = loop {
             tokio::select! {
+                _ = keep.tick() => self.keep_files(),
                 accepted = self.unix.accept() => match accepted {
                     Ok((stream, _)) => self.accept_unix(stream),
                     Err(e) => {
@@ -934,6 +1030,18 @@ impl Daemon {
         .await;
         if waited.is_err() {
             tracing::warn!("a session was still starting at shutdown; giving up on it");
+        }
+    }
+}
+
+/// The shared lock on the socket directory, or none (logged) when it cannot be taken; the
+/// daemon takes it again at its next look.
+fn hold_dir_lock(paths: &Paths) -> Option<File> {
+    match paths.lock_dir() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot lock the socket directory");
+            None
         }
     }
 }

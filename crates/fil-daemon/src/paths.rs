@@ -19,11 +19,16 @@
 //!
 //! The directory is deliberately not under `$XDG_RUNTIME_DIR`: systemd-logind removes that
 //! directory when the user's last login ends, which would strand a live daemon.
+//!
+//! `/tmp` is also aged by cleaners (systemd-tmpfiles, macOS's `tmp_cleaner`), so the files are
+//! kept alive on purpose: see [`Keeping`], [`Paths::lock_dir`] and [`Paths::refresh_times`].
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fil_proto::limits::PROTOCOL_MAJOR;
 use fil_proto::msg::{MAX_OTHER_DAEMONS, OtherDaemon};
@@ -244,6 +249,114 @@ impl Paths {
     }
 }
 
+/// How the daemon keeps its files alive under a temporary-file cleaner (DESIGN.md section 5.3).
+/// The default is what ships; the fields exist so a test can switch one defense off and see the
+/// other, or neither, hold or fail.
+#[derive(Clone, Debug)]
+pub struct Keeping {
+    /// How often the daemon looks after its files ([`Paths::refresh_times`] and the repairs).
+    pub every: Duration,
+    /// Set fresh times on the daemon's files at every look.
+    pub refresh: bool,
+    /// Hold a shared `flock` on the socket directory ([`Paths::lock_dir`]).
+    pub dir_lock: bool,
+}
+
+impl Default for Keeping {
+    fn default() -> Self {
+        Keeping {
+            every: Duration::from_secs(3600),
+            refresh: true,
+            dir_lock: true,
+        }
+    }
+}
+
+impl Paths {
+    /// A shared `flock` on the socket directory itself, to be held for the daemon's whole life.
+    /// systemd-tmpfiles takes an exclusive, non-blocking lock on every directory it is about to
+    /// age and skips the ones it cannot lock; a shared lock is enough to be skipped, and several
+    /// daemons (of other revisions) share it. It does not stop a cleaner that ignores locks, which
+    /// the refresh ([`Paths::refresh_times`]) is for. The descriptor is close-on-exec, so no
+    /// session's shell keeps the directory locked after the daemon is gone. The directory is
+    /// opened without following a link.
+    ///
+    /// The lock is on the directory that is there now: [`dir_lock_is_current`] says whether it
+    /// still is the one at the path.
+    pub fn lock_dir(&self) -> std::io::Result<File> {
+        use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+        let fd = openat(
+            CWD,
+            &self.dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        // A cleaner in the middle of a pass holds the lock exclusively for a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match flock(&file, FlockOperation::NonBlockingLockShared) {
+                Ok(()) => return Ok(file),
+                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Sets the access and modification times of everything this daemon keeps in the socket
+    /// directory to now, which also renews the change time (a cleaner looks at all three, and
+    /// the change time cannot be set back by anyone): the directory, the socket, the lock and
+    /// start files, and the agent directory with its sockets, when they pass the same checks as
+    /// at start. Only this daemon's own revision: the leftovers of a crashed daemon of another
+    /// are not kept alive, so they still age out. A link is never followed. Returns how many
+    /// entries were touched; one that is missing or not ours is skipped.
+    pub fn refresh_times(&self) -> usize {
+        use rustix::fs::{AtFlags, CWD, Timestamps, UTIME_NOW, utimensat};
+        let now = rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        };
+        let stamps = Timestamps {
+            last_access: now,
+            last_modification: now,
+        };
+        let touch = |p: &Path| utimensat(CWD, p, &stamps, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        let mut n = 0;
+        for p in [
+            self.dir.clone(),
+            self.socket(),
+            self.lock(),
+            self.start_lock(),
+        ] {
+            n += usize::from(touch(&p));
+        }
+        let agents = self.agent_dir();
+        if agent_dir_is_ours(&agents) {
+            n += usize::from(touch(&agents));
+            let ours = current_uid();
+            if let Ok(rd) = std::fs::read_dir(&agents) {
+                for e in rd.filter_map(Result::ok) {
+                    let p = e.path();
+                    if std::fs::symlink_metadata(&p)
+                        .is_ok_and(|m| m.file_type().is_socket() && m.uid() == ours)
+                    {
+                        n += usize::from(touch(&p));
+                    }
+                }
+            }
+        }
+        n
+    }
+}
+
+/// Whether `held` (from [`Paths::lock_dir`]) is still the directory at `dir`: it has not been
+/// removed and made again, which would leave the lock on a directory nobody looks at.
+pub fn dir_lock_is_current(held: &File, dir: &Path) -> bool {
+    crate::start::is_current(held, dir)
+}
+
 /// The socket directory cannot be trusted or used.
 #[derive(Debug, thiserror::Error)]
 pub enum DirError {
@@ -436,6 +549,117 @@ mod tests {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, socket};
         let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         bind(&fd, &SocketAddrUnix::new(path).unwrap()).unwrap();
+    }
+
+    /// The refresh sets all of the revision's own files to now, and only those: the leftovers of
+    /// another revision (a crashed daemon's) keep ageing. A link is not followed.
+    #[test]
+    fn the_refresh_touches_this_revisions_files_and_nothing_else() {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("socket-dir");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let p = Paths::in_dir(&base);
+        let other = p.clone().with_revision(p.revision + 1);
+        let agents = p.agent_dir();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&agents)
+            .unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(agents.join("s.sock")).unwrap();
+        std::fs::write(agents.join("notes"), b"").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"").unwrap();
+        std::os::unix::fs::symlink(&outside, p.start_lock()).unwrap();
+        let _sock = std::os::unix::net::UnixListener::bind(p.socket()).unwrap();
+        std::fs::write(p.lock(), b"1\n").unwrap();
+        std::fs::write(other.lock(), b"2\n").unwrap();
+
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        let all = [
+            base.clone(),
+            p.socket(),
+            p.lock(),
+            other.lock(),
+            agents.clone(),
+            agents.join("s.sock"),
+            agents.join("notes"),
+            outside.clone(),
+        ];
+        for f in &all {
+            utimensat(CWD, f, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        }
+        // dir, socket, lock, agent dir, agent socket; the start file is a link, which is touched
+        // as a link (it is not ours to follow) and counts.
+        assert_eq!(p.refresh_times(), 6);
+        let mtime = |f: &Path| std::fs::symlink_metadata(f).unwrap().mtime();
+        for f in [
+            &base,
+            &p.socket(),
+            &p.lock(),
+            &agents,
+            &agents.join("s.sock"),
+        ] {
+            assert!(
+                mtime(f) > 1_500_000_000,
+                "{} was not refreshed",
+                f.display()
+            );
+        }
+        for f in [&other.lock(), &agents.join("notes"), &outside] {
+            assert_eq!(mtime(f), 1_000_000_000, "{} was touched", f.display());
+        }
+    }
+
+    /// The directory lock is shared (daemons of other revisions hold it too), keeps an exclusive
+    /// try out (what systemd-tmpfiles makes), and does not follow a link.
+    #[test]
+    fn the_directory_lock_is_shared_and_keeps_an_exclusive_try_out() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("socket-dir");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let p = Paths::in_dir(&base);
+        let a = p.lock_dir().unwrap();
+        let b = p.clone().with_revision(p.revision + 1).lock_dir().unwrap();
+        assert!(dir_lock_is_current(&a, &base));
+        let probe = File::open(&base).unwrap();
+        assert!(flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err());
+        drop(a);
+        // Still shared by the other.
+        assert!(flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err());
+        drop(b);
+        // A lock is released when the last copy of the descriptor is closed, and another test's
+        // `fork` (before its `exec` closes the copy) can hold one for a moment.
+        fil_testkit::wait_until("the lock is released", fil_testkit::WAIT, || {
+            flock(&probe, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        drop(probe);
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(
+            Paths::in_dir(&link).lock_dir().is_err(),
+            "a link is not followed"
+        );
+        let held = p.lock_dir().unwrap();
+        std::fs::remove_dir(&base).unwrap();
+        assert!(!dir_lock_is_current(&held, &base));
     }
 
     /// The agent directory's clean-up never touches a directory that fails the socket

@@ -1,0 +1,407 @@
+//! The daemon under temporary-file cleaners (DESIGN.md section 5.3, "Temporary-file cleaners").
+//!
+//! `/tmp` is aged by systemd-tmpfiles (Fedora-like hosts: `10d`) and by macOS's `tmp_cleaner`
+//! (3 days). Both look at the access, modification **and change** time of a file, and the change
+//! time cannot be set back by anyone, so a test cannot fake an old file by touching it: it has to
+//! let real time pass. The cleaner is therefore run for real, against a tree of its own, with its
+//! age cut to two seconds:
+//!
+//! - Linux: `systemd-tmpfiles --clean` on a one-line `e` rule (it works unprivileged on files of
+//!   the caller's own). Run for real, not a model of it.
+//! - macOS: `/usr/libexec/tmp_cleaner`, the script launchd runs at midnight, with the directory
+//!   and the age edited by `sed`: the `find` expressions are Apple's own. (It is `tmp_cleaner`
+//!   now; older text says `periodic daily clean-tmps`, whose script was the same.) It deletes
+//!   regular files only, never sockets, so what is at stake there is the lock and start files.
+//!
+//! What each defense is for, and so what the cases below switch off:
+//!
+//! | defense | stops |
+//! |---|---|
+//! | `flock` on the directory | systemd-tmpfiles (it skips a directory or file it cannot lock); not tmp_cleaner |
+//! | fresh times, hourly | both, since it renews the change time as well |
+//! | the connect check at start, and the repairs | what is left: a removed lock file never lets a second daemon take the first one's socket |
+//!
+//! What each real cleaner takes from a daemon that defends nothing (the control below): systemd-tmpfiles
+//! 255 spares every socket, and a file that is `flock`ed (so the daemon's own lock file), and takes
+//! the start file, which nothing holds; `tmp_cleaner` takes every regular file, flocked or not, so
+//! the lock file and the start file, and no socket. The directory lock and the fresh times are
+//! checked against those.
+//!
+//! A cleaner that needs neither is a test that cannot fail, so every case has a control with both
+//! defenses off that must lose files.
+
+mod common;
+
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use common::*;
+use fil_daemon::paths::Keeping;
+use fil_daemon::{Daemon, Paths, StartError};
+use fil_proto::msg::{Request, Response};
+use fil_transport::Link;
+
+/// The age the cleaner is told to use, and how long a test waits before running it.
+const AGE_SECS: u64 = 2;
+const WAIT_BEFORE_CLEAN: Duration = Duration::from_millis(3500);
+/// How often the daemon looks after its files in these tests (it is an hour in the product).
+const EVERY: Duration = Duration::from_millis(300);
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `/tmp/fil-tc-PID-N/d`: the cleaner is given the parent, as `/tmp` is given to it on a real
+/// host, and the daemon's socket directory is the child, so a directory the cleaner could age is
+/// a subdirectory of the tree it works on. Removed on drop.
+struct Tree {
+    parent: PathBuf,
+    dir: PathBuf,
+}
+
+impl Tree {
+    fn new() -> Tree {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let parent = PathBuf::from(format!("/tmp/fil-tc-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("d");
+        Tree { parent, dir }
+    }
+
+    fn paths(&self) -> Paths {
+        Paths::in_dir(&self.dir)
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.parent);
+    }
+}
+
+/// A daemon in this process with `keeping`, a start file as a relay leaves one, and one detached
+/// session (`main`) on it.
+async fn run(tree: &Tree, keeping: Keeping) -> Running {
+    let paths = tree.paths();
+    fil_daemon::ensure_socket_dir(&tree.dir).unwrap();
+    std::fs::File::create(paths.start_lock()).unwrap();
+    let mut daemon = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("daemon starts");
+    daemon.set_keeping(keeping);
+    let d = Running {
+        paths,
+        handle: daemon.handle(),
+        udp_port: daemon.udp_port(),
+        fingerprint: daemon.fingerprint(),
+        registry: daemon.registry().clone(),
+        task: tokio::spawn(daemon.run()),
+    };
+    let a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+    a.link.close();
+    d
+}
+
+/// Whether the daemon answers on its socket and still has the session.
+async fn has_the_session(d: &Running) -> bool {
+    let Ok(sock) = std::os::unix::net::UnixStream::connect(d.paths.socket()) else {
+        return false;
+    };
+    drop(sock);
+    matches!(
+        ask(d, Request::ListSessions).await,
+        Response::Sessions { list, .. } if list.len() == 1
+    )
+}
+
+/// `(dev, inode)` of what the daemon keeps: the directory, the socket, the lock and start files.
+/// A file that was deleted and made again has another inode, so a repair cannot pass for a
+/// survival.
+fn identities(p: &Paths) -> Vec<Option<(u64, u64)>> {
+    [p.dir.clone(), p.socket(), p.lock(), p.start_lock()]
+        .iter()
+        .map(|f| {
+            std::fs::symlink_metadata(f)
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        })
+        .collect()
+}
+
+/// A real cleaner that can be pointed at a tree with an age of [`AGE_SECS`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cleaner {
+    /// `systemd-tmpfiles --clean`.
+    Tmpfiles,
+    /// macOS's `/usr/libexec/tmp_cleaner`.
+    TmpCleaner,
+}
+
+impl Cleaner {
+    /// The cleaner of this host, or `None` (and a note) where it is not installed. On CI a
+    /// missing cleaner fails the test: a skipped cleaner test would pass whatever the daemon does.
+    fn here() -> Option<Cleaner> {
+        let found = if cfg!(target_os = "macos") {
+            Path::new("/usr/libexec/tmp_cleaner")
+                .exists()
+                .then_some(Cleaner::TmpCleaner)
+        } else {
+            Command::new("systemd-tmpfiles")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|_| Cleaner::Tmpfiles)
+        };
+        if found.is_none() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no temporary-file cleaner on this CI host"
+            );
+            eprintln!("skipped: no temporary-file cleaner (systemd-tmpfiles or tmp_cleaner) here");
+        }
+        found
+    }
+
+    /// One pass over `tree.parent`, aging everything not touched for [`AGE_SECS`].
+    fn clean(self, tree: &Tree) {
+        let out = match self {
+            Cleaner::Tmpfiles => {
+                let rule = tree.parent.with_extension("conf");
+                std::fs::write(
+                    &rule,
+                    format!("e {} - - - {AGE_SECS}s\n", tree.parent.display()),
+                )
+                .unwrap();
+                let out = Command::new("systemd-tmpfiles")
+                    .arg("--clean")
+                    .arg(&rule)
+                    .output()
+                    .unwrap();
+                let _ = std::fs::remove_file(&rule);
+                out
+            }
+            Cleaner::TmpCleaner => {
+                // Apple's script, with its directory and its three days replaced; `find` takes
+                // the `s` suffix. Nothing else is changed.
+                let script = std::fs::read_to_string("/usr/libexec/tmp_cleaner").unwrap();
+                let edited: String = script
+                    .lines()
+                    .map(|l| {
+                        if l.starts_with("daily_clean_tmps_dirs=") {
+                            format!("daily_clean_tmps_dirs=\"{}\"", tree.parent.display())
+                        } else if l.starts_with("daily_clean_tmps_days=") {
+                            format!("daily_clean_tmps_days=\"{AGE_SECS}s\"")
+                        } else {
+                            l.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    edited.contains(&format!("{AGE_SECS}s")),
+                    "the script changed"
+                );
+                let path = tree.parent.with_extension("sh");
+                std::fs::write(&path, edited).unwrap();
+                let out = Command::new("/bin/sh").arg(&path).output().unwrap();
+                let _ = std::fs::remove_file(&path);
+                out
+            }
+        };
+        assert!(
+            out.status.success(),
+            "{self:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn keeping(refresh: bool, dir_lock: bool) -> Keeping {
+    Keeping {
+        every: EVERY,
+        refresh,
+        dir_lock,
+    }
+}
+
+/// Lets time pass, runs the cleaner, lets the daemon have a few looks, and checks that nothing
+/// was removed (and made again) and that the session is still reachable.
+async fn survives(keeping: Keeping) {
+    let Some(cleaner) = Cleaner::here() else {
+        return;
+    };
+    let tree = Tree::new();
+    let d = run(&tree, keeping).await;
+    let before = identities(&d.paths);
+    assert!(before.iter().all(Option::is_some), "{before:?}");
+    tokio::time::sleep(WAIT_BEFORE_CLEAN).await;
+    cleaner.clean(&tree);
+    tokio::time::sleep(EVERY * 4).await;
+    assert_eq!(
+        identities(&d.paths),
+        before,
+        "{cleaner:?} removed (or the daemon had to remake) a file of a live daemon"
+    );
+    assert!(has_the_session(&d).await, "the session is gone");
+    d.stop().await;
+}
+
+/// The control: with neither defense the cleaner takes the daemon's files, which is what the
+/// cases above would otherwise prove nothing about. (The daemon's own looks are an hour apart
+/// here, so it does not repair before this is read.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_defense_the_cleaner_takes_the_files() {
+    let Some(cleaner) = Cleaner::here() else {
+        return;
+    };
+    let tree = Tree::new();
+    let off = Keeping {
+        every: Duration::from_secs(3600),
+        refresh: false,
+        dir_lock: false,
+    };
+    let d = run(&tree, off).await;
+    let before = identities(&d.paths);
+    tokio::time::sleep(WAIT_BEFORE_CLEAN).await;
+    cleaner.clean(&tree);
+    let after = identities(&d.paths);
+    match cleaner {
+        // v255 spares what is flocked (the lock file, whatever its age) and every socket, so
+        // the start file, which nothing holds, is the one it takes. That is the canary: the
+        // same file is what the defenses below keep.
+        Cleaner::Tmpfiles => {
+            assert_eq!(after, [before[0], before[1], before[2], None]);
+        }
+        // Regular files only, flocked or not: the lock and start files go, the socket and
+        // directory stay.
+        Cleaner::TmpCleaner => {
+            assert_eq!(after[0], before[0], "the directory");
+            assert_eq!(after[1], before[1], "tmp_cleaner never removes a socket");
+            assert_eq!(&after[2..], &[None, None], "the lock and start files");
+        }
+    }
+    // The cleaner took a file of a live daemon, and the daemon can still be reached.
+    assert!(has_the_session(&d).await);
+    d.handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, d.task).await;
+}
+
+/// Fresh times alone keep every file (both cleaners).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_times_alone_survive_the_cleaner() {
+    survives(keeping(true, false)).await;
+}
+
+/// Both defenses, as shipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_defenses_survive_the_cleaner() {
+    survives(keeping(true, true)).await;
+}
+
+/// The directory lock alone keeps everything from systemd-tmpfiles, however old the files are.
+/// macOS's `find` knows nothing of locks, so this is Linux only.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_directory_lock_alone_survives_systemd_tmpfiles() {
+    survives(keeping(false, true)).await;
+}
+
+/// The lock file of a live daemon is removed (by a cleaner that did not spare it, or by hand).
+/// A second daemon that takes a fresh lock finds the first answering on the socket and leaves
+/// it alone; the first notices and takes a lock file again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_lock_file_does_not_let_a_second_daemon_take_the_socket() {
+    let tree = Tree::new();
+    let d = run(&tree, keeping(true, true)).await;
+    let sock = identities(&d.paths)[1];
+    std::fs::remove_file(d.paths.lock()).unwrap();
+    assert!(!lock_is_held(&d.paths), "nothing holds a lock file now");
+
+    // Before the daemon's next look: a relay would see the socket answer and start nothing, but
+    // a daemon started by hand, or by a relay that raced the removal, is this one.
+    let mut cfg = config(CAT);
+    cfg.lock_wait = Duration::from_millis(100);
+    let second = Daemon::start(d.paths.clone(), cfg.clone()).await;
+    assert!(
+        matches!(second, Err(StartError::AlreadyRunning(_))),
+        "a second daemon started: {:?}",
+        second.map(|_| ())
+    );
+    assert_eq!(identities(&d.paths)[1], sock, "the socket was replaced");
+    assert!(has_the_session(&d).await, "the first daemon was disturbed");
+
+    // The first one makes its lock file again, and holds it.
+    wait_until("the lock file is made again and held", || {
+        lock_is_held(&d.paths)
+    });
+    let third = Daemon::start(d.paths.clone(), cfg).await;
+    assert!(matches!(third, Err(StartError::AlreadyRunning(_))));
+    assert_eq!(identities(&d.paths)[1], sock);
+    assert!(has_the_session(&d).await);
+    d.stop().await;
+}
+
+/// The socket, or the whole directory, removed under a live daemon: it makes them again, with the
+/// directory's lock, at its next look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_socket_or_directory_is_made_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new();
+    let d = run(&tree, keeping(true, true)).await;
+
+    std::fs::remove_file(d.paths.socket()).unwrap();
+    wait_until("the socket is bound again", || {
+        std::os::unix::net::UnixStream::connect(d.paths.socket()).is_ok()
+    });
+    assert!(has_the_session(&d).await, "same daemon, same session");
+
+    std::fs::remove_dir_all(&tree.dir).unwrap();
+    wait_until("the directory, the socket and the lock are back", || {
+        lock_is_held(&d.paths) && std::os::unix::net::UnixStream::connect(d.paths.socket()).is_ok()
+    });
+    let mode = std::fs::metadata(&tree.dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert!(has_the_session(&d).await);
+    // And the directory is locked again: a cleaner's exclusive lock would fail.
+    wait_until("the directory is locked again", || dir_is_locked(&tree.dir));
+    d.stop().await;
+}
+
+/// A directory the daemon can no longer trust (wrong mode, as if another user had made it) is not
+/// touched: no file is made in it and no time is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_that_is_no_longer_ours_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new();
+    let d = run(&tree, keeping(true, true)).await;
+    std::fs::remove_file(d.paths.lock()).unwrap();
+    std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tokio::time::sleep(EVERY * 5).await;
+    assert!(
+        !d.paths.lock().exists(),
+        "a file was made in a refused directory"
+    );
+    std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    wait_until("it carries on once the directory is right", || {
+        lock_is_held(&d.paths)
+    });
+    d.stop().await;
+}
+
+/// Whether something holds a shared lock on the directory (an exclusive try fails), which is what
+/// systemd-tmpfiles tries.
+fn dir_is_locked(dir: &Path) -> bool {
+    use rustix::fs::{FlockOperation, flock};
+    let Ok(f) = std::fs::File::open(dir) else {
+        return false;
+    };
+    flock(&f, FlockOperation::NonBlockingLockExclusive).is_err()
+}
+
+fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    fil_testkit::wait_until(what, WAIT, cond);
+}

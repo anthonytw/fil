@@ -299,6 +299,53 @@ async fn stuck_forwards_on_a_slow_pipe_body() {
     );
 }
 
+/// **A local abort releases what the pacer counted** (#88 re-check, R1). The application resets
+/// its connection while the forward's bytes are in flight and unacknowledged (the target never
+/// reads): the mux tells the peer itself and raises no `Closed` event, so the endpoint has to tell
+/// the pacer, or the channel's records stay in the cap until the peer's `Close` has made the round
+/// trip. The pipe's 100 ms each way keeps that round trip far longer than the check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_abort_releases_what_the_pacer_counted() {
+    bounded(a_local_abort_releases_what_the_pacer_counted_body()).await
+}
+
+async fn a_local_abort_releases_what_the_pacer_counted_body() {
+    let (deaf_port, deaf) = deaf_target().await;
+    let stream = StreamConfig {
+        latency: Duration::from_millis(100),
+        jitter: Duration::ZERO,
+        bandwidth: None,
+        buffer: 1 << 20,
+    };
+    let w = World::new_pipe_on(mux_config(), stream).await;
+    let port = w.local_forward(1, deaf_port);
+    let s = connect(port).await;
+    fil_forward::stream::set_zero_linger(&s).unwrap();
+    let writer = tokio::spawn(async move {
+        // A little, not a window's worth: a pump whose window is full does not read, and would not
+        // see the reset. The ack takes the pipe's 200 ms round trip, so the bytes are in flight
+        // when the reset comes.
+        let mut s = s;
+        let _ = s.write_all(&[5u8; 8 * 1024]).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let ep = w.client.ep.clone();
+    eventually(Duration::from_secs(10), || ep.pace_state().in_flight > 0).await;
+    assert_eq!(w.client.ep.stats(ForwardId(1)).map(|s| s.open), Some(1));
+    // The application resets: the connection is dropped with a zero linger, within the first round trip.
+    writer.abort();
+    eventually(Duration::from_secs(10), || {
+        ep.stats(ForwardId(1)).is_some_and(|s| s.open == 0)
+    })
+    .await;
+    let p = w.client.ep.pace_state();
+    assert_eq!(
+        p.in_flight, 0,
+        "the aborted channel is still counted: {p:?}"
+    );
+    deaf.abort();
+}
+
 /// A target that takes connections and never reads them, with a receive buffer so small that it
 /// is stuck at once. The default buffer is OS policy, not part of the test: Linux grows it (up
 /// to 6 MiB) as data arrives even when nobody reads, so with 16 of them the "stuck" forwards

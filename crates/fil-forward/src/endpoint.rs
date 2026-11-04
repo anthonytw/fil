@@ -787,6 +787,12 @@ impl<L: Link> State<L> {
     /// of its payloads is still queued is stale (a released channel has nothing the peer wants,
     /// and sending on a finished stream would fail the link), so it goes.
     fn finish_channel(&mut self, ch: ChannelId) {
+        self.drop_queued(ch);
+        self.finish_out.push_back(ch);
+    }
+
+    /// Drops the payloads of `ch` that wait for the data sender.
+    fn drop_queued(&mut self, ch: ChannelId) {
         let mut freed = 0;
         self.data_out.retain(|(c, p)| {
             let stale = *c == ch;
@@ -797,7 +803,6 @@ impl<L: Link> State<L> {
         });
         self.data_out_bytes -= freed;
         self.queued.remove(&ch.0);
-        self.finish_out.push_back(ch);
     }
 
     /// The next item the data sender may hand to the current link: a `Finish` (never held), then
@@ -2654,6 +2659,13 @@ impl<L: Link> Inner<L> {
         }
         st.touch(now());
         st.mux.abort(ch, why);
+        // No `Closed` event follows a local abort (the mux has told the peer already), so
+        // nothing else would tell the pacer: its records of the channel would stay counted until
+        // the peer's `Close` releases it, and the peer's acks for them are not fed once the
+        // channel is closing. What the abort discarded in the mux is stale in the queue too: sent
+        // after the pacer forgot the channel, it would be recorded again.
+        st.drop_queued(ch);
+        st.pacer.forget(ch);
         st.end_slot(ch, why);
         self.drain(&mut st);
         drop(st);

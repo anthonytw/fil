@@ -169,6 +169,8 @@ The bootstrap command (§3, U1) is a compile-time constant. A const check in `cr
 - the quoted body contains no `'`, `\` or `!`;
 - the version and wire it embeds use only `[0-9A-Za-z.+-]`.
 
+A second check, in the same test, rejects any `umask` outside a subshell, any `LC_ALL` assignment that is not a command prefix, and any `echo` of a value read from input.
+
 The reason: fish and tcsh parse the outer `sh -c '…'` before `sh` sees it. fish honors `\'` and `\\` inside single quotes, and csh refuses a newline inside quotes and may expand `!`. A golden file pins the exact bytes, as the wire golden pins messages.
 
 ## 3. Packages
@@ -253,15 +255,27 @@ Every package keeps M2's rules:
 - **The manual path, always.** A user can install by hand, by copying `bin/fil` to the host. If the default `fil server --stdio` cannot find it, the first-attach error says where fil looks and what to do. Without OQ-1, that and the docs are all U1 builds.
 - **One bootstrap command** (OQ-1; the exact text is in §7):
   - **What it is:** a compile-time constant POSIX `sh -c '…'` one-liner that holds the build's version and wire and nothing else.
+  - **It changes nothing it hands on.** It never sets `umask` outside a subshell, and `LC_ALL=C` only as a prefix of the one command that needs it (`expr`). So every `fil server --stdio` it `exec`s runs with the login's own umask, locale and environment, as the plain command does. A test checks that a session's umask is the same whether its daemon was started by the plain command or by the bootstrap.
   - **Modes travel on stdin, not in the command line.** The client writes one line before anything else: `attach`, `check` or `remove`.
+  - **Every `--version` call reads `/dev/null`,** so a program that is not fil cannot swallow the protocol.
   - **`attach`:**
-    1. It `exec`s the exact-version copy in `~/.local/share/fil`, once the script has checked the directory chain.
-    2. Otherwise it `exec`s `~/.local/bin/fil`, if that file's `--version` names the client's wire. That is where the manual instructions put the binary, and it fixes the usual "not on the `PATH` of a non-interactive login" failure that mosh and ET users hit.
+    1. It `exec`s the exact-version copy in `~/.local/share/fil`, once the script has checked the directory chain and the file.
+    2. Otherwise it `exec`s `~/.local/bin/fil`, but only if:
+       - `$HOME`, `~/.local` and `~/.local/bin` pass the same directory checks as the install chain;
+       - the file is a regular file, not a symbolic link, the user's own, and not group- or world-writable;
+       - its `--version` names the client's wire.
+
+       That is where the manual instructions put the binary, and it fixes the usual "not on the `PATH` of a non-interactive login" failure that mosh and ET users hit. A copy that passes these checks is trusted because it is in the user's own directory, as their `~/.bashrc` is. Its `--version` identifies it; it does not verify it.
     3. Otherwise it greets the client (`FIL-BOOT1 attach <uname -s> <uname -m>`) and waits for either an upload or `end`.
 
-    `PATH` is not tried, because the plain command has already tried it. That order also keeps an old system-wide fil from hiding a newer manual install.
-  - **`check`:** it reports the fil-installed copies and the `--version` of the fils on `PATH` and in `~/.local/bin` (`fil install --check HOST`). The client sanitizes all of that text, which is untrusted, before showing it.
-  - **`remove`:** it hands over to the exact-version copy's `--install-gc` (`fil install --remove HOST`).
+    Before each `exec … server --stdio`, it prints `FIL-BOOT1 exec`. `PATH` is not tried, because the plain command has already tried it. That order also keeps an old system-wide fil from hiding a newer manual install.
+  - **`check`** (`fil install --check HOST`): it lists the fil-installed copies that pass the checks, the `--version` of the fil on `PATH`, and the `--version` of `~/.local/bin/fil` if that passes the checks above. The client sanitizes all of that text, which is untrusted, before showing it, and ends the run after 10 s, since a wrapper on `PATH` may hang.
+  - **`remove`** (`fil install --remove HOST`): it hands over to `--install-gc` of a fil-installed copy that passes the checks, the exact version if present and any other otherwise, so that the collection of §2.4 runs whichever copies are there.
+- **The client's reading of the bootstrap's output** (in `attach` mode):
+  - **`FIL-BOOT1 exec` and then a preamble** means the fast path: the attach continues on this login.
+  - **`FIL-BOOT1 attach …`** is the greeting, so an upload can follow.
+  - **A preamble with no `FIL-BOOT1` line before it** means a forced command ran `fil server --stdio` in place of the bootstrap. That relay has already received the mode line, so the client ends the run at once, without sending anything more, and says that this host allows only the plain command (`remote = "plain"`).
+  - Noise from rc files before any of these is skipped, as the preamble scanner skips it.
 - **When the bootstrap runs: `remote = "auto"`** (proposed default).
   - **The first try.** Every connection of a run (attach, `fil ls`, `kill`, `ports`, `forward` and `detach HOST`) first uses the plain `fil server --stdio`, as today. An admin's `ForceCommand` or `authorized_keys` `command=` gate that allows only that exact command keeps working.
   - **The fallback.** The client tries the bootstrap once, if the plain command fails at the run's first connection in one of two ways:
@@ -272,22 +286,31 @@ Every package keeps M2's rules:
   - **The cost in logins** (with a password or a second factor, each one is a prompt):
     - on first contact with a host that has no usable fil: two logins (the plain try, then the bootstrap, which uploads and becomes the attach);
     - on every later run against a host that has only a fil-installed copy: two logins, unless the user sets `remote = "installed"` for that host. `fil install` and the offer print that one config line, for the user to add to their own config; fil keeps no state about the host.
-- **The upload** (OQ-1), in `attach` mode after the greeting, or by `fil install HOST`:
-  1. **The greeting first.** The client sends nothing but its one mode line until it has read the exact `FIL-BOOT1` greeting, scanning past noise from rc files the way the preamble scanner does. If a preamble comes back instead, a forced command ran the relay: the client ends that run and says so. It never writes the binary anywhere but to the script.
-  2. **The request.** The client sends `put <size> <sha256>`. The script checks the size (digits only, at most 128 MiB) and the hash (exactly 64 lowercase hex characters) with `tr` and `test`, with every expansion quoted. Anything else ends it.
-  3. **The directory chain, checked before a byte is written** (B1). For `$HOME`, `~/.local`, `~/.local/share` and `~/.local/share/fil`, the script uses `ls -ldn` and `id -u` (both POSIX): each must be a real directory, not a symbolic link, owned by the user (or by root, for the parents), and not group- or world-writable. `~/.local/share/fil` must be the user's own, with mode `drwx------`. A missing one is created with `mkdir -m 700`.
-  4. **A fresh directory per upload.** `mkdir -m 700 ~/.local/share/fil/.new-$$`, which fails if it exists.
-  5. **The bytes.** They arrive with `head -c <size>` (present in GNU, busybox, the BSDs and macOS), and the count is checked with `wc -c`.
-  6. **The hash.** It is checked with `sha256sum` or `shasum -a 256`, whichever is present. If neither is present, the script refuses, removes the directory, and the client points the user at the manual install.
-  7. **Only then is anything run.** The script `exec`s the new binary as `fil server --install-finish <ver-wire> <sha256> <mode>`. That Rust code:
-     - checks the chain again with `lstat`;
+- **The upload** (OQ-1), in `attach` mode after the greeting, or by `fil install HOST`. Every step runs in this order:
+  1. **The greeting first.** The client sends nothing but its one mode line until it has read the greeting (above). It never writes the binary anywhere but to the script.
+  2. **The request.** The client sends `put <size> <sha256>`. The script checks the size (1 to 9 digits, at most 128 MiB) and the hash (exactly 64 lowercase hex characters) with `expr` under `LC_ALL=C`, never with `echo`, whose handling of `\c` varies between shells, and with every expansion quoted. Anything else ends it.
+  3. **The hash tool.** It finds `sha256sum` or `shasum -a 256`. If neither is present, it refuses (`FIL-BOOT1 nohash`) before it has created anything, and the client points the user at the manual install.
+  4. **The directories that exist, checked before anything is created** (B1). For `$HOME`, `~/.local`, `~/.local/share` and `~/.local/share/fil`, the script uses `ls -ldn` and `id -u` (both POSIX) on each one that exists:
+     - each must be a real directory, not a symbolic link, owned by the user (or by root, for the parents), and not group- or world-writable;
+     - `~/.local/share/fil` must be the user's own, with mode exactly `drwx------`. No `+` is allowed: fil made that directory and it never needs an ACL;
+     - **on macOS** (`uname -s` is `Darwin`), a parent with any `allow` entry in `ls -lde` is refused. On macOS an ACL can grant another user write without changing the mode bits. A home's default `group:everyone deny delete` entry is accepted, because it only denies. On Linux, a POSIX ACL that grants write shows in the group bits, which the mode check already refuses.
+
+     A failure is `FIL-BOOT1 baddir`. Nothing has been created at that point, and nothing is ever created inside a refused parent.
+  5. **The missing directories,** created with `mkdir -m 700`. The script remembers which ones it created, then checks the whole chain again.
+  6. **A fresh directory per upload.** `mkdir -m 700 ~/.local/share/fil/.new-$$`, which fails if it exists.
+  7. **The bytes.** They arrive with `head -c <size>` (present in GNU, busybox, the BSDs and macOS), in a subshell under `umask 077`, and the count is checked with `wc -c`.
+  8. **The hash.** It is checked with the tool found in step 3. A mismatch is `FIL-BOOT1 badhash`.
+
+     **On any refusal from step 5 on,** the script removes its fresh directory and exactly the directories that this run created (`rmdir`), and nothing else.
+  9. **Only then is anything run.** The script `exec`s the new binary as `fil server --install-finish <ver-wire> <sha256> <created>`, where `<created>` says which parents this run made. That Rust code:
+     - checks the chain again with `lstat` (and undoes only this run's directories if it refuses);
      - renames the fresh directory into place (a copy of the same version that is already there is kept, and the new one is discarded);
-     - collects old copies (§2.4);
-     - prints `FIL-BOOT1 ok <wire>`, which the client compares with its own wire, and reads one more line. `go` `exec`s the installed `fil server --stdio`, so the install login is also the first attach. `done` ends the run (`fil install`).
+     - collects old copies (§2.4), and only those `.new-*` directories that are more than an hour old, so it never removes another client's upload in flight. A process ID alone cannot tell them apart: IDs repeat across hosts that share an NFS home, and across containers;
+     - prints `FIL-BOOT1 ok <wire>`, which the client compares with its own wire, and reads one more line. `go` prints `FIL-BOOT1 exec` and `exec`s the installed `fil server --stdio`, so the install login is also the first attach. `done` ends the run (`fil install`).
 
-     The exchange is in lockstep: the client sends nothing after the bytes until it has read that result line, so `head` cannot read past them.
+     The exchange is in lockstep: the client sends nothing after the bytes until it has read that result line, so `head` cannot read past them. macOS's `head -c` reads through stdio and could otherwise swallow later input. This is an invariant of the client.
 
-  **The rule, as §4 states it: nothing in the target path is executed until the script has checked the path and the hash.**
+  **The rule, as §4 states it: nothing in the target path, and no `~/.local/bin/fil`, is executed until the script has checked the path (and, for an upload, the hash).**
 - **Which binary is sent:**
   1. the bundled one in `libexec/fil/remote/` for the remote's OS and architecture, checked against that directory's `SHA256SUMS` before sending;
   2. otherwise the client's own executable, **only if it is a release build**: the release workflow marks its builds at compile time, and the client also scans the file for `FIL_TEST_` and for builder home paths (`/Users/`, `/home/`);
@@ -295,6 +318,9 @@ Every package keeps M2's rules:
 
   So a development build, or a `cargo install` build that still carries its builder's paths, is never uploaded. Its user's name and home directory would otherwise reach the remote host (§11.1).
 - **The offer** (OQ-1). With `install = "ask"` (proposed default), when the first attach of a run finds no usable fil, the client asks once, before the terminal goes raw: *install fil 0.1.0 (wire 1.12) into ~/.local/share/fil on HOST? [y/N]*. It asks only on an interactive first attach: never in a background reconnect, never for `fil ls` and the other management commands, and never when stdin is not a terminal. `install = "never"` only prints the error. `install = "always"` installs without asking; that is the user's explicit consent in their own config, and never the default.
+- **Known limits:**
+  - **A `$HOME` that is itself a symbolic link** (some NFS and automount setups) is refused by the chain check, so install through fil does not work there. That is a safe failure. Manual install still works, and the troubleshooting page (DOC) says so.
+  - **Visible to other users.** Other users on the host can see the bootstrap's command line, with its version, in `ps`, as they can see `fil server --stdio` today (§4).
 - **Security and privacy (§11, §11.1):**
   - the bootstrap contains no user input;
   - the binary travels only over the authenticated pipe, and nothing is downloaded;
@@ -304,27 +330,44 @@ Every package keeps M2's rules:
   - the remote host learns the binary and its version, which the hello already tells it, and a release binary carries no builder path (REL's `release-check`);
   - code running as the same user on the remote can replace the installed copy afterward. That is out of scope, as it is today for `~/.bashrc` (§11 of DESIGN).
 - **Tests:**
-  - **Unit tests:** the header and greeting parsers, the binary choice, the eligibility scan (a development build is refused), the GC selection, and the fallback state machine for each subcommand, over a fake pipe.
+  - **Unit tests:** the header and greeting parsers, the reading of the bootstrap's output (marker, greeting, unmarked preamble), the binary choice, the eligibility scan (a development build is refused), the GC selection (including the age bound on `.new-*`), and the fallback state machine for each subcommand, over a fake pipe.
   - **The golden** of the remote command.
-  - **realnet `install`** (x86_64 containers whose login shell is each of `bash`, `dash`, `zsh`, `fish`, `tcsh` and busybox `ash`):
+  - **A shell harness** that runs the golden string itself, in a temporary `HOME`, against a fake `fil`. It runs under every outer shell available on the machine (sh, bash, zsh, dash, ksh, tcsh, csh), with `/bin/sh` and dash as the inner `sh`, and covers the cases below that need no container. That harness was used, on macOS, to check the string in §7 (PR body).
+  - **realnet `install`** (x86_64 containers whose login shell is each of `bash`, `dash`, `zsh`, `fish` and `tcsh`, and a **stock Alpine image** for busybox `ash` and busybox `head -c`):
     - an install and an attach with each shell;
     - the trigger under `tcsh` (status 1, not 127);
-    - a host with neither hash tool: refused, nothing left behind;
-    - **a group-writable `~/.local/share`** and **a symbolic link in place of `~/.local/share/fil`**: both refused before anything runs; a canary binary in the link's target is never executed;
+    - **a session's umask is the same** whether its daemon was started by the plain command, the fast path or an install;
+    - a host with neither hash tool: refused, and **`$HOME` unchanged** (no `~/.local` made);
+    - **a group-writable `~/.local/share`**, and **a symbolic link in place of `~/.local/share/fil`**: both refused before anything runs, nothing is created inside the refused parent, and a canary binary in the link's target is never executed;
+    - **a world-writable `~/.local/bin`** holding a canary `fil` that prints the right wire, and **a group-writable `~/.local/bin/fil`**: neither runs;
+    - **a `~/.local/bin/fil` that is not fil and reads stdin:** the protocol is unaffected;
+    - a symbolic-link `$HOME`: refused, with the troubleshooting message;
     - a `noexec` home and a read-only home: clean errors;
-    - an interrupted upload: no binary under the final name, and the fresh directory is collected next time;
-    - two clients installing at once: one rename wins, and both attach;
+    - a bad hash, and a short upload: refused, with the fresh directory and this run's parents removed;
+    - an interrupted upload: no binary under the final name, and the fresh directory is collected once it is an hour old;
+    - two clients installing at once, **with a GC running while the other upload is in flight:** one rename wins, the other upload is not touched, and both attach;
     - an old wire's `fil` on `PATH`: the exact version wins, and the old daemon keeps its sessions;
-    - a `ForceCommand` gate that allows only `fil server --stdio`: the plain first try still works, and `remote = "installed"` is refused cleanly without writing the binary to the relay;
+    - a `ForceCommand` gate that allows only `fil server --stdio`: the plain first try still works, and `remote = "installed"` is refused cleanly (an unmarked preamble), without writing the binary to the relay;
     - GC keeps a directory whose wire has a running daemon, or whose `.start` lock is held.
   - **The bundle, end to end** (in realnet): a development-build client placed as `bin/fil` in an unpacked dry-run archive, so its own executable is not eligible and the bundle is chosen and checked. A tampered bundle (one byte changed) is refused before any byte is sent.
-  - **On macOS** (MAC's remote job): `fil install` to the runner itself.
+  - **On macOS** (MAC's remote job):
+    - `fil install` to the runner itself;
+    - an inheritable `allow` ACL on `~/.local/share/fil`, and an `allow` entry on `~/.local/share`: both refused;
+    - a home with only the default `deny` entry: accepted.
 - **Mutation:**
 
   | Mutation | The test that fails |
   |---|---|
   | interpolate the host into the bootstrap | the golden and const-check tests |
-  | **move the chain check after the `exec` of the new binary** | the canary in the symbolic-link test runs, and the test fails |
+  | **move the chain check after the `exec` of the new binary** | the canary in the symbolic-link test runs |
+  | run `~/.local/bin/fil` without its directory and file checks | the world-writable `~/.local/bin` canary runs |
+  | set `umask 077` for the whole script | the umask-equality test |
+  | validate the header with `echo` instead of `expr` | the `\c` header test under dash |
+  | create the missing directories before checking the existing ones | the group-writable-parent test finds a directory inside it |
+  | detect the hash tool after creating the directories | the no-hash-tool test finds a `~/.local` left behind |
+  | accept a `+` on `~/.local/share/fil` | the macOS ACL test |
+  | drop the `FIL-BOOT1 exec` marker | the `ForceCommand` test with `remote = "installed"` |
+  | let GC remove `.new-*` of any age | the GC-during-upload test |
   | create the fresh directory with `mkdir -p` | the pre-existing-directory test |
   | skip the hash check | the corrupted-upload test |
   | trigger on status 127 only | the `tcsh` test |
@@ -414,7 +457,7 @@ Every package keeps M2's rules:
 - **Done when:** a dry run from main produces complete, reproducible artifacts on the run, `release-verify` reproduces them in the VM, and nothing is published.
 
 **TMP: survive temporary-file cleaners**
-- **Owns:** `crates/fil-daemon/src/{paths.rs, daemon.rs}` (the hourly maintenance hook and the directory lock), `crates/fil-daemon/tests/tmp_clean.rs` (new), and the socket-directory paragraph of DESIGN §5.3.
+- **Owns:** `crates/fil-daemon/src/{paths.rs, daemon.rs}` (the hourly maintenance hook and the directory lock; `daemon.rs` after LOG's PR merges), `crates/fil-daemon/tests/tmp_clean.rs` (new), and the socket-directory paragraph of DESIGN §5.3 (after LOG).
 - **Builds (proposed):**
   - **Fresh times.** Every hour, on the wake it already has for log maintenance, the daemon sets fresh times on its socket directory, its socket, its lock and start files, and its agent directory and sockets. Setting the times also renews the change time, so neither cleaner sees an old entry.
   - **A shared lock.** The daemon holds a shared `flock` on the socket directory for its whole life, which systemd-tmpfiles honors by skipping the directory.
@@ -439,7 +482,8 @@ Every package keeps M2's rules:
 - **Done when:** every target runs. A campaign (each target for an hour, in the VM or on a runner) finds no crash, or each crash becomes a fix PR. The campaign is part of SWEEP's security audit.
 
 **LOG: a non-blocking log writer** (M1-A2)
-- **Owns:** `crates/fil-daemon/src/logging.rs`, `crates/fil/src/logging.rs` (if its glue changes), `crates/fil-daemon/tests/log_content.rs` and `crates/fil-daemon/tests/log_blocking.rs` (new), and the logging sentence of DESIGN §5.3 (after TMP's edit to that section, or merged with it by the coordinator).
+- **In flight:** PR #92 (`m4-log`).
+- **Owns:** `crates/fil-daemon/src/logging.rs`, `crates/fil/src/logging.rs` (if its glue changes), one exit-flush line each in `crates/fil/src/app.rs` and `crates/fil-daemon/src/daemon.rs`, `crates/fil-daemon/tests/log_content.rs` and `crates/fil-daemon/tests/log_blocking.rs` (new), and the logging sentence of DESIGN §5.3. `app.rs` is a serialized file, and LOG holds the first slot (§3, hot spots); TMP comes after LOG on `daemon.rs` and §5.3.
 - **Builds:**
   - **A bounded queue.** The tracing layer hands each formatted line to a queue (proposed: 1,024 lines or 1 MiB, whichever comes first) and returns at once.
   - **One writer thread** does every write, rotation, reopen and prune. `maintain` becomes a message to that thread instead of a lock taken by another one.
@@ -544,7 +588,7 @@ Every package keeps M2's rules:
     - `daemon.toml`;
     - **for host admins:** `/etc/fil/policy.toml` and the sshd mirror;
     - security and privacy, in plain words, from §11 and §11.1;
-    - troubleshooting: `fil install --check`, `FIL_LOG`, the logout warning, version mismatches, and patch releases with running daemons (§2.1);
+    - troubleshooting: `fil install --check`, `FIL_LOG`, the logout warning, version mismatches, patch releases with running daemons (§2.1), a `$HOME` that is a symbolic link (install through fil refuses it), and hosts that allow only the plain command;
     - fil compared with ssh, ET and mosh.
   - **Man pages:**
     - `fil(1)`, generated from the clap definitions;
@@ -577,7 +621,7 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 
 | Files | Order |
 |---|---|
-| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **U1** (M4, Wave 1, now) → **E1b** (M3's small config-and-flag PR, which follows M3's E1a) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). DOC's `docs_sync.rs` comes after CFG. |
+| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **LOG** (M4, #92, in flight: one exit-flush line in `app.rs`) → **U1** (M4, Wave 1) → **E1b** (M3's small config-and-flag PR, which follows M3's E1a) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). DOC's `docs_sync.rs` comes after CFG. |
 | `crates/fil-proto/src/limits.rs` and the wire golden | M3's **W1** while it is open; CFG edits only defaults the golden does not pin, after W1 merges; a golden-pinned default is a wire change of its own (§0). |
 | The catch-up rule (`crates/fil-proto/src/log.rs`, `crates/fil-session/src/core.rs` `on_catch_up`), DESIGN §6.2 | M3's **K1** only. |
 | `.github/workflows/linux-check.yml` | Each package adds its own suite or part (U1: the realnet `install` part and its timeout; M3's T2: a `terminals` suite). Each addition to the suite list, matrix or timeout map is one line, and whoever lands second merges it. |
@@ -591,7 +635,7 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 - `.github/workflows/release.yml`: REL, with step additions by LIC (notices) and DOC (man pages, completions) after REL merges.
 - `.github/workflows/macos-check.yml`: MAC, with PKG's `brew` step after MAC merges.
 - `docs/user/install.md`: DOC's skeleton, then PKG's install section.
-- DESIGN §5.3: TMP, then LOG, or both merged by the coordinator.
+- `crates/fil-daemon/src/daemon.rs` and DESIGN §5.3: LOG (#92), then TMP.
 - The `justfile`: REL, MAC, FUZZ, LIC, PKG and DOC each add recipes in a section of their own. The conflicts are append-only, and the coordinator resolves them.
 - `DESIGN.md` otherwise: each package edits its own sections (listed above), and the coordinator resolves overlaps.
 
@@ -601,10 +645,11 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 
 - **The remote command** (OQ-1).
   - Today it is exactly `fil server --stdio`, because ssh hands its command to the remote shell as a string (§8.2 of DESIGN). U1 keeps that as the first and default try.
-  - It adds exactly one more command: a compile-time constant that holds only the build's version and wire, checked character by character at compile time (§2.5) and pinned by a golden. Its modes travel on stdin.
+  - It adds exactly one more command: a compile-time constant that holds only the build's version and wire, checked character by character at compile time (§2.5) and pinned by a golden. Its modes travel on stdin. It hands on the login's umask and environment unchanged.
+  - Other local users can see that command line, with its version, in `ps`. That is acceptable: the version is no secret (the hello carries it), and `fil server --stdio` is just as visible today.
   - No session name, host name, path or config value is ever part of a remote command. A user's own `pipe` stays theirs, untouched.
-- **The upload.** **Nothing in the target path is executed until the script has checked the path and the hash**:
-  1. the directory chain is checked before a byte is written;
+- **The upload.** **Nothing in the target path, and no `~/.local/bin/fil`, is executed until the script has checked the path (and, for an upload, the hash)**:
+  1. the hash tool is found and the existing directories are checked before anything is created, and nothing is created inside a refused parent; a refusal removes only what this run created;
   2. the bytes go into a fresh `mkdir -m 700` directory;
   3. the size and the SHA-256 are verified;
   4. only then is the new binary run, and it checks the chain again before it renames itself into place.
@@ -726,31 +771,47 @@ Fix PRs follow, reviewed as usual. **A verification pass on the release-candidat
 
 ## 7. Owner questions
 
-Only the questions that are truly the owner's: accounts, identity, the site, and anything that touches a §11 invariant. Each comes with a recommendation.
+Only the questions that are truly the owner's: accounts, identity, the site, and anything that touches a §11 invariant. Each comes with a recommendation. Other plans cite them as "M4 OQ-n", since M3's plan has questions of its own.
 
 **OQ-1. May fil run one more fixed remote command, and write a binary to a new directory on the remote?** This changes three decided or invariant texts, so the owner's approval covers exactly the following.
 
 1. **The commands.** There would be exactly two remote commands, and no others:
    - **A, unchanged:** `fil server --stdio`. It stays the first try on every run, and the only command when the user's config says `remote = "plain"`.
-   - **B, new:** the bootstrap. It is one compile-time constant line, holding only the build's version and wire (`<ver>` and `<w>` below, checked at compile time to be `[0-9A-Za-z.+-]`), with no `'`, `\` or `!` in its body, and pinned by a golden. Its mode (`attach`, `check` or `remove`) is the first line the client writes on stdin, never part of the command. For 0.1.0 on wire 1.12 it is:
+   - **B, new:** the bootstrap. It is one compile-time constant line, holding only the build's version and wire (`v` and `w` below, checked at compile time to be `[0-9A-Za-z.+-]`), with no `'`, `\` or `!` in its body, and pinned by a golden. Its mode (`attach`, `check` or `remove`) is the first line the client writes on stdin, never part of the command.
+
+     **What it does** (§3, U1):
+     - **It changes nothing it hands on:** no `umask` outside the upload's subshell, and `LC_ALL=C` only as a prefix of `expr`. Every `exec … server --stdio` therefore runs with the login's own umask and environment.
+     - **It runs nothing unchecked.** It `exec`s an installed copy only after `$HOME`, `~/.local`, `~/.local/share` and `~/.local/share/fil` pass the ownership and mode checks: owned by the user (or root, for the parents), not group- or world-writable, not a symbolic link; `~/.local/share/fil` exactly `drwx------`, with no ACL; on macOS, no `allow` ACL entry on a parent.
+     - **It runs `~/.local/bin/fil` only after the same checks** on its directories and on the file itself, and only if its `--version` names the client's wire. A correctly owned copy there is trusted like the user's `~/.bashrc`: `--version` identifies it, it does not verify it.
+     - **Every `--version` call reads `/dev/null`.**
+     - **It marks the fast path** with `FIL-BOOT1 exec` before each `exec`, so the client can tell it from a forced command.
+     - **An upload checks the header with `expr`** (never `echo`), finds the hash tool and checks the existing directories before it creates anything, creates the missing ones with `mkdir -m 700`, writes into a fresh `.new-$$` directory under `umask 077` in a subshell, checks the size and the SHA-256, and only then runs the new binary.
+     - **On a refusal it removes** its fresh directory and the directories that this run created, and nothing else.
+
+     For 0.1.0 on wire 1.12 it is:
 
      ```sh
-     sh -c 'umask 077; v=0.1.0-w1.12; w="(wire 1.12)"; u=$(id -u); b="$HOME/.local/share/fil"; ok() { [ -d "$1" ] || return 1; [ -h "$1" ] && return 1; set -- $(ls -ldn "$1"); case $1 in d????-??-?*) ;; *) return 1;; esac; [ "$3" = "$u" ] || [ "$3" = 0 ]; }; own() { ok "$1" || return 1; set -- $(ls -ldn "$1"); case $1 in drwx------*) ;; *) return 1;; esac; [ "$3" = "$u" ]; }; chain() { ok "$HOME" && ok "$HOME/.local" && ok "$HOME/.local/share" && own "$b"; }; IFS= read -r m || exit 1; if [ "$m" = check ]; then for d in "$b"/*; do [ -x "$d/fil" ] && echo "FIL-HAVE ${d##*/}"; done; command -v fil >/dev/null && echo "FIL-PATH $(fil --version | head -n 1)"; [ -x "$HOME/.local/bin/fil" ] && echo "FIL-LOCAL $("$HOME/.local/bin/fil" --version | head -n 1)"; exit 0; fi; if [ "$m" = remove ]; then chain && own "$b/$v" && [ -x "$b/$v/fil" ] && exec "$b/$v/fil" server --install-gc; echo "FIL-BOOT1 none"; exit 1; fi; [ "$m" = attach ] || exit 1; if chain && own "$b/$v" && [ -x "$b/$v/fil" ]; then exec "$b/$v/fil" server --stdio; fi; f="$HOME/.local/bin/fil"; if [ -x "$f" ] && "$f" --version | grep -qF "$w"; then exec "$f" server --stdio; fi; echo "FIL-BOOT1 attach $(uname -s) $(uname -m)"; IFS=" " read -r c s h || exit 1; [ "$c" = put ] || exit 0; [ -n "$s" ] && [ -z "$(echo "$s" | tr -d 0-9)" ] && [ "$s" -le 134217728 ] && [ ${#h} -eq 64 ] && [ -z "$(echo "$h" | tr -d 0-9a-f)" ] || exit 1; for p in "$HOME/.local" "$HOME/.local/share" "$b"; do [ -e "$p" ] || mkdir -m 700 "$p" || exit 1; done; chain || { echo "FIL-BOOT1 baddir"; exit 1; }; n="$b/.new-$$"; mkdir -m 700 "$n" || exit 1; head -c "$s" > "$n/fil" || { rm -rf "$n"; exit 1; }; [ $(($(wc -c < "$n/fil"))) -eq "$s" ] || { rm -rf "$n"; exit 1; }; if command -v sha256sum >/dev/null; then x=$(sha256sum < "$n/fil"); elif command -v shasum >/dev/null; then x=$(shasum -a 256 < "$n/fil"); else echo "FIL-BOOT1 nohash"; rm -rf "$n"; exit 1; fi; [ "${x%% *}" = "$h" ] || { rm -rf "$n"; exit 1; }; chmod 700 "$n/fil" && exec "$n/fil" server --install-finish "$v" "$h" attach'
+     sh -c 'v=0.1.0-w1.12; w="(wire 1.12)"; u=$(id -u); b="$HOME/.local/share/fil"; f="$HOME/.local/bin/fil"; n=""; k1=""; k2=""; k3=""; say() { printf "%s" "$*"; echo; }; mac() { [ "$(uname -s)" = Darwin ] || return 1; ls -lde "$1" | grep -q " allow "; }; ok() { [ -d "$1" ] || return 1; [ -h "$1" ] && return 1; set -- "$1" $(ls -ldn "$1"); case $2 in d????-??-?*) ;; *) return 1;; esac; [ "$4" = "$u" ] || [ "$4" = 0 ] || return 1; mac "$1" && return 1; return 0; }; own() { [ -d "$1" ] || return 1; [ -h "$1" ] && return 1; set -- "$1" $(ls -ldn "$1"); case $2 in drwx------|drwx------[.@]) ;; *) return 1;; esac; [ "$4" = "$u" ]; }; exe() { [ -f "$1" ] || return 1; [ -h "$1" ] && return 1; set -- "$1" $(ls -ln "$1"); case $2 in -????-??-?|-????-??-?[.@]) ;; *) return 1;; esac; [ "$4" = "$u" ] && [ -x "$1" ]; }; chain() { ok "$HOME" && ok "$HOME/.local" && ok "$HOME/.local/share" && own "$b"; }; lb() { ok "$HOME" && ok "$HOME/.local" && ok "$HOME/.local/bin" && exe "$f"; }; pre() { [ -e "$1" ] || [ -h "$1" ] || return 0; "$2" "$1"; }; undo() { [ -n "$n" ] && rm -rf "$n"; [ -n "$k3" ] && rmdir "$b"; [ -n "$k2" ] && rmdir "$HOME/.local/share"; [ -n "$k1" ] && rmdir "$HOME/.local"; exit 1; }; IFS= read -r m || exit 1; if [ "$m" = check ]; then if chain; then for d in "$b"/*; do own "$d" && exe "$d/fil" && say FIL-HAVE "${d##*/}"; done; fi; command -v fil >/dev/null && say FIL-PATH "$(fil --version </dev/null | head -n 1)"; lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; exit 0; fi; if [ "$m" = remove ]; then if chain; then for d in "$b/$v" "$b"/*; do if own "$d" && exe "$d/fil"; then say FIL-BOOT1 gc; exec "$d/fil" server --install-gc; fi; done; fi; say FIL-BOOT1 none; exit 1; fi; [ "$m" = attach ] || exit 1; if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 exec; exec "$b/$v/fil" server --stdio; fi; if lb && "$f" --version </dev/null | grep -qF "$w"; then say FIL-BOOT1 exec; exec "$f" server --stdio; fi; say FIL-BOOT1 attach "$(uname -s)" "$(uname -m)"; IFS=" " read -r c s h || exit 1; [ "$c" = put ] || exit 0; [ -n "$s" ] && [ "${#s}" -le 9 ] && [ "$(LC_ALL=C expr "x$s" : "x[0-9]*")" = "$((${#s}+1))" ] && [ "$s" -le 134217728 ] && [ "${#h}" -eq 64 ] && [ "$(LC_ALL=C expr "x$h" : "x[0-9a-f]*")" = 65 ] || exit 1; if command -v sha256sum >/dev/null; then t=sha256sum; elif command -v shasum >/dev/null; then t="shasum -a 256"; else say FIL-BOOT1 nohash; exit 1; fi; ok "$HOME" && pre "$HOME/.local" ok && pre "$HOME/.local/share" ok && pre "$b" own || { say FIL-BOOT1 baddir; exit 1; }; [ -d "$HOME/.local" ] || { mkdir -m 700 "$HOME/.local" || undo; k1=1; }; [ -d "$HOME/.local/share" ] || { mkdir -m 700 "$HOME/.local/share" || undo; k2=1; }; [ -d "$b" ] || { mkdir -m 700 "$b" || undo; k3=1; }; chain || { say FIL-BOOT1 baddir; undo; }; mkdir -m 700 "$b/.new-$$" || undo; n="$b/.new-$$"; ( umask 077; head -c "$s" > "$n/fil" ) || undo; [ "$(($(wc -c < "$n/fil")))" -eq "$s" ] || undo; x=$($t < "$n/fil"); [ "${x%% *}" = "$h" ] || { say FIL-BOOT1 badhash; undo; }; chmod 700 "$n/fil" || undo; exec "$n/fil" server --install-finish "$v" "$h" "$k1$k2$k3"'
      ```
 
+     It was run, as written here, in a temporary `HOME` against a fake `fil`, under the outer shells sh (bash 3.2), bash, zsh, dash, ksh, tcsh and csh, each with `/bin/sh` and with dash as the inner `sh`: 18 cases each, the same results in all 14 combinations (the PR lists them). fish and busybox are covered by realnet.
+
      U1 may change this text only to fix a bug that its tests find. Any change of behavior goes back to the owner, and U1's PR shows the final string next to this one.
-   - **`fil install HOST`** uses command B in `attach` mode. After the upload, the installed fil reports its wire, and the client answers `done` instead of `go`, so nothing attaches. **`fil install --check`** and **`--remove`** use B's `check` and `remove` modes. No third command exists.
-2. **The directory.** `~/.local/share/fil/<ver>-w<major>.<rev>/` becomes the one place on the remote, besides the state directory and the socket directory, where fil writes. That changes **§11.1.5 of DESIGN (decided, owner 2026-11-02)**, which would read: "fil creates no shell history, dotfiles or configuration on the host beyond its own state directory, its socket directory and, when the user installs fil through fil, its install directory `~/.local/share/fil`."
+   - **`fil install HOST`** uses command B in `attach` mode. After the upload, the installed fil reports its wire, and the client answers `done` instead of `go`, so nothing attaches. **`fil install --check`** and **`--remove`** use B's `check` and `remove` modes; `remove` hands over to any fil-installed copy that passes the checks, the exact version first. No third command exists.
+2. **The directory.** `~/.local/share/fil/<ver>-w<major>.<rev>/` becomes the one place on the remote, besides the state directory and the socket directory, where fil writes. That changes **§11.1.5 of DESIGN (decided, owner 2026-11-02)**, which would read: "fil creates no shell history, dotfiles or configuration on the host beyond its own state directory, its socket directory and, when the user installs fil through fil, its install directory `~/.local/share/fil` (and `~/.local` and `~/.local/share`, mode 0700, if they did not exist)."
 3. **The invariant lines.** In `CLAUDE.md`, "the fixed remote command" (among the §11 invariants) would become "the fixed remote commands: `fil server --stdio`, and the constant bootstrap pinned by its golden (DESIGN §8.2)". In DESIGN §8.2, "the remote command is always exactly `fil server --stdio`" would become "the remote command is `fil server --stdio`, or, when that fails at a run's first connection or the user's config asks for it, the constant bootstrap; neither is ever assembled from user input". DESIGN §11's "Server binary distribution" paragraph would describe the upload as built.
 4. **The costs the owner accepts:**
    - On a host that has only a fil-installed copy, each run takes two ssh logins (two prompts, with a password or a second factor), unless the user adds the printed `remote = "installed"` line for that host.
-   - Command B runs `ls`, `id`, `uname`, `head`, `wc`, `tr` and `sha256sum` or `shasum` on the remote.
+   - Command B runs `id`, `ls`, `uname`, `grep`, `expr`, `head`, `wc`, `mkdir`, `rmdir`, `rm`, `chmod`, and `sha256sum` or `shasum` on the remote.
+   - Other local users can see B's command line, with the version, in `ps`, as they can see `fil server --stdio` today.
+   - A `$HOME` that is itself a symbolic link is refused, so install through fil does not work there; manual install does.
 
 **Recommendation: yes.** The guards are in §3 (U1) and §4:
 - the plain command stays the first try;
 - `install = "ask"` is the default, and an install never happens in a background reconnect;
 - nothing is downloaded, and nothing about a host is written to disk;
-- nothing in the target path runs until the path and the hash are checked;
+- nothing in the target path, and no `~/.local/bin/fil`, runs until the path (and, for an upload, the hash) is checked;
+- the sessions it starts see the login's own umask and environment;
 - only release builds are uploaded.
 
 **If no:** v1 ships manual install only (U1's manual path, plus the docs), and §16.5 is resolved as "manual".

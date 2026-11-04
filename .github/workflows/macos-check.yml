@@ -107,8 +107,17 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: brew install htop
+      # The runner's account has /bin/bash 3.2 as its login shell; every Mac a person uses has
+      # zsh (the default since macOS 10.15). bash 3.2 has no bracketed paste, which fails three
+      # drop-in scenarios (terminal_modes, escape_handling, binary_garbage) for a reason that is
+      # the shell's. The runner is a throwaway VM.
+      - name: Login shell zsh, as on a Mac a person uses
+        if: ${{ !cancelled() }}
+        run: sudo dscl . -create "/Users/$USER" UserShell /bin/zsh && dscl . -read "/Users/$USER" UserShell
       - name: Drop-in suite, local (the daemon on macOS, real PTYs, no ssh)
         if: ${{ !cancelled() }}
+        env:
+          SHELL: /bin/zsh
         run: just dropin --local
       - name: Logs
         if: always()

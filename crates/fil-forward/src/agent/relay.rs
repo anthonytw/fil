@@ -34,7 +34,7 @@ use tracing::debug;
 
 use super::filter::{
     self, FAILURE_MSG, IDENTITIES_ANSWER, KeyInfo, Request, SIGN_RESPONSE, check_answer,
-    check_request, filter_identities, length_ok,
+    check_request, filter_identities, length_ok, ssh_string,
 };
 use crate::stream::{BoxStream, ForwardStream};
 
@@ -270,6 +270,18 @@ enum Msg {
     Eof,
 }
 
+/// What a length prefix says before the body is read: the body's size, or the message that
+/// settles it (an empty one, or one too long).
+fn body_len(len: u32) -> Result<usize, Msg> {
+    if len == 0 {
+        Err(Msg::Empty)
+    } else if !length_ok(len) {
+        Err(Msg::Oversize)
+    } else {
+        Ok(len as usize)
+    }
+}
+
 /// Reads one message from the agent.
 async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Msg> {
     let mut head = [0u8; 4];
@@ -278,23 +290,13 @@ async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Msg> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Msg::Eof),
         Err(e) => return Err(e),
     }
-    let len = u32::from_be_bytes(head);
-    if len == 0 {
-        return Ok(Msg::Empty);
-    }
-    if !length_ok(len) {
-        return Ok(Msg::Oversize);
-    }
-    let mut body = vec![0u8; len as usize];
+    let len = match body_len(u32::from_be_bytes(head)) {
+        Ok(len) => len,
+        Err(end) => return Ok(end),
+    };
+    let mut body = vec![0u8; len];
     s.read_exact(&mut body).await?;
     Ok(Msg::One(body))
-}
-
-fn framed(msg: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + msg.len());
-    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    out.extend_from_slice(msg);
-    out
 }
 
 /// Most the relay holds of what the remote sent ahead: one whole message and its length.
@@ -328,14 +330,14 @@ impl<R: AsyncRead + AsyncWrite + Unpin> Inbound<R> {
             }
         }
         let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
-        if len == 0 {
-            self.buf.drain(..4);
-            return Ok(Msg::Empty);
-        }
-        if !length_ok(len) {
-            return Ok(Msg::Oversize);
-        }
-        let end = 4 + len as usize;
+        let end = match body_len(len) {
+            Ok(len) => 4 + len,
+            Err(Msg::Empty) => {
+                self.buf.drain(..4);
+                return Ok(Msg::Empty);
+            }
+            Err(end) => return Ok(end),
+        };
         while self.buf.len() < end {
             if !self.fill().await? {
                 return Ok(Msg::Eof);
@@ -406,12 +408,6 @@ impl BindKey {
         m.push(1);
         Some(m)
     }
-}
-
-fn ssh_string(b: &[u8]) -> Vec<u8> {
-    let mut v = (b.len() as u32).to_be_bytes().to_vec();
-    v.extend_from_slice(b);
-    v
 }
 
 /// Relays one connection: requests from `remote` (the channel) through the filter and `rules`
@@ -509,7 +505,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
 {
     let talk = async {
-        agent.write_all(&framed(msg)).await?;
+        agent.write_all(&ssh_string(msg)).await?;
         read_msg(agent).await
     };
     let bounded = tokio::time::timeout(AGENT_ANSWER_TIMEOUT, talk);
@@ -634,7 +630,7 @@ where
             match filter_identities(&answer, |fp| rules.allows(fp)) {
                 Some((out, infos)) => {
                     uses.listed(infos);
-                    Some(framed(&out))
+                    Some(ssh_string(&out))
                 }
                 None => {
                     uses.refused();
@@ -646,9 +642,9 @@ where
             if let Some(info) = signer {
                 uses.signed(info);
             }
-            Some(framed(&answer))
+            Some(ssh_string(&answer))
         }
-        _ => Some(framed(&answer)),
+        _ => Some(ssh_string(&answer)),
     }
 }
 
@@ -837,7 +833,9 @@ mod tests {
             let Ok(Msg::One(_bind)) = read_msg(&mut far).await else {
                 return 0;
             };
-            far.write_all(&framed(&[filter::SUCCESS])).await.unwrap();
+            far.write_all(&ssh_string(&[filter::SUCCESS]))
+                .await
+                .unwrap();
             let mut n = 0;
             let mut b = [0u8; 256];
             while let Ok(k) = far.read(&mut b).await {
@@ -866,7 +864,7 @@ mod tests {
             Arc::new(KeyUses::default()),
         ));
         remote
-            .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+            .write_all(&ssh_string(&[filter::REQUEST_IDENTITIES]))
             .await
             .unwrap();
         let mut answer = Vec::new();
@@ -904,7 +902,7 @@ mod tests {
                 Arc::new(KeyUses::default()),
             ));
             remote
-                .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+                .write_all(&ssh_string(&[filter::REQUEST_IDENTITIES]))
                 .await
                 .unwrap();
             // The request reaches the agent, which says nothing; then the remote ends its side.
@@ -944,7 +942,7 @@ mod tests {
                     return;
                 };
                 agent_far
-                    .write_all(&framed(&[filter::SUCCESS]))
+                    .write_all(&ssh_string(&[filter::SUCCESS]))
                     .await
                     .unwrap();
                 let Ok(Msg::One(_list)) = read_msg(&mut agent_far).await else {
@@ -952,7 +950,7 @@ mod tests {
                 };
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 let _ = agent_far
-                    .write_all(&framed(&[IDENTITIES_ANSWER, 0, 0, 0, 0]))
+                    .write_all(&ssh_string(&[IDENTITIES_ANSWER, 0, 0, 0, 0]))
                     .await;
                 let mut rest = Vec::new();
                 let _ = agent_far.read_to_end(&mut rest).await;
@@ -964,7 +962,7 @@ mod tests {
                 Arc::new(KeyUses::default()),
             ));
             remote
-                .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+                .write_all(&ssh_string(&[filter::REQUEST_IDENTITIES]))
                 .await
                 .unwrap();
             remote.shutdown().await.unwrap();
@@ -975,7 +973,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 answer,
-                framed(&[IDENTITIES_ANSWER, 0, 0, 0, 0]),
+                ssh_string(&[IDENTITIES_ANSWER, 0, 0, 0, 0]),
                 "delay {delay}"
             );
             tokio::time::timeout(Duration::from_secs(5), task)

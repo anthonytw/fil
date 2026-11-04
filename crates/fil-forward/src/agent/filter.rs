@@ -112,6 +112,20 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// An SSH `string` (a four-byte big-endian length, then the bytes). A whole agent message on the
+/// stream is the same form, so this also frames one.
+pub fn ssh_string(s: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + s.len());
+    put_string(&mut v, s);
+    v
+}
+
+/// Appends an SSH `string` to `out`.
+fn put_string(out: &mut Vec<u8>, s: &[u8]) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s);
+}
+
 /// The filter: whether a request from the remote may reach the agent. `msg` is the message
 /// without its length (type byte first).
 pub fn check_request(msg: &[u8]) -> Result<Request<'_>, Refusal> {
@@ -204,10 +218,8 @@ pub fn filter_identities(
     out.push(IDENTITIES_ANSWER);
     out.extend_from_slice(&(kept.len() as u32).to_be_bytes());
     for (blob, comment) in kept {
-        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        out.extend_from_slice(blob);
-        out.extend_from_slice(&(comment.len() as u32).to_be_bytes());
-        out.extend_from_slice(comment);
+        put_string(&mut out, blob);
+        put_string(&mut out, comment);
     }
     Some((out, infos))
 }
@@ -279,12 +291,9 @@ pub fn plain_key(blob: &[u8]) -> Option<Vec<u8>> {
     let (plain, n) = cert_type(f.string()?)?;
     f.string()?; // the nonce
     let mut out = Vec::with_capacity(blob.len());
-    out.extend_from_slice(&(plain.len() as u32).to_be_bytes());
-    out.extend_from_slice(plain.as_bytes());
+    put_string(&mut out, plain.as_bytes());
     for _ in 0..n {
-        let field = f.string()?;
-        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-        out.extend_from_slice(field);
+        put_string(&mut out, f.string()?);
     }
     Some(out)
 }
@@ -337,23 +346,17 @@ pub fn length_ok(len: u32) -> bool {
 mod tests {
     use super::*;
 
-    fn string(s: &[u8]) -> Vec<u8> {
-        let mut v = (s.len() as u32).to_be_bytes().to_vec();
-        v.extend_from_slice(s);
-        v
-    }
-
     fn sign(key: &[u8]) -> Vec<u8> {
         let mut m = vec![SIGN_REQUEST];
-        m.extend(string(key));
-        m.extend(string(b"data"));
+        m.extend(ssh_string(key));
+        m.extend(ssh_string(b"data"));
         m.extend(0u32.to_be_bytes());
         m
     }
 
     fn ext(name: &str) -> Vec<u8> {
         let mut m = vec![EXTENSION];
-        m.extend(string(name.as_bytes()));
+        m.extend(ssh_string(name.as_bytes()));
         m
     }
 
@@ -452,15 +455,15 @@ mod tests {
         let mut m = vec![IDENTITIES_ANSWER];
         m.extend((keys.len() as u32).to_be_bytes());
         for (b, c) in keys {
-            m.extend(string(b));
-            m.extend(string(c));
+            m.extend(ssh_string(b));
+            m.extend(ssh_string(c));
         }
         m
     }
 
     fn blob(ty: &str, key: &[u8]) -> Vec<u8> {
-        let mut b = string(ty.as_bytes());
-        b.extend(string(key));
+        let mut b = ssh_string(ty.as_bytes());
+        b.extend(ssh_string(key));
         b
     }
 
@@ -493,15 +496,15 @@ mod tests {
             ),
         ] {
             let public: Vec<Vec<u8>> = (0..fields).map(|i| vec![i as u8 + 1; 7 + i]).collect();
-            let mut p = string(plain.as_bytes());
-            let mut c = string(cert.as_bytes());
-            c.extend(string(b"nonce-nonce"));
+            let mut p = ssh_string(plain.as_bytes());
+            let mut c = ssh_string(cert.as_bytes());
+            c.extend(ssh_string(b"nonce-nonce"));
             for f in &public {
-                p.extend(string(f));
-                c.extend(string(f));
+                p.extend(ssh_string(f));
+                c.extend(ssh_string(f));
             }
             // What follows the public fields (serial, principals, the CA's signature...).
-            c.extend(string(b"the rest of the certificate"));
+            c.extend(ssh_string(b"the rest of the certificate"));
             assert_eq!(fingerprint(&c), fingerprint(&p), "{cert}");
             let info = key_info(&c, b"me");
             assert!(info.certificate);
@@ -509,7 +512,11 @@ mod tests {
             assert!(!key_info(&p, b"").certificate);
         }
         // A short certificate falls back to its whole blob; an unknown one too.
-        let short = [string(b"ssh-ed25519-cert-v01@openssh.com"), string(b"n")].concat();
+        let short = [
+            ssh_string(b"ssh-ed25519-cert-v01@openssh.com"),
+            ssh_string(b"n"),
+        ]
+        .concat();
         assert_eq!(fingerprint(&short), {
             let d = ring::digest::digest(&ring::digest::SHA256, &short);
             format!("SHA256:{}", base64_unpadded(d.as_ref()))

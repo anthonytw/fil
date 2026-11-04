@@ -301,6 +301,8 @@ def make_term(name):
 CR_WRAPS = False
 # The terminal under test.
 TERM = ""
+# Set when an origin-mode cursor report was accepted as absolute (WezTerm, declared traces only).
+ABSOLUTE_SEEN = []
 # Whether the read-back is xterm's print-screen.
 XTERM_PRINT = False
 
@@ -338,10 +340,17 @@ def cursor_ok(exp, cur):
         return True
     row, col = exp["cursor"]
     pending = exp.get("pending_wrap")
-    if TERM in ("tmux", "wezterm"):
-        # tmux reports a pending wrap one column past the edge. In origin mode tmux reports the
-        # cursor absolute, and WezTerm does so in some runs (the screen shows where it is).
-        return (TERM == "tmux" and pending and cur == (row, col + 1)) or list(cur) == exp.get("cursor_absolute")
+    if TERM == "tmux":
+        # A pending wrap is reported one column past the edge; origin mode, absolute.
+        return (pending and cur == (row, col + 1)) or list(cur) == exp.get("cursor_absolute")
+    if TERM == "wezterm":
+        # In some runs of the traces declared intermittent in known.tsv WezTerm reports the cursor
+        # absolute in origin mode (as if origin mode were off at that moment). It is accepted
+        # there and recorded, never silently; on any other trace it is a difference.
+        if list(cur) == exp.get("cursor_absolute") and os.environ.get("FIL_INTERMITTENT") == "1":
+            ABSOLUTE_SEEN.append(True)
+            return True
+        return False
     if TERM == "kitty":
         # A pending wrap is reported at the start of the next row. In origin mode the report
         # is wrong (by a constant that depends on the region), so the cursor is not compared.
@@ -443,6 +452,7 @@ def main():
 
     def emit(obj):
         obj["trace"] = name
+        obj["attempt"] = int(os.environ.get("FIL_ATTEMPT", "1"))
         res.write(json.dumps(obj) + "\n")
 
     tty.setraw(0)
@@ -496,7 +506,10 @@ def main():
                     observed["cursor"] = list(cur)
                     if getattr(term, "dims", None):
                         observed["dims"] = list(term.dims)
+                    ABSOLUTE_SEEN.clear()
                     diffs = compare(step["expect"], step.get("attrs", ""), screen_rows, hist_rows, cur, observed)
+                    if ABSOLUTE_SEEN:
+                        observed["origin_cursor_reported_absolute"] = True
                     if os.environ.get("TERMINALS_BLIND") == "1":
                         # A mutation of the harness itself (docs/m3/terminals.md): a read-back that
                         # sees nothing. The canary must notice.

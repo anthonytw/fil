@@ -170,16 +170,33 @@ def diff_hash(diffs):
     return hashlib.sha256("\n".join(diffs).encode()).hexdigest()[:12]
 
 
+INTERMITTENT = set()  # (terminal, trace): answers vary from run to run (declared with `!intermittent`)
+SUSPECT = {}  # (trace/check, hash): a signature of a fil bug (declared with `!suspect`)
+MAX_RETRIED = 2  # more traces than this needing a retry in one run means the flake rate changed
+
+
 def load_known(path):
     """{(terminal, trace/check): [(hash or "*", reason)]}. A `trace/*` key with hash `*` covers
-    every checkpoint of an intermittent trace and is never stale."""
+    every checkpoint of a trace. Directive lines: `!intermittent TAB terminal TAB trace` (the
+    trace may be run again, up to twice, and may report an origin-mode cursor as absolute) and
+    `!suspect TAB trace/check TAB hash TAB note` (a difference that is the signature of a
+    bug in what fil writes: it fails the run even if a later attempt passes)."""
     known = {}
+    INTERMITTENT.clear()
+    SUSPECT.clear()
     if os.path.exists(path):
         for line in open(path):
             line = line.rstrip("\n")
             if not line or line.startswith("#"):
                 continue
-            term, key, why, h = (line.split("\t") + ["", "", "", "*"])[:4]
+            cols = line.split("\t")
+            if cols[0] == "!intermittent":
+                INTERMITTENT.add((cols[1], cols[2]))
+                continue
+            if cols[0] == "!suspect":
+                SUSPECT[(cols[1], cols[2])] = cols[3] if len(cols) > 3 else ""
+                continue
+            term, key, why, h = (cols + ["", "", "", "*"])[:4]
             known.setdefault((term, key), []).append((h, why))
     return known
 
@@ -229,7 +246,7 @@ def main():
 
     started = time.time()
     failed = False
-    summary = {"ok": 0, "info": 0, "known": 0, "new": 0, "error": 0, "stale": 0}
+    summary = {"ok": 0, "info": 0, "known": 0, "new": 0, "error": 0, "stale": 0, "retried": 0}
     seen = set()
     ran = {tr["name"] for tr in traces}
     lines = []
@@ -260,6 +277,7 @@ def main():
     def evaluate(tr, recs, done, err_tail, timed_out):
         """Sorts one attempt's records: (lines, counts, matched known entries, failed)."""
         lines, counts, matched, bad = [], dict.fromkeys(summary, 0), set(), False
+        unlisted, suspects = {}, []
         for r in recs:
             if "error" in r:
                 counts["error"] += 1
@@ -291,32 +309,67 @@ def main():
                     else:
                         counts["new"] += 1
                         bad = True
+                        h = diff_hash(r["diffs"])
+                        unlisted[key] = h
+                        if (key, h) in SUSPECT:
+                            suspects.append(f"SUSPECT {key} [{h}]: {SUSPECT[(key, h)]}; {'; '.join(r['diffs'][:2])}")
                         note = " (a listed checkpoint, but not the listed difference)" if state == "changed" else ""
-                        lines.append(f"DIFF    {key}{note} [{diff_hash(r['diffs'])}]: {'; '.join(r['diffs'][:3])}")
+                        lines.append(f"DIFF    {key}{note} [{h}]: {'; '.join(r['diffs'][:3])}")
         if not done and not any("error" in r for r in recs):
             counts["error"] += 1
             bad = True
             lines.append(f"ERROR   {tr['name']}: the terminal exited without finishing the trace" + (" (timed out)" if timed_out else "") + (f"; its stderr: {err_tail}" if err_tail else ""))
-        return lines, counts, matched, bad
+        return lines, counts, matched, bad, unlisted, suspects
 
-    # WezTerm is not deterministic on some traces (scroll regions, a pending wrap: finding 8), so a
-    # trace with an unlisted difference is run again, up to twice; it passes if one run shows
-    # nothing but listed differences. A bug in what fil writes shows in every run.
-    tries = 3 if args.terminal == "wezterm" else 1
+    # Some traces are declared intermittent for a terminal (`!intermittent` in known.tsv: WezTerm's
+    # scroll regions, origin mode and pending wrap, finding 8). Only those are run again when they
+    # show an unlisted difference, up to twice. Every other trace fails on its first one. The
+    # evidence is kept: each failed attempt is printed as RETRIED and counted, the same unlisted
+    # difference in two attempts fails, a SUSPECT signature fails even if a later attempt passes,
+    # and more than MAX_RETRIED retried traces in a run fails.
+    retried = 0
     for tr in traces:
         t0 = time.time()
+        flaky = (args.terminal, tr["name"]) in INTERMITTENT
+        tries = 3 if flaky and os.environ.get("TERMINALS_NO_RETRY") != "1" else 1
+        os.environ["FIL_INTERMITTENT"] = "1" if flaky else "0"
+        evs = []
         for n in range(tries):
-            res = attempt(tr)
-            ev = evaluate(tr, *res)
-            if not ev[3] or n == tries - 1:
+            os.environ["FIL_ATTEMPT"] = str(n + 1)
+            evs.append(evaluate(tr, *attempt(tr)))
+            if not evs[-1][3] or evs[-1][5]:
                 break
-            print(f"{args.terminal} {tr['name']}: unlisted difference, run again ({n + 1} of {tries})", file=sys.stderr, flush=True)
-        lines.extend(ev[0])
-        for k, v in ev[1].items():
+        good = next((e for e in evs if not e[3]), None)
+        final = good or evs[-1]
+        failed_attempts = [e for e in evs if e is not good and e[3]]
+        out = list(final[0])
+        trace_failed = good is None
+        if good is not None and failed_attempts:
+            retried += 1
+            summary["retried"] += 1
+            for e in failed_attempts:
+                out += [l.replace("DIFF    ", "RETRIED ", 1) for l in e[0] if l.startswith("DIFF")]
+        suspects = [s for e in evs for s in e[5]]
+        if suspects:
+            trace_failed = True
+            out += suspects
+        counts_seen = {}
+        for e in evs:
+            for kv in e[4].items():
+                counts_seen[kv] = counts_seen.get(kv, 0) + 1
+        for (key, h), c in counts_seen.items():
+            if c >= 2:
+                trace_failed = True
+                out.append(f"REPEATED {key} [{h}]: the same unlisted difference in {c} of {len(evs)} attempts")
+        lines.extend(out)
+        for k, v in final[1].items():
             summary[k] += v
-        seen |= ev[2]
-        failed = failed or ev[3]
-        print(f"{args.terminal} {tr['name']}: {time.time() - t0:.1f}s", file=sys.stderr, flush=True)
+        seen |= final[2]
+        failed = failed or trace_failed
+        print(f"{args.terminal} {tr['name']}: {time.time() - t0:.1f}s" + (f" ({len(evs)} attempts)" if len(evs) > 1 else ""), file=sys.stderr, flush=True)
+    if retried > MAX_RETRIED:
+        failed = True
+        lines.append(f"FLAKY   {retried} traces needed a retry in this run (more than {MAX_RETRIED}): the flake rate has changed")
 
     # A listed difference that no longer occurs: the disagreement was fixed, or the line was wrong.
     for (term, key), entries in sorted(known.items()):
@@ -326,15 +379,15 @@ def main():
         for eh, why in entries:
             if ((term, key), eh) not in seen:
                 summary["stale"] += 1
-                # WezTerm's intermittent traces can agree in the accepted run: a warning there.
-                failed = failed or term != "wezterm"
+                # A declared-intermittent trace can agree in the accepted run: a warning there.
+                failed = failed or (term, trace) not in INTERMITTENT
                 lines.append(f"STALE   {key} [{eh}]: listed in known.tsv ({why}) and no longer occurring; remove the line")
 
     shutil.rmtree(TMP, ignore_errors=True)
     elapsed = time.time() - started
     print("\n".join(lines))
     print(f"{args.terminal}: {len(traces)} traces, {summary['ok']} checks agree, {summary['info']} informational, "
-          f"{summary['known']} known disagreements, {summary['new']} NEW disagreements, {summary['stale']} stale entries, {summary['error']} errors; {elapsed:.0f}s")
+          f"{summary['known']} known disagreements, {summary['new']} NEW disagreements, {summary['stale']} stale entries, {summary['retried']} retried traces, {summary['error']} errors; {elapsed:.0f}s")
     sys.exit(1 if failed else 0)
 
 

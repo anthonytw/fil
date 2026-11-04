@@ -22,6 +22,18 @@
 # WEZTERM-NO-CURLY: WezTerm's `get-text --escapes` prints no curly underline, so the curly cells cannot be read back (a read-back limit, not a verdict on the terminal).
 # REFLOW: this terminal reflows (or, for xterm, does not reflow) differently from alacritty_terminal; the shadow screen no longer says what the terminal shows after a resize (docs/m3/terminals.md, finding 1: W1's second trigger).
 #
+!intermittent	wezterm	ov-scroll-region
+!intermittent	wezterm	ov-scroll-region-nosync
+!intermittent	wezterm	ov-origin
+!intermittent	wezterm	ov-origin-nosync
+!intermittent	wezterm	sn-region-tabs-charset
+!intermittent	wezterm	ov-pending-wrap
+!intermittent	wezterm	ov-pending-wrap-nosync
+!suspect	ov-origin/e2/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin/end/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin-nosync/e2/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin-nosync/end/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+#
 kitty	cl-ed2-short/after	ED2-NO-PUSH	614724ad0a67
 kitty	cl-ed2/after	ED2-NO-PUSH	a2ed2bcc05c9
 kitty	ov-clear-screen-nosync/e2/flush	ED2-NO-PUSH	e0ea351514c7

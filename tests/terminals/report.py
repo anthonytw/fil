@@ -12,6 +12,7 @@ import os
 import sys
 from collections import OrderedDict
 
+RETRIES = {}
 ORDER = ["xterm", "kitty", "wezterm", "tmux"]
 
 
@@ -21,11 +22,13 @@ def load(out):
         path = os.path.join(out, f"{t}.jsonl")
         if os.path.exists(path):
             recs = [json.loads(x) for x in open(path) if x.strip()]
-            # A WezTerm trace that was run again has several attempts; the last one counts.
-            last = OrderedDict()
+            # A trace declared intermittent can have several attempts: the statistics use the
+            # last attempt of each trace, and RETRIES lists the earlier ones.
+            final = {}
             for r in recs:
-                last[(r.get("trace"), r.get("check"), "error" in r, "done" in r)] = r
-            res[t] = list(last.values())
+                final[r.get("trace")] = max(final.get(r.get("trace"), 1), r.get("attempt", 1))
+            res[t] = [r for r in recs if r.get("attempt", 1) == final[r.get("trace")]]
+            RETRIES[t] = [r for r in recs if r.get("attempt", 1) < final[r.get("trace")] and r.get("status") == "diff"]
     return res
 
 
@@ -34,6 +37,13 @@ def main():
     res = load(out)
     terms = list(res)
     # Checks per terminal by status.
+    retried = sum(len({r["trace"] for r in v}) for v in RETRIES.values())
+    print(f"Retried traces (earlier attempts that showed a difference): {retried}\n")
+    for t, v in RETRIES.items():
+        for r in v:
+            print(f"- {t} attempt {r.get('attempt', 1)}: {r['trace']}/{r['check']}: {'; '.join(r['diffs'])[:160]}")
+    if retried:
+        print()
     print("| terminal | checks | agree | disagree | informational | errors |")
     print("|---|---|---|---|---|---|")
     for t, recs in res.items():

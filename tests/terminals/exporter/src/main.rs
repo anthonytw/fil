@@ -161,4 +161,53 @@ mod selfcheck {
         eprintln!("{checks} checkpoints replayed; informational, not replayed: {skipped:?}");
         assert!(checks > 100);
     }
+
+    fn written(j: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        for step in j["steps"].as_array().unwrap() {
+            if step["op"] == "write" {
+                let h = step["hex"].as_str().unwrap();
+                out.extend(
+                    (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()),
+                );
+            }
+        }
+        out
+    }
+
+    fn strip(mut b: Vec<u8>) -> Vec<u8> {
+        for marker in [&b"\x1b[?2026h"[..], &b"\x1b[?2026l"[..]] {
+            while let Some(i) = b.windows(marker.len()).position(|w| w == marker) {
+                b.drain(i..i + marker.len());
+            }
+        }
+        b
+    }
+
+    /// The `-nosync` twin of each overlay trace is the one that checks the erase at rest. That
+    /// argument holds only while the overlay writes the same bytes whether or not it brackets
+    /// them in synchronized output; this fails if an overlay change makes the erase depend on it.
+    #[test]
+    fn each_sync_trace_and_its_nosync_twin_write_the_same_bytes_without_the_markers() {
+        let all: Vec<_> = crate::all();
+        let mut pairs = 0;
+        for (tb, cols, rows) in &all {
+            let Some(base) = tb.name.strip_suffix("-nosync") else {
+                continue;
+            };
+            let twin = all
+                .iter()
+                .find(|(t, _, _)| t.name == base)
+                .unwrap_or_else(|| panic!("{} has no sync twin", tb.name));
+            let a = strip(written(&twin.0.to_json(twin.1, twin.2)));
+            let b = strip(written(&tb.to_json(*cols, *rows)));
+            assert_eq!(
+                a, b,
+                "{base} and {}: different bytes without the markers",
+                tb.name
+            );
+            pairs += 1;
+        }
+        assert!(pairs >= 25, "only {pairs} pairs");
+    }
 }

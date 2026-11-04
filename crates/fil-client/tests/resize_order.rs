@@ -820,3 +820,57 @@ async fn a_link_lost_while_a_repaint_is_held_resumes() {
         "a resume that asks for the repaint again: {a:?}"
     );
 }
+
+/// W1 (re-check 2, F4): the repaint is confirmed early (an ack of its `at` the client sent before
+/// it saw the announcement), so the daemon announces a catch-up, and that announcement
+/// (control) overtakes the repaint's bytes on channel 2. The client must not read the repaint's
+/// bytes into the catch-up: the catch-up waits until they are all in, supersedes the repaint
+/// (never applied), and lands whole. Its history puts every skipped line in the scrollback.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_announced_ahead_of_a_repaints_bytes_waits_for_them() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon
+        .set_repaint_then_catch_ups(vec![lines(0..60)])
+        .await;
+    rig.term.resize(60, 24);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text()
+    );
+    let mut all = rig.term.history();
+    all.extend(rig.term.rows());
+    let missing: Vec<usize> = (0..60)
+        .filter(|&i| !all.iter().any(|l| l.trim_end() == numbered(i).trim_end()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "lines lost from the scrollback: {missing:?}"
+    );
+}
+
+/// W1 (F4): one snapshot at a time leaves room for one announcement behind an incomplete
+/// snapshot, not two. A third is a protocol error: the client reconnects (and resumes).
+#[tokio::test(start_paused = true)]
+async fn a_third_snapshot_announced_behind_an_incomplete_one_reconnects() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon
+        .set_repaint_then_catch_ups(vec![lines(0..10), lines(10..20)])
+        .await;
+    rig.term.resize(60, 24);
+    until_async("the reconnect", 30, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some(), "a resume: {a:?}");
+}

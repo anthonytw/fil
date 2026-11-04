@@ -226,6 +226,13 @@ struct Conn {
     gap_since: Option<Instant>,
     /// Snapshot segments that arrived before the snapshot was announced.
     snap_early: Vec<(u64, Vec<u8>)>,
+    /// A snapshot announced while `snap` was still incomplete or held. The daemon confirms a
+    /// snapshot by an ack at or past its `at`, and for a repaint (`at` is where its stream was)
+    /// an ack the client sent before it even saw the announcement does that: the daemon may then
+    /// announce the next snapshot while the repaint's bytes are still on their way. Channel 2
+    /// keeps its order on every transport, so the current snapshot's bytes all come first; the
+    /// next one waits here until they have. One at a time leaves room for one more, no more.
+    snap_next: Option<SnapshotInfo>,
     early_bytes: usize,
 }
 
@@ -240,6 +247,7 @@ impl Conn {
             held_bytes: 0,
             gap_since: None,
             snap_early: Vec::new(),
+            snap_next: None,
             early_bytes: 0,
         }
     }
@@ -1640,6 +1648,26 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if info.len > MAX_SNAPSHOT {
             return Err(ClientError::Protocol("snapshot too large".into()));
         }
+        if let Some(cur) = conn.snap.as_mut() {
+            // The current snapshot's bytes are not all in, or it is a repaint held for its
+            // position: this one waits for them (see `Conn::snap_next`).
+            if conn.snap_next.is_some() {
+                return Self::reconnect("a third snapshot announced while two are outstanding");
+            }
+            if cur.info.reason == SnapshotReason::Repaint
+                && !cur.stale
+                && info.reason != SnapshotReason::Repaint
+                && info.at >= cur.info.at
+            {
+                // A catch-up past a repaint that has not been applied supersedes it: the
+                // repaint's remaining bytes are read and dropped, the output below the catch-up
+                // goes on, and the catch-up begins once they are.
+                cur.stale = true;
+                cur.buf = Vec::new();
+            }
+            conn.snap_next = Some(info);
+            return self.drain_terminal(conn);
+        }
         // The position only ever moves forward.
         if info.at < self.sess.recv.received() {
             if info.reason == SnapshotReason::Repaint {
@@ -1707,8 +1735,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         seq: u64,
         data: &[u8],
     ) -> Result<Flow, ClientError> {
-        if conn.awaiting_reply || conn.snap.is_none() {
-            // The announcement is on another stream and has not arrived: hold the bytes.
+        let current_complete = conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.recv.received() == s.info.len);
+        if conn.awaiting_reply || conn.snap.is_none() || current_complete {
+            // The announcement is on another stream and has not arrived, or the bytes are the
+            // next snapshot's (the current one is complete and held for its position): hold them.
             if conn.early_bytes + data.len() > self.cfg.max_held_output {
                 return Self::reconnect("too much snapshot data before its announcement");
             }
@@ -1760,11 +1793,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             .as_ref()
             .is_some_and(|s| s.recv.received() == s.info.len);
         if complete && conn.snap.as_ref().is_some_and(|s| s.stale) {
-            // All of a stale repaint's bytes are read: drop it, and ask again.
+            // All of a stale repaint's bytes are read: drop it, and ask again, unless a snapshot
+            // is waiting to begin (it may repair the screen; if it does not, it asks).
             conn.snap = None;
             self.repair.stale_repaint();
-            self.send_repaint();
-            return Ok(Flow::Continue);
+            if conn.snap_next.is_none() {
+                self.send_repaint();
+            }
+            return self.begin_next_snapshot(conn);
         }
         let reached = Self::repaint_at(conn).is_none_or(|at| self.sess.recv.received() >= at);
         if complete && reached {
@@ -1813,8 +1849,26 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if let Flow::End(s) = self.drain_terminal(conn)? {
             return Ok(Flow::End(s));
         }
+        if conn.snap_next.is_some() {
+            return self.begin_next_snapshot(conn);
+        }
         self.link_became_ready(conn)?;
         Ok(Flow::Continue)
+    }
+
+    /// Begins the snapshot that was announced while the last one's bytes were still arriving.
+    fn begin_next_snapshot(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
+        match conn.snap_next.take() {
+            Some(info) => self.on_snapshot_announced(conn, info),
+            None => {
+                // The terminal data held behind the snapshot, and what waited for the screen.
+                if let Flow::End(s) = self.drain_terminal(conn)? {
+                    return Ok(Flow::End(s));
+                }
+                self.link_became_ready(conn)?;
+                Ok(Flow::Continue)
+            }
+        }
     }
 
     fn on_terminal(&mut self, conn: &mut Conn, seq: u64, data: &[u8]) -> Result<Flow, ClientError> {

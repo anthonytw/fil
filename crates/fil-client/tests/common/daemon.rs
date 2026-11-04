@@ -163,6 +163,11 @@ pub struct DState {
     repaint_straddle: Option<usize>,
     /// The link dies after the next repaint's snapshot, before the tail below its `at` is sent.
     repaint_kill: bool,
+    /// After the next repaint is announced, catch-ups over these outputs are announced too,
+    /// before any snapshot bytes are sent: the repaint was confirmed early (an ack of `at` the
+    /// client sent before it saw the announcement), and the catch-up's announcement (control)
+    /// overtook the repaint's bytes on channel 2.
+    repaint_then_catch_ups: Vec<Vec<u8>>,
     /// Repaint snapshots sent, with the generation each was rendered at.
     pub repaints: Vec<u64>,
 }
@@ -251,6 +256,7 @@ impl FakeDaemon {
                 repaint_after: Vec::new(),
                 repaint_straddle: None,
                 repaint_kill: false,
+                repaint_then_catch_ups: Vec::new(),
                 repaints: Vec::new(),
             }),
         })
@@ -708,6 +714,44 @@ impl FakeDaemon {
             st.sent = tail_at + tail.len() as u64;
         }
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        let catch_ups = std::mem::take(&mut st.repaint_then_catch_ups);
+        if !catch_ups.is_empty() {
+            let mut all = vec![bytes];
+            for skip in catch_ups {
+                st.log.append(&skip);
+                st.emu.feed(&skip);
+                let b = fil_term::snapshot::snapshot(&st.emu.state(1000));
+                let bat = st.log.end();
+                st.flows.insert(key_of(&link), bat);
+                st.pending_jump = Some(bat);
+                st.sent = bat;
+                st.snapshots += 1;
+                let binfo = SnapshotInfo {
+                    at: bat,
+                    len: b.len() as u64,
+                    skipped: skip.len() as u64,
+                    reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+                    size_gen: st.size_gen,
+                };
+                let _ = send(&link, &ControlMsg::Snapshot(binfo)).await;
+                all.push(b);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for b in all {
+                let mut off = 0u64;
+                for chunk in b.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+            return;
+        }
         let mut off = 0u64;
         for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
             let seg = Segment {
@@ -754,6 +798,12 @@ impl FakeDaemon {
     /// across `at`: a broken daemon.
     pub async fn set_repaint_straddle(&self, cut: usize) {
         self.st.lock().await.repaint_straddle = Some(cut);
+    }
+
+    /// After the next repaint's announcement, catch-ups over each of `skips` are announced, all
+    /// ahead of the snapshot bytes (see `DState::repaint_then_catch_ups`).
+    pub async fn set_repaint_then_catch_ups(&self, skips: Vec<Vec<u8>>) {
+        self.st.lock().await.repaint_then_catch_ups = skips;
     }
 
     /// The link dies after the next repaint's snapshot, before its tail is sent.

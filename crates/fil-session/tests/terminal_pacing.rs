@@ -5,7 +5,8 @@
 //!
 //! The cell: a shell floods numbered lines; three seconds in, Ctrl-C; how long until the line the
 //! shell prints after the interrupt is on the client's screen. Unpaced, QUIC buffers about
-//! 1.6 MB, all of which is delivered first (a jump skips only what was never sent): about 13 s.
+//! 1.6 MB, all of which is delivered first (a jump skips only what was never sent), and quinn
+//! fills the bottleneck's queue as well: about 19 s here.
 //! Paced, the backlog stays in the daemon and the catch-up skips it. Either way nothing is lost:
 //! every line the client shows is in order, the only jumps are at the gap markers, one per
 //! catch-up, and the scripted client checks the protocol positions as it goes (no gap on the
@@ -13,9 +14,9 @@
 //! stream was).
 //!
 //! The default run measures the paced cells (QUIC and the pipe at 1 Mbit/s). The `#[ignore]`d
-//! ones are the measurements for the PR and `docs/m3/pacing.md`: the unpaced "before" (which
-//! takes its 13 s), and throughput on a fast link and on the slow one, paced against unpaced.
-//! `just pacing` runs them all in release.
+//! ones are the measurements behind DESIGN.md section 8.5's numbers: the unpaced "before"
+//! (which takes its 20 s), and throughput on a fast link, a 100 Mbit/s 40 ms one and the slow
+//! one, paced against unpaced. `just pacing` runs them all in release.
 
 mod common;
 
@@ -214,16 +215,6 @@ fn assert_no_loss<L: Link>(c: &fil_testkit::Client<L>) -> usize {
     for part in seen.split(Option::is_none) {
         let part: Vec<u32> = part.iter().flatten().copied().collect();
         if let Some(w) = part.windows(2).find(|w| w[1] != w[0] + 1) {
-            if let Some(dir) = std::env::var_os("K1_DUMP") {
-                let text = format!("{}\n=====SCREEN\n{}", c.history(), c.screen());
-                std::fs::write(std::path::Path::new(&dir).join("shown.txt"), text).unwrap();
-                std::fs::write(std::path::Path::new(&dir).join("out.bin"), &c.out).unwrap();
-                for (i, b) in c.snapshot_bytes.iter().enumerate() {
-                    std::fs::write(std::path::Path::new(&dir).join(format!("snap{i}.bin")), b)
-                        .unwrap();
-                }
-                eprintln!("snapshots: {:?}", c.mid_snapshots);
-            }
             panic!("a jump without a marker: {} to {}", w[0], w[1]);
         }
     }
@@ -265,29 +256,9 @@ async fn run_ctrl_c<L: Link>(h: &SessionHandle, mut c: fil_testkit::Client<L>) -
     let flood_bytes = log_end(h).await;
     let t = Instant::now();
     c.type_bytes(b"\x03").await;
-    let mut back = false;
-    for _ in 0..240 {
-        back = c
-            .try_wait(Duration::from_millis(250), |c| {
-                c.screen().contains("ALIVE-42")
-            })
-            .await;
-        if std::env::var_os("K1_TRACE").is_some() {
-            eprintln!(
-                "t={:.2} next={} log_end={} snaps={:?}",
-                t.elapsed().as_secs_f64(),
-                c.next,
-                log_end(h).await,
-                c.mid_snapshots
-                    .iter()
-                    .map(|i| (i.at, i.skipped, i.len))
-                    .collect::<Vec<_>>()
-            );
-        }
-        if back {
-            break;
-        }
-    }
+    let back = c
+        .try_wait(Duration::from_secs(60), |c| c.screen().contains("ALIVE-42"))
+        .await;
     let took = t.elapsed();
     assert!(back, "ALIVE-42 never came: {}", c.screen());
     // Everything after it too: the client reaches the end of the log.

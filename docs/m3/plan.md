@@ -12,7 +12,7 @@
   - `.github/workflows/linux-check.yml` and `tests/realnet/**`: each package adds its own suite or part file. The shared suite list in the workflow and the part list in `tests/realnet/run.sh` take one-line additions, merged by whichever PR lands second.
 - **The wire.** W1 (§2.8) is the only planned wire change. If an M2 sweep PR bumps `PROTOCOL_REVISION` first, W1 takes main's golden, bumps past it and regenerates (the `[history]` conflict is the guard, `CLAUDE.md`).
 - **The M3 sweep starts only after the M2 sweep is closed** (§15: every milestone ends with its own sweep).
-- **M3's `DESIGN.md` sections:** §2 goal 1 (W1), §4.2 (W1), §6.2 (W1, K1), §8.5's terminal messages, in-band records and mode poll (C1, W1), §9 (C1, P1), §11 (OQ-1's outcome), §12 (C1), §14 (E1b), §16.7's prediction RTT threshold (P1) and §16. Conflicts with M2's and M4's edits are resolved by the later PR.
+- **M3's `DESIGN.md` sections:** §2 goal 1 (W1), §4.2 (W1), §6.2 (W1, K1), §8.5's terminal messages, in-band records and mode poll (C1, W1) and "Pacing the terminal" (K1), §9 (C1, P1), §11 (OQ-1's outcome), §12 (C1), §14 (E1b), §16.7's prediction RTT threshold (P1) and §16. Conflicts with M2's and M4's edits are resolved by the later PR.
 
 ## 1. Scope
 
@@ -46,7 +46,7 @@
 | **Status-line known limit: a narrowing resize under the overlay** leaves damage until the next resume or swap (`ResumeRequest.want_snapshot`, §4.2). | yes (`display.rs` `resize`, `engine.rs`) | With prediction painting at every keystroke this stops being rare. **W1** repairs it at once, for predictions and status lines alike. |
 | **The client reads no RTT.** | yes: `LinkStatus.rtt` exists (`fil-transport/src/link.rs`); nothing in `fil-client` reads it. On the pipe it is a single ping sample, refreshed only after 1 s without traffic, so it goes stale while the user types. | E1a passes it as a hint; P1 measures its own smoothed echo time (§2.7). |
 | **`predict` is parsed and unused.** | yes: `Predict { Off, Adaptive, Always }`, per `[defaults]` and `[host.NAME]` (`crates/fil/src/config.rs`); `run` passes no predictor (`fil-client/src/lib.rs`). | E1a (the client) and E1b (the `fil` binary). |
-| **Big-`cat` scrollback loss** (deferred to M3 by the M2 plan). | yes: L1 found catch-up firing on every 4 MB `cat` on both transports, even with a fast consumer (`docs/m2/latency.md` §4). | **K1**, optional and parallel (§3). Not a done-when item. |
+| **Big-`cat` scrollback loss** (deferred to M3 by the M2 plan). | yes: L1 found catch-up firing on every 4 MB `cat` on both transports, even with a fast consumer (`docs/m2/latency.md` §4). | **K1** was to take it; K1 is now terminal pacing (§3), which leaves a fast link unchanged, so this stays open for the M3 sweep or later. |
 | **Final output tail of an ended session; Unix-socket forwards** (deferred to M3 by the M2 plan). | yes | Handed to M4 (`docs/m4/plan.md`). |
 | **Test harness code ships in the library.** `fil-predict`'s `oracle`, `driver` and `sim` are unconditional `pub mod`s. | yes (`lib.rs`) | C1 puts them behind a cargo feature that the `harness` feature and the tests enable (proposed). `just predict-harness --seeds 2 --keys 60` (which M4's MAC job runs) keeps working with the same flags. |
 | **Duplicated parsers.** The tracker reimplements charsets (now in `fil_term::model::Modes.charsets`) and an at-rest scanner (now `fil-term/src/boundary.rs`). | yes | M3 sweep, redundancy audit. Not in C1: the tracker's "unknown after DECSTR" semantics differ and must be kept. |
@@ -366,7 +366,7 @@ flowchart LR
   T2["T2: real terminals"] --> W1
   T2 -.-> P1
   E1a --> E1b["E1b: fil config and flag<br/>(slot after M4's U1)"]
-  W1 --> K1["K1: catch-up while healthy<br/>(optional)"]
+  W1 --> K1["K1: terminal pacing"]
   T1a --> T1b["T1 part 2: prediction suites"]
   P1 --> T1b
   E1a --> T1b
@@ -376,7 +376,7 @@ flowchart LR
   W1 --> V1
   E1b --> V1
   V1 --> SW["M3 sweep"]
-  K1 -.-> SW
+  K1 --> SW
 ```
 
 Order is riskiest first: the core's secret rules and the contract (C1), the real terminals that could invalidate the core (T2), and the resize damage (T1 part 1, W1) start at once; the predictor's quality (P1) and the integration (E1a, E1b) follow; verification (V1) and the sweep close.
@@ -487,14 +487,14 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Tests:** keyprobe's `--screen` on a raw `cat` with no prediction agrees with its byte mode within 1 ms; netcut's delay measured within 2 ms of the setting both ways.
 - **Done when:** both hold, and the `predict` part runs (with fil's prediction still off, until E1a) in `linux-check -f suite=latency`.
 
-**K1: catch-up while healthy** (optional, carried from M2; after W1, which owns `core.rs` before it; if W1 is dropped, after C1)
-- **Owns:** `crates/fil-proto/src/log.rs` (`decide_start`, `CatchUpParams`), the catch-up decision in `crates/fil-session/src/core.rs` (`on_catch_up`), `crates/fil-session/tests/catch_up.rs` (new), `DESIGN.md` §6.2. M4's CFG comes after it and does not touch the rule.
-- **Proposal:** while acknowledgements keep up (the client acknowledged output within the last 2 s), do not jump on bytes behind alone; jump only on the time rule (output waiting unacknowledged for more than 2 s with at least 16 KiB outstanding). On a slow link `cat hugefile` and Ctrl-C still recover within about 2 s; on a fast one a 4 MB `cat` keeps its scrollback, as over ssh.
-- **Tests:** `decide_start` unit tests for both rules; a session test over a netsim link: a 4 MB `cat` with a fast consumer gets no snapshot, and the same at 1 Mbit/s gets one within 2.5 s, after which Ctrl-C's prompt arrives within 3 s.
-- **Mutation:** keep the byte rule while healthy (the fast test snapshots); drop the time rule (the slow test never snapshots).
-- **Done when:** the tests pass, L1's `l_catchup` cells show no marker on the clean network, and §6.2 says the new rule.
-- **Visible behavior:** the owner may veto it; it is not a done-when item.
-- **Carried from PR #110** (which changed the rule to unsent bytes and made the client apply the output sent before a jump, `DESIGN.md` §6.2): a jump now waits for what the transport holds, so on QUIC Ctrl-C's prompt after a flood takes about W/R (W about 1.6 MB: about 13 s at 1 Mbit/s, about 50 s at 256 kbit/s). The bytes the transport buffers should count: pace the terminal channel as the forwards are paced (§8.5 "Pacing"), so the backlog stays in the daemon, where a jump skips it. If K1 is dropped, this is an M3 sweep item (efficiency).
+**K1: pace the terminal channel** (on the critical path for v0.1.0 since 2026-11-04; carried from M2 and PR #110; after W1, which owns `core.rs` before it)
+- **Why.** PR #110 made the catch-up skip only output never sent (`DESIGN.md` §6.2), so a jump waits for what the transport holds: on QUIC Ctrl-C's prompt after a flood took about W/R (W about 1.6 MB: 13 s at 1 Mbit/s by the estimate, 19 s measured in the simulator with a one-second router queue). The requirement: Ctrl-C at most 3 s at 1 Mbit/s on QUIC, with no output lost (every byte delivered, or covered by a correct catch-up snapshot per #110's rule), and the pipe not worse.
+- **Owns:** `crates/fil-session/src/pace.rs` (new), the terminal send path and `Flow` in `crates/fil-session/src/serve.rs`, `SessionConfig::terminal_pacing`, `crates/fil-session/tests/terminal_pacing.rs` (new), the bottleneck of `crates/fil-netsim/src/datagram.rs` (`Conditions::rate`, `queue`), the testkit client's real-client acks (`client_acks`), the realnet `l_ctrlc` cell in `tests/realnet/latency.sh`, `just pacing`, `DESIGN.md` §6.2 and §8.5 "Pacing the terminal". No wire change (`PROTOCOL_REVISION` stays 13).
+- **Design** (`DESIGN.md` §8.5, "Pacing the terminal"): each connection keeps the terminal output in flight (sent and unacknowledged, plus an unconfirmed snapshot) under `max(64 KiB, rate × (rtprop + 250 ms))`, `rate` the client's delivery rate from its terminal acks (BBR's sample, max of 2 s) and `rtprop` the smallest round trip seen (for the connection's life, reset on a QUIC path change). A time budget rather than the forwards' LEDBAT: the cost being bounded is the backlog's own drain time, and a fast link is left as it was (the window is far above what the transport holds). The catch-up rule's time half counts the longer of the oldest unacknowledged output's age and the backlog's drain time at the measured rate: with the backlog held in the daemon, acks keep coming and the age alone stayed short (the pipe cell measured up to 7.8 s without it). A finished session is not paced. `FIL_TERMINAL_PACING=off` is the "before" switch.
+- **Tests:** `pace.rs` unit tests (the window, the floor, the max filter and its expiry, the path change, unpaced); `serve.rs` (the window bounds what is in flight, a snapshot counted until confirmed; the drain wait); `terminal_pacing.rs` over real `QuicLink`/`PipeLink` on a 1 Mbit/s, 50 ms simulated path with a one-second queue, the scripted client acking as the real one: Ctrl-C to its output at most 3 s on both, every shown line in order with jumps only at markers, the client at the log's end; the unpaced cells and throughput (fast, 100 Mbit/s 40 ms, 1 Mbit/s) as ignored measurements (`just pacing`); realnet `l_ctrlc` (netem 1 Mbit/s: `ssh -tt`, and fil on the pipe and QUIC, paced and not).
+- **Mutation:** the window never holds (both Ctrl-C cells fail: 19 s QUIC, 11 s pipe); the drain half dropped from the rule (the pipe cell fails: 5.4 to 5.9 s).
+- **Done when:** the paced cells pass in `just ci`, the throughput comparison is within a few percent, and the realnet cell is recorded.
+- **Not in K1 any more:** the M2-era proposal to skip no output on a fast link while acknowledgements keep up (L1's catch-up on a 4 MB `cat`). Pacing leaves a fast link unchanged, so that finding stands; it is an M3 sweep item or later, and needs the owner (it changes what a healthy link shows).
 
 ### Wave 2
 

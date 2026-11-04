@@ -26,12 +26,16 @@
 //! read it.
 //!
 //! **Flow control.** The client acks the terminal channel cumulatively. The session never sends
-//! beyond what the emulator has seen at a sequence boundary. When too much output is waiting to
-//! be sent (`fil_proto::log::should_snapshot` on the unsent bytes: what is already sent is not
-//! counted, a jump does not skip it), or the client falls off the back of the log, the stream
-//! jumps ahead: `Snapshot` (control), the snapshot bytes on the snapshot channel, and the
-//! terminal channel continues at the snapshot's `at`. The snapshot starts with a gap marker in
-//! the client's scrollback, so the client must not add one of its own.
+//! beyond what the emulator has seen at a sequence boundary, nor more than the terminal pacer's
+//! window ahead of the client's acks (`crate::pace`; DESIGN.md section 8.5, "Pacing the terminal"):
+//! the transport holds about a quarter second of the link, and the backlog stays in the log, where
+//! a jump can skip it. When too much output is waiting to be sent
+//! (`fil_proto::log::should_snapshot` on the unsent bytes: what is already sent is not counted, a
+//! jump does not skip it; its time half on the longer of the oldest unacknowledged output's age and
+//! the backlog's drain time at the pacer's rate), or the client falls off the back of the log, the
+//! stream jumps ahead: `Snapshot` (control), the snapshot bytes on the snapshot channel, and the
+//! terminal channel continues at the snapshot's `at`. The snapshot starts with a gap marker in the
+//! client's scrollback, so the client must not add one of its own.
 //!
 //! **One snapshot at a time.** No further snapshot is announced until the previous one is
 //! confirmed by the client's ack at or past its offset (see `Flow`'s `unconfirmed`), because

@@ -179,14 +179,8 @@ pub async fn connect(port: u16) -> Option<TcpStream> {
 }
 
 /// Waits (real time) until `f` holds; panics after `secs`.
-pub async fn eventually<F: FnMut() -> bool>(what: &str, secs: u64, mut f: F) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while !f() {
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for: {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+pub async fn eventually<F: FnMut() -> bool>(what: &str, secs: u64, f: F) {
+    fil_testkit::until_within(what, Duration::from_secs(secs), f).await;
 }
 
 /// Some bytes that are not all alike.

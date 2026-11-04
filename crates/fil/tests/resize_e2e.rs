@@ -9,7 +9,7 @@
 //! control channel (answered by sending the size in band).
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use fil_client::{ClientConfig, DialError, DialPurpose, Dialed, Dialer};
@@ -125,12 +125,8 @@ fn session_config(dir: &std::path::Path) -> SessionConfig {
     cfg
 }
 
-async fn until(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(15);
-    while !f() {
-        assert!(Instant::now() < end, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+async fn until(what: &str, f: impl FnMut() -> bool) {
+    fil_testkit::until_within(what, fil_testkit::WAIT, f).await;
 }
 
 fn size_lines(term: &TermHandle) -> Vec<String> {

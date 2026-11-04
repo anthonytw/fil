@@ -448,20 +448,39 @@ async fn each_agent_connection_is_checked_while_attached() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A loopback port free on this machine now (both families), below every OS's ephemeral range:
-/// a port the kernel hands out to other tests' connections and listeners (port 0) could be taken
-/// again between two steps of a test that lets it go and binds it again.
-fn free_port() -> u16 {
+/// A loopback port to try for a fixed-port `-R`, below every OS's ephemeral range (a port the
+/// kernel hands out to other tests' connections could be taken between two steps of a test
+/// that lets it go and binds it again). Not probed: a probe socket, inherited by another test's
+/// child between its fork and exec, would hold the port for a moment after it is closed. A
+/// caller whose bind fails takes the next one ([`add_bound`]).
+fn next_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let base = 21000 + (std::process::id() % 5000) as u16;
-    loop {
-        let p = base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5000;
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
-            && std::net::TcpListener::bind(("::1", p)).is_ok()
-        {
-            return p;
+    21000
+        + (std::process::id() % 5000) as u16
+        + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5000
+}
+
+/// Adds a loopback `-R` on a fixed port that it could bind: its port and id.
+async fn add_bound(c: &mut FwdClient, h: &fil_session::SessionHandle) -> (u16, ForwardId) {
+    for _ in 0..20 {
+        let port = next_port();
+        let id = add(c, remote_on(port, 9)).await.unwrap();
+        let state = || {
+            h.forward_rows()
+                .into_iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.listen)
+        };
+        until("the -R bind is reported", || state().is_some()).await;
+        if matches!(state(), Some(ListenState::Listening { .. })) {
+            return (port, id);
         }
+        h.forward(ForwardOp::Remove {
+            kind: Some(ForwardKind::Remote),
+            port,
+        });
     }
+    panic!("no free port to bind");
 }
 
 fn remote_on(port: u16, to: u16) -> ForwardSpec {
@@ -485,8 +504,7 @@ async fn a_replaced_entry_leaves_no_policy_mark_behind() {
     host.sshd("Port 22\n");
     let (_s, h) = session(&host, None).await;
     let mut a = FwdClient::attach(&h, key(1), "laptop").await;
-    let port = free_port();
-    let old = add(&mut a, remote_on(port, 9)).await.unwrap();
+    let (port, old) = add_bound(&mut a, &h).await;
     host.sshd("AllowTcpForwarding local\n");
     let mut b = FwdClient::attach(&h, key(2), "desk").await;
     until("blocked at the takeover", || h.policy_blocked_count() == 1).await;
@@ -509,8 +527,7 @@ async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
     host.sshd("Port 22\n");
     let (_s, h) = session(&host, None).await;
     let mut a = FwdClient::attach(&h, key(1), "laptop").await;
-    let port = free_port();
-    let id = add(&mut a, remote_on(port, 9)).await.unwrap();
+    let (port, id) = add_bound(&mut a, &h).await;
     let state = |h: &fil_session::SessionHandle| {
         h.forward_rows()
             .into_iter()
@@ -527,8 +544,16 @@ async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
         state(&h) == Some(ListenState::Failed(BindFailure::Policy))
     })
     .await;
-    // Someone takes the port meanwhile; the policy allows the entry again.
-    let squat = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // Someone takes the port meanwhile (once a forked child no longer holds a copy of the
+    // closed listener); the policy allows the entry again.
+    let end = Instant::now() + WAIT;
+    let squat = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => break l,
+            Err(e) => assert!(Instant::now() < end, "the port stays taken: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     host.sshd("Port 22\n");
     b.reconnect(&h).await;
     until(

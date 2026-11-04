@@ -92,7 +92,15 @@ impl State {
             return;
         }
         match (mode, on) {
-            (6, _) => self.origin = on,
+            (6, _) => {
+                self.origin = on;
+                // A 6 after `1049 l` in the same sequence (`CSI ? 1049 ; 6 l`) sets the mode
+                // after the restore, and `alacritty_terminal` applies it itself: the queued
+                // restore of the primary screen's mode would undo it.
+                if matches!(self.action, Some(Action::LeaveAlt(_))) {
+                    self.action = None;
+                }
+            }
             // Entering the alternate screen saves the cursor on the primary one; leaving it
             // restores that. (`alacritty_terminal` has no other alternate-screen mode.)
             (1049, true) if !self.alt => {
@@ -318,6 +326,20 @@ mod tests {
         t.feed(b"\x1bc");
         assert!(!t.saved_origin(false));
         assert_eq!(t.feed(b"\x1b8"), vec![]);
+    }
+
+    #[test]
+    fn a_mode_6_after_leaving_the_alternate_screen_in_one_sequence_wins() {
+        let mut t = RegionTracker::new(24, false, true);
+        t.feed(b"\x1b[?6h\x1b[?1049h\x1b[?6l");
+        // `1049 l` would restore the primary screen's origin mode, but the 6 after it in the
+        // same sequence turns it off again, as xterm does: nothing is left for the backend.
+        assert_eq!(t.feed(b"\x1b[?1049;6l"), vec![]);
+        assert!(!t.st.origin);
+        // The other order restores the primary screen's mode last.
+        let mut t = RegionTracker::new(24, false, true);
+        t.feed(b"\x1b[?6h\x1b[?1049h\x1b[?6l");
+        assert_eq!(t.feed(b"\x1b[?6;1049l"), vec![(10, Action::LeaveAlt(true))]);
     }
 
     #[test]

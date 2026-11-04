@@ -68,6 +68,13 @@ deny:
 netsim-soak:
     cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak
 
+# Terminal pacing (M3 K1, crates/fil-session/tests/terminal_pacing.rs) in release: Ctrl-C during a
+# flood at 1 Mbit/s paced and unpaced (the unpaced QUIC cell takes about 20 s), and throughput
+# paced against unpaced on a fast, a 100 Mbit/s 40 ms and the 1 Mbit/s link. Not part of `ci`,
+# which runs the paced Ctrl-C cells.
+pacing:
+    cargo test --release -p fil-session --test terminal_pacing -- --include-ignored --nocapture --test-threads=1
+
 # The MUX model (crates/fil-proto/tests/mux_model.rs: both ends over a reordering, dropping link)
 # over many seeds, in release. Not part of `ci`, which runs a few. MUX_SEED_BASE moves the range.
 mux-soak seeds="5000":

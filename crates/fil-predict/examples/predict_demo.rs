@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use fil_predict::{CellStyle, Config, InputKind, LinkView, MoshConfig, MoshPredictor, Overlay};
+use fil_predict::{Config, InputKind, LinkView, MoshConfig, MoshPredictor, Overlay};
 use fil_term::{DEFAULT_BACKEND, Size, backends};
 use rustix::stdio::{stdin, stdout};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
@@ -128,11 +128,11 @@ fn main() {
         let mut remote = spawn(&spec, size, &link)?;
         let mut cfg = MoshConfig::default();
         if !predict {
-            cfg.rtt_threshold = Duration::MAX;
+            // Never on: no estimate is above the threshold, and no glitch shows them.
+            cfg.show_above = Duration::MAX;
+            cfg.glitch_window = Duration::ZERO;
         }
-        if !underline {
-            cfg.style = CellStyle::Plain;
-        }
+        cfg.underline = underline;
         let mut overlay = Overlay::with_backend(
             &b,
             size,

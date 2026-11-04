@@ -44,6 +44,9 @@ tempfile = "3"
 fil-session = { path = ".", features = ["test-hooks"] }
 # The scripted protocol client, shared with the daemon's tests.
 fil-testkit = { path = "../fil-testkit" }
+# Real transports on simulated links (tests/terminal_pacing.rs).
+fil-netsim = { path = "../fil-netsim" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustix = { version = "1", features = ["process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 

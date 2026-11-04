@@ -23,6 +23,9 @@ use crate::WAIT;
 
 /// Scrollback lines the emulator keeps.
 const HISTORY: usize = 5000;
+/// How long output may wait past a gap for the snapshot announcement that explains it, as the
+/// real client's `GAP_PATIENCE`: past it the test fails, naming the gap.
+const GAP_PATIENCE: Duration = Duration::from_secs(5);
 
 pub struct Client<L: Link> {
     pub link: L,
@@ -74,6 +77,15 @@ pub struct Client<L: Link> {
     input_sent: u64,
     /// Acknowledge what arrives (terminal output and snapshots), as the real client does.
     pub auto_ack: bool,
+    /// With `auto_ack`, acknowledge terminal output as the real client does (`fil-client`'s
+    /// engine): once `ACK_AFTER_BYTES` are unacknowledged, or `ACK_DELAY` after the first byte
+    /// that is not, instead of every segment. A snapshot is acknowledged at once either way.
+    pub client_acks: bool,
+    /// The terminal position last acknowledged, and when an ack of the rest is due.
+    ack_sent: u64,
+    ack_due: Option<tokio::time::Instant>,
+    /// Since when output has been held past a gap with no snapshot announced (`term_waiting`).
+    gap_since: Option<tokio::time::Instant>,
     pub emu: Box<dyn Emulator>,
     /// The size generation of this client's window: up by one with every `resize`.
     pub size_gen: u64,
@@ -123,6 +135,10 @@ impl<L: Link> Client<L> {
             forward_traffic: 0,
             input_sent: 0,
             auto_ack: true,
+            client_acks: false,
+            ack_sent: 0,
+            ack_due: None,
+            gap_since: None,
             emu,
             size_gen: 0,
             held: None,
@@ -254,11 +270,46 @@ impl<L: Link> Client<L> {
             if self.down {
                 return false;
             }
-            match tokio::time::timeout_at(end, self.link.recv()).await {
+            if let Some(t) = self.gap_since
+                && t.elapsed() >= GAP_PATIENCE
+            {
+                panic!(
+                    "a gap on the terminal channel that no snapshot announcement explained: \
+                     received up to {}, held {:?}",
+                    self.recv.received(),
+                    self.term_waiting
+                        .iter()
+                        .map(|(seq, d)| (*seq, *seq + d.len() as u64))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let gap_end = self.gap_since.map(|t| t + GAP_PATIENCE);
+            let wake = [Some(end), self.ack_due, gap_end]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(end);
+            match tokio::time::timeout_at(wake, self.link.recv()).await {
                 Ok(Ok((ch, payload))) => self.apply(ch, payload).await,
                 Ok(Err(_)) => self.down = true,
+                Err(_) if wake < end => {
+                    self.ack_due = None;
+                    self.ack_terminal().await;
+                }
                 Err(_) => return pred(self),
             }
+        }
+    }
+
+    /// Acknowledges the terminal up to where it is, if that is news.
+    async fn ack_terminal(&mut self) {
+        if self.auto_ack && self.next > self.ack_sent {
+            self.ack_sent = self.next;
+            self.send_ctl(ControlMsg::Ack {
+                channel: ChannelId::TERMINAL,
+                upto: self.next,
+            })
+            .await;
         }
     }
 
@@ -322,6 +373,14 @@ impl<L: Link> Client<L> {
                         return;
                     }
                 }
+                if self.snap_info.is_none() && seg.seq > self.recv.received() {
+                    // Past a gap with no snapshot announced: on QUIC the output after a jump
+                    // can overtake its announcement (a lost control packet). It waits for it,
+                    // as the real client's does (`GAP_PATIENCE`).
+                    self.term_waiting.push((seg.seq, seg.data.to_vec()));
+                    self.gap_since.get_or_insert_with(tokio::time::Instant::now);
+                    return;
+                }
                 self.apply_terminal(seg.seq, seg.data).await;
                 // A mid-stream snapshot waiting for the output before it.
                 self.finish_snapshot().await;
@@ -342,11 +401,14 @@ impl<L: Link> Client<L> {
         self.emu.feed(&fresh);
         self.next = self.recv.received();
         if self.auto_ack && !fresh.is_empty() {
-            self.send_ctl(ControlMsg::Ack {
-                channel: ChannelId::TERMINAL,
-                upto: self.next,
-            })
-            .await;
+            if !self.client_acks
+                || self.next.saturating_sub(self.ack_sent) >= fil_proto::limits::ACK_AFTER_BYTES
+            {
+                self.ack_due = None;
+                self.ack_terminal().await;
+            } else if self.ack_due.is_none() {
+                self.ack_due = Some(tokio::time::Instant::now() + fil_proto::limits::ACK_DELAY);
+            }
         }
     }
 
@@ -364,6 +426,29 @@ impl<L: Link> Client<L> {
                 .push(until.saturating_sub(self.next));
             until
         });
+        // Output that came past a gap before this announcement gets the checks it would have got
+        // had the announcement come first: nothing across the snapshot's position, nothing the
+        // catch-up skipped, and nothing below the position (that would be a real gap: bytes
+        // before the snapshot lost).
+        if let Some(until) = self.snap_until {
+            for (seq, data) in &self.term_waiting {
+                let end = *seq + data.len() as u64;
+                assert!(
+                    *seq >= until || end <= until,
+                    "a segment across a snapshot's position: {seq}..{end}, {info:?}"
+                );
+                assert!(
+                    *seq >= until,
+                    "a gap below a snapshot's position: received {}, then {seq}..{end}, {info:?}",
+                    self.recv.received()
+                );
+                assert!(
+                    *seq >= info.at,
+                    "output the catch-up skipped arrived: {seq}, {info:?}"
+                );
+            }
+        }
+        self.gap_since = None;
         self.finish_snapshot().await;
     }
 
@@ -396,6 +481,8 @@ impl<L: Link> Client<L> {
         self.next = info.at;
         self.snap_info = None;
         self.snap_until = None;
+        self.ack_sent = info.at;
+        self.ack_due = None;
         if self.auto_ack {
             self.send_ctl(ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
@@ -407,6 +494,11 @@ impl<L: Link> Client<L> {
         let mut waiting = std::mem::take(&mut self.term_waiting);
         waiting.sort_by_key(|(seq, _)| *seq);
         for (seq, data) in waiting {
+            // Below `at` would be dropped as a duplicate by the receive channel: never silently.
+            assert!(
+                seq >= info.at,
+                "held output below the snapshot's `at`: {seq}, {info:?}"
+            );
             self.apply_terminal(seq, &data).await;
         }
     }
@@ -422,6 +514,7 @@ impl<L: Link> Client<L> {
                     StartPoint::Resume { from } => {
                         self.recv = RecvChannel::starting_at(from);
                         self.next = from;
+                        self.ack_sent = from;
                     }
                     StartPoint::Snapshot(info) => self.expect_snapshot(info, false).await,
                 }

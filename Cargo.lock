@@ -505,6 +505,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fil-forward",
+ "fil-netsim",
  "fil-proto",
  "fil-session",
  "fil-term",
@@ -512,6 +513,7 @@ dependencies = [
  "fil-transport",
  "nix",
  "portable-pty",
+ "quinn",
  "rustix",
  "serde",
  "tempfile",

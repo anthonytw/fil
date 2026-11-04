@@ -17,5 +17,8 @@ fil-transport = { path = "../fil-transport" }
 ring = "0.17"
 tokio = { version = "1", features = ["time", "net", "io-util", "rt", "sync"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+
 [lints]
 workspace = true

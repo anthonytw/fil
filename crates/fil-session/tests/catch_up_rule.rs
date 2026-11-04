@@ -52,6 +52,10 @@ async fn late_acknowledgements_alone_never_jump() {
         min_bytes_for_age: 512 * 1024,
         ..CatchUpParams::default()
     };
+    // Unpaced: this is the rule alone, with everything sent. The terminal pacer (DESIGN.md
+    // section 8.5) would hold the output a client never acknowledges in the daemon, where it is
+    // unsent and a jump would skip it, which is right then: the client does not have it.
+    cfg.terminal_pacing = false;
     let h = spawn_plain(cfg).await;
     // Room for the whole flood on the link: the daemon is never held up sending.
     let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 1024);

@@ -54,7 +54,8 @@ pub enum Blocker {
     /// and by the alacritty backend's shadow (which buffers them until `?2026 l`), so the
     /// shadow screen is stale and anything restored from it would be wrong.
     ProgramSync,
-    /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown, or a cursor restore
+    /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown,
+    /// a cursor restore after it left the cursor's position in dispute, or a cursor restore
     /// left the open hyperlink unknown: terminals disagree on all of them. Cleared when the
     /// program sets the mode, the region or the link.
     Uncertain,
@@ -101,6 +102,12 @@ struct Modes {
     /// saves it with the cursor, xterm has no links to save. Unknown until the program next
     /// sends OSC 8.
     link_unknown: bool,
+    /// A soft reset (DECSTR) with no cursor save since: a restore now lands where terminals
+    /// disagree (the shadow and xterm at home, kitty and tmux at the old saved cursor).
+    reset_unsaved: bool,
+    /// The cursor's position came from such a restore, and no absolute position (`CUP`, `HVP`)
+    /// has been set since (`crate::CoreView::cursor_disputed`).
+    cursor_disputed: bool,
 }
 
 impl Default for Modes {
@@ -123,12 +130,15 @@ impl Default for Modes {
             link: None,
             link_possible: false,
             link_unknown: false,
+            reset_unsaved: false,
+            cursor_disputed: false,
         }
     }
 }
 
 impl Modes {
     fn save(&mut self) {
+        self.reset_unsaved = false;
         self.saved = Some(SavedCharsets {
             g: self.g,
             gl: self.gl,
@@ -137,6 +147,9 @@ impl Modes {
     }
 
     fn restore(&mut self) {
+        if self.reset_unsaved {
+            self.cursor_disputed = true;
+        }
         if self.link_possible {
             self.link_unknown = true;
         }
@@ -250,7 +263,9 @@ impl Perform for Modes {
                     gl: 0,
                     origin: false,
                 });
+                self.reset_unsaved = true;
             }
+            ([], 'H' | 'f') => self.cursor_disputed = false,
             ([], 'r') => self.region_unknown = false,
             ([], 's') => self.save(),
             ([], 'u') => self.restore(),
@@ -331,6 +346,17 @@ impl Tracker {
         self.modes.origin
     }
 
+    /// Origin mode is on, or unknown after a soft reset or a cursor restore.
+    pub fn origin_maybe(&self) -> bool {
+        self.modes.origin || self.modes.origin_unknown
+    }
+
+    /// The cursor's position came from a cursor restore after a soft reset with nothing saved
+    /// since, and no absolute position has been set after it: terminals disagree on where it is.
+    pub fn cursor_disputed(&self) -> bool {
+        self.modes.cursor_disputed
+    }
+
     pub fn insert(&self) -> bool {
         self.modes.insert
     }
@@ -346,6 +372,9 @@ impl Tracker {
             // The region only matters where an origin-mode cursor is placed.
             || (self.modes.region_unknown && (self.modes.origin || self.modes.origin_unknown))
             || self.modes.link_unknown
+            // A cursor restored after a soft reset: terminals put it in different places
+            // (`docs/m3/terminals.md` finding 2).
+            || self.modes.cursor_disputed
     }
 
     /// The program has synchronized output (`?2026`) on.
@@ -535,6 +564,23 @@ mod tests {
             fed(b"\x1b]8;;t\x07\x1b[?1049h\x1b[?1049l").blockers(),
             vec![Blocker::Uncertain]
         );
+    }
+
+    #[test]
+    fn a_restore_after_a_soft_reset_disputes_the_cursor_until_one_is_set() {
+        assert!(!fed(b"\x1b7\x1b8").cursor_disputed());
+        assert!(!fed(b"\x1b[!p").cursor_disputed());
+        for restore in [&b"\x1b8"[..], b"\x1b[u", b"\x1b[?1049l"] {
+            let mut bytes = b"\x1b[5;5H\x1b7\x1b[!p".to_vec();
+            bytes.extend_from_slice(restore);
+            assert!(fed(&bytes).cursor_disputed());
+            bytes.extend_from_slice(b"\x1b[2;3H");
+            assert!(!fed(&bytes).cursor_disputed());
+        }
+        // A save after the reset is one every terminal agrees on.
+        assert!(!fed(b"\x1b[!p\x1b7\x1b8").cursor_disputed());
+        assert!(!fed(b"\x1b[!p\x1b8\x1bc").cursor_disputed());
+        assert!(!fed(b"\x1b[!p\x1b8\x1b[1;1f").cursor_disputed());
     }
 
     #[test]

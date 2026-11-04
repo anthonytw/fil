@@ -69,6 +69,62 @@ netsim-soak:
 mux-soak seeds="5000":
     MUX_SEEDS={{seeds}} cargo test --release -p fil-proto --test mux_model -- --nocapture
 
+# Fuzz one target for SECONDS (libFuzzer via cargo-fuzz). Needs the NIGHTLY toolchain (the sanitizer
+# flags are nightly-only) and cargo-fuzz:
+#   rustup toolchain install nightly --profile minimal && cargo install cargo-fuzz --locked
+# Not part of `ci`: the fuzz crates are workspaces of their own (crates/*/fuzz) that the stable build
+# never sees; `fuzz-deny` (run first) holds them to the same license policy. `just fuzz` alone lists the targets. The seeds are committed (fuzz/seeds/TARGET); what
+# the run finds goes to the git-ignored fuzz/corpus/TARGET, a crash to fuzz/artifacts/TARGET. To
+# replay a crash on stable: put its bytes in a regression test of the owning crate.
+fuzz target="" seconds="60":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{source_directory()}}"
+    targets=$(ls crates/*/fuzz/fuzz_targets/*.rs 2>/dev/null | sed -E 's#crates/([^/]+)/fuzz/fuzz_targets/(.*)\.rs#\2 (\1)#')
+    if [[ -z "{{target}}" ]]; then
+      echo "usage: just fuzz TARGET [SECONDS]   (nightly toolchain + cargo-fuzz; see the comment on this recipe)"
+      echo "targets:"; sed 's/^/  /' <<<"$targets"
+      exit 0
+    fi
+    src=$(ls crates/*/fuzz/fuzz_targets/"{{target}}".rs 2>/dev/null || true)
+    if [[ -z "$src" || $(wc -l <<<"$src") -ne 1 ]]; then
+      echo "fuzz: no (single) target named '{{target}}'. Targets:" >&2; sed 's/^/  /' <<<"$targets" >&2; exit 1
+    fi
+    crate=${src%/fuzz/fuzz_targets/*}
+    if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+      echo "fuzz: needs a nightly toolchain: rustup toolchain install nightly --profile minimal" >&2; exit 1
+    fi
+    if ! cargo fuzz --version >/dev/null 2>&1; then
+      echo "fuzz: needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1
+    fi
+    if ! cargo deny --version >/dev/null 2>&1; then
+      echo "fuzz: needs cargo-deny (for fuzz-deny): cargo install cargo-deny --locked" >&2; exit 1
+    fi
+    just fuzz-deny
+    cd "$crate"
+    dirs=("fuzz/corpus/{{target}}")
+    if [[ -d "fuzz/seeds/{{target}}" ]]; then dirs+=("fuzz/seeds/{{target}}"); fi
+    mkdir -p "fuzz/corpus/{{target}}"
+    # -timeout: an input that takes 20 s is a hang, which is a bug. -max_len: past a frame's body
+    # limit (16 KiB), and for the preamble scanner past its default skip limit (64 KiB).
+    max_len=17000
+    if [[ "{{target}}" == preamble ]]; then max_len=70000; fi
+    # The sshd target makes a scratch directory in $TMPDIR; give it one to throw away.
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    TMPDIR=$scratch cargo +nightly fuzz run "{{target}}" "${dirs[@]}" -- -max_total_time={{seconds}} -timeout=20 -max_len=$max_len
+
+# The license, ban and source policy (deny.toml) on each fuzz crate, which `deny` does not see (they
+# are workspaces of their own). The advisory database is not consulted: the fuzz crates ship nothing.
+# Resolving a fuzz crate that has no lock file yet needs network access (the registry index).
+fuzz-deny:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{source_directory()}}"
+    for m in crates/*/fuzz/Cargo.toml; do
+      cargo deny --manifest-path "$m" check licenses bans sources
+    done
+
 # The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
 # forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
 # tests at 8 MiB and 2,000 (and 300 concurrent off QUIC). Release build. Also runs the SOCKS fuzz

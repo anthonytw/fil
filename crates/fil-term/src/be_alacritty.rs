@@ -139,6 +139,9 @@ struct Alacritty {
 
 impl Alacritty {
     fn new(size: Size, history: usize) -> Self {
+        // The floor: a wide character on a one-column grid makes alacritty_terminal allocate
+        // without bound (`Size::MIN_COLS`).
+        let size = size.clamped();
         let shared = Shared::default();
         let config = Config {
             scrolling_history: history,
@@ -177,6 +180,7 @@ impl Emulator for Alacritty {
     }
 
     fn resize(&mut self, size: Size) {
+        let size = size.clamped();
         self.size = size;
         self.term.get_mut().resize(Dims::from(size));
         self.region.resize(size.rows);

@@ -1,0 +1,65 @@
+# The cargo-fuzz targets of fil-proto's decoders. Not part of the workspace and not run by `just ci`
+# (it needs a nightly toolchain):
+#   just fuzz TARGET SECONDS             (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run TARGET fuzz/corpus/TARGET fuzz/seeds/TARGET   (from crates/fil-proto)
+# The seeds in seeds/ are derived from tests/golden/wire.txt by seed-corpus.py.
+[package]
+name = "fil-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil-proto = { path = ".." }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "preamble"
+path = "fuzz_targets/preamble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opening"
+path = "fuzz_targets/opening.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input"
+path = "fuzz_targets/input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux"
+path = "fuzz_targets/mux.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,6 @@
+target
+# libFuzzer's working corpus (`just fuzz` writes new inputs here). The committed seeds are in seeds/.
+corpus
+artifacts
+coverage
+Cargo.lock

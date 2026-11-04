@@ -14,6 +14,10 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
+    # libfuzzer-sys, `(MIT OR Apache-2.0) AND NCSA` (the LLVM libFuzzer sources it bundles). The fuzz
+    # crates are workspaces of their own and never reach a release, but `just fuzz` runs this check
+    # on them too (`fuzz-deny`). NCSA is permissive (MIT/BSD-style) and GPL-3.0-compatible.
+    "NCSA",
     "LGPL-2.1-or-later",
     "LGPL-3.0-or-later",
     "GPL-3.0-or-later",

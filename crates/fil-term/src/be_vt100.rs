@@ -149,7 +149,7 @@ impl Vt100 {
         );
         Vt100 {
             parser: RefCell::new(parser),
-            region: RegionTracker::new(size.rows, true),
+            region: RegionTracker::new(size.rows, true, false),
             size,
             history,
         }
@@ -163,7 +163,8 @@ impl Emulator for Vt100 {
 
     fn feed(&mut self, bytes: &[u8]) {
         self.parser.get_mut().process(bytes);
-        self.region.feed(bytes);
+        // `vt100` is not asked to follow the origin mode, so there is nothing to put right.
+        let _ = self.region.feed(bytes);
     }
 
     fn resize(&mut self, size: Size) {

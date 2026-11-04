@@ -208,6 +208,9 @@ pub struct SavedCursor {
     pub pen: Attrs,
     /// The G0 to G3 designations DECSC saved with the cursor (DECRC brings them back).
     pub charsets: [Charset; 4],
+    /// The origin mode DECSC saved with the cursor (DECRC brings it back, as in xterm). The
+    /// position is absolute either way.
+    pub origin: bool,
 }
 
 /// The tab stops a fresh terminal of `cols` columns has: every 8th column, leaving out the first

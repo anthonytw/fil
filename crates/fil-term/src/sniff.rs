@@ -1,12 +1,29 @@
-//! A second, tiny parser that tracks the DECSTBM scroll region and the invoked character set.
+//! A second, tiny parser that tracks the DECSTBM scroll region and the invoked character set,
+//! and tells a backend where the stream holds a sequence it handles wrongly or not at all.
 //!
 //! Neither `alacritty_terminal` (`Term::scroll_region` is private) nor `vt100` (no accessor)
 //! lets a caller read the scroll region, though DESIGN.md §6.2 requires restoring it. This
 //! shadows the region from the same bytes: it costs a second pass of the parser over the
 //! stream, and it must mirror each backend's rules for what counts as a valid region and
 //! what resets one.
+//!
+//! The same pass finds what the backends get wrong about origin mode, and returns it from
+//! [`RegionTracker::feed`] as an [`Action`] at the byte where it takes effect, for the backend
+//! to put right in the emulator (so the emulator and the model agree with real terminals).
+//! xterm saves the origin mode with the cursor (DECSC) and DECRC brings it back;
+//! `alacritty_terminal` saves the cursor without it. The tracker keeps the mode and the saved
+//! bit (one per screen, as the cursor save is), and reports a restore after which the
+//! emulator's mode differs from the saved one.
 
 use vte::{Params, Parser, Perform};
+
+/// Something a backend has to do to its emulator at a byte offset of the fed stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// A restore (DECRC, or leaving the alternate screen) has just been parsed and the origin
+    /// mode it should have brought back differs from the emulator's: set it to this.
+    SetOrigin(bool),
+}
 
 pub(crate) struct RegionTracker {
     parser: Parser,
@@ -22,10 +39,61 @@ struct State {
     /// Which of G0 to G3 is invoked: SI selects G0, SO selects G1. (Neither backend honors
     /// the locking shifts `ESC n` and `ESC o`.)
     active_charset: u8,
+    /// Follow the origin mode and its save (DECSC, DECRC, the alternate screen).
+    track_origin: bool,
+    origin: bool,
+    /// The origin bit the cursor save of the primary [0] and the alternate [1] screen holds.
+    saved_origin: [bool; 2],
+    alt: bool,
+    /// Set by the parser callbacks, taken by `feed` after each byte.
+    action: Option<Action>,
+}
+
+impl State {
+    fn save_cursor(&mut self) {
+        if self.track_origin {
+            self.saved_origin[usize::from(self.alt)] = self.origin;
+        }
+    }
+
+    /// The origin bit a restore from the save of screen `from_alt` brings back.
+    fn restore_origin(&mut self, from_alt: bool) {
+        if !self.track_origin {
+            return;
+        }
+        let saved = self.saved_origin[usize::from(from_alt)];
+        if saved != self.origin {
+            self.origin = saved;
+            self.action = Some(Action::SetOrigin(saved));
+        }
+    }
+
+    fn private_mode(&mut self, mode: u16, on: bool) {
+        if !self.track_origin {
+            return;
+        }
+        match (mode, on) {
+            (6, _) => self.origin = on,
+            // Entering the alternate screen saves the cursor on the primary one; leaving it
+            // restores that. (`alacritty_terminal` has no other alternate-screen mode.)
+            (1049, true) if !self.alt => {
+                self.save_cursor();
+                self.alt = true;
+            }
+            (1049, false) if self.alt => {
+                self.alt = false;
+                self.restore_origin(false);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl RegionTracker {
-    pub(crate) fn new(rows: u16, invalid_resets: bool) -> Self {
+    /// `invalid_resets`: see [`State`]. `track_origin`: follow the origin mode and report the
+    /// restores that change it (the `alacritty_terminal` backend; `vt100` does not expose the
+    /// mode).
+    pub(crate) fn new(rows: u16, invalid_resets: bool, track_origin: bool) -> Self {
         RegionTracker {
             parser: Parser::new(),
             st: State {
@@ -33,12 +101,33 @@ impl RegionTracker {
                 region: None,
                 invalid_resets,
                 active_charset: 0,
+                track_origin,
+                origin: false,
+                saved_origin: [false; 2],
+                alt: false,
+                action: None,
             },
         }
     }
 
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.st, bytes);
+    /// Parses `bytes`. Returns what the backend has to do, with the offset into `bytes` just
+    /// after the sequence it follows, in order.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, Action)> {
+        let mut actions = Vec::new();
+        // One byte at a time, to know where in the chunk a sequence ends.
+        for (i, byte) in bytes.iter().enumerate() {
+            self.parser
+                .advance(&mut self.st, std::slice::from_ref(byte));
+            if let Some(a) = self.st.action.take() {
+                actions.push((i + 1, a));
+            }
+        }
+        actions
+    }
+
+    /// The origin bit of the cursor save of the screen (`alt`: the alternate one).
+    pub(crate) fn saved_origin(&self, alt: bool) -> bool {
+        self.st.saved_origin[usize::from(alt)]
     }
 
     /// A resize resets the region in both backends.
@@ -81,15 +170,34 @@ impl Perform for State {
             }
             // DECSTR, soft terminal reset.
             ([b'!'], 'p') => self.region = None,
+            // The ANSI.SYS forms of DECSC and DECRC (both emulators take any parameters).
+            ([], 's') => self.save_cursor(),
+            ([], 'u') => self.restore_origin(self.alt),
+            ([b'?'], 'h' | 'l') => {
+                for p in params.iter() {
+                    self.private_mode(p.first().copied().unwrap_or(0), action == 'h');
+                }
+            }
             _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        // RIS, full reset.
-        if intermediates.is_empty() && byte == b'c' {
-            self.region = None;
-            self.active_charset = 0;
+        if !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            // RIS, full reset.
+            b'c' => {
+                self.region = None;
+                self.active_charset = 0;
+                self.origin = false;
+                self.saved_origin = [false; 2];
+                self.alt = false;
+            }
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_origin(self.alt),
+            _ => {}
         }
     }
 }
@@ -100,7 +208,7 @@ mod tests {
 
     #[test]
     fn tracks_set_reset_and_invalid() {
-        let mut t = RegionTracker::new(24, false);
+        let mut t = RegionTracker::new(24, false, false);
         t.feed(b"\x1b[3;8r");
         assert_eq!(t.region(), Some((2, 7)));
         t.feed(b"\x1b[8;3r"); // invalid: ignored by alacritty rules
@@ -119,7 +227,7 @@ mod tests {
 
     #[test]
     fn follows_shift_in_and_out() {
-        let mut t = RegionTracker::new(24, false);
+        let mut t = RegionTracker::new(24, false, false);
         assert_eq!(t.active_charset(), 0);
         t.feed(b"a\x0eb");
         assert_eq!(t.active_charset(), 1);
@@ -133,7 +241,7 @@ mod tests {
 
     #[test]
     fn split_sequences_and_vt100_invalid_rule() {
-        let mut t = RegionTracker::new(10, true);
+        let mut t = RegionTracker::new(10, true, false);
         t.feed(b"\x1b[2");
         t.feed(b";5");
         t.feed(b"r");
@@ -142,5 +250,49 @@ mod tests {
         assert_eq!(t.region(), None);
         t.feed(b"\x1b[1;10r");
         assert_eq!(t.region(), None);
+    }
+
+    #[test]
+    fn reports_where_a_restore_changes_the_origin_mode() {
+        let mut t = RegionTracker::new(24, false, true);
+        // Saved with origin on, then origin off, then restored: the mode must come back, at
+        // the byte that ends the restore.
+        let bytes = b"\x1b[?6h\x1b7\x1b[?6lab\x1b8cd";
+        assert_eq!(t.feed(bytes), vec![(16, Action::SetOrigin(true))]);
+        assert_eq!(bytes[15], b'8');
+        assert!(t.saved_origin(false));
+        // Restoring again changes nothing: the emulator's mode is already the saved one.
+        assert_eq!(t.feed(b"\x1b8\x1b[u"), vec![]);
+        // The same restore, with `CSI s` and `CSI u`, and split across chunks.
+        let mut t = RegionTracker::new(24, false, true);
+        assert_eq!(t.feed(b"\x1b[?6;7h\x1b[s\x1b[?"), vec![]);
+        assert_eq!(t.feed(b"6l\x1b["), vec![]);
+        assert_eq!(t.feed(b"u"), vec![(1, Action::SetOrigin(true))]);
+    }
+
+    #[test]
+    fn the_alternate_screen_has_its_own_save_and_returns_the_primary_origin_mode() {
+        let mut t = RegionTracker::new(24, false, true);
+        t.feed(b"\x1b[?6h");
+        // `1049 h` saves on the primary screen; the alternate one starts with nothing saved.
+        assert_eq!(
+            t.feed(b"\x1b[?1049h\x1b8"),
+            vec![(10, Action::SetOrigin(false))]
+        );
+        assert!(t.saved_origin(false));
+        assert!(!t.saved_origin(true));
+        // Leaving brings back the primary one's.
+        assert_eq!(t.feed(b"\x1b[?1049l"), vec![(8, Action::SetOrigin(true))]);
+        // RIS forgets all of it.
+        t.feed(b"\x1bc");
+        assert!(!t.saved_origin(false));
+        assert_eq!(t.feed(b"\x1b8"), vec![]);
+    }
+
+    #[test]
+    fn origin_mode_is_not_tracked_unless_asked() {
+        let mut t = RegionTracker::new(24, false, false);
+        assert_eq!(t.feed(b"\x1b[?6h\x1b7\x1b[?6l\x1b8"), vec![]);
+        assert!(!t.saved_origin(false));
     }
 }

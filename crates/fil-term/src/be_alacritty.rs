@@ -15,6 +15,12 @@
 //!   test in `tests/roundtrip.rs` guards the whole class.
 //! - The scroll region (`Term::scroll_region`) is private, so it is shadowed by a second
 //!   tiny parser (`sniff::RegionTracker`) fed the same bytes.
+//! - DECSC does not save the origin mode and DECRC does not restore it, though xterm, kitty,
+//!   WezTerm and tmux do. The tracker follows the mode and its save, and where a restore should
+//!   have changed the mode, `feed` puts `CSI ? 6 h|l` and a second `ESC 8` into the stream
+//!   right after it: setting the origin mode homes the cursor, and the second restore takes it
+//!   back to the saved position, pen, wrap flag and character sets. Going through the parser
+//!   keeps the order right inside a synchronized-update bracket.
 //! - Tab stops (`Term::tabs`) are private. They are read back by probing: park the cursor on
 //!   each column in turn and ask `move_forward_tabs` where one tab goes (a tab stop at column
 //!   `c` is a stop exactly when a tab from `c - 1` lands on `c`), then put the cursor back.
@@ -46,7 +52,7 @@ use crate::model::{
     MouseEncoding, MouseTracking, PrimaryScreen, SavedCursor, Size, TermState, Underline,
     default_tab_stops,
 };
-use crate::sniff::RegionTracker;
+use crate::sniff::{Action, RegionTracker};
 use crate::{Backend, Capabilities, Emulator};
 
 pub(crate) const BACKEND: Backend = Backend {
@@ -154,7 +160,7 @@ impl Alacritty {
             term: RefCell::new(term),
             parser: Processor::new(),
             shared,
-            region: RegionTracker::new(size.rows, false),
+            region: RegionTracker::new(size.rows, false, true),
             size,
         }
     }
@@ -166,8 +172,22 @@ impl Emulator for Alacritty {
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(self.term.get_mut(), bytes);
-        self.region.feed(bytes);
+        let mut done = 0;
+        for (end, action) in self.region.feed(bytes) {
+            self.parser.advance(self.term.get_mut(), &bytes[done..end]);
+            done = end;
+            match action {
+                Action::SetOrigin(on) => {
+                    let fix: &[u8] = if on {
+                        b"\x1b[?6h\x1b8"
+                    } else {
+                        b"\x1b[?6l\x1b8"
+                    };
+                    self.parser.advance(self.term.get_mut(), fix);
+                }
+            }
+        }
+        self.parser.advance(self.term.get_mut(), &bytes[done..]);
     }
 
     fn apply_pending(&mut self) {
@@ -204,7 +224,7 @@ impl Emulator for Alacritty {
 
         let (screen, history, cursor, primary, saved) = if !alt {
             let (screen, history, cursor) = read_grid(term.grid(), history_lines, &mut links);
-            let saved = saved_of(&term.grid().saved_cursor);
+            let saved = saved_of(&term.grid().saved_cursor, self.region.saved_origin(false));
             (screen, history, cursor, None, saved)
         } else {
             // Copy the alternate grid and its cursors, swap the primary in to read it, swap
@@ -212,7 +232,7 @@ impl Emulator for Alacritty {
             let (alt_screen, _, alt_cursor) = read_grid(term.grid(), 0, &mut links);
             let raw_cursor = term.grid().cursor.clone();
             let raw_saved = term.grid().saved_cursor.clone();
-            let saved = saved_of(&raw_saved);
+            let saved = saved_of(&raw_saved, self.region.saved_origin(true));
             let raw_rows: Vec<Vec<ACell>> = (0..term.screen_lines())
                 .map(|r| {
                     let row = &term.grid()[GLine(r as i32)];
@@ -343,8 +363,9 @@ fn read_tab_stops(term: &mut Term<Shared>) -> Option<Vec<u16>> {
     (stops != default_tab_stops(cols as u16)).then_some(stops)
 }
 
-fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>) -> Option<SavedCursor> {
+fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>, origin: bool) -> Option<SavedCursor> {
     let saved = SavedCursor {
+        origin,
         row: c.point.line.0.max(0) as u16,
         col: c.point.column.0 as u16,
         pen: attrs(&c.template),

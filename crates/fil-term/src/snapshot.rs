@@ -15,8 +15,8 @@
 //!    are written without a newline and left to autowrap, which restores the wrap flag;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
 //!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
-//! 4. tab stops, the scroll region, the saved cursor with the character sets it saved, origin
-//!    mode, the cursor (with the pending-wrap flag), the pen;
+//! 4. tab stops, the scroll region, the saved cursor with the origin mode and the character
+//!    sets it saved, origin mode, the cursor (with the pending-wrap flag), the pen;
 //! 5. the live character sets, input modes, mouse, kitty keyboard flags, title, cursor shape
 //!    and visibility.
 //!
@@ -166,11 +166,29 @@ impl<'a> Writer<'a> {
             }
             None => self.put("\x1b[r"),
         }
-        // DECSC with origin mode still off, so the saved position is absolute. It saves the
-        // character sets too, so designate the saved ones first and the ASCII ones after (the
-        // pending-wrap rewrite below prints a cell and must not go through line drawing).
+        // DECSC. It saves the origin mode and the character sets with the position, so a DECRC
+        // by the program later does what it would have done without the snapshot. The origin
+        // mode is set to the saved one first, and the position written in its coordinates (the
+        // region is already set); if the saved row is outside the region it cannot be written
+        // in origin mode, and the save is made without it. The character sets are the saved
+        // ones, then the ASCII ones after (the pending-wrap rewrite below prints a cell and
+        // must not go through line drawing).
         if let Some(sv) = st.saved_cursor {
-            self.cup(sv.row, sv.col);
+            let (top, bottom) = st
+                .modes
+                .scroll_region
+                .unwrap_or((0, st.size.rows.saturating_sub(1)));
+            if sv.origin && (top..=bottom).contains(&sv.row) {
+                self.put("\x1b[?6h");
+                self.put(&format!(
+                    "\x1b[{};{}H",
+                    u32::from(sv.row - top) + 1,
+                    u32::from(sv.col) + 1
+                ));
+            } else {
+                self.put("\x1b[?6l");
+                self.cup(sv.row, sv.col);
+            }
             self.set_pen(sv.pen);
             self.designate(sv.charsets);
             self.put("\x1b7");
@@ -529,7 +547,7 @@ pub fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Hyperlink, Modes, PrimaryScreen, Size};
+    use crate::model::{Hyperlink, Modes, PrimaryScreen, SavedCursor, Size};
 
     fn text_cell(t: &str) -> Cell {
         Cell {
@@ -859,6 +877,36 @@ mod tests {
         st.cursor.col = 1;
         let out = s(&snapshot(&st));
         assert!(out.contains("\x1b[3;5r\x1b[?6h\x1b[2;2H"), "{out:?}");
+    }
+
+    #[test]
+    fn the_saved_cursor_is_saved_with_its_origin_mode() {
+        let mut st = state(10, 6);
+        st.modes.scroll_region = Some((2, 4));
+        st.saved_cursor = Some(SavedCursor {
+            row: 3,
+            col: 1,
+            origin: true,
+            ..SavedCursor::default()
+        });
+        let out = s(&snapshot(&st));
+        // Origin mode on, the position relative to the region (row 3 is region row 2), DECSC.
+        assert!(out.contains("\x1b[3;5r\x1b[?6h\x1b[2;2H\x1b("), "{out:?}");
+        // Saved without origin mode, it is absolute and the mode is off while saving.
+        st.saved_cursor = Some(SavedCursor {
+            origin: false,
+            ..st.saved_cursor.unwrap()
+        });
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[3;5r\x1b[?6l\x1b[4;2H\x1b("), "{out:?}");
+        // A saved row outside the region cannot be written in origin mode: saved without it.
+        st.saved_cursor = Some(SavedCursor {
+            row: 0,
+            origin: true,
+            ..st.saved_cursor.unwrap()
+        });
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[3;5r\x1b[?6l\x1b[1;2H\x1b("), "{out:?}");
     }
 
     #[test]

@@ -21,14 +21,14 @@
 //! directory when the user's last login ends, which would strand a live daemon.
 
 use std::ffi::OsStr;
-use std::fs::DirBuilder;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use fil_proto::limits::PROTOCOL_MAJOR;
 use fil_proto::msg::{MAX_OTHER_DAEMONS, OtherDaemon};
 use fil_proto::version::wire_revision;
+use fil_session::private_dir::{DirFault, check_facts, ensure_private_dir};
 
 /// The longest socket path `bind` accepts everywhere we run (macOS allows 103 bytes plus the
 /// terminator; Linux 107).
@@ -36,7 +36,7 @@ const MAX_SOCKET_PATH: usize = 100;
 
 /// The effective user id of this process.
 pub fn current_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
+    fil_session::private_dir::euid()
 }
 
 /// `$HOME`, when it is an absolute path.
@@ -268,47 +268,23 @@ pub enum DirError {
     },
 }
 
-/// What [`check_dir`] needs to know about a directory entry, so the policy can be tested
-/// without being able to create files owned by other users.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DirFacts {
-    /// A real directory (not a symbolic link to one).
-    pub is_real_dir: bool,
-    pub uid: u32,
-    /// The permission bits (`mode & 0o777`).
-    pub mode: u32,
-}
-
-impl DirFacts {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        DirFacts {
-            is_real_dir: meta.file_type().is_dir(),
-            uid: meta.uid(),
-            mode: meta.mode() & 0o777,
-        }
-    }
-}
+pub use fil_session::private_dir::DirFacts;
 
 /// The policy: a real directory, owned by `our_uid`, with mode exactly 0700. Anything else is
-/// refused, because it could have been created by another user to intercept the socket.
+/// refused, because it could have been created by another user to intercept the socket. The
+/// rule is [`fil_session::private_dir::check_facts`], the agent directory's too.
 pub fn check_dir(path: &Path, facts: DirFacts, our_uid: u32) -> Result<(), DirError> {
-    if !facts.is_real_dir {
-        return Err(DirError::NotADirectory(path.to_path_buf()));
+    check_facts(facts, our_uid).map_err(|f| dir_error(path, f))
+}
+
+fn dir_error(path: &Path, fault: DirFault) -> DirError {
+    let path = path.to_path_buf();
+    match fault {
+        DirFault::NotADirectory => DirError::NotADirectory(path),
+        DirFault::WrongOwner { owner, ours } => DirError::WrongOwner { path, owner, ours },
+        DirFault::WrongMode { mode } => DirError::WrongMode { path, mode },
+        DirFault::Io(source) => DirError::Io { path, source },
     }
-    if facts.uid != our_uid {
-        return Err(DirError::WrongOwner {
-            path: path.to_path_buf(),
-            owner: facts.uid,
-            ours: our_uid,
-        });
-    }
-    if facts.mode != 0o700 {
-        return Err(DirError::WrongMode {
-            path: path.to_path_buf(),
-            mode: facts.mode,
-        });
-    }
-    Ok(())
 }
 
 /// The agent directory is there and passes [`check_dir`]: a real directory, ours, mode 0700.
@@ -323,25 +299,7 @@ fn agent_dir_is_ours(dir: &Path) -> bool {
 /// The check uses `lstat`, so a symbolic link planted at the path is refused, and it runs after
 /// creation too, so a directory somebody else created a moment earlier is refused as well.
 pub fn ensure_socket_dir(dir: &Path) -> Result<(), DirError> {
-    let io = |source| DirError::Io {
-        path: dir.to_path_buf(),
-        source,
-    };
-    let created = match DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(io(e)),
-    };
-    let ours = current_uid();
-    if created {
-        // The umask can only remove bits, but an odd one could remove too many.
-        let meta = std::fs::symlink_metadata(dir).map_err(io)?;
-        if meta.uid() == ours && meta.mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
-        }
-    }
-    let meta = std::fs::symlink_metadata(dir).map_err(io)?;
-    check_dir(dir, DirFacts::of(&meta), ours)
+    ensure_private_dir(dir).map_err(|f| dir_error(dir, f))
 }
 
 /// A daemon's socket in the socket directory.
@@ -439,6 +397,7 @@ pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn facts(is_real_dir: bool, uid: u32, mode: u32) -> DirFacts {
         DirFacts {

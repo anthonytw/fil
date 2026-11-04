@@ -21,7 +21,7 @@
 //! **Privacy**: nothing here logs a path or a session name; debug lines say what happened.
 
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,6 +32,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::debug;
+
+use crate::private_dir::{DirFault, ensure_private_dir, euid};
 
 /// Connections that may wait for a link at once; more are closed at once.
 pub(crate) const MAX_WAITING: usize = 32;
@@ -67,46 +69,12 @@ pub(crate) fn check_open(
     }
 }
 
-/// The effective uid of this process.
-pub(crate) fn our_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
-/// Creates `dir` with mode 0700, or checks the one there: a real directory (`lstat`: a symbolic
-/// link is refused), owned by us, with mode exactly 0700.
-pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
-    let created = match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(e),
-    };
-    let ours = our_uid();
-    let meta = std::fs::symlink_metadata(dir)?;
-    // The umask can only remove bits, but an odd one could remove too many.
-    if created && meta.file_type().is_dir() && meta.uid() == ours && meta.mode() & 0o777 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let meta = std::fs::symlink_metadata(dir)?;
-    check_dir_facts(
-        meta.file_type().is_dir(),
-        meta.uid(),
-        meta.mode() & 0o777,
-        ours,
-    )
-}
-
-/// The directory policy, on what `lstat` said.
-pub(crate) fn check_dir_facts(is_dir: bool, uid: u32, mode: u32, ours: u32) -> io::Result<()> {
-    if !is_dir {
-        return Err(io::Error::other("the agent directory is not a directory"));
-    }
-    if uid != ours {
-        return Err(io::Error::other("the agent directory is another user's"));
-    }
-    if mode != 0o700 {
-        return Err(io::Error::other("the agent directory's mode is not 0700"));
-    }
-    Ok(())
+/// Creates the agent directory, or checks the one there ([`crate::private_dir`]).
+fn ensure_dir(dir: &Path) -> io::Result<()> {
+    ensure_private_dir(dir).map_err(|fault| match fault {
+        DirFault::Io(e) => e,
+        other => io::Error::other(format!("the agent directory {other}")),
+    })
 }
 
 /// The bound socket: its accept task, and which file it is (so only that file is removed: a
@@ -207,7 +175,7 @@ impl AgentSocket {
         let listener = UnixListener::bind(&self.path)?;
         std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
         let m = std::fs::symlink_metadata(&self.path)?;
-        if !m.file_type().is_socket() || m.uid() != our_uid() || m.mode() & 0o777 != 0o600 {
+        if !m.file_type().is_socket() || m.uid() != euid() || m.mode() & 0o777 != 0o600 {
             drop(listener);
             return Err(io::Error::other("the agent socket is not as bound"));
         }
@@ -338,18 +306,5 @@ mod tests {
             check_open(Gate::Off, false, &peer(1000), 1000),
             Err(OpenFailure::AgentUnavailable)
         );
-    }
-
-    #[test]
-    fn the_directory_policy() {
-        assert!(check_dir_facts(true, 7, 0o700, 7).is_ok());
-        assert!(check_dir_facts(false, 7, 0o700, 7).is_err());
-        assert!(check_dir_facts(true, 8, 0o700, 7).is_err());
-        for mode in [0o755, 0o711, 0o770, 0o701, 0o600, 0o1700 & 0o777, 0o500] {
-            assert!(
-                check_dir_facts(true, 7, mode, 7).is_err() || mode == 0o700,
-                "{mode:o}"
-            );
-        }
     }
 }

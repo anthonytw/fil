@@ -345,7 +345,7 @@ impl Forwards {
             consented: HashSet::new(),
             listen: HashMap::new(),
             agent: false,
-            agent_uid: agent::our_uid(),
+            agent_uid: crate::private_dir::euid(),
             ended: false,
             policy,
             blocked: HashMap::new(),
@@ -361,7 +361,7 @@ impl Forwards {
         let policy = Arc::new(SessionPolicy {
             st: st.clone(),
             remote_peers,
-            uid: agent::our_uid(),
+            uid: crate::private_dir::euid(),
             #[cfg(feature = "test-hooks")]
             gate: gate.clone(),
         });

@@ -736,7 +736,8 @@ mod tests {
 
     #[test]
     fn a_systemctl_that_hangs_does_not_hang_the_kill() {
-        let dir = std::env::temp_dir().join(format!("fil-systemctl-test-{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("systemctl");
         let marker = dir.join("ran");
@@ -769,7 +770,6 @@ mod tests {
             }
         }
         let args = std::fs::read_to_string(&marker);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             args.expect("the fake systemctl never ran").trim(),
             "--user kill --signal=SIGKILL fil-x.scope"

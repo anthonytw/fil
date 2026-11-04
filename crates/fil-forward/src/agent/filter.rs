@@ -529,8 +529,8 @@ mod tests {
     /// it, both made now, have the fingerprint `ssh-keygen -l` prints.
     #[test]
     fn fingerprints_match_ssh_keygen_for_a_certificate() {
-        let dir = std::env::temp_dir().join(format!("fil-a1-cert-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let keygen = |args: &[&str]| {
             std::process::Command::new("ssh-keygen")
@@ -568,7 +568,6 @@ mod tests {
         assert_eq!(fingerprint(&plain), printed("user.pub"));
         assert_eq!(fingerprint(&cert), printed("user-cert.pub"));
         assert_eq!(fingerprint(&cert), fingerprint(&plain));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn base64_decode(s: &str) -> Vec<u8> {

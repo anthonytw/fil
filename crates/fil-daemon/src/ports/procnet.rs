@@ -816,11 +816,11 @@ mod tests {
         assert!(r.sockets.is_empty());
         assert!(r.missing && !r.truncated);
         assert!(r.cut, "no target can be given an owner (review of #79, N3)");
-        let dir = std::env::temp_dir().join(format!("fil-procnet-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("net")).unwrap();
         std::fs::write(dir.join("net/tcp"), fixture("tcp")).unwrap();
         let r = read(&dir, later, &none, ME);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(!r.missing && !r.truncated);
         assert_eq!(r.sockets.len(), 5);
     }

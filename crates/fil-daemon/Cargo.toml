@@ -32,6 +32,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 test-hooks = ["fil-proto/test-hooks"]
 
 [dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
 # Enables `test-hooks` for this crate's own tests and for the dev binary they spawn.
 fil-daemon = { path = ".", features = ["test-hooks"] }
 # The scripted protocol client, shared with fil-session's tests.

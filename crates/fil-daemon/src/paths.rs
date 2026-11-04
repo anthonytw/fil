@@ -443,8 +443,8 @@ mod tests {
     #[test]
     fn the_agent_directory_clean_up_is_careful() {
         use std::os::unix::fs::{DirBuilderExt, symlink};
-        let base = std::env::temp_dir().join(format!("fil-adir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("socket-dir");
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&base)
@@ -487,15 +487,14 @@ mod tests {
         symlink(&real, &dir).unwrap();
         assert!(!p.remove_agent_dir());
         assert!(real.exists() && std::fs::symlink_metadata(&dir).is_ok());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `fil ls` probes other daemons' lock files; one that is a FIFO (or a link) must neither block
     /// it nor be followed.
     #[test]
     fn a_lock_file_that_is_a_fifo_or_a_link_is_no_daemon_and_costs_no_wait() {
-        let dir = std::env::temp_dir().join(format!("fil-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("fifo.lock");
         assert!(
@@ -521,7 +520,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the probe of a FIFO did not block");
         assert!(!fifo_held && !link_held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

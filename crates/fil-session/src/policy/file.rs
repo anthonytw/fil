@@ -364,8 +364,8 @@ mod tests {
     /// directory.
     #[test]
     fn files_on_disk() {
-        let base = std::env::temp_dir().join(format!("fil-pf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
         let dir = base.join("etc/fil");
         std::fs::create_dir_all(&dir).unwrap();
         let set = |p: &Path, m: u32| {
@@ -439,6 +439,5 @@ mod tests {
         symlink(base.join("etc"), base.join("etc-link")).unwrap();
         let via = base.join("etc-link/fil/policy.toml");
         assert!(matches!(read(&via, &trust).0, FilePolicy::Keys(_)));
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -827,9 +827,10 @@ fn a_move_to_a_slow_long_path_reaches_what_a_fresh_pacer_does() {
 /// path's must not stay (the cap would grow until the queue read as the target above it: a
 /// standing queue of the difference), nor a base taken with the old cap's queue in it. With the
 /// old path's undelivered bytes sent again over the new one (as QUIC does after the old path's
-/// losses) they queue ahead of the new path's, and their late acks used to seed a base 75 ms
-/// above the path's 20 Mbit/s 10 ms (median queue 75 ms against 36 ms with the fix; the other
-/// model, in which they arrive as the old path scheduled them, never showed it).
+/// losses) they queue ahead of the new path's, and their late acks used to seed a base about
+/// 49 ms above the path's on 20 Mbit/s 10 ms (main's median queue was 75 ms against 36 ms with
+/// the fix; the other model, in which they arrive as the old path scheduled them, never showed
+/// it).
 #[test]
 fn a_move_to_a_faster_path_leaves_no_standing_queue() {
     for resend in [false, true] {

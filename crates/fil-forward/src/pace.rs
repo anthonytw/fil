@@ -80,7 +80,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use fil_proto::ChannelId;
-use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
+use fil_proto::limits::ACK_DELAY;
 use tracing::debug;
 
 /// The queueing delay the pacer aims for. Keystrokes wait behind about this much forward data
@@ -868,11 +868,6 @@ impl Pacer {
         self.linear(queued, false, COALESCE as usize);
         self.cap = self.cap.clamp(MIN_CAP, MAX_CAP);
     }
-}
-
-/// The threshold at which a peer whose window is `window` acknowledges at once.
-pub fn ack_threshold(window: u32) -> u64 {
-    ACK_AFTER_BYTES.min(u64::from(window) / 4)
 }
 
 #[cfg(test)]

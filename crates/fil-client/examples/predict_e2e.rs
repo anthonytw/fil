@@ -203,6 +203,15 @@ async fn resize(a: &Args) {
                                 repainted += 1;
                                 if !out.comparison.clean() {
                                     repaint_bad += 1;
+                                    if a.verbose {
+                                        println!(
+                                            "seed {seed}: after the repaint, vs a fresh snapshot:\n{}",
+                                            out.comparison.side_by_side()
+                                        );
+                                        for d in out.comparison.screen_diffs.iter().take(6) {
+                                            println!("   diff: {d}");
+                                        }
+                                    }
                                 }
                             }
                         }

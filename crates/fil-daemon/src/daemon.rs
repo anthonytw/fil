@@ -692,7 +692,7 @@ pub struct Daemon {
     keeping: Keeping,
     /// This daemon's executable and `$HOME`, to keep its install directory (`fil install`'s
     /// garbage collection spares a version directory modified in the last seven days).
-    install: Option<(PathBuf, PathBuf, Option<(u64, u64)>)>,
+    install: Option<Install>,
     stop: watch::Sender<Option<bool>>,
 }
 
@@ -804,10 +804,7 @@ impl Daemon {
             install: std::env::current_exe()
                 .ok()
                 .zip(crate::paths::home_dir())
-                .map(|(exe, home)| {
-                    let id = crate::paths::file_identity(&exe);
-                    (exe, home, id)
-                }),
+                .map(|(exe, home)| Install::new(exe, home)),
             stop,
         })
     }
@@ -826,8 +823,7 @@ impl Daemon {
     /// Names the executable and home directory the install directory is looked for from (the
     /// process's own by default). For tests.
     pub fn set_install(&mut self, exe: PathBuf, home: PathBuf) {
-        let id = crate::paths::file_identity(&exe);
-        self.install = Some((exe, home, id));
+        self.install = Some(Install::new(exe, home));
     }
 
     /// One look after the daemon's files: repairs what is missing or was replaced, then sets
@@ -888,8 +884,8 @@ impl Daemon {
         if self.keeping.refresh {
             let n = self.paths.refresh_times();
             tracing::debug!(files = n, "refreshed the times of the daemon's files");
-            if let Some((exe, home, id)) = &self.install {
-                let kept = crate::paths::refresh_install_dir(exe, home, *id);
+            if let Some(i) = &self.install {
+                let kept = crate::paths::refresh_install_dir(&i.exe, &i.home, i.id);
                 tracing::debug!(kept, "looked after the install directory");
             }
         }
@@ -1052,6 +1048,21 @@ impl Daemon {
         if waited.is_err() {
             tracing::warn!("a session was still starting at shutdown; giving up on it");
         }
+    }
+}
+
+/// The daemon's executable as it was at start (path and identity) and `$HOME`: what
+/// [`refresh_install_dir`](crate::paths::refresh_install_dir) needs.
+struct Install {
+    exe: PathBuf,
+    home: PathBuf,
+    id: Option<(u64, u64)>,
+}
+
+impl Install {
+    fn new(exe: PathBuf, home: PathBuf) -> Self {
+        let id = crate::paths::file_identity(&exe);
+        Install { exe, home, id }
     }
 }
 

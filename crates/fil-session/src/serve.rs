@@ -389,9 +389,15 @@ impl Flow {
     /// released and not yet acknowledged (`ready - acked`, a snapshot in flight too) takes
     /// `drain` to reach the client at the measured rate. The pacer holds the backlog in the
     /// daemon while acknowledgements keep coming, so `age` alone stays short however long the
-    /// backlog is; the drain time is what the user waits.
+    /// backlog is; the drain time is what the user waits. Paced, neither counts until the
+    /// pacer's pipe is full (`Pacer::waits_count`): while the window and the transport ramp up,
+    /// output waits for the ramp, not for a slow link, and unpaced it would have waited the same
+    /// inside the transport, where the rule does not look.
     fn wait(&mut self, ready: u64, now: Instant, generation: u64) -> Duration {
         self.path(generation);
+        if !self.pacer.waits_count(now) {
+            return Duration::ZERO;
+        }
         let ahead = ready.saturating_sub(self.acked) + self.snapshot_len;
         self.age(now).max(self.pacer.drain_time(ahead, now))
     }
@@ -1233,7 +1239,27 @@ mod tests {
         }
         let rate = f.pacer.rate(t).expect("a rate from the snapshots");
         assert!((150_000..=300_000).contains(&rate), "{rate}");
-        assert!(f.pacer.drain_time(1_000_000, t) > Duration::ZERO, "the pipe never filled");
+        assert!(
+            f.pacer.drain_time(1_000_000, t) > Duration::ZERO,
+            "the pipe never filled"
+        );
+    }
+
+    /// Paced, the rule's time half waits for a full pipe: output unacknowledged for 3 s while
+    /// the transport ramps up (quinn's slow start on a 600 ms path) does not count, and does
+    /// once the rate is the link's. Unpaced the age counts at once, as before pacing.
+    #[test]
+    fn the_wait_counts_only_once_the_pipe_is_full() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        f.record_send(16_384, t0, false);
+        let t1 = t0 + Duration::from_secs(3);
+        assert_eq!(f.wait(500_000, t1, 0), Duration::ZERO);
+        let mut u = Flow::new(0, Pacer::new(false));
+        u.record_send(16_384, t0, false);
+        assert_eq!(u.wait(500_000, t1, 0), Duration::from_secs(3));
+        let t2 = f.pacer.fill(Duration::from_millis(600), 12_500_000, t1);
+        assert!(f.wait(500_000, t2, 0) >= Duration::from_secs(3));
     }
 
     #[test]

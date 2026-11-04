@@ -216,6 +216,19 @@ impl Pacer {
         self.rates.front().map(|&(_, r)| r).filter(|&r| r > 0)
     }
 
+    /// Whether the catch-up rule may judge the time output waits: unpaced always (as before
+    /// pacing), paced once the pipe is full. Before that, output waits in the daemon because the
+    /// window and the transport are still ramping up, not because the link is slow: on a 600 ms
+    /// path quinn's slow start alone kept 420 kB unacknowledged for more than 2 s, and the age
+    /// half jumped where unpaced, with the same wait inside quinn, nothing was left unsent.
+    pub(crate) fn waits_count(&mut self, now: Instant) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        self.expire(now);
+        self.full
+    }
+
     /// How long `bytes` take to drain at the delivery rate: zero when unpaced, not measured,
     /// or measured only while the window was still ramping up (before the pipe is full the rate
     /// is the window's, a lower bound that grows each round trip: on a 200 ms path a burst read

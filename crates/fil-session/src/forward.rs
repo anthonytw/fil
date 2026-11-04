@@ -674,12 +674,21 @@ impl Forwards {
     /// the relay is, and binds or removes the socket (it exists only while the relay is on, and
     /// only where server policy allows it: asked before the socket is created).
     fn sync_agent(&self, st: &mut State) {
-        st.agent_refused = None;
         if st.agent && !st.ended && st.sub == Sub::Held {
-            st.agent_refused = st.policy.agent().err();
-            if st.agent_refused.is_some() {
-                debug!("agent relay refused by server policy");
+            match st.policy.agent() {
+                Ok(()) => st.agent_refused = None,
+                // A policy that cannot decide now (its read is too old, a re-read is running)
+                // changes nothing, as in `recheck`: the agent stays as it was, and no refusal
+                // is reported. Each agent connection is still checked as it comes (refused
+                // meanwhile), and the read, once in, syncs the agent again.
+                Err(why) if why.setting == PolicySetting::Pending => {}
+                Err(why) => {
+                    debug!("agent relay refused by server policy");
+                    st.agent_refused = Some(why);
+                }
             }
+        } else {
+            st.agent_refused = None;
         }
         let g = st.agent_gate();
         self.agent_gate.send_if_modified(|v| {

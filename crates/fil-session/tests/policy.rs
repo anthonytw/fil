@@ -819,3 +819,69 @@ async fn a_new_read_brings_the_agent_socket_without_a_link_change() {
     h.kill(WAIT).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A resume while the last read is too old to decide on leaves the agent as it was: the socket
+/// stays and the attach reply reports no refusal (each agent connection is still checked, and
+/// refused, meanwhile).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_read_at_a_resume_leaves_the_agent_as_it_was() {
+    use fil_testkit::agent::MiniAgent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANG: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(vec!["dev".into()]),
+        }
+    }
+    let host = Host::new("agstale");
+    host.sshd("Port 22\n");
+    let mut src = host.sources();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::ZERO;
+    src.max_age = Duration::from_millis(300);
+    let p = Arc::new(
+        tokio::task::spawn_blocking(move || Policy::new(src))
+            .await
+            .unwrap(),
+    );
+    let dir = PathBuf::from(format!("/tmp/fil-s1d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = dir.join("a/s.sock");
+    let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
+    let scratch = Scratch::new();
+    let mut cfg = sh_config(&scratch, "s", "cat");
+    cfg.policy = p.clone();
+    cfg.agent_socket = Some(sock.clone());
+    let h = spawn_plain(cfg).await;
+    let mut a = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
+    until("the agent socket", || sock.exists()).await;
+    // A re-read starts and hangs; the last read grows too old to decide on.
+    HANG.store(true, Ordering::SeqCst);
+    use fil_session::policy::ServerPolicy;
+    let _ = p.agent();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        p.agent().unwrap_err().setting,
+        fil_proto::mux::PolicySetting::Pending
+    );
+    a.reconnect(&h).await;
+    assert_eq!(
+        a.last_reply().unwrap().agent_refused,
+        None,
+        "a stale read reported as a refusal"
+    );
+    assert!(sock.exists(), "a stale read took the agent socket away");
+    HANG.store(false, Ordering::SeqCst);
+    until("the re-read is in", || p.agent().is_ok()).await;
+    assert!(sock.exists());
+    h.kill(WAIT).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

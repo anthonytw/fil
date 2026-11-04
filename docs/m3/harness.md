@@ -195,7 +195,7 @@ What W1's tests should assert, using this harness:
 
 ### After W1: the repaint repairs it
 
-W1 (wire revision 12, `DESIGN.md` §4.2 and §8.5 `InputRecord::Repaint`) lands the repair. The same matrix, `just predict-e2e resize --seeds 5`, 75 ms each way, `MoshAlways`, macOS, both transports, run as six processes (one per transport and program, under 4 minutes each). `repainted` is the runs in which the daemon sent a repaint snapshot; `after rp` the repainted runs that do not end equal to a fresh snapshot.
+W1 (wire revision 13, `DESIGN.md` §4.2 and §8.5 `InputRecord::Repaint`) lands the repair. The same matrix, `just predict-e2e resize --seeds 5`, 75 ms each way, `MoshAlways`, macOS, both transports, run as six processes (one per transport and program, under 4 minutes each). `repainted` is the runs in which the daemon sent a repaint snapshot; `after rp` the repainted runs that do not end equal to a fresh snapshot.
 
 | Program, direction | order | painted | **predict vs shadow** | predict vs snapshot | repainted | after rp | control vs shadow | control vs snapshot |
 |---|---|---|---|---|---|---|---|---|

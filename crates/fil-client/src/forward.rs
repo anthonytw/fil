@@ -1669,7 +1669,7 @@ fn summary_lines<L: Link>(v: &View, ep: &Endpoint<L>) -> Vec<String> {
     first.truncate(40);
     let mut second = String::new();
     for (shown, (kind, port, live)) in v.rows.iter().enumerate() {
-        let k = &consent::flag(*kind)[1..];
+        let k = &kind.flag()[1..];
         let item = match port {
             Some(p) => format!("{k}{p}{}", if *live { "" } else { "!" }),
             None => k.to_string(),

@@ -24,8 +24,7 @@ fn shape(kind: ForwardKind, s: &str) -> Result<(BindAddr, u16, Option<(String, u
     Ok((
         spec.bind(),
         spec.port(),
-        spec.target()
-            .map(|t| (forward_spec::target_host(&t.host), t.port.get())),
+        spec.target().map(|t| (t.host.bracketed(), t.port.get())),
     ))
 }
 

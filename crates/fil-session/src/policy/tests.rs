@@ -1,8 +1,8 @@
 //! The two layers together, on files: what each check answers and names.
 
 use super::*;
-use fil_proto::mux::{DnsName, TcpForwarding};
-use std::net::Ipv4Addr;
+use fil_proto::mux::{DnsName, TargetHost, TcpForwarding};
+use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU16;
 use std::os::unix::fs::PermissionsExt;
 

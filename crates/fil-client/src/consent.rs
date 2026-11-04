@@ -20,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use fil_proto::mux::{
     BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Target, TargetHost,
-    WITHHELD_TARGET,
+    WITHHELD_TARGET, bracketed_ip,
 };
 
 use crate::config::RemoteRequests;
@@ -206,35 +206,12 @@ impl Grants {
 
 // ---- words -----------------------------------------------------------------------------------
 
-fn ip_text(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{v6}]"),
-    }
-}
-
 fn bind_text(bind: BindAddr) -> String {
     match bind {
         BindAddr::Loopback => "localhost".into(),
         BindAddr::Any => "*".into(),
-        BindAddr::Ip(ip) => ip_text(ip),
+        BindAddr::Ip(ip) => bracketed_ip(ip),
         BindAddr::Withheld(_) => WITHHELD_TARGET.into(),
-    }
-}
-
-fn host_text(h: &TargetHost) -> String {
-    match h {
-        TargetHost::Ip(ip) => ip_text(*ip),
-        TargetHost::Name(n) => n.as_str().to_string(),
-    }
-}
-
-/// The flag of a kind: `-L`, `-R`, `-D`.
-pub fn flag(kind: ForwardKind) -> &'static str {
-    match kind {
-        ForwardKind::Local => "-L",
-        ForwardKind::Remote => "-R",
-        ForwardKind::Dynamic => "-D",
     }
 }
 
@@ -245,13 +222,13 @@ pub fn describe(spec: &ForwardSpec) -> String {
     let text = match spec.target() {
         Some(t) => format!(
             "{} {listen} -> {}:{}",
-            flag(spec.kind()),
-            host_text(&t.host),
+            spec.kind().flag(),
+            t.host.bracketed(),
             t.port
         ),
         // A `-R` another client named, whose target that client kept to itself.
         None if spec.target_withheld() => format!("-R {listen} -> {WITHHELD_TARGET}"),
-        None => format!("{} {listen}", flag(spec.kind())),
+        None => format!("{} {listen}", spec.kind().flag()),
     };
     debug_assert!(
         text.is_ascii() && !text.bytes().any(|b| b.is_ascii_control()),

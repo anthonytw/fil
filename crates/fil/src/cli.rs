@@ -317,7 +317,7 @@ impl clap::builder::TypedValueParser for SpecParser {
                 clap::error::ErrorKind::ValueValidation,
                 format!(
                     "invalid {} spec {}: {why}\n",
-                    forward_spec::flag(self.0),
+                    self.0.flag(),
                     forward_spec::quote(&raw)
                 ),
             )

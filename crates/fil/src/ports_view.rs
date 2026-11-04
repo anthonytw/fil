@@ -19,7 +19,7 @@ use fil_proto::msg::{
 use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin};
 use serde::Serialize;
 
-use crate::forward_spec::{self, host_port, is_loopback_ip, target_host_bare};
+use crate::forward_spec::{self, host_port, is_loopback_ip};
 
 /// The JSON layout's version. A field is never renamed or retyped within a version.
 pub const JSON_SCHEMA: u32 = 1;
@@ -395,7 +395,9 @@ fn forward_hint(port: u16, session: &str, o: &ViewOptions<'_>) -> String {
             };
             format!("fil forward {} {tail}", shell_word(&sanitize_inline(host)))
         }
-        (None, Some(current)) if sanitize_inline(current) == session => format!("fil forward -L {port}"),
+        (None, Some(current)) if sanitize_inline(current) == session => {
+            format!("fil forward -L {port}")
+        }
         (None, _) => format!("FIL_SESSION={} fil forward -L {port}", shell_word(&session)),
     }
 }
@@ -424,10 +426,10 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         (ForwardKind::Local, Some(t)) => (
             own,
             "→",
-            host_port(&sanitize_inline(&target_host_bare(&t.host)), t.port.get()),
+            host_port(&sanitize_inline(&t.host.to_string()), t.port.get()),
         ),
         (ForwardKind::Remote, Some(t)) => (
-            host_port(&sanitize_inline(&target_host_bare(&t.host)), t.port.get()),
+            host_port(&sanitize_inline(&t.host.to_string()), t.port.get()),
             "←",
             own,
         ),
@@ -443,7 +445,7 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
         ForwardKind::Dynamic => "—".to_string(),
     };
     let cells = vec![
-        forward_spec::flag(spec.kind()).to_string(),
+        spec.kind().flag().to_string(),
         format!("{laptop} {arrow}"),
         remote,
         owner,
@@ -934,7 +936,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         bind: json_bind(spec.bind()),
         port: spec.port(),
         target: spec.target().map(|t| JsonTarget {
-            host: target_host_bare(&t.host),
+            host: t.host.to_string(),
             port: t.port.get(),
         }),
         origin: match f.origin {
@@ -1025,7 +1027,9 @@ pub fn render_json(answer: &PortsAnswer, o: &ViewOptions<'_>) -> String {
                     .iter()
                     .map(|r| JsonRefused {
                         what: match &r.what {
-                            RefusedWhat::Forward(spec) => sanitize_inline(&forward_spec::format_flag(spec)),
+                            RefusedWhat::Forward(spec) => {
+                                sanitize_inline(&forward_spec::format_flag(spec))
+                            }
                             RefusedWhat::Agent => "agent".to_string(),
                         },
                         reason: r.why.to_string(),

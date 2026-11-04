@@ -286,35 +286,12 @@ pub fn is_exposed(spec: &ForwardSpec) -> bool {
     }
 }
 
-fn fmt_ip(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{v6}]"),
-    }
-}
-
 /// `host:port` for display, an IPv6 address in brackets.
 pub fn host_port(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
-    }
-}
-
-/// A target host as written in a spec: an IPv6 address in brackets.
-pub fn target_host(host: &TargetHost) -> String {
-    match host {
-        TargetHost::Ip(ip) => fmt_ip(*ip),
-        TargetHost::Name(n) => n.to_string(),
-    }
-}
-
-/// A target host on its own, never bracketed (for [`host_port`] and for data).
-pub fn target_host_bare(host: &TargetHost) -> String {
-    match host {
-        TargetHost::Ip(ip) => ip.to_string(),
-        TargetHost::Name(n) => n.to_string(),
     }
 }
 
@@ -329,13 +306,13 @@ pub fn format_spec(spec: &ForwardSpec) -> String {
         BindAddr::Any => "*:".to_string(),
         // Another client's bind on its machine, withheld from the host: shown, never parsed back.
         BindAddr::Withheld(_) => format!("{}:", fil_proto::mux::WITHHELD_TARGET),
-        BindAddr::Ip(ip) => format!("{}:", fmt_ip(ip)),
+        BindAddr::Ip(ip) => format!("{}:", fil_proto::mux::bracketed_ip(ip)),
     };
     match spec.target() {
         Some(t) => format!(
             "{bind}{}:{}:{}",
             spec.port(),
-            target_host(&t.host),
+            t.host.bracketed(),
             t.port.get()
         ),
         // Withheld by the client that named it: shown, never parsed back.
@@ -346,18 +323,9 @@ pub fn format_spec(spec: &ForwardSpec) -> String {
     }
 }
 
-/// The flag of a kind: `-L`, `-R`, `-D`.
-pub fn flag(kind: ForwardKind) -> &'static str {
-    match kind {
-        ForwardKind::Local => "-L",
-        ForwardKind::Remote => "-R",
-        ForwardKind::Dynamic => "-D",
-    }
-}
-
 /// `-L 5173:localhost:5173`: the spec as it would be typed or put in the config.
 pub fn format_flag(spec: &ForwardSpec) -> String {
-    format!("{} {}", flag(spec.kind()), format_spec(spec))
+    format!("{} {}", spec.kind().flag(), format_spec(spec))
 }
 
 /// `spec` joins `specs`, later winning: an equal spec is kept once, and a spec with another

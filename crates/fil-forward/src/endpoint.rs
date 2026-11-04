@@ -50,7 +50,7 @@
 //! data: nothing here logs them at any level. Logs carry channel ids, counts and the wire's enum
 //! reasons, at debug. `Debug` of every type here is counts and states only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -386,14 +386,6 @@ const DATA_AHEAD: usize = 64 * 1024;
 /// any other channel in the mux.
 const PASS_SCAN: usize = 64;
 
-/// How often the mux's timers run while something is time-bound (an ack due, an open waiting, a
-/// link down with channels), and not at all otherwise, so an idle endpoint costs no wakeups.
-const TICK: Duration = Duration::from_millis(50);
-const TICK_DOWN: Duration = Duration::from_millis(250);
-/// After any activity, the timers run for this long: acks are due 100 ms after the first
-/// unacknowledged byte (`ACK_DELAY`).
-const ACTIVE_FOR: Duration = Duration::from_millis(300);
-
 /// Largest read from a local socket into a channel (one data segment's worth).
 const READ_CHUNK: usize = fil_proto::limits::MAX_DATA_PAYLOAD;
 /// Largest piece taken from a channel's receive buffer for one socket write.
@@ -587,8 +579,13 @@ struct State<L> {
     queued: HashMap<u32, u32>,
     /// The channel the data sender last took a payload from (channels take turns).
     pass_rr: u32,
-    /// Reused for the channel ids `next_from_mux` goes round.
+    /// Reused for the channel ids `pull` and `next_from_mux` go round.
     scratch_ids: Vec<u32>,
+    /// The channels that may have bytes the mux has not handed out yet: every channel a pump
+    /// wrote to or the peer's `Resume` sent back, and every channel on a new link. The data
+    /// sender goes round these and not all the channels, so idle connections cost it nothing; a
+    /// channel whose bytes have all been taken is dropped from the set when it is next looked at.
+    unsent: BTreeSet<u32>,
     slots: HashMap<u32, Slot>,
     stats: HashMap<ForwardId, ForwardStats>,
     agent: ForwardStats,
@@ -614,8 +611,6 @@ struct State<L> {
     /// side acknowledges only what it was fed).
     mux_fed_end: u64,
     failed_told: bool,
-    last_tick: std::time::Instant,
-    active_until: Option<std::time::Instant>,
     closed: bool,
 }
 
@@ -681,35 +676,16 @@ impl<L: Link> State<L> {
         }
     }
 
-    fn active(&mut self, now: std::time::Instant) {
-        self.active_until = Some(now + ACTIVE_FOR);
+    /// Something happened at `now`: the mux stamps the timers it starts with it (a delayed ack,
+    /// an open's timeout). The mux's timers themselves run when [`Mux::next_deadline`] says, not
+    /// on a period, so a quiet endpoint wakes nothing.
+    fn touch(&mut self, now: std::time::Instant) {
+        self.mux.set_time(now);
     }
 
     fn tick(&mut self, now: std::time::Instant) {
         // An error is the mux's failure, which `drain` reports.
         let _ = self.mux.tick(now);
-        self.last_tick = now;
-    }
-
-    /// Whether the mux's timers have anything to do.
-    fn wants_tick(&self, now: std::time::Instant) -> bool {
-        if self.active_until.is_some_and(|t| now < t) {
-            return true;
-        }
-        let mut chans = self.mux.channels().peekable();
-        if chans.peek().is_none() {
-            return false;
-        }
-        self.link.is_none()
-            || chans.any(|c| {
-                self.mux
-                    .info(c)
-                    .is_some_and(|i| i.state == ChannelState::Opening)
-            })
-    }
-
-    fn tick_every(&self) -> Duration {
-        if self.link.is_some() { TICK } else { TICK_DOWN }
     }
 
     fn stat(&mut self, key: StatsKey) -> &mut ForwardStats {
@@ -882,12 +858,21 @@ impl<L: Link> State<L> {
         Some(Out::Data(ch, payload))
     }
 
+    /// The ids (in order) of the channels that have bytes to hand out, in the reusable buffer:
+    /// the set of channels that may, after dropping those that no longer do.
+    fn sendable_ids(&mut self) -> Vec<u32> {
+        let mux = &self.mux;
+        self.unsent.retain(|&id| mux.has_unsent(ChannelId(id)));
+        let mut ids = std::mem::take(&mut self.scratch_ids);
+        ids.clear();
+        ids.extend(self.unsent.iter().copied());
+        ids
+    }
+
     /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
     /// that the pacer lets go now, taken with `Mux::poll_transmit_channel`.
     fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
-        let mut ids = std::mem::take(&mut self.scratch_ids);
-        ids.clear();
-        ids.extend(self.mux.channels().map(|c| c.0));
+        let ids = self.sendable_ids();
         let start = ids.partition_point(|&id| id <= self.pass_rr);
         let mut found = None;
         for k in 0..ids.len() {
@@ -920,9 +905,7 @@ impl<L: Link> State<L> {
         if self.link.is_none() {
             return;
         }
-        let mut ids = std::mem::take(&mut self.scratch_ids);
-        ids.clear();
-        ids.extend(self.mux.channels().map(|c| c.0));
+        let ids = self.sendable_ids();
         // Rounds over the channels from the one after the last taken, one payload each, until
         // the queue is full or a round finds nothing.
         let mut k = ids.partition_point(|&id| id <= self.pass_rr);
@@ -982,12 +965,25 @@ struct Inner<L> {
     hooks: TestHooks,
 }
 
+/// Counts of the endpoint's wakeups ([`Endpoint::wakeups`], feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakeups {
+    pub ctl: u64,
+    pub data: u64,
+    pub ticks: u64,
+}
+
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
 #[cfg(feature = "test-hooks")]
 #[derive(Default)]
 struct TestHooks {
     /// Runs in `open_local` between the policy check and the open, without the lock.
     after_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// How often each sender task went round its loop, and how often the mux's timers ran.
+    ctl_runs: std::sync::atomic::AtomicU64,
+    data_runs: std::sync::atomic::AtomicU64,
+    ticks: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1065,6 +1061,7 @@ impl<L: Link> Endpoint<L> {
                 queued: HashMap::new(),
                 pass_rr: 0,
                 scratch_ids: Vec::new(),
+                unsent: BTreeSet::new(),
                 slots: HashMap::new(),
                 stats: HashMap::new(),
                 agent: ForwardStats::default(),
@@ -1079,8 +1076,6 @@ impl<L: Link> Endpoint<L> {
                 held_mux_bytes: 0,
                 mux_fed_end: 0,
                 failed_told: false,
-                last_tick: now(),
-                active_until: None,
                 closed: false,
             }),
             ctl_kick: Notify::new(),
@@ -1129,6 +1124,20 @@ impl<L: Link> Endpoint<L> {
     #[cfg(feature = "test-hooks")]
     pub fn set_after_check_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *lock(&self.inner().hooks.after_check) = hook;
+    }
+
+    /// How many times the control sender, the data sender and the mux's timers have run (feature
+    /// `test-hooks`): a test that a quiet forward wakes nothing, and that an event wakes only the
+    /// task that has work.
+    #[cfg(feature = "test-hooks")]
+    pub fn wakeups(&self) -> Wakeups {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = &self.inner().hooks;
+        Wakeups {
+            ctl: h.ctl_runs.load(Relaxed),
+            data: h.data_runs.load(Relaxed),
+            ticks: h.ticks.load(Relaxed),
+        }
     }
 
     pub fn side(&self) -> Side {
@@ -1188,7 +1197,10 @@ impl<L: Link> Endpoint<L> {
         st.pacer.path_changed(path);
         st.link = Some(link);
         st.generation += 1;
-        st.active(t);
+        // What the last link left unacknowledged may go again on this one.
+        let all: Vec<u32> = st.mux.channels().map(|c| c.0).collect();
+        st.unsent.extend(all);
+        st.touch(t);
         inner.drain(&mut st);
         drop(st);
         inner.kick();
@@ -1234,6 +1246,7 @@ impl<L: Link> Endpoint<L> {
             st.end_slot(ChannelId(id), CloseReason::Reset);
         }
         st.slots.clear();
+        st.unsent.clear();
         st.link = None;
         st.generation += 1;
         st.clear_queues();
@@ -1286,11 +1299,19 @@ impl<L: Link> Endpoint<L> {
         if let Some(end) = mux_end {
             st.mux_fed_end = st.mux_fed_end.max(end);
         }
+        st.touch(now());
         let r = st.mux.on_payload(ch, payload);
-        st.active(now());
         inner.drain(&mut st);
+        let control = st.mux.control_pending();
         drop(st);
-        inner.kick();
+        if ch == ChannelId::MUX {
+            // A record: it can open a channel, let data go, start an ack's delay.
+            inner.kick();
+        } else if control {
+            // Data lands in a buffer and wakes its pump through `drain`; neither sender has
+            // work unless the payload was a violation (a `Close` record).
+            inner.kick_ctl();
+        }
         r
     }
 
@@ -1298,6 +1319,7 @@ impl<L: Link> Endpoint<L> {
     pub fn on_ack(&self, ch: ChannelId, upto: u64) -> Result<(), MuxError> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
+        st.touch(now());
         let r = st.mux.on_ack(ch, upto);
         if r.is_ok() && st.link.is_some() {
             let threshold = st
@@ -1307,8 +1329,14 @@ impl<L: Link> Endpoint<L> {
             st.pacer.on_ack(ch, upto, threshold, now());
         }
         inner.drain(&mut st);
+        let control = st.mux.control_pending();
         drop(st);
-        inner.kick();
+        // Credit and a smaller send buffer: the data sender's, and the pacer's. A `Close` the ack
+        // completed (or any other record) is the control sender's.
+        inner.kick_data();
+        if control || ch == ChannelId::MUX {
+            inner.kick_ctl();
+        }
         r
     }
 
@@ -1317,6 +1345,8 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         let r = st.mux.on_resume(ch, received);
+        // The peer is missing bytes this side already handed out: they go again.
+        st.unsent.insert(ch.0);
         inner.drain(&mut st);
         drop(st);
         inner.kick();
@@ -1646,8 +1676,20 @@ impl<L: Link> State<L> {
 // ---- the tasks ------------------------------------------------------------------------------
 
 impl<L: Link> Inner<L> {
+    /// Wakes both senders: for what can give either work (a link, a channel's table change).
     fn kick(&self) {
         self.ctl_kick.notify_one();
+        self.data_kick.notify_one();
+    }
+
+    /// Wakes the control sender alone: an ack or a delayed-ack deadline (a local write
+    /// completed), never data.
+    fn kick_ctl(&self) {
+        self.ctl_kick.notify_one();
+    }
+
+    /// Wakes the data sender alone: new bytes to send, or credit for them.
+    fn kick_data(&self) {
         self.data_kick.notify_one();
     }
 
@@ -1746,7 +1788,7 @@ impl<L: Link> Inner<L> {
                     st.data_out.push_back(Out::Finish(channel));
                     st.end_slot(channel, CloseReason::Reset);
                     st.slots.remove(&channel.0);
-                    st.active(now());
+                    st.touch(now());
                 }
                 MuxEvent::Table(msg) => {
                     st.emit(EndpointEvent::Table(msg));
@@ -1808,6 +1850,7 @@ impl<L: Link> Inner<L> {
             }
         };
         let mut st = lock(&self.state);
+        st.touch(now());
         let live = st.live(ch, &sig)
             && st
                 .mux
@@ -1832,7 +1875,6 @@ impl<L: Link> Inner<L> {
                 }
             }
         }
-        st.active(now());
         self.drain(&mut st);
         drop(st);
         self.kick();
@@ -1874,8 +1916,8 @@ impl<L: Link> Inner<L> {
             return Err((OpenFailure::Detached, stream));
         }
         let t = now();
-        // The mux stamps the open with the time of its last tick: make that now.
-        st.tick(t);
+        // The mux stamps the open with the time it was last told: make that now.
+        st.touch(t);
         let ch = match st.mux.open(kind) {
             Ok(ch) => ch,
             Err(why) => {
@@ -1886,6 +1928,7 @@ impl<L: Link> Inner<L> {
         };
         if !early.is_empty() {
             st.mux.write(ch, early);
+            st.unsent.insert(ch.0);
         }
         let sig = Signals::new();
         st.slots.insert(
@@ -1903,7 +1946,7 @@ impl<L: Link> Inner<L> {
             st.note(ch, early.len(), 0);
         }
         self.spawn_pump(ch, stream, sig, socks);
-        st.active(t);
+        st.touch(t);
         self.drain(&mut st);
         drop(st);
         self.kick();
@@ -2197,8 +2240,8 @@ impl<L: Link> Inner<L> {
                     st.mux_fed_end = st.mux_fed_end.max(end);
                 }
                 // A protocol error here fails the mux; `drain` reports it (`Failed`).
+                st.touch(now());
                 let _ = st.mux.on_payload(ChannelId::MUX, p);
-                st.active(now());
                 self.drain(&mut st);
             }
             drop(st);
@@ -2211,6 +2254,8 @@ impl<L: Link> Inner<L> {
     /// Acks, the MUX stream and the restatements; and the mux's timers.
     async fn ctl_loop(self: Arc<Self>) {
         loop {
+            #[cfg(feature = "test-hooks")]
+            self.hooks.ctl_runs.fetch_add(1, Ordering::Relaxed);
             let kick = self.ctl_kick.notified();
             let (item, wake, data_ready) = {
                 let mut st = lock(&self.state);
@@ -2218,13 +2263,20 @@ impl<L: Link> Inner<L> {
                     return;
                 }
                 let t = now();
-                if t >= st.last_tick + st.tick_every() && st.wants_tick(t) {
+                // The mux's timers run when one is due, and the loop sleeps until the next:
+                // nothing ticks on a period, so a quiet forward wakes nothing.
+                let mut deadline = st.mux.next_deadline(t);
+                let ticked = deadline.is_some_and(|d| d <= t);
+                if ticked {
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks.ticks.fetch_add(1, Ordering::Relaxed);
                     st.tick(t);
                     self.drain(&mut st);
+                    deadline = st.mux.next_deadline(t);
                 }
                 // A MUX record taken (an `OpenOk` among them) can let data go that the data sender
                 // found held a moment ago (a server that speaks first): wake it then too, not only
-                // when it has a queue.
+                // when it has a queue. So can a tick (it closes what timed out).
                 let took_mux = st.pull_control();
                 let item = match st.link.clone() {
                     Some(link) => {
@@ -2233,12 +2285,14 @@ impl<L: Link> Inner<L> {
                     }
                     None => None,
                 };
-                let wake = if item.is_none() && st.wants_tick(t) {
-                    Some(st.last_tick + st.tick_every())
+                // Nothing to send: wait for a kick or the next deadline (never one already past: a
+                // tick has run, and what it left is not due again).
+                let wake = if item.is_none() {
+                    deadline.filter(|&d| d > t)
                 } else {
                     None
                 };
-                (item, wake, took_mux || !st.data_out.is_empty())
+                (item, wake, took_mux || (ticked && !st.data_out.is_empty()))
             };
             if data_ready {
                 self.data_kick.notify_one();
@@ -2265,8 +2319,10 @@ impl<L: Link> Inner<L> {
     /// The dynamic channels' data, and `Link::finish` once a channel is released.
     async fn data_loop(self: Arc<Self>) {
         loop {
+            #[cfg(feature = "test-hooks")]
+            self.hooks.data_runs.fetch_add(1, Ordering::Relaxed);
             let kick = self.data_kick.notified();
-            let (item, deadline, ctl_ready) = {
+            let (item, deadline) = {
                 let mut st = lock(&self.state);
                 if st.closed {
                     return;
@@ -2289,11 +2345,8 @@ impl<L: Link> Inner<L> {
                     (None, Some(_)) => st.pacer.next_deadline().filter(|&d| d > t),
                     _ => None,
                 };
-                (item, deadline, !st.ctl_out.is_empty())
+                (item, deadline)
             };
-            if ctl_ready {
-                self.ctl_kick.notify_one();
-            }
             match item {
                 Some((Out::Data(ch, payload), link, generation)) => {
                     if link.send(ch, payload).await.is_err() {
@@ -2437,13 +2490,20 @@ impl<L: Link> Inner<L> {
                             // while the read was in flight: the bytes go nowhere.
                             return Poll::Ready(Ok(None));
                         }
+                        st.touch(now());
                         let n = st.mux.write(ch, data);
+                        st.unsent.insert(ch.0);
                         debug_assert_eq!(n, data.len(), "the room was checked");
                         st.note(ch, n, 0);
-                        st.active(now());
                         self.drain(&mut st);
+                        let control = st.mux.control_pending();
                         drop(st);
-                        self.kick();
+                        // New bytes to send: the data sender's. The control sender has work only
+                        // if the write queued a record or an ack.
+                        self.kick_data();
+                        if control {
+                            self.kick_ctl();
+                        }
                         Poll::Ready(Ok(Some(data.len())))
                     }
                 }
@@ -2516,12 +2576,15 @@ impl<L: Link> Inner<L> {
                                 if !st.live(ch, sig) {
                                     return;
                                 }
+                                st.touch(now());
                                 st.mux.consumed(ch, n);
                                 st.note(ch, 0, n);
-                                st.active(now());
                                 self.drain(&mut st);
                                 drop(st);
-                                self.kick();
+                                // The write completing can produce an ack (at once, or after a
+                                // delay the control sender must be told of) or a `Close`: control
+                                // items. It frees none of this side's own sending.
+                                self.kick_ctl();
                             }
                             Ok(_) | Err(_) => {
                                 debug!(channel = ch.0, "forward socket write failed");
@@ -2541,9 +2604,9 @@ impl<L: Link> Inner<L> {
         if !st.live(ch, sig) {
             return;
         }
+        st.touch(now());
         st.mux.abort(ch, why);
         st.end_slot(ch, why);
-        st.active(now());
         self.drain(&mut st);
         drop(st);
         self.kick();

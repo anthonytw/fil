@@ -321,6 +321,11 @@ impl Sender {
 /// of a large buffer does not pin the buffer); a larger one is kept as a slice of it.
 const KEEP_SLICE_FROM: usize = 512;
 
+/// A tail that held more than this at once is let go when it is empty again, as a drained send
+/// ring is: a burst of small segments grows it (by doubling), and what it grew to stays allocated
+/// for as long as any view of it lives, an empty one included.
+const KEEP_TAIL: usize = 16 * 1024;
+
 /// Its `Debug` shows counts, never the bytes.
 #[derive(Default)]
 struct Receiver {
@@ -337,6 +342,10 @@ struct Receiver {
     /// Bytes in `[read, received)`: `chunks` then `tail`.
     chunks: VecDeque<Bytes>,
     tail: BytesMut,
+    /// The most `tail` held at once since it was last replaced: what its allocation has grown to,
+    /// which `capacity()` does not show once the tail has been split (an empty view of a shared
+    /// buffer reports what is left after its start, and keeps the whole buffer alive).
+    tail_peak: usize,
 }
 
 impl std::fmt::Debug for Receiver {
@@ -356,10 +365,12 @@ impl Receiver {
         if n >= KEEP_SLICE_FROM && n * 2 >= payload.len() {
             if !self.tail.is_empty() {
                 self.chunks.push_back(self.tail.split().freeze());
+                self.trim_tail();
             }
             self.chunks.push_back(payload.slice(fresh));
         } else {
             self.tail.put_slice(&payload[fresh]);
+            self.tail_peak = self.tail_peak.max(self.tail.len());
         }
         self.received += n as u64;
     }
@@ -373,10 +384,22 @@ impl Receiver {
             }
         } else {
             let n = self.tail.len().min(max);
-            self.tail.split_to(n).freeze()
+            let out = self.tail.split_to(n).freeze();
+            self.trim_tail();
+            out
         };
         self.read += out.len() as u64;
         out
+    }
+
+    /// Lets go of the tail's allocation when it holds nothing and has grown past [`KEEP_TAIL`]:
+    /// left alone, a burst of small segments pinned up to a window's worth for as long as the
+    /// channel stayed open. A tail that stayed small keeps its buffer for the next segments.
+    fn trim_tail(&mut self) {
+        if self.tail.is_empty() && self.tail_peak > KEEP_TAIL {
+            self.tail = BytesMut::new();
+            self.tail_peak = 0;
+        }
     }
 
     fn unconsumed(&self) -> u64 {
@@ -386,6 +409,7 @@ impl Receiver {
     fn clear(&mut self) {
         self.chunks.clear();
         self.tail = BytesMut::new();
+        self.tail_peak = 0;
         self.read = self.received;
         self.consumed = self.received;
         self.ack_since = None;
@@ -978,6 +1002,15 @@ impl Mux {
         None
     }
 
+    /// Whether [`Mux::poll_transmit_control`] has something to hand out now: a caller that
+    /// changed the mux and must wake its control sender only if there is work for it asks this,
+    /// in constant time.
+    pub fn control_pending(&self) -> bool {
+        self.up
+            && self.failed.is_none()
+            && (!self.acks.is_empty() || (self.mux_gate && self.mux_tx.next < self.mux_tx.end()))
+    }
+
     /// The next payload to send, and its channel: an `Ack` (on [`ChannelId::CONTROL`], an
     /// encoded control message), the MUX stream, then the dynamic channels in turn. Honours the
     /// credit, the Resume gates, and the rule that no data leaves before `OpenOk`. `None` while
@@ -1071,6 +1104,73 @@ impl Mux {
         Ok(())
     }
 
+    /// The time is `now`, with nothing else to do: the clock the mux stamps what it starts (an
+    /// ack's delay, an open's timeout) with. A caller that runs [`Mux::tick`] only when
+    /// [`Mux::next_deadline`] says so calls this on its way in, so no stamp is older than the
+    /// last thing that happened.
+    pub fn set_time(&mut self, now: Instant) {
+        if self.now.is_none_or(|t| now > t) {
+            self.now = Some(now);
+        }
+    }
+
+    /// When [`Mux::tick`] next has something to do, given that it is `now`: the earliest of the
+    /// delayed acks, the open timeouts and the linger deadline, or `now` itself for what waits
+    /// for a tick to start (a timer not yet stamped, a share to top up). `None`: nothing is
+    /// time-bound, and a caller need not tick at all. A deadline in the past is for the
+    /// caller to act on (tick); one in the future is when to wake.
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.failed.is_some() {
+            return None;
+        }
+        let mut next: Option<Instant> = None;
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if self.topup_due {
+            at(now);
+        }
+        if self.up {
+            // An ack already queued is not time-bound: it goes with the next poll.
+            if self.mux_rx.unacked() > 0 && !self.acks.contains(&ChannelId::MUX.0) {
+                at(self.mux_ack_since.map_or(now, |t| t + ACK_DELAY));
+            }
+            let total = self.cfg.connect_timeout + self.cfg.open_wait;
+            for (id, c) in &self.chans {
+                if c.recv.consumed > c.recv.acked && !c.close_sent && !self.acks.contains(id) {
+                    at(c.recv.ack_since.map_or(now, |t| t + ACK_DELAY));
+                }
+                if c.opened_at_pending {
+                    at(now);
+                } else if c.opening
+                    && !c.close_sent
+                    && let Some(t) = c.opened_at
+                {
+                    at(t + total);
+                }
+            }
+        } else {
+            let total = self.cfg.connect_timeout + self.cfg.open_wait;
+            let mut any = false;
+            for c in self.chans.values() {
+                if c.close_sent {
+                    continue;
+                }
+                any = true;
+                if c.opened_at_pending {
+                    at(now);
+                } else if c.opening
+                    && let Some(t) = c.opened_at
+                {
+                    at((t + self.cfg.open_wait).min(t + total));
+                }
+            }
+            // The linger clock matters only while a channel waits on it.
+            if any && !self.lingered {
+                at(self.down_since.map_or(now, |t| t + self.cfg.linger));
+            }
+        }
+        next
+    }
+
     /// The time is `now`: acks that are due, open and linger timeouts.
     pub fn tick(&mut self, now: Instant) -> Result<(), MuxError> {
         self.now = Some(now);
@@ -1096,10 +1196,12 @@ impl Mux {
                 }
             }
             for (&id, c) in &mut self.chans {
-                if c.recv.consumed > c.recv.acked
-                    && c.recv.ack_since.is_some_and(|t| now >= t + ACK_DELAY)
-                {
-                    self.acks.insert(id);
+                if c.recv.consumed > c.recv.acked {
+                    // Consumed before the mux had a clock: the delay starts now.
+                    let since = *c.recv.ack_since.get_or_insert(now);
+                    if now >= since + ACK_DELAY {
+                        self.acks.insert(id);
+                    }
                 }
             }
         }
@@ -1177,6 +1279,16 @@ impl Mux {
             peer_window: c.peer_window as u32,
             sent_high: c.send.high,
         })
+    }
+
+    /// Whether `ch` has bytes written that [`Mux::poll_transmit_channel`] has not yet handed out
+    /// (whether or not it may now: the credit or a gate may hold them). `false` for a channel
+    /// that is gone. A sender that goes round the channels asks this of the few that have
+    /// something, and need not visit the others.
+    pub fn has_unsent(&self, ch: ChannelId) -> bool {
+        self.chans
+            .get(&ch.0)
+            .is_some_and(|c| c.send.next < c.send.end())
     }
 
     /// The channels not yet released.

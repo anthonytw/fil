@@ -1546,3 +1546,213 @@ fn poll_transmit_channel_leaves_the_round_robin_alone() {
         .collect();
     assert_eq!(order, next, "the turn order is unchanged");
 }
+
+// ---- the timers, and what a quiet mux keeps ---------------------------------------------------
+
+/// `next_deadline` names the one thing that is time-bound, and `None` when nothing is, so a
+/// caller that sleeps until it ticks never late and never for nothing.
+#[test]
+fn the_next_deadline_is_the_delayed_ack_and_none_when_quiet() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    // The open's records are acknowledged by the delay (nothing else is owed): after it, quiet.
+    p.advance(ACK_DELAY);
+    p.pump();
+    assert_eq!(p.c.next_deadline(p.now), None);
+    assert_eq!(p.d.next_deadline(p.now), None);
+
+    // A reader that leaves bytes waiting: the ack is due `ACK_DELAY` after the first consumed byte.
+    p.c.write(ch, &[0; 200]);
+    p.pump();
+    let half = p.d.read(ch, 100);
+    p.d.consumed(ch, half.len());
+    assert_eq!(p.d.next_deadline(p.now), Some(p.now + ACK_DELAY));
+    assert_eq!(p.c.next_deadline(p.now), None, "the sender owes nothing");
+    p.advance(ACK_DELAY);
+    // Due now: the tick queued the ack, which is not time-bound any more.
+    assert_eq!(p.d.next_deadline(p.now), None);
+    p.pump();
+
+    // Drained: acknowledged at once, never a deadline.
+    drain(&mut p.d, ch);
+    assert_eq!(p.d.next_deadline(p.now), None);
+}
+
+/// An open waits for its answer for `connect_timeout + open_wait`, and with the link down for
+/// `open_wait`; a channel the link's loss strands is closed after `linger`.
+#[test]
+fn the_next_deadline_covers_open_timeouts_and_linger() {
+    let mut p = Pair::new();
+    let ch = p.c.open(local()).unwrap();
+    let total = p.c.cfg.connect_timeout + p.c.cfg.open_wait;
+    assert_eq!(p.c.next_deadline(p.now), Some(p.now + total));
+    p.pump();
+    p.d.accept(ch);
+    p.pump();
+    assert!(events(&mut p.c).contains(&MuxEvent::Opened { channel: ch }));
+    p.advance(ACK_DELAY);
+    p.pump();
+    assert_eq!(p.c.next_deadline(p.now), None, "answered: no timeout");
+
+    // The link goes down with the channel open: it lingers.
+    p.c.link_down();
+    assert_eq!(p.c.next_deadline(p.now), Some(p.now + p.c.cfg.linger));
+    // An open made now waits `open_wait` (the earlier of the two).
+    let second = p.c.open(local()).unwrap();
+    assert_eq!(p.c.next_deadline(p.now), Some(p.now + p.c.cfg.open_wait));
+    p.advance(p.c.cfg.open_wait);
+    assert!(events(&mut p.c).iter().any(|e| matches!(
+        e,
+        MuxEvent::Closed { channel, why: CloseReason::TimedOut } if *channel == second
+    )));
+    // The closed open gave its share back: topping the others up is due at once (it is done by a
+    // tick, so the caller must not sleep through it).
+    assert_eq!(p.c.next_deadline(p.now), Some(p.now));
+    p.c.tick(p.now).unwrap();
+    assert_eq!(
+        p.c.next_deadline(p.now),
+        Some(p.now + p.c.cfg.linger - p.c.cfg.open_wait)
+    );
+    p.advance(p.c.cfg.linger);
+    assert!(events(&mut p.c).iter().any(|e| matches!(
+        e,
+        MuxEvent::Closed { channel, why: CloseReason::TimedOut } if *channel == ch
+    )));
+    p.c.tick(p.now).unwrap(); // the share top-up, as above
+    assert_eq!(
+        p.c.next_deadline(p.now),
+        None,
+        "lingered, nothing left to wait for"
+    );
+}
+
+/// With no channel to strand, a link that is down sets no timer at all.
+#[test]
+fn a_link_down_with_no_channels_has_no_deadline() {
+    let mut p = Pair::new();
+    p.c.link_down();
+    assert_eq!(p.c.next_deadline(p.now), None);
+}
+
+/// A timer the mux has not started yet (it was never given a time) is due at once, so the
+/// caller ticks and the clock starts.
+#[test]
+fn a_timer_that_has_not_started_is_due_now() {
+    let now = Instant::now();
+    let mut m = Mux::new(Side::Client, cfg());
+    assert!(m.link_up(false).is_empty());
+    let ch = m.open(local()).unwrap();
+    assert_eq!(m.next_deadline(now), Some(now), "not stamped yet");
+    m.tick(now).unwrap();
+    let total = m.cfg.connect_timeout + m.cfg.open_wait;
+    assert_eq!(m.next_deadline(now), Some(now + total));
+    // `set_time` moves the clock forward only.
+    m.set_time(now - Duration::from_secs(5));
+    let other = m.open(local()).unwrap();
+    assert_ne!(ch, other);
+    assert_eq!(m.next_deadline(now), Some(now + total));
+}
+
+fn small(n: usize) -> Bytes {
+    // A segment's payload with a header in front of the data, as `push` sees it.
+    Bytes::from(vec![7u8; n + 8])
+}
+
+/// Whether the tail holds an allocation: an empty `BytesMut::new()` points at a dangling
+/// address, a view of a buffer that was once filled into the heap. (`capacity()` is no help: an
+/// empty view of a shared buffer reports only what lies after its start, often 0, while keeping
+/// the whole buffer alive.)
+fn holds_a_buffer(r: &Receiver) -> bool {
+    r.tail.as_ptr() as usize > 4096
+}
+
+/// A burst of small segments grows the receiver's tail; once it is read the buffer goes back (it
+/// pinned up to a window's worth for as long as the channel lived).
+#[test]
+fn a_receiver_gives_its_tail_back_after_a_burst_of_small_segments() {
+    let mut r = Receiver::default();
+    for _ in 0..8192 {
+        let p = small(100);
+        r.push(&p, 8..p.len());
+    }
+    assert!(
+        holds_a_buffer(&r) && r.tail_peak > KEEP_TAIL,
+        "the burst grew it"
+    );
+    let mut got = 0;
+    loop {
+        let b = r.read(4096);
+        if b.is_empty() {
+            break;
+        }
+        got += b.len();
+    }
+    assert_eq!(got, 8192 * 100);
+    assert!(!holds_a_buffer(&r), "an empty tail still holds its buffer");
+    // And it works afterwards.
+    let p = small(100);
+    r.push(&p, 8..p.len());
+    assert_eq!(r.read(usize::MAX).len(), 100);
+}
+
+/// The same when the burst is cut short by a large run (the tail is split into the chunks).
+#[test]
+fn a_receiver_gives_its_tail_back_when_a_large_run_follows_a_burst() {
+    let mut r = Receiver::default();
+    for _ in 0..8192 {
+        let p = small(100);
+        r.push(&p, 8..p.len());
+    }
+    let big = Bytes::from(vec![1u8; 4096 + 8]);
+    r.push(&big, 8..big.len());
+    assert!(!holds_a_buffer(&r));
+}
+
+/// Steady small traffic keeps its (small) tail: no allocation per segment.
+#[test]
+fn a_receiver_with_a_small_tail_keeps_it() {
+    let mut r = Receiver::default();
+    let p = small(100);
+    r.push(&p, 8..p.len());
+    r.read(usize::MAX);
+    for _ in 0..50 {
+        r.push(&p, 8..p.len());
+        r.read(usize::MAX);
+        assert!(holds_a_buffer(&r));
+    }
+    assert!(r.tail_peak <= KEEP_TAIL);
+}
+
+/// `control_pending` is what a caller asks after changing the mux to know whether its control
+/// sender has work: an ack to send, or a record on the MUX stream (a `Close` an ack completed).
+#[test]
+fn control_pending_tells_acks_and_records_from_nothing() {
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    p.advance(ACK_DELAY);
+    p.pump();
+    assert!(!p.c.control_pending() && !p.d.control_pending());
+
+    // A write the reader drains: the ack is pending until taken.
+    p.c.write(ch, b"x");
+    p.pump();
+    assert!(!p.d.control_pending(), "received, not yet written out");
+    let got = p.d.read(ch, 10);
+    p.d.consumed(ch, got.len());
+    assert!(p.d.control_pending(), "an ack on drain");
+    assert!(p.d.poll_transmit_control().is_some());
+    assert!(!p.d.control_pending());
+    p.pump();
+
+    // An EOF is a record on the MUX stream (as is the `Close` a final ack completes).
+    p.c.eof(ch);
+    p.pump();
+    p.d.eof(ch);
+    assert!(p.d.control_pending(), "an EOF record");
+    p.pump();
+    assert!(!p.c.control_pending() && !p.d.control_pending());
+    // A link that is down has nothing to hand out.
+    p.c.write(ch, b"y");
+    p.c.link_down();
+    assert!(!p.c.control_pending());
+}

@@ -84,6 +84,11 @@ impl Drop for Tree {
 /// A daemon in this process with `keeping`, a start file as a relay leaves one, and one detached
 /// session (`main`) on it.
 async fn run(tree: &Tree, keeping: Keeping) -> Running {
+    run_with(tree, keeping, |_| {}).await
+}
+
+/// [`run`], with `setup` applied to the daemon before it serves.
+async fn run_with(tree: &Tree, keeping: Keeping, setup: impl FnOnce(&mut Daemon)) -> Running {
     let paths = tree.paths();
     fil_daemon::ensure_socket_dir(&tree.dir).unwrap();
     std::fs::File::create(paths.start_lock()).unwrap();
@@ -91,6 +96,7 @@ async fn run(tree: &Tree, keeping: Keeping) -> Running {
         .await
         .expect("daemon starts");
     daemon.set_keeping(keeping);
+    setup(&mut daemon);
     let d = Running {
         paths,
         handle: daemon.handle(),
@@ -156,8 +162,10 @@ impl Cleaner {
                 .map(|_| Cleaner::Tmpfiles)
         };
         if found.is_none() {
+            // Linux CI has systemd-tmpfiles; a macOS host without Apple's script (older or newer
+            // releases keep it elsewhere or not at all) skips with a notice.
             assert!(
-                std::env::var_os("CI").is_none(),
+                cfg!(target_os = "macos") || std::env::var_os("CI").is_none(),
                 "no temporary-file cleaner on this CI host"
             );
             eprintln!("skipped: no temporary-file cleaner (systemd-tmpfiles or tmp_cleaner) here");
@@ -270,11 +278,15 @@ async fn without_a_defense_the_cleaner_takes_the_files() {
     cleaner.clean(&tree);
     let after = identities(&d.paths);
     match cleaner {
-        // v255 spares what is flocked (the lock file, whatever its age) and every socket, so
-        // the start file, which nothing holds, is the one it takes. That is the canary: the
-        // same file is what the defenses below keep.
+        // systemd 255 spares what is flocked (the lock file, whatever its age) and every socket,
+        // so the start file, which nothing holds, is the canary; another version may take more,
+        // so this asks only that something went.
         Cleaner::Tmpfiles => {
-            assert_eq!(after, [before[0], before[1], before[2], None]);
+            assert_ne!(
+                after, before,
+                "the cleaner took nothing: the cases prove nothing"
+            );
+            assert_eq!(after[3], None, "the start file, which nothing holds");
         }
         // Regular files only, flocked or not: the lock and start files go, the socket and
         // directory stay.
@@ -284,8 +296,10 @@ async fn without_a_defense_the_cleaner_takes_the_files() {
             assert_eq!(&after[2..], &[None, None], "the lock and start files");
         }
     }
-    // The cleaner took a file of a live daemon, and the daemon can still be reached.
-    assert!(has_the_session(&d).await);
+    if after[1].is_some() {
+        // The cleaner took a file of a live daemon, and the daemon can still be reached.
+        assert!(has_the_session(&d).await);
+    }
     d.handle.shutdown(true);
     let _ = tokio::time::timeout(WAIT, d.task).await;
 }
@@ -494,6 +508,102 @@ async fn the_daemon_keeps_the_install_directory_it_runs_from() {
     );
     handle.shutdown(true);
     let _ = tokio::time::timeout(WAIT, task).await;
+}
+
+/// A daemon replaced by another (its lock file and socket were removed, a relay started a
+/// successor) must not unlink the successor's socket when it exits, and must not bind one of its
+/// own while the successor holds the lock.
+async fn a_predecessor_leaves_its_successor_alone(every: Duration) {
+    let tree = Tree::new();
+    let a = run(&tree, keeping_every(every)).await;
+    let paths = a.paths.clone();
+    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.socket()).unwrap();
+    // A relay that finds no socket starts a daemon, which takes the lock and the path.
+    let b = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("the successor starts");
+    let b_handle = b.handle();
+    let b_task = tokio::spawn(b.run());
+    let b_socket = identities(&paths)[1];
+    assert!(b_socket.is_some());
+    // A looks (or does not) and then exits.
+    tokio::time::sleep(every.min(Duration::from_millis(400)) * 4 + Duration::from_millis(1200))
+        .await;
+    assert_eq!(identities(&paths)[1], b_socket, "A bound a socket over B's");
+    a.stop().await;
+    assert_eq!(
+        identities(&paths)[1],
+        b_socket,
+        "A's exit removed B's socket"
+    );
+    assert!(
+        std::os::unix::net::UnixStream::connect(paths.socket()).is_ok(),
+        "B no longer answers"
+    );
+    b_handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, b_task).await;
+}
+
+fn keeping_every(every: Duration) -> Keeping {
+    Keeping {
+        every,
+        refresh: true,
+        dir_lock: true,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_predecessor_that_never_looks_does_not_unlink_its_successors_socket() {
+    a_predecessor_leaves_its_successor_alone(Duration::from_secs(3600)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_predecessor_that_looks_does_not_bind_over_its_successor() {
+    a_predecessor_leaves_its_successor_alone(Duration::from_millis(400)).await;
+}
+
+/// The look that touches the user's home runs on a thread of its own: with that part hung (a
+/// home directory on a mount that does not answer, stood in for by a hook that blocks), the
+/// daemon still accepts and answers connections and still stops, and the hourly looks do not
+/// pile up behind the hung one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_home_directory_does_not_stop_the_daemon() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    let tree = Tree::new();
+    let home = tree.parent.join("home");
+    let installed = home.join(".local/share/fil/0.1.0-w1.12");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(installed.join("fil"), b"").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release, blocked) = mpsc::channel::<()>();
+    let blocked = Arc::new(Mutex::new(blocked));
+    let hook: Arc<dyn Fn() + Send + Sync> = {
+        let (calls, blocked) = (calls.clone(), blocked.clone());
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let _ = blocked.lock().unwrap().recv();
+        })
+    };
+    let exe = installed.join("fil");
+    let d = run_with(&tree, keeping(true, true), |daemon| {
+        daemon.set_install(exe, home);
+        daemon.set_install_hook(hook);
+    })
+    .await;
+    wait_until("the look reaches the install directory", || {
+        calls.load(Ordering::SeqCst) == 1
+    });
+    // Several more intervals pass: the daemon serves, and no second look starts.
+    for _ in 0..5 {
+        tokio::time::sleep(EVERY).await;
+        assert!(has_the_session(&d).await, "the daemon stopped serving");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "looks piled up");
+    // And it stops while the look is still hung.
+    d.stop().await;
+    let _ = release.send(());
 }
 
 /// Whether something holds a shared lock on the directory (an exclusive try fails), which is what

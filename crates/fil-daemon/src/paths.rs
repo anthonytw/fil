@@ -283,7 +283,7 @@ impl Paths {
     ///
     /// The lock is on the directory that is there now: [`dir_lock_is_current`] says whether it
     /// still is the one at the path.
-    pub fn lock_dir(&self) -> std::io::Result<File> {
+    pub fn lock_dir(&self, wait: Duration) -> std::io::Result<File> {
         use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
         let fd = openat(
             CWD,
@@ -293,7 +293,7 @@ impl Paths {
         )?;
         let file = File::from(fd);
         // A cleaner in the middle of a pass holds the lock exclusively for a moment.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + wait;
         loop {
             match flock(&file, FlockOperation::NonBlockingLockShared) {
                 Ok(()) => return Ok(file),
@@ -352,7 +352,7 @@ impl Paths {
 }
 
 /// `(device, inode)` of the file `path` names (links followed), or none.
-pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
@@ -368,7 +368,7 @@ pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
 /// that is another one now (the build was replaced) or none (deleted) is not the build this
 /// daemon runs, and nothing is touched. Returns whether it did.
 /// No path is logged here or by the caller above debug.
-pub fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64, u64)>) -> bool {
+pub(crate) fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64, u64)>) -> bool {
     use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, utimensat};
     let Ok(exe) = std::fs::canonicalize(exe) else {
         return false;
@@ -414,9 +414,50 @@ pub fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64, u64)>)
     utimensat(CWD, version_dir, &stamps, AtFlags::SYMLINK_NOFOLLOW).is_ok()
 }
 
+/// Whether something answers on the Unix socket at `sock`, without ever waiting: a non-blocking
+/// connect, hung up at once. A connect that would block (a live listener whose backlog is full)
+/// counts as an answer, so a busy daemon is never mistaken for a stale socket. (macOS refuses a
+/// connect to a full backlog instead, which this cannot tell from a dead socket.) Anything that
+/// is neither an answer nor a plain refusal or absence (no permission, say) also counts: the
+/// caller then leaves the socket alone, which is the safe side.
+pub(crate) fn something_answers(sock: &Path) -> bool {
+    use rustix::io::Errno;
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
+    let Ok(addr) = SocketAddrUnix::new(sock) else {
+        return false;
+    };
+    let Ok(fd) = socket(AddressFamily::UNIX, SocketType::STREAM, None) else {
+        return true;
+    };
+    if rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).is_err() {
+        return true; // cannot promise not to wait: do not connect, and leave the socket alone
+    }
+    let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC);
+    match connect(&fd, &addr) {
+        Ok(()) => true,
+        Err(Errno::CONNREFUSED | Errno::NOENT | Errno::NOTDIR) => false,
+        Err(_) => true,
+    }
+}
+
+/// The socket at `path` is this one, bound earlier: its `(device, inode)`.
+pub(crate) fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_socket())
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Removes the socket at `path` only if it still is the one this daemon bound (`bound`). A
+/// daemon that lost its files and was replaced by another must not unlink the replacement's
+/// socket on its way out. Returns whether it removed anything.
+pub(crate) fn remove_socket_if_ours(path: &Path, bound: Option<(u64, u64)>) -> bool {
+    bound.is_some() && socket_identity(path) == bound && std::fs::remove_file(path).is_ok()
+}
+
 /// Whether `held` (from [`Paths::lock_dir`]) is still the directory at `dir`: it has not been
 /// removed and made again, which would leave the lock on a directory nobody looks at.
-pub fn dir_lock_is_current(held: &File, dir: &Path) -> bool {
+pub(crate) fn dir_lock_is_current(held: &File, dir: &Path) -> bool {
     crate::start::is_current(held, dir)
 }
 
@@ -698,8 +739,12 @@ mod tests {
             .create(&base)
             .unwrap();
         let p = Paths::in_dir(&base);
-        let a = p.lock_dir().unwrap();
-        let b = p.clone().with_revision(p.revision + 1).lock_dir().unwrap();
+        let a = p.lock_dir(Duration::from_secs(2)).unwrap();
+        let b = p
+            .clone()
+            .with_revision(p.revision + 1)
+            .lock_dir(Duration::from_secs(2))
+            .unwrap();
         assert!(dir_lock_is_current(&a, &base));
         let probe = File::open(&base).unwrap();
         assert!(flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err());
@@ -717,10 +762,12 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&base, &link).unwrap();
         assert!(
-            Paths::in_dir(&link).lock_dir().is_err(),
+            Paths::in_dir(&link)
+                .lock_dir(Duration::from_secs(2))
+                .is_err(),
             "a link is not followed"
         );
-        let held = p.lock_dir().unwrap();
+        let held = p.lock_dir(Duration::from_secs(2)).unwrap();
         std::fs::remove_dir(&base).unwrap();
         assert!(!dir_lock_is_current(&held, &base));
     }

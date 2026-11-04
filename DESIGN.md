@@ -739,7 +739,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 **Out of scope:** root on the remote host, a compromised client machine, and the terminal emulator's own escape-sequence handling. fil passes bytes through exactly as ssh does.
 
-**Server binary distribution:** if fil uploads its own server binary (§16), it uploads the build for the remote's architecture over the authenticated pipe into `~/.local/share/fil/<version>/`. It verifies a SHA-256 before running it.
+**Server binary distribution:** by hand today: the user copies a release's `bin/fil` to the host, and a first attach that finds none says where fil looks and what to do (`docs/m4/install.md`). An upload through fil is built and **gated on M4 OQ-1**, compiled only with the off-by-default `install-bootstrap` feature: the constant bootstrap (`docs/m4/plan.md` §2.5) receives the build for the remote's OS and architecture over the authenticated pipe into `~/.local/share/fil/<ver>-w<major>.<rev>/` (`docs/m4/release.md` §5), checks the directories and the SHA-256 before anything there runs, and a release build is the only one ever sent.
 
 ### 11.1 Privacy: what fil reveals about its users
 
@@ -905,6 +905,8 @@ agent_keys = []           # SHA256 fingerprints the agent relay answers for; emp
 remote_requests = "ask"   # ask | deny: forwards a process on the host asks for with `fil forward`
 forward_failure = "warn"  # warn | exit (status 255, as ssh's ExitOnForwardFailure)
 direct.address = "devbox.example.net" # where the client dials UDP, when it is not what `ssh -G` reports; needed with a custom pipe or a jump host
+remote = "auto"           # auto | plain | installed: the remote command (docs/m4/install.md); until M4 OQ-1, always `fil server --stdio`
+install = "ask"           # ask | never | always: offer to install fil where there is none (M4 OQ-1; nothing installs until then)
 
 [host.k8s-dev]
 transport = "pipe"
@@ -945,7 +947,7 @@ M4's release contract (versioning and the wire, targets, artifact names and layo
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
 4. ~~**Terminal-query replies in flight during a takeover**~~ Resolved for M1 (proposed, not decided): the reply is lost and nothing is repaired; the program's own timeout ends the wait. See §6.3.
-5. **Server binary:** manual install, or upload by the client (§11)? Planned in `docs/m4/plan.md` (U1): manual install always, and an upload over the pipe if the owner allows one more fixed remote command, a constant bootstrap, and the install directory `~/.local/share/fil` (M4 OQ-1).
+5. **Server binary:** manual install, or upload by the client (§11)? Manual install always (built, `docs/m4/install.md`). The upload over the pipe is built behind the off-by-default `install-bootstrap` feature and waits for the owner's answer to M4 OQ-1: one more fixed remote command, the constant bootstrap, and the install directory `~/.local/share/fil` (`docs/m4/plan.md` §3 U1, §7).
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**
    - heartbeat interval and dead-link timeout

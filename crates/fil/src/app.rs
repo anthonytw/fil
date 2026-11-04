@@ -41,9 +41,11 @@ pub fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => e.exit(), // 2, like any usage error
     };
-    match action {
+    match &action {
         Action::ServerStdio => return server::run_stdio(),
         Action::ServerDaemon => return server::run_daemon(),
+        Action::ServerInstallFinish(args) => return server::run_install_finish(args),
+        Action::ServerInstallGc => return server::run_install_gc(),
         _ => {}
     }
     // The client's memory holds what was typed while disconnected: no core dumps. (After the
@@ -106,7 +108,14 @@ async fn run(action: Action, config: &Config) -> u8 {
             json,
             probe_other,
         } => cmds::ports(target, json, probe_other, config).await,
-        Action::ServerStdio | Action::ServerDaemon => unreachable!("handled before the runtime"),
+        #[cfg(feature = "install-bootstrap")]
+        Action::Install { host, request } => {
+            crate::install::client::run(&host, &request, &config.for_host(&host)).await
+        }
+        Action::ServerStdio
+        | Action::ServerDaemon
+        | Action::ServerInstallFinish(_)
+        | Action::ServerInstallGc => unreachable!("handled before the runtime"),
     }
 }
 
@@ -203,6 +212,23 @@ async fn attach(
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
     exit_code(&result)
+}
+
+/// The seam for `remote = "auto"`'s second trigger (`docs/m4/plan.md` §3 U1): an attach that
+/// failed because the host's relay is of another wire and no daemon of this client's wire runs
+/// there. The relay answers such a client with its own `Hello` and `Error(VersionMismatch)`
+/// (DESIGN.md §5.3), and the client checks the `Hello` before anything else: the error is
+/// `ClientError::VersionMismatch` (or `VersionRefused`, without the numbers), and it arrives
+/// before the terminal goes raw, which happens only once the first attach's snapshot is complete
+/// (`fil_client::engine`, `enter_session_screen`). So the fallback needs no change in
+/// `fil-client`. Gated on M4 OQ-1: nothing acts on it yet.
+pub fn fallback_outcome(e: &ClientError) -> Option<crate::install::fallback::Outcome> {
+    match e {
+        ClientError::VersionMismatch(_) | ClientError::VersionRefused => {
+            Some(crate::install::fallback::Outcome::VersionMismatch)
+        }
+        _ => None,
+    }
 }
 
 /// The client's forwards from the resolved plan.
@@ -332,6 +358,31 @@ mod tests {
         assert_eq!(short_name(".hidden"), ".hidden");
         assert_eq!(short_name("192.0.2.7"), "192.0.2.7");
         assert_eq!(short_name("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn only_a_version_mismatch_is_the_seams_trigger() {
+        use crate::install::fallback::Outcome as F;
+        let m = fil_proto::version::VersionMismatch {
+            ours: fil_proto::version::WireVersion {
+                major: 1,
+                revision: 11,
+            },
+            peer: fil_proto::version::WireVersion {
+                major: 1,
+                revision: 12,
+            },
+        };
+        assert_eq!(
+            fallback_outcome(&ClientError::VersionMismatch(m)),
+            Some(F::VersionMismatch)
+        );
+        assert_eq!(
+            fallback_outcome(&ClientError::VersionRefused),
+            Some(F::VersionMismatch)
+        );
+        assert_eq!(fallback_outcome(&ClientError::Dial("x".into())), None);
+        assert_eq!(fallback_outcome(&ClientError::Protocol("x".into())), None);
     }
 
     #[test]

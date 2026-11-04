@@ -406,9 +406,11 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
 async fn a_write_failure_reports_the_exit_status_of_a_child_that_exited() {
     let file = hello_file("epipe");
     let cmd = sh(&format!(
-        "cat '{}'; exec 0<&-; (sleep 3) & exit 3",
+        "cat '{}'; sleep 0.5; exec 0<&-; (sleep 3) & exit 3",
         file.display()
     ));
+    // The input is closed only after the opening is through (a write of the opening that failed
+    // would be a spawn error instead).
     let link = PipeLink::spawn(&cmd, cfg()).await.unwrap();
     let pid = link.child_id().unwrap();
     let t = Instant::now();

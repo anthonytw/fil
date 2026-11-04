@@ -99,7 +99,8 @@ pub struct MuxConfig {
     pub connect_timeout: Duration,
     pub open_wait: Duration,
     /// `forward.linger`: how long open channels outlive a disconnect. The same tunable also sets
-    /// how long a client-origin forward withheld from a run outlives that run (`fil_session`).
+    /// how long a client-origin forward withheld from a run outlives that run, at least 30 s
+    /// (`fil_session`).
     pub linger: Duration,
 }
 

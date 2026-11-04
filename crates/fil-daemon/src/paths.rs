@@ -19,11 +19,16 @@
 //!
 //! The directory is deliberately not under `$XDG_RUNTIME_DIR`: systemd-logind removes that
 //! directory when the user's last login ends, which would strand a live daemon.
+//!
+//! `/tmp` is also aged by cleaners (systemd-tmpfiles, macOS's `tmp_cleaner`), so the files are
+//! kept alive on purpose: see [`Keeping`], [`Paths::lock_dir`] and [`Paths::refresh_times`].
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fil_proto::limits::PROTOCOL_MAJOR;
 use fil_proto::msg::{MAX_OTHER_DAEMONS, OtherDaemon};
@@ -244,6 +249,218 @@ impl Paths {
     }
 }
 
+/// How the daemon keeps its files alive under a temporary-file cleaner (DESIGN.md section 5.3).
+/// The default is what ships; the fields exist so a test can switch one defense off and see the
+/// other, or neither, hold or fail.
+#[derive(Clone, Debug)]
+pub struct Keeping {
+    /// How often the daemon looks after its files ([`Paths::refresh_times`] and the repairs).
+    pub every: Duration,
+    /// Set fresh times on the daemon's files at every look.
+    pub refresh: bool,
+    /// Hold a shared `flock` on the socket directory ([`Paths::lock_dir`]).
+    pub dir_lock: bool,
+}
+
+impl Default for Keeping {
+    fn default() -> Self {
+        Keeping {
+            every: Duration::from_secs(3600),
+            refresh: true,
+            dir_lock: true,
+        }
+    }
+}
+
+impl Paths {
+    /// A shared `flock` on the socket directory itself, to be held for the daemon's whole life.
+    /// systemd-tmpfiles takes an exclusive, non-blocking lock on every directory it is about to
+    /// age and skips the ones it cannot lock; a shared lock is enough to be skipped, and several
+    /// daemons (of other revisions) share it. It does not stop a cleaner that ignores locks, which
+    /// the refresh ([`Paths::refresh_times`]) is for. The descriptor is close-on-exec, so no
+    /// session's shell keeps the directory locked after the daemon is gone. The directory is
+    /// opened without following a link.
+    ///
+    /// The lock is on the directory that is there now: [`dir_lock_is_current`] says whether it
+    /// still is the one at the path.
+    pub fn lock_dir(&self, wait: Duration) -> std::io::Result<File> {
+        use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+        let fd = openat(
+            CWD,
+            &self.dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        // A cleaner in the middle of a pass holds the lock exclusively for a moment.
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match flock(&file, FlockOperation::NonBlockingLockShared) {
+                Ok(()) => return Ok(file),
+                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Sets the access and modification times of everything this daemon keeps in the socket
+    /// directory to now, which also renews the change time (a cleaner looks at all three, and
+    /// the change time cannot be set back by anyone): the directory, the socket, the lock and
+    /// start files, and the agent directory with its sockets, when they pass the same checks as
+    /// at start. Only this daemon's own revision: the leftovers of a crashed daemon of another
+    /// are not kept alive, so they still age out. A link is never followed. Returns how many
+    /// entries were touched; one that is missing or not ours is skipped.
+    pub fn refresh_times(&self) -> usize {
+        use rustix::fs::{AtFlags, CWD, Timestamps, UTIME_NOW, utimensat};
+        let now = rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        };
+        let stamps = Timestamps {
+            last_access: now,
+            last_modification: now,
+        };
+        let touch = |p: &Path| utimensat(CWD, p, &stamps, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        let mut n = 0;
+        for p in [
+            self.dir.clone(),
+            self.socket(),
+            self.lock(),
+            self.start_lock(),
+        ] {
+            n += usize::from(touch(&p));
+        }
+        let agents = self.agent_dir();
+        if agent_dir_is_ours(&agents) {
+            n += usize::from(touch(&agents));
+            let ours = current_uid();
+            if let Ok(rd) = std::fs::read_dir(&agents) {
+                for e in rd.filter_map(Result::ok) {
+                    let p = e.path();
+                    if std::fs::symlink_metadata(&p)
+                        .is_ok_and(|m| m.file_type().is_socket() && m.uid() == ours)
+                    {
+                        n += usize::from(touch(&p));
+                    }
+                }
+            }
+        }
+        n
+    }
+}
+
+/// `(device, inode)` of the file `path` names (links followed), or none.
+pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// If `exe` (this daemon's executable) is `fil` in a version directory that `fil install` made,
+/// `<home>/.local/share/fil/<ver>-w<major>.<rev>/fil`, sets that directory's times to now, so
+/// the install's garbage collection, which keeps a version directory modified within the last
+/// seven days, never removes the build a live daemon runs from (docs/m4/release.md). Anything
+/// else does nothing: a daemon run from another place, a path that is only a link to one, a
+/// directory that is not a real directory of ours, a name that is not a version directory's.
+/// The path is canonical, so a link is never followed to a directory it is not in; the
+/// directory is touched, never the file, and without following a link. `running` is the
+/// identity ([`file_identity`]) of the executable when the daemon started: a file at the path
+/// that is another one now (the build was replaced) or none (deleted) is not the build this
+/// daemon runs, and nothing is touched. Returns whether it did.
+/// No path is logged here or by the caller above debug.
+pub(crate) fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64, u64)>) -> bool {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, utimensat};
+    let Ok(exe) = std::fs::canonicalize(exe) else {
+        return false;
+    };
+    if running.is_none() || file_identity(&exe) != running {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(home.join(".local/share/fil")) else {
+        return false;
+    };
+    let (Some(version_dir), true) = (exe.parent(), exe.file_name() == Some(OsStr::new("fil")))
+    else {
+        return false;
+    };
+    if version_dir.parent() != Some(root.as_path()) {
+        return false;
+    }
+    let is_version_name = version_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|n| n.rsplit_once("-w"))
+        .is_some_and(|(ver, wire)| {
+            let number =
+                |s: &str| !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit());
+            !ver.is_empty()
+                && wire
+                    .split_once('.')
+                    .is_some_and(|(m, r)| number(m) && number(r))
+        });
+    let ours = std::fs::symlink_metadata(version_dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == current_uid());
+    if !is_version_name || !ours {
+        return false;
+    }
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    let stamps = Timestamps {
+        last_access: now,
+        last_modification: now,
+    };
+    utimensat(CWD, version_dir, &stamps, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+}
+
+/// Whether something answers on the Unix socket at `sock`, without ever waiting: a non-blocking
+/// connect, hung up at once. A connect that would block (a live listener whose backlog is full)
+/// counts as an answer, so a busy daemon is never mistaken for a stale socket. (macOS refuses a
+/// connect to a full backlog instead, which this cannot tell from a dead socket.) Anything that
+/// is neither an answer nor a plain refusal or absence (no permission, say) also counts: the
+/// caller then leaves the socket alone, which is the safe side.
+pub(crate) fn something_answers(sock: &Path) -> bool {
+    use rustix::io::Errno;
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
+    let Ok(addr) = SocketAddrUnix::new(sock) else {
+        return false;
+    };
+    let Ok(fd) = socket(AddressFamily::UNIX, SocketType::STREAM, None) else {
+        return true;
+    };
+    if rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).is_err() {
+        return true; // cannot promise not to wait: do not connect, and leave the socket alone
+    }
+    let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC);
+    match connect(&fd, &addr) {
+        Ok(()) => true,
+        Err(Errno::CONNREFUSED | Errno::NOENT | Errno::NOTDIR) => false,
+        Err(_) => true,
+    }
+}
+
+/// The socket at `path` is this one, bound earlier: its `(device, inode)`.
+pub(crate) fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_socket())
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Removes the socket at `path` only if it still is the one this daemon bound (`bound`). A
+/// daemon that lost its files and was replaced by another must not unlink the replacement's
+/// socket on its way out. Returns whether it removed anything.
+pub(crate) fn remove_socket_if_ours(path: &Path, bound: Option<(u64, u64)>) -> bool {
+    bound.is_some() && socket_identity(path) == bound && std::fs::remove_file(path).is_ok()
+}
+
+/// Whether `held` (from [`Paths::lock_dir`]) is still the directory at `dir`: it has not been
+/// removed and made again, which would leave the lock on a directory nobody looks at.
+pub(crate) fn dir_lock_is_current(held: &File, dir: &Path) -> bool {
+    crate::start::is_current(held, dir)
+}
+
 /// The socket directory cannot be trusted or used.
 #[derive(Debug, thiserror::Error)]
 pub enum DirError {
@@ -436,6 +653,238 @@ mod tests {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, socket};
         let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         bind(&fd, &SocketAddrUnix::new(path).unwrap()).unwrap();
+    }
+
+    /// The refresh sets all of the revision's own files to now, and only those: the leftovers of
+    /// another revision (a crashed daemon's) keep ageing. A link is not followed.
+    #[test]
+    fn the_refresh_touches_this_revisions_files_and_nothing_else() {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("socket-dir");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let p = Paths::in_dir(&base);
+        let other = p.clone().with_revision(p.revision + 1);
+        let agents = p.agent_dir();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&agents)
+            .unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(agents.join("s.sock")).unwrap();
+        std::fs::write(agents.join("notes"), b"").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"").unwrap();
+        std::os::unix::fs::symlink(&outside, p.start_lock()).unwrap();
+        let _sock = std::os::unix::net::UnixListener::bind(p.socket()).unwrap();
+        std::fs::write(p.lock(), b"1\n").unwrap();
+        std::fs::write(other.lock(), b"2\n").unwrap();
+
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        let all = [
+            base.clone(),
+            p.socket(),
+            p.lock(),
+            other.lock(),
+            agents.clone(),
+            agents.join("s.sock"),
+            agents.join("notes"),
+            outside.clone(),
+        ];
+        for f in &all {
+            utimensat(CWD, f, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        }
+        // dir, socket, lock, agent dir, agent socket; the start file is a link, which is touched
+        // as a link (it is not ours to follow) and counts.
+        assert_eq!(p.refresh_times(), 6);
+        let mtime = |f: &Path| std::fs::symlink_metadata(f).unwrap().mtime();
+        for f in [
+            &base,
+            &p.socket(),
+            &p.lock(),
+            &agents,
+            &agents.join("s.sock"),
+        ] {
+            assert!(
+                mtime(f) > 1_500_000_000,
+                "{} was not refreshed",
+                f.display()
+            );
+        }
+        for f in [&other.lock(), &agents.join("notes"), &outside] {
+            assert_eq!(mtime(f), 1_000_000_000, "{} was touched", f.display());
+        }
+    }
+
+    /// The directory lock is shared (daemons of other revisions hold it too), keeps an exclusive
+    /// try out (what systemd-tmpfiles makes), and does not follow a link.
+    #[test]
+    fn the_directory_lock_is_shared_and_keeps_an_exclusive_try_out() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("socket-dir");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let p = Paths::in_dir(&base);
+        let a = p.lock_dir(Duration::from_secs(2)).unwrap();
+        let b = p
+            .clone()
+            .with_revision(p.revision + 1)
+            .lock_dir(Duration::from_secs(2))
+            .unwrap();
+        assert!(dir_lock_is_current(&a, &base));
+        let probe = File::open(&base).unwrap();
+        assert!(flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err());
+        drop(a);
+        // Still shared by the other.
+        assert!(flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err());
+        drop(b);
+        // A lock is released when the last copy of the descriptor is closed, and another test's
+        // `fork` (before its `exec` closes the copy) can hold one for a moment.
+        fil_testkit::wait_until("the lock is released", fil_testkit::WAIT, || {
+            flock(&probe, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        drop(probe);
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(
+            Paths::in_dir(&link)
+                .lock_dir(Duration::from_secs(2))
+                .is_err(),
+            "a link is not followed"
+        );
+        let held = p.lock_dir(Duration::from_secs(2)).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+        assert!(!dir_lock_is_current(&held, &base));
+    }
+
+    /// The version directory of the running executable is kept fresh, and nothing else is.
+    #[test]
+    fn the_install_directory_of_the_running_executable_is_refreshed_and_only_that() {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".local/share/fil");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        let mtime = |d: &Path| std::fs::symlink_metadata(d).unwrap().mtime();
+        let make = |name: &str, file: &str| {
+            let d = root.join(name);
+            std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+            std::fs::write(d.join(file), b"").unwrap();
+            utimensat(CWD, &d, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            d
+        };
+        let good = make("0.1.0-w1.12", "fil");
+        assert!(refresh_install_dir(
+            &good.join("fil"),
+            &home,
+            file_identity(&good.join("fil"))
+        ));
+        assert!(mtime(&good) > 1_500_000_000);
+
+        // Not a version directory's name, or not named `fil`.
+        for (name, file) in [
+            ("0.1.0", "fil"),
+            ("0.1.0-w1", "fil"),
+            ("0.1.0-w1.x", "fil"),
+            ("-w1.12", "fil"),
+            ("0.2.0-w1.12", "other"),
+        ] {
+            let d = make(name, file);
+            assert!(
+                !refresh_install_dir(&d.join(file), &home, file_identity(&d.join(file))),
+                "{name}/{file}"
+            );
+            assert_eq!(mtime(&d), 1_000_000_000, "{name}/{file}");
+        }
+        // A version directory's name, but not in the install root.
+        let decoy = home.join(".local/share/0.1.0-w1.12");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("fil"), b"").unwrap();
+        utimensat(CWD, &decoy, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!refresh_install_dir(
+            &decoy.join("fil"),
+            &home,
+            file_identity(&decoy.join("fil"))
+        ));
+        assert_eq!(mtime(&decoy), 1_000_000_000);
+        // Somewhere else entirely, and outside the home.
+        let elsewhere = tmp.path().join("bin");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("fil"), b"").unwrap();
+        utimensat(CWD, &elsewhere, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!refresh_install_dir(
+            &elsewhere.join("fil"),
+            &home,
+            file_identity(&elsewhere.join("fil"))
+        ));
+        assert_eq!(mtime(&elsewhere), 1_000_000_000);
+        // A link in the install root to a directory elsewhere: its canonical path is not in the
+        // root, so neither the link nor the target is touched. A link to the good file from
+        // elsewhere resolves to the good directory, which is the running executable's.
+        let link = root.join("1.0.0-w1.13");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(!refresh_install_dir(
+            &link.join("fil"),
+            &home,
+            file_identity(&link.join("fil"))
+        ));
+        assert_eq!(mtime(&elsewhere), 1_000_000_000);
+        let via = elsewhere.join("fil-link");
+        std::os::unix::fs::symlink(good.join("fil"), &via).unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(refresh_install_dir(&via, &home, file_identity(&via)));
+        assert!(mtime(&good) > 1_500_000_000);
+        // A missing install root or executable.
+        assert!(!refresh_install_dir(
+            &good.join("fil"),
+            &tmp.path().join("nohome"),
+            file_identity(&good.join("fil"))
+        ));
+        assert!(!refresh_install_dir(&good.join("gone"), &home, None));
+        // The build was replaced under the running daemon (another file at the path), or deleted:
+        // not the build this daemon runs, so its directory is not kept for it.
+        let running = file_identity(&good.join("fil"));
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        std::fs::remove_file(good.join("fil")).unwrap();
+        assert!(
+            !refresh_install_dir(&good.join("fil"), &home, running),
+            "deleted"
+        );
+        std::fs::write(good.join("fil"), b"new").unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        // (A new file can reuse the freed inode on some systems; give it another.)
+        let other = good.join("fil2");
+        std::fs::write(&other, b"x").unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(
+            !refresh_install_dir(&good.join("fil"), &home, file_identity(&other)),
+            "replaced"
+        );
+        assert_eq!(mtime(&good), 1_000_000_000);
     }
 
     /// The agent directory's clean-up never touches a directory that fails the socket

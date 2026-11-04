@@ -50,7 +50,8 @@ lipo -info "$out/$UNIVERSAL/fil" >&2
 # lipo drops the linker's signatures, and an arm64 binary without one is killed on Apple silicon
 # ("code object is not signed at all": found by the first dry run's smoke-macos job). Sign it
 # ad hoc, with a fixed identifier: no certificate, no timestamp and no secret, so the signature is a
-# pure function of the file. (Developer ID signing and notarization are not part of M4.)
+# pure function of the file. (Developer ID signing and notarization are done after CI by
+# `just release-sign-macos` (docs/m4/release.md section 10.3).)
 codesign --force --sign - --identifier fil "$out/$UNIVERSAL/fil" >&2
 codesign --verify --strict --verbose=2 "$out/$UNIVERSAL/fil" >&2
 just no-test-hooks "$out/$UNIVERSAL/fil"

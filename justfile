@@ -364,6 +364,14 @@ release-check *args:
 release-verify version *args:
     tests/release/verify.sh "$@"
 
+# Reserve the crates.io names of the nine published crates with a 0.0.1 placeholder each. Whoever holds the
+# publishing account runs it, after `cargo login`; the placeholders are built outside the repository, paced
+# for the new-crate limit, and names already registered are skipped (docs/m4/release.md section 10.1).
+# Dry run by default; `--publish` really publishes.
+[positional-arguments]
+reserve-crate-names *args:
+    tests/release/reserve-crate-names.sh "$@"
+
 # ---- Notices (docs/m4/release.md section 7) ----
 
 # The cargo-about that renders THIRD-PARTY-NOTICES.md. Pinned: another version can render other

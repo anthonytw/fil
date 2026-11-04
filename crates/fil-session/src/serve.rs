@@ -416,7 +416,10 @@ impl Flow {
             self.last_ack_at = now;
         }
         self.pre_jump = (self.acked < self.next).then_some((self.acked, self.next));
-        self.snapshot_rec = Some(SentRec {
+        // Only a catch-up's confirmation proves a delivery: a repaint (`at` is `next`) can be
+        // confirmed by an ack the client sent before it saw the announcement (DESIGN.md
+        // section 6.2), and would count its bytes as delivered in a few milliseconds.
+        self.snapshot_rec = (at > self.next).then_some(SentRec {
             end: at,
             began: now,
             delivered: self.delivered,
@@ -1260,6 +1263,30 @@ mod tests {
         assert_eq!(u.wait(500_000, t1, 0), Duration::from_secs(3));
         let t2 = f.pacer.fill(Duration::from_millis(600), 12_500_000, t1);
         assert!(f.wait(500_000, t2, 0) >= Duration::from_secs(3));
+    }
+
+    /// A repaint jumps with `at` at `next` and skips nothing, and its confirmation can come
+    /// before the client has even seen the announcement (DESIGN.md section 6.2): it proves no
+    /// delivery, so it gives no sample. Before the fix a 30 kB repaint confirmed 5 ms after
+    /// the jump read as 4.3 MB/s on a 1 Mbit/s link, and the window grew to 1.1 MB for 2 s.
+    #[test]
+    fn an_early_repaint_confirmation_gives_no_sample() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        // 1 Mbit/s steady, the pipe full.
+        let t0 = f.pacer.fill(Duration::from_millis(200), 125_000, t0);
+        f.last_ack_at = t0;
+        f.record_send(1000, t0, true);
+        let t1 = t0 + Duration::from_millis(250);
+        f.ack(1000, t1).unwrap();
+        // The shell echoes a little more; then a repaint at `next`, rendered 30 kB.
+        f.record_send(1100, t1 + Duration::from_millis(10), true);
+        f.jump(1100, 30_000, t1 + Duration::from_millis(12));
+        // The client's ack of 1100, sent before it saw the announcement, arrives 5 ms later.
+        let t2 = t1 + Duration::from_millis(17);
+        f.ack(1100, t2).unwrap();
+        assert_eq!(f.pacer.rate(t2), Some(125_000));
+        assert_eq!(f.pacer.window(t2), crate::pace::MIN_WINDOW);
     }
 
     #[test]

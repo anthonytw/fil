@@ -50,7 +50,7 @@
 //! data: nothing here logs them at any level. Logs carry channel ids, counts and the wire's enum
 //! reasons, at debug. `Debug` of every type here is counts and states only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -65,8 +65,8 @@ use fil_proto::ChannelId;
 use fil_proto::frame::DataSegment;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
-    BindAddr, BindFailure, ChannelInfo, ChannelState, CloseReason, ForwardId, ForwardKind, Mux,
-    MuxConfig, MuxError, MuxEvent, MuxMsg, OpenFailure, OpenKind, Side, TableError,
+    BindAddr, BindFailure, ChannelState, CloseReason, ForwardId, ForwardKind, Mux, MuxConfig,
+    MuxError, MuxEvent, MuxMsg, OpenFailure, OpenKind, Side, TableError,
 };
 use fil_transport::{Link, LinkState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -77,7 +77,7 @@ use tokio::time::sleep_until;
 use tracing::debug;
 
 use crate::listen;
-use crate::pace::{PaceConfig, PaceState, Pacer};
+use crate::pace::{PaceConfig, Pacer};
 use crate::socks::{self, Handshake, Progress};
 use crate::stream::BoxStream;
 
@@ -386,13 +386,10 @@ const DATA_AHEAD: usize = 64 * 1024;
 /// any other channel in the mux.
 const PASS_SCAN: usize = 64;
 
-/// How often the mux's timers run while something is time-bound (an ack due, an open waiting, a
-/// link down with channels), and not at all otherwise, so an idle endpoint costs no wakeups.
-const TICK: Duration = Duration::from_millis(50);
-const TICK_DOWN: Duration = Duration::from_millis(250);
-/// After any activity, the timers run for this long: acks are due 100 ms after the first
-/// unacknowledged byte (`ACK_DELAY`).
-const ACTIVE_FOR: Duration = Duration::from_millis(300);
+/// How long the control sender waits before looking again at a mux timer that is still due after
+/// a tick. It cannot happen (a tick leaves none due), but if it ever does, the timer must not be
+/// slept through.
+const DUE_RETRY: Duration = Duration::from_millis(10);
 
 /// Largest read from a local socket into a channel (one data segment's worth).
 const READ_CHUNK: usize = fil_proto::limits::MAX_DATA_PAYLOAD;
@@ -563,6 +560,7 @@ pub const MAX_PENDING: usize = 1024;
 /// flood of clients that never send their request holds this many places, not the whole queue.
 pub const MAX_HANDSHAKES: usize = 64;
 
+/// What the data sender hands to the link next.
 enum Out {
     Data(ChannelId, Bytes),
     Finish(ChannelId),
@@ -577,8 +575,12 @@ struct State<L> {
     /// The mux epoch, counted: a policy answer given in one epoch is not used in another.
     epoch: u64,
     ctl_out: VecDeque<(ChannelId, Bytes)>,
-    data_out: VecDeque<Out>,
+    /// Payloads taken from the mux for the data sender, waiting for the pacer.
+    data_out: VecDeque<(ChannelId, Bytes)>,
     data_out_bytes: usize,
+    /// Released channels whose link stream is to be finished. Not behind `data_out`: a finish is
+    /// never paced and never waits for payloads (a released channel has none left to send).
+    finish_out: VecDeque<ChannelId>,
     /// The current link's forward pacing (H1, [`crate::pace`]): what the data sender may hand to
     /// the link. A new one with every link.
     pacer: Pacer,
@@ -587,8 +589,13 @@ struct State<L> {
     queued: HashMap<u32, u32>,
     /// The channel the data sender last took a payload from (channels take turns).
     pass_rr: u32,
-    /// Reused for the channel ids `next_from_mux` goes round.
+    /// Reused for the channel ids `pull` and `next_from_mux` go round.
     scratch_ids: Vec<u32>,
+    /// The channels that may have bytes the mux has not handed out yet: every channel a pump
+    /// wrote to or the peer's `Resume` sent back, and every channel on a new link. The data
+    /// sender goes round these and not all the channels, so idle connections cost it nothing; a
+    /// channel whose bytes have all been taken is dropped from the set when it is next looked at.
+    unsent: BTreeSet<u32>,
     slots: HashMap<u32, Slot>,
     stats: HashMap<ForwardId, ForwardStats>,
     agent: ForwardStats,
@@ -614,8 +621,6 @@ struct State<L> {
     /// side acknowledges only what it was fed).
     mux_fed_end: u64,
     failed_told: bool,
-    last_tick: std::time::Instant,
-    active_until: Option<std::time::Instant>,
     closed: bool,
 }
 
@@ -661,6 +666,7 @@ impl<L: Link> State<L> {
         self.ctl_out.clear();
         self.data_out.clear();
         self.data_out_bytes = 0;
+        self.finish_out.clear();
         self.queued.clear();
 
         // Never fed, so never acknowledged: the peer sends them again on the next link.
@@ -681,35 +687,16 @@ impl<L: Link> State<L> {
         }
     }
 
-    fn active(&mut self, now: std::time::Instant) {
-        self.active_until = Some(now + ACTIVE_FOR);
+    /// Something happened at `now`: the mux stamps the timers it starts with it (a delayed ack,
+    /// an open's timeout). The mux's timers themselves run when [`Mux::next_deadline`] says, not
+    /// on a period, so a quiet endpoint wakes nothing.
+    fn touch(&mut self, now: std::time::Instant) {
+        self.mux.set_time(now);
     }
 
     fn tick(&mut self, now: std::time::Instant) {
         // An error is the mux's failure, which `drain` reports.
         let _ = self.mux.tick(now);
-        self.last_tick = now;
-    }
-
-    /// Whether the mux's timers have anything to do.
-    fn wants_tick(&self, now: std::time::Instant) -> bool {
-        if self.active_until.is_some_and(|t| now < t) {
-            return true;
-        }
-        let mut chans = self.mux.channels().peekable();
-        if chans.peek().is_none() {
-            return false;
-        }
-        self.link.is_none()
-            || chans.any(|c| {
-                self.mux
-                    .info(c)
-                    .is_some_and(|i| i.state == ChannelState::Opening)
-            })
-    }
-
-    fn tick_every(&self) -> Duration {
-        if self.link.is_some() { TICK } else { TICK_DOWN }
     }
 
     fn stat(&mut self, key: StatsKey) -> &mut ForwardStats {
@@ -796,58 +783,82 @@ impl<L: Link> State<L> {
         mux
     }
 
-    /// The next item the data sender may hand to the current link: the queue's head if the pacer
-    /// admits it (a `Finish` always goes), otherwise the first payload of a channel that has
+    /// A channel was released: its link stream is finished at once, ahead of the queue. Whatever
+    /// of its payloads is still queued is stale (a released channel has nothing the peer wants,
+    /// and sending on a finished stream would fail the link), so it goes.
+    fn finish_channel(&mut self, ch: ChannelId) {
+        let mut freed = 0;
+        self.data_out.retain(|(c, p)| {
+            let stale = *c == ch;
+            if stale {
+                freed += p.len();
+            }
+            !stale
+        });
+        self.data_out_bytes -= freed;
+        self.queued.remove(&ch.0);
+        self.finish_out.push_back(ch);
+    }
+
+    /// The next item the data sender may hand to the current link: a `Finish` (never held), then
+    /// the queue's head if the pacer admits it, otherwise the first payload of a channel that has
     /// nothing earlier in the queue and that the pacer lets through anyway (nothing in flight).
     /// What it takes is recorded with the pacer. `None` with a non-empty queue: held.
     fn next_out(&mut self, t: std::time::Instant) -> Option<Out> {
-        let path = self.link.as_ref()?.status().borrow().path_generation;
-        self.pacer.path_changed(path);
+        self.sync_path()?;
+        if let Some(ch) = self.finish_out.pop_front() {
+            self.pacer.forget(ch);
+            return Some(Out::Finish(ch));
+        }
         let idx = match self.data_out.front() {
             // `pull` found nothing the pacer lets go: nor will `pass_from_mux`.
             None => return None,
-            Some(Out::Finish(_)) => 0,
-            Some(Out::Data(ch, _)) if self.pacer.admit(*ch, self.is_agent(*ch), t) => 0,
-            Some(Out::Data(..)) => match self.pass_index() {
+            Some((ch, _)) if self.pacer.admit(*ch, self.is_agent(*ch), t) => 0,
+            Some(_) => match self.pass_index() {
                 Some(i) => i,
                 None => return self.pass_from_mux(t),
             },
         };
-        let item = self.data_out.remove(idx).expect("an index into the queue");
-        match &item {
-            Out::Data(ch, p) => {
-                self.data_out_bytes -= p.len();
-                if let Some(n) = self.queued.get_mut(&ch.0) {
-                    *n -= 1;
-                    if *n == 0 {
-                        self.queued.remove(&ch.0);
-                    }
-                }
-                let seg = DataSegment::parse(p);
-                debug_assert!(seg.is_ok(), "the mux built this payload");
-                if let Ok(seg) = seg {
-                    let start = seg.seq;
-                    let agent = self.is_agent(*ch);
-                    self.pacer
-                        .on_sent(*ch, start, start + seg.data.len() as u64, agent, t);
-                }
+        let (ch, p) = self.data_out.remove(idx).expect("an index into the queue");
+        self.data_out_bytes -= p.len();
+        if let Some(n) = self.queued.get_mut(&ch.0) {
+            *n -= 1;
+            if *n == 0 {
+                self.queued.remove(&ch.0);
             }
-            Out::Finish(ch) => self.pacer.forget(*ch),
         }
-        Some(item)
+        self.sent(ch, &p, t);
+        Some(Out::Data(ch, p))
     }
 
-    /// Where in the data queue (all of it: at most [`PASS_SCAN`] items) the first item is that may go although
-    /// the pacer holds the head: the first item of its channel in the queue (per-channel order
-    /// holds), and either a `Finish` (it frees the link's stream, and is never paced) or a payload
-    /// the pacer lets go (under the cap, or a pass: the head may be a channel whose reader stopped).
+    /// Tells the pacer which path the link is on now, so it forgets what it measured on the last
+    /// one before it takes the next ack or sends the next payload. `None` without a link.
+    fn sync_path(&mut self) -> Option<()> {
+        let path = self.link.as_ref()?.status().borrow().path_generation;
+        self.pacer.path_changed(path);
+        Some(())
+    }
+
+    /// Records with the pacer that `payload` of `ch` goes on the link now.
+    fn sent(&mut self, ch: ChannelId, payload: &Bytes, t: std::time::Instant) {
+        let seg = DataSegment::parse(payload);
+        debug_assert!(seg.is_ok(), "the mux built this payload");
+        if let Ok(seg) = seg {
+            let start = seg.seq;
+            let agent = self.is_agent(ch);
+            self.pacer
+                .on_sent(ch, start, start + seg.data.len() as u64, agent, t);
+        }
+    }
+
+    /// Where in the data queue (all of it: at most [`PASS_SCAN`] items) the first item is that
+    /// may go although the pacer holds the head: the first item of its channel in the queue
+    /// (per-channel order holds) that the pacer lets go (under the cap, or a pass: the head may
+    /// be a channel whose reader stopped).
     fn pass_index(&self) -> Option<usize> {
         let mut seen = [0u32; PASS_SCAN];
-        for (i, o) in self.data_out.iter().enumerate().take(PASS_SCAN) {
-            let (ch, may) = match o {
-                Out::Data(ch, _) => (*ch, self.pacer.may_go(*ch, self.is_agent(*ch))),
-                Out::Finish(ch) => (*ch, true),
-            };
+        for (i, (ch, _)) in self.data_out.iter().enumerate().take(PASS_SCAN) {
+            let may = self.pacer.may_go(*ch, self.is_agent(*ch));
             if i > 0 && may && !seen[..i].contains(&ch.0) {
                 return Some(i);
             }
@@ -871,28 +882,31 @@ impl<L: Link> State<L> {
             return None;
         }
         let (ch, payload) = self.next_from_mux()?;
-        let agent = self.is_agent(ch);
-        let seg = DataSegment::parse(&payload);
-        debug_assert!(seg.is_ok(), "the mux built this payload");
-        if let Ok(seg) = seg {
-            let start = seg.seq;
-            self.pacer
-                .on_sent(ch, start, start + seg.data.len() as u64, agent, t);
-        }
+        self.sent(ch, &payload, t);
         Some(Out::Data(ch, payload))
     }
 
-    /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
-    /// that the pacer lets go now, taken with `Mux::poll_transmit_channel`.
-    fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
+    /// The ids (in order) of the channels that have bytes to hand out, in the reusable buffer:
+    /// the set of channels that may, after dropping those that no longer do.
+    fn sendable_ids(&mut self) -> Vec<u32> {
+        let mux = &self.mux;
+        self.unsent.retain(|&id| mux.has_unsent(ChannelId(id)));
         let mut ids = std::mem::take(&mut self.scratch_ids);
         ids.clear();
-        ids.extend(self.mux.channels().map(|c| c.0));
+        ids.extend(self.unsent.iter().copied());
+        ids
+    }
+
+    /// The next payload, in turn over `ids` (the channels with bytes to send, in order) from the
+    /// one after the last taken, of the first channel the pacer lets go now: taken with
+    /// `Mux::poll_transmit_channel`, which says whether credit and the gates allow one.
+    /// `unqueued_only` skips channels that already have a payload in the data queue (the pass
+    /// from the mux; the queue itself keeps one channel's payloads in order).
+    fn take_in_turn(&mut self, ids: &[u32], unqueued_only: bool) -> Option<(ChannelId, Bytes)> {
         let start = ids.partition_point(|&id| id <= self.pass_rr);
-        let mut found = None;
         for k in 0..ids.len() {
             let id = ids[(start + k) % ids.len()];
-            if self.queued.contains_key(&id) {
+            if unqueued_only && self.queued.contains_key(&id) {
                 continue;
             }
             let ch = ChannelId(id);
@@ -901,10 +915,17 @@ impl<L: Link> State<L> {
             }
             if let Some(payload) = self.mux.poll_transmit_channel(ch) {
                 self.pass_rr = id;
-                found = Some((ch, payload));
-                break;
+                return Some((ch, payload));
             }
         }
+        None
+    }
+
+    /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
+    /// that the pacer lets go now.
+    fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
+        let ids = self.sendable_ids();
+        let found = self.take_in_turn(&ids, true);
         self.scratch_ids = ids;
         found
     }
@@ -920,35 +941,15 @@ impl<L: Link> State<L> {
         if self.link.is_none() {
             return;
         }
-        let mut ids = std::mem::take(&mut self.scratch_ids);
-        ids.clear();
-        ids.extend(self.mux.channels().map(|c| c.0));
-        // Rounds over the channels from the one after the last taken, one payload each, until
-        // the queue is full or a round finds nothing.
-        let mut k = ids.partition_point(|&id| id <= self.pass_rr);
-        let mut idle = 0;
-        while !ids.is_empty()
-            && idle < ids.len()
-            && self.data_out_bytes < DATA_AHEAD
-            && self.data_out.len() < PASS_SCAN
-        {
-            let id = ids[k % ids.len()];
-            k += 1;
-            let ch = ChannelId(id);
-            let payload = if self.pacer.may_go(ch, self.is_agent(ch)) {
-                self.mux.poll_transmit_channel(ch)
-            } else {
-                None
+        let ids = self.sendable_ids();
+        // One payload per channel in turn, until the queue is full or a round finds nothing.
+        while self.data_out_bytes < DATA_AHEAD && self.data_out.len() < PASS_SCAN {
+            let Some((ch, payload)) = self.take_in_turn(&ids, false) else {
+                break;
             };
-            let Some(payload) = payload else {
-                idle += 1;
-                continue;
-            };
-            idle = 0;
-            self.pass_rr = id;
             self.data_out_bytes += payload.len();
             *self.queued.entry(ch.0).or_default() += 1;
-            self.data_out.push_back(Out::Data(ch, payload));
+            self.data_out.push_back((ch, payload));
         }
         self.scratch_ids = ids;
     }
@@ -982,12 +983,25 @@ struct Inner<L> {
     hooks: TestHooks,
 }
 
+/// Counts of the endpoint's wakeups ([`Endpoint::wakeups`], feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakeups {
+    pub ctl: u64,
+    pub data: u64,
+    pub ticks: u64,
+}
+
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
 #[cfg(feature = "test-hooks")]
 #[derive(Default)]
 struct TestHooks {
     /// Runs in `open_local` between the policy check and the open, without the lock.
     after_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// How often each sender task went round its loop, and how often the mux's timers ran.
+    ctl_runs: std::sync::atomic::AtomicU64,
+    data_runs: std::sync::atomic::AtomicU64,
+    ticks: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1050,6 +1064,7 @@ impl<L: Link> Endpoint<L> {
         let max_held_mux = cfg.mux_buffer;
         let connect_timeout = cfg.connect_timeout;
         let open_wait = cfg.open_wait;
+        let pace_cfg = PaceConfig::from_env();
         let inner = Arc::new(Inner {
             side,
             state: Mutex::new(State {
@@ -1060,11 +1075,13 @@ impl<L: Link> Endpoint<L> {
                 ctl_out: VecDeque::new(),
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
-                pacer: Pacer::new(PaceConfig::from_env(), now()),
-                pace_cfg: PaceConfig::from_env(),
+                finish_out: VecDeque::new(),
+                pacer: Pacer::new(pace_cfg, now()),
+                pace_cfg,
                 queued: HashMap::new(),
                 pass_rr: 0,
                 scratch_ids: Vec::new(),
+                unsent: BTreeSet::new(),
                 slots: HashMap::new(),
                 stats: HashMap::new(),
                 agent: ForwardStats::default(),
@@ -1079,8 +1096,6 @@ impl<L: Link> Endpoint<L> {
                 held_mux_bytes: 0,
                 mux_fed_end: 0,
                 failed_told: false,
-                last_tick: now(),
-                active_until: None,
                 closed: false,
             }),
             ctl_kick: Notify::new(),
@@ -1131,6 +1146,20 @@ impl<L: Link> Endpoint<L> {
         *lock(&self.inner().hooks.after_check) = hook;
     }
 
+    /// How many times the control sender, the data sender and the mux's timers have run (feature
+    /// `test-hooks`): a test that a quiet forward wakes nothing, and that an event wakes only the
+    /// task that has work.
+    #[cfg(feature = "test-hooks")]
+    pub fn wakeups(&self) -> Wakeups {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = &self.inner().hooks;
+        Wakeups {
+            ctl: h.ctl_runs.load(Relaxed),
+            data: h.data_runs.load(Relaxed),
+            ticks: h.ticks.load(Relaxed),
+        }
+    }
+
     pub fn side(&self) -> Side {
         self.inner().side
     }
@@ -1144,8 +1173,9 @@ impl<L: Link> Endpoint<L> {
         st.pacer = Pacer::new(cfg, now());
     }
 
-    /// What the current link's pacer knows: counts only (DESIGN.md §11.1).
-    pub fn pace_state(&self) -> PaceState {
+    /// What the current link's pacer knows: counts only (DESIGN.md §11.1). Feature `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    pub fn pace_state(&self) -> crate::pace::PaceState {
         lock(&self.inner().state).pacer.state()
     }
 
@@ -1188,7 +1218,10 @@ impl<L: Link> Endpoint<L> {
         st.pacer.path_changed(path);
         st.link = Some(link);
         st.generation += 1;
-        st.active(t);
+        // What the last link left unacknowledged may go again on this one.
+        let all: Vec<u32> = st.mux.channels().map(|c| c.0).collect();
+        st.unsent.extend(all);
+        st.touch(t);
         inner.drain(&mut st);
         drop(st);
         inner.kick();
@@ -1234,6 +1267,7 @@ impl<L: Link> Endpoint<L> {
             st.end_slot(ChannelId(id), CloseReason::Reset);
         }
         st.slots.clear();
+        st.unsent.clear();
         st.link = None;
         st.generation += 1;
         st.clear_queues();
@@ -1286,11 +1320,21 @@ impl<L: Link> Endpoint<L> {
         if let Some(end) = mux_end {
             st.mux_fed_end = st.mux_fed_end.max(end);
         }
+        st.touch(now());
         let r = st.mux.on_payload(ch, payload);
-        st.active(now());
         inner.drain(&mut st);
+        let control = st.mux.control_pending();
         drop(st);
-        inner.kick();
+        if ch == ChannelId::MUX {
+            // A record: it can open a channel, let data go, start an ack's delay.
+            inner.kick();
+        } else if control {
+            // Data lands in a buffer and wakes its pump through `drain`; neither sender has
+            // work unless the payload was a violation (data past the window, or before the
+            // `OpenOk`): the mux queued `Close(Violation)`, which the peer, the one at fault,
+            // never answers with a record of its own that would wake the control sender.
+            inner.kick_ctl();
+        }
         r
     }
 
@@ -1298,17 +1342,36 @@ impl<L: Link> Endpoint<L> {
     pub fn on_ack(&self, ch: ChannelId, upto: u64) -> Result<(), MuxError> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
+        st.touch(now());
+        // Only an ack the mux takes is a sample for the pacer: one for a channel that is closing
+        // or gone, below what the peer already acknowledged, or beyond what was sent (a
+        // violation, which the mux also answers with `Ok`) says nothing about the path.
+        let before = st.mux.info(ch);
         let r = st.mux.on_ack(ch, upto);
-        if r.is_ok() && st.link.is_some() {
-            let threshold = st
-                .mux
-                .info(ch)
-                .map_or(u64::MAX, |i| crate::pace::ack_threshold(i.peer_window));
+        let taken = before.is_some_and(|i| {
+            i.state != ChannelState::Closing && upto > i.acked && upto <= i.sent_high
+        });
+        if r.is_ok() && taken && st.sync_path().is_some() {
+            // The path first: an ack that arrives after a path change but before the data sender
+            // next looked at it is still about the old path.
+            let threshold = st.mux.info(ch).map_or(u64::MAX, |i| {
+                fil_proto::mux::ack_threshold(u64::from(i.peer_window))
+            });
             st.pacer.on_ack(ch, upto, threshold, now());
         }
         inner.drain(&mut st);
+        let control = st.mux.control_pending();
         drop(st);
-        inner.kick();
+        // Credit and a smaller send buffer: the data sender's, and the pacer's. A record the
+        // ack queued is the control sender's. That kick is needed: an ack beyond what was sent is
+        // a violation, answered with `Close(Violation)`, and the peer that sent it never closes,
+        // so on an idle endpoint nothing else would wake the control sender to send it
+        // (`a_violation_on_an_idle_endpoint_is_answered_at_once`). A `Close` for a graceful end
+        // the ack completes is also answered by the peer's own, which wakes both.
+        inner.kick_data();
+        if control {
+            inner.kick_ctl();
+        }
         r
     }
 
@@ -1317,6 +1380,8 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         let r = st.mux.on_resume(ch, received);
+        // The peer is missing bytes this side already handed out: they go again.
+        st.unsent.insert(ch.0);
         inner.drain(&mut st);
         drop(st);
         inner.kick();
@@ -1524,7 +1589,9 @@ impl<L: Link> Endpoint<L> {
 
     /// Ends every channel of `forward` now with `why` (`Removed` when the user removes a forward
     /// and wants its connections gone too), and refuses its queued connections. Returns how many
-    /// of both.
+    /// of both. Feature `test-hooks`: the owners end forwards through `close_all` and the
+    /// close-by-policy paths, and only a test calls this.
+    #[cfg(feature = "test-hooks")]
     pub fn close_forward(&self, forward: ForwardId, why: CloseReason) -> usize {
         self.close_where(|k| k == StatsKey::Forward(forward), why)
     }
@@ -1617,7 +1684,7 @@ impl<L: Link> Endpoint<L> {
             buffered: st.mux.buffered(),
             reserved: st.mux.reserved(),
             mux_buffered: st.mux_buffered(),
-            queued: st.ctl_out.len() + st.data_out.len(),
+            queued: st.ctl_out.len() + st.data_out.len() + st.finish_out.len(),
             attached: st.link.is_some(),
             listeners: st.listeners.len(),
             failed: st.mux.failed().is_some(),
@@ -1626,8 +1693,9 @@ impl<L: Link> Endpoint<L> {
         }
     }
 
-    /// One channel's state in the mux.
-    pub fn channel_info(&self, ch: ChannelId) -> Option<ChannelInfo> {
+    /// One channel's state in the mux (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn channel_info(&self, ch: ChannelId) -> Option<fil_proto::mux::ChannelInfo> {
         lock(&self.inner().state).mux.info(ch)
     }
 
@@ -1646,8 +1714,20 @@ impl<L: Link> State<L> {
 // ---- the tasks ------------------------------------------------------------------------------
 
 impl<L: Link> Inner<L> {
+    /// Wakes both senders: for what can give either work (a link, a channel's table change).
     fn kick(&self) {
         self.ctl_kick.notify_one();
+        self.data_kick.notify_one();
+    }
+
+    /// Wakes the control sender alone: an ack or a delayed-ack deadline (a local write
+    /// completed), never data.
+    fn kick_ctl(&self) {
+        self.ctl_kick.notify_one();
+    }
+
+    /// Wakes the data sender alone: new bytes to send, or credit for them.
+    fn kick_data(&self) {
         self.data_kick.notify_one();
     }
 
@@ -1743,10 +1823,10 @@ impl<L: Link> Inner<L> {
                     st.end_slot(channel, why);
                 }
                 MuxEvent::Released { channel } => {
-                    st.data_out.push_back(Out::Finish(channel));
+                    st.finish_channel(channel);
                     st.end_slot(channel, CloseReason::Reset);
                     st.slots.remove(&channel.0);
-                    st.active(now());
+                    st.touch(now());
                 }
                 MuxEvent::Table(msg) => {
                     st.emit(EndpointEvent::Table(msg));
@@ -1808,6 +1888,7 @@ impl<L: Link> Inner<L> {
             }
         };
         let mut st = lock(&self.state);
+        st.touch(now());
         let live = st.live(ch, &sig)
             && st
                 .mux
@@ -1832,7 +1913,6 @@ impl<L: Link> Inner<L> {
                 }
             }
         }
-        st.active(now());
         self.drain(&mut st);
         drop(st);
         self.kick();
@@ -1874,8 +1954,8 @@ impl<L: Link> Inner<L> {
             return Err((OpenFailure::Detached, stream));
         }
         let t = now();
-        // The mux stamps the open with the time of its last tick: make that now.
-        st.tick(t);
+        // The mux stamps the open with the time it was last told: make that now.
+        st.touch(t);
         let ch = match st.mux.open(kind) {
             Ok(ch) => ch,
             Err(why) => {
@@ -1886,6 +1966,7 @@ impl<L: Link> Inner<L> {
         };
         if !early.is_empty() {
             st.mux.write(ch, early);
+            st.unsent.insert(ch.0);
         }
         let sig = Signals::new();
         st.slots.insert(
@@ -1903,7 +1984,7 @@ impl<L: Link> Inner<L> {
             st.note(ch, early.len(), 0);
         }
         self.spawn_pump(ch, stream, sig, socks);
-        st.active(t);
+        st.touch(t);
         self.drain(&mut st);
         drop(st);
         self.kick();
@@ -2197,8 +2278,8 @@ impl<L: Link> Inner<L> {
                     st.mux_fed_end = st.mux_fed_end.max(end);
                 }
                 // A protocol error here fails the mux; `drain` reports it (`Failed`).
+                st.touch(now());
                 let _ = st.mux.on_payload(ChannelId::MUX, p);
-                st.active(now());
                 self.drain(&mut st);
             }
             drop(st);
@@ -2211,6 +2292,8 @@ impl<L: Link> Inner<L> {
     /// Acks, the MUX stream and the restatements; and the mux's timers.
     async fn ctl_loop(self: Arc<Self>) {
         loop {
+            #[cfg(feature = "test-hooks")]
+            self.hooks.ctl_runs.fetch_add(1, Ordering::Relaxed);
             let kick = self.ctl_kick.notified();
             let (item, wake, data_ready) = {
                 let mut st = lock(&self.state);
@@ -2218,13 +2301,20 @@ impl<L: Link> Inner<L> {
                     return;
                 }
                 let t = now();
-                if t >= st.last_tick + st.tick_every() && st.wants_tick(t) {
+                // The mux's timers run when one is due, and the loop sleeps until the next:
+                // nothing ticks on a period, so a quiet forward wakes nothing.
+                let mut deadline = st.mux.next_deadline(t);
+                let ticked = deadline.is_some_and(|d| d <= t);
+                if ticked {
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks.ticks.fetch_add(1, Ordering::Relaxed);
                     st.tick(t);
                     self.drain(&mut st);
+                    deadline = st.mux.next_deadline(t);
                 }
                 // A MUX record taken (an `OpenOk` among them) can let data go that the data sender
                 // found held a moment ago (a server that speaks first): wake it then too, not only
-                // when it has a queue.
+                // when it has a queue. So can a tick (it closes what timed out).
                 let took_mux = st.pull_control();
                 let item = match st.link.clone() {
                     Some(link) => {
@@ -2233,12 +2323,20 @@ impl<L: Link> Inner<L> {
                     }
                     None => None,
                 };
-                let wake = if item.is_none() && st.wants_tick(t) {
-                    Some(st.last_tick + st.tick_every())
+                // Nothing to send: wait for a kick or the next deadline. A tick leaves none due
+                // (the mux model checks it), so one in the past here is a bug; a bounded retry
+                // keeps it from being slept through, or from spinning.
+                debug_assert!(deadline.is_none_or(|d| d > t), "a tick left a deadline due");
+                let wake = if item.is_none() {
+                    deadline.map(|d| if d > t { d } else { t + DUE_RETRY })
                 } else {
                     None
                 };
-                (item, wake, took_mux || !st.data_out.is_empty())
+                (
+                    item,
+                    wake,
+                    took_mux || (ticked && (!st.data_out.is_empty() || !st.finish_out.is_empty())),
+                )
             };
             if data_ready {
                 self.data_kick.notify_one();
@@ -2265,8 +2363,10 @@ impl<L: Link> Inner<L> {
     /// The dynamic channels' data, and `Link::finish` once a channel is released.
     async fn data_loop(self: Arc<Self>) {
         loop {
+            #[cfg(feature = "test-hooks")]
+            self.hooks.data_runs.fetch_add(1, Ordering::Relaxed);
             let kick = self.data_kick.notified();
-            let (item, deadline, ctl_ready) = {
+            let (item, deadline) = {
                 let mut st = lock(&self.state);
                 if st.closed {
                     return;
@@ -2289,11 +2389,8 @@ impl<L: Link> Inner<L> {
                     (None, Some(_)) => st.pacer.next_deadline().filter(|&d| d > t),
                     _ => None,
                 };
-                (item, deadline, !st.ctl_out.is_empty())
+                (item, deadline)
             };
-            if ctl_ready {
-                self.ctl_kick.notify_one();
-            }
             match item {
                 Some((Out::Data(ch, payload), link, generation)) => {
                     if link.send(ch, payload).await.is_err() {
@@ -2330,6 +2427,10 @@ impl<L: Link> Inner<L> {
             st.emit(EndpointEvent::LinkFailed);
         }
         self.drain(&mut st);
+        drop(st);
+        // Detaching starts the mux's link-down timers (linger, the shorter open wait): the
+        // control sender, which sleeps to the deadlines, must look again whoever called.
+        self.kick_ctl();
     }
 
     // ---- the pump ----------------------------------------------------------------------------
@@ -2437,13 +2538,20 @@ impl<L: Link> Inner<L> {
                             // while the read was in flight: the bytes go nowhere.
                             return Poll::Ready(Ok(None));
                         }
+                        st.touch(now());
                         let n = st.mux.write(ch, data);
+                        st.unsent.insert(ch.0);
                         debug_assert_eq!(n, data.len(), "the room was checked");
                         st.note(ch, n, 0);
-                        st.active(now());
                         self.drain(&mut st);
+                        let control = st.mux.control_pending();
                         drop(st);
-                        self.kick();
+                        // New bytes to send: the data sender's. The control sender has work only
+                        // if the write queued a record or an ack.
+                        self.kick_data();
+                        if control {
+                            self.kick_ctl();
+                        }
                         Poll::Ready(Ok(Some(data.len())))
                     }
                 }
@@ -2516,12 +2624,15 @@ impl<L: Link> Inner<L> {
                                 if !st.live(ch, sig) {
                                     return;
                                 }
+                                st.touch(now());
                                 st.mux.consumed(ch, n);
                                 st.note(ch, 0, n);
-                                st.active(now());
                                 self.drain(&mut st);
                                 drop(st);
-                                self.kick();
+                                // The write completing can produce an ack (at once, or after a
+                                // delay the control sender must be told of) or a `Close`: control
+                                // items. It frees none of this side's own sending.
+                                self.kick_ctl();
                             }
                             Ok(_) | Err(_) => {
                                 debug!(channel = ch.0, "forward socket write failed");
@@ -2541,9 +2652,9 @@ impl<L: Link> Inner<L> {
         if !st.live(ch, sig) {
             return;
         }
+        st.touch(now());
         st.mux.abort(ch, why);
         st.end_slot(ch, why);
-        st.active(now());
         self.drain(&mut st);
         drop(st);
         self.kick();

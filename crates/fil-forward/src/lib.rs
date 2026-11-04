@@ -24,6 +24,8 @@ pub mod socks;
 pub mod stream;
 pub mod tunables;
 
+#[cfg(feature = "test-hooks")]
+pub use endpoint::Wakeups;
 pub use endpoint::{
     AddressCheck, ConnectFuture, Connector, EVENT_QUEUE, Endpoint, EndpointEvent, EventReceiver,
     ForwardStats, LocalPeer, MAX_HANDSHAKES, MAX_PENDING, PeerCred, PeerOwner, PeerUid, Policy,

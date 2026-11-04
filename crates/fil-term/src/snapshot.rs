@@ -12,7 +12,9 @@
 //!    drawing);
 //! 2. history and the primary screen, written as ordinary text with line feeds, so that
 //!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
-//!    are written without a newline and left to autowrap, which restores the wrap flag;
+//!    are written without a newline and left to autowrap, which restores the wrap flag; the
+//!    line after one gets at least its first cell written (a blank one if need be), because the
+//!    wrap happens when that cell is printed;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
 //!    it, with its origin mode, for the eventual `1049 l`), then the alternate grid by absolute positioning;
 //! 4. tab stops, the saved cursor with the origin mode and the character sets it saved (before
@@ -257,10 +259,14 @@ impl<'a> Writer<'a> {
         for (i, line) in rows.iter().enumerate() {
             let last = i + 1 == rows.len();
             let wraps = line.wrapped && !last;
+            // A line entered by autowrap has at least its first cell written, even when it is
+            // blank: the wrap happens when that cell is printed, so without it the line before
+            // would not be marked as wrapped (a line whose tail was erased after a reflow).
+            let min = usize::from(from_wrap);
             let upto = if wraps {
                 line.cells.len()
             } else {
-                trimmed_len(&line.cells)
+                trimmed_len(&line.cells).max(min)
             };
             self.cells(&line.cells, upto);
             let tinted = line
@@ -273,14 +279,8 @@ impl<'a> Writer<'a> {
                 self.put("\x1b[K");
             }
             if wraps {
-                // Autowrap carries on in the next line. If that line is empty nothing will
-                // trigger the wrap, so end this one with a newline.
-                if rows[i + 1].cells.iter().all(Cell::is_plain_blank) {
-                    self.newline();
-                    from_wrap = false;
-                } else {
-                    from_wrap = true;
-                }
+                // Autowrap carries on in the next line.
+                from_wrap = true;
             } else {
                 if !last {
                     self.newline();
@@ -299,11 +299,13 @@ impl<'a> Writer<'a> {
             if !continuing {
                 self.cup(u16::try_from(r).unwrap_or(u16::MAX), 0);
             }
+            // As in `flow_lines`: a row entered by autowrap gets its first cell written.
+            let min = usize::from(continuing);
             if line.wrapped && r + 1 < rows.len() {
                 self.cells(&line.cells, line.cells.len());
-                continuing = !rows[r + 1].cells.iter().all(Cell::is_plain_blank);
+                continuing = true;
             } else {
-                self.cells(&line.cells, trimmed_len(&line.cells));
+                self.cells(&line.cells, trimmed_len(&line.cells).max(min));
                 continuing = false;
             }
         }

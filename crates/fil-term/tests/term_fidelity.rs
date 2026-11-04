@@ -310,3 +310,32 @@ fn leaving_the_alternate_screen_restores_origin_mode_without_moving_the_cursor()
     );
     assert_eq!(with.cursor.pending_wrap, without.cursor.pending_wrap);
 }
+
+#[test]
+fn a_wrapped_line_whose_continuation_was_erased_stays_wrapped_in_a_snapshot() {
+    // 30 characters fill the row, one more wraps to the next, and the erase empties that row
+    // again: the first row keeps its wrap flag with a blank row after it (after a narrowing
+    // reflow that is how bash's redrawn prompt looks). A newline between the two lost the flag.
+    let wrapped_then_erased = [&b"c".repeat(31)[..], b"\x08\x1b[K"].concat();
+    for (name, prefix) in [("primary", &b""[..]), ("alternate", b"\x1b[?1049h")] {
+        let before = state_after(&[prefix, &wrapped_then_erased].concat());
+        assert!(before.screen[0].wrapped, "{name}: the setup wraps");
+        assert!(before.screen[1].cells.iter().all(|c| c.text.is_empty()));
+        let after = restored(&before, WriteCaps::ALL);
+        let flags = |st: &TermState| st.screen.iter().map(|l| l.wrapped).collect::<Vec<_>>();
+        assert_eq!(flags(&after), flags(&before), "{name}");
+        assert_eq!(after.screen, before.screen, "{name}");
+    }
+    // The same in history: the wrapped row has scrolled off with its blank continuation.
+    let before = state_after(
+        &[
+            &wrapped_then_erased[..],
+            b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+        ]
+        .concat(),
+    );
+    assert!(before.history.iter().any(|l| l.wrapped));
+    let after = restored(&before, WriteCaps::ALL);
+    let flags = |st: &TermState| st.history.iter().map(|l| l.wrapped).collect::<Vec<_>>();
+    assert_eq!(flags(&after), flags(&before));
+}

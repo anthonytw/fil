@@ -855,10 +855,11 @@ async fn a_catch_up_announced_ahead_of_a_repaints_bytes_waits_for_them() {
     );
     // The repaint, superseded by the catch-up before it could apply, was never written: the
     // terminal got two snapshots, the attach's and the catch-up's.
-    let start = b"\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r";
-    let written = rig.term.written();
-    let n = written.windows(start.len()).filter(|w| w == start).count();
-    assert_eq!(n, 2, "snapshots written to the terminal");
+    assert_eq!(
+        snapshots_written(&rig),
+        2,
+        "snapshots written to the terminal"
+    );
 }
 
 /// W1 (F4): one snapshot at a time leaves room for one announcement behind an incomplete
@@ -913,8 +914,91 @@ async fn the_next_snapshots_bytes_wait_while_a_complete_repaint_is_held() {
         1
     );
     assert_eq!(rig.daemon.repaints().await.len(), 2);
+    // Both repaints were written: the second begins once the first has applied.
+    assert_eq!(
+        snapshots_written(&rig),
+        3,
+        "the attach's and the two repaints"
+    );
     assert_eq!(
         rig.term.state().screen_text(),
         rig.daemon.screen(0).await.screen_text()
     );
+}
+
+/// How many snapshots the user's terminal was given: each starts with the snapshot writer's
+/// fixed reset.
+fn snapshots_written(rig: &Rig) -> usize {
+    let start = b"\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r";
+    rig.term
+        .written()
+        .windows(start.len())
+        .filter(|w| w == start)
+        .count()
+}
+
+/// W1 (re-check 3, F5): both snapshots' bytes arrive before either announcement (the repaint
+/// was confirmed early, and on QUIC a lost control packet held both announcements back while
+/// channel 2 went on). The bytes kept for them are split at the first one's end: the second
+/// snapshot gets its own, both land, and output goes on, with no reconnect.
+#[tokio::test(start_paused = true)]
+async fn two_snapshots_bytes_ahead_of_both_announcements_each_go_to_their_own() {
+    for catch_up in [false, true] {
+        let rig = eager();
+        rig.attached().await;
+        rig.type_str("abc");
+        settle().await;
+        rig.daemon.set_repaint_bytes_first(catch_up).await;
+        rig.term.resize(60, 24);
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        settle().await;
+        assert_eq!(
+            rig.term.state().screen_text(),
+            rig.daemon.screen(0).await.screen_text(),
+            "second a catch-up: {catch_up}"
+        );
+        assert_eq!(snapshots_written(&rig), 3, "second a catch-up: {catch_up}");
+        // And the session goes on: output after both is shown.
+        rig.daemon.output(b"after\r\n").await;
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        settle().await;
+        assert!(
+            rig.term.rows().iter().any(|l| l.trim_end() == "after"),
+            "second a catch-up: {catch_up}: output stuck"
+        );
+        assert_eq!(
+            rig.daemon.attaches().await.len(),
+            1,
+            "second a catch-up: {catch_up}: no reconnect"
+        );
+    }
+}
+
+/// W1 (re-check 3, F6): a catch-up supersedes a repaint that is complete and held for its
+/// position. The repaint is dropped at once and the catch-up begins: it lands, with no reconnect.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_superseding_a_complete_held_repaint_begins() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_tail(&lines(0..40)).await;
+    rig.daemon.set_repaint_held_then_catch_up().await;
+    rig.term.resize(60, 24);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text(),
+        "the catch-up applied"
+    );
+    assert_eq!(snapshots_written(&rig), 2, "the attach's and the catch-up");
+    rig.daemon.output(b"after\r\n").await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    settle().await;
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
 }

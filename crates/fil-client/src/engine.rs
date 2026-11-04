@@ -1666,7 +1666,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 cur.buf = Vec::new();
             }
             conn.snap_next = Some(info);
-            return self.drain_terminal(conn);
+            if let Flow::End(s) = self.drain_terminal(conn)? {
+                return Ok(Flow::End(s));
+            }
+            // A repaint just superseded may be complete already: dropping it begins this one.
+            return self.finish_snapshot_when_due(conn);
         }
         // The position only ever moves forward.
         if info.at < self.sess.recv.received() {
@@ -1709,10 +1713,20 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             buf: Vec::with_capacity(cap),
             stale,
         });
-        // Snapshot bytes that arrived before their announcement.
+        // Snapshot bytes that arrived before their announcement: this snapshot's, up to its end.
+        // What comes after is the next snapshot's (since a repaint can be confirmed early, two
+        // snapshots' bytes can both arrive ahead of their announcements), kept for it.
         conn.early_bytes = 0;
-        for (seq, data) in std::mem::take(&mut conn.snap_early) {
-            if conn.snap.is_none() {
+        let mut early = std::mem::take(&mut conn.snap_early).into_iter();
+        while let Some((seq, data)) = early.next() {
+            let done = conn
+                .snap
+                .as_ref()
+                .is_none_or(|s| s.recv.received() == s.info.len);
+            if done {
+                conn.snap_early.push((seq, data));
+                conn.snap_early.extend(early);
+                conn.early_bytes = conn.snap_early.iter().map(|(_, d)| d.len()).sum();
                 break;
             }
             if let Flow::End(s) = self.feed_snapshot(conn, seq, &data)? {

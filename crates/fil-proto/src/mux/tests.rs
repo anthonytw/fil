@@ -1605,10 +1605,8 @@ fn the_next_deadline_covers_open_timeouts_and_linger() {
         e,
         MuxEvent::Closed { channel, why: CloseReason::TimedOut } if *channel == second
     )));
-    // The closed open gave its share back: topping the others up is due at once (it is done by a
-    // tick, so the caller must not sleep through it).
-    assert_eq!(p.c.next_deadline(p.now), Some(p.now));
-    p.c.tick(p.now).unwrap();
+    // The closed open gave its share back and the same tick topped the others up: nothing is
+    // left due (a caller that sleeps to the next deadline must not sleep through a top-up).
     assert_eq!(
         p.c.next_deadline(p.now),
         Some(p.now + p.c.cfg.linger - p.c.cfg.open_wait)
@@ -1618,7 +1616,6 @@ fn the_next_deadline_covers_open_timeouts_and_linger() {
         e,
         MuxEvent::Closed { channel, why: CloseReason::TimedOut } if *channel == ch
     )));
-    p.c.tick(p.now).unwrap(); // the share top-up, as above
     assert_eq!(
         p.c.next_deadline(p.now),
         None,

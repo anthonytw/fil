@@ -386,6 +386,11 @@ const DATA_AHEAD: usize = 64 * 1024;
 /// any other channel in the mux.
 const PASS_SCAN: usize = 64;
 
+/// How long the control sender waits before looking again at a mux timer that is still due after
+/// a tick. It cannot happen (a tick leaves none due), but if it ever does, the timer must not be
+/// slept through.
+const DUE_RETRY: Duration = Duration::from_millis(10);
+
 /// Largest read from a local socket into a channel (one data segment's worth).
 const READ_CHUNK: usize = fil_proto::limits::MAX_DATA_PAYLOAD;
 /// Largest piece taken from a channel's receive buffer for one socket write.
@@ -2285,10 +2290,12 @@ impl<L: Link> Inner<L> {
                     }
                     None => None,
                 };
-                // Nothing to send: wait for a kick or the next deadline (never one already past: a
-                // tick has run, and what it left is not due again).
+                // Nothing to send: wait for a kick or the next deadline. A tick leaves none due
+                // (the mux model checks it), so one in the past here is a bug; a bounded retry
+                // keeps it from being slept through, or from spinning.
+                debug_assert!(deadline.is_none_or(|d| d > t), "a tick left a deadline due");
                 let wake = if item.is_none() {
-                    deadline.filter(|&d| d > t)
+                    deadline.map(|d| if d > t { d } else { t + DUE_RETRY })
                 } else {
                     None
                 };

@@ -1118,7 +1118,8 @@ impl Mux {
     /// delayed acks, the open timeouts and the linger deadline, or `now` itself for what waits
     /// for a tick to start (a timer not yet stamped, a share to top up). `None`: nothing is
     /// time-bound, and a caller need not tick at all. A deadline in the past is for the
-    /// caller to act on (tick); one in the future is when to wake.
+    /// caller to act on (tick); one in the future is when to wake. Right after a successful
+    /// [`Mux::tick`] none is due: it is `None` or later than the tick's time.
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         if self.failed.is_some() {
             return None;
@@ -1205,9 +1206,6 @@ impl Mux {
                 }
             }
         }
-        if self.topup_due {
-            self.top_up();
-        }
         let total = self.cfg.connect_timeout + self.cfg.open_wait;
         let up = self.up;
         let open_wait = self.cfg.open_wait;
@@ -1237,6 +1235,11 @@ impl Mux {
             for id in open {
                 self.close(ChannelId(id), CloseReason::TimedOut);
             }
+        }
+        // Last: the closes above give shares back, and a tick must leave no timer due (a caller
+        // that sleeps until `next_deadline` would otherwise sleep through the top-up).
+        if self.topup_due {
+            self.top_up();
         }
         self.check()
     }

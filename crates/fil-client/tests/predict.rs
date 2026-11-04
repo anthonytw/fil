@@ -398,6 +398,26 @@ async fn a_take_back_forgets_the_old_attachs_acknowledgements() {
     );
 }
 
+/// A resume is a boundary: the first key after it is tentative, so an epoch confirmed before the
+/// link dropped writes nothing more until a new echo confirms one.
+#[tokio::test(start_paused = true)]
+async fn the_first_key_after_a_resume_is_tentative() {
+    let (rig, _) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.daemon.set_echo(Echo::Off).await;
+    rig.daemon.kill_link(DownReason::Dead).await;
+    until_async("the resume", 10, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    let from = rig.term.writes().len();
+    rig.type_str("b");
+    settle().await;
+    assert_eq!(drawn_since(&rig, from), 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Offline input and answers
 
@@ -601,9 +621,14 @@ async fn an_echo_ack_beyond_the_input_sent_settles_nothing() {
     settle().await;
     let sent = rig.daemon.input_received().await;
     assert_eq!(sent, 5, "`a`, and the four bytes the window holds");
+    // A key typed while the window is full still gets its offset in the stream: after the bytes
+    // waiting for room, not after the bytes sent.
+    rig.type_str("h");
+    settle().await;
+    assert_eq!(seen.lock().unwrap().keys[1..], [1, 2, 3, 4, 5, 6, 7]);
     let before = seen.lock().unwrap().settled.len();
     let end = rig.daemon.output_end().await;
-    rig.daemon.echo_ack(7, end).await;
+    rig.daemon.echo_ack(8, end).await;
     settle().await;
     let seen = seen.lock().unwrap();
     assert!(

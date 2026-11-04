@@ -19,6 +19,13 @@
 //! - a status line or a question was drawn on the untrusted screen and has since been removed (a
 //!   QUIC link that went quiet and recovered by itself: no resume, so no other repair).
 //!
+//! - a snapshot rendered at an older generation than the client's lands (the window changed while
+//!   it was on its way): it drew a whole screen at a size the terminal no longer has.
+//!
+//! "A status line or a question" is whatever lines the client gives the overlay: the `~#` port
+//! summary and notices count too, so a guess drawn while one of them is up asks only once they
+//! are gone. That is self-limiting (they go with the next key or after a few seconds).
+//!
 //! The repaint travels as an `InputRecord::Repaint` after the resize record of the size it is
 //! for, so the daemon renders at that size. One asked for and not yet landed when the link goes
 //! is asked for again on the next one: its resume carries `want_snapshot`, whose snapshot has the

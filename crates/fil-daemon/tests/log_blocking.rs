@@ -16,10 +16,37 @@ use fil_daemon::logging::{
 use fil_proto::msg::{Request, Response};
 use tracing_subscriber::fmt::MakeWriter;
 
-/// The spec says 100 ms; the margin is for a loaded runner (250 ms failed 1 run in 14 with 40 of
-/// these tests at once). A log that blocks takes forever, not a little longer, so a bound of
-/// seconds loses nothing.
+/// The spec says 100 ms. A step is done three times with the file hung, and the fastest must meet
+/// the spec: a loaded machine can deschedule a thread for tens of milliseconds, rarely all three
+/// runs of one step (250 ms bounds on single runs failed 1 run in 14 with 40 tests at once).
+const SPEC: Duration = Duration::from_millis(100);
+
+/// An attach starts a shell, which takes a hundred milliseconds or more when a few dozen tests
+/// run at once (the fastest of three took 100 to 160 ms in 1 run in 15): twice the spec for it.
+const SPEC_ATTACH: Duration = Duration::from_millis(250);
+
+/// What no step may take, however loaded the machine: below the 1 s a flush at exit may wait, so
+/// a log that stalls for about that long (a flush in a request path) is caught, and far above
+/// what a descheduled thread loses. A log that blocks for good takes for ever and is caught by
+/// the watchdog and the `within`s.
+const NEVER: Duration = Duration::from_secs(1);
+
+/// The bound a test of `within` puts on a call that returns at once.
 const WITHIN: Duration = Duration::from_secs(3);
+
+/// Judges a step that ran three times: the fastest within `spec`, every one below [`NEVER`].
+fn judge(what: &str, spec: Duration, took: &[Duration]) {
+    let fastest = took.iter().min().unwrap();
+    assert!(
+        *fastest < spec,
+        "{what}: the fastest of {} runs took {fastest:?} (the bound is {spec:?}): {took:?}",
+        took.len()
+    );
+    assert!(
+        took.iter().all(|d| *d < NEVER),
+        "{what}: a run took over {NEVER:?}: {took:?}"
+    );
+}
 
 /// A gate that is shut or open; a writer behind a shut one parks.
 #[derive(Clone, Default)]
@@ -150,27 +177,43 @@ async fn a_hung_log_file_does_not_stop_the_daemon() {
     each.sort();
     let p99 = each[FLOOD * 99 / 100];
     assert!(p99 < Duration::from_millis(50), "99th percentile {p99:?}");
+    // Load deschedules a thread for tens of milliseconds, not for a second.
+    assert!(each[FLOOD - 1] < NEVER, "slowest {:?}", each[FLOOD - 1]);
 
-    // The daemon, which logs as it works, goes on within 100 ms each.
-    let t = Instant::now();
-    let r = ask(&d, Request::ListSessions).await;
-    assert!(matches!(r, Response::Sessions { .. }));
-    assert!(t.elapsed() < WITHIN, "ListSessions took {:?}", t.elapsed());
-    let t = Instant::now();
-    a.type_bytes(b"echo-me\n").await;
-    a.wait("the echo", |c| c.out_str().contains("echo-me"))
-        .await;
-    assert!(t.elapsed() < WITHIN, "the echo took {:?}", t.elapsed());
-    // A new session logs its attach, and starts at once too.
-    let t = Instant::now();
-    let b = Client::attach(d.pipe().await, Connect::new("two", key(2))).await;
-    assert!(b.reply.is_some());
-    assert!(t.elapsed() < WITHIN, "an attach took {:?}", t.elapsed());
+    // The daemon, which logs as it works, goes on within 100 ms each (three runs of each step).
+    let mut took = Vec::new();
+    for _ in 0..3 {
+        let t = Instant::now();
+        let r = ask(&d, Request::ListSessions).await;
+        assert!(matches!(r, Response::Sessions { .. }));
+        took.push(t.elapsed());
+    }
+    judge("ListSessions", SPEC, &took);
+    let mut took = Vec::new();
+    for i in 0..3 {
+        let word = format!("echo-me-{i}");
+        let t = Instant::now();
+        a.type_bytes(format!("{word}\n").as_bytes()).await;
+        a.wait("the echo", |c| c.out_str().contains(&word)).await;
+        took.push(t.elapsed());
+    }
+    judge("the echo", SPEC, &took);
+    // New sessions log their attach, and start at once too.
+    let mut took = Vec::new();
+    let mut others = Vec::new();
+    for (n, name) in ["two", "three", "four"].into_iter().enumerate() {
+        let t = Instant::now();
+        let b = Client::attach(d.pipe().await, Connect::new(name, key(2 + n as u8))).await;
+        assert!(b.reply.is_some());
+        took.push(t.elapsed());
+        others.push(b);
+    }
+    judge("an attach", SPEC_ATTACH, &took);
 
     // Released: what was queued is written, and the last line says how many were lost.
     // (After the daemon has stopped and its last lines are queued, so the drop count is last.)
     d.stop().await;
-    drop((a, b));
+    drop((a, others));
     tokio::time::sleep(Duration::from_millis(300)).await;
     gate.open();
     assert!(log.flush(Duration::from_secs(5)));

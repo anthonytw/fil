@@ -853,6 +853,12 @@ async fn a_catch_up_announced_ahead_of_a_repaints_bytes_waits_for_them() {
         missing.is_empty(),
         "lines lost from the scrollback: {missing:?}"
     );
+    // The repaint, superseded by the catch-up before it could apply, was never written: the
+    // terminal got two snapshots, the attach's and the catch-up's.
+    let start = b"\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r";
+    let written = rig.term.written();
+    let n = written.windows(start.len()).filter(|w| w == start).count();
+    assert_eq!(n, 2, "snapshots written to the terminal");
 }
 
 /// W1 (F4): one snapshot at a time leaves room for one announcement behind an incomplete

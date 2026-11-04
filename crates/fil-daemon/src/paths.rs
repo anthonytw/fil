@@ -351,6 +351,58 @@ impl Paths {
     }
 }
 
+/// If `exe` (this daemon's executable) is `fil` in a version directory that `fil install` made,
+/// `<home>/.local/share/fil/<ver>-w<major>.<rev>/fil`, sets that directory's times to now, so
+/// the install's garbage collection, which keeps a version directory modified within the last
+/// seven days, never removes the build a live daemon runs from (docs/m4/release.md). Anything
+/// else does nothing: a daemon run from another place, a path that is only a link to one, a
+/// directory that is not a real directory of ours, a name that is not a version directory's.
+/// The path is canonical, so a link is never followed to a directory it is not in; the
+/// directory is touched, never the file, and without following a link. Returns whether it did.
+/// No path is logged here or by the caller above debug.
+pub fn refresh_install_dir(exe: &Path, home: &Path) -> bool {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, utimensat};
+    let Ok(exe) = std::fs::canonicalize(exe) else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(home.join(".local/share/fil")) else {
+        return false;
+    };
+    let (Some(version_dir), true) = (exe.parent(), exe.file_name() == Some(OsStr::new("fil")))
+    else {
+        return false;
+    };
+    if version_dir.parent() != Some(root.as_path()) {
+        return false;
+    }
+    let is_version_name = version_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|n| n.rsplit_once("-w"))
+        .is_some_and(|(ver, wire)| {
+            let number =
+                |s: &str| !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit());
+            !ver.is_empty()
+                && wire
+                    .split_once('.')
+                    .is_some_and(|(m, r)| number(m) && number(r))
+        });
+    let ours = std::fs::symlink_metadata(version_dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == current_uid());
+    if !is_version_name || !ours {
+        return false;
+    }
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    let stamps = Timestamps {
+        last_access: now,
+        last_modification: now,
+    };
+    utimensat(CWD, version_dir, &stamps, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+}
+
 /// Whether `held` (from [`Paths::lock_dir`]) is still the directory at `dir`: it has not been
 /// removed and made again, which would leave the lock on a directory nobody looks at.
 pub fn dir_lock_is_current(held: &File, dir: &Path) -> bool {
@@ -660,6 +712,74 @@ mod tests {
         let held = p.lock_dir().unwrap();
         std::fs::remove_dir(&base).unwrap();
         assert!(!dir_lock_is_current(&held, &base));
+    }
+
+    /// The version directory of the running executable is kept fresh, and nothing else is.
+    #[test]
+    fn the_install_directory_of_the_running_executable_is_refreshed_and_only_that() {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".local/share/fil");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        let mtime = |d: &Path| std::fs::symlink_metadata(d).unwrap().mtime();
+        let make = |name: &str, file: &str| {
+            let d = root.join(name);
+            std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+            std::fs::write(d.join(file), b"").unwrap();
+            utimensat(CWD, &d, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            d
+        };
+        let good = make("0.1.0-w1.12", "fil");
+        assert!(refresh_install_dir(&good.join("fil"), &home));
+        assert!(mtime(&good) > 1_500_000_000);
+
+        // Not a version directory's name, or not named `fil`.
+        for (name, file) in [
+            ("0.1.0", "fil"),
+            ("0.1.0-w1", "fil"),
+            ("0.1.0-w1.x", "fil"),
+            ("-w1.12", "fil"),
+            ("0.2.0-w1.12", "other"),
+        ] {
+            let d = make(name, file);
+            assert!(!refresh_install_dir(&d.join(file), &home), "{name}/{file}");
+            assert_eq!(mtime(&d), 1_000_000_000, "{name}/{file}");
+        }
+        // Somewhere else entirely, and outside the home.
+        let elsewhere = tmp.path().join("bin");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("fil"), b"").unwrap();
+        utimensat(CWD, &elsewhere, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!refresh_install_dir(&elsewhere.join("fil"), &home));
+        assert_eq!(mtime(&elsewhere), 1_000_000_000);
+        // A link in the install root to a directory elsewhere: its canonical path is not in the
+        // root, so neither the link nor the target is touched. A link to the good file from
+        // elsewhere resolves to the good directory, which is the running executable's.
+        let link = root.join("1.0.0-w1.13");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(!refresh_install_dir(&link.join("fil"), &home));
+        assert_eq!(mtime(&elsewhere), 1_000_000_000);
+        let via = elsewhere.join("fil-link");
+        std::os::unix::fs::symlink(good.join("fil"), &via).unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(refresh_install_dir(&via, &home));
+        assert!(mtime(&good) > 1_500_000_000);
+        // A missing install root or executable.
+        assert!(!refresh_install_dir(
+            &good.join("fil"),
+            &tmp.path().join("nohome")
+        ));
+        assert!(!refresh_install_dir(&good.join("gone"), &home));
     }
 
     /// The agent directory's clean-up never touches a directory that fails the socket

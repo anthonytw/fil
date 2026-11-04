@@ -392,6 +392,55 @@ async fn a_directory_that_is_no_longer_ours_is_left_alone() {
     d.stop().await;
 }
 
+/// A daemon that runs from a version directory `fil install` made keeps that directory's
+/// modification time fresh (the install's garbage collection spares what is under seven days
+/// old); one that runs from anywhere else touches nothing outside its socket directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_keeps_the_install_directory_it_runs_from() {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+    let tree = Tree::new();
+    let home = tree.parent.join("home");
+    let installed = home.join(".local/share/fil/0.1.0-w1.12");
+    let other = home.join("bin");
+    for d in [&installed, &other] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("fil"), b"").unwrap();
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        utimensat(CWD, d, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    }
+    let mtime = |d: &Path| std::fs::metadata(d).unwrap().mtime();
+    for (exe, kept) in [(other.join("fil"), false), (installed.join("fil"), true)] {
+        let paths = tree.paths();
+        fil_daemon::ensure_socket_dir(&tree.dir).unwrap();
+        let mut daemon = Daemon::start(paths, config(CAT)).await.unwrap();
+        daemon.set_keeping(keeping(true, true));
+        daemon.set_install(exe.clone(), home.clone());
+        let handle = daemon.handle();
+        let task = tokio::spawn(daemon.run());
+        tokio::time::sleep(EVERY * 4).await;
+        assert_eq!(mtime(&installed) > 1_500_000_000, kept, "{exe:?}");
+        assert_eq!(mtime(&other), 1_000_000_000, "only an install directory");
+        handle.shutdown(true);
+        let _ = tokio::time::timeout(WAIT, task).await;
+        let old = Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        let stamps = Timestamps {
+            last_access: old,
+            last_modification: old,
+        };
+        utimensat(CWD, &installed, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    }
+}
+
 /// Whether something holds a shared lock on the directory (an exclusive try fails), which is what
 /// systemd-tmpfiles tries.
 fn dir_is_locked(dir: &Path) -> bool {

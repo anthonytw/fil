@@ -690,6 +690,9 @@ pub struct Daemon {
     /// The shared lock on the socket directory, which systemd-tmpfiles honors by skipping it.
     dir_lock: Option<File>,
     keeping: Keeping,
+    /// This daemon's executable and `$HOME`, to keep its install directory (`fil install`'s
+    /// garbage collection spares a version directory modified in the last seven days).
+    install: Option<(PathBuf, PathBuf)>,
     stop: watch::Sender<Option<bool>>,
 }
 
@@ -798,6 +801,7 @@ impl Daemon {
             lock,
             dir_lock,
             keeping,
+            install: std::env::current_exe().ok().zip(crate::paths::home_dir()),
             stop,
         })
     }
@@ -811,6 +815,12 @@ impl Daemon {
             self.dir_lock = hold_dir_lock(&self.paths);
         }
         self.keeping = keeping;
+    }
+
+    /// Names the executable and home directory the install directory is looked for from (the
+    /// process's own by default). For tests.
+    pub fn set_install(&mut self, exe: PathBuf, home: PathBuf) {
+        self.install = Some((exe, home));
     }
 
     /// One look after the daemon's files: repairs what is missing or was replaced, then sets
@@ -871,6 +881,10 @@ impl Daemon {
         if self.keeping.refresh {
             let n = self.paths.refresh_times();
             tracing::debug!(files = n, "refreshed the times of the daemon's files");
+            if let Some((exe, home)) = &self.install {
+                let kept = crate::paths::refresh_install_dir(exe, home);
+                tracing::debug!(kept, "looked after the install directory");
+            }
         }
     }
 

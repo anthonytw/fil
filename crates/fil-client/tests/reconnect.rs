@@ -4,6 +4,7 @@ mod common;
 
 use std::time::Duration;
 
+use common::daemon::InFlight;
 use common::*;
 use fil_client::{DialError, DialPurpose, Outcome};
 use fil_transport::{DownReason, LinkKind};
@@ -534,6 +535,79 @@ async fn a_catch_up_snapshot_mid_stream_replaces_the_screen_and_the_stream_conti
         2,
         "one catch-up, and no snapshot for the resume"
     );
+    assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
+}
+
+/// The numbered lines the user can scroll back to, in order (history, then the screen).
+fn numbers_shown(rig: &Rig) -> Vec<usize> {
+    let mut all = rig.term.history();
+    all.extend(rig.term.rows());
+    all.iter()
+        .filter_map(|l| l.trim_end().strip_prefix("line ")?.parse().ok())
+        .collect()
+}
+
+/// PR #110's B1: a catch-up is announced while output the daemon sent before the jump is still
+/// on its way. The announcement (control) overtakes it on every transport, and on QUIC the
+/// snapshot's bytes (a stream of their own) may too. The daemon renders only the history the
+/// client was never sent (`unseen_history`), so that output is in no snapshot: the client applies
+/// it first and the snapshot after it, and every line is there exactly once.
+#[tokio::test(start_paused = true)]
+async fn output_in_flight_at_a_catch_up_is_applied_before_it() {
+    for order in [InFlight::BeforeSnapshot, InFlight::AfterSnapshot] {
+        let rig = start(config());
+        rig.attached().await;
+        rig.daemon.output(&lines(0..30)).await;
+        settle().await;
+        // 240 lines skipped on 24 rows: 240 + 1 - 24 of them scrolled off the daemon's screen
+        // since the client's position.
+        rig.daemon
+            .catch_up_in_flight(&lines(30..60), &lines(60..300), 217, order)
+            .await;
+        settle().await;
+        rig.daemon.output(&lines(300..305)).await;
+        settle().await;
+        assert_eq!(
+            numbers_shown(&rig),
+            (0..305).collect::<Vec<_>>(),
+            "{order:?}: every line once, in order"
+        );
+        assert_eq!(
+            rig.term.state().screen,
+            rig.daemon.screen(0).await.screen,
+            "{order:?}"
+        );
+        assert_eq!(
+            rig.daemon.attaches().await.len(),
+            1,
+            "{order:?}: no reconnect"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(rig.daemon.violations().await.is_empty(), "{order:?}");
+        assert_eq!(rig.daemon.unacked().await, 0, "{order:?}");
+    }
+}
+
+/// The link dies while a catch-up waits for the output before it. The terminal has not moved
+/// (a catch-up jumps the position only when its snapshot is written), so the next link resumes
+/// exactly where it is, with no fresh attach and no line lost.
+#[tokio::test(start_paused = true)]
+async fn a_link_lost_while_a_catch_up_waits_for_the_output_before_it_resumes() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..30)).await;
+    settle().await;
+    rig.daemon
+        .catch_up_in_flight(&lines(30..60), &lines(60..300), 217, InFlight::Lost)
+        .await;
+    until_async("the reconnect", 30, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    settle().await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some(), "a resume, not a fresh attach: {a:?}");
+    assert_eq!(numbers_shown(&rig), (0..300).collect::<Vec<_>>());
     assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
 }
 

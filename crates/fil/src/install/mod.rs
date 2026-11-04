@@ -16,11 +16,12 @@
 //!   bootstrap runs;
 //! - [`upload`]: which binary would be sent, and the checks before a byte leaves (the bundle's
 //!   `SHA256SUMS`, the release-build mark, the scan for test hooks and builder paths);
-//! - [`fallback`]: which remote command each connection of a run would use (`remote = ...`;
-//!   not consulted yet: the attach wiring is still to come);
+//! - [`fallback`]: which remote command each connection of a run uses (`remote = ...`);
 //! - [`boot`]: the client's half of the bootstrap's exchange;
-//! - [`client`]: `fil install`, the one caller of `PipeCommand::bootstrap` today.
+//! - [`attach`]: the bootstrap's greeting inside a run (the offer, the upload, `go`);
+//! - [`client`]: `fil install`.
 
+pub mod attach;
 pub mod boot;
 pub mod client;
 pub mod fallback;

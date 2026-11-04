@@ -297,6 +297,12 @@ fn lock_names(dir: &Path) -> Vec<String> {
 
 /// Two builds of different revisions use one socket directory: each starts its own daemon beside
 /// the other's, and `fil ls` of each notes the other and says what to do about it.
+/// File names sort as text (`fil-1-10` before `fil-1-9`), as [`lock_names`] lists them.
+fn sorted<const N: usize>(mut v: [String; N]) -> [String; N] {
+    v.sort();
+    v
+}
+
 #[test]
 fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
     let w = World::new("coexist");
@@ -320,7 +326,7 @@ fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{a}.sock"), format!("fil-1-{b}.sock")],
+        sorted([format!("fil-1-{a}.sock"), format!("fil-1-{b}.sock")]),
         "two sockets, named for their revisions and nothing else"
     );
 
@@ -393,6 +399,6 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{old}.sock"), format!("fil-1-{new}.sock")]
+        sorted([format!("fil-1-{old}.sock"), format!("fil-1-{new}.sock")])
     );
 }

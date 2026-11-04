@@ -20,6 +20,10 @@ fn total(w: &World) -> (Wakeups, Wakeups) {
 /// time-bound, so nothing ticks, and the tasks wake only for the traffic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lightly_used_forward_runs_no_timers() {
+    bounded(a_lightly_used_forward_runs_no_timers_body()).await
+}
+
+async fn a_lightly_used_forward_runs_no_timers_body() {
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -50,6 +54,10 @@ async fn a_lightly_used_forward_runs_no_timers() {
 /// After the last byte, nothing wakes at all: no period, no leftover timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quiet_forward_wakes_nothing() {
+    bounded(a_quiet_forward_wakes_nothing_body()).await
+}
+
+async fn a_quiet_forward_wakes_nothing_body() {
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -70,6 +78,10 @@ async fn a_quiet_forward_wakes_nothing() {
 /// data sender run on the receiving side for every payload that arrived.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_event_wakes_only_the_task_that_has_work() {
+    bounded(each_event_wakes_only_the_task_that_has_work_body()).await
+}
+
+async fn each_event_wakes_only_the_task_that_has_work_body() {
     let server = serve(|mut s| async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {

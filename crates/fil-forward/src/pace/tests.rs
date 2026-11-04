@@ -1037,8 +1037,8 @@ fn a_parked_channel_that_keeps_up_gives_samples_and_stays_unparked() {
         exchange(&mut p, rr, &mut roff, t, 50, false);
         t += Duration::from_millis(50);
     }
-    // Then a queue: the bulk's records take 140 ms, and the request (sent 5 ms after each)
-    // passes them on the way, as QUIC's other stream does, in 100 ms.
+    // Then a queue: both take 140 ms, longer than the age measured without it (in realnet both
+    // channels were parked, the request's passes too, and every sample left out).
     let mut parked_seen = false;
     for _ in 0..40 {
         p.on_sent(bulk, boff, boff + PAYLOAD, false, t);
@@ -1046,8 +1046,8 @@ fn a_parked_channel_that_keeps_up_gives_samples_and_stays_unparked() {
         let r = t + Duration::from_millis(5);
         p.on_sent(rr, roff, roff + PAYLOAD, false, r);
         roff += PAYLOAD;
-        p.on_ack(rr, roff, ACK_AFTER, r + Duration::from_millis(100));
         p.advance(t + Duration::from_millis(125));
+        p.on_ack(rr, roff, ACK_AFTER, r + Duration::from_millis(140));
         parked_seen |= p.chans.get(&16).is_some_and(|c| c.parked);
         p.on_ack(bulk, boff, ACK_AFTER, t + Duration::from_millis(140));
         t += Duration::from_millis(200);

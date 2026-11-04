@@ -43,7 +43,8 @@ release-deps:
         echo "$tree" >&2; exit 1
       fi
       # (The install bootstrap is in every build since the owner approved it, M4 OQ-1, 2026-11-04;
-      # release-check requires that it is the one `sh -c` text in a release binary, byte for byte.)
+      # crates/fil/tests/remote_commands.rs checks what reaches ssh; release-check's `sh -c` scan is
+      # a tripwire.)
       hooks=$(grep -E 'feature "test-hooks"' <<<"$tree" || true)
       test -z "$hooks" || { echo "release-deps: $c has a test-only feature in the release build of fil: $hooks" >&2; exit 1; }
     done

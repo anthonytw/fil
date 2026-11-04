@@ -266,11 +266,13 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   done
   # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
   if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
-  # The remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner 2026-11-04): the
-  # install bootstrap is in the binary, byte for byte as the golden pins it for this version and
-  # wire, and it is the only shell command line: every `sh -c` in the binary (which also catches
-  # `bash -c`, `zsh -c` and the like) is the start of that text. A universal binary holds one per
-  # architecture. `fil server --stdio` is assembled from separate words and has no line to find.
+  # A tripwire on the remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner
+  # 2026-11-04): the install bootstrap is in the binary, byte for byte as the golden pins it for
+  # this version and wire, and every `sh -c` in the binary (which also catches `bash -c`, `zsh -c`
+  # and the like) is the start of that text. A universal binary holds one per architecture. This
+  # finds a second shell-wrapped literal only: a command built from separate argv words has no
+  # such text, which is why crates/fil/tests/remote_commands.rs checks the behavior (every
+  # subcommand against a recording fake ssh).
   if [ -z "$boot" ]; then
     fail "$name: no install bootstrap to compare with (crates/fil-transport/src/pipe/remote-commands.txt)"
   else

@@ -17,12 +17,19 @@
 //! pattern (`docs/m4/release.md` §6.2), so no build can install a directory that garbage
 //! collection never recognizes. `remote-commands.txt` beside this file pins its exact bytes.
 //!
-//! **Approved by the owner (M4 OQ-1, 2026-11-04)**, with the text pinned here: fil's remote
-//! commands are exactly two, [`REMOTE_COMMAND`] and [`BOOTSTRAP`], and nothing else ever reaches a
-//! remote shell (DESIGN.md §8.2, §11). The one function that puts the bootstrap on a command line
-//! is [`PipeCommand::bootstrap`]; it takes a host and nothing else. A change to the script's text
-//! needs the owner's sign-off again; the release check (`tests/release/check.sh`) requires that
-//! every `sh -c` in a release binary is this exact text.
+//! **Approved by the owner (M4 OQ-1, 2026-11-04):** fil's remote commands are exactly two,
+//! [`REMOTE_COMMAND`] and [`BOOTSTRAP`] (DESIGN.md §8.2, decided). [`PipeCommand::ssh`] and
+//! [`PipeCommand::bootstrap`] are the only constructors of either; both take a host and nothing
+//! else. What each check proves:
+//!
+//! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
+//!   (a change to it needs the owner's sign-off again);
+//! - `crates/fil/tests/remote_commands.rs` runs every subcommand that reaches ssh with a
+//!   recording fake `ssh` and requires each remote part to be exactly one of the two: that is
+//!   the check of **behavior**, however a command line is built;
+//! - the release check (`tests/release/check.sh`) requires every `sh -c` in a release binary to
+//!   be the start of this text: a **tripwire** for a second shell-wrapped literal only (it cannot
+//!   see a command built from separate argv words).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -65,7 +72,7 @@ const BOOT_HEAD: &str = "sh -c 'v=";
 const BOOT_MID: &str = "; w=\"(wire ";
 /// The rest, one statement per piece (the pieces have no separators of their own: the text is
 /// their concatenation). The plan's §7 holds the same text for 0.1.0 on wire 1.12, and the test
-/// `the_bootstrap_is_the_text_the_owner_reviews` keeps the two equal.
+/// `the_bootstrap_is_the_text_the_owner_approved` keeps the two equal.
 const BOOT_TAIL: &str = concat!(
     r#")"; "#,
     r#"u=$(id -u); "#,
@@ -231,7 +238,9 @@ const _: () = assert!(
 );
 
 /// The bootstrap for any version and wire, at run time: the same pieces as [`BOOTSTRAP`], for
-/// the tests that compare it with the text the owner reviews and with the golden.
+/// the tests that compare it with the text the owner approved and with the golden. Not for
+/// building a command line: [`PipeCommand::bootstrap`] is the only one, with [`BOOTSTRAP`].
+#[doc(hidden)]
 pub fn render_bootstrap(version: &str, major: u16, revision: u16) -> String {
     format!("{BOOT_HEAD}{version}-w{major}.{revision}{BOOT_MID}{major}.{revision}{BOOT_TAIL}")
 }
@@ -307,6 +316,7 @@ impl PipeCommand {
     }
 
     /// The bootstrap for any version and wire ([`render_bootstrap`]), for tests.
+    #[doc(hidden)]
     pub fn render_bootstrap(version: &str, major: u16, revision: u16) -> String {
         render_bootstrap(version, major, revision)
     }

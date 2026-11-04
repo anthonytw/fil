@@ -57,7 +57,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 | Item | Verified | Decision |
 |---|---|---|
 | **M1-A2: synchronous log writes.** `fil_daemon::logging::RotatingLog` writes each line behind one `Mutex`, and rotation (rename, reopen, prune) runs inside that lock (`crates/fil-daemon/src/logging.rs`: the `State` mutex, `maintain` and `rotate`). The client uses the same module (`crates/fil/src/logging.rs`). There is no M2 regression at `info`, but a log directory on a hung NFS home would freeze every thread that logs, the daemon's included. | yes | **Include, LOG**: a non-blocking writer with a bounded queue, drop and count on overflow, rotation off the hot path, and a test with a writer that blocks. |
-| **§16.5: manual install or upload.** | open | **U1**, under OQ-1. |
+| **§16.5: manual install or upload.** | open (resolved since: both, M4 OQ-1 yes, owner 2026-11-04) | **U1**, under OQ-1. |
 | **§16.9: macOS as a remote host.** | open | **Proposed: supported**, with sessions, forwards and the agent; `fil ports` shows forwards only. MAC tests it on every release candidate. |
 | **The macOS trampoline after an in-place upgrade.** On Linux, a session's child starts through `/proc/self/exe`, which stays the daemon's own image after the file is replaced (`fil_session::nofile::own_executable`). On macOS it starts through `current_exe()`, which is a *path*: after a package upgrade replaces the file, a running old daemon starts its new sessions through the *new* binary's `__fil-exec-nofile` trampoline. | yes (found while reading) | **MAC tests it** (the upgrade-in-place scenario, §6.2). Proposed remedy if it fails: freeze the trampoline's argument contract within a `PROTOCOL_MAJOR`, pinned by a test. That remedy lands in `fil-session` after M3 closes. U1's versioned install directories avoid the case for fil-installed copies, because those are never replaced in place. |
 | **Temporary-file cleaners and a long-lived daemon.** `/tmp/fil-$UID/` holds the socket, the lock and start files and the agent sockets. Some systems age `/tmp`: systemd-tmpfiles' `10d` rule on Fedora-like hosts, and macOS's periodic `clean-tmps`. Both look at access, modification **and change** times (the last cannot be set back), so a test that only sets the cleaner's age to zero deletes nothing and passes whatever the daemon does. The failure that matters: once the lock and start files are aged out, the next relay takes a fresh lock, believes no daemon runs, and the new daemon removes the old one's "stale" socket. That strands every live session. U1's garbage collection reads the same lock files. | the mechanism yes; the cleaners' effect on a live daemon unverified | **Include, TMP** (Wave 1): design the remedy now and test the mechanism (§3). |
@@ -246,7 +246,7 @@ Every package keeps M2's rules:
 
 ### Wave 1 (in parallel, now)
 
-**U1: install and upload** (riskiest; its remote half waits for OQ-1)
+**U1: install and upload** (riskiest; its remote half waited for OQ-1, answered yes 2026-11-04)
 - **Owns:**
   - `crates/fil-transport/src/pipe/command.rs`: `REMOTE_COMMAND`, `PipeCommand::ssh`, the new constant and its compile-time check (§2.5); the remote-command golden and its test sit beside it;
   - `crates/fil/src/install/**` (new);

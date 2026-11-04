@@ -29,6 +29,13 @@ const PREAMBLE: &[u8] = b"\x1bFIL-CONNECT ";
 const MAX_LINE: usize = 4096;
 /// How long `fil install --check` may take, its login included (a wrapper on `PATH` may hang).
 pub const CHECK_LIMIT: Duration = Duration::from_secs(120);
+/// How long `fil install --remove` may take, its login included: the login (which may wait for a
+/// password) and one collection pass, so the same bound as `--check`.
+pub const REMOVE_LIMIT: Duration = Duration::from_secs(120);
+/// How long `fil install HOST` may take, its login included: the upload is at most 128 MiB, which
+/// takes about 18 minutes at 1 Mbit/s, so 30 minutes leaves room for the login and a slow link
+/// while still ending a hung wrapper or a stalled link.
+pub const INSTALL_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// The first line the client writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

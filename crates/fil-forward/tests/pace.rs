@@ -129,11 +129,7 @@ const RATE: u64 = 2_500_000;
 /// (median probe round trip, bulk bytes per second, most payloads the daemon's endpoint held
 /// queued for the link) on the slow pipe.
 async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
-    let source = serve(|mut s| async move {
-        let buf = vec![9u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
-    })
-    .await;
+    let source = endless_source().await;
     let stream = StreamConfig {
         latency: Duration::from_millis(20),
         jitter: Duration::ZERO,
@@ -141,6 +137,10 @@ async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
         buffer: 1 << 20,
     };
     let mut w = World::new_pipe_on(mux_config(), stream).await;
+    // The kernel buffers between the endless source and the daemon are not what is measured
+    // (the link is the bottleneck) and unbounded they hold megabytes per connection
+    // (`bounded_buffers`).
+    *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
     w.client.ep.set_pacing(cfg);
     w.daemon.ep.set_pacing(cfg);
     let port = w.local_forward(1, source.port);
@@ -207,12 +207,11 @@ async fn parallel_downloads_keep_the_link_full() {
 async fn parallel_downloads_keep_the_link_full_body() {
     let denied = mbufs_denied();
     for n in [16, 32] {
-        let source = serve(|mut s| async move {
-            let buf = vec![9u8; 64 * 1024];
-            while write_all_retry(&mut s, &buf).await.is_ok() {}
-        })
-        .await;
+        let source = endless_source().await;
         let mut w = World::new_pipe_on(mux_config(), slow_pipe()).await;
+        // As in `slow_pipe_cell`: 16 and 32 endless sources held 187 MiB of kernel buffers
+        // unbounded, more than a small macOS runner's mbuf pool.
+        *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
         let port = w.local_forward(1, source.port);
         let got = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::new();
@@ -387,14 +386,15 @@ const STUCK_BUFFER: u32 = 4096;
 /// (the live forward's 1 MiB echo, the agent's median request-and-answer).
 async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
     let (deaf_port, deaf) = deaf_target().await;
-    let source = serve(|mut s| async move {
-        let buf = vec![9u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
-    })
-    .await;
+    let source = endless_source().await;
     let echo = echo_server().await;
     let agent = echo_server().await;
     w.client.targets.set_agent(agent.port);
+    // The downloads end at sockets nobody reads, so what the kernel buffers between the endless
+    // source and the daemon is never drained; it is not what is tested (the endpoints' state
+    // and the live forward are), and unbounded it held megabytes per connection
+    // (`bounded_buffers`).
+    *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
     let up_port = w.local_forward(1, deaf_port);
     let down_port = w.local_forward(2, source.port);
     let echo_port = w.local_forward(3, echo.port);

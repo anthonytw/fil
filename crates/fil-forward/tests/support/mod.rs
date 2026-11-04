@@ -985,6 +985,30 @@ pub fn shrink_buffers(s: &TcpStream) {
     rustix::net::sockopt::set_socket_send_buffer_size(s, STUCK_BUFFER as usize).unwrap();
 }
 
+/// A [`Wrap`] that bounds the kernel buffers of every stream the endpoint connects to a target
+/// ([`shrink_buffers`]). For a forward whose target writes without end while the endpoint reads
+/// only as its window allows: the default (autotuned to 4 MiB a side on macOS) parks megabytes
+/// per connection in the kernel, which the tests never count, and a few dozen such connections
+/// take a small runner's whole mbuf pool (macOS: `parallel_downloads_keep_the_link_full` held
+/// 187 MiB on its own, beside tests whose sends then failed with `ENOBUFS`).
+pub fn bounded_buffers() -> Wrap {
+    Arc::new(|s| {
+        shrink_buffers(&s);
+        Box::new(s)
+    })
+}
+
+/// A server that writes 64 KiB pieces to each connection for ever, with the socket's buffers
+/// bounded (see [`bounded_buffers`]).
+pub async fn endless_source() -> Server {
+    serve(|mut s| async move {
+        shrink_buffers(&s);
+        let buf = vec![9u8; 64 * 1024];
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
+    })
+    .await
+}
+
 // ---- a local socket that runs out of memory -----------------------------------------------------
 
 /// A local stream whose reads and writes fail with `ENOBUFS` when told to, as a kernel short of

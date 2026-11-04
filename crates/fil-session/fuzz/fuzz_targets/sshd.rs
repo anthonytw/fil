@@ -3,9 +3,12 @@
 //!
 //! `read` follows `Include` into the real file system, which a fuzzer must not be allowed to
 //! point at `/dev/zero` or `/proc`. So the config sits in a scratch directory with a few files
-//! to include, and in an `Include` line a `/` or `~` that starts a word, and every `..`, is
-//! replaced: the include reaches only the scratch directory (by relative path and globs), which
-//! is what the include logic needs.
+//! to include, and in an `Include` line a `/` or `~` that starts a word, every `..`, and every
+//! `/` that follows a character that is not a letter or digit, is replaced: the include reaches
+//! only the scratch directory (by relative path and globs), which is what the include logic
+//! needs. (A component that is a wildcard, an escape or a `.` can match `..`, since `glob`
+//! yields it as `readdir` does; but the `/` after such a component is replaced, so it is
+//! always the last one, where it names a directory, and a directory is not a config.)
 
 #![no_main]
 

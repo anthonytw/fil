@@ -762,8 +762,19 @@ f_fwd_other_user() {
   fuid=$(id -u rnfil)
   muid=$(id -u "$FWD_MALLORY")
   [[ $fuid != "$muid" ]] || fail "mallory has fil's uid"
-  sock=$(as_root find "/tmp/fil-$fuid" -maxdepth 1 -name '*.sock' | head -n 1)
-  [[ -n $sock ]] || fail "no daemon socket in /tmp/fil-$fuid"
+  # The daemon's socket is the one that greets its own user: the directory can hold others (a
+  # stale socket left by a daemon of another run or revision answers ECONNREFUSED).
+  local s all
+  all=$(as_root find "/tmp/fil-$fuid" -maxdepth 1 -name '*.sock' | sort)
+  note "daemon_dir_sockets=$(for s in $all; do printf '%s:%s,' "$(basename "$s")" "$(nsx "$NS_S" runuser -u rnfil -- "$UDP_BIN/sockprobe" "$s" 2>&1 | cut -d' ' -f1-2)"; done)"
+  sock=
+  for s in $all; do
+    if [[ $(nsx "$NS_S" runuser -u rnfil -- "$UDP_BIN/sockprobe" "$s" 2>&1) == DATA* ]]; then
+      sock=$s
+      break
+    fi
+  done
+  [[ -n $sock ]] || fail "no live daemon socket in /tmp/fil-$fuid (sockets: $(tr '\n' ' ' <<< "$all"))"
   fwd_door_check daemon "$sock" DATA "/tmp/fil-$fuid"
   fc_detach "$name"
   cx_fk "$FWD_SESSION"

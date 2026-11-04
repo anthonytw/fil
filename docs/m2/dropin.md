@@ -77,6 +77,10 @@ Not here yet: `fwd_takeover`. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) i
 
 ## Results
 
+### Since S1 (#78): the Pis' gate refuses forwards and the agent
+
+From main at `6583a2a` the daemon mirrors sshd's forwarding settings (DESIGN §11.2, decided). The `fil-test` gate account's sshd config turns forwarding off: on a Pi with the merged build (sha256 `5c76e8a8…`, [run 41745399062](https://github.com/anthonytw/fil/actions/runs/41745399062)), `-L` is refused ("an own forward was refused") and so is `-A` (`agent forwarding refused by server policy: AllowAgentForwarding no (/etc/ssh/sshd_config.d/20-fil-test.conf:6)`). That is fil doing what it should. But from then on the forward and agent scenarios cannot run on the Pis until the Pis' admin allows them for that account: an `/etc/fil/policy.toml` that loosens them, or the gate's sshd config. Either needs root on the Pis, which this suite never has. The results below are from the tree before S1.
+
 ### After the review (the record)
 
 Run on 2026-11-03 from 17:40 ET, pi1 then pi2, with the client from this PR's tree (main at `7c5f93a`, A1, merged) and the Pi binary of the same tree from the `aarch64` job ([run 41721410062](https://github.com/anthonytw/fil/actions/runs/41721410062), `fil` sha256 `5ba2e891…`). Misses now fail a scenario. **The M2 set (25 scenarios: `tools`, the 14 forward ones, the 4 management ones and the 6 agent ones) passed on both Pis: 0 failed, 0 skipped, no miss and no finding.** After each run no daemon or socket was left. Another agent's fil daemon held one UDP port of the range on this Mac throughout; the relay took the other 1,000, and in every relay scenario the daemon's announced port was among them.

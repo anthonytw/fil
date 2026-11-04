@@ -252,3 +252,42 @@ Everything that names the predictor API is in `oracle_term.rs`, in the "adapter"
 4. **No test feature was added in part 1.** The plan lists "a test feature in `Cargo.toml`"; nothing in part 1 needs one (the tap is part 2's, and the example and test use dev-dependencies), so it comes with part 2.
 5. **The engine has no `on_tick`.** `Display` never calls `Overlay::on_tick`, so the predictor's timeout (1.5 s) never fires and a guess that is never echoed stays on the screen until output comes. The 10 s backstop of §2.9 needs a tick source in E1a.
 6. **Widening damages too, and in a way a "no write until repaint" rule alone does not repair**: the terminal's cursor ends on a different row. Rule 9's "no guess after a resize until a snapshot at the current generation" stops the *next* damage; the repaint is what repairs the screen that is already wrong. W1 has to ask for it when guesses were on the screen at the resize, not only when the next one is about to be written.
+
+## 8. P2: the screen view and the performance budget
+
+P2 (`docs/m3/plan.md` §3) made the shadow cheap to read. `fil_term::Emulator::screen` lends a read-only `Screen` borrowed from the backend's own grid: the cursor, the modes, one cell at a time (a printable ASCII cell borrows its text from a static table; other text is converted for its row only, the first time it is asked for), a cell's hyperlink, and a per-row stamp. The overlay reads only through it (`overlay.rs` `Shadow`), so it builds no `TermState` per key or per output chunk; `Overlay::view` (the oracle's) is the one place left that does. `ScreenView::test_state` is still `Some` for harnesses: the visible screen, copied once per event when first asked for.
+
+**How `row_stamp` works now.** It is the backend's per-row write counter, which only grows, so a change drawn and undone on another row between two keys is seen (C1's hash of the glyphs could not see it). Every emulator's stamps are in a range of their own.
+
+- **`alacritty_terminal`** (the release backend): its damage tracking, the record its renderer redraws from. After every `feed`, `resize` and `apply_pending`, each damaged line gets a new stamp (every line on full damage: a scroll, a clear, the alternate screen, a resize) and the damage is reset. A write is damage on its line directly (erase, delete, insert, clear) or through the cursor, whose line is damaged at every read and by every move between lines. Damage is per line, so the stamp is stricter than the glyphs: an attribute-only write moves it, and so does a cursor that passes through a row and comes back without writing (that makes the next key tentative; nothing in the faithful suites does it between two keys).
+- **`vt100`** (tests and the fidelity suite only): it has no damage tracking and no hook for a write, so `feed` parses the stream a second time and classifies each action by what `vt100` 0.18 does with it, feeding `vt100` up to the action when the cursor before it is needed. A run of printable characters stamps the cursor's row if it cannot reach the wrap at the last column; EL, ICH, DCH and ECH stamp the cursor's row; a line feed or reverse index that leaves the cursor where it was stamps every row (a scroll); ED, IL, DL, SU, SD, REP, the alternate screen and RIS stamp every row; cursor moves, modes, SGR, OSC and what `vt100` ignores stamp nothing. Its feed is slower for it (`just fidelity`: 81 to 58 MB/s); `alacritty`'s is unchanged (115 MB/s).
+
+`crates/fil-predict/tests/screen_view.rs` checks the stamps against C1's hash on random streams on both backends (every glyph change of a row moves its stamp; 1,000 seeds clean), counts `Emulator::state` calls while predicting (none), and checks that a prompt drawn and erased on another row between two keys makes the next one tentative. `crates/fil-term/tests/screen_view.rs` checks that the view says what `state(0)` says, cell by cell, on the fixtures and on random streams. `just fidelity` is unchanged (its output identical to main's at `932c479`, but for the timings).
+
+### The measurements (`cargo bench -p fil-predict --bench budget`)
+
+Taken on 2026-11-04 on the macOS development machine (Apple silicon, 14 cores), shared with other agents' builds: the load average is given with each. Each set was repeated; the numbers below are the ranges over the repeats. "main" is `932c479` (C1) with the same bench file.
+
+**Per keystroke** (§2.10: p99 under 200 µs here). `Overlay::on_input` for one printable key at 200x50 on `alacritty`, typing 150-key lines at a prompt under a full screen of colored text, with the default predictor showing and every key echoed two keys later (so guesses are outstanding and written: 5,960 of 6,000 keys written), 3 runs of 6,000 keys, twice. The echo chunk is `Overlay::on_server` for one echoed key.
+
+| build | load (1 min) | key p50 | key p99 | key max | echo chunk p50 | echo chunk p99 |
+|---|---|---|---|---|---|---|
+| P2 | 10 to 11 | 1.8 to 1.9 µs | 2.2 to 6.0 µs | 4.9 to 70 µs | 3.5 to 4.0 µs | 4.1 to 11.4 µs |
+| main (C1) | 10 to 11 | 117 to 120 µs | 139 to 153 µs | 190 to 465 µs | 140 to 144 µs | 158 to 166 µs |
+
+About 60 times cheaper; the p99 is two orders of magnitude inside the budget. C1's review measured 250 to 500 µs per key before P2, in its own scenario; on this one main is about 120 µs. What P2 removed is the `TermState` built at every event (the whole screen converted cell by cell, the tab stops probed by moving the cursor across the row).
+
+**`cat` of 100 MB** (§2.10: within 3 % of `predict = "off"` in client CPU, medians of 10 runs with the spread). `Overlay::on_server` in 16 KiB chunks at 200x50 on `alacritty`, thread CPU time, nothing outstanding, the default predictor (showing at the injected 150 ms) against one that never predicts (the client's `NoPrediction`), 10 runs each, interleaved, twice:
+
+| build | load (1 min) | off: median (min to max) | on: median (min to max) | on / off |
+|---|---|---|---|---|
+| P2, round 1 | 9.3 to 8.5 | 744 ms (741 to 749) | 742 ms (741 to 759) | −0.2 % |
+| P2, round 2 | 14.5 to 12.5 | 744 ms (741 to 749) | 744 ms (743 to 749) | +0.0 % |
+| main, round 1 | 8.5 to 14.5 | 769 ms (748 to 821) | 770 ms (751 to 810) | +0.1 % |
+| main, round 2 | 12.5 to 11.0 | 747 ms (745 to 777) | 746 ms (743 to 814) | −0.1 % |
+
+Within the budget, and the damage harvest costs `cat` nothing measurable (P2's "off" is no slower than main's). An earlier set at a load of 12 to 66 had a spread of about 20 % on both builds (P2 +1.1 %, main −0.6 %); the rounds above are the ones taken when the machine was quieter. This is the client's display path, the part prediction can change; the real client adds the transport and the engine, the same with and without prediction, so its relative difference is smaller still.
+
+**Output with guesses outstanding:** at most one screen read per output chunk, and no grid copy: the counting test shows no `Emulator::state` call at all while 48 keys are typed and echoed at 200x50 with guesses outstanding at every chunk.
+
+**Still to measure (done-when 7):** GitHub's Linux x86_64 and arm64 runners, which V1 measures with the Pis (`linux-check`; the bench needs no PTY and runs as is: `cargo bench -p fil-predict --bench budget`).

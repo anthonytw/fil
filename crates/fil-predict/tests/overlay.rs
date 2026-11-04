@@ -974,3 +974,23 @@ fn nothing_is_painted_on_a_cursor_restored_after_a_soft_reset() {
         }
     }
 }
+
+/// A kept guess (of an epoch that ended) does not set the cursor that explains an echo's second
+/// piece: only the current epoch's own confirmed guesses do. Here a kept space far right of the
+/// cursor settles on the chunk that confirms the new epoch; a later chunk that jumps the cursor
+/// to just after it, with a guess pending, is unexplained and ends the epoch.
+#[test]
+fn a_kept_guess_does_not_explain_a_cursor_after_it() {
+    let mut t = fixed(vec![(0, 2), (0, 10), (0, 3), (0, 4)]);
+    t.confirm(); // `$ a`, confirmed, cursor (0, 3)
+    t.key(b" ", 200); // a space guessed at (0, 10), written
+    assert!(t.painted());
+    t.key(b"\t", 210); // a boundary: the space is kept
+    t.ack(220);
+    t.key(b"x", 230); // the new epoch, at the shadow cursor
+    t.server(b"x", 300); // confirms it, and settles the kept space (its cell is blank)
+    assert!(t.o.epoch_confirmed());
+    t.key(b"y", 310);
+    t.server(b"\x1b[1;12H", 320); // the cursor to (0, 11), after the kept space
+    assert!(!t.o.epoch_confirmed(), "a kept guess explained the cursor");
+}

@@ -864,6 +864,8 @@ impl Core {
         }
         self.keys.clear();
         self.epoch += 1;
+        // The geometry changed: no cursor an earlier echo left is evidence of anything now.
+        self.echoed_at = None;
     }
 
     /// A snapshot replaces the shadow: the epoch ends (unless `Guards::snapshot` is off), and

@@ -488,12 +488,16 @@ pub enum SnapshotReason {
 }
 
 /// A snapshot is coming on [`ChannelId::SNAPSHOT`]: exactly `len` bytes, then the terminal
-/// channel continues at sequence number `at`.
+/// channel continues at sequence number `at`. A mid-stream one (`ControlMsg::Snapshot`) applies
+/// at `at - skipped`, where the daemon's stream was: the terminal data below that was sent before
+/// it and may arrive after this announcement, and the client applies it first (DESIGN.md section
+/// 6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     pub at: u64,
     pub len: u64,
-    /// Terminal bytes the client never saw (for the "skipped N bytes" marker). 0 for a new client.
+    /// Terminal bytes the daemon never sent the client (for the "skipped N bytes" marker). 0 for
+    /// a new client and a repaint.
     pub skipped: u64,
     pub reason: SnapshotReason,
     /// The size generation the snapshot was rendered at (DESIGN.md section 8.5), on every

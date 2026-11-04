@@ -1554,8 +1554,9 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// the output up to `sent`, on a screen of `rows` rows: the lines that scrolled off the
 /// emulator's screen since `sent` and were never on the client's, at most `max`.
 ///
-/// The client has everything before `sent` in its scrollback or on its screen, and the gap
-/// prologue scrolls that screen into the scrollback as it is. Of the lines the emulator scrolled
+/// The client has everything before `sent` in its scrollback or on its screen (what is still on
+/// its way when the snapshot is announced, it applies before the snapshot), and the gap prologue
+/// scrolls that screen into the scrollback as it is. Of the lines the emulator scrolled
 /// into its history since then, the first ones are those screen rows; only the rest are new.
 /// With `n` line feeds in `sent..at`, the screen rows the client has and the new lines that went
 /// to the history together number `n + 1` (the row the cursor was on at `sent` is the "+ 1"):
@@ -1567,10 +1568,16 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// Line feeds are a lower bound on the lines scrolled (a line wider than the screen wraps onto
 /// rows of its own; output the log no longer holds is not counted), so this errs towards
 /// showing too few of the skipped lines, never lines the client has. The exceptions are output
-/// that feeds lines without scrolling the primary screen's history (an alternate screen, a
-/// scroll region below the top row): a full-screen program's line feeds can bring back up to
-/// `max` lines the client has. The emulators keep no count of scrolled lines, so a line-feed
-/// count is what can be had: one backward scan of the log, stopped once `max + rows` are found.
+/// whose line feeds do not scroll the primary screen's history, and each can bring back up to
+/// `max` lines the client has:
+/// - multi-line redraws in place on the primary screen, the common one: a cursor-up and a few
+///   lines, over and over (docker and buildkit, bazel, pnpm, tqdm's multiple bars), count every
+///   redraw's line feeds though nothing scrolls;
+/// - an alternate screen, and a scroll region below the top row.
+///
+/// The emulators keep no count of scrolled lines, so a line-feed count is what can be had: one
+/// backward scan of the log, stopped once `max + rows` are found. (An exact count of scrolled
+/// rows in fil-term would end the exceptions.)
 pub(crate) fn unseen_history(log: &OutputLog, sent: u64, at: u64, rows: u16, max: usize) -> usize {
     const CHUNK: usize = 64 * 1024;
     let lo = sent.max(log.start());

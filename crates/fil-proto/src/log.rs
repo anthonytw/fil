@@ -89,8 +89,9 @@ impl Default for CatchUpParams {
 /// While attached: jump to a snapshot instead of replaying the backlog?
 ///
 /// `behind_bytes` is how much output a jump would skip: what has not been sent to the subscriber
-/// (output already sent reaches it anyway, so late acknowledgements alone never make a jump
-/// worth it); `age` is how long the oldest unacknowledged byte has been waiting.
+/// (a jump does not skip output already sent, the client applies it before the snapshot, so late
+/// acknowledgements alone never make a jump worth it; DESIGN.md section 6.2); `age` is how long
+/// the oldest unacknowledged byte has been waiting.
 pub fn should_snapshot(behind_bytes: u64, age: Duration, p: &CatchUpParams) -> bool {
     behind_bytes > p.max_bytes || (age > p.max_age && behind_bytes >= p.min_bytes_for_age)
 }

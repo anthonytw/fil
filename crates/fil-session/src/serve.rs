@@ -28,7 +28,7 @@
 //! **Flow control.** The client acks the terminal channel cumulatively. The session never sends
 //! beyond what the emulator has seen at a sequence boundary. When too much output is waiting to
 //! be sent (`fil_proto::log::should_snapshot` on the unsent bytes: what is already sent is not
-//! counted, a jump could not save it), or the client falls off the back of the log, the stream
+//! counted, a jump does not skip it), or the client falls off the back of the log, the stream
 //! jumps ahead: `Snapshot` (control), the snapshot bytes on the snapshot channel, and the
 //! terminal channel continues at the snapshot's `at`. The snapshot starts with a gap marker in
 //! the client's scrollback, so the client must not add one of its own.
@@ -635,10 +635,11 @@ impl<'a, L: Link> Conn<'a, L> {
                 return self.finish_exited(false).await;
             }
             // The rule is judged on what a jump would skip: output released but not sent
-            // (`ready - next`). What is sent and not yet acknowledged is on its way and reaches
-            // the client whatever happens; jumping over a small unsent rest only because the
-            // acknowledgements are late (a fast link, a slow terminal) would rewrite what the
-            // client has, for nothing (DESIGN.md section 6.2). And a finished session sends the
+            // (`ready - next`). What is sent and not yet acknowledged is not skipped: the client
+            // applies it before the snapshot (it may arrive after the announcement, which goes
+            // on control). Jumping over a small unsent rest only because the acknowledgements are
+            // late (a fast link, a slow terminal) would rewrite what the client has, for nothing
+            // (DESIGN.md section 6.2). And a finished session sends the
             // rest of its log: a snapshot would cost the client the tail.
             //
             // Not while the previous snapshot is unconfirmed: the announcement would overtake

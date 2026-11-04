@@ -134,12 +134,20 @@ sshd_up() {
     *) fail "MACOS_SSHD must be user or system" ;;
   esac
   local out
-  out=$(ssh -F "$SSH_CONFIG" -T macremote 'echo LOGIN-$((6*7)); echo "PATH=$PATH"; echo "SHELL=$SHELL"; echo "NOFILE=$(ulimit -Sn)/$(ulimit -Hn)"' 2>&1) \
+  out=$(ssh -F "$SSH_CONFIG" -T macremote 'echo LOGIN-$((6*7)); echo "PATH=$PATH"; echo "SHELL=$SHELL"; echo "NOFILE=$(ulimit -Sn)/$(ulimit -Hn)"; echo "FIL=$(command -v fil)"' 2>&1) \
     || { echo "$out" >&2; [[ ! -f $W/ssh/sshd.log ]] || tail -n 20 "$W/ssh/sshd.log" >&2; fail "cannot log in to $SSHD_MODE_NOTE"; }
   grep -q 'LOGIN-42' <<< "$out" || fail "login output: $out"
   log "sshd: $SSHD_MODE_NOTE"
   log "the login's environment: $(tr '\n' ' ' <<< "$out")"
-  grep -q "PATH=$W/bin" <<< "$out" || fail "the login's PATH does not start with the installed fil's directory ($W/bin): $out"
+  # A login shell can reset PATH from its own startup files (bash reads ~/.bashrc under sshd, and
+  # a runner's sets its tool paths): then `fil` is not the installed one, or is not found. The
+  # pipe command then names the installed fil by its path, and the log says so.
+  if grep -q "^FIL=$W/bin/fil\$" <<< "$out"; then
+    REMOTE_FIL=fil
+  else
+    REMOTE_FIL=$W/bin/fil
+    log "NOTE: the login's PATH does not reach the installed fil ($(grep '^FIL=' <<< "$out")); the pipe command names $REMOTE_FIL"
+  fi
 }
 
 sshd_down() {

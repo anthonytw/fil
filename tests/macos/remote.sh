@@ -484,7 +484,7 @@ setup() {
 transport = "pipe"
 
 [host.macremote]
-pipe = ["ssh", "-F", "$SSH_CONFIG", "-T", "--", "macremote", "fil", "server", "--stdio"]
+pipe = ["ssh", "-F", "$SSH_CONFIG", "-T", "--", "macremote", "$REMOTE_FIL", "server", "--stdio"]
 
 [host.macremote.direct]
 address = "127.0.0.1"
@@ -492,6 +492,7 @@ EOF
   {
     echo "W='$W'"
     echo "PD='$PD'"
+    echo "REMOTE_FIL='$REMOTE_FIL'"
     echo "CFG='$CFG'"
     echo "SSH_PORT='$SSH_PORT'"
     echo "SSH_CONFIG='$SSH_CONFIG'"

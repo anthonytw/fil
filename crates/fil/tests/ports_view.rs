@@ -113,6 +113,7 @@ fn fwd(
         target_other_user: false,
         target_unknown: false,
         policy: None,
+        peers_refused: 0,
         socks_refused: None,
     }
 }
@@ -156,6 +157,8 @@ fn fixed_rows() -> Vec<PortsRow> {
     );
     back.waiting = 1;
     back.last_unix_ms = at(10, 40);
+    // `remote_peers = "same-user"` refused two connections to it: a count, nobody named.
+    back.peers_refused = 2;
 
     let socks = fwd(
         "main",
@@ -431,6 +434,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "listen",
             "origin",
             "owner",
+            "peers_refused",
             "policy",
             "port",
             "probe",
@@ -966,4 +970,45 @@ fn a_target_whose_owner_is_unknown_says_so() {
     assert!(text.contains("unknown (scan incomplete)"), "{text}");
     assert!(text.contains("owner unknown: the host's socket table was not read to its end"));
     assert!(render_json(&a, &opts(None)).contains("\"target_unknown\": true"));
+}
+
+/// SW1 follow-up (the server policy's own reason for a read too old to decide on): it renders
+/// as that reason, naming no setting and no file, on the policy line, on a forward's row and in
+/// the JSON.
+#[test]
+fn a_pending_server_policy_renders_its_own_reason() {
+    let pending = PolicyRefusal {
+        setting: PolicySetting::Pending,
+        source: PolicySource::Default,
+    };
+    let mut f = fwd(
+        "main",
+        1,
+        ForwardKind::Local,
+        "5432:127.0.0.1:5432",
+        listening(5432),
+        Origin::Client,
+        true,
+    );
+    f.policy = Some(pending.clone());
+    let a = answer(vec![
+        PortsRow::Session(summary("main", None, 1, false)),
+        PortsRow::Forward(f),
+        PortsRow::Policy(PolicyLine::DenyAll(pending)),
+    ]);
+    let text = render_text(&a, &opts(None));
+    let reason = "the server policy is being read again; try again shortly";
+    assert!(
+        text.contains(&format!(
+            "every forward and the agent are refused: {reason}"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.matches(reason).count() >= 2,
+        "the row says it too: {text}"
+    );
+    assert!(!text.contains("OpenSSH's default"), "{text}");
+    let json = render_json(&a, &opts(None));
+    assert!(json.contains(reason), "{json}");
 }

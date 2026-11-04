@@ -150,8 +150,17 @@ pub trait Policy: Send + Sync + 'static {
     /// accept, or [`Endpoint::open_stream`]). `Err` resets it at once and opens nothing (an `-R`
     /// listener while detached, a forward without consent, a peer of another user under
     /// `remote_peers = "same-user"`). Called when the connection arrives and again when a queued
-    /// one is about to be opened, since the answer may have changed while it waited.
+    /// one is about to be opened, since the answer may have changed while it waited; the peer's
+    /// owner ([`PeerUid`]) was looked up once, at the accept, and is the same both times.
     fn check_outgoing(&self, kind: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure>;
+
+    /// Who owns the peer socket of each connection a listener accepts, if this side wants to know
+    /// (`remote_peers = "same-user"`): the endpoint asks it once per accepted connection, before
+    /// [`Policy::check_outgoing`], and hands the answer over in [`LocalPeer::Tcp`]. `None` (the
+    /// default): nothing is looked up, and the peer's owner is [`PeerUid::NotAsked`].
+    fn peer_owner(&self) -> Option<Arc<dyn PeerOwner>> {
+        None
+    }
 
     /// The acceptor may connect `kind` to `addr`: called for **every resolved address** of the
     /// target, before any connection attempt ([`AddressCheck`], [`crate::connect::connect_tcp`]).
@@ -167,13 +176,44 @@ pub trait Policy: Send + Sync + 'static {
     fn check_address(&self, kind: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure>;
 }
 
+/// Finds who owns the socket at the far end of an accepted TCP connection on this host (OD-9's
+/// `remote_peers = "same-user"`). The daemon's asks the kernel (`fil_daemon::ports`); tests plug in
+/// their own.
+pub trait PeerOwner: Send + Sync + 'static {
+    /// The uid of the socket whose own address is `peer` and whose remote address is `local` (the
+    /// accepted socket's address), or `None` if it cannot be determined: no such socket any more
+    /// (the peer already closed), no way to ask, a failed or bounded read.
+    fn owner(&self, peer: SocketAddr, local: SocketAddr) -> Option<u32>;
+
+    /// The lookup may take a while (a table scan): the endpoint then runs it on a blocking
+    /// thread, never on a runtime worker. Default: it is quick and never waits.
+    fn blocking(&self) -> bool {
+        false
+    }
+}
+
+/// The owner of a TCP connection's peer socket, as looked up when it was accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerUid {
+    /// Nothing was looked up (the policy did not ask, or the stream came from no listener).
+    NotAsked,
+    /// Looked up, and the owner could not be determined.
+    Unknown,
+    Uid(u32),
+}
+
 /// Who is at the local end of a connection the endpoint is about to open a channel for, for
 /// [`Policy::check_outgoing`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LocalPeer {
-    /// A TCP connection accepted on a forward's listener: the application's address (OD-9's
-    /// `remote_peers = "same-user"` looks its owner up by it).
-    Tcp(SocketAddr),
+    /// A TCP connection accepted on a forward's listener: the application's address (`peer`), the
+    /// accepted socket's own (`local`; `None` if the kernel would not say) and, where the policy
+    /// asked for it ([`Policy::peer_owner`]), who owns the peer socket.
+    Tcp {
+        peer: SocketAddr,
+        local: Option<SocketAddr>,
+        owner: PeerUid,
+    },
     /// A Unix-socket connection (the agent socket), with the peer's credentials where the
     /// platform gives them.
     Unix(Option<PeerCred>),
@@ -202,7 +242,7 @@ impl LocalPeer {
 impl fmt::Debug for LocalPeer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LocalPeer::Tcp(_) => f.write_str("Tcp(..)"),
+            LocalPeer::Tcp { .. } => f.write_str("Tcp(..)"),
             LocalPeer::Unix(c) => f.debug_tuple("Unix").field(c).finish(),
         }
     }
@@ -1163,6 +1203,9 @@ impl<L: Link> Endpoint<L> {
         inner.drain(&mut st);
         drop(st);
         inner.kick();
+        // The queued connections are looked at again now, against the new epoch's policy (a
+        // detached session refuses them at once), not when the oldest one's `open_wait` ends.
+        inner.pending_kick.notify_one();
     }
 
     // ---- what the link delivered --------------------------------------------------------------
@@ -1879,7 +1922,31 @@ impl<L: Link> Inner<L> {
                 None => return,
                 Some(Ok((stream, addr))) => {
                     let _ = stream.set_nodelay(true);
-                    self.local_accept(&l, stream, LocalPeer::Tcp(addr));
+                    let local = stream.local_addr().ok();
+                    // Looked up once, here, and carried with the connection: the answer is the
+                    // same when a queued one is checked again. A slow lookup runs on a blocking
+                    // thread; this listener's accepts wait for it meanwhile (one at a time, so a
+                    // flood of them cannot fill the blocking pool).
+                    let owner = match (self.policy.peer_owner(), local) {
+                        (None, _) => PeerUid::NotAsked,
+                        (Some(_), None) => PeerUid::Unknown,
+                        (Some(o), Some(local)) if o.blocking() => {
+                            tokio::task::spawn_blocking(move || o.owner(addr, local))
+                                .await
+                                .ok()
+                                .flatten()
+                                .map_or(PeerUid::Unknown, PeerUid::Uid)
+                        }
+                        (Some(o), Some(local)) => {
+                            o.owner(addr, local).map_or(PeerUid::Unknown, PeerUid::Uid)
+                        }
+                    };
+                    let peer = LocalPeer::Tcp {
+                        peer: addr,
+                        local,
+                        owner,
+                    };
+                    self.local_accept(&l, stream, peer);
                 }
                 Some(Err(e)) => {
                     // Out of descriptors and the like: try again shortly rather than spin.

@@ -12,6 +12,8 @@
 //! - [`socks`]: a pure SOCKS5 and SOCKS4a CONNECT handshake.
 //! - [`stream`]: the local socket a channel carries, and its reset.
 //! - [`agent`]: the agent relay's message filter and its two ends.
+//! - [`tunables`]: the forwards' config keys (`window`, `buffer`, `open_wait`, `linger`), shared by
+//!   the client's config and the daemon's.
 
 pub mod agent;
 pub mod connect;
@@ -20,10 +22,11 @@ pub mod listen;
 pub mod pace;
 pub mod socks;
 pub mod stream;
+pub mod tunables;
 
 pub use endpoint::{
     AddressCheck, ConnectFuture, Connector, EVENT_QUEUE, Endpoint, EndpointEvent, EventReceiver,
-    ForwardStats, LocalPeer, MAX_HANDSHAKES, MAX_PENDING, PeerCred, Policy, SOCKS_TIMEOUT,
-    Snapshot,
+    ForwardStats, LocalPeer, MAX_HANDSHAKES, MAX_PENDING, PeerCred, PeerOwner, PeerUid, Policy,
+    SOCKS_TIMEOUT, Snapshot,
 };
 pub use stream::{BoxStream, ForwardStream};

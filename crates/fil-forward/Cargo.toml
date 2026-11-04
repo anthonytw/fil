@@ -14,6 +14,8 @@ fil-transport = { path = "../fil-transport" }
 # SHA-256 for agent key fingerprints (already in the tree through rustls).
 ring = "0.17"
 rustix = { version = "1", features = ["net"] }
+# The tunables' config forms (`tunables::Value`); already in the tree.
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tracing = "0.1"
 

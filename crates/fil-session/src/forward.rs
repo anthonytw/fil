@@ -27,7 +27,9 @@
 //! that kind, and opens `Remote` channels only toward a subscriber that is attached or
 //! disconnected (never detached: refused at once) and consented to that entry in its own run
 //! (an entry from the client's own `AddForward`, or a `Consent { accepted: true }`). This is for
-//! the user's experience; the client's own check is the security boundary (section 7.2).
+//! the user's experience; the client's own check is the security boundary (section 7.2). With
+//! `remote_peers = "same-user"` an `-R` connection is also refused unless its peer socket is the
+//! daemon's uid's ([`crate::peers`]), after server policy, which still decides first.
 //!
 //! **Privacy** (section 11.1): targets, ports and addresses are user data. Nothing here logs them
 //! at any level; logs name the kind and the wire's enum reasons, at debug. `Debug` is counts only.
@@ -45,7 +47,7 @@ use bytes::Bytes;
 use fil_forward::agent::{CountingStream, RequestCounts};
 use fil_forward::{
     AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, EventReceiver, LocalPeer,
-    Policy,
+    PeerUid, Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::{
@@ -54,7 +56,8 @@ use fil_proto::msg::{
 };
 use fil_proto::mux::{
     Added, BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ForwardTable,
-    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, PolicyRefusal, Side,
+    ListenState, MuxConfig, MuxError, MuxMsg, OpenFailure, OpenKind, Origin, PolicyRefusal,
+    PolicySetting, Side,
 };
 use fil_transport::{Link, LinkError, LinkKind, LinkStatus};
 use tokio::sync::{mpsc, watch};
@@ -63,6 +66,7 @@ use tracing::debug;
 
 use crate::agent::{self, AgentSocket, Gate};
 use crate::core::{ConnEvent, ConnId};
+use crate::peers::RemotePeers;
 use crate::policy::ServerPolicy;
 
 /// Refusals by server policy a session keeps for `fil ports` (the newest; one per spec).
@@ -189,6 +193,9 @@ struct State {
     refused: VecDeque<(ForwardSpec, PolicyRefusal)>,
     /// The subscriber asked for the agent and server policy refused it.
     agent_refused: Option<PolicyRefusal>,
+    /// `-R` connections `remote_peers = "same-user"` refused, per entry (a count only: whose they
+    /// were is never kept).
+    peers_refused: HashMap<ForwardId, u32>,
 }
 
 impl State {
@@ -262,6 +269,7 @@ impl fmt::Debug for State {
             .field("consented", &self.consented.len())
             .field("agent", &self.agent)
             .field("blocked", &self.blocked.len())
+            .field("peers_refused", &self.peers_refused.values().sum::<u32>())
             .field("ended", &self.ended)
             .finish()
     }
@@ -279,6 +287,8 @@ pub(crate) struct Forwards {
     ep: Endpoint<SessionLink>,
     st: Shared,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Follows the reads of server policy ([`Forwards::policy_read`]).
+    policy_task: Mutex<Option<JoinHandle<()>>>,
     /// Where the MUX send buffer stops taking table records (three quarters of it).
     table_room: usize,
     /// The agent socket, when the session has a path for it.
@@ -311,7 +321,9 @@ impl Forwards {
         cfg: MuxConfig,
         agent_socket: Option<PathBuf>,
         policy: Arc<dyn ServerPolicy>,
+        remote_peers: RemotePeers,
     ) -> Arc<Self> {
+        let reads = policy.reads();
         let st: Shared = Arc::new(Mutex::new(State {
             table: ForwardTable::new(),
             sub: Sub::Detached,
@@ -329,11 +341,14 @@ impl Forwards {
             rebind: HashSet::new(),
             refused: VecDeque::new(),
             agent_refused: None,
+            peers_refused: HashMap::new(),
         }));
         #[cfg(feature = "test-hooks")]
         let gate = Arc::new(Mutex::new(None));
         let policy = Arc::new(SessionPolicy {
             st: st.clone(),
+            remote_peers,
+            uid: agent::our_uid(),
             #[cfg(feature = "test-hooks")]
             gate: gate.clone(),
         });
@@ -345,6 +360,7 @@ impl Forwards {
             ep,
             st,
             task: Mutex::new(None),
+            policy_task: Mutex::new(None),
             table_room,
             agent_sock: Mutex::new(agent_socket.map(AgentSocket::new)),
             agent_gate: watch::Sender::new(Gate::Off),
@@ -357,7 +373,34 @@ impl Forwards {
         });
         let task = tokio::spawn(fw.clone().drain_events(events));
         *fw.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        if let Some(mut reads) = reads {
+            let me = Arc::downgrade(&fw);
+            let t = tokio::spawn(async move {
+                while reads.changed().await.is_ok() {
+                    let Some(fw) = me.upgrade() else { return };
+                    fw.policy_read();
+                }
+            });
+            *fw.policy_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+        }
         fw
+    }
+
+    /// A new read of server policy is in: the table and the agent are checked again, as at a
+    /// re-establish. So a policy change closes an `-R` listener (or binds it again) and the
+    /// agent socket once its read is in, without waiting for a link change, and a stale read
+    /// at the last re-establish leaves nothing behind once a current one is in.
+    fn policy_read(&self) {
+        let mut st = self.lock();
+        if st.ended {
+            return;
+        }
+        self.sync_agent(&mut st);
+        for id in self.recheck(&mut st) {
+            if let Some(state) = st.listen.get(&id) {
+                self.tell(&st, MuxMsg::Listening { id, state: *state });
+            }
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -444,15 +487,20 @@ impl Forwards {
         }
     }
 
-    /// Server policy over the whole table (a re-establish): an entry it refuses now is marked
-    /// blocked and its `-R` listener closed (`Failed(Policy)`); one it allows again is unmarked,
-    /// and its `-R` bound again. Returns the `-R` entries whose listen state changed.
+    /// Server policy over the whole table (a re-establish, or a new read of the policy): an
+    /// entry it refuses now is marked blocked and its `-R` listener closed (`Failed(Policy)`);
+    /// one it allows again is unmarked, and its `-R` bound again. A policy that cannot decide
+    /// now ([`PolicySetting::Pending`]: its read is too old and a re-read is running) changes
+    /// nothing: the connections through the entry are refused meanwhile, each checked as it
+    /// comes, and the read, once in, checks the table again. Returns the `-R` entries whose
+    /// listen state changed.
     fn recheck(&self, st: &mut State) -> Vec<ForwardId> {
         let mut changed = Vec::new();
         let entries: Vec<_> = st.table.iter().cloned().collect();
         for e in entries {
             let remote = e.spec.kind() == ForwardKind::Remote;
             match st.policy.forward(&e.spec) {
+                Err(why) if why.setting == PolicySetting::Pending => {}
                 Err(why) => {
                     if st.blocked.insert(e.id, why).is_none() {
                         debug!(kind = ?e.spec.kind(), "forward blocked by server policy");
@@ -474,13 +522,18 @@ impl Forwards {
                             || st.rebind.contains(&e.id))
                     {
                         debug!("forward allowed again by server policy");
+                        let before = st.listen.get(&e.id).copied();
                         self.bind_remote(st, e.id, &e.spec);
-                        if matches!(st.listen.get(&e.id), Some(ListenState::Failed(_))) {
+                        let after = st.listen.get(&e.id).copied();
+                        if matches!(after, Some(ListenState::Failed(_))) {
                             st.rebind.insert(e.id);
                         } else {
                             st.rebind.remove(&e.id);
                         }
-                        changed.push(e.id);
+                        // A retry that failed as before is not news to the client.
+                        if after != before {
+                            changed.push(e.id);
+                        }
                     }
                 }
             }
@@ -517,6 +570,14 @@ impl Forwards {
         drop(st);
         self.ep.shutdown();
         if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            t.abort();
+        }
+        if let Some(t) = self
+            .policy_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             t.abort();
         }
     }
@@ -624,12 +685,21 @@ impl Forwards {
     /// the relay is, and binds or removes the socket (it exists only while the relay is on, and
     /// only where server policy allows it: asked before the socket is created).
     fn sync_agent(&self, st: &mut State) {
-        st.agent_refused = None;
         if st.agent && !st.ended && st.sub == Sub::Held {
-            st.agent_refused = st.policy.agent().err();
-            if st.agent_refused.is_some() {
-                debug!("agent relay refused by server policy");
+            match st.policy.agent() {
+                Ok(()) => st.agent_refused = None,
+                // A policy that cannot decide now (its read is too old, a re-read is running)
+                // changes nothing, as in `recheck`: the agent stays as it was, and no refusal
+                // is reported. Each agent connection is still checked as it comes (refused
+                // meanwhile), and the read, once in, syncs the agent again.
+                Err(why) if why.setting == PolicySetting::Pending => {}
+                Err(why) => {
+                    debug!("agent relay refused by server policy");
+                    st.agent_refused = Some(why);
+                }
             }
+        } else {
+            st.agent_refused = None;
         }
         let g = st.agent_gate();
         self.agent_gate.send_if_modified(|v| {
@@ -804,6 +874,7 @@ impl Forwards {
                     target_other_user: false,
                     target_unknown: false,
                     policy: st.blocked.get(&e.id).cloned(),
+                    peers_refused: st.peers_refused.get(&e.id).copied().unwrap_or(0),
                     socks_refused: st.socks_refused.get(&e.id).cloned(),
                 }
             })
@@ -831,6 +902,7 @@ impl Forwards {
             }
             st.consented.remove(&old);
             st.blocked.remove(&old);
+            st.peers_refused.remove(&old);
             st.rebind.remove(&old);
             self.tell(st, MuxMsg::ForwardGone { id: old });
         }
@@ -920,6 +992,7 @@ impl Forwards {
         st.listen.remove(&id);
         st.consented.remove(&id);
         st.blocked.remove(&id);
+        st.peers_refused.remove(&id);
         st.socks_refused.remove(&id);
         st.rebind.remove(&id);
         // Its open connections run until they close; then it has nothing left to count.
@@ -1087,6 +1160,10 @@ fn find_port(
 /// The daemon's checks (see the module docs).
 struct SessionPolicy {
     st: Shared,
+    /// Who may connect to the `-R` ports ([`crate::peers`]).
+    remote_peers: RemotePeers,
+    /// The daemon's uid, the one `same-user` admits.
+    uid: u32,
     /// Test hook: holds an `-R` accept right after its check passed (see
     /// [`Forwards::gate_outgoing`]).
     #[cfg(feature = "test-hooks")]
@@ -1132,8 +1209,10 @@ impl Policy for SessionPolicy {
         Ok(())
     }
 
-    /// `peer` is who connected: the seam for OD-9's `forward.remote_peers = "same-user"` (the
-    /// peer socket's owner, from `/proc/net/tcp`). The default, `any`, is ssh's: not checked.
+    /// `peer` is who connected. With `remote_peers = "same-user"` (OD-9, [`crate::peers`]) its
+    /// socket's owner, which the endpoint looked up once at the accept ([`Self::peer_owner`]),
+    /// must be the daemon's uid; it is checked last, after the cheap checks and server policy.
+    /// The default, `any`, is ssh's: not checked.
     fn check_outgoing(&self, kind: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure> {
         let st = lock(&self.st);
         let forward = match kind {
@@ -1154,8 +1233,28 @@ impl Policy for SessionPolicy {
             return Err(OpenFailure::NotPermitted);
         }
         let mut st = st;
+        // Server policy first: `same-user` only ever narrows what it allows.
         st.still_allowed(*forward)?;
         drop(st);
+        if !self.remote_peers.is_any() {
+            let theirs = match *peer {
+                LocalPeer::Tcp { owner, .. } => owner,
+                LocalPeer::Unix(_) => PeerUid::NotAsked,
+            };
+            if !crate::peers::admits(self.uid, theirs) {
+                // Whose it was stays out of the log, and out of the count.
+                debug!(
+                    known = matches!(theirs, PeerUid::Uid(_)),
+                    "-R connection refused: its peer is not this user (remote_peers = same-user)"
+                );
+                let mut st = lock(&self.st);
+                if st.table.get(*forward).is_some() {
+                    let n = st.peers_refused.entry(*forward).or_default();
+                    *n = n.saturating_add(1);
+                }
+                return Err(OpenFailure::NotPermitted);
+            }
+        }
         #[cfg(feature = "test-hooks")]
         {
             let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1169,6 +1268,14 @@ impl Policy for SessionPolicy {
     fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
         // `-L` and `-D` reach what the remote host can reach, as with ssh.
         Ok(())
+    }
+
+    /// Under `remote_peers = "same-user"`, the lookup the endpoint runs once per `-R` accept.
+    fn peer_owner(&self) -> Option<Arc<dyn fil_forward::PeerOwner>> {
+        match &self.remote_peers {
+            RemotePeers::Any => None,
+            RemotePeers::SameUser(o) => Some(o.clone()),
+        }
     }
 }
 

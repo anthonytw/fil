@@ -404,6 +404,7 @@ fn policy_settings() -> Vec<PolicySetting> {
         }
         all.push(PolicySetting::FileUnsafe(f));
     }
+    all.push(PolicySetting::Pending);
     for c in &all {
         match c {
             PolicySetting::DisableForwarding
@@ -413,7 +414,8 @@ fn policy_settings() -> Vec<PolicySetting> {
             | PolicySetting::PermitListen(_)
             | PolicySetting::GatewayPorts(_)
             | PolicySetting::File(_)
-            | PolicySetting::FileUnsafe(_) => {}
+            | PolicySetting::FileUnsafe(_)
+            | PolicySetting::Pending => {}
         }
     }
     all
@@ -925,6 +927,7 @@ fn ports_rows() -> Vec<PortsRow> {
             target_other_user: false,
             target_unknown: false,
             policy: None,
+            peers_refused: 0,
             socks_refused: None,
         }),
         // A `-L` whose target another user's listener takes: no owner, no probe.
@@ -945,6 +948,7 @@ fn ports_rows() -> Vec<PortsRow> {
             target_other_user: true,
             target_unknown: true,
             policy: Some(policy_refusals()[1].clone()),
+            peers_refused: 3,
             socks_refused: None,
         }),
         // A `-D` some of whose SOCKS connections server policy refused.
@@ -969,6 +973,7 @@ fn ports_rows() -> Vec<PortsRow> {
                 count: 3,
                 last: policy_refusals()[0].clone(),
             }),
+            peers_refused: 0,
         }),
         PortsRow::Agent(AgentRow {
             session: name("main"),
@@ -1087,6 +1092,7 @@ fn widest_forward_row() -> PortsRow {
         target_other_user: true,
         target_unknown: true,
         policy: Some(widest_policy_refusal()),
+        peers_refused: u32::MAX,
         socks_refused: Some(SocksRefused {
             count: u32::MAX,
             last: widest_policy_refusal(),

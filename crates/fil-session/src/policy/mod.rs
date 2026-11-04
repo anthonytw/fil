@@ -59,6 +59,11 @@ pub trait ServerPolicy: Send + Sync + fmt::Debug + 'static {
     fn dynamic_target(&self, target: &Target) -> Result<(), PolicyRefusal>;
     /// The session may have an agent socket.
     fn agent(&self) -> Result<(), PolicyRefusal>;
+    /// Follows the reads of the policy swapped in (a counter), for a session that re-checks its
+    /// table and agent when one is in. `None`: the policy never changes.
+    fn reads(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// No policy: everything is allowed (tests, and a host without one).

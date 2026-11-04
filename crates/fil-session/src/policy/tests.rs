@@ -555,15 +555,17 @@ async fn a_slow_re_read_blocks_no_check_and_a_stale_read_refuses() {
         t.elapsed()
     );
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let file = h.base.join("etc/fil/policy.toml").display().to_string();
-    let stale = format!("the policy file cannot be read ({file})");
+    // Its own reason: no setting of the host's, and no file to name (none may exist).
+    let stale = "the server policy is being read again; try again shortly";
     for r in [
         p.forward(&local(1, "db", 1)),
         p.dynamic_target(&target("db", 1)),
         p.agent(),
         p.direct(),
     ] {
-        assert_eq!(says(r), stale);
+        let why = r.unwrap_err();
+        assert_eq!(why.setting, PolicySetting::Pending);
+        assert_eq!(why.to_string(), stale);
     }
     assert!(matches!(p.lines()[..], [PolicyLine::DenyAll(_)]));
     assert_eq!(
@@ -578,4 +580,44 @@ async fn a_slow_re_read_blocks_no_check_and_a_stale_read_refuses() {
         assert!(std::time::Instant::now() < end, "the re-read never came in");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A full read that waits on a slow directory, with no file changed, leaves the last read
+/// current while it runs: the files were confirmed as it began, so only a read slower than
+/// `max_age` itself (not `max_age - full_reload`) makes checks refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_full_read_with_no_file_changed_keeps_the_last_read_current() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANG: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(vec!["dev".into()]),
+        }
+    }
+    let h = Host::new("slowfull", "", None);
+    let mut src = h.sources.clone();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::from_millis(300);
+    src.max_age = Duration::from_millis(500);
+    let p = tokio::task::spawn_blocking(move || Policy::new(src))
+        .await
+        .unwrap();
+    // Nothing asks for a while: the next look is a full read, and it hangs.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    HANG.store(true, Ordering::SeqCst);
+    assert_eq!(says(p.forward(&local(1, "db", 1))), "ok");
+    // Past `max_age` since the read before, well within it since this look began.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        says(p.forward(&local(1, "db", 1))),
+        "ok",
+        "the files were confirmed when the full read began"
+    );
+    HANG.store(false, Ordering::SeqCst);
 }

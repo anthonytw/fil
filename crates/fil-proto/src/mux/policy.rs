@@ -43,6 +43,11 @@ pub enum PolicySetting {
     /// fil's policy file is there but cannot be trusted or read, so every forward and the agent
     /// are refused.
     FileUnsafe(FileFault),
+    /// The daemon has no read of the server policy current enough to decide on: its last read
+    /// is older than its maximum age and a re-read is still running (a slow directory service).
+    /// Everything is refused until the re-read is in; nothing in the host's config refused it,
+    /// so the source says nothing ([`PolicySource::Default`], not shown).
+    Pending,
 }
 
 /// The `AllowTcpForwarding` value in force when it refused.
@@ -182,6 +187,9 @@ impl fmt::Display for PolicySetting {
                 FileFault::Unreadable => "the policy file cannot be read",
                 FileFault::Unparsable => "the policy file does not parse",
             }),
+            PolicySetting::Pending => {
+                f.write_str("the server policy is being read again; try again shortly")
+            }
         }
     }
 }
@@ -219,7 +227,11 @@ impl fmt::Display for PolicySource {
 /// Every string in it is sanitized.
 impl fmt::Display for PolicyRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.setting, self.source)
+        match self.setting {
+            // No setting of the host's decided it: there is no source to name.
+            PolicySetting::Pending => write!(f, "{}", self.setting),
+            _ => write!(f, "{} ({})", self.setting, self.source),
+        }
     }
 }
 
@@ -233,6 +245,21 @@ mod tests {
             line,
             maybe,
         }
+    }
+
+    /// A read too old to decide on names no setting and no file: there may be none.
+    #[test]
+    fn a_pending_refusal_names_no_source() {
+        let r = PolicyRefusal {
+            setting: PolicySetting::Pending,
+            source: PolicySource::File {
+                file: PortsPath::capped("/etc/fil/policy.toml"),
+            },
+        };
+        assert_eq!(
+            r.to_string(),
+            "the server policy is being read again; try again shortly"
+        );
     }
 
     #[test]

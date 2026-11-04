@@ -66,7 +66,11 @@ impl Host {
     }
 
     fn read(&self) -> Arc<Policy> {
-        Arc::new(Policy::new(PolicySources {
+        Arc::new(Policy::new(self.sources()))
+    }
+
+    fn sources(&self) -> PolicySources {
+        PolicySources {
             sshd_config: Some(self.sshd_config()),
             policy_file: Some(self.base.join("etc/fil/policy.toml")),
             trust: Trust {
@@ -81,7 +85,7 @@ impl Host {
                 groups: Some(vec!["dev".into()]),
             }),
             lookup: Account::current,
-        }))
+        }
     }
 }
 
@@ -104,6 +108,37 @@ fn remote(bind: BindAddr, to: u16) -> ForwardSpec {
 
 fn local(port: u16, to: u16) -> ForwardSpec {
     ForwardSpec::new(ForwardKind::Local, BindAddr::Loopback, port, Some(tgt(to))).unwrap()
+}
+
+/// The host's policy, with its reads hidden from the session: the session does not re-check its
+/// table and agent when a read is in, so a refusal can only come from the check at each
+/// connection (what the tests of that check need to isolate).
+#[derive(Debug)]
+struct Quiet(Arc<Policy>);
+
+impl fil_session::policy::ServerPolicy for Quiet {
+    fn forward(&self, spec: &ForwardSpec) -> Result<(), fil_proto::mux::PolicyRefusal> {
+        self.0.forward(spec)
+    }
+    fn dynamic_target(&self, t: &Target) -> Result<(), fil_proto::mux::PolicyRefusal> {
+        self.0.dynamic_target(t)
+    }
+    fn agent(&self) -> Result<(), fil_proto::mux::PolicyRefusal> {
+        use fil_session::policy::ServerPolicy;
+        ServerPolicy::agent(&*self.0)
+    }
+}
+
+async fn session_quiet(
+    host: &Host,
+    agent: Option<PathBuf>,
+) -> (Scratch, fil_session::SessionHandle) {
+    let scratch = Scratch::new();
+    let mut cfg = sh_config(&scratch, "s", "cat");
+    cfg.policy = Arc::new(Quiet(host.policy()));
+    cfg.agent_socket = agent;
+    let h = spawn_plain(cfg).await;
+    (scratch, h)
 }
 
 async fn session(host: &Host, agent: Option<PathBuf>) -> (Scratch, fil_session::SessionHandle) {
@@ -160,7 +195,11 @@ async fn through_local(c: &FwdClient, id: ForwardId) -> Option<Vec<u8>> {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
     let (inner, _) = l.accept().await.unwrap();
-    let peer = fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap());
+    let peer = fil_forward::LocalPeer::Tcp {
+        peer: "127.0.0.1:1".parse().unwrap(),
+        local: None,
+        owner: fil_forward::PeerUid::NotAsked,
+    };
     c.ep.open_stream(OpenKind::Local { forward: id }, Box::new(inner), peer)
         .unwrap();
     app.write_all(b"hi").await.ok()?;
@@ -372,13 +411,14 @@ async fn through_remote(port: u16) -> Option<Vec<u8>> {
 }
 
 /// A policy change while the subscriber stays attached: each `-R` connection is checked as it
-/// is accepted, so the next one is refused at once (the listener closes at the next
-/// re-establish).
+/// is accepted, so the next one is refused at once. (The listener itself closes once the read
+/// is in, `a_new_read_rechecks_the_table_without_a_link_change`; here the session does not
+/// follow reads, so only the check at the accept can refuse.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_remote_connection_is_checked_while_attached() {
     let host = Host::new("racc");
     host.sshd("Port 22\n");
-    let (_s, h) = session(&host, None).await;
+    let (_s, h) = session_quiet(&host, None).await;
     let mut c = FwdClient::attach(&h, key(1), "laptop").await;
     let (target, _srv) = echo().await;
     let id = add(&mut c, remote(BindAddr::Loopback, target))
@@ -410,7 +450,8 @@ async fn each_remote_connection_is_checked_while_attached() {
 }
 
 /// A policy change while the subscriber stays attached: each agent connection is checked as it
-/// is accepted, so the next one gets no answer.
+/// is accepted, so the next one gets no answer. (The session here does not follow reads, so
+/// the socket stays, and only the check at the accept can refuse.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_agent_connection_is_checked_while_attached() {
     use fil_testkit::agent::{MiniAgent, REQUEST_IDENTITIES, framed, listed, read_answer};
@@ -422,7 +463,7 @@ async fn each_agent_connection_is_checked_while_attached() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let sock = dir.join("a/s.sock");
     let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
-    let (_s, h) = session(&host, Some(sock.clone())).await;
+    let (_s, h) = session_quiet(&host, Some(sock.clone())).await;
     let _c = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
     let ask = |sock: PathBuf| async move {
         let mut s = tokio::net::UnixStream::connect(&sock).await.ok()?;
@@ -442,7 +483,10 @@ async fn each_agent_connection_is_checked_while_attached() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     host.sshd("AllowAgentForwarding no\n");
-    assert!(sock.exists(), "the socket stays until the next link change");
+    assert!(
+        sock.exists(),
+        "the socket stays: the session does not follow reads here"
+    );
     assert_eq!(ask(sock.clone()).await, None, "refused at its accept");
     h.kill(WAIT).await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -453,7 +497,11 @@ async fn through_dynamic(c: &FwdClient, id: ForwardId, to: u16) -> Option<Vec<u8
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
     let (inner, _) = l.accept().await.unwrap();
-    let peer = fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap());
+    let peer = fil_forward::LocalPeer::Tcp {
+        peer: "127.0.0.1:1".parse().unwrap(),
+        local: None,
+        owner: fil_forward::PeerUid::NotAsked,
+    };
     c.ep.open_stream(
         OpenKind::Dynamic {
             forward: id,
@@ -630,6 +678,21 @@ async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
         || matches!(state(&h), Some(ListenState::Failed(f)) if f != BindFailure::Policy),
     )
     .await;
+    // A retry that fails as before is not told again.
+    let failed_told = |b: &FwdClient| {
+        b.table()
+            .iter()
+            .filter(|m| {
+                matches!(m, MuxMsg::Listening { id: i, state: ListenState::Failed(f) }
+                    if *i == id && *f != BindFailure::Policy)
+            })
+            .count()
+    };
+    let told = failed_told(&b);
+    b.reconnect(&h).await;
+    assert!(matches!(state(&h), Some(ListenState::Failed(f)) if f != BindFailure::Policy));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(failed_told(&b), told, "the same failure told again");
     // The port is free again: a re-establish binds it. Each one tries, so this reconnects
     // until one has: another test's child, forked before its exec, can hold a copy of the
     // squatter's socket for a moment after it is dropped here.
@@ -644,4 +707,189 @@ async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     h.kill(WAIT).await;
+}
+
+/// A policy change while the subscriber stays attached and its link stays up: the `-R`
+/// listener closes once the read is in, and is bound again once a read allows it, with no
+/// link change in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_read_rechecks_the_table_without_a_link_change() {
+    let host = Host::new("onread");
+    host.sshd("Port 22\n");
+    let (_s, h) = session(&host, None).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let (_port, id) = add_bound(&mut a, &h).await;
+    let state = |h: &fil_session::SessionHandle| {
+        h.forward_rows()
+            .into_iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.listen)
+    };
+    host.sshd("AllowTcpForwarding local\n");
+    until("closed once the read is in", || {
+        state(&h) == Some(ListenState::Failed(BindFailure::Policy))
+    })
+    .await;
+    a.wait_table("told", |m| {
+        matches!(m, MuxMsg::Listening { id: i, state: ListenState::Failed(BindFailure::Policy) } if *i == id)
+            .then_some(())
+    })
+    .await;
+    host.sshd("Port 22\n");
+    until("bound again once a read allows it", || {
+        matches!(state(&h), Some(ListenState::Listening { .. }))
+    })
+    .await;
+    h.kill(WAIT).await;
+}
+
+/// A resume while the last read is too old to decide on (a slow directory service) changes
+/// nothing: the `-R` listener stays bound (its connections are refused meanwhile, each checked
+/// as it comes), and once the re-read is in it serves again. A stale read leaves nothing behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_read_at_a_resume_leaves_the_table_as_it_was() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANG: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(vec!["dev".into()]),
+        }
+    }
+    let host = Host::new("stale");
+    host.sshd("Port 22\n");
+    let mut src = host.sources();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::ZERO;
+    src.max_age = Duration::from_millis(300);
+    let p = Arc::new(
+        tokio::task::spawn_blocking(move || Policy::new(src))
+            .await
+            .unwrap(),
+    );
+    let scratch = Scratch::new();
+    let mut cfg = sh_config(&scratch, "s", "cat");
+    cfg.policy = p.clone();
+    let h = spawn_plain(cfg).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let (_port, id) = add_bound(&mut a, &h).await;
+    let state = |h: &fil_session::SessionHandle| {
+        h.forward_rows()
+            .into_iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.listen)
+    };
+    // A re-read starts and hangs; the last read grows too old to decide on.
+    HANG.store(true, Ordering::SeqCst);
+    use fil_session::policy::ServerPolicy;
+    let _ = p.agent();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        p.forward(&remote_on(1, 9)).unwrap_err().setting,
+        fil_proto::mux::PolicySetting::Pending
+    );
+    a.reconnect(&h).await;
+    assert!(
+        matches!(state(&h), Some(ListenState::Listening { .. })),
+        "a stale read closed the listener: {:?}",
+        state(&h)
+    );
+    HANG.store(false, Ordering::SeqCst);
+    until("the re-read is in", || p.forward(&remote_on(1, 9)).is_ok()).await;
+    assert!(matches!(state(&h), Some(ListenState::Listening { .. })));
+    h.kill(WAIT).await;
+}
+
+/// The agent the policy refused at the attach gets its socket once a read allows it, with no
+/// link change (and so a stale read at an attach leaves no lasting refusal either).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_read_brings_the_agent_socket_without_a_link_change() {
+    use fil_testkit::agent::MiniAgent;
+    let host = Host::new("agonread");
+    host.sshd("AllowAgentForwarding no\n");
+    let dir = PathBuf::from(format!("/tmp/fil-s1c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = dir.join("a/s.sock");
+    let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
+    let (_s, h) = session(&host, Some(sock.clone())).await;
+    let _c = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!sock.exists(), "refused at the attach");
+    host.sshd("Port 22\n");
+    until("the socket once the read is in", || sock.exists()).await;
+    h.kill(WAIT).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resume while the last read is too old to decide on leaves the agent as it was: the socket
+/// stays and the attach reply reports no refusal (each agent connection is still checked, and
+/// refused, meanwhile).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_read_at_a_resume_leaves_the_agent_as_it_was() {
+    use fil_testkit::agent::MiniAgent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANG: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(vec!["dev".into()]),
+        }
+    }
+    let host = Host::new("agstale");
+    host.sshd("Port 22\n");
+    let mut src = host.sources();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::ZERO;
+    src.max_age = Duration::from_millis(300);
+    let p = Arc::new(
+        tokio::task::spawn_blocking(move || Policy::new(src))
+            .await
+            .unwrap(),
+    );
+    let dir = PathBuf::from(format!("/tmp/fil-s1d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = dir.join("a/s.sock");
+    let agent = MiniAgent::start(&dir.join("mini.sock"), 1);
+    let scratch = Scratch::new();
+    let mut cfg = sh_config(&scratch, "s", "cat");
+    cfg.policy = p.clone();
+    cfg.agent_socket = Some(sock.clone());
+    let h = spawn_plain(cfg).await;
+    let mut a = FwdClient::attach_agent(&h, key(1), "laptop", agent.path()).await;
+    until("the agent socket", || sock.exists()).await;
+    // A re-read starts and hangs; the last read grows too old to decide on.
+    HANG.store(true, Ordering::SeqCst);
+    use fil_session::policy::ServerPolicy;
+    let _ = p.agent();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        p.agent().unwrap_err().setting,
+        fil_proto::mux::PolicySetting::Pending
+    );
+    a.reconnect(&h).await;
+    assert_eq!(
+        a.last_reply().unwrap().agent_refused,
+        None,
+        "a stale read reported as a refusal"
+    );
+    assert!(sock.exists(), "a stale read took the agent socket away");
+    HANG.store(false, Ordering::SeqCst);
+    until("the re-read is in", || p.agent().is_ok()).await;
+    assert!(sock.exists());
+    h.kill(WAIT).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

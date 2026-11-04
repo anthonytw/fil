@@ -11,13 +11,16 @@
 //! IPv6), ports are plain hex. Every field is parsed defensively: a line that does not parse is
 //! skipped, never a panic. The file lists every user's sockets; [`split`] is the uid filter that
 //! keeps another user's rows to their address and port before anything else looks at them.
+//! [`peer_owner`] reads the same rows for one connection's peer (`remote_peers = "same-user"`),
+//! and keeps nothing but the uid of the one row it matched.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
-use std::path::Path;
-use std::time::Instant;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// `TCP_LISTEN` in the `st` column.
 const LISTEN: u8 = 0x0A;
@@ -341,6 +344,155 @@ fn read_from(
         } else if !full {
             r_out.rest.push(s);
         }
+    }
+}
+
+/// How [`rows_from`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scan {
+    /// The end of the file.
+    Done,
+    /// The visitor stopped it.
+    Stopped,
+    /// A bound (lines, time) or a read error.
+    Cut,
+}
+
+/// Every row of one file, in order, to `visit`, within [`MAX_LINES`] and before `deadline`;
+/// header, malformed and overlong lines are skipped.
+fn rows_from(
+    f: impl Read,
+    deadline: Instant,
+    mut visit: impl FnMut(Row) -> ControlFlow<()>,
+) -> Scan {
+    let mut r = BufReader::new(f);
+    let mut line = Vec::with_capacity(MAX_LINE);
+    for n in 0.. {
+        if n == MAX_LINES {
+            return Scan::Cut;
+        }
+        if n % 1024 == 0 && Instant::now() >= deadline {
+            return Scan::Cut;
+        }
+        line.clear();
+        match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut line) {
+            Ok(0) => return Scan::Done,
+            Ok(_) => {}
+            Err(_) => return Scan::Cut,
+        }
+        if line.last() != Some(&b'\n') && line.len() == MAX_LINE {
+            // An overlong line: skip to its end.
+            let mut rest = Vec::new();
+            if (&mut r).take(1 << 20).read_until(b'\n', &mut rest).is_err() {
+                return Scan::Cut;
+            }
+            continue;
+        }
+        if let Some(row) = std::str::from_utf8(&line).ok().and_then(parse_line)
+            && visit(row).is_break()
+        {
+            return Scan::Stopped;
+        }
+    }
+    Scan::Cut
+}
+
+/// How long one peer lookup by the table scan may take before it gives up (and `same-user`
+/// refuses). It runs on a blocking thread ([`ProcPeers`]), one at a time per `-R` listener.
+pub const PEER_BUDGET: Duration = Duration::from_millis(20);
+
+/// The owner of the socket at the far end of a TCP connection accepted on this host: the row
+/// whose local address is the connection's `peer` and whose remote address is the accepted
+/// socket's own (`local`), as `ROOT/net/tcp` or `ROOT/net/tcp6` lists it. Its uid is the socket's
+/// creator's (`sk_uid`), so a socket root made reads as 0. A row with inode 0 is a closed peer's
+/// minisocket (FIN_WAIT2, TIME_WAIT), which reads as uid 0 whoever made it: unknown, not an owner.
+///
+/// An IPv4 peer is looked for in `tcp` first and then in `tcp6`, where a dual-stack socket lists it
+/// as `::ffff:a.b.c.d`; an IPv6 peer only in `tcp6`. The read stops at the match. `None`: no such
+/// row (the socket is gone or closed, another network namespace), a file that cannot be read, or
+/// the deadline passed first.
+pub fn peer_owner(
+    root: &Path,
+    peer: SocketAddr,
+    local: SocketAddr,
+    deadline: Instant,
+) -> Option<u32> {
+    let want_local = (peer.ip().to_canonical(), peer.port());
+    let want_remote = (local.ip().to_canonical(), local.port());
+    let files: &[&str] = if want_local.0.is_ipv4() {
+        &["tcp", "tcp6"]
+    } else {
+        &["tcp6"]
+    };
+    for name in files {
+        let Ok(f) = std::fs::File::open(root.join("net").join(name)) else {
+            continue;
+        };
+        let mut found = None;
+        let scan = rows_from(f, deadline, |r| {
+            if !r.is_listen()
+                && (r.local.0.to_canonical(), r.local.1) == want_local
+                && (r.remote.0.to_canonical(), r.remote.1) == want_remote
+            {
+                found = Some((r.inode != 0).then_some(r.uid));
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(owner) = found {
+            return owner;
+        }
+        if scan == Scan::Cut {
+            return None;
+        }
+    }
+    None
+}
+
+/// `remote_peers = "same-user"`'s lookup on Linux. The path is chosen once, when it is made: the
+/// kernel's `sock_diag` answer about the one socket where it works ([`super::diag::works`]), quick
+/// and run on the accepting task; otherwise [`peer_owner`] on a `/proc` root, within
+/// [`PEER_BUDGET`], which the endpoint runs on a blocking thread. Never one, then the other: with
+/// sock_diag chosen, anything but a full socket's uid is refused, so nobody can steer a lookup
+/// onto the slow path.
+#[derive(Clone, Debug)]
+pub struct ProcPeers {
+    root: PathBuf,
+    diag: bool,
+}
+
+impl ProcPeers {
+    pub fn new(root: PathBuf) -> Self {
+        #[cfg(target_os = "linux")]
+        let diag = super::diag::works();
+        #[cfg(not(target_os = "linux"))]
+        let diag = false;
+        Self { root, diag }
+    }
+
+    /// The table scan, whatever the host supports (tests).
+    #[cfg(test)]
+    fn scan_only(root: PathBuf) -> Self {
+        Self { root, diag: false }
+    }
+}
+
+impl fil_session::peers::PeerOwner for ProcPeers {
+    fn owner(&self, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
+        let canon = |a: SocketAddr| SocketAddr::new(a.ip().to_canonical(), a.port());
+        let (peer, local) = (canon(peer), canon(local));
+        if self.diag {
+            #[cfg(target_os = "linux")]
+            return match super::diag::lookup(peer, local) {
+                super::diag::Diag::Owner(uid) => Some(uid),
+                super::diag::Diag::NoSuchSocket | super::diag::Diag::Unsupported => None,
+            };
+        }
+        peer_owner(&self.root, peer, local, Instant::now() + PEER_BUDGET)
+    }
+
+    fn blocking(&self) -> bool {
+        !self.diag
     }
 }
 
@@ -671,5 +823,251 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!r.missing && !r.truncated);
         assert_eq!(r.sockets.len(), 5);
+    }
+
+    // ---- the peer lookup (remote_peers = "same-user") ----------------------------------------
+
+    /// An address as the kernel prints it: its 32-bit words in host byte order, in hex.
+    fn hex(ip: IpAddr) -> String {
+        let bytes = match ip {
+            IpAddr::V4(a) => a.octets().to_vec(),
+            IpAddr::V6(a) => a.octets().to_vec(),
+        };
+        bytes
+            .chunks(4)
+            .map(|w| format!("{:08X}", u32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+            .collect()
+    }
+
+    fn row(local: &str, remote: &str, state: u8, uid: u32) -> String {
+        let (l, r): (SocketAddr, SocketAddr) = (local.parse().unwrap(), remote.parse().unwrap());
+        format!(
+            "   1: {}:{:04X} {}:{:04X} {state:02X} 00000000:00000000 00:00000000 00000000 {uid:>5}        0 4242 1\n",
+            hex(l.ip()),
+            l.port(),
+            hex(r.ip()),
+            r.port()
+        )
+    }
+
+    const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+    /// A fake `/proc` with these `tcp` and `tcp6` rows (`None`: no such file).
+    fn fake(name: &str, tcp: Option<&[String]>, tcp6: Option<&[String]>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fil-peer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("net")).unwrap();
+        for (file, rows) in [("tcp", tcp), ("tcp6", tcp6)] {
+            if let Some(rows) = rows {
+                std::fs::write(
+                    dir.join("net").join(file),
+                    format!("{HEADER}{}", rows.concat()),
+                )
+                .unwrap();
+            }
+        }
+        dir
+    }
+
+    fn owner(root: &Path, peer: &str, local: &str) -> Option<u32> {
+        let later = Instant::now() + std::time::Duration::from_secs(5);
+        peer_owner(root, peer.parse().unwrap(), local.parse().unwrap(), later)
+    }
+
+    const EST: u8 = 0x01;
+
+    /// The peer's own row is the one whose local address is the peer: not the accepted socket's
+    /// (the same pair the other way round, the daemon's), not the listener, not a row of another
+    /// connection from the same port. Mutation: match on the peer's address alone, or take the
+    /// accepted socket's row, and this fails.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn the_peers_own_row_gives_its_uid() {
+        let tcp = [
+            row("127.0.0.1:9000", "0.0.0.0:0", LISTEN, ME),
+            // The accepted socket: the daemon's.
+            row("127.0.0.1:9000", "127.0.0.1:41000", EST, ME),
+            // The same source port toward another listener, someone else's socket.
+            row("127.0.0.1:41000", "127.0.0.1:5432", EST, 0),
+            // The peer.
+            row("127.0.0.1:41000", "127.0.0.1:9000", EST, THEM),
+        ];
+        let root = fake("v4", Some(&tcp), None);
+        assert_eq!(
+            owner(&root, "127.0.0.1:41000", "127.0.0.1:9000"),
+            Some(THEM)
+        );
+        // Nothing for a connection that is not there (gone already, or another namespace).
+        assert_eq!(owner(&root, "127.0.0.1:41001", "127.0.0.1:9000"), None);
+        // The listener's row is never a peer.
+        assert_eq!(owner(&root, "127.0.0.1:9000", "0.0.0.0:0"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dual-stack listener sees an IPv4 peer as `::ffff:a.b.c.d`; the peer is in `tcp` (an IPv4
+    /// socket) or `tcp6` (a dual-stack one), and both forms match. An IPv6 peer is only in `tcp6`.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn mapped_and_ipv6_peers_are_found() {
+        let tcp = [row("127.0.0.1:41000", "127.0.0.1:9000", EST, ME)];
+        let tcp6 = [
+            row(
+                "[::ffff:127.0.0.1]:41002",
+                "[::ffff:127.0.0.1]:9000",
+                EST,
+                THEM,
+            ),
+            row("[::1]:41003", "[::1]:9000", EST, ME),
+        ];
+        let root = fake("v6", Some(&tcp), Some(&tcp6));
+        assert_eq!(
+            owner(&root, "[::ffff:127.0.0.1]:41000", "[::ffff:127.0.0.1]:9000"),
+            Some(ME)
+        );
+        assert_eq!(
+            owner(&root, "127.0.0.1:41002", "127.0.0.1:9000"),
+            Some(THEM)
+        );
+        assert_eq!(owner(&root, "[::1]:41003", "[::1]:9000"), Some(ME));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// B2 (review of #82): a closed peer's row (a TIME_WAIT minisocket: uid 0, inode 0) is unknown,
+    /// not uid 0, so a root daemon does not admit it. Mutation: drop the inode check, and this
+    /// fails.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_closed_peers_row_is_unknown() {
+        let tw = row("127.0.0.1:41000", "127.0.0.1:9000", 0x06, 0).replace(" 4242 ", " 0 ");
+        let root = fake("closed", Some(&[tw]), None);
+        assert_eq!(owner(&root, "127.0.0.1:41000", "127.0.0.1:9000"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scan is the slow path: the endpoint runs it on a blocking thread.
+    #[test]
+    fn the_scan_runs_on_a_blocking_thread() {
+        use fil_session::peers::PeerOwner;
+        assert!(ProcPeers::scan_only(PathBuf::from("/proc")).blocking());
+    }
+
+    /// No socket table, an unreadable one, or a deadline already past: unknown, which
+    /// `same-user` refuses.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn no_table_or_no_time_is_unknown() {
+        assert_eq!(
+            owner(
+                Path::new("/nonexistent/fil-peer"),
+                "127.0.0.1:41000",
+                "127.0.0.1:9000"
+            ),
+            None
+        );
+        let tcp = [row("127.0.0.1:41000", "127.0.0.1:9000", EST, ME)];
+        let root = fake("late", Some(&tcp), None);
+        let past = Instant::now() - std::time::Duration::from_millis(1);
+        let p = "127.0.0.1:41000".parse().unwrap();
+        let l = "127.0.0.1:9000".parse().unwrap();
+        assert_eq!(peer_owner(&root, p, l, past), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real kernel: a connection this process made is its own uid's, by its accepted pair,
+    /// in either family.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_real_connection_is_this_users() {
+        let me = rustix::process::getuid().as_raw();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(l) = std::net::TcpListener::bind(bind) else {
+                continue; // no IPv6 on this host
+            };
+            let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (a, peer) = l.accept().unwrap();
+            let local = a.local_addr().unwrap();
+            assert_eq!(peer, c.local_addr().unwrap());
+            let later = Instant::now() + PEER_BUDGET;
+            assert_eq!(
+                peer_owner(Path::new("/proc"), peer, local, later),
+                Some(me),
+                "{bind}"
+            );
+        }
+    }
+
+    /// The real kernel: once the peer has closed, its row (FIN_WAIT2 or TIME_WAIT, inode 0) is
+    /// unknown.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_real_closed_peer_is_unknown() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, peer) = l.accept().unwrap();
+        let local = a.local_addr().unwrap();
+        let later = || Instant::now() + PEER_BUDGET;
+        assert!(peer_owner(Path::new("/proc"), peer, local, later()).is_some());
+        drop(c);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(peer_owner(Path::new("/proc"), peer, local, later()), None);
+        drop(a);
+    }
+
+    /// What one lookup costs on this host (`cargo test -p fil-daemon --lib -- --ignored
+    /// --nocapture peer_lookup_cost`), with `FIL_PEER_EXTRA` idle connections (default 0) open to
+    /// fatten the socket table. Prints the median and the worst of 2,000 lookups, by `sock_diag`
+    /// and by the table scan.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    #[cfg(target_os = "linux")]
+    fn peer_lookup_cost() {
+        let extra: usize = std::env::var("FIL_PEER_EXTRA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut keep = Vec::new();
+        for _ in 0..extra {
+            keep.push(std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap());
+            keep.push(l.accept().unwrap().0);
+        }
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, peer) = l.accept().unwrap();
+        let local = a.local_addr().unwrap();
+        let rows = std::fs::read_to_string("/proc/net/tcp")
+            .unwrap()
+            .lines()
+            .count()
+            + std::fs::read_to_string("/proc/net/tcp6").map_or(0, |t| t.lines().count());
+        let lookups: [(&str, &dyn Fn() -> Option<u32>); 2] = [
+            ("sock_diag (ProcPeers)", &|| {
+                use fil_session::peers::PeerOwner;
+                ProcPeers::new(PathBuf::from("/proc")).owner(peer, local)
+            }),
+            ("/proc/net/tcp scan", &|| {
+                peer_owner(
+                    Path::new("/proc"),
+                    peer,
+                    local,
+                    Instant::now() + PEER_BUDGET,
+                )
+            }),
+        ];
+        for (what, f) in lookups {
+            let mut took = Vec::new();
+            for _ in 0..2000 {
+                let t = Instant::now();
+                assert!(f().is_some());
+                took.push(t.elapsed());
+            }
+            took.sort();
+            println!(
+                "peer lookup, {what}: {rows} rows in tcp+tcp6, median {:?}, p99 {:?}, max {:?}",
+                took[took.len() / 2],
+                took[took.len() * 99 / 100],
+                took[took.len() - 1]
+            );
+        }
+        drop((c, keep));
     }
 }

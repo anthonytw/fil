@@ -165,7 +165,11 @@ async fn ends(s: &mut TcpStream) {
 
 /// The local peer of a stream handed to the endpoint directly (it came from no listener).
 fn peer() -> fil_forward::LocalPeer {
-    fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap())
+    fil_forward::LocalPeer::Tcp {
+        peer: "127.0.0.1:1".parse().unwrap(),
+        local: None,
+        owner: fil_forward::PeerUid::NotAsked,
+    }
 }
 
 /// A connected pair: what the application holds, and what the endpoint is handed.

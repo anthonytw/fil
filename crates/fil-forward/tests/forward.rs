@@ -237,26 +237,61 @@ async fn concurrent_connections(t: Transport) {
     // the kernel's listen queue, 128 on macOS, which resets them before fil sees them), send
     // their request and end their side, and all wait until every one is connected: then all of
     // them are open at once, most of them queued for a channel.
+    //
+    // The forward's own connects to the server come in bursts (a channel per connection, up to
+    // the open cap at once), and on a loaded macOS the server's listen queue (128) can overflow:
+    // the kernel completes such a handshake and then resets it at the first read or write. fil
+    // passes that reset on, as it should, so the application sees it before any byte came back.
+    // Such a connection is made again, as a client library would. Both kernel causes (a handshake
+    // dropped from the server's queue, or from fil's own `-L` queue) leave the server's `accept`
+    // count alone, so it must still be exactly `n`: a connection the server accepted and that
+    // was reset anyway is fil's doing, and fails the test at the first one. The retries are also
+    // capped (`MAX_RESETS`), and printed.
     let all = Arc::new(tokio::sync::Barrier::new(n as usize));
     let mut set = tokio::task::JoinSet::new();
     for i in 0..n {
-        let s = connect(port).await;
+        let first = connect(port).await;
         let all = all.clone();
         set.spawn(async move {
-            let (mut r, mut wr) = s.into_split();
             let mut out = vec![0u8; 4096];
             fill(i, 0, &mut out);
-            wr.write_all(&out).await.unwrap();
-            wr.shutdown().await.unwrap();
-            all.wait().await;
-            let mut back = Vec::new();
-            r.read_to_end(&mut back).await.unwrap();
-            assert!(back == out, "connection {i}");
+            let mut s = Some(first);
+            let mut waited = false;
+            let mut retries = 0u32;
+            loop {
+                let conn = match s.take() {
+                    Some(c) => c,
+                    None => connect(port).await,
+                };
+                let (mut r, mut wr) = conn.into_split();
+                let sent = async {
+                    wr.write_all(&out).await?;
+                    wr.shutdown().await
+                }
+                .await;
+                if !std::mem::replace(&mut waited, true) {
+                    all.wait().await;
+                }
+                let mut back = Vec::new();
+                let got = match sent {
+                    Ok(()) => r.read_to_end(&mut back).await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match got {
+                    Ok(()) => {
+                        assert!(back == out, "connection {i}");
+                        return retries;
+                    }
+                    Err(e) if back.is_empty() && is_reset(&e) && retries < 3 => retries += 1,
+                    Err(e) => panic!("connection {i}: {e} after {} bytes", back.len()),
+                }
+            }
         });
     }
+    let mut retries = 0u32;
     timeout(LONG, async {
         while let Some(r) = set.join_next().await {
-            r.unwrap();
+            retries += r.unwrap();
         }
     })
     .await
@@ -264,9 +299,12 @@ async fn concurrent_connections(t: Transport) {
     sampler.abort();
     let peak = peak.load(Ordering::Relaxed);
     eprintln!(
-        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once (sampled)",
+        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once (sampled), \
+         {retries} made again after a reset",
         t0.elapsed()
     );
+    const MAX_RESETS: u32 = 10;
+    assert!(retries <= MAX_RESETS, "{retries} connections were reset");
     assert!(peak <= fil_proto::limits::MAX_OPEN_CHANNELS, "{peak}");
     let live_peak = live_peak.load(Ordering::SeqCst);
     assert!(
@@ -274,7 +312,18 @@ async fn concurrent_connections(t: Transport) {
         "{live_peak} connections at once, wanted {hold}"
     );
     w.settled().await;
-    assert_eq!(server.accepted.load(Ordering::SeqCst), n as usize);
+    // A connection reset in a listen queue never reached the server.
+    assert_eq!(
+        server.accepted.load(Ordering::SeqCst),
+        n as usize,
+        "{retries} connections were made again"
+    );
+}
+
+/// A reset the application sees: on its read (`ConnectionReset`) or its write (`BrokenPipe`).
+fn is_reset(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(e.kind(), ConnectionReset | BrokenPipe | ConnectionAborted)
 }
 
 /// Many short connections, one after another, on one link that never goes down. Over QUIC every
@@ -845,7 +894,11 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
                     forward: ForwardId(1),
                 },
                 Box::new(acc),
-                LocalPeer::Tcp(peer),
+                LocalPeer::Tcp {
+                    peer,
+                    local: None,
+                    owner: fil_forward::PeerUid::NotAsked,
+                },
             )
             .unwrap();
         assert_eq!(ch.0, 16);
@@ -865,10 +918,15 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
 
 /// Behind a queue, a connection the policy refuses is refused when it arrives, not when it
 /// reaches the head; the policy sees the application's address.
+///
+/// No timing window: the head cannot move for a minute (the one channel is held by a server that
+/// answers after 60 s, and `open_wait` is longer), so a refusal that comes at all, within
+/// `expect_reset`'s 10 s, was made on arrival.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_queued_connection_is_checked_when_it_arrives() {
     let cfg = MuxConfig {
         max_open: 1,
+        open_wait: Duration::from_secs(120),
         ..mux_config()
     };
     let hold = serve(|s| async move {
@@ -878,12 +936,65 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
     .await;
     let w = World::new(Transport::Mem, cfg).await;
     let port = w.local_forward(1, hold.port);
+    let waiting = || w.client.ep.stats(ForwardId(1)).map(|s| s.waiting);
+    let checks = || w.client.policy.outgoing_checks.load(Ordering::SeqCst);
+    let a = connect(port).await;
+    // `a` holds the one channel, open (`waiting` counts an unanswered open too): only then is
+    // `b` sure to queue rather than to open, or to be checked after the policy changes.
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 1 && waiting() == Some(0)
+    })
+    .await;
+    let b = connect(port).await;
+    eventually(Duration::from_secs(5), || {
+        checks() == 2 && waiting() == Some(1)
+    })
+    .await;
+    match *w.client.policy.last_peer.lock().unwrap() {
+        // The listener's accept gives both ends: the application's and the accepted socket's.
+        Some(LocalPeer::Tcp {
+            peer,
+            local: Some(local),
+            // This policy asks for no owner.
+            owner: fil_forward::PeerUid::NotAsked,
+        }) => {
+            assert!(peer.ip().is_loopback(), "{peer}");
+            assert_eq!(local.port(), port, "the accepted socket's own address");
+        }
+        other => panic!("the policy saw {other:?}"),
+    }
+    *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);
+    expect_reset(port).await;
+    // Checked once, on arrival, and never queued: the one behind the head still waits alone.
+    assert_eq!(checks(), 3);
+    assert_eq!(waiting(), Some(1));
+    assert_eq!(w.client.ep.snapshot().channels, 1);
+    drop((a, b));
+}
+
+/// A new epoch (a detach, a takeover) re-checks the queued connections at once instead of
+/// leaving them until `open_wait`: on the daemon its policy then refuses them (`Detached` while
+/// nobody holds the session), as plan section 2.7 says a detached listener does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
+    let cfg = MuxConfig {
+        max_open: 1,
+        open_wait: Duration::from_secs(20),
+        ..mux_config()
+    };
+    let hold = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(s);
+    })
+    .await;
+    let mut w = World::new(Transport::Mem, cfg).await;
+    let port = w.local_forward(1, hold.port);
     let a = connect(port).await;
     eventually(Duration::from_secs(5), || {
         w.client.ep.snapshot().channels == 1
     })
     .await;
-    let b = connect(port).await;
+    let mut b = connect(port).await;
     eventually(Duration::from_secs(5), || {
         w.client
             .ep
@@ -891,20 +1002,21 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
             .is_some_and(|s| s.waiting == 1)
     })
     .await;
-    match *w.client.policy.last_peer.lock().unwrap() {
-        Some(LocalPeer::Tcp(addr)) => assert!(addr.ip().is_loopback(), "{addr}"),
-        other => panic!("the policy saw {other:?}"),
-    }
+    // Nobody holds the session now: the policy refuses what opens.
     *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);
     let t0 = std::time::Instant::now();
-    expect_reset(port).await;
+    w.client.detach();
+    w.client.ep.new_epoch();
+    let r = timeout(Duration::from_secs(10), b.read(&mut [0u8; 8]))
+        .await
+        .expect("the queued connection is refused");
     assert!(
-        t0.elapsed() < Duration::from_millis(500),
-        "{:?}",
-        t0.elapsed()
+        matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{r:?}"
     );
-    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 1);
-    drop((a, b));
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 0);
+    drop(a);
 }
 
 /// `close_forward` ends the forward's channels and refuses its queued connections too.

@@ -309,6 +309,61 @@ async fn ctrl_c_during_a_flood_on_a_slow_pipe_is_fast_and_loses_nothing() {
     );
 }
 
+/// A healthy fast link with the default catch-up rule: a few typed lines (small outputs, the
+/// pacer's app-limited samples, with quiet between them), then 480 kB of output. Nothing may
+/// jump: the link takes it in well under the rule's 2 s. (The review of #128 found 2 catch-ups
+/// a run here on both transports when an echo's sample, one byte over the time since the last
+/// ack, made the drain estimate hours.)
+async fn typing_then_output_cell(t: Transport, path: Path) -> usize {
+    let sc = Scratch::new();
+    let script = format!(
+        "stty -echo; echo READY; while read l; do if [ \"$l\" = go ]; then \
+         seq -f 'L%07g {PAD}' 1 8000; echo END; else echo ok-$l; fi; done"
+    );
+    let mut cfg = sh_config(&sc, "main", &script);
+    cfg.terminal_pacing = true;
+    let h = spawn_plain(cfg).await;
+    async fn run<L: Link>(mut c: fil_testkit::Client<L>) -> usize {
+        c.wait_screen("READY").await;
+        for i in 0..5 {
+            c.type_bytes(format!("{i}\n").as_bytes()).await;
+            c.wait_screen(&format!("ok-{i}")).await;
+            let _ = c.try_wait(Duration::from_millis(150), |_| false).await;
+        }
+        c.type_bytes(b"go\n").await;
+        assert!(
+            c.try_wait(Duration::from_secs(60), |c| c.screen().contains("END"))
+                .await
+        );
+        c.mid_snapshots
+            .iter()
+            .filter(|i| i.reason == SnapshotReason::TooFarBehind)
+            .count()
+    }
+    let n = match t {
+        Transport::Quic => {
+            let (client, daemon, _keep) = quic_pair(path).await;
+            run(attach(&h, client, daemon)).await
+        }
+        Transport::Pipe => {
+            let (client, daemon) = pipe_pair(path).await;
+            run(attach(&h, client, daemon)).await
+        }
+    };
+    let _ = h.kill(Duration::from_secs(5)).await;
+    n
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_then_a_medium_output_on_a_fast_quic_link_never_jumps() {
+    assert_eq!(typing_then_output_cell(Transport::Quic, WAN_PATH).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_then_a_medium_output_on_a_fast_pipe_never_jumps() {
+    assert_eq!(typing_then_output_cell(Transport::Pipe, WAN_PATH).await, 0);
+}
+
 /// "Before": unpaced, the jump waits for everything QUIC holds. Not in the default run (it
 /// takes its 13 s); `just pacing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

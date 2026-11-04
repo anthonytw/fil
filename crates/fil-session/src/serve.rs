@@ -196,10 +196,15 @@ struct SentRec {
     end: u64,
     /// When sending it began.
     began: Instant,
-    /// What the client had acknowledged when it was sent, and when that acknowledgement came:
+    /// What the client had been delivered when it was sent (`Flow::delivered`), and since when:
     /// the start of its delivery-rate sample (`crate::pace`).
     delivered: u64,
     delivered_at: Instant,
+    /// It emptied what was released: its acknowledgement measures the application, not the
+    /// link (BBR's app-limited sample), so it gives a rate only above the one measured.
+    app_limited: bool,
+    /// The path generation it was sent on: it gives no sample after a path change.
+    generation: u64,
 }
 
 /// The sender's view of the terminal channel.
@@ -226,8 +231,15 @@ struct Flow {
     /// The length of that snapshot: it is in the transport until confirmed, so the pacer counts
     /// it as in flight.
     snapshot_len: u64,
-    /// When the last acknowledgement that moved `acked` came (the connection's start before one).
+    /// Bytes the client has been delivered over this connection: terminal output acknowledged
+    /// and snapshots confirmed. Rate samples count from it, so a snapshot's bytes are in the
+    /// sample that spans its transfer.
+    delivered: u64,
+    /// When `delivered` last grew, or when a send found nothing in flight (a sample then starts
+    /// at that send, not across the idle time before it).
     last_ack_at: Instant,
+    /// The link's path generation the pacer's samples belong to.
+    generation: u64,
     /// The terminal pacer (DESIGN.md section 8.5, "Pacing the terminal"). Kept across jumps.
     pacer: Pacer,
 }
@@ -241,7 +253,9 @@ impl Flow {
             sent: VecDeque::new(),
             unconfirmed: None,
             snapshot_len: 0,
+            delivered: 0,
             last_ack_at: Instant::now(),
+            generation: 0,
             pacer,
         }
     }
@@ -265,12 +279,31 @@ impl Flow {
         self.next.saturating_sub(self.acked) + self.snapshot_len
     }
 
+    /// The link reports path generation `generation`: after a change (QUIC migration) the
+    /// pacer starts over, and records sent before it give no sample. Every pacer decision of
+    /// `outbound` goes through [`Flow::may_send`] or [`Flow::wait`], which take the generation,
+    /// so none is made on the old path's measurements.
+    fn path(&mut self, generation: u64) {
+        if generation != self.generation {
+            self.generation = generation;
+            self.pacer.path_changed(generation);
+        }
+    }
+
     /// Whether the pacer lets another segment go now. One segment may take it past the window.
-    fn may_send(&mut self, now: Instant) -> bool {
+    fn may_send(&mut self, now: Instant, generation: u64) -> bool {
+        self.path(generation);
         self.in_flight() < self.pacer.window(now)
     }
 
-    fn record_send(&mut self, end: u64, began: Instant) {
+    /// A segment ending at `end` was sent at `began`; `app_limited` if it emptied what was
+    /// released.
+    fn record_send(&mut self, end: u64, began: Instant, app_limited: bool) {
+        // Into an empty pipe: the sample starts here, not at the last ack before an idle time
+        // (which would make a keystroke's echo after a pause read as a few bytes a second).
+        if self.in_flight() == 0 {
+            self.last_ack_at = began;
+        }
         self.next = end;
         self.high = self.high.max(end);
         // At the cap the newest entry grows instead: the entries are only popped by acks and
@@ -278,12 +311,17 @@ impl Flow {
         // round trip sample, which the pacer's minimum ignores).
         let full = self.sent.len() >= SENT_MAX;
         match self.sent.back_mut() {
-            Some(last) if full => last.end = end,
+            Some(last) if full => {
+                last.end = end;
+                last.app_limited = app_limited;
+            }
             _ => self.sent.push_back(SentRec {
                 end,
                 began,
-                delivered: self.acked,
+                delivered: self.delivered,
                 delivered_at: self.last_ack_at,
+                app_limited,
+                generation: self.generation,
             }),
         }
     }
@@ -295,10 +333,12 @@ impl Flow {
                 sent: self.high,
             });
         }
-        let moved = upto > self.acked;
+        let before = self.delivered;
+        self.delivered += upto.saturating_sub(self.acked);
         self.acked = self.acked.max(upto);
         if self.unconfirmed.is_some_and(|at| upto >= at) {
             self.unconfirmed = None;
+            self.delivered += self.snapshot_len;
             self.snapshot_len = 0;
         }
         // The newest segment this ack covers gives the pacer its sample.
@@ -306,15 +346,16 @@ impl Flow {
         while self.sent.front().is_some_and(|r| r.end <= self.acked) {
             newest = self.sent.pop_front();
         }
-        if let Some(r) = newest {
+        if let Some(r) = newest.filter(|r| r.generation == self.generation) {
             self.pacer.on_sample(
                 now.saturating_duration_since(r.began),
-                self.acked.saturating_sub(r.delivered),
+                self.delivered.saturating_sub(r.delivered),
                 now.saturating_duration_since(r.delivered_at),
+                r.app_limited,
                 now,
             );
         }
-        if moved {
+        if self.delivered > before {
             self.last_ack_at = now;
         }
         Ok(())
@@ -326,7 +367,8 @@ impl Flow {
     /// `drain` to reach the client at the measured rate. The pacer holds the backlog in the
     /// daemon while acknowledgements keep coming, so `age` alone stays short however long the
     /// backlog is; the drain time is what the user waits.
-    fn wait(&mut self, ready: u64, now: Instant) -> Duration {
+    fn wait(&mut self, ready: u64, now: Instant, generation: u64) -> Duration {
+        self.path(generation);
         let ahead = ready.saturating_sub(self.acked) + self.snapshot_len;
         self.age(now).max(self.pacer.drain_time(ahead, now))
     }
@@ -341,10 +383,12 @@ impl Flow {
     /// After a snapshot of `len` bytes the stream continues at `at` and nothing earlier is owed.
     /// The pacer keeps what it has measured: the link is the same.
     fn jump(&mut self, at: u64, len: u64) {
-        let pacer = std::mem::replace(&mut self.pacer, Pacer::new(false));
-        let last_ack_at = self.last_ack_at;
-        *self = Self::after_snapshot(at, len, pacer);
-        self.last_ack_at = last_ack_at;
+        self.next = at;
+        self.acked = at;
+        self.high = at;
+        self.sent.clear();
+        self.unconfirmed = Some(at);
+        self.snapshot_len = len;
     }
 }
 
@@ -700,7 +744,7 @@ impl<'a, L: Link> Conn<'a, L> {
                 (
                     f.next,
                     prog.ready.saturating_sub(f.acked),
-                    f.wait(prog.ready, Instant::now()),
+                    f.wait(prog.ready, Instant::now(), status.borrow().path_generation),
                     f.awaiting_snapshot(),
                 )
             };
@@ -807,9 +851,7 @@ impl<'a, L: Link> Conn<'a, L> {
                 && !stalled
                 && (prog.exited || {
                     let generation = status.borrow().path_generation;
-                    let mut f = self.flow();
-                    f.pacer.path_changed(generation);
-                    f.may_send(Instant::now())
+                    self.flow().may_send(Instant::now(), generation)
                 });
             if paced_ok {
                 let want = (limit - next).min(MAX_DATA_PAYLOAD as u64) as usize;
@@ -828,7 +870,9 @@ impl<'a, L: Link> Conn<'a, L> {
                 if self.kicked.load(Ordering::SeqCst) {
                     return self.lost(out).await;
                 }
-                self.flow().record_send(end, Instant::now());
+                // It empties what is released: its ack measures the program, not the link.
+                self.flow()
+                    .record_send(end, Instant::now(), end >= prog.ready);
                 if let Err(e) = self.link.send(ChannelId::TERMINAL, payload).await {
                     return ServeEnd::LinkDown(e.0);
                 }
@@ -1037,14 +1081,14 @@ mod tests {
     #[test]
     fn a_snapshot_is_unconfirmed_until_an_ack_reaches_it() {
         let mut f = Flow::new(0, Pacer::new(true));
-        f.record_send(500, Instant::now());
+        f.record_send(500, Instant::now(), false);
         assert!(!f.awaiting_snapshot());
         f.jump(1000, 300);
         assert!(f.awaiting_snapshot());
         // Acks of what was sent before the jump say nothing about the snapshot.
         f.ack(500, Instant::now()).unwrap();
         assert!(f.awaiting_snapshot());
-        f.record_send(1200, Instant::now());
+        f.record_send(1200, Instant::now(), false);
         f.ack(1000, Instant::now()).unwrap();
         assert!(!f.awaiting_snapshot());
     }
@@ -1062,7 +1106,7 @@ mod tests {
         let t0 = Instant::now();
         let mut f = Flow::new(0, Pacer::new(true));
         for i in 1..=100_000u64 {
-            f.record_send(i * 10, t0 + Duration::from_millis(i));
+            f.record_send(i * 10, t0 + Duration::from_millis(i), false);
         }
         assert!(f.sent.len() <= SENT_MAX, "{}", f.sent.len());
         assert_eq!(f.next, 1_000_000);
@@ -1086,21 +1130,21 @@ mod tests {
         f.last_ack_at = t0;
         // Before any sample: the floor.
         let mut sent = 0;
-        while f.may_send(t0) {
+        while f.may_send(t0, 0) {
             sent += 16 * 1024;
-            f.record_send(sent, t0);
+            f.record_send(sent, t0, false);
         }
         assert_eq!(f.in_flight(), crate::pace::MIN_WINDOW);
         // 1 MB acknowledged 100 ms later: 10 MB/s over a 100 ms round trip, a window of
         // 10 MB/s * 350 ms.
-        f.record_send(1_000_000, t0);
+        f.record_send(1_000_000, t0, false);
         let t1 = t0 + Duration::from_millis(100);
         f.ack(1_000_000, t1).unwrap();
         assert_eq!(f.pacer.window(t1), 3_500_000);
-        assert!(f.may_send(t1));
+        assert!(f.may_send(t1, 0));
         // A snapshot of 4 MB is in flight until confirmed: nothing more goes.
         f.jump(2_000_000, 4_000_000);
-        assert!(!f.may_send(t1));
+        assert!(!f.may_send(t1, 0));
         f.ack(2_000_000, t1).unwrap();
         assert_eq!(f.in_flight(), 0);
         assert_eq!(f.pacer.window(t1), 3_500_000);
@@ -1115,25 +1159,92 @@ mod tests {
         let mut f = Flow::new(0, Pacer::new(true));
         f.last_ack_at = t0;
         // 125 kB/s measured: 1 Mbit/s.
-        f.record_send(125_000, t0);
+        f.record_send(125_000, t0, false);
         let t1 = t0 + Duration::from_secs(1);
         f.ack(125_000, t1).unwrap();
-        f.record_send(140_000, t1);
+        f.record_send(140_000, t1, false);
         // 500 kB released past what was acknowledged: 4 s to drain, though nothing has waited.
         assert_eq!(f.age(t1), Duration::ZERO);
-        assert_eq!(f.wait(625_000, t1), Duration::from_secs(4));
+        assert_eq!(f.wait(625_000, t1, 0), Duration::from_secs(4));
         // Unpaced it is the age alone.
         let mut u = Flow::new(0, Pacer::new(false));
-        u.record_send(125_000, t0);
+        u.record_send(125_000, t0, false);
         u.ack(125_000, t1).unwrap();
-        assert_eq!(u.wait(625_000, t1), Duration::ZERO);
+        assert_eq!(u.wait(625_000, t1, 0), Duration::ZERO);
     }
 
     #[test]
     fn unpaced_never_holds() {
         let t0 = Instant::now();
         let mut f = Flow::new(0, Pacer::new(false));
-        f.record_send(1 << 40, t0);
-        assert!(f.may_send(t0));
+        f.record_send(1 << 40, t0, false);
+        assert!(f.may_send(t0, 0));
+    }
+
+    /// The review's probe at the level of `Flow`: typing (small app-limited echoes, each acked
+    /// after the client's timer, with idle time between) gives the drain estimate no rate, so
+    /// a burst of output that follows is judged on its age alone; before the guards, a sample
+    /// of one byte over the idle time made the drain estimate hours and the rule jumped.
+    #[test]
+    fn typing_gives_no_rate_that_makes_a_burst_jump() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        let mut t = t0;
+        for i in 1..=5u64 {
+            // A second of quiet, then a keystroke's echo, which empties what is released.
+            t += Duration::from_secs(1);
+            f.record_send(i, t, true);
+            f.ack(i, t + Duration::from_millis(140)).unwrap();
+        }
+        let t = t + Duration::from_millis(200);
+        assert_eq!(f.pacer.rate(t), None, "an echo gave a rate");
+        // 480 kB released, one segment sent: no drain estimate, the age is the wait.
+        f.record_send(5 + 16_384, t, false);
+        assert_eq!(f.wait(480_000, t, 0), Duration::ZERO);
+        // Without the empty-pipe restart the sample would span the idle time: it does not.
+        let t2 = t + Duration::from_millis(40);
+        f.ack(5 + 16_384, t2).unwrap();
+        assert_eq!(f.pacer.rate(t2), Some(16_384 * 1000 / 40));
+    }
+
+    /// A path change starts the pacer over through the calls `outbound` makes (`may_send`,
+    /// `wait`), and a record sent on the old path gives no sample on the new one.
+    #[test]
+    fn a_path_change_reaches_the_pacer_and_old_records_give_no_sample() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        f.record_send(1_000_000, t0, false);
+        let t1 = t0 + Duration::from_millis(100);
+        f.ack(1_000_000, t1).unwrap();
+        assert_eq!(f.pacer.window(t1), 3_500_000);
+        f.record_send(2_000_000, t1, false);
+        // The path changes: the next decision sees the floor, through `wait` as through
+        // `may_send`.
+        assert_eq!(f.wait(2_000_000, t1, 1), Duration::ZERO);
+        assert_eq!(f.pacer.window(t1), crate::pace::MIN_WINDOW);
+        let mut g = Flow::new(0, Pacer::new(true));
+        g.record_send(1_000_000, t0, false);
+        g.ack(1_000_000, t1).unwrap();
+        assert!(g.may_send(t1, 1), "nothing in flight");
+        assert_eq!(g.pacer.window(t1), crate::pace::MIN_WINDOW);
+        // The ack of the record sent on the old path gives nothing.
+        f.ack(2_000_000, t1 + Duration::from_millis(10)).unwrap();
+        assert_eq!(f.pacer.window(t1), crate::pace::MIN_WINDOW);
+        assert_eq!(f.pacer.rate(t1 + Duration::from_millis(10)), None);
+    }
+
+    /// A snapshot's bytes count in the delivery sample that spans its transfer.
+    #[test]
+    fn a_snapshot_counts_in_the_first_sample_after_a_jump() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        f.record_send(100_000, t0, false);
+        f.jump(1_000_000, 400_000);
+        // Output after the jump, sent while the snapshot is on its way.
+        f.record_send(1_100_000, t0, false);
+        let t1 = t0 + Duration::from_millis(500);
+        f.ack(1_100_000, t1).unwrap();
+        // 400 kB of snapshot and 100 kB of output in 0.5 s: 1 MB/s, not 200 kB/s.
+        assert_eq!(f.pacer.rate(t1), Some(1_000_000));
     }
 }

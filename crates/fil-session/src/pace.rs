@@ -16,7 +16,10 @@
 //! - `rate` is the client's delivery rate: bytes acknowledged per second, each sample taken over
 //!   the time since the last acknowledgement before the newest byte it covers was sent (BBR's
 //!   delivery rate), and the largest sample of the last [`RATE_WINDOW`] used. It is what the link
-//!   and the client's terminal together drain, whichever is slower.
+//!   and the client's terminal together drain, whichever is slower. A sample of a segment that
+//!   emptied what the program had released is app-limited (it measures the program: a
+//!   keystroke's echo) and counts only above the rate measured; the caller (`serve::Flow`) also
+//!   starts a sample at the send when nothing was in flight, so none spans idle time.
 //! - `rtprop` is the smallest round trip seen on the link (from a send to the acknowledgement
 //!   that covers it), kept for the connection's life and started over on a QUIC path change. It
 //!   is not re-measured on a timer: the queue this window allows is at most `QUEUE_BUDGET`, and a
@@ -93,11 +96,16 @@ impl Pacer {
     }
 
     /// An acknowledgement gave a round trip `rtt` and `bytes` delivered over `interval`.
+    /// `app_limited`: the segment it covers emptied what the program had released, so the
+    /// sample measures the program (a keystroke's echo, a short reply), not the link: it gives
+    /// the round trip, and a rate only if that is above the rate measured (BBR's rule: an
+    /// app-limited sample can only understate the link).
     pub(crate) fn on_sample(
         &mut self,
         rtt: Duration,
         bytes: u64,
         interval: Duration,
+        app_limited: bool,
         now: Instant,
     ) {
         self.rtprop = Some(self.rtprop.map_or(rtt, |r| r.min(rtt)));
@@ -106,11 +114,14 @@ impl Pacer {
         }
         let rate = u64::try_from(u128::from(bytes) * 1_000_000 / interval.as_micros().max(1))
             .unwrap_or(u64::MAX);
+        self.expire(now);
+        if app_limited && self.rates.front().is_none_or(|&(_, max)| rate <= max) {
+            return;
+        }
         while self.rates.back().is_some_and(|&(_, r)| r <= rate) {
             self.rates.pop_back();
         }
         self.rates.push_back((now, rate));
-        self.expire(now);
     }
 
     /// The link moved to another path (QUIC migration to a new address): its round trip and rate
@@ -180,7 +191,7 @@ mod tests {
         let mut p = Pacer::new(true);
         assert_eq!(p.window(now), MIN_WINDOW);
         // A round trip alone gives no rate.
-        p.on_sample(ms(50), 0, ms(50), now);
+        p.on_sample(ms(50), 0, ms(50), false, now);
         assert_eq!(p.window(now), MIN_WINDOW);
     }
 
@@ -189,7 +200,7 @@ mod tests {
         let now = Instant::now();
         let mut p = Pacer::new(true);
         // 10 MB/s over a 50 ms path: 10e6 * 0.3 s.
-        p.on_sample(ms(50), 1_000_000, ms(100), now);
+        p.on_sample(ms(50), 1_000_000, ms(100), false, now);
         assert_eq!(p.window(now), 3_000_000);
     }
 
@@ -198,7 +209,7 @@ mod tests {
         let now = Instant::now();
         let mut p = Pacer::new(true);
         // 1 Mbit/s (125 kB/s) over a 50 ms path: 125e3 * 0.3 s = 37.5 kB, under the floor.
-        p.on_sample(ms(50), 125_000, ms(1000), now);
+        p.on_sample(ms(50), 125_000, ms(1000), false, now);
         assert_eq!(p.window(now), MIN_WINDOW);
     }
 
@@ -206,8 +217,8 @@ mod tests {
     fn the_largest_recent_rate_counts_and_old_ones_expire() {
         let t0 = Instant::now();
         let mut p = Pacer::new(true);
-        p.on_sample(ms(10), 1_000_000, ms(100), t0); // 10 MB/s
-        p.on_sample(ms(10), 100_000, ms(100), t0 + ms(500)); // 1 MB/s
+        p.on_sample(ms(10), 1_000_000, ms(100), false, t0); // 10 MB/s
+        p.on_sample(ms(10), 100_000, ms(100), false, t0 + ms(500)); // 1 MB/s
         assert_eq!(p.window(t0 + ms(600)), 2_600_000);
         // The fast sample is older than the window: the slow one is the rate now.
         assert_eq!(p.window(t0 + RATE_WINDOW + ms(100)), 260_000);
@@ -219,14 +230,14 @@ mod tests {
     fn the_round_trip_is_the_smallest_seen_and_a_path_change_forgets_it() {
         let now = Instant::now();
         let mut p = Pacer::new(true);
-        p.on_sample(ms(20), 1_000_000, ms(100), now);
-        p.on_sample(ms(400), 1_000_000, ms(100), now);
+        p.on_sample(ms(20), 1_000_000, ms(100), false, now);
+        p.on_sample(ms(400), 1_000_000, ms(100), false, now);
         assert_eq!(p.window(now), 2_700_000); // 10 MB/s * (20 + 250) ms
         p.path_changed(0); // the same generation: nothing changes
         assert_eq!(p.window(now), 2_700_000);
         p.path_changed(1);
         assert_eq!(p.window(now), MIN_WINDOW);
-        p.on_sample(ms(400), 1_000_000, ms(100), now);
+        p.on_sample(ms(400), 1_000_000, ms(100), false, now);
         assert_eq!(p.window(now), 6_500_000);
     }
 
@@ -234,15 +245,31 @@ mod tests {
     fn a_burst_of_acks_gives_no_rate() {
         let now = Instant::now();
         let mut p = Pacer::new(true);
-        p.on_sample(ms(10), 1_000_000, Duration::from_micros(10), now);
+        p.on_sample(ms(10), 1_000_000, Duration::from_micros(10), false, now);
         assert_eq!(p.window(now), MIN_WINDOW);
+    }
+
+    /// An app-limited sample (a keystroke's echo: one byte over the time it took) never lowers
+    /// the rate, and without a measured rate it gives none; above the rate it counts.
+    #[test]
+    fn an_app_limited_sample_never_understates_the_rate() {
+        let now = Instant::now();
+        let mut p = Pacer::new(true);
+        p.on_sample(ms(40), 1, ms(140), true, now);
+        assert_eq!(p.rate(now), None);
+        assert_eq!(p.drain_time(1_000_000, now), Duration::ZERO);
+        p.on_sample(ms(40), 1_000_000, ms(100), false, now); // 10 MB/s
+        p.on_sample(ms(40), 1, ms(140), true, now);
+        assert_eq!(p.rate(now), Some(10_000_000));
+        p.on_sample(ms(40), 2_000_000, ms(100), true, now); // 20 MB/s: above, so it counts
+        assert_eq!(p.rate(now), Some(20_000_000));
     }
 
     #[test]
     fn the_window_is_bounded() {
         let now = Instant::now();
         let mut p = Pacer::new(true);
-        p.on_sample(ms(100), u64::MAX / 2, ms(1), now);
+        p.on_sample(ms(100), u64::MAX / 2, ms(1), false, now);
         assert_eq!(p.window(now), MAX_WINDOW);
     }
 
@@ -251,7 +278,7 @@ mod tests {
         let now = Instant::now();
         let mut p = Pacer::new(false);
         assert_eq!(p.window(now), u64::MAX);
-        p.on_sample(ms(10), 1_000_000, ms(100), now);
+        p.on_sample(ms(10), 1_000_000, ms(100), false, now);
         assert_eq!(p.drain_time(1_000_000, now), Duration::ZERO);
     }
 
@@ -260,7 +287,7 @@ mod tests {
         let now = Instant::now();
         let mut p = Pacer::new(true);
         assert_eq!(p.drain_time(1_000_000, now), Duration::ZERO, "no rate yet");
-        p.on_sample(ms(50), 125_000, ms(1000), now);
+        p.on_sample(ms(50), 125_000, ms(1000), false, now);
         assert_eq!(p.drain_time(250_000, now), ms(2000));
     }
 }

@@ -115,7 +115,7 @@ Logs and per-scenario output are in `target/realnet` inside the synced directory
 
 ## Results in the VM
 
-First runs on 2026-11-03 (Lima 2.2, Apple silicon, 6 CPUs, 12 GiB; GitHub reference: [run 41630436471](https://github.com/anthonytw/fil/actions/runs/41630436471), all three parts passed). Wall-clock per part includes the sync and the first, cold `cargo build`; later runs reuse the build.
+First runs on 2026-11-03 (Lima 2.2, Apple silicon, 6 CPUs, 12 GiB; GitHub reference: run 41630436471 (in the pre-recreate repository), all three parts passed). Wall-clock per part includes the sync and the first, cold `cargo build`; later runs reuse the build.
 
 | Part | VM result | Wall-clock |
 |---|---|---|

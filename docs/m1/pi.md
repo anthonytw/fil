@@ -98,7 +98,7 @@ With the UDP address set to a documentation address nothing answers on, the clie
 - **`reset` restarts the whole systemd user manager** (it kills every process of the account, `systemd --user` included, and lingering starts it again). That is harmless for fil.
 - **The `logs` verb shows the user journal**, which has a `Started fil-HEX.scope - fil session` line for each session (it proves the process-scope path; the session name is deliberately not in it). The daemon's own log lines are in that journal too.
 
-Runs: the `aarch64` job builds, [run 41565928944](https://github.com/anthonytw/fil/actions/runs/41565928944) (first tree), [run 41569420955](https://github.com/anthonytw/fil/actions/runs/41569420955) (merged tree) and [run 41571148759](https://github.com/anthonytw/fil/actions/runs/41571148759) (pinned `cross`, `--locked`, static check: same binary hash). The scenarios in the results table ran against that binary.
+Runs: the `aarch64` job builds, run 41565928944 (in the pre-recreate repository) (first tree), run 41569420955 (merged tree) and run 41571148759 (pinned `cross`, `--locked`, static check: same binary hash). The scenarios in the results table ran against that binary.
 
 ## Findings
 

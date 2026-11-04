@@ -291,7 +291,14 @@ fn lock_names(dir: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    v.sort();
+    // By revision as a number: `fil-1-10.sock` sorts after `fil-1-9.sock`.
+    let rev = |n: &String| {
+        n.trim_end_matches(".sock")
+            .rsplit('-')
+            .next()
+            .and_then(|r| r.parse::<u32>().ok())
+    };
+    v.sort_by_key(|n| (rev(n), n.clone()));
     v
 }
 

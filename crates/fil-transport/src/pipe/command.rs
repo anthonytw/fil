@@ -20,7 +20,8 @@
 //! **Approved by the owner (M4 OQ-1, 2026-11-04):** fil's remote commands are exactly two,
 //! [`REMOTE_COMMAND`] and [`BOOTSTRAP`] (DESIGN.md §8.2, decided). [`PipeCommand::ssh`] and
 //! [`PipeCommand::bootstrap`] are the only constructors of either; both take a host and nothing
-//! else. What each check proves:
+//! else. ([`PipeCommand::with_options`] adds local options in front of the host, for a
+//! background run, and never touches the remote part.) What each check proves:
 //!
 //! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
 //!   (a change to it needs the owner's sign-off again);
@@ -92,7 +93,7 @@ const BOOT_TAIL: &str = concat!(
     r#"pre() { [ -e "$1" ] || [ -h "$1" ] || return 0; "$2" "$1"; }; "#,
     r#"undo() { [ -n "$n" ] && rm -rf "$n"; [ -n "$k3" ] && rmdir "$b"; [ -n "$k2" ] && rmdir "$HOME/.local/share"; [ -n "$k1" ] && rmdir "$HOME/.local"; exit 1; }; "#,
     r#"IFS= read -r m || exit 1; "#,
-    r#"if [ "$m" = check ]; then if chain; then for d in "$b"/*; do own "$d" && exe "$d/fil" && say FIL-HAVE "${d##*/}"; done; fi; command -v fil >/dev/null && say FIL-PATH "$(fil --version </dev/null | head -n 1)"; lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; exit 0; fi; "#,
+    r#"if [ "$m" = check ]; then if chain; then for d in "$b"/*; do own "$d" && exe "$d/fil" && say FIL-HAVE "${d##*/}"; done; fi; command -v fil >/dev/null && say FIL-PATH "$(fil --version </dev/null | head -n 1)"; lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; say FIL-CHECK-END; exit 0; fi; "#,
     r#"if [ "$m" = remove ]; then if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 gc; exec "$b/$v/fil" server --install-gc; fi; say FIL-BOOT1 none; exit 1; fi; "#,
     r#"[ "$m" = attach ] || exit 1; "#,
     r#"if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 exec; exec "$b/$v/fil" server --stdio; fi; "#,
@@ -281,6 +282,10 @@ fn host_is_acceptable(host: &str) -> bool {
 pub struct PipeCommand {
     argv: Vec<OsString>,
     ssh_keepalive: bool,
+    /// Made by [`PipeCommand::bootstrap`], and by nothing else: the pipe writes the bootstrap's
+    /// mode line (`attach`) first and reads its answer before fil's preamble
+    /// ([`PipeLink::start`](super::PipeLink::start)).
+    bootstrap: bool,
 }
 
 impl PipeCommand {
@@ -298,6 +303,7 @@ impl PipeCommand {
         Ok(Self {
             argv,
             ssh_keepalive: true,
+            bootstrap: false,
         })
     }
 
@@ -338,6 +344,7 @@ impl PipeCommand {
                 BOOTSTRAP.into(),
             ],
             ssh_keepalive: true,
+            bootstrap: true,
         })
     }
 
@@ -356,7 +363,35 @@ impl PipeCommand {
         Ok(Self {
             argv,
             ssh_keepalive: true,
+            bootstrap: false,
         })
+    }
+
+    /// A local stand-in for the bootstrap's login, for the pipe's own tests: `argv` runs with the
+    /// bootstrap's handling (the mode line, the answer before the preamble).
+    #[cfg(test)]
+    pub(crate) fn bootstrap_for_test(argv: &[&str]) -> Self {
+        Self {
+            argv: argv.iter().map(OsString::from).collect(),
+            ssh_keepalive: false,
+            bootstrap: true,
+        }
+    }
+
+    /// Whether this is the install bootstrap ([`bootstrap`](Self::bootstrap)), whose run starts
+    /// with its mode line on stdin and its answer before fil's preamble.
+    pub fn is_bootstrap(&self) -> bool {
+        self.bootstrap
+    }
+
+    /// The same command with `options` right after the program: options of the local program
+    /// (ssh's `-o BatchMode=yes` for a background run), never part of the remote command, which
+    /// follows the host. Everything else is kept: the remote part, whether this is the
+    /// bootstrap, and the keepalive setting.
+    pub fn with_options(&self, options: Vec<OsString>) -> Self {
+        let mut c = self.clone();
+        c.argv.splice(1..1, options);
+        c
     }
 
     /// Whether to add `ServerAliveInterval` and `ServerAliveCountMax` when the program is `ssh`
@@ -470,8 +505,17 @@ mod tests {
         r#"z=$(wc -c < "$n/fil") || undo; [ "$(($z))" -eq "$s" ] || undo; "#,
     );
 
-    /// The text the owner approved in M4 OQ-1 (2026-11-04), as `docs/m4/plan.md` section 7
-    /// holds it, byte for byte: any other change to the script goes back to the owner.
+    /// The second change the owner approved (N6, 2026-11-04): `check` mode ends with one fixed
+    /// line, so that `fil install --check` can tell a complete report from a host that answered
+    /// nothing (a forced `/bin/true`). Inserted before `check`'s `exit 0`; nothing else changed.
+    const CHECK_END: (&str, &str) = (
+        r#"lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; exit 0; fi; "#,
+        r#"lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; say FIL-CHECK-END; exit 0; fi; "#,
+    );
+
+    /// The text the owner approved in M4 OQ-1 (2026-11-04), with N6 (the same day), as
+    /// `docs/m4/plan.md` section 7 holds it, byte for byte: any other change to the script goes
+    /// back to the owner.
     #[test]
     fn the_bootstrap_is_the_text_the_owner_approved() {
         let plan = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/m4/plan.md");
@@ -488,6 +532,11 @@ mod tests {
         let (was, is) = DASH_FIX;
         assert_eq!(ours.matches(is).count(), 1);
         assert!(!ours.contains(was));
+        // And N6: the end marker once, as the last thing `check` says, and nowhere else.
+        let (was, is) = CHECK_END;
+        assert_eq!(ours.matches(is).count(), 1);
+        assert!(!ours.contains(was));
+        assert_eq!(ours.matches("FIL-CHECK-END").count(), 1);
     }
 
     /// The rest of §2.5's checks, on the text itself: nothing the script hands on is changed

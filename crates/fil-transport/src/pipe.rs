@@ -181,9 +181,22 @@ pub enum PipeErrorKind {
     Spawn(io::Error),
     #[error("no fil preamble within the first {limit} bytes; is fil installed on the remote host?")]
     NoPreamble { limit: usize },
-    /// The stream ended before the peer's first frame.
+    /// The stream ended before the peer's first frame. [`PipeError::ended_before_preamble`] says
+    /// whether fil's preamble had arrived.
     #[error("the pipe closed before fil started")]
     Closed,
+    /// The install bootstrap ran, but what answered was fil's preamble with no `FIL-BOOT1 exec`
+    /// before it: a forced command (`ForceCommand`, `command=` in `authorized_keys`) ran `fil
+    /// server --stdio` in place of the bootstrap. The run is ended at once, with nothing more
+    /// sent.
+    #[error(
+        "the host ran `fil server --stdio` in place of fil's install command (a forced command that allows only the plain one)"
+    )]
+    Forced,
+    /// The install bootstrap found no usable fil of this wire on the host and greeted for an
+    /// upload, which this run did not make ([`Greeting::decline`]).
+    #[error("the install bootstrap found no fil of this version on the host")]
+    NotInstalled,
     #[error("protocol version mismatch: this is major {ours}, the peer is major {theirs}")]
     Version { ours: u16, theirs: u16 },
     #[error("timed out waiting for {0}")]
@@ -207,6 +220,10 @@ pub struct PipeError {
     /// What the command wrote to stderr (the last few KiB), with [`PipeStderr::Capture`].
     /// Untrusted; use [`PipeError::stderr_text`].
     pub stderr: Vec<u8>,
+    /// The stream ended ([`PipeErrorKind::Closed`]) before fil's preamble: nothing of fil ever
+    /// answered, as when the login shell found no `fil`. `false` for a relay that wrote its
+    /// preamble and then failed, and for every other kind.
+    pub ended_before_preamble: bool,
 }
 
 impl PipeError {
@@ -216,6 +233,7 @@ impl PipeError {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            ended_before_preamble: false,
         }
     }
 
@@ -233,6 +251,8 @@ impl PipeError {
     pub fn down_reason(&self) -> DownReason {
         match &self.kind {
             PipeErrorKind::NoPreamble { .. }
+            | PipeErrorKind::Forced
+            | PipeErrorKind::NotInstalled
             | PipeErrorKind::Version { .. }
             | PipeErrorKind::Timeout(_)
             | PipeErrorKind::InvalidCommand(_) => DownReason::Refused(self.to_string()),
@@ -582,7 +602,7 @@ impl PipeLink {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (r, w) = tokio::io::split(stream);
-        Self::establish(r, w, Role::Client, cfg, None, None).await
+        Self::establish(r, w, Role::Client, cfg, None, None, Vec::new()).await
     }
 
     /// Daemon side over a byte stream (the relay's Unix socket): no preamble. Waits for the
@@ -592,7 +612,7 @@ impl PipeLink {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (r, w) = tokio::io::split(stream);
-        Self::establish(r, w, Role::Daemon, cfg, None, None).await
+        Self::establish(r, w, Role::Daemon, cfg, None, None, Vec::new()).await
     }
 
     /// Like [`accept`](Self::accept), for a stream that comes as two halves (a process's stdin
@@ -602,13 +622,40 @@ impl PipeLink {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        Self::establish(read, write, Role::Daemon, cfg, None, None).await
+        Self::establish(read, write, Role::Daemon, cfg, None, None, Vec::new()).await
     }
 
     /// Runs the pipe command and connects to it as the client. its stderr goes where `cfg.stderr` says: by default
     /// (`Inherit`) to ours, so ssh's prompts and errors stay visible. The child is reaped when the link ends,
-    /// whatever the reason.
+    /// whatever the reason. For the install bootstrap ([`PipeCommand::bootstrap`]) a greeting
+    /// (no usable copy on the host) is declined, never answered with an upload: that is an
+    /// error, [`PipeErrorKind::NotInstalled`]. [`start`](Self::start) hands the greeting over.
     pub async fn spawn(command: &PipeCommand, cfg: PipeConfig) -> Result<Self, PipeError> {
+        match Self::start(command, cfg).await? {
+            Spawned::Up(link) => Ok(link),
+            Spawned::Greeted(g) => Err(g.decline().await),
+        }
+    }
+
+    /// [`spawn`](Self::spawn), with the install bootstrap's greeting handed to the caller.
+    ///
+    /// For every command but [`PipeCommand::bootstrap`] this is `spawn`. For the bootstrap, the
+    /// pipe first writes the mode line `attach` (a constant: no caller supplies it) and reads the
+    /// script's answer, skipping noise (rc files) within `cfg.preamble_limit`:
+    ///
+    /// - `FIL-BOOT1 exec`: an installed copy of this wire is starting; the link is established
+    ///   on its preamble as usual ([`Spawned::Up`]);
+    /// - `FIL-BOOT1 attach <uname -s> <uname -m>`: no usable copy. The pipe stops there and
+    ///   returns [`Spawned::Greeted`], so the caller may upload one (in lockstep, over
+    ///   [`Greeting::io`]) and then [`proceed`](Greeting::proceed), or
+    ///   [`decline`](Greeting::decline);
+    /// - fil's preamble with no marker before it: a forced command ran `fil server --stdio` in
+    ///   place of the bootstrap, which has already read the mode line as input. The run ends at
+    ///   once with [`PipeErrorKind::Forced`], nothing more sent.
+    ///
+    /// `cfg.preamble_timeout` bounds the wait for the answer as it bounds the wait for a
+    /// preamble.
+    pub async fn start(command: &PipeCommand, cfg: PipeConfig) -> Result<Spawned, PipeError> {
         let argv = command.effective_argv(&cfg.params);
         let (program, args) = argv
             .split_first()
@@ -647,9 +694,40 @@ impl PipeLink {
             .stderr
             .take()
             .map(|e| StderrCapture::start(e, tee, terminal_sink()));
-        Self::establish(stdout, stdin, Role::Client, cfg, Some(child), capture).await
+        let read = BootRead::new(stdout);
+        if !command.is_bootstrap() {
+            return Self::establish(
+                read,
+                stdin,
+                Role::Client,
+                cfg,
+                Some(child),
+                capture,
+                Vec::new(),
+            )
+            .await
+            .map(Spawned::Up);
+        }
+        let mut boot = Boot {
+            read,
+            write: stdin,
+            child,
+            stderr: capture,
+            cfg,
+            noise: Vec::new(),
+        };
+        // A script that is already gone (a forced command that exited) cannot take the line;
+        // what it printed still says why, so the answer is read either way.
+        let _ = async {
+            boot.write.write_all(ATTACH_MODE).await?;
+            boot.write.flush().await
+        }
+        .await;
+        boot.answer().await
     }
 
+    /// `noise` is what the install bootstrap's run printed before its marker (rc files): it
+    /// leads the banner.
     async fn establish<R, W>(
         mut read: R,
         mut write: W,
@@ -657,6 +735,7 @@ impl PipeLink {
         cfg: PipeConfig,
         mut child: Option<ChildGuard>,
         stderr: Option<Arc<StderrCapture>>,
+        mut noise: Vec<u8>,
     ) -> Result<Self, PipeError>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -667,13 +746,19 @@ impl PipeLink {
             skipped: Vec::new(),
             decoder: FrameDecoder::default(),
             frames: Vec::new(),
+            preamble_found: false,
         };
         let result = hs.run(&mut read, &mut write, role, &cfg).await;
+        noise.append(&mut hs.skipped);
         let (peer_major, first_ping) = match result {
             Ok(v) => v,
             Err(kind) => {
+                let ended_before_preamble = role == Role::Client
+                    && !hs.preamble_found
+                    && matches!(kind, PipeErrorKind::Closed);
                 let mut err = PipeError::new(kind);
-                err.skipped = hs.skipped;
+                err.skipped = noise;
+                err.ended_before_preamble = ended_before_preamble;
                 if let Some(child) = child.as_mut() {
                     drop(write);
                     err.exit = Some(reap(child, cfg.close_grace).await);
@@ -710,7 +795,7 @@ impl PipeLink {
         );
         Ok(Self {
             shared,
-            banner: hs.skipped,
+            banner: noise,
             peer_major,
             child_id,
             finished: done_rx,
@@ -798,12 +883,286 @@ impl Drop for PipeLink {
     }
 }
 
+/// The install bootstrap's mode line for a pipe run: an attach. The only bytes the pipe writes
+/// before fil's own protocol, and only for a [`PipeCommand::bootstrap`] command: a constant, never
+/// bytes a caller supplies.
+const ATTACH_MODE: &[u8] = b"attach\n";
+/// What a run that will not upload answers the bootstrap's greeting with: anything but `put`
+/// ends the script.
+const END_LINE: &[u8] = b"end\n";
+/// The bootstrap's marker lines (`docs/m4/plan.md` §3 U1).
+const BOOT_EXEC: &[u8] = b"FIL-BOOT1 exec";
+const BOOT_ATTACH: &[u8] = b"FIL-BOOT1 attach ";
+/// The start of fil's preamble (`fil_proto::preamble`).
+const PREAMBLE_MAGIC: &[u8] = b"\x1bFIL-CONNECT ";
+/// The longest line of the bootstrap's answer kept whole; a longer one is noise.
+const BOOT_LINE_MAX: usize = 4096;
+
+/// What [`PipeLink::start`] made.
+pub enum Spawned {
+    /// The link is up.
+    Up(PipeLink),
+    /// The install bootstrap found no usable copy of this wire and waits for an upload.
+    Greeted(Box<Greeting>),
+}
+
+/// The stdout of a pipe command, with what has been read from it but not consumed yet in front.
+pub struct BootRead {
+    pending: Vec<u8>,
+    at: usize,
+    inner: tokio::process::ChildStdout,
+}
+
+impl BootRead {
+    fn new(inner: tokio::process::ChildStdout) -> Self {
+        Self {
+            pending: Vec::new(),
+            at: 0,
+            inner,
+        }
+    }
+
+    fn buffered(&self) -> &[u8] {
+        &self.pending[self.at..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.at += n;
+        if self.at == self.pending.len() {
+            self.pending.clear();
+            self.at = 0;
+        }
+    }
+
+    /// Puts `bytes` back in front of what is still to be read.
+    fn unread(&mut self, mut bytes: Vec<u8>) {
+        bytes.extend_from_slice(self.buffered());
+        self.pending = bytes;
+        self.at = 0;
+    }
+
+    /// Reads more into the buffer; `false` at the end of the stream.
+    async fn fill(&mut self) -> io::Result<bool> {
+        let mut chunk = [0u8; 4096];
+        let n = self.inner.read(&mut chunk).await?;
+        if self.at > 0 {
+            self.pending.drain(..self.at);
+            self.at = 0;
+        }
+        self.pending.extend_from_slice(&chunk[..n]);
+        Ok(n > 0)
+    }
+
+    /// Reads the bootstrap's answer in `attach` mode: up to and including its marker line, the
+    /// noise before it (rc files) moved to `noise`, at most `limit` bytes of it.
+    async fn scan_boot(
+        &mut self,
+        noise: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<BootSaid, PipeErrorKind> {
+        let mut skipped = 0usize;
+        let mut skip = |noise: &mut Vec<u8>, bytes: &[u8]| -> Result<(), PipeErrorKind> {
+            skipped += bytes.len();
+            if noise.len() < limit + 64 {
+                let take = bytes.len().min(limit + 64 - noise.len());
+                noise.extend_from_slice(&bytes[..take]);
+            }
+            if skipped > limit {
+                return Err(PipeErrorKind::NoPreamble { limit });
+            }
+            Ok(())
+        };
+        loop {
+            let buf = self.buffered();
+            let nl = buf.iter().position(|&b| b == b'\n');
+            // fil's preamble on the line being read, with no marker before it: a forced command.
+            let line_end = nl.unwrap_or(buf.len());
+            if buf[..line_end]
+                .windows(PREAMBLE_MAGIC.len())
+                .any(|w| w == PREAMBLE_MAGIC)
+            {
+                return Err(PipeErrorKind::Forced);
+            }
+            if let Some(nl) = nl {
+                let line = buf[..nl].strip_suffix(b"\r").unwrap_or(&buf[..nl]).to_vec();
+                if line == BOOT_EXEC {
+                    self.consume(nl + 1);
+                    return Ok(BootSaid::Exec);
+                }
+                if let Some(rest) = line.strip_prefix(BOOT_ATTACH) {
+                    let mut parts = rest.split(|&b| b == b' ');
+                    let sys = fil_proto::text::sanitize_inline(parts.next().unwrap_or_default());
+                    let machine =
+                        fil_proto::text::sanitize_inline(parts.next().unwrap_or_default());
+                    self.consume(nl + 1);
+                    return Ok(BootSaid::Attach { sys, machine });
+                }
+                let whole = buf[..=nl].to_vec();
+                self.consume(nl + 1);
+                skip(noise, &whole)?;
+                continue;
+            }
+            if buf.len() > BOOT_LINE_MAX {
+                // A line too long to be the answer: noise, but its tail may hold the start of a
+                // marker or of the preamble.
+                let cut = buf.len() - PREAMBLE_MAGIC.len();
+                let gone = buf[..cut].to_vec();
+                self.consume(cut);
+                skip(noise, &gone)?;
+            }
+            if !self.fill().await.map_err(PipeErrorKind::Io)? {
+                return Err(PipeErrorKind::Closed);
+            }
+        }
+    }
+}
+
+impl AsyncRead for BootRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.at < this.pending.len() {
+            let n = (this.pending.len() - this.at).min(buf.remaining());
+            buf.put_slice(&this.pending[this.at..this.at + n]);
+            this.consume(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+/// The marker the bootstrap answered `attach` with.
+enum BootSaid {
+    Exec,
+    Attach { sys: String, machine: String },
+}
+
+/// An install bootstrap's run before fil's preamble.
+struct Boot {
+    read: BootRead,
+    write: tokio::process::ChildStdin,
+    child: ChildGuard,
+    stderr: Option<Arc<StderrCapture>>,
+    cfg: PipeConfig,
+    /// What the run printed before its marker.
+    noise: Vec<u8>,
+}
+
+impl Boot {
+    /// Reads the answer to `attach` and acts on it.
+    async fn answer(mut self) -> Result<Spawned, PipeError> {
+        let limit = self.cfg.preamble_limit;
+        let said = {
+            let scan = self.read.scan_boot(&mut self.noise, limit);
+            match self.cfg.preamble_timeout {
+                Some(t) => timeout(t, scan).await.unwrap_or(Err(PipeErrorKind::Timeout(
+                    "the install bootstrap's answer",
+                ))),
+                None => scan.await,
+            }
+        };
+        match said {
+            Ok(BootSaid::Exec) => {
+                let noise = std::mem::take(&mut self.noise);
+                PipeLink::establish(
+                    self.read,
+                    self.write,
+                    Role::Client,
+                    self.cfg,
+                    Some(self.child),
+                    self.stderr,
+                    noise,
+                )
+                .await
+                .map(Spawned::Up)
+            }
+            Ok(BootSaid::Attach { sys, machine }) => Ok(Spawned::Greeted(Box::new(Greeting {
+                sys,
+                machine,
+                boot: self,
+            }))),
+            Err(kind) => Err(self.fail(kind).await),
+        }
+    }
+
+    /// Ends the run: its stdin is closed, it is given `close_grace` to exit and then killed,
+    /// and reaped. The error carries what it printed and how it ended.
+    async fn fail(mut self, kind: PipeErrorKind) -> PipeError {
+        let ended_before_preamble = matches!(kind, PipeErrorKind::Closed);
+        let mut err = PipeError::new(kind);
+        err.skipped = std::mem::take(&mut self.noise);
+        err.ended_before_preamble = ended_before_preamble;
+        drop(self.write);
+        err.exit = Some(reap(&mut self.child, self.cfg.close_grace).await);
+        if let Some(cap) = &self.stderr {
+            err.stderr = cap.finish(Duration::from_millis(200)).await;
+            cap.stop_tee();
+        }
+        err
+    }
+}
+
+/// The install bootstrap's greeting (`FIL-BOOT1 attach <uname -s> <uname -m>`): the host has no
+/// usable fil of this wire, and the script waits for an upload ([`PipeLink::start`]). Dropping
+/// it kills the command.
+pub struct Greeting {
+    sys: String,
+    machine: String,
+    boot: Boot,
+}
+
+impl Greeting {
+    /// The host's `uname -s` and `uname -m`, as the script reported them (sanitized; still
+    /// only the host's word).
+    pub fn uname(&self) -> (&str, &str) {
+        (&self.sys, &self.machine)
+    }
+
+    /// The run's stdout (what is buffered first) and stdin, for the upload. The caller keeps the
+    /// exchange in lockstep (`docs/m4/plan.md` §3 U1).
+    pub fn io(&mut self) -> (&mut BootRead, &mut tokio::process::ChildStdin) {
+        (&mut self.boot.read, &mut self.boot.write)
+    }
+
+    /// After an upload answered with `go`: reads on, `unread` (what the caller read past the
+    /// result line) first, for `FIL-BOOT1 exec` and the installed relay's preamble, and
+    /// establishes the link.
+    pub async fn proceed(mut self: Box<Self>, unread: Vec<u8>) -> Result<PipeLink, PipeError> {
+        self.boot.read.unread(unread);
+        match self.boot.answer().await? {
+            Spawned::Up(link) => Ok(link),
+            Spawned::Greeted(again) => Err(again
+                .boot
+                .fail(PipeErrorKind::Io(io::Error::other(
+                    "the install bootstrap greeted again after the upload",
+                )))
+                .await),
+        }
+    }
+
+    /// Ends the run without an upload (`end`, then the stream is closed): the error is
+    /// [`PipeErrorKind::NotInstalled`], with how the command ended.
+    pub async fn decline(mut self: Box<Self>) -> PipeError {
+        let _ = async {
+            self.boot.write.write_all(END_LINE).await?;
+            self.boot.write.flush().await
+        }
+        .await;
+        self.boot.fail(PipeErrorKind::NotInstalled).await
+    }
+}
+
 /// The state of the opening exchange, kept outside `run` so the caller can still read what was
 /// skipped when it fails.
 struct Handshake {
     skipped: Vec<u8>,
     decoder: FrameDecoder,
     frames: Vec<Frame>,
+    /// The preamble has been read (client side).
+    preamble_found: bool,
 }
 
 impl Handshake {
@@ -837,6 +1196,7 @@ impl Handshake {
                     theirs: major,
                 });
             }
+            self.preamble_found = true;
             peer_major = Some(major);
             leftover = rest;
         }
@@ -1247,6 +1607,7 @@ mod tests {
             cfg,
             Some(child),
             Some(cap.clone()),
+            Vec::new(),
         )
         .await;
         (link, cap)
@@ -1440,5 +1801,92 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         cap.stop_tee();
         assert_eq!(shown.text(), "ok\n");
+    }
+
+    // ---- the install bootstrap's run (`PipeLink::start`) -------------------------------------
+
+    fn boot_cfg() -> PipeConfig {
+        let mut cfg = PipeConfig::new(LinkParams::default());
+        cfg.stderr = PipeStderr::Capture;
+        cfg.preamble_timeout = Some(Duration::from_secs(20));
+        cfg
+    }
+
+    async fn boot(script: &str) -> Result<Spawned, PipeError> {
+        let cmd = PipeCommand::bootstrap_for_test(&["/bin/sh", "-c", script]);
+        PipeLink::start(&cmd, boot_cfg()).await
+    }
+
+    /// The mode line is the first and only thing written before the answer; a greeting past rc
+    /// noise is handed over with the host's names; declining answers `end`.
+    #[tokio::test]
+    async fn the_bootstrap_gets_its_mode_line_and_a_greeting_stops_the_pipe() {
+        let script = r#"IFS= read -r m; printf 'mode=%s;' "$m" >&2; echo motd; printf 'FIL-BOOT1 attach Lin\033[2Jux x86_64\n'; IFS= read -r c; printf 'then=%s;' "$c" >&2"#;
+        let Ok(Spawned::Greeted(g)) = boot(script).await else {
+            panic!("no greeting");
+        };
+        assert_eq!(g.uname(), ("Lin[2Jux", "x86_64"), "sanitized");
+        let e = g.decline().await;
+        assert!(matches!(e.kind, PipeErrorKind::NotInstalled), "{e}");
+        assert_eq!(e.skipped, b"motd\n");
+        assert_eq!(e.stderr_text(), "mode=attach;then=end;");
+        assert!(!e.ended_before_preamble);
+        // `spawn` declines for its caller.
+        let cmd = PipeCommand::bootstrap_for_test(&["/bin/sh", "-c", script]);
+        let e = PipeLink::spawn(&cmd, boot_cfg()).await.err().unwrap();
+        assert!(matches!(e.kind, PipeErrorKind::NotInstalled), "{e}");
+    }
+
+    /// Any other command gets nothing written before fil's own protocol.
+    #[tokio::test]
+    async fn a_plain_command_gets_no_mode_line() {
+        let cmd = PipeCommand::custom([
+            "/bin/sh",
+            "-c",
+            "IFS= read -r m; printf 'read=%s;' \"$m\" >&2",
+        ])
+        .unwrap();
+        let mut cfg = boot_cfg();
+        cfg.preamble_timeout = Some(Duration::from_millis(500));
+        let e = PipeLink::spawn(&cmd, cfg).await.err().unwrap();
+        assert!(matches!(e.kind, PipeErrorKind::Timeout(_)), "{e}");
+        // It read nothing at all before its stdin was closed.
+        assert_eq!(e.stderr_text(), "read=;");
+    }
+
+    /// A preamble with no `FIL-BOOT1 exec` before it is a forced command: the run ends at once.
+    #[tokio::test]
+    async fn an_unmarked_preamble_is_a_forced_command() {
+        for script in [
+            r#"read m; printf '\033FIL-CONNECT 1\n'; sleep 30"#,
+            r#"read m; echo noise; printf 'more noise\033FIL-CONNECT 1\n'; sleep 30"#,
+        ] {
+            let t = std::time::Instant::now();
+            let e = boot(script).await.err().unwrap();
+            assert!(matches!(e.kind, PipeErrorKind::Forced), "{e}");
+            assert!(t.elapsed() < Duration::from_secs(10), "ended at once");
+        }
+    }
+
+    /// After `FIL-BOOT1 exec` the preamble follows as on the plain command, and a stream that
+    /// ends after it is not "ended before the preamble"; one that ends before any answer is.
+    #[tokio::test]
+    async fn the_fast_path_goes_on_to_the_preamble() {
+        let e = boot(r#"read m; echo 'FIL-BOOT1 exec'; printf '\033FIL-CONNECT 1\n'; exit 127"#)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(e.kind, PipeErrorKind::Closed), "{e}");
+        assert!(!e.ended_before_preamble, "the preamble had come");
+        let e = boot("read m; exit 127").await.err().unwrap();
+        assert!(matches!(e.kind, PipeErrorKind::Closed), "{e}");
+        assert!(e.ended_before_preamble);
+        assert!(e.exit.unwrap().ends_with("exit status: 127"));
+        // Too much noise before any answer.
+        let e = boot("read m; yes noise | head -c 200000; sleep 30")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(e.kind, PipeErrorKind::NoPreamble { .. }), "{e}");
     }
 }

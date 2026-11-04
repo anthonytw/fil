@@ -29,13 +29,15 @@ use std::time::{Duration, Instant};
 use fil_proto::version::{Peer, VersionMismatch, WireVersion};
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::pipe::{
-    PipeCommand, PipeConfig, PipeError, PipeErrorKind, PipeLink, PipeStderr,
+    PipeCommand, PipeConfig, PipeError, PipeErrorKind, PipeLink, PipeStderr, Spawned,
 };
 use fil_transport::quic::QuicLink;
 use fil_transport::{DownReason, LinkError, LinkParams};
 use tokio::sync::OnceCell;
 
 use crate::dialer::{Connector, PipeFailure, PipeUp, Severity};
+use crate::install::attach::{self, Offer};
+use crate::install::fallback::{Command, Next, Outcome, RemoteMode, Run};
 use crate::link::AnyLink;
 
 /// How long a background pipe run may take to show fil's preamble. The first attach waits as
@@ -87,7 +89,15 @@ enum Target {
 }
 
 pub struct Connect {
+    /// The plain command, or the user's own `pipe`.
     command: PipeCommand,
+    /// The install bootstrap for the host; `None` with a custom `pipe`, which is never
+    /// rewritten.
+    bootstrap: Option<PipeCommand>,
+    /// Which of the two each connection of the run uses (`crate::install::fallback`).
+    run: Run,
+    /// What a connection may do when the bootstrap finds no fil on the host.
+    offer: Offer,
     /// The host as typed (a name to look up only with the default ssh pipe, when `ssh -G` fails).
     host: String,
     direct_address: Option<String>,
@@ -115,12 +125,15 @@ impl Connect {
         direct_address: Option<String>,
         params: LinkParams,
     ) -> Result<Self, PipeError> {
-        let command = match custom {
-            Some(argv) => PipeCommand::custom(argv)?,
-            None => PipeCommand::ssh(host)?,
+        let (command, bootstrap) = match custom {
+            Some(argv) => (PipeCommand::custom(argv)?, None),
+            None => (PipeCommand::ssh(host)?, Some(PipeCommand::bootstrap(host)?)),
         };
         Ok(Self {
             command,
+            run: Run::new(RemoteMode::Auto, bootstrap.is_none()),
+            bootstrap,
+            offer: Offer::None,
             host: host.to_string(),
             direct_address,
             custom_pipe: custom.is_some(),
@@ -129,6 +142,55 @@ impl Connect {
             lookup: system_lookup(),
             resolved: Mutex::new(None),
         })
+    }
+
+    /// The run's choice of remote command (`remote = ...`), shared with whoever else connects
+    /// in the run or sees its hello, and what a connection may do when the host has no fil.
+    pub fn with_run(mut self, run: Run, offer: Offer) -> Self {
+        self.run = run;
+        self.offer = offer;
+        self
+    }
+
+    /// One pipe run with `which` command.
+    async fn run_one(
+        &self,
+        which: Command,
+        interactive: bool,
+    ) -> Result<PipeUp<AnyLink>, (PipeFailure, Outcome)> {
+        let base = match (which, &self.bootstrap) {
+            (Command::Bootstrap, Some(b)) => b,
+            // The choice never asks for the bootstrap with a custom pipe; if it did, the
+            // user's command is what runs.
+            _ => &self.command,
+        };
+        let cfg = pipe_config(self.params, interactive);
+        let command = if interactive {
+            base.clone()
+        } else {
+            without_tty(base)
+        };
+        let link = match PipeLink::start(&command, cfg).await {
+            Ok(Spawned::Up(link)) => link,
+            Ok(Spawned::Greeted(g)) => attach::greeted(g, &self.host, self.offer, interactive)
+                .await
+                .map_err(|f| (f, Outcome::Other))?,
+            Err(e) => {
+                let outcome = Outcome::of_pipe_error(&e);
+                // The interactive run's stderr was shown as it arrived: not said again.
+                return Err((failure_with(e, interactive), outcome));
+            }
+        };
+        let banner = link.banner().to_vec();
+        Ok(PipeUp {
+            link: AnyLink::Pipe(link),
+            banner,
+        })
+    }
+
+    /// The run's choice, for whoever sees how a connection ended past the pipe (the hello).
+    pub fn run(&self) -> &Run {
+        &self.run
     }
 
     /// The name to resolve for the UDP dial, or why there is none.
@@ -256,23 +318,35 @@ where
 impl Connector for Connect {
     type Link = AnyLink;
 
+    /// The run's command (`remote = ...`): `fil server --stdio` first, and the bootstrap only
+    /// as `crate::install::fallback` says (at the run's first connection, or from the start with
+    /// `remote = "installed"`), never with a custom pipe or `remote = "plain"`.
     async fn run_pipe(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
-        let cfg = pipe_config(self.params, interactive);
-        let command = if interactive {
-            self.command.clone()
-        } else {
-            without_tty(&self.command)
-        };
-        match PipeLink::spawn(&command, cfg).await {
-            Ok(link) => {
-                let banner = link.banner().to_vec();
-                Ok(PipeUp {
-                    link: AnyLink::Pipe(link),
-                    banner,
-                })
+        let which = self.run.next();
+        let (failed, outcome) = match self.run_one(which, interactive).await {
+            Ok(up) => {
+                self.run.came_up(which);
+                return Ok(up);
             }
-            // The interactive run's stderr was shown as it arrived: not said again.
-            Err(e) => Err(failure_with(e, interactive)),
+            Err(e) => e,
+        };
+        match self.run.failed(which, outcome) {
+            Next::Retry(Command::Bootstrap) => {
+                tracing::info!(
+                    "the plain remote command found no fil of this wire; trying the install bootstrap"
+                );
+                match self.run_one(Command::Bootstrap, interactive).await {
+                    Ok(up) => {
+                        self.run.came_up(Command::Bootstrap);
+                        Ok(up)
+                    }
+                    Err((f, outcome)) => {
+                        self.run.failed(Command::Bootstrap, outcome);
+                        Err(f)
+                    }
+                }
+            }
+            Next::Retry(Command::Plain) | Next::Fail => Err(failed),
         }
     }
 
@@ -281,6 +355,7 @@ impl Connector for Connect {
     }
 
     fn session_started(&self, link: &AnyLink) {
+        self.run.session_started();
         if let AnyLink::Pipe(p) = link {
             p.stop_stderr_tee();
         }
@@ -396,6 +471,14 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
             Severity::Permanent,
             format!("fil is not installed on the remote host: {NOT_INSTALLED}"),
         ),
+        PipeErrorKind::Forced => (
+            Severity::Permanent,
+            format!(
+                "{}: use remote = \"plain\" or \"auto\" for this host",
+                e.kind
+            ),
+        ),
+        PipeErrorKind::NotInstalled => (Severity::Permanent, attach::NO_COPY.to_string()),
         PipeErrorKind::InvalidCommand(_) | PipeErrorKind::Spawn(_) => {
             (Severity::Permanent, e.to_string())
         }
@@ -425,8 +508,13 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
 pub const NOT_INSTALLED: &str = "the remote command `fil server --stdio` found no `fil` on the PATH of a non-interactive ssh login there (`ssh HOST 'echo $PATH'` shows that PATH). Copy a release's bin/fil into a directory on it, such as /usr/local/bin, or add its directory to the PATH that your shell sets for non-interactive logins (~/.bashrc above its interactive check, ~/.zshenv, ~/.config/fish/config.fish), then run fil again";
 
 /// Whether a pipe that ended before fil's preamble ended because the login shell found no `fil`:
-/// status 127 (sh, bash, zsh, dash, ksh, fish), or what csh and tcsh say (status 1).
+/// status 127 (sh, bash, zsh, dash, ksh, fish), or what csh and tcsh say (status 1). Only if the
+/// stream really ended before the preamble: a relay that exits 127 after its preamble is not "not
+/// installed".
 fn fil_missing(e: &PipeError) -> bool {
+    if !e.ended_before_preamble {
+        return false;
+    }
     let status_127 = e
         .exit
         .as_deref()
@@ -478,26 +566,27 @@ fn is_ssh(program: &OsString) -> bool {
 /// up on an unreachable host in ten seconds, and say only errors. Options the command already
 /// sets are left alone. Any other program runs as given (it may prompt on a reconnect).
 pub fn without_tty(command: &PipeCommand) -> PipeCommand {
-    let mut argv: Vec<OsString> = command.argv().to_vec();
-    if argv.first().is_some_and(is_ssh) {
-        let mentions = |opt: &str| {
-            argv.iter()
-                .any(|a| a.to_string_lossy().to_ascii_lowercase().contains(opt))
-        };
-        let mut extra: Vec<OsString> = Vec::new();
-        if !mentions("batchmode") {
-            extra.extend(["-o".into(), "BatchMode=yes".into()]);
-        }
-        if !mentions("connecttimeout") {
-            extra.extend(["-o".into(), "ConnectTimeout=10".into()]);
-        }
-        if !mentions("loglevel") {
-            extra.extend(["-o".into(), "LogLevel=ERROR".into()]);
-        }
-        argv.splice(1..1, extra);
+    let argv = command.argv();
+    if !argv.first().is_some_and(is_ssh) {
+        return command.clone();
     }
-    // The argv came from a valid command, so it is still one.
-    PipeCommand::custom(argv).unwrap_or_else(|_| command.clone())
+    let mentions = |opt: &str| {
+        argv.iter()
+            .any(|a| a.to_string_lossy().to_ascii_lowercase().contains(opt))
+    };
+    let mut extra: Vec<OsString> = Vec::new();
+    if !mentions("batchmode") {
+        extra.extend(["-o".into(), "BatchMode=yes".into()]);
+    }
+    if !mentions("connecttimeout") {
+        extra.extend(["-o".into(), "ConnectTimeout=10".into()]);
+    }
+    if !mentions("loglevel") {
+        extra.extend(["-o".into(), "LogLevel=ERROR".into()]);
+    }
+    // Local options, after the program: the remote part, and whether this is the bootstrap,
+    // stay as they were.
+    command.with_options(extra)
 }
 
 /// `user@host` and `[v6]` as a name to resolve.
@@ -640,6 +729,7 @@ mod tests {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            ended_before_preamble: false,
         });
         assert_eq!(v.severity, Severity::Version);
         assert!(v.message.contains("major 1") && v.message.contains("major 2"));
@@ -654,6 +744,7 @@ mod tests {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            ended_before_preamble: false,
         });
         assert!(
             older.message.contains("older")
@@ -666,6 +757,7 @@ mod tests {
             skipped: b"bash: fil: command not found\n".to_vec(),
             exit: None,
             stderr: Vec::new(),
+            ended_before_preamble: false,
         });
         assert_eq!(n.severity, Severity::Permanent);
         assert!(n.message.contains("fil server --stdio") && n.message.contains("non-interactive"));
@@ -675,6 +767,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
             stderr: Vec::new(),
+            ended_before_preamble: true,
         });
         assert_eq!(c.severity, Severity::Transient);
         assert!(c.message.contains("255"));
@@ -692,6 +785,7 @@ mod tests {
                 skipped: Vec::new(),
                 exit: Some(exit.into()),
                 stderr: stderr.to_vec(),
+                ended_before_preamble: true,
             });
             assert_eq!(m.severity, Severity::Permanent, "{exit}");
             assert!(
@@ -707,12 +801,33 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited: exit status: 1".into()),
             stderr: b"fil: cannot use /tmp/fil-1000\n".to_vec(),
+            ended_before_preamble: true,
         });
         assert_eq!(
             other.severity,
             Severity::Transient,
             "a relay's own failure is not a missing fil"
         );
+        // A relay that wrote its preamble and then exited 127 is not a missing fil either.
+        let after = failure(PipeError {
+            kind: PipeErrorKind::Closed,
+            skipped: Vec::new(),
+            exit: Some("exited: exit status: 127".into()),
+            stderr: Vec::new(),
+            ended_before_preamble: false,
+        });
+        assert_eq!(after.severity, Severity::Transient, "{}", after.message);
+        // The bootstrap's two refusals are permanent, with words that say what to do.
+        for kind in [PipeErrorKind::Forced, PipeErrorKind::NotInstalled] {
+            let f = failure(PipeError {
+                kind,
+                skipped: Vec::new(),
+                exit: None,
+                stderr: Vec::new(),
+                ended_before_preamble: false,
+            });
+            assert_eq!(f.severity, Severity::Permanent, "{}", f.message);
+        }
     }
 
     #[test]
@@ -767,6 +882,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited: exit status: 255".into()),
             stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
+            ended_before_preamble: true,
         });
         assert!(f.message.contains("Permission denied"), "{}", f.message);
         assert!(f.note.unwrap().contains("interactive login"));
@@ -997,6 +1113,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
             stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
+            ended_before_preamble: true,
         };
         let shown = failure_with(err(), true);
         assert!(

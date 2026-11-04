@@ -87,6 +87,12 @@ pub enum BootError {
     Ended(String),
     #[error("the host printed too much before fil's install command answered")]
     TooMuchNoise,
+    /// `check`'s report ended without its end marker (`FIL-CHECK-END`, owner's N6): the host
+    /// ran something other than the bootstrap (a forced `/bin/true`), or the report was cut.
+    #[error(
+        "no answer from the host: its report ended without fil's end marker (a forced command that runs something else, or a cut connection), so nothing was checked"
+    )]
+    NoAnswer,
     #[error("timed out waiting for the host")]
     Timeout,
     #[error("the pipe failed: {0}")]
@@ -350,13 +356,18 @@ fn clean(text: &str) -> String {
         .collect()
 }
 
-/// Reads `check`'s answer to the end.
+/// The last line of `check`'s report (N6, owner 2026-11-04).
+const CHECK_END: &str = "FIL-CHECK-END";
+
+/// Reads `check`'s answer, up to its end marker. A report that ends without it is no answer at
+/// all ([`BootError::NoAnswer`]), never "nothing installed".
 pub async fn read_check<R: AsyncRead + Unpin>(r: &mut Lines<R>) -> Result<CheckReport, BootError> {
     let mut report = CheckReport::default();
     let mut lines = 0;
     loop {
         match r.next().await? {
-            Said::End => return Ok(report),
+            Said::End => return Err(BootError::NoAnswer),
+            Said::Fil(l) if l == CHECK_END => return Ok(report),
             Said::Preamble => return Err(BootError::Forced),
             Said::Fil(l) => {
                 lines += 1;
@@ -512,13 +523,26 @@ mod tests {
 
     #[tokio::test]
     async fn check_and_remove_answers() {
-        let mut r = lines(
-            b"rc noise\nFIL-HAVE 0.1.0-w1.12\nFIL-HAVE x\x1b[2Jy\nFIL-PATH fil 0.0.9 (wire 1.3)\n",
-        );
-        let c = read_check(&mut r).await.unwrap();
+        let report =
+            b"rc noise\nFIL-HAVE 0.1.0-w1.12\nFIL-HAVE x\x1b[2Jy\nFIL-PATH fil 0.0.9 (wire 1.3)\n";
+        let mut whole = report.to_vec();
+        whole.extend_from_slice(b"FIL-CHECK-END\n");
+        let c = read_check(&mut lines(&whole)).await.unwrap();
         assert_eq!(c.installed, ["0.1.0-w1.12", "x[2Jy"]);
         assert_eq!(c.on_path.as_deref(), Some("fil 0.0.9 (wire 1.3)"));
         assert_eq!(c.local_bin, None);
+        // N6: without the end marker it is no answer, whatever came before it (a cut report),
+        // and nothing at all is no answer either (a forced `/bin/true`).
+        assert_eq!(
+            read_check(&mut lines(report)).await,
+            Err(BootError::NoAnswer)
+        );
+        assert_eq!(read_check(&mut lines(b"")).await, Err(BootError::NoAnswer));
+        assert_eq!(
+            read_check(&mut lines(b"FIL-CHECK-END-NOT\n")).await,
+            Err(BootError::NoAnswer),
+            "only the exact line"
+        );
 
         let mut r =
             lines(b"FIL-BOOT1 gc\nFIL-GC removed=1 failed=0 recent=0 far-future=0 in-use=1\n");

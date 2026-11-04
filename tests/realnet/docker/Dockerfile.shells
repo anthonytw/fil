@@ -2,7 +2,8 @@
 # with each shell the install bootstrap must survive. Two images from one file:
 #
 #   --target shells   Ubuntu: users u-bash, u-dash, u-zsh, u-fish, u-tcsh (each its login
-#                     shell), and gated, whose key allows only `/opt/fil/fil server --stdio`
+#                     shell); gated, whose key allows only `/opt/fil/fil server --stdio`; and
+#                     u-noexec (uid 2001, sh), whose home install.sh mounts noexec
 #   --target alpine   stock Alpine: busybox ash as the login shell of u-ash, busybox's own head,
 #                     expr, ls and sha256sum (only openssh is added, to log in at all)
 #
@@ -16,7 +17,9 @@ RUN apt-get update \
 RUN for s in bash dash zsh fish tcsh; do \
       useradd -m -s "$(command -v "$s")" "u-$s" && usermod -p '*' "u-$s"; \
     done \
- && useradd -m -s /bin/bash gated && usermod -p '*' gated
+ && useradd -m -s /bin/bash gated && usermod -p '*' gated \
+ && groupadd -g 2001 u-noexec && useradd -m -u 2001 -g 2001 -s /bin/sh u-noexec \
+ && usermod -p '*' u-noexec
 COPY sshd_config.shells /etc/ssh/sshd_config
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY bin/fil-boot /opt/fil/fil

@@ -14,6 +14,8 @@ use crate::config::{self, Config, ForwardFailure, HostSettings};
 use crate::connect::Connect;
 use crate::dialer::{DialerConfig, PathDialer};
 use crate::forward_spec::{CliForwards, ForwardPlan};
+use crate::install::attach::Offer;
+use crate::install::fallback::{Command as InstallCommand, Next, Run};
 use crate::{cmds, logging, server};
 
 /// How long the message printed after a run may take to reach the terminal.
@@ -92,7 +94,8 @@ async fn run(action: Action, config: &Config) -> u8 {
             forwards,
         } => {
             let settings = config.for_host(&host);
-            attach(&host, session, transport, forwards, settings).await
+            let run = Run::new(settings.remote, settings.pipe.is_some());
+            attach(&host, session, transport, forwards, settings, run).await
         }
         Action::List { host } => cmds::manage(&host, Request::ListSessions, config).await,
         Action::Kill { host, session } => {
@@ -124,6 +127,7 @@ async fn attach(
     transport: Option<TransportSetting>,
     forwards: CliForwards,
     settings: HostSettings,
+    run: Run,
 ) -> u8 {
     tidy_offline_log(&settings);
     let plan = match ForwardPlan::resolve(&settings, &forwards) {
@@ -161,7 +165,7 @@ async fn attach(
         settings.direct_address.clone(),
         LinkParams::default(),
     ) {
-        Ok(c) => c,
+        Ok(c) => c.with_run(run.clone(), Offer::Attach(settings.install)),
         Err(e) => {
             eprintln!("fil: {e}");
             return FAILED;
@@ -187,13 +191,23 @@ async fn attach(
     tracing::info!(?setting, "starting");
     tracing::debug!(host, %session, "starting for");
 
-    let mut cfg = ClientConfig::new(session, host_label(settings.host_label.as_deref()));
-    cfg.offline = settings.offline;
+    let mut cfg = ClientConfig::new(session.clone(), host_label(settings.host_label.as_deref()));
+    cfg.offline = settings.offline.clone();
     cfg.forwards = forward_set;
     // Only the path manager backs off; a second layer would double the waits.
     cfg.reconnect.backoff = Backoff::None;
 
     let result = fil_client::run(dialer, term, cfg).await;
+    // `remote = "auto"`'s second trigger: the run's first connection reached a relay of another
+    // wire with no daemon of ours. That shows only at the hello, before the terminal went raw;
+    // the run tries the bootstrap once, as a fresh attach (its listeners are bound again).
+    if let Err(e) = &result
+        && fallback_outcome(e).is_some()
+        && run.version_mismatch() == Next::Retry(InstallCommand::Bootstrap)
+    {
+        tracing::info!("the remote host's fil is of another wire; trying the install bootstrap");
+        return Box::pin(attach(host, session, transport, forwards, settings, run)).await;
+    }
     // The client has restored the terminal and printed how it ended; an error still needs saying.
     // Through a bounded write: a terminal that stopped reading would hold `eprintln!` for good,
     // and the shell would not get the terminal back.
@@ -220,8 +234,7 @@ async fn attach(
 /// `ClientError::VersionMismatch` (or `VersionRefused`, without the numbers), and it arrives
 /// before the terminal goes raw, which happens only once the first attach's snapshot is complete
 /// (`fil_client::engine`, `enter_session_screen`). So the fallback needs no change in
-/// `fil-client`. Nothing acts on it yet: the attach wiring that uses it is still to come
-/// (`docs/m4/install.md`).
+/// `fil-client`: [`attach`] acts on it, once per run, through the run's [`Run`].
 pub fn fallback_outcome(e: &ClientError) -> Option<crate::install::fallback::Outcome> {
     match e {
         ClientError::VersionMismatch(_) | ClientError::VersionRefused => {

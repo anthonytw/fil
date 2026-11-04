@@ -1262,7 +1262,6 @@ impl<L: Link> Manager<L> {
 
     /// An entry the run did not name: a management request, or one left by another client.
     fn other(&mut self, id: ForwardId, spec: ForwardSpec, origin: Origin) {
-        let _ = origin;
         if self.entries.contains_key(&id) || self.own_index(id).is_some() {
             // Ids are never reused: a restatement, not a new entry.
             return;
@@ -1307,7 +1306,11 @@ impl<L: Link> Manager<L> {
         // bind's identity is that run's tag). It is removed rather than refused, so re-runs do not
         // pile up dead entries (and `-R` listeners) on the host. A withheld `-R` on a fixed port
         // is left: an own `-R` on that port replaces it, as for any changed target.
-        if spec.bind_withheld() || (spec.target_withheld() && spec.port() == 0) {
+        // Only a client's: a management request cannot make one (`NotPermitted`), so one that
+        // claims to be a request is the host's doing, and is refused as before.
+        if origin == Origin::Client
+            && (spec.bind_withheld() || (spec.target_withheld() && spec.port() == 0))
+        {
             debug!(kind = ?spec.kind(), "another run's withheld forward; removed");
             self.send(MuxMsg::RemoveForward { id });
             return;

@@ -1,4 +1,4 @@
-//! The M2 agent scenarios (docs/m2/dropin.md, plan §5.2; A1, DESIGN §10): a throwaway `ssh-agent`
+//! The M2 agent scenarios (docs/m2/dropin.md; DESIGN §10): a throwaway `ssh-agent`
 //! on this machine with a key made for the run, relayed by `fil -A`, used from the session's shell
 //! with the host's own `ssh-add` and `ssh-keygen`. A signature made in the session is verified here
 //! (`ssh-keygen -Y verify`), so a relay that returned anything but the agent's own signature fails.

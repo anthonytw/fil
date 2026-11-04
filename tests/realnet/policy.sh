@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Server policy on the real network (DESIGN.md §11.2, docs/m2/plan.md S1): the real fil daemon
+# Server policy on the real network (DESIGN.md §11.2): the real fil daemon
 # mirrors an sshd_config at the real path, /etc/ssh/sshd_config. It runs in the udp part's
 # topology (network namespaces, the runner's own sshd in the server namespace with a config of the
 # harness's own; see udp.sh), so it needs root and the same tools, plus unshare(1). Run:

@@ -1,5 +1,5 @@
 //! Port-forward specs as ssh writes them (`ssh(1)`: `-L`, `-R`, `-D`), parsed into the wire's
-//! [`ForwardSpec`], and the plan a run carries (DESIGN.md section 7.1, `docs/m2/plan.md` F4).
+//! [`ForwardSpec`], and the plan a run carries (DESIGN.md section 7.1).
 //!
 //! The grammar, where `PORT` is 1 to 65535 (0 for a `-R` listener), `BIND` is nothing, `*`,
 //! `localhost`, an IPv4 address or a bracketed IP address, and `HOST` is an IP address
@@ -15,7 +15,7 @@
 //!
 //! **The bind defaults to loopback.** A bare port, and a spec with no `BIND`, listens on
 //! 127.0.0.1 and ::1 only. Anything wider is written: `*`, an empty `BIND` (`:8080:db:5432`) or
-//! an address that is not loopback (DESIGN.md section 7.1, `docs/m2/plan.md` section 4.2). That
+//! an address that is not loopback (DESIGN.md section 7.1). That
 //! holds on both ends, for ssh's `GatewayPorts` default too.
 //!
 //! The differences from OpenSSH, each for a reason, are in `docs/m2/binary.md`. In short: fil

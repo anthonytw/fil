@@ -1,6 +1,6 @@
 //! Forwards end to end: both endpoints in one process over each transport (`link::mem`,
 //! `PipeLink` on fil-netsim streams, `QuicLink` on fil-netsim datagrams), with real loopback TCP
-//! applications and servers (`docs/m2/plan.md`, F1 tests).
+//! applications and servers (DESIGN.md sections 7 and 8.5).
 //!
 //! The heavy sizes run scaled down here and at full size with `just forward-soak`:
 //! `FIL_FORWARD_BULK_MIB` (default 8, soak 256), `FIL_FORWARD_SEQ` (default 2,000, soak 20,000),
@@ -1012,7 +1012,7 @@ async fn a_queued_connection_is_checked_when_it_arrives_body() {
 
 /// A new epoch (a detach, a takeover) re-checks the queued connections at once instead of
 /// leaving them until `open_wait`: on the daemon its policy then refuses them (`Detached` while
-/// nobody holds the session), as plan section 2.7 says a detached listener does.
+/// nobody holds the session), as DESIGN.md section 7.2 says a detached listener does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
     bounded(a_new_epoch_rechecks_the_queued_connections_at_once_body()).await

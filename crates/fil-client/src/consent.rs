@@ -1,5 +1,5 @@
 //! The client's rules for forwards, as pure functions and one value (DESIGN.md section 7.2, "The
-//! rule for every connection"; `docs/m2/plan.md` section 4.1). **This is the security boundary**
+//! rule for every connection"). **This is the security boundary**
 //! between the remote host and the laptop: the daemon socket is reachable by any process of the
 //! user's uid on the remote, so a remote compromise must not be able to pivot into the laptop's
 //! network, squat its ports or reach its agent through fil. The daemon checks too, for the user's

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The M2 forward scenarios (docs/m2/realnet.md, plan §5.3): port forwards of the real `fil` binary
+# The M2 forward scenarios (docs/m2/realnet.md): port forwards of the real `fil` binary
 # on the real network. They run in the udp part's topology (network namespaces, NAT, tc netem, the
 # runner's own sshd in the server namespace; see udp.sh), so they need root and the same tools,
 # plus python3 for f_fwd_vs_ssh. Run: fwd.sh [SCENARIO...], `just realnet fwd`.
@@ -55,7 +55,7 @@ FWD_MALLORY=rnmallory
 # ---------------------------------------------------------------------------------------------
 # Misses and findings
 #
-# A miss is a failure of what the done-when or a security property requires (plan §1): a wrong
+# A miss is a failure of what the done-when or a security property requires (DESIGN §15 and §11): a wrong
 # sha256, a second accept, a reader that did not end on EOF, a changed daemon, ResumeGone, a refused
 # forward that listens, another user reaching a socket. Each is recorded at once (a note and the
 # log) and collected, so every miss of a scenario is visible, and fwd_verdict fails the scenario at

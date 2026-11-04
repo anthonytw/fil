@@ -1,4 +1,4 @@
-//! The forwards' tunables as a config file writes them (`docs/m2/plan.md` section 2.9): the client's
+//! The forwards' tunables as a config file writes them (DESIGN.md section 14): the client's
 //! `[defaults.forward]` and the daemon's `daemon.toml` `[forward]` share these keys, their forms and
 //! their bounds.
 //!

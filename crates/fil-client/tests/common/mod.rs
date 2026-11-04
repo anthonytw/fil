@@ -4,6 +4,7 @@
 
 pub mod daemon;
 pub mod fwd;
+pub mod oracle_term;
 pub mod term;
 
 use std::collections::VecDeque;

@@ -15,6 +15,10 @@
 //!   with the body dropped (Flask, Express, Django and Rails all do this), so whatever `GET /`
 //!   does on a dev server, a `HEAD` does too. `ports.probe = "full"` sends a `GET` (for the page
 //!   title); `"off"` sends nothing. The server logs the request like any other.
+//! - **Tunnels.** A listener that forwards elsewhere (`ssh -L`, `kubectl port-forward`, a cloud
+//!   database proxy) passes the probe on to whatever it leads to, another host included, which
+//!   logs it. So the caller probes only the `-L` targets and the sessions' listeners unless asked
+//!   for more, and never a known forwarder (`super::FORWARDERS`).
 //! - **One-shot listeners** (`nc -l`, `gdbserver --once`, a script that accepts once) lose their
 //!   one connection to the probe: `nc` prints the request and exits.
 //! - **Postgres** logs `invalid length of startup packet` once (it reads the HTTP request line as
@@ -103,8 +107,10 @@ const HEAD_CAP: usize = 4096;
 const GET_CAP: usize = 16 * 1024;
 const SMALL_CAP: usize = 256;
 
-/// Probes each of `addrs` (in order; the answer has one entry per address). Returns within
-/// `limits.total` (and a little scheduling slack); a port not reached in time has no probe.
+/// Probes each of `addrs`, in that order (the answer has one entry per address): a port starts
+/// only once every port before it has started, so the first ones are never left waiting behind
+/// later ones. Returns within `limits.total` (and a little scheduling slack); a port not reached
+/// in time has no probe.
 pub async fn probe_all(
     addrs: &[SocketAddr],
     mode: ProbeMode,
@@ -118,11 +124,13 @@ pub async fn probe_all(
     let permits = Arc::new(Semaphore::new(limits.parallel.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     for (i, &addr) in addrs.iter().enumerate() {
-        let permits = permits.clone();
+        // The permit is taken here, in order, not in the task: tasks are not polled in the
+        // order they were spawned.
+        let Ok(Ok(permit)) = timeout_at(overall, permits.clone().acquire_owned()).await else {
+            break;
+        };
         tasks.spawn(async move {
-            let Ok(Ok(_permit)) = timeout_at(overall, permits.acquire_owned()).await else {
-                return (i, None);
-            };
+            let _permit = permit;
             let deadline = overall.min(Instant::now() + limits.per_port);
             (i, probe_one(addr, mode, deadline).await)
         });

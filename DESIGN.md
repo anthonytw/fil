@@ -799,7 +799,10 @@ Everything below that is not marked **(decided)** is proposed: the implementatio
   - CLI: clap
   - serialization: serde, with postcard for frames **(decided)** and toml for config
   - JSON logs: tracing
-- **Builds:** static binaries for Linux (x86_64 and aarch64, musl) and macOS (aarch64).
+- **Builds:** static binaries for Linux (x86_64 and aarch64, musl) and one universal macOS binary (aarch64 and x86_64, joined with `lipo`). The contract is `docs/m4/release.md`; the workflow is `.github/workflows/release.yml` (M4's REL).
+  - **Linux** is built by `cross` in images pinned by digest (`Cross.toml`), twice in two jobs; the workflow fails if the binaries or the archives differ. **The Linux binaries and archives are reproducible**: `just release-verify` rebuilds them from the tag in the same images in a Linux VM (under amd64 emulation on an Apple-silicon Mac) and compares hashes. macOS is built on a hosted Apple-silicon runner with an explicit Xcode, and two builds are compared and recorded, not gated.
+  - **Release profile:** `codegen-units = 1`, fat LTO, `strip = "symbols"`, `debug = 0`. No builder path may reach a binary: the profile key `trim-paths` is not stable in the pinned cargo (1.99.1), so the builds pass `--remap-path-prefix` for the workspace, `CARGO_HOME` and the toolchain (`tests/release/common.sh`), and `just release-check` greps the binaries for `/Users/`, `/home/` and `FIL_TEST_` and requires the remapped dependency paths to be there. `rust-version` in the root `Cargo.toml` is the pinned toolchain.
+  - **Provenance:** a tag push `v*` builds a *draft* release with build-provenance attestations (only that job has `id-token` and `attestations` permissions); a dry run from any ref (`workflow_dispatch`) builds the same files and publishes nothing. The owner verifies the draft (`just release-verify`: the tag and the SSH-signed `SHA256SUMS` against `.github/release-signers` on `main`, never the tag's own copy; the attestations, narrowly, by workflow and tag; the rebuild), signs `SHA256SUMS` offline and publishes. Every action is pinned by commit SHA; no secret and no cache is used in a release job.
 - **Workspace layout (proposed):**
   - `fil-proto`: frames and channel semantics
   - `fil-transport`: the trait, pipe and QUIC

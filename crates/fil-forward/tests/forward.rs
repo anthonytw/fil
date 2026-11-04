@@ -600,7 +600,7 @@ async fn budget(t: Transport) {
             "{t:?}: {what}; writers that stopped: {:?}{}\n{}",
             ended.lock().unwrap(),
             w.report(),
-            mbufs_note(denied)
+            mbufs_note(&denied)
         )
     };
     let check = || {
@@ -638,7 +638,7 @@ async fn budget(t: Transport) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (c, d) = (w.client.ep.snapshot(), w.daemon.ep.snapshot());
-    eprintln!("{t:?}: client {c:?}, daemon {d:?}; {}", mbufs_note(denied));
+    eprintln!("{t:?}: client {c:?}, daemon {d:?}; {}", mbufs_note(&denied));
     for a in &apps {
         a.abort();
     }
@@ -1555,24 +1555,47 @@ async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Two in a row: the listener was already waiting in its accept when the flood began, so the
     // first gets in either way; the second is accepted only if the bound leaves room for it.
-    for i in 0..2 {
+    //
+    // The TCP connect is timed apart from the echo. The `-L` listener's backlog is nearly empty,
+    // so the kernel completes the connect whether or not fil accepts: a slow connect is the
+    // kernel's (a SYN or SYN-ACK it dropped and sent again on its timer, 1 s on macOS, as when
+    // the mbuf pool runs out), and fil's accept is in the echo after it, which is what is bounded.
+    for i in 0..2u64 {
         let t0 = std::time::Instant::now();
-        timeout(Duration::from_secs(20), echo_once(lport, 10, i))
+        let mut s = timeout(Duration::from_secs(20), connect(lport))
+            .await
+            .expect("the kernel completed the connect");
+        let connected = t0.elapsed();
+        let echo = async {
+            let mut out = vec![0u8; 10];
+            fill(i, 0, &mut out);
+            s.write_all(&out).await.unwrap();
+            s.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            s.read_to_end(&mut back).await.unwrap();
+            assert!(back == out, "reply of {} bytes", back.len());
+        };
+        timeout(Duration::from_secs(20), echo)
             .await
             .expect("the -L connection went through");
-        let took = t0.elapsed();
+        let took = t0.elapsed() - connected;
         eprintln!(
-            "-L connection {i} beside {} silent SOCKS clients took {took:?}",
+            "-L connection {i} beside {} silent SOCKS clients: connected in {connected:?}, \
+             echoed in {took:?}",
             held.len()
         );
-        // A connect whose SYN the kernel dropped for want of mbufs (macOS: `tcp_output` takes an
-        // `ENOBUFS` silently and retransmits on its timer) takes a second or more: the note says
-        // whether that is what happened.
         assert!(
             took < Duration::from_secs(2),
-            "connection {i}: {took:?}; {}",
-            mbufs_note(denied)
+            "connection {i}: echoed in {took:?} after a connect of {connected:?}; {}",
+            mbufs_note(&denied)
         );
+        if connected >= Duration::from_secs(1) {
+            eprintln!(
+                "connection {i}: the kernel took {connected:?} to connect (not fil's: its \
+                 accept comes after); {}",
+                mbufs_note(&denied)
+            );
+        }
     }
     drop(held);
 }

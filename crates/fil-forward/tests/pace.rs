@@ -248,7 +248,7 @@ async fn parallel_downloads_keep_the_link_full_body() {
         assert!(
             rate >= 0.9 * RATE as f64,
             "{n}: {rate}; {}",
-            mbufs_note(denied)
+            mbufs_note(&denied)
         );
         assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");
         // The ack clock: the peer acks on drain, so nearly every sample is trusted. Without
@@ -692,7 +692,7 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
     assert!(
         worst <= Duration::from_millis(60),
         "{worst:?}; {}",
-        mbufs_note(denied)
+        mbufs_note(&denied)
     );
     writer.abort();
     deaf.abort();

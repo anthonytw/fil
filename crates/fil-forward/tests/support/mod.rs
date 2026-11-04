@@ -1232,7 +1232,7 @@ pub async fn bounded<F: Future>(body: F) -> F::Output {
             if mine.is_empty() {
                 report.push_str("\n(no endpoint built on this test's thread)");
             }
-            report.push_str(&format!("\n{}", mbufs_note(denied)));
+            report.push_str(&format!("\n{}", mbufs_note(&denied)));
             panic!("{name}: still running after {limit:?}{report}");
         }
     }
@@ -1284,32 +1284,38 @@ pub fn endpoint_report_timed(ep: &Endpoint<TestLink>) -> String {
 
 /// The kernel's count of mbuf requests it denied, ever (`netstat -m`, macOS): what rises when
 /// the mbuf pool runs out and loopback sends fail with `ENOBUFS` or, inside TCP, are dropped and
-/// retransmitted on a timer. `None` elsewhere, or if it cannot be read.
-pub fn mbufs_denied() -> Option<u64> {
+/// retransmitted on a timer. Why not, elsewhere or if it cannot be read.
+pub fn mbufs_denied() -> Result<u64, String> {
     if !cfg!(target_os = "macos") {
-        return None;
+        return Err("not measured on this OS".into());
     }
-    let out = std::process::Command::new("netstat")
+    let out = std::process::Command::new("/usr/sbin/netstat")
         .arg("-m")
         .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find(|l| l.contains("requests for memory denied"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+        .map_err(|e| format!("netstat -m: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find(|l| l.contains("requests for memory denied"))
+        .and_then(|l| l.split_whitespace().next()?.parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "netstat -m ({}) has no count of denied requests: {:?} {:?}",
+                out.status,
+                text.lines().take(3).collect::<Vec<_>>(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+        })
 }
 
 /// A line for a failure message: the mbuf requests the kernel denied since `before` (from
 /// [`mbufs_denied`]), machine-wide, so other tests running at the same time count too.
-pub fn mbufs_note(before: Option<u64>) -> String {
+pub fn mbufs_note(before: &Result<u64, String>) -> String {
     match (before, mbufs_denied()) {
-        (Some(b), Some(a)) => format!(
-            "kernel mbuf requests denied since the test began: {} (machine-wide)",
-            a.saturating_sub(b)
+        (Ok(b), Ok(a)) => format!(
+            "kernel mbuf requests denied since the test began: {} (machine-wide; {a} ever)",
+            a.saturating_sub(*b)
         ),
-        _ => "kernel mbuf denials: not measured on this OS".to_string(),
+        (Err(e), _) => format!("kernel mbuf denials: {e}"),
+        (_, Err(e)) => format!("kernel mbuf denials: {e}"),
     }
 }

@@ -48,7 +48,12 @@ source "$HERE/../realnet/fil.sh"
 # shellcheck source=sshd.sh
 source "$HERE/sshd.sh"
 REALNET_STRICT=${MACOS_STRICT:-0}
+# The shared summary table says "realnet results" in the job's step summary.
+eval "$(declare -f print_summary | sed 's/realnet results/macOS remote results/')"
 
+# tmp_cleaners must stay LAST: the real cleaner removes every regular file in /tmp that is older than
+# three days at clock +4 and +5 days, including this suite's own scratch directory (keys, config,
+# the installed fil), so nothing may run after it.
 SCENARIOS=(
   attach_type kill_ssh_resume detach_reattach daemon_survives_login takeover
   forwards_reconnect agent quic_upgrade upgrade_in_place install_acl tmp_cleaners
@@ -72,9 +77,10 @@ fil_cmd() { env "XDG_STATE_HOME=$W/state-cmd" fil --config "$CFG" "$@"; }
 
 scenario_cleanup() {
   local s h
+  # The clock first: a kill that hangs must not leave it moved.
+  clock_restore
   for s in ${SESSIONS[@]+"${SESSIONS[@]}"}; do fil_cmd kill macremote "$s" > /dev/null 2>&1; done
   for h in ${HELPERS[@]+"${HELPERS[@]}"}; do kill "$h" > /dev/null 2>&1; done
-  clock_restore
   return 0
 }
 
@@ -450,7 +456,8 @@ scenario_install_acl() {
 # section 5.3). The change time cannot be set back, so the only honest test is to move the clock.
 #
 # The daemon is `tmpclean-daemon` (tests/macos/tmpclean): fil's daemon with TMP's `Keeping` seam
-# given on the command line (the shipped binary has none), at the standard /tmp/fil-$UID paths,
+# given on the command line (the shipped binary has none; the tool is built with fil-daemon's
+# `test-hooks`, outside the workspace), at the standard /tmp/fil-$UID paths,
 # and a real `fil` client holds a session on it.
 #   refresh   the daemon looks after its files every second: after each of five one-day steps
 #             (day 1 to day 5, past the cleaner's limit of 3) the cleaner runs, and the directory, the
@@ -463,15 +470,16 @@ scenario_install_acl() {
 # throwaway GitHub runner (MACOS_MOVE_CLOCK=1, set by macos-check.yml) and puts everything it needs
 # outside /tmp, under $HOME. It is active once fil-daemon has the seam (TMP, PR #96).
 scenario_tmp_cleaners() {
-  if ! grep -q 'pub struct Keeping' "$REPO_ROOT/crates/fil-daemon/src/paths.rs" 2> /dev/null; then
+  if ! grep -q 'fn set_keeping' "$REPO_ROOT/crates/fil-daemon/src/daemon.rs" 2> /dev/null; then
     note "SKIPPED: fil-daemon has no Keeping seam on this ref yet (TODO TMP, PR #96)"
     return 0
   fi
-  if [[ -z ${MACOS_MOVE_CLOCK:-} ]]; then
+  if [[ ${MACOS_MOVE_CLOCK:-} != 1 ]]; then
     note "SKIPPED: moves the system clock and runs tmp_cleaner as root: a throwaway runner only (MACOS_MOVE_CLOCK=1)"
     return 0
   fi
-  [[ ${GITHUB_ACTIONS:-} == true ]] || fail "MACOS_MOVE_CLOCK is set outside a GitHub Actions runner: refusing to move the clock"
+  # GITHUB_ACTIONS is also true on a self-hosted runner, which is somebody's machine.
+  [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || fail "MACOS_MOVE_CLOCK=1 outside a GitHub-hosted runner: refusing to move the clock and clean /tmp as root"
   sudo -n true || fail "tmp_cleaners: no passwordless sudo"
   [[ -x /usr/libexec/tmp_cleaner ]] || fail "tmp_cleaners: no /usr/libexec/tmp_cleaner on this macOS"
 

@@ -1,7 +1,9 @@
 //! `tmpclean-daemon [--every-ms N] [--no-refresh] [--no-dir-lock]`: the fil daemon of the current
 //! user, at the standard `/tmp/fil-$UID` paths, with its keep-alive settings (`Keeping`) given on
 //! the command line. The real `fil` relay finds it by its socket, as it finds any daemon of this
-//! wire revision. For the macOS runner's `tmp_cleaner` test only; never shipped.
+//! wire revision. Built with fil-daemon's `test-hooks` feature (`Daemon::set_keeping` exists only with it),
+//! which is why it lives outside the workspace. For the macOS runner's `tmp_cleaner` test only; never
+//! shipped.
 
 use std::process::ExitCode;
 use std::time::Duration;

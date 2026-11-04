@@ -100,7 +100,11 @@ sshd_up_system() {
   fi
   # PATH for the login's command (the installed fil first).
   sudo mkdir -p /etc/ssh/sshd_config.d
-  printf 'SetEnv PATH=%s\n' "$(remote_path)" | sudo tee /etc/ssh/sshd_config.d/100-fil-macos-check.conf > /dev/null
+  # launchd's sshd listens on every interface and the runner's account may have a password: only the
+  # key of this run, only this user (Apple's sshd_config includes sshd_config.d first, and the first
+  # value of an option wins).
+  printf 'SetEnv PATH=%s\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nAllowUsers %s\n' \
+    "$(remote_path)" "$(id -un)" | sudo tee /etc/ssh/sshd_config.d/100-fil-macos-check.conf > /dev/null
   SYSTEM_DROPIN=1
   mkdir -p ~/.ssh
   chmod 700 ~/.ssh

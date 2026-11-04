@@ -169,6 +169,14 @@ jobs:
           # user-mode job; the system-mode job skips it.
           MACOS_MOVE_CLOCK: ${{ matrix.sshd == 'user' && '1' || '' }}
         run: just macos-remote
+      # The tmp_cleaners case moves the clock and puts it back. If the suite was killed hard, this
+      # sets the clock from the network before the artifact upload and the end of the job.
+      - name: Clock safety net (hosted runner, throwaway VM)
+        if: ${{ always() && matrix.sshd == 'user' }}
+        run: |
+          date -u
+          sudo sntp -sS time.apple.com || true
+          date -u
       - name: Logs and results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

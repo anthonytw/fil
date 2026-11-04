@@ -127,14 +127,14 @@ The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `s
 
 ## Results: the real `fil` binary
 
-From [run 41575537104](https://github.com/anthonytw/fil/actions/runs/41575537104) (GitHub `ubuntu-24.04`, `fil` built for `x86_64-unknown-linux-musl`, static). All three parts passed; one scenario reports a known finding (below). The measurements come from that run unless a range is given; a range is over the runs in which the scenario worked. One shared runner VM: timings are indicative.
+From run 41575537104 (in the pre-recreate repository) (GitHub `ubuntu-24.04`, `fil` built for `x86_64-unknown-linux-musl`, static). All three parts passed; one scenario reports a known finding (below). The measurements come from that run unless a range is given; a range is over the runs in which the scenario worked. One shared runner VM: timings are indicative.
 
 ### ssh topology (client, two jumps, target; `fil` over the real OpenSSH pipe)
 
 | Scenario | What it checks | Result |
 |---|---|---|
 | `f_attach_detach` | attach to `direct`, run a command, `~.`; `fil ls`; attach again | pass: shell prompt 300 to 380 ms after the start; `~.` printed `detached from session` and exited 0; the second client saw the earlier output on its screen and the same shell (same pid) |
-| `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. `DETACH_LOST_MAX` is 0: any lost detach fails | **0 of 10 lost** since #31 ([run](https://github.com/anthonytw/fil/actions/runs/41580011372)); before the fix, finding 1: 3 of 10 never reached the daemon, in each of three runs. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
+| `f_detach_delivery` | ten attach and `~.` cycles on one session; every cycle must find the same shell, the session must stay listed, and `fil ls` must stop listing the client as attached within 5 s. `DETACH_LOST_MAX` is 0: any lost detach fails | **0 of 10 lost** since #31 (run 41580011372, in the pre-recreate repository); before the fix, finding 1: 3 of 10 never reached the daemon, in each of three runs. (The single-cycle check in `f_attach_detach` lost one of the 3 runs that polled for 18 s; in the others `fil ls` showed the session detached after 237 to 276 ms) |
 | `f_ls_kill_detach` | `fil ls` shows who is attached; `fil detach` tells the client; `fil kill` of an attached session; kill again | pass; the client of a killed session exits **129** (SIGHUP), finding 2 |
 | `f_takeover` | a second machine (`client2`) attaches to a session held by `client` | pass: the first client was told `by client2` with the time, answered `n` and exited 1 with `was taken over by client2 ... (left alone)`; the second screen showed the earlier output; `fil ls` named `client2` |
 | `f_takeover_back` | the first client answers `y` (take it back) | pass: the second client is told in turn (`by client`, not `client2`); the first client's screen shows a line the second client printed while it held the session, so the take-back really carries the session's state; a working shell again |
@@ -195,7 +195,7 @@ Six stand-in scenarios were **removed in M1 S6b** because the real binary, or `c
 
 `s_netdown_ssh_keepalive` stays although `s_pipelink_netdown_keepalive` looks alike: it is the only run in which ssh's own keepalive is the sole detector, which proves the backstop works when fil's heartbeat is off. The rest stay too: they measure what the real binary does not print (raw quinn, netem, the bare pipe's detection times, the QuicLink state changes).
 
-From [run 41531920383](https://github.com/anthonytw/fil/actions/runs/41531920383) (GitHub `ubuntu-24.04`, image 20261021.618). Both parts passed. A fourth run of the final commit (after merging main, [run 41533608653](https://github.com/anthonytw/fil/actions/runs/41533608653)) passed too. Timings are from the first of those; ranges over the runs are noted where they matter. The ranges come from four runs of the same scripts (three for the scenarios added after the first run: NAT rebinding, the quiet and keystroke blackouts). One runner, a shared VM: treat throughput as indicative only.
+From run 41531920383 (in the pre-recreate repository) (GitHub `ubuntu-24.04`, image 20261021.618). Both parts passed. A fourth run of the final commit (after merging main, run 41533608653) passed too. Timings are from the first of those; ranges over the runs are noted where they matter. The ranges come from four runs of the same scripts (three for the scenarios added after the first run: NAT rebinding, the quiet and keystroke blackouts). One runner, a shared VM: treat throughput as indicative only.
 
 ### Pipe over OpenSSH
 

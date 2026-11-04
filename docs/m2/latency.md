@@ -157,7 +157,7 @@ Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-
 
 ## Results
 
-Run: [41640812186](https://github.com/anthonytw/fil/actions/runs/41640812186), 2026-11-03 08:02 ET, on `m2-l1` at `c0a2721` (all four scenarios passed; an earlier run, 41639007590, on the previous commit agreed with it to about 1 ms in every cell, apart from `l_catchup` failing there on a harness bug). Runner: GitHub `ubuntu-24.04`, OpenSSH 9.6p1 for the client and the sshd, a single run per cell (300 to 1000 keys each), so read differences under 1 to 2 ms as noise. No key was lost in any cell.
+Run: 41640812186 (in the pre-recreate repository), 2026-11-03 08:02 ET, on `m2-l1` at `c0a2721` (all four scenarios passed; an earlier run, 41639007590, on the previous commit agreed with it to about 1 ms in every cell, apart from `l_catchup` failing there on a harness bug). Runner: GitHub `ubuntu-24.04`, OpenSSH 9.6p1 for the client and the sshd, a single run per cell (300 to 1000 keys each), so read differences under 1 to 2 ms as noise. No key was lost in any cell.
 
 ### 1. `TCP_NODELAY`
 

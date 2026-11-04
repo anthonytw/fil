@@ -99,7 +99,7 @@ Realnet adds, on a 40 ms round trip with real NAT and `tc netem`:
 
 ## Results
 
-Run on 2026-11-03 (ET). The client is this Mac's, built from the branch after main at `ca90d0b` (S1a, S2, S3, S4, S5 merged); the Pi binary is the `aarch64` job's build of the same tree, sha256 `0bc40457…` ([run 41600284624](https://github.com/anthonytw/fil/actions/runs/41600284624)). Single runs from one LAN, so times are indicative; the two Pis agree within noise.
+Run on 2026-11-03 (ET). The client is this Mac's, built from the branch after main at `ca90d0b` (S1a, S2, S3, S4, S5 merged); the Pi binary is the `aarch64` job's build of the same tree, sha256 `0bc40457…` (run 41600284624, in the pre-recreate repository). Single runs from one LAN, so times are indicative; the two Pis agree within noise.
 
 **Both Pis, 30 scenarios each: pi1 has 28 passes and 2 expected failures; pi2 has 27 passes, 2 expected failures and 1 failure.** The expected failures were `resize_order` and `terminal_sane_after_detach` (findings 1 and 3; reported as XFAIL, they do not fail the run; both have been fixed since, by #43 and R3, and `XFAIL` is now empty, so this table is the run before the fixes). The failure, `ctrl_c_d` on pi2, happened once in the full run because the driver typed a character before bash had redrawn its prompt after a Ctrl-C (readline drops it, over ssh too); the driver now waits for the prompt, and the scenario passed 15 of 15 times on pi2 afterwards. After the last scenario no daemon or socket was left on either Pi.
 
@@ -136,7 +136,7 @@ Run on 2026-11-03 (ET). The client is this Mac's, built from the branch after ma
 
 ### Realnet (udp part, 40 ms round trip)
 
-[Run 41596719308](https://github.com/anthonytw/fil/actions/runs/41596719308) on the branch with main at `b376112` (S3, S4) merged; **all three parts passed**.
+Run 41596719308 (in the pre-recreate repository) on the branch with main at `b376112` (S3, S4) merged; **all three parts passed**.
 
 | Scenario | Result |
 |---|---|

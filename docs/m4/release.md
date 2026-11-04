@@ -8,7 +8,7 @@ Examples use package version `0.1.0` and wire `1.12`. The wire on `main` at the 
 
 ## 1. Versioning and the wire
 
-- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, an ssh/et drop-in without prediction (decided, owner 2026-11-04, 10:28 ET: N9; it has no `predict` key and no `--predict` flag, and prediction is 0.2.0's headline), then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
+- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The published crates also pin each other at exactly that version (`=X.Y.Z` in `[workspace.dependencies]`, `docs/m4/packaging.md` §3), so a bump changes those lines and `Cargo.lock` too: `just set-version X.Y.Z` does all of it (cargo refuses a tree where they disagree). A release version is `X.Y.Z` or `X.Y.Z-PRE` with PRE of `[0-9A-Za-z.]`, which the .deb and .rpm need (nfpm's semver; `release-check` refuses another). The first release is **0.1.0**, an ssh/et drop-in without prediction (decided, owner 2026-11-04, 10:28 ET: N9; it has no `predict` key and no `--predict` flag, and prediction is 0.2.0's headline), then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
 - **The wire** is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION` (`crates/fil-proto/src/limits.rs`). It is independent of the package version. Two builds talk only when their wires are equal (`DESIGN.md` §5.3, §8.5).
 - **A patch release never changes the wire.** REL's `release-check` compares the revision on the last line of the golden's `[history]` with that of the previous tag of the same minor.
 - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Daemons of different wires coexist on a host, so this is an upgrade, not a breakage.
@@ -54,12 +54,13 @@ Each release carries exactly these files:
 | `fil-<ver>-aarch64-linux-musl.tar.gz` | the Linux aarch64 archive |
 | `fil-<ver>-universal-apple-darwin.tar.gz` | the macOS archive |
 | `fil-<ver>-source.tar.gz` | the tagged tree with every dependency vendored (`cargo vendor`), which builds offline. It is the Corresponding Source for the binaries (LIC) |
-| `fil-shell_<ver>_amd64.deb`, `fil-shell-<ver>-1.x86_64.rpm` | the x86_64 Linux archive's files as a Debian and an RPM package (PKG, `docs/m4/packaging.md` §2) |
-| `fil-shell_<ver>_arm64.deb`, `fil-shell-<ver>-1.aarch64.rpm` | the same for aarch64 |
+| `fil_<ver>_amd64.deb`, `fil-<ver>-1.x86_64.rpm` | the x86_64 Linux archive's files as a Debian and an RPM package named `fil` (decided, owner 2026-11-04: D1; PKG, `docs/m4/packaging.md` §2). The rpm is signed with the package key (§10.4) |
+| `fil_<ver>_arm64.deb`, `fil-<ver>-1.aarch64.rpm` | the same for aarch64 |
 | `SHA256SUMS` | the checksums of the eight files above it: the three binary archives, the source archive and the four packages |
 | `SHA256SUMS.sig` | an SSH signature over `SHA256SUMS`, made with `ssh-keygen -Y sign -n fil-release` by the release identity, the owner's own SSH key (M4 OQ-2; decided, owner 2026-11-04) |
+| `SHA256SUMS.asc` | an OpenPGP signature over the same `SHA256SUMS`, by the package key (§10.4), for those who verify with gpg |
 
-The GitHub build-provenance attestation for each archive and each package is attached to the release by the workflow. It is not a file in the list.
+The GitHub build-provenance attestation for each archive and each package is attached to the release by the workflow. It is not a file in the list. The attestations of the two rpms are of the unsigned bytes CI built; after the owner signs them (§10.4), their provenance is the signature and the rebuild, which compares everything but the signature header.
 
 ### 4.2 `SHA256SUMS`
 
@@ -331,17 +332,20 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
    The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
 3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries, the four archives and the four packages from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
-4. **Sign the verified file.** Sign the copy that step 3 verified (`target/release-verify/X.Y.Z/files/SHA256SUMS`), not a fresh download, because any writer can replace draft assets in between:
+4. **Sign the verified files.** Sign the copies that step 3 verified (`target/release-verify/X.Y.Z/files/`), not a fresh download, because any writer can replace draft assets in between. First the two rpms (§10.4), which rewrites `SHA256SUMS` and writes `SHA256SUMS.asc` (after macOS signing, §10.3, when that is built: both rewrite `SHA256SUMS`, packages last); then `SHA256SUMS` with the release key; then upload what changed:
 
    ```sh
+   just release-sign-packages X.Y.Z                # the rpms, SHA256SUMS, SHA256SUMS.asc (gpg asks for the passphrase)
    ssh-keygen -Y sign -f ~/.ssh/fil-release -n fil-release target/release-verify/X.Y.Z/files/SHA256SUMS
-   gh release upload vX.Y.Z target/release-verify/X.Y.Z/files/SHA256SUMS.sig
+   cd target/release-verify/X.Y.Z/files
+   gh release upload vX.Y.Z --clobber fil-X.Y.Z-1.x86_64.rpm fil-X.Y.Z-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig
+   cd -
    just release-verify X.Y.Z                       # now the signature is checked too
    gh release edit vX.Y.Z --draft=false            # publish
    just release-verify X.Y.Z --no-rebuild          # once more, on what is published
    ```
 
-5. **crates.io.** Approve the waiting `crates-io` deployment of the tag's run (Actions, the run, "Review deployments"). The job refuses to run before the release is published with `SHA256SUMS.sig`, then publishes the nine crates in dependency order (`docs/m4/packaging.md` §3).
+5. **crates.io.** Approve the waiting `crates-io` deployment of the tag's run (Actions, the run, "Review deployments"). The job refuses to run unless the `crates-io` environment has a required reviewer, the tag still names the run's commit, and the release is published with a `SHA256SUMS.sig` that verifies against `.github/release-signers` on main; then it publishes the nine crates in dependency order without compiling anything (`docs/m4/packaging.md` §3).
 6. **Homebrew and the rest.** `just brew-formula X.Y.Z` and `just aur-pkgbuild X.Y.Z` render the formula and the PKGBUILD from the `SHA256SUMS` that step 3 verified; the formula goes to the tap as a PR (`docs/m4/packaging.md` §4).
 
 ### 9.3 The rebuild VM
@@ -371,7 +375,7 @@ Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or
 
 **Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. That account's token has since been revoked and removed.
 
-**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag:** create the `crates-io` environment (required reviewer: the owner; deployments limited to `v*` tags), and add a trusted publisher (this repository, the workflow `release.yml`, the environment `crates-io`) on each of the nine crates: `fil-shell` and the eight `fil-*`. The job is release.yml's `crates-io` (built by PKG, `docs/m4/packaging.md` §3).
+**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag, in this order:** (1) create the `crates-io` environment and protect it (required reviewer: the owner; deployment branches and tags: `v*` tags only). Do this first: GitHub creates a missing environment that a workflow names, with no protection, and a trusted publisher pins only the workflow file and the environment, not the ref, so an unprotected `crates-io` environment would let any writer's branch mint a token. (2) Then add a trusted publisher (this repository, the workflow `release.yml`, the environment `crates-io`) on each of the nine crates: `fil-shell` and the eight `fil-*`. The job also checks (1) itself and fails if the environment has no required reviewer. The job is release.yml's `crates-io` (built by PKG, `docs/m4/packaging.md` §3).
 
 **The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
 
@@ -405,3 +409,44 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 3. **Verifiability** (proposed, coordinator). Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
 4. **Stapling** (proposed, coordinator). A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
 5. **The release key** (proposed, coordinator) on a hardware token is optional, not chosen (§9.2).
+
+### 10.4 The .rpm and .deb packages: signed on the owner's Mac
+
+**Decided (owner 2026-11-04, D3):** the packages are signed, and the signing key never lives in CI (N4), as for notarization (§10.3). **Everything below is the design, proposed by PKG;** `just release-sign-packages` (`tests/release/sign-packages.sh`) is built and tested on fakes, and once on a real rpm with a throwaway key in a Fedora 45 container (rpm 6.1.0, gpg 2.4.9).
+
+- **What is signed, and why only that.**
+  - **The two .rpm files get an embedded signature** (`rpmsign --addsign`, an OpenPGP signature over the rpm's header, which carries the payload's digest). rpm and dnf check it on install once the key is imported (`rpm --import`; dnf asks for it, or the user imports it first), and Fedora's rpm refuses an unsigned package outright without `--nosignature`.
+  - **The .deb files are not signed.** dpkg and apt never verify a signature inside a .deb (`debsig-verify` is not installed or enforced anywhere by default); apt verifies only the signed `Release` file of a repository, and fil has no apt repository. A .deb's integrity is `SHA256SUMS` with its two signatures. A signed apt repository (on the site, say) is possible later and would reuse the package key.
+  - **`SHA256SUMS.asc`:** an OpenPGP detached signature over the final `SHA256SUMS`, by the same key, so that a user who has only gpg can verify every file of the release, the .debs included. `SHA256SUMS.sig` (the release key, SSH) stays the release's primary signature.
+- **The key.** One OpenPGP key, used only for this: RSA 4096, sign-only, with an expiry date. RSA, not Ed25519, because every rpm that fil's users run verifies RSA (the rpm 4.14 of RHEL 8 and openSUSE Leap 15 does not verify EdDSA; Fedora's own keys are RSA 4096). Its user ID carries no e-mail address, because the public key is committed to this repository.
+- **Where the public key lives:** `.github/package-signing-key.asc` (armored), reviewed by a code owner (`.github/CODEOWNERS`), and read from **main** by `release-verify`, never from a tag, like `.github/release-signers`. Its fingerprint is published outside the repository: in the README and on the site's install page, where users get the `rpm --import` command. Until the file holds a key it is a placeholder, and `release-verify` fails after signing.
+- **The tooling on the Mac:** Homebrew's `gnupg` (2.5) and `rpm` (6.1.0, which ships `rpmsign` and `rpmkeys`): `brew install gnupg rpm`. **Not yet tried on the Mac;** the flow was checked in Fedora's rpm 6.1.0.
+- **The signing step** (`just release-sign-packages X.Y.Z`, step 4 of §9.2), on the files that `release-verify --pre-sign` verified:
+  1. it refuses files that do not match their `SHA256SUMS`, and a key file with no key;
+  2. for each rpm: `rpmsign --addsign` with the key's fingerprint (gpg asks for the passphrase), then it requires that the rpm now carries a signature, that **everything after the signature header is byte for byte what it was** (the "body": the header and the payload; `pkg_inspect.py`), and that `rpmkeys` verifies the signature with the repository's key in a scratch database;
+  3. it rewrites `SHA256SUMS` (the same eight files, sorted, §4.2) and writes `SHA256SUMS.asc`, and checks it with the key.
+
+  Then the owner signs the new `SHA256SUMS` with the release key and uploads the two rpms, `SHA256SUMS`, `SHA256SUMS.asc` and `SHA256SUMS.sig` to the draft with `--clobber` (§9.2, step 4).
+- **Reproducibility stays verifiable,** as for the signed macOS binary (§10.3): strip the signature and compare. rpm's signing changes only the signature header, so `release-verify` compares the released rpm's body (everything after the signature header) with the rebuilt, unsigned rpm's body: identical means the signed rpm is the reproducible build plus a signature. After signing, `release-verify` also requires both rpm signatures to verify (`rpmkeys --checksig`) and `SHA256SUMS.asc` to verify (gpg) against the key on main, and it skips the rpms' attestations (of the unsigned bytes) with a note. `release-check` reads signed and unsigned rpms alike and reports which.
+- **The owner's key steps** (once, before the first tag; then a PR adds the public key):
+
+  ```sh
+  brew install gnupg rpm
+  # 1. The key: RSA 4096, sign only, two years; gpg asks for a passphrase (use a long one).
+  gpg --quick-generate-key "fil package signing key (Anthony Wertz)" rsa4096 sign 2y
+  gpg --list-secret-keys --with-colons "fil package signing key" | awk -F: '$1 == "fpr" { print $10; exit }'   # FPR
+  # 2. Backups, offline (an encrypted USB stick, say): the secret key and the revocation
+  #    certificate gpg wrote to ~/.gnupg/openpgp-revocs.d/FPR.rev.
+  gpg --armor --export-secret-keys FPR > fil-package-key.secret.asc
+  cp ~/.gnupg/openpgp-revocs.d/FPR.rev fil-package-key.rev
+  # 3. The public key, for the PR to main (and its fingerprint for the README and the site).
+  gpg --armor --export FPR > .github/package-signing-key.asc
+  gpg --show-keys --with-fingerprint .github/package-signing-key.asc
+  # 4. The check: sign a scratch file and verify it with the exported public key only.
+  echo test > /tmp/fil-key-check && gpg --local-user FPR --armor --detach-sign /tmp/fil-key-check
+  gpg --no-default-keyring --keyring /tmp/fil-key-check.kbx --import .github/package-signing-key.asc
+  gpg --no-default-keyring --keyring /tmp/fil-key-check.kbx --verify /tmp/fil-key-check.asc /tmp/fil-key-check
+  rm -f /tmp/fil-key-check /tmp/fil-key-check.asc /tmp/fil-key-check.kbx
+  ```
+
+  Extend the expiry before it lapses (`gpg --quick-set-expire FPR 2y`), then re-export the public key and send it in a PR: rpm checks a signature against the key's validity, so users re-import the extended key (`rpm --import`). If the secret key is lost or exposed, publish the revocation certificate in a PR (`gpg --import` the `.rev`, re-export) and make a new key.

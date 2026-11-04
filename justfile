@@ -391,6 +391,23 @@ crates-check:
 packages-install *args:
     tests/release/install-packages.sh "$@"
 
+# The owner signs the release's two .rpm packages with the package key, on their own machine (never
+# CI), in the verified files of `just release-verify VERSION --pre-sign`, then rewrites SHA256SUMS
+# and writes SHA256SUMS.asc (docs/m4/release.md section 10.4). Needs gpg and rpm (brew install gnupg rpm).
+release-sign-packages version *args:
+    tests/release/sign-packages.sh "{{version}}" {{args}}
+
+# Set the one package version (docs/m4/release.md section 1): [workspace.package] version and the
+# exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock.
+set-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{version}}"
+    printf '%s' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || { echo "set-version: '$v' is not X.Y.Z or X.Y.Z-PRE" >&2; exit 1; }
+    perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]*"/${1}'"$v"'"/; s/(version = ")=[^"]*(")/${1}='"$v"'${2}/g' Cargo.toml
+    cargo update -w --offline -q
+    grep -nE '^version = |version = "=' Cargo.toml
+
 # The Homebrew formula for VERSION, from the release's SHA256SUMS: by default the copy that
 # `just release-verify VERSION` verified (and the owner signed). Writes OUT/homebrew/fil.rb, for the
 # tap anthonytw/homebrew-tap (docs/m4/packaging.md says how it gets there).
@@ -462,7 +479,8 @@ _notices mode:
     # The workspace's published crates are in cargo-about's data (about.toml, [private]); about.hbs
     # leaves out each crate and license entry without a registry source. That is exact only if no
     # license entry, and no license kind, holds both workspace crates and registry crates.
-    cargo about generate --frozen --format json -m crates/fil/Cargo.toml -c about.toml -o "$scratch/about.json" 2> /dev/null
+    cargo about generate --frozen --format json -m crates/fil/Cargo.toml -c about.toml -o "$scratch/about.json" 2> "$scratch/about-json.log" \
+      || { cat "$scratch/about-json.log" >&2; echo "notices: cargo-about's JSON render failed" >&2; exit 1; }
     python3 -I tests/release/notice_workspace.py "$scratch/about.json"
     # A license file it does not recognize gets the canonical text, with its template fields.
     if grep -nE '<year>|<copyright holders>|<owner>|<name of author>' "$scratch/raw.md" > "$scratch/placeholders"; then

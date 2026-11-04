@@ -8,6 +8,12 @@ prints, one per line:
     name <name>
     version <version>          (a .deb's Version, or an rpm's VERSION-RELEASE)
     arch <architecture>
+    script <what>              for every maintainer script or trigger the package has
+    depends <what>             for every dependency (an rpm's `rpmlib(...)` features are not ones)
+    signed yes|no              an rpm: whether its signature header holds an OpenPGP signature
+                               (a .deb: always no; dpkg verifies no signature inside a .deb)
+    body <sha256>              an rpm: the digest of everything after its signature header (the
+                               header and the payload), which signing leaves alone; a .deb: of the file
     file <mode in octal> <owner>:<group> <path>      for every regular file
     dir <mode in octal> <owner>:<group> <path>       for every directory the package lists
 
@@ -18,6 +24,7 @@ an error, which fails the check: linux-packages.sh makes neither.
 """
 
 import gzip
+import hashlib
 import io
 import os
 import struct
@@ -69,6 +76,9 @@ def deb(path: str, out: str) -> None:
     if "control.tar.gz" not in m or "data.tar.gz" not in m:
         fail(f"expected control.tar.gz and data.tar.gz, found {sorted(m)}")
     with tarfile.open(fileobj=io.BytesIO(m["control.tar.gz"]), mode="r:gz") as t:
+        for name in t.getnames():
+            if name not in ("./control", "./md5sums", "."):
+                print(f"script {name}")
         control = t.extractfile("./control") or fail("no control file")
         fields = {}
         for line in control.read().decode("utf-8").splitlines():
@@ -78,6 +88,15 @@ def deb(path: str, out: str) -> None:
     print(f"name {fields.get('Package', '')}")
     print(f"version {fields.get('Version', '')}")
     print(f"arch {fields.get('Architecture', '')}")
+    for k in ("Depends", "Pre-Depends", "Recommends", "Suggests", "Enhances", "Breaks", "Conflicts", "Replaces", "Provides"):
+        if k in fields:
+            print(f"depends {k}: {fields[k]}")
+    extra = sorted(set(m) - {"debian-binary", "control.tar.gz", "data.tar.gz"})
+    for name in extra:
+        print(f"script ar member {name}")
+    print("signed no")
+    with open(path, "rb") as f:
+        print(f"body {hashlib.sha256(f.read()).hexdigest()}")
     with tarfile.open(fileobj=io.BytesIO(m["data.tar.gz"]), mode="r:gz") as t:
         for e in t.getmembers():
             owner = f"{e.uname or e.uid}:{e.gname or e.gid}"
@@ -112,6 +131,8 @@ def rpm_header(blob: bytes, pos: int):
             tags[tag] = list(struct.unpack(f">{count}I", store[off : off + 4 * count]))
         elif typ == 3:  # INT16
             tags[tag] = list(struct.unpack(f">{count}H", store[off : off + 2 * count]))
+        else:  # BIN and the rest: only whether the tag is there (a signature is BIN)
+            tags[tag] = None
     return tags, pos + 16 + 16 * nindex + hsize
 
 
@@ -120,14 +141,26 @@ def rpm(path: str, out: str) -> None:
         blob = f.read()
     if blob[:4] != b"\xed\xab\xee\xdb":
         fail("not an rpm")
-    _, end = rpm_header(blob, 96)
+    sig, end = rpm_header(blob, 96)
     end += (-end) % 8  # the signature header is padded to 8
+    body = end
     tags, end = rpm_header(blob, end)
     if tags.get(1125) not in (None, "gzip"):  # PAYLOADCOMPRESSOR
         fail(f"payload compression {tags.get(1125)} (expected gzip)")
     print(f"name {tags.get(1000, '')}")
     print(f"version {tags.get(1001, '')}-{tags.get(1002, '')}")
     print(f"arch {tags.get(1022, '')}")
+    # PREIN, POSTIN, PREUN, POSTUN, TRIGGERSCRIPTS, PRETRANS, POSTTRANS, VERIFYSCRIPT, the file
+    # triggers and the transaction file triggers.
+    for tag in (1023, 1024, 1025, 1026, 1065, 1151, 1152, 1079, 5066, 5076):
+        if tag in tags:
+            print(f"script rpm tag {tag}")
+    for req in tags.get(1049, []):
+        if not req.startswith("rpmlib("):
+            print(f"depends {req}")
+    # RSA (268) or DSA (267) over the header, or rpm 6's OpenPGP signatures (278).
+    print("signed " + ("yes" if any(t in sig for t in (267, 268, 278)) else "no"))
+    print(f"body {hashlib.sha256(blob[body:]).hexdigest()}")
     dirnames, basenames, dirindexes = tags.get(1118, []), tags.get(1117, []), tags.get(1116, [])
     users, groups = tags.get(1039, []), tags.get(1040, [])
     owner_of = {}

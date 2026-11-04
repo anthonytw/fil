@@ -21,6 +21,9 @@ kind=$1 version=${2#v} sums=$3 out=$4
 url_base=${5:-https://github.com/anthonytw/fil/releases/download/v$version}
 printf '%s' "$version" | grep -Eq '^[0-9][0-9A-Za-z.-]{0,63}$' || die "version '$version' is not [0-9][0-9A-Za-z.-]{0,63} (docs/m4/release.md section 2)"
 [ -f "$sums" ] || die "no file $sums"
+# URL_BASE goes into a sed replacement and a Ruby and bash string: an https or file URL of plain
+# characters only.
+printf '%s' "$url_base" | grep -Eqx '(https|file)://[A-Za-z0-9._~/:-]+' || die "URL_BASE '$url_base' is not an https:// or file:// URL of [A-Za-z0-9._~/:-]"
 
 sum_of() { # LABEL: the checksum of fil-VERSION-LABEL.tar.gz in SUMS, exactly one well-formed line
   local n=fil-$version-$1.tar.gz h
@@ -32,7 +35,7 @@ x86=$(sum_of x86_64-linux-musl)
 arm=$(sum_of aarch64-linux-musl)
 mac=$(sum_of universal-apple-darwin)
 # pacman's pkgver allows no `-`: a pre-release 0.1.0-rc.1 is 0.1.0rc.1, which sorts before 0.1.0.
-pkgver=$(printf '%s' "$version" | sed 's/-//')
+pkgver=$(printf '%s' "$version" | sed 's/-//g')
 
 fill() { # TEMPLATE OUTPUT
   sed -e "s|@VERSION@|$version|g" -e "s|@PKGVER@|$pkgver|g" -e "s|@URL_BASE@|$url_base|g" \

@@ -9,7 +9,6 @@ rust-version.workspace = true
 publish = ["crates-io"]
 # A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
 # builds; its API follows fil's needs and carries no stability promise of its own.
-keywords = ["fil"]
 
 [features]
 # One feature per emulator backend (DESIGN.md §6.5). alacritty is the default backend

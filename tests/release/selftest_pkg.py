@@ -4,10 +4,15 @@ the real packages come from nfpm (linux-packages.sh), which the Docker tests and
 exercise.
 
     python3 -I selftest_pkg.py deb|rpm OUT NAME VERSION RELEASE ARCH OWNER MANIFEST
+    python3 -I selftest_pkg.py sign RPM      add a (fake) RSA signature to the signature header
+    python3 -I selftest_pkg.py tamper RPM    add one to the last byte of the payload
 
-MANIFEST has one line per file, `SRC<TAB>DST<TAB>MODE` (octal); OWNER is the uid and gid of every
-entry (0 for root).
+MANIFEST has one line per file, `SRC<TAB>DST<TAB>MODE` (octal), and for an rpm's own directory
+`-<TAB>DST<TAB>755`; OWNER is the uid and gid of every entry (0 for root). SELFTEST_PKG_DEPENDS and
+SELFTEST_PKG_SCRIPT, if set, add a dependency and a maintainer script.
 """
+
+import os
 
 import gzip
 import io
@@ -22,6 +27,10 @@ def manifest(path: str):
             if line.strip():
                 src, dst, mode = line.rstrip("\n").split("\t")
                 yield src, dst, int(mode, 8)
+
+
+def files_only(entries):
+    return [e for e in entries if e[0] != "-"]
 
 
 def dirs_of(entries) -> list:
@@ -58,7 +67,13 @@ def ar(members) -> bytes:
 
 
 def deb(out, name, version, release, arch, owner, entries) -> None:
-    control = f"Package: {name}\nVersion: {version}-{release}\nArchitecture: {arch}\n".encode()
+    entries = files_only(entries)
+    control = f"Package: {name}\nVersion: {version}-{release}\nArchitecture: {arch}\n"
+    if os.environ.get("SELFTEST_PKG_DEPENDS"):
+        control += f"Depends: {os.environ['SELFTEST_PKG_DEPENDS']}\n"
+    control_members = [("./control", control.encode(), 0o644, 0)]
+    if os.environ.get("SELFTEST_PKG_SCRIPT"):
+        control_members.append(("./postinst", b"#!/bin/sh\n", 0o755, 0))
     data = [("./" + d.lstrip("/"), None, 0o755, owner) for d in dirs_of(entries)]
     for src, dst, mode in entries:
         with open(src, "rb") as f:
@@ -66,7 +81,7 @@ def deb(out, name, version, release, arch, owner, entries) -> None:
     blob = ar(
         [
             ("debian-binary", b"2.0\n"),
-            ("control.tar.gz", tar_gz([("./control", control, 0o644, 0)])),
+            ("control.tar.gz", tar_gz(control_members)),
             ("data.tar.gz", tar_gz(data)),
         ]
     )
@@ -106,6 +121,9 @@ def cpio(entries) -> bytes:
 def rpm(out, name, version, release, arch, owner, entries) -> None:
     files = []
     for src, dst, mode in entries:
+        if src == "-":
+            files.append((dst, b"", 0o040000 | mode))
+            continue
         with open(src, "rb") as f:
             files.append((dst, f.read(), 0o100000 | mode))
     dirnames = sorted({d.rsplit("/", 1)[0] + "/" for d, _, _ in files})
@@ -122,6 +140,11 @@ def rpm(out, name, version, release, arch, owner, entries) -> None:
         (1118, 8, dirnames),
         (1125, 6, "gzip"),
     ]
+    if os.environ.get("SELFTEST_PKG_DEPENDS"):
+        tags.append((1049, 8, [os.environ["SELFTEST_PKG_DEPENDS"]]))
+    if os.environ.get("SELFTEST_PKG_SCRIPT"):
+        tags.append((1024, 6, "true"))
+    tags.sort()
     lead = b"\xed\xab\xee\xdb\x03\x00" + b"\0" * 90
     sig = header([])
     sig += b"\0" * ((-len(sig)) % 8)
@@ -130,7 +153,36 @@ def rpm(out, name, version, release, arch, owner, entries) -> None:
         f.write(lead + sig + header(tags) + payload)
 
 
+def sign(path: str) -> None:
+    """Insert a BIN tag 268 (RSA) into the signature header; the rest of the file is unchanged."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    pos = 96
+    nindex, hsize = struct.unpack(">II", blob[pos + 8 : pos + 16])
+    index = blob[pos + 16 : pos + 16 + 16 * nindex]
+    store = blob[pos + 16 + 16 * nindex : pos + 16 + 16 * nindex + hsize]
+    end = pos + 16 + 16 * nindex + hsize
+    end += (-end) % 8
+    index += struct.pack(">IIII", 268, 7, len(store), 8)
+    store += b"FAKE-SIG"
+    sig = b"\x8e\xad\xe8\x01\0\0\0\0" + struct.pack(">II", nindex + 1, len(store)) + index + store
+    sig += b"\0" * ((-len(sig)) % 8)
+    with open(path, "wb") as f:
+        f.write(blob[:96] + sig + blob[end:])
+
+
+def tamper(path: str) -> None:
+    with open(path, "rb") as f:
+        blob = bytearray(f.read())
+    blob[-1] = (blob[-1] + 1) % 256
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
 def main() -> None:
+    if sys.argv[1] in ("sign", "tamper"):
+        (sign if sys.argv[1] == "sign" else tamper)(sys.argv[2])
+        return
     kind, out, name, version, release, arch, owner, man = sys.argv[1:9]
     entries = list(manifest(man))
     (deb if kind == "deb" else rpm)(out, name, version, release, arch, int(owner), entries)

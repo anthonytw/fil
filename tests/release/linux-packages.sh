@@ -3,8 +3,10 @@
 # made from the two Linux archives that package.sh has just assembled, so that every file in a
 # package is byte for byte the file of the archive it comes from:
 #
-#   fil-shell_<ver>_amd64.deb    fil-shell-<ver>-1.x86_64.rpm     from fil-<ver>-x86_64-linux-musl
-#   fil-shell_<ver>_arm64.deb    fil-shell-<ver>-1.aarch64.rpm    from fil-<ver>-aarch64-linux-musl
+#   fil_<ver>_amd64.deb    fil-<ver>-1.x86_64.rpm     from fil-<ver>-x86_64-linux-musl
+#   fil_<ver>_arm64.deb    fil-<ver>-1.aarch64.rpm    from fil-<ver>-aarch64-linux-musl
+#
+# The package is named `fil` (decided, owner 2026-11-04: D1; the crate is `fil-shell`).
 #
 #   linux-packages.sh --archives DIR --out DIR
 #
@@ -12,7 +14,9 @@
 #   --out       where the four packages go (may be the same directory)
 #
 # The packages are built by nfpm in its digest-pinned image (NFPM_IMAGE in common.sh), with no
-# network, from a configuration this script writes. They are reproducible: nfpm stamps every file and
+# network, from a configuration this script writes. Always the image's linux/amd64 variant, as the
+# archives' tar and gzip are (package.sh): the package job and the VM's rebuild then run the same
+# nfpm binary, so an nfpm whose output differed between architectures could not break the rebuild. They are reproducible: nfpm stamps every file and
 # the package itself with `mtime` (SOURCE_DATE_EPOCH, as for the archives), the rpm's build host is a
 # fixed name, and the file order is nfpm's own (sorted). Needs Docker.
 #
@@ -20,7 +24,7 @@
 # its remote bundle where it looks, ../libexec/fil/remote from its own directory (section 4.3):
 #   bin/fil                     /usr/bin/fil
 #   libexec/fil/**              /usr/libexec/fil/**
-#   share/doc/fil/*             /usr/share/doc/fil-shell/*
+#   share/doc/fil/*             /usr/share/doc/fil/*
 #   share/zsh/site-functions/*  /usr/share/zsh/vendor-completions/* (deb), the same path (rpm)
 #   share/**                    /usr/share/**
 set -euo pipefail
@@ -42,6 +46,7 @@ out=$(cd "$out" && pwd)
 
 V=$(cargo_version)
 [ -n "$V" ] || die "no version in Cargo.toml"
+package_version_ok "$V" || die "version '$V' is not X.Y.Z or X.Y.Z-PRE (PRE of [0-9A-Za-z.]), which the packages need (nfpm's semver)"
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(source_date_epoch)}
 export SOURCE_DATE_EPOCH
 case $SOURCE_DATE_EPOCH in '' | *[!0-9]*) die "SOURCE_DATE_EPOCH is not a number: '$SOURCE_DATE_EPOCH'" ;; esac
@@ -59,8 +64,8 @@ for t in $LINUX_TARGETS; do
   arc=$archives/fil-$V-$label.tar.gz
   [ -f "$arc" ] || die "missing archive $arc"
   case $t in
-    x86_64-*) goarch=amd64 rpmarch=x86_64 ;;
-    aarch64-*) goarch=arm64 rpmarch=aarch64 ;;
+    x86_64-*) a=x86_64 ;;
+    aarch64-*) a=aarch64 ;;
   esac
   d=$stage/$label
   mkdir -p "$d"
@@ -70,15 +75,16 @@ for t in $LINUX_TARGETS; do
   for kind in deb rpm; do
     cfg=$stage/$label.$kind.yaml
     {
-      echo "name: fil-shell"
-      echo "arch: $goarch"
+      echo "name: $PACKAGE_NAME"
+      echo "arch: $(package_arch deb "$a")"
       echo "platform: linux"
       echo "version: $(yaml_str "$V")"
       echo "version_schema: semver"
       echo "release: \"1\""
       echo "section: net"
       echo "priority: optional"
-      echo "maintainer: \"Anthony Wertz <https://github.com/anthonytw/fil/issues>\""
+      # The owner's address for this field (decided, owner 2026-11-04: D2). It belongs here only.
+      echo "maintainer: \"Anthony Wertz <me@mail.anthonywertz.com>\""
       echo "homepage: https://github.com/anthonytw/fil"
       echo "license: GPL-3.0-or-later"
       echo "description: |-"
@@ -97,6 +103,8 @@ for t in $LINUX_TARGETS; do
         if [ -x "$d/$root/$f" ]; then mode=0755; else mode=0644; fi
         echo "  - src: $(yaml_str "/stage/$label/$root/$f")"
         echo "    dst: $(yaml_str "$dst")"
+        # The rpm marks the license as %license.
+        if [ "$kind" = rpm ] && [ "$f" = share/doc/fil/LICENSE ]; then echo "    type: license"; fi
         echo "    file_info:"
         echo "      mode: $mode"
         echo "      mtime: $(yaml_str "$mtime")"
@@ -111,7 +119,7 @@ for t in $LINUX_TARGETS; do
           find libexec/fil share/doc/fil -type d | LC_ALL=C sort
         ) | while IFS= read -r dir; do
           case $dir in
-            share/doc/fil) dst=/usr/share/doc/fil-shell ;;
+            share/doc/fil) dst=/usr/share/doc/fil ;;
             *) dst=/usr/$dir ;;
           esac
           echo "  - dst: $(yaml_str "$dst")"
@@ -131,21 +139,21 @@ for t in $LINUX_TARGETS; do
       echo "  group: Applications/Internet"
     } > "$cfg"
   done
-  echo "$goarch $rpmarch $label" >> "$stage/targets"
+  echo "$label $(package_file deb "$a" "$V") $(package_file rpm "$a" "$V")" >> "$stage/targets"
 done
 
 # The container sees the stage read-only and no network; the files it writes belong to the caller.
-docker run --rm --network none --user "$(id -u):$(id -g)" \
-  -e SOURCE_DATE_EPOCH -e V="$V" \
+docker run --rm --platform linux/amd64 --network none --user "$(id -u):$(id -g)" \
+  -e SOURCE_DATE_EPOCH \
   -v "$stage:/stage:ro" -v "$out:/out" \
   --entrypoint /bin/sh "$NFPM_IMAGE" -ec '
     nfpm --version 2>&1 | grep -E "GitVersion" >&2 || true
-    while read -r goarch rpmarch label; do
-      nfpm package --config "/stage/$label.deb.yaml" --packager deb --target "/out/fil-shell_${V}_${goarch}.deb" >&2
-      nfpm package --config "/stage/$label.rpm.yaml" --packager rpm --target "/out/fil-shell-${V}-1.${rpmarch}.rpm" >&2
+    while read -r label deb rpm; do
+      nfpm package --config "/stage/$label.deb.yaml" --packager deb --target "/out/$deb" >&2
+      nfpm package --config "/stage/$label.rpm.yaml" --packager rpm --target "/out/$rpm" >&2
     done < /stage/targets
   '
-for f in "fil-shell_${V}_amd64.deb" "fil-shell_${V}_arm64.deb" "fil-shell-$V-1.x86_64.rpm" "fil-shell-$V-1.aarch64.rpm"; do
+for f in $(package_names "$V"); do
   [ -s "$out/$f" ] || die "nfpm did not write $f"
   log "$(sha256 "$out/$f")  $f"
 done

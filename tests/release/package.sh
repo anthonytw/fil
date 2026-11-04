@@ -109,10 +109,5 @@ docker run --rm --platform linux/amd64 --network none \
 "$RELEASE_DIR/linux-packages.sh" --archives "$out" --out "$out"
 
 # ---- SHA256SUMS: exactly the four archives and the four packages, sorted bytewise (section 4.2)
-(
-  cd "$out"
-  for f in $({ printf '%s\n' fil-"$V"-*.tar.gz; package_names "$V"; } | LC_ALL=C sort); do
-    printf '%s  %s\n' "$(sha256 "$f")" "$f"
-  done > SHA256SUMS
-  cat SHA256SUMS >&2
-)
+rewrite_sums "$out" "$V"
+cat "$out/SHA256SUMS" >&2

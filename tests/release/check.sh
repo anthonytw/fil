@@ -145,7 +145,7 @@ fi
 extras=
 for f in "$dir"/*; do
   b=${f##*/}
-  case " SHA256SUMS SHA256SUMS.sig $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
+  case " SHA256SUMS SHA256SUMS.sig SHA256SUMS.asc $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
 done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
@@ -335,17 +335,17 @@ fi
 
 # ---- the .deb and .rpm packages (section 4.1; docs/m4/packaging.md): read by pkg_inspect.py, which
 # runs nothing from them. Each holds exactly the files of its Linux archive, byte for byte, at the
-# places package_path gives, owned by root, 0755 or 0644, under the name fil-shell, the version and
-# the architecture its file name says.
-# The packages' version: a pre-release's `-` is `~` (sorts before the release), then release 1.
-pkg_version=$(printf '%s' "$V" | sed 's/-/~/')-1
-for p in $packages; do
-  case $p in
-    *_amd64.deb) label=x86_64-linux-musl arch=amd64 kind=deb ;;
-    *_arm64.deb) label=aarch64-linux-musl arch=arm64 kind=deb ;;
-    *.x86_64.rpm) label=x86_64-linux-musl arch=x86_64 kind=rpm ;;
-    *.aarch64.rpm) label=aarch64-linux-musl arch=aarch64 kind=rpm ;;
-  esac
+# places package_path gives, owned by root, 0755 or 0644, under the name fil (PACKAGE_NAME), the
+# version and the architecture its file name says, with no maintainer script and no dependency, and
+# an rpm owns no directory but its own. An rpm may carry the owner's signature (section 10.4) or not
+# (the draft, before signing): which, is reported here and required by release-verify.
+package_version_ok "$V" || fail "version '$V' is not X.Y.Z or X.Y.Z-PRE (PRE of [0-9A-Za-z.]): nfpm cannot package it"
+pkg_version=$(package_version "$V")
+for kind in deb rpm; do for a in x86_64 aarch64; do
+  p=$(package_file "$kind" "$a" "$V")
+  arch=$(package_arch "$kind" "$a")
+  label=$a-linux-musl
+  aroot=$work/x-$label/fil-$V-$label
   if [ ! -f "$dir/$p" ]; then
     fail "missing package $p"
     continue
@@ -356,7 +356,15 @@ for p in $packages; do
     continue
   fi
   meta="$(sed -n 's/^name //p' "$work/p.list") $(sed -n 's/^version //p' "$work/p.list") $(sed -n 's/^arch //p' "$work/p.list")"
-  if [ "$meta" = "fil-shell $pkg_version $arch" ]; then ok "$p is fil-shell $pkg_version for $arch"; else fail "$p says '$meta', not 'fil-shell $pkg_version $arch'"; fi
+  if [ "$meta" = "$PACKAGE_NAME $pkg_version $arch" ]; then ok "$p is $PACKAGE_NAME $pkg_version for $arch"; else fail "$p says '$meta', not '$PACKAGE_NAME $pkg_version $arch'"; fi
+  extra=$(grep -E '^(script|depends) ' "$work/p.list" | tr '\n' ';' || true)
+  if [ -z "$extra" ]; then ok "$p has no maintainer script and no dependency"; else fail "$p has maintainer scripts or dependencies: $extra"; fi
+  if [ "$kind" = rpm ]; then
+    dirs=$(sed -n 's/^dir [^ ]* [^ ]* //p' "$work/p.list" | LC_ALL=C sort | tr '\n' ' ')
+    wantdirs=$(cd "$aroot" 2> /dev/null && find libexec/fil share/doc/fil -type d | sed -e 's|^share/doc/fil|/usr/share/doc/'"$PACKAGE_NAME"'|' -e 's|^libexec|/usr/libexec|' | LC_ALL=C sort | tr '\n' ' ')
+    if [ "$dirs" = "$wantdirs" ]; then ok "$p owns only its own directories"; else fail "$p owns the directories '$dirs', not '$wantdirs'"; fi
+    note "$p: signed $(sed -n 's/^signed //p' "$work/p.list")"
+  fi
   aroot=$work/x-$label/fil-$V-$label
   if [ ! -d "$aroot" ]; then
     fail "$p: no archive fil-$V-$label to compare it with"
@@ -384,7 +392,7 @@ for p in $packages; do
     cmp -s "$aroot/$f" "$px$dst" || differ="$differ $f"
   done < <(cd "$aroot" && find . -type f | sed 's|^\./||')
   if [ -z "$differ" ]; then ok "$p: every file is byte for byte the archive's"; else fail "$p: files differ from the archive's:$differ"; fi
-done
+done; done
 
 # ---- run the binary where it can run (section 2): the first line is FROZEN
 smoke() {

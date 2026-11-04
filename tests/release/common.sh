@@ -131,15 +131,43 @@ package_path() {
   case $2 in
     bin/fil) echo /usr/bin/fil ;;
     libexec/fil/*) echo "/usr/$2" ;;
-    share/doc/fil/*) echo "/usr/share/doc/fil-shell/${2#share/doc/fil/}" ;;
+    share/doc/fil/*) echo "/usr/share/doc/fil/${2#share/doc/fil/}" ;;
     share/zsh/site-functions/*) if [ "$1" = deb ]; then echo "/usr/share/zsh/vendor-completions/${2#share/zsh/site-functions/}"; else echo "/usr/$2"; fi ;;
     share/*) echo "/usr/$2" ;;
     *) return 1 ;;
   esac
 }
+# The Linux packages are named `fil` (decided, owner 2026-11-04: D1); the crate is `fil-shell`.
+PACKAGE_NAME=fil
+# package_file KIND ARCH VERSION: the file name of a package (KIND deb or rpm, ARCH x86_64 or
+# aarch64, the Linux archive's architecture).
+package_file() {
+  case $1-$2 in
+    deb-x86_64) echo "${PACKAGE_NAME}_$3_amd64.deb" ;;
+    deb-aarch64) echo "${PACKAGE_NAME}_$3_arm64.deb" ;;
+    rpm-x86_64) echo "$PACKAGE_NAME-$3-1.x86_64.rpm" ;;
+    rpm-aarch64) echo "$PACKAGE_NAME-$3-1.aarch64.rpm" ;;
+    *) die "no package file for $1 $2" ;;
+  esac
+}
+# The package's own name for an architecture (ARCH as above).
+package_arch() {
+  case $1-$2 in
+    deb-x86_64) echo amd64 ;;
+    deb-aarch64) echo arm64 ;;
+    rpm-*) echo "$2" ;;
+  esac
+}
+# The packages' version for a release version: a pre-release's first `-` is `~` (it sorts before
+# the release, as nfpm writes it), then release 1.
+package_version() { printf '%s-1' "$(printf '%s' "$1" | sed 's/-/~/')"; }
+# package_version_ok VERSION: X.Y.Z or X.Y.Z-PRE, PRE of [0-9A-Za-z.], the subset of the release
+# versions (section 2) that nfpm takes as semver and that becomes X.Y.Z~PRE in the packages.
+package_version_ok() { printf '%s' "$1" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?'; }
 # The four package files of version $1 (section 4.1), sorted bytewise.
 package_names() {
-  printf '%s\n' "fil-shell-$1-1.aarch64.rpm" "fil-shell-$1-1.x86_64.rpm" "fil-shell_$1_amd64.deb" "fil-shell_$1_arm64.deb" | LC_ALL=C sort
+  local k a
+  for k in deb rpm; do for a in x86_64 aarch64; do package_file "$k" "$a" "$1"; done; done | LC_ALL=C sort
 }
 
 # The committer time of REF (default HEAD): the SOURCE_DATE_EPOCH of a release (section 4.4).
@@ -173,4 +201,26 @@ clean_build_env() {
   unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
     CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_STRIP \
     CARGO_PROFILE_RELEASE_DEBUG CARGO_INCREMENTAL
+}
+
+# rewrite_sums DIR VERSION: DIR/SHA256SUMS for the release files of VERSION in DIR (section 4.2):
+# the four archives and the four packages, sorted bytewise. package.sh writes it, and the owner's
+# signing step (sign-packages.sh) rewrites it after signing the rpms.
+rewrite_sums() {
+  local dir=$1 v=$2 f
+  (
+    cd "$dir"
+    for f in $({ printf '%s\n' "fil-$v-aarch64-linux-musl.tar.gz" "fil-$v-source.tar.gz" "fil-$v-universal-apple-darwin.tar.gz" "fil-$v-x86_64-linux-musl.tar.gz"; package_names "$v"; } | LC_ALL=C sort); do
+      [ -f "$f" ] || die "rewrite_sums: no $f in $dir"
+      printf '%s  %s\n' "$(sha256 "$f")" "$f"
+    done > SHA256SUMS.new
+    mv SHA256SUMS.new SHA256SUMS
+  )
+}
+
+# package_key_fingerprint FILE: the fingerprint of the one OpenPGP public key in FILE (the package
+# signing key, .github/package-signing-key.asc; section 10.4). Fails unless FILE holds exactly one.
+package_key_fingerprint() {
+  ${FIL_GPG:-gpg} --show-keys --with-colons "$1" 2> /dev/null \
+    | awk -F: '$1 == "pub" { n++ } $1 == "fpr" && !seen { print $10; seen = 1 } END { exit n != 1 }'
 }

@@ -46,9 +46,13 @@ class Fil < Formula
 
   test do
     assert_match "fil #{version} (wire ", shell_output("#{bin}/fil --version")
-    # The bundle is where the client looks for it, and it checks.
-    cd libexec/"fil/remote" do
-      system "shasum", "-a", "256", "-c", "SHA256SUMS"
+    # The bundle is where the client looks for it, and every file of its SHA256SUMS checks (Ruby's
+    # own digest: Homebrew on Linux need not have shasum).
+    require "digest"
+    remote = libexec/"fil/remote"
+    (remote/"SHA256SUMS").read.each_line do |line|
+      sum, name = line.chomp.split("  ", 2)
+      assert_equal sum, Digest::SHA256.file(remote/name).hexdigest
     end
   end
 end

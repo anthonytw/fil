@@ -334,6 +334,35 @@ stage_release
 pack_release
 expect_fail "mutation: a patch release changes the wire" check --tag v0.9.1 --no-tree "$rel"
 
+# ============================================================== 4b. the in-workflow tag checks (prepare.sh)
+echo "== prepare.sh (the tag checks that are NOT the gate)"
+new_case 0.9.0
+git -C "$tree" tag -a -m "fil 0.9.0" v0.9.0
+git -C "$tree" tag v0.9.0-light
+git -C "$tree" tag -a -m "fil 0.9.1" v0.9.1
+prep() { # TAG [EVENT]: a fresh clone with origin set, as actions/checkout leaves it
+  rm -rf "$tmp/w"
+  git clone -q "$tree" "$tmp/w"
+  : > "$tmp/gho"
+  env FIL_RELEASE_ROOT="$tmp/w" GITHUB_EVENT_NAME="${2:-push}" GITHUB_REF="refs/tags/$1" GITHUB_REF_NAME="$1" GITHUB_OUTPUT="$tmp/gho" "$RELEASE_DIR/prepare.sh"
+}
+expect_pass "an annotated tag equal to the version on main is accepted" prep v0.9.0
+expect_pass "...and it reports release=true" grep -q '^release=true' "$tmp/gho"
+expect_fail "a tag that is not v<Cargo.toml version> is refused" prep v0.9.1
+expect_fail "a lightweight tag is refused (checkout turns annotated tags into lightweight ones; the script re-fetches the tag object)" prep v0.9.0-light
+main_tree=$tree
+new_case 0.9.0
+git -C "$tree" checkout -q -b side
+echo side > "$tree/side"
+git -C "$tree" add side
+git -C "$tree" commit -q -m side
+git -C "$tree" tag -a -m "off main" v0.9.0
+git -C "$tree" checkout -q main
+expect_fail "a v<version> tag whose commit is not on main is refused" prep v0.9.0
+tree=$main_tree
+expect_pass "a workflow_dispatch run is a dry run (release=false)" bash -c "cd '$tmp' && : > gho && FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/x GITHUB_OUTPUT='$tmp/gho' '$RELEASE_DIR/prepare.sh' && grep -q '^release=false' gho"
+expect_fail "a push that is not a v* tag is refused" bash -c "FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main '$RELEASE_DIR/prepare.sh'"
+
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"

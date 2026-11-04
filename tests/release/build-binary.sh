@@ -6,7 +6,7 @@
 #   build-binary.sh TARGET OUT
 #
 # The environment: SOURCE_DATE_EPOCH (default: HEAD's committer time), CARGO_TARGET_DIR (default
-# target/). The host needs `cross` 0.2.5 and Docker; on a non-x86_64 host the x86_64 toolchain too
+# target/; the build uses its own subdirectory release-TARGET of it). The host needs `cross` 0.2.5 and Docker; on a non-x86_64 host the x86_64 toolchain too
 # (rebuild.sh sets that up).
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
@@ -18,6 +18,11 @@ out=$2
 case " $LINUX_TARGETS " in *" $target "*) ;; *) die "not a Linux release target: $target" ;; esac
 
 clean_build_env
+# One target directory per target: the host-side artifacts (build scripts) of one `cross` image must
+# never be reused by another. Sharing one directory between the two targets made the second build
+# run the first one's build scripts, linked against a newer glibc than the second image has
+# ("GLIBC_2.30 not found", found by the first release-verify run in the VM).
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}/release-$target
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(source_date_epoch)}
 export SOURCE_DATE_EPOCH
 # The cross images are linux/amd64 only (they hold the cross compilers); on an arm64 host Docker
@@ -31,7 +36,7 @@ log "cross $(cross --version | head -n 1 | tr '\n' ' ')for $target; image $(cros
 log "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH RUSTFLAGS=$RUSTFLAGS"
 cross build --locked --release -p fil --target "$target"
 
-bin=${CARGO_TARGET_DIR:-$ROOT/target}/$target/release/fil
+bin=$CARGO_TARGET_DIR/$target/release/fil
 [ -f "$bin" ] || die "cross did not produce $bin"
 mkdir -p "$out/$target"
 cp "$bin" "$out/$target/fil"

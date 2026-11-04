@@ -195,23 +195,37 @@ fn an_insert_waits_for_the_keys_in_flight_before_it() {
 }
 
 #[test]
-fn no_insert_near_the_margin() {
-    // The row's text ends two columns before the last: an insert would push it there.
-    let mut t = T::shell();
-    let fill = "x".repeat(34);
-    t.key(fill.as_bytes(), 400)
-        .server(fill.as_bytes(), 550)
-        .ack(600);
-    // `$ ab` + 34 `x`: the last at column 37, two before the last column: one insert...
-    for _ in 0..10 {
-        t.key(b"\x1b[D", 610);
-    }
-    t.server(b"\x1b[10D", 760).ack(800);
-    t.key(b"Q", 810);
-    assert_eq!(t.painted(0), cells(&[(28, "Q")]));
-    t.server(b"Qxxxxxxxxxx\x1b[10D", 960).ack(1000);
-    // ...but now the text ends at column 38: no more.
-    t.key(b"R", 1010);
+fn appends_and_inserts_keep_two_columns_before_the_last() {
+    // `$ ` and 35 typed characters, up to column 36: an append there leaves columns 37 and 38.
+    let mut t = T::new();
+    t.server(b"$ ", 0);
+    let fill = format!("{}abcd", "x".repeat(31));
+    t.key(fill.as_bytes(), 10)
+        .server(fill.as_bytes(), 160)
+        .ack(220);
+    assert!(t.o.epoch_confirmed());
+    // Ten columns left, then inserts: while the row's text ends at column 37 or before, an
+    // insert is guessed; once it ends at 38, not.
+    t.key(&b"\x1b[D".repeat(10), 230)
+        .server(b"\x1b[10D", 380)
+        .ack(440);
+    t.key(b"Q", 450);
+    assert_eq!(t.painted(0), cells(&[(27, "Q")]));
+    t.server(b"Qxxxxxxabcd\x1b[10D", 600).ack(660);
+    t.key(b"R", 670);
+    assert_eq!(t.painted(0), cells(&[(28, "R")]));
+    t.server(b"Rxxxxxxabcd\x1b[10D", 820).ack(880);
+    t.key(b"S", 890);
+    assert_eq!(t.painted(0), Vec::new());
+    assert_eq!(t.mispredicted(), 0);
+
+    // An append at column 37 would leave one: followed, not guessed.
+    let mut t = T::new();
+    t.server(b"$ ", 0);
+    t.key(fill.as_bytes(), 10)
+        .server(fill.as_bytes(), 160)
+        .ack(220);
+    t.key(b"e", 230);
     assert_eq!(t.painted(0), Vec::new());
 }
 
@@ -287,6 +301,22 @@ fn arrows_and_ctrl_b_f_move_within_the_typed_span() {
     // Past the end of what it typed (Right at the end of the line): no move.
     t.key(b"\x1b[C", 450);
     assert_eq!(t.cursor(), Some((0, 5)));
+}
+
+#[test]
+fn a_guess_waits_for_the_moves_before_it() {
+    // A boundary (here released offline input) drops the moves but keeps the written `d`; the
+    // moves' echo would then leave the cursor where no guess says, and `d` would go unechoed.
+    let mut t = T::shell();
+    t.key(b"c", 400)
+        .key(b"\x1b[D", 410)
+        .key(b"\x1b[C", 420)
+        .key(b"d", 430);
+    assert_eq!(t.painted(0), cells(&[(4, "c")]));
+    t.o.on_input(b"oo", t.at, InputKind::Offline, ms(440));
+    t.at += 2;
+    t.server(b"c\x1b[D\x1b[Cdoo", 550).ack(600);
+    assert_eq!(t.mispredicted(), 0);
 }
 
 #[test]
@@ -571,4 +601,38 @@ fn the_second_underline_trigger() {
         assert!(underlined, "{after:?}: a 350 ms estimate underlines anyway");
         assert_eq!(glitch_underlined, by_glitch, "{after:?} after a glitch");
     }
+}
+
+// ---- late echoes -----------------------------------------------------------------------------
+
+/// A tentative epoch's guess that shows its glyph while a key typed before the epoch is still
+/// unacknowledged may be that key's late echo (`ccc`, the first one pasted): the epoch's guesses
+/// are withdrawn before the next echo can confirm the epoch one key off.
+#[test]
+fn a_match_before_the_earlier_keys_are_acknowledged_withdraws_the_epoch() {
+    let mut t = T::shell();
+    t.o.on_input(b"c", t.at, InputKind::Pasted, ms(400));
+    t.at += 1;
+    // Typed `c` starts an epoch at (0, 4), where the pasted `c`'s echo lands.
+    t.key(b"c", 410).key(b"c", 420);
+    t.server(b"c", 550); // the pasted `c`: matches the first guess, before its ack
+    t.ack(560).server(b"c", 600); // the first typed `c`: would match the second guess
+    t.key(b"m", 610);
+    assert_eq!(t.painted(0), Vec::new(), "confirmed one key off");
+    t.server(b"cm", 700).ack(760);
+    assert_eq!(t.mispredicted(), 0);
+}
+
+/// A guess confirmed by a suggestion that happened to show its character, before its echo: its
+/// echo is still to come (and redraws the suggestion), so it stays in flight on its row.
+#[test]
+fn a_guess_confirmed_ahead_of_its_echo_is_still_in_flight() {
+    let mut t = T::new();
+    t.server(b"$ ", 0).key(b"c", 10).key(b"a", 20);
+    // `c`'s echo and a suggestion `argo` from the history: `a`'s cell shows `a` already.
+    t.server(b"c\x1b[90margo\x1b[m\x1b[4D", 160);
+    t.key(b"q", 170);
+    assert_eq!(t.painted(0), Vec::new(), "guessed before `a`'s echo");
+    t.server(b"a\x1b[K", 180).server(b"q", 190).ack(250);
+    assert_eq!(t.mispredicted(), 0);
 }

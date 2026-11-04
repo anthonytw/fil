@@ -181,6 +181,10 @@ pub struct CoreView {
     pub epoch: u64,
     /// The current epoch is confirmed: the core accepts more than the plain forms (§2.3).
     pub confirmed: bool,
+    /// Every key typed before the current epoch's first key has been covered by an `EchoAck`
+    /// (rule 2's condition for the epoch's first confirmation). Until then a chunk that shows a
+    /// guess's glyph can be an earlier key's late echo.
+    pub prior_acked: bool,
     /// Origin mode (DECOM) is on, or may be: in the shadow, or unknown to the tracker after a
     /// soft reset or a cursor restore. WezTerm intermittently loses origin mode across the
     /// overlay's `?6l`/`?6h` toggling (`docs/m3/terminals.md`, finding 8).

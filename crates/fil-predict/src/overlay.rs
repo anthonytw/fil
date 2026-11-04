@@ -1021,6 +1021,7 @@ impl Overlay {
             core: CoreView {
                 epoch: self.core.epoch,
                 confirmed: self.core.epoch_confirmed(),
+                prior_acked: self.core.prior_acked(),
                 origin: st.modes.origin || self.tracker.origin_maybe(),
                 cursor_disputed: self.tracker.cursor_disputed(),
             },

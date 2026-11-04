@@ -249,7 +249,10 @@ fn a_space_over_a_blank_waits_for_its_echo() {
 /// nothing); the next echo after the ack does.
 #[test]
 fn a_new_epoch_confirms_only_after_the_keys_before_it_are_acknowledged() {
-    let mut t = T::trusted();
+    // The cells fixed: the default predictor itself withdraws a tentative epoch whose guess
+    // shows its glyph before the keys before it are acknowledged.
+    let mut t = fixed(vec![(0, 2), (1, 2), (1, 3), (1, 4)]);
+    t.confirm();
     t.key(b"\r", 200);
     t.server(b"\r\n$ ", 280);
     t.key(b"l", 300);

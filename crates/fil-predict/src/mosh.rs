@@ -6,22 +6,25 @@
 //!
 //! - **Append** at the cursor when the row from the cursor to the margin is blank, or holds a
 //!   right-aligned run (zsh's `RPROMPT`) or a suggestion the shell draws (fish's
-//!   autosuggestion). Never in the last column (a character there would wrap).
+//!   autosuggestion). Never in the last three columns (a character in the last would wrap, and a
+//!   blank tail can hide spaces the shell shifts right).
 //! - **Mid-line insert** (the typed character goes in at the cursor and the shell shifts the
 //!   rest right) only in a confirmed epoch, only when the row's text ends at least two columns
 //!   before the last column and does not end in a right-aligned run.
-//! - **Backspace** only over a character it typed on this row in this epoch, at the end of the
-//!   line, never over the prompt.
+//! - **Backspace** only over a character it typed on this row in this epoch and already echoed,
+//!   at the end of the line, never over the prompt.
 //! - **Left, right, Ctrl-B, Ctrl-F** move the predicted cursor within the span it typed.
-//! - **One guess in flight** wherever the program redraws the cells right of the cursor (a
-//!   mid-line insert, a suggestion): the core contradicts a pending guess whose cell the program
-//!   changes before its echo, so a second guess there would be a visible misprediction.
+//! - **One guess in flight** for a key whose echo moves the cursor through other places or
+//!   redraws cells right of it (a Backspace, a mid-line insert, a key in front of a suggestion):
+//!   the core contradicts a pending guess whose cell such an echo changes, and ends the epoch at
+//!   a cursor no pending guess leaves, so a second guess there would be a visible misprediction.
 //! - **Nothing** next to a cell whose width terminals dispute, while origin mode is on, or while
 //!   the cursor's position depends on a cursor restore after a soft reset (`CoreView`).
 //! - **The adaptive switch and the underline** (§2.7): from its own smoothed echo time (a key's
 //!   send to the `EchoAck` that covers it, less the echo window), seeded by the link's RTT hint
 //!   until the first acknowledgement; on above 30 ms, off below 20 ms; underlined above 80 ms or
-//!   within 30 s of a glitch (an `EchoAck` more than 250 ms after its key), plain otherwise.
+//!   within 30 s of a glitch (an `EchoAck` more than 250 ms after its key), plain otherwise. The
+//!   second underline trigger is [`UnderlineAfter`] (the owner's open question).
 //!
 //! **Following the line.** A key it declines but whose effect it knows (a second key where only
 //! one may be in flight, a Backspace in the middle of the line) is *held*: nothing more is
@@ -35,6 +38,9 @@
 //! earlier key that lands there. So until it has seen a key echoed before its
 //! acknowledgement, and for 30 s after it sees one echoed after it, this predictor starts an epoch
 //! (and leaves a held line) only once every key has been acknowledged for the late-echo grace.
+//! With a fast program too, a tentative epoch's guess that shows its glyph before the keys before
+//! the epoch are acknowledged (`CoreView::prior_acked`; the core treats that chunk as neutral)
+//! makes it withdraw the epoch's unwritten guesses: the next echo could confirm it one key off.
 //!
 //! Its `Debug` output and state hold no typed character (`docs/m3/plan.md` §4.3).
 
@@ -138,6 +144,9 @@ struct Pend {
     exposed: bool,
     /// An `EchoAck` covered its key while its cell did not show its glyph yet.
     unechoed_at_ack: bool,
+    /// Where the cursor is once its echo is in: the next column, or the cell itself for a
+    /// Backspace.
+    after: u16,
     /// Its echo moves more than the one cell (a Backspace's `\b \b`, an insert's shifted rest,
     /// a suggestion redrawn): nothing else may be in flight on its row (see [`Shifty`]).
     shifty: bool,
@@ -241,12 +250,16 @@ pub struct MoshPredictor {
     pending: BTreeMap<InputPos, Pend>,
     /// Moves declared on a row, until their echo is surely in: acknowledged, and for a program
     /// that echoes late, for the late-echo grace after that. A later key's guess waits for them:
-    /// the core settles a move at its acknowledgement, so a move echoed after it would move the
-    /// cursor where no pending guess leaves it.
+    /// the core settles a move at its acknowledgement, and drops it at a boundary, so a move
+    /// echoed after either would move the cursor where no pending guess leaves it.
     moves: Vec<(InputPos, u16, Option<Time>)>,
     /// The program has drawn a suggestion after the typed text (fish, zsh-autosuggestions): one
     /// guess in flight on its rows from then on, since a suggestion can appear after any key.
     suggests: bool,
+    /// Guesses confirmed before the shadow cursor reached them (a suggestion that happened to
+    /// show the typed character): their echo is still to come, so they stay in flight on their
+    /// row, as (row, the column after them), until the cursor gets there.
+    unreached: Vec<(u16, u16, Time)>,
 }
 
 impl std::fmt::Debug for MoshPredictor {
@@ -356,6 +369,7 @@ impl MoshPredictor {
             pending: BTreeMap::new(),
             moves: Vec::new(),
             suggests: false,
+            unreached: Vec::new(),
         }
     }
 
@@ -412,6 +426,10 @@ impl MoshPredictor {
             self.follow = Follow::Live;
             self.chain = Chain::Shadow;
         }
+        let cur = ctx.screen.cursor();
+        self.unreached.retain(|&(r, after, t)| {
+            cur.row == r && cur.col < after && ctx.now.saturating_sub(t) < EXPIRY
+        });
         // Drop what the core can no longer hold (it expires a guess after 10 s): an edit it
         // refused would otherwise stay outstanding here.
         let now = ctx.now;
@@ -467,6 +485,7 @@ impl MoshPredictor {
         let c = ctx.screen.cursor();
         self.pending.is_empty()
             && self.moves.is_empty()
+            && self.unreached.is_empty()
             && self.unacked.len() <= 1 // the key being typed
             && !c.pending_wrap
             && (c.row, c.col) == (line.row, line.cursor)
@@ -505,7 +524,9 @@ impl MoshPredictor {
     }
 
     fn row_pending(&self, row: u16) -> bool {
-        self.pending.values().any(|p| p.row == row) || self.row_moving(row)
+        self.pending.values().any(|p| p.row == row)
+            || self.row_moving(row)
+            || self.unreached.iter().any(|&(r, _, _)| r == row)
     }
 
     fn row_shifty(&self, row: u16) -> bool {
@@ -564,6 +585,7 @@ impl MoshPredictor {
                 exposed: false,
                 unechoed_at_ack: false,
                 shifty: shifty == Shifty::Yes,
+                after: line.cursor,
             },
         );
         self.line = Some(line);
@@ -635,11 +657,17 @@ impl MoshPredictor {
                 let mut next = line;
                 next.cursor = col + 1;
                 next.end = if mid { line.end + 1 } else { col + 1 };
-                if Self::disputed_near(v, row, col + 1) {
+                // Two columns kept before the last one, as for an insert: a blank tail can hide
+                // spaces the line holds (typed, then moved back over), which the shell shifts
+                // right, and a shift into the last column wraps the line.
+                if Self::disputed_near(v, row, col + 1) || col + 4 > cols {
                     return self.hold(next);
                 }
                 let busy = self.row_pending(row);
-                if self.row_shifty(row) || (self.late(ctx.now) && self.row_moving(row)) {
+                // After a move not yet acknowledged: a boundary drops the move from the core
+                // but keeps a written guess after it, and the move's echo would then end the
+                // epoch with the guess still waiting.
+                if self.row_shifty(row) || self.row_moving(row) {
                     return self.hold(next);
                 }
                 // A plain append, or one that goes alone (`Shifty`).
@@ -810,6 +838,64 @@ impl Predictor for MoshPredictor {
             .map(|(&a, p)| (a, p.col, p.exposed))
             .collect();
         let mut edits = Vec::new();
+        // A tentative epoch's guess that shows its glyph while a key typed before the epoch is
+        // still unacknowledged may be that key's late echo landing on it (the core withholds the
+        // confirmation, rule 2's prior-ack condition, but the next chunk could then confirm the
+        // epoch one key off). Withdraw the epoch's guesses, unwritten, and wait for the next.
+        if !ctx.core.confirmed && !ctx.core.prior_acked {
+            let shown: Vec<(InputPos, u16, u16)> = self
+                .pending
+                .iter()
+                .filter(|(_, p)| p.epoch == self.epoch && !p.exposed)
+                .map(|(&a, p)| (a, p.row, p.col))
+                .collect();
+            let matched = self.pending.values().any(|p| {
+                p.epoch == self.epoch
+                    && p.glyph != ' '
+                    && v.cell(p.row, p.col)
+                        .is_some_and(|c| c.text == text_of(p.glyph))
+            });
+            if matched {
+                for (a, row, col) in shown {
+                    edits.push(OverlayEdit::Withdraw { row, col });
+                    self.pending.remove(&a);
+                }
+                self.follow = Follow::Quiet;
+                self.chain = Chain::Unknown;
+                self.expose(ctx);
+                return edits;
+            }
+        }
+        // A program just seen echoing late: a space over a blank still waiting (written later
+        // in this flush, if the chunk confirmed the epoch) would end the epoch with its late
+        // echo, and with it every guess after it. Withdraw those while they are unwritten.
+        if self.late(ctx.now) {
+            let risky = self
+                .pending
+                .iter()
+                .find(|(_, p)| {
+                    p.epoch == self.epoch
+                        && p.glyph == ' '
+                        && v.cell(p.row, p.col).is_none_or(|c| blank(c.text))
+                })
+                .map(|(&a, p)| (a, p.row));
+            if let Some((from, row)) = risky {
+                let late: Vec<(InputPos, u16)> = self
+                    .pending
+                    .iter()
+                    .filter(|(a, p)| **a >= from && p.row == row && !p.exposed)
+                    .map(|(&a, p)| (a, p.col))
+                    .collect();
+                for (a, col) in late {
+                    edits.push(OverlayEdit::Withdraw { row, col });
+                    self.pending.remove(&a);
+                }
+                if !edits.is_empty() && self.follow == Follow::Live {
+                    self.follow = Follow::Held;
+                    self.chain = Chain::Unknown;
+                }
+            }
+        }
         if ahead.len() >= 2 {
             let hazard = match tail(v, c.row, c.col) {
                 Tail::Blank | Tail::Rprompt(_) => false,
@@ -842,6 +928,10 @@ impl Predictor for MoshPredictor {
                 continue;
             };
             if matches!(s.outcome, Outcome::Confirmed | Outcome::Restyled) {
+                let c = ctx.screen.cursor();
+                if c.row == p.row && c.col < p.after {
+                    self.unreached.push((p.row, p.after, s.settled));
+                }
                 if p.unechoed_at_ack {
                     self.late_echo(s.settled);
                 } else if s.at >= self.acked {

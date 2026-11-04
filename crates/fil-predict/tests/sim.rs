@@ -263,8 +263,17 @@ fn the_prior_ack_rule_only_withholds_confirmations() {
                             son.written <= soff.written,
                             "{what}: wrote more with the rule"
                         );
+                        // A guess kept from an ended epoch is not the rule's: it settles by its
+                        // glyph, and the run without the rule may settle it on another chunk. Such
+                        // a cell left painted shows what the shadow shows (a blank over a blank).
+                        let invisible = |c: &fil_predict::overlay::PaintedCell| {
+                            on.shadow.screen[usize::from(c.row)].cells[usize::from(c.col)].text
+                                == c.text
+                        };
                         assert!(
-                            on.painted.iter().all(|c| offv.painted.contains(c)),
+                            on.painted
+                                .iter()
+                                .all(|c| offv.painted.contains(c) || invisible(c)),
                             "{what}: painted something the run without the rule did not"
                         );
                         acted += 1;

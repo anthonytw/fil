@@ -838,6 +838,11 @@ impl Core {
             .map(|k| k.at)
     }
 
+    /// Every key before the current epoch's first key is acknowledged (`CoreView::prior_acked`).
+    pub fn prior_acked(&self) -> bool {
+        self.first_key_at().is_none_or(|a| self.acked >= a)
+    }
+
     fn is_kept(&self, i: usize) -> bool {
         self.keys[i].guess.as_ref().is_some_and(|g| g.kept)
     }

@@ -109,7 +109,7 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
 
 ### 4.4 Reproducible archives
 
-- **The recipe, one for all archives, with GNU tar and gzip.** All four archives, the universal macOS one included, are assembled on the Linux `publish` job, in its pinned environment, because macOS's bsdtar has no `--sort`. The macOS binary is built on a macOS runner and carried over as a file.
+- **The recipe, one for all archives, with GNU tar and gzip.** All four archives, the universal macOS one included, are assembled on the Linux `publish` job **inside the digest-pinned x86_64 Linux image that `Cross.toml` names** (the image REL pins for the `x86_64-unknown-linux-musl` target), not with the hosted runner's own tar and gzip, which the runner image can change. macOS's bsdtar has no `--sort`, which is the other reason. The macOS binary is built on a macOS runner and carried over as a file. REL's log records `tar --version` and `gzip --version` from inside the image, and `release-verify` rebuilds the archives in the same image.
   - `tar --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX'` (executables and directories end up 0755 and other files 0644; a PAX format would also need `--pax-option=delete=atime,delete=ctime`, which is why the format is `gnu`);
   - `gzip -n -9`, so the archive carries neither a name nor a time and the compression level is fixed;
   - `SOURCE_DATE_EPOCH` is the tagged commit's committer time.
@@ -156,6 +156,7 @@ GC looks at the entries of exactly one directory, `$HOME/.local/share/fil`, and 
 | Fresh-upload directory | an entry named `.new-` followed by one or more characters |
 | The `.new-*` age bound | **86400 seconds (24 hours)**: collected only when `now - mtime > 86400 s` of the directory itself. A modification time in the future is not old |
 | The "recently used" window | **604800 seconds (7 days)**: a version directory is kept when `now - mtime < 604800 s`, or when its mtime is in the future. At exactly 604800 s it is not recent |
+| The "far future" bound | **86400 seconds (1 day)**: an mtime more than this ahead of `now` is "far future". Plain GC still keeps it as recently used and reports it separately; a forced pass ignores it (§6.3, 2.5) |
 
 `<major>` and `<rev>` in the lock names are the numbers from the version directory's name, in decimal, without leading zeros, as `fil_daemon::paths` writes them (`Paths::lock`, `Paths::start_lock`). This section states the same names for the readers of other versions.
 
@@ -180,7 +181,10 @@ GC works through the entries of the install root and decides each one alone:
    5. **It was recently used:** its directory's mtime is less than 7 days old, or in the future. This is the only rule that covers what lock files on this host cannot show: a daemon on another host that shares the home, a copy that `fil install` has installed and nobody has attached to yet, and a concurrent install that has not reached its `exec`.
       - **Stamped at install:** `--install-finish` sets the version directory's mtime to the current time when it puts the directory in place (a rename does not change the moved directory's own mtime).
       - **Refreshed while in use:** a running daemon whose executable is a conforming version directory under the install root sets that directory's mtime to the current time on its hourly maintenance wake (TMP). It finds that directory from its own executable (`/proc/self/exe` on Linux, `current_exe()` on macOS).
-      - `--install-gc` honors the rule too, and its result line says how many copies it kept as recently used. Whether a forced variant exists is U1's call.
+      - **Two passes use this one function.** The **plain** pass is `--install-finish`'s collection after an install, and it applies every rule of this section. The **forced** pass is what `fil install --remove HOST` runs; it skips **rule 2.5 and nothing else**. The lock rules (2.2 and 2.3) and "unknown is keep" (2.4) still apply to it, so a running daemon's copy, a copy whose start lock is held and a copy the probe could not judge are never removed, forced or not. The current-copy exemption (2.1) is not in a forced pass, as before.
+      - **The forced pass is the bare `--install-gc`.** The bootstrap's `remove` mode `exec`s exactly `fil server --install-gc`, with no arguments, and its text is fixed (plan, OQ-1). So `--install-gc` with no arguments is the forced pass, and the user's explicit `fil install --remove` is what makes it forced. Any other spelling (a flag that keeps recent copies, for example) is U1's to add and is outside this contract.
+      - **A far-future stamp cannot pin a copy for good.** An mtime more than 1 day ahead of `now` (the clock was wrong at install) counts as recently used for the plain pass, which stays safe, and the plain pass's result line reports such copies separately. The forced pass ignores it like any other mtime, and a running daemon's hourly refresh sets the time back to the present.
+      - Both passes report in their result line how many copies they kept as recently used.
 3. **An entry named `.new-*`** is collected if it is a real directory (not a symbolic link) owned by the user, and its mtime is more than 24 hours in the past. Younger ones are never touched, so GC never removes another client's upload in flight. A process ID alone cannot tell uploads apart: IDs repeat across hosts that share an NFS home, and across containers.
 4. **Every other entry** (files, symbolic links, directories with any other name, a `.new` without the dash) is never touched.
 5. **Removal** of a selected directory is std's `fs::remove_dir_all` on its path, after the `lstat` check above. It has not followed symbolic links since Rust 1.58.1 (CVE-2022-21658), and the pinned toolchain is newer. A symbolic link inside a candidate is removed as a link and its target survives, and a test pins that. (An `openat`-based walk that never follows links would do as well.) A failure to remove is reported and does not stop the pass.
@@ -199,7 +203,7 @@ GC prints nothing that the user did not ask for beyond its result line; the line
 
 A later version may **extend** collection only so that **an older copy's rules stay safe** for everything that the later version creates. That means:
 
-1. **Names it recognizes: only a subset.** For any entry this section's rules recognize (a conforming version directory or a `.new-*` entry), a later version collects a subset of what §6.3 collects. It may add reasons to keep. It may not remove a directory that §6.3 keeps, and it may not shorten either time bound (a longer one is fine). A shorter `.new-*` bound would remove the upload in flight of an older client, which relies on the 24 hours; a shorter recency window would remove a copy that an older install stamped.
+1. **Names it recognizes: only a subset.** For any entry this section's rules recognize (a conforming version directory or a `.new-*` entry), a later version collects a subset of what §6.3 collects. It may add reasons to keep. It may not remove a directory that §6.3 keeps in a plain pass, and a later forced pass skips rule 2.5 only, never a lock rule or "unknown is keep". It may not shorten either time bound (a longer one is fine). A shorter `.new-*` bound would remove the upload in flight of an older client, which relies on the 24 hours; a shorter recency window would remove a copy that an older install stamped.
 2. **Names it does not recognize: only its own kinds.** A later version may collect kinds of entries that this section does not recognize, but only entries of kinds it defines and creates itself, and never one whose name matches the version-directory pattern or `.new-*`. Older copies leave such names alone (§6.3, 4).
 3. **Everything it installs follows the pattern and the clock.** A later version installs its binaries only as `<ver>-w<major>.<rev>` directories and stamps them at install (§6.3, 2.5). It stages uploads only in `.new-*` directories and finishes (renames) them within 24 hours. That bound implies a minimum upload rate: at the 128 MiB cap, about 1.5 KB/s; for a 15 MB binary, under 200 B/s. An upload that GC collects anyway fails cleanly: its `wc -c` check fails, the script removes what it created and exits 1. A test pins that.
 4. **It keeps the signs of life.** For every wire that has an install directory:
@@ -209,7 +213,7 @@ A later version may **extend** collection only so that **an older copy's rules s
 
 ### 6.5 What the test must pin (U1)
 
-U1 implements `--install-gc` and `--install-finish`'s collection, and writes the test that pins this section. The values are literals in the test, not derived from the code under test, so renaming a file or changing a bound fails it. They are also kept as a golden file, `crates/fil/tests/golden/install-gc.txt`: one `key = value` line per pinned value of §6.2, and a `[history]` like the wire golden's (one line per revision of the contract, a hash of the pinned block, only ever growing), so an edit to a frozen value is visible in review and fails the test. §6.4's extensions may add lines only in a separate section of the golden, below the pinned block.
+U1 implements `--install-gc` and `--install-finish`'s collection, and writes the test that pins this section. The values are literals in the test, not derived from the code under test, so renaming a file or changing a bound fails it. They are also kept as a golden file, `crates/fil/tests/golden/install-gc.txt`: one `key = value` line per pinned value of §6.2 (the far-future bound included), and a `[history]` like the wire golden's (one line per revision of the contract, a hash of the pinned block, only ever growing), so an edit to a frozen value is visible in review and fails the test. §6.4's extensions may add lines only in a separate section of the golden, below the pinned block.
 
 1. **The name pattern.**
    - Accepted, with their `(ver, major, rev)`: `0.1.0-w1.12` is (`0.1.0`, 1, 12); `0.1.0-rc.1-w1.12` is (`0.1.0-rc.1`, 1, 12); `0.1.0-wip-w1.12` is (`0.1.0-wip`, 1, 12); `1.0.0-w2-w1.12` is (`1.0.0-w2`, 1, 12); `1.2.3-w65535.65535`; a version of exactly 64 characters.
@@ -217,7 +221,10 @@ U1 implements `--install-gc` and `--install-finish`'s collection, and writes the
    - The remote command's compile-time check accepts and refuses exactly the same versions and wires (its const check is tested against this list).
 2. **The lock names.** For `0.1.0-w1.12` and uid 1000: `/tmp/fil-1000/fil-1-12.lock` and `/tmp/fil-1000/fil-1-12.start`. A second assertion checks that `fil_daemon::paths::Paths` produces the same file names for wire 1.12, so the daemon and GC cannot drift apart.
 3. **The `.new-*` bound.** A directory with mtime 86399 s old is kept, 86400 s is kept, 86401 s is collected, and one in the future is kept. A `.new-x` that is a symbolic link, a regular file or owned by another user is never touched. `.new`, `new-1` and `x.new-1` are never touched. An upload whose directory GC has removed fails cleanly (§6.4, 3).
-4. **The recency rule.** A candidate (no lock held, not current) with mtime 604799 s old is kept, 604800 s and 604801 s are collected, and one in the future is kept. `--install-finish` leaves the new directory's mtime at the install time. `--install-gc` reports the number kept as recently used.
+4. **The recency rule, and the forced pass.**
+   - A plain pass, candidate with no lock held and not current: mtime 604799 s old is kept; 604800 s and 604801 s are collected; one in the future is kept; one 86401 s in the future is kept and reported as far-future, and 86399 s ahead is kept and not so reported.
+   - A forced pass (bare `--install-gc`): a candidate with mtime of the current time and no lock is **removed**; so are 604799 s old and one 86401 s in the future. With the daemon lock held, the start lock held, or an unknown probe, the same candidates are **kept**.
+   - `--install-finish` leaves the new directory's mtime at the install time. Both passes report the number kept as recently used.
 5. **Each other keep rule alone, and each removal** (with the mtime older than 7 days, so rule 2.5 does not hide the others):
    - a directory whose wire's lock is held (a real `flock` taken by the test) is kept, and another directory of the same wire with a different `<ver>` is kept too;
    - the same with only the start lock held;
@@ -228,7 +235,7 @@ U1 implements `--install-gc` and `--install-finish`'s collection, and writes the
    - a missing socket directory removes the unprotected candidates;
    - a version directory owned by another user, or that is a symbolic link, is left alone (use the pure selection function with injected metadata where the test cannot `chown`).
 6. **Nothing else.** Files, symbolic links to directories, and directories with unknown names in the install root are untouched. A symbolic link inside a removed candidate is removed as a link, and the directory it points to outside the root, with its contents, survives. `~/.local/share` and `~/.local` are never removed. `--install-gc` removes `~/.local/share/fil` when the pass empties it, and `--install-finish` does not.
-7. **Mutation table.** The PR's mutation table includes: change either time bound; drop rule 2.5 (the test of a copy with a fresh mtime and no lock on this host fails); shorten the lock name; treat a held start lock as "free"; follow a symbolic link at a `.new-*` entry or inside a candidate; treat an unreadable lock as "no daemon"; treat a non-regular lock as "no daemon"; split the name at the first `-w`. Each must fail the named test.
+7. **Mutation table.** The PR's mutation table includes: change either time bound; drop rule 2.5 (the test of a copy with a fresh mtime and no lock on this host fails); let the forced pass skip a lock rule or "unknown is keep" (the forced-with-lock test fails); let the forced pass honor rule 2.5 (the forced fresh-copy test fails); shorten the lock name; treat a held start lock as "free"; follow a symbolic link at a `.new-*` entry or inside a candidate; treat an unreadable lock as "no daemon"; treat a non-regular lock as "no daemon"; split the name at the first `-w`. Each must fail the named test.
 
 ### 6.6 Why "recently used", and not the start lock
 
@@ -240,7 +247,14 @@ Holding the **start lock** over such a copy does not work:
 - `fil install` without an attach has no daemon to wait for, and nothing to hold the lock for;
 - `--install-finish` holding the start lock through `exec … server --stdio` would make that relay's own `StartLock::acquire` wait on itself until `START_LOCK_TIMEOUT`.
 
-The recency rule needs none of that: one install stamp, and one refresh an hour against a seven-day window, so it tolerates skew between hosts and costs at most one idle copy (about 15 MB) per version for a week. A copy outside the window with no daemon on this host is collectable, and if a daemon on another host is still running from it that daemon has not refreshed for a week, which means it is not running.
+The recency rule needs none of that: one install stamp, and one refresh an hour against a seven-day window, so it tolerates skew between hosts and costs at most one idle copy (about 15 MB) per version for a week.
+
+A copy outside the window with no daemon on this host is collectable. If a daemon is still running from it, one of these holds: the daemon is not running (its host was off), **or** its host was asleep or suspended for a week (a suspended VM or laptop) so it has not refreshed, **or** its host's clock is more than 7 days behind the host that runs GC (a board with no RTC before NTP, for example). The consequence is the same in the last two cases:
+
+- **Linux:** the daemon and its sessions go on (it runs from `/proc/self/exe`). The next connection to that host finds no copy, and the client re-uploads the same wire (one upload and, with `install = "ask"`, one prompt). The relay then reaches the live daemon.
+- **macOS remote:** existing sessions survive, but new sessions started in that daemon fail until the copy is installed again, because the daemon starts them through `current_exe()`, a path that no longer exists (plan §1, the trampoline item).
+
+That cost is **accepted** for 0.1.0, given its preconditions: a home shared across hosts, mixed versions, and a week of sleep or a clock that far behind.
 
 ## 7. Notices (LIC)
 

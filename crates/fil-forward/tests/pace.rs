@@ -48,6 +48,7 @@ per_transport!(a_stuck_forward_never_holds_the_control_sender_or_a_new_connectio
 /// counting, and the rest of the request follows.
 async fn a_stuck_forward_never_holds_the_control_sender_or_a_new_connection(t: Transport) {
     let deaf = serve(|s| async move {
+        shrink_buffers(&s);
         tokio::time::sleep(Duration::from_secs(120)).await;
         drop(s);
     })
@@ -60,10 +61,10 @@ async fn a_stuck_forward_never_holds_the_control_sender_or_a_new_connection(t: T
     });
     let stuck_port = w.local_forward(1, deaf.port);
     let echo_port = w.local_forward(2, echo.port);
-    let mut stuck = connect(stuck_port).await;
+    let mut stuck = connect_small(stuck_port).await;
     let writer = tokio::spawn(async move {
         let buf = vec![5u8; 64 * 1024];
-        while stuck.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut stuck, &buf).await.is_ok() {}
     });
     // Wait until the cap is full and stays full: the daemon's socket to the target is full, so
     // nothing more is consumed or acknowledged.
@@ -130,7 +131,7 @@ const RATE: u64 = 2_500_000;
 async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
     let source = serve(|mut s| async move {
         let buf = vec![9u8; 64 * 1024];
-        while s.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
     })
     .await;
     let stream = StreamConfig {
@@ -207,7 +208,7 @@ async fn parallel_downloads_keep_the_link_full_body() {
     for n in [16, 32] {
         let source = serve(|mut s| async move {
             let buf = vec![9u8; 64 * 1024];
-            while s.write_all(&buf).await.is_ok() {}
+            while write_all_retry(&mut s, &buf).await.is_ok() {}
         })
         .await;
         let mut w = World::new_pipe_on(mux_config(), slow_pipe()).await;
@@ -383,7 +384,7 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     let (deaf_port, deaf) = deaf_target().await;
     let source = serve(|mut s| async move {
         let buf = vec![9u8; 64 * 1024];
-        while s.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
     })
     .await;
     let echo = echo_server().await;
@@ -394,10 +395,10 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     let echo_port = w.local_forward(3, echo.port);
     let mut held = Vec::new();
     for _ in 0..k {
-        let mut s = connect(up_port).await;
+        let mut s = connect_small(up_port).await;
         held.push(tokio::spawn(async move {
             let buf = vec![5u8; 64 * 1024];
-            while s.write_all(&buf).await.is_ok() {}
+            while write_all_retry(&mut s, &buf).await.is_ok() {}
         }));
         // Downloads nobody reads: the socket is kept, never read.
         let s = connect_unread(down_port).await;
@@ -560,7 +561,7 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     let mut s = connect(stuck_port).await;
     let writer = tokio::spawn(async move {
         let buf = vec![5u8; 256];
-        while s.write_all(&buf).await.is_ok() {
+        while write_all_retry(&mut s, &buf).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
@@ -644,7 +645,7 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
     let mut s = connect(stuck_port).await;
     let writer = tokio::spawn(async move {
         let buf = vec![5u8; 256];
-        while s.write_all(&buf).await.is_ok() {
+        while write_all_retry(&mut s, &buf).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });

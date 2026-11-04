@@ -396,6 +396,78 @@ const READ_CHUNK: usize = fil_proto::limits::MAX_DATA_PAYLOAD;
 /// Largest piece taken from a channel's receive buffer for one socket write.
 const WRITE_CHUNK: usize = 64 * 1024;
 
+/// The first wait after a local socket call failed for want of kernel memory
+/// ([`is_no_memory`]); each further failure in a row doubles it.
+const NOMEM_FIRST: Duration = Duration::from_millis(1);
+/// The longest wait between two tries.
+const NOMEM_CAP: Duration = Duration::from_millis(100);
+/// How long a socket may fail for want of kernel memory, with no call succeeding between, before
+/// the channel is reset: the shortage is not passing.
+const NOMEM_LIMIT: Duration = Duration::from_secs(30);
+/// A failure this long after the previous one starts a new run: the call was not failing in
+/// between, it was waiting (`Pending`, an idle peer), and that time is not the shortage's.
+const NOMEM_GAP: Duration = Duration::from_millis(2 * NOMEM_CAP.as_millis() as u64);
+
+/// Whether `e` is the kernel running short of socket memory (`ENOBUFS`, or `ENOMEM` where a
+/// socket call uses it for the same thing): a transient condition, not a broken connection. It
+/// is seen on a loopback send when the mbuf pool is small and many sockets hold data
+/// (macOS, `kern.ipc.nmbclusters`), and clears as other sockets drain.
+///
+/// The endpoint tries such a call again only on a stream whose failed calls are known to have
+/// moved no bytes ([`ForwardStream::no_memory_moves_nothing`](crate::ForwardStream)): Linux, not
+/// macOS.
+fn is_no_memory(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
+}
+
+/// The wait between tries of a socket call that fails for want of kernel memory: exponential
+/// ([`NOMEM_FIRST`] to [`NOMEM_CAP`]), over once the failures have run for [`NOMEM_LIMIT`]
+/// without a call succeeding.
+struct NoMemoryRetry {
+    next: Duration,
+    /// When the current run of failures began.
+    since: Option<tokio::time::Instant>,
+    /// When the last failure was.
+    last: Option<tokio::time::Instant>,
+}
+
+impl NoMemoryRetry {
+    fn new() -> Self {
+        Self {
+            next: NOMEM_FIRST,
+            since: None,
+            last: None,
+        }
+    }
+
+    /// A call succeeded: the next failure starts a new run.
+    fn succeeded(&mut self) {
+        self.next = NOMEM_FIRST;
+        self.since = None;
+        self.last = None;
+    }
+
+    /// A call failed at `now`: how long to wait before the next try, or `None` to give up. A
+    /// failure more than [`NOMEM_GAP`] after the last one starts a new run, as a success would.
+    fn failed(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) > NOMEM_GAP)
+        {
+            self.succeeded();
+        }
+        self.last = Some(now);
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= NOMEM_LIMIT {
+            return None;
+        }
+        let wait = self.next;
+        self.next = (self.next * 2).min(NOMEM_CAP);
+        Some(wait)
+    }
+}
+
 /// Events waiting in the owner's channel ([`Endpoint::new`]).
 pub const EVENT_QUEUE: usize = 64;
 
@@ -2466,10 +2538,14 @@ impl<L: Link> Inner<L> {
                 return;
             }
         }
+        let retry = stream.no_memory_moves_nothing();
         let (mut rd, mut wr) = tokio::io::split(stream);
         {
             let work = async {
-                tokio::join!(self.up(ch, &mut rd, &sig), self.down(ch, &mut wr, &sig));
+                tokio::join!(
+                    self.up(ch, &mut rd, &sig, retry),
+                    self.down(ch, &mut wr, &sig, retry)
+                );
             };
             tokio::pin!(work);
             let mut worked = false;
@@ -2505,12 +2581,16 @@ impl<L: Link> Inner<L> {
     /// Local socket → channel. Reads only as much as the channel's send buffer has room for, so
     /// the pump itself never holds forwarded bytes: everything buffered is the mux's, inside the
     /// budget. With no room it stops reading (TCP backpressure) until the mux says `Writable`.
+    /// `retry`: a read that fails for want of kernel memory is tried again rather than resetting
+    /// the channel ([`ForwardStream::no_memory_moves_nothing`](crate::ForwardStream::no_memory_moves_nothing)).
     async fn up<R: AsyncRead + Unpin>(
         self: &Arc<Self>,
         ch: ChannelId,
         rd: &mut R,
         sig: &Arc<Signals>,
+        retry: bool,
     ) {
+        let mut nomem = NoMemoryRetry::new();
         loop {
             let notified = sig.tx.notified();
             let room = {
@@ -2583,7 +2663,21 @@ impl<L: Link> Inner<L> {
                     self.kick();
                     return;
                 }
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => nomem.succeeded(),
+                Err(e) if retry && is_no_memory(&e) => {
+                    // Nothing was read and nothing is registered to wake this task: wait a
+                    // moment and look again. The loop recomputes the room and takes a fresh
+                    // `notified`, so a `Writable` or an end during the wait is not missed.
+                    let Some(wait) = nomem.failed(tokio::time::Instant::now()) else {
+                        debug!(
+                            channel = ch.0,
+                            "forward socket read: out of memory for too long"
+                        );
+                        self.abort(ch, sig, CloseReason::Reset);
+                        return;
+                    };
+                    tokio::time::sleep(wait).await;
+                }
                 Err(e) => {
                     debug!(channel = ch.0, kind = ?e.kind(), "forward socket read failed");
                     self.abort(ch, sig, CloseReason::Reset);
@@ -2594,18 +2688,21 @@ impl<L: Link> Inner<L> {
     }
 
     /// Channel → local socket. Acknowledges (`consumed`) only what the socket took; shuts the
-    /// socket's write side down once every byte before the peer's `Eof` is written.
+    /// socket's write side down once every byte before the peer's `Eof` is written. `retry` as
+    /// for [`Self::up`].
     async fn down<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         ch: ChannelId,
         wr: &mut W,
         sig: &Arc<Signals>,
+        retry: bool,
     ) {
         enum Next {
             Data(Bytes),
             Eof,
             Wait,
         }
+        let mut nomem = NoMemoryRetry::new();
         loop {
             let notified = sig.rx.notified();
             let next = {
@@ -2633,6 +2730,7 @@ impl<L: Link> Inner<L> {
                     while off < data.len() {
                         match wr.write(&data[off..]).await {
                             Ok(n) if n > 0 => {
+                                nomem.succeeded();
                                 off += n;
                                 let mut st = lock(&self.state);
                                 if !st.live(ch, sig) {
@@ -2647,6 +2745,25 @@ impl<L: Link> Inner<L> {
                                 // delay the control sender must be told of) or a `Close`: control
                                 // items. It frees none of this side's own sending.
                                 self.kick_ctl();
+                            }
+                            Err(e) if retry && is_no_memory(&e) => {
+                                // The kernel is out of socket memory, for now, and the
+                                // failed write took nothing (`retry`). The rest of `data` stays here, unacknowledged (`consumed` is not called),
+                                // so the peer's window stays shut behind it: nothing is lost,
+                                // reordered or let in past the budget. The wait is a timer, not
+                                // a `Notify`: whatever arrives meanwhile is found by the next
+                                // turn of the outer loop, which takes a fresh `notified` before
+                                // it reads the mux. A channel that ends drops this future with
+                                // the pump's `work`.
+                                let Some(wait) = nomem.failed(tokio::time::Instant::now()) else {
+                                    debug!(
+                                        channel = ch.0,
+                                        "forward socket write: out of memory for too long"
+                                    );
+                                    self.abort(ch, sig, CloseReason::Reset);
+                                    return;
+                                };
+                                tokio::time::sleep(wait).await;
                             }
                             Ok(_) | Err(_) => {
                                 debug!(channel = ch.0, "forward socket write failed");
@@ -2737,5 +2854,89 @@ async fn socks_handshake(s: &mut TcpStream) -> Result<(socks::Request, Vec<u8>),
             Ok(Progress::Connect(req)) => return Ok((req, hs.rest().to_vec())),
             Err(e) => return Err(e.reply(hs.version())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Instant;
+
+    #[test]
+    fn only_kernel_memory_shortages_are_transient() {
+        use rustix::io::Errno;
+        for e in [Errno::NOBUFS, Errno::NOMEM] {
+            assert!(is_no_memory(&std::io::Error::from_raw_os_error(
+                e.raw_os_error()
+            )));
+        }
+        for e in [Errno::PIPE, Errno::CONNRESET, Errno::AGAIN] {
+            assert!(!is_no_memory(&std::io::Error::from_raw_os_error(
+                e.raw_os_error()
+            )));
+        }
+        assert!(!is_no_memory(&std::io::Error::other("no errno")));
+    }
+
+    #[test]
+    fn the_wait_doubles_to_a_cap_and_a_success_starts_over() {
+        let t0 = Instant::now();
+        let mut r = NoMemoryRetry::new();
+        let waits: Vec<_> = (0..10).map(|_| r.failed(t0).unwrap()).collect();
+        let ms: Vec<u64> = waits.iter().map(|w| w.as_millis() as u64).collect();
+        assert_eq!(ms, [1, 2, 4, 8, 16, 32, 64, 100, 100, 100]);
+        r.succeeded();
+        assert_eq!(r.failed(t0).unwrap(), NOMEM_FIRST);
+    }
+
+    /// Fails every `step` from `from` up to and including `to`, returning the last answer.
+    fn fail_until(
+        r: &mut NoMemoryRetry,
+        from: Instant,
+        to: Instant,
+        step: Duration,
+    ) -> Option<Duration> {
+        let mut t = from;
+        loop {
+            let w = r.failed(t);
+            if t >= to {
+                return w;
+            }
+            t = (t + step).min(to);
+        }
+    }
+
+    #[test]
+    fn it_gives_up_after_the_limit_of_continuous_failure_only() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Failures every 100 ms (the longest wait): one run, over at the limit.
+        let mut r = NoMemoryRetry::new();
+        assert!(fail_until(&mut r, t0, t0 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
+        assert!(r.failed(t0 + NOMEM_LIMIT).is_none());
+        // A success in between restarts the clock.
+        let mut r = NoMemoryRetry::new();
+        assert!(fail_until(&mut r, t0, t0 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
+        r.succeeded();
+        let t1 = t0 + NOMEM_LIMIT;
+        assert!(fail_until(&mut r, t1, t1 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
+        assert!(r.failed(t1 + NOMEM_LIMIT).is_none());
+    }
+
+    #[test]
+    fn a_failure_after_a_quiet_gap_starts_a_new_run() {
+        let t0 = Instant::now();
+        let mut r = NoMemoryRetry::new();
+        assert!(fail_until(&mut r, t0, t0 + Duration::from_secs(29), NOMEM_CAP).is_some());
+        // The call then waited (`Pending`) for longer than the gap: not a failure.
+        let t1 = t0 + Duration::from_secs(29) + NOMEM_GAP + Duration::from_millis(1);
+        assert_eq!(r.failed(t1), Some(NOMEM_FIRST));
+        assert!(
+            r.failed(t1 + Duration::from_secs(2))
+                .is_some_and(|w| w == NOMEM_FIRST)
+        );
+        // Within the gap, the run goes on and the wait keeps growing.
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(r.failed(t2 + NOMEM_GAP), Some(Duration::from_millis(2)));
     }
 }

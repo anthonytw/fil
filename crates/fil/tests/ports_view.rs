@@ -1077,3 +1077,44 @@ fn a_pending_server_policy_renders_its_own_reason() {
     let json = render_json(&a, &opts(None));
     assert!(json.contains(reason), "{json}");
 }
+
+/// SP2: an sshd line fil cannot evaluate refuses only what fil's policy file does not decide
+/// itself (a key set there stands), so its `fil ports` line does not claim every forward and the
+/// agent outright; a policy file that cannot be used still does, as it refuses everything.
+#[test]
+fn an_unevaluable_sshd_line_says_the_policy_file_s_keys_still_stand() {
+    let unevaluable = PolicyRefusal {
+        setting: PolicySetting::Unevaluable,
+        source: sshd_line(7),
+    };
+    let unsafe_file = PolicyRefusal {
+        setting: PolicySetting::FileUnsafe(fil_proto::mux::FileFault::Writable),
+        source: PolicySource::File {
+            file: PortsPath::new("/etc/fil/policy.toml").unwrap(),
+        },
+    };
+    let text = |r: &PolicyRefusal| {
+        render_text(
+            &answer(vec![PortsRow::Policy(PolicyLine::DenyAll(r.clone()))]),
+            &opts(None),
+        )
+    };
+    let t = text(&unevaluable);
+    assert!(
+        t.contains(
+            "every forward and the agent are refused, except what /etc/fil/policy.toml decides \
+             itself: a line of the sshd config that fil cannot evaluate as sshd would, so its \
+             settings are not known (/etc/ssh/sshd_config:7)"
+        ),
+        "{t}"
+    );
+    let t = text(&unsafe_file);
+    assert!(
+        t.contains(
+            "every forward and the agent are refused: the policy file is group- or \
+             world-writable (/etc/fil/policy.toml)"
+        ),
+        "{t}"
+    );
+    assert!(!t.contains("except"), "{t}");
+}

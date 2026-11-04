@@ -1,6 +1,6 @@
 # M3 plan: prediction
 
-> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default.
+> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
 
 ## 0. Preconditions and the overlap with M2 and M4
 
@@ -54,7 +54,7 @@
 ### Done when
 
 1. **No corruption and no secret, anywhere.** Across every suite below, with every guard on: zero oracle violations of the kinds `Erase`, `Flush`, `Painted`, `Cursor`, `Probe`, `Secret`, `Policy` and `Leftover`, and no character of a secret written to the terminal (the reserved-alphabet check, §5.2).
-2. **No visible mispredictions** at the bar in §2.5 (OQ-2), counted by the independent classifier (§5.4), in:
+2. **No visible mispredictions** at the split bar in §2.5 (OQ-2; decided, owner 2026-11-04), counted by the independent classifier (§5.4), in:
    - the sans-IO scripted soak (`just predict-soak`), 1,000 seeds;
    - the full-stack harness (T1) on real PTYs on macOS and on Linux, over the pipe and QUIC (§12's transport matrix), at 50, 150 and 400 ms RTT, with jitter and with 2 % loss on QUIC;
    - the real-network latency cells (§5.5);
@@ -258,11 +258,11 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 
 **Definition (proposed; OQ-2 confirms the bar).** A *visible misprediction* is a predicted glyph that the overlay wrote to the user's terminal and later removed without the shadow screen showing that glyph in that cell at the moment of removal, because the core contradicted it (by output or by `EchoAck`), expired it while the link was up, or retracted it under the password rule. Glyph means the cell's text: a different color or attribute (fish or zsh syntax highlighting recoloring the echo) is *restyled*, counted, and not a misprediction. A cursor drawn at a place the real cursor never reaches is counted separately (`cursor_miss`). C1 replaces §12's "any mismatch left after confirmation is a failure" with this definition.
 
-**Lifecycle withdrawals are counted apart** (`withdrawn { takeover, detached, exit, refusal, snapshot, resize, backstop }`): a takeover, a `fil detach` from elsewhere, a refusal, `SessionExited`, a snapshot's reset, a resize, and the 10 s backstop while the link is down remove written guesses that may well have been right. They are reported and excluded from the faithful bar; a fault run has its own bar (below).
+**Lifecycle withdrawals are counted apart** (decided, owner 2026-11-04, as part of OQ-2's bar) (`withdrawn { takeover, detached, exit, refusal, snapshot, resize, backstop }`): a takeover, a `fil detach` from elsewhere, a refusal, `SessionExited`, a snapshot's reset, a resize, and the 10 s backstop while the link is down remove written guesses that may well have been right. They are reported and excluded from the faithful bar; a fault run has its own bar (below).
 
 **Accounting (C1).** The core keeps `PredictStats`: `guessed`, `written`, `confirmed`, `restyled`, `tentative_dropped` (never written: correct behavior), `mispredicted { contradicted, echo_ack, expired, password }`, `withdrawn { .. }`, `cursor_miss`, `rejected` (edits the core refused). Counts only. A snapshot's reset classifies what was written against the shadow after the snapshot has landed. The client logs the counts at `debug` when a run ends (§4.3).
 
-**The bar (OQ-2, recommendation).**
+**The bar (OQ-2; decided, owner 2026-11-04: the split bar).** Everywhere, zero corruption and zero secrets shown; on programs that echo faithfully, late echo included, zero visible mispredictions; on programs that echo something else or share the screen, at most one shown run of wrong guesses per contradiction; withdrawals from takeover, exit, snapshot, resize or a link drop counted apart.
 
 | Suite | Bar |
 |---|---|
@@ -290,15 +290,15 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 
 ### 2.7 Configuration and the adaptive switch
 
-- `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed today; default `adaptive` (PC-1).
+- `predict = "off" | "adaptive" | "always"` in `[defaults]` and `[host.NAME]`, as parsed today; default `adaptive` (decided, owner 2026-11-04: PC-1).
 - **`--predict off|adaptive|always`** overrides it for one run, like `--transport` (E1b; proposed).
 - `off`: no predictor, `Attach.echo_ack = false` (no `EchoAck`, the M1 mode poll). `adaptive` and `always`: `echo_ack = true` for the whole attach, so turning on mid-session needs no message.
 - **The adaptive switch (P1, proposed, mosh's values, §16.7 "to tune"):**
   - **The estimate is P1's own:** a smoothed time from a key's send to the `EchoAck` that covers it, minus the 50 ms echo window, which is the link and the PTY's queue and not the program's own echo time. `LinkView.rtt_hint` seeds it until the first ack. The pipe's `LinkStatus.rtt` (one ping sample, refreshed only after a second without traffic) and QUIC's (quinn's smoothed RTT) therefore do not make the two transports behave differently.
-  - Show guesses when the estimate is above 30 ms; stop below 20 ms.
+  - Show guesses when the estimate is above 30 ms (decided, owner 2026-11-04: PC-1); stop below 20 ms.
   - Also show them for the next 30 s after a **glitch**: a key whose `EchoAck` came more than 250 ms after it was sent (measured from the ack, so a program that echoes late on a fast link is not a glitch).
   - `always` shows them at any RTT.
-- **Underline (PC-1):** a written guess is underlined while the estimate is above 80 ms or within a glitch window, and plain otherwise (mosh's rule). P1 updates §9's sentence "Unconfirmed predictions are underlined".
+- **Underline (PC-1):** a written guess is underlined while the estimate is above 80 ms (decided, owner 2026-11-04), and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise (mosh's rule). DESIGN §9 says the same.
 - Tunables (the thresholds, the glitch window, the grace, the backstop) are constants in `MoshConfig` and the core's config, not config keys, until V1's data says a user needs them. Proposed.
 
 ### 2.8 Wire changes
@@ -308,14 +308,16 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 - **`InputRecord::Repaint`** (variant 1, appended; client to daemon, on the terminal channel's keystroke direction, no fields): repaint my screen at the size I have told you. As an in-band record it takes no input space (§8.5) and is ordered after the `InputRecord::Resize` before it by the channel's own order, so the daemon has applied that size before it reads the request. (A control message would overtake the resize record, §8.1, and the daemon would render at the old size.)
 - **`SnapshotReason::Repaint`**: the daemon answers with a mid-stream `Snapshot` announcement, as for catch-up, rendering **the screen and the modes with no history lines** (the client's native scrollback already holds the history) and `skipped` 0 (no marker).
 - **`SnapshotInfo.size_gen`**: **every** snapshot (attach, catch-up, `want_snapshot`, repaint) says the size generation it was rendered at. The client trusts its screen again after applying any snapshot whose `size_gen` is its current one, so a catch-up or a resume snapshot rendered after the resize repairs it too, and prediction does not stay off until the next resize.
+- **Rendered where the stream is.** The repaint is rendered at exactly the offset the connection has sent (`at`); output released meanwhile is sent first and the render tried again, so nothing is skipped and no marker is needed. Acknowledgements are not waited for (that starved the repaint under steady output: review of #102, F1); the bytes below `at` that are still in flight are applied by the client before the snapshot, which it holds until its terminal stream reaches `at`. On QUIC the output after `at` can overtake the announcement: the client then drops that stale repaint's bytes and asks again, without reconnecting (re-check F3). A link lost while a repaint is held resumes (a repaint moves no position) with `want_snapshot`. A repaint's confirmation can be early (an ack of `at` sent before the client saw the announcement), so the next snapshot can be announced ahead of the repaint's bytes: the client queues one announcement behind an incomplete or held snapshot and begins it once the current one's bytes are in; a catch-up supersedes an unapplied repaint; a third announcement reconnects (re-check 2, F4).
 - **Coalesced, never dropped.** A request the daemon cannot serve at once becomes one *owed* repaint, served as soon as it can be:
+  - while output released is not yet sent: once it is;
   - while a snapshot is in flight (it was rendered before the resize, at the old size): after the client has acknowledged it (§6.2's one-at-a-time rule);
   - within 1 s of the last repaint served: when the second has passed (a trailing repaint, so the final size of a window drag is always repainted);
   - any number of requests meanwhile owe one repaint.
 - **Across links:** a repaint owed or in flight when the link dies is asked for again: a client that is still untrusted resumes with `want_snapshot`, whose snapshot carries `size_gen` like any other.
 - A `Repaint` from a connection that no longer holds the session is ignored, as its keys are.
-- **The client** sends it lazily, as §2.4 rule 9 says: when the core would write a guess on an untrusted screen, or when something was drawn at the resize, never just because the window changed. While disconnected, `want_snapshot` stays the repair (§4.2).
-- **The clear.** The snapshot writer starts with `CSI H CSI J` (`fil-term/src/snapshot.rs`). If T2 finds a terminal where that pushes the screen into the scrollback, W1 uses a clear that T2 finds safe on all four terminals; if there is none, a repaint on such a terminal costs one screen of scrollback per repaint, which the lazy rule keeps to resizes during active prediction, and `docs/m3/terminals.md` records it as a known limit.
+- **The client** sends it lazily, as §2.4 rule 9 says, never just because the window changed. Exactly (W1, `crates/fil-client/src/engine/repair.rs`): after any resize the screen is untrusted until a snapshot at the current `size_gen` lands; a repaint is needed (1) at once when anything was drawn at the resize, in either direction (T1: a widening that joins wrapped rows leaves the cursor on another row, so the next write would land wrong; the `Display::resize` flag that fires only on narrowing is not used); (2) when a guess would be written on the untrusted screen, before it is (C1's core holds it and raises `take_repaint_request`, which E1a feeds to the engine's `Repair` through `Display`; until then the M0 overlay writes the guess and the engine asks right after; T2 found that real terminals reflow unlike the shadow with nothing drawn, so this is the case that covers the terminal's own reflow: a client whose predictions show repaints after every resize before its first write, an adaptive one on a fast link never); (3) when a status line or a question drawn on the untrusted screen is removed (T1: a QUIC link that recovers by itself has no resume). The record goes after the resize record of the current generation. A snapshot that lands at an older generation than the client's (the window changed while it was on its way) also makes a repaint needed (F2); one asked for and not landed when the link goes (or needed while it is down) is the next resume's `want_snapshot`, and after a swap whose attach did not ask it is asked again on the new link.
+- **The clear.** The snapshot writer starts with `CSI H CSI J` (`fil-term/src/snapshot.rs`). T2 found that tmux pushes the screen into its scrollback on it (and on `CSI 2 J`), and that `CSI 2 K` on each row, then home, pushes nothing on xterm, kitty, WezTerm or tmux, nor in the emulator (`docs/m3/terminals.md`). A separate fil-term change (ST1) makes that the snapshot writer's clear for every snapshot; W1 renders the repaint through the writer and takes it from there.
 - **Why a wire change:** without it the only repair is a resume, which on the pipe is a new ssh login.
 - **Gate:** T1's true-order reproduction lands first and shows damage under the overlay on alacritty as the oracle. T1 cannot show a real terminal reflowing unlike the shadow (its oracle is the same emulator), so T2's reflow finding (§3) is the second trigger. If neither shows damage, W1 is dropped, §4.2's text stays, and rule 9 becomes "no guess after a resize while something is drawn, until the next snapshot".
 - **W1 also updates** §2 goal 1 ("while connected, the screen is never redrawn from a model": the repaint is the second exception after catch-up), §4.2, §6.2 and §8.5.
@@ -533,7 +535,7 @@ Owned in sequence, never in parallel:
 - **Threat model.** fil defends the user's keys from being written to the terminal *by fil*: against a buggy or hostile predictor, and against coincidence from benign programs. It does not defend against a program that reads the secret, which can print it itself; forging fil's checks would gain such a program nothing.
 - **Hard rule (core):** nothing is written while the PTY is canonical with echo off (§9), which is what `sudo`, `ssh`, `passwd`, `read -s` and `getpass` look like.
 - **Raw mode with echo off** is also what every line editor looks like (readline, zsh's ZLE, fish), which do their own echo: forbidding prediction there would turn it off in every shell. Raw-mode secrets are therefore protected by the core's epochs (§2.4 rules 2 to 4): a key is written only in an epoch the core has confirmed itself, from output that changed nothing but that epoch's guessed cells, to exactly the characters typed, with the cursor where the core computed, after the keys were sent; and every Enter or control key, mode change, unexplained output, paste or other unpredicted input, resume, snapshot and pause of 1 s starts a new, unconfirmed epoch. The predictor cannot choose a guess's character, its resulting cursor, or (in a tentative epoch) its cell, and cannot skip a key. None of this depends on the predictor, and the guards' tests run with a hostile one that guesses the prompt.
-- **What remains** is OQ-1 (§4.4).
+- **What remains** is OQ-1 (§4.4): accepted (decided, owner 2026-11-04) and listed in DESIGN §11's table.
 - **Every suite checks it:** the `Secret` oracle kind, and the reserved-alphabet check on everything written (§5.2).
 
 ### 4.2 What leaves the machine
@@ -560,18 +562,18 @@ Only where the answer is a §11 trade-off or the milestone's own done-when. Each
 In every case a guess once written is written: how long it stays on the screen does not matter, because the terminal, its recorders and anything sharing the screen have it, whether it is withdrawn at the next output, kept through a link drop until the 10 s backstop, or confirmed. mosh has the same exposure, with fewer boundaries and no checks on its predictor.
 
 - **Recommendation:** accept it, with the core's rules of §2.4; document it in the §11 table next to the offline-input log; `predict = "off"` per host for anyone who disagrees. The strict alternative, never predicting with echo off, disables prediction in every shell.
-- **Interim:** accepted and documented; the owner can veto it before V1.
+- **Decided (owner 2026-11-04):** accept the four residual cases, documented in DESIGN §11's table, with `predict = "off"` per host as the way out.
 
 **OQ-2: what "no visible mispredictions in the harness" means** (§15's done-when). Zero corruption and zero secrets everywhere; zero visible mispredictions on programs that echo faithfully, including ones that echo late; at most one written epoch per contradiction on programs that echo something else or share the terminal with another writer; lifecycle withdrawals (takeover, exit, snapshot, resize, a link drop's backstop) counted apart (§2.5)? Or zero on everything, which no predictor can meet when a program echoes something else or another process writes to the terminal?
 
 - **Recommendation:** the split bar of §2.5.
-- **Interim:** the split bar.
+- **Decided (owner 2026-11-04):** the split bar: everywhere, zero corruption and zero secrets shown; on faithful programs, late echo included, zero visible mispredictions; on programs that echo something else or share the screen, at most one shown run of wrong guesses per contradiction; withdrawals from takeover, exit, snapshot, resize or a link drop counted apart.
 
-### 4.5 Proposed calls (not the owner's; review may change them)
+### 4.5 Proposed calls (not the owner's, except PC-1, which the owner confirmed but for its glitch trigger; review may change the rest)
 
 | # | Call |
 |---|---|
-| PC-1 | **The default and the look** (the owner may veto: product look): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined only above 80 ms or after a glitch, plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). P1 updates §9's "unconfirmed predictions are underlined". |
+| PC-1 | **The default and the look** (decided, owner 2026-11-04, but for the glitch trigger): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined above 80 ms, and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). DESIGN §9 records it. |
 | PC-2 | The trait of §2.3, replacing the §9 sketch: declared guesses, the core decides. |
 | PC-3 | The core's boundaries and the strict first confirmation (§2.4). |
 | PC-4 | Visible misprediction is by glyph, not attributes; lifecycle withdrawals counted apart (§2.5). |
@@ -653,7 +655,7 @@ Five independent read-only audits of the whole tree, then fix PRs, then a verifi
 
 ### Risks
 
-1. **Writing a secret.** A rule gap writes typed secret characters to the terminal, where recorders keep them. *Mitigations:* the epochs and boundaries in the core, not the predictor, each with a guard and a trace run with a hostile predictor that guesses prompts; the core fixes each guess's character, cursor and (in a tentative epoch) cell; the first confirmation needs a whole chunk explained; other rows watched by `row_stamp`; the reserved-alphabet check in every suite; OQ-1 settled before V1.
+1. **Writing a secret.** A rule gap writes typed secret characters to the terminal, where recorders keep them. *Mitigations:* the epochs and boundaries in the core, not the predictor, each with a guard and a trace run with a hostile predictor that guesses prompts; the core fixes each guess's character, cursor and (in a tentative epoch) cell; the first confirmation needs a whole chunk explained; other rows watched by `row_stamp`; the reserved-alphabet check in every suite; OQ-1's residual accepted by the owner (2026-11-04) and documented in DESIGN §11.
 2. **Real terminals disagree with the emulators.** The core was proved only against alacritty and vt100. A terminal that keeps a pending wrap across `CUP`, reflows differently, or measures a glyph differently makes the erase wrong, which is corruption, not a misprediction. *Mitigations:* T2 first, on four terminals; a guard per disagreement; §2.4 rule 9 and W1 for reflow.
 3. **Resize damage**, now frequent. *Mitigations:* T1's true-order reproduction in both directions; W1's in-band, coalesced repaint; no guess written until it lands.
 4. **"Zero visible mispredictions" on real shells.** Syntax highlighting, autosuggestions, right prompts, vi modes, late echoes and redisplays can contradict good guesses. *Mitigations:* the faithful and slow suites include them from P1's start; the late-echo grace; conservative scope (§1 non-goals); OQ-2's split bar; the epochs.

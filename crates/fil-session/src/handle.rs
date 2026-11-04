@@ -12,7 +12,9 @@ use fil_transport::Link;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{SessionConfig, SessionHost};
-use crate::core::{self, AttachAnswer, CatchUp, Cmd, ConnId, ExitInfo, SessionInfo, Shared};
+use crate::core::{
+    self, AttachAnswer, CatchUp, Cmd, ConnId, ExitInfo, RepaintAnswer, SessionInfo, Shared,
+};
 use crate::forward::Forwards;
 use crate::proc::{Scope, resolve_scope};
 use crate::pty::SpawnError;
@@ -418,6 +420,22 @@ impl SessionHandle {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Asks the core for the repaint this connection owes its client. `None` when the session is
+    /// gone.
+    pub(crate) async fn repaint(&self, conn: ConnId, sent: u64) -> Option<RepaintAnswer> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Cmd::Repaint {
+                conn,
+                sent,
+                reply: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
 
     /// Tells the core a connection is gone, from a context that cannot wait (a destructor). The

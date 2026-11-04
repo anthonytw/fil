@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use fil_predict::overlay::Guards;
 use fil_predict::{
-    Config, CoreView, Ctx, InputKind, LinkView, Mode, MoshConfig, MoshPredictor, Outcome, Overlay,
-    OverlayEdit, Predictor, PtyMode, Settled, Show, UnderlineAfter,
+    Config, CoreView, Ctx, InputKind, LinkView, MoshConfig, MoshPredictor, Outcome, Overlay,
+    OverlayEdit, Predictor, PtyMode, Settled, Show,
 };
 use fil_term::{DEFAULT_BACKEND, Size, TermState, backends};
 
@@ -546,61 +546,55 @@ fn underlined_above_80_ms_plain_below() {
     assert_eq!(last, Show::Plain);
 }
 
-/// The second underline trigger (pending the owner's answer): after a glitch (the plan), after a
-/// wrong guess, or both. A contradicted written guess underlines only with `WrongGuess` or
-/// `Both`; a glitch only with `Glitch` or `Both`.
+/// The second underline trigger (decided, owner 2026-11-04): for the glitch window after a
+/// glitch, an `EchoAck` more than 250 ms after its key, as in mosh; a wrong guess does not
+/// underline by itself.
 #[test]
-fn the_second_underline_trigger() {
-    for (after, by_glitch, by_wrong) in [
-        (UnderlineAfter::Glitch, true, false),
-        (UnderlineAfter::WrongGuess, false, true),
-        (UnderlineAfter::Both, true, true),
-    ] {
-        let cfg = MoshConfig {
-            mode: Mode::Always,
-            underline_after: after,
-            ..MoshConfig::default()
-        };
-        let st = screen();
-        let confirmed = CoreView {
-            confirmed: true,
-            ..CoreView::default()
-        };
-        let at_ = |now| Ctx {
-            core: confirmed,
-            ..ctx(&st, Some(ms(40)), now)
-        };
-        // A wrong guess: written (the epoch confirmed and shown), then contradicted.
-        let mut p = MoshPredictor::new(cfg);
-        let e = p.on_key(&fil_predict::KeyEvent::Char('a'), 0, &at_(ms(100)));
-        assert!(matches!(e[..], [OverlayEdit::Guess { .. }]));
-        let wrong = Settled {
-            at: 0,
-            outcome: Outcome::Contradicted,
-            sent: ms(100),
-            settled: ms(150),
-        };
-        p.on_settled(&[wrong], &at_(ms(150)));
-        let underlined = p.show(&at_(ms(200))) == Show::Underline;
-        assert_eq!(underlined, by_wrong, "{after:?} after a wrong guess");
-        // A glitch.
-        let mut p = MoshPredictor::new(cfg);
-        let _ = p.on_key(&fil_predict::KeyEvent::Char('a'), 0, &at_(ms(100)));
-        p.on_echo_ack(1, &at_(ms(500)));
-        let underlined = p.show(&at_(ms(600))) == Show::Underline;
-        // Its own estimate is now 350 ms (above 80): take it back down first.
-        let mut q = MoshPredictor::new(cfg);
-        let mut at = 0;
-        for i in 0..60u64 {
-            let _ = typed(&mut q, &mut at, 1000 * (i + 1), 40, |_| Some(ms(40)));
-        }
-        let t = 100_000;
-        let _ = q.on_key(&fil_predict::KeyEvent::Char('a'), at, &at_(ms(t)));
-        q.on_echo_ack(at + 1, &at_(ms(t + 300)));
-        let glitch_underlined = q.show(&at_(ms(t + 301))) == Show::Underline;
-        assert!(underlined, "{after:?}: a 350 ms estimate underlines anyway");
-        assert_eq!(glitch_underlined, by_glitch, "{after:?} after a glitch");
+fn underlined_after_a_glitch_and_not_after_a_wrong_guess() {
+    let cfg = MoshConfig::always();
+    let st = screen();
+    let confirmed = CoreView {
+        confirmed: true,
+        ..CoreView::default()
+    };
+    let at_ = |now| Ctx {
+        core: confirmed,
+        ..ctx(&st, Some(ms(40)), now)
+    };
+    // A wrong guess: written (the epoch confirmed and shown), then contradicted.
+    let mut p = MoshPredictor::new(cfg);
+    let e = p.on_key(&fil_predict::KeyEvent::Char('a'), 0, &at_(ms(100)));
+    assert!(matches!(e[..], [OverlayEdit::Guess { .. }]));
+    let wrong = Settled {
+        at: 0,
+        outcome: Outcome::Contradicted,
+        sent: ms(100),
+        settled: ms(150),
+    };
+    p.on_settled(&[wrong], &at_(ms(150)));
+    assert_eq!(p.show(&at_(ms(200))), Show::Plain, "after a wrong guess");
+    // A glitch, with the estimate below 80 ms (taken down by 60 keys at 40 ms first).
+    let mut q = MoshPredictor::new(cfg);
+    let mut at = 0;
+    for i in 0..60u64 {
+        let _ = typed(&mut q, &mut at, 1000 * (i + 1), 40, |_| Some(ms(40)));
     }
+    let t = 100_000;
+    assert_eq!(q.show(&at_(ms(t))), Show::Plain);
+    let _ = q.on_key(&fil_predict::KeyEvent::Char('a'), at, &at_(ms(t)));
+    q.on_echo_ack(at + 1, &at_(ms(t + 300)));
+    assert!(q.estimate(&at_(ms(t + 301))).unwrap() < ms(80));
+    assert_eq!(q.show(&at_(ms(t + 301))), Show::Underline, "after a glitch");
+    assert_eq!(
+        q.show(&at_(ms(t + 30_299))),
+        Show::Underline,
+        "within the window"
+    );
+    assert_eq!(
+        q.show(&at_(ms(t + 30_301))),
+        Show::Plain,
+        "after the window"
+    );
 }
 
 // ---- late echoes -----------------------------------------------------------------------------

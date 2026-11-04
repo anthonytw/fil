@@ -23,8 +23,8 @@
 //! - **The adaptive switch and the underline** (§2.7): from its own smoothed echo time (a key's
 //!   send to the `EchoAck` that covers it, less the echo window), seeded by the link's RTT hint
 //!   until the first acknowledgement; on above 30 ms, off below 20 ms; underlined above 80 ms or
-//!   within 30 s of a glitch (an `EchoAck` more than 250 ms after its key), plain otherwise. The
-//!   second underline trigger is [`UnderlineAfter`] (the owner's open question).
+//!   within 30 s of a glitch (an `EchoAck` more than 250 ms after its key), plain otherwise
+//!   (decided, owner 2026-11-04).
 //!
 //! **Following the line.** A key it declines but whose effect it knows (a second key where only
 //! one may be in flight, a Backspace in the middle of the line) is *held*: nothing more is
@@ -73,19 +73,6 @@ pub enum Mode {
     Always,
 }
 
-/// What else underlines written guesses besides a slow echo (§2.7, PC-1). The plan says after a
-/// glitch, as mosh does; the owner is being asked (2026-11-04) whether it should be after a wrong
-/// guess, or both. Each is one value here, with its own test (`tests/predictor.rs`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum UnderlineAfter {
-    /// Within the glitch window after a glitch (an `EchoAck` late by more than the glitch time).
-    #[default]
-    Glitch,
-    /// Within the glitch window after a written guess turned out wrong (contradicted).
-    WrongGuess,
-    Both,
-}
-
 /// The adaptive switch's tunables (`docs/m3/plan.md` §2.7, §2.9: mosh's values, proposed).
 /// Constants, not configuration keys (§2.7).
 #[derive(Clone, Copy, Debug)]
@@ -103,8 +90,6 @@ pub struct MoshConfig {
     pub glitch_window: Duration,
     /// Underline at all (`false`: always plain; the demo's `--plain`).
     pub underline: bool,
-    /// The second underline trigger.
-    pub underline_after: UnderlineAfter,
 }
 
 impl Default for MoshConfig {
@@ -117,7 +102,6 @@ impl Default for MoshConfig {
             glitch: Duration::from_millis(250),
             glitch_window: Duration::from_secs(30),
             underline: true,
-            underline_after: UnderlineAfter::Glitch,
         }
     }
 }
@@ -226,8 +210,6 @@ pub struct MoshPredictor {
     /// The switch's state (hysteresis).
     on: bool,
     glitch_until: Option<Time>,
-    /// The end of the window after a written guess was contradicted.
-    wrong_until: Option<Time>,
     /// The time of the last call (for `next_deadline`, which has no context).
     now: Time,
     last_ack: Option<Time>,
@@ -355,7 +337,6 @@ impl MoshPredictor {
             srtt: None,
             on: false,
             glitch_until: None,
-            wrong_until: None,
             now: Time::ZERO,
             last_ack: None,
             acked: 0,
@@ -388,16 +369,6 @@ impl MoshPredictor {
 
     fn glitching(&self, now: Time) -> bool {
         self.glitch_until.is_some_and(|t| now < t)
-    }
-
-    /// The underline rule's second trigger (`UnderlineAfter`).
-    fn underline_trigger(&self, now: Time) -> bool {
-        let wrong = self.wrong_until.is_some_and(|t| now < t);
-        match self.cfg.underline_after {
-            UnderlineAfter::Glitch => self.glitching(now),
-            UnderlineAfter::WrongGuess => wrong,
-            UnderlineAfter::Both => self.glitching(now) || wrong,
-        }
     }
 
     /// The program has been seen to echo after the acknowledgement lately, or not yet seen to
@@ -938,9 +909,6 @@ impl Predictor for MoshPredictor {
                     self.on_time = self.on_time.saturating_add(1);
                 }
             }
-            if s.outcome == Outcome::Contradicted && p.exposed {
-                self.wrong_until = Some(s.settled + self.cfg.glitch_window);
-            }
         }
         self.expose(ctx);
     }
@@ -1009,11 +977,7 @@ impl Predictor for MoshPredictor {
             .map(|p| p.sent + EXPIRY + Duration::from_secs(1))
             .min();
         // The end of a window changes the style of what is drawn.
-        let window = [self.glitch_until, self.wrong_until]
-            .into_iter()
-            .flatten()
-            .filter(|&t| t > self.now)
-            .min();
+        let window = self.glitch_until.filter(|&t| t > self.now);
         match (window, expiry) {
             (Some(g), Some(e)) => Some(g.min(e)),
             (g, e) => g.or(e),
@@ -1026,8 +990,9 @@ impl Predictor for MoshPredictor {
         if self.cfg.mode == Mode::Adaptive && !(self.wants_on(est) || glitch) {
             return Show::Hide;
         }
-        let slow =
-            self.underline_trigger(ctx.now) || est.is_some_and(|e| e > self.cfg.underline_above);
+        // Underlined above 80 ms, or for the glitch window after a glitch (decided, owner
+        // 2026-11-04: an echo more than 250 ms late, as in mosh).
+        let slow = glitch || est.is_some_and(|e| e > self.cfg.underline_above);
         if slow && self.cfg.underline {
             Show::Underline
         } else {

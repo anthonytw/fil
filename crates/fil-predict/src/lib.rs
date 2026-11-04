@@ -30,7 +30,7 @@ pub mod sim;
 #[cfg(feature = "harness")]
 pub mod pty;
 
-pub use mosh::{Mode, MoshConfig, MoshPredictor, UnderlineAfter};
+pub use mosh::{Mode, MoshConfig, MoshPredictor};
 pub use overlay::{
     Bracket, Config, Flush, Guards, InputKind, Mispredicted, Overlay, Placement, PredictStats,
     PtyMode, Status, View, Withdrawn,

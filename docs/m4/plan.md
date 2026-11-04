@@ -13,9 +13,10 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
   The coordinator updates this list as M2 PRs open and close.
 - **The M3 fence.** M3 owns prediction and the files its packages name (`docs/m3/plan.md`). M4 does not edit any of these:
   - `crates/fil-predict/**`, `crates/fil-client/**`, `crates/fil-term/src/**`;
-  - `crates/fil-proto/src/{msg.rs, limits.rs, log.rs}` and the wire golden, while M3's W1 or K1 is open;
+  - `crates/fil-proto/src/{msg.rs, limits.rs, input.rs, log.rs}` and the wire golden, while M3's W1 or K1 is open;
   - `crates/fil-session/src/{core.rs, serve.rs}`;
-  - `crates/fil/examples/dropin/**`.
+  - `crates/fil/examples/dropin/**`;
+  - `crates/fil-testbins/src/bin/keyprobe.rs` (M3's T3).
 
   A fix M4 finds in one of them (for example, on macOS) goes to the M3 coordinator as a finding, not as an M4 PR. The files both milestones need are **serialized**, in the order given in §3, "File-ownership hot spots".
 - **The wire.** M4 changes no message encoding. Some of the defaults that CFG reviews are pinned in the wire golden's `[limits]`, though: `DEFAULT_WINDOW`, `DEFAULT_FORWARD_BUFFER`, `FORWARD_BUDGET`, `CONNECT_TIMEOUT_MS`, `OPEN_WAIT_MS`, `LINGER_MS` and `AGENT_WAIT_MS`. Changing one of them **is a wire change**. Any such change is either listed as a wire change, with its own `PROTOCOL_REVISION` bump made after M3's W1 merges (W1 holds `limits.rs` and the golden while it is open), or deferred. Defaults that the golden does not pin change without a bump. The install bootstrap (§3, U1) runs before the preamble and is not part of the protocol.
@@ -44,7 +45,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 - **A `curl | sh` installer.** It would run code the user has not seen. Install instructions are a download, a checksum check and a copy.
 - **Distro packages** (Debian, RPM, AUR, Nix) and **crates.io** in v1 (OQ-3).
 - **`-N` tunnel-only mode** (M2 OD-12) and **desktop notifications for new listeners** (§7.4 of DESIGN, moved out of M2). Both are features, and adding them now would put new code in front of the sweep. They move to after v0.1.0, unless the owner pulls them in. R0 updates DESIGN §7.4's notification sentence and points it at OD-12, so that DESIGN says "after v0.1.0".
-- **The two items M3 hands to M4** (M3 plan §1, PC-10), both after v0.1.0:
+- **The two items M3 hands to M4** (M3 plan §1, PC-11), both after v0.1.0:
   - **the final output tail of an ended session.** There is no emulator after exit, it needs a new bounded memory policy, ssh and ET do no better, and the value is low;
   - **Unix-socket forwards** (`-L 5432:/run/…sock`). This is a feature: a new `OpenKind` (a wire change), the policy mirror's `AllowStreamLocalForwarding`, and new consent and `fil ports` rows. It belongs in its own milestone-sized change, not in front of the pre-release sweep. It stays in §16.8 of DESIGN.
 - **File-descriptor handover between daemons** (§16.6 of DESIGN). Daemons of different builds keep running side by side, as built.
@@ -576,11 +577,11 @@ SWEEP, RC, RECREATE and SHIP are in §5 and §6.4.
 
 | Files | Order |
 |---|---|
-| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **U1** (M4, Wave 1, now) → **E1b** (M3's small config-and-flag PR, which waits for M3's W1 anyway) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). DOC's `docs_sync.rs` comes after CFG. |
+| `crates/fil/src/{cli.rs, config.rs, app.rs}`, `crates/fil/tests/*`, DESIGN §14 | **U1** (M4, Wave 1, now) → **E1b** (M3's small config-and-flag PR, which follows M3's E1a) → **LIC** (the version text in `cli.rs`) → **CFG** (also after M3's **K1**). DOC's `docs_sync.rs` comes after CFG. |
 | `crates/fil-proto/src/limits.rs` and the wire golden | M3's **W1** while it is open; CFG edits only defaults the golden does not pin, after W1 merges; a golden-pinned default is a wire change of its own (§0). |
 | The catch-up rule (`crates/fil-proto/src/log.rs`, `crates/fil-session/src/core.rs` `on_catch_up`), DESIGN §6.2 | M3's **K1** only. |
 | `.github/workflows/linux-check.yml` | Each package adds its own suite or part (U1: the realnet `install` part and its timeout; M3's T2: a `terminals` suite). Each addition to the suite list, matrix or timeout map is one line, and whoever lands second merges it. |
-| `tests/realnet/**` | Each package adds its own part file (U1: `install.sh` and `docker/Dockerfile.shells`; M3's V1 and T3: their scenarios and `latency.sh`). `run.sh`'s part list takes one-line additions, merged by whoever lands second. `lib.sh` changes go through the coordinator. |
+| `tests/realnet/**` | Each package adds its own part file (U1: `install.sh` and `docker/Dockerfile.shells`; M3: `tests/realnet/predict.sh`). `run.sh`'s part list takes one-line additions, merged by whoever lands second. `lib.sh` changes go through the coordinator. |
 | `just predict-harness` (run by MAC) | M3's; M3 keeps `--seeds 2 --keys 60` working. MAC only runs it. |
 
 **Within M4:**

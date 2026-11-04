@@ -79,8 +79,15 @@ pub(crate) struct ClientAgent {
 }
 
 impl ClientAgent {
-    /// `notes`: where `confirm` questions go (the client loop).
-    pub(crate) fn new(relay: AgentRelay, notes: mpsc::UnboundedSender<Note>) -> Arc<Self> {
+    /// `notes`: where `confirm` questions go (the client loop); `bind`: the run's session-bind
+    /// key. `None` without one: the run then does not relay its agent at all, rather than relay
+    /// it unbound (destination-constrained keys must fail closed, OD-5).
+    fn new(
+        relay: AgentRelay,
+        notes: mpsc::UnboundedSender<Note>,
+        bind: Option<Arc<agent::BindKey>>,
+    ) -> Option<Arc<Self>> {
+        let bind = bind?;
         let asker = relay.confirm.then(|| {
             Asker(Arc::new(Asking {
                 notes,
@@ -88,18 +95,18 @@ impl ClientAgent {
                 next: AtomicU64::new(0),
             }))
         });
-        Arc::new(ClientAgent {
+        Some(Arc::new(ClientAgent {
             socket: relay.socket,
-            // The run's own bind key comes with the defaults: every connection is bound to it
-            // first, so destination-constrained keys fail closed (OD-5).
+            // The run's own bind key: every connection is bound to it first, so
+            // destination-constrained keys fail closed (OD-5).
             rules: Arc::new(Rules {
                 keys: relay.keys,
                 confirm: asker.clone().map(|a| Arc::new(a) as Arc<dyn Confirm>),
-                ..Rules::default()
+                bind: agent::Bind::Key(bind),
             }),
             uses: Arc::new(KeyUses::default()),
             asker,
-        })
+        }))
     }
 
     /// Connects one `Open Agent` (its grant was checked first).
@@ -129,6 +136,26 @@ impl ClientAgent {
     pub(crate) fn uses(&self) -> AgentUse {
         self.uses.snapshot()
     }
+}
+
+/// The run's relay, when it asked for one (`relay`): `None` without, and `None` with a notice on
+/// the overlay when `bind` cannot make the session-bind key, so the agent is refused for the run
+/// instead of relayed unbound (OD-5).
+pub(crate) fn for_run(
+    relay: Option<AgentRelay>,
+    notes: &mpsc::UnboundedSender<Note>,
+    bind: impl FnOnce() -> Option<Arc<agent::BindKey>>,
+) -> Option<Arc<ClientAgent>> {
+    let relay = relay?;
+    let agent = ClientAgent::new(relay, notes.clone(), bind());
+    if agent.is_none() {
+        tracing::debug!("the agent relay is off: no session-bind key");
+        let _ = notes.send(Note::Notice(crate::text::wrap(
+            "fil: agent forwarding is off for this run: no key for its session-bind could be made",
+            38,
+        )));
+    }
+    agent
 }
 
 /// Asks the client loop about signatures (`agent = "confirm"`).
@@ -237,7 +264,9 @@ pub(crate) fn summary_lines(u: &AgentUse, now: Instant) -> Vec<String> {
         } else {
             k.info.comment.chars().take(18).collect()
         };
-        let mut line = format!("  {name} ×{} {}", k.signs, ago(k.last));
+        // A key and its certificate share a fingerprint and often a comment: the row says which.
+        let cert = if k.info.certificate { " (cert)" } else { "" };
+        let mut line = format!("  {name}{cert} ×{} {}", k.signs, ago(k.last));
         line = line.chars().take(40).collect();
         v.push(line);
     }
@@ -303,6 +332,60 @@ mod tests {
             summary_lines(&AgentUse::default(), now),
             ["agent: 0 signed, 0 refused, never"]
         );
+        // A key and its certificate: two rows, the certificate marked.
+        let cert = KeyInfo {
+            certificate: true,
+            ..info("me@laptop")
+        };
+        let u = AgentUse {
+            signs: 2,
+            keys: vec![
+                KeyUse {
+                    info: info("me@laptop"),
+                    signs: 1,
+                    last: Some(now),
+                },
+                KeyUse {
+                    info: cert,
+                    signs: 1,
+                    last: Some(now),
+                },
+            ],
+            ..AgentUse::default()
+        };
+        let lines = summary_lines(&u, now);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("(cert)")).count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    /// No session-bind key, no agent: refused for the run, with a notice, never relayed unbound.
+    #[test]
+    fn no_bind_key_means_no_agent_for_the_run() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let relay = || {
+            Some(AgentRelay {
+                socket: None,
+                keys: vec![],
+                confirm: false,
+            })
+        };
+        assert!(for_run(relay(), &tx, || None).is_none());
+        match rx.try_recv() {
+            Ok(Note::Notice(lines)) => {
+                assert!(
+                    lines.concat().contains("agent forwarding is off"),
+                    "{lines:?}"
+                )
+            }
+            other => panic!("a notice, not {other:?}"),
+        }
+        assert!(for_run(relay(), &tx, agent::BindKey::generate).is_some());
+        assert!(for_run(None, &tx, agent::BindKey::generate).is_none());
+        assert!(rx.try_recv().is_err(), "a notice only for the failure");
     }
 
     /// A question that is answered reaches its relay; one whose future is dropped is withdrawn
@@ -317,7 +400,9 @@ mod tests {
                 confirm: true,
             },
             tx,
-        );
+            agent::BindKey::generate(),
+        )
+        .expect("a bind key");
         let asker = agent.asker.clone().unwrap();
         let fut = asker.confirm(info("k"));
         let Some(Note::Ask(q)) = rx.recv().await else {

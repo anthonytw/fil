@@ -2,9 +2,10 @@
 # The real-network harness (Tier 1, docs/m1/realnet.md). Linux only: Docker for the OpenSSH
 # topology, network namespaces and root for the UDP/NAT topology.
 #
-#   run.sh [ssh|udp|sysd|latency|all] [SCENARIO...]
+#   run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|latency|all] [SCENARIO...]
 #
-# Exit status: 0 if every scenario passed, 1 if any failed, 2 if the host cannot run it.
+# Exit status: 0 if every scenario that ran passed, 1 if any failed, 2 if the host cannot run it.
+# A part that chose not to run (policy, outside CI and the VM) is listed as SKIPPED, not passed.
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -17,25 +18,47 @@ case $part in
   ssh) parts=(ssh) ;;
   udp) parts=(udp) ;;
   sysd) parts=(sysd) ;;
+  policy) parts=(policy) ;; # server policy, tests/realnet/policy.sh (plan S1)
+  fwd) parts=(fwd) ;; # the M2 forward scenarios, docs/m2/realnet.md
+  fwd-cable | fwd-rest) parts=("$part") ;; # the two halves of fwd, CI's two jobs
+  agent) parts=(agent) ;; # the M2 agent scenarios
   latency) parts=(latency) ;; # not in `all`: the latency lab, docs/m2/latency.md
-  all) parts=(ssh udp sysd) ;;
+  all) parts=(ssh udp sysd policy fwd agent) ;;
   *)
-    echo "usage: run.sh [ssh|udp|sysd|latency|all] [SCENARIO...]" >&2
+    echo "usage: run.sh [ssh|udp|sysd|policy|fwd|fwd-cable|fwd-rest|agent|latency|all] [SCENARIO...]" >&2
     exit 2
     ;;
 esac
 
 rm -rf "$OUT/notes" "$OUT/logs"
 mkdir -p "$OUT"
+# A part that skips itself exits with this (policy.sh), so it is not counted as passed.
+export REALNET_SKIP_RC=3
 rc=0
+skipped=()
 for p in "${parts[@]}"; do
   # Part scripts exit 2 when the host lacks Docker, root or a tool; that is not a test failure.
-  bash "$REALNET_DIR/$p.sh" "$@"
+  case $p in
+    fwd-cable) bash "$REALNET_DIR/fwd.sh" f_fwd_cable_pull ;;
+    fwd-rest) bash "$REALNET_DIR/fwd.sh" --rest "$@" ;;
+    *) bash "$REALNET_DIR/$p.sh" "$@" ;;
+  esac
   prc=$?
   if [[ $prc -eq 2 ]]; then exit 2; fi
+  if [[ $prc -eq $REALNET_SKIP_RC ]]; then
+    skipped+=("$p")
+    continue
+  fi
   if [[ $prc -ne 0 ]]; then rc=1; fi
 done
 
 echo
-if [[ $rc -eq 0 ]]; then echo "realnet: all scenarios passed"; else echo "realnet: FAILURES (see the tables above)"; fi
+for p in ${skipped[@]+"${skipped[@]}"}; do echo "realnet: $p SKIPPED (not run on this host; see above)"; done
+if [[ $rc -ne 0 ]]; then
+  echo "realnet: FAILURES (see the tables above)"
+elif [[ ${#skipped[@]} -gt 0 ]]; then
+  echo "realnet: every scenario that ran passed; skipped: ${skipped[*]}"
+else
+  echo "realnet: all scenarios passed"
+fi
 exit $rc

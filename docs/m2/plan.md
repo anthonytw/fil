@@ -159,6 +159,7 @@ pub enum CloseReason { Done, Reset, TimedOut, Removed, ResumeGone, Violation }
 - `Response::Forward(ForwardResult)`, either `Added(ForwardId)` or `Refused(ForwardRefusal)`.
 - `Response::Ports { part: PortsPart, more: bool }`. It is chunked: one control message is capped at 4 KiB, there are at most 256 rows, and every string field is capped (process name 32 B, path 128 B, probe label 64 B). Strings are sanitized on display, never trusted. Since wire revision 6 (P1): every part carries `incomplete: Option<PortsIncomplete>` (`NoSocketTable`, `Bounded`, `TimedOut`, `Unsupported`; a reason only), and `ForwardRow.target_other_user` marks a `-L` target that another user's listener takes (no owner, no probe).
 - `ControlMsg::Reset` removed.
+- Since wire revision 7 (S1, server policy, DESIGN §11.2): `PolicyRefusal` (the deciding setting, as enums, and its source: OpenSSH's default, a line of an sshd config file, or fil's policy file, with the path capped like a `fil ports` path), carried in `ForwardRefusal::Policy`, `AttachReply.agent_refused` and `ForwardRow.policy`; `BindFailure::Policy` and `OpenFailure::Policy`; `PortsRow::Policy` (host-wide lines) and `PortsRow::Refused` (a session's refused adds and agent).
 
 ### 2.5 Forward table semantics
 
@@ -313,6 +314,8 @@ flowchart LR
   F2 & F3 --> A1
   F4b & P1b & A1 --> V1 --> H1["H1 (conditional)"] --> SW["M2 sweep"]
   L1 & T1 -.-> V1
+  A1 & F4b --> S1["S1: server policy"] --> SW
+  S1 -.-> V1
 ```
 
 The diagram must be render-checked with mermaid-cli before it is committed (CLAUDE.md).
@@ -520,6 +523,24 @@ Every package keeps M1's rules:
   - socket permissions.
 - **Mutation:** allow `REMOVE_ALL` → filter test fails; skip the "agent enabled" check → hostile test fails; skip the peer-UID check → realnet `f_agent_other_user` fails.
 
+**S1: server policy** (OD-8, decided by the owner on 2026-11-03; after A1, beside V1)
+- **Owns:** `fil-session/src/policy/**` (new: the trait the session asks, the sshd mirror, the policy file, re-reading), the enforcement hooks in `fil-session/src/forward.rs` and `core.rs` (the attach reply), `fil-daemon` (`DaemonConfig::policy`, the direct transport, the `fil ports` lines), the wire (`fil-proto/src/mux/policy.rs`, `ForwardRefusal::Policy`, `BindFailure::Policy`, `OpenFailure::Policy`, `AttachReply.agent_refused`, `ForwardRow.policy`, `PortsRow::{Policy, Refused}`; a revision bump), the client's and CLI's display of refusals, the removal of OD-7's interim refusal, `tests/realnet/policy.sh` (its own file, sourced by the runner, so it does not touch V1's), DESIGN §7.2, §10, §11 (the table and §11.2) and §14.
+- **Builds** (DESIGN §11.2):
+  - **the sshd mirror:** `/etc/ssh/sshd_config` and its `Include`s; `DisableForwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`, `PermitOpen`, `PermitListen`, `GatewayPorts`; `Match User` and `Group` evaluated, every other criterion "might apply" (the stricter wins); OpenSSH's defaults; first value wins; unknown values strict; an `Include` inside a `Match` block caps that file's own blocks (sshd's `SSHCFG_NEVERMATCH`, and *might* for a block that might apply); `crit=arg` tokens pair as sshd's; an unreadable main file is `Unknown` (one line in `fil ports`) and, like a missing one, OpenSSH's defaults (so a wide `-R` stays refused); an unreadable include is skipped and the mirror marked incomplete (coordinator, for the owner to confirm);
+  - **`/etc/fil/policy.toml`:** root's alone (and its directories), or everything is refused naming it; keys `local`, `remote`, `agent`, `direct`, `permit_open`, `permit_listen`, `gateway_ports` override the mirror both ways;
+  - **re-reading** by metadata (`lstat` and `stat`, so changes behind symbolic links count; taken before each read) at most once a second on each check, including the policy file's canonical directories and `/etc/passwd` and `/etc/group` (the account is looked up again), and every five minutes regardless (NSS groups); not `SIGHUP`: an admin who never heard of fil reloads sshd, not fil;
+  - **enforcement on the remote side:** every add (CLI, config, management, takeover adoption), every re-establish (fresh attach and resume: closes or rebinds `-R` listeners), every connection (`-L`, `-D` with its SOCKS target, `-R`), the agent socket and its connections; with `direct = false` the direct transport is not offered, no key is registered for QUIC and a QUIC resume is dropped;
+  - **refusals** name the setting and its source, on the client's overlay, in `fil forward`'s error and in `fil ports`; nothing else of the config leaves the host, and logs say only that a refusal happened, at debug;
+  - **OD-7 settled:** a wide `-R` from the client's own CLI or config is honoured where `GatewayPorts` allows it (management still may not bind one);
+  - **A1 follow-ups:** no session-bind key means no agent for the run (a notice), never an unbound relay; in `~#` a key and its certificate are two rows, the certificate marked.
+- **Tests:**
+  - a parser table: `Match User`/`Group` with negation and wildcards; unknown criteria (and `all`, and malformed lines) resolve strict; `Include` with globs, sorted, relative paths, `Match` context and a depth bound; first value wins; case-insensitive keywords; the RHEL unreadable case and an unreadable include;
+  - the policy file's checks on facts and on disk (the root-owner check through a test seam, `Trust`), and an unsafe or unparsable file refusing everything;
+  - end to end in a session with the real mirror: `AllowTcpForwarding local` refuses `-R` and allows `-L` (data flows); `AllowAgentForwarding no` creates no agent socket and the reply says why; `GatewayPorts no` refuses a wide `-R` bind and `clientspecified` honours it; a policy change closes an `-R` at the next attach and reopens it after;
+  - through the daemon: `fil forward` refused naming the setting, `fil ports` rows, direct not offered;
+  - realnet `p_sshd_no_tcp_forwarding`: the runner's real `/etc/ssh/sshd_config` with `AllowTcpForwarding no` (restored after), and the real `fil` refusing with the named setting.
+- **Mutation:** unknown `Match` criteria as not applying → the parser and mirror tests fail; a group-writable policy file accepted → the file tests and the session test fail; no check on re-establish → `the_policy_is_checked_again_when_the_table_is_re_established` fails; no check on add, at the agent socket or per connection (including each `-R` accept and each agent connection while attached) → the session tests fail; the review's fixes (an `Include` capped by its `Match`, stamps behind links, defaults for an unreadable config, groups looked up again, the one-line path, `crit=arg`, sshd's case for `any`, `O_NOFOLLOW`, `direct = false` on QUIC) each have a mutation in the PR's fix list.
+
 **V1: drop-in and realnet M2 scenarios**
 - **Owns:** `crates/fil/examples/dropin/**`, `examples/support/harness.rs`, `tests/realnet/**`, `docs/m2/{dropin,realnet}.md`.
 - Forward scenarios start after F2, F3 and F4; agent scenarios after A1. The scenarios are in §5.
@@ -542,7 +563,7 @@ Owned in sequence, never in parallel:
 - `fil-client/tests/common/daemon.rs`: F3, then A1.
 - `fil-session/tests/common/mod.rs`: F2, then A1.
 - `fil-daemon/src/conn.rs`: F2, then P1 wiring.
-- The golden: C2, then C3 only.
+- The golden: C2, then C3; later packages that change the wire (P1, S1) bump the revision past main's.
 - DESIGN.md: each package edits its own sections, and the coordinator resolves overlaps.
 
 ## 4. Security design
@@ -564,7 +585,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | | Default | Wider only if |
 |---|---|---|
 | `-L` and `-D` bind (laptop) | loopback, 127.0.0.1 and ::1 | explicit address in own CLI or config |
-| `-R` bind (remote) | loopback | explicit address in own CLI or config, and `fil ports` warns about exposure (OD-7) |
+| `-R` bind (remote) | loopback | explicit address in own CLI or config, where the host's server policy allows it (`GatewayPorts`, §11.2 of DESIGN), and `fil ports` warns about exposure (OD-7) |
 | `-R` target (laptop) | own spec | non-loopback only from own CLI or config |
 | Forwards from management (`fil forward` anywhere, which the daemon cannot tell apart from a remote process) | the attached client asks y/N once per entry (`remote_requests = "ask"`); `deny` refuses them | the user adds the spec to config |
 | Takeover | the table survives; the new client adopts entries matching its own specs and asks about the rest | |
@@ -582,7 +603,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
   - an optional per-signature confirm and a key allowlist;
   - signature counts are visible in `fil ports` and `~#`.
 - **Worse than, or different from, ssh:**
-  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `orin>github.com` still fails. **OD-5** stays with the owner for accepting that "broken" half.
+  - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `orin>github.com` still fails; **OD-5 accepted by the owner (2026-11-03)**: such keys are refused through fil, and users limit an unconstrained key with `agent_keys` instead.
   - `ssh-add` on the remote can no longer load keys into the laptop agent (the filter, OD-3).
 - **Socket path:** `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`. The session name sits inside a 0700 directory and the child's own environment, which other users cannot read. That is consistent with §11.1.4.
 
@@ -602,10 +623,10 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 |---|---|---|
 | Forwards only when requested | client: yes | yes, plus consent for management-origin forwards |
 | Local bind | loopback (`GatewayPorts no`) | loopback |
-| Remote wide bind | sshd `GatewayPorts` must allow it | explicit address honoured; no server policy (OD-7, OD-8) |
+| Remote wide bind | sshd `GatewayPorts` must allow it | explicit address honoured from own CLI or config where the mirrored `GatewayPorts` (or `gateway_ports`) allows it (OD-7, OD-8) |
 | Client checks remote opens | rejects `forwarded-tcpip` for an unrequested listen | forward id plus consent plus own target |
 | Server side adding forwards | impossible | possible (`fil forward`), gated by on-screen consent |
-| Admin switches (`AllowTcpForwarding`, `PermitOpen`, `PermitListen`, `AllowAgentForwarding`) | enforced by sshd | **bypassed**: fil runs as the user (as any user-level relay would). Documented now; policy file in M4 (OD-8) |
+| Admin switches (`DisableForwarding`, `AllowTcpForwarding`, `PermitOpen`, `PermitListen`, `GatewayPorts`, `AllowAgentForwarding`) | enforced by sshd | **mirrored** by the daemon from the host's `sshd_config` (`Match User`/`Group` evaluated, other criteria strict), under the admin's `/etc/fil/policy.toml`; refusals name the setting (S1, OD-8). A courtesy, not a boundary: a user with a shell can run any relay |
 | Agent default | `ForwardAgent no` | off |
 | Agent mutations from the remote | allowed | filtered |
 | Per-use confirm | agent-side (`ssh-add -c`) | agent-side passes through, plus fil's `confirm` |
@@ -625,8 +646,8 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | OD-4 | `agent = off/on/confirm` and `agent_keys` in M2; default off | §10, §14 | Yes. |
 | OD-5 | Accept that destination-constrained keys are refused through fil's relay (the client's own forwarding `session-bind` makes them fail closed; they are no longer bypassed) | §10, §11 | Accept; document it in §10 and the §11 table, and point users at `agent_keys`. |
 | OD-6 | `SSH_AUTH_SOCK` always set to the stable path in every session | §10, §11.1.4 | Yes. Opt out with `daemon.toml agent_socket = false`. |
-| OD-7 | Honour an explicit non-loopback `-R` bind with no daemon-side switch | §7.1, §11 | Honour it from own CLI or config with an exposure warning; refuse it from management. |
-| OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. |
+| OD-7 | Honour an explicit non-loopback `-R` bind with no daemon-side switch | §7.1, §11 | Honour it from own CLI or config with an exposure warning; refuse it from management. **Settled (owner, 2026-11-03) by `GatewayPorts`:** honoured only where the effective server policy allows it (S1). |
+| OD-8 | fil bypasses sshd's forwarding and agent switches | §11 | Document it in §11 in M2; a read-only `/etc/fil/policy.toml` deny switch in M4. **Decided (owner, 2026-11-03):** fil respects the admin's intent in M2, in two layers: the sshd mirror and `/etc/fil/policy.toml` (DESIGN §11.2; S1). |
 | OD-9 | The `-R` peer check (`same-user`) | §11 table row "`-R` ports on 127.0.0.1" | Ship it as an option, default `any` (ssh parity). |
 | OD-10 | The NODELAY remedy, if L1 finds Nagle (for example `ssh -tt` with the relay setting raw mode before the preamble: a pty, utmp entries, stderr merged into the stream), and forward pacing (H1) | §8.2 (the pipe invocation; the remote command itself stays fixed) | Decide on L1's data; avoid `-tt` unless p50 improves by more than 20 ms. |
 | OD-11 | Infrastructure: a local aarch64 cross toolchain on the Mac (zig or Docker), optionally a Lima VM for realnet; or make the repo public, or a self-hosted runner | Actions budget | A local aarch64 build in T1. Making the repo public waits for M4. **Decided 2026-11-03:** the owner made the repo public, so Actions minutes are no longer scarce; T1 skipped the local cross build (the CI `aarch64` job builds `fil` and `fwdprobe`), and a seat-owned Lima VM runs realnet locally. |
@@ -636,10 +657,10 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 **Decision status (coordinator, 2026-11-03).** The owner asked for M1 to M2 to run without waiting on them. They still decide access changes, router changes and anything that weakens a §11 invariant. So:
 
 - **Adopted as recommended:** OD-1, OD-2, OD-3, OD-4, OD-6, OD-9, OD-10 (on L1's data) and OD-12. Each keeps or strengthens the §11 invariants, or is a scope call inside the milestone.
-- **OWNER, open:**
-  - **OD-5** (destination-constrained keys through the relay). Since the PR #74 review the relay binds each connection as a forwarding hop, so such keys fail closed rather than being bypassed (adopted by the coordinator: it strengthens §11). Open for the owner: accepting that they cannot be used through fil at all. The agent stays off by default, and A1 must not turn it on anywhere by default.
-  - **OD-7** (non-loopback `-R` bind). Interim: refused, with a message naming the decision, until the owner rules.
-  - **OD-8** (bypassing sshd's forwarding and agent switches). Interim: documented in §11 as a known property; no policy file.
+- **OWNER, decided 2026-11-03:**
+  - **OD-5 accepted.** Destination-constrained keys (`ssh-add -h`) fail closed through the relay (A1 sends a forwarding session-bind); they cannot be used through fil, and that is accepted. The agent stays off by default.
+  - **OD-7 settled by `GatewayPorts`:** a non-loopback `-R` bind from the client's own CLI or config is honoured only where the effective server policy allows it; the interim refusal is gone (S1). A management request still may not bind one.
+  - **OD-8 decided:** fil respects the server admin's intent in M2, in two layers, the sshd mirror and `/etc/fil/policy.toml`, as a courtesy rather than a boundary, with unclear cases strict (DESIGN §11.2; S1).
   - **OD-11** (infrastructure): decided, the repo is public (see the table).
   - **OD-13** (channel fairness between forwards). Interim: accepted as is; per-forward caps are a candidate for V1.
 
@@ -704,15 +725,16 @@ These rely on `ssh-add` and `ssh-keygen` being on the Pis; `tools` reports them,
 | Run | When | Suite | Minutes (about) |
 |---|---|---|---|
 | A | after C3 plus L1 | `check` plus realnet `udp` and `ssh` (latency lab) | 60 |
-| B | after V1 | `all` (check, realnet three parts, aarch64) | 70 |
-| C | sweep close | `all` | 70 |
+| B | after V1 | `all` (check, realnet seven jobs with S1's `policy`, aarch64) | 115 |
+| C | sweep close | `all` | 115 |
 
 - Pi binaries come from the CI `aarch64` artifact (OD-11 decided: the repo is public, so the minutes here no longer bind; batch runs anyway).
 - Pi runs are free, so they are the main end-to-end check:
   - after Wave 2: the forward subset;
   - after V1: the full M2 suite, both Pis;
   - at sweep close: the full M1 and M2 suites.
-- Total about 200 minutes. Anything more needs the coordinator's sign-off.
+- V1 added the `fwd-cable`, `fwd-rest` and `agent` jobs to every `realnet` and `all` run: about 16, 20 and 5 runner-minutes with the build, so `suite=realnet` is about 55 runner-minutes (60 with S1's `policy` job) and `all` about 115. The jobs run in parallel, so the wall clock of a realnet run is the longest job, about 20 minutes. Each job has a time limit of its own.
+- Total about 280 minutes. Anything more needs the coordinator's sign-off. (OD-11: the repo is public, so this is wall clock and sign-off, not money.)
 
 ### 5.5 The M2 sweep (§15)
 

@@ -13,7 +13,7 @@ use crate::{Ctx, Variant};
 pub fn tools(ctx: &Ctx, host: &str) -> Res {
     let mut c = ctx.shell(host, Variant::Auto, "tools")?;
     let out = c.run(
-        "for t in vim vi less top htop git tmux screen nano man tput stty seq awk; do command -v $t > /dev/null && echo HAVE-$t || echo MISS-$t; done",
+        "for t in vim vi less top htop git tmux screen nano man tput stty seq awk ssh ssh-add ssh-keygen; do command -v $t > /dev/null && echo HAVE-$t || echo MISS-$t; done",
         CMD_TIMEOUT,
     )?;
     let list = |p: &str| -> Vec<&str> {

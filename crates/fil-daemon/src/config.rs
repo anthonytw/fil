@@ -155,6 +155,10 @@ pub struct DaemonConfig {
     /// Heartbeat and liveness timing of every link.
     pub link: LinkParams,
     pub session: SessionDefaults,
+    /// Where the server policy comes from (DESIGN.md section 11.2): the host's sshd config and
+    /// `/etc/fil/policy.toml`. Not in the file (the user must not be able to point it
+    /// elsewhere); tests change it.
+    pub policy: fil_session::policy::PolicySources,
 }
 
 impl Default for DaemonConfig {
@@ -175,6 +179,7 @@ impl Default for DaemonConfig {
             spawn_delay: Duration::ZERO,
             link: LinkParams::default(),
             session: SessionDefaults::default(),
+            policy: fil_session::policy::PolicySources::system(),
         }
     }
 }

@@ -122,7 +122,8 @@ client-pty:
 
 # Real-network harness (docs/m1/realnet.md): real OpenSSH in Docker and real NAT/netem in network
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
-# `just realnet` runs everything; `just realnet ssh`, `udp` or `sysd`; add scenario names to narrow.
+# `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd`, `policy`, `fwd` (the M2
+# forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
 # `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
 realnet *args:
     tests/realnet/run.sh {{args}}
@@ -189,13 +190,15 @@ pi-e2e *args:
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
 # real client on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
-# --allow-missing, --allow-skip. `--local` runs against a private daemon on this machine instead (no
-# targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a missing tool
-# fails the run unless allowed. Never part of `ci`.
+# --allow-missing, --allow-skip, --strict. `--local` runs against a private daemon on this machine
+# instead (no targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
+# missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
+# this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
 dropin *args:
     cargo build -q --release -p fil --bins
     cargo build -q --release -p fil --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
+    cargo build -q --release -p fil-testbins --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
     "{{target_dir}}/release/examples/dropin" {{args}}
 

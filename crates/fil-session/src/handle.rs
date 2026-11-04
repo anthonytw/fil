@@ -116,7 +116,12 @@ impl SessionHandle {
             config.catch_up,
         );
         // The forwards' endpoint runs on this runtime and outlives every subscriber.
-        let forwards = Forwards::new(name.clone(), config.forward.clone(), agent_socket.clone());
+        let forwards = Forwards::new(
+            name.clone(),
+            config.forward.clone(),
+            agent_socket.clone(),
+            config.policy.clone(),
+        );
         let fw = forwards.clone();
         // Deciding the scope may run `loginctl` and `systemd-run`, opening the PTY and starting
         // the child fork and exec: none of that belongs on an async worker. (`tokio::spawn` of
@@ -200,6 +205,13 @@ impl SessionHandle {
         self.inner.forwards.set_agent_uid(uid);
     }
 
+    /// Test hook: how many entries server policy has marked blocked (a replaced or removed entry
+    /// must not stay among them).
+    #[cfg(feature = "test-hooks")]
+    pub fn policy_blocked_count(&self) -> usize {
+        self.inner.forwards.blocked_count()
+    }
+
     /// The session has not ended.
     pub fn is_alive(&self) -> bool {
         self.inner.exit.borrow().is_none()
@@ -225,6 +237,11 @@ impl SessionHandle {
     /// client asks its user about, or removes one (DESIGN.md section 7.3). Never waits.
     pub fn forward(&self, op: ForwardOp) -> ForwardResult {
         self.inner.forwards.request(op)
+    }
+
+    /// What server policy refused in the current subscriber's run (`fil ports`).
+    pub fn refused_rows(&self) -> Vec<fil_proto::msg::RefusedRow> {
+        self.inner.forwards.refused_rows()
     }
 
     /// Entries in the session's forward table (`SessionSummary::forwards`).

@@ -41,7 +41,7 @@ Part 1 is the pure half of F4: parsing, validating, carrying and rendering. Noth
 | Ports are digits | also service names (`http`) | A service name depends on the machine's services database. |
 | Brackets enclose IP literals only; IPv4 is dotted-quad | any host in brackets; `127.1`, octal and hex forms reach `getaddrinfo` | The wire keeps an address written as a name out of `TargetHost::Name` (§7.1), so policy sees every literal address. `127.1` is refused, not read as 127.0.0.1. |
 | Host names: letters, digits, hyphens | also `_` and anything else the resolver takes | `DnsName`. |
-| A `-R` listener beyond loopback parses and is **refused by policy** | honoured if the server's `GatewayPorts` allows | OD-7 is the owner's and open (plan §4.6). `forward_spec::check_policy` refuses it from the command line and the config, naming OD-7; flipping one constant allows it. |
+| A `-R` listener beyond loopback | honoured if the server's `GatewayPorts` allows | the same: the daemon honours it from the command line and the config where the host's server policy allows it (mirrored `GatewayPorts`, or `gateway_ports` in `/etc/fil/policy.toml`; DESIGN §11.2, OD-7 settled by the owner). A refusal names the setting. |
 | The bind default does not depend on any `GatewayPorts` setting | follows `GatewayPorts` (default no, so loopback) | The loopback default is a security requirement here (§7.1, plan §4.2), not a preference. |
 | Repeated specs: an equal one is kept once; one with the same `(kind, bind, port)` and another target replaces it; the order is config, then command line | the last wins per listener | The same rule as the daemon's table (§7.2). Every `-R 0` is its own listener. |
 | Two different entries that would listen on the same port of one machine (`-L 8080` with `-L 127.0.0.1:8080:…`, `[::1]:8080:…`, `*:8080:…` or `-D 8080`; two `-R 9000` binds that overlap) are refused when the plan is made | the second bind fails at run time | They are different table entries (their identities differ) but would fight over one socket. Overlap is by address: loopback with any loopback address, a wildcard (`*`, empty, `0.0.0.0`, `::`) with everything. `-L` and `-D` share the laptop; `-R` is on the host; port 0 never collides. |
@@ -76,7 +76,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
 
 - a port that cannot be bound is printed before the terminal goes raw; with `forward_failure = "exit"` nothing is attached and the status is 255 (ssh's `ExitOnForwardFailure`), otherwise it is a warning and the forward is still added to the session (reported as not listening, tried again at every fresh attach). A forward of the run's own that fails later (the host refuses it, or cannot bind a `-R`) ends the run with 255 under `"exit"` and is a notice otherwise;
 - the agent (A1): `-A` or a config `agent` of `on` or `confirm` relays the local agent at `SSH_AUTH_SOCK` as it is when `fil` starts (never a path from the host), with `agent_keys` and `confirm` carried into the client's `ForwardSet::agent`; with no `SSH_AUTH_SOCK` it warns and carries on (the session's socket then refuses, as `ssh -A` without an agent);
-- a bad spec is a usage error (exit 2), including `-R` beyond loopback (OD-7); two forwards that would take one port are an error (exit 1) when the plan is made.
+- a bad spec is a usage error (exit 2); a `-R` beyond loopback is not (the host decides it, OD-7); two forwards that would take one port are an error (exit 1) when the plan is made.
 
 ### `fil ports` rendering (`src/ports_view.rs`)
 
@@ -95,7 +95,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
 
 ### Tests
 
-- `tests/forward_spec.rs`: the grammar table, the loopback default (`a_bare_port_binds_loopback_never_wide`), hostile input (a flag as a spec, control characters, overlong names, port 0 on `-L`, out-of-range ports, unbalanced brackets, Unix sockets), a round trip through the formatter, random-input no-panic, OD-7, the plan's precedence and the agent flags.
+- `tests/forward_spec.rs`: the grammar table, the loopback default (`a_bare_port_binds_loopback_never_wide`), hostile input (a flag as a spec, control characters, overlong names, port 0 on `-L`, out-of-range ports, unbalanced brackets, Unix sockets), a round trip through the formatter, random-input no-panic, a wide `-R` parsing (OD-7: the host's call), the plan's precedence and the agent flags.
 - `tests/ports_view.rs`: the text golden (`tests/golden/ports.txt`) and JSON golden for a fixed answer (IPv6 targets, binds and listeners included), the JSON key set, an escape sequence in a process name, path, probe label and host label rendered inert, multi-part assembly, truncation.
 - `tests/binary.rs`: the forward flags and `-A` reach the attach, bad specs are usage errors, a refused spec is not echoed raw on a pty (clap styles its output there), and a `-L` on a port in use exits 255 under `forward_failure = "exit"` and warns otherwise.
 - Unit tests in `config.rs`, `cli.rs` and `mgmt.rs`.

@@ -277,6 +277,114 @@ fn an_unsafe_or_unparsable_policy_file_refuses_everything() {
     }
 }
 
+/// An sshd config with a line fil cannot evaluate as sshd would (an `Include` glob that other
+/// globs read differently, a byte that is not UTF-8 in one, a NUL byte) is not known: unlike an
+/// unreadable include (skipped, the rest enforced), the mirror refuses every forward and the
+/// agent, naming the line (never what it says), unless fil's own policy file sets the key.
+#[test]
+fn a_line_fil_cannot_evaluate_refuses_everything_the_policy_file_does_not_set() {
+    let sshd = "# header\nInclude conf.d/[^x]*.conf\nAllowTcpForwarding yes\nGatewayPorts yes\n";
+    let h = Host::new("unev", sshd, None);
+    let cfg = h.base.join("sshd_config");
+    let why = format!(
+        "a line of the sshd config that fil cannot evaluate as sshd would, so its settings are \
+         not known ({}:2)",
+        cfg.display()
+    );
+    let p = h.policy();
+    // Everything the mirror would decide.
+    assert_eq!(says(p.forward(&local(5173, "localhost", 5173))), why);
+    assert_eq!(says(p.forward(&dynamic(1080))), why);
+    assert_eq!(says(p.forward(&remote(BindAddr::Loopback, 9000))), why);
+    assert_eq!(says(p.forward(&remote(BindAddr::Any, 9000))), why);
+    assert_eq!(says(p.dynamic_target(&target("db", 5432))), why);
+    assert_eq!(says(p.agent()), why);
+    // Not the direct transport: sshd has no switch for it, only fil's file does.
+    assert_eq!(says(p.direct()), "ok");
+    // `fil ports` says so, once, as for a policy file that refuses everything.
+    let lines = p.lines();
+    assert!(
+        matches!(&lines[..], [PolicyLine::DenyAll(r)] if r.setting == PolicySetting::Unevaluable),
+        "{lines:?}"
+    );
+    // The line is named by file and number, and by nothing it says.
+    assert!(!why.contains("[^x]") && !why.contains("conf.d"));
+
+    // fil's policy file can still set a key itself: the key stands, the rest is refused.
+    std::fs::write(
+        h.base.join("etc/fil/policy.toml"),
+        "local = true\npermit_open = [\"*:*\"]\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        h.base.join("etc/fil/policy.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let p = h.policy();
+    assert_eq!(says(p.forward(&local(5173, "localhost", 5173))), "ok");
+    assert_eq!(says(p.dynamic_target(&target("db", 5432))), "ok");
+    assert_eq!(says(p.forward(&remote(BindAddr::Loopback, 9000))), why);
+    assert_eq!(says(p.agent()), why);
+    assert!(matches!(p.lines()[..], [PolicyLine::DenyAll(_)]));
+    // Each key stands for its own part: `remote` alone leaves the bind list to the mirror, and
+    // with the list too the gateway is still the mirror's.
+    for (policy, loopback, wide) in [
+        ("remote = true\n", why.as_str(), why.as_str()),
+        (
+            "remote = true\npermit_listen = [\"*:*\"]\n",
+            "ok",
+            why.as_str(),
+        ),
+        (
+            "remote = true\npermit_listen = [\"*:*\"]\ngateway_ports = true\n",
+            "ok",
+            "ok",
+        ),
+    ] {
+        std::fs::write(h.base.join("etc/fil/policy.toml"), policy).unwrap();
+        let p = h.policy();
+        assert_eq!(
+            says(p.forward(&remote(BindAddr::Loopback, 9000))),
+            loopback,
+            "{policy}"
+        );
+        assert_eq!(
+            says(p.forward(&remote(BindAddr::Any, 9000))),
+            wide,
+            "{policy}"
+        );
+    }
+    // Every key set: nothing is left for the mirror to decide, and nothing is said.
+    std::fs::write(
+        h.base.join("etc/fil/policy.toml"),
+        "local = true\nremote = true\nagent = true\ngateway_ports = true\n\
+         permit_open = [\"*:*\"]\npermit_listen = [\"*:*\"]\n",
+    )
+    .unwrap();
+    let p = h.policy();
+    assert_eq!(says(p.forward(&local(5173, "localhost", 5173))), "ok");
+    assert_eq!(says(p.forward(&remote(BindAddr::Any, 9000))), "ok");
+    assert_eq!(says(p.agent()), "ok");
+    assert!(p.lines().is_empty());
+    // And an include fil merely could not read is still the old rule: skipped and reported,
+    // the rest enforced (a 0600 `50-cloud-init.conf` must not refuse every forward).
+    std::fs::remove_file(h.base.join("etc/fil/policy.toml")).unwrap();
+    std::fs::write(&cfg, "Include conf.d/*.conf\nAllowTcpForwarding local\n").unwrap();
+    std::fs::create_dir_all(h.base.join("conf.d")).unwrap();
+    std::fs::write(h.base.join("conf.d/a.conf"), "# nothing\n").unwrap();
+    if rustix::process::geteuid().as_raw() != 0 {
+        std::fs::set_permissions(
+            h.base.join("conf.d/a.conf"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let p = h.policy();
+        assert_eq!(says(p.forward(&local(5173, "localhost", 5173))), "ok");
+        assert!(matches!(p.lines()[..], [PolicyLine::Partial { .. }]));
+    }
+}
+
 /// RHEL and Fedora keep `sshd_config` 0600: `Unknown`, one line in `fil ports`, and OpenSSH's
 /// defaults in force (so a wide `-R` is refused, as sshd's `GatewayPorts no` would keep it on
 /// loopback). The same for a missing config.

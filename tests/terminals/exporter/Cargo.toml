@@ -1,0 +1,24 @@
+# Exports fil's terminal writes as traces for tests/terminals (docs/m3/terminals.md).
+#
+# Its own workspace root on purpose: it is an on-demand harness, not part of `just ci`, and
+# Cargo.lock beside it pins the same versions as the workspace's (copied from it).
+[package]
+name = "terminals-export"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+fil-term = { path = "../../../crates/fil-term", default-features = false, features = ["alacritty"] }
+fil-predict = { path = "../../../crates/fil-predict" }
+serde_json = "1"
+unicode-width = "0.2"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,5 @@
+# The exporter's own target directory, when CARGO_TARGET_DIR is not set.
+/exporter/target/
+# Where a local run puts its traces and results.
+/out/
+__pycache__/

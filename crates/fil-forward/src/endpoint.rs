@@ -17,8 +17,10 @@
 //! - The data sender hands a payload to the link only when the link's pacer lets it
 //!   ([`crate::pace`], H1): a delay-based cap on the forward data in flight, so a bulk forward
 //!   does not fill ssh's buffers and the bottleneck queue in front of keystrokes. A channel with
-//!   nothing in flight passes the cap, and a `Link::finish` is never held. The control sender is
-//!   not paced at all.
+//!   nothing unacknowledged may pass the cap (the agent has a reserve of its own); when the
+//!   queue's head is held, the sender reaches a channel that may go in its queue or in the mux
+//!   (`Mux::poll_transmit_channel`), and otherwise sleeps until an ack or the pacer's deadline.
+//!   A `Link::finish` is never held. The control sender is not paced at all.
 //! - One pump task per channel moves bytes between its local socket and the mux, in both
 //!   directions, with backpressure: it reads the socket only while the channel's send buffer has
 //!   room, and acknowledges (`consumed`) only what it wrote to the socket.

@@ -285,6 +285,7 @@ impl Mux {
     fn link_up(&mut self, resumed: bool) -> Vec<ControlMsg>;
     fn new_epoch(&mut self);
     fn poll_transmit(&mut self) -> Option<(ChannelId, Bytes)>; // honours credit and the Resume gate
+    fn poll_transmit_channel(&mut self, ch: ChannelId) -> Option<Bytes>; // H1: one channel's next payload, same rules (one function), no round-robin turn
     fn poll_event(&mut self) -> Option<MuxEvent>; // Opened, Readable, PeerEof, Closed, Released(ch), Table(..)
     fn tick(&mut self, now: Instant);
 }
@@ -549,10 +550,11 @@ Every package keeps M1's rules:
 - It exists only if L1 or V1 shows that keystroke p50 under a bulk forward exceeds 2× idle plus 10 ms, or that `ssh -T` Nagles, *and* the owner approves (OD-10).
 - **Candidate:** a delay-based in-flight cap for forward data per link (LEDBAT-like, measured from fil-level ack RTT). It keeps ssh's and TCP's buffers short, so a bulk forward cannot make the shell laggy, which ssh -L does.
 - **Owns:** `fil-forward` pacing only.
-- **Built (2026-11-03, OD-10 approved on V1's data):** `fil_forward::pace`, a sans-IO LEDBAT-style controller per link and side, and the endpoint's data sender consulting it (DESIGN §8.5, "Pacing"). No wire change, no new decoder limit (its constants are implementation, in `fil-forward`), nothing outside `fil-forward`.
+- **Built (2026-11-03, OD-10 approved on V1's data):** `fil_forward::pace`, a sans-IO LEDBAT-style controller per link and side, and the endpoint's data sender consulting it (DESIGN §8.5, "Pacing"). No wire change and no new decoder limit (its constants are implementation, in `fil-forward`).
   - Investigation first (`docs/m2/realnet.md`, H1): on the pipe the queue was the client's TCP socket send buffer (about 360 KB unsent) plus the router's queue (about 630 KB), the whole 1 MiB channel window; ssh's process and fil's own queues held almost nothing. On QUIC it was the router's queue, which Cubic keeps full.
-  - Interactive channels are never paced (the control sender does not consult the pacer; the terminal never passes the endpoint). Agent channels are paced like forwards, with the pass every channel with nothing in flight gets.
-  - Tests: the controller against a simulated bottleneck (`src/pace/tests.rs`: the queue near the target with the link full, a fast LAN, a long fat path within 10 % of unpaced, a slow link, ten minutes without creep, a standing queue, a stuck reader, the free pass and its bound, accounting); end to end (`tests/pace.rs`): a stuck forward never holds the control sender or a new connection (all three transports), and a bulk download over a slow netsim pipe keeps the terminal's probe fast.
+  - Interactive channels are never paced (the control sender does not consult the pacer; the terminal never passes the endpoint). Agent channels are paced like forwards, with a reserve of their own beside the cap.
+  - **After the review (PR #83: several channels).** Two changes outside `fil-forward`, both in the mux, both without a wire change, with the coordinator's OK: the receiver acknowledges on drain (16 parallel downloads had made every ack a 100 ms timer ack, -52 %), and `Mux::poll_transmit_channel` (§2.11) lets the data sender reach a channel that may go without pulling held channels' data. In the pacer: timer-ack samples are only lower bounds; passes need nothing unacknowledged and have their own budget, the agent its reserve; channels whose readers are not keeping up are parked (no samples, ack-clocked); presumption by age; a deadline instead of polling; a drain's probe; `FIL_FORWARD_PACING=off` for "before" measurements.
+  - Tests: the controller against a simulated bottleneck (`src/pace/tests.rs`: one flow and 1 to 32 parallel ones on two paths, a receiver from before ack on drain, 8 to 32 stuck readers, the agent beside them, a slow reader, a fast LAN, a long fat path, a slow link with one and eight flows, ten minutes and two minutes without creep, a standing queue, the base after slow start, timer bounds, parked channels, passes, the reserve, deadlines, accounting); end to end (`tests/pace.rs`): a stuck forward never holds the control sender or a new connection, stuck forwards both ways hold neither a live forward nor the agent (all three transports, and on a slow netsim pipe against unpaced), 16 and 32 parallel downloads, and a bulk download on the slow pipe; realnet (`f_fwd_parallel`, `f_fwd_stuck`, `f_agent_beside_stuck`, paced against unpaced).
   - Results and the mutation table: the PR; the numbers also in `docs/m2/realnet.md`.
 
 ### File-ownership hot spots

@@ -77,9 +77,20 @@ Not here yet: `fwd_takeover`. The M1 "Planned (M2)" list (`docs/m1/dropin.md`) i
 
 ## Results
 
+### The M2 close run (2026-11-04)
+
+Run on 2026-11-04 from this Mac, one Pi at a time, with main at `12f974d` (H1 included) and the Pi binaries of that tree from the `aarch64` job (run 41782753781, in the pre-recreate repository; `fil` sha256 `2d99cde2…`, `fwdprobe` `9d0a2346…`). Each Pi's host policy (`/etc/fil/policy.toml`) allows fil's forwards and the agent for the gate account. **The M2 set (25 scenarios) passed on pi1 and on pi2: 0 failed, 0 skipped, 0 expected failures, no miss, no flake, and nothing refused by policy.** After each run no daemon or socket was left.
+
+- **The done-when holds again, on the build that will ship:** `fwd_cable_pull` moved 200 MB each way through a 30 s and a 5 min outage on both transports and both Pis, byte-exact with one accept each.
+- **Recovery after the long outage is slow, as in the first run:** the shell answered 13.9 to 26.6 s after a 5 min pull ended (pi1: 13.9 s on `auto`, 26.6 s on the pipe; pi2: 18.7 and 19.4 s), and 6.5 to 8.6 s after a 30 s pull. The Pis' relay keeps this Mac's address, so the client's network watcher sees no change and waits for its next retry (see "What the Pis add to realnet", below).
+- **Typing under a bulk forward (H1):** vim's echo p50 was 27 to 28 ms under a bulk `-L` download against 13 to 15 ms idle, on both transports and both Pis, so H1's rule (above 2x idle + 10 ms) held (p99 40 to 60 ms).
+- **`fwd_churn`:** 2 x 20,000 connections per transport, all echoed. The daemon's RSS grew by 2.7 MB over the first round and then by 0 to 80 KiB over the second, and its descriptor table stayed at 64: a high-water mark, not a leak.
+- **The agent scenarios** all passed, `agent_confirm` (each signature asked about, `n` refused, `y` signed) and `agent_filter` (`ssh-add -D` and `-x` refused, the key still held) included.
+- **The rest, unchanged:** 10,000 sequential connections at 125 per second with no link down; 200 concurrent connections each way in under 100 ms; `fwd_remote` 16 MiB exact, with a connection opened during an outage going through 11.6 to 12.8 s after it was opened.
+
 ### Since S1 (#78): the Pis' gate refuses forwards and the agent
 
-From main at `6583a2a` the daemon mirrors sshd's forwarding settings (DESIGN §11.2, decided). The `fil-test` gate account's sshd config turns forwarding off: on a Pi with the merged build (sha256 `5c76e8a8…`, run 41745399062, in the pre-recreate repository), `-L` is refused ("an own forward was refused") and so is `-A` (`agent forwarding refused by server policy: AllowAgentForwarding no (/etc/ssh/sshd_config.d/20-fil-test.conf:6)`). That is fil doing what it should. But from then on the forward and agent scenarios cannot run on the Pis until the Pis' admin allows them for that account: an `/etc/fil/policy.toml` that loosens them, or the gate's sshd config. Either needs root on the Pis, which this suite never has. The results below are from the tree before S1.
+From main at `6583a2a` the daemon mirrors sshd's forwarding settings (DESIGN §11.2, decided). The `fil-test` gate account's sshd config turns forwarding off: on a Pi with the merged build (sha256 `5c76e8a8…`, run 41745399062, in the pre-recreate repository), `-L` is refused ("an own forward was refused") and so is `-A` (`agent forwarding refused by server policy: AllowAgentForwarding no (/etc/ssh/sshd_config.d/20-fil-test.conf:6)`). That is fil doing what it should. From then on the forward and agent scenarios could not run on the Pis until their admin allowed them for that account, and this suite never has root there. The admin did: each Pi now has an `/etc/fil/policy.toml` that allows what the scenarios use (DESIGN §11.2, layer 2), and the 2026-11-04 run below passed with nothing refused by policy. The two runs after this one ("After the review" and "The first run") are from the tree before S1.
 
 ### After the review (the record)
 

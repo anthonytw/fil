@@ -1,0 +1,12 @@
+# TODO(owner, M4 OQ-2): THIS FILE HAS NO KEY YET, ON PURPOSE. No release can be verified, and the
+# release workflow warns, until the owner adds the release identity's public key here in a PR to main.
+#
+# The format is ssh-keygen's allowed-signers file. One line per key and namespace, ONE KEY PER LINE,
+# no private key ever:
+#
+#   release namespaces="git"          ssh-ed25519 AAAA...    (verifies the signed tag: git verify-tag)
+#   release namespaces="fil-release"  ssh-ed25519 AAAA...    (verifies SHA256SUMS.sig, ssh-keygen -Y verify -n fil-release)
+#
+# `just release-verify` reads this file from MAIN, never from the tag being checked, so a key added
+# only on a tag's own commit verifies nothing (tests/release/verify-tag.sh). Rotating the key is a PR
+# to main; a tag signed by a retired key stops verifying once main drops it.

@@ -1,4 +1,4 @@
-//! Forward pacing (H1, `docs/m2/plan.md`; DESIGN.md §8.5 "Pacing"): a delay-based cap on the
+//! Forward pacing (DESIGN.md §8.5 "Pacing"): a delay-based cap on the
 //! forward data one side has in flight on a link, measured from fil's own acknowledgements.
 //!
 //! **Why.** A bulk forward fills every buffer between the two endpoints: on the pipe, ssh's

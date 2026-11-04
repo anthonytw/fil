@@ -298,6 +298,9 @@ pub struct Targets {
     /// Wraps every stream this side connects (a [`Flaky`] one, say) before the endpoint gets it.
     pub wrap: Mutex<Option<Wrap>>,
     pub asked: AtomicUsize,
+    /// How long every connect waits before it starts (none by default): an open that stays
+    /// unanswered that long.
+    pub delay: Mutex<Duration>,
 }
 
 /// See [`Targets::wrap`].
@@ -336,7 +339,11 @@ impl Connector for Targets {
             OpenKind::Agent => self.agent.lock().unwrap().clone(),
         };
         let wrap = self.wrap.lock().unwrap().clone();
+        let delay = *self.delay.lock().unwrap();
         Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let target = target.ok_or(OpenFailure::NoSuchForward)?;
             let s = connect_tcp(&target, &check).await?;
             Ok(match wrap {

@@ -5,7 +5,7 @@
 //! - **Bounded.** [`LIMITS`]: 300 ms per port, 1 s for the whole answer, 8 ports at a time. Every
 //!   connect, write and read has a deadline; a port that is not done in time is cut off.
 //! - **Never logged.** Nothing a probe returns is logged at any level: this module has no
-//!   tracing events at all, and the rows it fills are user data (plan section 4.4).
+//!   tracing events at all, and the rows it fills are user data (DESIGN.md section 11.1).
 //!
 //! # What a probe does to the program it reaches
 //!
@@ -91,7 +91,7 @@ pub struct ProbeLimits {
     pub parallel: usize,
 }
 
-/// The limits of DESIGN.md section 7.4 and the M2 plan.
+/// The limits of DESIGN.md section 7.4.
 pub const LIMITS: ProbeLimits = ProbeLimits {
     per_port: Duration::from_millis(300),
     total: Duration::from_secs(1),

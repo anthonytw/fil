@@ -66,7 +66,7 @@ fn is_expected_failure(name: &str, err: &str) -> bool {
 
 /// The tools every host must have. A host without one fails the run (finding: a reimaged Pi must
 /// not turn the gate green by dropping the vim scenarios).
-/// `ssh-add` and `ssh-keygen` are the agent scenarios' (plan §5.2).
+/// `ssh-add` and `ssh-keygen` are the agent scenarios' (docs/m2/dropin.md).
 const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git", "ssh-add", "ssh-keygen"];
 
 pub struct Ctx {

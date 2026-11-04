@@ -6,16 +6,20 @@
 //!
 //! The order is chosen so that nothing depends on state a later step sets:
 //!
-//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen, and put
-//!    all four character sets back to ASCII with G0 invoked (the receiver may be mid-way
-//!    through line drawing);
+//! 1. reset the pen, hide the cursor, autowrap on, no scroll region, clear the screen with
+//!    [`clear_screen`] (one `CSI 2 K` per row, not `CSI J`: see there), and put all four
+//!    character sets back to ASCII with G0 invoked (the receiver may be mid-way through line
+//!    drawing);
 //! 2. history and the primary screen, written as ordinary text with line feeds, so that
 //!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
-//!    are written without a newline and left to autowrap, which restores the wrap flag;
+//!    are written without a newline and left to autowrap, which restores the wrap flag; the
+//!    line after one gets at least its first cell written (a blank one if need be), because the
+//!    wrap happens when that cell is printed;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
-//!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
-//! 4. tab stops, the scroll region, the saved cursor with the character sets it saved, origin
-//!    mode, the cursor (with the pending-wrap flag), the pen;
+//!    it, with its origin mode, for the eventual `1049 l`), then the alternate grid by absolute positioning;
+//! 4. tab stops, the saved cursor with the origin mode and the character sets it saved (before
+//!    the scroll region, so its position is absolute), the scroll region, origin mode, the
+//!    cursor (with the pending-wrap flag), the pen;
 //! 5. the live character sets, input modes, mouse, kitty keyboard flags, title, cursor shape
 //!    and visibility.
 //!
@@ -35,9 +39,48 @@ use crate::model::{
     TermState, Underline, default_tab_stops,
 };
 
-/// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
+/// What the terminal that will read the bytes is known to understand, as far as it changes the
+/// bytes written. [`WriteCaps::default`] is the program's own choice: a terminal that was sent
+/// `4:3` by the program is a terminal the program (which chose by terminfo, `Smulx`) believes
+/// has it, and the snapshot and the overlay's pen restore only ever repeat what a program sent.
+/// A caller that knows its terminal lacks a feature says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteCaps {
+    /// Underline styles (`4:2`, `4:3`, `4:4` and `4:5`) and the underline color (`58`). Terminals
+    /// that do not know the colon sub-parameters misread them (xterm 390 turns `4:3` and
+    /// `58:5:9` into a black foreground), so without this every underline is the plain `4`,
+    /// in the text color.
+    pub underline_styles: bool,
+}
+
+impl WriteCaps {
+    /// Everything is understood.
+    pub const ALL: WriteCaps = WriteCaps {
+        underline_styles: true,
+    };
+    /// Only what every terminal understands: a plain underline in the text color.
+    pub const PLAIN: WriteCaps = WriteCaps {
+        underline_styles: false,
+    };
+}
+
+impl Default for WriteCaps {
+    fn default() -> Self {
+        WriteCaps::ALL
+    }
+}
+
+/// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`, for a terminal
+/// that understands everything ([`WriteCaps::ALL`]). One daemon renders snapshots for every
+/// client on every terminal, so what a client lacks has to be passed per call, to
+/// [`snapshot_with`].
 pub fn snapshot(state: &TermState) -> Vec<u8> {
-    let mut w = Writer::new(state);
+    snapshot_with(state, WriteCaps::ALL)
+}
+
+/// [`snapshot`] for a terminal with the given capabilities.
+pub fn snapshot_with(state: &TermState, caps: WriteCaps) -> Vec<u8> {
+    let mut w = Writer::new(state, caps);
     w.run();
     w.out
 }
@@ -45,14 +88,16 @@ pub fn snapshot(state: &TermState) -> Vec<u8> {
 struct Writer<'a> {
     st: &'a TermState,
     out: Vec<u8>,
+    caps: WriteCaps,
     pen: Attrs,
     link: Option<u32>,
 }
 
 impl<'a> Writer<'a> {
-    fn new(st: &'a TermState) -> Self {
+    fn new(st: &'a TermState, caps: WriteCaps) -> Self {
         Writer {
             st,
+            caps,
             out: Vec::with_capacity(4096),
             pen: Attrs::default(),
             link: None,
@@ -67,7 +112,8 @@ impl<'a> Writer<'a> {
         let st = self.st;
         // 1. Known starting point. Not a full reset: that would drop the receiver's own
         // scrollback, which is the point of fil.
-        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r\x1b[H\x1b[J");
+        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r");
+        clear_screen(&mut self.out, st.size.rows);
         self.designate([Charset::Ascii; 4]);
         self.put("\x0f");
         // 2. History and the primary screen.
@@ -79,13 +125,23 @@ impl<'a> Writer<'a> {
         rows.extend(primary_rows.iter());
         self.flow_lines(&rows);
         if st.modes.alt_screen {
-            // 3. Park the primary cursor, then switch. `1049 h` saves it and clears the
-            // alternate screen.
+            // 3. Park the primary cursor, then switch. `1049 h` saves it, with the origin mode
+            // (which is on only for as long as the save needs it; no region is set yet, so the
+            // position stays absolute), and clears the alternate screen. The `CSI J` there is
+            // not the clear of step 1: it is redundant after `1049 h`, and an alternate screen
+            // has no scrollback to push into, so it is left as it is.
+            let saved_origin = st
+                .primary_behind_alt
+                .as_ref()
+                .is_some_and(|p| p.saved_origin);
             self.end_link();
             self.set_pen(Attrs::default());
+            if saved_origin {
+                self.put("\x1b[?6h");
+            }
             self.cup(primary_cursor.row, primary_cursor.col);
             self.set_pen(primary_cursor.pen);
-            self.put("\x1b[?1049h\x1b[0m\x1b[H\x1b[J");
+            self.put("\x1b[?1049h\x1b[?6l\x1b[0m\x1b[H\x1b[J");
             self.pen = Attrs::default();
             self.positioned_lines(&st.screen);
         }
@@ -98,23 +154,27 @@ impl<'a> Writer<'a> {
         for &c in stops {
             self.put(&format!("\x1b[{}G\x1bH", u32::from(c) + 1));
         }
-        // Scroll region, origin, cursor, pen.
-        match st.modes.scroll_region {
-            Some((top, bottom)) => {
-                self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
-            }
-            None => self.put("\x1b[r"),
-        }
-        // DECSC with origin mode still off, so the saved position is absolute. It saves the
-        // character sets too, so designate the saved ones first and the ASCII ones after (the
-        // pending-wrap rewrite below prints a cell and must not go through line drawing).
+        // DECSC, before the scroll region is set: with none, the position is absolute in origin
+        // mode too, so the saved row is always writable, whatever region the screen has now. It
+        // saves the origin mode and the character sets with the position, so a DECRC by the
+        // program later does what it would have done without the snapshot. The character sets
+        // are the saved ones, then the ASCII ones after (the pending-wrap rewrite below prints a
+        // cell and must not go through line drawing).
         if let Some(sv) = st.saved_cursor {
+            self.put(if sv.origin { "\x1b[?6h" } else { "\x1b[?6l" });
             self.cup(sv.row, sv.col);
             self.set_pen(sv.pen);
             self.designate(sv.charsets);
             self.put("\x1b7");
             self.designate([Charset::Ascii; 4]);
             self.set_pen(Attrs::default());
+        }
+        // Scroll region (which homes the cursor), origin, cursor, pen.
+        match st.modes.scroll_region {
+            Some((top, bottom)) => {
+                self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
+            }
+            None => self.put("\x1b[r"),
         }
         self.put(if st.modes.origin {
             "\x1b[?6h"
@@ -199,10 +259,14 @@ impl<'a> Writer<'a> {
         for (i, line) in rows.iter().enumerate() {
             let last = i + 1 == rows.len();
             let wraps = line.wrapped && !last;
+            // A line entered by autowrap has at least its first cell written, even when it is
+            // blank: the wrap happens when that cell is printed, so without it the line before
+            // would not be marked as wrapped (a line whose tail was erased after a reflow).
+            let min = usize::from(from_wrap);
             let upto = if wraps {
                 line.cells.len()
             } else {
-                trimmed_len(&line.cells)
+                trimmed_len(&line.cells).max(min)
             };
             self.cells(&line.cells, upto);
             let tinted = line
@@ -215,14 +279,8 @@ impl<'a> Writer<'a> {
                 self.put("\x1b[K");
             }
             if wraps {
-                // Autowrap carries on in the next line. If that line is empty nothing will
-                // trigger the wrap, so end this one with a newline.
-                if rows[i + 1].cells.iter().all(Cell::is_plain_blank) {
-                    self.newline();
-                    from_wrap = false;
-                } else {
-                    from_wrap = true;
-                }
+                // Autowrap carries on in the next line.
+                from_wrap = true;
             } else {
                 if !last {
                     self.newline();
@@ -241,11 +299,13 @@ impl<'a> Writer<'a> {
             if !continuing {
                 self.cup(u16::try_from(r).unwrap_or(u16::MAX), 0);
             }
+            // As in `flow_lines`: a row entered by autowrap gets its first cell written.
+            let min = usize::from(continuing);
             if line.wrapped && r + 1 < rows.len() {
                 self.cells(&line.cells, line.cells.len());
-                continuing = !rows[r + 1].cells.iter().all(Cell::is_plain_blank);
+                continuing = true;
             } else {
-                self.cells(&line.cells, trimmed_len(&line.cells));
+                self.cells(&line.cells, trimmed_len(&line.cells).max(min));
                 continuing = false;
             }
         }
@@ -358,14 +418,48 @@ impl<'a> Writer<'a> {
         if a == self.pen {
             return;
         }
-        let s = sgr(&a);
+        let s = sgr_with(&a, self.caps);
         self.put(&s);
         self.pen = a;
     }
 }
 
-/// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`).
+/// Appends a clear of a `rows`-row screen that leaves the cursor at the home position and does
+/// not push the screen into the receiver's scrollback.
+///
+/// `CSI H CSI J` is the textbook clear, but tmux (3.4) copies the visible screen into its history
+/// for it, so every snapshot would add a screen of scrollback to a local tmux. Erasing each row
+/// with `CSI 2 K` and then homing pushes nothing on xterm, kitty, WezTerm or tmux, and leaves the
+/// same cells (the real-terminal suite, `cl-rows*`, docs/m3/terminals.md finding 3). `CSI 2 J`
+/// is no substitute: tmux pushes on it too. The cost is a short sequence per row.
+///
+/// It clears `rows` rows and no more: `CSI J` also cleared the rows of a client terminal taller
+/// than the state (a snapshot that races a resize), which stay as they were until the next repaint.
+///
+/// The caller has put the terminal in a state where `CUP` is absolute: origin mode off. A scroll
+/// region does not matter, `CUP` and `EL` ignore it. The pen should be reset first, so the erased
+/// cells get the default background (the snapshot writer's own first step does that).
+pub fn clear_screen(out: &mut Vec<u8>, rows: u16) {
+    for row in 1..=u32::from(rows) {
+        out.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[H");
+}
+
+/// The SGR sequence that sets the pen to exactly `a` (it starts with a reset, `CSI 0`), for a
+/// terminal that understands everything ([`WriteCaps::ALL`]).
 pub fn sgr(a: &Attrs) -> String {
+    sgr_with(a, WriteCaps::ALL)
+}
+
+/// [`sgr`] for a terminal with the given capabilities.
+///
+/// The underline color is written in the colon form (`58:5:N`, `58:2::R:G:B`, with the color
+/// space left empty as ITU T.416 allows), which is what programs that use it send and what the
+/// terminals that know SGR 58 (kitty, WezTerm, alacritty, foot, VTE) accept. The semicolon form
+/// (`58;5;N`) is the unsafe one: a terminal that does not know 58 reads its 5 and 9 as blink and
+/// strikethrough. A terminal that does not know 58 gets no underline color (`caps`).
+pub fn sgr_with(a: &Attrs, caps: WriteCaps) -> String {
     let mut s = String::from("\x1b[0");
     if a.bold {
         s.push_str(";1");
@@ -376,13 +470,13 @@ pub fn sgr(a: &Attrs) -> String {
     if a.italic {
         s.push_str(";3");
     }
-    match a.underline {
-        Underline::None => {}
-        Underline::Single => s.push_str(";4"),
-        Underline::Double => s.push_str(";4:2"),
-        Underline::Curly => s.push_str(";4:3"),
-        Underline::Dotted => s.push_str(";4:4"),
-        Underline::Dashed => s.push_str(";4:5"),
+    match (a.underline, caps.underline_styles) {
+        (Underline::None, _) => {}
+        (Underline::Single, _) | (_, false) => s.push_str(";4"),
+        (Underline::Double, true) => s.push_str(";4:2"),
+        (Underline::Curly, true) => s.push_str(";4:3"),
+        (Underline::Dotted, true) => s.push_str(";4:4"),
+        (Underline::Dashed, true) => s.push_str(";4:5"),
     }
     if a.blink {
         s.push_str(";5");
@@ -398,7 +492,16 @@ pub fn sgr(a: &Attrs) -> String {
     }
     color(&mut s, 38, a.fg);
     color(&mut s, 48, a.bg);
-    color(&mut s, 58, a.underline_color);
+    // The underline color is for the terminals that have SGR 58, and those are the ones that
+    // have the underline styles (`Smulx` and `Setulc` come together). xterm 390 reads even the
+    // colon form as a black foreground.
+    if caps.underline_styles {
+        match a.underline_color {
+            Color::Default => {}
+            Color::Indexed(n) => s.push_str(&format!(";58:5:{n}")),
+            Color::Rgb(r, g, b) => s.push_str(&format!(";58:2::{r}:{g}:{b}")),
+        }
+    }
     s.push('m');
     s
 }
@@ -428,7 +531,7 @@ pub fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Hyperlink, Modes, PrimaryScreen, Size};
+    use crate::model::{Hyperlink, Modes, PrimaryScreen, SavedCursor, Size};
 
     fn text_cell(t: &str) -> Cell {
         Cell {
@@ -459,6 +562,46 @@ mod tests {
         assert!(out.contains("\x1b[?2004l"));
         assert!(out.ends_with("\x1b[0 q\x1b[?25h"));
         assert!(!out.contains("1049"));
+    }
+
+    /// Every erase-in-display (`CSI Ps J`) in `bytes`, by parameter.
+    fn erase_in_display(bytes: &[u8]) -> Vec<u16> {
+        use vte::{Params, Parser, Perform};
+        #[derive(Default)]
+        struct Seen(Vec<u16>);
+        impl Perform for Seen {
+            fn csi_dispatch(&mut self, p: &Params, _: &[u8], _: bool, action: char) {
+                if action == 'J' {
+                    self.0.push(p.iter().next().map_or(0, |x| x[0]));
+                }
+            }
+        }
+        let (mut parser, mut seen) = (Parser::new(), Seen::default());
+        parser.advance(&mut seen, bytes);
+        seen.0
+    }
+
+    #[test]
+    fn the_clear_erases_row_by_row_and_never_with_ed() {
+        // tmux pushes the screen into its history for `CSI H CSI J` and for `CSI 2 J`.
+        let mut out = Vec::new();
+        clear_screen(&mut out, 3);
+        assert_eq!(
+            s(&out),
+            "\x1b[1;1H\x1b[2K\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H"
+        );
+        assert_eq!(erase_in_display(&out), Vec::<u16>::new());
+        // The snapshot's clear is the same function, for the state's own height.
+        for (cols, rows) in [(10, 3), (80, 24)] {
+            let snap = snapshot(&state(cols, rows));
+            let mut want = Vec::new();
+            clear_screen(&mut want, rows);
+            assert!(
+                snap.windows(want.len()).any(|w| w == &want[..]),
+                "{rows} rows"
+            );
+            assert_eq!(erase_in_display(&snap), Vec::<u16>::new(), "{rows} rows");
+        }
     }
 
     #[test]
@@ -508,10 +651,8 @@ mod tests {
         assert!(out.contains("abcdef"), "{out:?}");
     }
 
-    #[test]
-    fn sgr_underline_style_and_colors() {
-        let mut st = state(10, 1);
-        st.screen[0].cells[0] = Cell {
+    fn styled_cell() -> Cell {
+        Cell {
             text: "x".into(),
             attrs: Attrs {
                 bold: true,
@@ -522,12 +663,69 @@ mod tests {
                 ..Attrs::default()
             },
             ..Cell::blank()
-        };
-        let out = s(&snapshot(&st));
+        }
+    }
+
+    #[test]
+    fn sgr_underline_style_and_colors() {
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = styled_cell();
+        let out = s(&snapshot_with(&st, WriteCaps::ALL));
         assert!(
-            out.contains("\x1b[0;1;4:3;38;5;200;48;2;9;8;7;58;2;1;2;3mx"),
+            out.contains("\x1b[0;1;4:3;38;5;200;48;2;9;8;7;58:2::1:2:3mx"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn underline_color_is_written_in_the_colon_form() {
+        // `58;5;9` is read by a terminal that does not know SGR 58 as blink (5) and
+        // strikethrough (9). A terminal that has 58 takes the colon form; one that does not
+        // gets no underline color at all.
+        for (color, want) in [
+            (Color::Indexed(9), "\x1b[0;4;58:5:9m"),
+            (Color::Rgb(1, 2, 3), "\x1b[0;4;58:2::1:2:3m"),
+        ] {
+            let a = Attrs {
+                underline: Underline::Single,
+                underline_color: color,
+                ..Attrs::default()
+            };
+            assert_eq!(sgr_with(&a, WriteCaps::ALL), want);
+            assert!(!sgr(&a).contains("58;"));
+            assert_eq!(sgr_with(&a, WriteCaps::PLAIN), "\x1b[0;4m");
+        }
+    }
+
+    #[test]
+    fn underline_styles_are_written_only_for_a_terminal_that_has_them() {
+        let styles = [
+            (Underline::Double, ";4:2"),
+            (Underline::Curly, ";4:3"),
+            (Underline::Dotted, ";4:4"),
+            (Underline::Dashed, ";4:5"),
+        ];
+        for (underline, colon) in styles {
+            let a = Attrs {
+                underline,
+                ..Attrs::default()
+            };
+            assert_eq!(sgr_with(&a, WriteCaps::ALL), format!("\x1b[0{colon}m"));
+            assert_eq!(sgr_with(&a, WriteCaps::PLAIN), "\x1b[0;4m");
+        }
+        let single = Attrs {
+            underline: Underline::Single,
+            ..Attrs::default()
+        };
+        assert_eq!(sgr_with(&single, WriteCaps::PLAIN), "\x1b[0;4m");
+        let none = Attrs::default();
+        assert_eq!(sgr_with(&none, WriteCaps::PLAIN), "\x1b[0m");
+        // A snapshot passes the capabilities on to every SGR it writes.
+        let mut st = state(10, 1);
+        st.screen[0].cells[0] = styled_cell();
+        let plain = s(&snapshot_with(&st, WriteCaps::PLAIN));
+        assert!(plain.contains("\x1b[0;1;4;38;5;200;48;2;9;8;7mx"));
+        assert!(!plain.contains("4:3") && !plain.contains("58"));
     }
 
     #[test]
@@ -591,6 +789,7 @@ mod tests {
                 col: 4,
                 ..Cursor::default()
             },
+            saved_origin: false,
         });
         let out = s(&snapshot(&st));
         let p = out.find('P').unwrap();
@@ -663,6 +862,54 @@ mod tests {
         st.cursor.col = 1;
         let out = s(&snapshot(&st));
         assert!(out.contains("\x1b[3;5r\x1b[?6h\x1b[2;2H"), "{out:?}");
+    }
+
+    #[test]
+    fn the_saved_cursor_is_saved_with_its_origin_mode() {
+        let mut st = state(10, 6);
+        st.modes.scroll_region = Some((2, 4));
+        st.saved_cursor = Some(SavedCursor {
+            row: 3,
+            col: 1,
+            origin: true,
+            ..SavedCursor::default()
+        });
+        // Origin mode on, the position absolute (no region is set yet), DECSC; then the region.
+        let out = s(&snapshot(&st));
+        let save = out.find("\x1b[?6h\x1b[4;2H").expect("origin save position");
+        let decsc = out[save..].find("\x1b7").expect("DECSC") + save;
+        assert!(out.find("\x1b[3;5r").unwrap() > decsc, "{out:?}");
+        // Saved without origin mode, the mode is off while saving.
+        st.saved_cursor = Some(SavedCursor {
+            origin: false,
+            ..st.saved_cursor.unwrap()
+        });
+        let out = s(&snapshot(&st));
+        let save = out.find("\x1b[?6l\x1b[4;2H").expect("plain save position");
+        assert!(out[save..].find("\x1b7").unwrap() < out.find("\x1b[3;5r").unwrap() - save);
+        // A saved row outside the region keeps the bit, which is the point of the order.
+        st.saved_cursor = Some(SavedCursor {
+            row: 0,
+            origin: true,
+            ..st.saved_cursor.unwrap()
+        });
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[?6h\x1b[1;2H"), "{out:?}");
+    }
+
+    #[test]
+    fn the_primary_screens_saved_origin_mode_is_set_around_the_alternate_screen_switch() {
+        let mut st = state(10, 2);
+        st.modes.alt_screen = true;
+        st.primary_behind_alt = Some(PrimaryScreen {
+            screen: vec![Line::blank(10), Line::blank(10)],
+            cursor: Cursor::default(),
+            saved_origin: true,
+        });
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[?6h\x1b[1;1H"), "{out:?}");
+        assert!(out.contains("\x1b[?1049h\x1b[?6l"), "{out:?}");
+        assert!(out.find("\x1b[?6h").unwrap() < out.find("\x1b[?1049h").unwrap());
     }
 
     #[test]

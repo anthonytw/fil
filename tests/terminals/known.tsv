@@ -1,0 +1,248 @@
+# The disagreements between the shadow model and each terminal that tests/terminals/run.sh knows about.
+# Columns: terminal TAB trace/check TAB reason id TAB hash of the exact differences (a trace/* line with hash * is a wildcard).
+# A disagreement at a listed checkpoint passes only if its differences are the listed ones (the hash is of their text, which is
+# deterministic); a different or an added difference there fails the run, like an unlisted checkpoint. A listed difference that no
+# longer occurs is STALE and fails the run: remove the line. The hash of a failing checkpoint is printed with it. TERMINALS_STRICT=1
+# ignores this file. Every line is a finding (docs/m3/terminals.md). Reasons tagged [fil-term fix PR: ...] are bugs on fil's side that
+# the follow-up fix PR removes; the line goes with the fix.
+#
+# FIL-DECSTR: [fil-term fix PR: model DECSTR] the shadow ignores DECSTR (vte 0.15 has no handler), so it keeps the character sets, insert mode, origin mode, saved cursor and pen that xterm and WezTerm reset (tmux resets the charsets); kitty ignores DECSTR too and agrees with the shadow. The tracker marks the state unknown, the shadow's own data is wrong.
+# FIL-DECRC-ORIGIN: [fil-term fix PR: track DECSC's origin bit] alacritty does not save origin mode in DECSC; all four terminals do, and the snapshot writer's own DECSC is taken with origin mode off. A later DECRC (the probe's `ESC 8`) turns origin mode off on the terminals and leaves it on in the shadow.
+# FIL-SGR58: [fil-term fix PR: write SGR 58 in colon form] fil_term::snapshot::sgr writes the underline color as `58;5;N` with semicolons (and a curly underline as `4:3`); xterm 390 knows neither, reads the 5 as blink and the 9 as strikethrough, and `4:3` as a black foreground. The snapshot and the overlay's pen restore both use that writer.
+# FIL-TMUX-CLEAR: [fil-term fix PR: the snapshot writer's clear] tmux pushes the screen into its history on `CSI H CSI J`, the snapshot writer's clear; alacritty and the other terminals do not.
+# UNSAVED-RESTORE: `CSI ? 1049 l` with nothing saved: xterm and tmux restore (and reset the charset); alacritty ignores it (hazard 7; the tracker marks the charset unknown).
+# KITTY-DECRC-PEN: kitty keeps the current pen across `ESC 8` with nothing saved; alacritty and xterm reset it.
+# ED2-NO-PUSH: alacritty pushes the screen into its scrollback on `CSI 2 J`; this terminal does not (as VTE and tmux do). The shadow's history then holds lines the terminal never scrolled (docs/m3/terminals.md, finding 4; a K1 note, not a bug).
+# TMUX-REGION-HISTORY: tmux saves lines scrolled out of a partial scroll region into its history; the other terminals do not. The screen is the same.
+# WEZTERM-REGION: WezTerm's handling of the partial scroll region of ov-scroll-region varies from run to run (a line feed at the bottom margin sometimes moves the cursor out of the region; at the probe a line feed below the region scrolls the whole screen). The overlay-free control as-scroll-region agrees in every run; the cause is not isolated. A wildcard because the answer is not deterministic.
+# WEZTERM-MARGINS: WezTerm after the probe's `ESC 8` with nothing saved: the scroll region seems to be reset (the screen scrolls as if there were none); the other terminals differ from the model in origin mode only (FIL-DECRC-ORIGIN).
+# XTERM-PRINT-NORM: xterm's print-screen precomposes a combining mark (`e` + U+0301 reads back as `é`) and drops U+200D; the screen itself may be right. A read-back normalization, not a width difference.
+# WIDTH: this terminal measures the string's width differently from alacritty_terminal (VS16 sequences, ZWJ, skin tones, soft hyphen, a lone regional indicator); docs/m3/terminals.md, the width table.
+# XTERM-SGR-PROGRAM: the program's own `58;5;9` and `4:3` (as-pen sends them itself): xterm 390 misreads them. Not fil's bytes.
+# WEZTERM-NO-CURLY: WezTerm's `get-text --escapes` prints no curly underline, so the curly cells cannot be read back (a read-back limit, not a verdict on the terminal).
+# REFLOW: this terminal reflows (or, for xterm, does not reflow) differently from alacritty_terminal; the shadow screen no longer says what the terminal shows after a resize (docs/m3/terminals.md, finding 1: W1's second trigger).
+#
+!intermittent	wezterm	ov-scroll-region
+!intermittent	wezterm	ov-scroll-region-nosync
+!intermittent	wezterm	ov-origin
+!intermittent	wezterm	ov-origin-nosync
+!intermittent	wezterm	sn-region-tabs-charset
+!intermittent	wezterm	ov-pending-wrap
+!intermittent	wezterm	ov-pending-wrap-nosync
+!suspect	ov-origin/e2/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin/end/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin-nosync/e2/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+!suspect	ov-origin-nosync/end/flush	3c24f559ddf2	the signature of an overlay that forgets `?6h` (a guess drawn from absolute coordinates in origin mode)
+#
+kitty	cl-ed2-short/after	ED2-NO-PUSH	614724ad0a67
+kitty	cl-ed2/after	ED2-NO-PUSH	a2ed2bcc05c9
+kitty	ov-clear-screen-nosync/e2/flush	ED2-NO-PUSH	e0ea351514c7
+kitty	ov-clear-screen-nosync/end/flush	ED2-NO-PUSH	e0ea351514c7
+kitty	ov-clear-screen-nosync/probe	ED2-NO-PUSH	8fb22fa645e6
+kitty	ov-clear-screen/e2/flush	ED2-NO-PUSH	e0ea351514c7
+kitty	ov-clear-screen/end/flush	ED2-NO-PUSH	e0ea351514c7
+kitty	ov-clear-screen/probe	ED2-NO-PUSH	8fb22fa645e6
+kitty	ov-origin-nosync/probe	FIL-DECRC-ORIGIN	71e1db9ab175
+kitty	ov-origin/probe	FIL-DECRC-ORIGIN	71e1db9ab175
+kitty	ov-pen-colon-nosync/probe	KITTY-DECRC-PEN	3486f10a6637
+kitty	ov-pen-colon/probe	KITTY-DECRC-PEN	3486f10a6637
+kitty	ov-pen-nosync/probe	KITTY-DECRC-PEN	3486f10a6637
+kitty	ov-pen/probe	KITTY-DECRC-PEN	3486f10a6637
+kitty	ov-resize-narrow-nosync/e2/client-erased	REFLOW	f6222d5ef829
+kitty	ov-resize-narrow-nosync/e2/terminal-resized	REFLOW	9221cc9decf2
+kitty	ov-resize-narrow-nosync/e3/flush	REFLOW	cab5c0650f0b
+kitty	ov-resize-narrow-nosync/probe	REFLOW	e6d6d39b1705
+kitty	ov-resize-narrow/e2/client-erased	REFLOW	f6222d5ef829
+kitty	ov-resize-narrow/e2/terminal-resized	REFLOW	9221cc9decf2
+kitty	ov-resize-narrow/e3/flush	REFLOW	cab5c0650f0b
+kitty	ov-resize-narrow/probe	REFLOW	e6d6d39b1705
+kitty	ov-resize-wide-nosync/e2/terminal-resized	REFLOW	69bc8f128d13
+kitty	ov-resize-wide/e2/terminal-resized	REFLOW	69bc8f128d13
+kitty	rf-after-snapshot/40x24	REFLOW	f7a5cf88ed1b
+kitty	rf-blank-below/30x24	REFLOW	926eba84f2c7
+kitty	rf-both/80x24	REFLOW	3e345726eb9d
+kitty	rf-history/100x24	REFLOW	746d110ea520
+kitty	rf-history/80x24	REFLOW	746d110ea520
+kitty	rf-rows-only/80x24	REFLOW	e20c749721e5
+kitty	rf-wide-at-edge/40x24	REFLOW	ef2cc779aba7
+kitty	rf-wide-at-edge/60x24	REFLOW	396f3948fb09
+kitty	rf-wrapped-lines/40x24	REFLOW	b9e9f2f4c653
+kitty	rf-wrapped-lines/80x24	REFLOW	1fe42ee174ab
+kitty	sn-region-tabs-charset/probe	FIL-DECRC-ORIGIN	8034d6d33095
+kitty	sn-styles/probe	KITTY-DECRC-PEN	31fe90ab5147
+kitty	wd-widths/digit-vs16	WIDTH	fea3da7193f8
+kitty	wd-widths/heart-vs16	WIDTH	f9634d0fbea1
+kitty	wd-widths/keycap	WIDTH	de655687ea07
+kitty	wd-widths/regional-indicator-alone	WIDTH	de655687ea07
+kitty	wd-widths/smiley-vs16	WIDTH	d61ca5e95d5b
+kitty	wd-widths/thumbs-skin-tone	WIDTH	509277fa8b62
+tmux	as-decstr/charset	FIL-DECSTR	fa0b992013c1
+tmux	as-restore-without-save/after	UNSAVED-RESTORE	fa0b992013c1
+tmux	as-scroll-region/probe	TMUX-REGION-HISTORY	05525b45485e
+tmux	as-scroll-region/scrolled	TMUX-REGION-HISTORY	05525b45485e
+tmux	as-wrap-flag-last-cell/widened	REFLOW	163b0eb899ff
+tmux	cl-snapshot-clear-short/after	FIL-TMUX-CLEAR	ad4d2d9ec8b4
+tmux	cl-snapshot-clear/after	FIL-TMUX-CLEAR	f94171fd0e1c
+tmux	ov-decstr-nosync/probe	FIL-DECSTR	445f44e162af
+tmux	ov-decstr/probe	FIL-DECSTR	445f44e162af
+tmux	ov-origin-nosync/probe	FIL-DECRC-ORIGIN	d4320ad022d2
+tmux	ov-origin/probe	FIL-DECRC-ORIGIN	d4320ad022d2
+tmux	ov-restore-without-save-nosync/probe	UNSAVED-RESTORE	445f44e162af
+tmux	ov-restore-without-save/probe	UNSAVED-RESTORE	445f44e162af
+tmux	ov-scroll-region-nosync/e2/flush	TMUX-REGION-HISTORY	05525b45485e
+tmux	ov-scroll-region-nosync/end/flush	TMUX-REGION-HISTORY	05525b45485e
+tmux	ov-scroll-region-nosync/probe	TMUX-REGION-HISTORY	05525b45485e
+tmux	ov-scroll-region/e2/flush	TMUX-REGION-HISTORY	05525b45485e
+tmux	ov-scroll-region/end/flush	TMUX-REGION-HISTORY	05525b45485e
+tmux	ov-scroll-region/probe	TMUX-REGION-HISTORY	05525b45485e
+tmux	rf-wide-at-edge/80x24	REFLOW	234ec5afa74f
+tmux	sn-region-tabs-charset/probe	FIL-DECRC-ORIGIN	17b134adbc8c
+tmux	sn-wide/probe	WIDTH	eca2f7327625
+tmux	sn-wide/snapshot	WIDTH	fca712e63170
+tmux	wd-widths/digit-vs16	WIDTH	fea3da7193f8
+tmux	wd-widths/heart-vs16	WIDTH	f9634d0fbea1
+tmux	wd-widths/keycap	WIDTH	de655687ea07
+tmux	wd-widths/regional-indicator-alone	WIDTH	de655687ea07
+tmux	wd-widths/smiley-vs16	WIDTH	d61ca5e95d5b
+tmux	wd-widths/soft-hyphen	WIDTH	def618a0db86
+tmux	wd-widths/thumbs-skin-tone	WIDTH	509277fa8b62
+tmux	wd-widths/zwj-family	WIDTH	2f2440460ee1
+wezterm	as-decstr/charset	FIL-DECSTR	fa0b992013c1
+wezterm	as-decstr/insert-mode	FIL-DECSTR	e2515b5f067e
+wezterm	as-decstr/origin-mode	FIL-DECSTR	905169da9c7e
+wezterm	as-decstr/saved-cursor	FIL-DECSTR	8791c74ead3f
+wezterm	as-pen/pen	WEZTERM-NO-CURLY	e5cd4d073116
+wezterm	as-wrap-flag-last-cell/widened	REFLOW	d59167a43377
+wezterm	cl-ed2-short/after	ED2-NO-PUSH	614724ad0a67
+wezterm	cl-ed2/after	ED2-NO-PUSH	a2ed2bcc05c9
+wezterm	ov-clear-screen-nosync/e2/flush	ED2-NO-PUSH	e0ea351514c7
+wezterm	ov-clear-screen-nosync/end/flush	ED2-NO-PUSH	e0ea351514c7
+wezterm	ov-clear-screen-nosync/probe	ED2-NO-PUSH	8fb22fa645e6
+wezterm	ov-clear-screen/e2/flush	ED2-NO-PUSH	e0ea351514c7
+wezterm	ov-clear-screen/end/flush	ED2-NO-PUSH	e0ea351514c7
+wezterm	ov-clear-screen/probe	ED2-NO-PUSH	8fb22fa645e6
+wezterm	ov-decstr-nosync/probe	FIL-DECSTR	445f44e162af
+wezterm	ov-decstr/probe	FIL-DECSTR	445f44e162af
+wezterm	ov-origin-nosync/probe	WEZTERM-MARGINS	18e2c14d987a
+wezterm	ov-origin/probe	WEZTERM-MARGINS	18e2c14d987a
+wezterm	ov-pen-colon-nosync/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e2/erase	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon-nosync/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-nosync/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-nosync/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-nosync/e2/erase	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-nosync/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-nosync/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-resize-narrow-nosync/e2/client-erased	REFLOW	f6222d5ef829
+wezterm	ov-resize-narrow-nosync/e2/terminal-resized	REFLOW	09561058879b
+wezterm	ov-resize-narrow-nosync/e3/flush	REFLOW	cab5c0650f0b
+wezterm	ov-resize-narrow-nosync/probe	REFLOW	e6d6d39b1705
+wezterm	ov-resize-narrow/e2/client-erased	REFLOW	f6222d5ef829
+wezterm	ov-resize-narrow/e2/terminal-resized	REFLOW	09561058879b
+wezterm	ov-resize-narrow/e3/flush	REFLOW	cab5c0650f0b
+wezterm	ov-resize-narrow/probe	REFLOW	e6d6d39b1705
+wezterm	ov-scroll-region-nosync/*	WEZTERM-REGION	*
+wezterm	ov-scroll-region/*	WEZTERM-REGION	*
+wezterm	rf-after-snapshot/40x24	REFLOW	f7a5cf88ed1b
+wezterm	rf-blank-below/30x24	REFLOW	926eba84f2c7
+wezterm	rf-both/50x10	REFLOW	5d4941925a1a
+wezterm	rf-both/80x24	REFLOW	26c19dcccd1e
+wezterm	rf-history/100x24	REFLOW	ef1924e0f419
+wezterm	rf-history/30x24	REFLOW	d9d0c452e12c
+wezterm	rf-history/80x24	REFLOW	ef1924e0f419
+wezterm	rf-wide-at-edge/40x24	REFLOW	ef2cc779aba7
+wezterm	rf-wide-at-edge/start	REFLOW	4ce29bc10184
+wezterm	rf-wrapped-lines/40x24	REFLOW	b9e9f2f4c653
+wezterm	rf-wrapped-lines/80x24	REFLOW	1fe42ee174ab
+wezterm	sn-region-tabs-charset/probe	FIL-DECRC-ORIGIN	e27ac3b9031b
+wezterm	sn-styles/snapshot	WEZTERM-NO-CURLY	2e51c320ac22
+wezterm	sn-wide/probe	WIDTH	90c7365b75f8
+wezterm	sn-wide/snapshot	WIDTH	0cc55a7e456d
+wezterm	wd-widths/thumbs-skin-tone	WIDTH	509277fa8b62
+wezterm	wd-widths/zwj-family	WIDTH	2f2440460ee1
+xterm	as-decstr/charset	FIL-DECSTR	fa0b992013c1
+xterm	as-decstr/insert-mode	FIL-DECSTR	e2515b5f067e
+xterm	as-decstr/origin-mode	FIL-DECSTR	905169da9c7e
+xterm	as-decstr/saved-cursor	FIL-DECSTR	8791c74ead3f
+xterm	as-pen/pen	XTERM-SGR-PROGRAM	da40bc720a62
+xterm	as-restore-without-save/after	UNSAVED-RESTORE	fa0b992013c1
+xterm	as-wrap-flag-kept/widened	REFLOW	1bed6aad129f
+xterm	as-wrap-flag-last-cell/widened	REFLOW	d59167a43377
+xterm	cl-ed2-short/after	ED2-NO-PUSH	614724ad0a67
+xterm	cl-ed2/after	ED2-NO-PUSH	a2ed2bcc05c9
+xterm	ov-clear-screen-nosync/e2/flush	ED2-NO-PUSH	e0ea351514c7
+xterm	ov-clear-screen-nosync/end/flush	ED2-NO-PUSH	e0ea351514c7
+xterm	ov-clear-screen-nosync/probe	ED2-NO-PUSH	8fb22fa645e6
+xterm	ov-clear-screen/e2/flush	ED2-NO-PUSH	e0ea351514c7
+xterm	ov-clear-screen/end/flush	ED2-NO-PUSH	e0ea351514c7
+xterm	ov-clear-screen/probe	ED2-NO-PUSH	8fb22fa645e6
+xterm	ov-decstr-nosync/probe	FIL-DECSTR	445f44e162af
+xterm	ov-decstr/probe	FIL-DECSTR	445f44e162af
+xterm	ov-origin-nosync/probe	FIL-DECRC-ORIGIN	d4320ad022d2
+xterm	ov-origin/probe	FIL-DECRC-ORIGIN	d4320ad022d2
+xterm	ov-pen-colon-nosync/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon-nosync/e1/flush	FIL-SGR58	8bf48ca6b774
+xterm	ov-pen-colon-nosync/e2/erase	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon-nosync/e2/flush	FIL-SGR58	3d01d63a739d
+xterm	ov-pen-colon-nosync/end/flush	FIL-SGR58	89f0dedd401f
+xterm	ov-pen-colon/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon/e1/flush	FIL-SGR58	8bf48ca6b774
+xterm	ov-pen-colon/e2/flush	FIL-SGR58	3d01d63a739d
+xterm	ov-pen-colon/end/flush	FIL-SGR58	89f0dedd401f
+xterm	ov-pen-nosync/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-nosync/e1/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-nosync/e2/erase	FIL-SGR58	d5752c054726
+xterm	ov-pen-nosync/e2/flush	FIL-SGR58	3522d80c5f3d
+xterm	ov-pen-nosync/end/flush	FIL-SGR58	3522d80c5f3d
+xterm	ov-pen/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen/e1/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen/e2/flush	FIL-SGR58	3522d80c5f3d
+xterm	ov-pen/end/flush	FIL-SGR58	3522d80c5f3d
+xterm	ov-resize-narrow-nosync/e2/client-erased	REFLOW	da96e908dd4e
+xterm	ov-resize-narrow-nosync/e2/terminal-resized	REFLOW	15d62f9c71bb
+xterm	ov-resize-narrow-nosync/e3/flush	REFLOW	e613ea27c195
+xterm	ov-resize-narrow-nosync/probe	REFLOW	8fb22fa645e6
+xterm	ov-resize-narrow/e2/client-erased	REFLOW	da96e908dd4e
+xterm	ov-resize-narrow/e2/terminal-resized	REFLOW	15d62f9c71bb
+xterm	ov-resize-narrow/e3/flush	REFLOW	e613ea27c195
+xterm	ov-resize-narrow/probe	REFLOW	8fb22fa645e6
+xterm	ov-resize-wide-nosync/e2/client-erased	REFLOW	493a082549f5
+xterm	ov-resize-wide-nosync/e2/terminal-resized	REFLOW	fad0294b5141
+xterm	ov-resize-wide-nosync/e3/flush	REFLOW	06b3d2c86e3e
+xterm	ov-resize-wide-nosync/probe	REFLOW	5b45f17b8f1d
+xterm	ov-resize-wide/e2/client-erased	REFLOW	493a082549f5
+xterm	ov-resize-wide/e2/terminal-resized	REFLOW	fad0294b5141
+xterm	ov-resize-wide/e3/flush	REFLOW	06b3d2c86e3e
+xterm	ov-resize-wide/probe	REFLOW	5b45f17b8f1d
+xterm	ov-restore-without-save-nosync/probe	UNSAVED-RESTORE	445f44e162af
+xterm	ov-restore-without-save/probe	UNSAVED-RESTORE	445f44e162af
+xterm	rf-after-snapshot/100x24	REFLOW	ec4b6134eced
+xterm	rf-after-snapshot/40x24	REFLOW	7b311cbe9117
+xterm	rf-blank-below/30x24	REFLOW	f313c2acaefd
+xterm	rf-blank-below/80x24	REFLOW	5694985e4956
+xterm	rf-both/50x10	REFLOW	7484a1720825
+xterm	rf-both/80x24	REFLOW	d23b60e89b33
+xterm	rf-history/100x24	REFLOW	737600fc6ee9
+xterm	rf-history/30x24	REFLOW	04e284295427
+xterm	rf-history/80x24	REFLOW	60a9e739d4d7
+xterm	rf-wide-at-edge/40x24	REFLOW	8987d3e2eb3e
+xterm	rf-wide-at-edge/60x24	REFLOW	679ddce5067c
+xterm	rf-wide-at-edge/80x24	REFLOW	b0dce088d756
+xterm	rf-wrapped-lines/120x24	REFLOW	e7ce73f0b533
+xterm	rf-wrapped-lines/40x24	REFLOW	a7c2069e1f51
+xterm	rf-wrapped-lines/80x24	REFLOW	89831f43c4dc
+xterm	sn-region-tabs-charset/probe	FIL-DECRC-ORIGIN	e27ac3b9031b
+xterm	sn-styles/snapshot	FIL-SGR58	acd654c325d4
+xterm	sn-wide/probe	XTERM-PRINT-NORM	89daf1b5a585
+xterm	sn-wide/snapshot	XTERM-PRINT-NORM	576c570d1029
+xterm	wd-widths/soft-hyphen	WIDTH	def618a0db86

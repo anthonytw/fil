@@ -15,6 +15,22 @@
 //!   test in `tests/roundtrip.rs` guards the whole class.
 //! - The scroll region (`Term::scroll_region`) is private, so it is shadowed by a second
 //!   tiny parser (`sniff::RegionTracker`) fed the same bytes.
+//! - DECSC does not save the origin mode and DECRC does not restore it, though xterm, kitty,
+//!   WezTerm and tmux do. The tracker follows the mode and its save, and where a restore should
+//!   have changed the mode, `feed` puts `CSI ? 6 h|l` and a second `ESC 8` into the stream
+//!   right after it: setting the origin mode homes the cursor, and the second restore takes it
+//!   back to the saved position, pen, wrap flag and character sets. Going through the parser
+//!   keeps the order right inside a synchronized-update bracket. Leaving the alternate screen
+//!   (`1049 l`) is the exception: its restore is the grid's own cursor, which differs from the
+//!   saved one after a resize in the alternate screen, so the mode is set on the `Term`
+//!   directly with the cursor put back (a held sync batch is applied first).
+//! - DECSTR (`CSI ! p`) has no handler. The tracker reports where one ends and `soft_reset`
+//!   applies xterm's definition to the `Term` there: replace mode, autowrap on, absolute origin mode, the
+//!   full-screen scroll region, ASCII in G0 to G3 with G0 invoked, a normal pen, and nothing
+//!   saved (home, plain pen, ASCII). The cursor stays where it is, with its pending wrap, though
+//!   setting the origin mode and the region homes it. The `Term` is changed directly, so a
+//!   synchronized-update batch the processor is holding is applied first, and the bytes of the
+//!   bracket that follow are applied as they arrive.
 //! - Tab stops (`Term::tabs`) are private. They are read back by probing: park the cursor on
 //!   each column in turn and ask `move_forward_tabs` where one tab goes (a tab stop at column
 //!   `c` is a stop exactly when a tab from `c - 1` lands on `c`), then put the cursor back.
@@ -37,8 +53,9 @@ use alacritty_terminal::index::{Column, Line as GLine};
 use alacritty_terminal::term::cell::{Cell as ACell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    CharsetIndex, Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler,
-    KeyboardModes, KeyboardModesApplyBehavior, NamedColor, Processor, StandardCharset,
+    Attr, CharsetIndex, Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler,
+    KeyboardModes, KeyboardModesApplyBehavior, Mode, NamedColor, NamedMode, NamedPrivateMode,
+    PrivateMode, Processor, StandardCharset,
 };
 
 use crate::model::{
@@ -46,7 +63,7 @@ use crate::model::{
     MouseEncoding, MouseTracking, PrimaryScreen, SavedCursor, Size, TermState, Underline,
     default_tab_stops,
 };
-use crate::sniff::RegionTracker;
+use crate::sniff::{Action, RegionTracker};
 use crate::{Backend, Capabilities, Emulator};
 
 pub(crate) const BACKEND: Backend = Backend {
@@ -154,9 +171,68 @@ impl Alacritty {
             term: RefCell::new(term),
             parser: Processor::new(),
             shared,
-            region: RegionTracker::new(size.rows, false),
+            region: RegionTracker::new(size.rows, false, true),
             size,
         }
+    }
+}
+
+impl Alacritty {
+    /// DECSTR, as xterm defines it (VT510: "soft terminal reset"), for what this model keeps.
+    fn soft_reset(&mut self) {
+        // The batch the processor holds precedes the DECSTR; apply it before changing the term.
+        if self.parser.sync_bytes_count() > 0 {
+            self.parser.stop_sync(self.term.get_mut());
+        }
+        let term = self.term.get_mut();
+        let (point, wrap) = {
+            let c = &term.grid().cursor;
+            (c.point, c.input_needs_wrap)
+        };
+        Handler::unset_mode(term, Mode::Named(NamedMode::Insert));
+        // xterm and WezTerm turn autowrap back on (the VT510 table says "no autowrap").
+        Handler::set_private_mode(term, PrivateMode::Named(NamedPrivateMode::LineWrap));
+        // Both of these home the cursor.
+        Handler::unset_private_mode(term, PrivateMode::Named(NamedPrivateMode::Origin));
+        Handler::set_scrolling_region(term, 1, None);
+        for index in [
+            CharsetIndex::G0,
+            CharsetIndex::G1,
+            CharsetIndex::G2,
+            CharsetIndex::G3,
+        ] {
+            Handler::configure_charset(term, index, StandardCharset::Ascii);
+        }
+        Handler::set_active_charset(term, CharsetIndex::G0);
+        Handler::terminal_attribute(term, Attr::Reset);
+        let grid = term.grid_mut();
+        grid.saved_cursor = Default::default();
+        grid.cursor.point = point;
+        grid.cursor.input_needs_wrap = wrap;
+    }
+}
+
+impl Alacritty {
+    /// Sets the origin mode without moving the cursor (setting it homes the cursor). The `Term`
+    /// is changed directly, so a held synchronized-update batch is applied first.
+    fn set_origin_in_place(&mut self, on: bool) {
+        if self.parser.sync_bytes_count() > 0 {
+            self.parser.stop_sync(self.term.get_mut());
+        }
+        let term = self.term.get_mut();
+        let (point, wrap) = {
+            let c = &term.grid().cursor;
+            (c.point, c.input_needs_wrap)
+        };
+        let mode = PrivateMode::Named(NamedPrivateMode::Origin);
+        if on {
+            Handler::set_private_mode(term, mode);
+        } else {
+            Handler::unset_private_mode(term, mode);
+        }
+        let c = &mut term.grid_mut().cursor;
+        c.point = point;
+        c.input_needs_wrap = wrap;
     }
 }
 
@@ -166,8 +242,24 @@ impl Emulator for Alacritty {
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(self.term.get_mut(), bytes);
-        self.region.feed(bytes);
+        let mut done = 0;
+        for (end, action) in self.region.feed(bytes) {
+            self.parser.advance(self.term.get_mut(), &bytes[done..end]);
+            done = end;
+            match action {
+                Action::Decstr => self.soft_reset(),
+                Action::LeaveAlt(on) => self.set_origin_in_place(on),
+                Action::SetOrigin(on) => {
+                    let fix: &[u8] = if on {
+                        b"\x1b[?6h\x1b8"
+                    } else {
+                        b"\x1b[?6l\x1b8"
+                    };
+                    self.parser.advance(self.term.get_mut(), fix);
+                }
+            }
+        }
+        self.parser.advance(self.term.get_mut(), &bytes[done..]);
     }
 
     fn apply_pending(&mut self) {
@@ -204,7 +296,7 @@ impl Emulator for Alacritty {
 
         let (screen, history, cursor, primary, saved) = if !alt {
             let (screen, history, cursor) = read_grid(term.grid(), history_lines, &mut links);
-            let saved = saved_of(&term.grid().saved_cursor);
+            let saved = saved_of(&term.grid().saved_cursor, self.region.saved_origin(false));
             (screen, history, cursor, None, saved)
         } else {
             // Copy the alternate grid and its cursors, swap the primary in to read it, swap
@@ -212,7 +304,7 @@ impl Emulator for Alacritty {
             let (alt_screen, _, alt_cursor) = read_grid(term.grid(), 0, &mut links);
             let raw_cursor = term.grid().cursor.clone();
             let raw_saved = term.grid().saved_cursor.clone();
-            let saved = saved_of(&raw_saved);
+            let saved = saved_of(&raw_saved, self.region.saved_origin(true));
             let raw_rows: Vec<Vec<ACell>> = (0..term.screen_lines())
                 .map(|r| {
                     let row = &term.grid()[GLine(r as i32)];
@@ -246,6 +338,7 @@ impl Emulator for Alacritty {
                 Some(PrimaryScreen {
                     screen: p_screen,
                     cursor: p_cursor,
+                    saved_origin: self.region.saved_origin(false),
                 }),
                 saved,
             )
@@ -343,8 +436,9 @@ fn read_tab_stops(term: &mut Term<Shared>) -> Option<Vec<u16>> {
     (stops != default_tab_stops(cols as u16)).then_some(stops)
 }
 
-fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>) -> Option<SavedCursor> {
+fn saved_of(c: &alacritty_terminal::grid::Cursor<ACell>, origin: bool) -> Option<SavedCursor> {
     let saved = SavedCursor {
+        origin,
         row: c.point.line.0.max(0) as u16,
         col: c.point.column.0 as u16,
         pen: attrs(&c.template),

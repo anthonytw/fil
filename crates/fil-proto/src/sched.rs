@@ -114,7 +114,7 @@ impl Scheduler {
 
     /// Drop everything queued for `channel` (the channel closed).
     ///
-    /// Nothing calls this yet outside the tests: the M2 forwards (docs/m2/plan.md) close channels
+    /// Nothing calls this yet outside the tests: the forwards (DESIGN.md section 7) close channels
     /// one at a time and need it.
     pub fn remove_channel(&mut self, channel: ChannelId) {
         match channel.class() {

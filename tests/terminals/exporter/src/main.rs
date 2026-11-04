@@ -41,7 +41,8 @@ pub fn all() -> Vec<(Tb, u16, u16)> {
         .chain(scenarios::widths())
         .chain(scenarios::reflows())
     {
-        out.push((tb, 80, 24));
+        let (c, r) = (tb.start.cols, tb.start.rows);
+        out.push((tb, c, r));
     }
     out
 }

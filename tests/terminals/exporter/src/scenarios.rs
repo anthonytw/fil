@@ -234,6 +234,18 @@ pub fn clears() -> Vec<Tb> {
             b"\x1b[H\x1b[2J",
         ),
         clear_trace(
+            "cl-ed0-nonhome",
+            "`CSI H CSI 2 K` (the first row), then `CSI 2;1 H CSI J` (the rest): an erase to the end of the screen that does not start at the home position, which tmux's scroll-on-clear is said not to act on.",
+            55,
+            b"\x1b[H\x1b[2K\x1b[2;1H\x1b[J\x1b[H",
+        ),
+        clear_trace(
+            "cl-ed0-nonhome-short",
+            "The same over a short session.",
+            3,
+            b"\x1b[H\x1b[2K\x1b[2;1H\x1b[J\x1b[H",
+        ),
+        clear_trace(
             "cl-rows",
             "No ED at all: `CSI 2 K` on each row in turn, then home.",
             55,
@@ -364,6 +376,21 @@ pub fn assumptions() -> Vec<Tb> {
             .rows(&[2, 9])
             .note("DECRC after DECSTR: home on xterm (the saved cursor is reset)"),
     );
+    v.push(t);
+
+    // The control for ov-scroll-region: the same server bytes with no overlay at all.
+    let mut t = Tb::new(
+        "as-scroll-region",
+        "assumption",
+        "The server bytes of ov-scroll-region with no overlay: a scroll region 3-8, two line feeds at its bottom margin, then the probe. WezTerm answers this trace differently from run to run.",
+        Size { cols: 40, rows: 12 },
+    );
+    t.write(b"\x1b[3;8r\x1b[8;1Hab");
+    t.check(Check::new("before"));
+    t.write(b"\r\n\r\ncd");
+    t.check(Check::new("scrolled").hist(Hist::Exact));
+    t.write(&probe(Size { cols: 40, rows: 12 }));
+    t.check(Check::new("probe").hist(Hist::Exact));
     v.push(t);
 
     let mut t = Tb::new(

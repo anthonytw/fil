@@ -124,6 +124,8 @@ pub struct Tb {
     pub group: &'static str,
     pub doc: String,
     pub size: Size,
+    /// The size the terminal starts at.
+    pub start: Size,
     /// The model of the user's terminal: fed what the real terminal is fed (without the
     /// synchronized-output markers, which the model would hold back).
     pub model: Oracle,
@@ -158,6 +160,7 @@ impl Tb {
             group,
             doc: doc.to_string(),
             size,
+            start: size,
             model: Oracle::new(&model_backend(), size, HISTORY),
             steps: Vec::new(),
             boundary: Boundary::new(),

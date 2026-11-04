@@ -12,8 +12,10 @@ disagreement, a check that could not be read, or a trace that did not finish.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,6 +28,9 @@ PLAYER = os.path.join(HERE, "player.py")
 
 
 TMUX_N = 0
+# A short private directory for sockets and small files (a unix socket path is limited to about
+# 100 bytes; nothing predictable in a shared /tmp).
+TMP = ""
 
 
 def launch(term, trace, work, result, dump):
@@ -36,6 +41,7 @@ def launch(term, trace, work, result, dump):
     cols, rows = trace["cols"], trace["rows"]
     env = dict(os.environ, LANG="C.UTF-8", LC_ALL="C.UTF-8")
     env.pop("TMUX", None)
+    env["TMPDIR"] = TMP
     if term == "xterm":
         printed = os.path.join(work, "print.out")
         open(printed, "w").close()
@@ -49,7 +55,7 @@ def launch(term, trace, work, result, dump):
             "xterm", "-geometry", f"{cols}x{rows}", "-u8",
             "-xrm", "XTerm*allowWindowOps: true",
             "-xrm", "XTerm*saveLines: 2000",
-            "-xrm", f"XTerm*printerCommand: cat >> {printed}",
+            "-xrm", f"XTerm*printerCommand: cat >> {shlex.quote(printed)}",
             "-xrm", "XTerm*printAttributes: 2",
             "-xrm", "XTerm*printerFormFeed: true",
             "-xrm", "XTerm*printerExtent: true",
@@ -63,7 +69,7 @@ def launch(term, trace, work, result, dump):
     if term == "kitty":
         env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         # A unix socket path is limited to about 100 bytes; the work directory can be longer.
-        sock = os.path.join(tempfile.gettempdir(), f"fil-kitty-{os.getpid()}.sock")
+        sock = os.path.join(TMP, "k.sock")
         cmd = [
             "kitty", "--config", "NONE",
             "-o", "allow_remote_control=socket-only",
@@ -110,7 +116,7 @@ def launch(term, trace, work, result, dump):
         conf = os.path.join(work, "tmux.conf")
         with open(conf, "w") as f:
             f.write("set -g history-limit 2000\nset -g default-terminal tmux-256color\nset -s escape-time 0\n"
-                    "set -g remain-on-exit off\n")
+                    "set -g remain-on-exit off\n" + os.environ.get("TERMINALS_TMUX_CONF", ""))
         base = ["tmux", "-L", sock]
         # A holder session keeps the server alive when the player's session ends.
         subprocess.run(base + ["-f", conf, "new-session", "-d", "-s", "hold", "sleep 3600"], env=env, check=True)
@@ -157,25 +163,37 @@ def stop(proc):
             pass
 
 
+def diff_hash(diffs):
+    """A short hash of a checkpoint's differences. The differences are deterministic text, so a
+    listed disagreement is pinned to what it was when it was listed: a different or an added
+    difference at the same checkpoint is not the listed one."""
+    return hashlib.sha256("\n".join(diffs).encode()).hexdigest()[:12]
+
+
 def load_known(path):
+    """{(terminal, trace/check): [(hash or "*", reason)]}. A `trace/*` key with hash `*` covers
+    every checkpoint of an intermittent trace and is never stale."""
     known = {}
     if os.path.exists(path):
         for line in open(path):
             line = line.rstrip("\n")
             if not line or line.startswith("#"):
                 continue
-            term, key, why = (line.split("\t") + ["", "", ""])[:3]
-            known[(term, key)] = why
+            term, key, why, h = (line.split("\t") + ["", "", "", "*"])[:4]
+            known.setdefault((term, key), []).append((h, why))
     return known
 
 
-def is_known(known, term, key):
-    """A known entry matches its exact key, or a trace-wide `trace/*` or `*/check` pattern."""
-    trace, _, check = key.partition("/")
-    for k in ((term, key), (term, trace + "/*"), (term, "*/" + check), (term, "*")):
-        if k in known:
-            return known[k]
-    return None
+def lookup(known, term, key, h):
+    """(entry, state): the listed entry for this difference, or why there is none."""
+    trace = key.partition("/")[0]
+    for k in ((term, key), (term, trace + "/*")):
+        for eh, why in known.get(k, []):
+            if eh in ("*", h):
+                return (k, eh), "known"
+    if (term, key) in known:
+        return None, "changed"
+    return None, "new"
 
 
 def main():
@@ -195,7 +213,9 @@ def main():
     if args.dump:
         dump = os.path.join(args.out, "dump", args.terminal)
         os.makedirs(dump, exist_ok=True)
-    known = {} if os.environ.get("TERMINALS_STRICT") == "1" else load_known(os.path.join(HERE, "known.tsv"))
+    known = {} if os.environ.get("TERMINALS_STRICT") == "1" else load_known(os.environ.get("TERMINALS_KNOWN") or os.path.join(HERE, "known.tsv"))
+    global TMP
+    TMP = tempfile.mkdtemp(prefix="ft-")
 
     traces = []
     for fn in sorted(os.listdir(args.traces)):
@@ -209,13 +229,15 @@ def main():
 
     started = time.time()
     failed = False
-    summary = {"ok": 0, "info": 0, "known": 0, "new": 0, "error": 0}
+    summary = {"ok": 0, "info": 0, "known": 0, "new": 0, "error": 0, "stale": 0}
+    seen = set()
+    ran = {tr["name"] for tr in traces}
     lines = []
-    for tr in traces:
+    def attempt(tr):
+        """Runs one trace in a fresh terminal; returns (records, finished, stderr tail, timed out)."""
         work = os.path.join(args.out, "work", args.terminal, tr["name"])
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
-        t0 = time.time()
         before = os.path.getsize(result)
         proc = launch(args.terminal, tr, work, result, dump)
         deadline = time.time() + args.timeout
@@ -230,49 +252,89 @@ def main():
         except OSError:
             pass
         shutil.rmtree(work, ignore_errors=True)
-        recs = []
         with open(result) as f:
             f.seek(before)
             recs = [json.loads(x) for x in f if x.strip()]
-        done = any(r.get("done") for r in recs)
+        return recs, any(r.get("done") for r in recs), err_tail, timed_out
+
+    def evaluate(tr, recs, done, err_tail, timed_out):
+        """Sorts one attempt's records: (lines, counts, matched known entries, failed)."""
+        lines, counts, matched, bad = [], dict.fromkeys(summary, 0), set(), False
         for r in recs:
             if "error" in r:
-                summary["error"] += 1
-                failed = True
+                counts["error"] += 1
+                bad = True
                 lines.append(f"ERROR   {tr['name']}/{r.get('check', '')}: {r['error']}")
             elif "check" in r and tr["group"] == "canary":
-                # Wrong on purpose: the read-back must see it.
-                if r["status"] == "ok":
-                    summary["error"] += 1
-                    failed = True
-                    lines.append(f"ERROR   {tr['name']}/{r['check']}: the deliberately wrong expectation was not noticed; the read-back is blind")
+                # Wrong on purpose: it expects another text, another cursor and other
+                # attributes, and all three must show.
+                joined = " ".join(r["diffs"])
+                missing = [k for k, w in (("row", "row "), ("cursor", "cursor ("), ("attributes", "attrs:")) if w not in joined]
+                if r["status"] == "ok" or missing:
+                    counts["error"] += 1
+                    bad = True
+                    lines.append(f"ERROR   {tr['name']}/{r['check']}: the deliberately wrong expectation was not fully noticed (missing: {', '.join(missing) or 'all'}); the read-back is blind")
                 else:
-                    summary["ok"] += 1
+                    counts["ok"] += 1
             elif "check" in r:
                 key = f"{tr['name']}/{r['check']}"
                 if r["status"] == "ok":
-                    summary["ok"] += 1
+                    counts["ok"] += 1
                 elif r["status"] == "info":
-                    summary["info"] += 1
+                    counts["info"] += 1
                 else:
-                    why = is_known(known, args.terminal, key)
-                    if why is not None:
-                        summary["known"] += 1
+                    entry, state = lookup(known, args.terminal, key, diff_hash(r["diffs"]))
+                    if state == "known":
+                        counts["known"] += 1
+                        matched.add(entry)
                         lines.append(f"known   {key}: {'; '.join(r['diffs'][:2])}")
                     else:
-                        summary["new"] += 1
-                        failed = True
-                        lines.append(f"DIFF    {key}: {'; '.join(r['diffs'][:3])}")
+                        counts["new"] += 1
+                        bad = True
+                        note = " (a listed checkpoint, but not the listed difference)" if state == "changed" else ""
+                        lines.append(f"DIFF    {key}{note} [{diff_hash(r['diffs'])}]: {'; '.join(r['diffs'][:3])}")
         if not done and not any("error" in r for r in recs):
-            summary["error"] += 1
-            failed = True
+            counts["error"] += 1
+            bad = True
             lines.append(f"ERROR   {tr['name']}: the terminal exited without finishing the trace" + (" (timed out)" if timed_out else "") + (f"; its stderr: {err_tail}" if err_tail else ""))
+        return lines, counts, matched, bad
+
+    # WezTerm is not deterministic on some traces (scroll regions, a pending wrap: finding 8), so a
+    # trace with an unlisted difference is run again, up to twice; it passes if one run shows
+    # nothing but listed differences. A bug in what fil writes shows in every run.
+    tries = 3 if args.terminal == "wezterm" else 1
+    for tr in traces:
+        t0 = time.time()
+        for n in range(tries):
+            res = attempt(tr)
+            ev = evaluate(tr, *res)
+            if not ev[3] or n == tries - 1:
+                break
+            print(f"{args.terminal} {tr['name']}: unlisted difference, run again ({n + 1} of {tries})", file=sys.stderr, flush=True)
+        lines.extend(ev[0])
+        for k, v in ev[1].items():
+            summary[k] += v
+        seen |= ev[2]
+        failed = failed or ev[3]
         print(f"{args.terminal} {tr['name']}: {time.time() - t0:.1f}s", file=sys.stderr, flush=True)
 
+    # A listed difference that no longer occurs: the disagreement was fixed, or the line was wrong.
+    for (term, key), entries in sorted(known.items()):
+        trace = key.partition("/")[0]
+        if term != args.terminal or trace not in ran or key.endswith("/*"):
+            continue
+        for eh, why in entries:
+            if ((term, key), eh) not in seen:
+                summary["stale"] += 1
+                # WezTerm's intermittent traces can agree in the accepted run: a warning there.
+                failed = failed or term != "wezterm"
+                lines.append(f"STALE   {key} [{eh}]: listed in known.tsv ({why}) and no longer occurring; remove the line")
+
+    shutil.rmtree(TMP, ignore_errors=True)
     elapsed = time.time() - started
     print("\n".join(lines))
     print(f"{args.terminal}: {len(traces)} traces, {summary['ok']} checks agree, {summary['info']} informational, "
-          f"{summary['known']} known disagreements, {summary['new']} NEW disagreements, {summary['error']} errors; {elapsed:.0f}s")
+          f"{summary['known']} known disagreements, {summary['new']} NEW disagreements, {summary['stale']} stale entries, {summary['error']} errors; {elapsed:.0f}s")
     sys.exit(1 if failed else 0)
 
 

@@ -6,18 +6,18 @@ Until now the prediction core, the snapshot writer and the status line were chec
 
 ## What is replayed
 
-`tests/terminals/exporter` (its own cargo workspace; not part of `just ci`) writes one JSON trace per scenario. A trace is a list of steps: bytes to write, resizes, and checkpoints with the expected screen, cursor, cell attributes and scrollback taken from the model fed the same bytes. 89 traces, about 520 checkpoints:
+`tests/terminals/exporter` (its own cargo workspace; not part of `just ci`) writes one JSON trace per scenario. A trace is a list of steps: bytes to write, resizes, and checkpoints with the expected screen, cursor, cell attributes and scrollback taken from the model fed the same bytes. 92 traces, about 540 checkpoints:
 
 | Group | Traces | What the terminal is fed |
 |---|---|---|
 | `ov-*` | 20 hazard traces of the spike (`crates/fil-predict/tests/hazards.rs`, one per row of the hazard table), each with synchronized output on and off; `ov-typing`, a typing session with the default predictor at 200 ms | The real `Overlay`'s output: the erase, the server bytes, the paint, and the `?2026` markers, with a checkpoint after each flush and, where the erase is at rest, right after the erase |
 | `st-*` | 6 status-line scenarios (`crates/fil-predict/tests/status.rs`), with and without synchronized output | The same, for the pinned status (inverse video) |
 | `sn-*` | 9 snapshots: plain, history, wrapped lines, styles, wide characters, alternate screen, scroll region with origin mode and tab stops and DEC graphics, pending wrap, autowrap off | `fil_term::snapshot::snapshot` of a state, then the probe |
-| `as-*` | 10 micro-tests of the assumptions `docs/spikes/prediction.md` lists as unverified | Hand-written bytes |
+| `as-*` | 11 micro-tests of the assumptions `docs/spikes/prediction.md` lists as unverified, and `as-scroll-region`, the overlay-free control for `ov-scroll-region` | Hand-written bytes |
 | `wd-widths` | 30 strings | Each printed at the start of a row; the cursor position report says how wide the terminal thinks it is |
 | `rf-*` | 7 reflow cases | Wrapped lines, history, a prompt with typed text, wide characters at the edge, a snapshot; narrowed, widened, returned |
-| `cl-*` | 6 clears | A screen with scrollback, then `CSI H CSI J` (the snapshot writer's clear), `CSI H CSI 2 J`, or row-by-row `CSI 2 K`; and the same over a short session |
-| `canary` | 1 | A deliberately wrong expectation. The run fails if the terminal agrees with it: a blind read-back must not pass |
+| `cl-*` | 8 clears | A screen with scrollback, then `CSI H CSI J` (the snapshot writer's clear), `CSI H CSI 2 J`, `CSI H CSI 2 K CSI 2;1 H CSI J` (an erase to the end that does not start at home) or row-by-row `CSI 2 K`; and the same over a short session |
+| `canary` | 1 | A deliberately wrong expectation (another row text, another cursor, other attributes). The run fails unless all three are reported: a blind read-back must not pass |
 
 Two details keep the traces honest:
 
@@ -45,16 +45,17 @@ macOS terminals are not read back (`docs/m3/plan.md` §3 T2): that needs an Auto
 
 These are not findings about fil; each is handled in `player.py`, and each is a reason a checkpoint compares less than it seems to.
 
-- A cursor position report with a **wrap pending** is `(row, cols+1)` in tmux and `(row+1, 1)` in kitty; accepted when the model has a pending wrap.
-- In **origin mode** tmux reports the cursor absolute (xterm and WezTerm relative to the region, as the standard says); kitty's report is wrong by a constant (it was off by one in a plain case, by two in another) and is not compared there.
+- A cursor position report with a **wrap pending** is `(row, cols+1)` in tmux and `(row+1, 1)` in kitty; each is accepted on its own terminal only, when the model has a pending wrap.
+- In **origin mode** tmux reports the cursor absolute (xterm and WezTerm relative to the region, as the standard says; accepted on tmux only). kitty's report is wrong by a constant (off by one in a plain case, by two in another), so the cursor is not compared on kitty in origin mode; the probe shows where the cursor really is.
 - **xterm's print-screen** does not write a cell's attributes across blanks and does not go back to the default after an attributed run, so the attributes of blank cells are not compared on xterm, and neither is a cell that has exactly the flags of the cell before it unless the model expects them. A bug that spread an attribute to the *next* cell would not be seen on xterm.
 - **WezTerm's** `get-text --escapes` prints no curly underline, so the curly cells of `sn-styles` and `as-pen` cannot be read back; and `get-text` ends with an extra empty row.
 - Inside a synchronized-output bracket **WezTerm holds its replies** until the end marker (no cursor report in two seconds); the check is informational.
-- Some of the model's own reports are unreliable after DECSTR (alacritty reports no scroll region while keeping one), which shows as a cursor difference in `as-decstr/origin-mode`.
+- xterm's print-screen **precomposes combining marks** (`e` + U+0301 reads back as `é`) and **drops U+200D**; the `sn-wide` differences on xterm are that, not a width verdict.
+- After DECSTR the model's reports are inconsistent: `fil-term`'s sniffer drops the *reported* scroll region while alacritty keeps scrolling inside the old one (finding 2). That is a fil-term gap, not a read-back quirk.
 
 ## Results
 
-`tests/terminals/known.tsv` lists every disagreement the run knows about, with a reason. A disagreement that is **not** listed fails the run (`TERMINALS_STRICT=1` ignores the list); a listed one is reported and does not. Today: **no unlisted disagreement, no read-back error, the canary caught on all four.**
+`tests/terminals/known.tsv` lists every disagreement the run knows about: the terminal, the checkpoint, a reason, and a hash of the **exact differences** found there (their text is deterministic). A disagreement passes only if it is the listed one. An unlisted checkpoint fails, a listed checkpoint with a different or an added difference fails (so a new bug at a checkpoint that already has a known difference is not hidden), and a listed difference that no longer occurs is reported as `STALE` and fails. The one exception is a `trace/*` wildcard for an intermittent trace (WezTerm's scroll region). `TERMINALS_STRICT=1` ignores the list. Reasons tagged `[fil-term fix PR: ...]` are fil-side bugs the follow-up fix PR removes, not terminal quirks. Today: **no unlisted or changed disagreement, no stale entry, no read-back error, the canary caught on all four.**
 
 | Terminal | Checkpoints | Agree | Disagree (all listed) |
 |---|---|---|---|
@@ -63,7 +64,7 @@ These are not findings about fil; each is handled in `player.py`, and each is a 
 | WezTerm | 521 | 468 | 52 (and 1 informational) |
 | tmux | 521 | 492 | 29 |
 
-**The overlay's own writes agree on all four terminals**, with synchronized output on and off, at every flush checkpoint and at every erase point where the erase is at rest, for all 20 hazard traces, the typing session, and all 6 status-line scenarios, *except across a resize and where the terminal does not understand the SGR the program itself sent*. That is the answer to "can the erase be wrong on a real terminal": not outside a resize. The disagreements that remain fall into the findings below.
+**The overlay's own writes agree on all four terminals**, with synchronized output on and off, at every flush checkpoint and at every erase point where the erase is at rest, for the 20 hazard traces, the typing session and the 6 status-line scenarios, with these exceptions: across a resize (finding 1); on xterm, where the pen restore and the program's own pen carry `58;5;N` and `4:3`, which xterm 390 misreads (finding 6); on WezTerm, where `get-text` cannot show a curly underline (a read-back limit, not a verdict); at the probe after `ov-origin` on every terminal (finding 2: the shadow, not the terminal, is wrong); and WezTerm's intermittent partial scroll region trace (finding 8). That is the answer to "can the erase be wrong on a real terminal": not outside a resize, on what was measured.
 
 ### Verdicts on the assumptions of `docs/spikes/prediction.md`
 
@@ -96,13 +97,15 @@ Consequence: after any resize that reflows, the shadow no longer says what the t
 
 tmux alone behaves like the shadow here; do not take it as evidence about the others.
 
-### 2. DECSC/DECRC and DECSTR: the shadow keeps state the terminals drop (known, now measured)
+### 2. DECSC/DECRC and DECSTR: fil-side gaps in the shadow, measured on real terminals
 
-`ov-origin*`, `ov-decstr*`, `ov-restore-without-save*`, `as-decstr`, `as-restore-without-save`, `sn-region-tabs-charset`. All four are the rows of the spike's hazard table (7 and the DECSC note) turning out as described, on real terminals:
+`ov-origin*`, `ov-decstr*`, `ov-restore-without-save*`, `as-decstr`, `as-restore-without-save`, `sn-region-tabs-charset`. The spike's hazard table (row 7 and the DECSC note) listed these as "terminals disagree"; the measurement says the terminals mostly agree with each other and the **shadow is the odd one out**, so they are fil-term gaps, tagged in `known.tsv` for the fix PR:
 
-- A restore (`ESC 8`) with nothing saved, and a restore after the snapshot, restores **origin mode** on xterm, WezTerm, kitty and tmux; alacritty does not save it. The tracker marks origin mode unknown after a restore, so nothing is painted in that state.
-- DECSTR resets the charsets (xterm, WezTerm, tmux), insert and origin mode and the saved cursor (xterm, WezTerm); alacritty keeps them; kitty ignores DECSTR entirely. After DECSTR the shadow can also hold a **saved cursor** the terminal no longer has (`as-decstr/saved-cursor`): a program that does DECSTR and then DECRC lands at its old position in the shadow and at home on xterm and WezTerm, so the cursor the client restores after the next server bytes would be wrong. The tracker does not list the saved cursor as unknown after DECSTR. This is a **new, small guard to add** (by whichever package holds `tracker.rs` then): treat the cursor as unknown after a DECSTR until the next explicit cursor move, or paint nothing. It needs a program that sends DECSTR then DECRC, which is rare.
-- kitty keeps the current pen across a restore with nothing saved.
+- **DECRC and origin mode.** All four terminals save and restore origin mode with DECSC/DECRC; alacritty does not save it, and the snapshot writer takes its own DECSC with origin mode off. A program's later `ESC 8` therefore turns origin mode off on every real terminal and leaves it on in the shadow. The tracker marks origin mode unknown after a restore, so nothing is painted in that state, but the shadow's cursor and screen are wrong from there. Fix: track DECSC's origin bit in `fil-term` and make the snapshot writer's DECSC reproduce it.
+- **DECSTR.** vte 0.15 has no `CSI ! p` handler, so the shadow ignores it. xterm and WezTerm reset the character sets, insert mode, origin mode and the saved cursor; tmux resets the character sets; kitty ignores DECSTR too (and agrees with the shadow). `xterm-256color`'s `is2` and `rs2` contain `\E[!p`, so `tput init` sends it. After it the snapshot writer re-applies the shadow's insert mode, origin mode and character sets to the user's terminal. The shadow can also hold a **saved cursor** the terminal dropped (`as-decstr/saved-cursor`: a program that does DECSTR and then DECRC lands at its old position in the shadow and at home on xterm and WezTerm), and the tracker does not list the saved cursor as unknown after DECSTR: a **small new tracker guard** (by whichever package holds `tracker.rs` then). Fix in `fil-term`: model DECSTR.
+- `CSI ? 1049 l` with nothing saved restores (and resets the charset) on xterm and tmux and is ignored by alacritty, WezTerm and kitty. The tracker already marks the charset unknown; not a fix-PR item.
+- kitty keeps the current pen across a restore with nothing saved (terminal-side).
+- WezTerm after the probe's `ESC 8` with nothing saved: the screen scrolls as if the scroll region were gone (`ov-origin` on WezTerm shows `hi!` where the others show origin-mode differences). Probably DECRC resets the margins in WezTerm; not isolated.
 
 ### 3. The snapshot writer's clear pushes the screen into the scrollback on tmux (W1's clear)
 
@@ -116,8 +119,8 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 | `CSI H CSI 2 J`, short session | **3** | 0 | 0 | 0 | **3** |
 | `CSI 2 K` on each row, then `CSI H` (full / short) | 32 / 0 | 32 / 0 | 32 / 0 | 32 / 0 | 32 / 0 |
 
-- **tmux pushes the visible screen into its history on `CSI H CSI J`**, and the visible lines of a short session too. A snapshot (attach, catch-up, resume) and W1's repaint therefore cost one screen of tmux scrollback each time. For W1 the plan's fallback applies to tmux: "a repaint on such a terminal costs one screen of scrollback per repaint".
-- **The row-by-row `CSI 2 K` clear pushes nothing on any of the four, and the model agrees.** That is the clear W1 can use if it wants one that is "safe on all four terminals": cursor to each row, `CSI 2 K`, cursor home. (The pen is reset first, as the snapshot writer already does, so the erase fills with the default background.) It writes 24 more small sequences per snapshot and does nothing about the scrollback tmux already has.
+- **tmux pushes the visible screen into its history on `CSI H CSI J`**, and the visible lines of a short session too. A snapshot (attach, catch-up, resume) and W1's repaint therefore cost one screen of tmux scrollback each time. The cause is tmux's `scroll-on-clear` option (on by default since 3.4): with `set -g scroll-on-clear off` the same traces agree with the model on `CSI H CSI J` and on `CSI 2 J` (measured with `TERMINALS_TMUX_CONF`). That is the user's lever; fil cannot set it.
+- **Two clears push nothing on any of the four, and the model agrees**: `CSI 2 K` on each of the 24 rows then `CSI H` (`cl-rows`), and `CSI H CSI 2 K CSI 2;1 H CSI J` (`cl-ed0-nonhome`: an erase to the end of the screen that does not start at home; three sequences, 32 and 0 lines before and after on all four, measured). Either is the clear W1 and the snapshot writer can use if they want one that is "safe on all four terminals". (The pen is reset first, as the snapshot writer already does, so the erase fills with the default background.) The three-sequence form is the cheaper.
 - `CSI 2 J` is not a substitute: tmux pushes on it too, and the model does as well (next finding).
 
 ### 4. The shadow pushes a cleared screen into its history; xterm, kitty and WezTerm do not
@@ -128,7 +131,7 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 
 `wd-widths`. Columns the cursor advances after printing the string at the start of a row. A `*` marks a row where the five columns are not all equal.
 
-| String | `unicode-width` (the overlay's table) | alacritty (shadow) | xterm | kitty | WezTerm | tmux |
+| String | `unicode-width` (the crate, on the whole string) | alacritty (shadow) | xterm | kitty | WezTerm | tmux |
 |---|---|---|---|---|---|---|
 | ASCII, Latin-1, Latin Extended-A, combining acute, Greek, box drawing, middle dot, plus-minus, curly quote, black star, circled 1 (the "ambiguous" ones), check mark, halfwidth katakana | 1 | 1 | 1 | 1 | 1 | 1 |
 | CJK, fullwidth, Hangul, emoji with default emoji presentation, a regional-indicator pair, ZWSP in `x​y` | 2 (pair: 2; ZWSP string: 2) | same | same | same | same | same |
@@ -139,12 +142,12 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 | a lone regional indicator | 1 | 1 | 1 | **2** | 1 | **2** |
 
 - **Ambiguous-width characters are not a problem on these four**: every one measures 1 everywhere.
-- **VS16 sequences, skin tones, ZWJ sequences, the soft hyphen and a lone regional indicator are disputed.** The overlay's `unicode-width` table is *not* the shadow's table (it says 2 for VS16, 2 for the skin tone and ZWJ strings where alacritty says 1, 4 and 6), and the terminals split three ways. A cell restored from the shadow after the client has painted next to such a sequence can land one column off. `crates/fil-predict` paints only printable ASCII and Latin letters, which are 1 everywhere, so the core is safe by construction; the **P1 rule** "no guess next to a cell T2's table marks as disputed" needs the list: any cell whose text contains `U+FE0F`, `U+200D`, a skin-tone modifier (`U+1F3FB` to `U+1F3FF`), `U+00AD` or a regional indicator.
+- **VS16 sequences, skin tones, ZWJ sequences, the soft hyphen and a lone regional indicator are disputed.** `unicode-width` applied to a whole string is *not* the shadow's table (it says 2 for VS16 and for the skin-tone and ZWJ strings where alacritty says 1, 4 and 6); the overlay itself only measures single characters (`predictable()` admits printable ASCII and Latin letters, via `UnicodeWidthChar`), so the column marked `unicode-width` is the crate's answer for the string, not something the overlay computes, and the terminals split three ways. A cell restored from the shadow after the client has painted next to such a sequence can land one column off. `crates/fil-predict` paints only printable ASCII and Latin letters, which are 1 everywhere, so the core is safe by construction; the **P1 rule** "no guess next to a cell T2's table marks as disputed" needs the list: any cell whose text contains `U+FE0F`, `U+200D`, a skin-tone modifier (`U+1F3FB` to `U+1F3FF`), `U+00AD` or a regional indicator.
 - The snapshot writer writes such cells as the shadow's text; the only visible effect seen is an extra blank after a VS16 heart on tmux and a missing one on WezTerm (`sn-wide`).
 
-### 6. xterm 390 misreads the colon forms and SGR 58 that the snapshot writer emits
+### 6. fil writes SGR 58 with semicolons; xterm 390 misreads it (and `4:3`)
 
-`sn-styles`, `as-pen`, `ov-pen`. `fil_term::snapshot::sgr` writes a curly underline as `4:3` and an underline color as `58;5;N`. xterm 390 does not parse the colon sub-parameters or 58: it reads `4:3;58;5;9` as blink and strikethrough and loses the underline (the cells print as `0;1;5;9;90;44` for bold, blink, strike). A snapshot (or the overlay's pen restore) of a curly or colored underline is therefore wrong on xterm. Programs normally send curly underlines only when terminfo advertises them (`Smulx`), which `xterm-256color` does not, so this needs a session started in a terminal that does and attached to from an xterm. A guard for the sweep: write `4` instead of `4:3` unless the client's terminfo has `Smulx`.
+`sn-styles`, `ov-pen`, `as-pen`. `fil_term::snapshot::sgr`, which the snapshot writer and the overlay's pen restore (`set_pen`) both use, writes the underline color as `58;5;N` and `58;2;R;G;B` **with semicolons**, and a curly underline as `4:3`. A terminal that does not know 58 reads the `5` and the `9` of `58;5;9` as blink and strikethrough (the xterm cells print as `0;1;5;9;90;44`), and xterm 390 reads `4:3` as a black foreground (`sn-styles` reads back `f0`, `ov-pen` `f8`, bold black): the text goes black rather than just losing its underline. alacritty parses the colon form, so a program that sends the safe `58:5:9` has it rewritten by fil into the unsafe form in every snapshot and every erase. The traces cannot show that last part: `ov-pen` and `as-pen` send the semicolon form from the program itself, and `ov-pen` compares `bfgu` but not `s` and `k`. This is a fil encoding choice, not an xterm bug: the follow-up writes `58:5:N` / `58:2::R:G:B`, and `4` instead of `4:3` unless the terminal advertises `Smulx`. Programs normally send curly underlines only when terminfo advertises them, which `xterm-256color` does not.
 
 ### 7. Smaller observations
 
@@ -154,18 +157,35 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 
 ### 8. Partial scroll regions: tmux's history, and WezTerm's intermittent behavior
 
-`ov-scroll-region`. tmux saves lines scrolled out of a partial scroll region into its history; the screen is identical, so only a test that compares scrollback sees it. **WezTerm 20240203 is not deterministic here**: a line feed at the bottom margin of the region sometimes moves the cursor out of the region instead of scrolling it (the same bytes, run after run, give either answer; a settle delay before the trace does not change it), and a line feed below the region scrolls the whole screen where the model and the other terminals scroll nothing. The cause was not isolated (whether the overlay's cursor hide and paint around the line feeds matter, or WezTerm alone), so the trace is listed as known for WezTerm; it is the only intermittent one in six full runs, and the first thing to look at if it is ever worth knowing.
+`ov-scroll-region`, `as-scroll-region`. tmux saves lines scrolled out of a partial scroll region into its history; the screen is identical, so only a test that compares scrollback sees it.
+
+**WezTerm 20240203 is not deterministic on traces with a scroll region, origin mode or a pending wrap** (seen on `ov-scroll-region`, `ov-origin`, `sn-region-tabs-charset` and once on `ov-pending-wrap-nosync`). A line feed at the bottom margin of the region sometimes moves the cursor out of the region instead of scrolling it, and at the probe a line feed below the region scrolls the whole screen where the model and the other terminals scroll nothing; the same bytes give either answer from run to run (a settle delay before the trace does not change it). The overlay-free control `as-scroll-region` (the same server bytes, no paint, same checkpoints) agreed in all nine runs, and so did that control with the overlay's cursor hide, SGR, CUP, paint and erase injected as one write. The full trace, where the overlay's flushes and the checkpoints between them are separate writes, differs. So the cause is not isolated: it may be the overlay's writes interleaved with the line feeds, or the checkpoints (a cursor position report and a `get-text` between the flushes). In one run `ov-origin` on WezTerm showed exactly the differences of the "overlay forgets `?6h`" mutation below, then agreed in the next. The harness therefore runs a WezTerm trace again, up to twice, when it shows an unlisted difference, and passes it if one run shows only listed ones (a bug in what fil writes shows in every run; the mutation check was repeated on WezTerm with this rule and still fails); `ov-scroll-region` stays a `trace/*` wildcard because its answer changes between listed ones. A listed WezTerm difference that does not occur in the accepted run is a warning, not a failure. **Do not read any of this as proven harmless to the overlay**: it is the first place to look if a WezTerm user reports garbage in a program that sets a scroll region.
 
 ## What to do with the findings
 
 | Finding | Package | Change |
 |---|---|---|
 | 1 | W1 (and E1a) | W1 goes ahead; the repaint renders the whole screen; no guess is written between a resize and the repaint (rule 9). The reflow is not a thing the core can predict |
-| 2 | C1 / P2 (the holder of `tracker.rs`) | After DECSTR the saved cursor is unknown (the cursor after a later DECRC is not trusted) |
-| 3 | W1 | Use the row-by-row clear (`CSI 2 K` per row, then home) in the repaint, or accept one screen of tmux scrollback per repaint and say so in `DESIGN.md` §6.2; the same question for the snapshot writer's own clear |
+| 2 | fil-term fix PR; C1 / P2 (the holder of `tracker.rs`) | `fil-term`: model DECSTR, track DECSC's origin bit and make the snapshot writer's DECSC reproduce it. Tracker: after DECSTR the saved cursor is unknown |
+| 3 | W1; fil-term fix PR (the snapshot writer's clear) | Use `CSI H CSI 2 K CSI 2;1 H CSI J` (or the 24-row `CSI 2 K` loop) in the repaint and in the snapshot writer, or accept one screen of tmux scrollback per snapshot and say so in `DESIGN.md` §6.2; users can also set tmux's `scroll-on-clear off` |
 | 4 | K1 | Remember that the shadow's history is not a terminal's |
 | 5 | P1 | The disputed-width list above |
-| 6 | the sweep | `4:3` and `58` only with `Smulx` |
+| 6 | fil-term fix PR | SGR 58 in colon form; `4` instead of `4:3` unless `Smulx` |
+
+## Mutation checks
+
+Does the suite notice what it should? `tests/terminals/mutants.py` rewrites exported traces as if the overlay wrote different bytes (expectations unchanged); the table is what `run.py` said on each terminal with `TERMINALS_STRICT=1` (traces `ov-typing`, `ov-origin`, `ov-pen`, `st-edge` and the ones whose names start with `ov-pen`), in the Lima VM on 2026-11-04.
+
+| Mutation | Result |
+|---|---|
+| The read-back sees nothing (`TERMINALS_BLIND=1`: every difference is dropped) | The run fails: `ERROR canary/wrong: ... not fully noticed (missing: row, cursor, attributes)` |
+| The overlay forgets `CSI ? 6 h` after a paint or an erase (`no-origin-restore`) | 6 failing checkpoints on each of xterm, kitty, WezTerm and tmux, all in `ov-origin` and `ov-origin-nosync` (`e2/flush`, `end/flush`, `probe`). With `known.tsv` in force the probes are reported as "a listed checkpoint, but not the listed difference" and still fail: a pinned difference does not hide it |
+| The erase writes `#` where it should restore the cell (`wrong-erase`) | 11 failing checkpoints on each of the four terminals, in `ov-pending-wrap`, `ov-pending-wrap-nosync` and `ov-typing-nosync`. `ov-typing` with synchronized output on is **not** caught: the erase there is inside a bracket and the next checkpoint follows the repaint, so the sync-off twin is the one that checks erases |
+| The paint leaves its underline pen on (`no-pen-reset`) | 37 failing checkpoints on xterm, WezTerm and tmux and 39 on kitty, in `ov-typing` and `ov-typing-nosync` |
+| A line removed from `known.tsv` (tmux `cl-snapshot-clear/after`) | `DIFF cl-snapshot-clear/after`, the run fails |
+| A line that no longer matches added to `known.tsv` | `STALE ... no longer occurring; remove the line`, the run fails |
+
+Run them with `python3 -I tests/terminals/mutants.py NAME TRACE_DIR OUT_DIR`, then `TERMINALS_STRICT=1 python3 -I tests/terminals/run.py TERMINAL OUT_DIR RESULTS` under Xvfb (`TRACE_DIR` is `target/terminals/traces` after a run).
 
 ## Running it
 
@@ -189,7 +209,7 @@ just vm-run tests/terminals/run.sh
 
 ### Run times
 
-89 traces, about 520 checkpoints per terminal.
+92 traces, about 540 checkpoints per terminal.
 
 | | xterm | kitty | WezTerm | tmux | Whole job |
 |---|---|---|---|---|---|
@@ -202,5 +222,5 @@ Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `
 
 ## Files
 
-- `tests/terminals/run.sh`: the entry point. `run.py` starts a terminal per trace, `player.py` runs inside it, `ansi.py` parses the read-back, `report.py` prints the tables, `known.tsv` lists the known disagreements.
+- `tests/terminals/run.sh`: the entry point. `run.py` starts a terminal per trace, `player.py` runs inside it, `ansi.py` parses the read-back, `report.py` prints the tables, `mutants.py` makes the mutated traces, `known.tsv` lists the known disagreements with the hash of their differences.
 - `tests/terminals/exporter/`: the trace exporter, a standalone cargo workspace with its own `Cargo.lock`. It was planned as `crates/fil-predict/examples/trace_export.rs`; it lives here because it is a harness, not an example of the crate, and so that T2 touches nothing in `crates/`.

@@ -57,19 +57,33 @@ def winsize():
     return cols, rows
 
 
-def cpr(timeout=15.0):
-    """Asks for the cursor position and returns (row, col), 1-based."""
-    termios.tcflush(0, termios.TCIFLUSH)
+# Cursor position reports asked for and not yet answered (an optional barrier that timed out:
+# the terminal answers when its synchronized-output bracket ends). The next barrier waits for
+# them too, so a late reply cannot satisfy it early.
+OUTSTANDING = 0
+
+
+def cpr(timeout=15.0, optional=False):
+    """Asks for the cursor position and returns (row, col), 1-based. With `optional` an
+    unanswered request is left outstanding and ReadbackError is raised."""
+    global OUTSTANDING
+    if not OUTSTANDING:
+        termios.tcflush(0, termios.TCIFLUSH)
     out(b"\x1b[6n")
+    want = OUTSTANDING + 1
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
         r, _, _ = select.select([0], [], [], 0.1)
         if r:
             buf += os.read(0, 4096)
-            m = CPR.search(buf)
-            if m:
-                return int(m.group(1)), int(m.group(2))
+            found = CPR.findall(buf)
+            if len(found) >= want:
+                OUTSTANDING = 0
+                row, col = found[-1]
+                return int(row), int(col)
+    if optional:
+        OUTSTANDING = want
     raise ReadbackError("no answer to the cursor position report (barrier)")
 
 
@@ -285,6 +299,8 @@ def make_term(name):
 
 # Whether the terminal marks soft wraps with a lone carriage return in its read-back (kitty).
 CR_WRAPS = False
+# The terminal under test.
+TERM = ""
 # Whether the read-back is xterm's print-screen.
 XTERM_PRINT = False
 
@@ -315,6 +331,23 @@ def brief(s, n=70):
     return s if len(s) <= n else s[: n - 3] + "...'"
 
 
+def cursor_ok(exp, cur):
+    """Whether the cursor position report is the model's, allowing for each terminal's known way
+    of reporting it (docs/m3/terminals.md, the quirks of the read-back)."""
+    if list(cur) == exp["cursor"]:
+        return True
+    row, col = exp["cursor"]
+    pending = exp.get("pending_wrap")
+    if TERM == "tmux":
+        # A pending wrap is reported one column past the edge; origin mode, absolute.
+        return (pending and cur == (row, col + 1)) or list(cur) == exp.get("cursor_absolute")
+    if TERM == "kitty":
+        # A pending wrap is reported at the start of the next row. In origin mode the report
+        # is wrong (by a constant that depends on the region), so the cursor is not compared.
+        return (pending and cur == (row + 1, 1)) or "cursor_absolute" in exp
+    return False
+
+
 def compare(exp, attrs_keys, screen_rows, hist_rows, cur, observed):
     """The differences between the expectation and what was read, as short strings."""
     diffs = []
@@ -327,14 +360,7 @@ def compare(exp, attrs_keys, screen_rows, hist_rows, cur, observed):
             g = ansi.row_text(screen_rows[i]) if i < len(screen_rows) else ""
             if g != w:
                 diffs.append(f"row {i}: want {brief(w)} got {brief(g)}")
-    # kitty's cursor position report is wrong inside origin mode (it subtracts the region's top
-    # twice, as far as it was measured), so the cursor is not compared there; the probe shows
-    # where the cursor really is.
-    if "cursor" in exp and not (CR_WRAPS and "cursor_absolute" in exp) and list(cur) != exp["cursor"] and not (
-        exp.get("pending_wrap") and cur[0] == exp["cursor"][0] and cur[1] == exp["cursor"][1] + 1
-    ) and list(cur) != exp.get("cursor_absolute") and not (
-        exp.get("pending_wrap") and cur[1] == 1 and cur[0] == exp["cursor"][0] + 1
-    ):
+    if "cursor" in exp and not cursor_ok(exp, cur):
         diffs.append(f"cursor (row, col) want {tuple(exp['cursor'])} got {tuple(cur)}")
     if "attrs" in exp:
         want = {(r, c): f for r, c, f in exp["attrs"]}
@@ -408,7 +434,8 @@ def main():
         trace = json.load(f)
     name = trace["name"]
     term = make_term(args.term)
-    global CR_WRAPS, XTERM_PRINT
+    global CR_WRAPS, XTERM_PRINT, TERM
+    TERM = args.term
     CR_WRAPS = args.term == "kitty"
     XTERM_PRINT = args.term == "xterm"
     res = open(args.out, "a", buffering=1)
@@ -420,6 +447,7 @@ def main():
     tty.setraw(0)
     try:
         cols, rows = winsize()
+        size = (trace["cols"], trace["rows"])
         if (cols, rows) != (trace["cols"], trace["rows"]):
             emit({"error": f"the terminal started at {cols}x{rows}, not {trace['cols']}x{trace['rows']}"})
         # The terminal starts empty; make sure the cursor is home with a clean pen.
@@ -437,13 +465,19 @@ def main():
                 cols, rows = winsize()
                 if (cols, rows) != (step["cols"], step["rows"]):
                     raise ReadbackError(f"resize to {step['cols']}x{step['rows']} left the window {cols}x{rows}")
+                size = (cols, rows)
                 cpr()
             elif op == "check":
                 cols, rows = winsize()
+                if (cols, rows) != size:
+                    # The window changed size on its own (a GUI terminal settling its window): the
+                    # screen would be compared at a size the trace never asked for.
+                    emit({"check": step["name"], "error": f"the window is {cols}x{rows}, not the {size[0]}x{size[1]} of the trace"})
+                    break
                 observed = {}
                 try:
                     try:
-                        cur = cpr(2.0 if step.get("optional_barrier") else 15.0)
+                        cur = cpr(2.0, True) if step.get("optional_barrier") else cpr()
                     except ReadbackError:
                         if not step.get("optional_barrier"):
                             raise
@@ -462,6 +496,10 @@ def main():
                     if getattr(term, "dims", None):
                         observed["dims"] = list(term.dims)
                     diffs = compare(step["expect"], step.get("attrs", ""), screen_rows, hist_rows, cur, observed)
+                    if os.environ.get("TERMINALS_BLIND") == "1":
+                        # A mutation of the harness itself (docs/m3/terminals.md): a read-back that
+                        # sees nothing. The canary must notice.
+                        diffs = []
                 except ReadbackError as e:
                     emit({"check": step["name"], "error": str(e)})
                     if args.dump:

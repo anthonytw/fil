@@ -197,15 +197,31 @@ jobs:
           # only from main (see the check job).
           workspaces: tests/terminals/exporter
           save-if: ${{ inputs.ref == 'main' }}
-      - name: Lint the harness
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Lint the harness (the exporter is outside the workspace, so `just ci` never sees it)
         run: |
           shellcheck -x -S warning tests/terminals/run.sh
-          python3 -I -m py_compile tests/terminals/ansi.py tests/terminals/player.py tests/terminals/run.py tests/terminals/report.py
+          python3 -I -m py_compile tests/terminals/ansi.py tests/terminals/player.py tests/terminals/run.py tests/terminals/report.py tests/terminals/mutants.py
+          cargo fmt --check --manifest-path tests/terminals/exporter/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path tests/terminals/exporter/Cargo.toml -- -D warnings
+          cargo deny --manifest-path tests/terminals/exporter/Cargo.toml --config deny.toml check advisories licenses bans sources
       - name: Real terminals
         run: tests/terminals/run.sh
       - name: Summary
         if: always()
-        run: python3 -I tests/terminals/report.py target/terminals >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          {
+            echo '### Terminal versions'
+            echo '```'
+            xterm -version
+            kitty --version
+            wezterm --version
+            tmux -V
+            echo '```'
+            python3 -I tests/terminals/report.py target/terminals
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

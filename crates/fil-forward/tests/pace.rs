@@ -205,6 +205,7 @@ async fn parallel_downloads_keep_the_link_full() {
 }
 
 async fn parallel_downloads_keep_the_link_full_body() {
+    let denied = mbufs_denied();
     for n in [16, 32] {
         let source = serve(|mut s| async move {
             let buf = vec![9u8; 64 * 1024];
@@ -244,7 +245,11 @@ async fn parallel_downloads_keep_the_link_full_body() {
             rate / 1e3,
             w.daemon.ep.pace_state()
         );
-        assert!(rate >= 0.9 * RATE as f64, "{n}: {rate}");
+        assert!(
+            rate >= 0.9 * RATE as f64,
+            "{n}: {rate}; {}",
+            mbufs_note(denied)
+        );
         assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");
         // The ack clock: the peer acks on drain, so nearly every sample is trusted. Without
         // ack on drain, half or more of them are timer-bound (405 trusted, 579 bounded at 16).
@@ -627,6 +632,7 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
 /// acks park the stuck channel), each answered; the answers go back through the client's data
 /// sender, which the trickle's payloads once filled for good.
 async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transport) {
+    let denied = mbufs_denied();
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(2048).unwrap();
     sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -680,8 +686,14 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     eprintln!("{t:?}: the agent beside a trickling stuck channel: at most {worst:?}");
-    // Milliseconds on these links; a wait for a timer (100 ms and more) must fail this.
-    assert!(worst <= Duration::from_millis(60), "{worst:?}");
+    // Milliseconds on these links; a wait for a timer (100 ms and more) must fail this. So does
+    // a loopback segment the kernel dropped for want of mbufs and sent again on its retransmit
+    // timer (macOS), which the note shows.
+    assert!(
+        worst <= Duration::from_millis(60),
+        "{worst:?}; {}",
+        mbufs_note(denied)
+    );
     writer.abort();
     deaf.abort();
 }

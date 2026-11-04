@@ -1531,6 +1531,7 @@ async fn a_socks_flood_does_not_stall_the_other_forwards() {
 
 async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
     let _one_at_a_time = heavy().await;
+    let denied = mbufs_denied();
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let lport = w.local_forward(1, server.port);
@@ -1564,7 +1565,14 @@ async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
             "-L connection {i} beside {} silent SOCKS clients took {took:?}",
             held.len()
         );
-        assert!(took < Duration::from_secs(2), "connection {i}: {took:?}");
+        // A connect whose SYN the kernel dropped for want of mbufs (macOS: `tcp_output` takes an
+        // `ENOBUFS` silently and retransmits on its timer) takes a second or more: the note says
+        // whether that is what happened.
+        assert!(
+            took < Duration::from_secs(2),
+            "connection {i}: {took:?}; {}",
+            mbufs_note(denied)
+        );
     }
     drop(held);
 }

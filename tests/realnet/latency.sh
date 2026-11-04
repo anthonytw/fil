@@ -483,6 +483,9 @@ l_catchup() {
   done
 }
 
-ALL_SCENARIOS=(l_nodelay l_keys_idle l_keys_bulk l_catchup)
+LAT_SCENARIOS=(l_nodelay l_keys_idle l_keys_bulk l_catchup)
 
-part_main latency lat_setup lat_teardown "${ALL_SCENARIOS[@]}" -- "$@"
+# Sourced by fwd.sh for the keystroke cells and the bulk programs; run directly, it is the latency part.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  part_main latency lat_setup lat_teardown "${LAT_SCENARIOS[@]}" -- "$@"
+fi

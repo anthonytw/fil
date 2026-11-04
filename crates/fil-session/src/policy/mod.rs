@@ -26,11 +26,14 @@
 //! A refusal names the deciding setting and its source ([`PolicyRefusal`]); nothing else of the
 //! host's config reaches the client.
 //!
-//! **Re-reading.** Each check first looks at the metadata of every file the policy was read from
-//! (and each directory a glob listed or the policy file sits in), at most once a second, and reads
-//! it all again when any of it changed. Not on `SIGHUP`: an admin who edits `sshd_config` reloads
-//! sshd, not fil daemons they may not know are there, so a signal would never come; and a stat
-//! of a handful of files is cheap next to a connection.
+//! **Re-reading.** At most once a second, a check starts a look at the metadata of every file
+//! the policy was read from (and each directory a glob listed or the policy file sits in), and
+//! everything is read again when any of it changed, or every five minutes in any case. The look
+//! and the read run in the background (`spawn_blocking`), never in the check: a check decides on
+//! the last read, so a slow directory service (an LDAP group lookup) holds up no session. A
+//! last read not known current for longer than [`MAX_AGE`] decides nothing: checks refuse until
+//! the re-read is in. Not on `SIGHUP`: an admin who edits `sshd_config` reloads sshd, not fil
+//! daemons they may not know are there, so a signal would never come.
 //!
 //! **Privacy.** Nothing of the config is logged above debug, and the debug lines say what
 //! happened, not what the config holds.
@@ -40,15 +43,15 @@ mod mirror;
 pub mod sshd;
 mod stamp;
 
-pub use mirror::{POLICY_FILE, Policy, PolicySources, SSHD_CONFIG};
+pub use mirror::{FULL_RELOAD, MAX_AGE, POLICY_FILE, Policy, PolicySources, SSHD_CONFIG};
 
 use std::fmt;
 use std::sync::Arc;
 
 use fil_proto::mux::{ForwardSpec, PolicyRefusal, Target};
 
-/// What the host's policy allows. Calls must be cheap (they run on every connection) and must
-/// not block for long: an implementation may look at a few files' metadata.
+/// What the host's policy allows. Calls must be cheap (they run on every connection, under the
+/// session's lock, on async workers) and must not block: no file IO, no account lookup.
 pub trait ServerPolicy: Send + Sync + fmt::Debug + 'static {
     /// The forward may be in the table, and its `-R` listener bound.
     fn forward(&self, spec: &ForwardSpec) -> Result<(), PolicyRefusal>;

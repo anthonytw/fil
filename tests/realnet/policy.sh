@@ -18,14 +18,16 @@
 # processes), and a symbolic link at the host's path (NixOS) is never replaced.
 #
 # It still runs only where it was asked for: CI=true (GitHub Actions) or FIL_REALNET_POLICY=1 (the
-# VM recipe, `just vm-realnet`, sets it). Elsewhere it says so and passes without running.
+# VM recipe, `just vm-realnet`, sets it). Elsewhere it says so and runs nothing: on its own it
+# exits 0, and under run.sh (which sets REALNET_SKIP_RC) with that status, so the summary lists
+# the part as skipped, not passed.
 set -uo pipefail
 # shellcheck source=udp.sh
 source "$(dirname "${BASH_SOURCE[0]}")/udp.sh"
 
 if [[ ${CI:-} != true && ${FIL_REALNET_POLICY:-} != 1 ]]; then
   echo "realnet policy: skipped (set FIL_REALNET_POLICY=1 to run it; CI=true does too)" >&2
-  exit 0
+  exit "${REALNET_SKIP_RC:-0}"
 fi
 
 POLICY_LINE="AllowTcpForwarding no"

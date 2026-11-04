@@ -61,6 +61,7 @@ async fn all_ports(d: &Running, session: Option<&str>) -> Result<Vec<PortsRow>, 
         &link,
         Request::Ports {
             session: session.map(name),
+            probe_other: false,
         },
         d.paths.revision,
     )

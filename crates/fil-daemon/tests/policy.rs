@@ -80,7 +80,15 @@ fn spec(kind: ForwardKind, port: u16) -> ForwardSpec {
 /// Every row of a `Ports` answer.
 async fn all_ports(d: &Running) -> Vec<PortsRow> {
     let link = d.pipe().await;
-    let mut next = request_rev(&link, Request::Ports { session: None }, d.paths.revision).await;
+    let mut next = request_rev(
+        &link,
+        Request::Ports {
+            session: None,
+            probe_other: false,
+        },
+        d.paths.revision,
+    )
+    .await;
     let mut rows = Vec::new();
     loop {
         let Response::Ports { part, more } = next else {

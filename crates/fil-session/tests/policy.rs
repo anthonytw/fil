@@ -488,6 +488,75 @@ async fn each_agent_connection_is_checked_while_attached() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A connection through `-D` `id` to `127.0.0.1:to`: its round trip, or `None` if it was refused.
+async fn through_dynamic(c: &FwdClient, id: ForwardId, to: u16) -> Option<Vec<u8>> {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+    let (inner, _) = l.accept().await.unwrap();
+    let peer = fil_forward::LocalPeer::Tcp("127.0.0.1:1".parse().unwrap());
+    c.ep.open_stream(
+        OpenKind::Dynamic {
+            forward: id,
+            target: tgt(to),
+        },
+        Box::new(inner),
+        peer,
+    )
+    .unwrap();
+    app.write_all(b"hi").await.ok()?;
+    let mut got = [0u8; 2];
+    match tokio::time::timeout(WAIT, app.read_exact(&mut got)).await {
+        Ok(Ok(_)) => Some(got.to_vec()),
+        _ => None,
+    }
+}
+
+/// SW4 (security sweep, finding 13): a SOCKS target `PermitOpen` refuses is counted on the `-D`
+/// row, with the setting, and the entry is not marked refused as a whole (mutation: mark the
+/// entry blocked on a refused target, and `policy` is set). No target is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_socks_target_is_counted_and_does_not_block_the_entry() {
+    let host = Host::new("socks");
+    let (allowed, _a) = echo().await;
+    let (denied, _d) = echo().await;
+    host.sshd(&format!("PermitOpen 127.0.0.1:{allowed}\n"));
+    let (_s, h) = session(&host, None).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    let spec = ForwardSpec::new(ForwardKind::Dynamic, BindAddr::Loopback, 40131, None).unwrap();
+    let id = add(&mut c, spec).await.unwrap();
+    let row =
+        |h: &fil_session::SessionHandle| h.forward_rows().into_iter().find(|r| r.id == id).unwrap();
+
+    assert_eq!(through_dynamic(&c, id, denied).await, None);
+    assert_eq!(through_dynamic(&c, id, denied).await, None);
+    let r = row(&h);
+    assert_eq!(r.policy, None, "the entry itself is not refused");
+    let s = r.socks_refused.expect("counted");
+    assert_eq!(s.count, 2);
+    let text = s.last.to_string();
+    assert!(text.starts_with("PermitOpen"), "{text}");
+    assert!(
+        !text.contains(&denied.to_string()),
+        "no target named: {text}"
+    );
+
+    // An allowed target still goes through; the count stays for this client's run.
+    assert_eq!(
+        through_dynamic(&c, id, allowed).await.as_deref(),
+        Some(&b"hi"[..])
+    );
+    let r = row(&h);
+    assert_eq!(
+        (r.policy, r.socks_refused.map(|s| s.count)),
+        (None, Some(2))
+    );
+
+    // A new client's run starts from nothing.
+    let _b = FwdClient::attach(&h, key(2), "desk").await;
+    assert_eq!(row(&h).socks_refused, None);
+    h.kill(WAIT).await;
+}
+
 /// A loopback port to try for a fixed-port `-R`, below every OS's ephemeral range (a port the
 /// kernel hands out to other tests' connections could be taken between two steps of a test
 /// that lets it go and binds it again). Not probed: a probe socket, inherited by another test's

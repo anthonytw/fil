@@ -405,9 +405,11 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
 #[tokio::test]
 async fn a_write_failure_reports_the_exit_status_of_a_child_that_exited() {
     let file = hello_file("epipe");
+    let helper = std::env::temp_dir().join(format!("fil-pipe-epipe-helper-{}", std::process::id()));
     let cmd = sh(&format!(
-        "cat '{}'; sleep 0.5; exec 0<&-; (sleep 3) & exit 3",
-        file.display()
+        "cat '{}'; sleep 0.5; exec 0<&-; sleep 3 & echo $! > '{}'; exit 3",
+        file.display(),
+        helper.display()
     ));
     // The input is closed only after the opening is through (a write of the opening that failed
     // would be a spawn error instead).
@@ -438,5 +440,10 @@ async fn a_write_failure_reports_the_exit_status_of_a_child_that_exited() {
     );
     link.closed().await;
     assert!(!exists(pid));
+    // The helper that held stdout is not left running.
+    let helper_pid = std::fs::read_to_string(&helper).unwrap();
+    let helper_pid = helper_pid.trim();
+    let _ = Command::new("kill").arg(helper_pid).status();
+    std::fs::remove_file(&helper).unwrap();
     std::fs::remove_file(&file).unwrap();
 }

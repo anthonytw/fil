@@ -378,6 +378,7 @@ impl<L: Link> Forwards<L> {
             .collect();
         let current: Current<L> = Arc::new(Mutex::new(None));
         let epoch_lock = Arc::new(Mutex::new(()));
+        let router_grants = grants.clone();
         let mgr = Manager {
             epoch: ep.epoch(),
             epoch_lock: epoch_lock.clone(),
@@ -415,6 +416,7 @@ impl<L: Link> Forwards<L> {
             to_manager,
             current,
             epoch_lock,
+            grants: router_grants,
         };
         (Self { router, manager }, handle, notes_rx)
     }
@@ -450,6 +452,8 @@ pub(crate) struct Router<L: Link> {
     current: Current<L>,
     /// Held for `new_epoch` here and by the manager while it acts on an event or an answer.
     epoch_lock: Arc<Mutex<()>>,
+    /// Cleared with `new_epoch`: see [`Router::attach`].
+    grants: Arc<Mutex<Grants>>,
 }
 
 /// The link the endpoint is on (shared by the readers and the manager).
@@ -466,6 +470,7 @@ impl<L: Link> Clone for Router<L> {
             to_manager: self.to_manager.clone(),
             current: self.current.clone(),
             epoch_lock: self.epoch_lock.clone(),
+            grants: self.grants.clone(),
         }
     }
 }
@@ -478,8 +483,12 @@ impl<L: Link> Router<L> {
         let before = lock(&self.current).clone();
         if !resumed {
             // Under the manager's epoch lock: it acts on no event of the old epoch after this.
+            // The grants go first: `new_epoch` wakes the queued connections, and one of the old
+            // epoch must not open into the new one under its old id before `Manager::fresh` has
+            // run (it is refused instead).
             {
                 let _g = lock(&self.epoch_lock);
+                lock(&self.grants).clear();
                 self.ep.new_epoch();
             }
             let (done, wait) = oneshot::channel();
@@ -837,7 +846,10 @@ impl<L: Link> Manager<L> {
                 () = at(self.unanswered_by), if self.unanswered_by.is_some() => {
                     let gate = self.epoch_lock.clone();
                     let _g = lock(&gate);
-                    if self.ep.epoch() == self.epoch {
+                    if self.suspended {
+                        // The session is elsewhere: nobody is there to answer (`suspend`).
+                        self.unanswered_by = None;
+                    } else if self.ep.epoch() == self.epoch {
                         self.dirty = true;
                         self.unanswered();
                     }
@@ -886,7 +898,7 @@ impl<L: Link> Manager<L> {
     /// A link was attached (a reconnect or a swap): own forwards still waiting for their answer
     /// get the full wait again, now that there is a link to answer over.
     fn attached(&mut self) {
-        if self.own.iter().any(|o| o.req.is_some()) {
+        if !self.suspended && self.own.iter().any(|o| o.req.is_some()) {
             self.unanswered_by = Some(tokio::time::Instant::now() + self.answer_wait);
         }
     }
@@ -947,8 +959,9 @@ impl<L: Link> Manager<L> {
         lock(&self.grants).clear();
         let n = self.ep.close_all(CloseReason::Reset);
         // One paused for a fresh attach whose answer had not come refuses too, rather than
-        // holding applications in its backlog; one bound before the first answer, and never
-        // handed over, closes (the take-back binds it again).
+        // holding applications in its backlog. One bound before the first answer and never
+        // handed over cannot refuse (nothing accepts on it), so it closes and gives its port up;
+        // the take-back binds it again.
         for o in &mut self.own {
             match &o.listener {
                 Listener::On(id) => {

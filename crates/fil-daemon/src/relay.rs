@@ -158,6 +158,11 @@ const EOF_WATCH: Duration = Duration::from_secs(1);
 
 /// `fd` as a stream, if it is a socket in blocking mode (sshd hands some sessions a socketpair
 /// rather than pipes).
+///
+/// Any socket, of any family: an AF_UNIX socketpair from sshd, or a TCP socket from inetd or
+/// launchd. It is held as a `UnixStream` only for its `read` and `set_read_timeout`, which are
+/// `read(2)` and `SO_RCVTIMEO` on the descriptor whatever the family; nothing that depends on the
+/// address is called on it.
 fn blocking_socket(fd: std::os::fd::BorrowedFd<'_>) -> Option<UnixStream> {
     use rustix::fs::{FileType, OFlags};
     let socket = FileType::from_raw_mode(rustix::fs::fstat(fd).ok()?.st_mode) == FileType::Socket;

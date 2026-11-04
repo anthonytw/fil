@@ -793,7 +793,8 @@ f_takeover_back() {
   fc_wait b 'by client\n' 5
   fc_wait a SECOND-25 30
   # The take-back's redraw can land after SECOND-25 is sampled: wait for it. On a failure, keep the
-  # raw output of that moment, which tells a line the restore lost from one drawn late.
+  # raw output of that moment, which tells a line the restore lost from one drawn late. This checks
+  # the state after the restore, not its drawing: a momentary flash without FIRST-42 still passes.
   fc a wait --timeout 5 FIRST-42 > /dev/null 2>&1 || { fc a raw > "$OUT/run/$SCENARIO-a.first42.raw" 2>&1; fail "the first client lost the earlier output after taking the session back (raw: run/$SCENARIO-a.first42.raw): $(fc_screen a)"; }
   fc_line a 'echo BACK-$((2*8))'
   fc_wait a BACK-16 20

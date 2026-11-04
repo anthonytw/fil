@@ -4,7 +4,11 @@
 //! reorders nothing; it resets the channel only after the shortage has lasted 30 s.
 //!
 //! The local socket here is a real one wrapped in [`Flaky`], which fails calls on request
-//! before they reach the socket, as the kernel does.
+//! before they reach the socket, as Linux does, and passes at most [`FLAKY_WRITE`] bytes per
+//! write, so that a failure lands partway through the endpoint's piece. The endpoint retries
+//! only where a failed call is known to have moved nothing: a real socket on Linux, not on macOS,
+//! where a write can queue part of its bytes and still fail. There, and on a [`Flaky`] that
+//! fails that way, the channel is reset instead (the last test).
 
 mod support;
 
@@ -12,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use fil_forward::ForwardStream;
 use fil_proto::mux::ForwardId;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +46,7 @@ macro_rules! per_transport {
 per_transport!(
     enobufs_on_the_local_write_loses_and_repeats_nothing,
     enobufs_on_the_local_read_loses_and_repeats_nothing,
+    enobufs_after_a_partial_write_resets_the_forward,
 );
 
 const N: u64 = 1 << 20;
@@ -187,4 +193,57 @@ async fn a_channel_that_ends_during_the_wait_releases_its_pump_body() {
     fil_forward::stream::set_zero_linger(&s).unwrap();
     drop(s);
     w.settled().await;
+}
+
+/// A write that fails with `ENOBUFS` after the socket took part of its bytes, as `sosend` on
+/// macOS can, resets the forward, as any other socket error does: trying `data[off..]` again
+/// would repeat the bytes taken. The application sees the reset, and the target sees its stream
+/// cut off, never a clean end of a stream with bytes twice in it.
+async fn enobufs_after_a_partial_write_resets_the_forward(t: Transport) {
+    // 0 while the server reads, then 1 for a clean end, 2 for an error.
+    let end = Arc::new(AtomicUsize::new(0));
+    let seen = end.clone();
+    let server = serve(move |mut s| {
+        let seen = seen.clone();
+        async move {
+            let r = read_stream(&mut s, None).await;
+            seen.store(if r.is_ok() { 1 } else { 2 }, Ordering::SeqCst);
+        }
+    })
+    .await;
+    let w = World::new(t, mux_config()).await;
+    let injected = Arc::new(AtomicUsize::new(0));
+    *w.daemon.targets.wrap.lock().unwrap() =
+        Some(Flaky::wrap_partial(|n| n == 5, injected.clone()));
+    let port = w.local_forward(1, server.port);
+    let mut s = connect(port).await;
+    let outcome = async {
+        write_stream(&mut s, 14, N, None).await?;
+        s.shutdown().await?;
+        let mut back = Vec::new();
+        s.read_to_end(&mut back).await?;
+        Ok::<_, std::io::Error>(back.len())
+    }
+    .await;
+    assert!(outcome.is_err(), "the forward was not reset: {outcome:?}");
+    assert_eq!(injected.load(Ordering::SeqCst), 1);
+    eventually(Duration::from_secs(20), || end.load(Ordering::SeqCst) != 0).await;
+    assert_eq!(end.load(Ordering::SeqCst), 2, "the target saw a clean end");
+    w.settled().await;
+    for (who, ep) in [("client", &w.client.ep), ("daemon", &w.daemon.ep)] {
+        let s = ep.stats(ForwardId(1)).expect("stats");
+        assert_eq!((s.open, s.total), (0, 1), "{who}: {s:?}");
+    }
+}
+
+/// A real socket's failed call is taken to have moved nothing on Linux only.
+#[tokio::test]
+async fn a_real_socket_is_retried_on_linux_only() {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(s.no_memory_moves_nothing(), cfg!(target_os = "linux"));
+    let (u, _) = tokio::net::UnixStream::pair().unwrap();
+    assert_eq!(u.no_memory_moves_nothing(), cfg!(target_os = "linux"));
 }

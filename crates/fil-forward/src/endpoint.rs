@@ -404,11 +404,18 @@ const NOMEM_CAP: Duration = Duration::from_millis(100);
 /// How long a socket may fail for want of kernel memory, with no call succeeding between, before
 /// the channel is reset: the shortage is not passing.
 const NOMEM_LIMIT: Duration = Duration::from_secs(30);
+/// A failure this long after the previous one starts a new run: the call was not failing in
+/// between, it was waiting (`Pending`, an idle peer), and that time is not the shortage's.
+const NOMEM_GAP: Duration = Duration::from_millis(2 * NOMEM_CAP.as_millis() as u64);
 
 /// Whether `e` is the kernel running short of socket memory (`ENOBUFS`, or `ENOMEM` where a
 /// socket call uses it for the same thing): a transient condition, not a broken connection. It
 /// is seen on a loopback send when the mbuf pool is small and many sockets hold data
 /// (macOS, `kern.ipc.nmbclusters`), and clears as other sockets drain.
+///
+/// The endpoint tries such a call again only on a stream whose failed calls are known to have
+/// moved no bytes ([`ForwardStream::no_memory_moves_nothing`](crate::ForwardStream)): Linux, not
+/// macOS.
 fn is_no_memory(e: &std::io::Error) -> bool {
     use rustix::io::Errno;
     matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
@@ -421,6 +428,8 @@ struct NoMemoryRetry {
     next: Duration,
     /// When the current run of failures began.
     since: Option<tokio::time::Instant>,
+    /// When the last failure was.
+    last: Option<tokio::time::Instant>,
 }
 
 impl NoMemoryRetry {
@@ -428,6 +437,7 @@ impl NoMemoryRetry {
         Self {
             next: NOMEM_FIRST,
             since: None,
+            last: None,
         }
     }
 
@@ -435,10 +445,19 @@ impl NoMemoryRetry {
     fn succeeded(&mut self) {
         self.next = NOMEM_FIRST;
         self.since = None;
+        self.last = None;
     }
 
-    /// A call failed at `now`: how long to wait before the next try, or `None` to give up.
+    /// A call failed at `now`: how long to wait before the next try, or `None` to give up. A
+    /// failure more than [`NOMEM_GAP`] after the last one starts a new run, as a success would.
     fn failed(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) > NOMEM_GAP)
+        {
+            self.succeeded();
+        }
+        self.last = Some(now);
         let since = *self.since.get_or_insert(now);
         if now.saturating_duration_since(since) >= NOMEM_LIMIT {
             return None;
@@ -2519,10 +2538,14 @@ impl<L: Link> Inner<L> {
                 return;
             }
         }
+        let retry = stream.no_memory_moves_nothing();
         let (mut rd, mut wr) = tokio::io::split(stream);
         {
             let work = async {
-                tokio::join!(self.up(ch, &mut rd, &sig), self.down(ch, &mut wr, &sig));
+                tokio::join!(
+                    self.up(ch, &mut rd, &sig, retry),
+                    self.down(ch, &mut wr, &sig, retry)
+                );
             };
             tokio::pin!(work);
             let mut worked = false;
@@ -2558,11 +2581,14 @@ impl<L: Link> Inner<L> {
     /// Local socket → channel. Reads only as much as the channel's send buffer has room for, so
     /// the pump itself never holds forwarded bytes: everything buffered is the mux's, inside the
     /// budget. With no room it stops reading (TCP backpressure) until the mux says `Writable`.
+    /// `retry`: a read that fails for want of kernel memory is tried again rather than resetting
+    /// the channel ([`ForwardStream::no_memory_moves_nothing`](crate::ForwardStream::no_memory_moves_nothing)).
     async fn up<R: AsyncRead + Unpin>(
         self: &Arc<Self>,
         ch: ChannelId,
         rd: &mut R,
         sig: &Arc<Signals>,
+        retry: bool,
     ) {
         let mut nomem = NoMemoryRetry::new();
         loop {
@@ -2638,7 +2664,7 @@ impl<L: Link> Inner<L> {
                     return;
                 }
                 Ok(Some(_)) => nomem.succeeded(),
-                Err(e) if is_no_memory(&e) => {
+                Err(e) if retry && is_no_memory(&e) => {
                     // Nothing was read and nothing is registered to wake this task: wait a
                     // moment and look again. The loop recomputes the room and takes a fresh
                     // `notified`, so a `Writable` or an end during the wait is not missed.
@@ -2662,12 +2688,14 @@ impl<L: Link> Inner<L> {
     }
 
     /// Channel → local socket. Acknowledges (`consumed`) only what the socket took; shuts the
-    /// socket's write side down once every byte before the peer's `Eof` is written.
+    /// socket's write side down once every byte before the peer's `Eof` is written. `retry` as
+    /// for [`Self::up`].
     async fn down<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         ch: ChannelId,
         wr: &mut W,
         sig: &Arc<Signals>,
+        retry: bool,
     ) {
         enum Next {
             Data(Bytes),
@@ -2718,9 +2746,9 @@ impl<L: Link> Inner<L> {
                                 // items. It frees none of this side's own sending.
                                 self.kick_ctl();
                             }
-                            Err(e) if is_no_memory(&e) => {
-                                // The kernel is out of socket memory, for now. The rest of
-                                // `data` stays here, unacknowledged (`consumed` is not called),
+                            Err(e) if retry && is_no_memory(&e) => {
+                                // The kernel is out of socket memory, for now, and the
+                                // failed write took nothing (`retry`). The rest of `data` stays here, unacknowledged (`consumed` is not called),
                                 // so the peer's window stays shut behind it: nothing is lost,
                                 // reordered or let in past the budget. The wait is a timer, not
                                 // a `Notify`: whatever arrives meanwhile is found by the next

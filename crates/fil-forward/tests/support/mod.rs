@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -413,6 +413,12 @@ static WATCHED: Mutex<Vec<Watched>> = Mutex::new(Vec::new());
 /// An [`End`]'s id, the thread that built it, its side and its endpoint.
 type Watched = (u64, String, Side, Endpoint<TestLink>);
 
+/// [`WATCHED`], even after a panic while it was held (a report's snapshot, say): an [`End`]
+/// dropped while unwinding must not panic again on the poison.
+fn watched() -> std::sync::MutexGuard<'static, Vec<Watched>> {
+    WATCHED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn thread_name() -> String {
     std::thread::current().name().unwrap_or("?").to_string()
 }
@@ -455,10 +461,7 @@ impl End {
         let (probes, probes_rx) = mpsc::unbounded_channel();
         static NEXT_WATCH: AtomicUsize = AtomicUsize::new(0);
         let watch_id = NEXT_WATCH.fetch_add(1, Ordering::Relaxed) as u64;
-        WATCHED
-            .lock()
-            .unwrap()
-            .push((watch_id, thread_name(), side, ep.clone()));
+        watched().push((watch_id, thread_name(), side, ep.clone()));
         Self {
             ep,
             targets,
@@ -516,7 +519,7 @@ impl End {
 impl Drop for End {
     fn drop(&mut self) {
         let mine = self.watch_id;
-        WATCHED.lock().unwrap().retain(|w| w.0 != mine);
+        watched().retain(|w| w.0 != mine);
         self.stop_recv();
         if let Some(t) = self.events.take() {
             t.abort();
@@ -973,16 +976,30 @@ pub fn shrink_buffers(s: &TcpStream) {
 
 // ---- a local socket that runs out of memory -----------------------------------------------------
 
-/// A local stream whose reads and writes fail with `ENOBUFS` when told to (before reaching the
-/// socket, so nothing is read or written by the failed call), as a kernel short of mbufs does.
-/// `fail_write(n)` and `fail_read(n)` are asked with the number of the call (every poll counts,
-/// from 0); `injected` counts the failures given.
+/// A local stream whose reads and writes fail with `ENOBUFS` when told to, as a kernel short of
+/// mbufs does. `fail_write(n)` and `fail_read(n)` are asked with the number of the call (every
+/// poll counts, from 0); `injected` counts the failures given.
+///
+/// Each write passes at most [`FLAKY_WRITE`] bytes to the socket, so the endpoint's 64 KiB
+/// pieces take many writes and a failure lands partway through one.
+///
+/// A failure comes in one of two kinds:
+/// - **all-or-nothing** ([`Flaky::wrap`]): before the call reaches the socket, so nothing is
+///   read or written by it, as on Linux. The stream says so
+///   ([`ForwardStream::no_memory_moves_nothing`]), and the endpoint tries again.
+/// - **partial** ([`Flaky::wrap_partial`]): the write first passes half of its bytes to the
+///   socket, then fails, as `sosend` on macOS can. The stream says its failures may have moved
+///   bytes, and the endpoint resets the channel.
 pub struct Flaky {
     inner: TcpStream,
     polls: [u64; 2],
     fail: [Arc<dyn Fn(u64) -> bool + Send + Sync>; 2],
+    partial: bool,
     pub injected: Arc<AtomicUsize>,
 }
+
+/// The most a [`Flaky`] write passes to the socket at once (about a packet).
+pub const FLAKY_WRITE: usize = 1500;
 
 impl Flaky {
     /// A [`Wrap`] making [`Flaky`] streams that all count into `injected`.
@@ -991,13 +1008,30 @@ impl Flaky {
         fail_write: impl Fn(u64) -> bool + Send + Sync + 'static,
         injected: Arc<AtomicUsize>,
     ) -> Wrap {
-        let (fail_read, fail_write): (Arc<dyn Fn(u64) -> bool + Send + Sync>, _) =
-            (Arc::new(fail_read), Arc::new(fail_write));
+        Self::make(Arc::new(fail_read), Arc::new(fail_write), false, injected)
+    }
+
+    /// A [`Wrap`] making [`Flaky`] streams whose writes fail after passing half their bytes on
+    /// (reads never fail).
+    pub fn wrap_partial(
+        fail_write: impl Fn(u64) -> bool + Send + Sync + 'static,
+        injected: Arc<AtomicUsize>,
+    ) -> Wrap {
+        Self::make(Arc::new(|_| false), Arc::new(fail_write), true, injected)
+    }
+
+    fn make(
+        fail_read: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+        fail_write: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+        partial: bool,
+        injected: Arc<AtomicUsize>,
+    ) -> Wrap {
         Arc::new(move |inner| {
             Box::new(Flaky {
                 inner,
                 polls: [0; 2],
                 fail: [fail_read.clone(), fail_write.clone()],
+                partial,
                 injected: injected.clone(),
             })
         })
@@ -1032,7 +1066,16 @@ impl AsyncWrite for Flaky {
     ) -> Poll<io::Result<usize>> {
         let n = self.polls[1];
         self.polls[1] += 1;
+        let buf = &buf[..buf.len().min(FLAKY_WRITE)];
         if (self.fail[1])(n) {
+            if self.partial {
+                // Half goes to the socket first; whatever it took is not reported.
+                let half = buf.len().div_ceil(2);
+                if let Poll::Ready(Err(e)) = Pin::new(&mut self.inner).poll_write(cx, &buf[..half])
+                {
+                    return Poll::Ready(Err(e));
+                }
+            }
             return Poll::Ready(Err(self.enobufs()));
         }
         Pin::new(&mut self.inner).poll_write(cx, buf)
@@ -1050,6 +1093,10 @@ impl AsyncWrite for Flaky {
 impl ForwardStream for Flaky {
     fn set_reset(&self) -> io::Result<()> {
         fil_forward::stream::set_zero_linger(&self.inner)
+    }
+
+    fn no_memory_moves_nothing(&self) -> bool {
+        !self.partial
     }
 }
 
@@ -1150,13 +1197,20 @@ pub async fn bounded<F: Future>(body: F) -> F::Output {
     tokio::select! {
         v = &mut body => v,
         () = tokio::time::sleep(limit) => {
-            // The body is still alive here, so its endpoints are in `WATCHED`.
+            // The body is still alive here, so its endpoints are in `WATCHED`. The name goes out
+            // first: a snapshot takes the endpoint's state lock, and if that is what the test is
+            // stuck on, the report never comes. The endpoints are cloned out of `WATCHED` so that
+            // a panic in a snapshot leaves the list unheld.
             let name = thread_name();
+            eprintln!("{name}: still running after {limit:?}; taking the endpoints' snapshots");
+            let mine: Vec<_> = watched()
+                .iter()
+                .filter(|(_, who, ..)| *who == name)
+                .map(|(_, _, side, ep)| (*side, ep.clone()))
+                .collect();
             let mut report = String::new();
-            for (_, who, side, ep) in WATCHED.lock().unwrap().iter() {
-                if *who == name {
-                    report.push_str(&format!("\n  {side:?}: {:?}", ep.snapshot()));
-                }
+            for (side, ep) in mine {
+                report.push_str(&format!("\n  {side:?}: {:?}", ep.snapshot()));
             }
             if report.is_empty() {
                 report.push_str("\n  (no endpoint to report)");

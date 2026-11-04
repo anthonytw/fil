@@ -895,19 +895,31 @@ pub fn env_or(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// The longest a test may run. Every wait in a test is for something that happens at once or
-/// within seconds, so a test still running after this has lost a wakeup (or hit a stall): it fails,
-/// named, instead of hanging `cargo test` for ever.
+/// The longest a test may run, by default. Every wait in a test is for something that happens at
+/// once or within seconds, so a test still running after this has lost a wakeup (or hit a
+/// stall): it fails, named, instead of hanging `cargo test` for ever. `FIL_FORWARD_TEST_LIMIT`
+/// (seconds) sets it, for soak runs whose scale knobs (`FIL_FORWARD_*`) make a test last longer.
 pub const TEST_LIMIT: Duration = Duration::from_secs(120);
 
-/// Runs a test's body under [`TEST_LIMIT`]; the panic names the test.
+/// The limit in force: [`TEST_LIMIT`] unless the environment sets another.
+pub fn test_limit() -> Duration {
+    Duration::from_secs(env_or("FIL_FORWARD_TEST_LIMIT", TEST_LIMIT.as_secs()))
+}
+
+/// Runs a test's body under [`test_limit`]; the panic names the test.
+///
+/// **Never wrap a test with a paused clock** (`start_paused`): the timeout is a timer on that
+/// clock, and tokio advances a paused clock to the next timer as soon as everything waits, which
+/// real I/O does, so the body would be cut off at once with "still running after 120 s". Only
+/// `multi_thread` tests, which cannot pause the clock, are wrapped.
 pub async fn bounded<F: Future>(body: F) -> F::Output {
-    match tokio::time::timeout(TEST_LIMIT, body).await {
+    let limit = test_limit();
+    match tokio::time::timeout(limit, body).await {
         Ok(v) => v,
         Err(_) => {
             let t = std::thread::current();
             panic!(
-                "{}: still running after {TEST_LIMIT:?}: a lost wakeup or a stalled forward",
+                "{}: still running after {limit:?}: a lost wakeup or a stalled forward",
                 t.name().unwrap_or("test")
             );
         }

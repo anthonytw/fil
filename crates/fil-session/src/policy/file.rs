@@ -52,6 +52,19 @@ pub struct Keys {
     pub gateway_ports: Option<bool>,
 }
 
+impl Keys {
+    /// Every key that stands in for a setting of the sshd mirror is set, so nothing is left to
+    /// the mirror to decide (`direct` has no sshd counterpart).
+    pub fn sets_every_mirrored_key(&self) -> bool {
+        self.local.is_some()
+            && self.remote.is_some()
+            && self.agent.is_some()
+            && self.permit_open.is_some()
+            && self.permit_listen.is_some()
+            && self.gateway_ports.is_some()
+    }
+}
+
 /// What the policy file gave.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilePolicy {

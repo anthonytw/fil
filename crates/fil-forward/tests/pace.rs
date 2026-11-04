@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use fil_forward::pace::{MIN_CAP, PaceConfig};
 use fil_netsim::stream::StreamConfig;
-use fil_proto::mux::OpenKind;
+use fil_proto::mux::{ForwardId, OpenKind};
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -299,13 +299,88 @@ async fn stuck_forwards_on_a_slow_pipe_body() {
     );
 }
 
-/// (the live forward's 1 MiB echo, the agent's median request-and-answer).
-async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
-    let deaf = serve(|s| async move {
-        tokio::time::sleep(Duration::from_secs(300)).await;
-        drop(s);
+/// **A local abort releases what the pacer counted** (#88 re-check, R1). The application resets
+/// its connection while the forward's bytes are in flight and unacknowledged (the target never
+/// reads): the mux tells the peer itself and raises no `Closed` event, so the endpoint has to tell
+/// the pacer, or the channel's records stay in the cap until the peer's `Close` has made the round
+/// trip. The pipe's 100 ms each way keeps that round trip far longer than the check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_abort_releases_what_the_pacer_counted() {
+    bounded(a_local_abort_releases_what_the_pacer_counted_body()).await
+}
+
+async fn a_local_abort_releases_what_the_pacer_counted_body() {
+    let (deaf_port, deaf) = deaf_target().await;
+    let stream = StreamConfig {
+        latency: Duration::from_millis(100),
+        jitter: Duration::ZERO,
+        bandwidth: None,
+        buffer: 1 << 20,
+    };
+    let w = World::new_pipe_on(mux_config(), stream).await;
+    let port = w.local_forward(1, deaf_port);
+    let s = connect(port).await;
+    fil_forward::stream::set_zero_linger(&s).unwrap();
+    let writer = tokio::spawn(async move {
+        // A little, not a window's worth: a pump whose window is full does not read, and would not
+        // see the reset. The ack takes the pipe's 200 ms round trip, so the bytes are in flight
+        // when the reset comes.
+        let mut s = s;
+        let _ = s.write_all(&[5u8; 8 * 1024]).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let ep = w.client.ep.clone();
+    eventually(Duration::from_secs(10), || ep.pace_state().in_flight > 0).await;
+    assert_eq!(w.client.ep.stats(ForwardId(1)).map(|s| s.open), Some(1));
+    // The application resets: the connection is dropped with a zero linger, within the first round trip.
+    writer.abort();
+    eventually(Duration::from_secs(10), || {
+        ep.stats(ForwardId(1)).is_some_and(|s| s.open == 0)
     })
     .await;
+    let p = w.client.ep.pace_state();
+    assert_eq!(
+        p.in_flight, 0,
+        "the aborted channel is still counted: {p:?}"
+    );
+    deaf.abort();
+}
+
+/// A target that takes connections and never reads them, with a receive buffer so small that it
+/// is stuck at once. The default buffer is OS policy, not part of the test: Linux grows it (up
+/// to 6 MiB) as data arrives even when nobody reads, so with 16 of them the "stuck" forwards
+/// went on moving megabytes through the slow pipe for the whole 10 s settle and beside the echo,
+/// 16 bulk transfers the live forward had to share the link with, paced or not (VF2). The
+/// listener is returned to be kept: its accepted sockets and its task go with it.
+async fn deaf_target() -> (u16, tokio::task::JoinHandle<()>) {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(STUCK_BUFFER).unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = sock.listen(64).unwrap();
+    let port = l.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            keep.push(s);
+        }
+    });
+    (port, task)
+}
+
+/// A connection nobody reads, with a receive buffer as small as the deaf target's (see there).
+async fn connect_unread(port: u16) -> TcpStream {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(STUCK_BUFFER).unwrap();
+    sock.connect(([127, 0, 0, 1], port).into()).await.unwrap()
+}
+
+/// What a stuck socket's kernel buffer holds at most, about: the OS rounds it up (Linux doubles it
+/// and has a floor of a few KiB).
+const STUCK_BUFFER: u32 = 4096;
+
+/// (the live forward's 1 MiB echo, the agent's median request-and-answer).
+async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
+    let (deaf_port, deaf) = deaf_target().await;
     let source = serve(|mut s| async move {
         let buf = vec![9u8; 64 * 1024];
         while s.write_all(&buf).await.is_ok() {}
@@ -314,7 +389,7 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     let echo = echo_server().await;
     let agent = echo_server().await;
     w.client.targets.set_agent(agent.port);
-    let up_port = w.local_forward(1, deaf.port);
+    let up_port = w.local_forward(1, deaf_port);
     let down_port = w.local_forward(2, source.port);
     let echo_port = w.local_forward(3, echo.port);
     let mut held = Vec::new();
@@ -325,13 +400,19 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
             while s.write_all(&buf).await.is_ok() {}
         }));
         // Downloads nobody reads: the socket is kept, never read.
-        let s = connect(down_port).await;
+        let s = connect_unread(down_port).await;
         held.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(300)).await;
             drop(s);
         }));
     }
     tokio::time::sleep(settle).await;
+    // What the stuck forwards have delivered so far, to show they are stuck while the echo runs.
+    let moved = |w: &World| {
+        w.daemon.ep.stats(ForwardId(1)).map_or(0, |s| s.to_local)
+            + w.client.ep.stats(ForwardId(2)).map_or(0, |s| s.to_local)
+    };
+    let moved0 = moved(w);
     let t0 = std::time::Instant::now();
     if timeout(Duration::from_secs(10), echo_once(echo_port, 1 << 20, 7))
         .await
@@ -346,6 +427,14 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
         );
     }
     let echo_took = t0.elapsed();
+    // The premise: nothing reads them, so they move little beside the echo (what the kernel
+    // buffers on the sending side still takes: 1 to 3 MB on Linux, none on macOS). An OS that
+    // also buffered megabytes at the receiving end turned them into bulk transfers: 8.6 MB.
+    let moved = moved(w) - moved0;
+    assert!(
+        moved <= 6 << 20,
+        "the stuck forwards were not stuck: {moved} bytes moved beside the echo"
+    );
     // The agent: the daemon opens an agent channel for a process on the host, which asks and
     // waits for the answer, 20 times.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -373,7 +462,7 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     }
     rtts.sort();
     eprintln!(
-        "{k} stuck each way: 1 MiB echo in {echo_took:?}, agent p50 {:?} max {:?}; client {:?}, daemon {:?}",
+        "{k} stuck each way ({moved} bytes moved): 1 MiB echo in {echo_took:?}, agent p50 {:?} max {:?}; client {:?}, daemon {:?}",
         rtts[10],
         rtts[19],
         w.client.ep.pace_state(),
@@ -382,6 +471,7 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     // About 0.9 s of link both ways on the slow pipe (0.52 s unpaced end to end in the review);
     // instant on the plain links.
     held.iter().for_each(|h| h.abort());
+    deaf.abort();
     (echo_took, rtts[10])
 }
 
@@ -394,9 +484,12 @@ per_transport!(
 /// **A server that speaks first** (sshd, SMTP, MySQL: a banner on accept; B-new-2 of the second
 /// re-check). The acceptor's first payload may go only once its `OpenOk` is out, which the control
 /// sender takes; the data sender, which found nothing sendable a moment before, must be woken
-/// then. When it was not, about 1 connection in 10 waited for the peer's timer-driven ack
-/// (100 to 250 ms), paced or not. 150 connects, each timed to its banner.
+/// then. When it was not, some connections waited for the peer's timer-driven ack (85 to 250 ms),
+/// paced or not: 1 in 10 at first, 2 to 5% (3 to 8 in 150) with the kick dropped from the
+/// control sender's loop. 200 connects (fewer than a side may have open at once, since the target
+/// holds each for 5 s), each timed to its banner.
 async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
+    const CONNECTS: usize = 200;
     let server = serve(|mut s| async move {
         let _ = s.write_all(b"220 hello\r\n").await;
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -405,7 +498,7 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
     let mut lat = Vec::new();
-    for _ in 0..150 {
+    for _ in 0..CONNECTS {
         let t0 = std::time::Instant::now();
         let mut c = connect(port).await;
         let mut b = [0u8; 11];
@@ -417,17 +510,24 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
         drop(c);
     }
     lat.sort();
+    let p99 = lat[CONNECTS * 99 / 100];
     let slow = lat
         .iter()
-        .filter(|d| **d > Duration::from_millis(50))
+        .filter(|d| **d > Duration::from_millis(75))
         .count();
     eprintln!(
-        "{t:?}: connect to banner p50 {:?} p99 {:?} max {:?}, {slow} of 150 over 50 ms",
-        lat[75], lat[148], lat[149]
+        "{t:?}: connect to banner p50 {:?} p99 {p99:?} max {:?}, {slow} of {CONNECTS} over 75 ms",
+        lat[CONNECTS / 2],
+        lat[CONNECTS - 1]
     );
-    // About a millisecond each on these links; one that waits for a timer is 100 ms or more.
-    assert!(lat[148] <= Duration::from_millis(30), "p99 {:?}", lat[148]);
-    assert!(slow <= 1, "{slow} of 150 over 50 ms");
+    // About a millisecond each on these links; one that waits for a timer is 85 ms or more. A
+    // loaded machine (a load average of 70) delays some connects by tens of milliseconds (a p99 of
+    // 38 ms was seen), so the bounds sit between that and the bug, which the sample size makes
+    // sure to catch.
+    // (With 200 connects, at most one over 75 ms already implies the p99 bound; kept for the
+    // message that names it.)
+    assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}");
+    assert!(slow <= 1, "{slow} of {CONNECTS} over 75 ms");
 }
 
 /// **A reader that stopped, written to in small chunks** (B-new-1 of the re-check): an

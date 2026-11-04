@@ -905,14 +905,17 @@ fn degraded_threshold(params: &LinkParams, rtt: Duration) -> Duration {
 }
 
 /// Whether the peer's address changing from `old` to `new` is a change of path for the layers
-/// above: quinn keeps its round-trip estimate and congestion state when only the port of an IPv4
-/// peer changed (a NAT rebinding: the same host behind the same address) and starts over for any
-/// other change, so only those count in `path_generation`. A pacer that restarted for a rebind
-/// would throw away a base and a cap that are still right. This mirrors quinn-proto's
-/// `Connection::migrate` (0.11): `remote.is_ipv4() && remote.ip() == previous.ip()`, which is
-/// also why an IPv6 port change counts; if quinn changes the rule this has to follow.
-fn path_state_resets(old: SocketAddr, new: SocketAddr) -> bool {
-    !(new.is_ipv4() && new.ip() == old.ip())
+/// above: its IP address changed. A change of the port alone is a NAT rebinding, the same host
+/// behind the same address, and the path (its round trip, its capacity) is the one the layers
+/// above measured, so a pacer that restarted for it would throw away a base and a cap that are
+/// still right. Addresses are compared canonically: the daemon's socket is dual-stack, so an IPv4
+/// client arrives as `::ffff:a.b.c.d`. This is fil's own rule, not quinn's (which keeps its
+/// round-trip and congestion state only for an IPv4 peer, and starts over for any other change).
+///
+/// The link sees the address only when it looks (every 500 ms at most), so a client that moved to
+/// another IP and back between two looks is not seen to have changed.
+fn path_changed(old: SocketAddr, new: SocketAddr) -> bool {
+    old.ip().to_canonical() != new.ip().to_canonical()
 }
 
 /// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
@@ -1000,7 +1003,7 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
         let mut changed = false;
         let now_remote = conn.remote_address();
         if now_remote != remote {
-            changed |= path_state_resets(remote, now_remote);
+            changed |= path_changed(remote, now_remote);
             remote = now_remote;
         }
         let now_local = conn.local_ip();
@@ -1049,37 +1052,53 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
 
 #[cfg(test)]
 mod tests {
-    use super::path_state_resets;
+    use super::path_changed;
 
     fn a(s: &str) -> std::net::SocketAddr {
         s.parse().unwrap()
     }
 
     #[test]
-    fn a_port_only_change_of_an_ipv4_peer_is_not_a_new_path() {
-        assert!(!path_state_resets(
+    fn a_port_only_change_is_not_a_new_path() {
+        assert!(!path_changed(
             a("198.51.100.7:5000"),
+            a("198.51.100.7:6001")
+        ));
+        assert!(!path_changed(
+            a("[2001:db8::7]:5000"),
+            a("[2001:db8::7]:6001")
+        ));
+    }
+
+    /// The daemon binds `[::]` dual-stack: an IPv4 client's address is the v4-mapped one.
+    #[test]
+    fn a_port_only_change_of_a_v4_mapped_address_is_not_a_new_path() {
+        assert!(!path_changed(
+            a("[::ffff:198.51.100.7]:5000"),
+            a("[::ffff:198.51.100.7]:6001")
+        ));
+        assert!(!path_changed(
+            a("[::ffff:198.51.100.7]:5000"),
             a("198.51.100.7:6001")
         ));
     }
 
     #[test]
     fn a_new_ip_is_a_new_path() {
-        assert!(path_state_resets(
-            a("198.51.100.7:5000"),
-            a("203.0.113.9:5000")
+        assert!(path_changed(a("198.51.100.7:5000"), a("203.0.113.9:5000")));
+        assert!(path_changed(a("198.51.100.7:5000"), a("203.0.113.9:6001")));
+        assert!(path_changed(
+            a("[::ffff:198.51.100.7]:5000"),
+            a("[::ffff:203.0.113.9]:5000")
         ));
-        assert!(path_state_resets(
-            a("198.51.100.7:5000"),
-            a("203.0.113.9:6001")
-        ));
-    }
-
-    #[test]
-    fn quinn_restarts_its_estimates_for_an_ipv6_port_change_so_that_counts() {
-        assert!(path_state_resets(
+        assert!(path_changed(
             a("[2001:db8::7]:5000"),
-            a("[2001:db8::7]:6001")
+            a("[2001:db8::8]:5000")
+        ));
+        // From IPv4 to IPv6 and back: another network.
+        assert!(path_changed(
+            a("[::ffff:198.51.100.7]:5000"),
+            a("[2001:db8::7]:5000")
         ));
     }
 }

@@ -695,7 +695,7 @@ impl Pacer {
         }
     }
 
-    /// The link's path changed (QUIC migration, a NAT rebind included): the base, the cap and the
+    /// The link's path changed (QUIC migration to another IP address; a rebind of the port alone is not one, see the link's `path_generation`): the base, the cap and the
     /// controller's state belong to the old path, so the pacer starts over as a new link's does:
     /// slow start from the cap it had, or [`INITIAL_CAP`] if that was more, no base, no drain
     /// pending. Records sent before the change stay counted until they are acknowledged (they

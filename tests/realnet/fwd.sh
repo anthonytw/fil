@@ -1126,21 +1126,33 @@ f_fwd_parallel() {
     done
   done
   fwd_pacing on
-  # The verdicts: goodput paced within 10 % of unpaced; keystroke p50 under H1's line (2 x the
-  # paced idle + 10 ms) on every loaded cell; QUIC's request round trips beside a bulk one.
-  local v p u idle
+  # The verdicts, misses when they fail (the done-when of H1): keystroke p50 paced under H1's line
+  # (2 x the paced idle + 10 ms) on every loaded cell; goodput paced at least 90 % of unpaced; on
+  # QUIC the request round trips beside a bulk one under the same line. No margin for shared
+  # runners: measured, the paced cells sat 12 to 20 ms under the line.
+  local v p u idle line pp50 ratio rrp
   for kind in pipe quic; do
     v="FWD_H1_par${kind}on0"
     idle=$(cut -d' ' -f1 <<< "${!v}")
+    line=$(awk -v i="$idle" 'BEGIN { printf "%.1f", 2 * i + 10 }')
     for n in 1 4 16 32 rr; do
       [[ $n == rr && $kind != quic ]] && continue
       v="FWD_H1_par${kind}on$n"
       p=${!v}
       v="FWD_H1_par${kind}off$n"
       u=${!v}
-      note "H1PAR verdict kind=$kind flows=$n paced_p50=$(cut -d' ' -f1 <<< "$p") line=$(awk -v i="$idle" 'BEGIN { printf "%.1f", 2 * i + 10 }') unpaced_p50=$(cut -d' ' -f1 <<< "$u") goodput_ratio=$(awk -v a="$(cut -d' ' -f2 <<< "$p")" -v b="$(cut -d' ' -f2 <<< "$u")" 'BEGIN { if (b > 0) printf "%.3f", a / b; else print "n/a" }') rr_p50=$(cut -d' ' -f3 <<< "$p")/$(cut -d' ' -f3 <<< "$u")"
+      pp50=$(cut -d' ' -f1 <<< "$p")
+      ratio=$(awk -v a="$(cut -d' ' -f2 <<< "$p")" -v b="$(cut -d' ' -f2 <<< "$u")" 'BEGIN { if (b > 0) printf "%.3f", a / b; else print "n/a" }')
+      rrp=$(cut -d' ' -f3 <<< "$p")
+      note "H1PAR verdict kind=$kind flows=$n paced_p50=$pp50 line=$line unpaced_p50=$(cut -d' ' -f1 <<< "$u") goodput_ratio=$ratio rr_p50=$rrp/$(cut -d' ' -f3 <<< "$u")"
+      awk -v p="$pp50" -v l="$line" 'BEGIN { exit !(p <= l) }' || fwd_miss "H1 $kind, $n flows: keystroke p50 $pp50 ms over the line $line ms (2 x idle + 10)"
+      awk -v r="$ratio" 'BEGIN { exit !(r != "n/a" && r >= 0.9) }' || fwd_miss "H1 $kind, $n flows: paced goodput $ratio of unpaced (under 0.9)"
+      if [[ $n == rr ]]; then
+        awk -v p="$rrp" -v l="$line" 'BEGIN { exit !(p != "n/a" && p <= l) }' || fwd_miss "H1 $kind: the request round trip $rrp ms beside a bulk one is over the line $line ms"
+      fi
     done
   done
+  fwd_verdict
 }
 
 # f_fwd_stuck: 8 uploads into a -L whose target never reads, then (once they are stuck) a live
@@ -1161,9 +1173,16 @@ f_fwd_stuck() {
       res=$(client_exec_on x timeout 60 python3 -c "$FWD_H1_PY" echo "$FWD_H1_RR" 1048576 2>&1 | tail -n 1)
       fwd_h1_end "$tag" "$kind"
       note "H1STUCK kind=$kind pacing=$pace echo_1MiB=$res p50_ms=$LAT_P50 p99_ms=$LAT_P99"
+      printf -v "FWD_H1_$tag" '%s' "$(sed -n 's/.*MS=\([0-9]*\).*/\1/p' <<< "$res")"
     done
+    # A channel whose reader stopped stops only itself: the live echo paced takes at most 10 %
+    # (and 500 ms) more than unpaced.
+    local pv="FWD_H1_stuck${kind}on" uv="FWD_H1_stuck${kind}off"
+    awk -v p="${!pv:-x}" -v u="${!uv:-x}" 'BEGIN { exit !(p ~ /^[0-9]+$/ && u ~ /^[0-9]+$/ && p <= u * 1.1 + 500) }' \
+      || fwd_miss "H1 $kind: the live 1 MiB echo beside stuck forwards took ${!pv:-?} ms paced against ${!uv:-?} ms unpaced"
   done
   fwd_pacing on
+  fwd_verdict
 }
 
 FWD_SCENARIOS=(

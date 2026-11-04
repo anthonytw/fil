@@ -181,12 +181,18 @@ f_agent_beside_stuck() {
     ms=$(nsx "$NS_S" runuser -u rnfil -- env "SSH_AUTH_SOCK=$sock" bash -c \
       'for i in $(seq 20); do s=$(date +%s%N); ssh-add -l > /dev/null || echo FAIL; e=$(date +%s%N); echo $(((e - s) / 1000000)); done' 2>&1)
     grep -q FAIL <<< "$ms" && fwd_miss "ssh-add -l beside stuck forwards failed (pacing $pace)"
-    note "H1AGENT pacing=$pace ssh_add_ms_p50=$(grep -v FAIL <<< "$ms" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }') max=$(grep -v FAIL <<< "$ms" | sort -n | tail -n 1)"
+    local p50
+    p50=$(grep -v FAIL <<< "$ms" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
+    printf -v "AG_H1_$pace" '%s' "$p50"
+    note "H1AGENT pacing=$pace ssh_add_ms_p50=$p50 max=$(grep -v FAIL <<< "$ms" | sort -n | tail -n 1)"
     fc_detach a
     cx_fk "$FWD_SESSION"
   done
   fwd_pacing on
   lat_stop_listener "$NS_S" "$FWD_H1_DEAF"
+  # The agent beside stuck forwards, paced, at most 25 % (and 25 ms) slower than unpaced.
+  awk -v p="${AG_H1_on:-x}" -v u="${AG_H1_off:-x}" 'BEGIN { exit !(p ~ /^[0-9]+$/ && u ~ /^[0-9]+$/ && p <= u * 1.25 + 25) }' \
+    || fwd_miss "H1: ssh-add -l beside stuck forwards took ${AG_H1_on:-?} ms paced against ${AG_H1_off:-?} ms unpaced (p50)"
   fwd_verdict
 }
 

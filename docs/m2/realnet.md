@@ -192,7 +192,14 @@ The LAN pipe download is noisy in this shared VM in both builds (paced 674 to 94
 
 The PR #83 review found two failures that only appear with several channels. With 16 or more channels sharing the cap, every ack waited for the receiver's 100 ms timer and throughput fell by half. Readers that stopped could stall every other forward and the agent. The fixes are in DESIGN §8.5 "Pacing": ack on drain, timer samples kept as bounds, the pass budget and the agent's reserve, parked channels, and `Mux::poll_transmit_channel`.
 
-These cells measure them on V1's bottleneck, paced against unpaced on the same build. `FIL_FORWARD_PACING=off` is set in the client's command and in a daemon the harness restarts with it. Keystrokes run at 20 keys/s for 20 s; goodput is what the application received. The Lima VM, aarch64. Times in ms are p50 / p99 unless marked otherwise.
+These cells measure them on V1's bottleneck, paced against unpaced on the same build.
+
+Their verdicts are misses: the scenario fails when one does not hold. The rules:
+- **`f_fwd_parallel`:** a paced keystroke p50 over H1's line (2 × the paced idle p50 + 10 ms), on every loaded cell; paced goodput under 0.9 of unpaced; or, on QUIC, a request round trip over the same line.
+- **`f_fwd_stuck`:** the paced live echo more than 10 % and 500 ms over unpaced.
+- **`f_agent_beside_stuck`:** the paced `ssh-add -l` p50 more than 25 % and 25 ms over unpaced.
+
+There is no extra margin for shared runners: on GitHub the paced cells sat 12 to 20 ms under the line. `FIL_FORWARD_PACING=off` is set in the client's command and in a daemon the harness restarts with it. Keystrokes run at 20 keys/s for 20 s; goodput is what the application received. The Lima VM, aarch64. Times in ms are p50 / p99 unless marked otherwise.
 
 **Parallel downloads through one `-L`** (`f_fwd_parallel`, the final build). Goodput is paced against unpaced:
 

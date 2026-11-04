@@ -96,6 +96,14 @@ fidelity *args:
 predict-harness *args:
     cargo run --release -p fil-predict --features harness --example predict_harness -- {{args}}
 
+# The full-stack prediction harness (docs/m3/harness.md): the real client engine against a real session
+# on a real PTY, over simulated pipe and QUIC links, the user's terminal an emulator that reflows.
+# Commands: resize (the true-order resize reproduction; W1's gate), baseline, secret, all. Flags:
+# --transport pipe|quic|both, --seeds N, --one-way-ms N, --filter TEXT, --verbose. `--ignored` tests
+# of crates/fil-client/tests/predict_e2e.rs are the resize reproduction as a test.
+predict-e2e *args:
+    cargo run --release -p fil-client --example predict_e2e -- {{args}}
+
 # Prediction demo in your own terminal: `just predict-demo 200ms` (latency each way).
 # Flags: --backend NAME, --no-predict, --plain, --no-sync.
 predict-demo *args:

@@ -1,4 +1,4 @@
-//! The session's agent socket (DESIGN.md section 10; `docs/m2/plan.md`, A1): a scripted client
+//! The session's agent socket (DESIGN.md section 10): a scripted client
 //! with a real client-side endpoint relays a test-only mini agent (Ed25519, generated at test
 //! time). List and sign through the session's socket across a reconnect and while the link is
 //! down; the socket's permissions; the refusal while detached; the peer-UID check.

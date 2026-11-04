@@ -1,4 +1,4 @@
-//! The M2 forward scenarios (docs/m2/dropin.md, plan §5.2): `-L`, `-R` and `-D` used the way people
+//! The M2 forward scenarios (docs/m2/dropin.md): `-L`, `-R` and `-D` used the way people
 //! use ssh's, with `fwdprobe` at both ends: the Mac's build here, `~/.local/bin/fwdprobe` inside the
 //! fil session's shell on the host (installed through the gate's `install` verb, docs/m2/pi.md).
 //!
@@ -685,7 +685,7 @@ fn have_fp(ctx: &Ctx, host: &str, c: &mut Client) -> Result<bool, String> {
     c.test(&format!("test -x {}", ctx.fp(host)))
 }
 
-/// THE done-when (plan §1): an -L download and an -R upload across a pulled cable, 30 s and then
+/// THE done-when (DESIGN §15): an -L download and an -R upload across a pulled cable, 30 s and then
 /// 5 min, on auto (QUIC) and on the pipe.
 pub fn fwd_cable_pull(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();

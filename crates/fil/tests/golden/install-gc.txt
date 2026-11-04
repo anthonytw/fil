@@ -1,0 +1,20 @@
+# The FROZEN --install-gc contract (docs/m4/release.md section 6.2), pinned by
+# crates/fil/tests/install_gc.rs, whose literals hold the same values. A change to [pinned] is not
+# an extension (section 6.4, item 5): it needs a new install root and the owner's decision.
+# [history] only grows: one line per revision of the contract, the FNV-1a hash of [pinned] as that
+# revision had it. Section 6.4's extensions add lines only under [extensions].
+[pinned]
+install_root = $HOME/.local/share/fil
+version_dir = ^<ver>-w<major>.<rev>$, split at the last -w
+version = [0-9][0-9A-Za-z.-]{0,63}
+wire_number = [1-9][0-9]{0,4}, at most 65535
+socket_dir = /tmp/fil-<uid>
+daemon_lock = <socket_dir>/fil-<major>-<rev>.lock
+start_lock = <socket_dir>/fil-<major>-<rev>.start
+fresh_upload = .new- followed by one or more characters
+fresh_max_age_secs = 86400
+recent_secs = 604800
+far_future_secs = 86400
+[extensions]
+[history]
+1 = 8bcef03e05dfb2cf

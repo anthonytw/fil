@@ -31,6 +31,9 @@ fil-transport = { path = "../fil-transport" }
 # `localtime_r`, for the time zone of `fil ports` (rustix has no time zone calls): one narrow
 # `unsafe` in src/localtime.rs.
 libc = "0.2"
+# SHA-256 for the install (the bundle's SHA256SUMS, the upload's hash, `--install-finish`'s second
+# check): the crate the QUIC stack already uses.
+ring = "0.17"
 rustix = { version = "1", features = ["system", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,6 +41,12 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
 toml = "0.9"
 tracing = "0.1"
+
+[features]
+# The install bootstrap's client side: `fil install`, and the code that sends the bootstrap
+# (docs/m4/plan.md §3 U1). Gated on M4 OQ-1: off by default and never in a release build until
+# the owner approves the second remote command; `just ci` builds and tests it (--all-features).
+install-bootstrap = ["fil-transport/install-bootstrap"]
 
 [dev-dependencies]
 # The test hooks (FIL_TEST_WIRE_REVISION, FIL_TEST_SOCKET_DIR) for the `fil` binary the integration

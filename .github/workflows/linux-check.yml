@@ -80,11 +80,11 @@ jobs:
     if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
     # Each part its own limit: about twice its usual time.
-    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"latency":45}')[matrix.part] }}
+    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45}')[matrix.part] }}
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy"]') }}
+        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy","install"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

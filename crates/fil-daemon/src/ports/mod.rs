@@ -1,5 +1,5 @@
 //! `fil ports` on the remote host: the TCP listeners, whose they are, which session started them,
-//! and what they speak (DESIGN.md section 7.4; M2 plan, P1).
+//! and what they speak (DESIGN.md section 7.4).
 //!
 //! [`ports`] is the whole answer to a `Request::Ports`: it takes the sessions (their summaries,
 //! forward rows, agent rows and how to recognise their processes) and gives an [`Answer`]: the
@@ -11,7 +11,7 @@
 //! 2. the user's other listeners (`ListenerOwner::Mine`);
 //! 3. other users' listeners, by address and port only (`ListenerOwner::Other`).
 //!
-//! # Privacy and safety (plan section 4.4, DESIGN.md section 11.1)
+//! # Privacy and safety (DESIGN.md sections 7.4 and 11.1)
 //!
 //! - Only the user's own processes are read: the socket tables' uid column splits the rows first
 //!   ([`procnet::split`]), and the owner of `/proc/<pid>` is checked before anything in it is

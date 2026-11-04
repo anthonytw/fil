@@ -50,6 +50,8 @@ impl Host {
                 top: self.0.clone(),
             },
             recheck: Duration::ZERO,
+            full_reload: fil_session::policy::FULL_RELOAD,
+            max_age: fil_session::policy::MAX_AGE,
             account: Some(Account::default()),
             lookup: Account::current,
         }
@@ -110,7 +112,10 @@ async fn the_daemon_enforces_and_reports_its_server_policy() {
     // Off the default range, which other runs on this machine may hold.
     cfg.ports = 63100..=63199;
     let d = start(&s, cfg).await;
-    assert!(d.udp_port.is_some(), "the port is bound");
+    assert!(
+        d.udp_port.is_none(),
+        "no UDP port: the policy refuses direct mode"
+    );
     let a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
     let reply = a.reply.clone().expect("attached");
     assert_eq!(reply.udp_port, None, "direct mode is not offered");
@@ -159,66 +164,55 @@ async fn the_daemon_enforces_and_reports_its_server_policy() {
     );
 }
 
-/// `direct = false` is enforced on QUIC too, not only left out of the attach reply: a key
-/// registered while direct mode was allowed cannot resume over QUIC once it is refused (the
-/// client then falls back to the pipe), and a pipe attach under the refusal registers no key.
+/// Waits until `f` holds.
+async fn until(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    while !f() {
+        assert!(std::time::Instant::now() < end, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `direct = false` closes the UDP port, not only leaves it out of the attach reply: at the next
+/// read of the policy (here the periodic one, with nothing asking) the port is let go, and a pipe
+/// attach registers no key; once the policy allows direct mode again, the next read opens a port
+/// and the next attach offers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn direct_false_refuses_quic_resumes_and_registers_no_key() {
-    use fil_transport::auth::{ClientKey, Fingerprint};
-    use fil_transport::quic::QuicLink;
+async fn the_udp_port_follows_direct_in_the_policy_file() {
     let host = Host::named("direct", "", "");
     let s = Scratch::new();
     let mut cfg = direct_config(CAT);
     cfg.policy = host.sources();
+    cfg.policy.full_reload = Duration::from_millis(200);
     cfg.ports = 63200..=63299;
     let d = start(&s, cfg).await;
-    let ck = ClientKey::generate().unwrap();
-    let pk = proto_key(&ck);
-    let mut a = Client::attach(d.pipe().await, Connect::new("main", pk.clone())).await;
-    assert!(
-        a.reply.as_ref().unwrap().udp_port.is_some(),
-        "allowed at first"
-    );
-    assert!(d.registry.contains(&transport_key(&pk)));
+    let port = d.udp_port.expect("allowed at first: the port is bound");
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
+    assert_eq!(a.reply.as_ref().unwrap().udp_port, Some(port));
     a.wait_screen("ready").await;
 
-    // The admin turns direct mode off.
     let f = host.0.join("etc/fil/policy.toml");
     std::fs::write(&f, "direct = false\n").unwrap();
-    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let dial = || async {
-        let addr: std::net::SocketAddr = ([127, 0, 0, 1], d.udp_port.unwrap()).into();
-        let pin = Fingerprint::from_bytes(
-            d.fingerprint
-                .as_ref()
-                .unwrap()
-                .as_bytes()
-                .try_into()
-                .unwrap(),
-        );
-        let params = fil_transport::LinkParams {
-            connect_timeout: Duration::from_secs(60),
-            ..fil_transport::LinkParams::default()
-        };
-        QuicLink::connect(addr, pin, &ck, params).await
-    };
-    let q = dial().await.expect("the key was still registered");
-    send_ctl(&q, &hello()).await;
-    let resume = Connect::new("main", pk.clone()).resume(a.resume_request());
-    send_ctl(&q, &ControlMsg::Attach(resume.attach())).await;
-    let mut b = Client::new(q, size(80, 24));
-    b.wait_down().await;
-    assert!(b.reply.is_none(), "no resume over QUIC: {:?}", b.reply);
+    until("the port closes", || d.handle.udp_port().is_none()).await;
+    until("the port is let go", || {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+    })
+    .await;
+    let pk = key(2);
+    let c = Client::attach(d.pipe().await, Connect::new("other", pk.clone())).await;
+    assert_eq!(c.reply.as_ref().unwrap().udp_port, None);
     assert!(
         !d.registry.contains(&transport_key(&pk)),
-        "and the key is gone"
+        "no key registered"
     );
 
-    // A pipe attach now registers no key for QUIC.
-    let ck2 = ClientKey::generate().unwrap();
-    let pk2 = proto_key(&ck2);
-    let c = Client::attach(d.pipe().await, Connect::new("other", pk2.clone())).await;
-    assert_eq!(c.reply.as_ref().unwrap().udp_port, None);
-    assert!(!d.registry.contains(&transport_key(&pk2)));
+    std::fs::write(&f, "# direct mode again\n").unwrap();
+    until("a port opens", || d.handle.udp_port().is_some()).await;
+    let e = Client::attach(d.pipe().await, Connect::new("third", key(3))).await;
+    assert_eq!(
+        e.reply.as_ref().unwrap().udp_port,
+        d.handle.udp_port(),
+        "offered again"
+    );
     d.stop().await;
 }

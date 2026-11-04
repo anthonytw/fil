@@ -17,9 +17,12 @@
 //! the driver will touch.
 //!
 //! ```text
-//! dropin [--hosts pi1,pi2 | --local] [--only NAME[,NAME]] [--fil PATH] [--verbose] [--list]
-//!        [--require vim,less,...] [--allow-missing] [--allow-skip]
+//! dropin [--hosts pi1,pi2 | --local] [--only NAME[,NAME]] [--fil PATH] [--fwdprobe PATH]
+//!        [--verbose] [--list] [--require vim,less,...] [--allow-missing] [--allow-skip] [--strict]
 //! ```
+//!
+//! The M2 forward scenarios (`forward.rs`, docs/m2/dropin.md) also need `fwdprobe`: this machine's
+//! build (`--fwdprobe`, default next to `--fil`) and the host's, installed through the gate.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,8 +32,12 @@ use std::time::Instant;
 #[path = "../support/harness.rs"]
 mod harness;
 
+mod agent;
 mod common;
 mod disrupt;
+mod forward;
+mod manage;
+mod netcut;
 mod output;
 mod session;
 mod tools;
@@ -59,10 +66,13 @@ fn is_expected_failure(name: &str, err: &str) -> bool {
 
 /// The tools every host must have. A host without one fails the run (finding: a reimaged Pi must
 /// not turn the gate green by dropping the vim scenarios).
-const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git"];
+/// `ssh-add` and `ssh-keygen` are the agent scenarios' (plan §5.2).
+const REQUIRED_TOOLS: &[&str] = &["vim", "less", "top", "htop", "git", "ssh-add", "ssh-keygen"];
 
 pub struct Ctx {
     pub fil: PathBuf,
+    /// This machine's fwdprobe (the forward scenarios' ends here).
+    pub fwdprobe: PathBuf,
     pub work: PathBuf,
     pub targets: Targets,
     pub verbose: bool,
@@ -96,6 +106,19 @@ impl Variant {
 
 static SEQ: Mutex<u32> = Mutex::new(0);
 
+/// What a client may have beyond the default (`Ctx::client_with`).
+#[derive(Default)]
+pub struct Extra<'a> {
+    /// Options before the host: `-L`, `-R`, `-D`, `-A`.
+    pub args: &'a [String],
+    /// Both paths through the cut relay (`netcut.rs`).
+    pub via: Option<&'a netcut::Cut>,
+    /// Environment for the client (the throwaway agent's `SSH_AUTH_SOCK`).
+    pub env: Vec<(String, String)>,
+    /// `agent = ...` for the host in its config.
+    pub agent: Option<&'static str>,
+}
+
 impl Ctx {
     pub fn is_local(host: &str) -> bool {
         host == LOCAL
@@ -103,9 +126,37 @@ impl Ctx {
 
     /// A scratch config for one host and variant; returns its path.
     pub fn config(&self, host: &str, variant: Variant) -> PathBuf {
-        let path = self
-            .work
-            .join(format!("config-{host}-{}.toml", variant.tag()));
+        self.config_via(host, variant, None, None, false)
+    }
+
+    /// The same, with both paths through the cut relay when `via` is given (`netcut.rs`): ssh to
+    /// the relay's port with the host key checked under the real name, QUIC to 127.0.0.1; and with
+    /// `agent = AGENT` for the host when given (`confirm`, agent.rs).
+    ///
+    /// `keep_agent`: the client's own `SSH_AUTH_SOCK` is a throwaway agent (agent.rs), so the pipe's
+    /// ssh is told to keep authenticating with the driver's own (`IdentityAgent`, or `none` for
+    /// the key files when the driver has no agent).
+    pub fn config_via(
+        &self,
+        host: &str,
+        variant: Variant,
+        via: Option<&netcut::Cut>,
+        agent: Option<&str>,
+        keep_agent: bool,
+    ) -> PathBuf {
+        let path = self.work.join(format!(
+            "config-{host}-{}{}{}{}.toml",
+            variant.tag(),
+            if via.is_some() { "-cut" } else { "" },
+            agent.map(|a| format!("-agent-{a}")).unwrap_or_default(),
+            if keep_agent { "-keep" } else { "" }
+        ));
+        let keep = if keep_agent {
+            let own = std::env::var("SSH_AUTH_SOCK").unwrap_or_else(|_| "none".into());
+            format!("\"-o\", {}, ", toml_str(&format!("IdentityAgent={own}")))
+        } else {
+            String::new()
+        };
         let transport = if variant == Variant::Pipe {
             "pipe"
         } else {
@@ -120,16 +171,30 @@ impl Ctx {
                 ),
                 Some("127.0.0.1".to_string()),
             ),
-            _ => (
-                format!(
-                    "[\"ssh\", \"-o\", \"BatchMode=yes\", {}, \"fil\", \"server\", \"--stdio\"]",
-                    toml_str(&self.targets.target(host))
+            _ => match via {
+                None => (
+                    format!(
+                        "[\"ssh\", \"-o\", \"BatchMode=yes\", {keep}{}, \"fil\", \"server\", \"--stdio\"]",
+                        toml_str(&self.targets.target(host))
+                    ),
+                    Some(self.targets.host_part(host)),
                 ),
-                Some(self.targets.host_part(host)),
-            ),
+                Some(cut) => (
+                    format!(
+                        "[\"ssh\", \"-o\", \"BatchMode=yes\", {keep}\"-o\", \"HostName=127.0.0.1\", \"-o\", \"Port={}\", \"-o\", {}, \"-o\", \"CheckHostIP=no\", {}, \"fil\", \"server\", \"--stdio\"]",
+                        cut.tcp_port,
+                        toml_str(&format!("HostKeyAlias={}", self.targets.host_part(host))),
+                        toml_str(&self.targets.target(host))
+                    ),
+                    Some("127.0.0.1".to_string()),
+                ),
+            },
         };
         let mut s =
             format!("[defaults]\ntransport = \"{transport}\"\n\n[host.{host}]\npipe = {pipe}\n");
+        if let Some(a) = agent {
+            s.push_str(&format!("agent = {}\n", toml_str(a)));
+        }
         if variant == Variant::Auto
             && let Some(a) = address
         {
@@ -151,24 +216,47 @@ impl Ctx {
         rows: u16,
         cols: u16,
     ) -> Client {
+        self.client_with(host, variant, session, rows, cols, &Extra::default())
+    }
+
+    /// A client with what `x` adds: options before the host (forward flags, `-A`), its paths
+    /// through the cut relay, environment (`SSH_AUTH_SOCK`), the `agent` setting.
+    pub fn client_with(
+        &self,
+        host: &str,
+        variant: Variant,
+        session: &str,
+        rows: u16,
+        cols: u16,
+        x: &Extra<'_>,
+    ) -> Client {
         let n = {
             let mut s = SEQ.lock().unwrap();
             *s += 1;
             *s
         };
-        let mut c = Client::start(Spawn {
-            fil: &self.fil,
-            config: &self.config(host, variant),
-            host,
-            session,
-            rows,
-            cols,
-            state: self
-                .work
-                .join("state")
-                .join(format!("{n}-{host}-{session}")),
-            env: Vec::new(),
-        });
+        let mut c = Client::start_with(
+            Spawn {
+                fil: &self.fil,
+                config: &self.config_via(
+                    host,
+                    variant,
+                    x.via,
+                    x.agent,
+                    x.env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"),
+                ),
+                host,
+                session,
+                rows,
+                cols,
+                state: self
+                    .work
+                    .join("state")
+                    .join(format!("{n}-{host}-{session}")),
+                env: x.env.clone(),
+            },
+            x.args,
+        );
         c.set_scrub(self.targets.clone());
         c
     }
@@ -365,12 +453,39 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("killed_ssh_midcommand", disrupt::killed_ssh_midcommand),
         ("client_sleep", disrupt::client_sleep),
         ("disrupt_vim", disrupt::disrupt_vim),
+        // M2: forwards (docs/m2/dropin.md).
+        ("fwd_local_http", forward::fwd_local_http),
+        ("fwd_cable_pull", forward::fwd_cable_pull),
+        ("fwd_reconnect", forward::fwd_reconnect),
+        ("fwd_swap", forward::fwd_swap),
+        ("fwd_sleep", forward::fwd_sleep),
+        ("fwd_many_short", forward::fwd_many_short),
+        ("fwd_parallel", forward::fwd_parallel),
+        ("fwd_halfclose", forward::fwd_halfclose),
+        ("fwd_rst", forward::fwd_rst),
+        ("fwd_remote", forward::fwd_remote),
+        ("fwd_remote_detached", forward::fwd_remote_detached),
+        ("fwd_dynamic", forward::fwd_dynamic),
+        ("fwd_bulk_typing", forward::fwd_bulk_typing),
+        ("fwd_churn", forward::fwd_churn),
+        // M2: managing forwards after the attach (F4 part 2).
+        ("fwd_inside_add_rm", manage::fwd_inside_add_rm),
+        ("fwd_hostile_remote", manage::fwd_hostile_remote),
+        ("fwd_ports_view", manage::fwd_ports_view),
+        ("detach_inside", manage::detach_inside),
+        // M2: the agent relay (A1).
+        ("agent_list_sign", agent::agent_list_sign),
+        ("agent_reconnect", agent::agent_reconnect),
+        ("agent_off_default", agent::agent_off_default),
+        ("agent_detached", agent::agent_detached),
+        ("agent_filter", agent::agent_filter),
+        ("agent_confirm", agent::agent_confirm),
     ]
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip]"
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]"
     );
     std::process::exit(2);
 }
@@ -394,6 +509,8 @@ fn main() {
     let mut hosts: Option<Vec<String>> = None;
     let mut only: Option<Vec<String>> = None;
     let mut fil = PathBuf::from("target/release/fil");
+    let mut fwdprobe: Option<PathBuf> = None;
+    let mut strict = false;
     let mut verbose = false;
     let mut local = false;
     let mut allow_missing = false;
@@ -406,6 +523,8 @@ fn main() {
             "--only" => only = Some(csv(args.next())),
             "--require" => require = csv(args.next()),
             "--fil" => fil = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            "--fwdprobe" => fwdprobe = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--strict" => strict = true,
             "--local" => local = true,
             "--allow-missing" => allow_missing = true,
             "--allow-skip" => allow_skip = true,
@@ -466,8 +585,12 @@ fn main() {
     std::fs::create_dir_all(&work).expect("work dir");
     let work = std::fs::canonicalize(work).expect("work dir");
     let local_daemon = local.then(|| Local::start(&fil));
+    // fwdprobe next to fil unless named; only the forward scenarios need it, so a missing one is
+    // their failure, not the run's.
+    let fwdprobe = fwdprobe.unwrap_or_else(|| fil.with_file_name("fwdprobe"));
     let ctx = Ctx {
         fil,
+        fwdprobe,
         work,
         targets,
         verbose,
@@ -479,6 +602,7 @@ fn main() {
     let mut table = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut xfailed: Vec<String> = Vec::new();
+    let mut known: Vec<String> = Vec::new();
     let mut ran = 0;
     for host in &hosts {
         let version = if local {
@@ -531,12 +655,23 @@ fn main() {
             let secs = took.as_secs_f64();
             match end {
                 End::Pass(notes) => {
-                    println!("PASS {host} {name} ({secs:.1} s)");
+                    // A finding in fil the scenario recorded and went past (docs/m2/dropin.md):
+                    // the run marks it, and fails on it with --strict.
+                    let bugs = notes.iter().filter(|n| n.starts_with("KNOWN-BUG:")).count();
+                    let mark = if bugs > 0 { "PASS*" } else { "PASS" };
+                    if bugs > 0 {
+                        known.push(format!("{host} {name}"));
+                        if strict {
+                            failures += 1;
+                        }
+                    }
+                    println!("{mark} {host} {name} ({secs:.1} s)");
                     for n in &notes {
                         println!("       {}", ctx.targets.scrub(n));
                     }
                     table.push(format!(
-                        "| {host} | {name} | pass | {} |",
+                        "| {host} | {name} | {} | {} |",
+                        if bugs > 0 { "pass*" } else { "pass" },
                         ctx.targets.scrub(&notes.join("; "))
                     ));
                 }
@@ -632,6 +767,18 @@ fn main() {
     for l in table {
         println!("{l}");
     }
+    if !known.is_empty() {
+        println!(
+            "\n{} scenario(s) recorded KNOWN-BUG findings in fil{}: {}",
+            known.len(),
+            if strict {
+                " (failures with --strict)"
+            } else {
+                ""
+            },
+            known.join(", ")
+        );
+    }
     println!(
         "\n{ran} scenarios run, {failures} failed, {} skipped{}, {} expected failures{}",
         skipped.len(),
@@ -661,6 +808,22 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
     let xfail = XFAIL.contains(&name);
     match r {
         Ok(notes) => {
+            // A miss in what a done-when or a security property requires (forward.rs): every one
+            // the scenario collected fails it, all listed. Only a named finding (KNOWN-BUG:,
+            // which says what fixes it) passes as PASS*.
+            let misses: Vec<&String> = notes.iter().filter(|n| n.starts_with("MISS:")).collect();
+            if !misses.is_empty() {
+                return End::Fail(format!(
+                    "{} miss(es): {}\n{}",
+                    misses.len(),
+                    misses
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    notes.join("\n")
+                ));
+            }
             if xfail && local {
                 // The known bugs need a network (resize order) or are the same everywhere; on
                 // this machine a pass proves nothing either way.
@@ -738,6 +901,28 @@ mod tests {
         assert_eq!(ls_row_of(&table, "busy").unwrap().0, "client2");
         assert!(ls_row_of(&table, "gone").is_none());
         assert!(ls_row_of("no sessions\n", "idle").is_none());
+    }
+
+    #[test]
+    fn a_miss_fails_the_scenario_and_a_named_finding_does_not() {
+        use super::{End, classify};
+        let miss = vec![
+            "sha256 equal".to_string(),
+            "MISS: -L sha256 differs".to_string(),
+        ];
+        assert!(
+            matches!(classify("fwd_reconnect", Ok(miss.clone()), false, false, false), End::Fail(e) if e.contains("1 miss") && e.contains("-L sha256 differs"))
+        );
+        // Also with every allowance a run can give.
+        assert!(matches!(
+            classify("fwd_reconnect", Ok(miss), true, true, true),
+            End::Fail(_)
+        ));
+        let named = vec!["KNOWN-BUG: slow, fixed by PR X".to_string()];
+        assert!(matches!(
+            classify("fwd_cable_pull", Ok(named), false, false, false),
+            End::Pass(_)
+        ));
     }
 
     #[test]

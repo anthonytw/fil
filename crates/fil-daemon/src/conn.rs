@@ -324,9 +324,8 @@ impl Inner {
         // Server policy refuses the direct transport now (it may have allowed it when the key
         // was registered): the key goes, and the connection is dropped as for a revoked key, so
         // the client falls back to the pipe, whose attach reply offers no direct mode.
-        if self.host.policy.direct().is_err() {
+        if self.host.refuses_direct(peer) {
             tracing::debug!("direct attach refused: server policy");
-            self.registry.revoke(peer);
             return Err(Fail::Drop("server policy"));
         }
         match self.host.binding(peer) {

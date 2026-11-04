@@ -9,12 +9,12 @@ use crate::harness::{Client, ensure, ms, secs};
 use crate::{Ctx, Variant};
 
 /// How many times the client logged that its link went down.
-fn link_downs(c: &Client) -> usize {
+pub fn link_downs(c: &Client) -> usize {
     c.log().matches("\"message\":\"link down\"").count()
 }
 
 /// Kills the one ssh the client started.
-fn kill_ssh(c: &Client) -> Result<(), String> {
+pub fn kill_ssh(c: &Client) -> Result<(), String> {
     let ssh = c.ssh_children();
     ensure(ssh.len() == 1, || {
         format!("expected one ssh child, found {ssh:?}")

@@ -30,5 +30,5 @@ pub use endpoint::{
     SOCKS_TIMEOUT, Snapshot,
 };
 #[cfg(feature = "test-hooks")]
-pub use endpoint::{LocalError, PumpPhase, PumpReport, Wakeups};
+pub use endpoint::{ChannelClose, LocalError, PumpPhase, PumpReport, Wakeups};
 pub use stream::{BoxStream, ForwardStream};

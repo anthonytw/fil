@@ -257,10 +257,12 @@ fn sess_wait(c: &mut Client, out: &str, timeout: Duration) -> Result<(), String>
 /// session. The daemon is not dumpable (`hardening.rs`), which makes `/proc/PID/fd` root's, so the
 /// count is `FDSize` from `/proc/PID/status`: the table's size, which the kernel grows (in powers
 /// of two) as descriptors are opened and never shrinks, so a leak shows as growth. On a host
-/// without `/proc` (macOS on `--local`) it is `-1`.
+/// without `/proc` (macOS on `--local`) it is `-1`. The daemon is an ancestor of the session's
+/// shell, and macOS's (BSD) `pgrep` leaves its own ancestors out unless given `-a`; Linux's
+/// `pgrep` has no such rule, and its `-a` means something else (list the command lines).
 fn daemon_stats(c: &mut Client) -> Result<(u32, u64, i64), String> {
     let out = c.run(
-        "p=$(pgrep -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(awk '/^FDSize:/ { print $2 }' /proc/$p/status 2>/dev/null || echo -1)\"",
+        "a=; [ \"$(uname)\" = Darwin ] && a=-a; p=$(pgrep $a -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(awk '/^FDSize:/ { print $2 }' /proc/$p/status 2>/dev/null || echo -1)\"",
         CMD_TIMEOUT,
     )?;
     let line = out
@@ -271,7 +273,7 @@ fn daemon_stats(c: &mut Client) -> Result<(u32, u64, i64), String> {
     let pid = w
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or("no daemon pid")?;
+        .ok_or_else(|| format!("no daemon pid: {out:?}"))?;
     let rss = w.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let fds = w.next().and_then(|s| s.parse().ok()).unwrap_or(-1);
     Ok((pid, rss, fds))
@@ -834,8 +836,18 @@ pub fn fwd_local_http(ctx: &Ctx, host: &str) -> Res {
     Ok(notes)
 }
 
+/// Bytes each burst connection sends and gets back.
+const BURST_BYTES: u64 = 1000;
+
 /// fwdprobe burst through the -L (from here to an echo server in the session) or the -R (from the
 /// session to an echo server here). Returns (ok, failed, ms, first error).
+///
+/// The echo server closes first (`--close-after`, and the burst's `--no-shutdown`), so each
+/// connection's TIME_WAIT is on a fixed port: the server's and the forward's listener. Were the
+/// burst to half-close first, the TIME_WAITs would be on ephemeral ports, two per connection (the
+/// burst's and the forward's connect to the server), and macOS gives no port in TIME_WAIT out
+/// again for 2 x MSL (30 s) whatever the destination: 10,000 sequential connections ran out of
+/// its 16,384 after 8,188, and every scenario for the next 30 s failed with `addrnotavailable`.
 fn burst(
     ctx: &Ctx,
     host: &str,
@@ -848,7 +860,11 @@ fn burst(
     let fp = ctx.fp(host);
     let text = if !remote {
         let _ = c.run("rm -f \"$D\"/echo.out*", CMD_TIMEOUT)?;
-        sess_bg(c, &format!("{fp} serve 127.0.0.1:{PL} echo"), "echo.out")?;
+        sess_bg(
+            c,
+            &format!("{fp} serve 127.0.0.1:{PL} echo --close-after {BURST_BYTES}"),
+            "echo.out",
+        )?;
         sess_listening(c, "echo.out")?;
         let mut b = Mac::spawn(
             ctx,
@@ -861,6 +877,9 @@ fn burst(
                 count.to_string(),
                 "--parallel".into(),
                 par.to_string(),
+                "--bytes".into(),
+                BURST_BYTES.to_string(),
+                "--no-shutdown".into(),
             ],
         )?;
         b.wait(Duration::from_secs(1800))
@@ -871,12 +890,20 @@ fn burst(
         let _e = Mac::serve(
             ctx,
             "echo",
-            &["serve".into(), format!("127.0.0.1:{}", p.r), "echo".into()],
+            &[
+                "serve".into(),
+                format!("127.0.0.1:{}", p.r),
+                "echo".into(),
+                "--close-after".into(),
+                BURST_BYTES.to_string(),
+            ],
         )?;
         let _ = c.run("rm -f \"$D\"/burst.out*", CMD_TIMEOUT)?;
         sess_bg(
             c,
-            &format!("{fp} connect 127.0.0.1:{PR} burst --count {count} --parallel {par}"),
+            &format!(
+                "{fp} connect 127.0.0.1:{PR} burst --count {count} --parallel {par} --bytes {BURST_BYTES} --no-shutdown"
+            ),
             "burst.out",
         )?;
         sess_wait(c, "burst.out", Duration::from_secs(1800))?;
@@ -906,10 +933,11 @@ pub fn fwd_many_short(ctx: &Ctx, host: &str) -> Res {
     let downs = link_downs(&c);
     let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, false, 10_000, 1)?;
     let mut notes = vec![format!(
-        "10000 sequential -L connections over QUIC: {ok} echoed, {failed} failed, in {} ({:.0}/s); link downs during it: {}",
+        "10000 sequential -L connections over QUIC: {ok} echoed, {failed} failed, in {} ({:.0}/s); link downs during it: {}{}",
         ms(Duration::from_millis(t)),
         ok as f64 * 1000.0 / t.max(1) as f64,
-        link_downs(&c) - downs
+        link_downs(&c) - downs,
+        ephemeral_note()
     )];
     if ok != 10_000 || failed != 0 {
         notes.push(format!(
@@ -923,6 +951,33 @@ pub fn fwd_many_short(ctx: &Ctx, host: &str) -> Res {
     }
     finish(c)?;
     Ok(notes)
+}
+
+/// This machine's ephemeral port range and TIME_WAIT, for a note (macOS; empty elsewhere): what
+/// bounds how many connections a burst can make in 30 s (see [`burst`]).
+fn ephemeral_note() -> String {
+    if !cfg!(target_os = "macos") {
+        return String::new();
+    }
+    let keys = [
+        "net.inet.ip.portrange.first",
+        "net.inet.ip.portrange.last",
+        "net.inet.tcp.msl",
+    ];
+    let v: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            Command::new("/usr/sbin/sysctl")
+                .args(["-n", k])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    format!(
+        "; here: ephemeral ports {}-{}, MSL {} ms (TIME_WAIT is twice that)",
+        v[0], v[1], v[2]
+    )
 }
 
 /// 200 concurrent connections each way: all exact.

@@ -463,7 +463,13 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
         timeout(Duration::from_secs(10), ask(&mut asker, &req, &mut back))
             .await
             .expect("the agent answered beside stuck forwards")
-            .unwrap_or_else(|e| panic!("an agent request: {e}; {}", mbufs_note(&denied)));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "an agent request: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
+                )
+            });
         rtts.push(t.elapsed());
     }
     rtts.sort();
@@ -610,7 +616,13 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
         timeout(Duration::from_secs(5), ask(&mut asker, &req, &mut back))
             .await
             .expect("the agent answered beside the trickling channel")
-            .unwrap_or_else(|e| panic!("an agent request: {e}; {}", mbufs_note(&denied)));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "an agent request: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
+                )
+            });
         worst = worst.max(t1.elapsed());
     }
     eprintln!(
@@ -680,7 +692,13 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
                     w.client.ep.snapshot()
                 )
             })
-            .unwrap_or_else(|e| panic!("{t:?}: agent request #{i}: {e}; {}", mbufs_note(&denied)));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{t:?}: agent request #{i}: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
+                )
+            });
         worst = worst.max(t1.elapsed());
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

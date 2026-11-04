@@ -579,11 +579,21 @@ pub struct World {
 }
 
 impl World {
-    /// Both endpoints' [`endpoint_report_timed`], for a failure message.
+    /// Both endpoints' [`endpoint_report_timed`], with what each side's harness saw (endpoint and
+    /// receive-loop errors, `LinkFailed`s), for a failure message.
     pub fn report(&self) -> String {
+        let harness = |e: &End| {
+            format!(
+                "harness errors {:?}, LinkFailed {}",
+                e.errors.lock().unwrap_or_else(PoisonError::into_inner),
+                e.link_failed.load(Ordering::SeqCst)
+            )
+        };
         format!(
-            "\n  client: {}\n  daemon: {}",
+            "\n  client: {}; {}\n  daemon: {}; {}",
+            harness(&self.client),
             endpoint_report_timed(&self.client.ep),
+            harness(&self.daemon),
             endpoint_report_timed(&self.daemon.ep)
         )
     }
@@ -1309,6 +1319,13 @@ pub fn endpoint_report(ep: &Endpoint<TestLink>) -> String {
     for e in &errors {
         r.push_str(&format!("\n      {e:?}"));
     }
+    let (closes, seen) = ep.abnormal_closes();
+    r.push_str(&format!(
+        "\n    channels the mux closed other than Done: {seen}"
+    ));
+    for c in &closes {
+        r.push_str(&format!("\n      {c:?}"));
+    }
     let pumps = ep.pumps();
     r.push_str(&format!("\n    pumps alive: {}", pumps.len()));
     for p in &pumps {
@@ -1334,45 +1351,75 @@ pub fn endpoint_report_timed(ep: &Endpoint<TestLink>) -> String {
         })
 }
 
+/// What the kernel says about its socket memory, at one moment (macOS): see [`mbufs_denied`].
+pub struct KernelMemory {
+    /// The count of mbuf requests the kernel denied, ever (`netstat -m`), or why not.
+    denied: Result<u64, String>,
+    /// How many times the kernel made sockets defunct, ever (`kern.ipc.sodefunct_calls`): it
+    /// does so to a process's sockets under memory pressure, among other reasons, and the peer of
+    /// a defunct socket sees a reset.
+    defunct: Option<u64>,
+}
+
 /// The kernel's count of mbuf requests it denied, ever (`netstat -m`, macOS): what rises when
 /// the mbuf pool runs out and loopback sends fail with `ENOBUFS` or, inside TCP, are dropped and
-/// retransmitted on a timer. Why not, elsewhere or if it cannot be read.
-pub fn mbufs_denied() -> Result<u64, String> {
+/// retransmitted on a timer. Why not, elsewhere or if it cannot be read: the macOS 15 Intel
+/// runner's `netstat -m` has no such line, so then the note carries the whole output. With it,
+/// the kernel's count of defunct sockets.
+pub fn mbufs_denied() -> KernelMemory {
     if !cfg!(target_os = "macos") {
-        return Err("not measured on this OS".into());
+        return KernelMemory {
+            denied: Err("not measured on this OS".into()),
+            defunct: None,
+        };
     }
-    let out = std::process::Command::new("/usr/sbin/netstat")
-        .arg("-m")
+    let defunct = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.ipc.sodefunct_calls"])
         .output()
-        .map_err(|e| format!("netstat -m: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .find(|l| l.contains("requests for memory denied"))
-        .and_then(|l| l.split_whitespace().next()?.parse().ok())
-        .ok_or_else(|| {
-            format!(
-                "netstat -m ({}) has no count of denied requests: {:?} {:?}",
-                out.status,
-                text.lines().take(3).collect::<Vec<_>>(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )
-        })
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
+    let denied = (|| {
+        let out = std::process::Command::new("/usr/sbin/netstat")
+            .arg("-m")
+            .output()
+            .map_err(|e| format!("netstat -m: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find(|l| l.contains("requests for memory denied"))
+            .and_then(|l| l.split_whitespace().next()?.parse().ok())
+            .ok_or_else(|| {
+                format!(
+                    "netstat -m ({}) has no count of denied requests: {:?} {:?}",
+                    out.status,
+                    text.lines().map(str::trim).collect::<Vec<_>>().join(" | "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )
+            })
+    })();
+    KernelMemory { denied, defunct }
 }
 
 /// A line for a failure message: the mbuf requests the kernel denied since `before` (from
 /// [`mbufs_denied`]), machine-wide, so other tests running at the same time count too.
-pub fn mbufs_note(before: &Result<u64, String>) -> String {
+pub fn mbufs_note(before: &KernelMemory) -> String {
     let retried = NO_BUFFERS_RETRIES.load(Ordering::Relaxed);
-    let denied = match (before, mbufs_denied()) {
+    let now = mbufs_denied();
+    let denied = match (&before.denied, &now.denied) {
         (Ok(b), Ok(a)) => format!(
             "kernel mbuf requests denied since the test began: {} (machine-wide; {a} ever)",
             a.saturating_sub(*b)
         ),
-        (Err(e), _) => format!("kernel mbuf denials: {e}"),
-        (_, Err(e)) => format!("kernel mbuf denials: {e}"),
+        (Err(e), _) | (_, Err(e)) => format!("kernel mbuf denials: {e}"),
+    };
+    let defunct = match (before.defunct, now.defunct) {
+        (Some(b), Some(a)) => format!(
+            "; sockets made defunct by the kernel since the test began: {} (machine-wide)",
+            a.saturating_sub(b)
+        ),
+        _ => String::new(),
     };
     format!(
-        "{denied}; the tests' own socket calls in this process were retried {retried} times \
-         for want of kernel memory"
+        "{denied}{defunct}; the tests' own socket calls in this process were retried {retried} \
+         times for want of kernel memory"
     )
 }

@@ -1161,6 +1161,21 @@ pub struct LocalError {
 #[cfg(feature = "test-hooks")]
 const LOCAL_ERRORS_KEPT: usize = 64;
 
+/// A channel the mux closed with a reason other than `Done`: the peer's `Close`, or this side's
+/// own mux (a violation, an open or linger timeout), as the `Closed` event told it
+/// ([`Endpoint::abnormal_closes`], feature `test-hooks`). A local socket error is a
+/// [`LocalError`] instead.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct ChannelClose {
+    pub channel: u32,
+    pub why: CloseReason,
+    /// It was an `Agent` channel.
+    pub agent: bool,
+    /// The endpoint had a link when it happened.
+    pub attached: bool,
+}
+
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
 #[cfg(feature = "test-hooks")]
 #[derive(Default)]
@@ -1172,6 +1187,9 @@ struct TestHooks {
     local_errors: Mutex<Vec<LocalError>>,
     /// How many there were in all.
     local_errors_seen: std::sync::atomic::AtomicU64,
+    /// The channels closed other than `Done` (the first [`LOCAL_ERRORS_KEPT`]), and how many.
+    closes: Mutex<Vec<ChannelClose>>,
+    closes_seen: std::sync::atomic::AtomicU64,
     /// Runs in `open_local` between the policy check and the open, without the lock.
     after_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// How often each sender task went round its loop, and how often the mux's timers ran.
@@ -1194,6 +1212,14 @@ impl TestHooks {
                 errno: e.and_then(std::io::Error::raw_os_error),
                 gave_up,
             });
+        }
+    }
+
+    fn closed(&self, c: ChannelClose) {
+        self.closes_seen.fetch_add(1, Ordering::Relaxed);
+        let mut v = lock(&self.closes);
+        if v.len() < LOCAL_ERRORS_KEPT {
+            v.push(c);
         }
     }
 
@@ -1931,6 +1957,17 @@ impl<L: Link> Endpoint<L> {
             h.local_errors_seen.load(Ordering::Relaxed),
         )
     }
+
+    /// The channels the mux closed other than `Done` (the first 64), and how many there were in
+    /// all (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn abnormal_closes(&self) -> (Vec<ChannelClose>, u64) {
+        let h = &self.inner().hooks;
+        (
+            lock(&h.closes).clone(),
+            h.closes_seen.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl<L: Link> State<L> {
@@ -2045,6 +2082,18 @@ impl<L: Link> Inner<L> {
                 }
                 MuxEvent::Closed { channel, why } => {
                     debug!(channel = channel.0, why = ?why, "forward channel closed");
+                    #[cfg(feature = "test-hooks")]
+                    if why != CloseReason::Done {
+                        self.hooks.closed(ChannelClose {
+                            channel: channel.0,
+                            why,
+                            agent: st
+                                .slots
+                                .get(&channel.0)
+                                .is_some_and(|s| s.key == StatsKey::Agent),
+                            attached: st.link.is_some(),
+                        });
+                    }
                     // Nothing it sent is still owed: the peer's `Close` says it consumed all
                     // of it (or gave up on it), and a `Close` ends the peer's acks for it. What
                     // still waits for the data sender is stale, and sent after the pacer

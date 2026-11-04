@@ -2396,6 +2396,10 @@ impl<L: Link> Inner<L> {
             st.emit(EndpointEvent::LinkFailed);
         }
         self.drain(&mut st);
+        drop(st);
+        // Detaching starts the mux's link-down timers (linger, the shorter open wait): the
+        // control sender, which sleeps to the deadlines, must look again whoever called.
+        self.kick_ctl();
     }
 
     // ---- the pump ----------------------------------------------------------------------------

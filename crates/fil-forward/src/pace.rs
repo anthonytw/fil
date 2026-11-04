@@ -13,9 +13,10 @@
 //! socket consumed (§8.5 "Data and credit"); an acknowledgement that covers a record still in
 //! flight gives a round-trip sample: the time since the newest record it covers left. The base
 //! is the smallest sample of the last two periods (30 s each); the current delay is the smallest
-//! of the last four samples; their difference is the queueing delay. The cap on bytes in flight
-//! then follows LEDBAT: slow start (the cap grows by what is acknowledged) until the queueing
-//! delay reaches half the target, then a linear controller toward [`TARGET`] (25 ms) of queueing
+//! sample of the last base round trip, and of at least the last four (a standing queue shows, a
+//! burst's passing queue does not); their difference is the queueing delay. The cap on bytes in
+//! flight then follows LEDBAT: slow start (the cap grows by what is acknowledged) until the
+//! queueing delay reaches three quarters of the target, then a linear controller toward [`TARGET`] (25 ms) of queueing
 //! delay, halving per round trip past four times the target. It grows only while it held something
 //! back, so an application that sends little never earns a cap it does not use.
 //!
@@ -67,10 +68,12 @@
 //! never goes through the endpoint at all.
 //!
 //! **Clock.** The pacer is sans-IO: no clock and no tasks, the time is passed in. It changes with
-//! acks, sends and two kinds of deadline (a record that becomes presumed delivered, a drain's time
-//! limit), which [`Pacer::next_deadline`] reports, so a held sender sleeps until then or the next
-//! ack. One pacer per link: a new link starts a new one (its path, and so its base, may be
-//! another), and a path change on QUIC forgets the base.
+//! acks, sends and three kinds of deadline (a record that becomes presumed delivered, a drain
+//! probe's time, a drain's time limit), which [`Pacer::next_deadline`] reports, so a held sender
+//! sleeps until then or the next ack. One pacer per link: a new link starts a new one (its path,
+//! and so its base, may be another). A path change on QUIC starts the pacer over the same way
+//! ([`Pacer::path_changed`]): no base, slow start from [`INITIAL_CAP`], and the records sent
+//! before the change give no sample, so the base is learned from the new path alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -171,6 +174,8 @@ enum Via {
 /// a sample measures from there, and "sent before the newest acknowledged record" is decided by
 /// it, which for a merged record is the later (safe) end. `first_at` is when its first byte was:
 /// whether an ack can have waited for the peer's timer is decided by it (the earlier, safe end).
+/// `epoch` is the path it was sent on ([`Pacer::path_changed`]): it gives no sample once the path
+/// has changed, since the round trip it would measure is the old path's.
 #[derive(Clone, Copy, Debug)]
 struct Rec {
     start: u64,
@@ -178,6 +183,7 @@ struct Rec {
     at: Instant,
     first_at: Instant,
     via: Via,
+    epoch: u32,
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +267,8 @@ pub struct Pacer {
     /// The first drain, due two round trips after slow start ends.
     first_drain_at: Option<Instant>,
     path_generation: u64,
+    /// Counts the path changes; records carry the one they were sent in.
+    epoch: u32,
     samples: u64,
     bounded: u64,
     /// The latest time seen (`advance`, `on_sent`, `on_ack`).
@@ -292,6 +300,7 @@ impl Pacer {
             drain: None,
             first_drain_at: None,
             path_generation: 0,
+            epoch: 0,
             samples: 0,
             bounded: 0,
             clock: now,
@@ -456,8 +465,11 @@ impl Pacer {
         let len = (end - start) as usize;
         let full = c.recs.len() >= MAX_RECORDS;
         match c.recs.back_mut() {
+            // Only a payload that continues the record exactly (a gap would be counted as in
+            // flight by `counted_of` but not by the `len` below, and `uncount` would underflow).
             Some(last)
-                if last.end <= start
+                if last.end == start
+                    && last.epoch == self.epoch
                     && last.via == via
                     && (last.end - last.start < COALESCE || full) =>
             {
@@ -470,6 +482,7 @@ impl Pacer {
                 at: now,
                 first_at: now,
                 via,
+                epoch: self.epoch,
             }),
         }
         self.in_flight += len;
@@ -516,12 +529,14 @@ impl Pacer {
             .filter(|r| r.start <= prev && r.end > prev)
             .map(|r| r.first_at);
         let mut newest: Option<Instant> = None;
+        let mut newest_epoch = self.epoch;
         let mut freed: Vec<(Via, usize)> = Vec::new();
         while let Some(r) = c.recs.front().copied() {
             if r.end <= upto {
                 freed.push((r.via, c.counted_of(&r)));
                 c.recs.pop_front();
                 newest = Some(r.at);
+                newest_epoch = r.epoch;
             } else {
                 // Partly acknowledged: those bytes are no longer in flight, but its `at` is its
                 // last byte's, which has not been acknowledged.
@@ -544,7 +559,16 @@ impl Pacer {
             self.uncount(via, n);
         }
         let acked = before - self.in_flight;
-        if let Some(at) = newest {
+        if newest.is_some() && newest_epoch != self.epoch {
+            // The newest record this ack covers left on a path that has since changed: its round
+            // trip is the old path's, so no sample, and its time says nothing of what the new
+            // path has delivered. (A record's ack is still an ack: it freed bytes, and unparked
+            // the channel above.)
+            if parked {
+                self.parked_acks += 1;
+            }
+            self.prune(now);
+        } else if let Some(at) = newest {
             self.newest_acked_at = Some(self.newest_acked_at.map_or(at, |t| t.max(at)));
             let rtt = now.saturating_duration_since(at);
             // Can this ack have waited for the peer's timer? Not if it covers a threshold's worth
@@ -645,17 +669,29 @@ impl Pacer {
         }
     }
 
-    /// The link's path changed (QUIC migration): the base belongs to the old path.
+    /// The link's path changed (QUIC migration): the base, the cap and the controller's state
+    /// belong to the old path, so the pacer starts over as a new link's does: slow start from
+    /// [`INITIAL_CAP`], no base, no drain pending. Records sent before the change stay counted
+    /// until they are acknowledged (they may still be on their way) but give no sample: their
+    /// acks measure the old path, and would seed the new base (too low from a faster path, so the
+    /// queue reads as several targets and the cap sinks to its floor; too high from a slower one,
+    /// so a standing queue is read as none) until it aged out, a base period or two later.
     pub fn path_changed(&mut self, generation: u64) {
         if generation == self.path_generation {
             return;
         }
         self.path_generation = generation;
+        self.epoch = self.epoch.wrapping_add(1);
         self.base_now = None;
         self.base_prev = None;
         self.recent.clear();
         self.drain = None;
         self.first_drain_at = None;
+        self.cap = self.cfg.fixed_cap.unwrap_or(INITIAL_CAP);
+        self.slow_start = true;
+        self.limited = false;
+        self.limited_in_period = false;
+        self.period_start = self.clock;
     }
 
     pub fn path_generation(&self) -> u64 {

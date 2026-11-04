@@ -98,6 +98,8 @@ struct Sim {
     /// The receiver acknowledges on drain (this build); off, it is a receiver from before H1.
     drain_acks: bool,
     deadline: Option<Duration>,
+    /// The path generation the pacer is told about ([`Sim::switch_path`]).
+    path: u64,
 }
 
 impl Sim {
@@ -119,6 +121,7 @@ impl Sim {
             max_queue: 0,
             drain_acks: true,
             deadline: None,
+            path: 0,
         }
     }
 
@@ -240,10 +243,14 @@ impl Sim {
 
     fn run(&mut self, until: Duration) {
         self.send();
-        while let Some(Reverse((t, _, ev))) = self.events.pop() {
-            if t > until {
+        while self
+            .events
+            .peek()
+            .is_some_and(|Reverse((t, _, _))| *t <= until)
+        {
+            let Some(Reverse((t, _, ev))) = self.events.pop() else {
                 break;
-            }
+            };
             self.now = t;
             let old: Vec<Duration> = self.queued_bytes.range(..t).map(|(k, _)| *k).collect();
             for k in old {
@@ -326,6 +333,24 @@ impl Sim {
             self.send();
         }
         self.now = until;
+    }
+
+    /// The path changes now to another bottleneck (a rate and a round trip): the new path's
+    /// queue is empty, what was sent before is still on its way as it was scheduled, and acks
+    /// come back over the new path. The pacer is told, as the endpoint does when the link's
+    /// path generation changes.
+    fn switch_path(&mut self, mbit: f64, rtt_ms: u64) {
+        self.rate = mbit * 1e6 / 8.0;
+        self.delay = Duration::from_millis(rtt_ms) / 2;
+        self.link_free = self.now;
+        self.queued_bytes.clear();
+        self.path += 1;
+        self.pacer.path_changed(self.path);
+    }
+
+    /// Bytes delivered so far over all flows.
+    fn delivered(&self) -> u64 {
+        self.flows.iter().map(|f| f.delivered).sum()
     }
 
     /// The median queueing delay of payloads sent in `[from, to)`.
@@ -696,11 +721,167 @@ fn a_path_change_forgets_the_base() {
     s.flow(16, Source::Bulk);
     s.run(secs(3));
     assert!(s.pacer.state().base.is_some());
+    let st = s.pacer.state();
+    assert!(!st.slow_start && st.cap != INITIAL_CAP, "{st:?}");
     s.pacer.path_changed(1);
-    assert_eq!(s.pacer.state().base, None);
+    let st = s.pacer.state();
+    assert_eq!(st.base, None);
+    // The pacer starts over: slow start from the initial cap, nothing draining.
+    assert!(st.slow_start && !st.draining, "{st:?}");
+    assert_eq!(st.cap, INITIAL_CAP);
+    // The same generation again changes nothing.
     s.pacer.path_changed(1);
     s.run(secs(4));
     assert!(s.pacer.state().base.is_some());
+}
+
+/// `n` bulk flows that ran 8 s on the path `from` (Mbit/s, round trip in ms), which then changes
+/// to `to`; or, with `from` `None`, start on `to` (a fresh pacer). The goodput in Mbit/s and the
+/// median queueing delay over the 10 s that begin `settle` after the change (or after the start).
+fn moved_cell(from: Option<(f64, u64)>, to: (f64, u64), n: u32, settle: u64) -> (f64, Duration) {
+    let first = from.unwrap_or(to);
+    let mut s = Sim::new(first.0, first.1, PaceConfig::default());
+    for i in 0..n {
+        s.flow(16 + 2 * i, Source::Bulk);
+    }
+    let mut t = 0;
+    if from.is_some() {
+        s.run(secs(8));
+        s.switch_path(to.0, to.1);
+        t = 8;
+    }
+    s.run(secs(t + settle));
+    let before = s.delivered();
+    s.run(secs(t + settle + 10));
+    let mbit = (s.delivered() - before) as f64 * 8.0 / 10.0 / 1e6;
+    (
+        mbit,
+        s.median_qdelay(secs(t + settle), secs(t + settle + 10)),
+    )
+}
+
+/// A path change forgets the base and re-learns it from the new path alone (DESIGN.md §8.5): four
+/// bulk forwards that move from a fast LAN to a slow, long path (a hotel, LTE) reach what a
+/// fresh pacer on that path does within a few seconds. Acks of records sent on the old path gave
+/// samples of a path that is gone; they seeded a base of the old path's round trip, the queue
+/// read as several targets, and the cap sat at its floor for a base period or two (about 45 s,
+/// 7.7 against 49 Mbit/s in this cell).
+#[test]
+fn a_move_to_a_slow_long_path_reaches_what_a_fresh_pacer_does() {
+    let (fresh, fresh_q) = moved_cell(None, (50.0, 80), 4, 3);
+    let (moved, moved_q) = moved_cell(Some((1000.0, 2)), (50.0, 80), 4, 3);
+    eprintln!("fresh {fresh:.2} Mbit/s q {fresh_q:?}; moved {moved:.2} Mbit/s q {moved_q:?}");
+    assert!(moved >= 0.9 * fresh, "moved {moved} against fresh {fresh}");
+    assert!(moved_q <= Duration::from_millis(100), "queue {moved_q:?}");
+}
+
+/// ... and the other way: from a slow, long path to a faster, shorter one, a base that is the old
+/// path's must not stay (the cap would grow until the queue read as the target above it: a
+/// standing queue of the difference), nor a base taken with the old cap's queue in it.
+#[test]
+fn a_move_to_a_faster_path_leaves_no_standing_queue() {
+    for to in [(1000.0, 2), (20.0, 10)] {
+        let (fresh, fresh_q) = moved_cell(None, to, 4, 3);
+        let (moved, moved_q) = moved_cell(Some((50.0, 80)), to, 4, 3);
+        eprintln!(
+            "to {to:?}: fresh {fresh:.2} Mbit/s q {fresh_q:?}; moved {moved:.2} Mbit/s q {moved_q:?}"
+        );
+        assert!(moved >= 0.9 * fresh, "{to:?}: moved {moved}, fresh {fresh}");
+        assert!(
+            moved_q <= Duration::from_millis(50).max(fresh_q * 2),
+            "{to:?}: queue {moved_q:?} (fresh {fresh_q:?})"
+        );
+    }
+}
+
+/// An ack that arrives after a path change for a record sent before it is the old path's round
+/// trip: it frees the bytes but gives no sample and no base. A record sent after the change does.
+#[test]
+fn an_old_paths_ack_gives_no_sample_after_a_path_change() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let c = ch(16);
+    // Four payloads on a 2 ms path, three acknowledged: a base of 2 ms.
+    for i in 0..4u64 {
+        p.on_sent(c, i * PAYLOAD, (i + 1) * PAYLOAD, false, t0 + ms(i));
+    }
+    p.on_ack(c, 3 * PAYLOAD, ACK_AFTER, t0 + ms(10));
+    assert_eq!(p.state().base, Some(ms(8)));
+    // The path changes (a slow one); the cap starts over in slow start.
+    p.path_changed(1);
+    let st = p.state();
+    assert_eq!((st.base, st.cap, st.slow_start), (None, INITIAL_CAP, true));
+    assert!(!st.draining);
+    // A payload goes out on the new path, then the old record's ack arrives: freed, no sample.
+    p.on_sent(c, 4 * PAYLOAD, 5 * PAYLOAD, false, t0 + ms(20));
+    let before = p.state();
+    p.on_ack(c, 4 * PAYLOAD, ACK_AFTER, t0 + ms(30));
+    let st = p.state();
+    assert_eq!(st.base, None, "{st:?}");
+    assert_eq!((st.samples, st.bounded), (before.samples, before.bounded));
+    assert_eq!(st.in_flight, PAYLOAD as usize);
+    // The new path's record, acknowledged 90 ms after it left, is the base.
+    p.on_ack(c, 5 * PAYLOAD, ACK_AFTER, t0 + ms(110));
+    assert_eq!(p.state().base, Some(ms(90)));
+}
+
+/// Small payloads that straddle a path change are not merged into one record (it would carry
+/// the old path's epoch and the new payload would never give a sample), and a drain in progress
+/// ends with the change.
+#[test]
+fn a_path_change_splits_records_and_ends_a_drain() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let c = ch(16);
+    p.on_sent(c, 0, 100, false, t0);
+    p.path_changed(1);
+    p.on_sent(c, 100, 200, false, t0 + ms(1));
+    assert_eq!(p.chans[&16].recs.len(), 2);
+    p.on_ack(c, 200, ACK_AFTER, t0 + ms(50));
+    assert_eq!(p.state().base, Some(ms(49)));
+    // A drain in progress belongs to the old path.
+    p.start_drain(t0 + ms(60), "test");
+    assert!(p.state().draining);
+    p.path_changed(2);
+    assert!(!p.state().draining);
+    assert_eq!(p.next_deadline(), None);
+}
+
+/// A path change on a pacer with a fixed cap (tests) keeps the cap as set.
+#[test]
+fn a_path_change_with_a_fixed_cap_keeps_it() {
+    let t0 = Instant::now();
+    let cfg = PaceConfig {
+        enabled: true,
+        fixed_cap: Some(100_000),
+    };
+    let mut p = Pacer::new(cfg, t0);
+    p.path_changed(3);
+    assert_eq!(p.state().cap, 100_000);
+}
+
+/// Payloads that do not continue a channel's last record exactly are records of their own: a gap
+/// is not in flight, and the accounting stays exact (merged, `counted_of` would have counted the
+/// gap and `uncount` underflowed).
+#[test]
+fn a_gap_between_payloads_is_not_merged() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let c = ch(16);
+    p.on_sent(c, 0, 100, false, t0);
+    p.on_sent(c, 150, 200, false, t0 + Duration::from_millis(1));
+    assert_eq!(p.chans[&16].recs.len(), 2);
+    assert_eq!(p.state().in_flight, 150);
+    p.on_ack(c, 100, ACK_AFTER, t0 + Duration::from_millis(5));
+    assert_eq!(p.state().in_flight, 50);
+    p.on_ack(c, 200, ACK_AFTER, t0 + Duration::from_millis(10));
+    assert_eq!(p.state().in_flight, 0);
+    // Contiguous payloads still merge.
+    p.on_sent(c, 200, 300, false, t0 + Duration::from_millis(11));
+    p.on_sent(c, 300, 400, false, t0 + Duration::from_millis(12));
+    assert_eq!(p.chans[&16].recs.len(), 1);
 }
 
 /// The bookkeeping per channel is bounded: many small payloads merge.

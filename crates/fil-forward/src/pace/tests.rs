@@ -1073,3 +1073,59 @@ fn the_agent_reserve_is_beside_the_pass_budget() {
         "the agent waits for forwards' passes"
     );
 }
+
+/// A channel presumed stuck that was only slow to arrive (a burst's queue, QUIC serving another
+/// stream first) is unparked by the first ack of a record still counted: it is not held at what it
+/// had outstanding, which for a bulk channel would keep that much queued.
+#[test]
+fn a_channel_that_keeps_up_is_unparked() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let (bulk, other) = (ch(16), ch(18));
+    p.on_sent(bulk, 0, PAYLOAD, false, t0);
+    let mut off = 0;
+    let mut t = t0 + Duration::from_millis(5);
+    for _ in 0..10 {
+        exchange(&mut p, other, &mut off, t, 40, false);
+        t += Duration::from_millis(40);
+    }
+    p.advance(t);
+    // Presumed delivered: parked, at its limit.
+    assert!(p.chans[&16].parked);
+    p.on_sent(bulk, PAYLOAD, 2 * PAYLOAD, false, t);
+    assert!(!p.admit(bulk, false, t), "parked and at its limit");
+    // Its reader acknowledges the record still counted: it keeps up.
+    p.on_ack(bulk, 2 * PAYLOAD, ACK_AFTER, t + Duration::from_millis(45));
+    assert!(!p.chans[&16].parked);
+}
+
+/// A bulk transfer beside a request every 50 ms, with half a second of extra delay (a burst's
+/// queue, or QUIC serving the request's stream first): the bulk's records outlive the presumption
+/// age and it is parked for a moment, but the queue comes back to the target once its acks catch
+/// up (the realnet QUIC cell of the review's S1 held about 100 ms of queue before).
+#[test]
+fn a_moment_of_delay_does_not_leave_a_bulk_transfer_parked() {
+    let mut s = Sim::new(20.0, 40, PaceConfig::default());
+    let b = s.flow(16, Source::Bulk);
+    s.flow(
+        18,
+        Source::Periodic {
+            bytes: 1024,
+            every: Duration::from_millis(50),
+        },
+    );
+    s.run(secs(5));
+    s.delay += Duration::from_millis(80);
+    s.run(Duration::from_millis(5500));
+    s.delay -= Duration::from_millis(80);
+    let d0 = s.flows[b].delivered;
+    s.run(secs(20));
+    let q = s.median_qdelay(secs(10), secs(20));
+    let mbit = (s.flows[b].delivered - d0) as f64 * 8.0 / 14.5 / 1e6;
+    eprintln!(
+        "after a moment of delay: queueing {q:?}, bulk {mbit:.2} Mbit/s, {:?}",
+        s.pacer.state()
+    );
+    assert!(q <= TARGET + Duration::from_millis(15), "{q:?}");
+    assert!(mbit >= 0.9 * 20.0, "{mbit}");
+}

@@ -193,7 +193,8 @@ client-pty:
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd`, `policy`, `fwd` (the M2
 # forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
-# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
+# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run;
+# nor is `just realnet predict`, M3's prediction cells (docs/m3/plan.md §5.5).
 realnet *args:
     tests/realnet/run.sh {{args}}
 

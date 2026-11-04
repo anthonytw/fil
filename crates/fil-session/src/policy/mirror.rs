@@ -84,7 +84,12 @@ pub const FULL_RELOAD: Duration = Duration::from_secs(300);
 
 /// How long after it was last known current a read may still decide, while a re-read is
 /// running (a directory service that is slow to answer): five minutes and one more. Past it,
-/// every check refuses, as for a policy file that cannot be read, until the re-read is in.
+/// every check refuses ([`PolicySetting::Pending`]) until the re-read is in.
+///
+/// "Known current" is per look, not per account lookup: a look that finds no file changed
+/// confirms the read from `stat`s alone, which say nothing of NSS group membership. Membership
+/// is looked up at every full read (every [`FULL_RELOAD`]), so the membership a check decides
+/// on can be up to `FULL_RELOAD + MAX_AGE` (about eleven minutes) old when a full read hangs.
 pub const MAX_AGE: Duration = Duration::from_secs(360);
 
 /// The account database's files: a change there can change `Match User` and `Match Group`.
@@ -166,16 +171,25 @@ impl Shared {
     fn refresh(&self, force: bool) {
         let started = Instant::now();
         let current = self.lock().loaded.clone();
-        let full = force
-            || current.at.elapsed() >= self.src.full_reload
-            || current.stamps.iter().any(Stamp::changed);
+        let changed = current.stamps.iter().any(Stamp::changed);
+        if !changed {
+            // No file changed: what was read from them is current as of now, before the
+            // account lookup of a full read below (which may wait on a slow directory) begins.
+            // Otherwise a full read slower than `max_age - full_reload` would make every check
+            // refuse for its slow tail, every period.
+            let mut st = self.lock();
+            st.confirmed = st.confirmed.max(started);
+        }
+        let full = force || changed || current.at.elapsed() >= self.src.full_reload;
         let read = full.then(|| {
             tracing::debug!("server policy: reading the files again");
             Arc::new(load(&self.src))
         });
         let mut st = self.lock();
-        // Two looks can overlap (`reread_now` while one runs in the background): the read that
-        // began last wins, so an older one finishing late never undoes a newer one.
+        // Two looks can overlap only through `reread_now` (tests), while one runs in the
+        // background: in production `start` holds the `reading` flag, so the ticker's looks and
+        // the checks' never do. The read that began last wins, so an older one finishing late
+        // never undoes a newer one.
         if let Some(l) = read
             && l.at >= st.loaded.at
         {
@@ -279,10 +293,13 @@ impl Policy {
         }
     }
 
-    /// The refusal while the last read is too old: the wire has no reason of its own for it,
-    /// and "cannot be read" is what it is, for now.
+    /// The refusal while the last read is too old to decide on: no setting of the host's, so
+    /// no source.
     fn stale(&self) -> PolicyRefusal {
-        self.unsafe_file(FileFault::Unreadable)
+        PolicyRefusal {
+            setting: PolicySetting::Pending,
+            source: PolicySource::Default,
+        }
     }
 
     /// The policy now, handed to `f`; a refusal from `stale` when the last read is too old.
@@ -491,6 +508,10 @@ impl Policy {
 }
 
 impl ServerPolicy for Policy {
+    fn reads(&self) -> Option<watch::Receiver<u64>> {
+        Some(Policy::reads(self))
+    }
+
     fn forward(&self, spec: &ForwardSpec) -> Result<(), PolicyRefusal> {
         self.with(Err, |l| self.forward_in(l.settings(), &l.file, spec))
     }
@@ -638,8 +659,8 @@ fn host_text(t: &Target) -> String {
 
 /// A `-R` bind as sshd compares it with `PermitListen`, as ssh sends it
 /// (`channel_rfwd_bind_host`): `localhost` for loopback (`-R port:...`), the empty string for
-/// every address (`-R *:port:...`; so only a pattern that matches nothing, like `*`, permits
-/// it, and `?` does not), the address otherwise.
+/// every address (`-R *:port:...`; so only a pattern that matches the empty string, like `*`,
+/// permits it, and `?` does not), the address otherwise.
 fn listen_text(b: BindAddr) -> String {
     match b {
         BindAddr::Loopback => "localhost".to_string(),

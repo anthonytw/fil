@@ -78,6 +78,7 @@ pub mod env;
 mod forward;
 mod handle;
 pub mod nofile;
+mod pace;
 pub mod peers;
 pub mod policy;
 pub mod private_dir;

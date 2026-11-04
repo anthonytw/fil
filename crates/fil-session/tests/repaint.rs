@@ -137,6 +137,9 @@ async fn a_repaint_waits_for_the_snapshot_in_flight_and_renders_at_the_new_size(
         max_bytes: 64 * 1024,
         ..CatchUpParams::default()
     };
+    // Unpaced: the client acknowledges nothing, and the pacer would hold the output after the
+    // catch-up (the snapshot, unconfirmed, counts as in flight) where this test reads it.
+    cfg.terminal_pacing = false;
     let h = spawn_plain(cfg).await;
     // A tiny link, so the serve task blocks as soon as the client stops reading.
     let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
@@ -226,12 +229,15 @@ async fn a_repaint_is_served_under_steady_output_and_skips_none_of_it() {
     let h = spawn_plain(sh_config(
         &sc,
         "main",
-        "stty -echo; echo READY; i=0; while [ $i -lt 120 ]; do printf .; sleep 0.05; i=$((i+1)); done; \
+        "stty -echo; echo READY; read go; i=0; while [ $i -lt 120 ]; do printf .; sleep 0.05; i=$((i+1)); done; \
          echo; echo QUIET; sleep 60",
     ))
     .await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
-    c.wait_out("READY").await;
+    // On the screen, not in the output: an attach after the shell printed it gets it in the
+    // attach snapshot. The dots start only on the go, so all of them are in the output.
+    c.wait_screen("READY").await;
+    c.type_bytes(b"\n").await;
     // Acks lag the output by 150 ms, as the real client's would on a link with some delay.
     c.auto_ack = false;
     let t0 = Instant::now();

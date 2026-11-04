@@ -12,6 +12,9 @@
 #                      link rate-limited so a queue forms: the baseline fil's forwards are held to
 #   l_catchup       4. how often a 4 MB `cat` makes the daemon skip ahead (catch-up) with a fast
 #                      discarding consumer, on the pipe and on QUIC (the Pi procedure is in the doc)
+#   l_ctrlc         5. Ctrl-C during a flood on a 1 Mbit/s link: how long until the next command's
+#                      output shows, through `ssh -tt`, and fil on the pipe and on QUIC with the
+#                      terminal paced and not (FIL_TERMINAL_PACING=off; M3 K1, DESIGN.md §8.5)
 #
 # Measurements go to the results table (notes) and, per keystroke cell, to
 # $OUT/results-latency-cells.tsv (also appended to the job summary). Knobs (environment):
@@ -19,6 +22,7 @@
 #   LAT_SECS=20      minimum seconds of typing per cell (at least 300 keys)
 #   LAT_BULK_RATE=20mbit LAT_BULK_LIMIT=500   the bottleneck of l_keys_bulk (rate; queue, packets)
 #   LAT_CATCH_RUNS=5 runs of the 4 MB cat per cell in l_catchup
+#   LAT_SLOW_RATE=1mbit LAT_SLOW_LIMIT=100   the link of l_ctrlc (rate; queue, packets)
 set -uo pipefail
 # shellcheck source=udp.sh
 source "$(dirname "${BASH_SOURCE[0]}")/udp.sh"
@@ -31,6 +35,8 @@ LAT_SECS=${LAT_SECS:-20}
 LAT_BULK_RATE=${LAT_BULK_RATE:-20mbit}
 LAT_BULK_LIMIT=${LAT_BULK_LIMIT:-500}
 LAT_CATCH_RUNS=${LAT_CATCH_RUNS:-5}
+LAT_SLOW_RATE=${LAT_SLOW_RATE:-1mbit}
+LAT_SLOW_LIMIT=${LAT_SLOW_LIMIT:-100}
 LAT_CELLS=$OUT/results-latency-cells.tsv
 LAT_RATES=(5 20 50)
 SSHD_TRACE_PORT=2222
@@ -72,6 +78,7 @@ lat_net() {
     clean) return 0 ;;
     rtt) rate=1gbit limit=100000 ;;
     bottleneck) rate=$LAT_BULK_RATE limit=$LAT_BULK_LIMIT ;;
+    slow) rate=$LAT_SLOW_RATE limit=$LAT_SLOW_LIMIT ;;
     *) fail "lat_net: unknown network $1" ;;
   esac
   for d in "${NETEM_DEVS[@]}"; do
@@ -483,7 +490,63 @@ l_catchup() {
   done
 }
 
-LAT_SCENARIOS=(l_nodelay l_keys_idle l_keys_bulk l_catchup)
+# lat_term_pacing on|off: the server's daemon (one per user) restarted with
+# FIL_TERMINAL_PACING=$1, so the sessions of the next attaches pace their terminal or not.
+lat_term_pacing() {
+  local i pid
+  lat_daemon_pid() { nsx "$NS_S" pgrep -u rnfil -f 'fil server --daemon' | head -n 1 || true; }
+  pid=$(lat_daemon_pid)
+  [[ -z $pid ]] || as_root kill "$pid" 2> /dev/null || true
+  for ((i = 0; i < 100; i++)); do
+    [[ -z $(lat_daemon_pid) ]] && break
+    sleep 0.1
+  done
+  nsx "$NS_S" runuser -u rnfil -- env -i HOME=/home/rnfil USER=rnfil LOGNAME=rnfil "PATH=$UDP_PATH" \
+    "FIL_TERMINAL_PACING=$1" setsid "$UDP_BIN/fil" server --daemon < /dev/null > /dev/null 2>&1 &
+  for ((i = 0; i < 100; i++)); do
+    [[ -n $(lat_daemon_pid) ]] && break
+    sleep 0.1
+  done
+  [[ -n $(lat_daemon_pid) ]] || fail "the daemon did not start (FIL_TERMINAL_PACING=$1)"
+}
+
+# l_ctrlc: a flood of numbered lines on a 1 Mbit/s link (LAT_SLOW_RATE, one-way LAT_DELAY_MS),
+# Ctrl-C three seconds in, then `echo ALIVE-42`: the time from the Ctrl-C to ALIVE-42 on the
+# screen. `ssh -tt` is the reference (it delivers every byte: its time is the backlog in ssh's
+# window and the router's queue); fil paced is K1's cell (at most 3 s on QUIC), fil unpaced the
+# "before" (the jump waits for everything the transport holds).
+l_ctrlc() {
+  local pace kind tag t0 t1
+  lat_net slow
+  for pace in on off; do
+    lat_term_pacing "$pace"
+    for kind in ssh pipe quic; do
+      [[ $kind == ssh && $pace == off ]] && continue
+      tag=k$kind$pace
+      log "=== Ctrl-C cell $tag"
+      case $kind in
+        ssh) FC_PROG=ssh fc_start "$tag" -- -tt srv ;;
+        pipe) fc_start "$tag" -- --transport pipe srv "lat$tag" ;;
+        quic) fc_start "$tag" -- --transport direct srv "lat$tag" ;;
+      esac
+      fc_ready "$tag" 60
+      fc_line "$tag" "stty noflsh; seq -f 'LINE-%09g abcdefghij0123456789abcdefghij0123456789' 1 999999999"
+      sleep 3
+      t0=$(now_ms)
+      fc_type "$tag" '\x03'
+      fc_line "$tag" 'echo ALIVE-$((6*7))'
+      fc_wait "$tag" 'ALIVE-42' 180
+      t1=$(now_ms)
+      note "ctrlc.$kind.pacing_$pace.ms=$((t1 - t0)) marks=$(fc "$tag" raw | grep -a -c 'fil: skipped' || true)"
+      if [[ $kind == quic ]]; then lat_check_path "$tag" quic 9999999999999 > /dev/null; fi
+      [[ $kind == ssh ]] || cx_fk "lat$tag"
+    done
+  done
+  # The default again for whatever runs next.
+  lat_term_pacing on
+}
+
+LAT_SCENARIOS=(l_nodelay l_keys_idle l_keys_bulk l_catchup l_ctrlc)
 
 # Sourced by fwd.sh for the keystroke cells and the bulk programs; run directly, it is the latency part.
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

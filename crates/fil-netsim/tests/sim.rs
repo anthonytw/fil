@@ -173,6 +173,36 @@ async fn datagram_latency_applied() {
     assert_eq!(t1.elapsed(), 5 * MS);
 }
 
+/// The bottleneck sends at its rate, after which the latency applies; a full queue drops.
+#[tokio::test(start_paused = true)]
+async fn datagram_bottleneck_paces_and_drops_past_its_queue() {
+    let net = Net::new(1);
+    net.update_conditions(|c| {
+        c.latency = 10 * MS;
+        c.rate = Some(100_000); // 1000-byte datagrams: 10 ms each
+        c.queue = 5_000;
+    });
+    let (a, b) = pair(&net);
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        send(&a, addr("192.0.2.2:2000"), &[7u8; 1000]);
+    }
+    // Six fit (one leaving and five waiting); four found the queue full.
+    assert_eq!(net.stats().overflowed, 4);
+    let mut at = Vec::new();
+    for _ in 0..6 {
+        recv(&b).await;
+        at.push(t0.elapsed());
+    }
+    let want: Vec<Duration> = (1..=6).map(|i| (10 * i + 10) * MS).collect();
+    assert_eq!(at, want);
+    // The other direction has its own bottleneck, idle.
+    let t1 = Instant::now();
+    send(&b, addr("192.0.2.1:1000"), &[1u8; 1000]);
+    recv(&a).await;
+    assert_eq!(t1.elapsed(), 20 * MS);
+}
+
 #[tokio::test(start_paused = true)]
 async fn datagram_loss_rate_is_close() {
     let net = Net::new(42);

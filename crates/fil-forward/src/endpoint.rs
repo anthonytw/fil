@@ -65,8 +65,8 @@ use fil_proto::ChannelId;
 use fil_proto::frame::DataSegment;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
-    BindAddr, BindFailure, ChannelInfo, ChannelState, CloseReason, ForwardId, ForwardKind, Mux,
-    MuxConfig, MuxError, MuxEvent, MuxMsg, OpenFailure, OpenKind, Side, TableError,
+    BindAddr, BindFailure, ChannelState, CloseReason, ForwardId, ForwardKind, Mux, MuxConfig,
+    MuxError, MuxEvent, MuxMsg, OpenFailure, OpenKind, Side, TableError,
 };
 use fil_transport::{Link, LinkState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -77,7 +77,7 @@ use tokio::time::sleep_until;
 use tracing::debug;
 
 use crate::listen;
-use crate::pace::{PaceConfig, PaceState, Pacer};
+use crate::pace::{PaceConfig, Pacer};
 use crate::socks::{self, Handshake, Progress};
 use crate::stream::BoxStream;
 
@@ -1173,8 +1173,9 @@ impl<L: Link> Endpoint<L> {
         st.pacer = Pacer::new(cfg, now());
     }
 
-    /// What the current link's pacer knows: counts only (DESIGN.md §11.1).
-    pub fn pace_state(&self) -> PaceState {
+    /// What the current link's pacer knows: counts only (DESIGN.md §11.1). Feature `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    pub fn pace_state(&self) -> crate::pace::PaceState {
         lock(&self.inner().state).pacer.state()
     }
 
@@ -1588,7 +1589,9 @@ impl<L: Link> Endpoint<L> {
 
     /// Ends every channel of `forward` now with `why` (`Removed` when the user removes a forward
     /// and wants its connections gone too), and refuses its queued connections. Returns how many
-    /// of both.
+    /// of both. Feature `test-hooks`: the owners end forwards through `close_all` and the
+    /// close-by-policy paths, and only a test calls this.
+    #[cfg(feature = "test-hooks")]
     pub fn close_forward(&self, forward: ForwardId, why: CloseReason) -> usize {
         self.close_where(|k| k == StatsKey::Forward(forward), why)
     }
@@ -1690,8 +1693,9 @@ impl<L: Link> Endpoint<L> {
         }
     }
 
-    /// One channel's state in the mux.
-    pub fn channel_info(&self, ch: ChannelId) -> Option<ChannelInfo> {
+    /// One channel's state in the mux (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn channel_info(&self, ch: ChannelId) -> Option<fil_proto::mux::ChannelInfo> {
         lock(&self.inner().state).mux.info(ch)
     }
 

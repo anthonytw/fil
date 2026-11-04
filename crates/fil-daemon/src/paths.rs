@@ -773,6 +773,17 @@ mod tests {
             );
             assert_eq!(mtime(&d), 1_000_000_000, "{name}/{file}");
         }
+        // A version directory's name, but not in the install root.
+        let decoy = home.join(".local/share/0.1.0-w1.12");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("fil"), b"").unwrap();
+        utimensat(CWD, &decoy, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!refresh_install_dir(
+            &decoy.join("fil"),
+            &home,
+            file_identity(&decoy.join("fil"))
+        ));
+        assert_eq!(mtime(&decoy), 1_000_000_000);
         // Somewhere else entirely, and outside the home.
         let elsewhere = tmp.path().join("bin");
         std::fs::create_dir(&elsewhere).unwrap();

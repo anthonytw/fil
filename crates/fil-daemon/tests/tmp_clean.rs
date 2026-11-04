@@ -440,6 +440,34 @@ async fn the_daemon_keeps_the_install_directory_it_runs_from() {
         utimensat(CWD, &installed, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
     }
 
+    // The build is replaced under the running daemon (another file renamed over it), and then
+    // deleted: nothing is kept for either.
+    let exe = installed.join("fil");
+    let mut daemon = Daemon::start(tree.paths(), config(CAT)).await.unwrap();
+    daemon.set_keeping(keeping(true, true));
+    daemon.set_install(exe.clone(), home.clone());
+    std::fs::write(installed.join("new"), b"x").unwrap();
+    std::fs::rename(installed.join("new"), &exe).unwrap();
+    let old = Timespec {
+        tv_sec: 1_000_000_000,
+        tv_nsec: 0,
+    };
+    let stamps = Timestamps {
+        last_access: old,
+        last_modification: old,
+    };
+    utimensat(CWD, &installed, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    let handle = daemon.handle();
+    let task = tokio::spawn(daemon.run());
+    tokio::time::sleep(EVERY * 4).await;
+    assert_eq!(
+        mtime(&installed),
+        1_000_000_000,
+        "a replaced build's directory"
+    );
+    handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, task).await;
+
     // The build is deleted under the running daemon: nothing is kept for it.
     let exe = installed.join("fil");
     let mut daemon = Daemon::start(tree.paths(), config(CAT)).await.unwrap();

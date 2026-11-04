@@ -721,7 +721,11 @@ async fn a_snapshot_from_an_older_size_leaves_the_screen_untrusted() {
     rig.term.resize_quietly(100, 30);
     rig.attached().await;
     let a = rig.daemon.attaches().await;
-    assert_eq!((a[0].size_gen, a[0].size.cols()), (0, 80), "the attach was at the old size");
+    assert_eq!(
+        (a[0].size_gen, a[0].size.cols()),
+        (0, 80),
+        "the attach was at the old size"
+    );
     assert_eq!(rig.daemon.repaints().await.len(), 0, "the repaint is held");
     warm(&rig).await;
     // Acknowledged and not echoed, so the next epoch's prior-ack rule is met.

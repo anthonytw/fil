@@ -328,12 +328,23 @@ mod tests {
             .unwrap();
         assert!(s.nodelay().unwrap());
         drop(l);
-        assert_eq!(
-            connect_tcp(&ip_target("127.0.0.1", port), &check(false))
-                .await
-                .unwrap_err(),
-            OpenFailure::Refused
-        );
+        // A closed port: one just let go. On a busy machine another process can take it at once
+        // (and a port bound without listening is no stand-in: macOS drops the SYN, and the
+        // connect times out instead of being refused). So a port found taken again is not a
+        // closed one: another is tried. Anything but a connect or a refusal fails.
+        for _ in 0..20 {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            match connect_tcp(&ip_target("127.0.0.1", port), &check(false)).await {
+                Err(e) => {
+                    assert_eq!(e, OpenFailure::Refused);
+                    return;
+                }
+                Ok(_) => continue,
+            }
+        }
+        panic!("every closed port was taken again at once");
     }
 
     /// A canary listening on loopback in both families, counting connection attempts.

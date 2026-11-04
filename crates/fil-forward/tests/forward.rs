@@ -901,10 +901,15 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
 
 /// Behind a queue, a connection the policy refuses is refused when it arrives, not when it
 /// reaches the head; the policy sees the application's address.
+///
+/// No timing window: the head cannot move for a minute (the one channel is held by a server that
+/// answers after 60 s, and `open_wait` is longer), so a refusal that comes at all, within
+/// `expect_reset`'s 10 s, was made on arrival.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_queued_connection_is_checked_when_it_arrives() {
     let cfg = MuxConfig {
         max_open: 1,
+        open_wait: Duration::from_secs(120),
         ..mux_config()
     };
     let hold = serve(|s| async move {
@@ -914,17 +919,18 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
     .await;
     let w = World::new(Transport::Mem, cfg).await;
     let port = w.local_forward(1, hold.port);
+    let waiting = || w.client.ep.stats(ForwardId(1)).map(|s| s.waiting);
+    let checks = || w.client.policy.outgoing_checks.load(Ordering::SeqCst);
     let a = connect(port).await;
+    // `a` holds the one channel, open (`waiting` counts an unanswered open too): only then is
+    // `b` sure to queue rather than to open, or to be checked after the policy changes.
     eventually(Duration::from_secs(5), || {
-        w.client.ep.snapshot().channels == 1
+        w.client.ep.snapshot().channels == 1 && waiting() == Some(0)
     })
     .await;
     let b = connect(port).await;
     eventually(Duration::from_secs(5), || {
-        w.client
-            .ep
-            .stats(ForwardId(1))
-            .is_some_and(|s| s.waiting == 1)
+        checks() == 2 && waiting() == Some(1)
     })
     .await;
     match *w.client.policy.last_peer.lock().unwrap() {
@@ -932,14 +938,11 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
         other => panic!("the policy saw {other:?}"),
     }
     *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);
-    let t0 = std::time::Instant::now();
     expect_reset(port).await;
-    assert!(
-        t0.elapsed() < Duration::from_millis(500),
-        "{:?}",
-        t0.elapsed()
-    );
-    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 1);
+    // Checked once, on arrival, and never queued: the one behind the head still waits alone.
+    assert_eq!(checks(), 3);
+    assert_eq!(waiting(), Some(1));
+    assert_eq!(w.client.ep.snapshot().channels, 1);
     drop((a, b));
 }
 

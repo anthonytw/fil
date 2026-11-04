@@ -159,6 +159,7 @@ pub fn render(
             | Request::Forward { session, .. }
             | Request::Ports {
                 session: Some(session),
+                ..
             },
             Response::NoSuchSession,
         ) => Err(format!(
@@ -706,7 +707,10 @@ mod tests {
     }
 
     fn ports_request() -> Request {
-        Request::Ports { session: None }
+        Request::Ports {
+            session: None,
+            probe_other: false,
+        }
     }
 
     #[tokio::test]
@@ -729,6 +733,7 @@ mod tests {
                     part: fil_proto::msg::PortsPart {
                         rows: c.to_vec(),
                         incomplete: None,
+                        cut: false,
                     },
                     more: (i + 1) * 7 < all.len(),
                 })
@@ -768,6 +773,7 @@ mod tests {
             part: fil_proto::msg::PortsPart {
                 rows: (1..=100).map(listener_row).collect(),
                 incomplete: None,
+                cut: false,
             },
             more: true,
         };

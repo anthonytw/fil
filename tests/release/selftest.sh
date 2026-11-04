@@ -403,7 +403,9 @@ expect_fail "mutation: SHA256SUMS lists only three files" check --dry-run --no-t
 expect_fail "mutation: SHA256SUMS is not sorted" check --dry-run --no-tree "$rel"
 { cat "$tmp/sums.good"; echo "$(sha256 "$tmp/sums.good")  SHA256SUMS"; } > "$rel/SHA256SUMS"
 expect_fail "mutation: SHA256SUMS covers itself" check --dry-run --no-tree "$rel"
-sed '1s/^./0/;1s/^0/f/' "$tmp/sums.good" > "$rel/SHA256SUMS"
+# Change the first digest's first hex digit, whatever it is (0 becomes 1, anything else 0).
+sed '1s/^0/X/;1s/^[1-9a-f]/0/;1s/^X/1/' "$tmp/sums.good" > "$rel/SHA256SUMS"
+cmp -s "$tmp/sums.good" "$rel/SHA256SUMS" && flunk "(the checksum mutation changed nothing)"
 expect_fail "mutation: a checksum is wrong" check --dry-run --no-tree "$rel"
 
 # the wire: the golden's [history] must end at PROTOCOL_REVISION

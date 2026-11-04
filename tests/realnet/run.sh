@@ -32,8 +32,9 @@ esac
 
 rm -rf "$OUT/notes" "$OUT/logs"
 mkdir -p "$OUT"
-# A part that skips itself exits with this (policy.sh), so it is not counted as passed.
-export REALNET_SKIP_RC=3
+# A part that skips itself exits with this (policy.sh), so it is not counted as passed: 77, the
+# automake convention for a skipped test, which no part exits with otherwise (0, 1, 2).
+export REALNET_SKIP_RC=77
 rc=0
 skipped=()
 for p in "${parts[@]}"; do

@@ -404,6 +404,7 @@ fn policy_settings() -> Vec<PolicySetting> {
         }
         all.push(PolicySetting::FileUnsafe(f));
     }
+    all.push(PolicySetting::Pending);
     for c in &all {
         match c {
             PolicySetting::DisableForwarding
@@ -413,7 +414,8 @@ fn policy_settings() -> Vec<PolicySetting> {
             | PolicySetting::PermitListen(_)
             | PolicySetting::GatewayPorts(_)
             | PolicySetting::File(_)
-            | PolicySetting::FileUnsafe(_) => {}
+            | PolicySetting::FileUnsafe(_)
+            | PolicySetting::Pending => {}
         }
     }
     all

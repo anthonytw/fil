@@ -154,3 +154,97 @@ How to read them for OD-10/H1:
 - **QUIC: about 273 ms, almost exactly the bottleneck queue.** The 500-packet queue at 20 Mbit/s holds about 300 ms; the keystroke rides its own stream but the same congestion window, so each one waits behind the queue the bulk keeps full. The p99 is tight (320 ms): nothing but the router's queue is in the way. A forward that is paced to keep the queue short (the plan's delay-based cap) is the only thing that would bring this down.
 - **The pipe: about 432 ms, the queue plus what sits in TCP and ssh's buffers in front of it.** Half of ssh -L's 850 ms. Most likely because fil's channel window is 1 MiB against ssh's 2 MiB (at 20 Mbit/s, about 420 ms against 840), so less forward data waits in front of a keystroke; that is an inference from the sizes, not a measurement of the buffers. Either way it waits behind the bytes already in the one TCP connection.
 - **The idle cells are fil's own cost: none.** 41.6 and 41.8 ms idle against ssh's 40.9 without batching: the network's 40 ms plus a millisecond and a half, as in L1.
+
+### After H1: forward pacing
+
+H1 (`fil_forward::pace`, DESIGN §8.5 "Pacing") caps the forward data each side has in flight on a link, LEDBAT-style on fil's own acknowledgements, aiming at 25 ms of queueing delay. Measured in the Lima VM (aarch64) on a local merge of H1 with this harness. "Before" is the same build with pacing off in both ends, interleaved cell by cell with the paced one; it matches main (pipe upload 432.9 / 715 ms on main). Keystrokes at 20 keys/s for 20 s; goodput is what the application received; "bulk only" is the same transfer with 1 key/s. ms as p50 / p99, Mbit/s.
+
+**Where the queue was, before** (medians of 250 ms samples during the upload; the download is the mirror image). Pipe: fil had its whole 1 MiB window in flight (1,015,808 bytes), and the client's TCP socket held 1.03 MB of it (Send-Q), 370 KB not yet sent; the router held 630 KB. ssh's process and fil's own queues held almost nothing (fil's in-flight bytes equal the socket's Send-Q, plus ssh's framing). So V1's inference holds: the window bounds the queue, in the socket's send buffer and the router. QUIC: the router's queue, 620 to 675 KB. ssh -L: 2.03 MB in its socket (1.35 MB unsent) and 630 KB in the router.
+
+**V1's cell** (`delay 20ms 5ms rate 20mbit limit 500`):
+
+| Path | idle | upload | download | goodput up / down, typing | goodput up / down, bulk only |
+|---|---|---|---|---|---|
+| pipe, before | 50.2 / 61.3 | 433 / 700 | 434 / 705 | 19.06 / 18.88 | 19.07 / 19.06 |
+| **pipe, paced** | 50.2 / 60.4 | **81 / 92** | **86 / 98** | 19.00 / 18.99 | 18.99 / 18.80 |
+| QUIC, before | 49.7 / 62.6 | 272 / 319 | 274 / 324 | 18.97 / 18.90 | 18.98 / 18.93 |
+| **QUIC, paced** | 49.6 / 64.6 | **75 / 87** | **76 / 86** | 18.92 / 18.84 | 18.90 / 18.86 |
+| ssh -tt -L | 58.8 / 80.4 | 850 / 1133 | 845 / 1119 | 19.10 / 19.07 | |
+| ssh -tt -o ObscureKeystrokeTiming=no -L | 50.5 / 64.9 | 852 / 1124 | 850 / 1089 | 19.10 / 19.06 | |
+
+- **H1's rule holds on both transports:** p50 under load 75 to 86 ms against a line of about 110 ms (2 x idle + 10), and p99 under 100 ms (from 700 and 320). Goodput is within 1.4 % of before in every cell. A 150 s download with typing (base periods and their drains included) gave pipe 80.5 / 93.0 at 18.96 Mbit/s and QUIC 78.7 / 96.9 at 18.87: no creep.
+- **What is left queued, paced:** in the router 125 to 155 KB (about 55 ms at 20 Mbit/s; the target plus the controller's swing), in the client's socket about 190 KB with nothing unsent, and in flight for fil 230 to 245 KB.
+- **On GitHub x86_64** ([run 41750688392](https://github.com/anthonytw/fil/actions/runs/41750688392), H1 merged with main at `69d84f8`; every realnet job passed), this harness's `f_fwd_vs_ssh` against V1's table above: pipe **73.9 / 85.0** up and **75.0 / 88.3** down (431.8 / 701.0 and 431.7 / 673.4 before), QUIC **73.6 / 84.9** and **76.3 / 86.8** (271.1 / 320.2 and 276.5 / 321.6), against H1 triggers of 93.7 and 93.6 ms: `h1_rule_exceeded=no` in all four. Goodput 19.0 (pipe) and 18.9 (QUIC) Mbit/s, against 19.1 and 19.0 before. ssh -L in the same job: 856 / 1134 and 848 / 1111; without `ObscureKeystrokeTiming`, idle 40.6 ms and loaded 852 / 1117 and 857 / 1096.
+- **This harness's `f_fwd_vs_ssh` in the VM**, on the same build: pipe 81.2 / 128.4 up and 80.1 / 91.4 down, QUIC 86.9 / 99.6 and 74.8 / 86.5, `h1_rule_exceeded=no` in all four; with pacing off 433.3 / 684.2, 434.4 / 666.2, 273.3 / 320.5 and 216.0 / 321.1, exceeded in all four.
+
+**A fast LAN** (`delay 1ms rate 1gbit limit 1000`) **and no netem** (veth): the queue stays under the target, the cap grows to the window, and nothing changes.
+
+| Path | download with typing | download goodput | upload goodput, bulk only |
+|---|---|---|---|
+| LAN pipe, before / paced | p50 9.0 to 13.7 / 9.0 to 11.8 (7 pairs) | medians of 7 pairs 921 / 919 | 945 / 945 |
+| LAN QUIC, before / paced | 5.5 / 8.7, 5.1 / 9.2 | 943 / 941 | 943 / 944 |
+| veth pipe, before / paced | 1.3 / 14, 1.3 / 8.1 | 3444 / 3427 | 3529 / 3531 |
+| veth QUIC, before / paced | 1.0 / 3.1, 1.0 / 3.1 | 3529 / 3503 | 3385 / 3394 |
+
+The LAN pipe download is noisy in this shared VM in both builds (paced 674 to 944, unpaced 603 to 946 Mbit/s over seven interleaved pairs); the pacer's trace in the low paced cells has the cap at the window, so it was not what limited them.
+
+### H1 with several channels (`f_fwd_parallel`, `f_fwd_stuck`, `f_agent_beside_stuck`)
+
+The PR #83 review found two failures that only appear with several channels. With 16 or more channels sharing the cap, every ack waited for the receiver's 100 ms timer and throughput fell by half. Readers that stopped could stall every other forward and the agent. The fixes are in DESIGN §8.5 "Pacing": ack on drain, timer samples kept as bounds, the pass budget and the agent's reserve, parked channels, and `Mux::poll_transmit_channel`.
+
+These cells measure them on V1's bottleneck, paced against unpaced on the same build.
+
+Their verdicts are misses: the scenario fails when one does not hold. The rules:
+- **`f_fwd_parallel`:** a paced keystroke p50 over H1's line (2 × the paced idle p50 + 10 ms), on every loaded cell; paced goodput under 0.9 of unpaced; or, on QUIC, a request round trip over the same line.
+- **`f_fwd_stuck`:** the paced live echo more than 10 % and 500 ms over unpaced.
+- **`f_agent_beside_stuck`:** the paced `ssh-add -l` p50 more than 25 % and 25 ms over unpaced.
+
+There is no extra margin for shared runners: on GitHub the paced cells sat 12 to 20 ms under the line. `FIL_FORWARD_PACING=off` is set in the client's command and in a daemon the harness restarts with it. Keystrokes run at 20 keys/s for 20 s; goodput is what the application received. The Lima VM, aarch64. Times in ms are p50 / p99 unless marked otherwise.
+
+**Parallel downloads through one `-L`** (`f_fwd_parallel`, the final build). Goodput is paced against unpaced:
+
+| Path | flows | keystrokes, unpaced | keystrokes, paced (H1 line) | goodput, paced / unpaced |
+|---|---|---|---|---|
+| pipe | 1 | 436 / 674 | 75 / 85 (110) | 0.996 |
+| pipe | 4 | 967 / 1232 | 73 / 90 | 0.996 |
+| pipe | 16 | 965 / 1204 | 78 / 90 | 0.999 |
+| pipe | 32 | 968 / 1245 | 80 / 92 | 0.995 |
+| QUIC | 1 | 292 / 322 | 81 / 88 (110) | 0.990 |
+| QUIC | 4 | 286 / 323 | 77 / 85 | 0.993 |
+| QUIC | 16 | 334 / 990 | 78 / 91 | 0.995 |
+| QUIC | 32 | 347 / 684 | 79 / 92 | 0.998 |
+
+**A request-and-response forward beside a bulk download, on QUIC** (the review's S1: QUIC streams are not delivered in order across each other):
+
+| | keystrokes | request p50 | goodput |
+|---|---|---|---|
+| unpaced | 293 / 324 | 274 | 18.98 |
+| paced | 75 / 86 | 74 | 18.82 |
+
+The request is 1 KiB, echoed, every 50 ms, on its own forward.
+
+**This cell found a bug.** Before the last fix it held about 137 ms in the VM and 144 ms on GitHub, against a line of 94 to 110 ms:
+
+1. The bulk channel's records outlived the presumption age while the slow-start queue lasted.
+2. The request's acks then presumed them delivered, and the bulk channel was parked.
+3. Parked channels gave no samples, so the current delay froze. The age stayed short, and the channel was parked again at every ack.
+
+Now a parked channel's acks of records still counted unpark it and give samples (DESIGN §8.5, "Parked channels").
+
+**A live 1 MiB echo beside 8 uploads whose target never reads** (`f_fwd_stuck`, after a 10 s settle):
+
+| Path | echo, unpaced | echo, paced | keystrokes, unpaced | keystrokes, paced |
+|---|---|---|---|---|
+| pipe | 4.33 s | 1.40 s | 54 / 990 | 52 / 191 |
+| QUIC | 3.53 s | 0.78 s | 54 / 331 | 51 / 128 |
+
+Paced is faster here because unpaced, the stuck channels' windows sit in the router's queue in front of the echo.
+
+**The agent beside 8 stuck forwards**, over QUIC (`f_agent_beside_stuck`). Twenty `ssh-add -l` from the session's agent socket:
+
+| | p50 | max |
+|---|---|---|
+| unpaced | 101 ms | 590 ms |
+| paced | 103 ms | 109 ms |
+
+The single-flow cell (`f_fwd_vs_ssh`) on the same build: pipe 78.9 / 88.2 up and 80.9 / 92.6 down, QUIC 73.5 / 80.7 and 81.1 / 106.2, against lines of 110.9 and 109.5. Goodput was 19.0 and 18.9 Mbit/s. `h1_rule_exceeded=no` in all four cells.

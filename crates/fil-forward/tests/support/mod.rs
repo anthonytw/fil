@@ -171,6 +171,8 @@ struct QuicEnv {
 pub struct Factory {
     quic: Option<QuicEnv>,
     seed: u64,
+    /// The byte stream under a pipe link (default: no latency, no rate limit).
+    pub stream: StreamConfig,
 }
 
 impl Default for Factory {
@@ -184,6 +186,7 @@ impl Factory {
         Self {
             quic: None,
             seed: 1,
+            stream: StreamConfig::default(),
         }
     }
 
@@ -199,7 +202,7 @@ impl Factory {
                 }
             }
             Transport::Pipe => {
-                let (a, mut b, ctl) = stream_pair(self.seed, StreamConfig::default());
+                let (a, mut b, ctl) = stream_pair(self.seed, self.stream.clone());
                 let cfg = || PipeConfig::new(params());
                 let (client, daemon) = tokio::join!(
                     async { PipeLink::connect(a, cfg()).await.unwrap() },
@@ -285,12 +288,19 @@ fn quic_env() -> QuicEnv {
 #[derive(Default)]
 pub struct Targets {
     map: Mutex<HashMap<ForwardId, Target>>,
+    /// Where an `Agent` open connects (a stand-in for the local ssh-agent).
+    agent: Mutex<Option<Target>>,
     pub asked: AtomicUsize,
 }
 
 impl Targets {
     pub fn set(&self, id: ForwardId, port: u16) {
         self.map.lock().unwrap().insert(id, loopback(port));
+    }
+
+    /// `Agent` opens connect to `port` on loopback.
+    pub fn set_agent(&self, port: u16) {
+        *self.agent.lock().unwrap() = Some(loopback(port));
     }
 
     pub fn remove(&self, id: ForwardId) {
@@ -313,7 +323,7 @@ impl Connector for Targets {
                 self.map.lock().unwrap().get(forward).cloned()
             }
             OpenKind::Dynamic { target, .. } => Some(target.clone()),
-            OpenKind::Agent => None,
+            OpenKind::Agent => self.agent.lock().unwrap().clone(),
         };
         Box::pin(async move {
             let target = target.ok_or(OpenFailure::NoSuchForward)?;
@@ -567,10 +577,26 @@ impl World {
 
     /// `hold_client_events`: the client's events are left for the test (`client.events_rx`).
     pub async fn new_with(t: Transport, cfg: MuxConfig, hold_client_events: bool) -> Self {
+        Self::new_on(t, cfg, hold_client_events, Factory::new()).await
+    }
+
+    /// A pipe over a byte stream like `stream` (a slow path, say).
+    pub async fn new_pipe_on(cfg: MuxConfig, stream: StreamConfig) -> Self {
+        let mut factory = Factory::new();
+        factory.stream = stream;
+        Self::new_on(Transport::Pipe, cfg, false, factory).await
+    }
+
+    async fn new_on(
+        t: Transport,
+        cfg: MuxConfig,
+        hold_client_events: bool,
+        factory: Factory,
+    ) -> Self {
         raise_fd_limit();
         let mut w = Self {
             t,
-            factory: Factory::new(),
+            factory,
             client: End::new_with(Side::Client, cfg.clone(), hold_client_events),
             daemon: End::new(Side::Daemon, cfg),
             link: None,

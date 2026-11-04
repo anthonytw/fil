@@ -98,6 +98,9 @@ pub struct MuxConfig {
     pub max_open: usize,
     pub connect_timeout: Duration,
     pub open_wait: Duration,
+    /// `forward.linger`: how long open channels outlive a disconnect. The same tunable also sets
+    /// how long a client-origin forward withheld from a run outlives that run, at least 30 s
+    /// (`fil_session`).
     pub linger: Duration,
 }
 
@@ -782,7 +785,12 @@ impl Mux {
         }
         c.recv.consumed += n;
         let threshold = ACK_AFTER_BYTES.min(c.window / 4);
-        if c.recv.consumed - c.recv.acked >= threshold {
+        // Acknowledged at once when a threshold's worth is unacknowledged, or when the local
+        // socket has taken everything received (ack on drain): an ack that waits for the timer
+        // tells the sender's pacer a round trip 100 ms longer than the path's, which with many
+        // channels sharing its cap (none reaching the threshold) is every ack (H1). The timer
+        // remains for a reader that keeps bytes waiting. No wire change: the same `Ack`, sooner.
+        if c.recv.consumed - c.recv.acked >= threshold || c.recv.consumed == c.recv.received {
             self.acks.insert(ch.0);
         } else if c.recv.ack_since.is_none() {
             c.recv.ack_since = now;
@@ -978,12 +986,7 @@ impl Mux {
         if let Some(t) = self.poll_transmit_control() {
             return Some(t);
         }
-        if !self.up || self.failed.is_some() {
-            return None;
-        }
-        // The acceptor's data goes only once its OpenOk is on this link's wire (or was received
-        // on an earlier one): MUX not gated, and sent past the OpenOk.
-        let mux_sent = if self.mux_gate { self.mux_tx.next } else { 0 };
+        let mux_sent = self.data_may_go()?;
         let start = self.rr;
         let after = start.saturating_add(1);
         for (&id, c) in self.chans.range_mut(after..) {
@@ -1001,9 +1004,33 @@ impl Mux {
         None
     }
 
+    /// The next data payload of `ch` alone, if it may send one now: the same rules as
+    /// [`Mux::poll_transmit`] (one function decides for both), without its turn in the round
+    /// robin, which goes on as before for the others. For a sender that paces its channels and
+    /// must reach one it may send on (a new connection, the agent) while it holds the rest: it
+    /// need not take the others' data out of their send buffers to get there. Acks and MUX records
+    /// are not here: [`Mux::poll_transmit_control`] has them. No wire change.
+    pub fn poll_transmit_channel(&mut self, ch: ChannelId) -> Option<Bytes> {
+        let mux_sent = self.data_may_go()?;
+        let c = self.chans.get_mut(&ch.0)?;
+        Self::next_data(c, mux_sent)
+    }
+
+    /// Whether dynamic channels may send at all now (the link is up and the mux healthy), and
+    /// how far the MUX stream has gone on this link's wire: the acceptor's data goes only once
+    /// its OpenOk is on it (or was received on an earlier one): MUX not gated, and sent past the
+    /// OpenOk.
+    fn data_may_go(&self) -> Option<u64> {
+        if !self.up || self.failed.is_some() {
+            return None;
+        }
+        Some(if self.mux_gate { self.mux_tx.next } else { 0 })
+    }
+
     /// The next data segment of `c`, if it may send one now: the Resume gate is open, the
     /// channel is open (no data before `OpenOk`; an acceptor's only once its `OpenOk` is on the
-    /// wire), and the peer's credit allows it.
+    /// wire), and the peer's credit allows it. The one place these rules live, for
+    /// [`Mux::poll_transmit`] and [`Mux::poll_transmit_channel`] alike.
     fn next_data(c: &mut Chan, mux_sent: u64) -> Option<Bytes> {
         let may =
             c.gate && c.is_open() && (c.ours || mux_sent >= c.ok_at) && c.send.next < c.send.end();

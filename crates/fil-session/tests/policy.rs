@@ -448,13 +448,20 @@ async fn each_agent_connection_is_checked_while_attached() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A loopback port free on this machine now.
+/// A loopback port free on this machine now (both families), below every OS's ephemeral range:
+/// a port the kernel hands out to other tests' connections and listeners (port 0) could be taken
+/// again between two steps of a test that lets it go and binds it again.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let base = 21000 + (std::process::id() % 5000) as u16;
+    loop {
+        let p = base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5000;
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+            && std::net::TcpListener::bind(("::1", p)).is_ok()
+        {
+            return p;
+        }
+    }
 }
 
 fn remote_on(port: u16, to: u16) -> ForwardSpec {
@@ -529,12 +536,18 @@ async fn a_remote_rebind_that_failed_after_a_policy_change_is_tried_again() {
         || matches!(state(&h), Some(ListenState::Failed(f)) if f != BindFailure::Policy),
     )
     .await;
-    // The port is free again: the next re-establish binds it.
+    // The port is free again: a re-establish binds it. Each one tries, so this reconnects
+    // until one has: another test's child, forked before its exec, can hold a copy of the
+    // squatter's socket for a moment after it is dropped here.
     drop(squat);
-    b.reconnect(&h).await;
-    until("bound again", || {
-        matches!(state(&h), Some(ListenState::Listening { .. }))
-    })
-    .await;
+    let end = Instant::now() + WAIT;
+    loop {
+        b.reconnect(&h).await;
+        if matches!(state(&h), Some(ListenState::Listening { .. })) {
+            break;
+        }
+        assert!(Instant::now() < end, "bound again: {:?}", state(&h));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     h.kill(WAIT).await;
 }

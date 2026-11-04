@@ -174,11 +174,15 @@ impl Shared {
             Arc::new(load(&self.src))
         });
         let mut st = self.lock();
-        if let Some(l) = read {
+        // Two looks can overlap (`reread_now` while one runs in the background): the read that
+        // began last wins, so an older one finishing late never undoes a newer one.
+        if let Some(l) = read
+            && l.at >= st.loaded.at
+        {
             st.loaded = l;
             self.reads.send_modify(|n| *n = n.wrapping_add(1));
         }
-        st.confirmed = started;
+        st.confirmed = st.confirmed.max(started);
     }
 }
 

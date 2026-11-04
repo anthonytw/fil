@@ -749,7 +749,9 @@ pub enum PolicyLine {
     /// Files the sshd config includes could not be read: the mirror is incomplete (fil mirrors
     /// the rest). `file` is the first; `more` counts the others. Names files, never contents.
     Partial { file: PortsPath, more: u16 },
-    /// fil's policy file is there but cannot be used: every forward and the agent are refused.
+    /// Every forward and the agent are refused: fil's policy file is there but cannot be used,
+    /// or the last read is too old to decide on. With [`crate::mux::PolicySetting::Unevaluable`]
+    /// (an sshd line fil cannot evaluate), everything the policy file does not set itself.
     DenyAll(PolicyRefusal),
     /// Server policy refuses fil's direct (QUIC) transport: attaches use the pipe.
     Direct(PolicyRefusal),

@@ -595,7 +595,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 - **Better than ssh:**
   - nothing is relayed while detached; the socket file does not exist then;
   - the filter means the remote cannot add, remove or lock keys;
-  - an optional per-signature confirm and a key allowlist; the confirm questions stop for 60 s after three in a row end without a yes (M2 sweep), so a host cannot wear the user down;
+  - an optional per-signature confirm and a key allowlist; the confirm questions stop for 60 s after three in a row are answered no or time out (M2 sweep; one the host withdraws does not count), so a host cannot wear the user down;
   - signature counts are visible in `fil ports` (the current client's only: they start over at every fresh attach) and `~#`;
   - a local agent that does not answer holds a connection for at most 60 s per request, and not at all once the host has hung up (M2 sweep).
 - **Worse than, or different from, ssh:**
@@ -609,7 +609,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 - **No per-connection lines at info.**
 - **Probe results and agent key comments are never logged** at any level.
 - **The forward table lives in daemon memory only**, nothing on disk.
-- **A `-R` target beyond loopback never leaves the client** (M2 sweep, coordinator's proposal, owner veto-able; DESIGN §7.2): the host has the bind and port, and shows `(client network)`.
+- **A `-R` target beyond loopback never leaves the client**, nor a `-L`/`-D` bind beyond loopback that is not a wildcard (M2 sweep, coordinator's proposals, owner veto-able; DESIGN §7.2): each goes as an opaque tag under a per-run key, and the host shows `(client network)`.
 - **`fil ports`** shows another user's listener rows by port and address only. It never reads their processes (it cannot).
 - **Error enums only on the wire** (§2.4).
 - **The sweep's privacy audit** gets this list as its checklist.
@@ -622,7 +622,8 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Local bind | loopback (`GatewayPorts no`) | loopback |
 | Remote wide bind | sshd `GatewayPorts` must allow it | explicit address honoured from own CLI or config where the mirrored `GatewayPorts` (or `gateway_ports`) allows it (OD-7, OD-8) |
 | Client checks remote opens | rejects `forwarded-tcpip` for an unrequested listen | forward id plus consent plus own target |
-| `-R` target sent to the server | never: `tcpip-forward` carries the bind address and port only | a loopback target only; one beyond loopback is withheld, and the host shows `(client network)` (M2 sweep; before it, every target was sent, worse than ssh) |
+| `-R` target sent to the server | never: `tcpip-forward` carries the bind address and port only | a loopback target only; one beyond loopback goes as an opaque per-run tag, and the host shows `(client network)` (M2 sweep; before it, every target was sent, worse than ssh) |
+| `-L`/`-D` bind address sent to the server | never: a local forward's listener is the client's alone | loopback and wildcards as they are; any other address (the laptop's LAN address) goes as an opaque per-run tag (M2 sweep, coordinator's proposal, owner veto-able; before it, sent in the clear) |
 | Server side adding forwards | impossible | possible (`fil forward`), gated by on-screen consent |
 | Admin switches (`DisableForwarding`, `AllowTcpForwarding`, `PermitOpen`, `PermitListen`, `GatewayPorts`, `AllowAgentForwarding`) | enforced by sshd | **mirrored** by the daemon from the host's `sshd_config` (`Match User`/`Group` evaluated, other criteria strict), under the admin's `/etc/fil/policy.toml`; refusals name the setting (S1, OD-8). A courtesy, not a boundary: a user with a shell can run any relay |
 | Agent default | `ForwardAgent no` | off |

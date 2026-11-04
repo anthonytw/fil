@@ -205,84 +205,100 @@ pub(crate) enum Note {
     Failed(String),
 }
 
-/// Most notices waiting for the client loop at once. Past it a notice is dropped, and one equal
-/// to a notice still waiting is coalesced with it: a host repeating a report (a bind failure, a
-/// refusal) cannot grow the queue while the loop is stuck on a terminal that does not read. The
-/// loop shows one notice at a time anyway. Questions are bounded by their own caps
-/// ([`MAX_QUESTIONS`], [`crate::agent::MAX_QUESTIONS`]), and the rest end the run.
+/// Most notices waiting for the client loop at once. Past it the oldest waiting is dropped (the
+/// loop shows one notice at a time, each replacing the last, so in a burst the newest is the one
+/// worth keeping), and one equal to a notice still waiting is coalesced with it: a host repeating
+/// a report (a bind failure, a refusal) cannot grow the queue while the loop is stuck on a
+/// terminal that does not read. Questions are bounded by their own caps ([`MAX_QUESTIONS`],
+/// [`crate::agent::MAX_QUESTIONS`]), and the rest end the run.
 pub(crate) const MAX_NOTICES: usize = 8;
 
-/// The notices sent and not yet received, shared by the two ends of the notes channel.
-type Queued = Arc<Mutex<VecDeque<Vec<String>>>>;
+/// The notices waiting, outside the channel (so the oldest can be dropped), and the wake-up for
+/// the loop.
+#[derive(Default)]
+struct Notices {
+    queue: Mutex<VecDeque<Vec<String>>>,
+    ready: tokio::sync::Notify,
+}
 
 /// The sending end of the notes to the client loop (the manager's and the agent relay's), with
 /// notices bounded ([`MAX_NOTICES`]).
 #[derive(Clone)]
 pub(crate) struct NotesTx {
     tx: mpsc::UnboundedSender<Note>,
-    queued: Queued,
+    notices: Arc<Notices>,
 }
 
 /// The client loop's end of the notes.
 pub(crate) struct NotesRx {
     rx: mpsc::UnboundedReceiver<Note>,
-    queued: Queued,
+    notices: Arc<Notices>,
 }
 
 /// A channel of notes to the client loop.
 pub(crate) fn notes_channel() -> (NotesTx, NotesRx) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let queued = Queued::default();
+    let notices = Arc::new(Notices::default());
     (
         NotesTx {
             tx,
-            queued: queued.clone(),
+            notices: notices.clone(),
         },
-        NotesRx { rx, queued },
+        NotesRx { rx, notices },
     )
 }
 
 impl NotesTx {
-    /// Sends `n`; `false` when the client loop is gone. A notice equal to one still waiting, or
-    /// past [`MAX_NOTICES`] waiting, is not sent (and that is not a failure).
+    /// Sends `n`; `false` when the client loop is gone. A notice equal to one still waiting is
+    /// coalesced with it, and past [`MAX_NOTICES`] waiting the oldest goes.
     pub(crate) fn send(&self, n: Note) -> bool {
-        if let Note::Notice(lines) = &n {
-            let mut q = lock(&self.queued);
-            if q.contains(lines) {
+        let Note::Notice(lines) = n else {
+            return self.tx.send(n).is_ok();
+        };
+        if self.tx.is_closed() {
+            return false;
+        }
+        {
+            let mut q = lock(&self.notices.queue);
+            if q.contains(&lines) {
                 debug!("a notice equal to one still waiting; coalesced");
                 return true;
             }
             if q.len() >= MAX_NOTICES {
-                debug!("too many notices waiting; dropped");
-                return true;
+                debug!("too many notices waiting; the oldest dropped");
+                q.pop_front();
             }
-            q.push_back(lines.clone());
+            q.push_back(lines);
         }
-        self.tx.send(n).is_ok()
+        self.notices.ready.notify_one();
+        true
     }
 }
 
 impl NotesRx {
-    fn took(&self, n: &Note) {
-        if let Note::Notice(lines) = n {
-            let mut q = lock(&self.queued);
-            if let Some(i) = q.iter().position(|l| l == lines) {
-                q.remove(i);
+    fn notice(&self) -> Option<Note> {
+        lock(&self.notices.queue).pop_front().map(Note::Notice)
+    }
+
+    /// The next note: the other notes in order, the notices as they wait.
+    pub(crate) async fn recv(&mut self) -> Option<Note> {
+        loop {
+            // Looked at first every time: a wake-up taken by a call that returned a note from
+            // the channel instead is not needed to find a notice later.
+            if let Some(n) = self.notice() {
+                return Some(n);
+            }
+            tokio::select! {
+                biased;
+                n = self.rx.recv() => return n,
+                () = self.notices.ready.notified() => {}
             }
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<Note> {
-        let n = self.rx.recv().await?;
-        self.took(&n);
-        Some(n)
-    }
-
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Option<Note> {
-        let n = self.rx.try_recv().ok()?;
-        self.took(&n);
-        Some(n)
+        self.rx.try_recv().ok().or_else(|| self.notice())
     }
 }
 
@@ -439,6 +455,7 @@ impl<L: Link> Forwards<L> {
                     Some(b) => Listener::Prebound(b),
                     None => Listener::None,
                 },
+                wire: spec.on_wire(),
                 spec,
                 req: None,
                 id: None,
@@ -744,6 +761,9 @@ enum Listener {
 /// One of this run's own specs.
 struct Own {
     spec: ForwardSpec,
+    /// The spec as it goes on the wire, what the host has of it ([`ForwardSpec::on_wire`]: its
+    /// withheld parts under this run's tags).
+    wire: ForwardSpec,
     /// The `AddForward` waiting for its answer.
     req: Option<u32>,
     /// The daemon's entry for it, once answered.
@@ -1046,6 +1066,11 @@ impl<L: Link> Manager<L> {
             self.own[i].req = Some(req);
             self.own[i].id = None;
             self.own[i].wait_failed = false;
+            // The host's `-R` reports are said again in the new attach (`-L` and `-D` say theirs
+            // as they bind again).
+            if self.own[i].spec.kind() == ForwardKind::Remote {
+                self.own[i].bind_reported = false;
+            }
             let spec = self.own[i].spec.clone();
             self.send(MuxMsg::AddForward { req, spec });
         }
@@ -1125,7 +1150,7 @@ impl<L: Link> Manager<L> {
     }
 
     fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
-        if *_wire != self.own[i].spec.on_wire() {
+        if *_wire != self.own[i].wire {
             debug!("the host's entry differs from the spec asked for; the own copy is used");
         }
         // An honest daemon answers with a new id or with an entry of this spec's identity (which
@@ -1269,12 +1294,22 @@ impl<L: Link> Manager<L> {
         // gone, but no answer is coming): an entry with its identity now is asked about.
         let mine = self.own.iter().any(|o| {
             o.req.is_some()
-                && (o.spec.on_wire() == spec
-                    || (spec.port() != 0 && o.spec.identity() == spec.identity()))
+                && (o.wire == spec || (spec.port() != 0 && o.wire.identity() == spec.identity()))
         });
         self.dirty = true;
         if mine {
             self.entries.insert(id, Other::new(spec, State::Superseded));
+            return;
+        }
+        // Withheld by another run (another client, or an earlier run of this one), and of no use
+        // to any other: only that run knows the target or bind, its tags match nothing of any
+        // other run's, and nothing can adopt or replace it (an `-R 0` has no identity; a withheld
+        // bind's identity is that run's tag). It is removed rather than refused, so re-runs do not
+        // pile up dead entries (and `-R` listeners) on the host. A withheld `-R` on a fixed port
+        // is left: an own `-R` on that port replaces it, as for any changed target.
+        if spec.bind_withheld() || (spec.target_withheld() && spec.port() == 0) {
+            debug!(kind = ?spec.kind(), "another run's withheld forward; removed");
+            self.send(MuxMsg::RemoveForward { id });
             return;
         }
         let asking = self
@@ -1807,6 +1842,7 @@ mod tests {
 
     fn own(spec: ForwardSpec) -> Own {
         Own {
+            wire: spec.on_wire(),
             spec,
             req: None,
             id: None,
@@ -1853,6 +1889,35 @@ mod tests {
         assert_eq!(m.entries[&ForwardId(5)].state, State::Superseded);
     }
 
+    /// Another run's `-L` with a withheld bind (its laptop's address, under its tag), and its
+    /// `-R 0` with a withheld target: no run but that one could use them, so they are removed,
+    /// neither kept nor asked about. Its `-R` on a fixed port is left (refused): an own `-R`
+    /// there would replace it.
+    #[tokio::test]
+    async fn another_runs_withheld_forwards_are_removed_not_asked_about() {
+        let (mut m, mut rx) = manager();
+        let tag = [0x77u8; 16];
+        let bind = [vec![0u8, 3], tag.to_vec(), vec![0x90, 0x3f, 1, 0, 1, 9]]
+            .concat()
+            .into_iter()
+            .chain(*b"localhost")
+            .chain([80])
+            .collect::<Vec<u8>>();
+        let l: ForwardSpec = postcard::from_bytes(&bind).unwrap();
+        assert!(l.bind_withheld());
+        let r0: ForwardSpec =
+            postcard::from_bytes(&[vec![1u8, 0, 0, 1, 1], tag.to_vec()].concat()).unwrap();
+        let r9: ForwardSpec =
+            postcard::from_bytes(&[vec![1u8, 0, 0xa8, 0x46, 1, 1], tag.to_vec()].concat()).unwrap();
+        m.other(ForwardId(1), l, Origin::Client);
+        m.other(ForwardId(2), r0, Origin::Client);
+        m.other(ForwardId(3), r9, Origin::Client);
+        assert!(!m.entries.contains_key(&ForwardId(1)));
+        assert!(!m.entries.contains_key(&ForwardId(2)));
+        assert_eq!(m.entries[&ForwardId(3)].state, State::Refused);
+        assert!(asked(&mut rx).is_empty());
+    }
+
     /// The host's own `-R` failure reports are said once until it listens again: a host that
     /// repeats them gets no more notices out of it.
     #[tokio::test]
@@ -1883,6 +1948,12 @@ mod tests {
         m.listening(x, failed);
         m.listening(x, failed);
         assert_eq!(notices(&mut rx), 1, "said again after it listened");
+        // And again in a new attach (a take-back), where the host reports it anew.
+        m.fresh();
+        m.own[0].id = Some(x);
+        let _ = notices(&mut rx);
+        m.listening(x, failed);
+        assert_eq!(notices(&mut rx), 1, "said again after a fresh attach");
     }
 
     /// Notices waiting for the client loop are bounded, and one equal to a notice still waiting
@@ -1900,6 +1971,9 @@ mod tests {
         }
         assert_eq!(got.len(), MAX_NOTICES, "{got:?}");
         assert_eq!(got.iter().filter(|l| *l == "the same").count(), 1);
+        // The oldest went, the newest stayed.
+        assert!(got.iter().any(|l| l == "notice 999"), "{got:?}");
+        assert!(!got.iter().any(|l| l == "notice 0"), "{got:?}");
         // Taken: there is room again, and an equal one is sent again.
         assert!(tx.send(Note::Notice(vec!["the same".into()])));
         assert!(matches!(rx.try_recv(), Some(Note::Notice(_))));

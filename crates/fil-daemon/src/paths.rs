@@ -470,6 +470,15 @@ mod tests {
         assert_eq!(a, p.dir.join(format!("a-{PROTOCOL_MAJOR}-6/main.sock")));
     }
 
+    /// A socket file nobody listens on, as a crashed daemon leaves one: bound and never
+    /// listening, so a connect is refused every time (a listener dropped by the test could still
+    /// be held, for a moment, by a process another test thread is starting).
+    pub(crate) fn dead_socket(path: &Path) {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, socket};
+        let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        bind(&fd, &SocketAddrUnix::new(path).unwrap()).unwrap();
+    }
+
     /// The agent directory's clean-up never touches a directory that fails the socket
     /// directory's checks, nor anything in one but a dead socket of ours.
     #[test]
@@ -487,9 +496,7 @@ mod tests {
         assert!(!p.remove_agent_dir());
 
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        {
-            let _dead = std::os::unix::net::UnixListener::bind(dir.join("a.sock")).unwrap();
-        }
+        dead_socket(&dir.join("a.sock"));
         let live = std::os::unix::net::UnixListener::bind(dir.join("b.sock")).unwrap();
         std::fs::write(dir.join("c.sock"), b"not a socket").unwrap();
         assert_eq!(p.clean_stale_agent_sockets(), 1);
@@ -501,9 +508,7 @@ mod tests {
         std::fs::remove_file(dir.join("c.sock")).unwrap();
 
         // The wrong mode: nothing in it is touched, and it stays.
-        {
-            let _dead = std::os::unix::net::UnixListener::bind(dir.join("a.sock")).unwrap();
-        }
+        dead_socket(&dir.join("a.sock"));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(p.clean_stale_agent_sockets(), 0);
         assert!(dir.join("a.sock").exists());

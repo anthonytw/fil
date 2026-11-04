@@ -576,6 +576,114 @@ async fn an_own_remote_target_beyond_loopback_never_reaches_the_host() -> Test {
     Ok(())
 }
 
+fn remote_to(port: u16, host: &str) -> fil_proto::mux::ForwardSpec {
+    fil_proto::mux::ForwardSpec::new(
+        ForwardKind::Remote,
+        fil_proto::mux::BindAddr::Loopback,
+        port,
+        Some(fil_proto::mux::Target {
+            host: fil_proto::mux::TargetHost::Name(host.parse().unwrap()),
+            port: std::num::NonZeroU16::new(443).unwrap(),
+        }),
+    )
+    .unwrap()
+}
+
+/// What another run left on the host: a `-R` on `port` whose target that run withheld, under a
+/// tag of its own (decoded from fixed bytes, as no run here has that key).
+fn foreign_withheld_remote(port: u16) -> fil_proto::mux::ForwardSpec {
+    let mut b = vec![1u8, 0];
+    b.extend(postcard::to_allocvec(&u64::from(port)).unwrap());
+    b.extend([1, 1]);
+    b.extend([0x5a; 16]);
+    postcard::from_bytes(&b).unwrap()
+}
+
+/// Two own `-R 0`s to different hosts beyond loopback: each its own entry (with one tag for
+/// both they were one, and the run ended with "an id already in use").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_own_ephemeral_remotes_beyond_loopback_are_two_forwards() -> Test {
+    let rig = attached(
+        vec![remote_to(0, "a.example"), remote_to(0, "b.example")],
+        Rules::default(),
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("both in the table", 5, || fwd.ids().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.is_finished(), "the run ended");
+    let ids = fwd.ids();
+    assert!(ids.iter().all(|(_, s, _)| s.target_withheld()));
+    assert_ne!(ids[0].1, ids[1].1);
+    // The listen notices show this run's own copies (one notice at a time on the screen).
+    until("a listen notice", 5, || {
+        let t = rig.term.text();
+        t.contains("a.example") || t.contains("b.example")
+    })
+    .await;
+    Ok(())
+}
+
+/// A re-run (another client process, so another key): what the earlier run withheld matches
+/// nothing of this run's. An `-R 0` of it, which nothing could adopt, is removed; an `-R` on a
+/// fixed port is replaced by this run's own on that port, as for any changed target. Neither is
+/// asked about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_run_removes_or_replaces_what_an_earlier_run_withheld() -> Test {
+    let rig = attached(
+        vec![remote_to(9000, "intranet-wiki.example")],
+        Rules::default(),
+    )
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("own -R in the table", 5, || fwd.ids().len() == 1).await;
+    let own = fwd.ids()[0].clone();
+
+    // The earlier run's `-R 0`: removed, without a question.
+    let stale = fil_proto::mux::ForwardId(500);
+    rig.daemon.fwd.announce(
+        stale,
+        foreign_withheld_remote(0),
+        fil_proto::mux::Origin::Client,
+    );
+    eventually("the stale -R 0 removed", 5, || {
+        fwd.st.lock().unwrap().removed.contains(&stale)
+    })
+    .await;
+
+    // The earlier run's `-R 9000`, in the table when this run takes the session (back): its own
+    // `-R 9000` replaces it.
+    {
+        let mut st = fwd.st.lock().unwrap();
+        st.table.remove(own.0);
+        st.table
+            .add(
+                foreign_withheld_remote(9000),
+                fil_proto::mux::Origin::Client,
+            )
+            .unwrap();
+    }
+    rig.daemon.take_over("other").await;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("the own add answered again", 5, || {
+        fwd.st.lock().unwrap().added.len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.is_finished(), "the run ended");
+    let ids = fwd.ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(ids[0].1, own.1, "this run's own spec holds port 9000");
+    let text = rig.term.text();
+    assert!(!text.contains("asks to forward"), "asked");
+    assert!(!fwd.st.lock().unwrap().removed.iter().any(|id| *id != stale));
+    Ok(())
+}
+
 /// Two own `-L`s (ids 0 and 1) whose ids cross after a take-back (R2): `a` is answered with 1
 /// (`b`'s old id), `b` with 900. Each port reaches its own forward, under its own new id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

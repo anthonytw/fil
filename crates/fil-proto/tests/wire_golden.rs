@@ -233,13 +233,12 @@ fn longest_name() -> DnsName {
 }
 
 /// Every field of a spec at its widest: an IPv6 bind, the longest name, the top port. A `-L`:
-/// a `-R` target that is a name beyond loopback is never on the wire.
+/// a `-R` target that is a name beyond loopback is never on the wire. Its bind is the IPv6
+/// wildcard, as wide as any address, which goes as it is (any other is withheld).
 fn spec_widest() -> ForwardSpec {
     ForwardSpec::new(
         ForwardKind::Local,
-        BindAddr::Ip(IpAddr::V6(Ipv6Addr::new(
-            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-        ))),
+        BindAddr::Ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
         u16::MAX,
         Some(Target {
             host: TargetHost::Name(longest_name()),
@@ -267,12 +266,14 @@ fn bind_addrs() -> Vec<BindAddr> {
     let all = vec![
         BindAddr::Loopback,
         BindAddr::Any,
-        BindAddr::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+        // A wildcard: a -D bind beyond loopback that is not one is withheld, under a run's tag.
+        BindAddr::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
         BindAddr::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     ];
     for c in &all {
         match c {
-            BindAddr::Loopback | BindAddr::Any | BindAddr::Ip(_) => {}
+            // A withheld bind is pinned on its own (`withheld_specs`): only decoding makes one.
+            BindAddr::Loopback | BindAddr::Any | BindAddr::Ip(_) | BindAddr::Withheld(_) => {}
         }
     }
     all
@@ -613,21 +614,21 @@ fn mux_msgs() -> Vec<(String, MuxMsg)> {
             },
         );
     }
-    // A `-R` target beyond loopback: encoded without it (withheld).
+    // What a spec withholds: a -R target beyond loopback, a -L bind on the laptop's network.
+    // Their tags are a run's own, so the pinned specs are decoded from a fixed one.
+    let (remote, local) = withheld_specs();
     add(
         "add-forward-remote-withheld".into(),
         MuxMsg::AddForward {
             req: 1,
-            spec: ForwardSpec::new(
-                ForwardKind::Remote,
-                BindAddr::Loopback,
-                9000,
-                Some(Target {
-                    host: TargetHost::Name("db.example.com".parse().unwrap()),
-                    port: port(5432),
-                }),
-            )
-            .unwrap(),
+            spec: remote,
+        },
+    );
+    add(
+        "add-forward-local-withheld-bind".into(),
+        MuxMsg::AddForward {
+            req: 1,
+            spec: local,
         },
     );
     for (i, bind) in bind_addrs().into_iter().enumerate() {
@@ -2242,12 +2243,12 @@ fn forward_probes() -> Entries {
     ] {
         e.push((format!("decode/window-{v}"), outcome::<Window>(&varint(v))));
     }
-    // A spec as postcard writes it: kind, bind, port, target.
+    // A spec as postcard writes it: kind, bind, port, target (`Shown` or `Withheld`).
     let loopback = vec![0u8];
-    let target = |p: u64| [vec![1u8], vec![1], counted_str("localhost"), varint(p)].concat();
-    let spec = |kind: u8, p: u64, target: Option<Vec<u8>>| {
+    let target = |p: u64| [vec![1u8, 0], vec![1], counted_str("localhost"), varint(p)].concat();
+    let spec_with = |kind: u8, bind: &[u8], p: u64, target: Option<Vec<u8>>| {
         let mut v = vec![kind];
-        v.extend(&loopback);
+        v.extend(bind);
         v.extend(varint(p));
         match target {
             Some(t) => v.extend(t),
@@ -2255,6 +2256,7 @@ fn forward_probes() -> Entries {
         }
         outcome::<ForwardSpec>(&v)
     };
+    let spec = |kind: u8, p: u64, target: Option<Vec<u8>>| spec_with(kind, &loopback, p, target);
     e.push((
         "decode/spec-local-port-0".into(),
         spec(0, 0, Some(target(80))),
@@ -2269,9 +2271,57 @@ fn forward_probes() -> Entries {
     ));
     e.push(("decode/spec-dynamic-port-0".into(), spec(2, 0, None)));
     e.push(("decode/spec-local-no-target".into(), spec(0, 1, None)));
-    // Withheld: the client kept a target beyond loopback to itself.
     e.push(("decode/spec-remote-no-target".into(), spec(1, 1, None)));
-    let wide = |p: u64| [vec![1u8], vec![1], counted_str("db.example"), varint(p)].concat();
+    // Withheld: the client kept a target beyond loopback to itself.
+    let withheld = [vec![1u8, 1], TAG.to_vec()].concat();
+    e.push((
+        "decode/spec-remote-withheld-target".into(),
+        spec(1, 1, Some(withheld.clone())),
+    ));
+    e.push((
+        "decode/spec-local-withheld-target".into(),
+        spec(0, 1, Some(withheld.clone())),
+    ));
+    e.push((
+        "decode/spec-dynamic-withheld-target".into(),
+        spec(2, 1, Some(withheld)),
+    ));
+    // A -L/-D bind: loopback and wildcards as they are, anything else withheld; never a -R's.
+    let held_bind = [vec![3u8], TAG.to_vec()].concat();
+    let ip_bind = |ip: IpAddr| postcard::to_allocvec(&BindAddr::Ip(ip)).unwrap();
+    e.push((
+        "decode/spec-local-withheld-bind".into(),
+        spec_with(0, &held_bind, 1, Some(target(80))),
+    ));
+    e.push((
+        "decode/spec-dynamic-withheld-bind".into(),
+        spec_with(2, &held_bind, 1, None),
+    ));
+    e.push((
+        "decode/spec-remote-withheld-bind".into(),
+        spec_with(1, &held_bind, 1, Some(target(80))),
+    ));
+    for (label, ip) in [
+        ("lan", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5))),
+        ("v4-wildcard", IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        ("v6-wildcard", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ("v4-loopback", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+    ] {
+        e.push((
+            format!("decode/spec-local-bind-{label}"),
+            spec_with(0, &ip_bind(ip), 1, Some(target(80))),
+        ));
+    }
+    e.push((
+        "decode/spec-remote-bind-lan".into(),
+        spec_with(
+            1,
+            &ip_bind(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5))),
+            1,
+            Some(target(80)),
+        ),
+    ));
+    let wide = |p: u64| [vec![1u8, 0], vec![1], counted_str("db.example"), varint(p)].concat();
     e.push((
         "decode/spec-remote-wide-target".into(),
         spec(1, 1, Some(wide(80))),
@@ -2299,6 +2349,11 @@ fn forward_probes() -> Entries {
     ));
     e.push(("decode/spec-kind-3".into(), spec(3, 1, None)));
     e.push(("decode/bind-addr-3".into(), outcome::<BindAddr>(&[3])));
+    e.push((
+        "decode/bind-addr-3-tag".into(),
+        outcome::<BindAddr>(&[vec![3u8], TAG.to_vec()].concat()),
+    ));
+    e.push(("decode/bind-addr-4".into(), outcome::<BindAddr>(&[4])));
     let listening = |p: u64| [vec![0u8], varint(p)].concat();
     e.push((
         "decode/listening-port-0".into(),
@@ -2571,6 +2626,31 @@ fn forward_probes() -> Entries {
         ),
     ));
     e
+}
+
+/// A tag as the wire carries it: 16 bytes, no length.
+const TAG: [u8; 16] = [0xab; 16];
+
+/// `-R 9000` with its target withheld, and `-L <withheld>:8080:localhost:80`, decoded from a
+/// fixed tag (a real one is a run's own).
+fn withheld_specs() -> (ForwardSpec, ForwardSpec) {
+    let remote = [vec![1u8, 0], varint(9000), vec![1, 1], TAG.to_vec()].concat();
+    let local = [
+        vec![0u8, 3],
+        TAG.to_vec(),
+        varint(8080),
+        vec![1, 0, 1],
+        counted_str("localhost"),
+        varint(80),
+    ]
+    .concat();
+    let r: ForwardSpec = postcard::from_bytes(&remote).unwrap();
+    let l: ForwardSpec = postcard::from_bytes(&local).unwrap();
+    assert!(r.target_withheld() && l.bind_withheld());
+    // A decoded withheld spec encodes as it came.
+    assert_eq!(postcard::to_allocvec(&r).unwrap(), remote);
+    assert_eq!(postcard::to_allocvec(&l).unwrap(), local);
+    (r, l)
 }
 
 fn counted_str(s: &str) -> Vec<u8> {

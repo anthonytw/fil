@@ -339,19 +339,37 @@ impl<R: AsyncRead + AsyncWrite + Unpin> Inbound<R> {
         Ok(Msg::One(msg))
     }
 
-    /// Waits until the remote hangs up (`true`), or until the buffer is full or reading fails
-    /// (`false`: nothing more can be seen). What arrives meanwhile is kept for later.
-    async fn closed(&mut self) -> bool {
+    /// Waits until the remote ends its side, and says how ([`Hangup`]). Never returns while the
+    /// buffer is full (nothing more can be seen then). What arrives meanwhile is kept for later.
+    async fn closed(&mut self) -> Hangup {
         loop {
             if self.buf.len() >= AHEAD {
                 return std::future::pending().await;
             }
             match self.fill().await {
                 Ok(true) => {}
-                Ok(false) | Err(_) => return true,
+                // The end of what it sends. Gone altogether, or only done sending (a half-close,
+                // `shutdown(SHUT_WR)`), waiting for its answers? Only a write tells: an empty
+                // one fails once nothing reads.
+                Ok(false) => {
+                    return match self.s.write(&[]).await {
+                        Ok(_) => Hangup::HalfClosed,
+                        Err(_) => Hangup::Gone,
+                    };
+                }
+                Err(_) => return Hangup::Gone,
             }
         }
     }
+}
+
+/// How the remote ended its side ([`Inbound::closed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hangup {
+    /// It sends nothing more, but still reads: what it asked for is still answered.
+    HalfClosed,
+    /// Nothing reads any more.
+    Gone,
 }
 
 /// The client's own host key for the `session-bind@openssh.com` it sends first on every agent
@@ -505,19 +523,25 @@ where
     };
     let bounded = tokio::time::timeout(AGENT_ANSWER_TIMEOUT, talk);
     tokio::pin!(bounded);
-    tokio::select! {
-        r = &mut bounded => match r {
-            Ok(Ok(m)) => Exchange::Answer(m),
-            Ok(Err(_)) => Exchange::Failed,
-            Err(_) => {
-                debug!("the local agent did not answer in time");
-                Exchange::TimedOut
-            }
-        },
-        true = remote.closed() => {
-            debug!("the remote hung up while the local agent was asked");
-            Exchange::Gone
+    let done = |r: Result<io::Result<Msg>, _>| match r {
+        Ok(Ok(m)) => Exchange::Answer(m),
+        Ok(Err(_)) => Exchange::Failed,
+        Err(_) => {
+            debug!("the local agent did not answer in time");
+            Exchange::TimedOut
         }
+    };
+    tokio::select! {
+        r = &mut bounded => done(r),
+        h = remote.closed() => match h {
+            Hangup::Gone => {
+                debug!("the remote hung up while the local agent was asked");
+                Exchange::Gone
+            }
+            // Done sending but still reading: its answer still goes (within the same bound),
+            // and then the connection ends (the next read sees the end).
+            Hangup::HalfClosed => done(bounded.await),
+        },
     }
 }
 
@@ -900,6 +924,61 @@ mod tests {
             t0.elapsed()
         );
         assert_eq!(heard.await.unwrap(), 5);
+    }
+
+    /// A remote that half-closes after its request (`shutdown(SHUT_WR)`, as `nc -N` does) still
+    /// gets the answer, from an agent that answers at once or a little later; then the
+    /// connection ends.
+    #[tokio::test]
+    async fn a_half_closed_remote_still_gets_its_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for delay in [0u64, 5, 50] {
+            let (mut remote, far) = tokio::io::duplex(1 << 12);
+            let (agent, mut agent_far) = tokio::io::duplex(1 << 12);
+            tokio::spawn(async move {
+                let Ok(Msg::One(_bind)) = read_msg(&mut agent_far).await else {
+                    return;
+                };
+                agent_far
+                    .write_all(&framed(&[filter::SUCCESS]))
+                    .await
+                    .unwrap();
+                let Ok(Msg::One(_list)) = read_msg(&mut agent_far).await else {
+                    return;
+                };
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let _ = agent_far
+                    .write_all(&framed(&[IDENTITIES_ANSWER, 0, 0, 0, 0]))
+                    .await;
+                let mut rest = Vec::new();
+                let _ = agent_far.read_to_end(&mut rest).await;
+            });
+            let task = tokio::spawn(relay(
+                far,
+                agent,
+                Arc::new(Rules::default()),
+                Arc::new(KeyUses::default()),
+            ));
+            remote
+                .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+                .await
+                .unwrap();
+            remote.shutdown().await.unwrap();
+            let mut answer = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), remote.read_to_end(&mut answer))
+                .await
+                .expect("answered, then ended")
+                .unwrap();
+            assert_eq!(
+                answer,
+                framed(&[IDENTITIES_ANSWER, 0, 0, 0, 0]),
+                "delay {delay}"
+            );
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the relay ended")
+                .unwrap();
+        }
     }
 
     /// A key and its certificate share `ssh-add -l`'s fingerprint, and are counted apart.

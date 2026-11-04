@@ -70,12 +70,13 @@ const AGENT_TOKEN: u64 = 1 << 63;
 /// cannot keep the keyboard busy by opening many agent connections.
 pub(crate) const MAX_QUESTIONS: usize = 4;
 
-/// After this many signature questions in a row that end without a yes (a "n", the 30 s
-/// timeout, or the host withdrawing one), signatures are refused without asking for
+/// After this many signature questions in a row answered no (a "n", or no answer in the 30 s the
+/// question waits), signatures are refused without asking for
 /// [`DENIAL_COOLDOWN`]: the forward questions' rule ([`crate::consent::MAX_DENIALS`]), so a
 /// process on the host cannot keep the keyboard busy, or wear the user down until a "y" slips
 /// out, by asking again and again. The questions still waiting are refused too, and the user is
-/// told once.
+/// told once. A question the host withdraws (it hung up) does not count: the host could
+/// otherwise turn the rule against the user's own signatures for free.
 pub(crate) const MAX_DENIALS: u32 = crate::consent::MAX_DENIALS;
 
 /// How long signatures are refused without asking once [`MAX_DENIALS`] tripped. Then questions
@@ -214,12 +215,14 @@ impl Asking {
         }
     }
 
-    /// A question ended: `yes`, or not (a "n", the timeout, a withdrawal).
+    /// A question was answered: `yes`, or not (a "n", or the timeout).
     fn ended(&self, yes: bool) {
         let mut d = self.denials();
-        if d.until.is_some() {
+        match d.until {
             // Refused by the rule itself (the questions waiting when it tripped).
-            return;
+            Some(t) if tokio::time::Instant::now() < t => return,
+            Some(_) => *d = Denials::default(),
+            None => {}
         }
         if yes {
             d.in_row = 0;
@@ -239,7 +242,7 @@ impl Asking {
         }
         self.notes.send(Note::Notice(crate::text::wrap(
             &format!(
-                "fil: refusing signatures for {} s: too many were refused",
+                "fil: refusing signatures for {} s: {MAX_DENIALS} in a row were refused",
                 DENIAL_COOLDOWN.as_secs()
             ),
             38,
@@ -248,12 +251,13 @@ impl Asking {
 }
 
 /// Withdraws a question whose future was dropped (its connection ended, or it timed out), and
-/// counts how every question ended toward the refusal rule.
+/// counts how it ended toward the refusal rule.
 struct Withdraw {
     asker: Arc<Asking>,
     token: u64,
-    /// The answer, once there is one: none (dropped first) counts as a refusal.
-    yes: bool,
+    /// The answer, once there is one.
+    yes: Option<bool>,
+    asked: tokio::time::Instant,
 }
 
 impl Drop for Withdraw {
@@ -261,7 +265,14 @@ impl Drop for Withdraw {
         if self.asker.lock().remove(&self.token).is_some() {
             self.asker.notes.send(Note::Cancel { token: self.token });
         }
-        self.asker.ended(self.yes);
+        // Dropped unanswered: the relay's timeout (no answer in time, a refusal), or the host
+        // hanging up first (not the user's refusal; not counted).
+        let answer = self
+            .yes
+            .or((self.asked.elapsed() >= fil_forward::agent::CONFIRM_TIMEOUT).then_some(false));
+        if let Some(yes) = answer {
+            self.asker.ended(yes);
+        }
     }
 }
 
@@ -287,12 +298,13 @@ impl Confirm for Asker {
         let guard = Withdraw {
             asker: a.clone(),
             token,
-            yes: false,
+            yes: None,
+            asked: tokio::time::Instant::now(),
         };
         Box::pin(async move {
             let mut guard = guard;
             let yes = sent && rx.await.unwrap_or(false);
-            guard.yes = yes;
+            guard.yes = Some(yes);
             yes
         })
     }
@@ -472,10 +484,10 @@ mod tests {
         assert!(rx.try_recv().is_none(), "a notice only for the failure");
     }
 
-    /// The refusal rule: [`MAX_DENIALS`] questions in a row without a yes (here a "n", a
-    /// withdrawal and a "n") refuse the one still waiting and every signature after without
-    /// asking, with one notice, for [`DENIAL_COOLDOWN`]; then questions come again. A yes in
-    /// between starts the count over.
+    /// The refusal rule: [`MAX_DENIALS`] questions in a row answered no (here two "n" and a
+    /// timeout; the host withdrawing one does not count) refuse the one still waiting and every
+    /// signature after without asking, with one notice, for [`DENIAL_COOLDOWN`]; then questions
+    /// come again. A yes in between starts the count over.
     #[tokio::test(start_paused = true)]
     async fn too_many_refusals_stop_the_questions_for_a_while() {
         let (tx, mut rx) = crate::forward::notes_channel();
@@ -505,7 +517,7 @@ mod tests {
         agent.answer(ask(&mut rx), true);
         assert!(fut.await, "a yes resets the count");
 
-        // n, a withdrawal, then a "n" with another question waiting.
+        // n, a withdrawal by the host (not counted), n: still asking.
         let fut = asker.confirm(info("k"));
         agent.answer(ask(&mut rx), false);
         assert!(!fut.await);
@@ -513,12 +525,18 @@ mod tests {
         let gone = ask(&mut rx);
         drop(fut);
         assert!(matches!(rx.try_recv(), Some(Note::Cancel { token }) if token == gone));
+        let fut = asker.confirm(info("k"));
+        agent.answer(ask(&mut rx), false);
+        assert!(!fut.await);
+        // Then one left unanswered until the relay's timeout drops it (counted), with another
+        // question waiting: the rule trips.
         let third = asker.confirm(info("k"));
         let third_token = ask(&mut rx);
         let waiting = asker.confirm(info("k"));
         let waiting_token = ask(&mut rx);
-        agent.answer(third_token, false);
-        assert!(!third.await);
+        tokio::time::advance(fil_forward::agent::CONFIRM_TIMEOUT).await;
+        drop(third);
+        assert!(matches!(rx.try_recv(), Some(Note::Cancel { token }) if token == third_token));
         let quick = std::time::Duration::from_secs(1);
         assert_eq!(
             tokio::time::timeout(quick, waiting).await,

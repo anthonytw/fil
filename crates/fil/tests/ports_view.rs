@@ -869,3 +869,68 @@ fn the_forward_hint_is_a_command_that_works_where_ports_was_run() {
     assert!(hint(None, Some("other")).contains("FIL_SESSION=main fil forward -L 8000"));
     assert!(hint(None, None).contains("FIL_SESSION=main fil forward -L 8000"));
 }
+
+/// What another client withheld from the host (DESIGN.md section 7.2): a `-R` target beyond
+/// loopback and a `-L` bind on the laptop's network. The rows show `(client network)` where
+/// they would show it, in the text and in `--json` (`target` null for the `-R`, `bind`
+/// `"withheld"` for the `-L`; `spec` is display text then, which does not parse back).
+#[test]
+fn a_withheld_target_and_bind_show_as_the_client_network() {
+    let mut r = fwd(
+        "main",
+        1,
+        ForwardKind::Remote,
+        "9000:intranet-wiki.example:443",
+        listening(9000),
+        Origin::Client,
+        true,
+    );
+    r.spec = r.spec.on_wire();
+    let mut l = fwd(
+        "main",
+        2,
+        ForwardKind::Local,
+        "192.0.2.5:8080:localhost:80",
+        None,
+        Origin::Client,
+        true,
+    );
+    l.spec = l.spec.on_wire();
+    assert!(r.spec.target_withheld() && l.spec.bind_withheld());
+    let rows = vec![PortsRow::Forward(r), PortsRow::Forward(l)];
+    let text = render_text(&answer(rows.clone()), &opts(Some("devbox")));
+    for gone in ["intranet", "192.0.2.5"] {
+        assert!(!text.contains(gone), "{gone}:\n{text}");
+    }
+    let r_row = text
+        .lines()
+        .find(|l| l.contains("←"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(r_row.contains("(client network) ←"), "{r_row}");
+    let l_row = text
+        .lines()
+        .find(|l| l.contains("-L"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(l_row.contains("(client network):8080 →"), "{l_row}");
+
+    let json = render_json(&answer(rows), &opts(Some("devbox")));
+    for gone in ["intranet", "192.0.2.5"] {
+        assert!(!json.contains(gone), "{gone}:\n{json}");
+    }
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let f = &v["sessions"][0]["forwards"];
+    let by_kind = |k: &str| {
+        f.as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["kind"] == k)
+            .unwrap_or_else(|| panic!("{json}"))
+            .clone()
+    };
+    let (r, l) = (by_kind("remote"), by_kind("local"));
+    assert_eq!(r["target"], serde_json::Value::Null);
+    assert_eq!(r["spec"], "-R 9000:(client network)");
+    assert_eq!(l["bind"], "withheld");
+    assert_eq!(l["spec"], "-L (client network):8080:localhost:80");
+    assert!(parse(ForwardKind::Remote, "9000:(client network)").is_err());
+}

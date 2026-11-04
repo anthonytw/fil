@@ -118,8 +118,12 @@ async fn stale_agent_sockets_go_at_start_and_the_empty_directory_at_exit() {
     ensure_socket_dir(&s.dir).unwrap();
     let dir = s.paths().agent_dir();
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    // Bound, never listening: refused every time, as a crashed daemon's (a listener dropped here
+    // could still be held by a process another test thread is starting).
     {
-        let _crashed = std::os::unix::net::UnixListener::bind(dir.join("old.sock")).unwrap();
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, socket};
+        let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        bind(&fd, &SocketAddrUnix::new(dir.join("old.sock")).unwrap()).unwrap();
     }
     let live = std::os::unix::net::UnixListener::bind(dir.join("live.sock")).unwrap();
     let d = start(&s, config(CAT)).await;

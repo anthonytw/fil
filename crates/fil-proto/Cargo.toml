@@ -12,6 +12,9 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
 bytes = "1"
+# HMAC for the tags of what a spec withholds (src/mux/wire.rs, `Withheld`), under a key drawn
+# from the system's random source.
+ring = "0.17"
 
 [features]
 # Lets a test override the wire revision with FIL_TEST_WIRE_REVISION (src/version.rs). Never in the

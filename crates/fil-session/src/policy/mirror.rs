@@ -646,6 +646,8 @@ fn listen_text(b: BindAddr) -> String {
         BindAddr::Any => String::new(),
         BindAddr::Ip(IpAddr::V4(a)) => a.to_string(),
         BindAddr::Ip(IpAddr::V6(a)) => a.to_string(),
+        // Never a -R's (it does not decode); a laptop-side bind of another client's.
+        BindAddr::Withheld(_) => "(withheld)".to_string(),
     }
 }
 

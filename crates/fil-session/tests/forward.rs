@@ -648,19 +648,20 @@ async fn takeover_and_take_back() {
 
 /// A `-R` target beyond loopback never reaches the daemon (DESIGN.md section 7.2): the table,
 /// `fil ports` and the next client after a takeover see it withheld, and the connections still
-/// reach the client, which connects to its own copy. Another client's equal `-R` (any target
-/// beyond loopback) is the same entry. A loopback target is kept as it is.
+/// reach the client, which connects to its own copy. Another client's `-R 0` to another target
+/// is an entry of its own (its tag differs), and on a fixed port it replaces the entry, as for
+/// any changed target, keeping the port. A loopback target is kept as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_target_beyond_loopback_stays_with_its_client() {
     let s = Scratch::new();
     let h = spawn_plain(cat(&s, "withheld")).await;
     let mut a = FwdClient::attach(&h, key(1), "laptop").await;
     let at = tagged_echo(b"A").await;
-    let to = |host: &str| {
+    let to_on = |port: u16, host: &str| {
         ForwardSpec::new(
             ForwardKind::Remote,
             BindAddr::Loopback,
-            0,
+            port,
             Some(Target {
                 host: TargetHost::Name(host.parse().unwrap()),
                 port: NonZeroU16::new(443).unwrap(),
@@ -668,6 +669,7 @@ async fn a_remote_target_beyond_loopback_stays_with_its_client() {
         )
         .unwrap()
     };
+    let to = |host: &str| to_on(0, host);
     let id = add(&mut a, to("intranet-wiki.example")).await;
     let port = bound_port(&a, id, 0).await;
     a.side.targets.lock().unwrap().insert(id, at.addr);
@@ -717,7 +719,29 @@ async fn a_remote_target_beyond_loopback_stays_with_its_client() {
         })
         .await;
     looked("the takeover", &told);
-    assert_eq!(add(&mut b, to("other-host.example")).await, id);
+    let b_id = add(&mut b, to("other-host.example")).await;
+    assert_ne!(b_id, id, "another target took A's -R 0 (and its port)");
+    assert_ne!(bound_port(&b, b_id, 0).await, port);
+
+    // On a fixed port: B's own -R there replaces A's, under a new id, on the same port.
+    let fixed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut c = FwdClient::attach(&h, key(3), "third").await;
+    b.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    let old = add(&mut c, to_on(fixed, "intranet-wiki.example")).await;
+    assert_eq!(bound_port(&c, old, 0).await, fixed);
+    let mut d = FwdClient::attach(&h, key(4), "fourth").await;
+    c.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    let from = d.table().len();
+    let new = add(&mut d, to_on(fixed, "other-host.example")).await;
+    assert_ne!(new, old);
+    d.wait_table("ForwardGone for the replaced entry", |m| {
+        matches!(m, MuxMsg::ForwardGone { id } if *id == old).then_some(())
+    })
+    .await;
+    assert_eq!(bound_port(&d, new, from).await, fixed);
 }
 
 /// The attached client's spec with an entry's identity (kind, bind, port) and another target

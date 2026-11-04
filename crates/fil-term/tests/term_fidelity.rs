@@ -288,3 +288,25 @@ fn a_saved_cursor_outside_the_current_region_keeps_its_origin_mode() {
     assert_eq!(marker_row(&receiver), Some(4));
     assert_eq!(receiver, source);
 }
+
+#[test]
+fn leaving_the_alternate_screen_restores_origin_mode_without_moving_the_cursor() {
+    // A line that wraps, so the cursor sits on the reflowed second row; the alternate screen is
+    // entered and the terminal narrowed (the primary grid reflows behind it); on the way back
+    // the cursor is where alacritty puts it, whether or not origin mode had to change.
+    let run = |origin: &[u8]| {
+        let mut e = create("alacritty", SIZE, 100).unwrap();
+        e.feed(&[origin, &b"x".repeat(40), b"\x1b[?1049h"].concat());
+        e.resize(Size { cols: 20, rows: 8 });
+        e.feed(b"\x1b[?6l\x1b[?1049l");
+        e.state(100)
+    };
+    let with = run(b"\x1b[?6h");
+    let without = run(b"");
+    assert!(with.modes.origin && !without.modes.origin);
+    assert_eq!(
+        (with.cursor.row, with.cursor.col),
+        (without.cursor.row, without.cursor.col)
+    );
+    assert_eq!(with.cursor.pending_wrap, without.cursor.pending_wrap);
+}

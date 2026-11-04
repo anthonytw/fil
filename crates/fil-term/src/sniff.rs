@@ -29,6 +29,11 @@ pub(crate) enum Action {
     /// A restore (DECRC, or leaving the alternate screen) has just been parsed and the origin
     /// mode it should have brought back differs from the emulator's: set it to this.
     SetOrigin(bool),
+    /// `CSI ? 1049 l` has just been parsed and the origin mode the alternate screen's entry
+    /// saved differs from the emulator's: set it to this without moving the cursor. (A DECRC
+    /// would move it to the primary grid's saved position, which is not where alacritty leaves
+    /// it after a resize in the alternate screen.)
+    LeaveAlt(bool),
 }
 
 pub(crate) struct RegionTracker {
@@ -96,7 +101,11 @@ impl State {
             }
             (1049, false) if self.alt => {
                 self.alt = false;
-                self.restore_origin(false);
+                let saved = self.saved_origin[0];
+                if saved != self.origin {
+                    self.origin = saved;
+                    self.action = Some(Action::LeaveAlt(saved));
+                }
             }
             _ => {}
         }
@@ -304,7 +313,7 @@ mod tests {
         assert!(t.saved_origin(false));
         assert!(!t.saved_origin(true));
         // Leaving brings back the primary one's.
-        assert_eq!(t.feed(b"\x1b[?1049l"), vec![(8, Action::SetOrigin(true))]);
+        assert_eq!(t.feed(b"\x1b[?1049l"), vec![(8, Action::LeaveAlt(true))]);
         // RIS forgets all of it.
         t.feed(b"\x1bc");
         assert!(!t.saved_origin(false));

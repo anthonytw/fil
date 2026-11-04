@@ -181,7 +181,7 @@ impl Emulator for Vt100 {
             match action {
                 Action::Decstr => soft_reset(parser),
                 // `vt100` is not asked to follow the origin mode.
-                Action::SetOrigin(_) => {}
+                Action::SetOrigin(_) | Action::LeaveAlt(_) => {}
             }
         }
         self.parser.get_mut().process(&bytes[done..]);

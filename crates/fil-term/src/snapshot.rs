@@ -431,6 +431,9 @@ impl<'a> Writer<'a> {
 /// same cells (the real-terminal suite, `cl-rows*`, docs/m3/terminals.md finding 3). `CSI 2 J`
 /// is no substitute: tmux pushes on it too. The cost is a short sequence per row.
 ///
+/// It clears `rows` rows and no more: `CSI J` also cleared the rows of a client terminal taller
+/// than the state (a snapshot that races a resize), which stay as they were until the next repaint.
+///
 /// The caller has put the terminal in a state where `CUP` is absolute: origin mode off. A scroll
 /// region does not matter, `CUP` and `EL` ignore it. The pen should be reset first, so the erased
 /// cells get the default background (the snapshot writer's own first step does that).

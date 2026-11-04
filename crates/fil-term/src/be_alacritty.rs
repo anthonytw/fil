@@ -20,7 +20,10 @@
 //!   have changed the mode, `feed` puts `CSI ? 6 h|l` and a second `ESC 8` into the stream
 //!   right after it: setting the origin mode homes the cursor, and the second restore takes it
 //!   back to the saved position, pen, wrap flag and character sets. Going through the parser
-//!   keeps the order right inside a synchronized-update bracket.
+//!   keeps the order right inside a synchronized-update bracket. Leaving the alternate screen
+//!   (`1049 l`) is the exception: its restore is the grid's own cursor, which differs from the
+//!   saved one after a resize in the alternate screen, so the mode is set on the `Term`
+//!   directly with the cursor put back (a held sync batch is applied first).
 //! - DECSTR (`CSI ! p`) has no handler. The tracker reports where one ends and `soft_reset`
 //!   applies xterm's definition to the `Term` there: replace mode, autowrap on, absolute origin mode, the
 //!   full-screen scroll region, ASCII in G0 to G3 with G0 invoked, a normal pen, and nothing
@@ -209,6 +212,30 @@ impl Alacritty {
     }
 }
 
+impl Alacritty {
+    /// Sets the origin mode without moving the cursor (setting it homes the cursor). The `Term`
+    /// is changed directly, so a held synchronized-update batch is applied first.
+    fn set_origin_in_place(&mut self, on: bool) {
+        if self.parser.sync_bytes_count() > 0 {
+            self.parser.stop_sync(self.term.get_mut());
+        }
+        let term = self.term.get_mut();
+        let (point, wrap) = {
+            let c = &term.grid().cursor;
+            (c.point, c.input_needs_wrap)
+        };
+        let mode = PrivateMode::Named(NamedPrivateMode::Origin);
+        if on {
+            Handler::set_private_mode(term, mode);
+        } else {
+            Handler::unset_private_mode(term, mode);
+        }
+        let c = &mut term.grid_mut().cursor;
+        c.point = point;
+        c.input_needs_wrap = wrap;
+    }
+}
+
 impl Emulator for Alacritty {
     fn backend(&self) -> &'static str {
         "alacritty"
@@ -221,6 +248,7 @@ impl Emulator for Alacritty {
             done = end;
             match action {
                 Action::Decstr => self.soft_reset(),
+                Action::LeaveAlt(on) => self.set_origin_in_place(on),
                 Action::SetOrigin(on) => {
                     let fix: &[u8] = if on {
                         b"\x1b[?6h\x1b8"

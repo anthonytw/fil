@@ -1052,6 +1052,9 @@ impl<L: Link> Endpoint<L> {
         inner.drain(&mut st);
         drop(st);
         inner.kick();
+        // The queued connections are looked at again now, against the new epoch's policy (a
+        // detached session refuses them at once), not when the oldest one's `open_wait` ends.
+        inner.pending_kick.notify_one();
     }
 
     // ---- what the link delivered --------------------------------------------------------------

@@ -4,7 +4,10 @@
 //! /tmp/fil-$UID/             mode 0700, owned by us (refused otherwise)
 //!     fil-<major>-<rev>.sock  the daemon's Unix socket (mode 0600)
 //!     fil-<major>-<rev>.lock  held (flock) by the running daemon for its whole life; holds its pid
-//!     fil-<major>-<rev>.start held briefly by a relay that is starting the daemon
+//!     fil-<major>-<rev>.start the start lock: held for a moment by a relay that is starting
+//!                             the daemon; the empty file stays until the daemon exits
+//!     a-<major>-<rev>/        mode 0700: the sessions' agent sockets (`<session>.sock`, 0600),
+//!                             removed at a clean exit when empty
 //! ~/.config/fil/daemon.toml  optional configuration (see [`crate::DaemonConfig`])
 //! ~/.local/state/fil/daemon.log
 //! ```
@@ -20,7 +23,7 @@
 use std::ffi::OsStr;
 use std::fs::DirBuilder;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fil_proto::limits::PROTOCOL_MAJOR;
@@ -159,9 +162,58 @@ impl Paths {
     /// directory's name is short so the longest path fits `sockaddr_un`: a 10-digit uid, a
     /// 64-byte session name and a revision up to 9999 make 98 bytes.
     pub fn agent_socket(&self, session: &fil_proto::msg::SessionName) -> PathBuf {
-        self.dir
-            .join(format!("a-{}-{}", self.major, self.revision))
-            .join(format!("{session}.sock"))
+        self.agent_dir().join(format!("{session}.sock"))
+    }
+
+    /// `a-<major>-<rev>/`: this revision's agent sockets ([`Paths::agent_socket`]). Only the
+    /// daemon of this revision, which holds its lock, puts sockets in it.
+    pub fn agent_dir(&self) -> PathBuf {
+        self.dir.join(format!("a-{}-{}", self.major, self.revision))
+    }
+
+    /// At start, holding the daemon lock: removes the agent sockets a crashed daemon of this
+    /// revision left (each names a session). Only from a directory that passes the socket
+    /// directory's checks ([`check_dir`]), and only what is a socket, ours, that nobody answers
+    /// on. Returns how many went.
+    pub fn clean_stale_agent_sockets(&self) -> usize {
+        let dir = self.agent_dir();
+        if !agent_dir_is_ours(&dir) {
+            return 0;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        let ours = current_uid();
+        let mut removed = 0;
+        for e in rd.filter_map(Result::ok) {
+            let path = e.path();
+            if path.extension() != Some(OsStr::new("sock")) {
+                continue;
+            }
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !m.file_type().is_socket() || m.uid() != ours {
+                continue;
+            }
+            // A live listener answers; a crashed daemon's socket refuses.
+            if matches!(
+                std::os::unix::net::UnixStream::connect(&path),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+            ) && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// At a clean exit, holding the daemon lock and after the sessions ended: removes the agent
+    /// directory when it is ours (the socket directory's checks) and empty, so nothing of the
+    /// relay stays in `/tmp` (DESIGN.md section 5.3). A directory with anything in it stays.
+    pub fn remove_agent_dir(&self) -> bool {
+        let dir = self.agent_dir();
+        agent_dir_is_ours(&dir) && std::fs::remove_dir(&dir).is_ok()
     }
 
     /// `fil-<major>-<rev>.lock`: held by the running daemon.
@@ -257,6 +309,12 @@ pub fn check_dir(path: &Path, facts: DirFacts, our_uid: u32) -> Result<(), DirEr
         });
     }
     Ok(())
+}
+
+/// The agent directory is there and passes [`check_dir`]: a real directory, ours, mode 0700.
+fn agent_dir_is_ours(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| check_dir(dir, DirFacts::of(&m), current_uid()).is_ok())
 }
 
 /// Creates the socket directory with mode 0700, or checks the one that exists. The last path
@@ -410,6 +468,67 @@ mod tests {
         );
         assert_ne!(a.parent(), b.parent());
         assert_eq!(a, p.dir.join(format!("a-{PROTOCOL_MAJOR}-6/main.sock")));
+    }
+
+    /// A socket file nobody listens on, as a crashed daemon leaves one: bound and never
+    /// listening, so a connect is refused every time (a listener dropped by the test could still
+    /// be held, for a moment, by a process another test thread is starting).
+    pub(crate) fn dead_socket(path: &Path) {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, socket};
+        let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        bind(&fd, &SocketAddrUnix::new(path).unwrap()).unwrap();
+    }
+
+    /// The agent directory's clean-up never touches a directory that fails the socket
+    /// directory's checks, nor anything in one but a dead socket of ours.
+    #[test]
+    fn the_agent_directory_clean_up_is_careful() {
+        use std::os::unix::fs::{DirBuilderExt, symlink};
+        let base = std::env::temp_dir().join(format!("fil-adir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let p = Paths::in_dir(&base);
+        let dir = p.agent_dir();
+        assert_eq!(p.clean_stale_agent_sockets(), 0, "no directory");
+        assert!(!p.remove_agent_dir());
+
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dead_socket(&dir.join("a.sock"));
+        let live = std::os::unix::net::UnixListener::bind(dir.join("b.sock")).unwrap();
+        std::fs::write(dir.join("c.sock"), b"not a socket").unwrap();
+        assert_eq!(p.clean_stale_agent_sockets(), 1);
+        assert!(!dir.join("a.sock").exists());
+        assert!(dir.join("b.sock").exists() && dir.join("c.sock").exists());
+        assert!(!p.remove_agent_dir(), "not empty");
+        drop(live);
+        std::fs::remove_file(dir.join("b.sock")).unwrap();
+        std::fs::remove_file(dir.join("c.sock")).unwrap();
+
+        // The wrong mode: nothing in it is touched, and it stays.
+        dead_socket(&dir.join("a.sock"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(p.clean_stale_agent_sockets(), 0);
+        assert!(dir.join("a.sock").exists());
+        std::fs::remove_file(dir.join("a.sock")).unwrap();
+        assert!(!p.remove_agent_dir());
+        assert!(dir.exists());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(p.remove_agent_dir(), "ours, 0700 and empty");
+        assert!(!dir.exists());
+
+        // A link in its place is not followed.
+        let real = base.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        symlink(&real, &dir).unwrap();
+        assert!(!p.remove_agent_dir());
+        assert!(real.exists() && std::fs::symlink_metadata(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `fil ls` probes other daemons' lock files; one that is a FIFO (or a link) must neither block

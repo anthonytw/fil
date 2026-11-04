@@ -1233,7 +1233,7 @@ mod tests {
     #[test]
     fn every_message_round_trips() {
         let t = TakenOver {
-            by: "orin".parse().unwrap(),
+            by: "devbox".parse().unwrap(),
             at_unix_ms: 1_700_000_000_000,
             epoch: 3,
         };

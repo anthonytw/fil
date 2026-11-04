@@ -174,16 +174,31 @@ pub(crate) struct Question {
     pub(crate) lines: Vec<String>,
     /// A `confirm`-mode signature ([`crate::agent`]), not a forward: `id` means nothing then.
     pub(crate) agent: bool,
+    /// When the client loop first put it on the screen (a signature question's; the agent rule
+    /// counts a withdrawal only once it was seen).
+    pub(crate) shown: Option<Arc<std::sync::OnceLock<std::time::Instant>>>,
 }
 
 impl Question {
     /// A question about a signature, answered to the agent relay.
-    pub(crate) fn agent(token: u64, lines: Vec<String>) -> Self {
+    pub(crate) fn agent(
+        token: u64,
+        lines: Vec<String>,
+        shown: Arc<std::sync::OnceLock<std::time::Instant>>,
+    ) -> Self {
         Self {
             id: ForwardId(0),
             token,
             lines,
             agent: true,
+            shown: Some(shown),
+        }
+    }
+
+    /// The client loop put it on the screen now (the first time counts).
+    pub(crate) fn on_screen(&self) {
+        if let Some(s) = &self.shown {
+            let _ = s.set(std::time::Instant::now());
         }
     }
 }
@@ -203,6 +218,103 @@ pub(crate) enum Note {
     Exit(String),
     /// The daemon broke the MUX protocol: the run ends with a protocol error.
     Failed(String),
+}
+
+/// Most notices waiting for the client loop at once. Past it the oldest waiting is dropped (the
+/// loop shows one notice at a time, each replacing the last, so in a burst the newest is the one
+/// worth keeping), and one equal to a notice still waiting is coalesced with it: a host repeating
+/// a report (a bind failure, a refusal) cannot grow the queue while the loop is stuck on a
+/// terminal that does not read. Questions are bounded by their own caps ([`MAX_QUESTIONS`],
+/// [`crate::agent::MAX_QUESTIONS`]), and the rest end the run.
+pub(crate) const MAX_NOTICES: usize = 8;
+
+/// The notices waiting, outside the channel (so the oldest can be dropped), and the wake-up for
+/// the loop.
+#[derive(Default)]
+struct Notices {
+    queue: Mutex<VecDeque<Vec<String>>>,
+    ready: tokio::sync::Notify,
+}
+
+/// The sending end of the notes to the client loop (the manager's and the agent relay's), with
+/// notices bounded ([`MAX_NOTICES`]).
+#[derive(Clone)]
+pub(crate) struct NotesTx {
+    tx: mpsc::UnboundedSender<Note>,
+    notices: Arc<Notices>,
+}
+
+/// The client loop's end of the notes.
+pub(crate) struct NotesRx {
+    rx: mpsc::UnboundedReceiver<Note>,
+    notices: Arc<Notices>,
+}
+
+/// A channel of notes to the client loop.
+pub(crate) fn notes_channel() -> (NotesTx, NotesRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let notices = Arc::new(Notices::default());
+    (
+        NotesTx {
+            tx,
+            notices: notices.clone(),
+        },
+        NotesRx { rx, notices },
+    )
+}
+
+impl NotesTx {
+    /// Sends `n`; `false` when the client loop is gone. A notice equal to one still waiting is
+    /// coalesced with it, and past [`MAX_NOTICES`] waiting the oldest goes.
+    pub(crate) fn send(&self, n: Note) -> bool {
+        let Note::Notice(lines) = n else {
+            return self.tx.send(n).is_ok();
+        };
+        if self.tx.is_closed() {
+            return false;
+        }
+        {
+            let mut q = lock(&self.notices.queue);
+            if q.contains(&lines) {
+                debug!("a notice equal to one still waiting; coalesced");
+                return true;
+            }
+            if q.len() >= MAX_NOTICES {
+                debug!("too many notices waiting; the oldest dropped");
+                q.pop_front();
+            }
+            q.push_back(lines);
+        }
+        self.notices.ready.notify_one();
+        true
+    }
+}
+
+impl NotesRx {
+    fn notice(&self) -> Option<Note> {
+        lock(&self.notices.queue).pop_front().map(Note::Notice)
+    }
+
+    /// The next note: the other notes in order, the notices as they wait.
+    pub(crate) async fn recv(&mut self) -> Option<Note> {
+        loop {
+            // Looked at first every time: a wake-up taken by a call that returned a note from
+            // the channel instead is not needed to find a notice later.
+            if let Some(n) = self.notice() {
+                return Some(n);
+            }
+            tokio::select! {
+                biased;
+                n = self.rx.recv() => return n,
+                () = self.notices.ready.notified() => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<Note> {
+        self.rx.try_recv().ok().or_else(|| self.notice())
+    }
 }
 
 /// The client loop's handle: answers, and the `~#` summary. Not generic over the link.
@@ -326,11 +438,9 @@ pub(crate) struct Forwards<L: Link> {
 
 impl<L: Link> Forwards<L> {
     /// Starts the endpoint and the manager. Must run inside a tokio runtime.
-    pub(crate) fn start(
-        mut set: ForwardSet,
-    ) -> (Self, ForwardHandle, mpsc::UnboundedReceiver<Note>) {
+    pub(crate) fn start(mut set: ForwardSet) -> (Self, ForwardHandle, NotesRx) {
         let grants = Arc::new(Mutex::new(Grants::default()));
-        let (notes, notes_rx) = mpsc::unbounded_channel();
+        let (notes, notes_rx) = notes_channel();
         // No key for the session-bind: the agent is refused for the run (an unbound relay would
         // let the host use destination-constrained keys, OD-5), and `Attach.agent` says so.
         let agent = crate::agent::for_run(
@@ -368,6 +478,7 @@ impl<L: Link> Forwards<L> {
                     Some(b) => Listener::Prebound(b),
                     None => Listener::None,
                 },
+                wire: spec.on_wire(),
                 spec,
                 req: None,
                 id: None,
@@ -683,12 +794,16 @@ enum Listener {
 /// One of this run's own specs.
 struct Own {
     spec: ForwardSpec,
+    /// The spec as it goes on the wire, what the host has of it ([`ForwardSpec::on_wire`]: its
+    /// withheld parts under this run's tags).
+    wire: ForwardSpec,
     /// The `AddForward` waiting for its answer.
     req: Option<u32>,
     /// The daemon's entry for it, once answered.
     id: Option<ForwardId>,
     listener: Listener,
-    /// A bind failure was said already (before the attach, or since).
+    /// A bind failure was said already (before the attach, or since; for `-R`, the host's
+    /// report, until it listens again).
     bind_reported: bool,
     /// Its answer did not come in time over a working link, and that was said.
     wait_failed: bool,
@@ -789,7 +904,7 @@ struct Manager<L: Link> {
     own: Vec<Own>,
     entries: HashMap<ForwardId, Other>,
     next_req: u32,
-    notes: mpsc::UnboundedSender<Note>,
+    notes: NotesTx,
     rules: RemoteRequests,
     failure: ForwardFailure,
     /// Refusals and unanswered questions in a row (an allowed one resets it).
@@ -904,7 +1019,7 @@ impl<L: Link> Manager<L> {
     }
 
     fn note(&self, n: Note) {
-        let _ = self.notes.send(n);
+        self.notes.send(n);
     }
 
     /// An event of mux epoch `epoch`. Acted on only while that is the endpoint's epoch and the
@@ -1022,6 +1137,11 @@ impl<L: Link> Manager<L> {
             self.own[i].req = Some(req);
             self.own[i].id = None;
             self.own[i].wait_failed = false;
+            // The host's `-R` reports are said again in the new attach (`-L` and `-D` say theirs
+            // as they bind again).
+            if self.own[i].spec.kind() == ForwardKind::Remote {
+                self.own[i].bind_reported = false;
+            }
             let spec = self.own[i].spec.clone();
             self.send(MuxMsg::AddForward { req, spec });
         }
@@ -1101,7 +1221,7 @@ impl<L: Link> Manager<L> {
     }
 
     fn own_answer(&mut self, i: usize, id: ForwardId, _wire: &ForwardSpec) {
-        if *_wire != self.own[i].spec {
+        if *_wire != self.own[i].wire {
             debug!("the host's entry differs from the spec asked for; the own copy is used");
         }
         // An honest daemon answers with a new id or with an entry of this spec's identity (which
@@ -1238,12 +1358,14 @@ impl<L: Link> Manager<L> {
             self.refuse(id, &spec, consent::Refusal::Busy);
             return;
         }
-        // An own spec whose answer is still on its way, equal to this entry (an `-R 0` too: it
-        // has no identity, but an equal add is answered with the equal entry), or with its
-        // identity: that answer names this entry, or replaces it.
+        // An own spec whose answer is still on its way (`req`), equal to this entry as it goes
+        // on the wire (an `-R 0` too: it has no identity, but an equal add is answered with the
+        // equal entry; a `-R` beyond loopback is withheld on the wire), or with its identity:
+        // that answer names this entry, or replaces it. Not one the host removed (its `id` is
+        // gone, but no answer is coming): an entry with its identity now is asked about.
         let mine = self.own.iter().any(|o| {
-            o.id.is_none()
-                && (o.spec == spec || (spec.port() != 0 && o.spec.identity() == spec.identity()))
+            o.req.is_some()
+                && (o.wire == spec || (spec.port() != 0 && o.wire.identity() == spec.identity()))
         });
         self.dirty = true;
         if mine {
@@ -1276,6 +1398,7 @@ impl<L: Link> Manager<L> {
                     token,
                     lines,
                     agent: false,
+                    shown: None,
                 }));
             }
             Decision::Refuse(why) => {
@@ -1356,7 +1479,16 @@ impl<L: Link> Manager<L> {
         tracing::info!(kind = ?spec.kind(), "forward from the host allowed");
         match spec.kind() {
             ForwardKind::Remote => {
-                let target = spec.target().cloned().expect("-R has a target");
+                // Only a loopback target is ever asked about (`consent::decide`); a withheld
+                // one is refused before that.
+                let Some(target) = spec.target().cloned() else {
+                    o.state = State::Refused;
+                    self.send(MuxMsg::Consent {
+                        id,
+                        accepted: false,
+                    });
+                    return;
+                };
                 lock(&self.grants).grant_remote(id, target, false);
                 self.send(MuxMsg::Consent { id, accepted: true });
             }
@@ -1428,9 +1560,12 @@ impl<L: Link> Manager<L> {
             }
             match state {
                 ListenState::Listening { port } => {
-                    let first = self.own[i].port.is_none();
+                    // Said the first time, and again whenever the port is another than before
+                    // (a take-back after the entry went: the host's programs must be told).
+                    let changed = self.own[i].port != Some(port.get());
                     self.own[i].port = Some(port.get());
-                    if self.own[i].spec.port() == 0 && first {
+                    self.own[i].bind_reported = false;
+                    if self.own[i].spec.port() == 0 && changed {
                         let text = format!(
                             "fil: {} listens on port {} on the host",
                             describe(&self.own[i].spec),
@@ -1439,7 +1574,11 @@ impl<L: Link> Manager<L> {
                         self.note(Note::Notice(crate::text::wrap(&text, 38)));
                     }
                 }
+                // Said once until it listens again: a host repeating the report says nothing
+                // new (and costs no more notices).
+                ListenState::Failed(_) if self.own[i].bind_reported => {}
                 ListenState::Failed(why) => {
+                    self.own[i].bind_reported = true;
                     let text = format!(
                         "{}: the host cannot listen ({})",
                         describe(&self.own[i].spec),
@@ -1588,7 +1727,7 @@ mod tests {
     use fil_transport::link::mem::MemLink;
 
     /// A manager with no own forwards, not running: the tests call its handlers.
-    fn manager() -> (Manager<MemLink>, mpsc::UnboundedReceiver<Note>) {
+    fn manager() -> (Manager<MemLink>, NotesRx) {
         let grants = Arc::new(Mutex::new(Grants::default()));
         let (ep, _events) = Endpoint::<MemLink>::new(
             Side::Client,
@@ -1596,7 +1735,7 @@ mod tests {
             Arc::new(ClientConnector(grants.clone(), None)),
             Arc::new(ClientPolicy(grants.clone())),
         );
-        let (notes, rx) = mpsc::unbounded_channel();
+        let (notes, rx) = notes_channel();
         let m = Manager {
             epoch: ep.epoch(),
             epoch_lock: Arc::new(Mutex::new(())),
@@ -1638,9 +1777,9 @@ mod tests {
         .unwrap()
     }
 
-    fn asked(rx: &mut mpsc::UnboundedReceiver<Note>) -> Vec<Question> {
+    fn asked(rx: &mut NotesRx) -> Vec<Question> {
         let mut v = Vec::new();
-        while let Ok(n) = rx.try_recv() {
+        while let Some(n) = rx.try_recv() {
             if let Note::Ask(q) = n {
                 v.push(q);
             }
@@ -1763,6 +1902,190 @@ mod tests {
             m.gone(ForwardId(i));
         }
         assert!(m.gone_ids.len() <= MAX_OTHERS);
+    }
+
+    fn own(spec: ForwardSpec) -> Own {
+        Own {
+            wire: spec.on_wire(),
+            spec,
+            req: None,
+            id: None,
+            listener: Listener::None,
+            bind_reported: false,
+            wait_failed: false,
+            port: None,
+        }
+    }
+
+    fn rspec_on(port: u16, target: u16) -> ForwardSpec {
+        ForwardSpec::new(
+            ForwardKind::Remote,
+            BindAddr::Loopback,
+            port,
+            Some(Target {
+                host: TargetHost::Ip("127.0.0.1".parse().unwrap()),
+                port: std::num::NonZeroU16::new(target).unwrap(),
+            }),
+        )
+        .unwrap()
+    }
+
+    /// After the host removes an own forward, an entry with its identity (a `fil forward` on
+    /// the host, say) is a new entry: asked about, not taken for the own add's answer (none is
+    /// coming).
+    #[tokio::test]
+    async fn an_entry_like_a_removed_own_forward_is_asked_about() {
+        let (mut m, mut rx) = manager();
+        m.own.push(own(rspec_on(9000, 80)));
+        m.own[0].req = Some(0);
+        let x = ForwardId(3);
+        m.own_answer(0, x, &rspec_on(9000, 80));
+        assert_eq!(m.own_index(x), Some(0));
+        m.gone(x);
+        let _ = asked(&mut rx);
+        let y = ForwardId(4);
+        m.other(y, rspec_on(9000, 80), Origin::Request);
+        assert_eq!(m.entries[&y].state, State::Asking, "kept as superseded");
+        assert_eq!(asked(&mut rx).len(), 1);
+        // While the own add's answer is on its way, the same entry is that answer's.
+        m.own[0].req = Some(1);
+        m.other(ForwardId(5), rspec_on(9000, 80), Origin::Request);
+        assert_eq!(m.entries[&ForwardId(5)].state, State::Superseded);
+    }
+
+    /// Another run's `-L` with a withheld bind (its laptop's address, under its tag), and its
+    /// `-R`s with withheld targets: refused without asking, as any forward beyond loopback this
+    /// run did not name. They are left for the daemon (it removes them once their run has been
+    /// gone for `linger`): this client cannot tell a live run it took over from a dead one.
+    #[tokio::test]
+    async fn another_runs_withheld_forwards_are_refused_not_asked_about() {
+        let (mut m, mut rx) = manager();
+        let tag = [0x77u8; 16];
+        let bind = [vec![0u8, 3], tag.to_vec(), vec![0x90, 0x3f, 1, 0, 1, 9]]
+            .concat()
+            .into_iter()
+            .chain(*b"localhost")
+            .chain([80])
+            .collect::<Vec<u8>>();
+        let l: ForwardSpec = postcard::from_bytes(&bind).unwrap();
+        assert!(l.bind_withheld());
+        let r0: ForwardSpec =
+            postcard::from_bytes(&[vec![1u8, 0, 0, 1, 1], tag.to_vec()].concat()).unwrap();
+        let r9: ForwardSpec =
+            postcard::from_bytes(&[vec![1u8, 0, 0xa8, 0x46, 1, 1], tag.to_vec()].concat()).unwrap();
+        m.other(ForwardId(1), l, Origin::Client);
+        m.other(ForwardId(2), r0, Origin::Client);
+        m.other(ForwardId(3), r9, Origin::Client);
+        for i in 1..=3 {
+            assert_eq!(m.entries[&ForwardId(i)].state, State::Refused, "{i}");
+        }
+        assert!(asked(&mut rx).is_empty());
+    }
+
+    /// An own `-R 0`'s port is said when it first listens, not again for the same port (a
+    /// resume restates it), and again after a fresh attach that got it another port.
+    #[tokio::test]
+    async fn an_own_ephemeral_remote_says_its_port_whenever_it_changes() {
+        let (mut m, mut rx) = manager();
+        m.own.push(own(rspec_on(0, 80)));
+        let x = ForwardId(3);
+        m.own[0].id = Some(x);
+        let port_notices = |rx: &mut NotesRx| {
+            std::iter::from_fn(|| rx.try_recv())
+                .filter_map(|n| match n {
+                    Note::Notice(l) => Some(l.concat()),
+                    _ => None,
+                })
+                .filter(|l| l.contains("listens on port"))
+                .collect::<Vec<_>>()
+        };
+        let on = |p: u16| ListenState::Listening {
+            port: std::num::NonZeroU16::new(p).unwrap(),
+        };
+        m.listening(x, on(41000));
+        assert_eq!(port_notices(&mut rx).len(), 1);
+        m.listening(x, on(41000));
+        assert!(port_notices(&mut rx).is_empty(), "the same port said again");
+        m.fresh();
+        let y = ForwardId(4);
+        m.own[0].id = Some(y);
+        let _ = port_notices(&mut rx);
+        m.listening(y, on(41000));
+        assert!(
+            port_notices(&mut rx).is_empty(),
+            "a take-back on the same port"
+        );
+        m.listening(y, on(41001));
+        let said = port_notices(&mut rx);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("41001"), "{said:?}");
+    }
+
+    /// The host's own `-R` failure reports are said once until it listens again: a host that
+    /// repeats them gets no more notices out of it.
+    #[tokio::test]
+    async fn a_repeated_remote_listen_failure_is_said_once() {
+        let (mut m, mut rx) = manager();
+        m.own.push(own(rspec_on(9000, 80)));
+        let x = ForwardId(3);
+        m.own[0].id = Some(x);
+        let failed = ListenState::Failed(BindFailure::AddrInUse);
+        let notices = |rx: &mut NotesRx| {
+            std::iter::from_fn(|| rx.try_recv())
+                .filter(|n| matches!(n, Note::Notice(_)))
+                .count()
+        };
+        // Taken as they come, so the notes' own coalescing does not hide a repeat.
+        let mut said = 0;
+        for _ in 0..100 {
+            m.listening(x, failed);
+            said += notices(&mut rx);
+        }
+        assert_eq!(said, 1);
+        m.listening(
+            x,
+            ListenState::Listening {
+                port: std::num::NonZeroU16::new(9000).unwrap(),
+            },
+        );
+        m.listening(x, failed);
+        m.listening(x, failed);
+        assert_eq!(notices(&mut rx), 1, "said again after it listened");
+        // And again in a new attach (a take-back), where the host reports it anew.
+        m.fresh();
+        m.own[0].id = Some(x);
+        let _ = notices(&mut rx);
+        m.listening(x, failed);
+        assert_eq!(notices(&mut rx), 1, "said again after a fresh attach");
+    }
+
+    /// Notices waiting for the client loop are bounded, and one equal to a notice still waiting
+    /// is coalesced with it. Questions are not.
+    #[test]
+    fn the_notices_waiting_are_bounded_and_coalesced() {
+        let (tx, mut rx) = notes_channel();
+        for i in 0..1000 {
+            assert!(tx.send(Note::Notice(vec![format!("notice {i}")])));
+            assert!(tx.send(Note::Notice(vec!["the same".into()])));
+        }
+        let mut got = Vec::new();
+        while let Some(Note::Notice(l)) = rx.try_recv() {
+            got.push(l.concat());
+        }
+        assert_eq!(got.len(), MAX_NOTICES, "{got:?}");
+        assert_eq!(got.iter().filter(|l| *l == "the same").count(), 1);
+        // The oldest went, the newest stayed.
+        assert!(got.iter().any(|l| l == "notice 999"), "{got:?}");
+        assert!(!got.iter().any(|l| l == "notice 0"), "{got:?}");
+        // Taken: there is room again, and an equal one is sent again.
+        assert!(tx.send(Note::Notice(vec!["the same".into()])));
+        assert!(matches!(rx.try_recv(), Some(Note::Notice(_))));
+        for t in 0..100 {
+            tx.send(Note::Cancel { token: t });
+        }
+        assert_eq!(std::iter::from_fn(|| rx.try_recv()).count(), 100);
+        drop(rx);
+        assert!(!tx.send(Note::Cancel { token: 0 }), "the loop is gone");
     }
 
     #[test]

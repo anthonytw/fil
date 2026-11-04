@@ -319,11 +319,16 @@ pub fn target_host_bare(host: &TargetHost) -> String {
 }
 
 /// The spec in its full form, which [`parse`] reads back to the same value: `5173:localhost:5173`,
-/// `*:8080:db:5432`, `[::1]:1080`. Loopback is written by leaving the bind out.
+/// `*:8080:db:5432`, `[::1]:1080`. Loopback is written by leaving the bind out. What another
+/// client withheld from the host (a `-R` target, a `-L`/`-D` bind beyond loopback) is written
+/// `(client network)`: `9000:(client network)`, `(client network):8080:db:5432`. That does not
+/// parse.
 pub fn format_spec(spec: &ForwardSpec) -> String {
     let bind = match spec.bind() {
         BindAddr::Loopback => String::new(),
         BindAddr::Any => "*:".to_string(),
+        // Another client's bind on its machine, withheld from the host: shown, never parsed back.
+        BindAddr::Withheld(_) => format!("{}:", fil_proto::mux::WITHHELD_TARGET),
         BindAddr::Ip(ip) => format!("{}:", fmt_ip(ip)),
     };
     match spec.target() {
@@ -333,6 +338,10 @@ pub fn format_spec(spec: &ForwardSpec) -> String {
             target_host(&t.host),
             t.port.get()
         ),
+        // Withheld by the client that named it: shown, never parsed back.
+        None if spec.target_withheld() => {
+            format!("{bind}{}:{}", spec.port(), fil_proto::mux::WITHHELD_TARGET)
+        }
         None => format!("{bind}{}", spec.port()),
     }
 }
@@ -425,6 +434,8 @@ fn binds_overlap(a: BindAddr, b: BindAddr) -> bool {
             unspecified(x) || unspecified(y) || x.to_canonical() == y.to_canonical()
         }
         (Loopback, Ip(x)) | (Ip(x), Loopback) => unspecified(x) || is_loopback_ip(x),
+        // Only the wire withholds a bind: never one of this run's own specs.
+        (BindAddr::Withheld(_), _) | (_, BindAddr::Withheld(_)) => false,
     }
 }
 

@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn a_custom_ssh_gets_the_background_rule_and_other_programs_do_not() {
         let jump =
-            PipeCommand::custom(["ssh", "-J", "bastion", "orin", "fil", "server", "--stdio"])
+            PipeCommand::custom(["ssh", "-J", "bastion", "devbox", "fil", "server", "--stdio"])
                 .unwrap();
         let bg = strings(&without_tty(&jump));
         assert!(bg.contains(&"BatchMode=yes".to_string()), "{bg:?}");
@@ -671,10 +671,10 @@ mod tests {
         // The rest of the line is the user's, in order.
         assert_eq!(&bg[bg.len() - 6..], &strings(&jump)[1..]);
         let abs =
-            PipeCommand::custom(["/usr/bin/ssh", "orin", "fil", "server", "--stdio"]).unwrap();
+            PipeCommand::custom(["/usr/bin/ssh", "devbox", "fil", "server", "--stdio"]).unwrap();
         assert!(strings(&without_tty(&abs)).contains(&"BatchMode=yes".to_string()));
-        let tsh =
-            PipeCommand::custom(["tailscale", "ssh", "orin", "fil", "server", "--stdio"]).unwrap();
+        let tsh = PipeCommand::custom(["tailscale", "ssh", "devbox", "fil", "server", "--stdio"])
+            .unwrap();
         assert_eq!(strings(&without_tty(&tsh)), strings(&tsh));
     }
 
@@ -682,7 +682,7 @@ mod tests {
     fn what_a_background_ssh_says_becomes_a_status_note() {
         // Needing a login is said as an instruction, with what ssh said after it.
         for said in [
-            "orin: Permission denied (publickey,password).\n",
+            "devbox: Permission denied (publickey,password).\n",
             "Host key verification failed.\n",
             "Enter passphrase for key '/x/id': \n",
             "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n",
@@ -696,8 +696,8 @@ mod tests {
         }
         // Anything else is its last line.
         assert_eq!(
-            stderr_note("ssh: Could not resolve hostname orin\n\n").as_deref(),
-            Some("ssh: Could not resolve hostname orin")
+            stderr_note("ssh: Could not resolve hostname devbox\n\n").as_deref(),
+            Some("ssh: Could not resolve hostname devbox")
         );
         assert_eq!(stderr_note("  \n"), None);
         assert_eq!(stderr_note(""), None);
@@ -711,7 +711,7 @@ mod tests {
             kind: PipeErrorKind::Closed,
             skipped: Vec::new(),
             exit: Some("exited: exit status: 255".into()),
-            stderr: b"orin: Permission denied (publickey).\n".to_vec(),
+            stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
         });
         assert!(f.message.contains("Permission denied"), "{}", f.message);
         assert!(f.note.unwrap().contains("interactive login"));
@@ -941,7 +941,7 @@ mod tests {
             kind: PipeErrorKind::Closed,
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
-            stderr: b"orin: Permission denied (publickey).\n".to_vec(),
+            stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
         };
         let shown = failure_with(err(), true);
         assert!(

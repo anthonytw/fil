@@ -131,7 +131,7 @@ fn a_refused_forward_spec_is_not_echoed_raw_on_a_terminal() {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(FIL);
-        cmd.args([flag, "8080:h:80\x1b[2J\u{202e}", "orin"]);
+        cmd.args([flag, "8080:h:80\x1b[2J\u{202e}", "devbox"]);
         cmd.env_clear();
         cmd.env("PATH", "/usr/bin:/bin");
         cmd.env("TERM", "xterm-256color");

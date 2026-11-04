@@ -446,16 +446,16 @@ mod tests {
         let kill = Request::KillSession { name: name.clone() };
         let detach = Request::DetachSession { name: name.clone() };
         assert_eq!(
-            render(&kill, &Response::Done, "orin", NOW).unwrap(),
+            render(&kill, &Response::Done, "devbox", NOW).unwrap(),
             "killed session \"build\"\n"
         );
         assert!(
-            render(&detach, &Response::Done, "orin", NOW)
+            render(&detach, &Response::Done, "devbox", NOW)
                 .unwrap()
                 .contains("keeps running")
         );
-        let err = render(&kill, &Response::NoSuchSession, "orin", NOW).unwrap_err();
-        assert_eq!(err, "no session \"build\" on orin");
+        let err = render(&kill, &Response::NoSuchSession, "devbox", NOW).unwrap_err();
+        assert_eq!(err, "no session \"build\" on devbox");
         // A daemon that answers the wrong question is reported, not printed as success.
         assert!(
             render(
@@ -465,7 +465,7 @@ mod tests {
                     truncated: false,
                     others: vec![]
                 },
-                "orin",
+                "devbox",
                 NOW
             )
             .is_err()
@@ -594,7 +594,7 @@ mod tests {
             truncated: false,
             others,
         };
-        let out = render(&Request::ListSessions, &reply, "orin", NOW).unwrap();
+        let out = render(&Request::ListSessions, &reply, "devbox", NOW).unwrap();
         assert!(
             out.contains("also running: a daemon of wire rev 4"),
             "{out}"
@@ -616,7 +616,7 @@ mod tests {
                 },
             ],
         };
-        let out = render(&Request::ListSessions, &major, "orin", NOW).unwrap();
+        let out = render(&Request::ListSessions, &major, "devbox", NOW).unwrap();
         assert!(
             out.contains("a daemon of protocol major 2 (wire rev 3)")
                 && out.contains("a daemon of protocol major 2 (before wire revisions)")
@@ -630,7 +630,7 @@ mod tests {
             others: vec![],
         };
         assert_eq!(
-            render(&Request::ListSessions, &none, "orin", NOW).unwrap(),
+            render(&Request::ListSessions, &none, "devbox", NOW).unwrap(),
             "no sessions\n"
         );
         // An empty list still says where the other sessions are.
@@ -642,7 +642,7 @@ mod tests {
                 revision: 2,
             }],
         };
-        let out = render(&Request::ListSessions, &only, "orin", NOW).unwrap();
+        let out = render(&Request::ListSessions, &only, "devbox", NOW).unwrap();
         assert!(
             out.starts_with("no sessions\n") && out.contains("wire rev 2"),
             "{out}"
@@ -830,7 +830,7 @@ mod tests {
         let done = render(
             &add,
             &Response::Forward(ForwardResult::Added(ForwardId(3))),
-            "orin",
+            "devbox",
             NOW,
         )
         .unwrap();
@@ -846,7 +846,7 @@ mod tests {
         let gone = render(
             &rm(None, 5173),
             &Response::Forward(ForwardResult::Removed(ForwardId(3))),
-            "orin",
+            "devbox",
             NOW,
         )
         .unwrap();
@@ -854,7 +854,7 @@ mod tests {
         let ambiguous = render(
             &rm(None, 5173),
             &Response::Forward(ForwardResult::Refused(ForwardRefusal::Ambiguous)),
-            "orin",
+            "devbox",
             NOW,
         )
         .unwrap_err();
@@ -872,7 +872,7 @@ mod tests {
             let e = render(
                 &rm(None, 80),
                 &Response::Forward(ForwardResult::Refused(why.clone())),
-                "orin",
+                "devbox",
                 NOW,
             )
             .unwrap_err();
@@ -892,7 +892,7 @@ mod tests {
         let e = render(
             &add,
             &Response::Forward(ForwardResult::Refused(policy)),
-            "orin",
+            "devbox",
             NOW,
         )
         .unwrap_err();

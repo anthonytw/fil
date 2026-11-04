@@ -187,3 +187,49 @@ H1 (`fil_forward::pace`, DESIGN §8.5 "Pacing") caps the forward data each side 
 | veth QUIC, before / paced | 1.0 / 3.1, 1.0 / 3.1 | 3529 / 3503 | 3385 / 3394 |
 
 The LAN pipe download is noisy in this shared VM in both builds (paced 674 to 944, unpaced 603 to 946 Mbit/s over seven interleaved pairs); the pacer's trace in the low paced cells has the cap at the window, so it was not what limited them.
+
+### H1 with several channels (`f_fwd_parallel`, `f_fwd_stuck`, `f_agent_beside_stuck`)
+
+The PR #83 review found two failures that only appear with several channels. With 16 or more channels sharing the cap, every ack waited for the receiver's 100 ms timer and throughput fell by half. Readers that stopped could stall every other forward and the agent. The fixes are in DESIGN §8.5 "Pacing": ack on drain, timer samples kept as bounds, the pass budget and the agent's reserve, parked channels, and `Mux::poll_transmit_channel`.
+
+These cells measure them on V1's bottleneck, paced against unpaced on the same build. `FIL_FORWARD_PACING=off` is set in the client's command and in a daemon the harness restarts with it. Keystrokes run at 20 keys/s for 20 s; goodput is what the application received. The Lima VM, aarch64. Times in ms are p50 / p99 unless marked otherwise.
+
+**Parallel downloads through one `-L`** (`f_fwd_parallel`). Goodput is paced against unpaced:
+
+| Path | flows | keystrokes, unpaced | keystrokes, paced (H1 line) | goodput, paced / unpaced |
+|---|---|---|---|---|
+| pipe | 1 | 436 / 702 | 84 / 94 (105) | 0.998 |
+| pipe | 4 | 969 / 1216 | 81 / 92 | 0.995 |
+| pipe | 16 | 969 / 1224 | 82 / 97 | 0.993 |
+| pipe | 32 | 964 / 1236 | 82 / 97 | 0.992 |
+| QUIC | 1 | 284 / 322 | 77 / 86 (109) | 0.995 |
+| QUIC | 4 | 282 / 323 | 77 / 86 | 0.994 |
+| QUIC | 16 | 331 / 709 | 75 / 85 | 0.996 |
+| QUIC | 32 | 349 / 881 | 82 / 92 | 0.997 |
+
+**A request-and-response forward beside a bulk download, on QUIC** (the review's S1: QUIC streams are not delivered in order across each other):
+
+| | keystrokes | request p50 | goodput |
+|---|---|---|---|
+| unpaced | 292 / 321 | 274 | 18.92 |
+| paced | 75 / 80 | 75 | 18.85 |
+
+The request is 1 KiB, echoed, every 50 ms, on its own forward.
+
+**A live 1 MiB echo beside 8 uploads whose target never reads** (`f_fwd_stuck`, after a 10 s settle):
+
+| Path | echo, unpaced | echo, paced | keystrokes, unpaced | keystrokes, paced |
+|---|---|---|---|---|
+| pipe | 4.30 s | 1.45 s | 53 / 1076 | 52 / 139 |
+| QUIC | 3.54 s | 0.77 s | 54 / 319 | 51 / 88 |
+
+Paced is faster here because unpaced, the stuck channels' windows sit in the router's queue in front of the echo.
+
+**The agent beside 8 stuck forwards**, over QUIC (`f_agent_beside_stuck`). Twenty `ssh-add -l` from the session's agent socket:
+
+| | p50 | max |
+|---|---|---|
+| unpaced | 101 ms | 590 ms |
+| paced | 103 ms | 109 ms |
+
+The single-flow cell (`f_fwd_vs_ssh`) on the same build: pipe 78.9 / 88.2 up and 80.9 / 92.6 down, QUIC 73.5 / 80.7 and 81.1 / 106.2, against lines of 110.9 and 109.5. Goodput was 19.0 and 18.9 Mbit/s. `h1_rule_exceeded=no` in all four cells.

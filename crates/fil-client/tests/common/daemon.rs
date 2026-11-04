@@ -152,6 +152,9 @@ pub struct DState {
     echo: Echo,
     /// Every `EchoAck` sent: `(input_upto, output_at)`.
     pub echo_acks: Vec<(u64, u64)>,
+    /// An attach answered with a snapshot sends an `EchoAck` at the snapshot's point ahead of the
+    /// snapshot's bytes (control overtakes channel 2).
+    echo_ack_in_attach_snapshot: bool,
     /// Direct-mode details for the reply.
     direct: Option<(u16, Vec<u8>)>,
     /// The reply says server policy refuses the agent.
@@ -292,6 +295,7 @@ impl FakeDaemon {
                 withhold_input_acks: false,
                 echo: Echo::Off,
                 echo_acks: Vec::new(),
+                echo_ack_in_attach_snapshot: false,
                 direct: None,
                 agent_refused: None,
                 data_before_reply: false,
@@ -674,6 +678,10 @@ impl FakeDaemon {
             resume_sent = true;
         }
         if let Some(mut bytes) = snapshot_bytes {
+            if st.echo_ack_in_attach_snapshot {
+                let ack = (st.input_rx.received(), st.log.end());
+                self.send_echo_ack(st, ack).await;
+            }
             if let Some(d) = st.snapshot_delay {
                 tokio::time::sleep(d).await;
             }
@@ -1810,6 +1818,11 @@ impl FakeDaemon {
             )
             .await;
         }
+    }
+
+    /// Attaches answered with a snapshot send an `EchoAck` at its point ahead of its bytes.
+    pub async fn set_echo_ack_in_attach_snapshot(&self, on: bool) {
+        self.st.lock().await.echo_ack_in_attach_snapshot = on;
     }
 
     /// Sends an `EchoAck` as given: a hostile or broken daemon.

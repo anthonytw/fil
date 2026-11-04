@@ -36,6 +36,10 @@ struct Seen {
     settled: Vec<(InputPos, Settlement)>,
     /// The link, as of the last call.
     link: Option<LinkView>,
+    /// Snapshots the core reset the predictor for, so far.
+    resets: usize,
+    /// For every `EchoAck` applied, `resets` at that moment.
+    ack_resets: Vec<usize>,
 }
 
 /// The default predictor, shown at any round-trip time, and recorded.
@@ -71,7 +75,11 @@ impl Predictor for Recording {
     fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>) {
         self.note(ctx);
         let col = ctx.screen.cursor().col;
-        self.seen.lock().unwrap().acks.push((input_upto, col));
+        let mut seen = self.seen.lock().unwrap();
+        seen.acks.push((input_upto, col));
+        let resets = seen.resets;
+        seen.ack_resets.push(resets);
+        drop(seen);
         self.inner.on_echo_ack(input_upto, ctx);
     }
     fn on_tick(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
@@ -85,6 +93,7 @@ impl Predictor for Recording {
         self.inner.show(ctx)
     }
     fn reset(&mut self) {
+        self.seen.lock().unwrap().resets += 1;
         self.inner.reset();
     }
     fn has_outstanding(&self) -> bool {
@@ -856,8 +865,8 @@ async fn too_many_reports_waiting_for_their_output_end_the_link() {
     .await;
 }
 
-/// A report that arrives while a catch-up's bytes are on their way, for an offset the jump has
-/// passed, waits for the snapshot: the terminal position has moved, the screen has not.
+/// A report that arrives while a catch-up's bytes are on their way, at the catch-up's point,
+/// waits for the snapshot.
 #[tokio::test(start_paused = true)]
 async fn a_report_during_a_catch_up_waits_for_its_snapshot() {
     let (rig, seen) = start_predicting(predicting());
@@ -923,4 +932,37 @@ async fn the_screen_stays_untrusted_until_the_catch_up_lands() {
     );
     rig.daemon.send_snapshot(&bytes).await;
     settle().await;
+}
+
+/// A resume answered with a snapshot moves the terminal position to the snapshot's point with
+/// the reply: a report at that point that arrives ahead of the snapshot's bytes waits for them,
+/// rather than being applied to the screen the snapshot replaces.
+#[tokio::test(start_paused = true)]
+async fn a_report_during_an_attachs_snapshot_waits_for_it() {
+    let (rig, seen) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    assert_eq!(seen.lock().unwrap().resets, 1);
+    rig.daemon.set_force_snapshot(true).await;
+    rig.daemon.set_echo_ack_in_attach_snapshot(true).await;
+    rig.daemon
+        .set_snapshot_delay(Some(Duration::from_millis(200)))
+        .await;
+    rig.daemon.kill_link(DownReason::Dead).await;
+    until_async("the resume", 10, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    until("the resume's snapshot", 10, || {
+        seen.lock().unwrap().resets == 2
+    })
+    .await;
+    settle().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.ack_resets.last(),
+        Some(&2),
+        "applied before the snapshot landed: {:?}",
+        seen.ack_resets
+    );
 }

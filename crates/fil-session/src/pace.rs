@@ -26,6 +26,12 @@
 //!   minimum that forgot the empty path would take that queue into its next estimate and let the
 //!   window grow round after round.
 //!
+//! **Startup.** Until the rate stops growing (BBR's full-pipe test: not by a quarter for
+//! [`FULL_ROUNDS`] round trips of link-limited samples), a rate is the ramping window's, not the
+//! link's: the window is then at least `2 × rate × rtprop`, so it doubles each round trip, and
+//! [`Pacer::drain_time`] gives nothing, so the catch-up rule does not jump on a ramp's
+//! underestimate. Quiet for [`RATE_WINDOW`] or a path change starts over.
+//!
 //! So what waits in the transport ahead of new output is about `QUEUE_BUDGET` of drain time
 //! beyond the path's own round trip, whatever the rate, and never less than `MIN_WINDOW` (on a
 //! slow link the floor is what holds it: 64 KiB is about 0.5 s at 1 Mbit/s). On a fast link the

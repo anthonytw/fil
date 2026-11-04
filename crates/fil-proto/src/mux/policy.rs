@@ -49,8 +49,9 @@ pub enum PolicySetting {
     /// so the source says nothing ([`PolicySource::Default`], not shown).
     Pending,
     /// The sshd config holds a line fil cannot evaluate the way sshd would (an `Include` pattern
-    /// whose meaning differs between `glob(3)` implementations, one that is not valid UTF-8,
-    /// or a file with a NUL byte, which sshd reads as gluing two lines together), so what the
+    /// whose meaning differs between `glob(3)` implementations, one `PATH_MAX` bytes or longer
+    /// or not valid UTF-8, an `Include` line OpenSSH releases split differently, or a file with
+    /// a NUL byte, which sshd reads as gluing two lines together), so what the
     /// config says is not known and everything is refused, unless fil's policy file sets the
     /// key itself. The source is that line (never what it says).
     Unevaluable,

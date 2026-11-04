@@ -103,7 +103,7 @@ async fn bulk_sha256(t: Transport) {
 async fn half_close(t: Transport) {
     let server = serve(|mut s| async move {
         let (digest, _) = read_stream(&mut s, None).await.unwrap();
-        s.write_all(&digest).await.unwrap();
+        write_all_retry(&mut s, &digest).await.unwrap();
     })
     .await;
     let w = World::new(t, mux_config()).await;
@@ -214,7 +214,7 @@ async fn concurrent_connections(t: Transport) {
                 let mut req = Vec::new();
                 if s.read_to_end(&mut req).await.is_ok() {
                     let _ = reached.wait_for(|r| *r >= hold).await;
-                    let _ = s.write_all(&req).await;
+                    let _ = write_all_retry(&mut s, &req).await;
                 }
                 live.fetch_sub(1, Ordering::SeqCst);
             }
@@ -267,7 +267,7 @@ async fn concurrent_connections(t: Transport) {
                 };
                 let (mut r, mut wr) = conn.into_split();
                 let sent = async {
-                    wr.write_all(&out).await?;
+                    write_all_retry(&mut wr, &out).await?;
                     wr.shutdown().await
                 }
                 .await;
@@ -285,7 +285,12 @@ async fn concurrent_connections(t: Transport) {
                         return retries;
                     }
                     Err(e) if back.is_empty() && is_reset(&e) && retries < 3 => retries += 1,
-                    Err(e) => panic!("connection {i}: {e} after {} bytes", back.len()),
+                    Err(e) => panic!(
+                        "connection {i}: {e} (kind {:?}, errno {:?}) after {} bytes",
+                        e.kind(),
+                        e.raw_os_error(),
+                        back.len()
+                    ),
                 }
             }
         });
@@ -468,13 +473,14 @@ async fn open_wait_expiry(t: Transport) {
 async fn stuck_consumer(t: Transport) {
     // A server that sends forever.
     let server = serve(|mut s| async move {
+        shrink_buffers(&s);
         let buf = vec![7u8; 64 * 1024];
-        while s.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
     })
     .await;
     let mut w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
-    let stuck = connect(port).await;
+    let stuck = connect_small(port).await;
     // Wait until the client holds a full window for the application, or as much as the daemon's
     // pacer lets out for a channel that is never acknowledged (its cap: DESIGN.md §8.5, "Pacing").
     let ep = w.client.ep.clone();
@@ -536,9 +542,13 @@ async fn budget(t: Transport) {
         max_open: 16,
         ..mux_config()
     };
+    // Every socket that is never read has small kernel buffers: the test is about the endpoint's
+    // budget, and the OS's autotuning (4 MiB each on macOS) across some 80 loopback sockets
+    // can take a small runner's whole mbuf pool.
     let server = serve(|mut s| async move {
+        shrink_buffers(&s);
         let buf = vec![1u8; 64 * 1024];
-        while s.write_all(&buf).await.is_ok() {}
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
     })
     .await;
     let w = World::new(t, cfg).await;
@@ -553,10 +563,10 @@ async fn budget(t: Transport) {
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
     for _ in 0..24 {
-        let mut s = connect(port).await;
+        let mut s = connect_small(port).await;
         apps.push(tokio::spawn(async move {
             let buf = vec![2u8; 64 * 1024];
-            while s.write_all(&buf).await.is_ok() {}
+            while write_all_retry(&mut s, &buf).await.is_ok() {}
         }));
     }
     let check = || {

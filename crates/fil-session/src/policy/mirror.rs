@@ -354,10 +354,14 @@ impl Policy {
                     _ => {}
                 }
                 // A line fil cannot evaluate: everything the policy file does not set itself is
-                // refused (the line says so for all of it, as for an unusable policy file).
+                // refused. One line for all of it, which the client words as leaving the
+                // policy file's keys standing (it is not told which are set). Not when the
+                // policy file cannot be used (unsafe or unparsable): it sets nothing, its own
+                // line below refuses everything, and the exception would be one that is not.
                 if let Sshd::Mirrored(s) = &l.sshd
                     && let Err(why) = evaluable(s)
                     && !matches!(&l.file, FilePolicy::Keys(k) if k.sets_every_mirrored_key())
+                    && !matches!(&l.file, FilePolicy::Unsafe(_))
                 {
                     v.push(PolicyLine::DenyAll(why));
                 }
@@ -641,7 +645,8 @@ fn source(src: &Src) -> PolicySource {
 }
 
 /// An sshd config with a line fil cannot evaluate as sshd would (an `Include` pattern whose
-/// meaning differs between globs, one that is not UTF-8, a NUL byte) says nothing fil can trust:
+/// meaning differs between globs, one `PATH_MAX` bytes or longer or not UTF-8, an `Include`
+/// line OpenSSH releases split differently, a NUL byte) says nothing fil can trust:
 /// the mirror refuses, naming that line (never what it says). It is asked wherever the mirror
 /// would decide, after fil's own policy file had its say, so a key of `/etc/fil/policy.toml`
 /// that sets the thing explicitly still stands. (An include fil merely could not *read* is

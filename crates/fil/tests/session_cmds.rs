@@ -764,7 +764,11 @@ fn an_answer_in_several_parts_is_one_listing() {
     // The session asked about is sent as the request's focus.
     let asked = fake.asked.lock().unwrap().clone();
     assert!(
-        asked.iter().all(|r| *r == Request::Ports { session: None }),
+        asked.iter().all(|r| *r
+            == Request::Ports {
+                session: None,
+                probe_other: false
+            }),
         "{asked:?}"
     );
     let focused = w.inside("main", &["ports", "--json"]);
@@ -773,7 +777,8 @@ fn an_answer_in_several_parts_is_one_listing() {
     assert_eq!(
         asked.last(),
         Some(&Request::Ports {
-            session: Some(name("main"))
+            session: Some(name("main")),
+            probe_other: false
         })
     );
     let named = w.laptop(&["ports", "probe", "build"]);
@@ -781,7 +786,18 @@ fn an_answer_in_several_parts_is_one_listing() {
     assert_eq!(
         fake.asked.lock().unwrap().last(),
         Some(&Request::Ports {
-            session: Some(name("build"))
+            session: Some(name("build")),
+            probe_other: false
+        })
+    );
+    // `--probe` asks the daemon to probe the listeners outside the sessions too.
+    let probing = w.laptop(&["ports", "probe", "--probe"]);
+    assert!(probing.ok, "{}", probing.stderr);
+    assert_eq!(
+        fake.asked.lock().unwrap().last(),
+        Some(&Request::Ports {
+            session: None,
+            probe_other: true
         })
     );
 }

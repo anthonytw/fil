@@ -190,9 +190,13 @@ fn requests() -> Vec<Request> {
                 port: 5173,
             },
         },
-        Request::Ports { session: None },
+        Request::Ports {
+            session: None,
+            probe_other: false,
+        },
         Request::Ports {
             session: Some(name("main")),
+            probe_other: true,
         },
     ];
     for c in &all {
@@ -919,7 +923,9 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: Some(process(4, 5)),
             probe: Some(probes()[1].clone()),
             target_other_user: false,
+            target_unknown: false,
             policy: None,
+            socks_refused: None,
         }),
         // A `-L` whose target another user's listener takes: no owner, no probe.
         PortsRow::Forward(ForwardRow {
@@ -937,7 +943,32 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: None,
             probe: None,
             target_other_user: true,
+            target_unknown: true,
             policy: Some(policy_refusals()[1].clone()),
+            socks_refused: None,
+        }),
+        // A `-D` some of whose SOCKS connections server policy refused.
+        PortsRow::Forward(ForwardRow {
+            session: name("main"),
+            id: ForwardId(3),
+            spec: ForwardSpec::new(ForwardKind::Dynamic, BindAddr::Loopback, 1080, None).unwrap(),
+            origin: Origin::Client,
+            listen: Some(ListenState::Listening { port: port(1080) }),
+            consented: true,
+            conns: 0,
+            waiting: 0,
+            bytes_down: 0,
+            bytes_up: 0,
+            last_unix_ms: 0,
+            owner: None,
+            probe: None,
+            target_other_user: false,
+            target_unknown: false,
+            policy: None,
+            socks_refused: Some(SocksRefused {
+                count: 3,
+                last: policy_refusals()[0].clone(),
+            }),
         }),
         PortsRow::Agent(AgentRow {
             session: name("main"),
@@ -1054,7 +1085,12 @@ fn widest_forward_row() -> PortsRow {
             label: Some(ProbeLabel::new("l".repeat(MAX_PROBE_LABEL)).unwrap()),
         }),
         target_other_user: true,
+        target_unknown: true,
         policy: Some(widest_policy_refusal()),
+        socks_refused: Some(SocksRefused {
+            count: u32::MAX,
+            last: widest_policy_refusal(),
+        }),
     })
 }
 
@@ -1128,6 +1164,7 @@ fn responses() -> Vec<Response> {
         part: PortsPart {
             rows: ports_rows(),
             incomplete: None,
+            cut: false,
         },
         more: false,
     });
@@ -1140,6 +1177,7 @@ fn responses() -> Vec<Response> {
             part: PortsPart {
                 rows: Vec::new(),
                 incomplete: Some(i),
+                cut: false,
             },
             more: false,
         });
@@ -1471,6 +1509,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         "max/request-ports",
         ControlMsg::Request(Request::Ports {
             session: Some(name(&longest('n', MAX_SESSION_NAME))),
+            probe_other: true,
         }),
     );
     add(
@@ -1483,6 +1522,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             part: PortsPart {
                 rows: vec![widest_forward_row(); 4],
                 incomplete: Some(PortsIncomplete::Unsupported),
+                cut: true,
             },
             more: true,
         }),
@@ -2150,7 +2190,8 @@ fn revisioned() -> Entries {
         outcome::<AttachRefusal>(&past(6)),
     ));
     e.push(("decode/request-0".into(), outcome::<Request>(&past(0))));
-    e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0])));
+    // `Ports { session: None, probe_other: false }`.
+    e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0, 0])));
     e.push(("decode/request-5".into(), outcome::<Request>(&[5, 0])));
     e.push(("decode/response-2".into(), outcome::<Response>(&past(2))));
     e.push(("decode/response-3".into(), outcome::<Response>(&[3, 0, 1])));
@@ -2350,8 +2391,8 @@ fn forward_probes() -> Entries {
         // A part with no rows and `incomplete: Some(last)`, then one past it.
         (
             "ports-part-incomplete",
-            vec![0, 1, 3],
-            vec![0, 1, 4],
+            vec![0, 1, 3, 0],
+            vec![0, 1, 4, 0],
             outcome::<PortsPart>,
         ),
     ];
@@ -2463,6 +2504,7 @@ fn forward_probes() -> Entries {
             v.extend([3u8, 1, b'a', 0, 0, 0]);
         }
         v.push(0); // incomplete: None
+        v.push(0); // cut: false
         e.push((format!("decode/ports-rows-{n}"), outcome::<PortsPart>(&v)));
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
@@ -2535,10 +2577,16 @@ fn forward_probes() -> Entries {
         .skip(1)
         .all(|r| matches!(r, Response::Ports { more: true, .. }))
         && matches!(parts.last(), Some(Response::Ports { more: false, .. }));
+    let cut = parts
+        .iter()
+        .all(|r| matches!(r, Response::Ports { part, .. } if part.cut));
+    let whole = Response::ports_with(vec![widest_forward_row(); MAX_PORTS_ROWS], None)
+        .iter()
+        .all(|r| matches!(r, Response::Ports { part, .. } if !part.cut));
     e.push((
         "ports/chunked-widest".into(),
         format!(
-            "parts {} rows {rows} fit {fits} more-on-all-but-last {last_only} incomplete-on-all {marked}",
+            "parts {} rows {rows} fit {fits} more-on-all-but-last {last_only} incomplete-on-all {marked} cut-on-all {cut} full-not-cut {whole}",
             parts.len()
         ),
     ));

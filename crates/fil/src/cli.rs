@@ -8,7 +8,7 @@
 //! fil detach [HOST SESSION]                      detach whoever is attached (no arguments: inside a session)
 //! fil forward [HOST [SESSION]] -L|-R|-D SPEC     add a forward to a running session
 //! fil forward [HOST [SESSION]] --rm [-L|-R|-D] PORT   remove one
-//! fil ports [HOST [SESSION]] [--json]            listeners, forwards and the agent
+//! fil ports [HOST [SESSION]] [--json] [--probe]  listeners, forwards and the agent
 //! fil server --stdio                             the remote side of the pipe (not for people)
 //! ```
 //!
@@ -229,6 +229,12 @@ pub struct PortsArgs {
     /// Print JSON (schema 1) instead of the table
     #[arg(long)]
     pub json: bool,
+
+    /// Also probe the listeners no fil session started (by default only the -L targets and the
+    /// sessions' listeners are). Such a listener is often a tunnel, and the probe reaches
+    /// whatever it leads to; a known forwarder (ssh, kubectl, ...) is never probed
+    #[arg(long)]
+    pub probe: bool,
 }
 
 impl ForwardArgs {
@@ -426,6 +432,8 @@ pub enum Action {
     Ports {
         target: Target,
         json: bool,
+        /// `--probe`.
+        probe_other: bool,
     },
     ServerStdio,
     ServerDaemon,
@@ -545,6 +553,7 @@ impl Cli {
                     None => Target::Here,
                 },
                 json: p.json,
+                probe_other: p.probe,
             }),
             Some(Command::Server(s)) => Ok(if s.daemon {
                 Action::ServerDaemon
@@ -946,7 +955,8 @@ mod tests {
                     host: "orin".into(),
                     session: Some(s.clone())
                 },
-                json: true
+                json: true,
+                probe_other: false
             }
         );
         // The form the forward hint prints.
@@ -967,14 +977,16 @@ mod tests {
             action(&["ports"]),
             Action::Ports {
                 target: Target::Here,
-                json: false
+                json: false,
+                probe_other: false
             }
         );
         assert_eq!(
             action(&["ports", "--json"]),
             Action::Ports {
                 target: Target::Here,
-                json: true
+                json: true,
+                probe_other: false
             }
         );
         assert_eq!(
@@ -984,7 +996,8 @@ mod tests {
                     host: "orin".into(),
                     session: None
                 },
-                json: false
+                json: false,
+                probe_other: false
             }
         );
         assert_eq!(
@@ -994,7 +1007,19 @@ mod tests {
                     host: "orin".into(),
                     session: Some(name("build"))
                 },
-                json: true
+                json: true,
+                probe_other: false
+            }
+        );
+        assert_eq!(
+            action(&["ports", "orin", "--probe"]),
+            Action::Ports {
+                target: Target::Host {
+                    host: "orin".into(),
+                    session: None
+                },
+                json: false,
+                probe_other: true
             }
         );
         // A session needs its host.

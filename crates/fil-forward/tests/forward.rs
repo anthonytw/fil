@@ -5,6 +5,8 @@
 //! The heavy sizes run scaled down here and at full size with `just forward-soak`:
 //! `FIL_FORWARD_BULK_MIB` (default 8, soak 256), `FIL_FORWARD_SEQ` (default 2,000, soak 20,000),
 //! `FIL_FORWARD_CONCURRENT` (default 1,000 on QUIC and 300 on the others, soak 1,000).
+//! A test fails if it runs longer than `FIL_FORWARD_TEST_LIMIT` seconds (default 120; the soak sets
+//! 3600).
 
 mod support;
 

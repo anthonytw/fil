@@ -787,6 +787,12 @@ impl<L: Link> State<L> {
     /// of its payloads is still queued is stale (a released channel has nothing the peer wants,
     /// and sending on a finished stream would fail the link), so it goes.
     fn finish_channel(&mut self, ch: ChannelId) {
+        self.drop_queued(ch);
+        self.finish_out.push_back(ch);
+    }
+
+    /// Drops the payloads of `ch` that wait for the data sender.
+    fn drop_queued(&mut self, ch: ChannelId) {
         let mut freed = 0;
         self.data_out.retain(|(c, p)| {
             let stale = *c == ch;
@@ -797,7 +803,6 @@ impl<L: Link> State<L> {
         });
         self.data_out_bytes -= freed;
         self.queued.remove(&ch.0);
-        self.finish_out.push_back(ch);
     }
 
     /// The next item the data sender may hand to the current link: a `Finish` (never held), then
@@ -990,6 +995,8 @@ pub struct Wakeups {
     pub ctl: u64,
     pub data: u64,
     pub ticks: u64,
+    /// Items (acks, MUX records) the control sender handed to the link.
+    pub ctl_sent: u64,
 }
 
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
@@ -1002,6 +1009,7 @@ struct TestHooks {
     ctl_runs: std::sync::atomic::AtomicU64,
     data_runs: std::sync::atomic::AtomicU64,
     ticks: std::sync::atomic::AtomicU64,
+    ctl_sent: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1157,6 +1165,7 @@ impl<L: Link> Endpoint<L> {
             ctl: h.ctl_runs.load(Relaxed),
             data: h.data_runs.load(Relaxed),
             ticks: h.ticks.load(Relaxed),
+            ctl_sent: h.ctl_sent.load(Relaxed),
         }
     }
 
@@ -1818,7 +1827,10 @@ impl<L: Link> Inner<L> {
                 MuxEvent::Closed { channel, why } => {
                     debug!(channel = channel.0, why = ?why, "forward channel closed");
                     // Nothing it sent is still owed: the peer's `Close` says it consumed all
-                    // of it (or gave up on it), and a `Close` ends the peer's acks for it.
+                    // of it (or gave up on it), and a `Close` ends the peer's acks for it. What
+                    // still waits for the data sender is stale, and sent after the pacer
+                    // forgot the channel it would be recorded again, until the channel is released.
+                    st.drop_queued(channel);
                     st.pacer.forget(channel);
                     st.end_slot(channel, why);
                 }
@@ -2343,6 +2355,8 @@ impl<L: Link> Inner<L> {
             }
             match item {
                 Some(((ch, payload), link, generation)) => {
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks.ctl_sent.fetch_add(1, Ordering::Relaxed);
                     if link.send(ch, payload).await.is_err() {
                         self.send_failed(&link, generation);
                     }
@@ -2654,6 +2668,13 @@ impl<L: Link> Inner<L> {
         }
         st.touch(now());
         st.mux.abort(ch, why);
+        // No `Closed` event follows a local abort (the mux has told the peer already), so
+        // nothing else would tell the pacer: its records of the channel would stay counted until
+        // the peer's `Close` releases it, and the peer's acks for them are not fed once the
+        // channel is closing. What the abort discarded in the mux is stale in the queue too: sent
+        // after the pacer forgot the channel, it would be recorded again.
+        st.drop_queued(ch);
+        st.pacer.forget(ch);
         st.end_slot(ch, why);
         self.drain(&mut st);
         drop(st);

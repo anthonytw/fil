@@ -5,27 +5,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+keywords = ["fil"]
 
 [features]
 default = []
 # The test harness (oracle, driver, sim): not in the shipped library. Its traces hold keystrokes
 # by design (docs/m3/plan.md §4.3). The tests enable it through the dev-dependency below.
 testkit = []
-# The PTY harness and demo: real programs on a PTY behind fil-netsim (examples/).
-harness = ["testkit", "dep:fil-netsim", "dep:tokio", "dep:portable-pty", "dep:nix"]
+# The PTY harness and demo: real programs on a PTY behind fil-netsim (examples/, with their module
+# examples/support/pty.rs). Their crates are dev-dependencies, so the published library depends on
+# no unpublished crate (fil-netsim is test-only: docs/m4/release.md section 10.1).
+harness = ["testkit"]
 
 [lints]
 workspace = true
 
 [dependencies]
-fil-term = { path = "../fil-term", default-features = false, features = ["alacritty"] }
+fil-term = { workspace = true, features = ["alacritty"] }
 unicode-width = "0.2"
 vte = "0.15"
-fil-netsim = { path = "../fil-netsim", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "io-util"], optional = true }
-portable-pty = { version = "0.9", optional = true }
-nix = { version = "0.28", default-features = false, features = ["term"], optional = true }
 
 # The vt100 backend is not in the shipped binary (fil-term's default features); the tests and
 # examples iterate over every backend, so they build it.
@@ -33,6 +35,11 @@ nix = { version = "0.28", default-features = false, features = ["term"], optiona
 fil-term = { path = "../fil-term", features = ["vt100"] }
 # The tests use the harness (oracle, driver, sim).
 fil-predict = { path = ".", features = ["testkit"] }
+# The harness examples' PTY, link and runtime (examples/support/pty.rs).
+fil-netsim = { path = "../fil-netsim" }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "io-util"] }
+portable-pty = "0.9"
+nix = { version = "0.28", default-features = false, features = ["term"] }
 # Used by examples/predict_demo.rs (needs the harness feature), and by benches/budget.rs for the
 # thread CPU clock.
 rustix = { version = "1", features = ["termios", "stdio", "time"] }

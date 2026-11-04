@@ -904,6 +904,17 @@ fn degraded_threshold(params: &LinkParams, rtt: Duration) -> Duration {
         .min(params.dead_after * 3 / 4)
 }
 
+/// Whether the peer's address changing from `old` to `new` is a change of path for the layers
+/// above: quinn keeps its round-trip estimate and congestion state when only the port of an IPv4
+/// peer changed (a NAT rebinding: the same host behind the same address) and starts over for any
+/// other change, so only those count in `path_generation`. A pacer that restarted for a rebind
+/// would throw away a base and a cap that are still right. This mirrors quinn-proto's
+/// `Connection::migrate` (0.11): `remote.is_ipv4() && remote.ip() == previous.ip()`, which is
+/// also why an IPv6 port change counts; if quinn changes the rule this has to follow.
+fn path_state_resets(old: SocketAddr, new: SocketAddr) -> bool {
+    !(new.is_ipv4() && new.ip() == old.ip())
+}
+
 /// Watches the connection: reports `Degraded`, the round-trip time and path changes, and the
 /// final `Down`.
 ///
@@ -989,8 +1000,8 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
         let mut changed = false;
         let now_remote = conn.remote_address();
         if now_remote != remote {
+            changed |= path_state_resets(remote, now_remote);
             remote = now_remote;
-            changed = true;
         }
         let now_local = conn.local_ip();
         if now_local.is_some() && local_ip.is_some() && now_local != local_ip {
@@ -1034,4 +1045,41 @@ async fn supervise(io: Arc<Io>, status: Arc<watch::Sender<LinkStatus>>, params: 
     // What was received stays readable, whatever ended the link.
     io.inbox.close(reason.clone());
     status.send_modify(|s| s.state = LinkState::Down(reason));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_state_resets;
+
+    fn a(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_port_only_change_of_an_ipv4_peer_is_not_a_new_path() {
+        assert!(!path_state_resets(
+            a("198.51.100.7:5000"),
+            a("198.51.100.7:6001")
+        ));
+    }
+
+    #[test]
+    fn a_new_ip_is_a_new_path() {
+        assert!(path_state_resets(
+            a("198.51.100.7:5000"),
+            a("203.0.113.9:5000")
+        ));
+        assert!(path_state_resets(
+            a("198.51.100.7:5000"),
+            a("203.0.113.9:6001")
+        ));
+    }
+
+    #[test]
+    fn quinn_restarts_its_estimates_for_an_ipv6_port_change_so_that_counts() {
+        assert!(path_state_resets(
+            a("[2001:db8::7]:5000"),
+            a("[2001:db8::7]:6001")
+        ));
+    }
 }

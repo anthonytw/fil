@@ -67,7 +67,9 @@
 //!   client to speak first.
 //! - **Path changes:** `path_generation` counts address changes the link observed (polled every
 //!   500 ms at most). The daemon sees every change of the client's source address, which is what
-//!   quinn's connection migration follows. A client cannot see its NAT rebind at all, and sees a
+//!   quinn's connection migration follows. A change of the port alone of an IPv4 peer (a NAT
+//!   rebinding) is not counted: quinn keeps its round-trip and congestion state across it, so
+//!   the layers above keep theirs. A client cannot see its NAT rebind at all, and sees a
 //!   change of its own local IP only where the OS reports it to quinn (not on the simulated
 //!   socket).
 //!

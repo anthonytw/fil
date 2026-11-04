@@ -86,7 +86,9 @@ pub struct LinkStatus {
     /// The latest round-trip estimate, once there is one.
     pub rtt: Option<Duration>,
     /// Increments on every path change that the link absorbed without going down (QUIC
-    /// connection migration: a new client address or NAT rebinding). Always 0 on the pipe.
+    /// connection migration to a new client IP address). A NAT rebinding that changes only the
+    /// port of an IPv4 peer is not one: the path's round trip and congestion state carry over.
+    /// Always 0 on the pipe.
     pub path_generation: u64,
 }
 

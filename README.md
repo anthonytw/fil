@@ -14,4 +14,6 @@ It has no panes: your terminal already does that.
 
 **Status:** in development. The `fil` client, the daemon, sessions that survive a reconnect or a takeover, and both transports (the ssh pipe and direct QUIC) work, and M1 is being closed out. Port forwards, `fil ports`, the agent relay and predictive echo are not built yet, and there is no release, so there's nothing to install. See [DESIGN.md](DESIGN.md) (milestones in §15).
 
+PR numbers (#NN) in docs and comments refer to the repository's earlier history, which is archived.
+
 **License:** [GPL-3.0-or-later](LICENSE).

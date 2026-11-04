@@ -15,8 +15,7 @@
 //!   from a file birth time (musl's `std` has none, and a log must age out there too); a first
 //!   line that does not parse falls back to the file's last write, never to "now". It is checked
 //!   when a line is written, when the log is opened, and every [`MAINTAIN_EVERY`] (an hour) by
-//!   [`NonBlockingLog`]'s writer thread every [`MAINTAIN_EVERY`], so a process that logs little
-//!   honours it as well.
+//!   [`NonBlockingLog`]'s writer thread, so a process that logs little honours it as well.
 //! - **Never in the way.** A log directory on a hung network file system must not freeze the
 //!   process. The tracing layer only formats a line and puts it in a bounded queue
 //!   ([`QueueLimits`]: 1,024 lines or 1 MiB); one writer thread does every write, rotation,
@@ -92,8 +91,9 @@ pub struct RotatingLog {
     /// When the oldest line in the file in use was written (see [`file_born`]).
     born: SystemTime,
     last_prune: Instant,
-    /// Runs where a rotation starts, on the thread that rotates. Tests only (see
-    /// [`set_rotation_hook`](Self::set_rotation_hook)).
+    /// Runs where a rotation starts, on the thread that rotates. Tests only (the `test-hooks`
+    /// feature; see `set_rotation_hook`).
+    #[cfg(feature = "test-hooks")]
     before_rotate: Option<Box<dyn FnMut() + Send>>,
 }
 
@@ -122,12 +122,14 @@ impl RotatingLog {
             len,
             born,
             last_prune: Instant::now(),
+            #[cfg(feature = "test-hooks")]
             before_rotate: None,
         })
     }
 
     /// Test seam: `hook` runs at the start of every rotation, on the thread that rotates, so a
     /// test can park it as a hung `rename` would be and see which thread it was.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn set_rotation_hook(&mut self, hook: impl FnMut() + Send + 'static) {
         self.before_rotate = Some(Box::new(hook));
@@ -160,6 +162,7 @@ impl RotatingLog {
     }
 
     fn rotate(&mut self) {
+        #[cfg(feature = "test-hooks")]
         if let Some(hook) = self.before_rotate.as_mut() {
             hook();
         }
@@ -314,19 +317,15 @@ impl NonBlockingLog {
         std::thread::Builder::new()
             .name("fil-log".into())
             .spawn(move || {
+                // However the thread ends (no sink, a clean end, a panic in `open` or in the
+                // sink), the log is marked finished, so a flush returns at once instead of
+                // waiting out its time, and nothing is queued for a writer that is gone. A panic
+                // is also said by the panic hook, on stderr, as any thread's is.
+                let _finish = FinishOnDrop(Arc::clone(&theirs));
                 let sink = open();
                 let _ = tx.send(sink.is_some());
-                match sink {
-                    Some(sink) => write_loop(&theirs, sink, maintain_every),
-                    // No log: whatever is submitted from now on is dropped, uncounted.
-                    None => {
-                        let mut q = theirs.lock();
-                        q.finished = true;
-                        q.lines.clear();
-                        q.pending_lines = 0;
-                        q.pending_bytes = 0;
-                        theirs.ended.notify_all();
-                    }
+                if let Some(sink) = sink {
+                    write_loop(&theirs, sink, maintain_every);
                 }
             })?;
         Ok((Self { shared }, rx))
@@ -357,6 +356,20 @@ impl NonBlockingLog {
                 .0;
         }
         true
+    }
+}
+
+/// Marks the log finished when the writer thread ends, however it ends.
+struct FinishOnDrop(Arc<Shared>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        let mut q = self.0.lock();
+        q.finished = true;
+        q.lines.clear();
+        q.pending_lines = 0;
+        q.pending_bytes = 0;
+        self.0.ended.notify_all();
     }
 }
 
@@ -643,16 +656,12 @@ pub fn init(path: &Path, log_panics: bool) -> bool {
         return false;
     }
     let path = path.to_path_buf();
-    let Ok((log, opened)) = NonBlockingLog::spawn(
+    let Some(log) = start(
         move || RotatingLog::open(&path, LogPolicy::default()),
-        QueueLimits::default(),
-        MAINTAIN_EVERY,
+        OPEN_WAIT,
     ) else {
         return false;
     };
-    if opened.recv_timeout(OPEN_WAIT) == Ok(false) {
-        return false;
-    }
     let installed = tracing_subscriber::fmt()
         .json()
         .with_env_filter(env_filter())
@@ -674,6 +683,21 @@ pub fn init(path: &Path, log_panics: bool) -> bool {
         }));
     }
     installed
+}
+
+/// Starts a writer on whatever `open` makes (on the writer's own thread) and waits at most
+/// `wait` for it: `None` if it made nothing, or the thread could not start or died; the log
+/// otherwise, also when `open` has not answered yet (lines wait for it, within the queue's
+/// bounds). This is the part of [`init`] that must not hang on a hung file system.
+fn start<S: LogSink>(
+    open: impl FnOnce() -> Option<S> + Send + 'static,
+    wait: Duration,
+) -> Option<NonBlockingLog> {
+    let (log, opened) = NonBlockingLog::spawn(open, QueueLimits::default(), MAINTAIN_EVERY).ok()?;
+    match opened.recv_timeout(wait) {
+        Ok(true) | Err(mpsc::RecvTimeoutError::Timeout) => Some(log),
+        Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 /// Gives the installed log's writer [`EXIT_FLUSH`] to write what is queued. For a process that is
@@ -1058,6 +1082,93 @@ mod tests {
         nb.shared.submit(b"a line longer than ten bytes\n".to_vec());
         assert!(nb.flush(Duration::from_secs(5)));
         assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    /// `init`'s first step must not wait for a first open that hangs (the M1-A2 hang, at start).
+    #[test]
+    fn a_hung_first_open_does_not_hold_up_the_start() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let (r, g) = (Arc::clone(&release), Arc::clone(&got));
+        let begun = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let log = start(
+                move || {
+                    let mut hung = r.0.lock().unwrap();
+                    while !*hung {
+                        hung = r.1.wait(hung).unwrap();
+                    }
+                    Some(WriteSink(Rec(g)))
+                },
+                Duration::from_millis(300),
+            );
+            let _ = tx.send(log);
+        });
+        let log = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the start waited for the hung open")
+            .expect("a log that has not answered yet is still a log");
+        assert!(begun.elapsed() < Duration::from_secs(3));
+        // Lines wait, and are written when the file system answers.
+        log.shared.submit(b"queued\n".to_vec());
+        assert!(got.lock().unwrap().is_empty());
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        assert!(log.flush(Duration::from_secs(5)));
+        assert_eq!(*got.lock().unwrap(), ["queued\n"]);
+        // And an open that makes nothing is no log.
+        assert!(start(|| None::<WriteSink<Vec<u8>>>, Duration::from_secs(5)).is_none());
+    }
+
+    struct Rec(Arc<Mutex<Vec<String>>>);
+    impl Write for Rec {
+        fn write(&mut self, l: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(l).into());
+            Ok(l.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that panics ends the log: the flush at exit returns at once, and nothing is
+    /// queued for a thread that is gone.
+    #[test]
+    fn a_panic_in_the_writer_finishes_the_log() {
+        struct Boom;
+        impl LogSink for Boom {
+            fn write_line(&mut self, _: &[u8]) -> io::Result<()> {
+                panic!("a sink that fails (expected by the test)");
+            }
+            fn maintain(&mut self) {}
+        }
+        let (log, _) =
+            NonBlockingLog::spawn(|| Some(Boom), QueueLimits::default(), MAINTAIN_EVERY).unwrap();
+        log.shared.submit(b"one\n".to_vec());
+        let begun = Instant::now();
+        assert!(log.flush(Duration::from_secs(30)), "the flush timed out");
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        log.shared.submit(b"two\n".to_vec());
+        let q = log.shared.lock();
+        assert!(q.finished && q.lines.is_empty() && q.pending_lines == 0);
+        drop(q);
+        // A panic while opening is the same.
+        let (log, opened) = NonBlockingLog::spawn(
+            || -> Option<Boom> { panic!("an open that fails (expected by the test)") },
+            QueueLimits::default(),
+            MAINTAIN_EVERY,
+        )
+        .unwrap();
+        assert!(opened.recv().is_err());
+        assert!(log.flush(Duration::from_secs(30)));
     }
 
     #[test]

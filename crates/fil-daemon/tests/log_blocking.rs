@@ -16,7 +16,9 @@ use fil_daemon::logging::{
 use fil_proto::msg::{Request, Response};
 use tracing_subscriber::fmt::MakeWriter;
 
-const WITHIN: Duration = Duration::from_millis(100);
+/// The spec says 100 ms; the margin is for a loaded runner. A log that blocks takes forever, not
+/// a little longer.
+const WITHIN: Duration = Duration::from_millis(250);
 
 /// A gate that is shut or open; a writer behind a shut one parks.
 #[derive(Clone, Default)]

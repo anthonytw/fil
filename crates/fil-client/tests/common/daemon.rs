@@ -666,7 +666,11 @@ impl FakeDaemon {
         };
         let tail = std::mem::take(&mut st.repaint_tail);
         let tail_at = st.log.end();
-        let cut = st.repaint_straddle.take().unwrap_or(tail.len()).min(tail.len());
+        let cut = st
+            .repaint_straddle
+            .take()
+            .unwrap_or(tail.len())
+            .min(tail.len());
         st.log.append(&tail);
         st.emu.feed(&tail[..cut]);
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(0));

@@ -761,7 +761,11 @@ async fn output_that_overtakes_a_repaints_announcement_makes_it_stale_not_a_reco
     tokio::time::sleep(Duration::from_secs(3)).await;
     settle().await;
     assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
-    assert_eq!(rig.daemon.repaint_requests().await, vec![1, 1], "asked again");
+    assert_eq!(
+        rig.daemon.repaint_requests().await,
+        vec![1, 1],
+        "asked again"
+    );
     assert_eq!(rig.daemon.repaints().await, vec![1, 1]);
     assert_eq!(
         rig.term.state().screen_text(),

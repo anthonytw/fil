@@ -865,7 +865,7 @@ impl<L: Link> State<L> {
         if !self.pacer.enabled() {
             return None;
         }
-        let (ch, payload) = self.next_from_mux(true)?;
+        let (ch, payload) = self.next_from_mux()?;
         let agent = self.is_agent(ch);
         let seg = DataSegment::parse(&payload);
         debug_assert!(seg.is_ok(), "the mux built this payload");
@@ -877,12 +877,9 @@ impl<L: Link> State<L> {
         Some(Out::Data(ch, payload))
     }
 
-    /// The next payload, in turn over the mux's channels, of one the pacer lets go now
-    /// (`unqueued`: and with nothing in the data queue), taken with `Mux::poll_transmit_channel`.
-    /// A channel the pacer holds keeps its data in its send buffer, so the data queue holds only
-    /// payloads that may go: a channel whose reader stopped cannot fill it (with many small
-    /// payloads it once filled past the pass scan and hid every other channel).
-    fn next_from_mux(&mut self, unqueued: bool) -> Option<(ChannelId, Bytes)> {
+    /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
+    /// that the pacer lets go now, taken with `Mux::poll_transmit_channel`.
+    fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
         let mut ids = std::mem::take(&mut self.scratch_ids);
         ids.clear();
         ids.extend(self.mux.channels().map(|c| c.0));
@@ -890,7 +887,7 @@ impl<L: Link> State<L> {
         let mut found = None;
         for k in 0..ids.len() {
             let id = ids[(start + k) % ids.len()];
-            if unqueued && self.queued.contains_key(&id) {
+            if self.queued.contains_key(&id) {
                 continue;
             }
             let ch = ChannelId(id);
@@ -910,20 +907,45 @@ impl<L: Link> State<L> {
     /// Takes what the mux has to send, in turn over its channels, up to [`DATA_AHEAD`] bytes and
     /// [`PASS_SCAN`] payloads, from the channels the pacer lets go now (the data sender; acks and
     /// MUX records are the control sender's, `poll_transmit_control`). A held channel's data stays
-    /// in its send buffer; one that becomes held after its payload was taken is passed by the
+    /// in its send buffer, so the queue holds only payloads that may go: a channel whose reader
+    /// stopped cannot fill it (with many small payloads it once filled past the scan and hid
+    /// every other channel). One that becomes held after its payload was taken is passed by the
     /// scan of the whole queue ([`State::pass_index`]) and by [`State::pass_from_mux`].
     fn pull(&mut self) {
         if self.link.is_none() {
             return;
         }
-        while self.data_out_bytes < DATA_AHEAD && self.data_out.len() < PASS_SCAN {
-            let Some((ch, payload)) = self.next_from_mux(false) else {
-                break;
+        let mut ids = std::mem::take(&mut self.scratch_ids);
+        ids.clear();
+        ids.extend(self.mux.channels().map(|c| c.0));
+        // Rounds over the channels from the one after the last taken, one payload each, until
+        // the queue is full or a round finds nothing.
+        let mut k = ids.partition_point(|&id| id <= self.pass_rr);
+        let mut idle = 0;
+        while !ids.is_empty()
+            && idle < ids.len()
+            && self.data_out_bytes < DATA_AHEAD
+            && self.data_out.len() < PASS_SCAN
+        {
+            let id = ids[k % ids.len()];
+            k += 1;
+            let ch = ChannelId(id);
+            let payload = if self.pacer.may_go(ch, self.is_agent(ch)) {
+                self.mux.poll_transmit_channel(ch)
+            } else {
+                None
             };
+            let Some(payload) = payload else {
+                idle += 1;
+                continue;
+            };
+            idle = 0;
+            self.pass_rr = id;
             self.data_out_bytes += payload.len();
             *self.queued.entry(ch.0).or_default() += 1;
             self.data_out.push_back(Out::Data(ch, payload));
         }
+        self.scratch_ids = ids;
     }
 }
 

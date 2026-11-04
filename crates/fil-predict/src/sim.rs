@@ -903,6 +903,12 @@ pub struct HostileCfg {
     /// Shows nothing below a 20 ms RTT hint, as an adaptive predictor does (and as M0's did
     /// while it skipped its epochs).
     pub adaptive: bool,
+    /// Withdraws every guess it made at the next tick, before its `EchoAck` can settle it
+    /// (review B2a).
+    pub withdraw_on_tick: bool,
+    /// Guesses each key on a cell elsewhere on the screen that already shows its character
+    /// (review B2b; allowed in a confirmed epoch, where the cells are the predictor's).
+    pub match_cells: bool,
 }
 
 impl HostileCfg {
@@ -913,6 +919,8 @@ impl HostileCfg {
             forge: None,
             skip_every: None,
             adaptive: false,
+            withdraw_on_tick: false,
+            match_cells: false,
         }
     }
 
@@ -938,6 +946,16 @@ impl HostileCfg {
         self.adaptive = true;
         self
     }
+
+    pub fn withdrawing(mut self) -> Self {
+        self.withdraw_on_tick = true;
+        self
+    }
+
+    pub fn matching(mut self) -> Self {
+        self.match_cells = true;
+        self
+    }
 }
 
 /// A predictor that tries everything the core must refuse (`docs/m3/plan.md` §2.1): it wants every
@@ -955,6 +973,8 @@ pub struct HostilePredictor {
     since_enter: usize,
     keys: u64,
     ats: Vec<InputPos>,
+    /// Cells guessed since the last tick (`withdraw_on_tick`).
+    since_tick: Vec<(u16, u16)>,
 }
 
 impl HostilePredictor {
@@ -967,6 +987,7 @@ impl HostilePredictor {
             since_enter: 0,
             keys: 0,
             ats: Vec::new(),
+            since_tick: Vec::new(),
         }
     }
 
@@ -1043,6 +1064,19 @@ impl Predictor for HostilePredictor {
                         at,
                     });
                 }
+                if let (true, KeyEvent::Char(ch)) = (self.cfg.match_cells, key) {
+                    let size = ctx.screen.size();
+                    let want = ch.to_string();
+                    'find: for row in 0..size.rows {
+                        for col in 0..size.cols.saturating_sub(2) {
+                            if ctx.screen.cell(row, col).is_some_and(|c| c.text == want) {
+                                v.push(OverlayEdit::Guess { row, col, at });
+                                self.since_tick.push((row, col));
+                                break 'find;
+                            }
+                        }
+                    }
+                }
                 let (cell, after) = if *key == KeyEvent::Backspace {
                     let c = c.saturating_sub(1);
                     ((r, c), (r, c))
@@ -1054,6 +1088,7 @@ impl Predictor for HostilePredictor {
                     col: cell.1,
                     at,
                 });
+                self.since_tick.push(cell);
                 self.cursor = Some(after);
                 self.ats.push(at);
                 self.since_enter += 1;
@@ -1110,7 +1145,13 @@ impl Predictor for HostilePredictor {
     fn on_echo_ack(&mut self, _input_upto: InputPos, _ctx: &Ctx<'_>) {}
 
     fn on_tick(&mut self, _ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
-        Vec::new()
+        if !self.cfg.withdraw_on_tick {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.since_tick)
+            .into_iter()
+            .map(|(row, col)| OverlayEdit::Withdraw { row, col })
+            .collect()
     }
 
     fn next_deadline(&self) -> Option<Time> {
@@ -1134,6 +1175,7 @@ impl Predictor for HostilePredictor {
         self.anchor = None;
         self.since_enter = 0;
         self.ats.clear();
+        self.since_tick.clear();
     }
 
     fn has_outstanding(&self) -> bool {

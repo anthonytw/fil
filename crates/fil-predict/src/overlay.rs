@@ -192,6 +192,15 @@ pub struct Guards {
     pub explained_chunk: bool,
     /// The first confirmation needs a guessed glyph that changed in the chunk (rule 2).
     pub changed_glyph: bool,
+    /// The first confirmation needs a non-blank guess: a Backspace's erase or a typed space
+    /// cannot give it (rule 2; review B1, a masked prompt erasing its `*`).
+    pub nonblank_first: bool,
+    /// A written guess the predictor withdraws makes the epoch tentative (rule 5; review B2:
+    /// otherwise withdrawing before the ack hides an unechoed key from it).
+    pub withdraw_tentative: bool,
+    /// An `EchoAck` confirms a guess whose cell already showed its glyph only if the cursor shows
+    /// the echo reached it (rule 5; review B2).
+    pub ack_reached: bool,
     /// The first confirmation also needs an `EchoAck` covering every key typed before the
     /// epoch's first key (rule 2, coordinator's call 2026-11-04): until then a matching chunk
     /// can be an earlier key's late echo (typing ahead of a prompt).
@@ -254,6 +263,9 @@ impl Guards {
             "contradiction_first" => &mut self.contradiction_first,
             "explained_chunk" => &mut self.explained_chunk,
             "changed_glyph" => &mut self.changed_glyph,
+            "nonblank_first" => &mut self.nonblank_first,
+            "withdraw_tentative" => &mut self.withdraw_tentative,
+            "ack_reached" => &mut self.ack_reached,
             "prior_acked" => &mut self.prior_acked,
             "key_boundary" => &mut self.key_boundary,
             "mode_boundary" => &mut self.mode_boundary,
@@ -308,6 +320,9 @@ impl Guards {
         contradiction_first: true,
         explained_chunk: true,
         changed_glyph: true,
+        nonblank_first: true,
+        withdraw_tentative: true,
+        ack_reached: true,
         prior_acked: true,
         key_boundary: true,
         mode_boundary: true,
@@ -335,6 +350,9 @@ impl Guards {
         contradiction_first: true,
         explained_chunk: false,
         changed_glyph: false,
+        nonblank_first: false,
+        withdraw_tentative: false,
+        ack_reached: false,
         prior_acked: false,
         key_boundary: false,
         mode_boundary: false,
@@ -363,6 +381,9 @@ impl Guards {
         "contradiction_first",
         "explained_chunk",
         "changed_glyph",
+        "nonblank_first",
+        "withdraw_tentative",
+        "ack_reached",
         "prior_acked",
         "key_boundary",
         "mode_boundary",
@@ -835,14 +856,15 @@ impl Overlay {
             if class == KeyClass::Boundary {
                 self.core.boundary(Why::Key, Some(&st), now);
             } else {
-                if g.cap && self.core.pending() >= MAX_OUTSTANDING {
+                if g.cap && self.core.held() >= MAX_OUTSTANDING {
                     self.core.end(Why::Unpredicted, Some(&st), now);
                     continue;
                 }
                 self.core.push_key(kat, kend, class, now);
             }
             let edits = self.predictor.on_key(&key, kat, &self.ctx(&st, now));
-            self.core.apply_edits(edits, &st, now);
+            // The baseline is taken once, after every key of this read.
+            self.core.apply_edits_only(edits, &st, now);
         }
         self.core.last_activity = Some(now);
         self.core.rebase(&st);
@@ -923,6 +945,18 @@ impl Overlay {
         self.report(&st, now);
     }
 
+    /// A fresh attach (after a take-back) rebases the input offsets to 0 (DESIGN.md §8.5): forget
+    /// what was sent and acknowledged before, and any paste in progress. Call it with
+    /// [`Overlay::reset`] when the new attach's input starts again at 0 (E1a). Without it an old
+    /// attach's acknowledgement would satisfy the prior-ack rule for the new one's keys.
+    pub fn rebase_input(&mut self) {
+        self.input_end = 0;
+        self.in_paste = false;
+        self.paste_until = None;
+        self.decoder.clear();
+        self.core.rebase_input();
+    }
+
     /// Shows, replaces or (with `None`) removes the pinned [`Status`]. Returns what to write to
     /// the terminal: only the difference from what is already drawn.
     pub fn set_status(&mut self, status: Option<Status>) -> Flush {
@@ -947,6 +981,8 @@ impl Overlay {
         let drawn = self.on_screen.is_some();
         let st = self.shadow.state(0);
         let now = self.core.last_activity.unwrap_or_default();
+        // Output since the last key is checked before the new geometry becomes the baseline.
+        self.core.sync(&st, now);
         self.core.withdraw_all(WithdrawReason::Resize, &st, now);
         self.report(&st, now);
         let mut f = self.new_flush();

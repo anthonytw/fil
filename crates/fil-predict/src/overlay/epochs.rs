@@ -237,16 +237,28 @@ struct Baseline {
     size: Size,
     cursor: (u16, u16),
     stamps: Vec<u64>,
-    rows: BTreeMap<u16, Vec<String>>,
+    /// Each watched cell's glyph, as a hash (no allocation per cell; a collision is accidental,
+    /// as for `row_stamp`).
+    rows: BTreeMap<u16, Vec<u64>>,
 }
 
 impl Baseline {
-    fn text(&self, row: u16, col: u16) -> Option<&str> {
+    fn glyph(&self, row: u16, col: u16) -> Option<u64> {
         self.rows
             .get(&row)
             .and_then(|r| r.get(usize::from(col)))
-            .map(String::as_str)
+            .copied()
     }
+}
+
+/// FNV-1a of a cell's text.
+fn cell_hash(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in text.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// What changed since the baseline.
@@ -259,13 +271,9 @@ struct Diff {
     cursor: (u16, u16),
 }
 
-fn row_texts(v: &dyn ScreenView, row: u16) -> Vec<String> {
+fn row_glyphs(v: &dyn ScreenView, row: u16) -> Vec<u64> {
     (0..v.size().cols)
-        .map(|c| {
-            v.cell(row, c)
-                .map(|c| c.text.to_owned())
-                .unwrap_or_default()
-        })
+        .map(|c| cell_hash(v.cell(row, c).map_or("", |c| c.text)))
         .collect()
 }
 
@@ -353,6 +361,12 @@ impl Core {
             .count()
     }
 
+    /// Keys the epoch holds a guess for, settled or not, superseded ones included (rule 8's
+    /// cap counts these, so `a`, Backspace, `a`, ... with no echo is bounded too).
+    pub fn held(&self) -> usize {
+        self.keys.iter().filter(|k| k.guess.is_some()).count()
+    }
+
     pub fn has_pending(&self) -> bool {
         self.keys
             .iter()
@@ -391,7 +405,7 @@ impl Core {
         }
         for r in watch {
             if r < size.rows {
-                rows.entry(r).or_insert_with(|| row_texts(v, r));
+                rows.entry(r).or_insert_with(|| row_glyphs(v, r));
             }
         }
         self.baseline = Some(Baseline {
@@ -419,10 +433,9 @@ impl Core {
         for r in 0..size.rows {
             match base.rows.get(&r) {
                 Some(texts) => {
-                    for (c, was) in texts.iter().enumerate() {
+                    for (c, &was) in texts.iter().enumerate() {
                         let c = c as u16;
-                        let now = v.cell(r, c).map_or("", |c| c.text);
-                        if now != was {
+                        if cell_hash(v.cell(r, c).map_or("", |c| c.text)) != was {
                             cells.push((r, c));
                         }
                     }
@@ -542,6 +555,16 @@ impl Core {
     }
 
     pub fn apply_edits(&mut self, edits: Vec<OverlayEdit>, v: &dyn ScreenView, now: Time) {
+        let any = !edits.is_empty();
+        self.apply_edits_only(edits, v, now);
+        if any {
+            self.rebase(v);
+        }
+    }
+
+    /// As [`Core::apply_edits`], without taking the baseline again: for a caller that takes it
+    /// once after several keys (`Overlay::on_input`).
+    pub fn apply_edits_only(&mut self, edits: Vec<OverlayEdit>, v: &dyn ScreenView, now: Time) {
         if edits.is_empty() {
             return;
         }
@@ -567,22 +590,32 @@ impl Core {
                         }) if (*r, *c) == (row, col))
                     });
                     match hit {
-                        Some(i) => {
-                            self.retire(i, Why::Lifecycle(WithdrawReason::Predictor), Some(v), now)
-                        }
+                        Some(i) => self.withdraw_by_predictor(i, v, now),
                         None => self.reject(),
                     }
                 }
                 OverlayEdit::Clear => {
                     for i in 0..self.keys.len() {
                         if self.is_pending(i) {
-                            self.retire(i, Why::Lifecycle(WithdrawReason::Predictor), Some(v), now);
+                            self.withdraw_by_predictor(i, v, now);
                         }
                     }
                 }
             }
         }
-        self.rebase(v);
+    }
+
+    /// The predictor withdraws key `i`'s guess. A written one makes the epoch tentative
+    /// (`Guards::withdraw_tentative`): otherwise a predictor that withdraws each written guess
+    /// before its `EchoAck` would keep rule 5 from ever seeing a key unechoed, and the epoch
+    /// confirmed through a silent secret read (OQ-1 case 1's bound). A late echo or the next
+    /// explained chunk confirms it again.
+    fn withdraw_by_predictor(&mut self, i: usize, v: &dyn ScreenView, now: Time) {
+        let written = self.keys[i].guess.as_ref().is_some_and(|g| g.written);
+        self.retire(i, Why::Lifecycle(WithdrawReason::Predictor), Some(v), now);
+        if written && self.g.withdraw_tentative {
+            self.state = State::Tentative;
+        }
     }
 
     fn is_pending(&self, i: usize) -> bool {
@@ -858,6 +891,11 @@ impl Core {
         self.dirty = false;
     }
 
+    /// The input offsets start again at 0 (a fresh attach): no earlier acknowledgement counts.
+    pub fn rebase_input(&mut self) {
+        self.acked = 0;
+    }
+
     pub fn has_deferred(&self) -> bool {
         !self.deferred.is_empty()
     }
@@ -1057,7 +1095,7 @@ impl Core {
             let (want, seen) = glyph_of(i);
             if now_text == want {
                 matched.push(i);
-                if base.text(r, c) != Some(want.as_str()) {
+                if base.glyph(r, c) != Some(cell_hash(&want)) {
                     matched_changed.push(i);
                 }
             } else if !seen.iter().any(|s| s == now_text) {
@@ -1139,6 +1177,20 @@ impl Core {
         }
         .into_iter()
         .filter(|&i| !self.is_kept(i))
+        // A blank (a Backspace's erase, a typed space) cannot give the first confirmation
+        // (`Guards::nonblank_first`): a masked prompt erases its `*` for a Backspace exactly as
+        // the core computed, which is no evidence that the program echoes what is typed.
+        .filter(|&i| {
+            self.confirmed_once
+                || !self.g.nonblank_first
+                || !matches!(
+                    &self.keys[i].guess,
+                    Some(Guess {
+                        kind: GKind::Glyph { glyph: ' ', .. },
+                        ..
+                    })
+                )
+        })
         .collect();
         let cursor_ok = self.cursor_clause(&confirming, cur, v);
         // Rule 2 (coordinator's call): the first confirmation also needs an `EchoAck` covering
@@ -1311,7 +1363,16 @@ impl Core {
                     ..
                 } => {
                     let text = v.cell(*row, *col).map_or("", |c| c.text).to_owned();
-                    if text == text_of(*glyph) && (self.confirmed() || g.kept) {
+                    // A cell that showed the glyph before the guess (a space over a blank, a
+                    // guess placed on a matching cell) proves nothing by itself: confirmed only
+                    // if the cursor shows the echo reached the key (`Guards::ack_reached`).
+                    let cur = cursor_of(v);
+                    let reached = !self.g.ack_reached
+                        || seen.first() != Some(&text)
+                        || self.keys[i..]
+                            .iter()
+                            .any(|k| k.guess.as_ref().is_some_and(|g| g.after == cur));
+                    if text == text_of(*glyph) && (self.confirmed() || g.kept) && reached {
                         self.confirm(i, v, now);
                     } else if text != text_of(*glyph) && !seen.contains(&text) {
                         self.retire_as(i, Why::Contradiction, Some(v), now, true);

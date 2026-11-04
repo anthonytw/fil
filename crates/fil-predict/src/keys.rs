@@ -11,8 +11,9 @@
 
 use crate::predictor::KeyEvent;
 
-/// What the core makes of one key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the core makes of one key. Its `Debug` shows no typed character (`docs/m3/plan.md`
+/// §4.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KeyClass {
     /// May be guessed (`OverlayEdit::Guess`) as this character.
     Printable(char),
@@ -30,6 +31,21 @@ pub enum KeyClass {
     /// Everything else ends the epoch (rule 3, `Key`): Enter, Tab, every C0 control but
     /// Backspace, a bare Esc, every other escape sequence, every Alt-key.
     Boundary,
+}
+
+impl std::fmt::Debug for KeyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            KeyClass::Printable(_) => "Printable(..)",
+            KeyClass::Backspace => "Backspace",
+            KeyClass::Left => "Left",
+            KeyClass::Right => "Right",
+            KeyClass::Release => "Release",
+            KeyClass::PasteStart => "PasteStart",
+            KeyClass::PasteEnd => "PasteEnd",
+            KeyClass::Boundary => "Boundary",
+        })
+    }
 }
 
 /// The core's class of a key (rules 3 and 7).

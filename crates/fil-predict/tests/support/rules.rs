@@ -56,7 +56,123 @@ fn plain() -> HostileCfg {
     HostileCfg::quiet(1)
 }
 
+/// A masked password prompt (pwfeedback): raw, echo off, a `*` per key and `\b \b` for a
+/// Backspace. Offsets: `s` 0, Enter 1, `Ø` 2..4, DEL 4, `Ñ` 5..7.
+fn masked_prompt() -> Trace {
+    shell()
+        .input(50, b"\r")
+        .server(90, b"\r\nPassword: ")
+        .pty(95, false, false)
+        .echo_ack(96, 2)
+        .input(100, "Ø".as_bytes())
+        .server(150, b"*")
+        .echo_ack(155, 4)
+        .input(400, b"\x7f")
+        .server(450, b"\x08 \x08")
+        .echo_ack(455, 5)
+        .input(600, "Ñ".as_bytes())
+        .server(650, b"*")
+}
+
 pub const RULES: &[Rule] = &[
+    Rule {
+        // Review B1: the Backspace's erase of a `*` is exactly where the core computed the blank
+        // guess would leave the cell; it must not confirm the epoch.
+        name: "masked prompt and a Backspace",
+        guard: Some("nonblank_first"),
+        trace: masked_prompt,
+        adversary: plain,
+        mosh_breaks: true,
+    },
+    Rule {
+        // Review B1, inquirer-style: the line redrawn at every key, with no mode change at all.
+        name: "redrawn masked prompt and a Backspace",
+        guard: Some("nonblank_first"),
+        trace: || {
+            shell()
+                .input(50, b"\r")
+                .server(90, b"\r\n? Password: ")
+                .echo_ack(96, 2)
+                .input(100, "Ø".as_bytes())
+                .server(150, b"\r? Password: *\x1b[K")
+                .echo_ack(155, 4)
+                .input(400, b"\x7f")
+                .server(450, b"\r? Password: \x1b[K")
+                .echo_ack(455, 5)
+                .input(600, "Ñ".as_bytes())
+                .server(650, b"\r? Password: *\x1b[K")
+        },
+        adversary: plain,
+        mosh_breaks: true,
+    },
+    Rule {
+        // Review B2a: OQ-1 case 1's bound against a predictor that withdraws each written guess
+        // before its EchoAck could show it unechoed.
+        name: "unechoed key withdrawn before its ack",
+        guard: Some("withdraw_tentative"),
+        trace: || {
+            keys(
+                shell().input(100, b"a").tick(105).echo_ack(170, 2),
+                180,
+                "ØÑ",
+            )
+        },
+        adversary: || HostileCfg::quiet(1).withdrawing(),
+        mosh_breaks: false,
+    },
+    Rule {
+        // Review B2b: the key guessed on a cell elsewhere that already shows its character, so the
+        // ack would find it "echoed".
+        name: "unechoed key guessed on a matching cell",
+        guard: Some("ack_reached"),
+        trace: || {
+            let t = Trace::new()
+                .rtt(0, 100)
+                .server(0, b"abc\r\n$ ")
+                .input(10, b"s")
+                .server(40, b"s")
+                .input(100, b"a")
+                .echo_ack(170, 2);
+            keys(t, 180, "ØÑ")
+        },
+        adversary: || HostileCfg::quiet(1).matching(),
+        mosh_breaks: false,
+    },
+    Rule {
+        // Review B2c, with no hostility: a passphrase that starts with a space typed over a
+        // blank; the ack must not take the unchanged blank for its echo.
+        name: "unechoed space over a blank",
+        guard: Some("ack_reached"),
+        trace: || keys(shell().input(100, b" ").echo_ack(170, 2), 180, "ØÑ"),
+        adversary: plain,
+        mosh_breaks: true,
+    },
+    Rule {
+        // Review S1 (M11): a prompt drawn left of the cursor on its row while nothing is
+        // outstanding, the cursor left where it was.
+        name: "prompt left of the cursor while idle",
+        guard: Some("unexplained"),
+        trace: || keys(shell().server(100, b"\rPw:"), 200, "ØÑ"),
+        adversary: plain,
+        mosh_breaks: true,
+    },
+    Rule {
+        // Review S1 (M7): the prompt right of a cursor moved back to column 0 (exempt by
+        // position), while nothing is outstanding: only the cursor check sees it.
+        name: "prompt right of a moved cursor while idle",
+        guard: Some("unexplained"),
+        trace: || keys(shell().server(100, b"\rPw:\r"), 200, "ØÑ"),
+        adversary: plain,
+        mosh_breaks: true,
+    },
+    Rule {
+        // Review S1 (M20): the same with a guess outstanding, in a confirmed epoch's chunk.
+        name: "prompt right of a moved cursor in a chunk",
+        guard: Some("unexplained"),
+        trace: || keys(shell().input(100, b"x").server(150, b"\rPw:\r"), 200, "ØÑ"),
+        adversary: plain,
+        mosh_breaks: true,
+    },
     Rule {
         // §3 C1: a password typed right after Enter, before the echo-off report.
         name: "sudo typed ahead",

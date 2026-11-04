@@ -264,6 +264,75 @@ fn a_new_epoch_confirms_only_after_the_keys_before_it_are_acknowledged() {
     );
 }
 
+// ---- single checks the guard table does not separate (review S1) ----------------------
+
+fn fixed(cells: Vec<(u16, u16)>) -> T {
+    T::with(
+        Box::new(FixedPredictor::new(cells)),
+        Guards::ALL,
+        Size { cols: 40, rows: 10 },
+    )
+}
+
+/// M6: input at an offset the core did not expect (bytes it never saw) is a boundary.
+#[test]
+fn input_at_an_unexpected_offset_is_a_boundary() {
+    let mut t = T::trusted();
+    t.at += 4; // bytes the overlay never saw
+    assert!(t.key(b"b", 200).paint.is_empty(), "written across a gap");
+}
+
+/// M1: in a tentative epoch, a guessed cell changed to something other than its current guess
+/// (here an earlier guess for it) keeps the chunk from confirming. Strictness only: what such a
+/// cell shows is the cell's own text or a character typed into it.
+#[test]
+fn a_stray_change_to_a_guessed_cell_does_not_confirm() {
+    let mut t = T::new();
+    t.server(b"$ ", 0);
+    for (i, k) in [b"x".as_slice(), b"a", b"\x7f", b"b"].iter().enumerate() {
+        t.key(k, 10 + 10 * i as u64);
+    }
+    t.server(b"xa", 100);
+    assert!(!t.o.epoch_confirmed());
+}
+
+/// M3: a kept guess never seeds the new epoch's cursor chain: a new epoch's first guess right
+/// after it is not the plain form (the shadow cursor is still on the kept guess's cell).
+#[test]
+fn a_kept_guess_does_not_seed_the_next_epochs_chain() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+    t.server(b"$ ", 0);
+    t.key(b"a", 10);
+    t.server(b"a", 100);
+    t.key(b"b", 200); // written at (0, 3)
+    t.key(b"\t", 210); // a Key boundary that draws nothing: `b` is kept
+    let rejected = t.o.stats().rejected;
+    t.key(b"c", 220); // guessed at (0, 4), after the kept guess
+    assert_eq!(t.o.stats().rejected, rejected + 1, "{:?}", t.o.stats());
+    assert_eq!(t.o.outstanding(), 1, "only the kept guess");
+}
+
+/// M8: the prior-ack rule counts from the new epoch's first key, not from a kept key of the
+/// ended epoch: an ack that covers the kept key but not the boundary key confirms nothing.
+#[test]
+fn the_prior_ack_rule_counts_from_the_new_epochs_first_key() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4), (0, 5)]);
+    t.server(b"$ ", 0);
+    t.key(b"a", 10); // at 0
+    t.server(b"a", 100);
+    t.key(b"b", 200); // at 1, written
+    t.key(b"\t", 210); // at 2: `b` kept
+    t.server(b"b", 300); // the kept guess confirmed
+    t.key(b"c", 310); // at 3: the new epoch's first key
+    t.o.on_echo_ack(2, ms(320)); // covers `a` and `b`, not the Tab
+    t.server(b"c", 400);
+    assert!(
+        !t.o.epoch_confirmed(),
+        "confirmed by an ack that misses the Tab"
+    );
+    assert!(t.key(b"d", 410).paint.is_empty());
+}
+
 // ---- settling by EchoAck (rule 5) ----------------------------------------------------
 
 #[test]

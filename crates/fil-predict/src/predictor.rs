@@ -57,14 +57,24 @@ pub enum CellStyle {
     Reverse,
 }
 
-/// One cell of a [`ScreenView`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One cell of a [`ScreenView`]. Its `Debug` shows no text (`docs/m3/plan.md` §4.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CellRef<'a> {
     /// The cell's text (`""` for a blank).
     pub text: &'a str,
     /// 1, 2 for the first half of a wide character, 0 for its second half.
     pub width: u8,
     pub attrs: Attrs,
+}
+
+impl std::fmt::Debug for CellRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellRef")
+            .field("text_len", &self.text.len())
+            .field("width", &self.width)
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 /// A read-only view of the shadow screen. C1 implements it over [`TermState`]; P2 makes it cheap.

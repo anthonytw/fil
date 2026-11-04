@@ -347,6 +347,14 @@ macro_rules! rules {
 }
 
 rules! {
+    a_masked_prompt_backspace_does_not_confirm => "masked prompt and a Backspace",
+    a_redrawn_masked_prompt_backspace_does_not_confirm => "redrawn masked prompt and a Backspace",
+    a_key_withdrawn_before_its_ack_still_stops_the_writing => "unechoed key withdrawn before its ack",
+    a_key_on_a_matching_cell_still_stops_the_writing => "unechoed key guessed on a matching cell",
+    an_unechoed_space_over_a_blank_stops_the_writing => "unechoed space over a blank",
+    a_prompt_left_of_the_cursor_while_idle_is_unexplained => "prompt left of the cursor while idle",
+    a_prompt_right_of_a_moved_cursor_while_idle_is_unexplained => "prompt right of a moved cursor while idle",
+    a_prompt_right_of_a_moved_cursor_in_a_chunk_is_unexplained => "prompt right of a moved cursor in a chunk",
     sudo_typed_ahead_is_never_written => "sudo typed ahead",
     sudo_typed_ahead_needs_tentative_epochs => "sudo typed ahead: tentative epochs",
     sudo_typed_ahead_while_quiet_is_never_written => "sudo typed ahead, quiet at the Enter",

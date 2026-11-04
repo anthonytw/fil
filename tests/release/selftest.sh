@@ -256,6 +256,7 @@ stage_release() { # uses $tree $stage $VER
   ROOT=$saved
 }
 # A file named .second-top-LABEL in the stage becomes a second top-level entry of that archive.
+# A file named .source-drop-notices in the stage leaves THIRD-PARTY-NOTICES.md out of the source archive.
 pack_release() { # uses $tree $stage $rel $VER
   local d src="$stage/fil-$VER-source" lbl
   rm -rf "$rel" "$src"
@@ -269,6 +270,7 @@ pack_release() { # uses $tree $stage $rel $VER
   (cd "$src" && cargo generate-lockfile --offline > /dev/null 2>&1)
   : > "$src/.cargo/config.toml"
   [ -d "$stage/.source-extra" ] && cp -R "$stage/.source-extra/." "$src/"
+  [ -e "$stage/.source-drop-notices" ] && rm "$src/THIRD-PARTY-NOTICES.md"
   for d in "$stage"/fil-*; do
     lbl=${d##*/}
     lbl=${lbl#fil-"$VER"-}
@@ -365,6 +367,7 @@ mutated "the license is missing" "rm fil-0.9.0-x86_64-linux-musl/share/doc/fil/L
 mutated "the notices are missing" "rm fil-0.9.0-aarch64-linux-musl/share/doc/fil/THIRD-PARTY-NOTICES.md"
 mutated_msg "an archive's notices are not the source archive's" "differs from the source archive's THIRD-PARTY-NOTICES.md" \
   "echo '- stale' >> fil-0.9.0-universal-apple-darwin/share/doc/fil/THIRD-PARTY-NOTICES.md"
+mutated_msg "the source archive lacks the notices" "fil-0.9.0-source.tar.gz lacks THIRD-PARTY-NOTICES.md" "touch .source-drop-notices"
 mutated "the binary is not static" "perl -pi -e 's/FAKE-ELF-X86/FAKE-DYNAMIC/' fil-0.9.0-x86_64-linux-musl/bin/fil"
 
 # --no-exec: nothing from the download runs. The source archive's own cargo config names a rustc

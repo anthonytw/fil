@@ -1088,5 +1088,6 @@ ALL_SCENARIOS=(
 
 # Sourced by latency.sh for the topology and the helpers; run directly, it is the udp part.
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  source "$REALNET_DIR/peers.sh" # f_fwd_same_user (OD-9), a file of its own
   part_main udp udp_setup udp_teardown "${ALL_SCENARIOS[@]}" -- "$@"
 fi

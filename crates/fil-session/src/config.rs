@@ -92,6 +92,9 @@ pub struct SessionConfig {
     /// The host's server policy (DESIGN.md section 11.2): what forwards and agent relay it
     /// allows. Default: everything ([`crate::policy::AllowAll`]); the daemon sets its mirror.
     pub policy: Arc<dyn crate::policy::ServerPolicy>,
+    /// Who may connect to the session's `-R` ports (`daemon.toml` `[forward] remote_peers`, OD-9):
+    /// every local user by default, as with `ssh -R`.
+    pub remote_peers: crate::peers::RemotePeers,
 }
 
 impl SessionConfig {
@@ -117,6 +120,7 @@ impl SessionConfig {
             max_queued_input: 4 * 1024 * 1024,
             forward: MuxConfig::default(),
             policy: crate::policy::AllowAll::arc(),
+            remote_peers: crate::peers::RemotePeers::Any,
         }
     }
 }

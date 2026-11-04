@@ -797,6 +797,10 @@ pub struct ForwardRow {
     /// Server policy refuses this entry, though it allowed it when it was added: its `-R`
     /// listener is closed, or its connections are refused (DESIGN.md section 11.2).
     pub policy: Option<PolicyRefusal>,
+    /// `-R` connections refused because their peer socket was not the user's, or its owner could
+    /// not be told (`daemon.toml` `[forward] remote_peers = "same-user"`, OD-9). A count only:
+    /// who connected is never sent.
+    pub peers_refused: u32,
     /// A `-D` only: the SOCKS connections server policy refused in the current client's run,
     /// counted, with the setting of the latest. The entry itself stays allowed, and the targets
     /// are not named.

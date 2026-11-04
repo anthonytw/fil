@@ -170,9 +170,11 @@ predict-e2e *args:
 predict-demo *args:
     cargo run --release -p fil-predict --features harness --example predict_demo -- {{args}}
 
-# Scripted prediction scenarios at scale (no PTY): many seeds, release build.
+# Scripted prediction scenarios at scale (no PTY): many seeds, release build. Also the shadow's row
+# stamps against a byte-by-byte reference (crates/fil-predict/tests/screen_view.rs).
 predict-soak seeds="200":
     FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim
+    FIL_STAMP_SEEDS={{seeds}} cargo test --release -p fil-predict --test screen_view every_row
 
 # Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
 predict-mutants:
@@ -193,7 +195,8 @@ client-pty:
 # namespaces. Linux only, needs Docker and root; refuses on macOS. Never part of `ci`.
 # `just realnet` runs everything; `just realnet ssh`, `udp`, `sysd`, `policy`, `fwd` (the M2
 # forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
-# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run.
+# `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run;
+# nor is `just realnet predict`, M3's prediction cells (docs/m3/plan.md §5.5).
 realnet *args:
     tests/realnet/run.sh {{args}}
 

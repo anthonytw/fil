@@ -33,8 +33,9 @@ nix = { version = "0.28", default-features = false, features = ["term"], optiona
 fil-term = { path = "../fil-term", features = ["vt100"] }
 # The tests use the harness (oracle, driver, sim).
 fil-predict = { path = ".", features = ["testkit"] }
-# Used only by examples/predict_demo.rs (needs the harness feature).
-rustix = { version = "1", features = ["termios", "stdio"] }
+# Used by examples/predict_demo.rs (needs the harness feature), and by benches/budget.rs for the
+# thread CPU clock.
+rustix = { version = "1", features = ["termios", "stdio", "time"] }
 
 [[example]]
 name = "predict_harness"
@@ -43,3 +44,8 @@ required-features = ["harness"]
 [[example]]
 name = "predict_demo"
 required-features = ["harness"]
+
+# The performance budget (docs/m3/plan.md §2.10): `cargo bench -p fil-predict --bench budget`.
+[[bench]]
+name = "budget"
+harness = false

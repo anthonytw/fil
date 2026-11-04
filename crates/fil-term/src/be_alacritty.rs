@@ -11,8 +11,24 @@
 //!   touching the stack), and entering from the primary copies the cursor into the saved
 //!   cursor (harmless: `1049 h`, the only way alacritty enters the alternate screen, does
 //!   exactly that already, and the primary cursor cannot move while the alternate is up).
-//!   Selection and damage tracking are also reset; nothing here uses them. The idempotence
-//!   test in `tests/roundtrip.rs` guards the whole class.
+//!   Selection is also reset, and the whole screen is marked damaged (so every row stamp moves
+//!   at the next feed: stricter, never wrong). The idempotence test in `tests/roundtrip.rs`
+//!   guards the whole class.
+//! - **Row stamps** ([`crate::Screen::row_stamp`]) come from `alacritty_terminal`'s damage
+//!   tracking, the record its renderer redraws from. After every `feed`, `resize` and
+//!   `apply_pending` the damaged lines (all of them on full damage: a scroll, a clear, the
+//!   alternate screen, a resize) get a new stamp and the damage is reset. A write to a cell is
+//!   damage on its line either directly (erase, delete, insert, clear) or through the cursor:
+//!   `Term::damage` damages the cursor's line and the line it was on at the last read, and every
+//!   move between lines (`goto`, a line feed, a wrap, a restore) damages both lines, so a line
+//!   the cursor wrote on is damaged even if the cursor left it again. The one write off the
+//!   cursor's line that is not damaged (a wide character overwritten at column 0 or 1 clears the
+//!   leading-spacer flag at the end of the line above) is covered in `harvest`. Damage is per line and
+//!   also covers attribute-only writes and lines the cursor only passed through, which makes the
+//!   stamp stricter than the glyphs, as the contract allows (the cost: a program that moves the
+//!   cursor through another row and back, writing nothing, makes the next key tentative).
+//!   `crates/fil-predict/tests/screen_view.rs` checks it against a hash of the glyphs on random
+//!   streams.
 //! - The scroll region (`Term::scroll_region`) is private, so it is shadowed by a second
 //!   tiny parser (`sniff::RegionTracker`) fed the same bytes.
 //! - DECSC does not save the origin mode and DECRC does not restore it, though xterm, kitty,
@@ -43,7 +59,7 @@
 //! - Replies arrive as `Event::PtyWrite`; color and text-area-size queries arrive as
 //!   closures that need the host's answer, and are not answered here.
 
-use std::cell::RefCell;
+use std::cell::{Cell as StdCell, OnceCell, Ref, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -51,7 +67,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line as GLine};
 use alacritty_terminal::term::cell::{Cell as ACell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, Color as AColor, CursorShape as AShape, CursorStyle as AStyle, Handler,
     KeyboardModes, KeyboardModesApplyBehavior, Mode, NamedColor, NamedMode, NamedPrivateMode,
@@ -64,6 +80,7 @@ use crate::model::{
     default_tab_stops,
 };
 use crate::sniff::{Action, RegionTracker};
+use crate::view::{CellView, Screen, Stamps, ascii_str};
 use crate::{Backend, Capabilities, Emulator};
 
 pub(crate) const BACKEND: Backend = Backend {
@@ -152,6 +169,11 @@ struct Alacritty {
     shared: Shared,
     region: RegionTracker,
     size: Size,
+    /// Per-row write stamps, from the damage tracking (see the module notes).
+    stamps: Stamps,
+    /// The modes as [`Screen::modes`] reports them, refreshed by the first view after a change.
+    modes: RefCell<Modes>,
+    modes_stale: StdCell<bool>,
 }
 
 impl Alacritty {
@@ -167,13 +189,59 @@ impl Alacritty {
             ..Config::default()
         };
         let term = Term::new(config, &Dims::from(size), shared.clone());
-        Alacritty {
+        let mut a = Alacritty {
             term: RefCell::new(term),
             parser: Processor::new(),
             shared,
             region: RegionTracker::new(size.rows, false, true),
             size,
+            stamps: Stamps::new(size.rows),
+            modes: RefCell::new(Modes::default()),
+            modes_stale: StdCell::new(true),
+        };
+        a.harvest();
+        a
+    }
+
+    /// Turns the damage since the last call into new row stamps, and resets it.
+    fn harvest(&mut self) {
+        let term = self.term.get_mut();
+        let mark = self.stamps.mark();
+        let partial = match term.damage() {
+            TermDamage::Full => {
+                self.stamps.bump_all();
+                false
+            }
+            TermDamage::Partial(lines) => {
+                for d in lines {
+                    self.stamps.bump(d.line);
+                }
+                true
+            }
+        };
+        if partial {
+            // The one write off the cursor's line that alacritty does not damage: overwriting a
+            // wide character at column 0 or 1 clears the leading-spacer flag on the last cell of
+            // the line above (`Term::write_at_cursor`). Shown as a blank, that changes nothing,
+            // unless a zero-width character sits on the spacer (a combining mark typed after a
+            // wide character that did not fit with autowrap off): then its text goes from "" to
+            // " \u{301}". So a damaged line also stamps the line above when that line's last
+            // cell carries zero-width characters (rare; stricter, never wrong). Lines stamped in
+            // this harvest are the ones whose stamp is past `mark`: no list is kept.
+            let grid = term.grid();
+            let last = Column(grid.columns() - 1);
+            for l in 1..grid.screen_lines() {
+                if self.stamps.since(mark, l)
+                    && grid[GLine(l as i32 - 1)][last]
+                        .zerowidth()
+                        .is_some_and(|z| !z.is_empty())
+                {
+                    self.stamps.bump(l - 1);
+                }
+            }
         }
+        term.reset_damage();
+        self.modes_stale.set(true);
     }
 }
 
@@ -260,6 +328,7 @@ impl Emulator for Alacritty {
             }
         }
         self.parser.advance(self.term.get_mut(), &bytes[done..]);
+        self.harvest();
     }
 
     fn apply_pending(&mut self) {
@@ -268,6 +337,7 @@ impl Emulator for Alacritty {
         // is then a no-op, and what follows in the same batch is applied as it arrives.
         if self.parser.sync_bytes_count() > 0 {
             self.parser.stop_sync(self.term.get_mut());
+            self.harvest();
         }
     }
 
@@ -276,10 +346,31 @@ impl Emulator for Alacritty {
         self.size = size;
         self.term.get_mut().resize(Dims::from(size));
         self.region.resize(size.rows);
+        self.stamps.resize(size.rows);
+        self.harvest();
     }
 
     fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut *self.shared.replies.lock().unwrap())
+    }
+
+    fn screen(&self) -> Box<dyn Screen + '_> {
+        let term = self.term.borrow();
+        if self.modes_stale.replace(false) {
+            let title = self.shared.title.lock().unwrap();
+            fill_modes(
+                &mut self.modes.borrow_mut(),
+                *term.mode(),
+                &self.region,
+                &title,
+            );
+        }
+        Box::new(View {
+            term,
+            modes: self.modes.borrow(),
+            emu: self,
+            texts: OnceCell::new(),
+        })
     }
 
     fn state(&self, history_lines: usize) -> TermState {
@@ -345,28 +436,14 @@ impl Emulator for Alacritty {
         };
 
         // Shape, blink and visibility are terminal-wide, not per screen.
-        let (shape, blinking) = shape_of(style);
-        let mut cursor = cursor;
-        cursor.shape = shape;
-        cursor.blinking = blinking;
-        cursor.visible = mode.contains(TermMode::SHOW_CURSOR);
-
-        let mouse_tracking = if mode.contains(TermMode::MOUSE_MOTION) {
-            MouseTracking::AnyEvent
-        } else if mode.contains(TermMode::MOUSE_DRAG) {
-            MouseTracking::ButtonEvent
-        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
-            MouseTracking::Normal
-        } else {
-            MouseTracking::Off
-        };
-        let mouse_encoding = if mode.contains(TermMode::SGR_MOUSE) {
-            MouseEncoding::Sgr
-        } else if mode.contains(TermMode::UTF8_MOUSE) {
-            MouseEncoding::Utf8
-        } else {
-            MouseEncoding::Default
-        };
+        let cursor = with_style(cursor, style, mode);
+        let mut modes = Modes::default();
+        fill_modes(
+            &mut modes,
+            mode,
+            &self.region,
+            &self.shared.title.lock().unwrap(),
+        );
         TermState {
             size: self.size,
             screen,
@@ -374,21 +451,7 @@ impl Emulator for Alacritty {
             history,
             cursor,
             saved_cursor: saved,
-            modes: Modes {
-                alt_screen: alt,
-                app_cursor_keys: mode.contains(TermMode::APP_CURSOR),
-                app_keypad: mode.contains(TermMode::APP_KEYPAD),
-                autowrap: mode.contains(TermMode::LINE_WRAP),
-                origin: mode.contains(TermMode::ORIGIN),
-                insert: mode.contains(TermMode::INSERT),
-                bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
-                focus_events: mode.contains(TermMode::FOCUS_IN_OUT),
-                mouse_tracking,
-                mouse_encoding,
-                kitty_keyboard: kitty,
-                scroll_region: self.region.region(),
-                title: self.shared.title.lock().unwrap().clone(),
-            },
+            modes,
             hyperlinks: links.table,
             charsets: Charsets {
                 g: live_sets,
@@ -397,6 +460,169 @@ impl Emulator for Alacritty {
             tab_stops,
         }
     }
+}
+
+/// [`Emulator::screen`] for this backend: the `Term` borrowed, a cell converted when asked for.
+struct View<'a> {
+    term: Ref<'a, Term<Shared>>,
+    modes: Ref<'a, Modes>,
+    emu: &'a Alacritty,
+    /// The text of rows that hold a cell which is not printable ASCII, made when first asked for
+    /// (a printable ASCII cell borrows its text from a static table).
+    texts: OnceCell<Box<[OnceCell<RowText>]>>,
+}
+
+/// One row's cell texts, end to end, and where each cell's is.
+struct RowText {
+    text: String,
+    spans: Vec<(u32, u32)>,
+}
+
+impl View<'_> {
+    fn acell(&self, row: u16, col: u16) -> Option<&ACell> {
+        let grid = self.term.grid();
+        if usize::from(row) >= grid.screen_lines() || usize::from(col) >= grid.columns() {
+            return None;
+        }
+        Some(&grid[GLine(i32::from(row))][Column(usize::from(col))])
+    }
+
+    fn row_text(&self, row: u16) -> &RowText {
+        let rows = self.texts.get_or_init(|| {
+            (0..self.term.screen_lines())
+                .map(|_| OnceCell::new())
+                .collect()
+        });
+        rows[usize::from(row)].get_or_init(|| {
+            let grid = self.term.grid();
+            let line = &grid[GLine(i32::from(row))];
+            let mut text = String::new();
+            let mut spans = Vec::with_capacity(grid.columns());
+            for c in 0..grid.columns() {
+                let start = text.len() as u32;
+                push_text(&line[Column(c)], &mut text);
+                spans.push((start, text.len() as u32));
+            }
+            RowText { text, spans }
+        })
+    }
+}
+
+impl Screen for View<'_> {
+    fn size(&self) -> Size {
+        self.emu.size
+    }
+
+    fn cursor(&self) -> Cursor {
+        let mode = *self.term.mode();
+        with_style(
+            cursor_of(&self.term.grid().cursor),
+            self.term.cursor_style(),
+            mode,
+        )
+    }
+
+    fn modes(&self) -> &Modes {
+        &self.modes
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
+        let c = self.acell(row, col)?;
+        let f = c.flags;
+        let blank = f.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        let zw = c.zerowidth().is_some_and(|z| !z.is_empty());
+        let text = if blank || (!zw && (c.c == ' ' || c.c == '\t')) {
+            ""
+        } else if let Some(s) = ascii_str(c.c).filter(|_| !zw) {
+            s
+        } else {
+            let rt = self.row_text(row);
+            let (s, e) = rt.spans[usize::from(col)];
+            &rt.text[s as usize..e as usize]
+        };
+        Some(CellView {
+            text,
+            width: width_of(f),
+            attrs: attrs(c),
+        })
+    }
+
+    fn hyperlink(&self, row: u16, col: u16) -> Option<Hyperlink> {
+        let h = self.acell(row, col)?.hyperlink()?;
+        Some(link_of(h.id(), h.uri()))
+    }
+
+    fn row_stamp(&self, row: u16) -> u64 {
+        self.emu.stamps.get(row)
+    }
+
+    fn screen_state(&self) -> TermState {
+        let grid = self.term.grid();
+        let mut links = Links::default();
+        let (screen, _, cursor) = read_grid(grid, 0, &mut links);
+        let alt = self.modes.alt_screen;
+        TermState {
+            size: self.emu.size,
+            screen,
+            primary_behind_alt: None,
+            history: Vec::new(),
+            cursor: with_style(cursor, self.term.cursor_style(), *self.term.mode()),
+            saved_cursor: saved_of(&grid.saved_cursor, self.emu.region.saved_origin(alt)),
+            modes: self.modes.clone(),
+            hyperlinks: links.table,
+            charsets: Charsets {
+                g: charset_array(&grid.cursor.charsets),
+                active: self.emu.region.active_charset(),
+            },
+            tab_stops: None,
+        }
+    }
+}
+
+/// The modes of `mode` and the trackers, as [`TermState::modes`] has them. `title` is copied
+/// only if it changed.
+fn fill_modes(m: &mut Modes, mode: TermMode, region: &RegionTracker, title: &str) {
+    let mouse_tracking = if mode.contains(TermMode::MOUSE_MOTION) {
+        MouseTracking::AnyEvent
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        MouseTracking::ButtonEvent
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        MouseTracking::Normal
+    } else {
+        MouseTracking::Off
+    };
+    let mouse_encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        MouseEncoding::Sgr
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        MouseEncoding::Utf8
+    } else {
+        MouseEncoding::Default
+    };
+    m.alt_screen = mode.contains(TermMode::ALT_SCREEN);
+    m.app_cursor_keys = mode.contains(TermMode::APP_CURSOR);
+    m.app_keypad = mode.contains(TermMode::APP_KEYPAD);
+    m.autowrap = mode.contains(TermMode::LINE_WRAP);
+    m.origin = mode.contains(TermMode::ORIGIN);
+    m.insert = mode.contains(TermMode::INSERT);
+    m.bracketed_paste = mode.contains(TermMode::BRACKETED_PASTE);
+    m.focus_events = mode.contains(TermMode::FOCUS_IN_OUT);
+    m.mouse_tracking = mouse_tracking;
+    m.mouse_encoding = mouse_encoding;
+    m.kitty_keyboard = kitty_flags(mode);
+    m.scroll_region = region.region();
+    if m.title != title {
+        m.title.clear();
+        m.title.push_str(title);
+    }
+}
+
+/// A grid cursor with the terminal-wide shape, blink and visibility.
+fn with_style(mut cursor: Cursor, style: AStyle, mode: TermMode) -> Cursor {
+    let (shape, blinking) = shape_of(style);
+    cursor.shape = shape;
+    cursor.blinking = blinking;
+    cursor.visible = mode.contains(TermMode::SHOW_CURSOR);
+    cursor
 }
 
 fn charset_of(c: StandardCharset) -> Charset {
@@ -486,19 +712,23 @@ struct Links {
 
 impl Links {
     fn intern(&mut self, id: &str, uri: &str) -> u32 {
-        // Ids alacritty invents for id-less links are not part of the content.
-        let id = (!id.ends_with("_alacritty")).then(|| id.to_string());
-        let key = (id.clone(), uri.to_string());
+        let link = link_of(id, uri);
+        let key = (link.id.clone(), link.uri.clone());
         if let Some(i) = self.index.get(&key) {
             return *i;
         }
         let i = self.table.len() as u32;
-        self.table.push(Hyperlink {
-            id,
-            uri: uri.to_string(),
-        });
+        self.table.push(link);
         self.index.insert(key, i);
         i
+    }
+}
+
+fn link_of(id: &str, uri: &str) -> Hyperlink {
+    // Ids alacritty invents for id-less links are not part of the content.
+    Hyperlink {
+        id: (!id.ends_with("_alacritty")).then(|| id.to_string()),
+        uri: uri.to_string(),
     }
 }
 
@@ -553,28 +783,37 @@ fn attrs(c: &ACell) -> Attrs {
     }
 }
 
-fn convert_cell(c: &ACell, links: &mut Links) -> Cell {
+/// Appends a cell's text as the model has it (see the conventions in [`crate::model`]).
+fn push_text(c: &ACell, text: &mut String) {
     let f = c.flags;
-    let spacer = f.contains(Flags::WIDE_CHAR_SPACER);
-    let mut text = String::new();
-    if !spacer && !f.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-        if (c.c != ' ' && c.c != '\t') || c.zerowidth().is_some_and(|z| !z.is_empty()) {
-            text.push(c.c);
-        }
-        if let Some(z) = c.zerowidth() {
-            text.extend(z);
-        }
+    if f.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        return;
     }
+    if (c.c != ' ' && c.c != '\t') || c.zerowidth().is_some_and(|z| !z.is_empty()) {
+        text.push(c.c);
+    }
+    if let Some(z) = c.zerowidth() {
+        text.extend(z);
+    }
+}
+
+fn width_of(f: Flags) -> u8 {
+    if f.contains(Flags::WIDE_CHAR_SPACER) {
+        0
+    } else if f.contains(Flags::WIDE_CHAR) {
+        2
+    } else {
+        1
+    }
+}
+
+fn convert_cell(c: &ACell, links: &mut Links) -> Cell {
+    let mut text = String::new();
+    push_text(c, &mut text);
     let hyperlink = c.hyperlink().map(|h| links.intern(h.id(), h.uri()));
     Cell {
         text,
-        width: if spacer {
-            0
-        } else if f.contains(Flags::WIDE_CHAR) {
-            2
-        } else {
-            1
-        },
+        width: width_of(c.flags),
         attrs: attrs(c),
         hyperlink,
     }
@@ -604,8 +843,12 @@ fn read_grid(
         .rev()
         .map(|k| convert_line(grid, -k, links))
         .collect();
-    let cur = &grid.cursor;
-    let cursor = Cursor {
+    (screen, hist, cursor_of(&grid.cursor))
+}
+
+/// A grid's cursor, before the terminal-wide shape and visibility ([`with_style`]).
+fn cursor_of(cur: &alacritty_terminal::grid::Cursor<ACell>) -> Cursor {
+    Cursor {
         row: cur.point.line.0.max(0) as u16,
         col: cur.point.column.0 as u16,
         visible: true,
@@ -613,6 +856,5 @@ fn read_grid(
         blinking: false,
         pending_wrap: cur.input_needs_wrap,
         pen: attrs(&cur.template),
-    };
-    (screen, hist, cursor)
+    }
 }

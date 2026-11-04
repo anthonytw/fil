@@ -16,7 +16,7 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem; one job, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
+        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
         type: choice
         options: [check, realnet, aarch64, latency, terminals, all]
         default: check
@@ -71,7 +71,8 @@ jobs:
     # two jobs, `fwd-cable` (the done-when's cable pulls, about 13 min) and `fwd-rest` (everything
     # else, with a smaller MAX_ENDING stress than the VM's and the Pis' 20,000), and the `agent`
     # part. Seven jobs, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
-    # the one part `latency` (the latency lab, docs/m2/latency.md) instead. It builds `fil` and the test
+    # the parts `latency` (the latency lab, docs/m2/latency.md) and `predict` (M3's prediction cells,
+    # docs/m3/plan.md §5.5) instead. It builds `fil` and the test
     # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
     # release-target check.
     # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
@@ -80,11 +81,11 @@ jobs:
     if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
     # Each part its own limit: about twice its usual time.
-    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45}')[matrix.part] }}
+    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45,"predict":45}')[matrix.part] }}
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy","install"]') }}
+        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency","predict"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy","install"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

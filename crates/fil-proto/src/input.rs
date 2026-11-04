@@ -42,6 +42,14 @@ pub enum InputRecord {
         size_gen: u64,
         size: TermSize,
     },
+    /// Repaint my screen at the size I have told you (DESIGN.md sections 4.2 and 8.5): the
+    /// client's terminal reflowed under something it had drawn, so its screen no longer matches
+    /// the stream. The daemon answers with a mid-stream `Snapshot` (reason
+    /// [`crate::msg::SnapshotReason::Repaint`]): the screen and the modes, no history. In band, so
+    /// it comes after the [`InputRecord::Resize`] before it and the snapshot is rendered at that
+    /// size (a control message would overtake the record). Requests are coalesced, never
+    /// dropped; a connection that no longer holds the session is ignored.
+    Repaint,
 }
 
 /// What a payload on the terminal channel, client to daemon, holds.
@@ -105,6 +113,7 @@ mod tests {
                 size_gen: u64::MAX,
                 size: size(TermSize::MAX_COLS, 500),
             },
+            InputRecord::Repaint,
         ] {
             let wire = rec.encode().unwrap();
             assert_eq!(
@@ -129,6 +138,10 @@ mod tests {
         want.push(0x01); // RECORD_MARK
         want.extend_from_slice(&[0, 5, 2, 80, 24]); // variant 0, at, gen, cols, rows
         assert_eq!(wire, want);
+        // A repaint is the mark and variant index 1, nothing else.
+        let mut want = vec![0xFF; 9];
+        want.extend_from_slice(&[0x01, 0x01]);
+        assert_eq!(InputRecord::Repaint.encode().unwrap(), want);
     }
 
     #[test]
@@ -173,7 +186,11 @@ mod tests {
         assert!(TerminalInput::parse(&v).is_err());
         // An unknown kind.
         let mut v = good.clone();
-        v[10] = 1;
+        v[10] = 2;
+        assert!(TerminalInput::parse(&v).is_err());
+        // A repaint carries nothing: a byte after it is trailing.
+        let mut v = InputRecord::Repaint.encode().unwrap();
+        v.push(0);
         assert!(TerminalInput::parse(&v).is_err());
         // A zero dimension, either one.
         let mut v = good.clone();

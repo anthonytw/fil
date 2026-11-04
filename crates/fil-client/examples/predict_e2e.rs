@@ -12,7 +12,7 @@
 //! - `secret`: a secret typed at a password prompt, and the full-stack mutation (the daemon's
 //!   `PtyMode` withheld), which must leak.
 //!
-//! Flags: `--transport pipe|quic|both` (both), `--seeds N` (8), `--one-way-ms N` (75, each way),
+//! Flags: `--transport pipe|quic|both` (both), `--seeds N` (5, as `docs/m3/harness.md` uses), `--one-way-ms N` (75, each way),
 //! `--filter TEXT` (only cases whose label contains it), `--verbose` (show the two screens for
 //! every case that differs).
 
@@ -41,7 +41,7 @@ fn parse() -> Args {
     let mut a = Args {
         cmd: String::new(),
         transports: vec![Transport::Pipe, Transport::Quic],
-        seeds: 8,
+        seeds: 5,
         one_way: Duration::from_millis(75),
         filter: None,
         verbose: false,
@@ -133,8 +133,8 @@ fn spec(a: &Args, t: Transport, program: Program, seed: u64) -> Spec {
 async fn resize(a: &Args) {
     println!("== resize: the terminal reflows first, then the client erases (the true order)\n");
     println!(
-        "{:<52} {:>4} {:>8} {:>9} {:>9}   rows vs shadow (first seed)",
-        "case", "runs", "painted", "vs shadow", "vs snap"
+        "{:<52} {:>4} {:>8} {:>9} {:>9} {:>9} {:>13}   rows vs shadow (first seed)",
+        "case", "runs", "painted", "vs shadow", "vs snap", "repainted", "snap after rp"
     );
     for &t in &a.transports {
         let dirs: [Dir; 2] = [
@@ -169,6 +169,9 @@ async fn resize(a: &Args) {
                             continue;
                         }
                         let (mut painted, mut shadow_bad, mut snap_bad) = (0, 0, 0);
+                        // W1: runs that were repainted, and those of them not equal to a fresh
+                        // snapshot at the end (the repaint makes the terminal the daemon's).
+                        let (mut repainted, mut repaint_bad) = (0, 0);
                         let mut first: Option<ResizeOutcome> = None;
                         for seed in 1..=a.seeds {
                             let mut s = spec(a, t, program.clone(), seed);
@@ -196,6 +199,21 @@ async fn resize(a: &Args) {
                             if !out.comparison.clean() {
                                 snap_bad += 1;
                             }
+                            if out.repaints > 0 {
+                                repainted += 1;
+                                if !out.comparison.clean() {
+                                    repaint_bad += 1;
+                                    if a.verbose {
+                                        println!(
+                                            "seed {seed}: after the repaint, vs a fresh snapshot:\n{}",
+                                            out.comparison.side_by_side()
+                                        );
+                                        for d in out.comparison.screen_diffs.iter().take(6) {
+                                            println!("   diff: {d}");
+                                        }
+                                    }
+                                }
+                            }
                         }
                         let rows = first
                             .as_ref()
@@ -203,8 +221,15 @@ async fn resize(a: &Args) {
                             .map(|c| format!("{:?}", c.damaged_rows))
                             .unwrap_or_default();
                         println!(
-                            "{:<52} {:>4} {:>8} {:>9} {:>9}   {}",
-                            label, a.seeds, painted, shadow_bad, snap_bad, rows
+                            "{:<52} {:>4} {:>8} {:>9} {:>9} {:>9} {:>13}   {}",
+                            label,
+                            a.seeds,
+                            painted,
+                            shadow_bad,
+                            snap_bad,
+                            repainted,
+                            repaint_bad,
+                            rows
                         );
                         if a.verbose
                             && let Some(o) = first
@@ -322,7 +347,7 @@ async fn baseline(a: &Args) {
                         total.adapter.shown += r.adapter.shown;
                         total.adapter.confirmed += r.adapter.confirmed;
                         total.adapter.mispredicted += r.adapter.mispredicted;
-                        total.adapter.withdrawn_on_key += r.adapter.withdrawn_on_key;
+                        total.adapter.withdrawn += r.adapter.withdrawn;
                         let c = rig.compare_to_snapshot().await;
                         if !c.clean() {
                             dirty += 1;
@@ -339,7 +364,7 @@ async fn baseline(a: &Args) {
                         total.adapter.shown,
                         total.adapter.confirmed,
                         total.adapter.mispredicted,
-                        total.adapter.withdrawn_on_key,
+                        total.adapter.withdrawn,
                         if dirty == 0 {
                             "= snapshot".to_string()
                         } else {

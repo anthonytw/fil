@@ -1,6 +1,6 @@
 # M3 T1 part 1: the full-stack prediction harness, and resize in the true order
 
-> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `c16606b` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this.
+> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this.
 
 ## 1. What it is
 
@@ -40,7 +40,7 @@ flowchart LR
 | File | What |
 |---|---|
 | `crates/fil-client/tests/common/oracle_term.rs` | the oracle terminal, the rig, the adapter, the trials. Self-contained, so the test and the example both include it |
-| `crates/fil-client/tests/predict_e2e.rs` | the small cases that run in `just ci`; two reproductions are `#[ignore]`d |
+| `crates/fil-client/tests/predict_e2e.rs` | the small cases that run in `just ci`; one reproduction is `#[ignore]`d |
 | `crates/fil-client/examples/predict_e2e.rs` | the on-demand runs: `just predict-e2e resize\|baseline\|secret\|all` |
 | `crates/fil-client/tests/common/mod.rs` | one line: `pub mod oracle_term;` |
 
@@ -189,9 +189,40 @@ On the pipe the path coming back is a new link and a resume, and the resume's sn
 
 What W1's tests should assert, using this harness:
 
-- `a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order` (`#[ignore]`d, in `predict_e2e.rs`) passes today and must be flipped to assert the opposite when W1 lands (its six seeds then end with `compare_to_shadow` clean, or the terminal equal to a fresh snapshot once the repair has landed);
+- `a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order` (`#[ignore]`d, in `predict_e2e.rs`) passed then and was to be flipped to assert the opposite when W1 landed (done: see "After W1" below) (its six seeds then end with `compare_to_shadow` clean, or the terminal equal to a fresh snapshot once the repair has landed);
 - add the widening fill case, which needs W1's repaint, not just a no-write rule: the terminal's cursor is on the wrong row;
 - `the_resize_controls_are_clean` stays as it is.
+
+### After W1: the repaint repairs it
+
+W1 (wire revision 13, `DESIGN.md` §4.2 and §8.5 `InputRecord::Repaint`) lands the repair. The same matrix, `just predict-e2e resize --seeds 5`, 75 ms each way, `MoshAlways`, macOS, both transports, run as six processes (one per transport and program, under 4 minutes each). `repainted` is the runs in which the daemon sent a repaint snapshot; `after rp` the repainted runs that do not end equal to a fresh snapshot.
+
+| Program, direction | order | painted | **predict vs shadow** | predict vs snapshot | repainted | after rp | control vs shadow | control vs snapshot |
+|---|---|---|---|---|---|---|---|---|
+| `cat`, `fill`, bash, 80 to 30 | true, live | 5 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 1 / 5 |
+| | true, frozen | 5 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 0 to 1 / 5 |
+| | M0, frozen | 5 | 0 / 5 | 0 / 5 | 5 | 0 | 0 / 5 (QUIC bash: 1 / 5) | 0 to 1 / 5 |
+| `cat`, `fill`, bash, 30 to 80 | true, live | 4 | **0 / 5** | 0 / 5 | 5 | 0 | 0 / 5 | 0 / 5 |
+| | true, frozen | 4 | **0 / 5** | 0 / 5 | 4 | 0 | 0 / 5 | 0 / 5 |
+| | M0, frozen | 4 | 0 / 5 | 0 / 5 | 4 | 0 | 0 / 5 | 0 / 5 |
+
+Every row is the same for the three programs and the two transports, bar what the cells say.
+
+- **The predicting runs end equal to the shadow, and equal to a fresh snapshot**, in every case: the client had guesses on the screen at the resize, asked for a repaint after the resize record, and the repaint made the terminal the daemon's. That includes the widening `fill` case (4 of 5 damaged before), whose cursor ended on another row: a rule that only stops guesses could not have fixed it.
+- `repainted` is 5 where `painted` is 4 in the live widening rows: the fifth run had nothing drawn at the resize but wrote a guess afterwards, on the untrusted screen, which asks too (with C1's rule 9 the core holds that guess instead of writing it).
+- **The controls do not ask** (nothing is drawn, so nothing is repainted: the lazy rule), and they are where the stream-point skew of §1 still shows against a fresh snapshot (1 run in 5, as before). Against the shadow they stay clean, bar the QUIC bash M0-order row that was noise before too.
+
+The status line, the same `fill narrow` case as above:
+
+| | pipe | QUIC |
+|---|---|---|
+| true order, while disconnected | no difference outside the status rows | row 1 differs (nothing can be repaired while the link is down) |
+| true order, after the path is back | clean | **clean** (was: rows 0 and 1 still differ) |
+| M0 order, after the path is back | clean | one cell of the status line differs: the harness compared before the link had come back (its "the client wrote" wait was met by the status line's clock ticking), a timing artifact of `status_trial` and not damage |
+
+**After the review of #102 (F1).** The repaint is no longer held until every byte sent is acknowledged (steady output starved it); it is rendered where the daemon's stream is, and the client applies the output in flight first. Re-run with 2 seeds: every predicting row is still 0 against the shadow. One case moved: on QUIC, bash, narrowing in the true order with output live, 2 of 6 runs ended with the text and cursor equal to a fresh snapshot but **row 0's `wrapped` flag** different. The repaint now lands before bash's redraw after `SIGWINCH` instead of after it, and that exposed a snapshot-writer gap: a wrapped row followed by an entirely blank row was ended with a newline, so the receiver lost the wrap. ST1 (#105) fixed the writer (the next row's first cell is always written). **After #105, the same case is 0 of 6, and 0 of 12 in a second run.** Command: `just predict-e2e resize --transport quic --seeds 6 --filter "quic bash narrow 80->30 true-order live predict" --verbose` (it prints the comparison after a repaint that differs).
+
+On QUIC the client now asks for the repaint when the quiet link recovers by itself: the status line had been drawn at the resize, and the request goes out after the resize record once the link is up. The small tests in `just ci`: `a_narrowing_resize_with_guesses_on_screen_is_repaired_in_the_true_order` (three seeds) and `a_widening_resize_that_joins_wrapped_rows_is_repaired_in_the_true_order` (two), in `predict_e2e.rs`.
 
 ## 4. The baseline, with `EchoAck` off
 
@@ -232,6 +263,17 @@ Everything that names the predictor API is in `oracle_term.rs`, in the "adapter"
 - `fil_predict::sim::Rng` (the seeded typist) and `fil_predict::oracle::diffs` / `Capabilities` (the comparison) are used as public functions: keep them public or tell this file's owner.
 - `CellStyle::Underline` is how the oracle terminal recognizes a written guess. If P1 stops underlining (plan §2.7 underlines only above 80 ms or in a glitch window), the `paints` and `flashes` counts go to zero at low RTT by design; use the adapter's `shown`, or have the harness count the style P1 uses. The C1 tests of the password rule and the resize damage do not depend on it for `Eager` and `MoshAlways` at 150 ms.
 - The tests that must still hold after C1: `the_resize_controls_are_clean`, the three secret tests, the two typing tests. The `#[ignore]`d reproduction should *keep* passing until W1.
+
+**Done in C1 (PR #98).**
+
+- The adapter is on the new trait. `ctx.screen` is a `&dyn ScreenView`; the shadow for `compare_to_shadow` comes from the test-only `ScreenView::test_state` (the `testkit` feature of `fil-predict`, a dev-dependency here).
+- `AdapterStats` counts the keys the core gave the predictor, the guesses it declared (`shown`: what it asked to be shown; the core decides what is written), and what the core settled (`confirmed`, `mispredicted`, `withdrawn`).
+- `compare_to_shadow` reports `guesses_shown`, the underlined glyphs still on the user's terminal, so that a guess the engine never ticked away is not read as resize damage.
+- **The secret tests against the core:**
+  - After the report, the core does not ask the predictor at all (`keys == 0`, `leaked == 0`).
+  - Typed ahead of the report, the hostile predictor is asked and guesses every key (`keys > 0`, `shown > 0`), and nothing is written (`leaked == 0`, down from 3 to 6).
+  - With `PtyMode` withheld, the core's epochs now stop the hostile predictor too (`keys > 0`, `shown > 0`, `leaked == 0`), so that run is no longer a leak. A full-stack mutation that leaks needs a guard seam in the engine (finding 2, E1a). The oracle terminal's own test still shows it sees a leak.
+- **Until E1a routes `EchoAck`**, only an epoch that starts the session can be confirmed through the full stack: rule 2 makes every later epoch's first confirmation wait for an `EchoAck` covering the keys before it. The cases here type into a fresh session, so they still show guesses.
 
 ## 7. Findings about the plan
 

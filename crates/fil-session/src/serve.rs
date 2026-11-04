@@ -38,6 +38,18 @@
 //! control overtakes data on every transport and the announcement would reach the client ahead of
 //! the previous snapshot's bytes. Nothing weaker confirms it: a QUIC flush only says the peer's
 //! link has queued the payloads, and its inbox hands control out before them.
+//!
+//! **Repaints.** An `InputRecord::Repaint` on the terminal channel makes the connection *owe*
+//! its client a repaint: a mid-stream `Snapshot` (reason `Repaint`) of the screen and the modes,
+//! with no history and no marker. It is rendered at exactly the point the connection has sent
+//! (`at` is the next offset; the core refuses with `Behind` if more output was released
+//! meanwhile), so the jump skips nothing: the bytes before `at` are still on their way, and the
+//! client applies them before the snapshot. It is served as soon as it can be: once everything
+//! released is sent, once a snapshot still in flight is confirmed (it was rendered before the
+//! resize the request followed), and at most once a second per session (the core's
+//! `REPAINT_INTERVAL`; the requests meanwhile owe one more, served when the second has passed).
+//! Acknowledgements are not waited for, so steady output (a spinner) does not hold it back. Any
+//! number of requests owe one repaint, and a catch-up snapshot pays it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +68,9 @@ use fil_transport::{DownReason, Link, LinkError};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::core::{Accepted, AttachAnswer, Cmd, ConnEvent, ConnId, ExitInfo, Progress};
+use crate::core::{
+    Accepted, AttachAnswer, CatchUp, Cmd, ConnEvent, ConnId, ExitInfo, Progress, RepaintAnswer,
+};
 use crate::forward::Forwards;
 use crate::handle::{Gone, SessionHandle};
 
@@ -335,6 +349,12 @@ struct Conn<'a, L: Link> {
     /// rather than the transport. The peer hangs up on receiving the news, and that must not
     /// turn the outcome into a plain link failure.
     verdict: Mutex<Option<ServeEnd>>,
+    /// The client asked for a repaint (`InputRecord::Repaint`) that has not been served yet. Set
+    /// by the inbound half once the commands for everything before the request (the resize it
+    /// follows) are in the core's queue.
+    repaint_owed: AtomicBool,
+    /// Signalled when a repaint becomes owed.
+    repaint_wake: Notify,
 }
 
 impl<'a, L: Link> Conn<'a, L> {
@@ -358,6 +378,8 @@ impl<'a, L: Link> Conn<'a, L> {
             }),
             acked: Notify::new(),
             verdict: Mutex::new(None),
+            repaint_owed: AtomicBool::new(false),
+            repaint_wake: Notify::new(),
         }
     }
 
@@ -542,6 +564,12 @@ impl<'a, L: Link> Conn<'a, L> {
                             })
                             .await;
                     }
+                    // Owed, not served here: the outbound half serves it when it can, and its
+                    // request to the core is queued behind the resize sent just above.
+                    Ok(TerminalInput::Record(InputRecord::Repaint)) => {
+                        self.repaint_owed.store(true, Ordering::SeqCst);
+                        self.repaint_wake.notify_one();
+                    }
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },
                 // The MUX channel and the dynamic channels: handed to the forwards, which never
@@ -569,6 +597,8 @@ impl<'a, L: Link> Conn<'a, L> {
     /// Sends the terminal channel and what goes with it, in order.
     async fn outbound(&self, out: &mut Out) -> ServeEnd {
         let params = *self.handle.catch_up_params();
+        // An owed repaint waits until then (the session's one-a-second limit).
+        let mut repaint_not_before: Option<Instant> = None;
         loop {
             // The one await before output is sent comes first, and the events (a takeover among
             // them) are looked at after it, so output produced after a takeover is not sent
@@ -627,6 +657,24 @@ impl<'a, L: Link> Conn<'a, L> {
                     Ok(()) => continue,
                     Err(end) => return end,
                 }
+            }
+            // An owed repaint, once nothing stands in its way: no snapshot in flight (the one-at-
+            // a-time rule), everything released sent (it is rendered at `next`, so the jump skips
+            // nothing; the client applies what is still in flight first), and the session's
+            // interval passed. Not waiting for acknowledgements: under steady output they always
+            // lag what was sent, and the repaint would never be served.
+            let repaint_owed = self.repaint_owed.load(Ordering::SeqCst);
+            if repaint_owed
+                && !prog.exited
+                && !awaiting
+                && next >= prog.ready
+                && repaint_not_before.is_none_or(|t| Instant::now() >= t)
+            {
+                match self.repaint(out).await {
+                    Ok(not_before) => repaint_not_before = not_before,
+                    Err(end) => return end,
+                }
+                continue;
             }
 
             // PtyMode and EchoAck go out when the output they refer to has.
@@ -711,6 +759,8 @@ impl<'a, L: Link> Conn<'a, L> {
                 },
                 () = self.acked.notified() => {}
                 () = tokio::time::sleep(AGE_CHECK), if behind > 0 => {}
+                () = self.repaint_wake.notified() => {}
+                () = sleep_until(repaint_not_before), if repaint_owed && repaint_not_before.is_some() => {}
             }
         }
     }
@@ -740,19 +790,57 @@ impl<'a, L: Link> Conn<'a, L> {
     /// Jump the stream ahead with a snapshot (DESIGN.md section 6.2).
     async fn catch_up(&self, out: &mut Out) -> Result<(), ServeEnd> {
         let sent = self.flow().next;
+        // A repaint owed now is paid by this snapshot: it is rendered after the resize the
+        // request followed, which the core has had since before the request was noted.
+        let owed = self.repaint_owed.swap(false, Ordering::SeqCst);
         let Some(c) = self.handle.catch_up(self.id, sent).await else {
-            // Not the live connection any more. If the reason is a takeover, its notice is
-            // already waiting (the core queues it before it answers anything later).
-            if let Some(r) = out.drain_events() {
-                return Err(self.end_with(r).await);
+            if owed {
+                self.repaint_owed.store(true, Ordering::SeqCst);
             }
-            if self.handle.is_alive() {
-                return Err(ServeEnd::Superseded);
-            }
-            // The shell exited while we asked. The next round sees `exited` and sends the rest of
-            // the log instead of a snapshot, then the status.
-            return Ok(());
+            return self.not_live(out).await;
         };
+        self.send_jump(out, c).await
+    }
+
+    /// The repaint the client asked for. Returns when an owed one may be tried again, if the
+    /// session's interval holds it back.
+    async fn repaint(&self, out: &mut Out) -> Result<Option<Instant>, ServeEnd> {
+        let sent = self.flow().next;
+        self.repaint_owed.store(false, Ordering::SeqCst);
+        let c = match self.handle.repaint(self.id, sent).await {
+            Some(RepaintAnswer::Ready(c)) => c,
+            // Output came in since we looked: send it, and try again.
+            Some(RepaintAnswer::Behind) => {
+                self.repaint_owed.store(true, Ordering::SeqCst);
+                return Ok(None);
+            }
+            Some(RepaintAnswer::NotBefore(t)) => {
+                self.repaint_owed.store(true, Ordering::SeqCst);
+                return Ok(Some(t));
+            }
+            Some(RepaintAnswer::Gone) | None => return self.not_live(out).await.map(|()| None),
+        };
+        self.send_jump(out, c).await.map(|()| None)
+    }
+
+    /// The core did not answer for this connection: it is not the live one any more, or the
+    /// shell exited meanwhile.
+    async fn not_live(&self, out: &mut Out) -> Result<(), ServeEnd> {
+        // If the reason is a takeover, its notice is already waiting (the core queues it before
+        // it answers anything later).
+        if let Some(r) = out.drain_events() {
+            return Err(self.end_with(r).await);
+        }
+        if self.handle.is_alive() {
+            return Err(ServeEnd::Superseded);
+        }
+        // The shell exited while we asked. The next round sees `exited` and sends the rest of
+        // the log instead of a snapshot, then the status.
+        Ok(())
+    }
+
+    /// Announces and sends a mid-stream snapshot, a catch-up's or a repaint's.
+    async fn send_jump(&self, out: &mut Out, c: CatchUp) -> Result<(), ServeEnd> {
         // The stream is at the snapshot's `at` from here on, before anything is sent: the client
         // may acknowledge `at` as soon as it has applied the snapshot, and that ack must not be
         // taken for one beyond what was sent. Changes before the snapshot are folded into its
@@ -840,6 +928,13 @@ impl<'a, L: Link> Conn<'a, L> {
         self.farewell(&ControlMsg::SessionExited { code, signal })
             .await;
         ServeEnd::SessionExited(info)
+    }
+}
+
+async fn sleep_until(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending().await,
     }
 }
 

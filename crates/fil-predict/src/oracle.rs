@@ -46,6 +46,28 @@ pub enum Kind {
     /// A rule of DESIGN.md §9 that is policy, not terminal correctness: predictions on the
     /// alternate screen.
     Policy,
+    /// A visible misprediction where the run's bar allows none (`docs/m3/plan.md` §2.5).
+    Mispredict,
+}
+
+/// The reserved alphabet the typists' secrets are drawn from (`docs/m3/plan.md` §5.2): Latin-1
+/// letters, U+00C0 to U+00FF without `×` and `÷`. The core can paint them, and no scenario
+/// program prints them otherwise, so a printable write of one by the overlay is a leak.
+pub fn reserved(c: char) -> bool {
+    ('\u{c0}'..='\u{ff}').contains(&c) && c != '×' && c != '÷'
+}
+
+/// The printable characters in `bytes`, after the escape sequences are decoded.
+pub fn printed(bytes: &[u8]) -> Vec<char> {
+    struct P(Vec<char>);
+    impl vte::Perform for P {
+        fn print(&mut self, c: char) {
+            self.0.push(c);
+        }
+    }
+    let mut p = P(Vec::new());
+    vte::Parser::new().advance(&mut p, bytes);
+    p.0
 }
 
 #[derive(Clone, Debug)]

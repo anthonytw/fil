@@ -1,0 +1,17 @@
+# A test tool of the macOS-remote suite (tests/macos/remote.sh, scenario tmp_cleaners), NOT part of
+# the fil workspace (it has a workspace of its own, so `just ci` never builds it). It runs the
+# daemon with the keep-alive seam of fil-daemon (`Keeping`, DESIGN.md section 5.3) set from the
+# command line, which the shipped binary deliberately has no way to do.
+[package]
+name = "tmpclean-daemon"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+fil-daemon = { path = "../../../crates/fil-daemon" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "signal", "macros", "time"] }
+tracing = "0.1"

@@ -74,6 +74,7 @@ scenario_cleanup() {
   local s h
   for s in ${SESSIONS[@]+"${SESSIONS[@]}"}; do fil_cmd kill macremote "$s" > /dev/null 2>&1; done
   for h in ${HELPERS[@]+"${HELPERS[@]}"}; do kill "$h" > /dev/null 2>&1; done
+  clock_restore
   return 0
 }
 
@@ -443,13 +444,157 @@ scenario_install_acl() {
   fi
 }
 
-# TMP has not landed. When it does: its mechanism checks on macOS (plan §3, TMP), and the case the
-# plan names for this job: macOS's periodic clean-tmps with the runner's clock moved forward (the
-# runner is throwaway); a live daemon keeps its files and its sessions. Only on a runner (it moves
-# the clock and needs root).
-# TODO(TMP): write the clean-tmps case once TMP's remedy exists.
+# Apple's real, unscaled /usr/libexec/tmp_cleaner (the script launchd's com.apple.tmp_cleaner runs
+# at midnight: `find` on /tmp with `-atime/-mtime/-ctime +3`, regular files only) against a live
+# daemon, as root, with the clock moved forward a day at a time (docs/m4/plan.md, TMP; DESIGN.md
+# section 5.3). The change time cannot be set back, so the only honest test is to move the clock.
+#
+# The daemon is `tmpclean-daemon` (tests/macos/tmpclean): fil's daemon with TMP's `Keeping` seam
+# given on the command line (the shipped binary has none), at the standard /tmp/fil-$UID paths,
+# and a real `fil` client holds a session on it.
+#   refresh   the daemon looks after its files every second: after each of five one-day steps
+#             (day 1 to day 5, past the cleaner's limit of 3) the cleaner runs, and the directory, the
+#             socket, the lock and start files must be the same files (same inodes: a repair
+#             cannot pass for a survival), and the session must be alive.
+#   control   no refresh, no repair: the same steps; the lock and start files must be GONE at day 4
+#             and the socket must still be there (the cleaner takes regular files, never a socket),
+#             and nothing before day 4. A cleaner that takes nothing proves nothing.
+# It moves the system clock and runs the cleaner over all of /tmp as root, so it runs only on a
+# throwaway GitHub runner (MACOS_MOVE_CLOCK=1, set by macos-check.yml) and puts everything it needs
+# outside /tmp, under $HOME. It is active once fil-daemon has the seam (TMP, PR #96).
 scenario_tmp_cleaners() {
-  note "SKIPPED: TMP has not landed (TODO TMP)"
+  if ! grep -q 'pub struct Keeping' "$REPO_ROOT/crates/fil-daemon/src/paths.rs" 2> /dev/null; then
+    note "SKIPPED: fil-daemon has no Keeping seam on this ref yet (TODO TMP, PR #96)"
+    return 0
+  fi
+  if [[ -z ${MACOS_MOVE_CLOCK:-} ]]; then
+    note "SKIPPED: moves the system clock and runs tmp_cleaner as root: a throwaway runner only (MACOS_MOVE_CLOCK=1)"
+    return 0
+  fi
+  [[ ${GITHUB_ACTIONS:-} == true ]] || fail "MACOS_MOVE_CLOCK is set outside a GitHub Actions runner: refusing to move the clock"
+  sudo -n true || fail "tmp_cleaners: no passwordless sudo"
+  [[ -x /usr/libexec/tmp_cleaner ]] || fail "tmp_cleaners: no /usr/libexec/tmp_cleaner on this macOS"
+
+  TS=$HOME/.filmac-tmpclean
+  rm -rf "$TS"
+  mkdir -p "$TS/bin" "$TS/pd"
+  cp "$REPO_ROOT/Cargo.lock" "$REPO_ROOT/tests/macos/tmpclean/Cargo.lock"
+  cargo build -q --release --manifest-path "$REPO_ROOT/tests/macos/tmpclean/Cargo.toml" \
+    --target-dir "$REPO_ROOT/target/macos-tmpclean" || fail "tmpclean-daemon did not build"
+  cp "$REPO_ROOT/target/macos-tmpclean/release/tmpclean-daemon" "$W/bin/fil" "$W/tools/ptydrive" "$TS/bin/"
+  # Nothing the scenario runs is in /tmp from here on; the clients' state is in $TS/pd too.
+  PATH=$TS/bin:$PATH
+  export PATH
+  PD=$TS/pd
+  cat > "$TS/config.toml" << EOF
+[defaults]
+transport = "pipe"
+pipe = ["$TS/bin/fil", "server", "--stdio"]
+EOF
+  CFG=$TS/config.toml
+  mkdir -p "$OUT/run/$SCENARIO"
+  # The earlier scenarios' daemon (it idles out after five minutes) must not be here: this scenario
+  # runs a daemon of its own at the same paths. The setup refused to start beside one of the user's.
+  local p
+  for p in $(daemon_pids); do kill "$p" 2> /dev/null; done
+  sleep 1
+  CLOCK0=$(date +%s)
+  CLOCK_SECONDS0=$SECONDS
+  log "tmp_cleaner: $(date -u) on $(sw_vers -productVersion); the clock will move at most a day at a time and be put back"
+  # Network time would fight the steps; best effort (it needs privileges the image may not grant).
+  sudo -n systemsetup -setusingnetworktime off > /dev/null 2>&1 || true
+  tmp_case refresh --every-ms 1000
+  tmp_case control --every-ms 3600000 --no-refresh --no-dir-lock
+  clock_restore
+}
+
+# The clock as it would be had it not been moved, plus DAYS days.
+clock_target() { echo $((CLOCK0 + (SECONDS - CLOCK_SECONDS0) + $1 * 86400)); }
+
+clock_set() {
+  local want=$1 now
+  CLOCK_MOVED=1
+  sudo -n date -u "$(date -u -r "$want" +%m%d%H%M%Y.%S)" > /dev/null || fail "cannot set the clock"
+  now=$(date +%s)
+  [[ $((now - want)) -ge -10 && $((now - want)) -le 10 ]] || fail "the clock did not stay where it was set (wanted $want, it is $now): something else is setting it"
+}
+
+clock_restore() {
+  [[ -n ${CLOCK_MOVED:-} ]] || return 0
+  sudo -n date -u "$(date -u -r "$(clock_target 0)" +%m%d%H%M%Y.%S)" > /dev/null 2>&1
+  sudo -n systemsetup -setusingnetworktime on > /dev/null 2>&1
+  CLOCK_MOVED=
+  log "the clock is back: $(date -u)"
+  return 0
+}
+
+# ids: the daemon's directory, socket, lock and start file as device:inode, or gone.
+tmp_ids() {
+  local d=/tmp/fil-$(id -u) rev f out=""
+  rev=$(fil --version | sed -n 's/.*wire \([0-9]*\)\.\([0-9]*\).*/\1-\2/p')
+  for f in "$d" "$d/fil-$rev.sock" "$d/fil-$rev.lock" "$d/fil-$rev.start"; do
+    out="$out $(stat -f '%d:%i' "$f" 2> /dev/null || echo gone)"
+  done
+  echo "${out# }"
+}
+
+# tmp_case MODE DAEMON_ARGS...: see scenario_tmp_cleaners.
+tmp_case() {
+  local mode=$1 d rev dpid sp before after day gone
+  shift
+  d=/tmp/fil-$(id -u)
+  rev=$(fil --version | sed -n 's/.*wire \([0-9]*\)\.\([0-9]*\).*/\1-\2/p')
+  [[ -z $(daemon_pids) ]] || fail "$mode: a daemon is running before the case starts: $(daemon_pids | tr '\n' ' ')"
+  rm -rf "$d"
+  tmpclean-daemon "$@" > "$OUT/run/$SCENARIO/daemon-$mode.log" 2>&1 &
+  dpid=$!
+  HELPERS+=("$dpid")
+  local i
+  for ((i = 0; i < 100; i++)); do [[ -S $d/fil-$rev.sock ]] && break; sleep 0.1; done
+  [[ -S $d/fil-$rev.sock ]] || fail "$mode: the daemon did not come up: $(cat "$OUT/run/$SCENARIO/daemon-$mode.log")"
+  # What a relay leaves when it starts a daemon (it did not start this one).
+  : > "$d/fil-$rev.start"
+  chmod 600 "$d/fil-$rev.start"
+  attach a "mac-tmp-$mode"
+  fc_show_pid a
+  sp=$(shell_pid a)
+  fc_detach a
+  before=$(tmp_ids)
+  log "$mode: before: $before (dir sock lock start); daemon pid $dpid, shell pid $sp"
+  [[ $before != *gone* ]] || fail "$mode: a file the daemon should have is missing: $before"
+  for day in 1 2 3 4 5; do
+    clock_set "$(clock_target "$day")"
+    sleep 4
+    sudo -n /usr/libexec/tmp_cleaner > "$OUT/run/$SCENARIO/cleaner-$mode-day$day.log" 2>&1 || fail "$mode: tmp_cleaner failed on day $day: $(cat "$OUT/run/$SCENARIO/cleaner-$mode-day$day.log")"
+    after=$(tmp_ids)
+    log "$mode: day $day after the cleaner: $after ($(grep -c . "$OUT/run/$SCENARIO/cleaner-$mode-day$day.log") lines from the cleaner)"
+    if [[ $mode == refresh ]]; then
+      [[ $after == "$before" ]] || fail "refresh: day $day: the daemon's files changed (before: $before, after: $after)"
+      kill -0 "$dpid" 2> /dev/null || fail "refresh: day $day: the daemon is gone"
+      kill -0 "$sp" 2> /dev/null || fail "refresh: day $day: the session's shell is gone"
+      fil --config "$CFG" ls local 2> /dev/null | grep -q "mac-tmp-$mode" || fail "refresh: day $day: fil ls does not list the session"
+    else
+      # Control: the cleaner takes the regular files once they are past 3 days (day 4), the socket never.
+      local b_dir b_sock b_lock b_start a_dir a_sock a_lock a_start
+      read -r b_dir b_sock b_lock b_start <<< "$before"
+      read -r a_dir a_sock a_lock a_start <<< "$after"
+      if [[ $day -ge 4 ]]; then
+        [[ $a_lock == gone && $a_start == gone ]] || fail "control: day $day: the lock and start files should be gone and are not ($after): the cleaner removes nothing here, so the refresh case above proves nothing"
+      else
+        [[ $after == "$before" ]] || fail "control: day $day: files changed before the age limit ($before -> $after)"
+      fi
+      [[ $a_sock == "$b_sock" && $a_dir == "$b_dir" ]] || fail "control: day $day: the socket or the directory was touched ($before -> $after)"
+      kill -0 "$dpid" 2> /dev/null || fail "control: day $day: the daemon is gone"
+    fi
+  done
+  ok "$mode: five days of the real cleaner behaved as expected"
+  note "tmp_cleaner_$mode=ok"
+  # Back to the real time, then the daemon ends and its files go.
+  clock_restore
+  kill "$dpid" 2> /dev/null
+  for ((i = 0; i < 100; i++)); do kill -0 "$dpid" 2> /dev/null || break; sleep 0.1; done
+  fil --config "$CFG" kill local "mac-tmp-$mode" > /dev/null 2>&1 || true
+  rm -rf "$d"
 }
 
 # ---------------------------------------------------------------------------------------------

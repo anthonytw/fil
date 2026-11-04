@@ -28,7 +28,7 @@ on:
   # TEMPORARY (removed before merge): a workflow that is not on main cannot be dispatched, so the
   # branch's own pushes run it while it is being written.
   push:
-    branches: [m4-mac]
+    branches: [m4-mac, m4-mac-seam]
   workflow_dispatch:
     inputs:
       ref:
@@ -159,6 +159,10 @@ jobs:
         env:
           MACOS_SSHD: ${{ matrix.sshd }}
           MACOS_STRICT: ${{ inputs.strict && '1' || '0' }}
+          # tmp_cleaners (once the TMP seam is on the ref): Apple's real tmp_cleaner as root over
+          # /tmp with the clock moved forward, a day at a time, and put back. Once per run, in the
+          # user-mode job; the system-mode job skips it.
+          MACOS_MOVE_CLOCK: ${{ matrix.sshd == 'user' && '1' || '' }}
         run: just macos-remote
       - name: Logs and results
         if: always()

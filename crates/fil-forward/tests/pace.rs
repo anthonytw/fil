@@ -23,15 +23,15 @@ macro_rules! per_transport {
                 use super::*;
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn mem() {
-                    super::$name(Transport::Mem).await
+                    bounded(super::$name(Transport::Mem)).await
                 }
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn pipe() {
-                    super::$name(Transport::Pipe).await
+                    bounded(super::$name(Transport::Pipe)).await
                 }
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn quic() {
-                    super::$name(Transport::Quic).await
+                    bounded(super::$name(Transport::Quic)).await
                 }
             }
         )*
@@ -102,6 +102,10 @@ async fn a_stuck_forward_never_holds_the_control_sender_or_a_new_connection(t: T
 /// ms); paced, behind about the target. The download keeps most of the rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe() {
+    bounded(a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body()).await
+}
+
+async fn a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body() {
     let paced = slow_pipe_cell(PaceConfig::default()).await;
     let unpaced = slow_pipe_cell(PaceConfig {
         enabled: false,
@@ -196,6 +200,10 @@ fn slow_pipe() -> StreamConfig {
 /// that, 16 gave 1.2 MB/s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_downloads_keep_the_link_full() {
+    bounded(parallel_downloads_keep_the_link_full_body()).await
+}
+
+async fn parallel_downloads_keep_the_link_full_body() {
     for n in [16, 32] {
         let source = serve(|mut s| async move {
             let buf = vec![9u8; 64 * 1024];
@@ -261,6 +269,10 @@ async fn stuck_forwards_hold_neither_a_live_forward_nor_the_agent(t: Transport) 
 /// The same on the slow pipe, with pacing and without (for the comparison it prints).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stuck_forwards_on_a_slow_pipe() {
+    bounded(stuck_forwards_on_a_slow_pipe_body()).await
+}
+
+async fn stuck_forwards_on_a_slow_pipe_body() {
     let mut took = Vec::new();
     for cfg in [OFF, PaceConfig::default()] {
         let w = World::new_pipe_on(mux_config(), slow_pipe()).await;

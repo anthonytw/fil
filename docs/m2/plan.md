@@ -290,6 +290,8 @@ impl Mux {
     fn poll_transmit_channel(&mut self, ch: ChannelId) -> Option<Bytes>; // H1: one channel's next payload, same rules (one function), no round-robin turn
     fn poll_event(&mut self) -> Option<MuxEvent>; // Opened, Readable, PeerEof, Closed, Released(ch), Table(..)
     fn tick(&mut self, now: Instant);
+    fn next_deadline(&self, now: Instant) -> Option<Instant>; // SW6: when tick next has something to do; the caller sleeps until then
+    fn set_time(&mut self, now: Instant); // SW6: stamps new timers without running them
 }
 ```
 

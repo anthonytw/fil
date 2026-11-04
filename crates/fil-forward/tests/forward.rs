@@ -29,15 +29,15 @@ macro_rules! per_transport {
                 use super::*;
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn mem() {
-                    super::$name(Transport::Mem).await
+                    bounded(super::$name(Transport::Mem)).await
                 }
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn pipe() {
-                    super::$name(Transport::Pipe).await
+                    bounded(super::$name(Transport::Pipe)).await
                 }
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn quic() {
-                    super::$name(Transport::Quic).await
+                    bounded(super::$name(Transport::Quic)).await
                 }
             }
         )*
@@ -590,6 +590,10 @@ async fn budget(t: Transport) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_forward() {
+    bounded(remote_forward_body()).await
+}
+
+async fn remote_forward_body() {
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     w.client.targets.set(ForwardId(5), server.port);
@@ -613,6 +617,10 @@ async fn socks_listener(w: &World) -> u16 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_forward_socks5_and_socks4a() {
+    bounded(dynamic_forward_socks5_and_socks4a_body()).await
+}
+
+async fn dynamic_forward_socks5_and_socks4a_body() {
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = socks_listener(&w).await;
@@ -673,6 +681,10 @@ async fn dynamic_forward_socks5_and_socks4a() {
 /// never asked (a canary target counts zero connections).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_open_never_connects() {
+    bounded(a_refused_open_never_connects_body()).await
+}
+
+async fn a_refused_open_never_connects_body() {
     let canary = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, canary.port);
@@ -710,6 +722,10 @@ async fn a_refused_open_never_connects() {
 /// second, against an `open_wait` of 30 s), nothing opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_local_connection_is_reset_at_once() {
+    bounded(a_refused_local_connection_is_reset_at_once_body()).await
+}
+
+async fn a_refused_local_connection_is_reset_at_once_body() {
     let canary = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     w.client.targets.set(ForwardId(3), canary.port);
@@ -732,6 +748,10 @@ async fn a_refused_local_connection_is_reset_at_once() {
 /// still up when the new one takes over. Byte-exact, one connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn swaps_mid_transfer() {
+    bounded(swaps_mid_transfer_body()).await
+}
+
+async fn swaps_mid_transfer_body() {
     let n = env_or("FIL_FORWARD_BULK_MIB", 8) << 20;
     let server = echo_server().await;
     let mut w = World::new(Transport::Pipe, mux_config()).await;
@@ -760,6 +780,10 @@ async fn swaps_mid_transfer() {
 /// listeners stay, and the next epoch works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_resets_every_channel() {
+    bounded(a_new_epoch_resets_every_channel_body()).await
+}
+
+async fn a_new_epoch_resets_every_channel_body() {
     let server = echo_server().await;
     let mut w = World::new(Transport::Mem, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -790,6 +814,10 @@ async fn a_new_epoch_resets_every_channel() {
 /// channel, oldest first, and every one goes through; past `open_wait` a waiting one is reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connections_wait_for_a_channel() {
+    bounded(connections_wait_for_a_channel_body()).await
+}
+
+async fn connections_wait_for_a_channel_body() {
     let cfg = MuxConfig {
         max_open: 4,
         open_wait: Duration::from_secs(2),
@@ -859,6 +887,10 @@ async fn connections_wait_for_a_channel() {
 /// from the old one. Before the fix about one run in five crossed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
+    bounded(a_new_epoch_never_crosses_bytes_into_a_reused_id_body()).await
+}
+
+async fn a_new_epoch_never_crosses_bytes_into_a_reused_id_body() {
     let runs = env_or("FIL_FORWARD_EPOCH_RUNS", 30);
     for run in 0..runs {
         let server = echo_server().await;
@@ -924,6 +956,10 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
 /// `expect_reset`'s 10 s, was made on arrival.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_queued_connection_is_checked_when_it_arrives() {
+    bounded(a_queued_connection_is_checked_when_it_arrives_body()).await
+}
+
+async fn a_queued_connection_is_checked_when_it_arrives_body() {
     let cfg = MuxConfig {
         max_open: 1,
         open_wait: Duration::from_secs(120),
@@ -977,6 +1013,10 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
 /// nobody holds the session), as plan section 2.7 says a detached listener does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
+    bounded(a_new_epoch_rechecks_the_queued_connections_at_once_body()).await
+}
+
+async fn a_new_epoch_rechecks_the_queued_connections_at_once_body() {
     let cfg = MuxConfig {
         max_open: 1,
         open_wait: Duration::from_secs(20),
@@ -1022,6 +1062,10 @@ async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
 /// `close_forward` ends the forward's channels and refuses its queued connections too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_forward_also_clears_its_queue() {
+    bounded(close_forward_also_clears_its_queue_body()).await
+}
+
+async fn close_forward_also_clears_its_queue_body() {
     let cfg = MuxConfig {
         max_open: 1,
         ..mux_config()
@@ -1072,6 +1116,10 @@ async fn close_forward_also_clears_its_queue() {
 /// owner (`LinkFailed`); the next link resumes the transfer byte-exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_failure_on_a_live_link_detaches_and_is_reported() {
+    bounded(a_send_failure_on_a_live_link_detaches_and_is_reported_body()).await
+}
+
+async fn a_send_failure_on_a_live_link_detaches_and_is_reported_body() {
     let n = 16 << 20;
     let server = echo_server().await;
     let mut w = World::new(Transport::Mem, mux_config()).await;
@@ -1104,6 +1152,10 @@ async fn a_send_failure_on_a_live_link_detaches_and_is_reported() {
 /// A socket bound before the attach is handed over without letting the port go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listen_bound_takes_sockets_bound_earlier() {
+    bounded(listen_bound_takes_sockets_bound_earlier_body()).await
+}
+
+async fn listen_bound_takes_sockets_bound_earlier_body() {
     let server = echo_server().await;
     let bound = fil_forward::listen::bind(BindAddr::Loopback, 0).unwrap();
     let port = bound.port;
@@ -1124,6 +1176,10 @@ async fn listen_bound_takes_sockets_bound_earlier() {
 /// that rebinds its own `-L` on a take-back).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unlisten_frees_the_port_at_once() {
+    bounded(unlisten_frees_the_port_at_once_body()).await
+}
+
+async fn unlisten_frees_the_port_at_once_body() {
     let w = World::new(Transport::Mem, mux_config()).await;
     let ep = &w.client.ep;
     for i in 0..50 {
@@ -1146,6 +1202,10 @@ async fn unlisten_frees_the_port_at_once() {
 /// meanwhile, both open under the new id; the old id names nothing on the daemon any more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_listener_rekeys_without_rebinding() {
+    bounded(a_paused_listener_rekeys_without_rebinding_body()).await
+}
+
+async fn a_paused_listener_rekeys_without_rebinding_body() {
     let cfg = MuxConfig {
         max_open: 1,
         ..mux_config()
@@ -1217,6 +1277,10 @@ async fn a_paused_listener_rekeys_without_rebinding() {
 /// nothing is opened in the new epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_checked_in_one_epoch_never_goes_out_in_the_next() {
+    bounded(an_open_checked_in_one_epoch_never_goes_out_in_the_next_body()).await
+}
+
+async fn an_open_checked_in_one_epoch_never_goes_out_in_the_next_body() {
     let canary = echo_server().await;
     let mut w = World::new(Transport::Mem, mux_config()).await;
     w.client.targets.set(ForwardId(3), canary.port);
@@ -1266,6 +1330,10 @@ async fn an_open_checked_in_one_epoch_never_goes_out_in_the_next() {
 /// muxes are healthy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_owner_holds_back_a_table_flood() {
+    bounded(a_slow_owner_holds_back_a_table_flood_body()).await
+}
+
+async fn a_slow_owner_holds_back_a_table_flood_body() {
     use fil_proto::mux::{MuxMsg, TableError};
     let mut w = World::new_with(Transport::Mem, mux_config(), true).await;
     let mut sent = 0u32;
@@ -1330,6 +1398,10 @@ async fn a_slow_owner_holds_back_a_table_flood() {
 /// subscriber).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_drops_the_old_epochs_events() {
+    bounded(a_new_epoch_drops_the_old_epochs_events_body()).await
+}
+
+async fn a_new_epoch_drops_the_old_epochs_events_body() {
     use fil_proto::mux::MuxMsg;
     let mut w = World::new_with(Transport::Mem, mux_config(), true).await;
     for i in 0..(fil_forward::EVENT_QUEUE as u32 * 4) {
@@ -1375,6 +1447,10 @@ async fn a_new_epoch_drops_the_old_epochs_events() {
 /// silent clients when handshakes shared the whole queue).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_socks_flood_does_not_stall_the_other_forwards() {
+    bounded(a_socks_flood_does_not_stall_the_other_forwards_body()).await
+}
+
+async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
     let _one_at_a_time = heavy().await;
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
@@ -1420,6 +1496,10 @@ async fn a_socks_flood_does_not_stall_the_other_forwards() {
 /// protocol error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mux_hold_is_bounded_by_stream_offset() {
+    bounded(the_mux_hold_is_bounded_by_stream_offset_body()).await
+}
+
+async fn the_mux_hold_is_bounded_by_stream_offset_body() {
     use fil_proto::frame::DataSegment;
     use fil_proto::mux::{MuxMsg, encode_record};
     let cfg = mux_config();
@@ -1468,6 +1548,10 @@ async fn the_mux_hold_is_bounded_by_stream_offset() {
 /// stats, not the sum of both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rekeying_onto_an_id_with_old_stats_resets_them() {
+    bounded(rekeying_onto_an_id_with_old_stats_resets_them_body()).await
+}
+
+async fn rekeying_onto_an_id_with_old_stats_resets_them_body() {
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     // Forward 2 carried a connection, then went away; its stats were not forgotten.

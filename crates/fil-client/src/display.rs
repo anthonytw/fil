@@ -13,7 +13,8 @@
 use std::time::Duration;
 
 use fil_predict::{
-    Config, Ctx, KeyEvent, Overlay, OverlayEdit, Placement, Predictor, PtyMode, Status, Time,
+    Config, Ctx, InputKind, InputPos, KeyEvent, Overlay, OverlayEdit, Placement, Predictor,
+    PtyMode, Settled, Show, Status, Time,
 };
 use fil_term::model::{CursorShape, MouseEncoding, MouseTracking};
 use fil_term::{Backend, Size, TermState};
@@ -24,17 +25,22 @@ use tokio::time::Instant;
 pub struct NoPrediction;
 
 impl Predictor for NoPrediction {
-    fn on_key(&mut self, _: &KeyEvent, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+    fn on_key(&mut self, _: &KeyEvent, _: InputPos, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
     fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
+    fn on_settled(&mut self, _: &[Settled], _: &Ctx<'_>) {}
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
     fn on_tick(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
         Vec::new()
     }
     fn next_deadline(&self) -> Option<Time> {
         None
+    }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        Show::Hide
     }
     fn reset(&mut self) {}
     fn has_outstanding(&self) -> bool {
@@ -60,6 +66,9 @@ pub struct Display {
     kitty_used: bool,
     /// The last bytes of the stream, so a sequence cut between two reads is still seen.
     kitty_tail: Vec<u8>,
+    /// The input offset of the next keystroke given to the overlay. A stand-in until the engine
+    /// passes the session's own offsets (`docs/m3/plan.md` §3 E1a).
+    input_at: InputPos,
 }
 
 impl Display {
@@ -84,6 +93,7 @@ impl Display {
             pty: PtyMode::default(),
             kitty_used: false,
             kitty_tail: Vec::new(),
+            input_at: 0,
         }
     }
 
@@ -107,6 +117,13 @@ impl Display {
     pub fn reset(&mut self) {
         self.overlay = Self::overlay_for(&self.backend, self.size, &self.make_predictor);
         let _ = self.overlay.set_pty_mode(self.pty);
+    }
+
+    /// True once after the core held a guess it would have written on a screen a resize left
+    /// untrusted, or saw something drawn at the resize (`docs/m3/plan.md` §2.4 rule 9): the
+    /// engine asks for a repaint (W1).
+    pub fn take_repaint_request(&mut self) -> bool {
+        self.overlay.take_repaint_request()
     }
 
     /// The session is a different one: forget what is known about its PTY.
@@ -206,7 +223,11 @@ impl Display {
             return Vec::new();
         }
         let now = self.now();
-        self.overlay.on_input(bytes, now).to_bytes()
+        let at = self.input_at;
+        self.input_at += bytes.len() as u64;
+        self.overlay
+            .on_input(bytes, at, InputKind::Typed, now)
+            .to_bytes()
     }
 
     /// The user's terminal changed size.

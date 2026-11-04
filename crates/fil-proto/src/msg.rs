@@ -481,6 +481,10 @@ pub enum SnapshotReason {
     BadResumePoint,
     /// The client asked for one (`ResumeRequest::want_snapshot`).
     Requested,
+    /// The client asked for a repaint in band ([`crate::input::InputRecord::Repaint`]): the
+    /// screen and the modes, rendered at the size it has told the daemon, with no history lines
+    /// (its native scrollback holds them) and `skipped` 0 (no marker).
+    Repaint,
 }
 
 /// A snapshot is coming on [`ChannelId::SNAPSHOT`]: exactly `len` bytes, then the terminal
@@ -492,6 +496,10 @@ pub struct SnapshotInfo {
     /// Terminal bytes the client never saw (for the "skipped N bytes" marker). 0 for a new client.
     pub skipped: u64,
     pub reason: SnapshotReason,
+    /// The size generation the snapshot was rendered at (DESIGN.md section 8.5), on every
+    /// snapshot. A client whose screen a resize left untrusted trusts it again after applying a
+    /// snapshot at its current generation, whatever the reason.
+    pub size_gen: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,7 +749,9 @@ pub enum PolicyLine {
     /// Files the sshd config includes could not be read: the mirror is incomplete (fil mirrors
     /// the rest). `file` is the first; `more` counts the others. Names files, never contents.
     Partial { file: PortsPath, more: u16 },
-    /// fil's policy file is there but cannot be used: every forward and the agent are refused.
+    /// Every forward and the agent are refused: fil's policy file is there but cannot be used,
+    /// or the last read is too old to decide on. With [`crate::mux::PolicySetting::Unevaluable`]
+    /// (an sshd line fil cannot evaluate), everything the policy file does not set itself.
     DenyAll(PolicyRefusal),
     /// Server policy refuses fil's direct (QUIC) transport: attaches use the pipe.
     Direct(PolicyRefusal),
@@ -1242,6 +1252,7 @@ mod tests {
             len: 1234,
             skipped: 5,
             reason: SnapshotReason::TooFarBehind,
+            size_gen: 4,
         };
         let msgs = vec![
             ControlMsg::Hello(Hello::ours("fil test".parse().unwrap())),

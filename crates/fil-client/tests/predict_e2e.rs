@@ -3,8 +3,9 @@
 //! on simulated networks, the user's terminal an emulator that reflows.
 //!
 //! The big runs (the whole resize matrix, the baseline at several round-trip times) are the
-//! `predict_e2e` example (`just predict-e2e`). Two tests here are `#[ignore]`d on purpose: they
-//! reproduce the resize damage that W1 repairs, so they only pass while the damage is there.
+//! `predict_e2e` example (`just predict-e2e`). The resize damage T1 reproduced is repaired by
+//! W1's in-band repaint: the true-order cases below end equal to the shadow and, once repainted,
+//! to a fresh snapshot of the session.
 //!
 //! Real time, real PTYs: each test takes a few seconds.
 
@@ -116,32 +117,53 @@ async fn typing_ends_equal_to_the_shadow_and_the_snapshot_over_quic() {
 // ---------------------------------------------------------------------------------------------
 // Secrets
 
-/// The core's password rule through the whole stack: a predictor that shows every key at once
-/// is stopped once the daemon has said echo is off.
+/// The core's password rule through the whole stack: once the daemon has said echo is off, the
+/// core does not even ask a predictor (one that shows every key at once) about the keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hostile_predictor_is_stopped_at_a_password_prompt() {
     let r = secret_trial(spec(Transport::Pipe, Program::ReadS, Predict::Eager), false).await;
     assert_eq!(r.leaked, 0, "{r:?}");
+    assert_eq!(r.adapter.keys, 0, "the core asked the predictor: {r:?}");
     assert!(
         r.pty_modes >= 2,
         "the daemon reported the mode change: {r:?}"
     );
 }
 
-/// The mutation: the same run with the daemon's `PtyMode` withheld from the client. The
-/// secret is written, and the harness sees it. This is what `--guard-off password` would
-/// show; the engine gives the harness no way to switch a guard off, so the information the
-/// guard needs is taken away instead.
+/// The same hostile predictor with the daemon's `PtyMode` withheld from the client, so the
+/// password rule never applies: the core asks the predictor about every key and gets a guess
+/// for each, and its epochs still write none (the prompt is unexplained output, and nothing
+/// echoes the keys). Before C1 this was the leak the harness had to see; the oracle terminal's
+/// own test above shows it would see one. A full-stack mutation that leaks needs a guard switch
+/// in the engine (E1a's seam).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_harness_sees_a_secret_leak_when_the_mode_report_is_withheld() {
+async fn the_core_stops_a_hostile_predictor_with_the_mode_report_withheld() {
     let mut s = spec(Transport::Pipe, Program::ReadS, Predict::Eager);
     s.drop_pty_mode = true;
     let r = secret_trial(s, false).await;
-    assert!(r.leaked > 0, "the leak should have been seen: {r:?}");
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
+    assert!(
+        r.adapter.shown > 0,
+        "the predictor declared no guess: {r:?}"
+    );
+    assert_eq!(r.leaked, 0, "{r:?}");
 }
 
-/// Keys typed the moment echo goes off, before the report can have reached the client: the
-/// M0 predictor's epochs keep them off the screen.
+/// Keys typed the moment echo goes off, before the report can have reached the client (the
+/// `sudo` typed-ahead case), with the hostile predictor: it is asked and guesses every key, and
+/// the core writes none (before C1 this leaked 3 to 6 characters, `docs/m3/harness.md` §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_predictor_writes_no_secret_typed_ahead_of_the_report() {
+    let r = secret_trial(spec(Transport::Pipe, Program::ReadS, Predict::Eager), true).await;
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
+    assert!(
+        r.adapter.shown > 0,
+        "the predictor declared no guess: {r:?}"
+    );
+    assert_eq!(r.leaked, 0, "{r:?}");
+}
+
+/// The same with the default predictor, over QUIC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mosh_predictor_writes_no_secret_typed_ahead_of_the_report() {
     let r = secret_trial(
@@ -149,6 +171,7 @@ async fn the_mosh_predictor_writes_no_secret_typed_ahead_of_the_report() {
         true,
     )
     .await;
+    assert!(r.adapter.keys > 0, "the predictor was never asked: {r:?}");
     assert_eq!(r.leaked, 0, "{r:?}");
 }
 
@@ -162,7 +185,18 @@ fn resize_case(
     to: (u16, u16),
     seed: u64,
 ) -> ResizeCase {
-    let mut s = Spec::new(Transport::Pipe, Program::Cat);
+    resize_case_of(Program::Cat, predict, order, from, to, seed)
+}
+
+fn resize_case_of(
+    program: Program,
+    predict: Predict,
+    order: Order,
+    from: (u16, u16),
+    to: (u16, u16),
+    seed: u64,
+) -> ResizeCase {
+    let mut s = Spec::new(Transport::Pipe, program);
     s.one_way = Duration::from_millis(75);
     s.predict = predict;
     s.size = from;
@@ -211,17 +245,15 @@ async fn the_resize_controls_are_clean() {
     assert!(c.clean(), "guesses, M0's order:\n{}", c.side_by_side());
 }
 
-/// **The reproduction (W1's gate).** The same case as the second control, in the true order:
-/// the terminal reflows its screen, guesses included, and the client then erases them where
-/// they were, on a geometry that is gone. The screen ends different from the shadow.
-///
-/// Ignored because it passes only while the damage exists: W1 flips it (the repaint repairs
-/// the screen), and the case then moves to the clean list.
+/// **The reproduction (W1's gate), repaired.** The same case as the second control, in the true
+/// order: the terminal reflows its screen, guesses included, and the client then erases them
+/// where they were, on a geometry that is gone. Before W1 the screen ended different from the
+/// shadow in most of these runs (`docs/m3/harness.md` §3). Now the client, which had something
+/// drawn at the resize, asks for a repaint after the resize record: the screen ends equal to the
+/// shadow, and, the repaint having made it the daemon's, to a fresh snapshot too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces the resize damage that W1 repairs: passes only while it exists"]
-async fn a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order() {
-    let mut damaged = 0;
-    for seed in 1..=6 {
+async fn a_narrowing_resize_with_guesses_on_screen_is_repaired_in_the_true_order() {
+    for seed in 1..=3 {
         let out = resize_trial(resize_case(
             Predict::MoshAlways,
             Order::True,
@@ -230,9 +262,49 @@ async fn a_narrowing_resize_with_guesses_on_screen_damages_it_in_the_true_order(
             seed,
         ))
         .await;
-        if out.guesses_on_screen > 0 && !out.shadow.as_ref().expect("shadow").clean() {
-            damaged += 1;
-        }
+        assert_repaired(&out, seed);
     }
-    assert!(damaged > 0, "no damage in six runs");
+}
+
+/// The widening case T1 found: eight long lines wrapped at 30 columns, joined by the widening,
+/// move everything below them up, and the erase leaves the terminal's cursor on another row than
+/// the shadow's. A rule that only stops further guesses cannot fix that; the repaint does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_widening_resize_that_joins_wrapped_rows_is_repaired_in_the_true_order() {
+    for seed in 1..=2 {
+        let mut case = resize_case_of(
+            Program::Fill(8),
+            Predict::MoshAlways,
+            Order::True,
+            (30, 24),
+            (80, 24),
+            seed,
+        );
+        // Shorter than the 30 columns, so the guesses are on the screen at the resize (the
+        // predictor stops before the last column), as in the matrix (`just predict-e2e resize`).
+        case.typed_before = 14 + (seed as usize % 5) * 6;
+        let out = resize_trial(case).await;
+        assert_repaired(&out, seed);
+    }
+}
+
+fn assert_repaired(out: &ResizeOutcome, seed: u64) {
+    assert!(
+        out.guesses_on_screen > 0,
+        "seed {seed}: guesses were on the screen at the resize"
+    );
+    assert!(out.repaints > 0, "seed {seed}: no repaint was asked for");
+    let c = out.shadow.as_ref().expect("shadow");
+    assert!(
+        c.clean(),
+        "seed {seed}, vs the shadow:\n{}",
+        c.side_by_side()
+    );
+    let c = &out.comparison;
+    assert!(
+        c.clean(),
+        "seed {seed}, vs a fresh snapshot after the repaint:\n{}\n{:?}",
+        c.side_by_side(),
+        c.screen_diffs
+    );
 }

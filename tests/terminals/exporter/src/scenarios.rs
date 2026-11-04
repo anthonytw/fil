@@ -208,16 +208,34 @@ pub fn clears() -> Vec<Tb> {
         b.extend_from_slice(b"\x1b[H");
         b
     };
+    // The bytes the snapshot writer itself appends for a 24-row state, not a copy of them.
+    let snapshot_clear = {
+        let mut b = Vec::new();
+        fil_term::snapshot::clear_screen(&mut b, 24);
+        b
+    };
     vec![
         clear_trace(
             "cl-snapshot-clear",
-            "The snapshot writer's clear, `CSI H CSI J`, over a full screen with 31 lines of scrollback.",
+            "The snapshot writer's clear, `fil_term::snapshot::clear_screen` (`CSI 2 K` on each row, then home), over a full screen with 31 lines of scrollback.",
             55,
-            b"\x1b[H\x1b[J",
+            &snapshot_clear,
         ),
         clear_trace(
             "cl-snapshot-clear-short",
             "The same clear over a short session: three lines at the top, nothing in the scrollback.",
+            3,
+            &snapshot_clear,
+        ),
+        clear_trace(
+            "cl-textbook-clear",
+            "`CSI H CSI J`, the clear the snapshot writer used before `clear_screen`: kept to show what tmux does with it.",
+            55,
+            b"\x1b[H\x1b[J",
+        ),
+        clear_trace(
+            "cl-textbook-clear-short",
+            "The same `CSI H CSI J` over a short session.",
             3,
             b"\x1b[H\x1b[J",
         ),

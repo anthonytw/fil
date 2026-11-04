@@ -1220,7 +1220,11 @@ pub async fn bounded<F: Future>(body: F) -> F::Output {
                 .map(|(_, who, side, ep)| (*who == name, *side, ep.clone()))
                 .partition(|(m, ..)| *m);
             let mut report = String::new();
-            for (title, eps) in [("endpoints", &mine), ("endpoints built off a test thread (maybe another test's)", &others)] {
+            let groups = [
+                ("endpoints", &mine),
+                ("endpoints built off a test thread (maybe another test's)", &others),
+            ];
+            for (title, eps) in groups {
                 if eps.is_empty() {
                     continue;
                 }

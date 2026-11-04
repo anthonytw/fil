@@ -117,7 +117,7 @@ async fn session(prog: &'static Program, backend: &'static str, seed: u64, o: &O
     run.secret = prog.secret;
     if o.hostile {
         // A predictor with no manners: only the core stands between it and the screen.
-        run.kind = PredictorKind::Hostile { seed, noise: true };
+        run.kind = PredictorKind::hostile(seed);
         run.secret = "";
     }
     for g in &o.guard_off {
@@ -139,7 +139,9 @@ async fn session(prog: &'static Program, backend: &'static str, seed: u64, o: &O
     let mut eof = false;
 
     loop {
-        if d.failure.is_some() || Instant::now() > deadline {
+        // At EOF the program is gone: `remote.next()` would return at once on every poll, and
+        // the keys left would go nowhere.
+        if d.failure.is_some() || eof || Instant::now() > deadline {
             break;
         }
         if keys.peek().is_none() {

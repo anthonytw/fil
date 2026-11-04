@@ -4,7 +4,7 @@
 //! sessions.
 
 use fil_predict::oracle::{Kind, Oracle, PROBE, check_equal, check_view, common};
-use fil_predict::{Config, MoshPredictor, Overlay, Placement, Status};
+use fil_predict::{Config, InputKind, MoshPredictor, Overlay, Placement, Status};
 use fil_term::{Backend, Size, backends};
 
 const SIZE: Size = Size { cols: 40, rows: 10 };
@@ -498,17 +498,28 @@ fn restoring_cells_that_are_not_plain_ascii_moves_the_cursor_for_each() {
 #[test]
 fn review_resize_with_status_and_predictions_shown() {
     each_backend(|r| {
-        r.overlay.set_rtt(std::time::Duration::from_millis(500));
+        r.overlay.set_link(fil_predict::LinkView {
+            rtt_hint: Some(std::time::Duration::from_millis(500)),
+            ..Default::default()
+        });
         r.server(b"$ ");
         r.status(lines(&[" status "]));
-        let f = r
-            .overlay
-            .on_input(b"a", std::time::Duration::from_millis(10));
+        let f = r.overlay.on_input(
+            b"a",
+            0,
+            InputKind::Typed,
+            std::time::Duration::from_millis(10),
+        );
         r.user.write(&f.erase);
         r.user.write(&f.paint);
         r.server(b"a");
-        for _ in 0..3 {
-            let f = r.overlay.on_input(b"a", std::time::Duration::from_secs(1));
+        for at in 1..4 {
+            let f = r.overlay.on_input(
+                b"a",
+                at,
+                InputKind::Typed,
+                std::time::Duration::from_secs(1),
+            );
             r.user.write(&f.erase);
             r.user.write(&f.paint);
         }

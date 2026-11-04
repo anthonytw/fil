@@ -1,6 +1,6 @@
 //! Shared helpers for the real-network harness binaries (`tests/realnet`, `docs/m1/realnet.md`).
 //!
-//! Seven programs live here, all test-only and never shipped. The two drivers for the real `fil`
+//! Nine programs live here, all test-only and never shipped. The two drivers for the real `fil`
 //! binary (`ptydrive`, a terminal; `sockprobe`, a stranger at a Unix socket) have their own docs;
 //! the rest stand in for one end of a link:
 //!
@@ -11,6 +11,8 @@
 //! - `quiclink-probe`: the same two roles, built on the real `QuicLink` and `QuicListener`.
 //! - `pipe-probe`: the same for the real `PipeLink`, on a pipe command.
 //! - `pipe-detach`: the daemon side and a slow ssh stand-in for the detach-delivery test.
+//! - `fwdprobe`: the TCP end for port-forward tests (serve and connect, seeded streams, sha256).
+//! - `keyprobe`: keystroke-to-echo latency on a pty, and the catch-up drain.
 //!
 //! Shared by the programs: [`keys`] (the key bootstrap of the two QUIC programs) and [`pty`] (a
 //! program on a pseudo-terminal, shared by `ptydrive` and the Pi examples).

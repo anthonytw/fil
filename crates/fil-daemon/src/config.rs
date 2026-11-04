@@ -24,7 +24,7 @@
 //! # "systemd" (always, failing if it cannot) or "tree" (always the process tree).
 //! scope = "auto"
 //!
-//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/agent/<session>.sock
+//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/a-<major>-<rev>/<session>.sock
 //! # (DESIGN.md section 10), whether or not a client relays its agent: a program started while
 //! # nobody relays finds the path and gets a refusal, and works once a client with -A attaches.
 //! # With `false` sessions get no SSH_AUTH_SOCK and the agent is never relayed.

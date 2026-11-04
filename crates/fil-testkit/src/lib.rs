@@ -1,10 +1,12 @@
 //! Test support shared by the crates' integration tests. It is a dev-dependency of its users and
 //! of nothing else, so it is never in a release build (`just release-deps` checks the graph).
 //!
-//! The one thing in here that is worth a crate is the scripted protocol client ([`Client`]): the
-//! far end of any [`Link`], speaking the real protocol with a real emulator behind it. It used to
-//! be written twice, once for the session tests (over `link::mem`) and once for the daemon tests
-//! (over a pipe through a relay), and the two copies had drifted apart.
+//! The main thing in here is the scripted protocol client ([`Client`]): the far end of any
+//! [`Link`], speaking the real protocol with a real emulator behind it. It used to be written
+//! twice, once for the session tests (over `link::mem`) and once for the daemon tests (over a pipe
+//! through a relay), and the two copies had drifted apart. The fil-client and fil-forward tests
+//! use the mini ssh-agent ([`agent`]); every crate's tests use the wait helpers ([`eventually`]
+//! and friends).
 
 use std::time::Duration;
 

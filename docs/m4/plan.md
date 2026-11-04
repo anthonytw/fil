@@ -1,6 +1,6 @@
 # M4 plan: release
 
-> **Status: proposed by the coordinator on 2026-11-04 and revised after its review; nothing here is built yet.** The owner asked (2026-11-04) for M4 to start now, in parallel with M3 (prediction, planned separately in `docs/m3/plan.md`) and with M2's last sweep PRs. `DESIGN.md` stays the source of truth; when a package changes a decision, it updates `DESIGN.md` in the same PR. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **OWNER** wait for the owner (§7). Written on `origin/main` at `12f974d`.
+> **Status: proposed by the coordinator on 2026-11-04 and revised after its review; nothing here is built yet.** The owner asked (2026-11-04) for M4 to start now, in parallel with M3 (prediction, planned separately in `docs/m3/plan.md`) and with M2's last sweep PRs. `DESIGN.md` stays the source of truth; when a package changes a decision, it updates `DESIGN.md` in the same PR. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **OWNER** wait for the owner (§7). **The owner answered OQ-2, OQ-3 and OQ-4 on 2026-11-04** (§7; OQ-3 and OQ-4 differ from the recommendations); OQ-5 is open. Written on `origin/main` at `12f974d`.
 
 M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com; macOS target tests on GitHub's macOS runners. It is done when **the pre-release sweep is closed before the first release**.
 
@@ -28,7 +28,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 
 1. **Getting fil onto a remote host**, by hand or with the client's help (U1, §16.5 of DESIGN).
 2. **Release builds with provenance:** reproducible static Linux binaries and archives, a macOS binary, checksums, signatures and build attestations (REL).
-3. **Packaging channels** for v1: GitHub Releases, a Homebrew tap and `cargo install --git` (PKG).
+3. **Packaging channels** for v1, **being planned**: the owner wants the names reserved and packages prepared everywhere, crates.io and distro packages included (OQ-3; decided, owner 2026-11-04). Planned so far: GitHub Releases, a Homebrew tap and `cargo install --git` (PKG).
 4. **Versioning** that relates the package version to the wire (`PROTOCOL_MAJOR`.`PROTOCOL_REVISION`) (R0).
 5. **Config finished and documented:** reviewed defaults, a reference that tests keep in step with the code, and `fil config show` (CFG, DOC).
 6. **Docs:** a user guide, man pages, shell completions, a changelog and an install-first README (DOC).
@@ -43,7 +43,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 - **Windows**, as a client or a remote (decided, §2 of DESIGN). WSL counts as Linux.
 - **Runtime downloads.** fil never fetches anything from the internet, not even its own binary for a remote (§11.1.1, decided). Whatever the client uploads, it already has on disk.
 - **A `curl | sh` installer.** It would run code the user has not seen. Install instructions are a download, a checksum check and a copy.
-- **Distro packages** (Debian, RPM, AUR, Nix) and **crates.io** in v1 (OQ-3).
+- ~~**Distro packages** (Debian, RPM, AUR, Nix) and **crates.io** in v1~~ are **no longer non-goals**: they are in scope for v1, with the names reserved and packages prepared everywhere (OQ-3; decided, owner 2026-11-04). The channel list is being planned (goal 3, PKG).
 - **`-N` tunnel-only mode** (M2 OD-12) and **desktop notifications for new listeners** (§7.4 of DESIGN, moved out of M2). Both are features, and adding them now would put new code in front of the sweep. They move to after v0.1.0, unless the owner pulls them in. R0 updates DESIGN §7.4's notification sentence and points it at OD-12, so that DESIGN says "after v0.1.0".
 - **The two items M3 hands to M4** (M3 plan §1, PC-11), both after v0.1.0:
   - **the final output tail of an ended session.** There is no emulator after exit, it needs a new bounded memory policy, ssh and ET do no better, and the value is low;
@@ -90,6 +90,7 @@ U1, REL, PKG, LIC and DOC all build on it.
 ### 2.1 Versioning (proposed)
 
 - **The package version.** It is SemVer, in `[workspace.package] version` in the root `Cargo.toml`, and it is the one version of every crate. The first release is **0.1.0**: fil is new, and 0.x tells users that the config and the CLI may still change.
+- **Open:** the owner asked (2026-11-04) why the first release is 0.1.0 and not 1.0.0. The version stays open until that is answered (with OQ-5).
 - **The wire.** It is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION`, already printed by `fil --version` (`fil 0.1.0 (wire 1.12)`). The two numbers are independent.
   - **A patch release never changes the wire.** REL's release check compares the last line of the golden's `[history]` with that of the previous tag of the same minor.
   - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Because daemons of different wires coexist (§5.3 of DESIGN), that is an upgrade, not a breakage.
@@ -521,11 +522,11 @@ Every package keeps M2's rules:
   - a `notices` step in `release.yml`;
   - `docs/m4/release.md` § Notices.
 - **Builds:**
-  - **`THIRD-PARTY-NOTICES.md`,** generated by cargo-about for the release graph: `-p fil`, normal and build edges, every target. cargo-about is MIT or Apache-2.0, a build tool that is not in the binary, pinned by version. It accepts the same licenses as `deny.toml`. Two notices that cargo-about does not see are added by hand:
+  - **`THIRD-PARTY-NOTICES.md`,** generated by cargo-about for the release graph: `-p fil`, normal and build edges, on the four release targets (`docs/m4/release.md` §7). cargo-about is MIT or Apache-2.0, a build tool that is not in the binary, pinned by version. It accepts the same licenses as `deny.toml`. Two notices that cargo-about does not see are added by hand:
     - **Rust's standard library** (MIT or Apache-2.0);
     - **musl** (MIT), statically linked into the Linux binaries.
   - **`fil --version`** keeps its first line, `fil 0.1.0 (wire 1.12)`, which tests parse. It adds GNU-style lines, which are GPLv3's "Appropriate Legal Notices" for an interactive program:
-    - the copyright holder (OQ-2);
+    - the copyright holder, Anthony Wertz (OQ-2; decided, owner 2026-11-04);
     - "License GPL-3.0-or-later <https://gnu.org/licenses/gpl.html>";
     - "This is free software: you are free to change and redistribute it. There is NO WARRANTY, to the extent permitted by law."
   - **Corresponding Source:** REL's vendored source archive, with each release. The release notes and the man page point at it.
@@ -533,7 +534,7 @@ Every package keeps M2's rules:
 - **Tests:** `just notices` fails when a crate in the release graph has a license outside the allowed list, or when the generated file is stale. The `--version` test keeps its first line.
 - **Done when:** the archives carry the notices, and `--version` carries the legal lines.
 
-**PKG: packaging channels** (after REL; the tap waits for OQ-3)
+**PKG: packaging channels** (after REL; being planned: OQ-3 now puts crates.io and distro packages in v1, with the names reserved and packages prepared everywhere, decided, owner 2026-11-04)
 - **Owns:**
   - `packaging/homebrew/fil.rb.in` (new, a template);
   - the `brew-formula` recipe, which fills the template from a release's `SHA256SUMS`;
@@ -696,10 +697,10 @@ Prerequisites:
 Steps:
 
 1. **The new repository.** The coordinator exports the tree. The owner commits it as one signed "Initial commit" and pushes it as the new public `anthonytw/fil`, with the old repository renamed to a private `fil-archive`, as was done for Sempere.
-2. **The settings that do not move.** The owner re-creates:
+2. **The settings that do not move.** The owner sets these before the first tag (owner, 2026-11-04), re-creating:
    - the collaborator invitation for the bot account;
    - the `main` ruleset (PR required, no force-push or delete);
-   - **a tag ruleset for `v*`**, which only the release identity passes;
+   - **a tag ruleset for `v*`**, which only the owner passes (OQ-2; decided, owner 2026-11-04);
    - Actions' default token, set to read-only;
    - GitHub's **immutable releases** setting, so that a published release's assets and tag cannot be changed afterward.
 
@@ -830,14 +831,14 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 
 | # | Question | Recommendation |
 |---|---|---|
-| **OQ-2** | **The release identity:** who signs release tags and `SHA256SUMS`, who may create `v*` tags (the tag ruleset), and the copyright holder named in `fil --version` and the notices. | **The owner's own SSH signing key** for tags and checksums (the bot account signs commits, never releases). A tag ruleset that only the owner passes, and GitHub attestations on. The owner's legal name as the copyright holder (the domain already carries it), or "the fil authors" if the owner prefers. |
-| **OQ-3** | **Distribution channels that need accounts:** a Homebrew tap repository, crates.io, distro packages. | **A tap at `anthonytw/homebrew-tap`** (`brew install anthonytw/tap/fil`), a general name that leaves room for other tools. **No crates.io in v1:** publishing would mean about a dozen internal crates, each a permanent public API, and `cargo install --git` covers Rust users. The name `fil` is unclaimed today, so the risk of waiting is a squatter, which is accepted. **No distro packages in v1:** the static binaries make them easy for packagers later. |
-| **OQ-4** | **macOS signing and notarization** with the Apple Developer membership. Gatekeeper quarantines a browser download of an unsigned binary. Homebrew formulae and `curl` downloads are not quarantined. | **Not in v1.** Homebrew is the main macOS channel, the install page explains `xattr -d com.apple.quarantine` for a browser download, and the release stays fully automated, with no Apple secret in CI. Signing would also put the Developer ID name in the binary and break the bit-for-bit comparison. Revisit if users ask. |
-| **OQ-5** | **The site:** create the private `fil-site` repository (Astro source, like Sempere's site) and the public `anthonytw/fil-site` repository for GitHub Pages; point `fil.anthonywertz.com` at GitHub Pages in DNS; set the custom domain with HTTPS enforced; and say when it launches. | **Yes, launch with v0.1.0.** Until then the domain can stay unpointed, so that it shows no "coming soon" page. The site task (scope in §3, SITE) runs as soon as the repositories exist, and shows the docs from a release tag only. |
+| **OQ-2** | **The release identity:** who signs release tags and `SHA256SUMS`, who may create `v*` tags (the tag ruleset), and the copyright holder named in `fil --version` and the notices. | **The owner's own SSH signing key** for tags and checksums (the bot account signs commits, never releases). A tag ruleset that only the owner passes, and GitHub attestations on. The owner's legal name as the copyright holder (the domain already carries it), or "the fil authors" if the owner prefers. **Answer (decided, owner 2026-11-04):** as recommended: the owner's own SSH key signs release tags and `SHA256SUMS`; a `v*` tag ruleset that only the owner passes; GitHub attestations on; the copyright holder is the owner's own name, Anthony Wertz. The owner sets the repository settings (`docs/m4/release.md` §9) before the first tag. |
+| **OQ-3** | **Distribution channels that need accounts:** a Homebrew tap repository, crates.io, distro packages. | **A tap at `anthonytw/homebrew-tap`** (`brew install anthonytw/tap/fil`), a general name that leaves room for other tools. **No crates.io in v1:** publishing would mean about a dozen internal crates, each a permanent public API, and `cargo install --git` covers Rust users. The name `fil` is unclaimed today, so the risk of waiting is a squatter, which is accepted. **No distro packages in v1:** the static binaries make them easy for packagers later. **Answer (decided, owner 2026-11-04), changed from the recommendation:** reserve the names and prepare packages "everywhere" for v1. crates.io and distro packages are in scope, not non-goals (§1). The channel list is being planned (PKG). |
+| **OQ-4** | **macOS signing and notarization** with the Apple Developer membership. Gatekeeper quarantines a browser download of an unsigned binary. Homebrew formulae and `curl` downloads are not quarantined. | **Not in v1.** Homebrew is the main macOS channel, the install page explains `xattr -d com.apple.quarantine` for a browser download, and the release stays fully automated, with no Apple secret in CI. Signing would also put the Developer ID name in the binary and break the bit-for-bit comparison. Revisit if users ask. **Answer (decided, owner 2026-11-04), changed from the recommendation:** notarize in v1, "with the most trust" (the owner: "Figure out how to do this with the most trust. Other apps do it, so should we"). The design is pending. |
+| **OQ-5** | **The site:** create the private `fil-site` repository (Astro source, like Sempere's site) and the public `anthonytw/fil-site` repository for GitHub Pages; point `fil.anthonywertz.com` at GitHub Pages in DNS; set the custom domain with HTTPS enforced; and say when it launches. | **Yes, launch with v0.1.0.** Until then the domain can stay unpointed, so that it shows no "coming soon" page. The site task (scope in §3, SITE) runs as soon as the repositories exist, and shows the docs from a release tag only. **Still open** (2026-11-04): the owner asked why the first release is 0.1.0 and not 1.0.0 (§2.1). |
 
 **Proposed calls** (no owner input needed; the owner may veto any):
 
-- 0.1.0, and the versioning rule (§2.1);
+- 0.1.0, and the versioning rule (§2.1; the version is open: the owner asked why not 1.0.0);
 - the targets, with the universal macOS binary (§2.2);
 - macOS supported as a remote, with `fil ports` showing forwards only (§16.9);
 - no runtime downloads, and no `curl | sh`;
@@ -867,7 +868,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 7. **GPL compliance gaps:** a missing notice (the standard library, musl) or missing Corresponding Source. *Mitigation:* LIC's generated notices with a staleness check, and the vendored source archive in every release.
 8. **The recreate disrupts work:** PR links, Actions history, rulesets, the collaborator. *Mitigation:* §5's prerequisites and checklist, and no release tag before it.
 9. **The LOG change touches every process's logging** late in the project. *Mitigation:* a small, isolated module with a blocking-writer test, merged before the sweep so that the sweep audits it.
-10. **Unsigned macOS binaries** confuse users who download them in a browser (OQ-4). *Mitigation:* Homebrew first, and clear install docs.
+10. **Unsigned macOS binaries** confuse users who download them in a browser. *Mitigation:* notarized in v1 (OQ-4; decided, owner 2026-11-04), with the design pending; Homebrew first, and clear install docs.
 
 ## 9. Critical files
 

@@ -385,6 +385,42 @@ fn a_line_fil_cannot_evaluate_refuses_everything_the_policy_file_does_not_set() 
     }
 }
 
+/// An unevaluable sshd line next to a policy file that cannot be used (unsafe, unparsable):
+/// the file sets nothing, so the one `fil ports` line is the file's, which refuses everything.
+/// The unevaluable line is not added beside it (the client words that one as leaving the file's
+/// keys standing, which an unusable file has none of). With a usable file it is back.
+#[test]
+fn an_unusable_policy_file_is_the_only_line_beside_an_unevaluable_sshd_line() {
+    let sshd = "Include conf.d/[^x]*.conf\nAllowTcpForwarding yes\n";
+    for (tag, text, mode, fault) in [
+        ("uu-writable", "local = true\n", 0o664, FileFault::Writable),
+        ("uu-parse", "local = \n", 0o644, FileFault::Unparsable),
+    ] {
+        let h = Host::new(tag, sshd, Some(text));
+        let f = h.base.join("etc/fil/policy.toml");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+        let p = h.policy();
+        let lines = p.lines();
+        assert!(
+            matches!(&lines[..], [PolicyLine::DenyAll(r)] if r.setting == PolicySetting::FileUnsafe(fault)),
+            "{tag}: {lines:?}"
+        );
+        // Every check names the file, not the sshd line.
+        assert!(
+            says(p.forward(&local(1, "db", 1))).contains("policy file"),
+            "{tag}"
+        );
+        assert!(says(p.agent()).contains("policy file"), "{tag}");
+    }
+    // A usable file that sets some keys: the unevaluable line is the one said.
+    let h = Host::new("uu-ok", sshd, Some("local = true\n"));
+    let lines = h.policy().lines();
+    assert!(
+        matches!(&lines[..], [PolicyLine::DenyAll(r)] if r.setting == PolicySetting::Unevaluable),
+        "{lines:?}"
+    );
+}
+
 /// RHEL and Fedora keep `sshd_config` 0600: `Unknown`, one line in `fil ports`, and OpenSSH's
 /// defaults in force (so a wide `-R` is refused, as sshd's `GatewayPorts no` would keep it on
 /// loopback). The same for a missing config.

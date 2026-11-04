@@ -48,7 +48,7 @@ use fil_predict::{
 };
 use fil_proto::ChannelId;
 use fil_proto::limits::PROTOCOL_MAJOR;
-use fil_proto::msg::{Agent, Attach, ControlMsg, Hello, PublicKey, TermSize};
+use fil_proto::msg::{Agent, Attach, ControlMsg, Hello, PublicKey, SnapshotReason, TermSize};
 use fil_session::{NoHost, ScopeMode, SessionConfig, SessionHandle};
 use fil_term::{Capabilities, Emulator, Size, TermState};
 use fil_transport::auth::{ClientKey, DaemonIdentity, Fingerprint, KeyRegistry};
@@ -609,7 +609,7 @@ impl Predictor for EagerPredictor {
 
 /// The factory `run_with` takes: a new predictor for every shadow screen (a snapshot starts a
 /// new one), all feeding the same stats.
-fn predictor_factory(
+pub fn predictor_factory(
     predict: Predict,
     rtt: Duration,
     stats: &Arc<Mutex<AdapterStats>>,
@@ -644,6 +644,8 @@ pub struct Faults {
     pub drop_pty_mode: AtomicBool,
     pub pty_modes: AtomicU64,
     pub echo_acks: AtomicU64,
+    /// Mid-stream repaint snapshots the daemon sent (W1's in-band `Repaint` answered).
+    pub repaints: AtomicU64,
     /// Dials fail while set (a link that cannot be remade).
     pub failing: AtomicBool,
     pub dials: AtomicU64,
@@ -676,6 +678,9 @@ impl<L: Link> Link for FaultLink<L> {
                     }
                     ControlMsg::EchoAck { .. } => {
                         self.faults.echo_acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ControlMsg::Snapshot(i) if i.reason == SnapshotReason::Repaint => {
+                        self.faults.repaints.fetch_add(1, Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -1551,6 +1556,8 @@ pub struct ResizeOutcome {
     pub shadow: Option<ShadowComparison>,
     /// The terminal against a fresh snapshot of the session (what a repaint would give).
     pub comparison: Comparison,
+    /// Repaints the client asked for and got (W1).
+    pub repaints: u64,
 }
 
 fn words(rng: &mut Rng, n: usize) -> String {
@@ -1598,6 +1605,7 @@ pub async fn resize_trial(case: ResizeCase) -> ResizeOutcome {
         rig.settle().await;
         c
     };
+    let repaints = rig.faults.repaints.load(Ordering::SeqCst);
     let comparison = rig.compare_to_snapshot().await;
     rig.abort().await;
     ResizeOutcome {
@@ -1606,6 +1614,7 @@ pub async fn resize_trial(case: ResizeCase) -> ResizeOutcome {
         report,
         shadow,
         comparison,
+        repaints,
     }
 }
 

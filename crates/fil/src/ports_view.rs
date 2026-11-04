@@ -16,7 +16,7 @@ use fil_proto::msg::{
     AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsRow,
     ProbeKind, ProcessInfo, RefusedRow, RefusedWhat, Response, SessionSummary,
 };
-use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin};
+use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin, PolicySetting};
 use serde::Serialize;
 
 use crate::forward_spec::{self, host_port, is_loopback_ip};
@@ -193,6 +193,12 @@ fn policy_line(p: &PolicyLine) -> String {
             "the sshd mirror is incomplete: fil cannot read {} and {more} more file{} the sshd config includes",
             sanitize_inline(file.as_str()),
             if *more == 1 { "" } else { "s" }
+        ),
+        // An sshd line fil cannot evaluate refuses only what the mirror would decide: a key
+        // the policy file sets stands. The daemon does not say which keys are set, so the line
+        // says where the exceptions come from instead of claiming everything.
+        PolicyLine::DenyAll(r) if r.setting == PolicySetting::Unevaluable => format!(
+            "every forward and the agent are refused, except what /etc/fil/policy.toml decides itself: {r}"
         ),
         PolicyLine::DenyAll(r) => format!("every forward and the agent are refused: {r}"),
         PolicyLine::Direct(r) => format!("direct mode is refused (attaches use the pipe): {r}"),

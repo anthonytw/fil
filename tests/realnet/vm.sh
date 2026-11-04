@@ -3,7 +3,7 @@
 # on the developer's Mac, not in the harness: the justfile's vm-* recipes call it.
 #
 #   vm.sh check                 the instance exists and is running
-#   vm.sh setup                 install what the VM lacks (conntrack, the toolchain, just, cargo-deny)
+#   vm.sh setup                 install what the VM lacks (conntrack, the toolchain, just, cargo-deny, cargo-about)
 #   vm.sh sync                  rsync this worktree to ~/src/<worktree> in the VM
 #   vm.sh run COMMAND...        sync, then run COMMAND in that directory with the pinned toolchain
 #   vm.sh realnet [ARGS...]     sync, then `just realnet ARGS` in the VM under the VM-wide lock
@@ -115,7 +115,7 @@ setup() {
   check
   sync
   # The one package the image lacks (the VM config in docs/dev/vm.md stays as created), then the
-  # toolchain and the two tools `just ci` needs, at the versions the CI jobs pin.
+  # toolchain and the three tools `just ci` needs, at the versions the CI jobs pin.
   vm_sh "$PRELUDE"'
 if ! command -v conntrack > /dev/null; then
   sudo apt-get update -q
@@ -123,6 +123,7 @@ if ! command -v conntrack > /dev/null; then
 fi
 command -v just > /dev/null || cargo install --locked just@1.59.0
 command -v cargo-deny > /dev/null || cargo install --locked cargo-deny@0.20.2
+command -v cargo-about > /dev/null || cargo install --locked cargo-about@0.9.3 --features cli
 just --version
 cargo --version' "$SRC" "$TARGET" "$TIMEOUT"
 }

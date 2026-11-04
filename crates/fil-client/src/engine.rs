@@ -74,6 +74,13 @@ const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
 /// How long output may sit behind a gap in the terminal stream before the link is given up on.
 const GAP_PATIENCE: Duration = Duration::from_secs(5);
+/// How long a mid-stream snapshot may be held with no progress at all, neither in the terminal
+/// stream below its position nor in its own bytes, before the link is given up on (DESIGN.md
+/// section 6.2). A live link always makes progress, however slow: at 256 kbit/s a 16 KiB segment
+/// takes half a second. A dead one goes `Down` long before this (`dead_after`, 5 s, is not
+/// configurable). So this only catches a link that stays up but has lost what it accepted, and a
+/// resume from a held snapshot is exact. Six times `dead_after`, for margin.
+const SNAPSHOT_PATIENCE: Duration = Duration::from_secs(30);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
@@ -234,6 +241,9 @@ struct Conn {
     /// next one waits here until they have. One at a time leaves room for one more, no more.
     snap_next: Option<SnapshotInfo>,
     early_bytes: usize,
+    /// While a mid-stream snapshot is held: what it last progressed to (its `at`, the terminal
+    /// position, its bytes received) and when ([`SNAPSHOT_PATIENCE`]).
+    snap_progress: Option<((u64, u64, u64), Instant)>,
 }
 
 impl Conn {
@@ -249,6 +259,25 @@ impl Conn {
             snap_early: Vec::new(),
             snap_next: None,
             early_bytes: 0,
+            snap_progress: None,
+        }
+    }
+
+    /// When a held mid-stream snapshot is given up on if nothing moves before then
+    /// ([`SNAPSHOT_PATIENCE`]); `terminal` is the terminal stream's position.
+    fn snapshot_stall_deadline(&mut self, terminal: u64) -> Option<Instant> {
+        let Some(s) = self.snap.as_ref().filter(|s| s.until.is_some()) else {
+            self.snap_progress = None;
+            return None;
+        };
+        let now = (s.info.at, terminal, s.recv.received());
+        match self.snap_progress {
+            Some((seen, since)) if seen == now => Some(since + SNAPSHOT_PATIENCE),
+            _ => {
+                let since = Instant::now();
+                self.snap_progress = Some((now, since));
+                Some(since + SNAPSHOT_PATIENCE)
+            }
         }
     }
 }
@@ -1036,10 +1065,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let result: Result<Served, ClientError> = async {
             Ok(loop {
                 let gap_deadline = primary.conn.gap_since.map(|t| t + GAP_PATIENCE);
-                let wake = match (self.next_wake(), gap_deadline) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                let stall_deadline = primary
+                    .conn
+                    .snapshot_stall_deadline(self.sess.recv.received());
+                let wake = [self.next_wake(), gap_deadline, stall_deadline]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 // No swap before the reply and any snapshot are in, and none without a session
                 // to resume (a fresh attach would reuse the key). None once the session has
                 // exited either: the new path would only hear `SessionGone` and lose the status.
@@ -1171,6 +1203,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                         }
                         if primary.conn.gap_since.is_some_and(|t| t.elapsed() >= GAP_PATIENCE) {
                             tracing::warn!("terminal data stayed out of order; reconnecting");
+                            ended = Some(Served::Reconnect);
+                        }
+                        if stall_deadline.is_some_and(|t| Instant::now() >= t) {
+                            tracing::warn!("a held snapshot made no progress; reconnecting");
                             ended = Some(Served::Reconnect);
                         }
                     }
@@ -1948,6 +1984,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 let fresh = fresh.to_vec();
                 self.apply_output(pos, &fresh)?;
             }
+        }
+        if limit.is_some_and(|until| self.sess.recv.received() < until)
+            && !conn.term_held.is_empty()
+        {
+            // Output past what is still missing below the snapshot's position has arrived. The
+            // terminal channel keeps its order on every link, so the missing bytes will never
+            // come on this one: the resume is exact (the position has not moved).
+            return Self::reconnect("output below a snapshot's position was lost");
         }
         conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
             // Output past a snapshot's position waits for the snapshot, which is announced: not

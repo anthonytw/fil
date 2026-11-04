@@ -611,6 +611,67 @@ async fn a_link_lost_while_a_catch_up_waits_for_the_output_before_it_resumes() {
     assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
 }
 
+/// The output below a catch-up's position never comes, but later output does: the terminal
+/// channel keeps its order, so the missing bytes are lost for good. The client reconnects at once
+/// (not after 4 MiB of held output) and resumes exactly, and every line is there once.
+#[tokio::test(start_paused = true)]
+async fn output_past_a_held_catch_up_with_the_output_before_it_missing_reconnects_at_once() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..30)).await;
+    settle().await;
+    rig.daemon
+        .catch_up_in_flight(&lines(30..60), &lines(60..300), 217, InFlight::Withheld)
+        .await;
+    settle().await;
+    assert_eq!(
+        rig.daemon.attaches().await.len(),
+        1,
+        "waits while nothing is proven lost"
+    );
+    rig.daemon.output(&lines(300..305)).await;
+    until_async("the reconnect", 1, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    settle().await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some(), "a resume, not a fresh attach: {a:?}");
+    assert_eq!(numbers_shown(&rig), (0..305).collect::<Vec<_>>());
+    assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
+}
+
+/// The output below a catch-up's position never comes and the session is quiet, on a link that
+/// stays up: nothing moves, so after `SNAPSHOT_PATIENCE` (30 s) the client gives the link up and
+/// resumes exactly.
+#[tokio::test(start_paused = true)]
+async fn a_held_catch_up_that_makes_no_progress_is_given_up_after_30_s() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..30)).await;
+    settle().await;
+    rig.daemon
+        .catch_up_in_flight(&lines(30..60), &lines(60..300), 217, InFlight::Withheld)
+        .await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    settle().await;
+    assert_eq!(
+        rig.daemon.attaches().await.len(),
+        1,
+        "still waiting at 25 s"
+    );
+    until_async("the reconnect", 10, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    settle().await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some(), "a resume, not a fresh attach: {a:?}");
+    assert_eq!(numbers_shown(&rig), (0..300).collect::<Vec<_>>());
+    assert_eq!(rig.term.state().screen, rig.daemon.screen(0).await.screen);
+}
+
 #[tokio::test(start_paused = true)]
 async fn output_that_overtakes_its_snapshot_waits_behind_it() {
     let rig = start(config());

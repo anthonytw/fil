@@ -61,6 +61,8 @@ pub enum InFlight {
     AfterSnapshot,
     /// Never: the link dies after the snapshot's bytes, before the output arrives.
     Lost,
+    /// Never, and the link stays up: a peer or transport that lost what it accepted.
+    Withheld,
 }
 
 pub const NOW_MS: u64 = 1_700_000_000_000;
@@ -1511,6 +1513,10 @@ impl FakeDaemon {
                 if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
                     c.control.kill(DownReason::Dead);
                 }
+            }
+            InFlight::Withheld => {
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+                snapshot().await;
             }
         }
     }

@@ -130,7 +130,15 @@ async fn a_backlog_jumps_with_the_marker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catch_up_never_repeats_what_the_client_has() {
     let sc = Scratch::new();
-    let mut cfg = sh_config(&sc, "main", &lines_script(1500));
+    // The first 20 lines go out alone, and the flood waits until the client has them: whether the
+    // client has anything before the jump must not depend on how fast the daemon's reader and
+    // serve task run against the shell (on a loaded runner the whole flood can be in the log
+    // before the first byte of it is sent, and then the first jump skips from the start).
+    let script = format!(
+        "stty -echo; echo READY; read go; seq -f 'L%06g {PAD}' 1 20; read go2; \
+         seq -f 'L%06g {PAD}' 21 1500; echo END; sleep 30"
+    );
+    let mut cfg = sh_config(&sc, "main", &script);
     cfg.catch_up = CatchUpParams {
         max_bytes: 16 * 1024,
         ..CatchUpParams::default()
@@ -139,6 +147,10 @@ async fn a_catch_up_never_repeats_what_the_client_has() {
     let h = spawn_plain(cfg).await;
     let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
     c.wait_screen("READY").await;
+    c.type_bytes(b"\n").await;
+    c.wait_out(&format!("L000020 {PAD}\r\n")).await;
+    assert!(c.mid_snapshots.is_empty(), "{:?}", c.mid_snapshots);
+    // Only now the flood: the client reads none of it until it is all in the log.
     c.type_bytes(b"\n").await;
     wait_log_end(&h, 1500 * 59).await;
     c.wait_screen("END").await;
@@ -151,8 +163,9 @@ async fn a_catch_up_never_repeats_what_the_client_has() {
         c.mid_snapshots.len()
     );
     let nums: Vec<u32> = seen.iter().flatten().copied().collect();
-    // Not vacuous: the client did have lines before the jump, and got lines from the snapshot.
-    assert!(seen[..marker].iter().flatten().count() > 0, "{seen:?}");
+    // Not vacuous: the client did have lines before the jump (the script holds the flood back
+    // until it has the first 20), and got lines from the snapshot.
+    assert!(seen[..marker].iter().flatten().count() >= 20, "{seen:?}");
     assert!(seen[marker + 1..].iter().flatten().count() > 24, "{seen:?}");
     // Every line once, wherever the jumps were.
     assert_eq!(nums, (1..=1500).collect::<Vec<_>>());

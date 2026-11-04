@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use fil_forward::pace::{MIN_CAP, PaceConfig};
 use fil_netsim::stream::StreamConfig;
+use fil_proto::mux::OpenKind;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 macro_rules! per_transport {
@@ -171,4 +173,198 @@ async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
         w.daemon.ep.pace_state()
     );
     (rtts[rtts.len() / 2], rate, queued)
+}
+
+const OFF: PaceConfig = PaceConfig {
+    enabled: false,
+    fixed_cap: None,
+};
+
+/// The slow pipe of the cell above.
+fn slow_pipe() -> StreamConfig {
+    StreamConfig {
+        latency: Duration::from_millis(20),
+        jitter: Duration::ZERO,
+        bandwidth: Some(RATE),
+        buffer: 1 << 20,
+    }
+}
+
+/// **Parallel downloads** (B1 of the review): 16 and 32 at once through one `-L` on the slow
+/// pipe. The peer acknowledges on drain, so the shared cap keeps its ack clock, and the link stays
+/// as full as unpaced (2.5 MB/s, measured in the cell above) with the terminal still fast. Before
+/// that, 16 gave 1.2 MB/s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_downloads_keep_the_link_full() {
+    for n in [16, 32] {
+        let source = serve(|mut s| async move {
+            let buf = vec![9u8; 64 * 1024];
+            while s.write_all(&buf).await.is_ok() {}
+        })
+        .await;
+        let mut w = World::new_pipe_on(mux_config(), slow_pipe()).await;
+        let port = w.local_forward(1, source.port);
+        let got = Arc::new(AtomicU64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..n {
+            let mut down = connect(port).await;
+            let got = got.clone();
+            readers.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(k) = down.read(&mut buf).await {
+                    if k == 0 {
+                        break;
+                    }
+                    got.fetch_add(k as u64, Ordering::Relaxed);
+                }
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
+        let mut rtts = Vec::new();
+        for i in 0..15 {
+            rtts.push(probe(&mut w, i).await);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
+        readers.iter().for_each(|r| r.abort());
+        rtts.sort();
+        let p50 = rtts[rtts.len() / 2];
+        eprintln!(
+            "{n} parallel downloads: {:.0} KB/s, probe p50 {p50:?}, daemon {:?}",
+            rate / 1e3,
+            w.daemon.ep.pace_state()
+        );
+        assert!(rate >= 0.9 * RATE as f64, "{n}: {rate}");
+        assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");
+    }
+}
+
+per_transport!(stuck_forwards_hold_neither_a_live_forward_nor_the_agent);
+
+/// **Readers that stopped** (B2 of the review), on both sides at once: 8 uploads into a `-L` whose
+/// target never reads (the client's pacer) and 8 downloads whose application never reads (the
+/// daemon's). A live forward's 1 MiB echo and the agent's request-and-answer still go at about
+/// their unpaced speed: each stuck channel stops only itself. Before, 8 stuck readers stalled every
+/// other channel for good.
+async fn stuck_forwards_hold_neither_a_live_forward_nor_the_agent(t: Transport) {
+    let w = World::new(t, mux_config()).await;
+    let (echo, agent) = stuck_cell(&w, 8, Duration::from_secs(3)).await;
+    assert!(echo <= Duration::from_secs(2), "{echo:?}");
+    assert!(agent <= Duration::from_millis(100), "{agent:?}");
+}
+
+/// The same on the slow pipe, with pacing and without (for the comparison it prints).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stuck_forwards_on_a_slow_pipe() {
+    let mut took = Vec::new();
+    for cfg in [OFF, PaceConfig::default()] {
+        let w = World::new_pipe_on(mux_config(), slow_pipe()).await;
+        w.client.ep.set_pacing(cfg);
+        w.daemon.ep.set_pacing(cfg);
+        eprintln!("slow pipe, {cfg:?}:");
+        took.push(stuck_cell(&w, 8, Duration::from_secs(10)).await);
+    }
+    // Both are slow-ish for the same reason: 16 stuck channels hold the opener's half of the
+    // budget, so the live channel gets the smallest window (16 KiB a round trip). Pacing must not
+    // add to that.
+    let (unpaced, paced) = (took[0], took[1]);
+    assert!(
+        paced.0 <= unpaced.0.mul_f64(1.25) + Duration::from_millis(300),
+        "echo {:?} paced against {:?}",
+        paced.0,
+        unpaced.0
+    );
+    assert!(
+        paced.1 <= unpaced.1 + Duration::from_millis(50),
+        "agent {:?} paced against {:?}",
+        paced.1,
+        unpaced.1
+    );
+}
+
+/// (the live forward's 1 MiB echo, the agent's median request-and-answer).
+async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
+    let deaf = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        drop(s);
+    })
+    .await;
+    let source = serve(|mut s| async move {
+        let buf = vec![9u8; 64 * 1024];
+        while s.write_all(&buf).await.is_ok() {}
+    })
+    .await;
+    let echo = echo_server().await;
+    let agent = echo_server().await;
+    w.client.targets.set_agent(agent.port);
+    let up_port = w.local_forward(1, deaf.port);
+    let down_port = w.local_forward(2, source.port);
+    let echo_port = w.local_forward(3, echo.port);
+    let mut held = Vec::new();
+    for _ in 0..k {
+        let mut s = connect(up_port).await;
+        held.push(tokio::spawn(async move {
+            let buf = vec![5u8; 64 * 1024];
+            while s.write_all(&buf).await.is_ok() {}
+        }));
+        // Downloads nobody reads: the socket is kept, never read.
+        let s = connect(down_port).await;
+        held.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            drop(s);
+        }));
+    }
+    tokio::time::sleep(settle).await;
+    let t0 = std::time::Instant::now();
+    if timeout(Duration::from_secs(10), echo_once(echo_port, 1 << 20, 7))
+        .await
+        .is_err()
+    {
+        panic!(
+            "the live forward did not answer beside stuck ones: client {:?} {:?}, daemon {:?} {:?}",
+            w.client.ep.pace_state(),
+            w.client.ep.snapshot(),
+            w.daemon.ep.pace_state(),
+            w.daemon.ep.snapshot()
+        );
+    }
+    let echo_took = t0.elapsed();
+    // The agent: the daemon opens an agent channel for a process on the host, which asks and
+    // waits for the answer, 20 times.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+    let (theirs, _) = l.accept().await.unwrap();
+    w.daemon
+        .ep
+        .open_stream(
+            OpenKind::Agent,
+            Box::new(theirs),
+            fil_forward::LocalPeer::Unix(None),
+        )
+        .expect("the agent channel opens");
+    let mut rtts = Vec::new();
+    let req = vec![3u8; 1024];
+    let mut back = vec![0u8; 1024];
+    for _ in 0..20 {
+        let t = std::time::Instant::now();
+        asker.write_all(&req).await.unwrap();
+        timeout(Duration::from_secs(10), asker.read_exact(&mut back))
+            .await
+            .expect("the agent answered beside stuck forwards")
+            .unwrap();
+        rtts.push(t.elapsed());
+    }
+    rtts.sort();
+    eprintln!(
+        "{k} stuck each way: 1 MiB echo in {echo_took:?}, agent p50 {:?} max {:?}; client {:?}, daemon {:?}",
+        rtts[10],
+        rtts[19],
+        w.client.ep.pace_state(),
+        w.daemon.ep.pace_state()
+    );
+    // About 0.9 s of link both ways on the slow pipe (0.52 s unpaced end to end in the review);
+    // instant on the plain links.
+    held.iter().for_each(|h| h.abort());
+    (echo_took, rtts[10])
 }

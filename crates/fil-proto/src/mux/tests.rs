@@ -942,13 +942,18 @@ fn records_split_across_segments_are_reassembled() {
     );
 }
 
+/// Acks: at once when the local socket took everything received (ack on drain, H1) or a quarter
+/// window is unacknowledged; otherwise (a reader that leaves bytes waiting) after the delay.
 #[test]
-fn acks_come_after_a_quarter_window_or_the_delay() {
+fn acks_come_on_drain_after_a_quarter_window_or_the_delay() {
     let mut p = Pair::new();
     let ch = open_pair(&mut p);
-    p.c.write(ch, &[0; 100]);
+    p.c.write(ch, &[0; 200]);
     p.pump();
-    drain(&mut p.d, ch);
+    // The reader takes half: bytes still wait, so no ack before the delay.
+    let half = p.d.read(ch, 100);
+    assert_eq!(half.len(), 100);
+    p.d.consumed(ch, half.len());
     let acks = |p: &mut Pair| {
         let mut n = 0;
         while let Some((c, pl)) = p.d.poll_transmit() {
@@ -961,9 +966,16 @@ fn acks_come_after_a_quarter_window_or_the_delay() {
         }
         n
     };
-    assert_eq!(acks(&mut p), 0, "100 bytes: not yet");
+    assert_eq!(acks(&mut p), 0, "100 of 200 bytes consumed: not yet");
     p.advance(ACK_DELAY);
     assert_eq!(acks(&mut p), 1, "after the delay");
+    // The rest consumed: everything received is written, so the ack goes at once.
+    drain(&mut p.d, ch);
+    assert_eq!(acks(&mut p), 1, "drained: at once");
+    p.c.write(ch, &[0; 100]);
+    p.pump();
+    drain(&mut p.d, ch);
+    assert_eq!(acks(&mut p), 1, "100 bytes, drained: at once");
     p.c.write(ch, &[0; 4096]);
     p.pump();
     drain(&mut p.d, ch);
@@ -1430,4 +1442,107 @@ fn the_control_poll_never_hands_out_data() {
         data += DataSegment::parse(&pl).unwrap().data.len();
     }
     assert_eq!(data, 8 * 1024);
+}
+
+/// `poll_transmit_channel` (H1's pacer reaches one channel with it) refuses wherever
+/// `poll_transmit` would hold that channel's data: before `OpenOk` at the opener, before the
+/// acceptor's `OpenOk` is on the wire, past the peer's credit, behind the Resume gate, and with
+/// the link down. The rules live in one function for both.
+#[test]
+fn poll_transmit_channel_holds_what_poll_transmit_holds() {
+    // The opener, before OpenOk.
+    let mut p = Pair::new();
+    let ch = p.c.open(local()).unwrap();
+    assert_eq!(p.c.write(ch, b"early"), 5);
+    assert!(
+        p.c.poll_transmit_channel(ch).is_none(),
+        "data before OpenOk"
+    );
+    p.pump();
+    assert!(
+        p.c.poll_transmit_channel(ch).is_none(),
+        "data before OpenOk"
+    );
+    p.d.accept(ch);
+    p.pump();
+    assert_eq!(drain(&mut p.d, ch), b"early");
+
+    // The acceptor, before its OpenOk is on the wire.
+    let mut c = Mux::new(Side::Client, cfg());
+    let mut d = Mux::new(Side::Daemon, cfg());
+    c.link_up(false);
+    d.link_up(false);
+    let ch = c.open(local()).unwrap();
+    let (mch, open) = c.poll_transmit().unwrap();
+    d.on_payload(mch, open).unwrap();
+    assert_eq!(d.write(ch, b"banner"), 6);
+    assert!(d.poll_transmit_channel(ch).is_none(), "before accept");
+    d.accept(ch);
+    assert!(
+        d.poll_transmit_channel(ch).is_none(),
+        "before its OpenOk is on the wire"
+    );
+    let (first, _ok) = d.poll_transmit_control().unwrap();
+    assert_eq!(first, ChannelId::MUX);
+    assert!(d.poll_transmit_channel(ch).is_some(), "after the OpenOk");
+
+    // Credit: exactly one window, as poll_transmit.
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    let window = crate::limits::MIN_WINDOW as usize;
+    assert_eq!(p.c.write(ch, &vec![7u8; 4 * window]), 4 * window);
+    let mut n = 0;
+    while let Some(pl) = p.c.poll_transmit_channel(ch) {
+        n += DataSegment::parse(&pl).unwrap().data.len();
+    }
+    assert_eq!(n, window, "exactly one window");
+    assert!(p.c.poll_transmit().is_none(), "and poll_transmit agrees");
+
+    // The Resume gate, and the link down.
+    let mut p = Pair::new();
+    let ch = open_pair(&mut p);
+    p.c.write(ch, b"one");
+    p.pump();
+    p.c.link_down();
+    p.d.link_down();
+    p.c.write(ch, b"two");
+    assert!(p.c.poll_transmit_channel(ch).is_none(), "link down");
+    let _ = p.c.link_up(true);
+    let from_d = p.d.link_up(true);
+    assert!(p.c.poll_transmit_channel(ch).is_none(), "gated");
+    for m in &from_d {
+        deliver_ctl(&mut p.c, m).unwrap();
+    }
+    assert!(
+        p.c.poll_transmit_channel(ch).is_some(),
+        "after the peer's Resume"
+    );
+    // An unknown channel.
+    assert!(p.c.poll_transmit_channel(ChannelId(10_000)).is_none());
+}
+
+/// Taking one channel's payload out of turn does not change `poll_transmit`'s round robin for
+/// the others.
+#[test]
+fn poll_transmit_channel_leaves_the_round_robin_alone() {
+    let big = MuxConfig {
+        window: Window::DEFAULT,
+        buffer: 1 << 20,
+        ..MuxConfig::default()
+    };
+    let mut p = Pair::with(big.clone(), big);
+    let a = open_pair(&mut p);
+    let b = open_pair(&mut p);
+    let c = open_pair(&mut p);
+    for ch in [a, b, c] {
+        assert!(p.c.write(ch, &vec![1u8; 64 * 1024]) > 0);
+    }
+    let order: Vec<ChannelId> = std::iter::from_fn(|| p.c.poll_transmit().map(|(ch, _)| ch))
+        .take(3)
+        .collect();
+    assert!(p.c.poll_transmit_channel(b).is_some());
+    let next: Vec<ChannelId> = std::iter::from_fn(|| p.c.poll_transmit().map(|(ch, _)| ch))
+        .take(3)
+        .collect();
+    assert_eq!(order, next, "the turn order is unchanged");
 }

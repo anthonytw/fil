@@ -15,65 +15,102 @@
 //! is the smallest sample of the last two periods (30 s each); the current delay is the smallest
 //! of the last four samples; their difference is the queueing delay. The cap on bytes in flight
 //! then follows LEDBAT: slow start (the cap grows by what is acknowledged) until the queueing
-//! delay reaches half the target, then a linear controller that moves the cap by up to
-//! [`STEP`] per round trip toward [`TARGET`] (25 ms) of queueing delay, and halves it per round
-//! trip past twice the target. It grows only while it held something back, so an application
-//! that sends little never earns a cap it does not use.
+//! delay reaches half the target, then a linear controller toward [`TARGET`] (25 ms) of queueing
+//! delay, halving per round trip past four times the target. It grows only while it held something
+//! back, so an application that sends little never earns a cap it does not use.
+//!
+//! **Samples never include the peer's ack timer.** The peer acknowledges at once when its local
+//! socket has taken everything received or a threshold's worth is unacknowledged, and otherwise
+//! after a 100 ms timer (`ACK_DELAY`; fil-proto's mux). A timer ack would read as 100 ms or more of
+//! queue, and with several channels sharing the cap (none reaching the threshold) it was every
+//! ack: the cap sank to its floor. So a sample counts in full only when its ack cannot have waited
+//! for the timer: it covers a threshold's worth, or it came back sooner than the path's base
+//! round trip plus `ACK_DELAY` after the first byte it covers was sent. Any other is *bounded*:
+//! the real round trip is at least the sample less [`ACK_SLACK`], and that lower bound is used only
+//! to shrink the cap, never to grow it or to measure the base.
 //!
 //! **What counts as in flight.** A record is in flight from when it is handed to the link until
-//! it is acknowledged, or until the peer acknowledges a record of *any* channel sent after it:
-//! the path delivers in order (the pipe is one byte stream; QUIC streams share a path), so by
-//! then the earlier one has arrived and waits only for its own reader or for the peer's ack
-//! delay. Without that rule an application that reads slowly would keep up to its whole window
-//! counted as "in flight" and stop every other forward. A channel with nothing in flight may
-//! always send one payload (up to twice the cap in all): a new connection, an agent request or a
-//! reply in a request-and-response protocol is never held behind a bulk transfer, and a channel
-//! whose peer stopped reading cannot hold the others' first bytes.
+//! it is acknowledged, or until it is *presumed delivered*: the peer acknowledged a record of any
+//! channel sent after it, and the record is old enough that a reader that reads would have
+//! acknowledged it (two round trips from a peer that acknowledges on drain; a round trip and
+//! [`ACK_SLACK`] from one that may wait for its timer). Such a record waits at a reader that is
+//! not reading; without the rule a slow reader would keep its whole window counted and stop every
+//! other forward. A channel with bytes presumed delivered is *parked*: its acks give no round-trip
+//! samples (they measure its reader) until it has acknowledged everything sent. The age gate keeps the presumption from running ahead of a transport that does
+//! not deliver in order across channels: QUIC round-robins its streams, so a light channel's ack
+//! can overtake a bulk channel's bytes still in quinn's buffer.
+//!
+//! **Passes.** A channel with nothing unacknowledged on this link may send one payload past the
+//! cap: a new connection's first bytes, or the next request of a request-and-response protocol,
+//! is not held behind a bulk transfer. Passes have a budget of their own beyond the cap
+//! ([`PASS_BUDGET`]), and agent channels a separate one ([`AGENT_RESERVE`]), so neither many new
+//! connections nor readers that stopped can take the agent's way through. A channel whose reader
+//! stopped never gets a pass again (its bytes stay unacknowledged), so it stops only itself.
 //!
 //! **Re-measuring the base.** A controller that keeps the queue at its target never sees the
 //! empty path again, so its base would creep up with every period it forgets. Once per period, if
-//! the cap held something back in it, the cap drops to [`MIN_CAP`] until a payload sent while at
-//! most that much was in flight has been acknowledged (about one round trip), then returns to
-//! where it was. That costs about one round trip in 30 s. The first such drain comes two round
-//! trips after slow start ends (as LEDBAT++'s initial slowdown): slow start's samples include the
-//! queue of its own bursts and of the path's own ramp-up (TCP's slow start under the pipe), and a
-//! base measured then would leave a standing queue until the next period.
+//! the cap held something back in it, the cap drops to [`MIN_CAP`], without forward passes, until a
+//! payload sent while less than that was in flight has been acknowledged (about one round trip),
+//! then returns to where it was. If what is still counted keeps it above that (a reader that
+//! stopped keeps its bytes counted until a later ack), one payload goes as the probe after two
+//! round trips of holding, when the path's queue has drained anyway. The first such drain comes two
+//! round trips after slow start ends (as LEDBAT++'s initial slowdown): slow start's samples include
+//! the queue of its own bursts and of the path's own ramp-up (TCP's slow start under the pipe).
+//! Only trusted samples enter the base, so a drain that ends on its time limit cannot raise it.
 //!
 //! **What is never paced.** Only dynamic channels (forwarded and agent connections) pass through
 //! here. Control messages, the terminal, the snapshot and the MUX channel never do: the
 //! endpoint's control sender (acks and MUX records) does not consult the pacer, and the terminal
 //! never goes through the endpoint at all.
 //!
-//! The pacer is sans-IO: no clock and no tasks, the time is passed in. One per link: a new link
-//! starts a new one (its path, and so its base, may be another), and a path change on QUIC
-//! forgets the base.
+//! **Clock.** The pacer is sans-IO: no clock and no tasks, the time is passed in. It changes with
+//! acks, sends and two kinds of deadline (a record that becomes presumed delivered, a drain's time
+//! limit), which [`Pacer::next_deadline`] reports, so a held sender sleeps until then or the next
+//! ack. One pacer per link: a new link starts a new one (its path, and so its base, may be
+//! another), and a path change on QUIC forgets the base.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use fil_proto::ChannelId;
+use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use tracing::debug;
 
 /// The queueing delay the pacer aims for. Keystrokes wait behind about this much forward data
 /// (DESIGN.md §8.5 "Pacing"; H1's target was a keystroke p50 under load of at most twice idle
 /// plus 10 ms).
 pub const TARGET: Duration = Duration::from_millis(25);
-/// The smallest cap: two acknowledgements' worth (the peer acknowledges every 32 KiB), so a
-/// paced channel's acknowledgements are never only the peer's 100 ms timer.
+/// The smallest cap: two full payloads and more than the peer's ack threshold, so a lone channel
+/// paced at the floor still keeps the path busy between acks.
 pub const MIN_CAP: usize = 64 * 1024;
 /// The largest cap. Far more than any channel's window (4 MiB at most), so on a fast path the
 /// windows limit, as without pacing.
 pub const MAX_CAP: usize = 64 * 1024 * 1024;
 /// The cap a link starts with, in slow start.
 pub const INITIAL_CAP: usize = 256 * 1024;
-/// How far the linear controller moves the cap in one round trip, at most.
+/// How far the linear controller moves the cap in one round trip, at least (it moves up to an
+/// eighth of the cap when that is more).
 pub const STEP: usize = 16 * 1024;
-/// How many recent samples the current delay is the smallest of.
+/// What forward passes may have in flight beyond the cap: two full payloads. Small, so a slow
+/// path's queue is the floor's and not twice it.
+pub const PASS_BUDGET: usize = 32 * 1024;
+/// What agent channels may have in flight beyond the cap, besides [`PASS_BUDGET`]: an agent
+/// request or answer (rarely more than a few KiB) never waits for forwards.
+pub const AGENT_RESERVE: usize = 32 * 1024;
+/// The longest an acknowledgement can wait at a peer that consumed its bytes: its timer
+/// (`ACK_DELAY`) and the tick that runs it (50 ms). A sample is at most this much longer than
+/// the round trip it measures.
+pub const ACK_SLACK: Duration = Duration::from_millis(ACK_DELAY.as_millis() as u64 + 50);
+/// After this many small acks that no timer can have sent, the peer is taken to acknowledge on
+/// drain.
+const DRAIN_PROOFS: u32 = 3;
+/// The current delay is the smallest sample of the last base round trip, and of at least this
+/// many samples: a standing queue shows, a burst's passing queue does not.
 const CURRENT_SAMPLES: usize = 4;
 /// The base is the smallest sample of this period and the one before.
 pub const BASE_PERIOD: Duration = Duration::from_secs(30);
 /// A drain that has not seen its sample by then ends anyway (the application stopped sending).
-const DRAIN_LIMIT: Duration = Duration::from_secs(1);
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 /// A payload is merged into its channel's last record while that record is smaller than this,
 /// so a channel that sends many small payloads keeps few records.
 const COALESCE: u64 = 16 * 1024;
@@ -99,19 +136,45 @@ impl Default for PaceConfig {
     }
 }
 
+impl PaceConfig {
+    /// The default, unless the environment says `FIL_FORWARD_PACING=off`: the switch for
+    /// measuring "before" (DESIGN.md §8.5 "Pacing"). Read when an endpoint starts; the daemon has
+    /// the environment of whatever started it.
+    pub fn from_env() -> Self {
+        match std::env::var_os("FIL_FORWARD_PACING") {
+            Some(v) if v == "off" => Self {
+                enabled: false,
+                fixed_cap: None,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
 /// Whether the pacer applies to `ch`: dynamic channels only (forwarded and agent connections).
 pub fn paced(ch: ChannelId) -> bool {
     ch.is_dynamic()
 }
 
+/// What a payload was sent on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    Cap,
+    Pass,
+    Agent,
+}
+
 /// One payload, or several merged, in flight. `at` is when its last byte was handed to the link:
 /// a sample measures from there, and "sent before the newest acknowledged record" is decided by
-/// it, which for a merged record is the later (safe) end.
+/// it, which for a merged record is the later (safe) end. `first_at` is when its first byte was:
+/// whether an ack can have waited for the peer's timer is decided by it (the earlier, safe end).
 #[derive(Clone, Copy, Debug)]
 struct Rec {
     start: u64,
     end: u64,
     at: Instant,
+    first_at: Instant,
+    via: Via,
 }
 
 #[derive(Debug, Default)]
@@ -119,8 +182,15 @@ struct Chan {
     recs: VecDeque<Rec>,
     /// The highest acknowledgement seen on this link.
     acked: u64,
-    /// Bytes of `recs` still counted in flight.
-    counted: usize,
+    /// One past the highest byte handed to this link.
+    sent: u64,
+    /// Bytes of it were presumed delivered (its reader is not keeping up): its acks give no
+    /// samples, since they measure its reading, until it has acknowledged everything sent.
+    parked: bool,
+    /// While parked, it keeps no more unacknowledged than it had when it was parked: it sends
+    /// as its reader consumes (a reader that stopped, nothing more), and leaves the cap to the
+    /// channels whose readers read.
+    parked_limit: u64,
 }
 
 impl Chan {
@@ -133,7 +203,12 @@ impl Chan {
 struct Drain {
     saved: usize,
     started: Instant,
-    /// When the first payload left with no more than [`MIN_CAP`] in flight.
+    /// After holding this long (two round trips) the path's queue has drained whatever is
+    /// still counted (a reader that stopped keeps its bytes counted until a later ack), so one
+    /// payload may go as the drain's probe.
+    probe_at: Instant,
+    /// When the probe left: the first payload with less than [`MIN_CAP`] in flight, or after
+    /// `probe_at`.
     low_at: Option<Instant>,
 }
 
@@ -142,11 +217,18 @@ struct Drain {
 pub struct PaceState {
     pub cap: usize,
     pub in_flight: usize,
+    /// Of `in_flight`, sent on a forward pass and on the agent's reserve.
+    pub passes: usize,
+    pub agent: usize,
     pub base: Option<Duration>,
     pub current: Option<Duration>,
     pub slow_start: bool,
     pub draining: bool,
+    /// Samples used in full, and bounded ones (their ack may have waited for the peer's timer).
     pub samples: u64,
+    pub bounded: u64,
+    /// Acks of channels whose reader is not keeping up, which give no sample.
+    pub parked_acks: u64,
 }
 
 /// The pacer of one link and side.
@@ -156,24 +238,34 @@ pub struct Pacer {
     cap: usize,
     slow_start: bool,
     in_flight: usize,
+    passes: usize,
+    agent: usize,
     chans: HashMap<u32, Chan>,
     /// The send time of the newest record acknowledged: every record sent before it has arrived.
     newest_acked_at: Option<Instant>,
+    /// When the next record becomes presumed delivered, if one is waiting to.
+    next_prune: Option<Instant>,
     /// The cap held something back since the last update.
     limited: bool,
     /// ... and in this base period.
     limited_in_period: bool,
-    recent: VecDeque<Duration>,
+    /// Recent trusted samples and when they came.
+    recent: VecDeque<(Instant, Duration)>,
     base_now: Option<Duration>,
     base_prev: Option<Duration>,
     period_start: Instant,
     drain: Option<Drain>,
-    /// The first drain, due two round trips after slow start ends: what slow start measured
-    /// includes the queue its own bursts and the path's own ramp-up (TCP's slow start under the
-    /// pipe) made, so the base is measured once more before the controller trusts it.
+    /// The first drain, due two round trips after slow start ends.
     first_drain_at: Option<Instant>,
     path_generation: u64,
     samples: u64,
+    bounded: u64,
+    /// The latest time seen (`advance`, `on_sent`, `on_ack`).
+    clock: Instant,
+    /// Small acks this link saw that no timer can have sent (the peer acknowledges on drain).
+    drain_proofs: u32,
+    /// Acks of parked channels (no sample taken).
+    parked_acks: u64,
 }
 
 impl Pacer {
@@ -183,11 +275,14 @@ impl Pacer {
             cap: cfg.fixed_cap.unwrap_or(INITIAL_CAP),
             slow_start: true,
             in_flight: 0,
+            passes: 0,
+            agent: 0,
             chans: HashMap::new(),
             newest_acked_at: None,
+            next_prune: None,
             limited: false,
             limited_in_period: false,
-            recent: VecDeque::with_capacity(CURRENT_SAMPLES),
+            recent: VecDeque::new(),
             base_now: None,
             base_prev: None,
             period_start: now,
@@ -195,18 +290,30 @@ impl Pacer {
             first_drain_at: None,
             path_generation: 0,
             samples: 0,
+            bounded: 0,
+            clock: now,
+            drain_proofs: 0,
+            parked_acks: 0,
         }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.cfg.enabled
     }
 
     pub fn state(&self) -> PaceState {
         PaceState {
             cap: self.cap,
             in_flight: self.in_flight,
+            passes: self.passes,
+            agent: self.agent,
             base: self.base(),
-            current: self.recent.iter().min().copied(),
+            current: self.current(),
             slow_start: self.slow_start,
             draining: self.drain.is_some(),
             samples: self.samples,
+            bounded: self.bounded,
+            parked_acks: self.parked_acks,
         }
     }
 
@@ -217,6 +324,10 @@ impl Pacer {
         }
     }
 
+    fn current(&self) -> Option<Duration> {
+        self.recent.iter().map(|&(_, d)| d).min()
+    }
+
     fn effective_cap(&self) -> usize {
         if self.drain.is_some() {
             MIN_CAP.min(self.cap)
@@ -225,18 +336,77 @@ impl Pacer {
         }
     }
 
-    /// May a payload on `ch` go now? `false` marks the cap as limiting. Channels that are not
-    /// [`paced`] always may.
-    pub fn admit(&mut self, ch: ChannelId, now: Instant) -> bool {
+    /// When something time-driven is next due: a record becoming presumed delivered, or a drain's
+    /// time limit. `None`: only an ack or a send changes anything. A held sender sleeps until
+    /// then (or the next ack) and calls [`Pacer::advance`].
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let drain = self.drain.map(|d| match d.low_at {
+            None => d.probe_at,
+            Some(_) => d.started + DRAIN_LIMIT,
+        });
+        match (self.next_prune, drain) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The time is `now`: what is due by then (see [`Pacer::next_deadline`]).
+    pub fn advance(&mut self, now: Instant) {
+        self.clock = self.clock.max(now);
+        if self.next_prune.is_some_and(|t| now >= t) {
+            self.prune(now);
+        }
+        if let Some(d) = self.drain
+            && now.duration_since(d.started) >= DRAIN_LIMIT
+        {
+            // No sample from the probe (the application stopped, or every ack was bounded): the
+            // base stays what trusted samples made it.
+            self.cap = d.saved;
+            self.drain = None;
+        }
+    }
+
+    /// How a payload on `ch` would go now: under the cap, on a pass, or not at all.
+    fn route(&self, ch: ChannelId, agent: bool) -> Option<Via> {
+        if let Some(c) = self.chans.get(&ch.0)
+            && c.parked
+            && c.sent - c.acked >= c.parked_limit
+        {
+            return None;
+        }
+        if self.in_flight < self.effective_cap() || self.probe_due() {
+            return Some(Via::Cap);
+        }
+        if !self.nothing_unacked(ch) {
+            return None;
+        }
+        if agent && self.agent < AGENT_RESERVE {
+            return Some(Via::Agent);
+        }
+        if self.drain.is_none() && self.passes < PASS_BUDGET {
+            return Some(Via::Pass);
+        }
+        None
+    }
+
+    /// A drain has held for its two round trips and not sent its probe yet.
+    fn probe_due(&self) -> bool {
+        self.drain
+            .is_some_and(|d| d.low_at.is_none() && self.clock >= d.probe_at)
+    }
+
+    fn nothing_unacked(&self, ch: ChannelId) -> bool {
+        self.chans.get(&ch.0).is_none_or(|c| c.acked >= c.sent)
+    }
+
+    /// May a payload on `ch` (`agent`: an agent channel) go now? `false` marks the cap as
+    /// limiting. Channels that are not [`paced`] always may.
+    pub fn admit(&mut self, ch: ChannelId, agent: bool, now: Instant) -> bool {
         if !self.cfg.enabled || !paced(ch) {
             return true;
         }
-        self.end_stale_drain(now);
-        let cap = self.effective_cap();
-        if self.in_flight < cap {
-            return true;
-        }
-        if self.free_pass(ch) {
+        self.advance(now);
+        if self.route(ch, agent).is_some() {
             return true;
         }
         self.limited = true;
@@ -245,41 +415,43 @@ impl Pacer {
     }
 
     /// Whether a payload on `ch` would be held now ([`Pacer::admit`] without its side effects).
-    pub fn holds(&self, ch: ChannelId) -> bool {
-        self.cfg.enabled
-            && paced(ch)
-            && self.in_flight >= self.effective_cap()
-            && !self.free_pass(ch)
+    pub fn holds(&self, ch: ChannelId, agent: bool) -> bool {
+        self.cfg.enabled && paced(ch) && self.route(ch, agent).is_none()
     }
 
-    /// Whether `ch` may go although the cap is reached: it has nothing in flight, and the
-    /// passes in flight stay under one more cap.
-    pub fn free_pass(&self, ch: ChannelId) -> bool {
-        paced(ch)
-            && self.chans.get(&ch.0).is_none_or(|c| c.counted == 0)
-            && self.in_flight < 2 * self.effective_cap()
+    /// Whether a payload on `ch` may go now (under the cap, on a pass or the agent's reserve):
+    /// for a sender that looks past a held payload of another channel.
+    pub fn may_go(&self, ch: ChannelId, agent: bool) -> bool {
+        !self.cfg.enabled || !paced(ch) || self.route(ch, agent).is_some()
     }
 
-    /// The payload `[start, end)` of `ch` was handed to the link.
-    pub fn on_sent(&mut self, ch: ChannelId, start: u64, end: u64, now: Instant) {
+    /// The payload `[start, end)` of `ch` was handed to the link (after [`Pacer::admit`]).
+    pub fn on_sent(&mut self, ch: ChannelId, start: u64, end: u64, agent: bool, now: Instant) {
         if !self.cfg.enabled || !paced(ch) || end <= start {
             return;
         }
+        self.clock = self.clock.max(now);
+        let via = self.route(ch, agent).unwrap_or(Via::Cap);
         if let Some(d) = &mut self.drain
             && d.low_at.is_none()
-            && self.in_flight < MIN_CAP
+            && (self.in_flight < MIN_CAP || now >= d.probe_at)
         {
             d.low_at = Some(now);
         }
         let c = self.chans.entry(ch.0).or_default();
         let start = start.max(c.acked);
+        c.sent = c.sent.max(end);
         if end <= start {
             return;
         }
         let len = (end - start) as usize;
         let full = c.recs.len() >= MAX_RECORDS;
         match c.recs.back_mut() {
-            Some(last) if last.end <= start && (last.end - last.start < COALESCE || full) => {
+            Some(last)
+                if last.end <= start
+                    && last.via == via
+                    && (last.end - last.start < COALESCE || full) =>
+            {
                 last.end = end;
                 last.at = now;
             }
@@ -287,15 +459,35 @@ impl Pacer {
                 start,
                 end,
                 at: now,
+                first_at: now,
+                via,
             }),
         }
-        c.counted += len;
         self.in_flight += len;
+        match via {
+            Via::Cap => {}
+            Via::Pass => self.passes += len,
+            Via::Agent => self.agent += len,
+        }
+        if via != Via::Cap {
+            let due = now + self.prune_age();
+            self.next_prune = Some(self.next_prune.map_or(due, |n| n.min(due)));
+        }
     }
 
-    /// The peer acknowledged (consumed) everything of `ch` below `upto`. Returns whether that
-    /// freed anything in flight.
-    pub fn on_ack(&mut self, ch: ChannelId, upto: u64, now: Instant) -> bool {
+    fn uncount(&mut self, via: Via, n: usize) {
+        self.in_flight -= n;
+        match via {
+            Via::Cap => {}
+            Via::Pass => self.passes -= n,
+            Via::Agent => self.agent -= n,
+        }
+    }
+
+    /// The peer acknowledged (consumed) everything of `ch` below `upto`; `threshold` is how many
+    /// unacknowledged bytes make it acknowledge at once (`min(32 KiB, its window / 4)`). Returns
+    /// whether that freed anything in flight.
+    pub fn on_ack(&mut self, ch: ChannelId, upto: u64, threshold: u64, now: Instant) -> bool {
         if !self.cfg.enabled || !paced(ch) {
             return false;
         }
@@ -305,62 +497,134 @@ impl Pacer {
         if upto <= c.acked {
             return false;
         }
+        self.clock = self.clock.max(now);
         let before = self.in_flight;
-        let mut sample: Option<Instant> = None;
+        let prev = c.acked;
+        // The first byte this ack covers left with the record holding it (if it is still kept).
+        let first_at = c
+            .recs
+            .front()
+            .filter(|r| r.start <= prev && r.end > prev)
+            .map(|r| r.first_at);
         let mut newest: Option<Instant> = None;
+        let mut freed: Vec<(Via, usize)> = Vec::new();
         while let Some(r) = c.recs.front().copied() {
             if r.end <= upto {
-                let n = c.counted_of(&r);
-                c.counted -= n;
-                self.in_flight -= n;
+                freed.push((r.via, c.counted_of(&r)));
                 c.recs.pop_front();
-                sample = Some(r.at);
                 newest = Some(r.at);
             } else {
                 // Partly acknowledged: those bytes are no longer in flight, but its `at` is its
                 // last byte's, which has not been acknowledged.
                 if r.start.max(c.acked) < upto {
-                    let n = (upto - r.start.max(c.acked)) as usize;
-                    c.counted -= n;
-                    self.in_flight -= n;
+                    freed.push((r.via, (upto - r.start.max(c.acked)) as usize));
                 }
                 break;
             }
         }
         c.acked = upto;
+        let parked = c.parked;
+        if c.acked >= c.sent {
+            c.parked = false;
+        }
+        for (via, n) in freed {
+            self.uncount(via, n);
+        }
         let acked = before - self.in_flight;
         if let Some(at) = newest {
             self.newest_acked_at = Some(self.newest_acked_at.map_or(at, |t| t.max(at)));
-            self.prune_delivered();
-        }
-        if let Some(at) = sample {
-            self.on_sample(now.saturating_duration_since(at), at, acked, now);
+            let rtt = now.saturating_duration_since(at);
+            // Can this ack have waited for the peer's timer? Not if it covers a threshold's worth
+            // (that acks at once), nor if it came back sooner than the timer could have let it.
+            // A peer that acknowledges on drain (this build) shows it: a small ack well inside
+            // the timer's reach. Once it has shown that a few times, its small acks are taken as
+            // drain acks; the timer then only fires for a reader that leaves bytes waiting, whose
+            // samples measure its reading anyway, and the current delay is the smallest sample
+            // across every channel.
+            let small = upto - prev < threshold.max(1);
+            let age = first_at.map(|f| now.saturating_duration_since(f));
+            let base = self.base().unwrap_or(rtt);
+            if small && age.is_some_and(|a| a < base + ACK_DELAY / 2) {
+                self.drain_proofs = self.drain_proofs.saturating_add(1);
+            }
+            let prompt = !small
+                || self.drain_proofs >= DRAIN_PROOFS
+                || age.is_some_and(|a| a < base + ACK_DELAY);
+            if parked {
+                self.parked_acks += 1;
+            } else {
+                self.on_sample(rtt, prompt, at, acked, now);
+            }
+            // After the sample, so the age a record must reach uses the current round trip.
+            self.prune(now);
         }
         self.in_flight < before
     }
 
-    /// Records sent before the newest acknowledged one have arrived: no longer in flight.
-    fn prune_delivered(&mut self) {
-        let Some(t) = self.newest_acked_at else {
-            return;
-        };
+    /// Records presumed delivered stop counting (see the module docs); `next_prune` becomes the
+    /// next time one will.
+    fn prune(&mut self, now: Instant) {
+        self.next_prune = None;
+        let newest = self.newest_acked_at;
+        let age = self.prune_age();
+        let mut freed: Vec<(Via, usize)> = Vec::new();
+        let mut next: Option<Instant> = None;
         for c in self.chans.values_mut() {
             while let Some(r) = c.recs.front().copied() {
-                if r.at >= t {
+                // A pass (one payload from a channel with nothing else unacknowledged) that its
+                // reader has not acknowledged in time stops counting by age alone: else readers
+                // that stopped would keep the pass budget, and with the cap full of their bytes and
+                // nothing else moving, no later ack would ever free it. Bytes under the cap wait
+                // for a later ack too, so a dead path is not filled.
+                let later_acked = newest.is_some_and(|t| r.at < t);
+                if !later_acked && r.via == Via::Cap {
                     break;
                 }
-                let n = c.counted_of(&r);
-                c.counted -= n;
-                self.in_flight -= n;
+                if now < r.at + age {
+                    let due = r.at + age;
+                    next = Some(next.map_or(due, |n: Instant| n.min(due)));
+                    break;
+                }
+                freed.push((r.via, c.counted_of(&r)));
                 c.recs.pop_front();
+                if !c.parked {
+                    c.parked = true;
+                    c.parked_limit = c.sent - c.acked;
+                }
             }
+        }
+        for (via, n) in freed {
+            self.uncount(via, n);
+        }
+        self.next_prune = next;
+    }
+
+    /// How old a record must be to be presumed delivered: two round trips (and 10 ms of jitter)
+    /// from a peer that acknowledges on drain, which acknowledges a consumed record within a round
+    /// trip; a round trip and the ack slack otherwise. Readers that stopped then fill what their
+    /// windows allow about as fast as the path takes it, and leave the cap to the others.
+    fn prune_age(&self) -> Duration {
+        // At most the base and four targets: a current delay past that is not a queue the age
+        // should wait out (it is a reader's, or a queue this controller is already shrinking).
+        let base = self.base().unwrap_or(Duration::ZERO);
+        let rtt = self
+            .current()
+            .unwrap_or(base)
+            .min(base.max(Duration::from_millis(1)) + 4 * TARGET);
+        if self.drain_proofs >= DRAIN_PROOFS {
+            2 * rtt + Duration::from_millis(10)
+        } else {
+            rtt + ACK_SLACK
         }
     }
 
-    /// The channel is released: forget it.
+    /// The channel is released (or closed: the peer sends no acks after its `Close`): forget it.
     pub fn forget(&mut self, ch: ChannelId) {
         if let Some(c) = self.chans.remove(&ch.0) {
-            self.in_flight -= c.counted;
+            for r in &c.recs {
+                let n = c.counted_of(r);
+                self.uncount(r.via, n);
+            }
         }
     }
 
@@ -381,47 +645,60 @@ impl Pacer {
         self.path_generation
     }
 
-    fn end_stale_drain(&mut self, now: Instant) {
-        if let Some(d) = self.drain
-            && now.duration_since(d.started) >= DRAIN_LIMIT
-        {
-            self.cap = d.saved;
-            self.drain = None;
-        }
+    fn start_drain(&mut self, now: Instant, why: &'static str) {
+        debug!(
+            cap = self.cap,
+            why, "forward pacing: measuring the base again"
+        );
+        let rtt = self.current().or(self.base()).unwrap_or(Duration::ZERO);
+        self.drain = Some(Drain {
+            saved: self.cap,
+            started: now,
+            probe_at: now + 2 * rtt,
+            low_at: None,
+        });
     }
 
-    fn on_sample(&mut self, rtt: Duration, sent_at: Instant, acked: usize, now: Instant) {
-        self.samples += 1;
+    fn on_sample(
+        &mut self,
+        rtt: Duration,
+        prompt: bool,
+        sent_at: Instant,
+        acked: usize,
+        now: Instant,
+    ) {
         if now.duration_since(self.period_start) >= BASE_PERIOD {
             self.period_start = now;
+            // Only trusted samples ever enter the base (never a drain's end, never a bounded
+            // sample), so a period whose drain timed out cannot raise it; a base that no trusted
+            // sample confirms expires with its periods, as a changed path needs.
             self.base_prev = self.base_now.take();
             if self.limited_in_period && self.drain.is_none() && self.cfg.fixed_cap.is_none() {
-                debug!(cap = self.cap, "forward pacing: measuring the base again");
-                self.drain = Some(Drain {
-                    saved: self.cap,
-                    started: now,
-                    low_at: None,
-                });
+                self.start_drain(now, "period");
             }
             self.limited_in_period = false;
         }
         if self.first_drain_at.is_some_and(|t| now >= t) && self.drain.is_none() {
             self.first_drain_at = None;
-            debug!(
-                cap = self.cap,
-                "forward pacing: measuring the base after slow start"
-            );
-            self.drain = Some(Drain {
-                saved: self.cap,
-                started: now,
-                low_at: None,
-            });
+            self.start_drain(now, "after slow start");
         }
+        if !prompt {
+            self.bounded += 1;
+            self.on_bounded(rtt, now);
+            return;
+        }
+        self.samples += 1;
         self.base_now = Some(self.base_now.map_or(rtt, |b| b.min(rtt)));
-        if self.recent.len() == CURRENT_SAMPLES {
+        self.recent.push_back((now, rtt));
+        let span = self.base().unwrap_or(rtt);
+        while self.recent.len() > CURRENT_SAMPLES
+            && self
+                .recent
+                .front()
+                .is_some_and(|&(t, _)| now.duration_since(t) > span)
+        {
             self.recent.pop_front();
         }
-        self.recent.push_back(rtt);
         if let Some(d) = self.drain {
             if d.low_at.is_some_and(|low| sent_at >= low) {
                 self.cap = d.saved;
@@ -434,40 +711,86 @@ impl Pacer {
             return;
         }
         let base = self.base().unwrap_or(rtt);
-        let current = self.recent.iter().min().copied().unwrap_or(rtt);
+        let current = self.current().unwrap_or(rtt);
         let queued = current.saturating_sub(base);
         let limited = std::mem::take(&mut self.limited);
         if self.slow_start {
-            if queued * 2 < TARGET {
+            // Out at three quarters of the target (LEDBAT++): slow start's own bursts queue a
+            // little, and leaving at the first sign of that left long fat paths short.
+            if queued * 4 < TARGET * 3 {
                 if limited {
                     self.cap = self.cap.saturating_add(acked);
                 }
             } else {
-                self.slow_start = false;
-                self.cap /= 2;
-                self.first_drain_at = Some(now + 2 * current);
-                debug!(
-                    cap = self.cap,
-                    base_us = base.as_micros() as u64,
-                    "forward pacing: slow start ends"
-                );
+                self.end_slow_start(now, base, current);
             }
         } else {
-            let target = TARGET.as_secs_f64();
-            let off = ((target - queued.as_secs_f64()) / target).clamp(-1.0, 1.0);
-            if off < 0.0 || limited {
-                // Up to an eighth of the cap per round trip, at least STEP: a long fat path
-                // reaches its rate in a few dozen round trips, a short one moves gently.
-                let gain = (STEP as f64).max(self.cap as f64 / 8.0);
-                let delta = gain * off * acked as f64 / self.cap.max(1) as f64;
-                self.cap = (self.cap as f64 + delta).max(0.0) as usize;
-            }
-            if queued > 2 * TARGET {
-                self.cap = self.cap.saturating_sub(acked / 2);
-            }
+            self.linear(queued, limited, acked);
         }
         self.cap = self.cap.clamp(MIN_CAP, MAX_CAP);
     }
+
+    fn end_slow_start(&mut self, now: Instant, base: Duration, current: Duration) {
+        self.slow_start = false;
+        // Take out the queue slow start overshot by: what is in flight, scaled from the current
+        // round trip down to the base plus half the target (a delay-based exit has no loss's
+        // factor-of-two overshoot to undo).
+        let keep = (base + TARGET / 2).as_secs_f64() / current.max(base).as_secs_f64().max(1e-6);
+        self.cap = (self.cap as f64 * keep.min(1.0)) as usize;
+        self.first_drain_at = Some(now + 2 * current);
+        debug!(
+            cap = self.cap,
+            base_us = base.as_micros() as u64,
+            "forward pacing: slow start ends"
+        );
+    }
+
+    fn linear(&mut self, queued: Duration, limited: bool, acked: usize) {
+        let target = TARGET.as_secs_f64();
+        let off = ((target - queued.as_secs_f64()) / target).clamp(-1.0, 1.0);
+        if off < 0.0 || limited {
+            // Up to an eighth of the cap per round trip, at least STEP: a long fat path reaches
+            // its rate in a few dozen round trips, a short one moves gently.
+            let gain = (STEP as f64).max(self.cap as f64 / 8.0);
+            let delta = gain * off * acked as f64 / self.cap.max(1) as f64;
+            self.cap = (self.cap as f64 + delta).max(0.0) as usize;
+        }
+        // Far past the target (a queue that is not this controller's overshoot), halve per round
+        // trip; nearer, the linear term's eighth per round trip does it without undershooting a
+        // long path's round trip of feedback delay.
+        if queued > 4 * TARGET {
+            self.cap = self.cap.saturating_sub(acked / 2);
+        }
+    }
+
+    /// A sample whose ack may have waited for the peer's timer: the real round trip is at least
+    /// `rtt - ACK_SLACK`. Only a queue that this lower bound already shows shrinks the cap; nothing
+    /// grows it, and it is not a base.
+    fn on_bounded(&mut self, rtt: Duration, now: Instant) {
+        if self.drain.is_some() || self.cfg.fixed_cap.is_some() {
+            return;
+        }
+        let Some(base) = self.base() else {
+            return;
+        };
+        let queued = rtt.saturating_sub(ACK_SLACK).saturating_sub(base);
+        if queued <= TARGET {
+            return;
+        }
+        if self.slow_start {
+            let current = self.current().unwrap_or(base);
+            self.end_slow_start(now, base, current);
+            return;
+        }
+        // As a prompt sample with that queue would, for one payload's worth.
+        self.linear(queued, false, COALESCE as usize);
+        self.cap = self.cap.clamp(MIN_CAP, MAX_CAP);
+    }
+}
+
+/// The threshold at which a peer whose window is `window` acknowledges at once.
+pub fn ack_threshold(window: u32) -> u64 {
+    ACK_AFTER_BYTES.min(u64::from(window) / 4)
 }
 
 #[cfg(test)]

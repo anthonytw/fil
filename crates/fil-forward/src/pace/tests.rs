@@ -1,6 +1,8 @@
 //! The pacer against a simulated path: a FIFO bottleneck of a given rate and queue, a one-way
-//! delay each way, and a receiver that acknowledges as fil's does (after 32 KiB consumed, or
-//! 100 ms after the first unacknowledged byte). Simulated time, so every run is exact and fast.
+//! delay each way, and a receiver that acknowledges as fil's does: at once when it consumed
+//! everything received (ack on drain) or 32 KiB is unacknowledged, otherwise 100 ms after the
+//! first unacknowledged byte, on a 50 ms tick. `drain_acks: false` is a receiver from before H1
+//! (no ack on drain). Simulated time, so every run is exact and fast.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -9,7 +11,9 @@ use super::*;
 
 const PAYLOAD: u64 = 16 * 1024;
 const ACK_AFTER: u64 = 32 * 1024;
-const ACK_DELAY: Duration = Duration::from_millis(100);
+const TICK: Duration = Duration::from_millis(50);
+/// How often a slow reader reads.
+const READ_EVERY: Duration = Duration::from_millis(10);
 /// Each channel's window, fil's default.
 const WINDOW: u64 = 1 << 20;
 
@@ -25,6 +29,8 @@ enum Source {
     Stuck(u64),
     /// `bytes` every `every`, from `from`.
     Periodic { bytes: u64, every: Duration },
+    /// Always has data; its reader takes this many bytes a second.
+    Slow(u64),
 }
 
 #[derive(Debug)]
@@ -42,14 +48,35 @@ struct Flow {
     ack_timer: Option<Duration>,
     /// Bytes delivered to the receiving application (throughput).
     delivered: u64,
+    /// An agent channel (the pacer's reserve).
+    agent: bool,
+    /// Periodic writes not yet delivered (their end offset and time), and how long each took.
+    writes: std::collections::VecDeque<(u64, Duration)>,
+    latencies: Vec<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Ev {
-    Arrive { flow: usize, end: u64 },
-    AckTimer { flow: usize },
-    AckArrive { flow: usize, upto: u64 },
-    Write { flow: usize },
+    Arrive {
+        flow: usize,
+        end: u64,
+    },
+    AckTimer {
+        flow: usize,
+    },
+    AckArrive {
+        flow: usize,
+        upto: u64,
+    },
+    Write {
+        flow: usize,
+    },
+    /// The pacer's next deadline (the endpoint's data sender sleeps until it).
+    Deadline,
+    /// A slow reader takes its share.
+    Read {
+        flow: usize,
+    },
 }
 
 struct Sim {
@@ -68,6 +95,9 @@ struct Sim {
     /// (time, queueing delay of a payload at the bottleneck).
     qdelays: Vec<(Duration, Duration)>,
     max_queue: u64,
+    /// The receiver acknowledges on drain (this build); off, it is a receiver from before H1.
+    drain_acks: bool,
+    deadline: Option<Duration>,
 }
 
 impl Sim {
@@ -87,7 +117,15 @@ impl Sim {
             pacer: Pacer::new(cfg, t0),
             qdelays: Vec::new(),
             max_queue: 0,
+            drain_acks: true,
+            deadline: None,
         }
+    }
+
+    fn agent_flow(&mut self, n: u32, source: Source) -> usize {
+        let i = self.flow(n, source);
+        self.flows[i].agent = true;
+        i
     }
 
     fn flow(&mut self, n: u32, source: Source) -> usize {
@@ -102,9 +140,15 @@ impl Sim {
             acked: 0,
             ack_timer: None,
             delivered: 0,
+            agent: false,
+            writes: std::collections::VecDeque::new(),
+            latencies: Vec::new(),
         });
         if let Source::Periodic { .. } = source {
             self.at(self.now, Ev::Write { flow: i });
+        }
+        if let Source::Slow(_) = source {
+            self.at(self.now + READ_EVERY, Ev::Read { flow: i });
         }
         i
     }
@@ -121,7 +165,7 @@ impl Sim {
     fn available(&self, f: &Flow) -> u64 {
         let credit = (f.peer_acked + WINDOW).saturating_sub(f.next);
         let data = match f.source {
-            Source::Bulk | Source::Stuck(_) => PAYLOAD,
+            Source::Bulk | Source::Stuck(_) | Source::Slow(_) => PAYLOAD,
             Source::Periodic { .. } => f.written - f.next,
         };
         data.min(PAYLOAD).min(credit)
@@ -137,13 +181,14 @@ impl Sim {
                     continue;
                 }
                 let c = self.flows[i].ch;
+                let agent = self.flows[i].agent;
                 let now = self.instant();
-                if !self.pacer.admit(c, now) {
+                if !self.pacer.admit(c, agent, now) {
                     continue;
                 }
                 let start = self.flows[i].next;
                 self.flows[i].next += n;
-                self.pacer.on_sent(c, start, start + n, now);
+                self.pacer.on_sent(c, start, start + n, agent, now);
                 // The bottleneck.
                 let backlog: u64 = self.queued_bytes.range(self.now..).map(|(_, b)| *b).sum();
                 assert!(
@@ -166,7 +211,14 @@ impl Sim {
                 sent = true;
             }
             if !sent {
-                return;
+                break;
+            }
+        }
+        if let Some(d) = self.pacer.next_deadline() {
+            let at = d.saturating_duration_since(self.t0).max(self.now);
+            if self.deadline != Some(at) {
+                self.deadline = Some(at);
+                self.at(at, Ev::Deadline);
             }
         }
     }
@@ -175,6 +227,7 @@ impl Sim {
         let f = &mut self.flows[i];
         let upto = match f.source {
             Source::Stuck(limit) => f.received.min(limit),
+            Source::Slow(_) => f.delivered,
             _ => f.received,
         };
         f.ack_timer = None;
@@ -202,14 +255,26 @@ impl Sim {
                     f.received = end;
                     let consumable = match f.source {
                         Source::Stuck(limit) => end.min(limit),
+                        Source::Slow(_) => f.delivered,
                         _ => end,
                     };
                     f.delivered = consumable;
-                    if consumable.saturating_sub(f.acked) >= ACK_AFTER {
+                    while f.writes.front().is_some_and(|&(e, _)| e <= consumable) {
+                        let (_, w) = f.writes.pop_front().expect("checked");
+                        f.latencies.push(t - w);
+                    }
+                    let drained = consumable == end;
+                    if consumable.saturating_sub(f.acked) >= ACK_AFTER
+                        || (self.drain_acks && drained && consumable > f.acked)
+                    {
                         self.ack(flow);
                     } else if consumable > f.acked && f.ack_timer.is_none() {
-                        f.ack_timer = Some(t + ACK_DELAY);
-                        self.at(t + ACK_DELAY, Ev::AckTimer { flow });
+                        // The timer runs on the endpoint's tick.
+                        let due = t + ACK_DELAY;
+                        let ticks = due.as_nanos().div_ceil(TICK.as_nanos()) as u32;
+                        let at = TICK * ticks;
+                        f.ack_timer = Some(at);
+                        self.at(at, Ev::AckTimer { flow });
                     }
                 }
                 Ev::AckTimer { flow } => {
@@ -221,11 +286,39 @@ impl Sim {
                     self.flows[flow].peer_acked = upto;
                     let c = self.flows[flow].ch;
                     let now = self.instant();
-                    self.pacer.on_ack(c, upto, now);
+                    self.pacer.on_ack(c, upto, ACK_AFTER, now);
+                }
+                Ev::Read { flow } => {
+                    if let Source::Slow(rate) = self.flows[flow].source {
+                        let f = &mut self.flows[flow];
+                        let take = (rate as f64 * READ_EVERY.as_secs_f64()) as u64;
+                        f.delivered = (f.delivered + take).min(f.received);
+                        let consumable = f.delivered;
+                        let drained = consumable == f.received;
+                        if consumable.saturating_sub(f.acked) >= ACK_AFTER
+                            || (self.drain_acks && drained && consumable > f.acked)
+                        {
+                            self.ack(flow);
+                        } else if consumable > f.acked && f.ack_timer.is_none() {
+                            let due = t + ACK_DELAY;
+                            let ticks = due.as_nanos().div_ceil(TICK.as_nanos()) as u32;
+                            let at = TICK * ticks;
+                            self.flows[flow].ack_timer = Some(at);
+                            self.at(at, Ev::AckTimer { flow });
+                        }
+                        self.at(t + READ_EVERY, Ev::Read { flow });
+                    }
+                }
+                Ev::Deadline => {
+                    self.deadline = None;
+                    let now = self.instant();
+                    self.pacer.advance(now);
                 }
                 Ev::Write { flow } => {
                     if let Source::Periodic { bytes, every } = self.flows[flow].source {
                         self.flows[flow].written += bytes;
+                        let end = self.flows[flow].written;
+                        self.flows[flow].writes.push_back((end, t));
                         self.at(t + every, Ev::Write { flow });
                     }
                 }
@@ -399,10 +492,12 @@ fn a_stuck_reader_does_not_hold_the_other_channels() {
 }
 
 /// The cap is full of a channel whose reader stopped, and nothing else is moving: a new channel
-/// still gets its first payload out (a channel with nothing in flight is never held), and once
-/// its bytes are acknowledged the stuck ones stop counting.
+/// still gets its first payload out (it has nothing unacknowledged), and not a second before its
+/// peer acknowledges. The stuck channel never gets a pass (its bytes stay unacknowledged), and
+/// once the new channel's ack has come, the stuck bytes stop counting when they are old enough to
+/// have been acknowledged by a reader that reads.
 #[test]
-fn a_channel_with_nothing_in_flight_may_always_send() {
+fn a_channel_with_nothing_unacknowledged_may_pass() {
     let t0 = Instant::now();
     let mut p = Pacer::new(
         PaceConfig {
@@ -413,29 +508,48 @@ fn a_channel_with_nothing_in_flight_may_always_send() {
     );
     let stuck = ch(16);
     let mut off = 0;
-    while p.admit(stuck, t0) {
-        p.on_sent(stuck, off, off + PAYLOAD, t0);
+    while p.admit(stuck, false, t0) {
+        p.on_sent(stuck, off, off + PAYLOAD, false, t0);
         off += PAYLOAD;
     }
     assert!(p.state().in_flight >= MIN_CAP);
     let later = t0 + Duration::from_millis(10);
     let new = ch(17);
-    assert!(
-        p.admit(new, later),
-        "a channel with nothing in flight is held"
-    );
-    p.on_sent(new, 0, 100, later);
-    assert!(!p.admit(new, later), "a second payload goes past the cap");
-    assert!(!p.admit(stuck, later));
-    // Its reply comes back: the stuck channel's older bytes have arrived.
-    p.on_ack(new, 100, later + Duration::from_millis(40));
+    assert!(p.admit(new, false, later), "a new channel is held");
+    p.on_sent(new, 0, 100, false, later);
+    assert_eq!(p.state().passes, 100);
+    assert!(!p.admit(new, false, later), "a second payload passes");
+    assert!(!p.admit(stuck, false, later), "the stuck channel passes");
+    // Its reply comes back in 40 ms: the stuck bytes stop counting once they are older than a
+    // round trip and the ack slack, not before.
+    let back = later + Duration::from_millis(40);
+    p.on_ack(new, 100, ACK_AFTER, back);
+    assert_eq!(p.state().passes, 0);
+    assert!(p.state().in_flight >= MIN_CAP, "{:?}", p.state());
+    let due = p
+        .next_deadline()
+        .expect("a record is waiting to be presumed delivered");
+    assert!(due > back && due <= t0 + Duration::from_millis(40) + ACK_SLACK);
+    p.advance(due);
     assert_eq!(p.state().in_flight, 0, "{:?}", p.state());
-    assert!(p.admit(stuck, later + Duration::from_millis(40)));
+    assert_eq!(p.next_deadline(), None);
+    // The stuck channel is parked: under the cap, but it sends nothing more until its reader
+    // consumes (it keeps no more unacknowledged than it had).
+    assert!(
+        !p.admit(stuck, false, due),
+        "a reader that stopped gets more"
+    );
+    assert!(p.admit(new, false, due), "the live channel is held");
+    // Its reader takes a payload's worth: as much may go again.
+    p.on_ack(stuck, PAYLOAD, ACK_AFTER, due);
+    assert!(p.admit(stuck, false, due), "an ack-clocked channel is held");
 }
 
-/// Free passes are bounded: past twice the cap, nobody goes.
+/// Passes have a budget of their own beyond the cap, and agent channels a reserve beside it: new
+/// connections fill the budget, an agent request still goes. A drain suspends forward passes,
+/// not the agent's.
 #[test]
-fn free_passes_stop_at_twice_the_cap() {
+fn passes_have_a_budget_and_the_agent_a_reserve() {
     let t0 = Instant::now();
     let mut p = Pacer::new(
         PaceConfig {
@@ -445,13 +559,45 @@ fn free_passes_stop_at_twice_the_cap() {
         t0,
     );
     let mut n = 16;
-    while p.admit(ch(n), t0) {
-        p.on_sent(ch(n), 0, PAYLOAD, t0);
+    while p.admit(ch(n), false, t0) {
+        p.on_sent(ch(n), 0, PAYLOAD, false, t0);
         n += 2;
     }
     let st = p.state();
-    assert!(st.in_flight >= 2 * MIN_CAP, "{st:?}");
-    assert!(st.in_flight <= 2 * MIN_CAP + PAYLOAD as usize, "{st:?}");
+    assert!(st.in_flight >= MIN_CAP + PASS_BUDGET, "{st:?}");
+    assert!(st.passes <= PASS_BUDGET + PAYLOAD as usize, "{st:?}");
+    assert!(
+        st.in_flight <= MIN_CAP + PASS_BUDGET + 2 * PAYLOAD as usize,
+        "{st:?}"
+    );
+    // An agent request beside them.
+    let agent = ch(17);
+    assert!(p.admit(agent, true, t0), "the agent waits for forwards");
+    p.on_sent(agent, 0, 2000, true, t0);
+    assert_eq!(p.state().agent, 2000);
+    assert!(
+        !p.admit(agent, true, t0),
+        "a second agent payload before the ack"
+    );
+    // A forward in the same position would not have gone: the pass budget is spent.
+    assert!(p.holds(ch(999), false), "{:?}", p.state());
+}
+
+/// During a drain forward passes wait; a new connection goes once the drain is over.
+#[test]
+fn a_drain_holds_forward_passes() {
+    let mut s = Sim::new(20.0, 40, PaceConfig::default());
+    s.flow(16, Source::Bulk);
+    s.run(secs(5));
+    let now = s.instant();
+    s.pacer.start_drain(now, "test");
+    assert!(s.pacer.holds(ch(99), false), "a pass during a drain");
+    assert!(
+        !s.pacer.holds(ch(97), true),
+        "the agent's reserve during a drain"
+    );
+    s.run(secs(7));
+    assert!(!s.pacer.state().draining, "{:?}", s.pacer.state());
 }
 
 /// Channels below 16 (control, terminal, snapshot, MUX) are never held, whatever is in flight.
@@ -466,8 +612,8 @@ fn interactive_channels_are_never_held() {
         t0,
     );
     let mut n = 16;
-    while p.admit(ch(n), t0) {
-        p.on_sent(ch(n), 0, PAYLOAD, t0);
+    while p.admit(ch(n), false, t0) {
+        p.on_sent(ch(n), 0, PAYLOAD, false, t0);
         n += 2;
     }
     for c in [
@@ -476,8 +622,8 @@ fn interactive_channels_are_never_held() {
         ChannelId::SNAPSHOT,
         ChannelId::MUX,
     ] {
-        assert!(p.admit(c, t0), "{c:?} was held");
-        p.on_sent(c, 0, 1000, t0);
+        assert!(p.admit(c, false, t0), "{c:?} was held");
+        p.on_sent(c, 0, 1000, false, t0);
     }
     assert!(p.state().in_flight <= 2 * MIN_CAP + PAYLOAD as usize);
 }
@@ -512,8 +658,8 @@ fn disabled_admits_everything() {
         t0,
     );
     for i in 0..1000u64 {
-        assert!(p.admit(ch(16), t0));
-        p.on_sent(ch(16), i * PAYLOAD, (i + 1) * PAYLOAD, t0);
+        assert!(p.admit(ch(16), false, t0));
+        p.on_sent(ch(16), i * PAYLOAD, (i + 1) * PAYLOAD, false, t0);
     }
     assert_eq!(p.state().in_flight, 0);
 }
@@ -526,18 +672,18 @@ fn accounting_is_exact() {
     let mut p = Pacer::new(PaceConfig::default(), t0);
     let a = ch(16);
     let b = ch(18);
-    p.on_sent(a, 0, 1000, t0);
-    p.on_sent(a, 1000, 3000, t0 + Duration::from_millis(5));
-    p.on_sent(b, 0, 500, t0 + Duration::from_millis(6));
+    p.on_sent(a, 0, 1000, false, t0);
+    p.on_sent(a, 1000, 3000, false, t0 + Duration::from_millis(5));
+    p.on_sent(b, 0, 500, false, t0 + Duration::from_millis(6));
     assert_eq!(p.state().in_flight, 3500);
-    p.on_ack(a, 1500, t0 + Duration::from_millis(40));
+    p.on_ack(a, 1500, ACK_AFTER, t0 + Duration::from_millis(40));
     assert_eq!(p.state().in_flight, 2000);
     // A stale or repeated ack changes nothing.
-    p.on_ack(a, 1200, t0 + Duration::from_millis(41));
+    p.on_ack(a, 1200, ACK_AFTER, t0 + Duration::from_millis(41));
     assert_eq!(p.state().in_flight, 2000);
     p.forget(a);
     assert_eq!(p.state().in_flight, 500);
-    p.on_ack(b, 500, t0 + Duration::from_millis(50));
+    p.on_ack(b, 500, ACK_AFTER, t0 + Duration::from_millis(50));
     assert_eq!(p.state().in_flight, 0);
     // The ack of the newest record gave a sample.
     assert!(p.state().samples >= 1);
@@ -563,11 +709,11 @@ fn records_are_bounded() {
     let t0 = Instant::now();
     let mut p = Pacer::new(PaceConfig::default(), t0);
     for i in 0..10_000u64 {
-        p.on_sent(ch(16), i, i + 1, t0 + Duration::from_millis(i * 3));
+        p.on_sent(ch(16), i, i + 1, false, t0 + Duration::from_millis(i * 3));
     }
     assert!(p.chans[&16].recs.len() <= MAX_RECORDS);
     assert_eq!(p.state().in_flight, 10_000);
-    p.on_ack(ch(16), 10_000, t0 + Duration::from_secs(60));
+    p.on_ack(ch(16), 10_000, ACK_AFTER, t0 + Duration::from_secs(60));
     assert_eq!(p.state().in_flight, 0);
 }
 
@@ -584,18 +730,20 @@ fn a_base_measured_in_slow_start_is_measured_again() {
     let mut t = t0;
     // One payload out at `at`, acknowledged `rtt` later.
     let mut exchange = |p: &mut Pacer, at: Instant, rtt: u64| {
-        p.on_sent(c, off, off + PAYLOAD, at);
+        p.on_sent(c, off, off + PAYLOAD, false, at);
         off += PAYLOAD;
-        p.on_ack(c, off, at + Duration::from_millis(rtt));
+        p.on_ack(c, off, ACK_AFTER, at + Duration::from_millis(rtt));
     };
-    // Slow start sees 80 ms, then 100 ms: it ends, with 80 ms as the base.
+    // Slow start sees 80 ms, then (a base round trip later) 100 ms: it ends, with 80 ms as the
+    // base.
     for _ in 0..4 {
         exchange(&mut p, t, 80);
         t += Duration::from_millis(10);
     }
+    t += Duration::from_millis(100);
     for _ in 0..4 {
         exchange(&mut p, t, 100);
-        t += Duration::from_millis(10);
+        t += Duration::from_millis(30);
     }
     let st = p.state();
     assert!(!st.slow_start, "{st:?}");
@@ -608,10 +756,226 @@ fn a_base_measured_in_slow_start_is_measured_again() {
     // A payload sent with less than the floor in flight comes back in 45 ms: that is the base,
     // and the drain ends with the cap where it was.
     t += Duration::from_millis(10);
-    assert!(p.admit(c, t));
+    assert!(p.admit(c, false, t));
     exchange(&mut p, t, 45);
     let end = p.state();
     assert!(!end.draining, "{end:?}");
     assert_eq!(end.base, Some(Duration::from_millis(45)));
     assert!(end.cap > MIN_CAP, "{end:?}");
+}
+
+// ---- several channels (the review of PR #83: B1, B2, S2, S4) --------------------------------
+
+/// Total delivered Mbit/s of `n` bulk flows over `secs`, and the median queueing delay after 5 s.
+fn bulk_cell(
+    mbit: f64,
+    rtt: u64,
+    n: u32,
+    cfg: PaceConfig,
+    drain_acks: bool,
+    secs_: u64,
+) -> (f64, Duration, PaceState) {
+    let mut s = Sim::new(mbit, rtt, cfg);
+    s.drain_acks = drain_acks;
+    let fl: Vec<usize> = (0..n).map(|i| s.flow(16 + 2 * i, Source::Bulk)).collect();
+    s.run(secs(secs_));
+    let tot = fl.iter().map(|&f| s.mbit(f, secs_ as f64)).sum();
+    (tot, s.median_qdelay(secs(5), secs(secs_)), s.pacer.state())
+}
+
+const OFF: PaceConfig = PaceConfig {
+    enabled: false,
+    fixed_cap: None,
+};
+
+/// Parallel transfers through forwards (a browser through `-D`, `docker pull`, parallel
+/// `rsync`): 1 to 32 bulk channels share the cap. Each keeps its acks prompt (the receiver
+/// acknowledges on drain), so the link stays as full as without the pacer, and the queue near
+/// the target. Before ack on drain, 16 channels made every ack a timer ack and the cap sank to the
+/// floor (-52 %).
+#[test]
+fn parallel_flows_keep_the_link_full() {
+    for (mbit, rtt) in [(20.0, 40), (5.0, 80)] {
+        for n in [1, 4, 16, 32] {
+            let (paced, q, st) = bulk_cell(mbit, rtt, n, PaceConfig::default(), true, 20);
+            let (unpaced, uq, _) = bulk_cell(mbit, rtt, n, OFF, true, 20);
+            eprintln!(
+                "{mbit} Mbit/s {rtt} ms, {n} flows: {paced:.2} Mbit/s q {q:?} paced, {unpaced:.2} q {uq:?} unpaced, {st:?}"
+            );
+            assert!(
+                paced >= 0.9 * unpaced,
+                "{n} flows: {paced} against {unpaced}"
+            );
+            // The floor is more than a 5 Mbit/s path holds with 80 ms (about 105 ms of queue).
+            let bound = if mbit < 10.0 { 150 } else { 50 };
+            assert!(q <= Duration::from_millis(bound), "{n} flows: queue {q:?}");
+        }
+    }
+}
+
+/// A receiver from before ack on drain (timer acks only): the samples its acks give are never
+/// trusted when they may have waited for the timer, so the base stays the path's and the queue
+/// is not hidden; throughput is what such acks allow.
+#[test]
+fn a_receiver_that_acks_on_its_timer_does_not_skew_the_base() {
+    for n in [1, 16, 32] {
+        let (paced, q, st) = bulk_cell(20.0, 40, n, PaceConfig::default(), false, 20);
+        let (unpaced, _, _) = bulk_cell(20.0, 40, n, OFF, false, 20);
+        eprintln!(
+            "timer-only receiver, {n} flows: {paced:.2} paced, {unpaced:.2} unpaced, q {q:?}, {st:?}"
+        );
+        let base = st.base.expect("a base");
+        assert!(
+            base <= Duration::from_millis(60),
+            "{n} flows: base {base:?}"
+        );
+        assert!(q <= Duration::from_millis(60), "{n} flows: queue {q:?}");
+        assert!(
+            paced >= 0.6 * unpaced,
+            "{n} flows: {paced} against {unpaced}"
+        );
+    }
+}
+
+/// Readers that stopped (8 to 32 of them, each with a never-acknowledged window) beside a live
+/// bulk transfer: they fill their own windows and stop, as without the pacer, and the live one
+/// then has the link. (Before, they kept taking passes after every live ack until the passes
+/// filled their budget, and every other channel stopped for good.)
+#[test]
+fn stuck_readers_stop_only_themselves() {
+    for k in [8, 16, 32] {
+        let cell = |cfg| {
+            let mut s = Sim::new(20.0, 40, cfg);
+            let b = s.flow(16, Source::Bulk);
+            for i in 0..k {
+                s.flow(18 + 2 * i, Source::Stuck(0));
+            }
+            // 32 windows of 1 MiB take about 13 s of the link to fill, with or without pacing.
+            s.run(secs(25));
+            let d0 = s.flows[b].delivered;
+            s.run(secs(40));
+            (
+                (s.flows[b].delivered - d0) as f64 * 8.0 / 15.0 / 1e6,
+                s.pacer.state(),
+            )
+        };
+        let (paced, st) = cell(PaceConfig::default());
+        let (unpaced, _) = cell(OFF);
+        eprintln!("{k} stuck readers: live {paced:.2} paced, {unpaced:.2} unpaced, {st:?}");
+        assert!(
+            paced >= 0.9 * unpaced,
+            "{k} stuck: {paced} against {unpaced}"
+        );
+    }
+}
+
+/// The agent (a 1 KiB request every 200 ms) beside 8 stuck forwards and a bulk transfer: its
+/// requests arrive within the path's delay and the target, never behind forwards.
+#[test]
+fn the_agent_never_waits_behind_forwards() {
+    let cell = |cfg| {
+        let mut s = Sim::new(20.0, 40, cfg);
+        s.flow(16, Source::Bulk);
+        for i in 0..8 {
+            s.flow(18 + 2 * i, Source::Stuck(0));
+        }
+        let a = s.agent_flow(
+            17,
+            Source::Periodic {
+                bytes: 1024,
+                every: Duration::from_millis(200),
+            },
+        );
+        s.run(secs(30));
+        let mut l = s.flows[a].latencies.clone();
+        l.sort();
+        (l[l.len() / 2], l[l.len() * 99 / 100], l.len())
+    };
+    let (p50, p99, n) = cell(PaceConfig::default());
+    let (u50, u99, _) = cell(OFF);
+    eprintln!(
+        "agent beside stuck forwards: p50 {p50:?} p99 {p99:?} ({n} requests); unpaced {u50:?} {u99:?}"
+    );
+    assert!(n > 100);
+    // One way is 20 ms; the queue the bulk keeps is about the target.
+    assert!(p50 <= Duration::from_millis(70), "{p50:?}");
+    assert!(p99 <= Duration::from_millis(200), "{p99:?}");
+}
+
+/// Eight flows for two minutes: every period's drain gets its probe through (passes wait during a
+/// drain), so the base does not creep.
+#[test]
+fn parallel_flows_do_not_creep() {
+    let mut s = Sim::new(20.0, 40, PaceConfig::default());
+    let fl: Vec<usize> = (0..8).map(|i| s.flow(16 + 2 * i, Source::Bulk)).collect();
+    s.run(secs(120));
+    let early = s.median_qdelay(secs(5), secs(30));
+    let late = s.median_qdelay(secs(90), secs(120));
+    let mbit: f64 = fl.iter().map(|&f| s.mbit(f, 120.0)).sum();
+    eprintln!(
+        "8 flows, 2 min: queueing {early:?} early, {late:?} late, {mbit:.2} Mbit/s, {:?}",
+        s.pacer.state()
+    );
+    assert!(
+        late <= early + Duration::from_millis(5),
+        "{early:?} -> {late:?}"
+    );
+    assert!(mbit >= 0.95 * 20.0, "{mbit}");
+}
+
+/// A slow link with several channels: passes add at most their small budget to the floor's queue
+/// (they used to add a whole cap).
+#[test]
+fn a_slow_link_with_parallel_flows_queues_no_more_than_floor_and_passes() {
+    let (mbit, q, st) = bulk_cell(2.0, 40, 8, PaceConfig::default(), true, 30);
+    let floor =
+        Duration::from_secs_f64((MIN_CAP + PASS_BUDGET + PAYLOAD as usize) as f64 / (2e6 / 8.0));
+    eprintln!("2 Mbit/s, 8 flows: {mbit:.2} Mbit/s, queueing {q:?} (bound {floor:?}), {st:?}");
+    assert!(mbit >= 0.95 * 2.0, "{mbit}");
+    assert!(q <= floor, "{q:?}");
+}
+
+/// The pacer's clock: a held sender has a deadline only when something time-driven is pending.
+#[test]
+fn the_deadline_is_only_what_is_pending() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    assert_eq!(p.next_deadline(), None);
+    p.on_sent(ch(16), 0, PAYLOAD, false, t0);
+    assert_eq!(
+        p.next_deadline(),
+        None,
+        "nothing acknowledged: nothing to presume"
+    );
+    p.start_drain(t0, "test");
+    assert!(p.next_deadline().is_some(), "a drain's probe");
+}
+
+/// A reader that reads, slowly (1 MB/s on a 2.5 MB/s path), beside a bulk transfer: it is
+/// parked (its bytes wait at its reader) and then sends as its reader consumes, which is all it
+/// can use; the bulk transfer has the rest, and its samples are not the slow reader's.
+#[test]
+fn a_slow_reader_gets_what_it_reads() {
+    let cell = |cfg| {
+        let mut s = Sim::new(20.0, 40, cfg);
+        let slow = s.flow(16, Source::Slow(1_000_000));
+        let bulk = s.flow(18, Source::Bulk);
+        s.run(secs(10));
+        let (d0, b0) = (s.flows[slow].delivered, s.flows[bulk].delivered);
+        s.run(secs(30));
+        (
+            (s.flows[slow].delivered - d0) as f64 / 20.0 / 1e6,
+            (s.flows[bulk].delivered - b0) as f64 * 8.0 / 20.0 / 1e6,
+            s.median_qdelay(secs(10), secs(30)),
+            s.pacer.state(),
+        )
+    };
+    let (slow, bulk, q, st) = cell(PaceConfig::default());
+    let (uslow, ubulk, _, _) = cell(OFF);
+    eprintln!(
+        "slow reader: {slow:.2} MB/s, bulk {bulk:.2} Mbit/s, q {q:?} paced; {uslow:.2} MB/s, {ubulk:.2} unpaced; {st:?}"
+    );
+    assert!(slow >= 0.95, "the slow reader got {slow} MB/s");
+    assert!(bulk >= 0.9 * ubulk, "{bulk} against {ubulk}");
+    assert!(q <= TARGET + Duration::from_millis(15), "{q:?}");
 }

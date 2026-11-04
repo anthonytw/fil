@@ -342,9 +342,6 @@ const DATA_AHEAD: usize = 64 * 1024;
 /// While the pacer holds the head of the data queue, how far into the queue the data sender
 /// looks for a payload the pacer lets through anyway (a channel with nothing in flight).
 const PASS_SCAN: usize = 64;
-/// While the pacer holds the queue, the data sender looks again at least this often (an ack
-/// wakes it sooner; this is for the pacer's own timers).
-const PACE_RECHECK: Duration = Duration::from_millis(50);
 
 /// How often the mux's timers run while something is time-bound (an ack due, an open waiting, a
 /// link down with channels), and not at all otherwise, so an idle endpoint costs no wakeups.
@@ -431,9 +428,6 @@ struct Slot {
     peer_eof: bool,
     /// Counted in its forward's `open`.
     counted: bool,
-    /// The peer's highest `Ack` (what it consumed): with the mux's send buffer, where the stream
-    /// ends, so the data sender can tell whether the mux holds bytes of it not yet sent.
-    peer_acked: u64,
 }
 
 /// One forward's listening sockets. The accept tasks poll the sockets through their slots, so
@@ -546,6 +540,10 @@ struct State<L> {
     /// the link. A new one with every link.
     pacer: Pacer,
     pace_cfg: PaceConfig,
+    /// Data payloads in `data_out`, per channel (kept with the queue, for the pacer's passes).
+    queued: HashMap<u32, u32>,
+    /// The channel the last pass from the mux went to (passes take turns).
+    pass_rr: u32,
     slots: HashMap<u32, Slot>,
     stats: HashMap<ForwardId, ForwardStats>,
     agent: ForwardStats,
@@ -618,6 +616,7 @@ impl<L: Link> State<L> {
         self.ctl_out.clear();
         self.data_out.clear();
         self.data_out_bytes = 0;
+        self.queued.clear();
 
         // Never fed, so never acknowledged: the peer sends them again on the next link.
         self.held_mux.clear();
@@ -754,20 +753,32 @@ impl<L: Link> State<L> {
     fn next_out(&mut self, t: std::time::Instant) -> Option<Out> {
         let path = self.link.as_ref()?.status().borrow().path_generation;
         self.pacer.path_changed(path);
-        let idx = match self.data_out.front()? {
-            Out::Finish(_) => 0,
-            Out::Data(ch, _) if self.pacer.admit(*ch, t) => 0,
-            Out::Data(..) => self.pass_index()?,
+        let idx = match self.data_out.front() {
+            None => return self.pass_from_mux(t),
+            Some(Out::Finish(_)) => 0,
+            Some(Out::Data(ch, _)) if self.pacer.admit(*ch, self.is_agent(*ch), t) => 0,
+            Some(Out::Data(..)) => match self.pass_index() {
+                Some(i) => i,
+                None => return self.pass_from_mux(t),
+            },
         };
         let item = self.data_out.remove(idx).expect("an index into the queue");
-
         match &item {
             Out::Data(ch, p) => {
                 self.data_out_bytes -= p.len();
-                if let Ok(seg) = DataSegment::parse(p) {
+                if let Some(n) = self.queued.get_mut(&ch.0) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.queued.remove(&ch.0);
+                    }
+                }
+                let seg = DataSegment::parse(p);
+                debug_assert!(seg.is_ok(), "the mux built this payload");
+                if let Ok(seg) = seg {
                     let start = seg.seq;
+                    let agent = self.is_agent(*ch);
                     self.pacer
-                        .on_sent(*ch, start, start + seg.data.len() as u64, t);
+                        .on_sent(*ch, start, start + seg.data.len() as u64, agent, t);
                 }
             }
             Out::Finish(ch) => self.pacer.forget(*ch),
@@ -778,66 +789,78 @@ impl<L: Link> State<L> {
     /// Where in the data queue (within [`PASS_SCAN`]) the first item is that may go although
     /// the pacer holds the head: the first item of its channel in the queue (per-channel order
     /// holds), and either a `Finish` (it frees the link's stream, and is never paced) or a payload
-    /// on a channel with nothing in flight.
+    /// the pacer lets go (under the cap, or a pass: the head may be a channel whose reader stopped).
     fn pass_index(&self) -> Option<usize> {
-        let mut seen: Vec<u32> = Vec::new();
+        let mut seen = [0u32; PASS_SCAN];
         for (i, o) in self.data_out.iter().enumerate().take(PASS_SCAN) {
             let (ch, may) = match o {
-                Out::Data(ch, _) => (*ch, self.pacer.free_pass(*ch)),
+                Out::Data(ch, _) => (*ch, self.pacer.may_go(*ch, self.is_agent(*ch))),
                 Out::Finish(ch) => (*ch, true),
             };
-            if i > 0 && may && !seen.contains(&ch.0) {
+            if i > 0 && may && !seen[..i].contains(&ch.0) {
                 return Some(i);
             }
-            seen.push(ch.0);
+            seen[i] = ch.0;
         }
         None
     }
 
-    /// Whether the mux holds unsent bytes of an open channel that has nothing in the data queue
-    /// and that the pacer would let pass: then the data sender takes more from the mux to reach
-    /// them.
-    fn passable_waits(&self) -> bool {
-        self.slots.iter().any(|(&id, slot)| {
-            let ch = ChannelId(id);
-            self.pacer.free_pass(ch)
-                && self.mux.info(ch).is_some_and(|i| {
-                    i.state == ChannelState::Open
-                        && slot.peer_acked + i.send_buffered as u64 > i.sent_high
-                })
-                && !self
-                    .data_out
-                    .iter()
-                    .any(|o| matches!(o, Out::Data(c, _) if *c == ch))
-        })
+    /// Whether `ch` carries an agent connection (the pacer keeps a reserve for those).
+    fn is_agent(&self, ch: ChannelId) -> bool {
+        self.slots
+            .get(&ch.0)
+            .is_some_and(|s| matches!(s.key, StatsKey::Agent))
     }
 
-    /// Whether the data sender is held: the pacer holds the queue's head, and nothing behind it
-    /// may pass.
-    fn held(&self) -> bool {
-        match self.data_out.front() {
-            Some(Out::Data(ch, _)) => self.pacer.holds(*ch) && self.pass_index().is_none(),
-            _ => false,
+    /// The pacer holds the data queue (or it is empty): the next payload of a channel with
+    /// nothing queued that the pacer lets go (a new connection, the agent, a channel whose reader
+    /// reads beside one whose reader stopped), taken straight from the mux
+    /// (`Mux::poll_transmit_channel`), so held channels' data stays in their send buffers.
+    /// Channels take turns. Recorded with the pacer.
+    fn pass_from_mux(&mut self, t: std::time::Instant) -> Option<Out> {
+        if !self.pacer.enabled() {
+            return None;
         }
+        let mut ids: Vec<u32> = self
+            .slots
+            .keys()
+            .copied()
+            .filter(|id| !self.queued.contains_key(id))
+            .collect();
+        ids.sort_unstable();
+        let start = ids.partition_point(|&id| id <= self.pass_rr);
+        for k in 0..ids.len() {
+            let id = ids[(start + k) % ids.len()];
+            let ch = ChannelId(id);
+            let agent = self.is_agent(ch);
+            if !self.pacer.may_go(ch, agent) {
+                continue;
+            }
+            let Some(payload) = self.mux.poll_transmit_channel(ch) else {
+                continue;
+            };
+            self.pass_rr = id;
+            let seg = DataSegment::parse(&payload);
+            debug_assert!(seg.is_ok(), "the mux built this payload");
+            if let Ok(seg) = seg {
+                let start = seg.seq;
+                self.pacer
+                    .on_sent(ch, start, start + seg.data.len() as u64, agent, t);
+            }
+            return Some(Out::Data(ch, payload));
+        }
+        None
     }
 
     /// Takes what the mux has to send, up to [`DATA_AHEAD`] of queued data (the data sender;
-    /// control payloads it meets go to the control sender's queue). While the pacer holds the
-    /// queue and the mux holds bytes of a channel that may pass (nothing in flight, nothing
-    /// queued), it takes more, one payload at a time, until that channel's comes (the mux takes
-    /// its channels in turn) or [`PASS_SCAN`] items are queued: a new connection's first payload
-    /// is never stuck in the mux behind a held transfer, and a lone held transfer costs nothing
-    /// more than [`DATA_AHEAD`].
+    /// control payloads it meets go to the control sender's queue). A channel that may pass the
+    /// pacer while the queue is held is reached in the mux itself (`pass_from_mux`), not by taking
+    /// more.
     fn pull(&mut self) {
         if self.link.is_none() {
             return;
         }
-        loop {
-            if self.data_out_bytes >= DATA_AHEAD
-                && (self.data_out.len() >= PASS_SCAN || !self.held() || !self.passable_waits())
-            {
-                break;
-            }
+        while self.data_out_bytes < DATA_AHEAD {
             let Some((ch, payload)) = self.mux.poll_transmit() else {
                 break;
             };
@@ -845,6 +868,7 @@ impl<L: Link> State<L> {
                 self.ctl_out.push_back((ch, payload));
             } else {
                 self.data_out_bytes += payload.len();
+                *self.queued.entry(ch.0).or_default() += 1;
                 self.data_out.push_back(Out::Data(ch, payload));
             }
         }
@@ -957,8 +981,10 @@ impl<L: Link> Endpoint<L> {
                 ctl_out: VecDeque::new(),
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
-                pacer: Pacer::new(PaceConfig::default(), now()),
-                pace_cfg: PaceConfig::default(),
+                pacer: Pacer::new(PaceConfig::from_env(), now()),
+                pace_cfg: PaceConfig::from_env(),
+                queued: HashMap::new(),
+                pass_rr: 0,
                 slots: HashMap::new(),
                 stats: HashMap::new(),
                 agent: ForwardStats::default(),
@@ -1190,13 +1216,12 @@ impl<L: Link> Endpoint<L> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
         let r = st.mux.on_ack(ch, upto);
-        if r.is_ok() {
-            if let Some(slot) = st.slots.get_mut(&ch.0) {
-                slot.peer_acked = slot.peer_acked.max(upto);
-            }
-            if st.link.is_some() {
-                st.pacer.on_ack(ch, upto, now());
-            }
+        if r.is_ok() && st.link.is_some() {
+            let threshold = st
+                .mux
+                .info(ch)
+                .map_or(u64::MAX, |i| crate::pace::ack_threshold(i.peer_window));
+            st.pacer.on_ack(ch, upto, threshold, now());
         }
         inner.drain(&mut st);
         drop(st);
@@ -1675,7 +1700,6 @@ impl<L: Link> Inner<L> {
                 connect: Some(task.abort_handle()),
                 peer_eof: false,
                 counted: false,
-                peer_acked: 0,
             },
         );
     }
@@ -1789,7 +1813,6 @@ impl<L: Link> Inner<L> {
                 connect: None,
                 peer_eof: false,
                 counted: false,
-                peer_acked: 0,
             },
         );
         st.count_open(ch, t);
@@ -2133,7 +2156,7 @@ impl<L: Link> Inner<L> {
     async fn data_loop(self: Arc<Self>) {
         loop {
             let kick = self.data_kick.notified();
-            let (item, held, ctl_ready) = {
+            let (item, held, deadline, ctl_ready) = {
                 let mut st = lock(&self.state);
                 if st.closed {
                     return;
@@ -2147,7 +2170,8 @@ impl<L: Link> Inner<L> {
                     None => None,
                 };
                 let held = item.is_none() && st.link.is_some() && !st.data_out.is_empty();
-                (item, held, !st.ctl_out.is_empty())
+                let deadline = if held { st.pacer.next_deadline() } else { None };
+                (item, held, deadline, !st.ctl_out.is_empty())
             };
             if ctl_ready {
                 self.ctl_kick.notify_one();
@@ -2159,13 +2183,17 @@ impl<L: Link> Inner<L> {
                     }
                 }
                 Some((Out::Finish(ch), link, _)) => link.finish(ch),
-                // The pacer holds the queue: an ack (which kicks) or its own timers free it.
-                None if held => {
-                    tokio::select! {
-                        () = kick => {}
-                        () = tokio::time::sleep(PACE_RECHECK) => {}
+                // The pacer holds the queue: an ack (which kicks) frees it, or its next deadline
+                // (a record presumed delivered, a drain's end), if it has one.
+                None if held => match deadline {
+                    Some(at) => {
+                        tokio::select! {
+                            () = kick => {}
+                            () = sleep_until(at.into()) => {}
+                        }
                     }
-                }
+                    None => kick.await,
+                },
                 None => kick.await,
             }
         }

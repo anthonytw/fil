@@ -491,6 +491,14 @@ async fn budget(t: Transport) {
     })
     .await;
     let w = World::new(t, cfg).await;
+    // The budget's bounds, with every buffer as full as the windows allow: unpaced (the pacer
+    // stops a channel whose reader stopped before its window is full).
+    let off = fil_forward::pace::PaceConfig {
+        enabled: false,
+        fixed_cap: None,
+    };
+    w.client.ep.set_pacing(off);
+    w.daemon.ep.set_pacing(off);
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
     for _ in 0..24 {

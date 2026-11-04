@@ -288,12 +288,19 @@ fn quic_env() -> QuicEnv {
 #[derive(Default)]
 pub struct Targets {
     map: Mutex<HashMap<ForwardId, Target>>,
+    /// Where an `Agent` open connects (a stand-in for the local ssh-agent).
+    agent: Mutex<Option<Target>>,
     pub asked: AtomicUsize,
 }
 
 impl Targets {
     pub fn set(&self, id: ForwardId, port: u16) {
         self.map.lock().unwrap().insert(id, loopback(port));
+    }
+
+    /// `Agent` opens connect to `port` on loopback.
+    pub fn set_agent(&self, port: u16) {
+        *self.agent.lock().unwrap() = Some(loopback(port));
     }
 
     pub fn remove(&self, id: ForwardId) {
@@ -316,7 +323,7 @@ impl Connector for Targets {
                 self.map.lock().unwrap().get(forward).cloned()
             }
             OpenKind::Dynamic { target, .. } => Some(target.clone()),
-            OpenKind::Agent => None,
+            OpenKind::Agent => self.agent.lock().unwrap().clone(),
         };
         Box::pin(async move {
             let target = target.ok_or(OpenFailure::NoSuchForward)?;

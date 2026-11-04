@@ -12,8 +12,10 @@
 //!   is inside it.
 //! - **Two pattern languages** ([`super::pattern`]): `Match` criteria use OpenSSH's `match_pattern`
 //!   (`*`, `?` one byte, `!` in comma lists; no brackets), `Include` uses `glob(3)` (brackets, escapes).
-//!   An `Include` glob whose meaning differs between `glob(3)` implementations is skipped and the
-//!   mirror marked incomplete; a `Match` list fil cannot read as sshd does might apply.
+//!   A `Match` list fil cannot read as sshd does might apply. A line fil cannot evaluate as sshd
+//!   would (an `Include` glob whose meaning differs between `glob(3)` implementations, one with a
+//!   byte that is not UTF-8, a file with a NUL byte) makes the settings unknown
+//!   ([`Settings::unevaluable`]): the mirror refuses everything unless fil's policy file says.
 //! - **`Match`:** `User` and `Group` (pattern lists with `*`, `?` and `!`) are evaluated against
 //!   the daemon's user. Every other criterion (`Address`, `Host`, `LocalAddress`, `LocalPort`,
 //!   `RDomain`, `all`, ...) and every line fil cannot read **might apply**: its value is one of
@@ -330,6 +332,12 @@ pub struct Settings {
     /// Included files, and directories an include glob had to list, that could not be read (in
     /// the order met), and files whose `Include` lines fil could not split: skipped.
     pub unreadable: Vec<PathBuf>,
+    /// The first line (file, line number) fil could not evaluate as sshd would: an `Include`
+    /// pattern whose meaning differs between `glob(3)` implementations, or that is not valid
+    /// UTF-8, or a file with a NUL byte (which sshd reads as gluing two lines together). What
+    /// the config says is then not known, and unlike an unreadable include (skipped, the rest
+    /// enforced) the mirror refuses everything unless fil's own policy file sets the key.
+    pub unevaluable: Option<(PathBuf, u32)>,
 }
 
 impl Settings {
@@ -354,6 +362,7 @@ impl Settings {
                 values: vec![(Gateway::No, Src::Default)],
             },
             unreadable: Vec::new(),
+            unevaluable: None,
         }
     }
 }
@@ -382,15 +391,16 @@ pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
         blocks: 0,
         files: 0,
         unreadable: Vec::new(),
+        unevaluable: None,
         watched: vec![Stamp::of(main)],
     };
-    let text = match std::fs::read(main) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let bytes = match std::fs::read(main) {
+        Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Sshd::Missing, p.watched),
         Err(_) => return (Sshd::Unknown, p.watched),
     };
     let mut ctx = Ctx::Global;
-    p.file(main, &text, &mut ctx, Applies::Yes, 0);
+    p.file(main, &bytes, &mut ctx, Applies::Yes, 0);
     let a = p.acc;
     let settings = Settings {
         disable: a.disable.finish(Flag::No),
@@ -400,6 +410,7 @@ pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
         permit_listen: a.permit_listen.finish(PermitList::Any),
         gateway: a.gateway.finish(Gateway::No),
         unreadable: p.unreadable,
+        unevaluable: p.unevaluable,
     };
     (Sshd::Mirrored(Box::new(settings)), p.watched)
 }
@@ -436,22 +447,43 @@ struct Parser<'a> {
     blocks: usize,
     files: usize,
     unreadable: Vec<PathBuf>,
+    unevaluable: Option<(PathBuf, u32)>,
     watched: Watched,
 }
 
 impl Parser<'_> {
+    /// Notes a line fil cannot evaluate as sshd would (the first one is the one named).
+    fn cannot_evaluate(&mut self, file: &Path, line: u32) {
+        if self.unevaluable.is_none() {
+            self.unevaluable = Some((file.to_path_buf(), line));
+        }
+    }
+
     /// One file's lines; `ctx` is the `Match` context, which an included file starts in and
     /// which goes back to the includer's when the file ends. `cap` is how far the block that
     /// included the file applies: a `Match` in the file applies at most that far. That is sshd's
     /// `SSHCFG_NEVERMATCH` for a file included from a block that does not apply, and the strict
     /// side for one that might.
-    fn file(&mut self, path: &Path, text: &str, ctx: &mut Ctx, cap: Applies, depth: usize) {
+    fn file(&mut self, path: &Path, bytes: &[u8], ctx: &mut Ctx, cap: Applies, depth: usize) {
+        let text = String::from_utf8_lossy(bytes);
+        // Which lines are not valid UTF-8 (the text above has U+FFFD for them, which is no byte
+        // of the file), by the same line numbers as `lines()`; and the first with a NUL, which
+        // sshd (it copies each line with `strlen`) reads as ending the line *and its newline*,
+        // gluing the next line on: a file with one is not read as it is written.
+        let invalid: Vec<bool> = bytes
+            .split(|&b| b == b'\n')
+            .map(|l| std::str::from_utf8(l).is_err())
+            .collect();
+        if let Some(n) = bytes.split(|&b| b == b'\n').position(|l| l.contains(&0)) {
+            self.cannot_evaluate(path, u32::try_from(n + 1).unwrap_or(u32::MAX));
+        }
         for (n, raw) in text.lines().enumerate() {
             let Some(l) = split_line(raw) else {
                 continue;
             };
             let args = l.args();
             let line = u32::try_from(n + 1).unwrap_or(u32::MAX);
+            let not_utf8 = invalid.get(n).copied().unwrap_or(false);
             let src = |maybe: bool| Src::Line {
                 file: path.to_path_buf(),
                 line,
@@ -462,12 +494,21 @@ impl Parser<'_> {
             match l.keyword.to_ascii_lowercase().as_str() {
                 "match" => {
                     self.blocks += 1;
-                    *ctx = Ctx::Match(self.blocks, cap.and(self.match_line(&l)));
+                    // A criterion with a byte that is not UTF-8 is not the text fil compared.
+                    let applies = if not_utf8 {
+                        Applies::Maybe
+                    } else {
+                        self.match_line(&l)
+                    };
+                    *ctx = Ctx::Match(self.blocks, cap.and(applies));
                 }
+                // A pattern with a byte that is not UTF-8 is not the text fil would glob (the
+                // replacement character matches nothing): the include is not known.
+                "include" if not_utf8 => self.cannot_evaluate(path, line),
                 "include" => {
                     let cap = cap.and(ctx.applies());
                     match l.agreed() {
-                        Some(args) => self.include(args, path, ctx, cap, depth),
+                        Some(args) => self.include(args, path, line, ctx, cap, depth),
                         // sshd releases would include different files: fil reads none of
                         // them, and says the mirror is incomplete.
                         None => self.unreadable.push(path.to_path_buf()),
@@ -492,7 +533,15 @@ impl Parser<'_> {
         }
     }
 
-    fn include(&mut self, args: &[String], from: &Path, ctx: &mut Ctx, cap: Applies, depth: usize) {
+    fn include(
+        &mut self,
+        args: &[String],
+        from: &Path,
+        line: u32,
+        ctx: &mut Ctx,
+        cap: Applies,
+        depth: usize,
+    ) {
         if depth + 1 > MAX_DEPTH {
             // sshd refuses to start on this; fil cannot know what was meant.
             self.unreadable.push(from.to_path_buf());
@@ -518,9 +567,9 @@ impl Parser<'_> {
             }
             let g = glob(&pattern);
             if g.unevaluable {
-                // A pattern whose meaning differs between globs: fil includes none of it and
-                // says the mirror is incomplete (the strict side is not a guess).
-                self.unreadable.push(pattern.clone());
+                // A pattern whose meaning differs between globs: what the config says is not
+                // known, and the mirror refuses everything (unless the policy file sets the key).
+                self.cannot_evaluate(from, line);
             }
             self.watched.extend(g.dirs);
             self.unreadable.extend(g.unlistable);
@@ -537,12 +586,17 @@ impl Parser<'_> {
                 self.watched.push(Stamp::of(&f));
                 match std::fs::read(&f) {
                     Ok(b) => {
-                        let text = String::from_utf8_lossy(&b).into_owned();
                         let outer = *ctx;
-                        self.file(&f, &text, ctx, cap, depth + 1);
+                        self.file(&f, &b, ctx, cap, depth + 1);
                         *ctx = outer;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Not there (or a file where a directory is wanted): sshd's glob finds
+                    // nothing either.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) => {}
                     Err(_) => self.unreadable.push(f),
                 }
             }
@@ -851,25 +905,36 @@ fn group_match(groups: &[String], list: &str) -> Applies {
 struct Globbed {
     /// The files it names, sorted (as `glob(3)`).
     files: Vec<PathBuf>,
-    /// The directories it listed, stamped before they were listed.
+    /// The directories it listed (and the paths that were not directories where a directory was
+    /// needed), stamped before they were looked at.
     dirs: Vec<Stamp>,
-    /// Directories it had to list and could not (not a missing one), or whose entries it could
-    /// not match as sshd's glob would ([`Unevaluable`]): what they hold is unknown.
+    /// Directories it had to list and could not (not a missing one): what they hold is unknown.
     unlistable: Vec<PathBuf>,
     /// It named more than [`MAX_FILES`]; the rest were dropped.
     truncated: bool,
     /// The pattern uses a construct fil cannot evaluate as sshd's `glob(3)` does (see
-    /// `pattern::compile`): it names nothing, and the include is one fil could not read.
+    /// `pattern::compile`), or a name it cannot match identically by bytes and by characters:
+    /// the config's settings are not known.
     unevaluable: bool,
 }
+
+/// The longest path `glob(3)` takes: a pattern this long or longer finds nothing (OpenBSD's
+/// `glob()` returns `GLOB_NOMATCH` for `strnlen(pattern, PATH_MAX) == PATH_MAX`). It is the
+/// host's own limit (4096 on Linux, 1024 on macOS and the BSDs): the daemon runs where sshd does.
+const PATH_MAX: usize = nix::libc::PATH_MAX as usize;
 
 /// The files a glob names, as sshd's `glob(3)` (called with no flags) does: `*`, `?`, `[...]` and
 /// backslash escapes in any component; a leading `.` is matched only by a pattern that starts
 /// with one (glob(7)); the result sorted by `strcmp` on the whole path. A path without a
 /// wildcard names itself, whether or not it exists. A pattern whose meaning differs between
 /// `glob(3)` implementations is not guessed at ([`Globbed::unevaluable`]).
+///
+/// The pattern is taken apart on its raw bytes, not as `Path` components: `Path` drops a
+/// trailing `/` and every `.` component, and sshd's glob keeps both. `conf.d/a.conf/` and
+/// `conf.d/*.conf/.` name nothing there (`lstat` of a file with a `/` after it is `ENOTDIR`),
+/// where the normalized path would name `a.conf`.
 fn glob(pattern: &Path) -> Globbed {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let mut g = Globbed {
         files: Vec::new(),
@@ -878,33 +943,44 @@ fn glob(pattern: &Path) -> Globbed {
         truncated: false,
         unevaluable: false,
     };
-    let comps: Result<Vec<GlobComp>, Unevaluable> = glob_check(pattern.as_os_str().as_bytes())
-        .and_then(|()| {
-            pattern
-                .components()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(s) => Some(s.as_bytes()),
-                    std::path::Component::ParentDir => Some(&b".."[..]),
-                    _ => None,
-                })
-                .map(GlobComp::new)
-                .collect()
-        });
+    let raw = pattern.as_os_str().as_bytes();
+    if raw.len() >= PATH_MAX {
+        return g;
+    }
+    let comps: Result<Vec<GlobComp>, Unevaluable> =
+        glob_check(raw).and_then(|()| raw.split(|&b| b == b'/').map(GlobComp::new).collect());
     let Ok(comps) = comps else {
         g.unevaluable = true;
         return g;
     };
-    let mut paths = vec![PathBuf::from("/")];
+    let as_path = |b: &[u8]| PathBuf::from(OsString::from_vec(b.to_vec()));
+    // The paths so far, as bytes: the empty first component of an absolute pattern makes the
+    // root, and every other component (an empty one from `//` or a trailing `/`, `.`, `..`)
+    // is added as it is written.
+    let mut paths: Vec<Vec<u8>> = vec![Vec::new()];
     let mut listed = false;
-    for comp in &comps {
+    for (i, comp) in comps.iter().enumerate() {
+        let join = |base: &[u8], name: &[u8]| {
+            let mut p = base.to_vec();
+            if i > 0 {
+                p.push(b'/');
+            }
+            p.extend_from_slice(name);
+            p
+        };
         let mut next = Vec::new();
         if let Some(name) = comp.literal() {
-            next.extend(paths.iter().map(|b| b.join(OsStr::from_bytes(name))));
+            next.extend(paths.iter().map(|b| join(b, name)));
         } else {
             listed = true;
             for base in &paths {
-                g.dirs.push(Stamp::of(base));
-                let rd = match std::fs::read_dir(base) {
+                let dir = match (base.is_empty(), i) {
+                    (false, _) => as_path(base),
+                    (true, 0) => PathBuf::from("."),
+                    (true, _) => PathBuf::from("/"),
+                };
+                g.dirs.push(Stamp::of(&dir));
+                let rd = match std::fs::read_dir(&dir) {
                     Ok(rd) => rd,
                     // Nothing there: sshd's glob finds nothing either.
                     Err(e)
@@ -918,7 +994,7 @@ fn glob(pattern: &Path) -> Globbed {
                     // There, but fil may not list it (sshd, as root, can): what it holds is not
                     // mirrored, and the mirror says so.
                     Err(_) => {
-                        g.unlistable.push(base.clone());
+                        g.unlistable.push(dir);
                         continue;
                     }
                 };
@@ -933,21 +1009,18 @@ fn glob(pattern: &Path) -> Globbed {
                     names.push(b".".to_vec());
                     names.push(b"..".to_vec());
                 }
-                let mut unsure = false;
                 names.retain(|n| match comp.matches(n) {
                     Ok(m) => m,
-                    // A name the readings of the pattern disagree on: not included, and the
-                    // directory is reported as one fil could not read all of.
+                    // A name the readings of the pattern disagree on (bytes and characters):
+                    // the pattern cannot be evaluated identically, and what the config says
+                    // is not known.
                     Err(Unevaluable) => {
-                        unsure = true;
+                        g.unevaluable = true;
                         false
                     }
                 });
-                if unsure {
-                    g.unlistable.push(base.clone());
-                }
                 names.sort();
-                next.extend(names.into_iter().map(|n| base.join(OsString::from_vec(n))));
+                next.extend(names.iter().map(|n| join(base, n)));
             }
         }
         paths = next;
@@ -957,12 +1030,24 @@ fn glob(pattern: &Path) -> Globbed {
         }
     }
     if listed {
-        // glob(3) sorts the whole result with `strcmp`, not directory by directory, and a path
-        // compares as a string (`a-b/x` comes before `a/z`; `Path`'s ordering would not).
-        paths.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+        // glob(3) sorts the whole result with `strcmp`, not directory by directory (`a-b/x`
+        // comes before `a/x`).
+        paths.sort();
     }
-    // Only files: a directory a glob names is not a config.
-    g.files = paths.into_iter().filter(|p| !p.is_dir()).collect();
+    // What sshd's glob keeps is what `lstat` finds; of that, only files are configs. A path
+    // with a `/` after a file (a trailing `/`, a `.` component) is `ENOTDIR` there: nothing.
+    // (A path that is not there is kept: it is read, found missing, and watched, so that the
+    // file appearing is seen.)
+    for p in paths {
+        let p = as_path(&p);
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+                g.dirs.push(Stamp::of(&p));
+            }
+            _ if p.is_dir() => {}
+            _ => g.files.push(p),
+        }
+    }
     g
 }
 
@@ -1573,6 +1658,7 @@ mod tests {
             blocks: 0,
             files: 0,
             unreadable: Vec::new(),
+            unevaluable: None,
             watched: Vec::new(),
         };
         let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1728,25 +1814,40 @@ mod tests {
         t
     }
 
-    /// What `Include pattern` does in `dir`: the first `AllowTcpForwarding` (file name, or
-    /// `main` when it is the one after the include) and the unreadable list.
-    fn include_in(dir: &Path, pattern: &str) -> (Vec<(Tcp, String)>, Vec<PathBuf>) {
-        std::fs::write(
-            dir.join("sshd_config"),
-            format!("Include {pattern}\nAllowTcpForwarding local\n"),
+    /// The mirror of `Include pattern` in `dir` (then `AllowTcpForwarding local`).
+    fn include_settings(dir: &Path, pattern: &str) -> Settings {
+        write_main(
+            dir,
+            format!("Include {pattern}\nAllowTcpForwarding local\n").as_bytes(),
         )
-        .unwrap();
+    }
+
+    /// The mirror of the main config `bytes` in `dir`.
+    fn write_main(dir: &Path, bytes: &[u8]) -> Settings {
+        std::fs::write(dir.join("sshd_config"), bytes).unwrap();
         let (r, _) = read(&dir.join("sshd_config"), &me());
         let Sshd::Mirrored(s) = r else {
             panic!("{r:?}")
         };
+        *s
+    }
+
+    /// What `Include pattern` does in `dir`: the first `AllowTcpForwarding` (file name, or
+    /// `main` when it is the one after the include) and the unreadable list.
+    fn include_in(dir: &Path, pattern: &str) -> (Vec<(Tcp, String)>, Vec<PathBuf>) {
+        let s = include_settings(dir, pattern);
         let got = s
             .tcp
             .values
             .iter()
             .map(|(v, src)| match src {
                 Src::Line { file, .. } => {
-                    (*v, file.strip_prefix(dir).unwrap().display().to_string())
+                    // (The path is as the glob wrote it, `./` and all; compared without.)
+                    let rel = file.strip_prefix(dir).unwrap();
+                    (
+                        *v,
+                        rel.components().collect::<PathBuf>().display().to_string(),
+                    )
                 }
                 Src::Default => (*v, "default".into()),
             })
@@ -1755,9 +1856,10 @@ mod tests {
     }
 
     /// An `Include` whose glob means something different to another `glob(3)` than to
-    /// OpenBSD's is skipped and the mirror says it is incomplete; its evaluable twin is read.
+    /// OpenBSD's is a line fil cannot evaluate: the mirror names it (file and line) and refuses
+    /// everything ([`Settings::unevaluable`]); its evaluable twin is read.
     #[test]
-    fn an_include_glob_fil_cannot_evaluate_is_skipped_and_marks_the_mirror_incomplete() {
+    fn an_include_glob_fil_cannot_evaluate_makes_the_mirror_unevaluable() {
         let t = scratch(&[("a.conf", "AllowTcpForwarding no\n"), ("5.conf", "")]);
         let d = t.path();
         // (pattern, evaluable?)
@@ -1782,17 +1884,14 @@ mod tests {
             ("conf.d/a.conf", true),
             ("conf.d/?.conf", true),
         ] {
-            let (got, unreadable) = include_in(d, pattern);
+            let s = include_settings(d, pattern);
             if ok {
-                assert!(unreadable.is_empty(), "{pattern}: {unreadable:?}");
+                assert_eq!(s.unevaluable, None, "{pattern}");
+                assert!(s.unreadable.is_empty(), "{pattern}: {:?}", s.unreadable);
             } else {
-                // Skipped: nothing of the include is in force, and the pattern is named.
-                assert_eq!(unreadable, vec![d.join(pattern)], "{pattern}");
-                assert_eq!(
-                    got,
-                    vec![(Tcp::Local, "sshd_config".to_string())],
-                    "{pattern}"
-                );
+                // The line is named, not skipped as an unreadable include.
+                assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)), "{pattern}");
+                assert!(s.unreadable.is_empty(), "{pattern}: {:?}", s.unreadable);
             }
         }
         // The evaluable twins are read.
@@ -1800,25 +1899,213 @@ mod tests {
             include_in(d, "conf.d/[!x]*.conf").0,
             vec![(Tcp::No, "conf.d/a.conf".to_string())]
         );
+        // The line number is the include's, in whichever file it is.
+        let s = write_main(d, b"# one\nInclude conf.d/b.conf\n");
+        assert_eq!(s.unevaluable, None);
+        std::fs::write(d.join("conf.d/b.conf"), "# 1\n# 2\nInclude conf.d/[^x]\n").unwrap();
+        let s = write_main(d, b"# one\nInclude conf.d/b.conf\n");
+        assert_eq!(s.unevaluable, Some((d.join("conf.d/b.conf"), 3)));
+        // The first is the one named.
+        std::fs::write(
+            d.join("conf.d/b.conf"),
+            "Include conf.d/[^x]\nInclude conf.d/[^y]\n",
+        )
+        .unwrap();
+        let s = write_main(d, b"# one\nInclude conf.d/b.conf\n");
+        assert_eq!(s.unevaluable, Some((d.join("conf.d/b.conf"), 1)));
     }
 
-    /// A name `?` or a set cannot be matched identically on by bytes and by characters leaves
-    /// the directory marked unreadable and the name out; the rest of the directory is read.
+    /// The review's probe (F1): `Path` drops a trailing `/` and `.` components, sshd's glob
+    /// keeps them, and `lstat("a.conf/")` is `ENOTDIR`: those patterns include nothing, where
+    /// the normalized path read `a.conf`.
     #[test]
-    fn a_multibyte_name_a_wildcard_reads_two_ways_marks_the_directory() {
+    fn a_trailing_slash_or_dot_component_after_a_file_includes_nothing() {
+        let t = scratch(&[("a.conf", "AllowTcpForwarding yes\n")]);
+        std::fs::create_dir_all(t.path().join("conf.d/sub")).unwrap();
+        let d = t.path();
+        let read_a = (Tcp::All, "conf.d/a.conf".to_string());
+        let nothing = (Tcp::Local, "sshd_config".to_string());
+        let read_via_sub = (Tcp::All, "conf.d/sub/../a.conf".to_string());
+        for (pattern, want) in [
+            // The probe's three rows: nothing.
+            ("conf.d/*/", &nothing),
+            ("conf.d/a.conf/", &nothing),
+            ("conf.d/*.conf/.", &nothing),
+            // The same with the other ways to say it.
+            ("conf.d/a.conf/.", &nothing),
+            ("conf.d/a.conf/..", &nothing),
+            ("conf.d/a.conf//", &nothing),
+            ("conf.d/?.conf/", &nothing),
+            ("conf.d/a.conf/./", &nothing),
+            ("conf.d/*.conf/x", &nothing),
+            // `.` and `/` between directories are fine: they agree with sshd.
+            ("conf.d/./*.conf", &read_a),
+            ("conf.d//*.conf", &read_a),
+            ("conf.d/./a.conf", &read_a),
+            ("conf.d/sub/../*.conf", &read_via_sub),
+            ("conf.d/*.conf", &read_a),
+            ("./conf.d/*.conf", &read_a),
+        ] {
+            let (got, unreadable) = include_in(d, pattern);
+            let pattern = pattern.to_string();
+            assert_eq!(got.first(), Some(want), "{pattern}: {got:?}");
+            assert!(unreadable.is_empty(), "{pattern}: {unreadable:?}");
+        }
+        // A directory with a `/` after it is a directory (lstat finds it), and a directory is
+        // not a config: nothing, and nothing unreadable either.
+        let (got, unreadable) = include_in(d, "conf.d/sub/");
+        assert_eq!(got.first(), Some(&nothing));
+        assert!(unreadable.is_empty());
+    }
+
+    /// A pattern is the raw bytes: `glob` keeps what `Path::components` would drop.
+    #[test]
+    fn glob_keeps_the_trailing_slash_and_dot_components() {
+        let t = scratch(&[("a.conf", "")]);
+        let d = t.path();
+        let names = |p: &str| -> Vec<String> {
+            glob(&d.join(p))
+                .files
+                .iter()
+                .map(|f| f.strip_prefix(d).unwrap().display().to_string())
+                .collect()
+        };
+        assert_eq!(names("conf.d/*.conf"), ["conf.d/a.conf"]);
+        assert_eq!(names("conf.d/./*.conf"), ["conf.d/./a.conf"]);
+        assert_eq!(names("conf.d//*.conf"), ["conf.d//a.conf"]);
+        assert!(names("conf.d/*.conf/").is_empty());
+        assert!(names("conf.d/*.conf/.").is_empty());
+        assert!(names("conf.d/a.conf/").is_empty());
+        assert!(names("conf.d/*/").is_empty());
+    }
+
+    /// A pattern as long as the host's `PATH_MAX` or longer finds nothing in sshd's glob
+    /// (`GLOB_NOMATCH`): it is not unreadable and not unevaluable, and no directory is listed.
+    #[test]
+    fn a_pattern_of_path_max_bytes_or_more_includes_nothing() {
+        let t = scratch(&[("a.conf", "AllowTcpForwarding no\n")]);
+        let d = t.path();
+        let prefix = d.join("conf.d/").display().to_string().len();
+        for tail in ["*.conf", "a.conf"] {
+            // Total length PATH_MAX: nothing; one shorter is not cut off by the length check
+            // (and finds nothing here only because that name does not exist).
+            for (len, cut) in [(PATH_MAX, true), (PATH_MAX + 50, true)] {
+                let pad = "x".repeat(len - prefix - tail.len());
+                let pattern = format!("conf.d/{pad}{tail}");
+                let g = glob(&d.join(&pattern));
+                assert!(
+                    g.files.is_empty() && g.dirs.is_empty() && !g.unevaluable,
+                    "{len}"
+                );
+                let s = include_settings(d, &pattern);
+                assert!(
+                    s.unreadable.is_empty() && s.unevaluable.is_none() == cut,
+                    "{len}"
+                );
+            }
+        }
+        // Just under the limit the glob is run (a wildcard lists the directory).
+        let pad = "x".repeat(PATH_MAX - 1 - prefix - 1);
+        let g = glob(&d.join(format!("conf.d/{pad}*")));
+        assert!(!g.dirs.is_empty());
+    }
+
+    /// A NUL byte: sshd copies each line with `strlen`, so the rest of the line *and its
+    /// newline* are gone and the next line is glued onto the start. A file with one is not read
+    /// as it is written: unevaluable, naming the file and the line.
+    #[test]
+    fn a_nul_byte_in_a_file_makes_the_mirror_unevaluable() {
+        let t = scratch(&[]);
+        let d = t.path();
+        let s = write_main(
+            d,
+            b"AllowTcpForwarding no\nAllowAgentForwarding\0 no\nGatewayPorts yes\n",
+        );
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 2)));
+        // In an included file, that file's line.
+        std::fs::write(d.join("conf.d/z.conf"), b"# x\n# y\n\0\n").unwrap();
+        let s = write_main(d, b"Include conf.d/z.conf\n");
+        assert_eq!(s.unevaluable, Some((d.join("conf.d/z.conf"), 3)));
+        // The first one is the one named.
+        let s = write_main(d, b"\0\nInclude conf.d/z.conf\n");
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)));
+        // None: a clean file.
+        let s = write_main(d, b"AllowTcpForwarding no\n");
+        assert_eq!(s.unevaluable, None);
+    }
+
+    /// A byte that is not UTF-8 in an `Include` line is a pattern fil would glob as text, with
+    /// the replacement character in its place (matching nothing, silently, where sshd includes
+    /// the file): unevaluable. In a `Match` line the block might apply. Elsewhere, nothing.
+    #[test]
+    fn a_byte_that_is_not_utf8_is_unevaluable_in_an_include_and_maybe_in_a_match() {
+        let t = scratch(&[("a.conf", "AllowTcpForwarding no\n")]);
+        let d = t.path();
+        let s = write_main(
+            d,
+            b"# fine\nInclude conf.d/\xff.conf\nAllowTcpForwarding local\n",
+        );
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 2)));
+        let s = write_main(d, b"Include conf.d/a.conf conf.d/\xe9*\n");
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)));
+        // A Match with such a byte might apply, whatever it says.
+        let s = write_main(
+            d,
+            b"AllowTcpForwarding yes\nMatch User nobody\xff\n AllowTcpForwarding no\n",
+        );
+        assert_eq!(
+            s.tcp.values.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            [Tcp::No, Tcp::All]
+        );
+        assert_eq!(s.unevaluable, None);
+        // A comment, or a keyword fil does not mirror: not a line fil needs to read.
+        let s = write_main(
+            d,
+            b"# caf\xe9\nBanner /etc/\xffissue\nAllowTcpForwarding no\n",
+        );
+        assert_eq!(s.unevaluable, None);
+        // Valid UTF-8 outside ASCII is fine.
+        let s = write_main(d, "Include conf.d/é*\n".as_bytes());
+        assert_eq!(s.unevaluable, None);
+    }
+
+    /// The review's probe (F2) end to end: a run of `[` in an `Include` line is read in time
+    /// linear in its length.
+    #[test]
+    fn a_run_of_open_brackets_in_an_include_is_read_quickly() {
+        let t = scratch(&[]);
+        let d = t.path();
+        let started = std::time::Instant::now();
+        for n in [900, 3_000] {
+            let s = include_settings(d, &format!("conf.d/{}", "[".repeat(n)));
+            assert_eq!(s.unevaluable, None);
+            let s = include_settings(d, &format!("conf.d/{}]", "[".repeat(n)));
+            let _ = s;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A name `?` or a set cannot be matched identically on by bytes and by characters makes
+    /// the include a line fil cannot evaluate (the name is left out, and the settings are not
+    /// known); a pattern that reads the same either way is no problem.
+    #[test]
+    fn a_multibyte_name_a_wildcard_reads_two_ways_is_unevaluable() {
         let t = scratch(&[
             ("a.conf", "AllowTcpForwarding no\n"),
             ("é.conf", "AllowTcpForwarding yes\n"),
         ]);
         let d = t.path();
         // `?` is one byte or one character: `é.conf` is in doubt, `a.conf` is not.
-        let (got, unreadable) = include_in(d, "conf.d/?.conf");
-        assert_eq!(got, vec![(Tcp::No, "conf.d/a.conf".to_string())]);
-        assert_eq!(unreadable, vec![d.join("conf.d")]);
+        let s = include_settings(d, "conf.d/?.conf");
+        assert_eq!(s.unevaluable, Some((d.join("sshd_config"), 1)));
         // `*` is the same either way: both are read, sorted by bytes (`a` before `é`).
-        let (got, unreadable) = include_in(d, "conf.d/*.conf");
+        let s = include_settings(d, "conf.d/*.conf");
+        assert_eq!(s.unevaluable, None);
+        assert!(s.unreadable.is_empty());
+        let (got, _) = include_in(d, "conf.d/*.conf");
         assert_eq!(got, vec![(Tcp::No, "conf.d/a.conf".to_string())]);
-        assert!(unreadable.is_empty());
+        // A multibyte pattern against ASCII names, and `?` against ASCII names: no doubt.
+        assert_eq!(include_settings(d, "conf.d/é*").unevaluable, None);
     }
 
     /// glob(3) sorts the whole result with `strcmp`: `a-b/x.conf` comes before `a/x.conf` (`-` is

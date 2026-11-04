@@ -482,8 +482,9 @@ fn glob_caret_first_in_a_set_is_unevaluable() {
 
 #[test]
 fn glob_posix_classes_are_unevaluable() {
-    // glob(7) "Character classes": OpenBSD's glob has none, so `[[:digit:]]` is the set
-    // `[:dgit` followed by `]`. Refused, in every spelling.
+    // glob(7) "Character classes". fil does not implement them: OpenBSD's glob has the ctype
+    // classes (and finds nothing for an unknown name), and other globs differ on the names and on
+    // `[.x.]` and `[=x=]`. Refused, in every spelling.
     run(&[
         ("[[:digit:]]", "5", U),
         ("[[:digit:]]", "d]", U),
@@ -1007,4 +1008,37 @@ fn many_stars_cost_no_more_than_the_length_of_the_input() {
     // With `?` and sets mixed in, on a name of several bytes of a character.
     let mixed = format!("{}b", "?*[a]*".repeat(30));
     assert_eq!(verdict(&mixed, "é".repeat(100).as_bytes()), N);
+}
+
+#[test]
+fn a_run_of_open_brackets_costs_time_linear_in_its_length() {
+    // The review's probe: each `[` used to look to the end of the pattern for a `]` (and again
+    // for an escaped one), so a run of them was quadratic (5,000 took 5.7 s in a debug build,
+    // 20,000 over a minute). Now one pass finds where the closing brackets are.
+    use std::time::{Duration, Instant};
+    let t = Instant::now();
+    for n in [5_000, 20_000] {
+        // No `]` at all: every `[` is a literal.
+        let p = "[".repeat(n);
+        assert!(glob_check(p.as_bytes()).is_ok());
+        let g = GlobComp::new(p.as_bytes()).unwrap();
+        assert_eq!(g.literal(), Some(p.as_bytes()));
+        // A `]` only at the end: the first `[` opens a set that holds the rest.
+        let p = format!("{}]", "[".repeat(n));
+        assert!(glob_check(p.as_bytes()).is_ok());
+        let _ = GlobComp::new(p.as_bytes());
+        // An escaped `]` at the end: refused, once.
+        let p = format!("{}\\]", "[".repeat(n));
+        assert_eq!(glob_check(p.as_bytes()), Err(Unevaluable));
+        // Every `[` followed by `!`, and by a character that makes no range.
+        let p = "[!a".repeat(n / 3);
+        assert!(GlobComp::new(p.as_bytes()).is_ok());
+        let p = "[a-".repeat(n / 3);
+        assert!(GlobComp::new(p.as_bytes()).is_ok());
+    }
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
 }

@@ -11,10 +11,11 @@
 //! - **`GlobComp`** (`glob(3)`, called with no flags), for `Include` file names: `*`, `?`,
 //!   `[...]` sets, backslash escapes; no commas, no list negation, no braces. OpenSSH-portable
 //!   builds against its own copy of OpenBSD's `glob.c` where the system `glob(3)` lacks
-//!   `gl_matchc` (glibc does), but a distribution may build against the system one: the two
-//!   agree on the plain constructs and differ on others. fil evaluates what both agree on and
-//!   refuses to guess at the rest: such a pattern is **[`Unevaluable`]**, and the caller treats
-//!   the `Include` as one it could not read (skipped, the mirror marked incomplete).
+//!   `gl_matchc` or `gl_statv` (glibc, musl and macOS do not have them all), but a distribution
+//!   may build against the system one: the two agree on the plain constructs and differ on
+//!   others. fil evaluates what both agree on and refuses to guess at the rest: such a pattern
+//!   is **[`Unevaluable`]**, and the caller treats the config as one whose settings are not
+//!   known (everything is refused unless fil's own policy file says otherwise).
 //!
 //! Both matchers are linear in the product of their lengths however many `*` there are: a
 //! recursive match is exponential in them, and the fuzzer found config lines that never finished.
@@ -247,8 +248,11 @@ const SLASH: u32 = b'/' as u32;
 /// - **`^` first in a set.** glob(7) names `!` as the negation; OpenBSD's glob has no other and
 ///   keeps `^` as a member, while other implementations (glibc, musl) also accept `^` as
 ///   negation. `[^x]` is the opposite set in the two.
-/// - **`[:class:]`, `[.coll.]`, `[=equiv=]`** (glob(7) "Character classes"). OpenBSD's glob has
-///   none: `[[:digit:]]` is the set `[`, `:`, `d`, ... followed by a literal `]`.
+/// - **`[:class:]`, `[.coll.]`, `[=equiv=]`** (glob(7) "Character classes"). fil does not
+///   implement them. OpenBSD's glob supports the ctype classes (`g_charclass`; portable ships
+///   `charclass.h`) and finds nothing for an unknown class name, and the other globs differ
+///   again on the names and on collating symbols and equivalence classes, so a set that opens
+///   with `[:`, `[.` or `[=` is refused rather than guessed at.
 /// - **A backslash inside a set.** OpenBSD's glob quotes the next character (so `[\]]` is the
 ///   set `]`); glob(7) leaves it undefined, and some implementations keep the backslash as a
 ///   member.
@@ -282,6 +286,17 @@ fn compile(units: &[u32]) -> Result<Vec<Option<Item>>, Unevaluable> {
     let n = v.len();
     // An unprotected `ch` at `k`.
     let is = |k: usize, ch: char| v.get(k).is_some_and(|&(c, p)| !p && c == u32::from(ch));
+    // Whether an unprotected (`close`) or an escaped (`escaped`) `]` is at or after `k`, for
+    // every `k`, in one pass: a run of `[` would otherwise look to the end of the pattern once
+    // for each (quadratic: the fuzz-timeout class of bug).
+    let close_at = u32::from(']');
+    let mut close = vec![false; n + 1];
+    let mut escaped = vec![false; n + 1];
+    for k in (0..n).rev() {
+        let (c, p) = v[k];
+        close[k] = close[k + 1] || (!p && c == close_at);
+        escaped[k] = escaped[k + 1] || (p && c == close_at);
+    }
     let mut out: Vec<Option<Item>> = Vec::new();
     let mut i = 0;
     while i < n {
@@ -307,11 +322,11 @@ fn compile(units: &[u32]) -> Result<Vec<Option<Item>>, Unevaluable> {
                 let first = i + usize::from(neg);
                 // glob0(): no `]` after the first member, so a literal `[` (and the `!` is read
                 // again as itself).
-                if first >= n || !(first + 1..n).any(|k| is(k, ']')) {
+                if first >= n || !close[first + 1] {
                     // ... unless an escaped `]` follows: OpenBSD's glob reads it as a plain `]`,
                     // and a glob that lets a backslash escape inside a set would read the `[` as
                     // opening a set that the escaped `]` does not close, or as one it does.
-                    if (first.min(n)..n).any(|k| v[k] == (u32::from(']'), true)) {
+                    if escaped[first.min(n)] {
                         return Err(Unevaluable);
                     }
                     out.push(Some(Item::Lit(c)));

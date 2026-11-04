@@ -59,7 +59,7 @@ def launch(term, trace, work, result, dump):
             "-xrm", "XTerm*VT100.translations: #override <Key>F5: print-immediate()",
             "-e", *py,
         ]
-        return subprocess.Popen(cmd, env=env, start_new_session=True)
+        return subprocess.Popen(cmd, env=env, start_new_session=True, stderr=open(os.path.join(work, "stderr.log"), "w"))
     if term == "kitty":
         env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         # A unix socket path is limited to about 100 bytes; the work directory can be longer.
@@ -75,7 +75,7 @@ def launch(term, trace, work, result, dump):
             *py,
         ]
         env["KITTY_LISTEN_ON"] = f"unix:{sock}"
-        return subprocess.Popen(cmd, env=env, start_new_session=True)
+        return subprocess.Popen(cmd, env=env, start_new_session=True, stderr=open(os.path.join(work, "stderr.log"), "w"))
     if term == "wezterm":
         cfg = os.path.join(work, "wezterm.lua")
         with open(cfg, "w") as f:
@@ -100,7 +100,7 @@ def launch(term, trace, work, result, dump):
                 "}\n"
             )
         cmd = ["wezterm", "--config-file", cfg, "start", "--always-new-process", "--", *py]
-        return subprocess.Popen(cmd, env=env, start_new_session=True)
+        return subprocess.Popen(cmd, env=env, start_new_session=True, stderr=open(os.path.join(work, "stderr.log"), "w"))
     if term == "tmux":
         # A new socket per trace: a server that was just killed can still own the last one.
         global TMUX_N
@@ -223,6 +223,12 @@ def main():
             time.sleep(0.1)
         timed_out = proc.poll() is None
         stop(proc)
+        err_tail = ""
+        try:
+            with open(os.path.join(work, "stderr.log"), errors="replace") as f:
+                err_tail = " | ".join(x.strip()[:160] for x in f.read().splitlines()[-2:] if "PARSE ERROR" not in x)
+        except OSError:
+            pass
         shutil.rmtree(work, ignore_errors=True)
         recs = []
         with open(result) as f:
@@ -260,7 +266,7 @@ def main():
         if not done and not any("error" in r for r in recs):
             summary["error"] += 1
             failed = True
-            lines.append(f"ERROR   {tr['name']}: the terminal exited without finishing the trace" + (" (timed out)" if timed_out else ""))
+            lines.append(f"ERROR   {tr['name']}: the terminal exited without finishing the trace" + (" (timed out)" if timed_out else "") + (f"; its stderr: {err_tail}" if err_tail else ""))
         print(f"{args.terminal} {tr['name']}: {time.time() - t0:.1f}s", file=sys.stderr, flush=True)
 
     elapsed = time.time() - started

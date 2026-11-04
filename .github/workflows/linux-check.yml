@@ -180,7 +180,7 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Packages (Xvfb, the terminals, software OpenGL for kitty)
-        run: sudo apt-get update && sudo apt-get install -y xvfb xterm kitty tmux xdotool libgl1-mesa-dri fonts-dejavu-core python3 shellcheck
+        run: sudo apt-get update && sudo apt-get install -y xvfb xterm kitty tmux xdotool libgl1-mesa-dri libegl1 libgl1 fonts-dejavu-core python3 shellcheck
       - name: WezTerm 20240203-110809-5046fc22 (pinned by hash)
         env:
           WEZTERM_DEB: wezterm-20240203-110809-5046fc22.Ubuntu22.04.deb

@@ -400,6 +400,7 @@ name = "fil-client"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "fil-client",
  "fil-forward",
  "fil-netsim",
  "fil-predict",

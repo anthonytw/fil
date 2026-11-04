@@ -66,6 +66,8 @@ jobs:
         run: tests/release/prepare.sh
       - name: The release tree's dependency graph
         run: just release-deps
+      - name: Lint the release scripts
+        run: shellcheck -x -S warning tests/release/*.sh
       - name: The release scripts' own tests (workflow lint, tag signers, release-check)
         run: just release-test
 

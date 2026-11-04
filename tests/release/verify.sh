@@ -27,7 +27,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-version= dry=0 from_run= from_dir= repo=anthonytw/fil ref= vm=${FIL_VM:-fil} rebuild=1 work=
+version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 work=''
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;

@@ -267,7 +267,7 @@ mutated() {
   local name=$1
   shift
   new_case 0.9.0
-  (cd "$stage" && eval "$@")
+  (cd "$stage" && eval "$*")
   pack_release
   expect_fail "mutation: $name" check --dry-run --no-tree "$rel"
 }

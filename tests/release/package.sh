@@ -18,7 +18,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-bins= out= extra=
+bins='' out='' extra=''
 while [ $# -gt 0 ]; do
   case $1 in
     --bins) bins=$2; shift 2 ;;

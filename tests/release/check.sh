@@ -17,7 +17,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-dry=0 tag= complete=0 tree=1 dir=
+dry=0 tag='' complete=0 tree=1 dir=''
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;
@@ -135,8 +135,12 @@ else
   [ -z "$(tail -c 1 "$sums")" ] || fail "SHA256SUMS does not end with a newline"
   grep -q "$(printf '\r')" "$sums" && fail "SHA256SUMS has CR line endings"
 fi
-extras=$(ls "$dir" | grep -v -x -F -e SHA256SUMS -e SHA256SUMS.sig $(for n in $names; do printf ' -e %s' "$n"; done) || true)
-[ -z "$extras" ] || note "other files in $dir (not part of the release): $(echo "$extras" | tr '\n' ' ')"
+extras=
+for f in "$dir"/*; do
+  b=${f##*/}
+  case " SHA256SUMS SHA256SUMS.sig $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
+done
+[ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
 # ---- the archives
 # Layout (section 4.3). `pending` are files LIC and DOC add; they are required with --complete.
@@ -160,7 +164,7 @@ share/fish/vendor_completions.d/fil.fish"
 
 is_gnu_tar() { tar --version 2> /dev/null | grep -q 'GNU tar'; }
 
-x86_bin= aarch_bin=
+x86_bin='' aarch_bin=''
 for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source; do
   name=fil-$V-$label
   arc=$dir/$name.tar.gz

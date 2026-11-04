@@ -119,6 +119,13 @@ impl Display {
         let _ = self.overlay.set_pty_mode(self.pty);
     }
 
+    /// True once after the core held a guess it would have written on a screen a resize left
+    /// untrusted, or saw something drawn at the resize (`docs/m3/plan.md` §2.4 rule 9): the
+    /// engine asks for a repaint (W1).
+    pub fn take_repaint_request(&mut self) -> bool {
+        self.overlay.take_repaint_request()
+    }
+
     /// The session is a different one: forget what is known about its PTY.
     pub fn forget_pty(&mut self) -> Vec<u8> {
         self.set_pty_mode(true, true)

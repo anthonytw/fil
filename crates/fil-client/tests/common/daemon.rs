@@ -155,6 +155,14 @@ pub struct DState {
     /// Output the next repaint is rendered after, but whose bytes reach the client only after
     /// the snapshot (the announcement, on control, overtook them).
     repaint_tail: Vec<u8>,
+    /// Output produced after the next repaint was rendered, whose bytes (from `at` on the
+    /// terminal channel) reach the client before the announcement: QUIC, a control packet lost.
+    repaint_after: Vec<u8>,
+    /// The next repaint is rendered this many bytes into `repaint_tail`, and the tail is sent as
+    /// one segment across `at`: a daemon that breaks the rule that `at` is where its stream was.
+    repaint_straddle: Option<usize>,
+    /// The link dies after the next repaint's snapshot, before the tail below its `at` is sent.
+    repaint_kill: bool,
     /// Repaint snapshots sent, with the generation each was rendered at.
     pub repaints: Vec<u64>,
 }
@@ -240,6 +248,9 @@ impl FakeDaemon {
                 hold_repaints: false,
                 repaint_owed: false,
                 repaint_tail: Vec::new(),
+                repaint_after: Vec::new(),
+                repaint_straddle: None,
+                repaint_kill: false,
                 repaints: Vec::new(),
             }),
         })
@@ -655,10 +666,12 @@ impl FakeDaemon {
         };
         let tail = std::mem::take(&mut st.repaint_tail);
         let tail_at = st.log.end();
+        let cut = st.repaint_straddle.take().unwrap_or(tail.len()).min(tail.len());
         st.log.append(&tail);
-        st.emu.feed(&tail);
+        st.emu.feed(&tail[..cut]);
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(0));
-        let at = st.log.end();
+        st.emu.feed(&tail[cut..]);
+        let at = tail_at + cut as u64;
         st.flows.insert(key_of(&link), at);
         st.pending_jump = Some(at);
         st.sent = at;
@@ -672,6 +685,24 @@ impl FakeDaemon {
             reason: fil_proto::msg::SnapshotReason::Repaint,
             size_gen,
         };
+        let after = std::mem::take(&mut st.repaint_after);
+        if !after.is_empty() {
+            st.log.append(&after);
+            st.emu.feed(&after);
+            st.sent = at + after.len() as u64;
+            st.flows.insert(key_of(&link), st.sent);
+            let seg = Segment {
+                seq: at,
+                data: after.clone(),
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if cut < tail.len() {
+            st.sent = tail_at + tail.len() as u64;
+        }
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
         let mut off = 0u64;
         for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
@@ -683,6 +714,13 @@ impl FakeDaemon {
             let _ = link
                 .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
                 .await;
+        }
+        if std::mem::take(&mut st.repaint_kill) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+                c.control.kill(DownReason::Dead);
+            }
+            return;
         }
         for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
             let seg = Segment {
@@ -700,6 +738,23 @@ impl FakeDaemon {
     /// control channel, overtakes it.
     pub async fn set_repaint_tail(&self, tail: &[u8]) {
         self.st.lock().await.repaint_tail = tail.to_vec();
+    }
+
+    /// The output after the next repaint overtakes its announcement (QUIC, a lost control
+    /// packet): `after` is sent from `at` on the terminal channel first.
+    pub async fn set_repaint_after(&self, after: &[u8]) {
+        self.st.lock().await.repaint_after = after.to_vec();
+    }
+
+    /// The next repaint is rendered `cut` bytes into its tail, which is then sent as one segment
+    /// across `at`: a broken daemon.
+    pub async fn set_repaint_straddle(&self, cut: usize) {
+        self.st.lock().await.repaint_straddle = Some(cut);
+    }
+
+    /// The link dies after the next repaint's snapshot, before its tail is sent.
+    pub async fn set_repaint_kill(&self) {
+        self.st.lock().await.repaint_kill = true;
     }
 
     /// Sends the log from `sent` to the current subscriber.

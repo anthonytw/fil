@@ -115,6 +115,12 @@ impl Repair {
         self.needed && !self.trusted(size_gen)
     }
 
+    /// A repaint arrived for a point the terminal stream had already passed (on QUIC the output
+    /// after it overtook its announcement) and was dropped: ask again.
+    pub(super) fn stale_repaint(&mut self) {
+        self.asked = None;
+    }
+
     /// A different link is now the session's. `asked`: the generation its attach asked for a
     /// snapshot at, if it did. A repaint asked for on the old link is asked for again on this one
     /// (a snapshot that never landed repaired nothing).

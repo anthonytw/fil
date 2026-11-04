@@ -743,3 +743,76 @@ async fn output_in_flight_before_a_repaint_is_applied_before_it() {
         rig.daemon.screen(0).await.screen_text()
     );
 }
+
+/// W1 (the re-check's F3): on QUIC there is no order across channels, so output the daemon sent
+/// after a repaint can reach the client before the repaint's announcement (a control packet was
+/// lost). The repaint is then for a point the terminal has passed: its bytes are dropped, the
+/// repaint is asked for again, and the second one lands. No reconnect, so no resume snapshot
+/// rewriting the scrollback.
+#[tokio::test(start_paused = true)]
+async fn output_that_overtakes_a_repaints_announcement_makes_it_stale_not_a_reconnect() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_after(b"after the repaint\r\n").await;
+    rig.term.resize(60, 24);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no reconnect");
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1, 1], "asked again");
+    assert_eq!(rig.daemon.repaints().await, vec![1, 1]);
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text()
+    );
+    // The second one landed: trusted again, a guess asks for nothing more.
+    rig.type_str("d");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(rig.daemon.repaint_requests().await.len(), 2);
+}
+
+/// W1: a segment across a repaint's position means the daemon did not render where its stream
+/// was. The client cannot apply both the output and the snapshot exactly, so it reconnects (and
+/// resumes: a repaint moves no position) rather than apply the snapshot at the wrong point.
+#[tokio::test(start_paused = true)]
+async fn a_segment_across_a_repaints_position_is_refused() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_tail(&lines(0..10)).await;
+    rig.daemon.set_repaint_straddle(25).await;
+    rig.term.resize(60, 24);
+    until_async("the reconnect", 30, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some(), "a resume, not a fresh attach: {a:?}");
+}
+
+/// W1: the link dies while a repaint is held for its position. The terminal is still where it
+/// was (a repaint moves no position), so the next link resumes exactly, with `want_snapshot` for
+/// the repaint that never landed, and does not attach afresh.
+#[tokio::test(start_paused = true)]
+async fn a_link_lost_while_a_repaint_is_held_resumes() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    rig.daemon.set_repaint_tail(&lines(0..10)).await;
+    rig.daemon.set_repaint_kill().await;
+    rig.term.resize(60, 24);
+    until_async("the reconnect", 30, || async {
+        rig.daemon.attaches().await.len() >= 2
+    })
+    .await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(
+        a.resume.is_some_and(|r| r.want_snapshot),
+        "a resume that asks for the repaint again: {a:?}"
+    );
+}

@@ -249,6 +249,10 @@ struct Snap {
     info: SnapshotInfo,
     recv: RecvChannel,
     buf: Vec<u8>,
+    /// A repaint whose position the terminal stream had already passed when it was announced
+    /// (on QUIC the output after it can overtake its announcement): its bytes are read and
+    /// dropped, and the repaint is asked for again.
+    stale: bool,
 }
 
 #[derive(Debug)]
@@ -1218,9 +1222,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
         // Leave the links tidy, also when the loop failed: the daemon should see them close.
         self.tx = None;
-        if primary.conn.snap.is_some() {
+        if primary
+            .conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.info.reason != SnapshotReason::Repaint)
+        {
             // The snapshot never landed: the terminal and the daemon disagree about the
-            // position, and a snapshot is not resumable. The next attach starts afresh.
+            // position, and a snapshot is not resumable. The next attach starts afresh. A
+            // repaint moves no position (the terminal is still where it was), so a resume is
+            // still exact: the repaint it was for is asked for again by `want_snapshot`.
             self.sess.established = false;
         }
         if promoted.is_some() {
@@ -1610,7 +1621,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
                 self.sess.start_acks(info.at);
-                return self.begin_snapshot(conn, info);
+                return self.begin_snapshot(conn, info, false);
             }
         }
         // A resume: the screen is current as soon as the daemon continues.
@@ -1631,6 +1642,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         // The position only ever moves forward.
         if info.at < self.sess.recv.received() {
+            if info.reason == SnapshotReason::Repaint {
+                // QUIC has no order across channels: output the daemon sent after the repaint
+                // overtook its announcement and has been applied. The repaint is for a point
+                // the terminal has left; its bytes are read and dropped, and once they are, the
+                // repaint is asked for again (the daemon serves at most one a second). No
+                // reconnect: nothing is inconsistent.
+                tracing::debug!("a repaint behind the terminal position; asking again");
+                return self.begin_snapshot(conn, info, true);
+            }
             return Self::reconnect("a mid-stream snapshot behind the terminal position");
         }
         if info.reason != SnapshotReason::Repaint {
@@ -1641,14 +1661,25 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // still in flight below `at` is applied first (`drain_terminal`), so the scrollback loses
         // nothing. Acks below `at` mean nothing to the daemon's flow either way.
         self.sess.start_acks(info.at);
-        self.begin_snapshot(conn, info)
+        self.begin_snapshot(conn, info, false)
     }
 
-    fn begin_snapshot(&mut self, conn: &mut Conn, info: SnapshotInfo) -> Result<Flow, ClientError> {
+    fn begin_snapshot(
+        &mut self,
+        conn: &mut Conn,
+        info: SnapshotInfo,
+        stale: bool,
+    ) -> Result<Flow, ClientError> {
+        let cap = if stale {
+            0
+        } else {
+            usize::try_from(info.len).unwrap_or(0).min(1 << 20)
+        };
         conn.snap = Some(Snap {
             info,
             recv: RecvChannel::new(),
-            buf: Vec::with_capacity(usize::try_from(info.len).unwrap_or(0).min(1 << 20)),
+            buf: Vec::with_capacity(cap),
+            stale,
         });
         // Snapshot bytes that arrived before their announcement.
         conn.early_bytes = 0;
@@ -1700,8 +1731,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let Ok(fresh) = snap.recv.accept(seq, data) else {
             return Self::reconnect("a gap in the snapshot");
         };
-        snap.buf.extend_from_slice(fresh);
-        let len = snap.buf.len() as u64;
+        if !snap.stale {
+            snap.buf.extend_from_slice(fresh);
+        }
+        let len = snap.recv.received();
         if len > snap.info.len {
             return Self::reconnect("a snapshot longer than announced");
         }
@@ -1715,7 +1748,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     fn repaint_at(conn: &Conn) -> Option<u64> {
         conn.snap
             .as_ref()
-            .filter(|s| s.info.reason == SnapshotReason::Repaint)
+            .filter(|s| s.info.reason == SnapshotReason::Repaint && !s.stale)
             .map(|s| s.info.at)
     }
 
@@ -1725,7 +1758,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let complete = conn
             .snap
             .as_ref()
-            .is_some_and(|s| s.buf.len() as u64 == s.info.len);
+            .is_some_and(|s| s.recv.received() == s.info.len);
+        if complete && conn.snap.as_ref().is_some_and(|s| s.stale) {
+            // All of a stale repaint's bytes are read: drop it, and ask again.
+            conn.snap = None;
+            self.repair.stale_repaint();
+            self.send_repaint();
+            return Ok(Flow::Continue);
+        }
         let reached = Self::repaint_at(conn).is_none_or(|at| self.sess.recv.received() >= at);
         if complete && reached {
             return self.finish_snapshot(conn);
@@ -1797,7 +1837,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// snapshot was rendered), and the snapshot once it is reached.
     fn drain_terminal(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
         let limit = Self::repaint_at(conn);
-        if conn.awaiting_reply || (conn.snap.is_some() && limit.is_none()) {
+        // Output goes on while a stale repaint's bytes are read and dropped.
+        let holding = conn.snap.as_ref().is_some_and(|s| !s.stale);
+        if conn.awaiting_reply || (holding && limit.is_none()) {
             return Ok(Flow::Continue);
         }
         while let Some((&seq, data)) = conn.term_held.iter().next() {

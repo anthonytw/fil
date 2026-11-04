@@ -7,9 +7,10 @@
 #   --bins   DIR/x86_64-unknown-linux-musl/fil, DIR/aarch64-unknown-linux-musl/fil and
 #            DIR/universal-apple-darwin/fil (what build-binary.sh and macos-build.sh write)
 #   --out    where the archives and SHA256SUMS go (created; must be empty)
-#   --extra  a tree laid out like an archive (share/man/man1/fil.1, share/doc/fil/THIRD-PARTY-
-#            NOTICES.md, ...) whose files are added to every binary archive: the generated files
-#            (notices, man pages, completions, examples) that other steps of the workflow produce
+#   --extra  a tree laid out like an archive (share/man/man1/fil.1, ...) whose files are added to
+#            every binary archive: the generated files (man pages, completions, examples) that other
+#            steps of the workflow produce. THIRD-PARTY-NOTICES.md is not one of them: it is
+#            committed (`just notices` keeps it current) and comes from the tree, like LICENSE
 #
 # Every archive is assembled by the GNU tar and gzip inside the digest-pinned x86_64 image of
 # Cross.toml, never the host's, with the recipe of section 4.4. Needs Docker, git and cargo (for
@@ -64,7 +65,7 @@ for t in $LINUX_TARGETS $UNIVERSAL; do
       printf '%s  %s\n' "$(sha256 "$f")" "$f"
     done > SHA256SUMS
   )
-  for f in README.md LICENSE CHANGELOG.md; do
+  for f in README.md LICENSE THIRD-PARTY-NOTICES.md CHANGELOG.md; do
     [ -f "$ROOT/$f" ] && install -m 644 "$ROOT/$f" "$d/share/doc/fil/$f"
   done
   if [ -n "$extra" ]; then

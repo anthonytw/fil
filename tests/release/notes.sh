@@ -33,8 +33,10 @@ ssh-keygen -Y verify -f SIGNERS -I release -n fil-release -s SHA256SUMS.sig < SH
 \`\`\`
 
 \`SHA256SUMS.sig\` is an SSH signature by the release key listed in \`.github/release-signers\`
-**on main**. \`fil-$v-source.tar.gz\` is the Corresponding Source with every dependency vendored; it
-builds offline. The Linux binaries and archives are reproducible (\`just release-verify\` rebuilds
-them in a pinned image). The macOS binary is **ad-hoc signed** (no Developer ID, not notarized) and is
-not independently reproduced; the macOS archive is checked only around that binary.
+**on main**. fil is GPL-3.0-or-later: each archive carries \`share/doc/fil/LICENSE\` and the
+third-party notices, \`share/doc/fil/THIRD-PARTY-NOTICES.md\`. \`fil-$v-source.tar.gz\` is the
+Corresponding Source with every dependency vendored; it builds offline. The Linux binaries and
+archives are reproducible (\`just release-verify\` rebuilds them in a pinned image). The macOS
+binary is **ad-hoc signed** (no Developer ID, not notarized) and is not independently reproduced;
+the macOS archive is checked only around that binary.
 EOT

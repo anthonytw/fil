@@ -69,6 +69,34 @@ enum Remote {
     Installed,
     /// No fil at all.
     Nowhere,
+    /// A fil of another wire on the host's `PATH` (another major, or this major and another
+    /// revision), and in the install directory this build's copy, or with `everywhere` a fil of
+    /// that other wire too.
+    OtherWire { major: bool, everywhere: bool },
+}
+
+/// A `fil` of another wire: one that answers with another major's preamble, or this build run
+/// as another wire revision (the test hook `FIL_TEST_WIRE_REVISION`).
+fn other_wire_fil(major: bool) -> String {
+    if major {
+        "#!/bin/sh\nprintf '\\033FIL-CONNECT 99\\n'\nexec cat >/dev/null\n".to_string()
+    } else {
+        format!(
+            "#!/bin/sh\nexec env FIL_TEST_WIRE_REVISION={} {FIL} \"$@\"\n",
+            fil_proto::version::wire_revision() + 1
+        )
+    }
+}
+
+/// `~/.local/share/fil/<this version>/` in the remote home, made as the bootstrap requires.
+fn install_dir(remote_home: &Path) -> PathBuf {
+    let mut d = remote_home.to_path_buf();
+    for part in [".local", "share", "fil", PipeCommand::INSTALL_DIR_NAME] {
+        d = d.join(part);
+        std::fs::create_dir(&d).unwrap();
+        mode(&d, 0o700);
+    }
+    d
 }
 
 /// A scratch client `HOME` with its config, the fake `ssh`, and (for a live host) a remote
@@ -131,13 +159,20 @@ impl World {
                 std::os::unix::fs::symlink(FIL, root.join("remote-bin/fil")).unwrap();
             }
             Remote::Installed => {
-                let mut d = root.join("remote");
-                for part in [".local", "share", "fil", PipeCommand::INSTALL_DIR_NAME] {
-                    d = d.join(part);
-                    std::fs::create_dir(&d).unwrap();
-                    mode(&d, 0o700);
-                }
+                let d = install_dir(&root.join("remote"));
                 std::fs::copy(FIL, d.join("fil")).unwrap();
+                mode(&d.join("fil"), 0o700);
+            }
+            Remote::OtherWire { major, everywhere } => {
+                let on_path = root.join("remote-bin/fil");
+                std::fs::write(&on_path, other_wire_fil(major)).unwrap();
+                mode(&on_path, 0o755);
+                let d = install_dir(&root.join("remote"));
+                if everywhere {
+                    std::fs::write(d.join("fil"), other_wire_fil(major)).unwrap();
+                } else {
+                    std::fs::copy(FIL, d.join("fil")).unwrap();
+                }
                 mode(&d.join("fil"), 0o700);
             }
             Remote::Dead | Remote::Nowhere => {}
@@ -205,6 +240,11 @@ impl World {
 
     /// Starts the attach, `fil HOST`, on a pseudo-terminal (it refuses to start without one).
     fn start(&self) -> Attached {
+        self.start_with(&[HOST])
+    }
+
+    /// `fil ARGS` on a pseudo-terminal.
+    fn start_with(&self, args: &[&str]) -> Attached {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -215,7 +255,7 @@ impl World {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(FIL);
-        cmd.arg(HOST);
+        cmd.args(args);
         cmd.env_clear();
         for (k, v) in self.env_pairs() {
             cmd.env(k, v);
@@ -375,6 +415,29 @@ impl Attached {
 
     fn text(&self) -> String {
         self.output.lock().unwrap().clone()
+    }
+
+    /// The screen as a terminal shows it now (the status line is drawn by differences, so the
+    /// raw output need not hold its words in one piece).
+    fn screen(&self) -> String {
+        let n = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut p = vt100::Parser::new(n(40), n(100), 0);
+        p.process(self.text().as_bytes());
+        p.screen().contents()
+    }
+
+    /// Waits until the screen shows `needle`.
+    #[track_caller]
+    fn wait_screen(&self, needle: &str) {
+        let end = Instant::now() + Duration::from_secs(30);
+        while !self.screen().contains(needle) {
+            assert!(
+                Instant::now() < end,
+                "the screen never showed {needle:?}: {}",
+                self.screen()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Whether the output, from `from` bytes on, comes to contain `needle` within `limit`.
@@ -903,4 +966,138 @@ fn the_offer_asks_on_the_first_attach_only() {
         "{text:?}"
     );
     assert!(!never.remote_home().join(".local").exists());
+}
+
+/// The owner's guard for the management commands, on a terminal, where an offer could be made:
+/// `fil ls` never asks and never installs, under `ask` or `always`. (Under `always` an install
+/// would get as far as refusing this development build, "not uploading".)
+#[test]
+fn a_management_command_never_installs_even_on_a_terminal() {
+    for install in ["ask", "always"] {
+        let w = World::with(
+            &format!("{PIPE_ONLY}install = \"{install}\"\n"),
+            Remote::Nowhere,
+        );
+        let mut ls = w.start_with(&["ls", HOST]);
+        let end = Instant::now() + Duration::from_secs(60);
+        while ls.child.try_wait().unwrap().is_none() {
+            assert!(
+                !ls.text().contains("[y/N]"),
+                "install = {install}: fil ls asked: {:?}",
+                ls.text()
+            );
+            assert!(Instant::now() < end, "fil ls did not end: {:?}", ls.text());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let text = ls.text();
+        assert!(
+            text.contains("not installed"),
+            "install = {install}: {text:?}"
+        );
+        assert!(
+            !text.contains("[y/N]") && !text.contains("not uploading"),
+            "install = {install}: {text:?}"
+        );
+        assert_eq!(
+            logins_of(&w.calls()),
+            [(Run::Plain, false), (Run::Bootstrap, false)]
+        );
+        assert!(!w.remote_home().join(".local").exists());
+    }
+}
+
+/// The owner's guard for reconnects: the installed copy is gone when the pipe drops, and the
+/// background run's bootstrap greets; under `install = "always"` it still installs nothing, and
+/// the status line says that reconnects never install. (Were it to try, it would get as far as
+/// refusing this development build, with other words.)
+#[test]
+fn a_reconnect_never_installs() {
+    let w = World::with(
+        &format!("{PIPE_ONLY}install = \"always\"\n"),
+        Remote::Installed,
+    );
+    let mut a = w.start();
+    a.live(1);
+    let copy = w
+        .remote_home()
+        .join(".local/share/fil")
+        .join(PipeCommand::INSTALL_DIR_NAME);
+    std::fs::remove_dir_all(&copy).unwrap();
+    assert!(w.kill_relays() >= 1, "no relay to kill");
+    a.wait_screen("reconnects never install");
+    let runs = w.classified();
+    assert!(
+        runs.contains(&(Run::Bootstrap, true)),
+        "a background bootstrap ran: {runs:?}"
+    );
+    assert!(!copy.exists(), "nothing was installed");
+}
+
+/// `remote = "auto"`'s second trigger: the host's fil is of another wire, a major apart (the
+/// pipe's preamble says so) or a revision apart (the hello says so). The run tries the bootstrap
+/// once, which starts this version's installed copy, for an attach and for `fil ls`. When the
+/// bootstrap's fil is of that other wire too, the run fails after it: no third login.
+#[test]
+fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
+    for major in [true, false] {
+        let fresh = || {
+            World::with(
+                PIPE_ONLY,
+                Remote::OtherWire {
+                    major,
+                    everywhere: false,
+                },
+            )
+        };
+        // Each in a world of its own: once a daemon of this wire runs there, a relay of another
+        // revision reaches it, and the plain command works.
+        let w = fresh();
+        let out = w.run(&["ls", HOST]);
+        assert!(
+            out.status.success(),
+            "major={major}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            logins_of(&w.calls()),
+            [(Run::Plain, false), (Run::Bootstrap, false)],
+            "major={major}: ls"
+        );
+        let w = fresh();
+        let mut a = w.start();
+        a.live(1);
+        assert_eq!(
+            logins_of(&w.calls()),
+            [(Run::Plain, false), (Run::Bootstrap, false)],
+            "major={major}: the attach"
+        );
+        drop(a);
+
+        let both = World::with(
+            PIPE_ONLY,
+            Remote::OtherWire {
+                major,
+                everywhere: true,
+            },
+        );
+        let out = both.run(&["ls", HOST]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "major={major}: {err}");
+        assert!(
+            err.contains("wire") || err.contains("major"),
+            "major={major}: {err}"
+        );
+        assert_eq!(
+            logins_of(&both.calls()),
+            [(Run::Plain, false), (Run::Bootstrap, false)],
+            "major={major}: ls, no third login"
+        );
+        let text = both.attach();
+        assert!(!text.is_empty());
+        assert_eq!(
+            logins_of(&both.calls()),
+            [(Run::Plain, false), (Run::Bootstrap, false)],
+            "major={major}: the attach, no third login: {text:?}"
+        );
+    }
 }

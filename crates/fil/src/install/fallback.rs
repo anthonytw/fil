@@ -187,6 +187,9 @@ struct RunState {
     choice: Choice,
     /// The command of a pipe that came up and whose outcome is not known yet.
     pending: Option<Command>,
+    /// Why the run fell back to the bootstrap, when that is worth saying if it fails too (the
+    /// relay was of another wire).
+    trigger: Option<String>,
 }
 
 impl Run {
@@ -194,7 +197,23 @@ impl Run {
         Run(std::sync::Arc::new(std::sync::Mutex::new(RunState {
             choice: Choice::new(mode, custom_pipe),
             pending: None,
+            trigger: None,
         })))
+    }
+
+    /// The `remote` setting the run was made with.
+    pub fn mode(&self) -> RemoteMode {
+        self.state().choice.mode
+    }
+
+    /// Keeps why the run fell back (`take_trigger` gives it to the bootstrap's failure).
+    pub fn set_trigger(&self, why: String) {
+        self.state().trigger = Some(why);
+    }
+
+    /// Why the run fell back, once.
+    pub fn take_trigger(&self) -> Option<String> {
+        self.state().trigger.take()
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, RunState> {

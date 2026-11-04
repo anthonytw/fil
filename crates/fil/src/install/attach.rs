@@ -83,7 +83,8 @@ fn toml_key(host: &str) -> String {
 }
 
 /// The one config line that saves a host with only a fil-installed copy the plain command's
-/// login, for the user to add (`docs/m4/plan.md` §3 U1, "The cost in logins").
+/// login, for the user to add (`docs/m4/plan.md` §3 U1, "The cost in logins"). Said after an
+/// attach installed fil, where the plain command had just found none.
 pub fn config_line(host: &str) -> String {
     format!(
         "to start it with one ssh login next time, add remote = \"installed\" under [host.{}] in fil's config (~/.config/fil/config.toml)",
@@ -91,19 +92,84 @@ pub fn config_line(host: &str) -> String {
     )
 }
 
-fn failure(message: String, skipped: Vec<u8>) -> PipeFailure {
+/// [`config_line`] for `fil install`, which did not try the plain command: the line helps only
+/// if that finds no fil of this version on the host.
+pub fn config_line_if_needed(host: &str) -> String {
+    format!(
+        "if `fil server --stdio` finds no fil of this version there (a fil of this wire on the host's PATH needs nothing), add remote = \"installed\" under [host.{}] in fil's config (~/.config/fil/config.toml) to start fil with one ssh login",
+        toml_key(&fil_proto::text::sanitize_inline(host))
+    )
+}
+
+/// What a run does when the bootstrap greets (the host has no usable fil).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Ask the user, on the terminal, before raw mode.
+    Ask,
+    /// Install without asking (`install = "always"`, the user's own consent).
+    Install,
+    /// Say how to install, and install nothing.
+    Decline(Declined),
+}
+
+/// Why nothing is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Declined {
+    /// A management command (`fil ls` and the others): never an install.
+    Management,
+    /// A run after the first attach (a reconnect, a fresh attach after a takeover): nobody is
+    /// watching, and the terminal belongs to the session.
+    Reconnect,
+    /// `install = "never"`.
+    Never,
+    /// stdin is not a terminal: nobody to ask.
+    NoTerminal,
+}
+
+/// The owner's guards on an install, as one decision (`docs/m4/plan.md` §3 U1, "The offer"):
+/// only an attach's interactive first run, with a terminal on stdin, may install; it asks
+/// unless the user's config says `always`. A reconnect and a management command never install,
+/// whatever the config says.
+pub fn decide(offer: Offer, interactive: bool, stdin_tty: bool) -> Decision {
+    let Offer::Attach(mode) = offer else {
+        return Decision::Decline(Declined::Management);
+    };
+    if !interactive {
+        return Decision::Decline(Declined::Reconnect);
+    }
+    if mode == InstallMode::Never {
+        return Decision::Decline(Declined::Never);
+    }
+    if !stdin_tty {
+        return Decision::Decline(Declined::NoTerminal);
+    }
+    match mode {
+        InstallMode::Ask => Decision::Ask,
+        InstallMode::Always => Decision::Install,
+        InstallMode::Never => Decision::Decline(Declined::Never),
+    }
+}
+
+/// The status-line note of a reconnect that found fil gone (`Declined::Reconnect`).
+pub const RECONNECT_NOTE: &str = "reconnects never install fil: detach (~.) and run fil again";
+
+fn failure(message: String, skipped: Vec<u8>, note: &str) -> PipeFailure {
     PipeFailure {
         message,
         skipped,
         severity: Severity::Permanent,
-        note: Some("fil is not installed on the remote host".into()),
+        note: Some(note.into()),
     }
 }
 
 /// Declines the greeting and fails with `message`.
 async fn decline(g: Box<Greeting>, message: String) -> PipeFailure {
+    decline_noted(g, message, "fil is not installed on the remote host").await
+}
+
+async fn decline_noted(g: Box<Greeting>, message: String, note: &str) -> PipeFailure {
     let e = g.decline().await;
-    failure(message, e.skipped)
+    failure(message, e.skipped, note)
 }
 
 /// What a run does with the bootstrap's greeting: install and attach, or decline. `interactive`
@@ -120,22 +186,28 @@ pub async fn greeted(
     let manual = format!(
         "{NO_COPY}. Install it with `fil install {shown}` or by hand (docs/m4/install.md), or attach with `fil {shown}` to be offered the install"
     );
-    let mode = match offer {
-        Offer::None => return Err(decline(g, manual).await),
-        Offer::Attach(mode) => mode,
-    };
-    if !interactive {
-        // A reconnect nobody is watching never installs.
-        return Err(decline(
-            g,
-            format!("{NO_COPY} any more, and a reconnect never installs it: detach (~.) and run fil again"),
-        )
-        .await);
-    }
-    match mode {
-        InstallMode::Never => return Err(decline(g, manual).await),
-        InstallMode::Always => {}
-        InstallMode::Ask => {
+    use std::io::IsTerminal;
+    let decision = decide(offer, interactive, std::io::stdin().is_terminal());
+    tracing::info!(?decision, "install: the host has no fil of this version");
+    match decision {
+        Decision::Decline(Declined::Reconnect) => {
+            return Err(decline_noted(
+                g,
+                format!("{NO_COPY} any more, and {RECONNECT_NOTE}"),
+                RECONNECT_NOTE,
+            )
+            .await);
+        }
+        Decision::Decline(Declined::NoTerminal) => {
+            return Err(
+                decline(g, format!("not asking (stdin is not a terminal). {manual}")).await,
+            );
+        }
+        Decision::Decline(Declined::Management | Declined::Never) => {
+            return Err(decline(g, manual).await);
+        }
+        Decision::Install => {}
+        Decision::Ask => {
             let question = format!(
                 "fil is not installed on {shown}. Install fil {version} into ~/.local/share/fil there?"
             );
@@ -206,6 +278,43 @@ pub async fn greeted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every combination: only an attach's interactive first run with a terminal installs,
+    /// and only `always` installs without asking. A reconnect and a management command never
+    /// do, under any setting.
+    #[test]
+    fn only_an_interactive_first_attach_on_a_terminal_may_install() {
+        let offers = [
+            Offer::None,
+            Offer::Attach(InstallMode::Ask),
+            Offer::Attach(InstallMode::Never),
+            Offer::Attach(InstallMode::Always),
+        ];
+        for offer in offers {
+            for interactive in [false, true] {
+                for tty in [false, true] {
+                    let d = decide(offer, interactive, tty);
+                    let want = match (offer, interactive, tty) {
+                        (Offer::None, _, _) => Decision::Decline(Declined::Management),
+                        (_, false, _) => Decision::Decline(Declined::Reconnect),
+                        (Offer::Attach(InstallMode::Never), _, _) => {
+                            Decision::Decline(Declined::Never)
+                        }
+                        (_, _, false) => Decision::Decline(Declined::NoTerminal),
+                        (Offer::Attach(InstallMode::Ask), true, true) => Decision::Ask,
+                        (Offer::Attach(InstallMode::Always), true, true) => Decision::Install,
+                    };
+                    assert_eq!(d, want, "{offer:?} interactive={interactive} tty={tty}");
+                    if !interactive || offer == Offer::None {
+                        assert!(
+                            matches!(d, Decision::Decline(_)),
+                            "never installs: {offer:?} interactive={interactive} tty={tty}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_config_line_names_the_host_as_toml_would() {

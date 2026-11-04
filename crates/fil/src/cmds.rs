@@ -223,6 +223,7 @@ impl Conn {
             return None;
         }
         tracing::info!("the remote host's fil is of another wire; trying the install bootstrap");
+        connector.run().set_trigger(e.to_string());
         if let AnyLink::Pipe(p) = &self.link {
             p.shutdown().await;
         }

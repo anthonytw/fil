@@ -18,10 +18,8 @@
 //! the other (RFC 8305), so an IPv6 address nobody answers on costs a fraction of a second, not
 //! the whole connect timeout.
 
-use std::ffi::OsString;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -131,7 +129,8 @@ impl Connect {
         };
         Ok(Self {
             command,
-            run: Run::new(RemoteMode::Auto, bootstrap.is_none()),
+            // Only the plain command until the caller gives the run's own choice (`with_run`).
+            run: Run::new(RemoteMode::Plain, bootstrap.is_none()),
             bootstrap,
             offer: Offer::None,
             host: host.to_string(),
@@ -177,8 +176,17 @@ impl Connect {
                 .map_err(|f| (f, Outcome::Other))?,
             Err(e) => {
                 let outcome = Outcome::of_pipe_error(&e);
+                let forced = matches!(e.kind, PipeErrorKind::Forced);
                 // The interactive run's stderr was shown as it arrived: not said again.
-                return Err((failure_with(e, interactive), outcome));
+                let mut f = failure_with(e, interactive);
+                if forced && self.run.mode() == RemoteMode::Auto {
+                    // Already on auto: the plain command ran, and found no usable fil.
+                    f.message = format!(
+                        "{}: so only `fil server --stdio` runs there, and it found no fil of this version; install one by hand on the PATH it uses (docs/m4/install.md)",
+                        PipeErrorKind::Forced
+                    );
+                }
+                return Err((f, outcome));
             }
         };
         let banner = link.banner().to_vec();
@@ -186,6 +194,25 @@ impl Connect {
             link: AnyLink::Pipe(link),
             banner,
         })
+    }
+
+    /// A run of the bootstrap. If it fails right after a fallback from a relay of another wire,
+    /// the failure says that first: it is why the bootstrap ran.
+    async fn run_bootstrap(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
+        match self.run_one(Command::Bootstrap, interactive).await {
+            Ok(up) => {
+                self.run.take_trigger();
+                self.run.came_up(Command::Bootstrap);
+                Ok(up)
+            }
+            Err((mut f, outcome)) => {
+                self.run.failed(Command::Bootstrap, outcome);
+                if let Some(why) = self.run.take_trigger() {
+                    f.message = format!("{why}; the install bootstrap then failed: {}", f.message);
+                }
+                Err(f)
+            }
+        }
     }
 
     /// The run's choice, for whoever sees how a connection ended past the pipe (the hello).
@@ -323,6 +350,11 @@ impl Connector for Connect {
     /// `remote = "installed"`), never with a custom pipe or `remote = "plain"`.
     async fn run_pipe(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
         let which = self.run.next();
+        if which == Command::Bootstrap {
+            // The run's command already (`installed`, what worked, or after a mismatch at the
+            // hello).
+            return self.run_bootstrap(interactive).await;
+        }
         let (failed, outcome) = match self.run_one(which, interactive).await {
             Ok(up) => {
                 self.run.came_up(which);
@@ -332,19 +364,13 @@ impl Connector for Connect {
         };
         match self.run.failed(which, outcome) {
             Next::Retry(Command::Bootstrap) => {
+                if outcome == Outcome::VersionMismatch {
+                    self.run.set_trigger(failed.message.clone());
+                }
                 tracing::info!(
                     "the plain remote command found no fil of this wire; trying the install bootstrap"
                 );
-                match self.run_one(Command::Bootstrap, interactive).await {
-                    Ok(up) => {
-                        self.run.came_up(Command::Bootstrap);
-                        Ok(up)
-                    }
-                    Err((f, outcome)) => {
-                        self.run.failed(Command::Bootstrap, outcome);
-                        Err(f)
-                    }
-                }
+                self.run_bootstrap(interactive).await
             }
             Next::Retry(Command::Plain) | Next::Fail => Err(failed),
         }
@@ -556,37 +582,9 @@ pub fn stderr_note(text: &str) -> Option<String> {
     })
 }
 
-fn is_ssh(program: &OsString) -> bool {
-    Path::new(program).file_name().is_some_and(|n| n == "ssh")
-}
-
-/// The same command for a run nobody is watching. When its program is `ssh`, whether it is the
-/// default command or one from `pipe = [...]`: never ask for a password, a passphrase or a
-/// host-key decision (there is no one to answer, and the terminal belongs to the session), give
-/// up on an unreachable host in ten seconds, and say only errors. Options the command already
-/// sets are left alone. Any other program runs as given (it may prompt on a reconnect).
+/// The same command for a run nobody is watching: [`PipeCommand::for_background`].
 pub fn without_tty(command: &PipeCommand) -> PipeCommand {
-    let argv = command.argv();
-    if !argv.first().is_some_and(is_ssh) {
-        return command.clone();
-    }
-    let mentions = |opt: &str| {
-        argv.iter()
-            .any(|a| a.to_string_lossy().to_ascii_lowercase().contains(opt))
-    };
-    let mut extra: Vec<OsString> = Vec::new();
-    if !mentions("batchmode") {
-        extra.extend(["-o".into(), "BatchMode=yes".into()]);
-    }
-    if !mentions("connecttimeout") {
-        extra.extend(["-o".into(), "ConnectTimeout=10".into()]);
-    }
-    if !mentions("loglevel") {
-        extra.extend(["-o".into(), "LogLevel=ERROR".into()]);
-    }
-    // Local options, after the program: the remote part, and whether this is the bootstrap,
-    // stay as they were.
-    command.with_options(extra)
+    command.for_background()
 }
 
 /// `user@host` and `[v6]` as a name to resolve.

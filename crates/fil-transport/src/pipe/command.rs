@@ -20,7 +20,7 @@
 //! **Approved by the owner (M4 OQ-1, 2026-11-04):** fil's remote commands are exactly two,
 //! [`REMOTE_COMMAND`] and [`BOOTSTRAP`] (DESIGN.md §8.2, decided). [`PipeCommand::ssh`] and
 //! [`PipeCommand::bootstrap`] are the only constructors of either; both take a host and nothing
-//! else. ([`PipeCommand::with_options`] adds local options in front of the host, for a
+//! else. ([`PipeCommand::for_background`] adds its fixed ssh options in front of the host, for a
 //! background run, and never touches the remote part.) What each check proves:
 //!
 //! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
@@ -384,13 +384,34 @@ impl PipeCommand {
         self.bootstrap
     }
 
-    /// The same command with `options` right after the program: options of the local program
-    /// (ssh's `-o BatchMode=yes` for a background run), never part of the remote command, which
-    /// follows the host. Everything else is kept: the remote part, whether this is the
-    /// bootstrap, and the keepalive setting.
-    pub fn with_options(&self, options: Vec<OsString>) -> Self {
+    /// The same command for a run nobody is watching (every run after the first attach). When
+    /// its program is `ssh`, whether the default command or one from `pipe = [...]`: never ask
+    /// for a password, a passphrase or a host-key decision (no one can answer, and the terminal
+    /// belongs to the session), give up on an unreachable host in ten seconds, and say only
+    /// errors. That is exactly [`BACKGROUND_OPTIONS`], right after the program; one the command
+    /// line already sets (as `-o Key=...` or `-oKey=...` among the options before the host) is
+    /// left alone. Nothing else changes: the remote part, whether this is the bootstrap, the
+    /// keepalive setting. Any other program runs as given (it may prompt on a reconnect).
+    ///
+    /// The options are fixed here so that no caller can put other words in front of the host of
+    /// a command that is the bootstrap.
+    pub fn for_background(&self) -> Self {
+        if !self
+            .argv
+            .first()
+            .is_some_and(|p| Path::new(p).file_name().is_some_and(|n| n == "ssh"))
+        {
+            return self.clone();
+        }
+        let set = ssh_option_keys(&self.argv);
+        let mut extra: Vec<OsString> = Vec::new();
+        for (key, value) in BACKGROUND_OPTIONS {
+            if !set.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+                extra.extend(["-o".into(), format!("{key}={value}").into()]);
+            }
+        }
         let mut c = self.clone();
-        c.argv.splice(1..1, options);
+        c.argv.splice(1..1, extra);
         c
     }
 
@@ -433,6 +454,55 @@ impl PipeCommand {
     }
 }
 
+/// The ssh options [`PipeCommand::for_background`] adds, as `-o KEY=VALUE`.
+pub const BACKGROUND_OPTIONS: [(&str, &str); 3] = [
+    ("BatchMode", "yes"),
+    ("ConnectTimeout", "10"),
+    ("LogLevel", "ERROR"),
+];
+
+/// The keys of the `-o` options on an ssh command line, as `-o Key=Value`, `-o "Key Value"` or
+/// `-oKey=Value`, among the arguments before the first that is not an option (the host) or
+/// `--`. Options that take a value of their own (`-J host`, `-p 22`, ...) are skipped with it, so
+/// a host alias or a remote command is never read as an option.
+fn ssh_option_keys(argv: &[OsString]) -> Vec<String> {
+    // ssh(1)'s options that take an argument.
+    const WITH_ARG: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+    let key = |v: &str| {
+        v.split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut keys = Vec::new();
+    let mut it = argv
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned());
+    while let Some(a) = it.next() {
+        if a == "--" || !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        // A cluster of flags, the last of which may take an argument (`-Tq`, `-p22`, `-oX=y`).
+        let flags = &a.as_bytes()[1..];
+        for (i, &f) in flags.iter().enumerate() {
+            if WITH_ARG.contains(&f) {
+                let attached = &a[i + 2..];
+                let value = if attached.is_empty() {
+                    it.next().unwrap_or_default()
+                } else {
+                    attached.to_string()
+                };
+                if f == b'o' {
+                    keys.push(key(&value));
+                }
+                break;
+            }
+        }
+    }
+    keys
+}
+
 fn mentions(argv: &[OsString], option: &str) -> bool {
     argv.iter()
         .any(|a| a.to_string_lossy().to_ascii_lowercase().contains(option))
@@ -461,6 +531,77 @@ mod tests {
             REMOTE_COMMAND.join(" "),
             render_bootstrap("0.1.0", 1, 12)
         )
+    }
+
+    fn words(c: &PipeCommand) -> Vec<String> {
+        c.argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A background run gets exactly the three options, in front of the host; the remote part,
+    /// the bootstrap flag and the keepalive setting are kept.
+    #[test]
+    fn a_background_run_adds_only_its_fixed_options_before_the_host() {
+        for c in [
+            PipeCommand::ssh("box").unwrap(),
+            PipeCommand::bootstrap("box").unwrap(),
+        ] {
+            let bg = c.for_background();
+            assert_eq!(bg.is_bootstrap(), c.is_bootstrap());
+            let w = words(&bg);
+            assert_eq!(
+                &w[..7],
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "LogLevel=ERROR"
+                ]
+            );
+            assert_eq!(&w[7..], &words(&c)[1..], "the rest is as it was");
+        }
+        // Options the line already sets are left alone, in any of ssh's spellings.
+        let own = PipeCommand::custom([
+            "ssh",
+            "-o",
+            "batchmode no",
+            "-oConnectTimeout=3",
+            "-Tq",
+            "-o",
+            "LogLevel=INFO",
+            "box",
+            "fil",
+            "server",
+            "--stdio",
+        ])
+        .unwrap();
+        assert_eq!(words(&own.for_background()), words(&own));
+        // A host or a remote command that mentions an option's name is not an option.
+        let alias = PipeCommand::ssh("batchmode-loglevel.example").unwrap();
+        assert!(words(&alias.for_background()).contains(&"BatchMode=yes".to_string()));
+        let jump = PipeCommand::custom([
+            "ssh",
+            "-J",
+            "batchmode",
+            "-p",
+            "22",
+            "box",
+            "-o",
+            "BatchMode=no",
+        ])
+        .unwrap();
+        assert!(
+            words(&jump.for_background()).contains(&"BatchMode=yes".to_string()),
+            "-J's host and what follows the host are not options"
+        );
+        // Other programs run as given.
+        let k = PipeCommand::custom(["kubectl", "exec", "-i", "pod", "--", "fil"]).unwrap();
+        assert_eq!(k.for_background(), k);
     }
 
     #[test]

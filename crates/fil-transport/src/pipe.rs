@@ -57,6 +57,7 @@
 //!   it reports `Down(Io)`: the pipe has no goodbye frame, and adding one would be a wire change.
 //!   Frames the peer sent before the end are still delivered by `recv` first.
 
+pub mod answer;
 mod command;
 mod driver;
 mod shared;
@@ -890,13 +891,6 @@ const ATTACH_MODE: &[u8] = b"attach\n";
 /// What a run that will not upload answers the bootstrap's greeting with: anything but `put`
 /// ends the script.
 const END_LINE: &[u8] = b"end\n";
-/// The bootstrap's marker lines (`docs/m4/plan.md` §3 U1).
-const BOOT_EXEC: &[u8] = b"FIL-BOOT1 exec";
-const BOOT_ATTACH: &[u8] = b"FIL-BOOT1 attach ";
-/// The start of fil's preamble (`fil_proto::preamble`).
-const PREAMBLE_MAGIC: &[u8] = b"\x1bFIL-CONNECT ";
-/// The longest line of the bootstrap's answer kept whole; a longer one is noise.
-const BOOT_LINE_MAX: usize = 4096;
 
 /// What [`PipeLink::start`] made.
 pub enum Spawned {
@@ -954,14 +948,16 @@ impl BootRead {
     }
 
     /// Reads the bootstrap's answer in `attach` mode: up to and including its marker line, the
-    /// noise before it (rc files) moved to `noise`, at most `limit` bytes of it.
+    /// noise before it (rc files) moved to `noise`, at most `limit` bytes of it. Returns the
+    /// answer and how much of `limit` the noise used. The lines are read by the one classifier
+    /// of the answer ([`answer::classify`]).
     async fn scan_boot(
         &mut self,
         noise: &mut Vec<u8>,
         limit: usize,
-    ) -> Result<BootSaid, PipeErrorKind> {
+    ) -> Result<(BootSaid, usize), PipeErrorKind> {
         let mut skipped = 0usize;
-        let mut skip = |noise: &mut Vec<u8>, bytes: &[u8]| -> Result<(), PipeErrorKind> {
+        let mut skip = |noise: &mut Vec<u8>, bytes: &[u8]| -> Result<usize, PipeErrorKind> {
             skipped += bytes.len();
             if noise.len() < limit + 64 {
                 let take = bytes.len().min(limit + 64 - noise.len());
@@ -970,45 +966,40 @@ impl BootRead {
             if skipped > limit {
                 return Err(PipeErrorKind::NoPreamble { limit });
             }
-            Ok(())
+            Ok(skipped)
         };
+        let mut used = 0;
         loop {
             let buf = self.buffered();
             let nl = buf.iter().position(|&b| b == b'\n');
             // fil's preamble on the line being read, with no marker before it: a forced command.
-            let line_end = nl.unwrap_or(buf.len());
-            if buf[..line_end]
-                .windows(PREAMBLE_MAGIC.len())
-                .any(|w| w == PREAMBLE_MAGIC)
-            {
+            if answer::has_preamble(&buf[..nl.unwrap_or(buf.len())]) {
                 return Err(PipeErrorKind::Forced);
             }
             if let Some(nl) = nl {
-                let line = buf[..nl].strip_suffix(b"\r").unwrap_or(&buf[..nl]).to_vec();
-                if line == BOOT_EXEC {
+                let said = match answer::classify(&buf[..nl]) {
+                    answer::Line::Exec => Some(BootSaid::Exec),
+                    answer::Line::Attach { sys, machine } => {
+                        Some(BootSaid::Attach { sys, machine })
+                    }
+                    _ => None,
+                };
+                if let Some(said) = said {
                     self.consume(nl + 1);
-                    return Ok(BootSaid::Exec);
-                }
-                if let Some(rest) = line.strip_prefix(BOOT_ATTACH) {
-                    let mut parts = rest.split(|&b| b == b' ');
-                    let sys = fil_proto::text::sanitize_inline(parts.next().unwrap_or_default());
-                    let machine =
-                        fil_proto::text::sanitize_inline(parts.next().unwrap_or_default());
-                    self.consume(nl + 1);
-                    return Ok(BootSaid::Attach { sys, machine });
+                    return Ok((said, used));
                 }
                 let whole = buf[..=nl].to_vec();
                 self.consume(nl + 1);
-                skip(noise, &whole)?;
+                used = skip(noise, &whole)?;
                 continue;
             }
-            if buf.len() > BOOT_LINE_MAX {
+            if buf.len() > answer::LINE_MAX {
                 // A line too long to be the answer: noise, but its tail may hold the start of a
                 // marker or of the preamble.
-                let cut = buf.len() - PREAMBLE_MAGIC.len();
+                let cut = buf.len() - answer::PREAMBLE_MAGIC.len().max(answer::MARK.len() + 64);
                 let gone = buf[..cut].to_vec();
                 self.consume(cut);
-                skip(noise, &gone)?;
+                used = skip(noise, &gone)?;
             }
             if !self.fill().await.map_err(PipeErrorKind::Io)? {
                 return Err(PipeErrorKind::Closed);
@@ -1054,7 +1045,7 @@ struct Boot {
 impl Boot {
     /// Reads the answer to `attach` and acts on it.
     async fn answer(mut self) -> Result<Spawned, PipeError> {
-        let limit = self.cfg.preamble_limit;
+        let limit = self.cfg.preamble_limit.min(answer::NOISE_MAX);
         let said = {
             let scan = self.read.scan_boot(&mut self.noise, limit);
             match self.cfg.preamble_timeout {
@@ -1065,8 +1056,10 @@ impl Boot {
             }
         };
         match said {
-            Ok(BootSaid::Exec) => {
+            Ok((BootSaid::Exec, used)) => {
                 let noise = std::mem::take(&mut self.noise);
+                // One bound for everything before the preamble, the answer's noise included.
+                self.cfg.preamble_limit = self.cfg.preamble_limit.saturating_sub(used).max(1);
                 PipeLink::establish(
                     self.read,
                     self.write,
@@ -1079,11 +1072,13 @@ impl Boot {
                 .await
                 .map(Spawned::Up)
             }
-            Ok(BootSaid::Attach { sys, machine }) => Ok(Spawned::Greeted(Box::new(Greeting {
-                sys,
-                machine,
-                boot: self,
-            }))),
+            Ok((BootSaid::Attach { sys, machine }, _)) => {
+                Ok(Spawned::Greeted(Box::new(Greeting {
+                    sys,
+                    machine,
+                    boot: self,
+                })))
+            }
             Err(kind) => Err(self.fail(kind).await),
         }
     }
@@ -1854,6 +1849,19 @@ mod tests {
         assert_eq!(e.stderr_text(), "read=;");
     }
 
+    /// An rc file that printed no newline (a title escape) before the marker: still the marker.
+    #[tokio::test]
+    async fn noise_without_a_newline_before_the_marker_is_skipped() {
+        let Ok(Spawned::Greeted(g)) =
+            boot(r#"read m; printf '\033]0;title\007FIL-BOOT1 attach Linux aarch64\n'; read c"#)
+                .await
+        else {
+            panic!("no greeting");
+        };
+        assert_eq!(g.uname(), ("Linux", "aarch64"));
+        g.decline().await;
+    }
+
     /// A preamble with no `FIL-BOOT1 exec` before it is a forced command: the run ends at once.
     #[tokio::test]
     async fn an_unmarked_preamble_is_a_forced_command() {
@@ -1872,7 +1880,10 @@ mod tests {
     /// ends after it is not "ended before the preamble"; one that ends before any answer is.
     #[tokio::test]
     async fn the_fast_path_goes_on_to_the_preamble() {
-        let e = boot(r#"read m; echo 'FIL-BOOT1 exec'; printf '\033FIL-CONNECT 1\n'; exit 127"#)
+        // It takes the opening ping before it exits, so the ping's write cannot fail first.
+        let e = boot(
+            r#"read m; echo 'FIL-BOOT1 exec'; printf '\033FIL-CONNECT 1\n'; head -c 1 >/dev/null; exit 127"#,
+        )
             .await
             .err()
             .unwrap();

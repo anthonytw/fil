@@ -206,6 +206,7 @@ async fn attach(
         && run.version_mismatch() == Next::Retry(InstallCommand::Bootstrap)
     {
         tracing::info!("the remote host's fil is of another wire; trying the install bootstrap");
+        run.set_trigger(e.to_string());
         return Box::pin(attach(host, session, transport, forwards, settings, run)).await;
     }
     // The client has restored the terminal and printed how it ended; an error still needs saying.

@@ -8,7 +8,7 @@ Examples use package version `0.1.0` and wire `1.12`. The wire on `main` at the 
 
 ## 1. Versioning and the wire
 
-- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0** (decided, owner 2026-11-04), then one or two more 0.x releases, and 1.0 once the config and flags have met real use. Under SemVer, 0.x means the config, flags and exit statuses may still change.
+- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
 - **The wire** is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION` (`crates/fil-proto/src/limits.rs`). It is independent of the package version. Two builds talk only when their wires are equal (`DESIGN.md` §5.3, §8.5).
 - **A patch release never changes the wire.** REL's `release-check` compares the revision on the last line of the golden's `[history]` with that of the previous tag of the same minor.
 - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Daemons of different wires coexist on a host, so this is an upgrade, not a breakage.
@@ -353,21 +353,22 @@ vmOpts:
 
 Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or create a second instance for the rebuilds and name it with `--vm`. The rebuild installs, in the VM, `cross` 0.2.5 and `just` (`cargo install --locked`) and the pinned toolchain for `x86_64-unknown-linux-gnu` (`rustup toolchain install --force-non-host`; `cross` mounts it into the amd64 image) the first time, and clones the repository over HTTPS: the VM needs the network and nothing from the Mac. The macOS binary is the one input that is not rebuilt: the macOS archive is reassembled around the release's own `bin/fil`.
 
-## 10. Names, channels and macOS notarization (decided, owner 2026-11-04, round 2)
+## 10. Names, channels and macOS notarization
 
 ### 10.1 Reserving the crates.io names
 
-**Decided (owner 2026-11-04):** each published crate gets a 0.0.1 placeholder now, to reserve its name. No crates.io token goes to CI. The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there.
+**Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name; no crates.io token goes to CI. The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
 
 **The names.** The owner's list began with `fil` and eight `fil-*` libraries (`fil-proto`, `fil-transport`, `fil-session`, `fil-daemon`, `fil-client`, `fil-term`, `fil-predict`, `fil-forward`). **`fil` is unavailable on crates.io:** an unrelated crate (a random-number helper) took it on 2026-11-04 at 08:24 ET. The user-facing crate is therefore **`fil-shell`** (`cargo install fil-shell` installs the `fil` binary, matching `fil-shell-bin` on the AUR), reserved by the coordinator. **The name is not marked decided:** the owner can pick another. The workspace's `crates/fil` package must be renamed to match before it is published; the binary stays `fil`. Until then no document may suggest `cargo install fil`, which installs the wrong crate.
 
-**Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 they changed that: they logged in with a full-access token for the `splarg-bot` crates.io account, the coordinator publishes the placeholders from it, and `anthonytw` is invited as an owner of each crate. How v1 itself is published is not recorded yet.
+**Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. How v1 itself is published is not recorded yet.
 
 **The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
 
 1. After `cargo login`, `just reserve-crate-names` is a dry run, the default: it checks which names are free (a GET on `https://crates.io/api/v1/crates/<name>`, with a descriptive User-Agent) and runs `cargo publish --dry-run` for each placeholder. Nothing is uploaded.
-2. `just reserve-crate-names --publish` asks for a "yes", then publishes. A name that is already registered is skipped with a message, never a failure.
-3. `--invite OWNER` runs `cargo owner --add OWNER CRATE` after each publish, and for the crates already published, unless OWNER already owns the crate or was invited. A crate that the logged-in account does not own is reported and left alone.
+2. `just reserve-crate-names --publish` asks for a "yes", then publishes. A name that is already registered is skipped with a message, not a failure.
+3. `--account LOGIN` names the publishing account. With it, a taken name whose owners do not include LOGIN is reported as "taken by others", with its owners, in a list of its own, and the run exits 1.
+4. `--invite OWNER` runs `cargo owner --add OWNER CRATE` after each publish, and for the crates already published, unless OWNER already owns the crate or was invited. A crate that the publishing account does not own is never invited to.
 
 Each placeholder is built in a fresh temporary directory outside the repository (a `Cargo.toml` with the version 0.0.1, `GPL-3.0-or-later` and the repository URL; a `src/lib.rs` that is one doc comment; a `README.md`; no author, no email). The real workspace crates are never published by this script.
 
@@ -375,21 +376,21 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 
 ### 10.2 The v1 channels
 
-**Decided (owner 2026-11-04), superseding the narrower recommendation of `docs/m4/plan.md` OQ-3** (the owner's note: "Reserve names and prep packages everywhere for v1"):
+**Decided (owner 2026-11-04, round 2), superseding the narrower recommendation of `docs/m4/plan.md` OQ-3** (the owner's note: "Reserve names and prep packages everywhere for v1"). The channels, as the owner chose them:
 
-- GitHub Releases and the Homebrew tap `anthonytw/homebrew-tap`;
+- GitHub Releases and the Homebrew tap `anthonytw/homebrew-tap` (as recommended);
 - crates.io, nine crates: `fil-shell` and eight libraries (§10.1);
 - `.deb` and `.rpm` for x86_64 and arm64, built by CI and attached to the release;
 - the AUR package `fil-shell-bin`;
 - a Nix flake in the repository, plus a nixpkgs PR;
-- the start of the official distro submissions: Debian (an ITP, then an RFS; Ubuntu inherits Debian's package) and Fedora (a package review). These need owner accounts and a sponsor and finish whenever the distros finish; **v1 does not wait on their acceptance.**
+- the start of the official distro submissions: Debian (an ITP, then an RFS; Ubuntu inherits Debian's package) and Fedora (a package review). These need owner accounts and a sponsor and finish whenever the distros finish. **v1 does not wait on their acceptance** (coordinator's reading, not the owner's words).
 
 ### 10.3 macOS: signed and notarized on the owner's Mac
 
-**Decided (owner 2026-11-04):** v1 is notarized, on the owner's Mac, and Apple keys are never in CI. This is the design only; **the recipe is a work item, built later.**
+**Decided (owner 2026-11-04, round 2):** v1 is signed and notarized on the owner's Mac, and Apple keys are never in CI. **Everything below that sentence is proposed by the coordinator**, as the design only; the recipe is a work item, built later.
 
-1. **CI** builds the macOS binary unsigned and reproducibly (§9) into a draft release, as for any release.
-2. **The owner runs `just release-sign-macos vX.Y.Z`.** It downloads the draft and verifies it (as `release-verify` does before signing), signs the macOS binary with the Developer ID (hardened runtime, secure timestamp), submits it with `notarytool`, rebuilds the macOS archive and `SHA256SUMS` around the signed binary, signs those with the release key (§9.2) and uploads them to the draft. The owner then publishes as in §9.2.
-3. **Verifiability.** Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
-4. **Stapling.** A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
-5. **The release key** on a hardware token is optional, not chosen (§9.2).
+1. **CI** (proposed, coordinator) builds the macOS binary unsigned and reproducibly (§9) into a draft release, as for any release.
+2. **The owner runs `just release-sign-macos vX.Y.Z`** (proposed, coordinator). It downloads the draft and verifies it (as `release-verify` does before signing), signs the macOS binary with the Developer ID (hardened runtime, secure timestamp), submits it with `notarytool`, rebuilds the macOS archive and `SHA256SUMS` around the signed binary, signs those with the release key (§9.2) and uploads them to the draft. The owner then publishes as in §9.2.
+3. **Verifiability** (proposed, coordinator). Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
+4. **Stapling** (proposed, coordinator). A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
+5. **The release key** (proposed, coordinator) on a hardware token is optional, not chosen (§9.2).

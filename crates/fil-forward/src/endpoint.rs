@@ -995,6 +995,8 @@ pub struct Wakeups {
     pub ctl: u64,
     pub data: u64,
     pub ticks: u64,
+    /// Items (acks, MUX records) the control sender handed to the link.
+    pub ctl_sent: u64,
 }
 
 /// Hooks for tests of races (feature `test-hooks`; never in a released binary).
@@ -1007,6 +1009,7 @@ struct TestHooks {
     ctl_runs: std::sync::atomic::AtomicU64,
     data_runs: std::sync::atomic::AtomicU64,
     ticks: std::sync::atomic::AtomicU64,
+    ctl_sent: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1162,6 +1165,7 @@ impl<L: Link> Endpoint<L> {
             ctl: h.ctl_runs.load(Relaxed),
             data: h.data_runs.load(Relaxed),
             ticks: h.ticks.load(Relaxed),
+            ctl_sent: h.ctl_sent.load(Relaxed),
         }
     }
 
@@ -2348,6 +2352,8 @@ impl<L: Link> Inner<L> {
             }
             match item {
                 Some(((ch, payload), link, generation)) => {
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks.ctl_sent.fetch_add(1, Ordering::Relaxed);
                     if link.send(ch, payload).await.is_err() {
                         self.send_failed(&link, generation);
                     }

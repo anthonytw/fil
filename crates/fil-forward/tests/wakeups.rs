@@ -136,12 +136,15 @@ async fn each_event_wakes_only_the_task_that_has_work_body() {
     // The tasks that have work run once for an event at most (a wakeup is a permit that comes
     // to one run, however many events it covers). How many events there are depends on the
     // load, since a quicker local socket drains between payloads and acks at once (the
-    // receiver acknowledges on drain): 90 to 600 runs for the 1,024 payloads, so no bound
-    // tighter than one per payload holds on a loaded machine.
+    // receiver acknowledges on drain): 90 to 600 runs for the 1,024 payloads, so no bound on
+    // the runs alone holds on a loaded machine. Relative to what the control sender sent they
+    // do: it takes about 3 runs for each item (3.0 to 3.5 measured, 24 copies at once), and a
+    // wakeup that finds no work (the payload path always kicking it) makes that 4.4 to 5.3.
     let rx_ctl = d1.ctl - d0.ctl;
+    let items = d1.ctl_sent - d0.ctl_sent;
     assert!(
-        rx_ctl <= segments + IDLE_RUNS,
-        "the receiver's control sender ran {rx_ctl} times for {segments} segments"
+        rx_ctl <= segments + IDLE_RUNS && rx_ctl <= 4 * items + IDLE_RUNS,
+        "the receiver's control sender ran {rx_ctl} times for {items} items and {segments} segments"
     );
 }
 

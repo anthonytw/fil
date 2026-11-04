@@ -620,7 +620,14 @@ pub fn predictor_factory(
         Predict::Off => return None,
         Predict::Passive => Box::new(|| Box::new(Passive)),
         Predict::Mosh => Box::new(|| Box::new(MoshPredictor::new(MoshConfig::default()))),
-        Predict::MoshAlways => Box::new(|| Box::new(MoshPredictor::new(MoshConfig::always()))),
+        // Always shown, and always underlined: the oracle terminal counts a written guess by its
+        // underline, which the default predictor draws only above 80 ms (DESIGN.md §9).
+        Predict::MoshAlways => Box::new(|| {
+            Box::new(MoshPredictor::new(MoshConfig {
+                underline_above: Duration::ZERO,
+                ..MoshConfig::always()
+            }))
+        }),
         Predict::Eager => Box::new(|| Box::new(EagerPredictor::default())),
     };
     Some(Box::new(move || {

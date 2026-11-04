@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use fil_predict::driver::{PredictorKind, RunConfig, Trace, replay};
 use fil_predict::oracle::{Kind, printed, reserved};
-use fil_predict::sim::HostileCfg;
+use fil_predict::sim::{FixedPredictor, HostileCfg};
 use fil_predict::{
     Config, Ctx, Flush, Guards, InputKind, InputPos, KeyEvent, LinkView, MoshPredictor, Overlay,
     OverlayEdit, Predictor, Settled, Show, Time,
@@ -643,7 +643,13 @@ fn s3_an_old_attachs_ack_does_not_count_after_the_offsets_rebase() {
         &b,
         size,
         0,
-        Box::new(MoshPredictor::default()),
+        // The cells fixed (the 50 `x` guesses refused): the default predictor withdraws a
+        // tentative epoch whose guess shows before the keys ahead of it are acknowledged.
+        Box::new(FixedPredictor::new(
+            std::iter::repeat_n((0, 0), 50)
+                .chain([(0, 2), (1, 2), (1, 3)])
+                .collect(),
+        )),
         Config::default(),
     );
     o.set_link(LinkView {

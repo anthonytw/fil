@@ -71,7 +71,7 @@ pub struct CatchUpParams {
     /// Behind by more than this many bytes: snapshot.
     pub max_bytes: u64,
     /// Unacknowledged output older than this: snapshot, provided at least `min_bytes_for_age`
-    /// bytes are outstanding (so a quiet shell over a slow link never triggers it).
+    /// bytes are waiting to be sent (so a quiet shell over a slow link never triggers it).
     pub max_age: Duration,
     pub min_bytes_for_age: u64,
 }
@@ -88,8 +88,9 @@ impl Default for CatchUpParams {
 
 /// While attached: jump to a snapshot instead of replaying the backlog?
 ///
-/// `behind_bytes` is how much output the subscriber has not acknowledged; `age` is how long the
-/// oldest unacknowledged byte has been waiting.
+/// `behind_bytes` is how much output a jump would skip: what has not been sent to the subscriber
+/// (output already sent reaches it anyway, so late acknowledgements alone never make a jump
+/// worth it); `age` is how long the oldest unacknowledged byte has been waiting.
 pub fn should_snapshot(behind_bytes: u64, age: Duration, p: &CatchUpParams) -> bool {
     behind_bytes > p.max_bytes || (age > p.max_age && behind_bytes >= p.min_bytes_for_age)
 }

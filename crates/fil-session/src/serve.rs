@@ -26,8 +26,9 @@
 //! read it.
 //!
 //! **Flow control.** The client acks the terminal channel cumulatively. The session never sends
-//! beyond what the emulator has seen at a sequence boundary. When the client falls too far
-//! behind (`fil_proto::log::should_snapshot`), or falls off the back of the log, the stream
+//! beyond what the emulator has seen at a sequence boundary. When too much output is waiting to
+//! be sent (`fil_proto::log::should_snapshot` on the unsent bytes: what is already sent is not
+//! counted, a jump could not save it), or the client falls off the back of the log, the stream
 //! jumps ahead: `Snapshot` (control), the snapshot bytes on the snapshot channel, and the
 //! terminal channel continues at the snapshot's `at`. The snapshot starts with a gap marker in
 //! the client's scrollback, so the client must not add one of its own.
@@ -603,9 +604,12 @@ impl<'a, L: Link> Conn<'a, L> {
                 // client is still told how the session ended.
                 return self.finish_exited(false).await;
             }
-            // Nothing is gained by jumping when everything is already sent: the delay is in the
-            // link, and a snapshot would only rewrite what the client has. And a finished
-            // session sends the rest of its log: a snapshot would cost the client the tail.
+            // The rule is judged on what a jump would skip: output released but not sent
+            // (`ready - next`). What is sent and not yet acknowledged is on its way and reaches
+            // the client whatever happens; jumping over a small unsent rest only because the
+            // acknowledgements are late (a fast link, a slow terminal) would rewrite what the
+            // client has, for nothing (DESIGN.md section 6.2). And a finished session sends the
+            // rest of its log: a snapshot would cost the client the tail.
             //
             // Not while the previous snapshot is unconfirmed: the announcement would overtake
             // its bytes (see `Flow::unconfirmed`). Output past the snapshot is sent meanwhile,
@@ -616,7 +620,8 @@ impl<'a, L: Link> Conn<'a, L> {
             let stalled = wrapped && awaiting;
             if !prog.exited
                 && !awaiting
-                && (wrapped || (prog.ready > next && should_snapshot(behind, age, &params)))
+                && (wrapped
+                    || (prog.ready > next && should_snapshot(prog.ready - next, age, &params)))
             {
                 match self.catch_up(out).await {
                     Ok(()) => continue,

@@ -25,9 +25,13 @@ pub fn flood(ctx: &Ctx, host: &str) -> Res {
         200_000.0 / took.as_secs_f64(),
         check_seq(&c, from, "", 1, 200_000, Gap::Allowed)?
     ));
-    // A 50000-line, 4 MB file through `cat`.
+    // A 50000-line, 4 MB file through `cat`. The text after the number starts with a letter: a
+    // snapshot drops the blanks at the end of the cursor's row and puts the cursor after them, so
+    // when a catch-up falls just after the space, the terminal shows the space as an empty cell
+    // but the transcript (escapes stripped, cursor moves ignored) glues the number to what
+    // follows. With a digit there, `LINE-029407` and `0123...` would read as one huge number.
     c.run(
-        "seq -f 'LINE-%06g 0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij' 1 50000 > big.txt",
+        "seq -f 'LINE-%06g abcdefghij0123456789abcdefghij0123456789abcdefghij0123456789' 1 50000 > big.txt",
         CMD_TIMEOUT,
     )?;
     let from = c.len();

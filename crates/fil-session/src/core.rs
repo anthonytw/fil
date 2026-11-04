@@ -1023,11 +1023,12 @@ impl Core {
 
     // --- snapshots ---
 
-    /// The snapshot bytes for the terminal's state at the released offset. With `skipped`
-    /// bytes of output the client never saw, they start with the gap marker, in its scrollback.
-    fn render_snapshot(&mut self, skipped: u64) -> Vec<u8> {
+    /// The snapshot bytes for the terminal's state at the released offset, with `history` lines
+    /// of scrollback. With `skipped` bytes of output the client never saw, they start with the gap
+    /// marker, in its scrollback.
+    fn render_snapshot(&mut self, skipped: u64, history: usize) -> Vec<u8> {
         self.emu.apply_pending();
-        let state = self.emu.state(self.cfg.history_lines);
+        let state = self.emu.state(history);
         let body = snapshot(&state);
         if skipped == 0 {
             return body;
@@ -1043,7 +1044,12 @@ impl Core {
         }
         let at = self.ready();
         let skipped = at.saturating_sub(sent);
-        let bytes = self.render_snapshot(skipped);
+        // Only the lines the client never received: its scrollback has everything up to `sent`.
+        let history = {
+            let log = self.shared.lock_log();
+            unseen_history(&log, sent, at, self.size.rows(), self.cfg.history_lines)
+        };
+        let bytes = self.render_snapshot(skipped, history);
         Some(CatchUp {
             info: SnapshotInfo {
                 at,
@@ -1272,7 +1278,7 @@ impl Core {
         skipped: u64,
         reason: SnapshotReason,
     ) -> (StartPoint, Option<Vec<u8>>, u64) {
-        let bytes = self.render_snapshot(skipped);
+        let bytes = self.render_snapshot(skipped, self.cfg.history_lines);
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
@@ -1469,6 +1475,102 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// How many lines of scrollback a catch-up snapshot at `at` renders for a client that was sent
+/// the output up to `sent`, on a screen of `rows` rows: the lines that scrolled off the
+/// emulator's screen since `sent` and were never on the client's, at most `max`.
+///
+/// The client has everything before `sent` in its scrollback or on its screen, and the gap
+/// prologue scrolls that screen into the scrollback as it is. Of the lines the emulator scrolled
+/// into its history since then, the first ones are those screen rows; only the rest are new.
+/// With `n` line feeds in `sent..at`, the screen rows the client has and the new lines that went
+/// to the history together number `n + 1` (the row the cursor was on at `sent` is the "+ 1"):
+/// whichever row the cursor was on, `rows` of them are the client's screen, so `n + 1 - rows`
+/// are new. The row at the cursor is counted as new unless the skipped output starts by ending
+/// it (a line feed, after nothing but carriage returns and CSI sequences): a line the client got
+/// only part of is shown whole after the marker; a whole line is not shown twice.
+///
+/// Line feeds are a lower bound on the lines scrolled (a line wider than the screen wraps onto
+/// rows of its own; output the log no longer holds is not counted), so this errs towards
+/// showing too few of the skipped lines, never lines the client has. The exceptions are output
+/// that feeds lines without scrolling the primary screen's history (an alternate screen, a
+/// scroll region below the top row): a full-screen program's line feeds can bring back up to
+/// `max` lines the client has. The emulators keep no count of scrolled lines, so a line-feed
+/// count is what can be had: one backward scan of the log, stopped once `max + rows` are found.
+pub(crate) fn unseen_history(log: &OutputLog, sent: u64, at: u64, rows: u16, max: usize) -> usize {
+    const CHUNK: usize = 64 * 1024;
+    let lo = sent.max(log.start());
+    if lo >= at || max == 0 {
+        return 0;
+    }
+    let enough = max + usize::from(rows);
+    let mut feeds = 0;
+    let mut end = at;
+    while end > lo && feeds < enough {
+        let from = end.saturating_sub(CHUNK as u64).max(lo);
+        let chunk = log.read(from, (end - from) as usize);
+        feeds += chunk.iter().filter(|&&b| b == b'\n').count();
+        end = from;
+    }
+    // Does the skipped output start by ending the client's last row? Only knowable when the log
+    // still has the byte at `sent`.
+    let ends_row = sent >= log.start() && {
+        // The cut can fall inside a CSI sequence (sends are cut at any byte): its start, from
+        // before `sent`, goes with it.
+        let back = (sent - log.start()).min(32);
+        let mut b = unfinished_csi(&log.read(sent - back, back as usize)).to_vec();
+        b.extend(log.read(sent, (at - sent).min(256) as usize));
+        starts_with_line_feed(&b)
+    };
+    let cursor_row = usize::from(!ends_row);
+    (feeds + cursor_row)
+        .saturating_sub(usize::from(rows))
+        .min(max)
+}
+
+/// The end of `b` if it is the start of a CSI sequence that has not finished: `ESC`, or `ESC [`
+/// and parameters.
+fn unfinished_csi(b: &[u8]) -> &[u8] {
+    if b.last() == Some(&0x1b) {
+        return &b[b.len() - 1..];
+    }
+    let params = b
+        .iter()
+        .rev()
+        .take_while(|c| (0x20..0x40).contains(*c))
+        .count();
+    let j = b.len() - params;
+    if j >= 2 && b[j - 1] == b'[' && b[j - 2] == 0x1b {
+        &b[j - 2..]
+    } else {
+        &[]
+    }
+}
+
+/// Whether `b` is a line feed after nothing but carriage returns and CSI sequences (an SGR
+/// reset before the end of a line, say).
+fn starts_with_line_feed(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => return true,
+            b'\r' => i += 1,
+            0x1b if b.get(i + 1) == Some(&b'[') => {
+                // Parameters and intermediates, then the final byte.
+                i += 2;
+                while i < b.len() && (0x20..0x40).contains(&b[i]) {
+                    i += 1;
+                }
+                if !b.get(i).is_some_and(|f| (0x40..0x7f).contains(f)) {
+                    return false;
+                }
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// What is written ahead of a snapshot that replaces output the client never saw: put the
 /// terminal on its primary screen with plain modes, scroll what is on the screen into the
 /// scrollback, and leave the marker line there too (DESIGN.md section 6.2). The snapshot
@@ -1659,6 +1761,204 @@ mod tests {
             .map(|l| l.text())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// What a client shows after a catch-up from `sent` to the end of `out`: its emulator was
+    /// fed `out[..sent]`, then the gap prologue and the snapshot the daemon renders with
+    /// `unseen_history` lines of scrollback. Returns the numbers of the whole `L<n>` lines, in
+    /// order, with `None` for the marker.
+    fn after_catch_up(out: &[u8], log: &OutputLog, sent: usize, max: usize) -> Vec<Option<u32>> {
+        after_catch_up_at(out, log, sent, out.len(), max)
+    }
+
+    /// [`after_catch_up`] with the snapshot taken at `at`, and the rest of `out` sent after it.
+    fn after_catch_up_at(
+        out: &[u8],
+        log: &OutputLog,
+        sent: usize,
+        at: usize,
+        max: usize,
+    ) -> Vec<Option<u32>> {
+        let size = fil_term::Size { cols: 40, rows: 6 };
+        let mut client = fil_term::create("alacritty", size, 10_000).unwrap();
+        client.feed(&out[..sent]);
+        let mut daemon = fil_term::create("alacritty", size, max).unwrap();
+        daemon.feed(&out[..at]);
+        let history = unseen_history(log, sent as u64, at as u64, size.rows, max);
+        client.feed(&gap_prologue(size.rows, (at - sent) as u64));
+        client.feed(&snapshot(&daemon.state(history)));
+        client.feed(&out[at..]);
+        client.apply_pending();
+        let st = client.state(10_000);
+        st.history
+            .iter()
+            .map(|l| l.text())
+            .chain(st.screen_text())
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.contains("fil: skipped") {
+                    return Some(None);
+                }
+                let n = l
+                    .strip_prefix('L')?
+                    .strip_suffix(" x")
+                    .filter(|d| d.len() == 4)?;
+                n.parse().ok().map(Some)
+            })
+            .collect()
+    }
+
+    /// Plain lines, some with SGR around them (`ls --color`), so a cut can fall between a
+    /// line's text and its CR LF, between the CR and the LF, or inside an escape. Each has a
+    /// space in it: a cut just after it leaves the space at the end of the snapshot's cursor row,
+    /// which the snapshot drops as a trailing blank and puts the cursor after; the terminal must
+    /// still read the line whole.
+    fn numbered_lines(n: u32) -> Vec<u8> {
+        (1..=n)
+            .flat_map(|i| {
+                if i % 3 == 0 {
+                    format!("\x1b[1mL{i:04} x\x1b[0m\r\n").into_bytes()
+                } else {
+                    format!("L{i:04} x\r\n").into_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// The catch-up snapshot renders only the lines the client never received: wherever the
+    /// client's stream was cut, it shows every line exactly once, the marker between the ones it
+    /// had and the ones it gets from the snapshot (the line it got only part of is shown whole
+    /// after the marker). A skip of less than a screen is the exception: the screen is drawn
+    /// whole, so the rows the client still had on it come again.
+    #[test]
+    fn a_catch_up_shows_every_line_once_wherever_the_stream_was_cut() {
+        let out = numbered_lines(60);
+        let mut log = OutputLog::new(1 << 20);
+        log.append(&out);
+        for sent in 0..out.len() {
+            let seen = after_catch_up(&out, &log, sent, 1000);
+            let marker = seen.iter().position(Option::is_none).expect("the marker");
+            assert_eq!(seen.iter().filter(|n| n.is_none()).count(), 1);
+            let mut nums: Vec<u32> = seen.iter().flatten().copied().collect();
+            let what = format!(
+                "cut at {sent} ({:?}), marker after {marker} lines: {nums:?}",
+                String::from_utf8_lossy(&out[sent.saturating_sub(8)..sent])
+            );
+            let skipped_lines = out[sent..].iter().filter(|&&b| b == b'\n').count();
+            if skipped_lines < 6 {
+                // Only rows of the last screen come twice.
+                let twice: Vec<u32> = nums
+                    .windows(2)
+                    .filter(|w| w[1] <= w[0])
+                    .map(|w| w[1])
+                    .collect();
+                assert!(twice.iter().all(|&n| n > 60 - 6), "{what}");
+                nums.sort_unstable();
+                nums.dedup();
+            }
+            assert_eq!(nums, (1..=60).collect::<Vec<_>>(), "{what}");
+        }
+    }
+
+    /// Wherever the snapshot is taken (between escape sequences, as the session does), the live
+    /// stream continues it seamlessly: a snapshot just after the space in `L0012 x` drops the
+    /// space as a trailing blank of the cursor's row and puts the cursor after it, and the
+    /// terminal still reads `L0012 x` (an escape-stripped transcript would read `L0012x`).
+    #[test]
+    fn the_stream_after_a_catch_up_continues_the_snapshot_wherever_it_was_taken() {
+        let out = numbered_lines(30);
+        let mut log = OutputLog::new(1 << 20);
+        log.append(&out);
+        let sent = 40;
+        for at in sent + 1..out.len() {
+            if !unfinished_csi(&out[..at]).is_empty() {
+                continue;
+            }
+            let seen = after_catch_up_at(&out, &log, sent, at, 1000);
+            let mut nums: Vec<u32> = seen.iter().flatten().copied().collect();
+            // A skip of less than a screen draws rows the client has again (see above).
+            if out[sent..at].iter().filter(|&&b| b == b'\n').count() < 6 {
+                nums.sort_unstable();
+                nums.dedup();
+            }
+            assert_eq!(
+                nums,
+                (1..=30).collect::<Vec<_>>(),
+                "snapshot at {at}: {seen:?}"
+            );
+        }
+    }
+
+    /// With more skipped than the history holds, the snapshot is its last `max` lines and the
+    /// screen: a jump at the marker, never a line the client has.
+    #[test]
+    fn a_long_skip_shows_the_history_after_the_marker_and_nothing_twice() {
+        let out = numbered_lines(60);
+        let mut log = OutputLog::new(1 << 20);
+        log.append(&out);
+        // Every cut that skips at least a screen of lines.
+        for sent in 0..out.len() {
+            if out[sent..].iter().filter(|&&b| b == b'\n').count() < 6 {
+                continue;
+            }
+            let seen = after_catch_up(&out, &log, sent, 8);
+            let nums: Vec<u32> = seen.iter().flatten().copied().collect();
+            assert!(
+                nums.windows(2).all(|w| w[1] > w[0]),
+                "cut at {sent}: {nums:?}"
+            );
+            assert_eq!(nums.last(), Some(&60));
+            // Whatever came after the marker is contiguous up to the end.
+            let marker = seen.iter().position(Option::is_none).unwrap();
+            let tail: Vec<u32> = seen[marker + 1..].iter().flatten().copied().collect();
+            assert!(
+                tail.windows(2).all(|w| w[1] == w[0] + 1),
+                "cut at {sent}: {tail:?}"
+            );
+        }
+    }
+
+    /// When the log no longer holds the start of the skipped output, the line feeds it does hold
+    /// are a lower bound: some skipped lines may be missing, none the client has comes back.
+    #[test]
+    fn a_wrapped_log_errs_towards_fewer_lines() {
+        let out = numbered_lines(60);
+        let mut log = OutputLog::new(200);
+        log.append(&out);
+        let start = log.start() as usize;
+        for sent in 0..start {
+            let seen = after_catch_up(&out, &log, sent, 1000);
+            let nums: Vec<u32> = seen.iter().flatten().copied().collect();
+            assert!(
+                nums.windows(2).all(|w| w[1] > w[0]),
+                "cut at {sent}: {nums:?}"
+            );
+            assert_eq!(nums.last(), Some(&60));
+        }
+    }
+
+    #[test]
+    fn unseen_history_counts() {
+        let mut log = OutputLog::new(1 << 20);
+        log.append(b"a\r\nb\r\nc\r\nd\r\ne\r\n");
+        // Nothing skipped, or no history wanted.
+        assert_eq!(unseen_history(&log, 15, 15, 2, 100), 0);
+        assert_eq!(unseen_history(&log, 0, 15, 2, 0), 0);
+        // From the start: 5 line feeds, the cursor's row, 2 rows of screen.
+        assert_eq!(unseen_history(&log, 0, 15, 2, 100), 4);
+        // Cut between CR and LF: the client's row is whole.
+        assert_eq!(unseen_history(&log, 2, 15, 2, 100), 3);
+        // Fewer new lines than rows, and the cap.
+        assert_eq!(unseen_history(&log, 9, 15, 4, 100), 0);
+        assert_eq!(unseen_history(&log, 0, 15, 2, 3), 3);
+        assert!(starts_with_line_feed(b"\r\x1b[0m\x1b[K\n"));
+        assert!(!starts_with_line_feed(b"\x1b[0mx\n"));
+        assert!(!starts_with_line_feed(b"\x1b]0;t\x07\n"));
+        assert!(!starts_with_line_feed(b"\x1b[0"));
+        assert_eq!(unfinished_csi(b"ab\x1b"), b"\x1b");
+        assert_eq!(unfinished_csi(b"ab\x1b[0;1"), b"\x1b[0;1");
+        assert_eq!(unfinished_csi(b"ab\x1b[0m"), b"");
+        assert_eq!(unfinished_csi(b"[0"), b"");
     }
 
     /// A client that was cut off in an alternate screen entered (`?1049h`, which saves the

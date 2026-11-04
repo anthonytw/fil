@@ -432,6 +432,12 @@ impl Client {
         self.with_plain(|p| String::from_utf8_lossy(&p[from.min(p.len())..]).into_owned())
     }
 
+    /// The raw output (escapes and all), with real host names scrubbed out.
+    pub fn raw_text(&self) -> String {
+        let raw = String::from_utf8_lossy(&self.pty.state().raw).into_owned();
+        self.scrub.scrub(&raw)
+    }
+
     /// The length of the raw output (escapes and all).
     pub fn raw_len(&self) -> usize {
         self.pty.state().raw.len()

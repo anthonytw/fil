@@ -485,7 +485,7 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]"
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)"
     );
     std::process::exit(2);
 }
@@ -529,6 +529,10 @@ fn main() {
             "--allow-missing" => allow_missing = true,
             "--allow-skip" => allow_skip = true,
             "--verbose" => verbose = true,
+            "--dump" => {
+                let dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
+                let _ = common::DUMP_DIR.set(dir);
+            }
             "--list" => {
                 for (n, _) in scenarios() {
                     println!("{n}");

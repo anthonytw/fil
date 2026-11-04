@@ -137,11 +137,75 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
         eprintln!("fil: stdin or stdout is not open");
         return ExitCode::FAILURE;
     };
-    match relay(input, output, opts) {
+    let result = if cfg!(target_os = "macos")
+        && let Some(sock) = blocking_socket(input.as_fd())
+    {
+        relay(EofWatch::new(sock, EOF_WATCH), output, opts)
+    } else {
+        relay(input, output, opts)
+    };
+    match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fil: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// How often a relay whose input is a socket looks again for an end it was not woken for.
+const EOF_WATCH: Duration = Duration::from_secs(1);
+
+/// `fd` as a stream, if it is a socket in blocking mode (sshd hands some sessions a socketpair
+/// rather than pipes).
+///
+/// Any socket, of any family: an AF_UNIX socketpair from sshd, or a TCP socket from inetd or
+/// launchd. It is held as a `UnixStream` only for its `read` and `set_read_timeout`, which are
+/// `read(2)` and `SO_RCVTIMEO` on the descriptor whatever the family; nothing that depends on the
+/// address is called on it.
+fn blocking_socket(fd: std::os::fd::BorrowedFd<'_>) -> Option<UnixStream> {
+    use rustix::fs::{FileType, OFlags};
+    let socket = FileType::from_raw_mode(rustix::fs::fstat(fd).ok()?.st_mode) == FileType::Socket;
+    let nonblocking = rustix::fs::fcntl_getfl(fd).ok()?.contains(OFlags::NONBLOCK);
+    if !socket || nonblocking {
+        return None;
+    }
+    fd.try_clone_to_owned().ok().map(UnixStream::from)
+}
+
+/// The client's side when it is a socket, on macOS, whose kernel can lose the wakeup of a thread
+/// blocked in `read` when the peer half-closes (seen about once in a few hundred socketpair
+/// half-closes after a large transfer; the end is recorded, only the wakeup is lost). The read
+/// times out every `every` and is tried again, so a lost wakeup costs at most that, instead of
+/// the relay missing ssh's end until the whole connection closes. A read that fails at once with
+/// `WouldBlock` (the socket became non-blocking after all) is passed on, not retried, so this
+/// never spins.
+struct EofWatch {
+    sock: UnixStream,
+    every: Duration,
+}
+
+impl EofWatch {
+    fn new(sock: UnixStream, every: Duration) -> Self {
+        // Without the timeout this is a plain blocking read, as before.
+        let _ = sock.set_read_timeout(Some(every));
+        Self { sock, every }
+    }
+}
+
+impl Read for EofWatch {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let t = Instant::now();
+            match self.sock.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && t.elapsed() >= self.every / 2 => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                r => return r,
+            }
         }
     }
 }
@@ -469,6 +533,55 @@ where
 mod tests {
     use super::*;
     use rustix::fs::{FlockOperation, flock};
+
+    /// The EOF watch: its read timeouts are tried again, not taken for the end, so data after a
+    /// quiet spell and the end itself still come through; a socket that does not block fails at
+    /// once instead of spinning.
+    #[test]
+    fn the_eof_watch_retries_its_timeouts_and_never_spins() {
+        let (mut far, near) = UnixStream::pair().unwrap();
+        let mut w = EofWatch::new(near, Duration::from_millis(50));
+        assert_eq!(
+            w.sock.read_timeout().unwrap(),
+            Some(Duration::from_millis(50))
+        );
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            far.write_all(b"hi").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            far.shutdown(std::net::Shutdown::Write).unwrap();
+            far
+        });
+        let mut buf = [0u8; 8];
+        assert_eq!(w.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(w.read(&mut buf).unwrap(), 0);
+        let _far = writer.join().unwrap();
+
+        let (_far, near) = UnixStream::pair().unwrap();
+        let mut w = EofWatch::new(near, Duration::from_secs(1));
+        w.sock.set_nonblocking(true).unwrap();
+        let t = Instant::now();
+        let e = w.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// Only a blocking socket is watched: not a pipe, not a socket that does not block.
+    #[test]
+    fn only_a_blocking_socket_is_watched() {
+        use std::os::fd::AsFd;
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert!(blocking_socket(a.as_fd()).is_some());
+        a.set_nonblocking(true).unwrap();
+        assert!(blocking_socket(a.as_fd()).is_none());
+        let (r, _w) = std::io::pipe().unwrap();
+        assert!(blocking_socket(r.as_fd()).is_none());
+    }
 
     /// A first connection after an upgrade starts a daemon beside the old one: the relay says the
     /// old one is there (numbers only), and says nothing when it is alone.

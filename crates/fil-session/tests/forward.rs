@@ -1,4 +1,4 @@
-//! Forwards on the daemon side (DESIGN.md sections 7.2 and 8.5; `docs/m2/plan.md`, F2): a
+//! Forwards on the daemon side (DESIGN.md sections 7.2 and 8.5): a
 //! scripted client with a real client-side endpoint over `link::mem`, against real loopback
 //! targets.
 

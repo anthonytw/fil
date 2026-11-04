@@ -1,4 +1,4 @@
-//! A hostile daemon (`docs/m2/plan.md` F3, section 4.1): the daemon socket is reachable by any
+//! A hostile daemon (DESIGN.md sections 7.2 and 11): the daemon socket is reachable by any
 //! process of the user's uid on the remote, so the client's checks are the security boundary.
 //! Every refusal here leaves a **canary** listener on the would-be target that must see no
 //! connection attempt at all. Also: the target pinning, and a forward that keeps going while the

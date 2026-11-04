@@ -1,4 +1,4 @@
-//! The client end of the agent relay (`docs/m2/plan.md` A1) against the fake daemon, with a
+//! The client end of the agent relay (DESIGN.md section 10) against the fake daemon, with a
 //! test-only mini agent (Ed25519 keys generated at test time) as the local `SSH_AUTH_SOCK`: list
 //! and sign through a channel the daemon opens, across a swap and a reconnect; the filter and the
 //! allowlist end to end; `confirm` yes and no on the overlay; `~#`; and a hostile daemon's

@@ -1,4 +1,4 @@
-//! The agent relay's two ends (DESIGN.md section 10, `docs/m2/plan.md` A1).
+//! The agent relay's two ends (DESIGN.md section 10).
 //!
 //! - **The client** (the trusted end) connects an `Open Agent` channel to the local agent
 //!   through [`connect_local`]: the channel gets one end of an in-memory pipe, and a task between
@@ -11,7 +11,7 @@
 //! Every read and write is async: no tokio worker waits on the agent, the remote or the user (a
 //! confirm question waits in its own future, and the endpoint's event drain never sees it).
 //!
-//! **Privacy** (DESIGN.md section 11.1, plan section 4.4): which keys sign, and when, is user
+//! **Privacy** (DESIGN.md section 11.1): which keys sign, and when, is user
 //! data. It is kept in memory for `~#` and `fil ports` only; logs carry counts, at debug, and
 //! never a fingerprint, a key type or a comment.
 

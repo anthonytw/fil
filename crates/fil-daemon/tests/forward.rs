@@ -1,5 +1,5 @@
 //! `fil forward` and `fil ports` through the daemon's socket (DESIGN.md sections 7.3, 7.4 and
-//! 8.5; `docs/m2/plan.md`, F2): management requests reach the session's forward table, and the
+//! 8.5): management requests reach the session's forward table, and the
 //! ports answer lists every session with its forwards.
 
 mod common;

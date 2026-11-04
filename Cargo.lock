@@ -413,6 +413,7 @@ dependencies = [
  "libc",
  "nix",
  "portable-pty",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

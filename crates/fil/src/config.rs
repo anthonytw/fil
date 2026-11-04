@@ -12,6 +12,11 @@
 //! agent_keys = []             # SHA256 fingerprints the relay answers for; empty is every key
 //! remote_requests = "ask"     # ask | deny: `fil forward` run on the host (section 7.3)
 //! forward_failure = "warn"    # warn | exit: a forward that cannot bind (ssh ExitOnForwardFailure)
+//! remote = "auto"             # auto | plain | installed: the remote command (docs/m4/install.md);
+//!                             # until M4 OQ-1 is answered, always `fil server --stdio`, and
+//!                             # "installed" is refused
+//! install = "ask"             # ask | never | always: installing fil on a host that has none
+//!                             # (M4 OQ-1; nothing installs until then)
 //!
 //! [defaults.forward]          # instead of the list above, when tunables are set:
 //! # specs = ["-L 5173"]       #   the same list
@@ -56,6 +61,7 @@ use fil_transport::path::TransportSetting;
 use serde::Deserialize;
 
 use crate::forward_spec;
+pub use crate::install::fallback::{InstallMode, RemoteMode};
 
 pub use fil_daemon::paths::{base_dir, home_dir};
 
@@ -171,7 +177,7 @@ pub enum ForwardFailure {
     Exit,
 }
 
-/// The `[defaults.forward]` tunables (`docs/m2/plan.md` section 2.9), checked: the same keys and
+/// The `[defaults.forward]` tunables (DESIGN.md section 14), checked: the same keys and
 /// bounds as the daemon's `[forward]` (`fil_forward::tunables`).
 pub use fil_forward::tunables::ForwardTunables;
 use fil_forward::tunables::Value as TunableValue;
@@ -304,6 +310,8 @@ struct RawSection {
     forward_failure: Option<ForwardFailure>,
     offline_input: Option<RawOffline>,
     direct: Option<RawDirect>,
+    remote: Option<RemoteMode>,
+    install: Option<InstallMode>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -357,6 +365,8 @@ impl RawSection {
             agent_keys: self.agent_keys.clone().or_else(|| base.agent_keys.clone()),
             remote_requests: self.remote_requests.or(base.remote_requests),
             forward_failure: self.forward_failure.or(base.forward_failure),
+            remote: self.remote.or(base.remote),
+            install: self.install.or(base.install),
             offline_input: nested(
                 &self.offline_input,
                 &base.offline_input,
@@ -401,6 +411,11 @@ pub struct HostSettings {
     pub offline: OfflineInput,
     /// Where to dial UDP when it is not the host name (an ssh alias, a different interface).
     pub direct_address: Option<String>,
+    /// Which remote command a run uses (`crate::install::fallback`). Until M4 OQ-1 is answered
+    /// every connection runs `fil server --stdio`, whatever this says.
+    pub remote: RemoteMode,
+    /// Whether an attach that finds no fil offers to install it (M4 OQ-1: not yet).
+    pub install: InstallMode,
 }
 
 impl Default for HostSettings {
@@ -418,6 +433,8 @@ impl Default for HostSettings {
             forward_tunables: ForwardTunables::default(),
             offline: OfflineInput::default(),
             direct_address: None,
+            remote: RemoteMode::Auto,
+            install: InstallMode::Ask,
         }
     }
 }
@@ -586,6 +603,15 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
             });
         }
     }
+    if let Some(r) = s.remote {
+        if r == RemoteMode::Installed {
+            return Err(REMOTE_INSTALLED.into());
+        }
+        out.remote = r;
+    }
+    if let Some(i) = s.install {
+        out.install = i;
+    }
     if let Some(d) = &s.direct {
         if let Some(a) = &d.address {
             out.direct_address = Some(check_address(a)?);
@@ -683,6 +709,11 @@ fn check_label(l: &str) -> Result<String, String> {
     Ok(l.to_string())
 }
 
+/// Why `remote = "installed"` is refused for now: it would run the install bootstrap from a run's
+/// first connection, and no connection runs it until M4 OQ-1 is answered and the attach path can
+/// send it.
+const REMOTE_INSTALLED: &str = "remote = \"installed\" is not available in this version of fil (every connection runs `fil server --stdio`); use \"auto\" or \"plain\"";
+
 const DAEMON_SETTING: &str = "KEY is a setting of the daemon, not of the client: put it in ~/.config/fil/daemon.toml on the host where the daemon runs";
 
 #[cfg(test)]
@@ -769,6 +800,43 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
         assert_eq!(k.transport, TransportSetting::Pipe);
         assert_eq!(k.pipe.unwrap()[0], "kubectl");
         assert_eq!(cfg.for_host("elsewhere"), cfg.defaults());
+    }
+
+    #[test]
+    fn remote_and_install_default_to_auto_and_ask_and_layer_by_host() {
+        let d = parse("").unwrap().defaults();
+        assert_eq!((d.remote, d.install), (RemoteMode::Auto, InstallMode::Ask));
+        let cfg = parse(
+            r#"
+[defaults]
+remote = "plain"
+install = "never"
+[host.devbox]
+remote = "auto"
+install = "always"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults().remote, RemoteMode::Plain);
+        let h = cfg.for_host("devbox");
+        assert_eq!(
+            (h.remote, h.install),
+            (RemoteMode::Auto, InstallMode::Always)
+        );
+        assert_eq!(cfg.for_host("other").install, InstallMode::Never);
+    }
+
+    /// Until M4 OQ-1 is answered no connection runs the bootstrap, so the one value that asks
+    /// for it from the start is refused, naming the key, rather than silently meaning "plain".
+    #[test]
+    fn remote_installed_is_refused_until_the_bootstrap_runs() {
+        let e = parse("[host.devbox]\nremote = \"installed\"\n").unwrap_err();
+        assert!(
+            e.contains("[host.devbox]") && e.contains("remote = \"installed\""),
+            "{e}"
+        );
+        assert!(parse("[defaults]\nremote = \"sometimes\"\n").is_err());
+        assert!(parse("[defaults]\ninstall = \"yes\"\n").is_err());
     }
 
     #[test]

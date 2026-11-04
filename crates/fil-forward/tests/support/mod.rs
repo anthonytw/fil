@@ -291,6 +291,9 @@ pub struct Targets {
     /// Where an `Agent` open connects (a stand-in for the local ssh-agent).
     agent: Mutex<Option<Target>>,
     pub asked: AtomicUsize,
+    /// How long every connect waits before it starts (none by default): an open that stays
+    /// unanswered that long.
+    pub delay: Mutex<Duration>,
 }
 
 impl Targets {
@@ -325,7 +328,11 @@ impl Connector for Targets {
             OpenKind::Dynamic { target, .. } => Some(target.clone()),
             OpenKind::Agent => self.agent.lock().unwrap().clone(),
         };
+        let delay = *self.delay.lock().unwrap();
         Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let target = target.ok_or(OpenFailure::NoSuchForward)?;
             let s = connect_tcp(&target, &check).await?;
             Ok(Box::new(s) as fil_forward::BoxStream)

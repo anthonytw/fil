@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The M2 agent scenarios of the real-network harness (docs/m2/realnet.md, plan §5.3): the agent relay
+# The M2 agent scenarios of the real-network harness (docs/m2/realnet.md): the agent relay
 # (A1, DESIGN §10) of the real `fil` binary, with a real OpenSSH ssh-agent on the client and a real
 # ssh hop from the session. In the udp part's topology (fwd.sh, udp.sh), so it needs root and the
 # same tools. Run: agent.sh [SCENARIO...], `just realnet agent`.

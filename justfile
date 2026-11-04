@@ -202,6 +202,18 @@ dropin *args:
     just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
     "{{target_dir}}/release/examples/dropin" {{args}}
 
+# macOS as the REMOTE host (DESIGN.md §16.9, docs/m4/plan.md MAC): the real release `fil` serves a
+# session over a real ssh login to this Mac (an sshd of its own on a high loopback port with
+# throwaway keys; MACOS_SSHD=system uses the system sshd, on a throwaway runner only), driven by the
+# client on a pty. Scenarios: `just macos-remote --list`; narrow with names. It starts and stops a
+# `fil` daemon of its own and refuses to run beside one of yours (tests/macos/remote.sh). macOS
+# only; never part of `ci`. `fil` is built in an invocation of its own, so it has no test hooks.
+macos-remote *args:
+    cargo build -q --release -p fil --bins
+    cargo build -q --release -p fil-testbins --bin ptydrive --bin fwdprobe
+    just no-test-hooks "{{target_dir}}/release/fil"
+    FIL_BIN_DIR="{{target_dir}}/release" tests/macos/remote.sh {{args}}
+
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil
 # that is installed or released. Building an example or a test with `-p fil` unifies the dev-

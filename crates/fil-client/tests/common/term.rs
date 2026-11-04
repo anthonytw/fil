@@ -196,6 +196,11 @@ impl TermHandle {
         self.shared.lock().unwrap().exit_writes.clone()
     }
 
+    /// Every write so far, one entry per call.
+    pub fn writes(&self) -> Vec<Vec<u8>> {
+        self.shared.lock().unwrap().writes.clone()
+    }
+
     pub fn written(&self) -> Vec<u8> {
         self.shared.lock().unwrap().written.clone()
     }

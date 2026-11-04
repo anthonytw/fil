@@ -343,6 +343,49 @@ mod bootstrap {
         assert_eq!(w.names(), [PipeCommand::INSTALL_DIR_NAME]);
     }
 
+    /// The client dies in the middle of an upload (as opposed to the script): ssh's end of the
+    /// pipe closes, so the script's `head -c` reads fewer bytes than announced, and it removes
+    /// its fresh directory and the parents this run made. Nothing is left behind.
+    #[tokio::test]
+    async fn a_client_killed_during_an_upload_leaves_nothing_behind() {
+        let w = World::new("killed");
+        let up = this_fil();
+        let (child, mut stdin, mut lines) = spawn(&w);
+        boot::send_mode(&mut stdin, Mode::Attach).await.unwrap();
+        assert!(matches!(
+            boot::read_greeting(&mut lines).await.unwrap(),
+            Greeted::Greeting { .. }
+        ));
+        let header = format!("put {} {}\n", up.bytes.len(), up.sha256);
+        stdin.write_all(header.as_bytes()).await.unwrap();
+        stdin
+            .write_all(&up.bytes[..up.bytes.len() / 3])
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+        // The script has made its directories and is reading the bytes.
+        fil_testkit::until_within("the upload to start", Duration::from_secs(20), || {
+            w.names().iter().any(|n| n.starts_with(".new-"))
+        })
+        .await;
+        // The client is gone: its end of the pipe closes, and nothing more arrives.
+        assert_eq!(finish(child, stdin).await, 1, "the script refused");
+        assert!(
+            !w.home.join(".local").exists(),
+            "the fresh directory and this run's parents are gone"
+        );
+        let mut rest = Vec::new();
+        let (buffered, mut out) = lines.into_parts();
+        rest.extend(buffered);
+        tokio::io::AsyncReadExt::read_to_end(&mut out, &mut rest)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&rest).contains("FIL-BOOT1 ok"),
+            "nothing was installed"
+        );
+    }
+
     /// `fil install` refuses this test build before a byte of it is sent, and the host is left
     /// as it was.
     #[tokio::test]

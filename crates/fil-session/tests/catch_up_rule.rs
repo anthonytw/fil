@@ -116,13 +116,26 @@ async fn a_backlog_jumps_with_the_marker() {
         assert!(part.windows(2).all(|w| w[1] == w[0] + 1), "{part:?}");
     }
     let last = seen.iter().rposition(Option::is_none).unwrap();
+    let before: Vec<u32> = seen[..last].iter().flatten().copied().collect();
     let after: Vec<u32> = seen[last + 1..].iter().flatten().copied().collect();
     assert_eq!(after.last(), Some(&6000));
-    // The history's 1000 lines and the screen's, minus the END line and the prompt row.
+    // What the last snapshot carries is set by what that jump skipped, which depends on how many
+    // times the daemon jumped (it is behind each time it gets to look). The rule (`unseen_history`,
+    // the log has not wrapped here): the history lines the client never received, up to the
+    // history size, and the screen's rows. So either no line is lost across the marker (the
+    // lines the jump skipped fit in the history, and all of them come back after it), or the
+    // history was full: the history's 1000 lines and the screen's rows (minus the END line and
+    // the prompt row), all of them after the marker.
+    let first_after = after[0];
+    let lost = before
+        .last()
+        .map_or(first_after - 1, |&b| first_after - b - 1);
     assert!(
-        after.len() >= 1000,
-        "{} lines after the marker",
-        after.len()
+        lost == 0 || after.len() >= 1000,
+        "{lost} lines lost across the last marker, but only {} lines after it \
+         (before it up to {:?}, after it from {first_after})",
+        after.len(),
+        before.last()
     );
     let _ = h.kill(Duration::from_secs(5)).await;
 }
@@ -134,7 +147,15 @@ async fn a_backlog_jumps_with_the_marker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catch_up_never_repeats_what_the_client_has() {
     let sc = Scratch::new();
-    let mut cfg = sh_config(&sc, "main", &lines_script(1500));
+    // The first 20 lines go out alone, and the flood waits until the client has them: whether the
+    // client has anything before the jump must not depend on how fast the daemon's reader and
+    // serve task run against the shell (on a loaded runner the whole flood can be in the log
+    // before the first byte of it is sent, and then the first jump skips from the start).
+    let script = format!(
+        "stty -echo; echo READY; read go; seq -f 'L%06g {PAD}' 1 20; read go2; \
+         seq -f 'L%06g {PAD}' 21 1500; echo END; sleep 30"
+    );
+    let mut cfg = sh_config(&sc, "main", &script);
     cfg.catch_up = CatchUpParams {
         max_bytes: 16 * 1024,
         ..CatchUpParams::default()
@@ -143,6 +164,10 @@ async fn a_catch_up_never_repeats_what_the_client_has() {
     let h = spawn_plain(cfg).await;
     let mut c = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
     c.wait_screen("READY").await;
+    c.type_bytes(b"\n").await;
+    c.wait_out(&format!("L000020 {PAD}\r\n")).await;
+    assert!(c.mid_snapshots.is_empty(), "{:?}", c.mid_snapshots);
+    // Only now the flood: the client reads none of it until it is all in the log.
     c.type_bytes(b"\n").await;
     wait_log_end(&h, 1500 * 59).await;
     c.wait_screen("END").await;
@@ -155,8 +180,9 @@ async fn a_catch_up_never_repeats_what_the_client_has() {
         c.mid_snapshots.len()
     );
     let nums: Vec<u32> = seen.iter().flatten().copied().collect();
-    // Not vacuous: the client did have lines before the jump, and got lines from the snapshot.
-    assert!(seen[..marker].iter().flatten().count() > 0, "{seen:?}");
+    // Not vacuous: the client did have lines before the jump (the script holds the flood back
+    // until it has the first 20), and got lines from the snapshot.
+    assert!(seen[..marker].iter().flatten().count() >= 20, "{seen:?}");
     assert!(seen[marker + 1..].iter().flatten().count() > 24, "{seen:?}");
     // Every line once, wherever the jumps were.
     assert_eq!(nums, (1..=1500).collect::<Vec<_>>());
@@ -165,18 +191,22 @@ async fn a_catch_up_never_repeats_what_the_client_has() {
 
 /// PR #110's B1, at the session's level: on a QUIC-like link (control overtakes the data, two data
 /// segments in flight, each taking 200 ms) the catch-up is announced while output the daemon sent
-/// is still on its way (16 to 32 KiB of it in trial runs).
+/// is still on its way.
 /// The snapshot holds only the history the client was never sent, so the in-flight output is in
 /// no snapshot: the client applies it before the snapshot (the testkit client does as the real
 /// one), and every line is shown exactly once.
+///
+/// Whether output is in flight when the jump is announced is set up, not left to timing: the link's
+/// gate holds the data back from the client until it has read the announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_in_flight_at_a_catch_up_is_shown_once() {
     let sc = Scratch::new();
-    // In batches of 50 lines, a little faster than the link takes them: the first batches are
-    // sent and fill the link before a backlog builds behind them.
+    // The first 20 lines go out alone; the flood (in batches of 50 lines, a little faster than the
+    // link takes them) waits until the test has the link set up.
     let script = format!(
-        "stty -echo; echo READY; read go; i=0; while [ $i -lt 60 ]; do \
-         seq -f 'L%06g {PAD}' $((i*50+1)) $((i*50+50)); i=$((i+1)); sleep 0.002; done; \
+        "stty -echo; echo READY; read go; seq -f 'L%06g {PAD}' 1 20; read go2; i=0; \
+         while [ $i -lt 60 ]; do \
+         seq -f 'L%06g {PAD}' $((i*50+21)) $((i*50+70)); i=$((i+1)); sleep 0.002; done; \
          echo END; sleep 30"
     );
     let mut cfg = sh_config(&sc, "main", &script);
@@ -186,11 +216,38 @@ async fn output_in_flight_at_a_catch_up_is_shown_once() {
     };
     cfg.history_lines = 5000;
     let h = spawn_plain(cfg).await;
-    let mut c =
-        Client::connect_in_flight(&h, Connect::new(&h, key(1)), 2, Duration::from_millis(200));
+    let mut gate = None;
+    let mut c = Client::connect_wrapped(&h, Connect::new(&h, key(1)), 256, |l| {
+        let link = DelayLink::bounded(l, Duration::from_millis(200), 2);
+        gate = Some(link.gate());
+        link
+    });
+    let gate = gate.unwrap();
     c.wait_screen("READY").await;
+    // Everything so far has reached the client: nothing of the attach is still on the link.
+    eventually("the link empty", || async {
+        gate.delivered() == gate.sent()
+    })
+    .await;
+    // From here the client is sent nothing until the test lets the data through.
+    gate.hold();
+    let base = gate.sent();
     c.type_bytes(b"\n").await;
-    wait_log_end(&h, 3000 * 59).await;
+    // The daemon sends the 20 lines, which are held on the link (in flight, for good)...
+    eventually("the first 20 lines sent", || async { gate.sent() > base }).await;
+    // ...and only then is the flood released. The daemon sends the start of it, which fills the
+    // link (two segments in flight), and is then stuck for room with the rest piling up behind
+    // (or it has already jumped, and the snapshot is the second thing held).
+    c.type_bytes(b"\n").await;
+    eventually("a second segment sent", || async { gate.sent() > base + 1 }).await;
+    wait_log_end(&h, 3020 * 59).await;
+    // The first segment goes to the client: the daemon's next send gets room, and it looks at its
+    // backlog (the flood) and jumps. The announcement goes on control, ahead of the data the gate
+    // still holds, so the client reads it with that data in flight.
+    gate.release_one();
+    c.wait("the catch-up announced", |c| !c.mid_snapshots.is_empty())
+        .await;
+    gate.release_all();
     c.wait_screen("END").await;
     assert!(!c.mid_snapshots.is_empty());
     // Not vacuous: output was in flight when a jump was announced.
@@ -205,7 +262,7 @@ async fn output_in_flight_at_a_catch_up_is_shown_once() {
         c.mid_snapshots.len()
     );
     let nums: Vec<u32> = seen.iter().flatten().copied().collect();
-    assert_eq!(nums, (1..=3000).collect::<Vec<_>>());
+    assert_eq!(nums, (1..=3020).collect::<Vec<_>>());
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 

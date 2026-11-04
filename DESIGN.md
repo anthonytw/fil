@@ -365,7 +365,7 @@ OTHER LISTENERS YOU OWN ON THIS HOST
   - macOS: libproc
   - Ports are attributed to a session through its scope (§5.1), or through the process tree as a fallback.
 - **Caveats:** container ports show up as `docker-proxy`, and listeners owned by root show no owner.
-- **Notifications:** new listeners can raise a desktop notification (OSC 9 / OSC 777, which iTerm2 and Ghostty support). This is opt-in. fil never prints inline text, which would corrupt full-screen programs.
+- **Notifications (after v0.1.0):** new listeners can raise a desktop notification (OSC 9 / OSC 777, which iTerm2 and Ghostty support). This is opt-in. fil never prints inline text, which would corrupt full-screen programs. Not built: it moved out of M2 and, with `-N` tunnel-only mode (M2 OD-12), out of M4 to after v0.1.0 (`docs/m4/plan.md` §1, non-goals).
 
 ## 8. Transports
 
@@ -912,6 +912,8 @@ Direct mode is in M1 deliberately. Two real implementations are what prove the t
 - **Closing:** a verification pass closes the sweep.
 
 M4 adds a **deeper pre-release sweep** of the code, the git history, the docs and CI before the first release (`docs/m4/plan.md` §6.4). The repository went public early; the recreate with a single initial commit (decided, owner 2026-11-03 and 2026-11-04), before the first release tag, takes care of most of the history.
+
+M4's release contract (versioning and the wire, targets, artifact names and layout, `SHA256SUMS`, the remote install layout, the version string and the frozen `--install-gc` contract) is `docs/m4/release.md`.
 
 **Project site (M4).** fil.anthonywertz.com, set up the same way as Sempere's site: the site source lives in its own repository, `fil-site`, and its deploy script pushes the built output to a public GitHub Pages repository. The site hosts the docs, install instructions and release notes.
 

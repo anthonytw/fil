@@ -339,7 +339,7 @@ pub fn format_spec(spec: &ForwardSpec) -> String {
             t.port.get()
         ),
         // Withheld by the client that named it: shown, never parsed back.
-        None if spec.is_withheld() => {
+        None if spec.target_withheld() => {
             format!("{bind}{}:{}", spec.port(), fil_proto::mux::WITHHELD_TARGET)
         }
         None => format!("{bind}{}", spec.port()),

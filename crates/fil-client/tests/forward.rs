@@ -625,11 +625,11 @@ async fn two_own_ephemeral_remotes_beyond_loopback_are_two_forwards() -> Test {
 }
 
 /// A re-run (another client process, so another key): what the earlier run withheld matches
-/// nothing of this run's. An `-R 0` of it, which nothing could adopt, is removed; an `-R` on a
-/// fixed port is replaced by this run's own on that port, as for any changed target. Neither is
-/// asked about.
+/// nothing of this run's. Its `-R 0` is refused without asking and left in the table (the
+/// daemon removes it once its run has been gone for `linger`); its `-R` on a fixed port is
+/// replaced by this run's own on that port, as for any changed target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_re_run_removes_or_replaces_what_an_earlier_run_withheld() -> Test {
+async fn a_re_run_refuses_or_replaces_what_an_earlier_run_withheld() -> Test {
     let rig = attached(
         vec![remote_to(9000, "intranet-wiki.example")],
         Rules::default(),
@@ -639,17 +639,18 @@ async fn a_re_run_removes_or_replaces_what_an_earlier_run_withheld() -> Test {
     eventually("own -R in the table", 5, || fwd.ids().len() == 1).await;
     let own = fwd.ids()[0].clone();
 
-    // The earlier run's `-R 0`: removed, without a question.
+    // The earlier run's `-R 0`: refused without a question, and not removed.
     let stale = fil_proto::mux::ForwardId(500);
     rig.daemon.fwd.announce(
         stale,
         foreign_withheld_remote(0),
         fil_proto::mux::Origin::Client,
     );
-    eventually("the stale -R 0 removed", 5, || {
-        fwd.st.lock().unwrap().removed.contains(&stale)
+    eventually("the stale -R 0 refused", 5, || {
+        fwd.consents().contains(&(stale, false))
     })
     .await;
+    assert!(fwd.st.lock().unwrap().removed.is_empty());
 
     // The earlier run's `-R 9000`, in the table when this run takes the session (back): its own
     // `-R 9000` replaces it.
@@ -680,7 +681,10 @@ async fn a_re_run_removes_or_replaces_what_an_earlier_run_withheld() -> Test {
     assert_eq!(ids[0].1, own.1, "this run's own spec holds port 9000");
     let text = rig.term.text();
     assert!(!text.contains("asks to forward"), "asked");
-    assert!(!fwd.st.lock().unwrap().removed.iter().any(|id| *id != stale));
+    assert!(
+        fwd.st.lock().unwrap().removed.is_empty(),
+        "a client removed an entry"
+    );
     Ok(())
 }
 

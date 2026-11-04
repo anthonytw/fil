@@ -595,9 +595,9 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 - **Better than ssh:**
   - nothing is relayed while detached; the socket file does not exist then;
   - the filter means the remote cannot add, remove or lock keys;
-  - an optional per-signature confirm and a key allowlist; the confirm questions stop for 60 s after three in a row are answered no or time out (M2 sweep; one the host withdraws does not count), so a host cannot wear the user down;
+  - an optional per-signature confirm and a key allowlist; the confirm questions stop for 60 s after three in a row are answered no, time out or are withdrawn after being seen, and at most six are asked a minute (M2 sweep), so a host cannot wear the user down;
   - signature counts are visible in `fil ports` (the current client's only: they start over at every fresh attach) and `~#`;
-  - a local agent that does not answer holds a connection for at most 60 s per request, and not at all once the host has hung up (M2 sweep).
+  - a local agent that does not answer holds a connection for at most 60 s per request, and 2 s once the host has ended its side (M2 sweep).
 - **Worse than, or different from, ssh:**
   - OpenSSH 8.9+ destination constraints (`ssh-add -h`) assume the agent sees ssh's `session-bind` for the laptop→remote hop. A plain relay would make a key constrained to `-h github.com` (meaning "only from this laptop") usable from the remote. **Adopted (coordinator, PR #74 review):** the client binds each agent connection first, as a forwarding hop to a per-run ephemeral Ed25519 key, so such keys **fail closed** (refused) through fil instead of being bypassed. A key constrained to `devbox>github.com` still fails; **OD-5 accepted by the owner (2026-11-03)**: such keys are refused through fil, and users limit an unconstrained key with `agent_keys` instead.
   - `ssh-add` on the remote can no longer load keys into the laptop agent (the filter, OD-3).
@@ -629,7 +629,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Agent default | `ForwardAgent no` | off |
 | Agent mutations from the remote | allowed | filtered |
 | Per-use confirm | agent-side (`ssh-add -c`) | agent-side passes through, plus fil's `confirm`, which stops asking for 60 s after three refusals in a row |
-| Agent that does not answer | the channel waits | 60 s per request, and the request ends when the remote hangs up |
+| Agent that does not answer | the channel waits | 60 s per request, and 2 s more once the remote has ended its side |
 | Agent while not connected | n/a | the socket is removed; refused at once |
 | Forwards across reconnects or roaming | die | survive (the selling point) |
 | `ExitOnForwardFailure` | yes | `forward_failure = "exit"` |

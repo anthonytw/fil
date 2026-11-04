@@ -81,7 +81,7 @@ const EXIT_WRITE_BUDGET: Duration = Duration::from_secs(1);
 /// A yes/no question ignores the keyboard until the user has paused this long, and a lone key
 /// answers it only if nothing else is typed for this long afterwards: it is only answered by
 /// someone who has read it, and the first letter of a word is not an answer.
-const PROMPT_QUIET: Duration = Duration::from_millis(300);
+pub(crate) const PROMPT_QUIET: Duration = Duration::from_millis(300);
 /// After a question is answered, a lone Enter that arrives within this long is the end of the
 /// answer (`y`, then Enter) and is not passed on to the session.
 const ANSWER_ENTER_WINDOW: Duration = Duration::from_secs(1);
@@ -2390,6 +2390,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             && let Some(q) = self.fwd_asks.pop()
         {
             if self.show_or_open(q.lines.clone(), false)? {
+                q.on_screen();
                 self.fwd_confirm = Some(FwdConfirm {
                     q,
                     answer: Answer::new(),

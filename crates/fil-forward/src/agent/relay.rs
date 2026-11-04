@@ -41,6 +41,13 @@ use crate::stream::{BoxStream, ForwardStream};
 /// How long a `confirm` question waits for the user before the signature is refused.
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the local agent still has to answer a request already sent once the remote has ended
+/// its side. A half-closing client (`nc -N` and the like) still gets an answer from an agent
+/// that answers at once (real agents answer in milliseconds), and a remote that hung up holds
+/// the connection this long at most. The relay cannot tell the two apart: the channel carries
+/// one `Eof` for both.
+pub const AGENT_EOF_GRACE: Duration = Duration::from_secs(2);
+
 /// How long the relay waits for the local agent to answer one request (the session-bind, a list,
 /// a signature). Generous, because a signature may wait on the user: a hardware key to touch, a
 /// pinentry, an agent's own confirmation. Past it the remote is answered `SSH_AGENT_FAILURE` and
@@ -339,37 +346,21 @@ impl<R: AsyncRead + AsyncWrite + Unpin> Inbound<R> {
         Ok(Msg::One(msg))
     }
 
-    /// Waits until the remote ends its side, and says how ([`Hangup`]). Never returns while the
-    /// buffer is full (nothing more can be seen then). What arrives meanwhile is kept for later.
-    async fn closed(&mut self) -> Hangup {
+    /// Waits until the remote ends its side (the end of what it sends, or a read error). Never
+    /// returns while the buffer is full (nothing more can be seen then). What arrives meanwhile
+    /// is kept for later. A full close and a half-close (`shutdown(SHUT_WR)`) look the same here:
+    /// the channel carries one `Eof` for both.
+    async fn closed(&mut self) {
         loop {
             if self.buf.len() >= AHEAD {
                 return std::future::pending().await;
             }
             match self.fill().await {
                 Ok(true) => {}
-                // The end of what it sends. Gone altogether, or only done sending (a half-close,
-                // `shutdown(SHUT_WR)`), waiting for its answers? Only a write tells: an empty
-                // one fails once nothing reads.
-                Ok(false) => {
-                    return match self.s.write(&[]).await {
-                        Ok(_) => Hangup::HalfClosed,
-                        Err(_) => Hangup::Gone,
-                    };
-                }
-                Err(_) => return Hangup::Gone,
+                Ok(false) | Err(_) => return,
             }
         }
     }
-}
-
-/// How the remote ended its side ([`Inbound::closed`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hangup {
-    /// It sends nothing more, but still reads: what it asked for is still answered.
-    HalfClosed,
-    /// Nothing reads any more.
-    Gone,
 }
 
 /// The client's own host key for the `session-bind@openssh.com` it sends first on every agent
@@ -533,15 +524,18 @@ where
     };
     tokio::select! {
         r = &mut bounded => done(r),
-        h = remote.closed() => match h {
-            Hangup::Gone => {
-                debug!("the remote hung up while the local agent was asked");
-                Exchange::Gone
+        () = remote.closed() => {
+            // Gone, or only done sending: the agent has [`AGENT_EOF_GRACE`] to answer, then the
+            // request goes with the connection. An answer in time is passed on, and the next
+            // read sees the end.
+            match tokio::time::timeout(AGENT_EOF_GRACE, &mut bounded).await {
+                Ok(r) => done(r),
+                Err(_) => {
+                    debug!("the remote ended its side while the local agent was asked");
+                    Exchange::Gone
+                }
             }
-            // Done sending but still reading: its answer still goes (within the same bound),
-            // and then the connection ends (the next read sees the end).
-            Hangup::HalfClosed => done(bounded.await),
-        },
+        }
     }
 }
 
@@ -670,7 +664,7 @@ async fn ask<R: AsyncRead + AsyncWrite + Unpin>(
     tokio::pin!(answer);
     tokio::select! {
         r = &mut answer => Some(r.unwrap_or(false)),
-        _ = remote.closed() => None,
+        () = remote.closed() => None,
     }
 }
 
@@ -892,38 +886,48 @@ mod tests {
         );
     }
 
-    /// The remote hanging up while the agent is asked ends the request and the connection at
-    /// once: the relay does not wait for the agent.
+    /// The remote ending its side while a silent agent is asked ends the request and the
+    /// connection after [`AGENT_EOF_GRACE`], not at the 60 s bound: dropped altogether, and
+    /// half-closed with the other end kept open (as the mux endpoint does on a channel's `Eof`,
+    /// so a hang-up and a half-close look the same).
     #[tokio::test(start_paused = true)]
     async fn the_remote_hanging_up_ends_the_wait_on_the_agent() {
         use tokio::io::AsyncWriteExt;
-        let (mut remote, far) = tokio::io::duplex(1 << 12);
-        let (agent, agent_far) = tokio::io::duplex(1 << 12);
-        let heard = silent_agent(agent_far);
-        let t0 = tokio::time::Instant::now();
-        let task = tokio::spawn(relay(
-            far,
-            agent,
-            Arc::new(Rules::default()),
-            Arc::new(KeyUses::default()),
-        ));
-        remote
-            .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
-            .await
-            .unwrap();
-        // The request reaches the agent, which says nothing; then the remote goes.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        drop(remote);
-        tokio::time::timeout(2 * AGENT_ANSWER_TIMEOUT, task)
-            .await
-            .expect("the relay ended")
-            .unwrap();
-        assert!(
-            t0.elapsed() < AGENT_ANSWER_TIMEOUT / 2,
-            "waited {:?} on an agent for a remote that was gone",
-            t0.elapsed()
-        );
-        assert_eq!(heard.await.unwrap(), 5);
+        for drop_it in [true, false] {
+            let (mut remote, far) = tokio::io::duplex(1 << 12);
+            let (agent, agent_far) = tokio::io::duplex(1 << 12);
+            let heard = silent_agent(agent_far);
+            let task = tokio::spawn(relay(
+                far,
+                agent,
+                Arc::new(Rules::default()),
+                Arc::new(KeyUses::default()),
+            ));
+            remote
+                .write_all(&framed(&[filter::REQUEST_IDENTITIES]))
+                .await
+                .unwrap();
+            // The request reaches the agent, which says nothing; then the remote ends its side.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let t0 = tokio::time::Instant::now();
+            let _kept = if drop_it {
+                drop(remote);
+                None
+            } else {
+                remote.shutdown().await.unwrap();
+                Some(remote)
+            };
+            tokio::time::timeout(2 * AGENT_ANSWER_TIMEOUT, task)
+                .await
+                .expect("the relay ended")
+                .unwrap();
+            let took = t0.elapsed();
+            assert!(
+                took >= AGENT_EOF_GRACE && took < AGENT_EOF_GRACE + Duration::from_millis(500),
+                "dropped {drop_it}: waited {took:?} on an agent for a remote that ended"
+            );
+            assert_eq!(heard.await.unwrap(), 5);
+        }
     }
 
     /// A remote that half-closes after its request (`shutdown(SHUT_WR)`, as `nc -N` does) still

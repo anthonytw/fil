@@ -174,16 +174,31 @@ pub(crate) struct Question {
     pub(crate) lines: Vec<String>,
     /// A `confirm`-mode signature ([`crate::agent`]), not a forward: `id` means nothing then.
     pub(crate) agent: bool,
+    /// When the client loop first put it on the screen (a signature question's; the agent rule
+    /// counts a withdrawal only once it was seen).
+    pub(crate) shown: Option<Arc<std::sync::OnceLock<std::time::Instant>>>,
 }
 
 impl Question {
     /// A question about a signature, answered to the agent relay.
-    pub(crate) fn agent(token: u64, lines: Vec<String>) -> Self {
+    pub(crate) fn agent(
+        token: u64,
+        lines: Vec<String>,
+        shown: Arc<std::sync::OnceLock<std::time::Instant>>,
+    ) -> Self {
         Self {
             id: ForwardId(0),
             token,
             lines,
             agent: true,
+            shown: Some(shown),
+        }
+    }
+
+    /// The client loop put it on the screen now (the first time counts).
+    pub(crate) fn on_screen(&self) {
+        if let Some(s) = &self.shown {
+            let _ = s.set(std::time::Instant::now());
         }
     }
 }
@@ -1262,6 +1277,7 @@ impl<L: Link> Manager<L> {
 
     /// An entry the run did not name: a management request, or one left by another client.
     fn other(&mut self, id: ForwardId, spec: ForwardSpec, origin: Origin) {
+        let _ = origin;
         if self.entries.contains_key(&id) || self.own_index(id).is_some() {
             // Ids are never reused: a restatement, not a new entry.
             return;
@@ -1300,21 +1316,6 @@ impl<L: Link> Manager<L> {
             self.entries.insert(id, Other::new(spec, State::Superseded));
             return;
         }
-        // Withheld by another run (another client, or an earlier run of this one), and of no use
-        // to any other: only that run knows the target or bind, its tags match nothing of any
-        // other run's, and nothing can adopt or replace it (an `-R 0` has no identity; a withheld
-        // bind's identity is that run's tag). It is removed rather than refused, so re-runs do not
-        // pile up dead entries (and `-R` listeners) on the host. A withheld `-R` on a fixed port
-        // is left: an own `-R` on that port replaces it, as for any changed target.
-        // Only a client's: a management request cannot make one (`NotPermitted`), so one that
-        // claims to be a request is the host's doing, and is refused as before.
-        if origin == Origin::Client
-            && (spec.bind_withheld() || (spec.target_withheld() && spec.port() == 0))
-        {
-            debug!(kind = ?spec.kind(), "another run's withheld forward; removed");
-            self.send(MuxMsg::RemoveForward { id });
-            return;
-        }
         let asking = self
             .entries
             .values()
@@ -1341,6 +1342,7 @@ impl<L: Link> Manager<L> {
                     token,
                     lines,
                     agent: false,
+                    shown: None,
                 }));
             }
             Decision::Refuse(why) => {
@@ -1502,10 +1504,12 @@ impl<L: Link> Manager<L> {
             }
             match state {
                 ListenState::Listening { port } => {
-                    let first = self.own[i].port.is_none();
+                    // Said the first time, and again whenever the port is another than before
+                    // (a take-back after the entry went: the host's programs must be told).
+                    let changed = self.own[i].port != Some(port.get());
                     self.own[i].port = Some(port.get());
                     self.own[i].bind_reported = false;
-                    if self.own[i].spec.port() == 0 && first {
+                    if self.own[i].spec.port() == 0 && changed {
                         let text = format!(
                             "fil: {} listens on port {} on the host",
                             describe(&self.own[i].spec),
@@ -1893,11 +1897,11 @@ mod tests {
     }
 
     /// Another run's `-L` with a withheld bind (its laptop's address, under its tag), and its
-    /// `-R 0` with a withheld target: no run but that one could use them, so they are removed,
-    /// neither kept nor asked about. Its `-R` on a fixed port is left (refused): an own `-R`
-    /// there would replace it.
+    /// `-R`s with withheld targets: refused without asking, as any forward beyond loopback this
+    /// run did not name. They are left for the daemon (it removes them once their run has been
+    /// gone for `linger`): this client cannot tell a live run it took over from a dead one.
     #[tokio::test]
-    async fn another_runs_withheld_forwards_are_removed_not_asked_about() {
+    async fn another_runs_withheld_forwards_are_refused_not_asked_about() {
         let (mut m, mut rx) = manager();
         let tag = [0x77u8; 16];
         let bind = [vec![0u8, 3], tag.to_vec(), vec![0x90, 0x3f, 1, 0, 1, 9]]
@@ -1915,10 +1919,49 @@ mod tests {
         m.other(ForwardId(1), l, Origin::Client);
         m.other(ForwardId(2), r0, Origin::Client);
         m.other(ForwardId(3), r9, Origin::Client);
-        assert!(!m.entries.contains_key(&ForwardId(1)));
-        assert!(!m.entries.contains_key(&ForwardId(2)));
-        assert_eq!(m.entries[&ForwardId(3)].state, State::Refused);
+        for i in 1..=3 {
+            assert_eq!(m.entries[&ForwardId(i)].state, State::Refused, "{i}");
+        }
         assert!(asked(&mut rx).is_empty());
+    }
+
+    /// An own `-R 0`'s port is said when it first listens, not again for the same port (a
+    /// resume restates it), and again after a fresh attach that got it another port.
+    #[tokio::test]
+    async fn an_own_ephemeral_remote_says_its_port_whenever_it_changes() {
+        let (mut m, mut rx) = manager();
+        m.own.push(own(rspec_on(0, 80)));
+        let x = ForwardId(3);
+        m.own[0].id = Some(x);
+        let port_notices = |rx: &mut NotesRx| {
+            std::iter::from_fn(|| rx.try_recv())
+                .filter_map(|n| match n {
+                    Note::Notice(l) => Some(l.concat()),
+                    _ => None,
+                })
+                .filter(|l| l.contains("listens on port"))
+                .collect::<Vec<_>>()
+        };
+        let on = |p: u16| ListenState::Listening {
+            port: std::num::NonZeroU16::new(p).unwrap(),
+        };
+        m.listening(x, on(41000));
+        assert_eq!(port_notices(&mut rx).len(), 1);
+        m.listening(x, on(41000));
+        assert!(port_notices(&mut rx).is_empty(), "the same port said again");
+        m.fresh();
+        let y = ForwardId(4);
+        m.own[0].id = Some(y);
+        let _ = port_notices(&mut rx);
+        m.listening(y, on(41000));
+        assert!(
+            port_notices(&mut rx).is_empty(),
+            "a take-back on the same port"
+        );
+        m.listening(y, on(41001));
+        let said = port_notices(&mut rx);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("41001"), "{said:?}");
     }
 
     /// The host's own `-R` failure reports are said once until it listens again: a host that

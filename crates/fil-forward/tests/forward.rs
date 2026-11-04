@@ -237,26 +237,59 @@ async fn concurrent_connections(t: Transport) {
     // the kernel's listen queue, 128 on macOS, which resets them before fil sees them), send
     // their request and end their side, and all wait until every one is connected: then all of
     // them are open at once, most of them queued for a channel.
+    //
+    // The forward's own connects to the server come in bursts (a channel per connection, up to
+    // the open cap at once), and on a loaded macOS the server's listen queue (128) can overflow:
+    // the kernel completes such a handshake and then resets it at the first read or write. fil
+    // passes that reset on, as it should, so the application sees it before any byte came back.
+    // Such a connection is made again, as a client library would, a bounded number of times, and
+    // the retries are counted and bounded below: a fil that reset connections itself would
+    // exceed them.
     let all = Arc::new(tokio::sync::Barrier::new(n as usize));
     let mut set = tokio::task::JoinSet::new();
     for i in 0..n {
-        let s = connect(port).await;
+        let first = connect(port).await;
         let all = all.clone();
         set.spawn(async move {
-            let (mut r, mut wr) = s.into_split();
             let mut out = vec![0u8; 4096];
             fill(i, 0, &mut out);
-            wr.write_all(&out).await.unwrap();
-            wr.shutdown().await.unwrap();
-            all.wait().await;
-            let mut back = Vec::new();
-            r.read_to_end(&mut back).await.unwrap();
-            assert!(back == out, "connection {i}");
+            let mut s = Some(first);
+            let mut waited = false;
+            let mut retries = 0u32;
+            loop {
+                let conn = match s.take() {
+                    Some(c) => c,
+                    None => connect(port).await,
+                };
+                let (mut r, mut wr) = conn.into_split();
+                let sent = async {
+                    wr.write_all(&out).await?;
+                    wr.shutdown().await
+                }
+                .await;
+                if !std::mem::replace(&mut waited, true) {
+                    all.wait().await;
+                }
+                let mut back = Vec::new();
+                let got = match sent {
+                    Ok(()) => r.read_to_end(&mut back).await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match got {
+                    Ok(()) => {
+                        assert!(back == out, "connection {i}");
+                        return retries;
+                    }
+                    Err(e) if back.is_empty() && is_reset(&e) && retries < 3 => retries += 1,
+                    Err(e) => panic!("connection {i}: {e} after {} bytes", back.len()),
+                }
+            }
         });
     }
+    let mut retries = 0u32;
     timeout(LONG, async {
         while let Some(r) = set.join_next().await {
-            r.unwrap();
+            retries += r.unwrap();
         }
     })
     .await
@@ -264,8 +297,13 @@ async fn concurrent_connections(t: Transport) {
     sampler.abort();
     let peak = peak.load(Ordering::Relaxed);
     eprintln!(
-        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once (sampled)",
+        "{t:?}: {n} concurrent connections in {:?}, at most {peak} channels at once (sampled), \
+         {retries} made again after a reset",
         t0.elapsed()
+    );
+    assert!(
+        u64::from(retries) <= n / 10,
+        "{retries} connections were reset"
     );
     assert!(peak <= fil_proto::limits::MAX_OPEN_CHANNELS, "{peak}");
     let live_peak = live_peak.load(Ordering::SeqCst);
@@ -274,7 +312,18 @@ async fn concurrent_connections(t: Transport) {
         "{live_peak} connections at once, wanted {hold}"
     );
     w.settled().await;
-    assert_eq!(server.accepted.load(Ordering::SeqCst), n as usize);
+    // A connection reset in the server's listen queue never reached it.
+    let accepted = server.accepted.load(Ordering::SeqCst);
+    assert!(
+        (n as usize..=n as usize + retries as usize).contains(&accepted),
+        "{accepted} accepted for {n} connections and {retries} retries"
+    );
+}
+
+/// A reset the application sees: on its read (`ConnectionReset`) or its write (`BrokenPipe`).
+fn is_reset(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(e.kind(), ConnectionReset | BrokenPipe | ConnectionAborted)
 }
 
 /// Many short connections, one after another, on one link that never goes down. Over QUIC every

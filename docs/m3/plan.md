@@ -1,6 +1,6 @@
 # M3 plan: prediction
 
-> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed (§4.4, §4.5).
+> **Status: proposed by the coordinator on 2026-11-04, for the owner's questions in §4.4.** The owner asked (2026-11-04) for M3 to start now, overlapping the last M2 sweep PRs and running beside M4 (`docs/m4/plan.md`). Written on `origin/main` at `12f974d` (wire revision 11); revised after review. M3 in `DESIGN.md` §15 is "the trait and the default predictor; then the M3 sweep", done when "no visible mispredictions in the harness, and the sweep is closed". `DESIGN.md` stays the source of truth: each package updates its own sections, and where this file and `DESIGN.md` or the code differ, they win. Items marked **proposed** are the coordinator's calls and can change in review. Items marked **OWNER** wait for the owner, with an interim default. **The owner answered on 2026-11-04:** OQ-1 and OQ-2 as recommended, and PC-1 confirmed except its glitch underline trigger, which is pending (§2.7, §4.4, §4.5).
 
 ## 0. Preconditions and the overlap with M2 and M4
 
@@ -298,7 +298,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
   - Show guesses when the estimate is above 30 ms (decided, owner 2026-11-04: PC-1); stop below 20 ms.
   - Also show them for the next 30 s after a **glitch**: a key whose `EchoAck` came more than 250 ms after it was sent (measured from the ack, so a program that echoes late on a fast link is not a glitch).
   - `always` shows them at any RTT.
-- **Underline (decided, owner 2026-11-04: PC-1):** a written guess is underlined while the estimate is above 80 ms or within a glitch window, and plain otherwise (mosh's rule). DESIGN §9 says so since the owner's answer.
+- **Underline (PC-1):** a written guess is underlined while the estimate is above 80 ms (decided, owner 2026-11-04), and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise (mosh's rule). DESIGN §9 says the same.
 - Tunables (the thresholds, the glitch window, the grace, the backstop) are constants in `MoshConfig` and the core's config, not config keys, until V1's data says a user needs them. Proposed.
 
 ### 2.8 Wire changes
@@ -567,11 +567,11 @@ In every case a guess once written is written: how long it stays on the screen d
 - **Recommendation:** the split bar of §2.5.
 - **Decided (owner 2026-11-04):** the split bar: everywhere, zero corruption and zero secrets shown; on faithful programs, late echo included, zero visible mispredictions; on programs that echo something else or share the screen, at most one shown run of wrong guesses per contradiction; withdrawals from takeover, exit, snapshot, resize or a link drop counted apart.
 
-### 4.5 Proposed calls (not the owner's, except PC-1, which the owner confirmed; review may change the rest)
+### 4.5 Proposed calls (not the owner's, except PC-1, which the owner confirmed but for its glitch trigger; review may change the rest)
 
 | # | Call |
 |---|---|
-| PC-1 | **The default and the look** (decided, owner 2026-11-04: the owner confirmed this call): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined only above 80 ms or after a glitch, plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). DESIGN §9 records it. |
+| PC-1 | **The default and the look** (decided, owner 2026-11-04, but for the glitch trigger): `adaptive` by default for every host, as §14 sketches, on above 30 ms; written guesses underlined above 80 ms, and after a glitch (an echo more than 250 ms late) — pending: the owner's approval was given on wording that said 'after a wrong guess'; the owner is being asked (2026-11-04); plain otherwise, as mosh does (an underline that flickers for 40 ms under every key on a good link looks like a fault). DESIGN §9 records it. |
 | PC-2 | The trait of §2.3, replacing the §9 sketch: declared guesses, the core decides. |
 | PC-3 | The core's boundaries and the strict first confirmation (§2.4). |
 | PC-4 | Visible misprediction is by glyph, not attributes; lifecycle withdrawals counted apart (§2.5). |

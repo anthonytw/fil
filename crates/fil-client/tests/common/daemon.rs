@@ -70,6 +70,8 @@ pub enum TermLog {
         size_gen: u64,
         size: (u16, u16),
     },
+    /// An in-band `Repaint`, and the size generation in force when it arrived.
+    Repaint { size_gen: u64 },
 }
 
 struct Conn {
@@ -146,6 +148,12 @@ pub struct DState {
     pending_jump: Option<u64>,
     /// Catch-ups that were held back for want of that ack.
     pub blocked_catch_ups: u32,
+    /// `Repaint` records are logged and not answered (a daemon that has not got to them yet).
+    hold_repaints: bool,
+    /// A held request is owed.
+    repaint_owed: bool,
+    /// Repaint snapshots sent, with the generation each was rendered at.
+    pub repaints: Vec<u64>,
 }
 
 fn key_of(link: &Arc<MemLink>) -> usize {
@@ -226,6 +234,9 @@ impl FakeDaemon {
                 reply_delay: None,
                 pending_jump: None,
                 blocked_catch_ups: 0,
+                hold_repaints: false,
+                repaint_owed: false,
+                repaints: Vec::new(),
             }),
         })
     }
@@ -363,6 +374,16 @@ impl FakeDaemon {
                                 size: (size.cols(), size.rows()),
                             };
                             st.term_log.push(rec);
+                            continue;
+                        }
+                        TerminalInput::Record(InputRecord::Repaint) => {
+                            let size_gen = st.size_gen;
+                            st.term_log.push(TermLog::Repaint { size_gen });
+                            if st.hold_repaints {
+                                st.repaint_owed = true;
+                            } else if st.is_current(&link) {
+                                me.repaint(&mut st).await;
+                            }
                             continue;
                         }
                         TerminalInput::Keys(seg) => seg,
@@ -526,6 +547,7 @@ impl FakeDaemon {
                     len: bytes.len() as u64,
                     skipped,
                     reason,
+                    size_gen: st.size_gen,
                 };
                 snapshot_bytes = Some(bytes);
                 StartPoint::Snapshot(info)
@@ -613,6 +635,47 @@ impl FakeDaemon {
         self.fwd
             .attach(&link, matches!(mode, AttachMode::Resumed(_)));
         true
+    }
+
+    /// Answers a `Repaint`: a mid-stream snapshot of the screen at the size in force, no
+    /// history, at the end of the log (what was not sent yet is sent first, as the real daemon
+    /// repaints only where the stream is).
+    async fn repaint(&self, st: &mut DState) {
+        self.pump(st).await;
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(0));
+        let at = st.log.end();
+        st.flows.insert(key_of(&link), at);
+        st.pending_jump = Some(at);
+        st.sent = at;
+        st.snapshots += 1;
+        let size_gen = st.size_gen;
+        st.repaints.push(size_gen);
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: 0,
+            reason: fil_proto::msg::SnapshotReason::Repaint,
+            size_gen,
+        };
+        let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
     }
 
     /// Sends the log from `sent` to the current subscriber.
@@ -711,6 +774,35 @@ impl FakeDaemon {
 
     pub async fn snapshots(&self) -> u32 {
         self.st.lock().await.snapshots
+    }
+
+    /// The generations of the repaint snapshots sent so far.
+    pub async fn repaints(&self) -> Vec<u64> {
+        self.st.lock().await.repaints.clone()
+    }
+
+    /// While on, `Repaint` records are logged and not answered. Turned off, a held one is
+    /// answered (on the current link).
+    pub async fn hold_repaints(&self, on: bool) {
+        let mut st = self.st.lock().await;
+        st.hold_repaints = on;
+        if !on && std::mem::take(&mut st.repaint_owed) {
+            self.repaint(&mut st).await;
+        }
+    }
+
+    /// The `Repaint` records received, with the generation in force at each.
+    pub async fn repaint_requests(&self) -> Vec<u64> {
+        self.st
+            .lock()
+            .await
+            .term_log
+            .iter()
+            .filter_map(|l| match l {
+                TermLog::Repaint { size_gen } => Some(*size_gen),
+                _ => None,
+            })
+            .collect()
     }
 
     pub async fn acked(&self) -> u64 {
@@ -927,6 +1019,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
         if !after.is_empty() {
@@ -984,6 +1077,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         st.log.append(after);
         st.emu.feed(after);
@@ -1102,6 +1196,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         let mut off = 0u64;
         for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {

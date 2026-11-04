@@ -63,6 +63,10 @@ const MODE_HISTORY_MAX: usize = 4096;
 const INPUT_BACKLOG: usize = 64 * 1024;
 /// Capacity of the command channel.
 const CMD_CAPACITY: usize = 256;
+/// At most one in-band repaint per this long, per session (`docs/m3/plan.md` §2.8): requests
+/// meanwhile are owed and served once it has passed, so the last size of a window drag is always
+/// repainted.
+pub(crate) const REPAINT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long after the last input or output the PTY mode is polled at `mode_poll`. Mode changes
 /// follow a program's input or output, and both re-read the mode themselves; the poll is a net
 /// for the rest, so it slows to [`IDLE_POLL_FACTOR`] times `mode_poll` once things are quiet.
@@ -361,6 +365,20 @@ pub(crate) struct CatchUp {
     pub mode: (bool, bool),
 }
 
+/// The core's answer to a connection that owes its client a repaint
+/// ([`fil_proto::input::InputRecord::Repaint`]).
+pub(crate) enum RepaintAnswer {
+    /// The snapshot: the screen and the modes at the connection's position, no history.
+    Ready(CatchUp),
+    /// Output has been released past what the connection has sent: a repaint now would jump
+    /// over it with no marker. Send it first.
+    Behind,
+    /// Within [`REPAINT_INTERVAL`] of the last one: not before this.
+    NotBefore(Instant),
+    /// Not the live connection.
+    Gone,
+}
+
 pub(crate) enum Cmd {
     // From the PTY threads. Output is queued in the core's `OutputBatch`; this says it is there.
     PtyOutput,
@@ -396,6 +414,13 @@ pub(crate) enum Cmd {
         /// The terminal offset up to which this connection has sent output.
         sent: u64,
         reply: oneshot::Sender<Option<CatchUp>>,
+    },
+    /// The connection owes its client a repaint, and everything it has sent is acknowledged.
+    /// Queued behind every command the connection sent before (the resize the request followed).
+    Repaint {
+        conn: ConnId,
+        sent: u64,
+        reply: oneshot::Sender<RepaintAnswer>,
     },
     // From our own background work.
     ProcessTable(Vec<ProcRow>),
@@ -474,6 +499,8 @@ pub(crate) struct Core {
     /// The generation of `size` (DESIGN.md section 8.5): a size is applied only if its generation
     /// is newer, so a stale one can never replace a newer one.
     size_gen: u64,
+    /// When the last in-band repaint was rendered ([`REPAINT_INTERVAL`]).
+    last_repaint: Option<Instant>,
 
     emu: Box<dyn Emulator>,
     boundary: Boundary,
@@ -641,6 +668,7 @@ pub(crate) fn start(
         next_conn: 0,
         size: cfg.size,
         size_gen: 0,
+        last_repaint: None,
         emu,
         boundary: Boundary::new(),
         tail: Vec::new(),
@@ -800,6 +828,9 @@ impl Core {
             }
             Cmd::CatchUp { conn, sent, reply } => {
                 let _ = reply.send(self.on_catch_up(conn, sent));
+            }
+            Cmd::Repaint { conn, sent, reply } => {
+                let _ = reply.send(self.on_repaint(conn, sent, Instant::now()));
             }
             Cmd::ProcessTable(rows) => {
                 self.tracker.refresh(self.pty.pid, &rows);
@@ -1020,11 +1051,12 @@ impl Core {
 
     // --- snapshots ---
 
-    /// The snapshot bytes for the terminal's state at the released offset. With `skipped`
-    /// bytes of output the client never saw, they start with the gap marker, in its scrollback.
-    fn render_snapshot(&mut self, skipped: u64) -> Vec<u8> {
+    /// The snapshot bytes for the terminal's state at the released offset, with `history` lines
+    /// of scrollback. With `skipped` bytes of output the client never saw, they start with the gap
+    /// marker, in its scrollback.
+    fn render_snapshot(&mut self, skipped: u64, history: usize) -> Vec<u8> {
         self.emu.apply_pending();
-        let state = self.emu.state(self.cfg.history_lines);
+        let state = self.emu.state(history);
         let body = snapshot(&state);
         if skipped == 0 {
             return body;
@@ -1040,13 +1072,47 @@ impl Core {
         }
         let at = self.ready();
         let skipped = at.saturating_sub(sent);
-        let bytes = self.render_snapshot(skipped);
+        let bytes = self.render_snapshot(skipped, self.cfg.history_lines);
         Some(CatchUp {
             info: SnapshotInfo {
                 at,
                 len: bytes.len() as u64,
                 skipped,
                 reason: SnapshotReason::TooFarBehind,
+                size_gen: self.size_gen,
+            },
+            bytes,
+            mode: self.mode_at(at),
+        })
+    }
+
+    /// An in-band repaint (DESIGN.md section 8.5, `InputRecord::Repaint`): the screen and the
+    /// modes at the size the session has now, which includes every resize record the connection
+    /// sent before the request (this command is queued behind them). No history lines (the
+    /// client's native scrollback has them) and no marker: it is rendered only at the exact
+    /// point the connection has sent (and its client acknowledged), so nothing is jumped over.
+    fn on_repaint(&mut self, conn: ConnId, sent: u64, now: Instant) -> RepaintAnswer {
+        if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
+            return RepaintAnswer::Gone;
+        }
+        if let Some(t) = self.last_repaint
+            && now < t + REPAINT_INTERVAL
+        {
+            return RepaintAnswer::NotBefore(t + REPAINT_INTERVAL);
+        }
+        let at = self.ready();
+        if at != sent {
+            return RepaintAnswer::Behind;
+        }
+        self.last_repaint = Some(now);
+        let bytes = self.render_snapshot(0, 0);
+        RepaintAnswer::Ready(CatchUp {
+            info: SnapshotInfo {
+                at,
+                len: bytes.len() as u64,
+                skipped: 0,
+                reason: SnapshotReason::Repaint,
+                size_gen: self.size_gen,
             },
             bytes,
             mode: self.mode_at(at),
@@ -1269,12 +1335,15 @@ impl Core {
         skipped: u64,
         reason: SnapshotReason,
     ) -> (StartPoint, Option<Vec<u8>>, u64) {
-        let bytes = self.render_snapshot(skipped);
+        let bytes = self.render_snapshot(skipped, self.cfg.history_lines);
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
             skipped,
             reason,
+            // The attach's own size is applied before this (`on_attach`): the snapshot is at the
+            // generation the client attached with, or a newer one.
+            size_gen: self.size_gen,
         };
         (StartPoint::Snapshot(info), Some(bytes), at)
     }
@@ -1764,6 +1833,63 @@ mod tests {
         let got = std::fs::read_to_string(&out).unwrap_or(got);
         let _ = handle.kill(Duration::from_secs(5)).await;
         assert_eq!(got, "live\n", "only the live connection's input is applied");
+    }
+
+    /// A repaint asked for by a connection that lost the session (its request was read and
+    /// queued just before a takeover was handled) renders nothing; the live connection's does,
+    /// and only once a second.
+    #[tokio::test]
+    async fn a_repaint_for_a_connection_that_lost_the_session_renders_nothing() {
+        use crate::handle::SessionHandle;
+        use fil_proto::msg::{Attach, PublicKey, TermSize};
+
+        let mut cfg = SessionConfig::new(
+            "stale".parse().unwrap(),
+            "xterm".parse().unwrap(),
+            TermSize::new(80, 24).unwrap(),
+            9,
+        );
+        cfg.scope = crate::config::ScopeMode::Tree;
+        cfg.clear_env = true;
+        cfg.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        cfg.command = Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]);
+        let handle = SessionHandle::spawn(cfg, Arc::new(crate::config::NoHost))
+            .await
+            .unwrap();
+        let attach = |n: u8, host: &str| Attach {
+            name: "stale".parse().unwrap(),
+            size: TermSize::new(80, 24).unwrap(),
+            term: "xterm".parse().unwrap(),
+            host: host.parse().unwrap(),
+            key: PublicKey::new(vec![n; 32]).unwrap(),
+            resume: None,
+            echo_ack: false,
+            agent: false,
+            size_gen: 0,
+        };
+        let accepted = |answer: AttachAnswer| match answer {
+            AttachAnswer::Accepted(a) => a,
+            AttachAnswer::Refused(r) => panic!("refused: {r:?}"),
+        };
+        let first = accepted(handle.attach(attach(1, "laptop")).await.ok().unwrap());
+        let second = accepted(handle.attach(attach(2, "desktop")).await.ok().unwrap());
+        let at = second.start;
+        assert!(matches!(
+            handle.repaint(first.conn, first.start).await,
+            Some(RepaintAnswer::Gone)
+        ));
+        let Some(RepaintAnswer::Ready(c)) = handle.repaint(second.conn, at).await else {
+            panic!("the live connection's repaint");
+        };
+        assert_eq!(
+            (c.info.reason, c.info.skipped, c.info.at),
+            (SnapshotReason::Repaint, 0, at)
+        );
+        assert!(matches!(
+            handle.repaint(second.conn, at).await,
+            Some(RepaintAnswer::NotBefore(_))
+        ));
+        let _ = handle.kill(Duration::from_secs(5)).await;
     }
 }
 

@@ -133,8 +133,8 @@ fn spec(a: &Args, t: Transport, program: Program, seed: u64) -> Spec {
 async fn resize(a: &Args) {
     println!("== resize: the terminal reflows first, then the client erases (the true order)\n");
     println!(
-        "{:<52} {:>4} {:>8} {:>9} {:>9}   rows vs shadow (first seed)",
-        "case", "runs", "painted", "vs shadow", "vs snap"
+        "{:<52} {:>4} {:>8} {:>9} {:>9} {:>9} {:>13}   rows vs shadow (first seed)",
+        "case", "runs", "painted", "vs shadow", "vs snap", "repainted", "snap after rp"
     );
     for &t in &a.transports {
         let dirs: [Dir; 2] = [
@@ -169,6 +169,9 @@ async fn resize(a: &Args) {
                             continue;
                         }
                         let (mut painted, mut shadow_bad, mut snap_bad) = (0, 0, 0);
+                        // W1: runs that were repainted, and those of them not equal to a fresh
+                        // snapshot at the end (the repaint makes the terminal the daemon's).
+                        let (mut repainted, mut repaint_bad) = (0, 0);
                         let mut first: Option<ResizeOutcome> = None;
                         for seed in 1..=a.seeds {
                             let mut s = spec(a, t, program.clone(), seed);
@@ -196,6 +199,12 @@ async fn resize(a: &Args) {
                             if !out.comparison.clean() {
                                 snap_bad += 1;
                             }
+                            if out.repaints > 0 {
+                                repainted += 1;
+                                if !out.comparison.clean() {
+                                    repaint_bad += 1;
+                                }
+                            }
                         }
                         let rows = first
                             .as_ref()
@@ -203,8 +212,15 @@ async fn resize(a: &Args) {
                             .map(|c| format!("{:?}", c.damaged_rows))
                             .unwrap_or_default();
                         println!(
-                            "{:<52} {:>4} {:>8} {:>9} {:>9}   {}",
-                            label, a.seeds, painted, shadow_bad, snap_bad, rows
+                            "{:<52} {:>4} {:>8} {:>9} {:>9} {:>9} {:>13}   {}",
+                            label,
+                            a.seeds,
+                            painted,
+                            shadow_bad,
+                            snap_bad,
+                            repainted,
+                            repaint_bad,
+                            rows
                         );
                         if a.verbose
                             && let Some(o) = first

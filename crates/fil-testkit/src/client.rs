@@ -190,6 +190,21 @@ impl<L: Link> Client<L> {
             .unwrap();
     }
 
+    /// Asks for a repaint in band (`InputRecord::Repaint`), after whatever this client sent on the
+    /// terminal channel before.
+    pub async fn repaint(&mut self) {
+        let payload = InputRecord::Repaint.encode().unwrap();
+        self.link
+            .send(ChannelId::TERMINAL, Bytes::from(payload))
+            .await
+            .unwrap();
+    }
+
+    /// Lines in the emulator's scrollback.
+    pub fn history_len(&self) -> usize {
+        self.emu.state(HISTORY).history.len()
+    }
+
     /// From now on control messages (acks, a detach) are held back, as if the control stream
     /// had lost a packet; the terminal channel is not affected.
     pub fn hold_control(&mut self) {

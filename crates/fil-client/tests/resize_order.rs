@@ -7,9 +7,11 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::daemon::TermLog;
+use common::oracle_term::{Predict, predictor_factory};
 use common::*;
 use fil_transport::{DownReason, LinkKind};
 
@@ -444,4 +446,256 @@ async fn a_size_that_cannot_be_read_is_not_a_resize() {
         ]
     );
     assert_eq!(rig.daemon.pty_size().await, ((100, 30), 1));
+}
+
+// ---- the in-band repaint (DESIGN.md sections 4.2 and 8.5, docs/m3/plan.md §2.8) ---------------
+
+/// A client that predicts with `predict` (T1's adapter; `rtt` is the round trip the predictor is
+/// told) against a fresh fake daemon.
+fn start_predicting(predict: Predict, rtt: Duration) -> Rig {
+    let daemon = FakeDaemon::new(8 * 1024 * 1024);
+    let (dialer, dial) = test_dialer(&daemon);
+    let (terminal, term) = fake_terminal(80, 24, "xterm-256color");
+    let factory = predictor_factory(predict, rtt, &Arc::default(), &Arc::default());
+    let client = tokio::spawn(fil_client::run_with(dialer, terminal, config(), factory));
+    Rig {
+        daemon,
+        dial,
+        term,
+        client,
+    }
+}
+
+fn eager() -> Rig {
+    start_predicting(Predict::Eager, Duration::from_millis(150))
+}
+
+fn repaint(size_gen: u64) -> TermLog {
+    TermLog::Repaint { size_gen }
+}
+
+/// W1: after a resize with nothing drawn, a predicting client asks for no repaint until it has a
+/// guess to write; then the `Repaint` follows the resize record, so the daemon has the new size
+/// (generation 1) when it reads it, and its snapshot (at generation 1) makes the screen trusted
+/// again: later guesses ask for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_predicting_client_asks_for_a_repaint_only_when_it_has_a_guess_to_write() {
+    let rig = eager();
+    rig.attached().await;
+    rig.term.resize(100, 30);
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(rig.daemon.term_log().await, vec![resize(0, 1, (100, 30))]);
+    rig.type_str("a");
+    settle().await;
+    assert_eq!(
+        rig.daemon.term_log().await,
+        vec![
+            resize(0, 1, (100, 30)),
+            repaint(1),
+            keys(0, b"a", (100, 30))
+        ]
+    );
+    assert_eq!(rig.daemon.repaints().await, vec![1]);
+    // Trusted again: more guesses, no more repaints.
+    rig.daemon.output(b"a").await;
+    rig.type_str("bc");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
+}
+
+/// W1: an adaptive client on a fast link (the M0 predictor, below its threshold, shows nothing)
+/// never asks, however much it types after a resize.
+#[tokio::test(start_paused = true)]
+async fn an_adaptive_client_on_a_fast_link_asks_for_no_repaint() {
+    let rig = start_predicting(Predict::Mosh, Duration::from_millis(2));
+    rig.attached().await;
+    rig.term.resize(100, 30);
+    rig.term.resize(60, 20);
+    for k in ["l", "s", " ", "-", "l"] {
+        rig.type_str(k);
+        settle().await;
+        rig.daemon.output(k.as_bytes()).await;
+        settle().await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.daemon.repaint_requests().await.is_empty());
+    assert!(rig.daemon.repaints().await.is_empty());
+}
+
+/// W1 (T1's finding): guesses on the screen at the resize ask for a repaint at once, in either
+/// direction. Widening as well as narrowing: a widening that joins wrapped rows leaves the
+/// terminal's cursor on another row than the shadow's, and only a repaint fixes it.
+#[tokio::test(start_paused = true)]
+async fn guesses_on_the_screen_at_a_resize_ask_for_a_repaint_at_once_either_way() {
+    for (cols, rows) in [(40, 24), (120, 24)] {
+        let rig = eager();
+        rig.attached().await;
+        rig.type_str("abc");
+        settle().await;
+        // The fake daemon echoes nothing: the guesses stay on the screen.
+        rig.term.resize(cols, rows);
+        settle().await;
+        assert_eq!(
+            rig.daemon.term_log().await,
+            vec![
+                keys(0, b"abc", (80, 24)),
+                resize(3, 1, (cols, rows)),
+                repaint(1)
+            ],
+            "to {cols}x{rows}"
+        );
+        assert_eq!(rig.daemon.repaints().await, vec![1]);
+    }
+}
+
+/// W1: a client that does not predict asks only when something was drawn at the resize: with
+/// nothing on the screen, never; with the `~?` help on it, at once.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_does_not_predict_asks_only_with_something_drawn() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.term.resize(100, 30);
+    rig.type_str("x");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.daemon.repaint_requests().await.is_empty());
+
+    rig.type_str("\r~?");
+    settle().await;
+    rig.term.resize(60, 30);
+    settle().await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![2]);
+}
+
+/// W1: any snapshot at the client's current size generation restores trust, not only a repaint:
+/// a catch-up rendered after the resize record does, and the guess after it asks for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_at_the_current_generation_restores_trust_as_a_repaint_does() {
+    let rig = eager();
+    rig.attached().await;
+    rig.term.resize(100, 30);
+    settle().await;
+    rig.daemon
+        .catch_up(b"output the client never sees\r\n")
+        .await;
+    settle().await;
+    rig.type_str("a");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        rig.daemon.repaint_requests().await.is_empty(),
+        "{:?}",
+        rig.daemon.term_log().await
+    );
+}
+
+/// W1: a repaint asked for and not answered when the link drops is asked for again: the client,
+/// still untrusted, resumes with `want_snapshot`, and that snapshot (at the attach's generation)
+/// makes it trusted again.
+#[tokio::test(start_paused = true)]
+async fn a_repaint_owed_across_a_link_drop_is_the_resume_snapshot() {
+    let rig = eager();
+    rig.attached().await;
+    rig.daemon.hold_repaints(true).await;
+    rig.type_str("abc");
+    settle().await;
+    rig.term.resize(40, 24);
+    settle().await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
+    // The daemon never answers it on this link.
+    rig.daemon.kill_link(DownReason::Dead).await;
+    until_async("the resume", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some_and(|r| r.want_snapshot), "{a:?}");
+    assert_eq!(a.size_gen, 1);
+    // Trusted again: a guess asks for nothing.
+    rig.type_str("d");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
+}
+
+/// W1: the same across a swap. The candidate was set up before the repaint was needed, so its
+/// attach did not ask; the request went to the old link and was lost with it. Once the candidate
+/// is the session's link it is asked again, there.
+#[tokio::test(start_paused = true)]
+async fn a_repaint_owed_across_a_swap_is_asked_again_on_the_new_link() {
+    let rig = eager();
+    rig.attached().await;
+    rig.daemon.hold_repaints(true).await;
+    rig.daemon
+        .delay_next_attach(Duration::from_millis(200))
+        .await;
+    rig.dial.offer_swap(LinkKind::Direct);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    rig.type_str("abc");
+    settle().await;
+    rig.term.resize(40, 24);
+    settle().await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
+    until("the swap", 30, || rig.dial.swaps().len() == 1).await;
+    assert_eq!(rig.dial.swaps(), vec![Ok(LinkKind::Direct)]);
+    let a = &rig.daemon.attaches().await[1];
+    assert!(a.resume.is_some_and(|r| !r.want_snapshot));
+    rig.daemon.hold_repaints(false).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let log = rig.daemon.term_log().await;
+    assert_eq!(
+        rig.daemon.repaint_requests().await,
+        vec![1, 1],
+        "asked again on the new link: {log:?}"
+    );
+    // Its answer lands and the screen is trusted: a guess asks for nothing more.
+    rig.daemon.hold_repaints(false).await;
+    rig.type_str("d");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(rig.daemon.repaint_requests().await.len(), 2);
+}
+
+/// W1 (T1's finding on QUIC): the link goes quiet (`Degraded`), the status line is drawn, the
+/// window narrows under it, and the link recovers by itself, with no resume and so no resume
+/// snapshot. The repaint is asked for when the link is back, after the resize record.
+#[tokio::test(start_paused = true)]
+async fn a_resize_under_the_status_line_of_a_quiet_link_is_repaired_when_it_recovers() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.degrade_link().await;
+    until("the status line", 10, || rig.term.text().contains("fil: ")).await;
+    rig.term.resize(30, 24);
+    settle().await;
+    assert!(
+        rig.daemon.repaint_requests().await.is_empty(),
+        "not while quiet"
+    );
+    rig.daemon.recover_link().await;
+    settle().await;
+    assert_eq!(
+        rig.daemon.term_log().await,
+        vec![resize(0, 1, (30, 24)), repaint(1)]
+    );
+    assert_eq!(rig.daemon.repaints().await, vec![1]);
+    assert_eq!(rig.daemon.attaches().await.len(), 1, "no resume");
+}
+
+/// W1: a status line drawn on a screen a resize left untrusted (nothing was drawn at the resize)
+/// asks for a repaint once it is removed.
+#[tokio::test(start_paused = true)]
+async fn a_status_line_drawn_on_an_untrusted_screen_asks_once_it_is_gone() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.term.resize(30, 24);
+    settle().await;
+    rig.daemon.degrade_link().await;
+    until("the status line", 10, || rig.term.text().contains("fil: ")).await;
+    assert!(rig.daemon.repaint_requests().await.is_empty());
+    rig.daemon.recover_link().await;
+    settle().await;
+    assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
 }

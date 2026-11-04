@@ -14,7 +14,7 @@ use fil_proto::msg::{
     Agent, ControlMsg, ErrorCode, ForwardOp, ForwardResult, Hello, OtherDaemon, Request, Response,
     SessionName, SessionSummary,
 };
-use fil_proto::mux::{ForwardKind, ForwardRefusal};
+use fil_proto::mux::ForwardRefusal;
 use fil_proto::version::{Peer, VersionMismatch};
 use fil_transport::{Link, LinkError};
 
@@ -188,11 +188,7 @@ fn render_forward(
         )),
         (ForwardOp::Remove { kind, .. }, ForwardResult::Removed(_)) => Ok(format!(
             "removed the {}forward on port {port} from session \"{session}\"; connections already open run until they close\n",
-            kind.map_or("", |k| match k {
-                ForwardKind::Local => "-L ",
-                ForwardKind::Remote => "-R ",
-                ForwardKind::Dynamic => "-D ",
-            })
+            kind.map_or(String::new(), |k| format!("{} ", k.flag()))
         )),
         (_, ForwardResult::Refused(why)) => Err(refusal(why, port)),
         (_, other) => Err(format!("unexpected answer from the daemon: {other:?}")),
@@ -328,6 +324,7 @@ fn age(now_ms: u64, then_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use fil_proto::msg::{SessionName, SubscriberSummary, TermName};
+    use fil_proto::mux::ForwardKind;
     use fil_transport::link::mem;
     use fil_transport::{DownReason, LinkKind};
 

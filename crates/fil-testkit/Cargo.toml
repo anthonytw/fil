@@ -1,6 +1,6 @@
 [package]
 name = "fil-testkit"
-description = "Dev-only test support shared by the fil-session and fil-daemon tests: the scripted protocol client. A dev-dependency only; never in a release build (just release-deps)"
+description = "Dev-only test support shared by the crates' tests: the scripted protocol client, the mini ssh-agent and the wait helpers. A dev-dependency only; never in a release build (just release-deps)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

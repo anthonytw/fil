@@ -35,6 +35,8 @@ required-features = ["test-hooks"]
 test-hooks = []
 
 [dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
 # Enables `test-hooks` for this crate's own tests.
 fil-session = { path = ".", features = ["test-hooks"] }
 # The scripted protocol client, shared with the daemon's tests.

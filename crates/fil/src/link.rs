@@ -1,58 +1,11 @@
 //! The link types the binary hands to the client loop.
 
-use std::future::Future;
-use std::sync::Arc;
-
 use bytes::Bytes;
 use fil_proto::ChannelId;
 use fil_transport::pipe::PipeLink;
 use fil_transport::quic::QuicLink;
 use fil_transport::{Link, LinkError, LinkKind, LinkStatus};
 use tokio::sync::watch;
-
-/// A link the dialer and the client loop both hold: the loop reads and writes it, the dialer can
-/// still close it (`ClosePipe`, `CloseDirect`) and watch it die. `close` is idempotent.
-pub struct Shared<L>(pub Arc<L>);
-
-impl<L> Clone for Shared<L> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<L: Link> Link for Shared<L> {
-    fn kind(&self) -> LinkKind {
-        self.0.kind()
-    }
-
-    fn send(
-        &self,
-        channel: ChannelId,
-        payload: Bytes,
-    ) -> impl Future<Output = Result<(), LinkError>> + Send {
-        self.0.send(channel, payload)
-    }
-
-    fn recv(&self) -> impl Future<Output = Result<(ChannelId, Bytes), LinkError>> + Send {
-        self.0.recv()
-    }
-
-    fn flush(&self) -> impl Future<Output = Result<(), LinkError>> + Send {
-        self.0.flush()
-    }
-
-    fn status(&self) -> watch::Receiver<LinkStatus> {
-        self.0.status()
-    }
-
-    fn finish(&self, channel: ChannelId) {
-        self.0.finish(channel);
-    }
-
-    fn close(&self) {
-        self.0.close();
-    }
-}
 
 /// Either transport, as one type for the dialer.
 pub enum AnyLink {

@@ -341,13 +341,25 @@ pub struct ProcRow {
     pub zombie: bool,
 }
 
-/// Parses `/proc/<pid>/stat`. The command name may contain anything, including spaces and
-/// parentheses, so the fields are counted from the *last* `)`.
-pub fn parse_proc_stat(pid: u32, stat: &str) -> Option<ProcRow> {
+/// The fields of `/proc/<pid>/stat` after the command name: the state, the parent pid, and the
+/// rest. The command name may contain anything, including spaces and parentheses, so the fields
+/// are counted from the *last* `)`.
+fn stat_fields(stat: &str) -> Option<(&str, u32, impl Iterator<Item = &str>)> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let mut f = rest.split_whitespace();
     let state = f.next()?;
     let ppid: u32 = f.next()?.parse().ok()?;
+    Some((state, ppid, f))
+}
+
+/// The parent pid in `/proc/<pid>/stat`, and nothing else of it.
+pub fn parse_ppid(stat: &str) -> Option<u32> {
+    stat_fields(stat).map(|(_, ppid, _)| ppid)
+}
+
+/// Parses `/proc/<pid>/stat`.
+pub fn parse_proc_stat(pid: u32, stat: &str) -> Option<ProcRow> {
+    let (state, ppid, mut f) = stat_fields(stat)?;
     // Field 22 is the start time; state and ppid were fields 3 and 4, so 17 more to skip.
     let start = f.nth(17)?.to_string();
     Some(ProcRow {
@@ -724,7 +736,8 @@ mod tests {
 
     #[test]
     fn a_systemctl_that_hangs_does_not_hang_the_kill() {
-        let dir = std::env::temp_dir().join(format!("fil-systemctl-test-{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("systemctl");
         let marker = dir.join("ran");
@@ -757,7 +770,6 @@ mod tests {
             }
         }
         let args = std::fs::read_to_string(&marker);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             args.expect("the fake systemctl never ran").trim(),
             "--user kill --signal=SIGKILL fil-x.scope"
@@ -981,6 +993,9 @@ mod tests {
         let z = parse_proc_stat(5, "5 (x) Z 1 5 5 0 -1 4 0 0 0 0 0 0 0 0 20 0 1 0 42 0 0").unwrap();
         assert!(z.zombie);
         assert_eq!(parse_proc_stat(1, "garbage"), None);
+        // The parent pid alone needs no start time.
+        assert_eq!(parse_ppid("1 (a) b) c) S 7 1"), Some(7));
+        assert_eq!(parse_ppid("1 (a"), None);
     }
 
     #[test]

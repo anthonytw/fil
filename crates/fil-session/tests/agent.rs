@@ -56,11 +56,7 @@ async fn end(h: &fil_session::SessionHandle) {
 }
 
 async fn wait_for(what: &str, f: impl Fn() -> bool) {
-    let end = Instant::now() + WAIT;
-    while !f() {
-        assert!(Instant::now() < end, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    fil_testkit::until_within(what, WAIT, f).await;
 }
 
 /// List and sign through the socket.

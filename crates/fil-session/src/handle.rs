@@ -119,6 +119,7 @@ impl SessionHandle {
         let forwards = Forwards::new(
             name.clone(),
             config.forward.clone(),
+            config.withheld_min_life,
             agent_socket.clone(),
             config.policy.clone(),
             config.remote_peers.clone(),

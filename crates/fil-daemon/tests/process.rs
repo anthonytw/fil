@@ -7,11 +7,12 @@ mod common;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
 use fil_daemon::{DaemonLauncher, EnsureError, Paths, ensure_daemon};
 use fil_proto::msg::{AttachRefusal, Request, Response, SessionSummary};
+use fil_testkit::eventually;
 use fil_transport::pipe::{PipeCommand, PipeConfig, PipeLink};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
@@ -36,15 +37,8 @@ fn write_config(s: &Scratch, extra: &str) {
     std::fs::write(s.paths().config, format!("direct = false\n{extra}")).unwrap();
 }
 
-fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let end = Instant::now() + WAIT;
-    while Instant::now() < end {
-        if cond() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {what}");
+fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    fil_testkit::wait_until(what, WAIT, cond);
 }
 
 /// Processes whose command line mentions both `needle` markers, by `ps`.
@@ -367,7 +361,7 @@ async fn relay_process_to_daemon_process_to_session_and_a_daemon_restart() {
         name: name("second"),
     };
     assert_eq!(manage(&s, kill).await, Response::Done);
-    eventually(|| async {
+    eventually("the second session to be gone", || async {
         !sessions(&s)
             .await
             .iter()

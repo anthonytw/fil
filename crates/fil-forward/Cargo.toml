@@ -24,6 +24,8 @@ tracing = "0.1"
 test-hooks = []
 
 [dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
 # Enables `test-hooks` for this crate's own tests.
 fil-forward = { path = ".", features = ["test-hooks"] }
 # `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.

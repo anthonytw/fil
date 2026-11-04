@@ -24,7 +24,7 @@
 //! # "systemd" (always, failing if it cannot) or "tree" (always the process tree).
 //! scope = "auto"
 //!
-//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/agent/<session>.sock
+//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/a-<major>-<rev>/<session>.sock
 //! # (DESIGN.md section 10), whether or not a client relays its agent: a program started while
 //! # nobody relays finds the path and gets a refusal, and works once a client with -A attaches.
 //! # With `false` sessions get no SSH_AUTH_SOCK and the agent is never relayed.
@@ -55,7 +55,8 @@
 //! # window = "1MiB"         # 16KiB to 4MiB: the receive window per channel
 //! # buffer = "1MiB"         # 16KiB to 16MiB: what a channel's sender keeps unacknowledged
 //! # open_wait = "30s"       # 0 to 1h: how long an -R connection waits for a link
-//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect
+//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect, and how
+//! #                         # long a withheld entry outlives its run (at least 30 s)
 //! ```
 //!
 //! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file

@@ -11,6 +11,7 @@ use fil_proto::ChannelId;
 use fil_proto::msg::{
     AttachRefusal, ControlMsg, ErrorCode, ExitStatus, Hello, Request, Response, StartPoint,
 };
+use fil_testkit::eventually;
 use fil_transport::Link;
 use fil_transport::pipe::PipeLink;
 
@@ -112,7 +113,10 @@ async fn takeover_between_two_clients() {
     );
     // A refused attach does not leave its key registered (once the refusal has been delivered
     // and the link closed).
-    eventually(|| async { !d.registry.contains(&transport_key(&k1)) }).await;
+    eventually("the refused attach's key to leave the registry", || async {
+        !d.registry.contains(&transport_key(&k1))
+    })
+    .await;
     // And the new one still works.
     b.type_bytes(b"two\n").await;
     b.wait_screen("two").await;
@@ -172,7 +176,7 @@ async fn requests_ls_detach_kill() {
         name: "main".parse().unwrap(),
     };
     assert_eq!(ask(&d, kill.clone()).await, Response::Done);
-    eventually(|| async {
+    eventually("one session left", || async {
         let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
             return false;
         };
@@ -294,7 +298,7 @@ async fn a_session_that_ends_is_reported_then_gone() {
 
     // Reaped: the list is empty, and a late resume is told the session is gone, with how it
     // ended (the tombstone keeps the status for a client that missed `SessionExited`).
-    eventually(|| async { d.sessions_is_empty().await }).await;
+    eventually("no sessions", || async { d.sessions_is_empty().await }).await;
     let c = Client::attach(d.pipe().await, Connect::new("main", k).resume(resume)).await;
     assert_eq!(
         c.refused,
@@ -496,7 +500,7 @@ async fn ls_does_not_show_a_dropped_connection_as_attached() {
     assert!(attached(&list));
     // The connection dies without a goodbye.
     a.link.close();
-    eventually(|| async {
+    eventually("the session to be detached", || async {
         let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
             return false;
         };

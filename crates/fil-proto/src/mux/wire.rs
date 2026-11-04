@@ -39,6 +39,26 @@ pub enum ForwardKind {
     Dynamic,
 }
 
+impl ForwardKind {
+    /// The ssh flag of a kind, as the user types it: `-L`, `-R`, `-D`.
+    pub fn flag(self) -> &'static str {
+        match self {
+            ForwardKind::Local => "-L",
+            ForwardKind::Remote => "-R",
+            ForwardKind::Dynamic => "-D",
+        }
+    }
+}
+
+/// An address as it is written in a spec: an IPv6 address in brackets (`[::1]`), an IPv4 address
+/// as is.
+pub fn bracketed_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
 /// Where a forward's listener binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BindAddr {
@@ -149,7 +169,26 @@ pub enum TargetHost {
     Name(DnsName),
 }
 
+/// The host on its own, never bracketed (for `host:port` text that brackets itself, for data, and
+/// for sshd's comparisons).
+impl fmt::Display for TargetHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetHost::Ip(ip) => ip.fmt(f),
+            TargetHost::Name(n) => n.fmt(f),
+        }
+    }
+}
+
 impl TargetHost {
+    /// The host as written in a spec: an IPv6 address in brackets.
+    pub fn bracketed(&self) -> String {
+        match self {
+            TargetHost::Ip(ip) => bracketed_ip(*ip),
+            TargetHost::Name(n) => n.to_string(),
+        }
+    }
+
     /// A loopback address or a `localhost` name.
     pub fn is_loopback(&self) -> bool {
         match self {

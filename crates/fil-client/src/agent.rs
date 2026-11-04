@@ -67,7 +67,8 @@ impl std::fmt::Debug for AgentRelay {
 const AGENT_TOKEN: u64 = 1 << 63;
 
 /// Signature questions that may wait at once. More are refused without asking, so the host
-/// cannot keep the keyboard busy by opening many agent connections.
+/// cannot keep the keyboard busy by opening many agent connections. (Forward questions have their
+/// own queue and their own cap, `crate::forward::MAX_QUESTIONS`.)
 pub(crate) const MAX_QUESTIONS: usize = 4;
 
 /// After this many signature questions in a row answered no (a "n", or no answer in the 30 s the

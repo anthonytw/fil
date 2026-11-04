@@ -1,11 +1,12 @@
 # The `fil` binary (`crates/fil`)
 
-M1 package P6. One binary, both ends: `fil HOST` is the client; `fil server --stdio` and the daemon are the remote side (DESIGN.md §4, §13, §14). The crate has the command line, the config file, the **dialer** that turns the path manager into links, and the management commands. The client loop is `fil-client`; the transports are `fil-transport`; the remote side is `fil-daemon` (P5).
+M1 package P6, with the M2 additions noted where they touch it (the forward flags, `fil forward`, `fil ports` and the agent relay are in `docs/m2/binary.md`). One binary, both ends: `fil HOST` is the client; `fil server --stdio` and the daemon are the remote side (DESIGN.md §4, §13, §14). The crate has the command line, the config file, the **dialer** that turns the path manager into links, and the management commands. The client loop is `fil-client`; the transports are `fil-transport`; the remote side is `fil-daemon` (P5).
 
 ## Command line
 
 ```
-fil HOST [SESSION] [-L SPEC]... [-R SPEC]...   attach (default session: main)
+fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
+                                               attach (default session: main)
 fil ls HOST                                    list sessions
 fil kill HOST SESSION                          end a session
 fil detach HOST SESSION                        detach whoever is attached (it keeps running)
@@ -17,8 +18,7 @@ fil server --daemon                            the daemon itself (hidden; starte
 |---|---|
 | `--transport auto\|pipe\|direct` | Overrides the config for this attach. `auto`: ssh first, QUIC in the background. `pipe`: never dial. `direct`: as auto, but an ssh re-login waits 10 s after QUIC is lost. |
 | `--config FILE` | Another config file (also `$FIL_CONFIG`). A file named this way must exist: a typo is an error, not "no config" (only the default path may be missing). |
-| `-L SPEC`, `-R SPEC` | Accepted; port forwards are M2, so they fail with a clear "not yet" message (exit 1). |
-| `fil detach` with no host | Same: it needs the session's control socket (M2). |
+| `-L SPEC`, `-R SPEC`, `-D SPEC`, `-A`, `-a` | Port forwards and the agent relay (M2): see `docs/m2/binary.md`, which also has `fil forward`, `fil ports` and `fil detach` with no host. |
 | a HOST, SESSION, `-L`, `-R` or `--transport` together with a command | A usage error (exit 2): `fil devbox ls box` would list `box` and drop `devbox`. |
 
 A host or session named `ls`, `kill`, `detach` or `server` is attached with `--`: `fil -- ls`, `fil devbox -- ls`. (Without it `fil devbox ls` fails loudly, because `ls` wants a host.)
@@ -39,7 +39,7 @@ A missing default file means the defaults; a file named with `--config` or `$FIL
 | `pipe` | an argv, run untouched (except ssh keepalive options); default `ssh -T -- HOST fil server --stdio` | client |
 | `host_label` | text, 1 to 128 bytes (default: this machine's short host name) | client |
 | `predict` | `"off"`, `"adaptive"`, `"always"` | accepted; used from M3 |
-| `forward` | list of `-L`/`-R` specs | accepted, warned about and ignored until M2 |
+| `forward` | list of `-L`/`-R`/`-D` specs, or a `[defaults.forward]` table | client (M2: `docs/m2/binary.md`) |
 | `offline_input.buffer` | `"4KiB"`, `0`, `"512"`... (default 4 KiB) | client |
 | `offline_input.confirm` | `"off"` (default), `"after 10s"` | client |
 | `offline_input.log` | an absolute path or `~/...`, or a command `["logger", "-t", "fil"]`; off by default (can capture passwords) | client |
@@ -133,7 +133,7 @@ All run in `just ci`. Times are debug builds on an Apple M-series laptop.
 
 | Where | What | Time |
 |---|---|---|
-| `src/cli.rs` (15) | each form of the command line, defaults, `--`, `-L`/`-R` refused, usage errors, help text | under 0.05 s |
+| `src/cli.rs` (15) | each form of the command line, defaults, `--`, usage errors, help text (the forward flags came in with M2) | under 0.05 s |
 | `src/config.rs` (10) | the DESIGN.md sketch, field-by-field override, `user@host` matching, every kind of bad value (message names section and key) | under 0.05 s |
 | `src/mgmt.rs` (10) | the `fil ls` table, truncation, hostile labels, answers as sentences, and the exchange over `link::mem` (version mismatch, dropped link, silent daemon, error message) | under 0.05 s |
 | `src/connect.rs` (8), `src/logging.rs` (2), `src/app.rs` (2), `src/netwatch.rs` (1) | the background ssh command, `ssh -G` parsing, failure wording, log permissions and rotation, host labels, exit statuses | under 0.05 s |
@@ -145,7 +145,7 @@ Mutation checks (each change made by hand, the suites run, the change reverted):
 ## Not done here
 
 - Local time in the "taken over" message: the client formats UTC (labelled) because the local zone needs a database lookup this crate does not carry.
-- Port forwards (`-L`, `-R`, `forward = [...]`, `fil ports`, `fil forward`) are M2.
+- Port forwards (`-L`, `-R`, `-D`, `forward = [...]`, `fil ports`, `fil forward`) came in with M2: `docs/m2/binary.md`.
 
 ## On demand: a real run without sshd
 

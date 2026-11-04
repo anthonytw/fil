@@ -1015,10 +1015,10 @@ mod tests {
             }
         );
         assert_eq!(
-            action(&["ports", "orin", "--probe"]),
+            action(&["ports", "devbox", "--probe"]),
             Action::Ports {
                 target: Target::Host {
-                    host: "orin".into(),
+                    host: "devbox".into(),
                     session: None
                 },
                 json: false,

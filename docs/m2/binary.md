@@ -34,7 +34,7 @@ Part 1 is the pure half of F4: parsing, validating, carrying and rendering. Noth
 
 | fil | OpenSSH | Why |
 |---|---|---|
-| `-L PORT` and `-R PORT` are the same port on the other side's `localhost` | `-L` needs host and port; `-R PORT` alone is a SOCKS proxy on the remote | DESIGN §7.3 writes `fil orin -L 5173 -R 9000`. A remote SOCKS proxy is not in M2; `-R PORT:x` (two fields) is refused with a message that says so. |
+| `-L PORT` and `-R PORT` are the same port on the other side's `localhost` | `-L` needs host and port; `-R PORT` alone is a SOCKS proxy on the remote | DESIGN §7.3 writes `fil devbox -L 5173 -R 9000`. A remote SOCKS proxy is not in M2; `-R PORT:x` (two fields) is refused with a message that says so. |
 | No Unix-socket forms (`-L /path:…`, `-R …:/path`) | supported | Non-goal for M2 (plan open question 5). A `/` in a spec gets its own message. |
 | Port 0 only for a `-R` listener | `0` is accepted in more places | The wire's rule (`ForwardSpec`): the host reports the port it got, and nothing reports one for `-L`/`-D`. A target port is never 0. |
 | A bind is an IP address, `localhost`, `*` or empty | any host name, resolved | `BindAddr` has no name. A name would also make the bind depend on the resolver. `localhost` is loopback on both families. |
@@ -90,7 +90,7 @@ Keys in `[defaults]` and `[host.NAME]`; a host's value replaces the default's, a
   - Times are `HH:MM` for today and `YYYY-MM-DD HH:MM` otherwise, in the zone given. `now` is the last 5 seconds.
   - Sizes use 1024 and the labels KB, MB.
 - **Every string from the host goes through `fil_proto::text::sanitize`:** process names, working directories, probe labels and the attached client's host label, in the text and in the JSON. Control characters (escape sequences included) and invisible or reordering characters are removed and line breaks become spaces. The wire caps lengths (32, 128 and 64 bytes); the view does not rely on that. A name that is empty after cleaning shows as `(unnamed)`.
-- **JSON:** `schema` is 1; a field is never renamed or retyped within a schema. Times are Unix milliseconds (`null` for none); enums are lowercase strings; `bind` is `"loopback"`, `"any"` or an address; `spec` is the forward in full form, as a flag reads it; every key is always present. Addresses (`bind`, `target.host`, a listener's `addr`) are bare, never bracketed; `spec` is the one field written in spec syntax. Pinned by `tests/golden/ports.json` and a key-set test.
+- **JSON:** `schema` is 1; a field is never renamed or retyped within a schema. Times are Unix milliseconds (`null` for none); enums are lowercase strings; `bind` is `"loopback"`, `"any"`, an address or `"withheld"`; `spec` is the forward in full form, as a flag reads it, except where another client withheld part of it from the host (DESIGN.md section 7.2): a `-R` target beyond loopback (`target` is `null`) or a `-L`/`-D` bind on that client's network (`bind` is `"withheld"`). That part is written `(client network)` (`-R 9000:(client network)`, `-L (client network):8080:localhost:80`), which is display text and does not parse back, so a script reads `target` and `bind`, not `spec`, for those; every key is always present. Addresses (`bind`, `target.host`, a listener's `addr`) are bare, never bracketed; `spec` is the one field written in spec syntax. Pinned by `tests/golden/ports.json` and a key-set test.
 - **`fil ls`** has a `FORWARDS` column (the table size, and `agent` when the relay is on; `-` for neither). It is pure rendering of `SessionSummary`, so it is here.
 
 ### Tests

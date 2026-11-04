@@ -683,12 +683,12 @@ async fn a_pipe_that_dies_by_itself_leaves_what_it_said_as_a_note() {
     let mut d = auto(&fake);
     let _p = first_attach(&mut d).await;
     d.attached(&info(LinkKind::Pipe, false, false));
-    fake.set_diagnostics(Some("Connection to orin closed by remote host."));
+    fake.set_diagnostics(Some("Connection to devbox closed by remote host."));
     fake.kill_latest(LinkKind::Pipe, DownReason::Io("exited".into()));
     let _ = dial_for(secs(30), &mut d, DialPurpose::Resume).await;
     assert_eq!(
         d.status_note().as_deref(),
-        Some("Connection to orin closed by remote host.")
+        Some("Connection to devbox closed by remote host.")
     );
 }
 

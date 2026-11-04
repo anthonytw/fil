@@ -55,6 +55,8 @@ pub fn bind(bind: BindAddr, port: u16) -> Result<Bound, BindFailure> {
             port,
             true,
         ),
+        // Another client's bind on its own machine, which this one does not know: nothing to bind.
+        BindAddr::Withheld(_) => Err(BindFailure::AddrNotAvailable),
     }
 }
 

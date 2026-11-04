@@ -556,3 +556,20 @@ fn listeners_that_would_take_the_same_port_are_refused_at_plan_time() {
         1
     );
 }
+
+/// What another client withheld (DESIGN.md section 7.2) is written `(client network)` in its
+/// place only: a `-D` with a withheld bind has no target to write, so nothing stands for one.
+#[test]
+fn withheld_parts_are_written_where_they_are() {
+    let held = |kind, s: &str| format_flag(&parse(kind, s).unwrap().on_wire());
+    assert_eq!(held(Dynamic, "192.0.2.5:1080"), "-D (client network):1080");
+    assert_eq!(
+        held(Local, "192.0.2.5:8080:localhost:80"),
+        "-L (client network):8080:localhost:80"
+    );
+    assert_eq!(
+        held(Remote, "9000:intranet-wiki.example:443"),
+        "-R 9000:(client network)"
+    );
+    assert_eq!(held(Dynamic, "1080"), "-D 1080");
+}

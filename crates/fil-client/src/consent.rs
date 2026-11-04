@@ -20,6 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use fil_proto::mux::{
     BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Target, TargetHost,
+    WITHHELD_TARGET,
 };
 
 use crate::config::RemoteRequests;
@@ -37,7 +38,8 @@ fn loopback_ip(ip: IpAddr) -> bool {
 pub fn loopback_bind(bind: BindAddr) -> bool {
     match bind {
         BindAddr::Loopback => true,
-        BindAddr::Any => false,
+        // A withheld bind is another client's beyond loopback.
+        BindAddr::Any | BindAddr::Withheld(_) => false,
         BindAddr::Ip(ip) => loopback_ip(ip),
     }
 }
@@ -216,6 +218,7 @@ fn bind_text(bind: BindAddr) -> String {
         BindAddr::Loopback => "localhost".into(),
         BindAddr::Any => "*".into(),
         BindAddr::Ip(ip) => ip_text(ip),
+        BindAddr::Withheld(_) => WITHHELD_TARGET.into(),
     }
 }
 
@@ -246,6 +249,8 @@ pub fn describe(spec: &ForwardSpec) -> String {
             host_text(&t.host),
             t.port
         ),
+        // A `-R` another client named, whose target that client kept to itself.
+        None if spec.target_withheld() => format!("-R {listen} -> {WITHHELD_TARGET}"),
         None => format!("{} {listen}", flag(spec.kind())),
     };
     debug_assert!(
@@ -281,6 +286,7 @@ pub fn refusal_lines(spec: &ForwardSpec, why: Refusal) -> Vec<String> {
         match why {
             Refusal::Denied => "(remote_requests = \"deny\")",
             Refusal::WideBind => "(it would listen beyond localhost)",
+            Refusal::WideTarget if spec.target_withheld() => "(its target stayed with its client)",
             Refusal::WideTarget => "(its target is not this machine)",
             Refusal::WideRemoteBind => "(a wide -R: only from your config)",
             Refusal::TooMany => "(too many requests; refusing all)",

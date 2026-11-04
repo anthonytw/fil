@@ -650,6 +650,171 @@ async fn takeover_and_take_back() {
     );
 }
 
+/// A `-R` target beyond loopback never reaches the daemon (DESIGN.md section 7.2): the table,
+/// `fil ports` and the next client after a takeover see it withheld, and the connections still
+/// reach the client, which connects to its own copy. Another client's `-R 0` to another target
+/// is an entry of its own (its tag differs), and on a fixed port it replaces the entry, as for
+/// any changed target, keeping the port. A loopback target is kept as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_target_beyond_loopback_stays_with_its_client() {
+    let s = Scratch::new();
+    let h = spawn_plain(cat(&s, "withheld")).await;
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let at = tagged_echo(b"A").await;
+    let to_on = |port: u16, host: &str| {
+        ForwardSpec::new(
+            ForwardKind::Remote,
+            BindAddr::Loopback,
+            port,
+            Some(Target {
+                host: TargetHost::Name(host.parse().unwrap()),
+                port: NonZeroU16::new(443).unwrap(),
+            }),
+        )
+        .unwrap()
+    };
+    let to = |host: &str| to_on(0, host);
+    let id = add(&mut a, to("intranet-wiki.example")).await;
+    let port = bound_port(&a, id, 0).await;
+    a.side.targets.lock().unwrap().insert(id, at.addr);
+    assert_eq!(round_trip_eventually(port, b"x", 2).await, b"Ax");
+    let looked = |what: &str, spec: &ForwardSpec| {
+        assert!(spec.is_withheld(), "{what}: {spec:?}");
+        assert!(
+            !format!("{spec:?}").contains("intranet"),
+            "{what}: {spec:?}"
+        );
+    };
+    let rows = h.forward_rows();
+    looked("fil ports", &rows.iter().find(|r| r.id == id).unwrap().spec);
+    // The daemon's answer to the add says what it holds.
+    let answered = a
+        .table()
+        .into_iter()
+        .find_map(|m| match m {
+            MuxMsg::Forward {
+                id: i,
+                spec,
+                req: Some(_),
+                ..
+            } if i == id => Some(spec),
+            _ => None,
+        })
+        .unwrap();
+    looked("the answer", &answered);
+
+    // A loopback target is kept.
+    let lo = add(&mut a, remote(0, 8080)).await;
+    let lo_row = h.forward_rows().into_iter().find(|r| r.id == lo).unwrap();
+    assert_eq!(lo_row.spec, remote(0, 8080));
+
+    // B takes over: it is told of the entry, withheld, and its own equal `-R` adopts it.
+    let mut b = FwdClient::attach(&h, key(2), "desk").await;
+    a.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    let told = b
+        .wait_table("the table after the takeover", |m| match m {
+            MuxMsg::Forward {
+                id: i,
+                spec,
+                req: None,
+                ..
+            } if *i == id => Some(spec.clone()),
+            _ => None,
+        })
+        .await;
+    looked("the takeover", &told);
+    let b_id = add(&mut b, to("other-host.example")).await;
+    assert_ne!(b_id, id, "another target took A's -R 0 (and its port)");
+    assert_ne!(bound_port(&b, b_id, 0).await, port);
+
+    // On a fixed port: B's own -R there replaces A's, under a new id, on the same port.
+    let fixed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut c = FwdClient::attach(&h, key(3), "third").await;
+    b.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    let old = add(&mut c, to_on(fixed, "intranet-wiki.example")).await;
+    assert_eq!(bound_port(&c, old, 0).await, fixed);
+    let mut d = FwdClient::attach(&h, key(4), "fourth").await;
+    c.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    let from = d.table().len();
+    let new = add(&mut d, to_on(fixed, "other-host.example")).await;
+    assert_ne!(new, old);
+    d.wait_table("ForwardGone for the replaced entry", |m| {
+        matches!(m, MuxMsg::ForwardGone { id } if *id == old).then_some(())
+    })
+    .await;
+    assert_eq!(bound_port(&d, new, from).await, fixed);
+}
+
+/// A withheld client-origin entry outlives its run by `linger`, no longer (DESIGN.md section
+/// 7.2): a takeover keeps A's withheld `-R 0` and its port, a take-back within `linger` adopts it
+/// on that port, and once A's run has been gone for `linger` the daemon removes it and closes
+/// its listener. So re-runs (each with its own tags) do not pile up entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_entry_outlives_its_run_by_linger() {
+    let linger = Duration::from_millis(400);
+    let s = Scratch::new();
+    let mut cfg = cat(&s, "linger");
+    cfg.forward.linger = linger;
+    let h = spawn_plain(cfg).await;
+    let to = |host: &str| {
+        ForwardSpec::new(
+            ForwardKind::Remote,
+            BindAddr::Loopback,
+            0,
+            Some(Target {
+                host: TargetHost::Name(host.parse().unwrap()),
+                port: NonZeroU16::new(443).unwrap(),
+            }),
+        )
+        .unwrap()
+    };
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let id = add(&mut a, to("intranet-wiki.example")).await;
+    let port = bound_port(&a, id, 0).await;
+
+    // B takes over: A's entry and its port stay.
+    let b = FwdClient::attach(&h, key(2), "desk").await;
+    a.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    assert_eq!(bound_port(&b, id, 0).await, port);
+    // A takes it back within linger: the same entry, on the same port.
+    tokio::time::sleep(linger / 4).await;
+    a.take_back(&h).await;
+    b.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    assert_eq!(add(&mut a, to("intranet-wiki.example")).await, id);
+    assert_eq!(bound_port(&a, id, 0).await, port);
+    // Still there past linger while A holds the session.
+    tokio::time::sleep(linger * 2).await;
+    assert!(h.forward_rows().iter().any(|r| r.id == id));
+
+    // A's run goes (a takeover it never takes back): after linger, gone, listener and all.
+    let _c = FwdClient::attach(&h, key(3), "other").await;
+    a.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    eventually("the entry removed", || async {
+        !h.forward_rows().iter().any(|r| r.id == id)
+    })
+    .await;
+    refused(port).await;
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).await.is_ok(),
+        "the port is free"
+    );
+
+    // Re-runs, each with a withheld -R 0 of its own: the table stays bounded.
+    for i in 0..6u8 {
+        let mut r = FwdClient::attach(&h, key(10 + i), "rerun").await;
+        add(&mut r, to(&format!("host-{i}.example"))).await;
+        tokio::time::sleep(linger + linger / 2).await;
+        assert!(
+            h.forward_count() <= 2,
+            "run {i}: {} entries",
+            h.forward_count()
+        );
+    }
+}
+
 /// The attached client's spec with an entry's identity (kind, bind, port) and another target
 /// replaces it under a new id: the client hears `ForwardGone` for the old one, and the listener,
 /// on the same port, routes to the new target.

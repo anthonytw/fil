@@ -118,6 +118,126 @@ async fn list_and_sign_across_a_reconnect() {
     end(&h).await;
 }
 
+/// Agent use is per client: after a takeover `fil ports` counts only the new client's requests,
+/// never the previous client's (which would show its key use as this one's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_starts_the_agent_counts_over() {
+    let dir = Short::new("cnt");
+    let agent_a = MiniAgent::start(&dir.0.join("mini-a.sock"), 1);
+    let agent_b = MiniAgent::start(&dir.0.join("mini-b.sock"), 1);
+    let (_scratch, h) = session(&dir).await;
+    let _a = FwdClient::attach_agent(&h, key(1), "laptop", agent_a.path()).await;
+    wait_for("the socket", || dir.socket().exists()).await;
+    list_and_sign(&dir.socket(), &agent_a, b"a").await;
+    let row = h.agent_row().expect("an agent row");
+    assert_eq!(row.requests, 2);
+    assert!(row.last_unix_ms > 0);
+
+    let _b = FwdClient::attach_agent(&h, key(2), "desk", agent_b.path()).await;
+    wait_for("the new client's row", || {
+        h.agent_row()
+            .is_some_and(|r| r.requests == 0 && r.last_unix_ms == 0)
+    })
+    .await;
+    wait_for("the socket", || dir.socket().exists() && h.agent_relayed()).await;
+    list_and_sign(&dir.socket(), &agent_b, b"b").await;
+    let row = h.agent_row().expect("an agent row");
+    assert_eq!(row.requests, 2, "only the new client's requests");
+    end(&h).await;
+}
+
+/// A stand-in local agent on `path`: answers the session-bind, then the first request with an
+/// empty key list 300 ms later when `answers`, or never. Each connection reports when it got its request and
+/// when its end came (the relay closed it).
+fn stand_in_agent(
+    path: &Path,
+    answers: bool,
+) -> tokio::sync::mpsc::UnboundedReceiver<(&'static str, Instant)> {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let Ok(_bind) = read_answer(&mut s).await else {
+                    return;
+                };
+                s.write_all(&framed(&[6])).await.unwrap();
+                let Ok(_req) = read_answer(&mut s).await else {
+                    return;
+                };
+                let _ = tx.send(("request", Instant::now()));
+                if answers {
+                    // After the host program has ended its side: the grace is what gets the
+                    // answer through.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = s.write_all(&framed(&[12, 0, 0, 0, 0])).await;
+                }
+                let mut rest = Vec::new();
+                let _ = s.read_to_end(&mut rest).await;
+                let _ = tx.send(("end", Instant::now()));
+            });
+        }
+    });
+    rx
+}
+
+/// Finding 7, end to end (the session's socket, the mux, the client's `connect_local` relay):
+/// a host program that ends its side while a silent agent is asked frees the agent connection
+/// within [`fil_forward::agent::AGENT_EOF_GRACE`] (plus a margin), whether it closed or only
+/// half-closed (the channel carries one `Eof` for both); and a half-closed one still gets the
+/// answer of an agent that answers at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_program_that_ends_its_side_frees_the_agent_wait() {
+    let grace = fil_forward::agent::AGENT_EOF_GRACE;
+    for (how, answers) in [
+        ("close", false),
+        ("half-close", false),
+        ("half-close", true),
+    ] {
+        let dir = Short::new(&format!("eof{}", u8::from(answers)));
+        let agent = dir.0.join("stand-in.sock");
+        let mut seen = stand_in_agent(&agent, answers);
+        let (_scratch, h) = session(&dir).await;
+        let _c = FwdClient::attach_agent(&h, key(1), "laptop", &agent).await;
+        wait_for("the socket", || dir.socket().exists()).await;
+        let mut s = UnixStream::connect(dir.socket()).await.unwrap();
+        s.write_all(&framed(&[REQUEST_IDENTITIES])).await.unwrap();
+        let (what, _) = tokio::time::timeout(WAIT, seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(what, "request");
+        let t0 = Instant::now();
+        if how == "close" {
+            drop(s);
+        } else {
+            s.shutdown().await.unwrap();
+            let mut got = Vec::new();
+            tokio::time::timeout(grace + Duration::from_secs(2), s.read_to_end(&mut got))
+                .await
+                .expect("the connection ended")
+                .unwrap();
+            if answers {
+                assert_eq!(got, framed(&[12, 0, 0, 0, 0]), "the answer to a half-close");
+            } else {
+                assert!(got.is_empty(), "{got:?}");
+            }
+        }
+        let (what, at) = tokio::time::timeout(WAIT, seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(what, "end");
+        let took = at.saturating_duration_since(t0);
+        assert!(
+            took < grace + Duration::from_secs(1),
+            "{how} (answers {answers}): the agent connection was held {took:?}"
+        );
+        end(&h).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_permissions() {
     let dir = Short::new("perm");

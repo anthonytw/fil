@@ -332,6 +332,7 @@ fn bind_endpoint(bind: BindAddr, port: u16, side: Side) -> String {
         },
         BindAddr::Any => format!("*:{port}"),
         BindAddr::Ip(ip) => host_port(&ip.to_string(), port),
+        BindAddr::Withheld(_) => format!("{}:{port}", fil_proto::mux::WITHHELD_TARGET),
     }
 }
 
@@ -439,6 +440,8 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
             "←",
             own,
         ),
+        // The client kept a target beyond loopback to itself.
+        (ForwardKind::Remote, None) => (fil_proto::mux::WITHHELD_TARGET.to_string(), "←", own),
         _ => (own, "→", "(SOCKS)".to_string()),
     };
     let owner = match spec.kind() {
@@ -923,6 +926,7 @@ fn json_bind(b: BindAddr) -> String {
         BindAddr::Loopback => "loopback".to_string(),
         BindAddr::Any => "any".to_string(),
         BindAddr::Ip(ip) => ip.to_string(),
+        BindAddr::Withheld(_) => "withheld".to_string(),
     }
 }
 

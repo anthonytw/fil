@@ -61,7 +61,8 @@ impl ForwardTable {
 
     /// Whether `spec` may be added by `origin` at all, whatever the table holds.
     pub fn permitted(spec: &ForwardSpec, origin: Origin) -> Result<(), ForwardRefusal> {
-        let target_loopback = spec.target().is_none_or(|t| t.host.is_loopback());
+        // A withheld `-R` target is beyond loopback (that is why it was withheld).
+        let target_loopback = spec.target().is_some_and(|t| t.host.is_loopback());
         match spec.kind() {
             // OD-7: a wide -R bind only from the client's own CLI or config (and then where server
             // policy allows it, which the daemon checks).

@@ -19,9 +19,9 @@ fil server --daemon                            the daemon itself (hidden; starte
 | `--config FILE` | Another config file (also `$FIL_CONFIG`). A file named this way must exist: a typo is an error, not "no config" (only the default path may be missing). |
 | `-L SPEC`, `-R SPEC` | Accepted; port forwards are M2, so they fail with a clear "not yet" message (exit 1). |
 | `fil detach` with no host | Same: it needs the session's control socket (M2). |
-| a HOST, SESSION, `-L`, `-R` or `--transport` together with a command | A usage error (exit 2): `fil orin ls box` would list `box` and drop `orin`. |
+| a HOST, SESSION, `-L`, `-R` or `--transport` together with a command | A usage error (exit 2): `fil devbox ls box` would list `box` and drop `devbox`. |
 
-A host or session named `ls`, `kill`, `detach` or `server` is attached with `--`: `fil -- ls`, `fil orin -- ls`. (Without it `fil orin ls` fails loudly, because `ls` wants a host.)
+A host or session named `ls`, `kill`, `detach` or `server` is attached with `--`: `fil -- ls`, `fil devbox -- ls`. (Without it `fil devbox ls` fails loudly, because `ls` wants a host.)
 
 **Exit status.** 0: detached or input closed. When the session ends (`Outcome::SessionEnded { code, signal }`), like ssh: the shell's own status if it exited with one (low eight bits), 128+N if it was killed by signal N (`fil kill` from elsewhere sends SIGHUP first and SIGKILL only to what survives the grace period, so usually 129 (SIGHUP), and 137 if the shell survives the hangup, e.g. `trap '' HUP`), and 0 if the daemon could not say (a reconnect that learns the session is gone). 128+N also when fil itself is stopped by signal N. 1: an error, or the session was taken over, replaced or detached elsewhere (so a shell that exits 1 and an error are not told apart by the status alone; the message differs). 2: a usage error (clap).
 
@@ -31,7 +31,7 @@ Once the first attach has been accepted, nothing reaches the terminal except the
 
 ## Config: `~/.config/fil/config.toml`
 
-A missing default file means the defaults; a file named with `--config` or `$FIL_CONFIG` that is missing is an error. Unknown keys are errors. Every section is checked when the file is read, and an error names the file, the section and the key (`config.toml: [host.orin]: offline_input.buffer: not a size: "lots"`).
+A missing default file means the defaults; a file named with `--config` or `$FIL_CONFIG` that is missing is an error. Unknown keys are errors. Every section is checked when the file is read, and an error names the file, the section and the key (`config.toml: [host.devbox]: offline_input.buffer: not a size: "lots"`).
 
 | Key | Values | Used by |
 |---|---|---|

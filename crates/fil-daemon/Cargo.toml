@@ -36,6 +36,8 @@ test-hooks = ["fil-proto/test-hooks"]
 fil-daemon = { path = ".", features = ["test-hooks"] }
 # The scripted protocol client, shared with fil-session's tests.
 fil-testkit = { path = "../fil-testkit" }
+# A crashed daemon's socket in tests: bound, never listening (`net`).
+rustix = { version = "1", features = ["fs", "process", "net"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process", "test-util"] }
 
 [lints]

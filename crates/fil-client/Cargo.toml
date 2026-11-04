@@ -23,6 +23,8 @@ tracing = "0.1"
 [dev-dependencies]
 # The test-only mini ssh-agent.
 fil-testkit = { path = "../fil-testkit" }
+# Builds a spec another run withheld, from its wire bytes.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "pty", "process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "signal", "process", "io-util", "net"] }
 

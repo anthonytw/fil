@@ -432,7 +432,8 @@ The trait is not object-safe. A client that switches between the pipe and QUIC h
 ### 8.2 Pipe (ssh by default)
 
 - **What it runs:** a command whose stdin and stdout reach `fil server --stdio` on the remote. The default is `ssh -T -- HOST fil server --stdio`. Using the system `ssh` means everything in `~/.ssh/config` applies: ProxyJump, certificates, agents and ControlMaster.
-- **Fixed remote command:** the remote command is always exactly `fil server --stdio`. It is never assembled from user input, because ssh hands its command line to the remote shell as a string. Session names and everything else travel inside the protocol.
+- **Fixed remote commands** (decided, owner 2026-11-04): the remote command is `fil server --stdio`, or the constant bootstrap: when the plain command fails at a run's first connection, when the user's config asks for it, or when the user runs `fil install`, `fil install --check` or `fil install --remove`; neither is ever assembled from user input, because ssh hands its command line to the remote shell as a string. `fil server --stdio` is tried first on every run and is the only command with `remote = "plain"`. The bootstrap is one compile-time constant line that holds only the build's version and wire, pinned by a golden (`docs/m4/plan.md` §2.5); its mode travels on stdin, never in the command. Session names and everything else travel inside the protocol.
+- **Status of the bootstrap:** today `fil install` runs it, and refuses a host with `remote = "plain"` or a custom `pipe`; the attach's fallback to it, `remote = "installed"` and the install offer come with the attach wiring (`docs/m4/install.md`). `crates/fil/tests/remote_commands.rs` runs every subcommand that reaches ssh against a recording fake `ssh` and requires each remote part to be exactly one of the two commands.
 - **Configurable per host:** for example `kubectl exec -i`, `docker exec -i`, `aws ssm start-session` or `tailscale ssh`. This is fil's runtime extension point (§8.4).
 - **Multiplexing:** all channels share one byte stream with fil's own framing.
   - The scheduler sends terminal and control frames ahead of forward data.
@@ -749,7 +750,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 | Someone who steals a client key | the session | The key exists only in the memory of the client process, for one attach, is bound to its one session (over QUIC it can only resume that session), and is revoked on detach, takeover and when the session ends. |
 | Other users on the remote host | the socket directory | 0700 and owned by you; the daemon refuses a directory created by someone else; every connection's peer UID is checked by the kernel. |
 | Other users on the remote host | `-R` ports on 127.0.0.1 | Reachable by every user on that host by default, the same as `ssh -R`. Documented. `daemon.toml` `[forward] remote_peers = "same-user"` (OD-9) checks each connection's peer socket owner and resets another uid's (or an unknown one) before a byte reaches the laptop, which also keeps another user from flooding the opener's channels (OD-13); `fil ports` counts the refusals without naming anyone (§7.2). |
-| Crafted session names or arguments | the remote shell | The remote command is fixed. Names travel inside the protocol and are validated on both ends. |
+| Crafted session names or arguments | the remote shell | The remote commands are fixed (§8.2). Names travel inside the protocol and are validated on both ends. |
 | The remote host using your agent | signatures | Opt-in and off by default. Relayed only while a client that asked for it is attached; the socket does not exist otherwise. The client's filter refuses everything but list, sign and two extensions, and a signature only for a key blob the agent listed; `agent_keys` limits the keys, and `confirm` asks per signature. Each connection is bound as a forwarding hop first, so destination-constrained keys are refused, not bypassed (§10). |
 | Other users on the remote host | the agent socket | Inside the 0700 socket directory, in a 0700 `a-<major>-<rev>/` checked like it; mode 0600; every connection's peer UID is checked by the kernel. |
 | The host's admin, who may never have heard of fil | their sshd's forwarding and agent switches | fil mirrors them and reads `/etc/fil/policy.toml` (§11.2); unclear cases are refused. A courtesy, not a boundary: a user with a shell can run any relay (decided, OD-8). |
@@ -759,7 +760,7 @@ Prior work to learn from: mosh's prediction engine, mosh-rs, `morsh_predict` and
 
 **Out of scope:** root on the remote host, a compromised client machine, and the terminal emulator's own escape-sequence handling. fil passes bytes through exactly as ssh does.
 
-**Server binary distribution:** by hand today: the user copies a release's `bin/fil` to the host, and a first attach that finds none says where fil looks and what to do (`docs/m4/install.md`). An upload through fil is built and **gated on M4 OQ-1**, compiled only with the off-by-default `install-bootstrap` feature: the constant bootstrap (`docs/m4/plan.md` §2.5) receives the build for the remote's OS and architecture over the authenticated pipe into `~/.local/share/fil/<ver>-w<major>.<rev>/` (`docs/m4/release.md` §5), checks the directories and the SHA-256 before anything there runs, and a release build is the only one ever sent.
+**Server binary distribution:** by hand, or through fil (M4 OQ-1, approved by the owner 2026-11-04). By hand, the user copies a release's `bin/fil` to the host, and a first attach that finds none says where fil looks and what to do (`docs/m4/install.md`). Through fil, `fil install HOST` runs the constant bootstrap (`docs/m4/plan.md` §2.5), which receives the build for the remote's OS and architecture over the authenticated pipe into `~/.local/share/fil/<ver>-w<major>.<rev>/` (`docs/m4/release.md` §5). It checks every directory from `$HOME` down, and the size and SHA-256 of the upload, before anything there runs, and a release build is the only one ever sent. Nothing is downloaded, and nothing about the host is written on the laptop.
 
 ### 11.1 Privacy: what fil reveals about its users
 
@@ -774,7 +775,7 @@ Security keeps attackers out. Privacy is about the people using fil: what fil it
    - **To the remote host:** a `-R` target beyond loopback (a name or address on the laptop's network) never leaves the client, nor does a `-L`/`-D` bind beyond loopback that is not a wildcard (the laptop's LAN address; decided, owner 2026-11-04): each goes as an opaque tag under a per-run key (§7.2). Agent use in `fil ports` is the current client's only (§10).
    - **The session name in `SSH_AUTH_SOCK`:** the stable agent path (`/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`, §10) puts the session name in every session program's environment, where a tool that uploads its environment (a crash reporter, CLI telemetry, a CI log) could carry it off the host. `FIL_SESSION` carries the same name already, so a path keyed otherwise would hide nothing; accepted, and noted here.
    - **Remote environment:** the remote session's environment drops everything that describes the login that happened to start the daemon: ssh's connection details (`SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` and similar), the login's agent, X11 and Kerberos variables (`SSH_AUTH_SOCK`, `DISPLAY`, `XAUTHORITY`, `KRB5CCNAME`; tmux's `update-environment` set), logind's `XDG_SESSION_*`, the forwarded terminal identification (`LC_TERMINAL*`), and what a hand-started daemon inherits from a multiplexer or a local login (`TMUX`, `STY`, `XDG_SEAT`, `WAYLAND_DISPLAY` and similar). The session scrubs its environment with one list (`fil_session::env`); the daemon's launcher uses the same list for the daemon it starts. Session names stay out of systemd unit names and descriptions, which other local users and the journal can read (§5.1).
-5. **No surprises on the remote host.** fil creates no shell history, dotfiles or configuration on the host beyond its own state directory and socket directory. It removes what it no longer needs.
+5. **No surprises on the remote host.** fil creates nothing on the host beyond its state directory, its socket directory and, when the user installs fil through fil, its install directory (decided, owner 2026-11-04). The install directory is `~/.local/share/fil/<ver>-w<major>.<rev>/` (0700), with `~/.local` and `~/.local/share` (0700) if they did not exist (§11, "Server binary distribution"). It removes what it no longer needs.
 
 ### 11.2 Server policy (OD-8)
 
@@ -872,6 +873,8 @@ fil kill HOST SESSION
 fil ports [HOST [SESSION]] [--json] [--probe]   inside a session: the current one
 fil forward [HOST [SESSION]] -L|-R|-D SPEC | --rm [-L|-R|-D] PORT
 fil detach [HOST SESSION]                  with no arguments, inside a session
+fil install [--check|--remove] [--binary FILE] HOST
+                                           install this fil on HOST over ssh (or check, or remove what fil installed)
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 
@@ -931,8 +934,8 @@ agent_keys = []           # SHA256 fingerprints the agent relay answers for; emp
 remote_requests = "ask"   # ask | deny: forwards a process on the host asks for with `fil forward`
 forward_failure = "warn"  # warn | exit (status 255, as ssh's ExitOnForwardFailure)
 direct.address = "devbox.example.net" # where the client dials UDP, when it is not what `ssh -G` reports; needed with a custom pipe or a jump host
-remote = "auto"           # auto | plain | installed: the remote command (docs/m4/install.md); until M4 OQ-1, always `fil server --stdio`
-install = "ask"           # ask | never | always: offer to install fil where there is none (M4 OQ-1; nothing installs until then)
+remote = "auto"           # auto | plain | installed: the remote command (§8.2, docs/m4/install.md); until the attach wiring lands, attaches always run `fil server --stdio`
+install = "ask"           # ask | never | always: offer to install fil where there is none (the offer comes with the attach wiring; `fil install HOST` works now)
 
 [host.k8s-dev]
 transport = "pipe"
@@ -947,7 +950,7 @@ pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]
 | **M1: sessions and both transports** | daemon and sessions; attach, detach and takeover with epochs; resume and snapshot; pipe and QUIC with upgrade and fallback; then the M1 sweep | usable as a daily driver for shells, shown by an automated drop-in-replacement suite (an agent uses fil the way people use ssh, et and mosh), and the sweep is closed | done (M1), closed 2026-11-03: the sweep's fixes are merged and verified; the drop-in suite passes 60 of 60 on both Pis with no expected failures, and `linux-check` passes every suite on main |
 | **M2: forwards, ports, agent** | persistent `-L`/`-R`, `fil forward`, `fil ports`, agent relay; then the M2 sweep | port forwards survive a pulled network cable, and the sweep is closed | done (M2), closed 2026-11-04: forwards survive a pulled cable byte-exact, in the real-network harness and on both Pis; the five audits are done, their fix PRs are merged, and a verification pass found every finding closed or explicitly deferred with a home (51 findings, 37 closed, 14 deferred, 0 open; its two later fixes are merged too); the drop-in M2 set passes 25 of 25 on both Pis, with the host's `/etc/fil/policy.toml` allowing fil (`docs/m2/dropin.md`) |
 | **M3: prediction** | the trait and the default predictor; then the M3 sweep | no visible mispredictions in the harness, at the split bar of `docs/m3/plan.md` §2.5 (decided, owner 2026-11-04), and the sweep is closed | planning: the work order is `docs/m3/plan.md`; its two owner questions (OQ-1, OQ-2) and PC-1 were answered on 2026-11-04; started 2026-11-04, beside the M2 sweep's last PRs and M4, on files they do not touch or that the coordinator serializes |
-| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | planning: the work order is `docs/m4/plan.md` (proposed; the owner answered M4 OQ-2, OQ-3 and OQ-4 on 2026-11-04, its §7; OQ-5 is open), started 2026-11-04 in parallel with M3 by the owner's decision |
+| **M4: release** | install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com (below); macOS target tests on GitHub's macOS runners (free, since the repo is public) | the pre-release sweep is closed before the first release (the repo itself went public early, on 2026-11-03, by the owner's decision) | planning: the work order is `docs/m4/plan.md` (proposed; the owner answered M4 OQ-1, yes, and OQ-2, OQ-3 and OQ-4 on 2026-11-04, its §7; OQ-5 is open), started 2026-11-04 in parallel with M3 by the owner's decision |
 
 Direct mode is in M1 deliberately. Two real implementations are what prove the transport trait.
 
@@ -973,7 +976,7 @@ M4's release contract (versioning and the wire, targets, artifact names and layo
 2. ~~**Default emulator**~~ Resolved: `alacritty_terminal` **(decided)**. See §6.5.
 3. ~~**`TERM` when a different terminal takes over**~~ Resolved: keep the session's value and warn once on a mismatch **(decided)**. See §6.4.
 4. ~~**Terminal-query replies in flight during a takeover**~~ Resolved for M1 (proposed, not decided): the reply is lost and nothing is repaired; the program's own timeout ends the wait. See §6.3.
-5. **Server binary:** manual install, or upload by the client (§11)? Manual install always (built, `docs/m4/install.md`). The upload over the pipe is built behind the off-by-default `install-bootstrap` feature and waits for the owner's answer to M4 OQ-1: one more fixed remote command, the constant bootstrap, and the install directory `~/.local/share/fil` (`docs/m4/plan.md` §3 U1, §7).
+5. ~~**Server binary**~~ Resolved: both. Manual install always (`docs/m4/install.md`), and upload by the client through the constant bootstrap into `~/.local/share/fil` (M4 OQ-1, yes, owner 2026-11-04; §8.2, §11, `docs/m4/plan.md` §3 U1, §7).
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**
    - heartbeat interval and dead-link timeout

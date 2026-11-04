@@ -43,7 +43,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: just@1.59.0,cargo-deny@0.20.2
+          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Restore always, save only from main: a run on any other ref must not seed a cache

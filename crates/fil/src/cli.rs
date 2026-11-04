@@ -10,13 +10,13 @@
 //! fil forward [HOST [SESSION]] --rm [-L|-R|-D] PORT   remove one
 //! fil ports [HOST [SESSION]] [--json] [--probe]  listeners, forwards and the agent
 //! fil server --stdio                             the remote side of the pipe (not for people)
-//! fil install [--check|--remove] HOST            install fil on HOST (only with the gated
-//!                                                `install-bootstrap` feature, M4 OQ-1)
+//! fil install [--check|--remove] HOST            install fil on HOST over ssh (M4 OQ-1)
 //! ```
 //!
 //! With no HOST, `forward`, `ports` and `detach` talk to the daemon on this machine and work on
 //! the session named by `$FIL_SESSION` (set inside every session). A host or session named like
-//! a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`) is attached with `--`:
+//! a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`) is attached
+//! with `--`:
 //! `fil -- ls`, `fil devbox -- ls`.
 
 use std::path::PathBuf;
@@ -178,12 +178,10 @@ pub enum Command {
     Server(ServerArgs),
     /// Install this fil on HOST over ssh, into ~/.local/share/fil (or check what is there, or
     /// remove what fil installed)
-    #[cfg(feature = "install-bootstrap")]
     Install(InstallArgs),
 }
 
-/// `fil install` (gated on M4 OQ-1: only with the `install-bootstrap` feature).
-#[cfg(feature = "install-bootstrap")]
+/// `fil install` (M4 OQ-1, approved by the owner 2026-11-04).
 #[derive(Args, Debug)]
 pub struct InstallArgs {
     /// The host: a name or alias for ssh, or user@name
@@ -479,8 +477,7 @@ pub enum Action {
     ServerInstallFinish(Vec<std::ffi::OsString>),
     /// `fil server --install-gc`.
     ServerInstallGc,
-    /// `fil install` (gated on M4 OQ-1).
-    #[cfg(feature = "install-bootstrap")]
+    /// `fil install`.
     Install {
         host: String,
         request: crate::install::client::Request,
@@ -550,7 +547,6 @@ impl Cli {
             Command::Forward(_) => "forward",
             Command::Ports(_) => "ports",
             Command::Server(_) => "server",
-            #[cfg(feature = "install-bootstrap")]
             Command::Install(_) => "install",
         };
         Err(usage_error(
@@ -614,7 +610,6 @@ impl Cli {
             } else {
                 Action::ServerStdio
             }),
-            #[cfg(feature = "install-bootstrap")]
             Some(Command::Install(i)) => {
                 use crate::install::client::Request;
                 let request = if i.check {
@@ -1148,20 +1143,6 @@ mod tests {
         );
     }
 
-    /// The gate on M4 OQ-1: the code that sends the bootstrap is a feature that no default
-    /// build has. Flipping it on by default is the owner's decision, and changes this test.
-    #[test]
-    fn the_install_bootstrap_is_off_by_default() {
-        let manifest = include_str!("../Cargo.toml");
-        let default = manifest
-            .lines()
-            .find(|l| l.trim_start().starts_with("default"))
-            .unwrap_or("");
-        assert!(!default.contains("install-bootstrap"), "{default}");
-        assert!(manifest.contains("install-bootstrap = [\"fil-transport/install-bootstrap\"]"));
-    }
-
-    #[cfg(feature = "install-bootstrap")]
     #[test]
     fn install_modes() {
         use crate::install::client::Request;

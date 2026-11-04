@@ -5,9 +5,16 @@
 //! and milliseconds with thousands of sockets). Unprivileged: any user may ask about any TCP
 //! socket's uid, as `/proc/net/tcp` shows them all.
 //!
-//! [`lookup`] says [`Diag::Unsupported`] when the kernel cannot answer this way at all (no
-//! `tcp_diag`, a sandbox without netlink): the caller falls back to the `/proc/net/tcp` scan
-//! ([`super::procnet::peer_owner`]).
+//! Whether this works is decided once per process, by [`works`]: a lookup of a loopback
+//! connection of the daemon's own must answer with its uid. The kernel's "no such socket" and "no
+//! `tcp_diag` handler" are the same `ENOENT`, so a single answer cannot tell them apart; the probe
+//! can. Where it works, every answer but a live socket's uid means "not a known peer" and is
+//! refused, never a reason to scan instead (another user could otherwise pick the slow path on
+//! purpose, a reset connection whose reply names their listener, say). Where it does not, the
+//! caller uses the `/proc/net/tcp` scan for good ([`super::procnet::peer_owner`]).
+//!
+//! Only a full socket's uid is believed: a peer that already closed is a minisocket (FIN_WAIT2,
+//! TIME_WAIT) that the kernel reports as uid 0 and inode 0, whoever made it.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -32,15 +39,20 @@ const REQ: usize = 8 + SOCKID;
 /// Where the uid is in a reply: the header, then `struct inet_diag_msg` (family, state, timer,
 /// retrans, the sockid, expires, rqueue, wqueue, uid, inode).
 const UID_AT: usize = NLMSG_HDR + 4 + SOCKID + 12;
+/// The inode follows the uid.
+const INODE_AT: usize = UID_AT + 4;
 
 /// What the kernel said about one socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Diag {
-    /// The socket, and its owner's uid.
+    /// A full socket with that four-tuple, and its owner's uid.
     Owner(u32),
-    /// No socket has that four-tuple.
+    /// No full socket has that four-tuple: none at all (`ENOENT`, or a reply about another
+    /// socket, such as the listener a reset connection's lookup falls through to), or one that
+    /// already closed (inode 0).
     NoSuchSocket,
-    /// This way of asking does not work here.
+    /// The request or its answer failed (or, where [`works`] has not said yes, `ENOENT` may mean
+    /// this too).
     Unsupported,
 }
 
@@ -111,6 +123,11 @@ fn answer(reply: &[u8], src: SocketAddr, dst: SocketAddr) -> Diag {
     if reply.len() < NLMSG_HDR {
         return Diag::Unsupported;
     }
+    let len = u32::from_ne_bytes([reply[0], reply[1], reply[2], reply[3]]) as usize;
+    if len < NLMSG_HDR || len > reply.len() {
+        return Diag::Unsupported;
+    }
+    let reply = &reply[..len];
     let kind = u16::from_ne_bytes([reply[4], reply[5]]);
     if kind == NLMSG_ERROR {
         let Some(e) = reply.get(NLMSG_HDR..NLMSG_HDR + 4) else {
@@ -123,18 +140,51 @@ fn answer(reply: &[u8], src: SocketAddr, dst: SocketAddr) -> Diag {
             Diag::Unsupported
         };
     }
-    if kind != SOCK_DIAG_BY_FAMILY || reply.len() < UID_AT + 4 {
+    if kind != SOCK_DIAG_BY_FAMILY || reply.len() < INODE_AT + 4 {
         return Diag::Unsupported;
     }
     // The socket the kernel found has the two ends asked for (in its own family: a dual-stack
-    // socket answers in IPv6 for an IPv4 question). Anything else is not believed.
+    // socket answers in IPv6 for an IPv4 question). A reply about another socket (the exact
+    // lookup falls through to the listening table: a reset peer that also listens on its own
+    // address) means the one asked about is not there.
     let canon = |a: SocketAddr| SocketAddr::new(a.ip().to_canonical(), a.port());
     let id = &reply[NLMSG_HDR + 4..NLMSG_HDR + 4 + SOCKID];
     if ends(reply[NLMSG_HDR], id) != Some((canon(src), canon(dst))) {
-        return Diag::Unsupported;
+        return Diag::NoSuchSocket;
     }
-    let u = &reply[UID_AT..UID_AT + 4];
-    Diag::Owner(u32::from_ne_bytes([u[0], u[1], u[2], u[3]]))
+    let word = |i: usize| u32::from_ne_bytes([reply[i], reply[i + 1], reply[i + 2], reply[i + 3]]);
+    // A closed peer's minisocket says uid 0, inode 0: not an owner.
+    if word(INODE_AT) == 0 {
+        return Diag::NoSuchSocket;
+    }
+    Diag::Owner(word(UID_AT))
+}
+
+/// Whether sock_diag answers on this host, probed once per process ([`probe`] with [`lookup`]).
+pub fn works() -> bool {
+    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WORKS.get_or_init(|| probe(lookup))
+}
+
+/// Looks up a loopback connection of this process's own: sock_diag works if `lookup` answers
+/// with this process's uid. Anything else (`ENOENT` from a kernel without `tcp_diag`, no
+/// netlink, no loopback) says it does not.
+fn probe(lookup: impl Fn(SocketAddr, SocketAddr) -> Diag) -> bool {
+    let me = rustix::process::geteuid().as_raw();
+    let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") else {
+        return false;
+    };
+    let Ok(c) = l.local_addr().and_then(std::net::TcpStream::connect) else {
+        return false;
+    };
+    let Ok((a, peer)) = l.accept() else {
+        return false;
+    };
+    let ok = a
+        .local_addr()
+        .is_ok_and(|local| lookup(peer, local) == Diag::Owner(me));
+    drop((c, a));
+    ok
 }
 
 /// Asks the kernel who owns the TCP socket whose own address is `src` and whose peer is `dst`.
@@ -196,46 +246,147 @@ mod tests {
         }
     }
 
+    /// A reply as the kernel writes one: about the socket `src` to `dst`, with `uid` and `inode`.
+    fn reply(src: SocketAddr, dst: SocketAddr, uid: u32, inode: u32) -> Vec<u8> {
+        let (family, id) = sockid(src, dst).unwrap();
+        let mut r = vec![0u8; INODE_AT + 4 + 8];
+        let len = r.len() as u32;
+        r[0..4].copy_from_slice(&len.to_ne_bytes());
+        r[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+        r[NLMSG_HDR] = family.as_raw() as u8;
+        r[NLMSG_HDR + 4..NLMSG_HDR + 4 + SOCKID].copy_from_slice(&id);
+        r[UID_AT..UID_AT + 4].copy_from_slice(&uid.to_ne_bytes());
+        r[INODE_AT..INODE_AT + 4].copy_from_slice(&inode.to_ne_bytes());
+        r
+    }
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn mixed_families_and_short_or_foreign_replies_are_unsupported() {
-        let v4: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let v6: SocketAddr = "[::1]:2".parse().unwrap();
+    fn mixed_families_and_short_replies_are_unsupported() {
+        let (v4, v6) = (a("127.0.0.1:1"), a("[::1]:2"));
         assert_eq!(lookup(v4, v6), Diag::Unsupported);
         assert_eq!(answer(&[0u8; 8], v4, v4), Diag::Unsupported);
-        let (family, id) = sockid(v4, "127.0.0.1:9".parse().unwrap()).unwrap();
-        let mut reply = vec![0u8; UID_AT + 8];
-        reply[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        reply[NLMSG_HDR] = family.as_raw() as u8;
-        reply[UID_AT..UID_AT + 4].copy_from_slice(&1234u32.to_ne_bytes());
-        // An answer about another socket than the one asked about is not believed.
-        assert_eq!(
-            answer(&reply, v4, "127.0.0.1:9".parse().unwrap()),
-            Diag::Unsupported
-        );
-        reply[NLMSG_HDR + 4..NLMSG_HDR + 4 + SOCKID].copy_from_slice(&id);
-        assert_eq!(
-            answer(&reply, v4, "127.0.0.1:9".parse().unwrap()),
-            Diag::Owner(1234)
-        );
-        // A dual-stack socket answers in IPv6, with the mapped addresses.
-        let mapped = |a: &str| -> SocketAddr { a.parse().unwrap() };
-        let (f6, id6) = sockid(
-            mapped("[::ffff:127.0.0.1]:1"),
-            mapped("[::ffff:127.0.0.1]:9"),
-        )
-        .unwrap();
-        reply[NLMSG_HDR] = f6.as_raw() as u8;
-        reply[NLMSG_HDR + 4..NLMSG_HDR + 4 + SOCKID].copy_from_slice(&id6);
-        assert_eq!(
-            answer(&reply, v4, "127.0.0.1:9".parse().unwrap()),
-            Diag::Owner(1234)
-        );
-        // An error other than "no such socket" means this way does not work.
+        // A length beyond what arrived.
+        let mut r = reply(v4, a("127.0.0.1:9"), 1234, 77);
+        let past = r.len() as u32 + 1;
+        r[0..4].copy_from_slice(&past.to_ne_bytes());
+        assert_eq!(answer(&r, v4, a("127.0.0.1:9")), Diag::Unsupported);
+        // An error other than "no such socket".
         let mut err = vec![0u8; NLMSG_HDR + 4];
+        let len = err.len() as u32;
+        err[0..4].copy_from_slice(&len.to_ne_bytes());
         err[4..6].copy_from_slice(&NLMSG_ERROR.to_ne_bytes());
-        err[NLMSG_HDR..].copy_from_slice(&(-Errno::NOENT.raw_os_error()).to_ne_bytes());
-        assert_eq!(answer(&err, v4, v4), Diag::NoSuchSocket);
         err[NLMSG_HDR..].copy_from_slice(&(-Errno::INVAL.raw_os_error()).to_ne_bytes());
         assert_eq!(answer(&err, v4, v4), Diag::Unsupported);
+        // ENOENT: no such socket (where `works` said yes; a kernel without the handler answers
+        // the same, which is why the probe decides).
+        err[NLMSG_HDR..].copy_from_slice(&(-Errno::NOENT.raw_os_error()).to_ne_bytes());
+        assert_eq!(answer(&err, v4, v4), Diag::NoSuchSocket);
+    }
+
+    /// The live socket asked about gives its uid, also answered in IPv6 by a dual-stack socket.
+    #[test]
+    fn a_full_socket_gives_its_uid() {
+        let (p, l) = (a("127.0.0.1:41000"), a("127.0.0.1:9"));
+        assert_eq!(answer(&reply(p, l, 1234, 77), p, l), Diag::Owner(1234));
+        let mapped = reply(
+            a("[::ffff:127.0.0.1]:41000"),
+            a("[::ffff:127.0.0.1]:9"),
+            1234,
+            77,
+        );
+        assert_eq!(answer(&mapped, p, l), Diag::Owner(1234));
+    }
+
+    /// B1 (review of #82): a reply about another socket is "not there", never a reason to try
+    /// another way. Here the listener a reset connection's lookup falls through to (its own
+    /// address, peer `0.0.0.0:0`), with the attacker's uid. Mutation: treat it as `Unsupported`
+    /// (the scan fallback), and this fails.
+    #[test]
+    fn a_reply_about_another_socket_is_no_such_socket() {
+        let (p, l) = (a("127.0.0.1:41000"), a("127.0.0.1:9"));
+        let listener = reply(p, a("0.0.0.0:0"), 1001, 88);
+        assert_eq!(answer(&listener, p, l), Diag::NoSuchSocket);
+    }
+
+    /// B2 (review of #82): a peer that already closed is a minisocket, uid 0 and inode 0, whoever
+    /// made it: never an owner (a root daemon would otherwise admit it). Mutation: drop the inode
+    /// check, and this fails.
+    #[test]
+    fn a_closed_peer_is_no_owner() {
+        let (p, l) = (a("127.0.0.1:41000"), a("127.0.0.1:9"));
+        assert_eq!(answer(&reply(p, l, 0, 0), p, l), Diag::NoSuchSocket);
+    }
+
+    /// S1 (review of #82): the probe says sock_diag works only if it names this process's own
+    /// connection; the `ENOENT` of a kernel without `tcp_diag` (here faked) says it does not, so
+    /// the scan is used, and "no such socket" never stands for "cannot ask".
+    #[test]
+    fn the_probe_needs_a_real_answer() {
+        let me = rustix::process::geteuid().as_raw();
+        assert!(probe(|_, _| Diag::Owner(me)));
+        assert!(
+            !probe(|_, _| Diag::NoSuchSocket),
+            "ENOENT without a handler"
+        );
+        assert!(!probe(|_, _| Diag::Unsupported));
+        assert!(!probe(|_, _| Diag::Owner(me.wrapping_add(1))));
+    }
+
+    /// The real kernel: a peer that closed (FIN_WAIT2 or TIME_WAIT) is no owner.
+    #[test]
+    fn a_real_closed_peer_is_no_owner() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (acc, peer) = l.accept().unwrap();
+        let local = acc.local_addr().unwrap();
+        if lookup(peer, local) == Diag::Unsupported {
+            eprintln!("sock_diag is not available here");
+            return;
+        }
+        drop(c);
+        // The close is the kernel's at once (an orphan, then a minisocket).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lookup(peer, local), Diag::NoSuchSocket);
+        drop(acc);
+    }
+
+    /// The real kernel and B1's trigger: a peer that also listens on its own address and port
+    /// (SO_REUSEPORT) and resets its connection. The exact lookup falls through to that listener;
+    /// the answer must be "no such socket", not "ask another way".
+    #[test]
+    fn a_real_reset_peer_with_a_listener_on_its_port_is_no_such_socket() {
+        use rustix::net::{AddressFamily, SocketType, bind, connect, listen, socket, sockopt};
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reusable = || {
+            let s = socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+            sockopt::set_socket_reuseaddr(&s, true).unwrap();
+            sockopt::set_socket_reuseport(&s, true).unwrap();
+            s
+        };
+        let theirs = reusable();
+        bind(&theirs, &a("127.0.0.1:0")).unwrap();
+        let addr = rustix::net::getsockname(&theirs).unwrap();
+        let addr = SocketAddr::try_from(addr).unwrap();
+        listen(&theirs, 1).unwrap();
+        let client = reusable();
+        bind(&client, &addr).unwrap();
+        connect(&client, &target.local_addr().unwrap()).unwrap();
+        let (acc, peer) = target.accept().unwrap();
+        assert_eq!(peer, addr);
+        let local = acc.local_addr().unwrap();
+        if lookup(peer, local) == Diag::Unsupported {
+            eprintln!("sock_diag is not available here");
+            return;
+        }
+        // A reset: SO_LINGER 0, then close.
+        sockopt::set_socket_linger(&client, Some(std::time::Duration::ZERO)).unwrap();
+        drop(client);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lookup(peer, local), Diag::NoSuchSocket);
+        drop((acc, theirs));
     }
 }

@@ -118,9 +118,10 @@ pub fn system_proc_root() -> Option<PathBuf> {
     cfg!(target_os = "linux").then(|| PathBuf::from("/proc"))
 }
 
-/// The lookup `remote_peers = "same-user"` uses: `/proc/net/tcp{,6}` on Linux
-/// ([`procnet::peer_owner`]); elsewhere one that never knows, so every `-R` connection is refused
-/// (strict).
+/// The lookup `remote_peers = "same-user"` uses. On Linux, [`procnet::ProcPeers`]: the kernel's
+/// `sock_diag` answer where a probe at its creation shows it works, else the `/proc/net/tcp{,6}`
+/// scan on a blocking thread. Elsewhere one that never knows, so every `-R` connection is refused
+/// (strict; the daemon warns at its start).
 pub fn system_peer_owner() -> std::sync::Arc<dyn fil_session::peers::PeerOwner> {
     match system_proc_root() {
         Some(root) => std::sync::Arc::new(procnet::ProcPeers::new(root)),

@@ -47,7 +47,7 @@ use bytes::Bytes;
 use fil_forward::agent::{CountingStream, RequestCounts};
 use fil_forward::{
     AddressCheck, ConnectFuture, Connector, Endpoint, EndpointEvent, EventReceiver, LocalPeer,
-    Policy,
+    PeerUid, Policy,
 };
 use fil_proto::ChannelId;
 use fil_proto::msg::{
@@ -1109,8 +1109,9 @@ impl Policy for SessionPolicy {
     }
 
     /// `peer` is who connected. With `remote_peers = "same-user"` (OD-9, [`crate::peers`]) its
-    /// socket's owner must be the daemon's uid, looked up last, after the cheap checks and server
-    /// policy, and without the lock. The default, `any`, is ssh's: not checked.
+    /// socket's owner, which the endpoint looked up once at the accept ([`Self::peer_owner`]),
+    /// must be the daemon's uid; it is checked last, after the cheap checks and server policy.
+    /// The default, `any`, is ssh's: not checked.
     fn check_outgoing(&self, kind: &OpenKind, peer: &LocalPeer) -> Result<(), OpenFailure> {
         let st = lock(&self.st);
         let forward = match kind {
@@ -1134,18 +1135,15 @@ impl Policy for SessionPolicy {
         // Server policy first: `same-user` only ever narrows what it allows.
         st.still_allowed(*forward)?;
         drop(st);
-        if let RemotePeers::SameUser(owner) = &self.remote_peers {
+        if !self.remote_peers.is_any() {
             let theirs = match *peer {
-                LocalPeer::Tcp {
-                    peer,
-                    local: Some(local),
-                } => owner.owner(peer, local),
-                _ => None,
+                LocalPeer::Tcp { owner, .. } => owner,
+                LocalPeer::Unix(_) => PeerUid::NotAsked,
             };
-            if theirs != Some(self.uid) {
+            if !crate::peers::admits(self.uid, theirs) {
                 // Whose it was stays out of the log, and out of the count.
                 debug!(
-                    known = theirs.is_some(),
+                    known = matches!(theirs, PeerUid::Uid(_)),
                     "-R connection refused: its peer is not this user (remote_peers = same-user)"
                 );
                 let mut st = lock(&self.st);
@@ -1169,6 +1167,14 @@ impl Policy for SessionPolicy {
     fn check_address(&self, _: &OpenKind, _: SocketAddr) -> Result<(), OpenFailure> {
         // `-L` and `-D` reach what the remote host can reach, as with ssh.
         Ok(())
+    }
+
+    /// Under `remote_peers = "same-user"`, the lookup the endpoint runs once per `-R` accept.
+    fn peer_owner(&self) -> Option<Arc<dyn fil_forward::PeerOwner>> {
+        match &self.remote_peers {
+            RemotePeers::Any => None,
+            RemotePeers::SameUser(o) => Some(o.clone()),
+        }
     }
 }
 

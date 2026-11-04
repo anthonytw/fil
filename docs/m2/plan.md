@@ -586,7 +586,7 @@ The daemon also gates on consent, so `-R` listeners refuse instead of opening ch
 | Takeover | the table survives; the new client adopts entries matching its own specs and asks about the rest | |
 | Agent | **off** (`agent = "off"`; `-A` or per-host config turns it on) | `confirm` mode prompts per signature |
 | Agent while detached | the socket file is removed; refused at once | |
-| `-R` peers | any local user (ssh parity) | `daemon.toml` `[forward] remote_peers = "same-user"` checks the peer socket's uid, by a `sock_diag` request for that socket, or with P1's `/proc/net/tcp` parser where netlink cannot answer; unknown is refused (OD-9, built in SW2) |
+| `-R` peers | any local user (ssh parity) | `daemon.toml` `[forward] remote_peers = "same-user"` checks the peer socket's uid, once per connection at its arrival, by a `sock_diag` request for that socket where a probe at daemon start shows it works, else with P1's `/proc/net/tcp` parser on a blocking thread; unknown (a closed peer included) is refused (OD-9, built in SW2) |
 | Probe | own loopback listeners, `HEAD` | `ports.probe = "off"` or `"full"` |
 
 ### 4.3 The agent

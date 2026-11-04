@@ -1461,9 +1461,15 @@ impl FakeFwd {
             .unwrap();
         let (ours, peer) = l.accept().await.unwrap();
         // A refusal here (the daemon's own policy) never happens: it allows everything.
-        let _ = self
-            .ep
-            .open_stream(kind, Box::new(ours), LocalPeer::Tcp { peer, local: None });
+        let _ = self.ep.open_stream(
+            kind,
+            Box::new(ours),
+            LocalPeer::Tcp {
+                peer,
+                local: None,
+                owner: fil_forward::PeerUid::NotAsked,
+            },
+        );
         app
     }
 

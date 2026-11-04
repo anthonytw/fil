@@ -1,6 +1,6 @@
 //! `remote_peers = "same-user"` (OD-9, `fil_session::peers`): an `-R` connection is opened toward
 //! the client only if its peer socket is the daemon's user's. The lookup is a seam here; the real
-//! one (`/proc/net/tcp`) is tested in fil-daemon.
+//! ones (sock_diag, `/proc/net/tcp`) are tested in fil-daemon.
 
 mod common;
 
@@ -24,25 +24,50 @@ fn our_uid() -> u32 {
     nix::unistd::getuid().as_raw()
 }
 
-/// The lookup seam: answers `uid` for every connection, and remembers what it was asked.
+/// The lookup seam: answers `uid` for every connection, and remembers what it was asked and
+/// whether that was on a runtime worker. `slow` says it is a blocking lookup (the table scan's
+/// shape), which the endpoint must run on a blocking thread.
 struct Fake {
     uid: Mutex<Option<u32>>,
     asked: Mutex<Vec<(SocketAddr, SocketAddr)>>,
+    slow: bool,
+    on_worker: AtomicUsize,
 }
 
 impl Fake {
     fn new(uid: Option<u32>) -> Arc<Self> {
+        Self::with(uid, false)
+    }
+
+    fn with(uid: Option<u32>, slow: bool) -> Arc<Self> {
         Arc::new(Fake {
             uid: Mutex::new(uid),
             asked: Mutex::new(Vec::new()),
+            slow,
+            on_worker: AtomicUsize::new(0),
         })
     }
 }
 
 impl PeerOwner for Fake {
     fn owner(&self, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
+        // Blocking on the runtime is allowed on a blocking-pool thread and panics on a worker
+        // (inside an async context): that tells them apart.
+        if self.slow {
+            let on_worker = std::panic::catch_unwind(|| {
+                tokio::runtime::Handle::current().block_on(async {});
+            })
+            .is_err();
+            if on_worker {
+                self.on_worker.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         self.asked.lock().unwrap().push((peer, local));
         *self.uid.lock().unwrap()
+    }
+
+    fn blocking(&self) -> bool {
+        self.slow
     }
 }
 
@@ -140,7 +165,10 @@ async fn add_remote(c: &mut FwdClient, to: SocketAddr) -> (ForwardId, u16) {
 /// One round trip through `port`: `Some` with what came back, `None` if the connection was reset
 /// or closed without a byte. Also the connection's own address.
 async fn try_once(port: u16) -> (Option<Vec<u8>>, SocketAddr) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    // A reset can arrive before the connect returns (macOS): refused too.
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return (None, SocketAddr::from(([0, 0, 0, 0], 0)));
+    };
     let me = s.local_addr().unwrap();
     if s.write_all(b"ping").await.is_err() {
         return (None, me);
@@ -280,7 +308,6 @@ async fn server_policy_still_wins_over_same_user() {
     let before = accepts.load(Ordering::SeqCst);
 
     policy.refuse.store(true, Ordering::SeqCst);
-    let asked = fake.asked.lock().unwrap().len();
     assert_eq!(try_once(port).await.0, None, "the policy refuses it");
     assert_eq!(
         accepts.load(Ordering::SeqCst),
@@ -294,10 +321,86 @@ async fn server_policy_still_wins_over_same_user() {
         .expect("the row");
     assert!(row.policy.is_some(), "the row names the policy: {row:?}");
     assert_eq!(row.peers_refused, 0, "a policy refusal is not a peer's");
+    h.kill(WAIT).await;
+}
+
+/// A lookup that blocks (the `/proc` scan's shape) runs on a blocking thread, never on a runtime
+/// worker, and decides the same way. Mutation: call it inline on the accept task, and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocking_lookup_never_runs_on_a_worker() {
+    let s = Scratch::new();
+    let fake = Fake::with(Some(our_uid()), true);
+    let cfg = config(
+        &s,
+        "peers-slow",
+        RemotePeers::SameUser(fake.clone()),
+        Arc::default(),
+    );
+    let h = spawn_plain(cfg).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    let (to, _accepts, _t) = target().await;
+    let (id, port) = add_remote(&mut c, to).await;
+    through(port).await;
+    *fake.uid.lock().unwrap() = Some(our_uid().wrapping_add(1));
+    assert_eq!(try_once(port).await.0, None);
+    assert_eq!(refused_count(&h, id), 1);
+    assert!(!fake.asked.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.on_worker.load(Ordering::SeqCst),
+        0,
+        "a blocking lookup on a worker"
+    );
+    h.kill(WAIT).await;
+}
+
+/// S2 (review of #82): the peer is looked up once, when the connection arrives, and that answer
+/// stands when a connection that waited for the link is opened: here the lookup would say
+/// "another user" by then (a peer that closed meanwhile reads as unknown), and the connection still
+/// gets through, with one lookup. Mutation: look the peer up again at the dequeue, and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_at_arrival_stands_for_a_queued_connection() {
+    let s = Scratch::new();
+    let fake = Fake::new(Some(our_uid()));
+    let mut cfg = config(
+        &s,
+        "peers-queued",
+        RemotePeers::SameUser(fake.clone()),
+        Arc::default(),
+    );
+    cfg.forward.open_wait = std::time::Duration::from_secs(10);
+    let h = spawn_plain(cfg).await;
+    let mut c = FwdClient::attach(&h, key(1), "laptop").await;
+    let (to, _accepts, _t) = target().await;
+    let (id, port) = add_remote(&mut c, to).await;
+    through(port).await;
+
+    c.drop_link().await;
+    let before = fake.asked.lock().unwrap().len();
+    let waiting = tokio::spawn(try_once(port));
+    eventually("the connection to wait for the link", || async {
+        h.forward_rows()
+            .iter()
+            .any(|r| r.id == id && r.waiting == 1)
+    })
+    .await;
     assert_eq!(
         fake.asked.lock().unwrap().len(),
-        asked,
-        "the peer is not even looked up once the policy refuses"
+        before + 1,
+        "looked up at arrival"
     );
+    *fake.uid.lock().unwrap() = None;
+    c.resume(&h).await;
+    let (got, _) = waiting.await.unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"ping"[..]),
+        "the arrival's answer stood"
+    );
+    assert_eq!(
+        fake.asked.lock().unwrap().len(),
+        before + 1,
+        "and was not asked again"
+    );
+    assert_eq!(refused_count(&h, id), 0);
     h.kill(WAIT).await;
 }

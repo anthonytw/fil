@@ -887,6 +887,9 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
     let cfg = match DaemonConfig::load(&paths.config) {
         Ok(mut c) => {
             adjust(&mut c);
+            if let Some(w) = c.remote_peers_warning() {
+                tracing::warn!("{w}");
+            }
             c
         }
         Err(e) => {

@@ -41,9 +41,10 @@
 //! [forward]
 //! # Who may connect to the sessions' -R ports (OD-9): "any" local user, as with ssh -R (the
 //! # default), or "same-user": only this user's own sockets. Under "same-user" a connection from
-//! # another uid, or one whose owner cannot be told (no /proc/net/tcp, as on macOS), is reset
-//! # before a byte reaches the client, and `fil ports` counts it on the forward's row. The host's
-//! # server policy (/etc/fil/policy.toml, the sshd mirror) still decides first; this only narrows.
+//! # another uid, or one whose owner cannot be told (a peer that already closed, an off-host peer
+//! # of a non-loopback -R, any peer on macOS, where there is no lookup), is reset before a byte
+//! # reaches the client, and `fil ports` counts it on the forward's row. The host's server policy
+//! # (/etc/fil/policy.toml, the sshd mirror) still decides first; this only narrows.
 //! remote_peers = "any"
 //! # The daemon side's tunables, with the client's `[defaults.forward]` keys and bounds:
 //! # window = "1MiB"         # 16KiB to 4MiB: the receive window per channel
@@ -221,6 +222,14 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// A warning for the daemon's log at start: `remote_peers = "same-user"` where no peer can be
+    /// identified, so every `-R` connection is refused. Names nothing of the user's.
+    pub fn remote_peers_warning(&self) -> Option<&'static str> {
+        (!self.remote_peers.is_any() && crate::ports::system_proc_root().is_none()).then_some(
+            "remote_peers = \"same-user\" cannot identify peers on this platform: every -R connection is refused",
+        )
+    }
+
     /// Reads the file at `path`; a missing file gives the defaults.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
@@ -378,8 +387,14 @@ mod tests {
             (m.open_wait, m.linger),
             (c.forward.open_wait, c.forward.linger)
         );
+        // Where no peer can be identified the daemon warns at its start (not on Linux).
+        assert_eq!(
+            c.remote_peers_warning().is_some(),
+            cfg!(not(target_os = "linux"))
+        );
         let c = DaemonConfig::parse("[forward]\nremote_peers = \"any\"\n").unwrap();
         assert!(c.remote_peers.is_any());
+        assert!(c.remote_peers_warning().is_none());
         assert_eq!(c.forward, ForwardTunables::default());
     }
 

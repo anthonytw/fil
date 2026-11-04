@@ -168,6 +168,7 @@ fn peer() -> fil_forward::LocalPeer {
     fil_forward::LocalPeer::Tcp {
         peer: "127.0.0.1:1".parse().unwrap(),
         local: None,
+        owner: fil_forward::PeerUid::NotAsked,
     }
 }
 

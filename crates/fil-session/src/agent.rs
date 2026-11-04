@@ -323,6 +323,7 @@ mod tests {
             let tcp = LocalPeer::Tcp {
                 peer: "127.0.0.1:1".parse().unwrap(),
                 local: None,
+                owner: fil_forward::PeerUid::NotAsked,
             };
             assert_eq!(
                 check_open(gate, false, &tcp, 1000),

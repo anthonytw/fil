@@ -249,18 +249,20 @@ fn rows_from(
     Scan::Cut
 }
 
-/// How long one peer lookup may take before it gives up (and `same-user` refuses).
-pub const PEER_BUDGET: Duration = Duration::from_millis(50);
+/// How long one peer lookup by the table scan may take before it gives up (and `same-user`
+/// refuses). It runs on a blocking thread ([`ProcPeers`]), one at a time per `-R` listener.
+pub const PEER_BUDGET: Duration = Duration::from_millis(20);
 
 /// The owner of the socket at the far end of a TCP connection accepted on this host: the row
 /// whose local address is the connection's `peer` and whose remote address is the accepted
 /// socket's own (`local`), as `ROOT/net/tcp` or `ROOT/net/tcp6` lists it. Its uid is the socket's
-/// creator's (`sk_uid`), so a socket root made reads as 0.
+/// creator's (`sk_uid`), so a socket root made reads as 0. A row with inode 0 is a closed peer's
+/// minisocket (FIN_WAIT2, TIME_WAIT), which reads as uid 0 whoever made it: unknown, not an owner.
 ///
 /// An IPv4 peer is looked for in `tcp` first and then in `tcp6`, where a dual-stack socket lists it
 /// as `::ffff:a.b.c.d`; an IPv6 peer only in `tcp6`. The read stops at the match. `None`: no such
-/// row (the socket is gone, another network namespace), a file that cannot be read, or the
-/// deadline passed first.
+/// row (the socket is gone or closed, another network namespace), a file that cannot be read, or
+/// the deadline passed first.
 pub fn peer_owner(
     root: &Path,
     peer: SocketAddr,
@@ -284,13 +286,13 @@ pub fn peer_owner(
                 && (r.local.0.to_canonical(), r.local.1) == want_local
                 && (r.remote.0.to_canonical(), r.remote.1) == want_remote
             {
-                found = Some(r.uid);
+                found = Some((r.inode != 0).then_some(r.uid));
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
         });
-        if found.is_some() {
-            return found;
+        if let Some(owner) = found {
+            return owner;
         }
         if scan == Scan::Cut {
             return None;
@@ -299,37 +301,50 @@ pub fn peer_owner(
     None
 }
 
-/// `remote_peers = "same-user"`'s lookup on Linux: the kernel's `sock_diag` answer about the one
-/// socket, or, where that is not available, [`peer_owner`] on a `/proc` root, within
-/// [`PEER_BUDGET`].
+/// `remote_peers = "same-user"`'s lookup on Linux. The path is chosen once, when it is made: the
+/// kernel's `sock_diag` answer about the one socket where it works ([`super::diag::works`]), quick
+/// and run on the accepting task; otherwise [`peer_owner`] on a `/proc` root, within
+/// [`PEER_BUDGET`], which the endpoint runs on a blocking thread. Never one, then the other: with
+/// sock_diag chosen, anything but a full socket's uid is refused, so nobody can steer a lookup
+/// onto the slow path.
 #[derive(Clone, Debug)]
 pub struct ProcPeers {
     root: PathBuf,
+    diag: bool,
 }
 
 impl ProcPeers {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        #[cfg(target_os = "linux")]
+        let diag = super::diag::works();
+        #[cfg(not(target_os = "linux"))]
+        let diag = false;
+        Self { root, diag }
+    }
+
+    /// The table scan, whatever the host supports (tests).
+    #[cfg(test)]
+    fn scan_only(root: PathBuf) -> Self {
+        Self { root, diag: false }
     }
 }
 
 impl fil_session::peers::PeerOwner for ProcPeers {
-    /// The kernel's exact lookup first (`sock_diag`, [`super::diag`]); the table scan only where
-    /// that is not available.
     fn owner(&self, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
         let canon = |a: SocketAddr| SocketAddr::new(a.ip().to_canonical(), a.port());
-        #[cfg(target_os = "linux")]
-        match super::diag::lookup(canon(peer), canon(local)) {
-            super::diag::Diag::Owner(uid) => return Some(uid),
-            super::diag::Diag::NoSuchSocket => return None,
-            super::diag::Diag::Unsupported => {}
+        let (peer, local) = (canon(peer), canon(local));
+        if self.diag {
+            #[cfg(target_os = "linux")]
+            return match super::diag::lookup(peer, local) {
+                super::diag::Diag::Owner(uid) => Some(uid),
+                super::diag::Diag::NoSuchSocket | super::diag::Diag::Unsupported => None,
+            };
         }
-        peer_owner(
-            &self.root,
-            canon(peer),
-            canon(local),
-            Instant::now() + PEER_BUDGET,
-        )
+        peer_owner(&self.root, peer, local, Instant::now() + PEER_BUDGET)
+    }
+
+    fn blocking(&self) -> bool {
+        !self.diag
     }
 }
 
@@ -587,6 +602,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// B2 (review of #82): a closed peer's row (a TIME_WAIT minisocket: uid 0, inode 0) is unknown,
+    /// not uid 0, so a root daemon does not admit it. Mutation: drop the inode check, and this
+    /// fails.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_closed_peers_row_is_unknown() {
+        let tw = row("127.0.0.1:41000", "127.0.0.1:9000", 0x06, 0).replace(" 4242 ", " 0 ");
+        let root = fake("closed", Some(&[tw]), None);
+        assert_eq!(owner(&root, "127.0.0.1:41000", "127.0.0.1:9000"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scan is the slow path: the endpoint runs it on a blocking thread.
+    #[test]
+    fn the_scan_runs_on_a_blocking_thread() {
+        use fil_session::peers::PeerOwner;
+        assert!(ProcPeers::scan_only(PathBuf::from("/proc")).blocking());
+    }
+
     /// No socket table, an unreadable one, or a deadline already past: unknown, which
     /// `same-user` refuses.
     #[test]
@@ -630,6 +664,23 @@ mod tests {
                 "{bind}"
             );
         }
+    }
+
+    /// The real kernel: once the peer has closed, its row (FIN_WAIT2 or TIME_WAIT, inode 0) is
+    /// unknown.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_real_closed_peer_is_unknown() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, peer) = l.accept().unwrap();
+        let local = a.local_addr().unwrap();
+        let later = || Instant::now() + PEER_BUDGET;
+        assert!(peer_owner(Path::new("/proc"), peer, local, later()).is_some());
+        drop(c);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(peer_owner(Path::new("/proc"), peer, local, later()), None);
+        drop(a);
     }
 
     /// What one lookup costs on this host (`cargo test -p fil-daemon --lib -- --ignored

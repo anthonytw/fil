@@ -832,7 +832,11 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
                     forward: ForwardId(1),
                 },
                 Box::new(acc),
-                LocalPeer::Tcp { peer, local: None },
+                LocalPeer::Tcp {
+                    peer,
+                    local: None,
+                    owner: fil_forward::PeerUid::NotAsked,
+                },
             )
             .unwrap();
         assert_eq!(ch.0, 16);
@@ -883,6 +887,8 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
         Some(LocalPeer::Tcp {
             peer,
             local: Some(local),
+            // This policy asks for no owner.
+            owner: fil_forward::PeerUid::NotAsked,
         }) => {
             assert!(peer.ip().is_loopback(), "{peer}");
             assert_eq!(local.port(), port, "the accepted socket's own address");

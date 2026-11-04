@@ -11,7 +11,9 @@
 #                     counts the refusal without naming the user
 #
 # The daemon reads daemon.toml when it starts, so the scenario restarts rnfil's daemon (the
-# harness's own, by pid) with the setting, and again without it at the end.
+# harness's own, by pid) with the setting, and at the end puts the file back as it was (a copy
+# saved first) and restarts it again. Cleanup is scenario_cleanup, which fc_start's EXIT trap
+# (fc_finish) runs after saving the client's artifacts; it is safe to run twice.
 
 FIL_BINS+=(fwdprobe)
 
@@ -32,9 +34,11 @@ peers_restart_daemon() {
   fail "rnfil's daemon did not exit"
 }
 
+PEERS_TOML=/home/rnfil/.config/fil/daemon.toml
+
 peers_daemon_toml() {
-  printf '%s' "$1" | as_root tee /home/rnfil/.config/fil/daemon.toml > /dev/null
-  as_root chown rnfil:rnfil /home/rnfil/.config/fil/daemon.toml
+  printf '%s' "$1" | as_root tee "$PEERS_TOML" > /dev/null
+  as_root chown rnfil:rnfil "$PEERS_TOML"
 }
 
 # peers_wait_listen NS PORT: something listens on 127.0.0.1:PORT in NS within 10 s.
@@ -56,11 +60,16 @@ peers_connect() {
 f_fwd_same_user() {
   local d=$OUT/run/$SCENARIO out
   mkdir -p "$d"
+  PEERS_SAVED=$d/daemon.toml.saved
+  as_root cp -p "$PEERS_TOML" "$PEERS_SAVED"
   scenario_cleanup() {
     local p
     for p in $(nsx "$NS_C" pgrep -u rnclient -x fwdprobe || true); do as_root kill "$p" 2> /dev/null || true; done
-    peers_daemon_toml $'idle_exit_secs = 0\n'
-    peers_restart_daemon
+    if as_root test -f "$PEERS_SAVED"; then
+      as_root cp -p "$PEERS_SAVED" "$PEERS_TOML"
+      as_root rm -f "$PEERS_SAVED"
+      peers_restart_daemon
+    fi
     as_root userdel -r -f "$PEERS_USER" > /dev/null 2>&1 || true
   }
   trap scenario_cleanup EXIT
@@ -69,7 +78,7 @@ f_fwd_same_user() {
   [[ $(id -u "$PEERS_USER") != "$(id -u rnfil)" ]] || fail "$PEERS_USER has rnfil's uid"
 
   reset_net
-  peers_daemon_toml $'idle_exit_secs = 0\n[forward]\nremote_peers = "same-user"\n'
+  peers_daemon_toml "$(as_root cat "$PEERS_SAVED")"$'\n[forward]\nremote_peers = "same-user"\n'
   peers_restart_daemon
   client_bg_on x fwdprobe serve "127.0.0.1:$PEERS_R_TARGET" sink --reply
   peers_wait_listen "$NS_C" "$PEERS_R_TARGET"
@@ -109,8 +118,6 @@ f_fwd_same_user() {
 
   fc_detach a
   cx_fk peers
-  scenario_cleanup
-  trap - EXIT
 }
 
 ALL_SCENARIOS+=(f_fwd_same_user)

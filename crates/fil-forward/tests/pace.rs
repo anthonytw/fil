@@ -462,6 +462,9 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     );
     assert!(echo_took <= Duration::from_secs(2), "{echo_took:?}");
     assert!(worst <= Duration::from_millis(500), "{worst:?}");
+    // The held channel's payloads stay in its send buffer, not in the data sender's queue.
+    let queued = w.client.ep.snapshot().queued;
+    assert!(queued <= 8, "{queued} payloads queued for the link");
     writer.abort();
     deaf.abort();
 }

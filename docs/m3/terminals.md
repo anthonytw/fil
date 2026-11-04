@@ -65,6 +65,15 @@ Run 41810202004 on GitHub (before `ov-pen-colon` was added; the counts include t
 | WezTerm | 472 (470 to 474 across runs: the intermittent traces) | 56 | 1 |
 | tmux | 498 | 31 | 0 |
 
+After #105 (96 traces; GitHub run 41819942619, green, no retried trace; the Lima VM gave the same lists):
+
+| Terminal | Agree | Disagree (all listed) | Informational |
+|---|---|---|---|
+| xterm | 477 | 67 | 0 |
+| kitty | 498 | 45 | 1 |
+| WezTerm | 485 | 58 (56 in the VM: the intermittent traces) | 1 |
+| tmux | 515 | 29 | 0 |
+
 **The overlay's own writes agree on all four terminals**, with synchronized output on and off, at every flush checkpoint and at every erase point where the erase is at rest, for the 20 hazard traces, the typing session and the 6 status-line scenarios, with these exceptions: across a resize (finding 1); on xterm, where the program's own `4:3` and `58;5;N` and the curly underline fil's pen restore and snapshot still write as `4:3` are misread by xterm 390 (finding 6); on WezTerm, where `get-text` cannot show a curly underline (a read-back limit, not a verdict); at the probe after `ov-origin` on WezTerm, which resets its scroll region on a `ESC 8` with nothing saved (finding 2; the other three agreed with the shadow once #105 landed); and WezTerm's intermittent partial scroll region trace (finding 8). That is the answer to "can the erase be wrong on a real terminal": not outside a resize, on what was measured.
 
 ### Verdicts on the assumptions of `docs/spikes/prediction.md`
@@ -241,7 +250,7 @@ just vm-run tests/terminals/run.sh
 
 xterm is the slowest because each scrollback read sends a key with `xdotool` and waits for the file; the rest is the cost of a fresh terminal per trace (about 0.5 s for kitty and WezTerm).
 
-Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `libEGL`), 41798691924 (one intermittent WezTerm trace), 41801078111 (green, before the review fixes), 41809456777 (WezTerm's cursor report in origin mode, accepted since), 41810202004 (green, with the pinned `known.tsv`). `ov-pen-colon` was added after it and checked in the VM.
+Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `libEGL`), 41798691924 (one intermittent WezTerm trace), 41801078111 (green, before the review fixes), 41809456777 (WezTerm's cursor report in origin mode, accepted since), 41810202004 (green, with the pinned `known.tsv`). `ov-pen-colon` was added after it and checked in the VM. 41819942619 (green, after #105: the expectations of `known.tsv` re-derived).
 
 ## Files
 

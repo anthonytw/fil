@@ -63,6 +63,19 @@ impl KeyRegistry {
         was
     }
 
+    /// Revokes every key, as [`revoke`](Self::revoke) each: the daemon's QUIC port closed, so no
+    /// key registered for it so far may authenticate on a port opened later. Returns how many.
+    pub fn revoke_all(&self) -> usize {
+        let mut st = self.lock();
+        let keys: Vec<PublicKey> = st.keys.drain().collect();
+        st.revoked_at.retain(|_, t| t.elapsed() < REVOCATION_MEMORY);
+        let now = Instant::now();
+        for k in &keys {
+            st.revoked_at.insert(k.clone(), now);
+        }
+        keys.len()
+    }
+
     pub fn contains(&self, key: &PublicKey) -> bool {
         self.lock().keys.contains(key)
     }
@@ -90,6 +103,20 @@ impl KeyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn revoke_all_revokes_every_key() {
+        let reg = KeyRegistry::new();
+        let (a, b) = (
+            PublicKey::from_spki_der(vec![1]),
+            PublicKey::from_spki_der(vec![2]),
+        );
+        reg.register(a.clone());
+        reg.register(b.clone());
+        assert_eq!(reg.revoke_all(), 2);
+        assert!(reg.is_empty());
+        assert!(reg.revoked_ago(&a).is_some() && reg.revoked_ago(&b).is_some());
+    }
 
     #[test]
     fn register_lookup_revoke() {

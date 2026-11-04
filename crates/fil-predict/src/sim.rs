@@ -608,16 +608,12 @@ fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Item> {
         return items;
     }
     if sc == Scenario::Commands {
-        // Typed faster than the echo comes back, then Enter; the next command starts once the
-        // prompt is back. (Typing ahead of the prompt is a case of its own: an earlier key's
-        // late echo can match a new epoch's first guess, `docs/m3/plan.md` OQ-1 case 3.)
+        // Typed faster than the echo comes back, Enter, and the next command typed ahead of the
+        // prompt: an earlier key's late echo can then match a new epoch's first guess, which the
+        // core's prior-ack rule (rule 2) keeps from confirming it.
         while items.len() < keys {
-            for i in 0..rng.range(2, 8) {
-                let mut it = Item::key(vec![*rng.pick(b"abcdefghijklmnopqrstuvwxyz")]);
-                if i == 0 {
-                    it.gap_us = Some(rng.range(400_000, 600_000));
-                }
-                items.push(it);
+            for _ in 0..rng.range(2, 8) {
+                items.push(Item::key(vec![*rng.pick(b"abcdefghijklmnopqrstuvwxyz")]));
             }
             items.push(Item::key(b"\r".to_vec()));
         }

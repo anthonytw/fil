@@ -192,6 +192,10 @@ pub struct Guards {
     pub explained_chunk: bool,
     /// The first confirmation needs a guessed glyph that changed in the chunk (rule 2).
     pub changed_glyph: bool,
+    /// The first confirmation also needs an `EchoAck` covering every key typed before the
+    /// epoch's first key (rule 2, coordinator's call 2026-11-04): until then a matching chunk
+    /// can be an earlier key's late echo (typing ahead of a prompt).
+    pub prior_acked: bool,
     /// Enter, Tab, other controls and escape sequences end the epoch (rule 3, `Key`).
     pub key_boundary: bool,
     /// Every PTY mode change ends the epoch (rule 3, `ModeChange`).
@@ -250,6 +254,7 @@ impl Guards {
             "contradiction_first" => &mut self.contradiction_first,
             "explained_chunk" => &mut self.explained_chunk,
             "changed_glyph" => &mut self.changed_glyph,
+            "prior_acked" => &mut self.prior_acked,
             "key_boundary" => &mut self.key_boundary,
             "mode_boundary" => &mut self.mode_boundary,
             "unexplained" => &mut self.unexplained,
@@ -303,6 +308,7 @@ impl Guards {
         contradiction_first: true,
         explained_chunk: true,
         changed_glyph: true,
+        prior_acked: true,
         key_boundary: true,
         mode_boundary: true,
         unexplained: true,
@@ -329,6 +335,7 @@ impl Guards {
         contradiction_first: true,
         explained_chunk: false,
         changed_glyph: false,
+        prior_acked: false,
         key_boundary: false,
         mode_boundary: false,
         unexplained: false,
@@ -356,6 +363,7 @@ impl Guards {
         "contradiction_first",
         "explained_chunk",
         "changed_glyph",
+        "prior_acked",
         "key_boundary",
         "mode_boundary",
         "unexplained",

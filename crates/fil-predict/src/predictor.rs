@@ -83,6 +83,14 @@ pub trait ScreenView {
     /// change undone before it is read; P2's is a write counter or damage tracking in the backend,
     /// which sees every write. Off the screen: 0.
     fn row_stamp(&self, row: u16) -> u64;
+    /// **Test only** (the `testkit` feature; not part of the contract a predictor may rely on):
+    /// the whole shadow state, when the view is backed by one. `None` by default; `Some` for
+    /// C1's [`TermState`]-backed view. For harnesses that compare the shadow with an oracle
+    /// terminal from inside a predictor (T1's adapter).
+    #[cfg(feature = "testkit")]
+    fn test_state(&self) -> Option<&TermState> {
+        None
+    }
 }
 
 impl ScreenView for TermState {
@@ -130,6 +138,11 @@ impl ScreenView for TermState {
             eat(c.width);
         }
         h
+    }
+
+    #[cfg(feature = "testkit")]
+    fn test_state(&self) -> Option<&TermState> {
+        Some(self)
     }
 }
 

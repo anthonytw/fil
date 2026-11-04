@@ -227,6 +227,23 @@ fn last_column_stops_the_guesses() {
     assert!(t.key(b"b", 200).paint.is_empty());
 }
 
+/// A typed space over a blank shows its glyph before its echo: it is confirmed only once the
+/// echo reaches it, or its echo (which moves the cursor and changes no glyph) would end the
+/// epoch as unexplained. Found by T1's full-stack harness typing words into `cat`.
+#[test]
+fn a_space_over_a_blank_waits_for_its_echo() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.key(b" ", 210);
+    t.key(b"c", 220);
+    for (i, echo) in [b"b", b" ", b"c"].iter().enumerate() {
+        t.server(*echo, 300 + 10 * i as u64);
+    }
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (3, 0), "{s:?}");
+    assert!(!t.key(b"d", 340).paint.is_empty(), "the epoch ended");
+}
+
 // ---- settling by EchoAck (rule 5) ----------------------------------------------------
 
 #[test]

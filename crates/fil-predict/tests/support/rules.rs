@@ -38,9 +38,11 @@ fn shell() -> Trace {
         .server(40, b"s")
 }
 
-/// The shell prompt, Enter, and its newline echoed: cursor at (1, 0), nothing typed since.
+/// The shell prompt, Enter, its newline echoed and its `EchoAck` (input offset 2): cursor at
+/// (1, 0), nothing typed since. The ack lets a new epoch confirm (rule 2: the first confirmation
+/// needs every key before the epoch acknowledged), so these traces test the other rules.
 fn after_enter() -> Trace {
-    shell().input(50, b"\r").server(90, b"\r\n")
+    shell().input(50, b"\r").server(90, b"\r\n").echo_ack(95, 2)
 }
 
 fn keys(mut t: Trace, from: u64, text: &str) -> Trace {
@@ -138,7 +140,7 @@ pub const RULES: &[Rule] = &[
         guard: Some("plain_form"),
         trace: || {
             let t = shell().input(50, b"\r");
-            keys(t, 60, "xØÑ").server(120, b"\r\nx")
+            keys(t, 60, "xØÑ").echo_ack(110, 2).server(120, b"\r\nx")
         },
         adversary: || HostileCfg::quiet(1).forging("", 1),
         mosh_breaks: false,
@@ -177,7 +179,8 @@ pub const RULES: &[Rule] = &[
         trace: || {
             let t = shell()
                 .input(50, b"\r")
-                .server(90, b"\r\n$ \x1b[2mx\x1b[m\x08");
+                .server(90, b"\r\n$ \x1b[2mx\x1b[m\x08")
+                .echo_ack(95, 2);
             keys(t, 100, "xØÑ").server(200, b"\x1b[C")
         },
         adversary: plain,

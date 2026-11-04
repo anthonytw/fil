@@ -95,9 +95,13 @@ scenarios! {
 }
 
 /// The faithful bar (`docs/m3/plan.md` §2.5) at 150 ms RTT: commands typed faster than the echo
-/// comes back, Enter included, show no visible misprediction. With `keep_on_boundary` off, the
-/// guesses still waiting for their echo at each Enter are erased (and come back with the echo):
-/// visible mispredictions.
+/// comes back, Enter included, and the next command typed ahead of the prompt, show no visible
+/// misprediction. Each of two rules is needed for it:
+///
+/// - `keep_on_boundary` off: the guesses still waiting for their echo at each Enter are erased
+///   (and come back with the echo);
+/// - `prior_acked` off: a new epoch's first guess matches an earlier key's late echo, confirms,
+///   and the next written guess is contradicted.
 #[test]
 fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
     use fil_predict::overlay::Guards;
@@ -132,8 +136,64 @@ fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
     let (failures, written) = run_all(Guards::ALL);
     assert_eq!(failures, 0, "visible mispredictions with every guard on");
     assert!(written > 0, "nothing was ever written");
-    let mut g = Guards::ALL;
-    g.disable("keep_on_boundary");
-    let (failures, _) = run_all(g);
-    assert!(failures > 0, "keep_on_boundary off made no difference");
+    for guard in ["keep_on_boundary", "prior_acked"] {
+        let mut g = Guards::ALL;
+        g.disable(guard);
+        let (failures, _) = run_all(g);
+        assert!(failures > 0, "{guard} off made no difference");
+    }
+}
+
+/// The prior-ack rule only adds a condition to the first confirmation: it never makes anything
+/// writable earlier. Over every scenario, with both predictors, the first write with the rule on
+/// never comes before the first write with it off, and the secrets stay off the screen.
+#[test]
+fn the_prior_ack_rule_never_writes_earlier() {
+    use fil_predict::driver::{Driver, Ev};
+    use fil_predict::overlay::Guards;
+    let first_write = |trace: &fil_predict::driver::Trace, run: &fil_predict::driver::RunConfig| {
+        let mut d = Driver::new(run);
+        for (i, e) in trace.events.iter().enumerate() {
+            d.apply(e.at, e.ev.clone());
+            if d.overlay.stats().written > 0 {
+                return Some(i);
+            }
+            if let Ev::Tick = e.ev {}
+        }
+        None
+    };
+    for sc in Scenario::ALL {
+        for b in backends() {
+            for hostile in [false, true] {
+                for seed in base()..base() + seeds() {
+                    let mut cfg = SimConfig::new(sc, seed, b.name);
+                    cfg.keys = 50;
+                    if hostile {
+                        cfg.run.kind = PredictorKind::hostile(seed);
+                    }
+                    let out = run(&cfg);
+                    assert!(out.failure.is_none(), "{} {}", sc.name(), b.name);
+                    let mut off = cfg.run.clone();
+                    off.guards = Guards::ALL;
+                    off.guards.disable("prior_acked");
+                    let on_at = first_write(&out.trace, &cfg.run);
+                    let off_at = first_write(&out.trace, &off);
+                    match (on_at, off_at) {
+                        (Some(a), Some(b)) => assert!(
+                            a >= b,
+                            "{} seed {seed}: written at event {a} with the rule, {b} without",
+                            sc.name()
+                        ),
+                        (Some(a), None) => {
+                            panic!(
+                                "{} seed {seed}: written at {a} only with the rule",
+                                sc.name()
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }

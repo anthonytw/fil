@@ -165,6 +165,14 @@ fn every_c1_guard_is_needed() {
             println!("{name:<20} caught: tests/overlay.rs at_most_1024_guesses_are_outstanding");
             continue;
         }
+        if *name == "prior_acked" {
+            // A quality rule that also narrows OQ-1 case 3: shown needed by the faithful bar
+            // typed ahead of the prompt; tests/sim.rs also checks it never writes earlier.
+            println!(
+                "{name:<20} caught: tests/sim.rs faithful_commands_at_150_ms_show_no_visible_misprediction"
+            );
+            continue;
+        }
         if *name == "keep_on_boundary" {
             // Not a secrecy rule: it keeps what is already written, so it is shown needed by the
             // faithful bar, not by a secret.

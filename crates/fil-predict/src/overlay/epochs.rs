@@ -300,6 +300,12 @@ pub(crate) struct Core {
     /// The predictor shows nothing right now (`Show::Hide`).
     pub hidden: bool,
     pub link_down: bool,
+    /// The highest valid `EchoAck.input_upto` applied: every input byte below it has been taken
+    /// by the PTY, and its echo is in the output already applied.
+    acked: InputPos,
+    /// The current epoch has been confirmed at least once (rule 2's extra condition applies only
+    /// to the first confirmation; a late echo re-confirms without it).
+    confirmed_once: bool,
     /// Written guesses dropped by a snapshot, classified once it has landed.
     deferred: Vec<(InputPos, Time, Guess)>,
     /// Settled since the predictor was last told.
@@ -320,6 +326,8 @@ impl Core {
             resumed: false,
             hidden: false,
             link_down: false,
+            acked: 0,
+            confirmed_once: false,
             deferred: Vec::new(),
             settled: Vec::new(),
             stats: PredictStats::default(),
@@ -776,7 +784,16 @@ impl Core {
                 .is_some_and(|g| g.kept && g.state == GState::Pending)
         });
         self.state = State::Tentative;
+        self.confirmed_once = false;
         self.awaiting_ack = None;
+    }
+
+    /// Where the current epoch's first key starts (kept guesses belong to an earlier epoch).
+    fn first_key_at(&self) -> Option<InputPos> {
+        self.keys
+            .iter()
+            .find(|k| !k.guess.as_ref().is_some_and(|g| g.kept))
+            .map(|k| k.at)
     }
 
     fn is_kept(&self, i: usize) -> bool {
@@ -830,6 +847,7 @@ impl Core {
         }
         self.keys.clear();
         self.state = State::Tentative;
+        self.confirmed_once = false;
         self.awaiting_ack = None;
         self.baseline = None;
         self.dirty = false;
@@ -1085,9 +1103,7 @@ impl Core {
                 self.end(Why::Unexplained, Some(v), now);
                 return self.rebase(v);
             }
-            for i in matched {
-                self.confirm(i, v, now);
-            }
+            self.confirm_reached(&matched, &matched_changed, cur, v, now);
             return self.rebase(v);
         }
 
@@ -1112,7 +1128,7 @@ impl Core {
             .filter(|&i| self.is_kept(i))
             .collect();
         let confirming: Vec<usize> = if self.g.changed_glyph {
-            matched_changed
+            matched_changed.clone()
         } else {
             matched.clone()
         }
@@ -1120,18 +1136,28 @@ impl Core {
         .filter(|&i| !self.is_kept(i))
         .collect();
         let cursor_ok = self.cursor_clause(&confirming, cur, v);
+        // Rule 2 (coordinator's call): the first confirmation also needs an `EchoAck` covering
+        // every key typed before the epoch's first key. Until then a chunk that matches can be
+        // the late echo of an earlier key that happens to be the same character (typing ahead
+        // of a prompt), so it confirms nothing: it is neutral, like a chunk that changes nothing.
+        // An extra condition only: it can delay or prevent a confirmation, never cause one.
+        let prior_acked = !self.g.prior_acked
+            || self.confirmed_once
+            || self.first_key_at().is_none_or(|a| self.acked >= a);
+        if explained && !confirming.is_empty() && cursor_ok && !prior_acked {
+            return self.rebase(v);
+        }
         if explained && !confirming.is_empty() && cursor_ok {
             let first_write = !self
                 .keys
                 .iter()
                 .any(|k| k.guess.as_ref().is_some_and(|g| g.written));
             self.state = State::Confirmed;
+            self.confirmed_once = true;
             if self.g.ack_before_write && first_write {
                 self.awaiting_ack = confirming.iter().map(|&i| self.keys[i].end).max();
             }
-            for i in matched {
-                self.confirm(i, v, now);
-            }
+            self.confirm_reached(&matched, &matched_changed, cur, v, now);
             for k in &mut self.keys {
                 if let Some(g) = k.guess.as_mut() {
                     g.grace = None;
@@ -1156,9 +1182,7 @@ impl Core {
             && confirming.is_empty()
             && kept_cursor
         {
-            for i in kept_matched {
-                self.confirm(i, v, now);
-            }
+            self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
             return self.rebase(v);
         }
         // Anything else breaks rule 2: the tentative epoch ends unwritten.
@@ -1168,6 +1192,38 @@ impl Core {
             contradict(self, &contradicted);
         }
         self.rebase(v);
+    }
+
+    /// Confirms the guesses in `matched` that the echo has reached. A guess whose glyph was in
+    /// its cell already (a typed space over a blank, an autosuggestion under the cursor) is
+    /// confirmed only once the cursor is at or past its key, or a later guess changed to its
+    /// glyph: settled before its echo, the cursor its echo leaves would no longer be one the
+    /// epoch allows, and the echo would end the epoch as unexplained.
+    fn confirm_reached(
+        &mut self,
+        matched: &[usize],
+        changed: &[usize],
+        cur: (u16, u16),
+        v: &dyn ScreenView,
+        now: Time,
+    ) {
+        let reached = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| {
+                k.guess
+                    .as_ref()
+                    .is_some_and(|g| g.state == GState::Pending && g.after == cur)
+            })
+            .map(|(i, _)| i)
+            .chain(changed.iter().copied())
+            .max();
+        for &i in matched {
+            if changed.contains(&i) || reached.is_some_and(|r| i <= r) {
+                self.confirm(i, v, now);
+            }
+        }
     }
 
     /// Rule 2's cursor clause: the cursor ends after one of the confirming guesses, or after a
@@ -1218,7 +1274,11 @@ impl Core {
         v: &dyn ScreenView,
         now: Time,
     ) {
-        if !self.g.echo_ack || input_upto > input_end {
+        if input_upto > input_end {
+            return;
+        }
+        self.acked = self.acked.max(input_upto);
+        if !self.g.echo_ack {
             return;
         }
         if self.awaiting_ack.is_some_and(|e| e <= input_upto) {

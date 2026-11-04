@@ -481,6 +481,31 @@ fn eager() -> Rig {
     start_predicting(Predict::Eager, Duration::from_millis(150))
 }
 
+/// The numbered lines `range`, starting on a line of their own (the echoed key of
+/// `guesses_on_screen` is on the first row).
+fn fresh_lines(range: std::ops::Range<usize>) -> Vec<u8> {
+    let mut v = b"\r\n".to_vec();
+    v.extend(lines(range));
+    v
+}
+
+/// Leaves guesses drawn on the screen: "a" is typed and echoed (the prediction core writes a
+/// guess only in an epoch an echo has confirmed), then "bc" is typed and not echoed, so its two
+/// guesses stay drawn.
+async fn guesses_on_screen(rig: &Rig) {
+    rig.type_str("a");
+    settle().await;
+    rig.daemon.output(b"a").await;
+    settle().await;
+    rig.type_str("bc");
+    settle().await;
+    assert!(
+        rig.term.rows()[0].starts_with("abc"),
+        "the guesses for bc are drawn: {:?}",
+        rig.term.rows()[0]
+    );
+}
+
 fn repaint(size_gen: u64) -> TermLog {
     TermLog::Repaint { size_gen }
 }
@@ -493,24 +518,35 @@ fn repaint(size_gen: u64) -> TermLog {
 async fn a_predicting_client_asks_for_a_repaint_only_when_it_has_a_guess_to_write() {
     let rig = eager();
     rig.attached().await;
+    // A confirmed epoch: "a" echoed.
+    rig.type_str("a");
+    settle().await;
+    rig.daemon.output(b"a").await;
+    settle().await;
+    // The resize alone asks for nothing.
     rig.term.resize(100, 30);
     settle().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(rig.daemon.term_log().await, vec![resize(0, 1, (100, 30))]);
-    rig.type_str("a");
+    assert_eq!(
+        rig.daemon.term_log().await,
+        vec![keys(0, b"a", (80, 24)), resize(1, 1, (100, 30))]
+    );
+    // The next key's guess would be written: the core holds it, and the repaint follows the
+    // resize record, ahead of the key.
+    rig.type_str("b");
     settle().await;
     assert_eq!(
         rig.daemon.term_log().await,
         vec![
-            resize(0, 1, (100, 30)),
+            keys(0, b"a", (80, 24)),
+            resize(1, 1, (100, 30)),
             repaint(1),
-            keys(0, b"a", (100, 30))
+            keys(1, b"b", (100, 30))
         ]
     );
     assert_eq!(rig.daemon.repaints().await, vec![1]);
     // Trusted again: more guesses, no more repaints.
-    rig.daemon.output(b"a").await;
-    rig.type_str("bc");
+    rig.daemon.output(b"b").await;
+    rig.type_str("cd");
     settle().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
@@ -543,15 +579,15 @@ async fn guesses_on_the_screen_at_a_resize_ask_for_a_repaint_at_once_either_way(
     for (cols, rows) in [(40, 24), (120, 24)] {
         let rig = eager();
         rig.attached().await;
-        rig.type_str("abc");
-        settle().await;
+        guesses_on_screen(&rig).await;
         // The fake daemon echoes nothing: the guesses stay on the screen.
         rig.term.resize(cols, rows);
         settle().await;
         assert_eq!(
             rig.daemon.term_log().await,
             vec![
-                keys(0, b"abc", (80, 24)),
+                keys(0, b"a", (80, 24)),
+                keys(1, b"bc", (80, 24)),
                 resize(3, 1, (cols, rows)),
                 repaint(1)
             ],
@@ -610,8 +646,7 @@ async fn a_repaint_owed_across_a_link_drop_is_the_resume_snapshot() {
     let rig = eager();
     rig.attached().await;
     rig.daemon.hold_repaints(true).await;
-    rig.type_str("abc");
-    settle().await;
+    guesses_on_screen(&rig).await;
     rig.term.resize(40, 24);
     settle().await;
     assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
@@ -645,8 +680,7 @@ async fn a_repaint_owed_across_a_swap_is_asked_again_on_the_new_link() {
         .await;
     rig.dial.offer_swap(LinkKind::Direct);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    rig.type_str("abc");
-    settle().await;
+    guesses_on_screen(&rig).await;
     rig.term.resize(40, 24);
     settle().await;
     assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
@@ -719,9 +753,8 @@ async fn a_status_line_drawn_on_an_untrusted_screen_asks_once_it_is_gone() {
 async fn output_in_flight_before_a_repaint_is_applied_before_it() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    let tail = lines(0..40);
+    guesses_on_screen(&rig).await;
+    let tail = fresh_lines(0..40);
     rig.daemon.set_repaint_tail(&tail).await;
     rig.term.resize(60, 24);
     settle().await;
@@ -753,8 +786,7 @@ async fn output_in_flight_before_a_repaint_is_applied_before_it() {
 async fn output_that_overtakes_a_repaints_announcement_makes_it_stale_not_a_reconnect() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
+    guesses_on_screen(&rig).await;
     rig.daemon.set_repaint_after(b"after the repaint\r\n").await;
     rig.term.resize(60, 24);
     settle().await;
@@ -785,9 +817,8 @@ async fn output_that_overtakes_a_repaints_announcement_makes_it_stale_not_a_reco
 async fn a_segment_across_a_repaints_position_is_refused() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    rig.daemon.set_repaint_tail(&lines(0..10)).await;
+    guesses_on_screen(&rig).await;
+    rig.daemon.set_repaint_tail(&fresh_lines(0..10)).await;
     rig.daemon.set_repaint_straddle(25).await;
     rig.term.resize(60, 24);
     until_async("the reconnect", 30, || async {
@@ -805,9 +836,8 @@ async fn a_segment_across_a_repaints_position_is_refused() {
 async fn a_link_lost_while_a_repaint_is_held_resumes() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    rig.daemon.set_repaint_tail(&lines(0..10)).await;
+    guesses_on_screen(&rig).await;
+    rig.daemon.set_repaint_tail(&fresh_lines(0..10)).await;
     rig.daemon.set_repaint_kill().await;
     rig.term.resize(60, 24);
     until_async("the reconnect", 30, || async {
@@ -830,10 +860,9 @@ async fn a_link_lost_while_a_repaint_is_held_resumes() {
 async fn a_catch_up_announced_ahead_of_a_repaints_bytes_waits_for_them() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
+    guesses_on_screen(&rig).await;
     rig.daemon
-        .set_repaint_then_catch_ups(vec![lines(0..60)])
+        .set_repaint_then_catch_ups(vec![fresh_lines(0..60)])
         .await;
     rig.term.resize(60, 24);
     settle().await;
@@ -868,10 +897,9 @@ async fn a_catch_up_announced_ahead_of_a_repaints_bytes_waits_for_them() {
 async fn a_third_snapshot_announced_behind_an_incomplete_one_reconnects() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
+    guesses_on_screen(&rig).await;
     rig.daemon
-        .set_repaint_then_catch_ups(vec![lines(0..10), lines(10..20)])
+        .set_repaint_then_catch_ups(vec![fresh_lines(0..10), fresh_lines(10..20)])
         .await;
     rig.term.resize(60, 24);
     until_async("the reconnect", 30, || async {
@@ -890,9 +918,8 @@ async fn a_third_snapshot_announced_behind_an_incomplete_one_reconnects() {
 async fn the_next_snapshots_bytes_wait_while_a_complete_repaint_is_held() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    rig.daemon.set_repaint_tail(&lines(0..40)).await;
+    guesses_on_screen(&rig).await;
+    rig.daemon.set_repaint_tail(&fresh_lines(0..40)).await;
     rig.daemon.set_repaint_twice().await;
     rig.term.resize(60, 24);
     settle().await;
@@ -946,8 +973,7 @@ async fn two_snapshots_bytes_ahead_of_both_announcements_each_go_to_their_own() 
     for catch_up in [false, true] {
         let rig = eager();
         rig.attached().await;
-        rig.type_str("abc");
-        settle().await;
+        guesses_on_screen(&rig).await;
         rig.daemon.set_repaint_bytes_first(catch_up).await;
         rig.term.resize(60, 24);
         settle().await;
@@ -982,9 +1008,8 @@ async fn two_snapshots_bytes_ahead_of_both_announcements_each_go_to_their_own() 
 async fn a_catch_up_superseding_a_complete_held_repaint_begins() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    rig.daemon.set_repaint_tail(&lines(0..40)).await;
+    guesses_on_screen(&rig).await;
+    rig.daemon.set_repaint_tail(&fresh_lines(0..40)).await;
     rig.daemon.set_repaint_held_then_catch_up().await;
     rig.term.resize(60, 24);
     settle().await;
@@ -1011,9 +1036,8 @@ async fn a_catch_up_superseding_a_complete_held_repaint_begins() {
 async fn early_bytes_of_the_next_snapshot_are_not_fed_to_a_held_complete_one() {
     let rig = eager();
     rig.attached().await;
-    rig.type_str("abc");
-    settle().await;
-    rig.daemon.set_repaint_tail(&lines(0..20)).await;
+    guesses_on_screen(&rig).await;
+    rig.daemon.set_repaint_tail(&fresh_lines(0..20)).await;
     rig.daemon.set_repaint_bytes_first(false).await;
     rig.term.resize(60, 24);
     settle().await;

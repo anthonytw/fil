@@ -14,11 +14,13 @@
 //!   the terminal reflowed it, and the erase ran on a geometry the terminal no longer has, so the
 //!   screen is already wrong (a narrowing leaves a stale guess behind; a widening that joins
 //!   wrapped rows leaves the cursor on another row);
-//! - a guess was written on the untrusted screen (with `fil-predict`'s rule 9 the core holds it
-//!   instead and says so; the engine asks either way);
+//! - the prediction core would write a guess on the untrusted screen: it holds the guess and says
+//!   so (`fil-predict`'s rule 9, `Display::take_repaint_request`), and the repaint is asked for
+//!   before anything is written. Real terminals reflow unlike the shadow even with nothing drawn
+//!   (`docs/m3/terminals.md`), so this is what repairs a predicting client after any resize. (A
+//!   guess the overlay does write on an untrusted screen asks too.)
 //! - a status line or a question was drawn on the untrusted screen and has since been removed (a
-//!   QUIC link that went quiet and recovered by itself: no resume, so no other repair).
-//!
+//!   QUIC link that went quiet and recovered by itself: no resume, so no other repair);
 //! - a snapshot rendered at an older generation than the client's lands (the window changed while
 //!   it was on its way): it drew a whole screen at a size the terminal no longer has.
 //!
@@ -80,6 +82,15 @@ impl Repair {
                     self.needed = true;
                 }
             }
+        }
+    }
+
+    /// The prediction core held a guess it would have written, because the screen is untrusted
+    /// (rule 9, `Overlay::take_repaint_request`): the screen needs a repaint, before the guess is
+    /// written.
+    pub(super) fn guess_held(&mut self, size_gen: u64) {
+        if !self.trusted(size_gen) {
+            self.needed = true;
         }
     }
 

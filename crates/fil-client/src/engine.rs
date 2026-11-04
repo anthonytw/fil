@@ -2120,6 +2120,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// The daemon renders it where its stream is; the client applies the output still in flight
     /// before it (`drain_terminal`).
     fn send_repaint(&mut self) {
+        // The prediction core holds a guess on an untrusted screen instead of writing it, and
+        // says so (rule 9): it writes nothing, so this is where it is heard.
+        if let Some(d) = self.display.as_mut()
+            && d.take_repaint_request()
+        {
+            self.repair.guess_held(self.size_gen);
+        }
         if self.told_gen < self.size_gen
             || self.tx.is_none()
             || !self.sess.input_ready

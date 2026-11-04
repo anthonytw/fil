@@ -47,7 +47,7 @@ use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
-    SnapshotInfo, StartPoint, TakenOver, TermName, TermSize,
+    SnapshotInfo, SnapshotReason, StartPoint, TakenOver, TermName, TermSize,
 };
 use fil_term::Size;
 use fil_transport::{Link, LinkError, LinkKind, LinkState, LinkStatus};
@@ -1629,12 +1629,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if info.len > MAX_SNAPSHOT {
             return Err(ClientError::Protocol("snapshot too large".into()));
         }
-        // A catch-up jump: what is in flight below `at` is covered by the snapshot. The position
-        // only ever moves forward.
+        // The position only ever moves forward.
         if info.at < self.sess.recv.received() {
-            return Self::reconnect("a catch-up snapshot behind the terminal position");
+            return Self::reconnect("a mid-stream snapshot behind the terminal position");
         }
-        self.sess.recv.skip_to(info.at);
+        if info.reason != SnapshotReason::Repaint {
+            // A catch-up jump: what is in flight below `at` is covered by the snapshot.
+            self.sess.recv.skip_to(info.at);
+        }
+        // A repaint is rendered where the daemon's stream was: nothing is skipped, and what is
+        // still in flight below `at` is applied first (`drain_terminal`), so the scrollback loses
+        // nothing. Acks below `at` mean nothing to the daemon's flow either way.
         self.sess.start_acks(info.at);
         self.begin_snapshot(conn, info)
     }
@@ -1655,8 +1660,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 return Ok(Flow::End(s));
             }
         }
-        if info.len == 0 && conn.snap.is_some() {
-            return self.finish_snapshot(conn);
+        if conn.snap.is_some() {
+            // A repaint may be waiting for output that already arrived.
+            if let Flow::End(s) = self.drain_terminal(conn)? {
+                return Ok(Flow::End(s));
+            }
+            return self.finish_snapshot_when_due(conn);
         }
         Ok(Flow::Continue)
     }
@@ -1697,6 +1706,28 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             return Self::reconnect("a snapshot longer than announced");
         }
         if len == snap.info.len {
+            return self.finish_snapshot_when_due(conn);
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// A repaint's position: the snapshot waits until the terminal stream has reached it.
+    fn repaint_at(conn: &Conn) -> Option<u64> {
+        conn.snap
+            .as_ref()
+            .filter(|s| s.info.reason == SnapshotReason::Repaint)
+            .map(|s| s.info.at)
+    }
+
+    /// Finishes a complete snapshot, unless it is a repaint whose position the terminal stream
+    /// has not reached yet: then the output before it is applied first, as it arrives.
+    fn finish_snapshot_when_due(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
+        let complete = conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.buf.len() as u64 == s.info.len);
+        let reached = Self::repaint_at(conn).is_none_or(|at| self.sess.recv.received() >= at);
+        if complete && reached {
             return self.finish_snapshot(conn);
         }
         Ok(Flow::Continue)
@@ -1761,13 +1792,20 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// Applies the held terminal segments that are next in line. They wait while the reply or a
     /// snapshot is outstanding, and while a gap (which a not-yet-arrived `Snapshot` will
     /// explain) separates them from the terminal position.
+    ///
+    /// Behind a repaint the output below its position is applied (it was sent before the
+    /// snapshot was rendered), and the snapshot once it is reached.
     fn drain_terminal(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
-        if conn.awaiting_reply || conn.snap.is_some() {
+        let limit = Self::repaint_at(conn);
+        if conn.awaiting_reply || (conn.snap.is_some() && limit.is_none()) {
             return Ok(Flow::Continue);
         }
-        while let Some(&seq) = conn.term_held.keys().next() {
-            if seq > self.sess.recv.received() {
+        while let Some((&seq, data)) = conn.term_held.iter().next() {
+            if seq > self.sess.recv.received() || limit.is_some_and(|at| seq >= at) {
                 break;
+            }
+            if limit.is_some_and(|at| seq + data.len() as u64 > at) {
+                return Self::reconnect("terminal data across a repaint's position");
             }
             let data = conn.term_held.remove(&seq).expect("just seen");
             conn.held_bytes -= data.len();
@@ -1788,6 +1826,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // Also when nothing was new: a resend of what the terminal already has (a swap's) is
         // still owed an ack on this link.
         self.after_output();
+        if limit.is_some() {
+            return self.finish_snapshot_when_due(conn);
+        }
         Ok(Flow::Continue)
     }
 
@@ -1966,8 +2007,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// in-band `Repaint` record, after the resize record of the size the client has now, so the
     /// daemon renders at that size (a control message would overtake the resize record). Only
     /// once the daemon on this link has been told that size, and only where keystrokes may go.
-    /// The terminal position is acknowledged with it: the daemon repaints only once everything it
-    /// sent is acknowledged, so the jump skips nothing.
+    /// The daemon renders it where its stream is; the client applies the output still in flight
+    /// before it (`drain_terminal`).
     fn send_repaint(&mut self) {
         if self.told_gen < self.size_gen
             || self.tx.is_none()
@@ -1981,13 +2022,6 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             tracing::debug!("the screen needs a repaint after a resize; asking for one");
             tx.data(ChannelId::TERMINAL, payload);
             self.repair.asked(self.size_gen);
-        }
-        if let Some(upto) = self.sess.ack_now() {
-            self.send_ctl(&ControlMsg::Ack {
-                channel: ChannelId::TERMINAL,
-                upto,
-            });
-            self.ack_due = None;
         }
     }
 

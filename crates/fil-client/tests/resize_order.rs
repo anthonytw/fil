@@ -361,6 +361,10 @@ async fn a_resize_with_a_full_send_window_goes_out_at_the_next_offset() {
 /// The window changes while the first attach's snapshot is arriving, and its event has not been
 /// handled yet: the client draws at the new size when the snapshot lands, and the daemon must be
 /// told as well (the size is re-read there, so that is where the generation has to move).
+///
+/// W1 (the review's F2): the snapshot was rendered at the old size (generation 0) and drawn on a
+/// terminal of the new one, so the screen needs a repaint although nothing was drawn: one follows
+/// the resize record, and its answer (at generation 1) makes the screen trusted.
 #[tokio::test(start_paused = true)]
 async fn a_resize_during_the_first_snapshot_reaches_the_daemon() {
     let rig = start(config());
@@ -377,14 +381,20 @@ async fn a_resize_during_the_first_snapshot_reaches_the_daemon() {
     let log = rig.daemon.term_log().await;
     assert_eq!(
         log,
-        vec![resize(0, 1, (100, 30)), keys(0, b"ls\n", (100, 30))]
+        vec![
+            resize(0, 1, (100, 30)),
+            repaint(1),
+            keys(0, b"ls\n", (100, 30))
+        ]
     );
+    assert_eq!(rig.daemon.repaints().await, vec![1]);
 }
 
 /// A swap whose resume comes with a snapshot (QUIC: the `Resume` on the control stream overtakes
 /// the snapshot stream). The window changes after the promotion but before the `Resume`, and keys
 /// are typed after the `Resume` but before the snapshot has landed: the record must still go out
-/// before those keys, or they run at the old size.
+/// before those keys, or they run at the old size. The snapshot was rendered at the old size
+/// (W1, F2): a repaint follows once it has landed.
 #[tokio::test(start_paused = true)]
 async fn keys_typed_while_a_swapped_links_snapshot_arrives_follow_the_resize_record() {
     let rig = start(config());
@@ -411,6 +421,7 @@ async fn keys_typed_while_a_swapped_links_snapshot_arrives_follow_the_resize_rec
             keys(0, b"a", (80, 24)),
             resize(1, 1, (100, 30)),
             keys(1, b"b", (100, 30)),
+            repaint(1),
         ]
     );
     assert_eq!(rig.daemon.pty_size().await, ((100, 30), 1));
@@ -698,4 +709,33 @@ async fn a_status_line_drawn_on_an_untrusted_screen_asks_once_it_is_gone() {
     rig.daemon.recover_link().await;
     settle().await;
     assert_eq!(rig.daemon.repaint_requests().await, vec![1]);
+}
+
+/// W1 (the review's F1): a repaint is rendered where the daemon's stream is, and output sent
+/// before it can still be on its way when the announcement (control goes first) and the snapshot
+/// arrive. The client applies that output first, then the snapshot: the lines it scrolled are in
+/// the scrollback, nothing is skipped, and the screen ends as the daemon's.
+#[tokio::test(start_paused = true)]
+async fn output_in_flight_before_a_repaint_is_applied_before_it() {
+    let rig = eager();
+    rig.attached().await;
+    rig.type_str("abc");
+    settle().await;
+    let tail = lines(0..40);
+    rig.daemon.set_repaint_tail(&tail).await;
+    rig.term.resize(60, 24);
+    settle().await;
+    assert_eq!(rig.daemon.repaints().await, vec![1]);
+    let history = rig.term.history().join("\n");
+    for i in [0, 10, 15] {
+        let want = numbered(i);
+        assert!(
+            history.contains(want.trim_end()),
+            "{want:?} scrolled off before the repaint and must be in the scrollback: {history}"
+        );
+    }
+    assert_eq!(
+        rig.term.state().screen_text(),
+        rig.daemon.screen(0).await.screen_text()
+    );
 }

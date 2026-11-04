@@ -77,12 +77,17 @@ impl Repair {
     }
 
     /// A snapshot rendered at generation `snap_gen` has landed while the client's generation is
-    /// `size_gen`.
+    /// `size_gen`. One of an older generation (the window changed while it was on its way: during
+    /// the first attach, behind a catch-up announced before the resize record, a swap's attach)
+    /// has just drawn a whole screen at a size the terminal no longer has: that screen needs a
+    /// repaint, whatever was drawn.
     pub(super) fn snapshot(&mut self, snap_gen: u64, size_gen: u64) {
         if snap_gen == size_gen {
             self.trusted_gen = size_gen;
             self.needed = false;
             self.drawn_untrusted = false;
+        } else if snap_gen < size_gen {
+            self.needed = true;
         }
     }
 
@@ -135,6 +140,19 @@ mod tests {
         assert!(!r.trusted(1));
         r.snapshot(1, 1);
         assert!(r.trusted(1) && !r.should_ask(1) && !r.wants_snapshot(1));
+    }
+
+    /// A snapshot rendered before the last resize drew a screen at the old size: a repaint is
+    /// needed even though nothing of the client's was drawn.
+    #[test]
+    fn a_snapshot_of_an_older_generation_asks_for_a_repaint() {
+        let mut r = Repair::default();
+        r.resized(false);
+        assert!(!r.should_ask(1));
+        r.snapshot(0, 1);
+        assert!(r.should_ask(1) && r.wants_snapshot(1));
+        r.snapshot(1, 1);
+        assert!(!r.should_ask(1));
     }
 
     #[test]

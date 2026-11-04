@@ -152,6 +152,9 @@ pub struct DState {
     hold_repaints: bool,
     /// A held request is owed.
     repaint_owed: bool,
+    /// Output the next repaint is rendered after, but whose bytes reach the client only after
+    /// the snapshot (the announcement, on control, overtook them).
+    repaint_tail: Vec<u8>,
     /// Repaint snapshots sent, with the generation each was rendered at.
     pub repaints: Vec<u64>,
 }
@@ -236,6 +239,7 @@ impl FakeDaemon {
                 blocked_catch_ups: 0,
                 hold_repaints: false,
                 repaint_owed: false,
+                repaint_tail: Vec::new(),
                 repaints: Vec::new(),
             }),
         })
@@ -649,6 +653,10 @@ impl FakeDaemon {
         else {
             return;
         };
+        let tail = std::mem::take(&mut st.repaint_tail);
+        let tail_at = st.log.end();
+        st.log.append(&tail);
+        st.emu.feed(&tail);
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(0));
         let at = st.log.end();
         st.flows.insert(key_of(&link), at);
@@ -676,6 +684,22 @@ impl FakeDaemon {
                 .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
                 .await;
         }
+        for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+            let seg = Segment {
+                seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                data: chunk.to_vec(),
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    /// The next repaint is rendered after `tail`, whose bytes reach the client after the
+    /// snapshot: what a real daemon's output in flight looks like when the announcement, on the
+    /// control channel, overtakes it.
+    pub async fn set_repaint_tail(&self, tail: &[u8]) {
+        self.st.lock().await.repaint_tail = tail.to_vec();
     }
 
     /// Sends the log from `sent` to the current subscriber.

@@ -214,6 +214,75 @@ async fn a_repaint_waits_for_the_attach_snapshots_ack() {
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 
+/// The review's F1: a program that prints more often than the client acknowledges (a spinner,
+/// `watch -n 0.1`: acks follow the output by the client's ack delay plus the round trip). The
+/// repaint is not held back by the acks: it is served promptly while the output goes on,
+/// rendered exactly where the daemon's stream was. The output sent before it, still on its way,
+/// is applied before it (the scripted client holds the snapshot as the real one does), so the
+/// stream has no gap and not one byte of the output is skipped.
+#[tokio::test]
+async fn a_repaint_is_served_under_steady_output_and_skips_none_of_it() {
+    let sc = Scratch::new();
+    let h = spawn_plain(sh_config(
+        &sc,
+        "main",
+        "stty -echo; echo READY; i=0; while [ $i -lt 120 ]; do printf .; sleep 0.05; i=$((i+1)); done; \
+         echo; echo QUIET; sleep 60",
+    ))
+    .await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.wait_out("READY").await;
+    // Acks lag the output by 150 ms, as the real client's would on a link with some delay.
+    c.auto_ack = false;
+    let t0 = Instant::now();
+    let mut seen: std::collections::VecDeque<(Instant, u64)> = Default::default();
+    let mut asked = None;
+    let mut served = None;
+    while t0.elapsed() < Duration::from_secs(10) && !c.out_str().contains("QUIET") {
+        if asked.is_none() && t0.elapsed() > Duration::from_millis(800) {
+            c.resize(size(50, 15)).await;
+            c.repaint().await;
+            asked = Some(t0.elapsed());
+        }
+        c.drain(Duration::from_millis(20)).await;
+        seen.push_back((Instant::now(), c.next));
+        let mut ack = None;
+        while let Some(&(t, n)) = seen.front() {
+            if t.elapsed() < Duration::from_millis(150) {
+                break;
+            }
+            ack = Some(n);
+            seen.pop_front();
+        }
+        if let Some(upto) = ack {
+            c.send_ctl(ControlMsg::Ack {
+                channel: ChannelId::TERMINAL,
+                upto,
+            })
+            .await;
+        }
+        if served.is_none() && !repaints(&c).is_empty() {
+            served = Some(t0.elapsed());
+        }
+    }
+    c.auto_ack = true;
+    c.wait_out("QUIET").await;
+    let (asked, served) = (
+        asked.unwrap(),
+        served.expect("the repaint was never served"),
+    );
+    assert!(
+        served < asked + Duration::from_millis(1500),
+        "asked at {asked:?}, served at {served:?}: held back by the output"
+    );
+    let info = repaints(&c)[0];
+    assert_eq!((info.size_gen, info.skipped), (1, 0));
+    // Every dot the program printed reached the client, in its stream, around the repaint.
+    let out = c.out_str();
+    assert_eq!(out.matches('.').count(), 120, "{out:?}");
+    let _ = h.kill(Duration::from_secs(5)).await;
+}
+
 /// A connection that lost the session (taken over) asks for a repaint: nothing happens, to it or
 /// to the new subscriber.
 #[tokio::test]

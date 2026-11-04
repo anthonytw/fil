@@ -40,11 +40,15 @@
 //!
 //! **Repaints.** An `InputRecord::Repaint` on the terminal channel makes the connection *owe*
 //! its client a repaint: a mid-stream `Snapshot` (reason `Repaint`) of the screen and the modes,
-//! with no history and no marker. It is served as soon as it can be: once a snapshot still in
-//! flight is confirmed (it was rendered before the resize the request followed), once the client
-//! has acknowledged everything sent (so the jump skips nothing), and at most once a second per
-//! session (the core's `REPAINT_INTERVAL`; the requests meanwhile owe one more, served when the
-//! second has passed). Any number of requests owe one repaint, and a catch-up snapshot pays it.
+//! with no history and no marker. It is rendered at exactly the point the connection has sent
+//! (`at` is the next offset; the core refuses with `Behind` if more output was released
+//! meanwhile), so the jump skips nothing: the bytes before `at` are still on their way, and the
+//! client applies them before the snapshot. It is served as soon as it can be: once everything
+//! released is sent, once a snapshot still in flight is confirmed (it was rendered before the
+//! resize the request followed), and at most once a second per session (the core's
+//! `REPAINT_INTERVAL`; the requests meanwhile owe one more, served when the second has passed).
+//! Acknowledgements are not waited for, so steady output (a spinner) does not hold it back. Any
+//! number of requests owe one repaint, and a catch-up snapshot pays it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -613,11 +617,10 @@ impl<'a, L: Link> Conn<'a, L> {
             }
 
             let prog = *out.progress.borrow_and_update();
-            let (next, acked, behind, age, awaiting) = {
+            let (next, behind, age, awaiting) = {
                 let f = self.flow();
                 (
                     f.next,
-                    f.acked,
                     prog.ready.saturating_sub(f.acked),
                     f.age(Instant::now()),
                     f.awaiting_snapshot(),
@@ -651,14 +654,15 @@ impl<'a, L: Link> Conn<'a, L> {
                 }
             }
             // An owed repaint, once nothing stands in its way: no snapshot in flight (the one-at-
-            // a-time rule), everything released sent and acknowledged (the jump skips nothing),
-            // and the session's interval passed.
+            // a-time rule), everything released sent (it is rendered at `next`, so the jump skips
+            // nothing; the client applies what is still in flight first), and the session's
+            // interval passed. Not waiting for acknowledgements: under steady output they always
+            // lag what was sent, and the repaint would never be served.
             let repaint_owed = self.repaint_owed.load(Ordering::SeqCst);
             if repaint_owed
                 && !prog.exited
                 && !awaiting
                 && next >= prog.ready
-                && acked >= next
                 && repaint_not_before.is_none_or(|t| Instant::now() >= t)
             {
                 match self.repaint(out).await {

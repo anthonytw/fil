@@ -14,7 +14,7 @@ use fil_proto::frame::DataSegment;
 use fil_proto::input::InputRecord;
 use fil_proto::msg::{
     AttachRefusal, AttachReply, ControlMsg, ErrorCode, Hello, ResumeRequest, SnapshotInfo,
-    StartPoint, TakenOver, TermSize,
+    SnapshotReason, StartPoint, TakenOver, TermSize,
 };
 use fil_term::{Emulator, Size};
 use fil_transport::Link;
@@ -297,6 +297,8 @@ impl<L: Link> Client<L> {
                 self.out.extend_from_slice(&fresh);
                 self.emu.feed(&fresh);
                 self.next = self.recv.received();
+                // A repaint waiting for the output before it.
+                self.finish_snapshot().await;
                 if self.auto_ack && !fresh.is_empty() {
                     self.send_ctl(ControlMsg::Ack {
                         channel: ChannelId::TERMINAL,
@@ -324,6 +326,14 @@ impl<L: Link> Client<L> {
         if self.snap_buf.len() as u64 != info.len {
             assert!(self.snap_buf.len() as u64 <= info.len, "snapshot too long");
             return;
+        }
+        // A repaint is rendered where the daemon's stream was: the output before it, still on its
+        // way, is applied first (as the real client does), so nothing is skipped.
+        if info.reason == SnapshotReason::Repaint && self.next < info.at {
+            return;
+        }
+        if info.reason == SnapshotReason::Repaint {
+            assert_eq!(self.next, info.at, "a repaint not where the stream is");
         }
         let bytes = std::mem::take(&mut self.snap_buf);
         self.emu.feed(&bytes);

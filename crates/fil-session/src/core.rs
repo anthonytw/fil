@@ -415,7 +415,7 @@ pub(crate) enum Cmd {
         sent: u64,
         reply: oneshot::Sender<Option<CatchUp>>,
     },
-    /// The connection owes its client a repaint, and everything it has sent is acknowledged.
+    /// The connection owes its client a repaint, and has sent everything released up to `sent`.
     /// Queued behind every command the connection sent before (the resize the request followed).
     Repaint {
         conn: ConnId,
@@ -1093,7 +1093,8 @@ impl Core {
     /// modes at the size the session has now, which includes every resize record the connection
     /// sent before the request (this command is queued behind them). No history lines (the
     /// client's native scrollback has them) and no marker: it is rendered only at the exact
-    /// point the connection has sent (and its client acknowledged), so nothing is jumped over.
+    /// point the connection has sent, so nothing is jumped over: the bytes before it are on their
+    /// way to the client, which applies them before the snapshot.
     fn on_repaint(&mut self, conn: ConnId, sent: u64, now: Instant) -> RepaintAnswer {
         if !self.live.as_ref().is_some_and(|l| l.conn == conn) {
             return RepaintAnswer::Gone;
@@ -1858,7 +1859,11 @@ mod tests {
         cfg.scope = crate::config::ScopeMode::Tree;
         cfg.clear_env = true;
         cfg.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
-        cfg.command = Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]);
+        cfg.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 0.5; echo later; sleep 30".into(),
+        ]);
         let handle = SessionHandle::spawn(cfg, Arc::new(crate::config::NoHost))
             .await
             .unwrap();
@@ -1894,6 +1899,23 @@ mod tests {
         assert!(matches!(
             handle.repaint(second.conn, at).await,
             Some(RepaintAnswer::NotBefore(_))
+        ));
+        // Output released past what the connection has sent: a repaint there would jump over
+        // it with no marker, so it is refused until the connection has sent it (`Behind`).
+        let end = Instant::now() + Duration::from_secs(10);
+        while handle.shared().progress.borrow().ready == at {
+            assert!(Instant::now() < end, "no output");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(REPAINT_INTERVAL).await;
+        assert!(matches!(
+            handle.repaint(second.conn, at).await,
+            Some(RepaintAnswer::Behind)
+        ));
+        let ready = handle.shared().progress.borrow().ready;
+        assert!(matches!(
+            handle.repaint(second.conn, ready).await,
+            Some(RepaintAnswer::Ready(_))
         ));
         let _ = handle.kill(Duration::from_secs(5)).await;
     }

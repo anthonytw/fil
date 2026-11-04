@@ -48,7 +48,7 @@ use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
-    SnapshotInfo, StartPoint, TakenOver, TermName, TermSize,
+    SnapshotInfo, SnapshotReason, StartPoint, TakenOver, TermName, TermSize,
 };
 use fil_term::Size;
 use fil_transport::{Link, LinkError, LinkKind, LinkState, LinkStatus};
@@ -65,6 +65,9 @@ use crate::offline::{LogSink, OfflineBuffer};
 use crate::status::{self, Connection};
 use crate::terminal::{TermEvent, TermInput, TermOutput, Terminal};
 use crate::text::{sanitize_inline, sanitize_lines};
+
+mod repair;
+use repair::Repair;
 
 /// A snapshot bigger than this is a protocol error, not something to buffer.
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
@@ -123,11 +126,6 @@ struct Session {
     input: SendChannel,
     /// The daemon has said where to continue the input stream on this link.
     input_ready: bool,
-    /// The screen no longer matches the byte position (the window narrowed under something we
-    /// had drawn, and the terminal re-wrapped it): the next resume asks the daemon for a
-    /// snapshot instead of a replay from `recv`. Epoch, key and input stream are kept, so it is
-    /// still a resume, and a swap or a reconnect over QUIC needs no ssh login.
-    want_snapshot: bool,
     /// `PtyMode` reports and `EchoAck`s waiting for the output to reach their offset, in the
     /// order they came: each is applied once the output below its offset has been.
     modes: VecDeque<(u64, Ordered)>,
@@ -149,7 +147,6 @@ impl Session {
             acking: false,
             input: SendChannel::new(window),
             input_ready: false,
-            want_snapshot: false,
             modes: VecDeque::new(),
             exited: None,
         }
@@ -203,12 +200,16 @@ impl Session {
         }
     }
 
-    fn resume_request(&self) -> Option<ResumeRequest> {
+    /// `want_snapshot`: the screen no longer matches the byte position (a resize left it needing
+    /// a repaint, [`Repair`]): the daemon repaints from a snapshot instead of replaying from
+    /// `recv`. Epoch, key and input stream are kept, so it is still a resume, and a swap or a
+    /// reconnect over QUIC needs no ssh login.
+    fn resume_request(&self, want_snapshot: bool) -> Option<ResumeRequest> {
         self.established.then(|| ResumeRequest {
             incarnation: self.incarnation,
             epoch: self.epoch,
             seq: self.recv.received(),
-            want_snapshot: self.want_snapshot,
+            want_snapshot,
         })
     }
 }
@@ -237,6 +238,13 @@ struct Conn {
     gap_since: Option<Instant>,
     /// Snapshot segments that arrived before the snapshot was announced.
     snap_early: Vec<(u64, Vec<u8>)>,
+    /// A snapshot announced while `snap` was still incomplete or held. The daemon confirms a
+    /// snapshot by an ack at or past its `at`, and for a repaint (`at` is where its stream was)
+    /// an ack the client sent before it even saw the announcement does that: the daemon may then
+    /// announce the next snapshot while the repaint's bytes are still on their way. Channel 2
+    /// keeps its order on every transport, so the current snapshot's bytes all come first; the
+    /// next one waits here until they have. One at a time leaves room for one more, no more.
+    snap_next: Option<SnapshotInfo>,
     early_bytes: usize,
 }
 
@@ -251,6 +259,7 @@ impl Conn {
             held_bytes: 0,
             gap_since: None,
             snap_early: Vec::new(),
+            snap_next: None,
             early_bytes: 0,
         }
     }
@@ -260,6 +269,10 @@ struct Snap {
     info: SnapshotInfo,
     recv: RecvChannel,
     buf: Vec<u8>,
+    /// A repaint whose position the terminal stream had already passed when it was announced
+    /// (on QUIC the output after it can overtake its announcement): its bytes are read and
+    /// dropped, and the repaint is asked for again.
+    stale: bool,
 }
 
 #[derive(Debug)]
@@ -420,6 +433,8 @@ struct LinkCtx<L: Link> {
     /// The size generation this link's `Attach` carried: what its daemon knows once it has
     /// taken the attach, whatever the old link was told since.
     attach_gen: u64,
+    /// The attach asked for a snapshot to repair the screen (`want_snapshot`), at `attach_gen`.
+    repaint_asked: bool,
 }
 
 impl<L: Link> LinkCtx<L> {
@@ -467,6 +482,7 @@ impl<L: Link> LinkCtx<L> {
             pre: Vec::new(),
             pre_bytes: 0,
             attach_gen: 0,
+            repaint_asked: false,
         }
     }
 
@@ -580,6 +596,11 @@ pub(crate) struct Core<I, O> {
     /// The generation of the size the daemon on the current link has been told, by the `Attach`
     /// or a resize record. A new link starts from its own attach's.
     told_gen: u64,
+    /// Whether the screen can be trusted after a resize, and the repaint it still needs.
+    repair: Repair,
+    /// The status lines last given to the overlay were not empty (a status line, a notice or a
+    /// question is meant to be on the screen).
+    status_shown: bool,
     raw: bool,
     display: Option<Display>,
     make_predictor: Option<PredictorFactory>,
@@ -673,6 +694,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             size,
             size_gen: 0,
             told_gen: 0,
+            repair: Repair::default(),
+            status_shown: false,
             raw: false,
             display: None,
             predicting: make_predictor.is_some(),
@@ -1011,7 +1034,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         dialed: Dialed<D::Link>,
         fwd: &Forwards<D::Link>,
     ) -> Result<Served, ClientError> {
-        let resume = self.sess.resume_request();
+        let resume = self
+            .sess
+            .resume_request(self.repair.wants_snapshot(self.size_gen));
         let mut primary = LinkCtx::open(dialed.link, resume.is_some(), fwd.router());
         self.set_link_view(Self::link_view_of(&primary.status.borrow()));
         self.last_kind = Some(primary.kind);
@@ -1022,7 +1047,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.quiet = false;
         self.tx = Some(primary.tx.clone());
         primary.attach_gen = self.begin_attach(&primary.tx, resume, dialer.public_key());
+        primary.repaint_asked = resume.is_some_and(|r| r.want_snapshot);
         self.told_gen = primary.attach_gen;
+        self.repair
+            .link_changed(primary.repaint_asked.then_some(primary.attach_gen));
         // A candidate being tried, and the kind of a candidate that has taken over but whose
         // resume is not complete yet.
         let mut cand: Option<LinkCtx<D::Link>> = None;
@@ -1155,9 +1183,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     note = next_note(&mut notes) => self.on_note(note)?,
                     swap = dialer.next_swap(), if can_swap => {
                         let mut candidate = LinkCtx::open(swap.link, true, fwd.router());
-                        let resume = self.sess.resume_request();
+                        let resume = self
+                            .sess
+                            .resume_request(self.repair.wants_snapshot(self.size_gen));
                         candidate.attach_gen =
                             self.begin_attach(&candidate.tx, resume, dialer.public_key());
+                        candidate.repaint_asked = resume.is_some_and(|r| r.want_snapshot);
                         cand = Some(candidate);
                     }
                     _ = at(wake) => {
@@ -1233,9 +1264,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
         // Leave the links tidy, also when the loop failed: the daemon should see them close.
         self.tx = None;
-        if primary.conn.snap.is_some() {
+        if primary
+            .conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.info.reason != SnapshotReason::Repaint)
+        {
             // The snapshot never landed: the terminal and the daemon disagree about the
-            // position, and a snapshot is not resumable. The next attach starts afresh.
+            // position, and a snapshot is not resumable. The next attach starts afresh. A
+            // repaint moves no position (the terminal is still where it was), so a resume is
+            // still exact: the repaint it was for is asked for again by `want_snapshot`.
             self.sess.established = false;
         }
         if promoted.is_some() {
@@ -1363,8 +1401,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.last_kind = Some(primary.kind);
         self.set_link_view(Self::link_view_of(&primary.status.borrow()));
         // What the new link's daemon knows of our size is what its own attach said; a resize
-        // since (told to the old link only) goes to it after its `Resume`.
+        // since (told to the old link only) goes to it after its `Resume`. So does a repaint the
+        // old link was asked for and its attach was not.
         self.told_gen = primary.attach_gen;
+        self.repair
+            .link_changed(primary.repaint_asked.then_some(primary.attach_gen));
         // The new link's daemon tells us where its input stream stands, and its reply where its
         // output flow starts: an ack that fell due for the old link means nothing to it.
         self.sess.input_ready = false;
@@ -1661,9 +1702,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
                 self.sess.start_acks(info.at);
-                // This is the repaint that was asked for (or a fresh screen anyway).
-                self.sess.want_snapshot = false;
-                return self.begin_snapshot(conn, info);
+                return self.begin_snapshot(conn, info, false);
             }
         }
         // A resume: the screen is current as soon as the daemon continues.
@@ -1682,34 +1721,97 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if info.len > MAX_SNAPSHOT {
             return Err(ClientError::Protocol("snapshot too large".into()));
         }
-        // A catch-up jump: what is in flight below `at` is covered by the snapshot. The position
-        // only ever moves forward.
-        if info.at < self.sess.recv.received() {
-            return Self::reconnect("a catch-up snapshot behind the terminal position");
+        if let Some(cur) = conn.snap.as_mut() {
+            // The current snapshot's bytes are not all in, or it is a repaint held for its
+            // position: this one waits for them (see `Conn::snap_next`).
+            if conn.snap_next.is_some() {
+                return Self::reconnect("a third snapshot announced while two are outstanding");
+            }
+            if cur.info.reason == SnapshotReason::Repaint
+                && !cur.stale
+                && info.reason != SnapshotReason::Repaint
+                && info.at >= cur.info.at
+            {
+                // A catch-up past a repaint that has not been applied supersedes it: the
+                // repaint's remaining bytes are read and dropped, the output below the catch-up
+                // goes on, and the catch-up begins once they are.
+                cur.stale = true;
+                cur.buf = Vec::new();
+            }
+            conn.snap_next = Some(info);
+            if let Flow::End(s) = self.drain_terminal(conn)? {
+                return Ok(Flow::End(s));
+            }
+            // A repaint just superseded may be complete already: dropping it begins this one.
+            return self.finish_snapshot_when_due(conn);
         }
-        self.sess.recv.skip_to(info.at);
+        // The position only ever moves forward.
+        if info.at < self.sess.recv.received() {
+            if info.reason == SnapshotReason::Repaint {
+                // QUIC has no order across channels: output the daemon sent after the repaint
+                // overtook its announcement and has been applied. The repaint is for a point
+                // the terminal has left; its bytes are read and dropped, and once they are, the
+                // repaint is asked for again (the daemon serves at most one a second). No
+                // reconnect: nothing is inconsistent.
+                tracing::debug!("a repaint behind the terminal position; asking again");
+                return self.begin_snapshot(conn, info, true);
+            }
+            return Self::reconnect("a mid-stream snapshot behind the terminal position");
+        }
+        if info.reason != SnapshotReason::Repaint {
+            // A catch-up jump: what is in flight below `at` is covered by the snapshot.
+            self.sess.recv.skip_to(info.at);
+        }
+        // A repaint is rendered where the daemon's stream was: nothing is skipped, and what is
+        // still in flight below `at` is applied first (`drain_terminal`), so the scrollback loses
+        // nothing. Acks below `at` mean nothing to the daemon's flow either way.
         self.sess.start_acks(info.at);
-        self.begin_snapshot(conn, info)
+        self.begin_snapshot(conn, info, false)
     }
 
-    fn begin_snapshot(&mut self, conn: &mut Conn, info: SnapshotInfo) -> Result<Flow, ClientError> {
+    fn begin_snapshot(
+        &mut self,
+        conn: &mut Conn,
+        info: SnapshotInfo,
+        stale: bool,
+    ) -> Result<Flow, ClientError> {
+        let cap = if stale {
+            0
+        } else {
+            usize::try_from(info.len).unwrap_or(0).min(1 << 20)
+        };
         conn.snap = Some(Snap {
             info,
             recv: RecvChannel::new(),
-            buf: Vec::with_capacity(usize::try_from(info.len).unwrap_or(0).min(1 << 20)),
+            buf: Vec::with_capacity(cap),
+            stale,
         });
-        // Snapshot bytes that arrived before their announcement.
+        // Snapshot bytes that arrived before their announcement: this snapshot's, up to its end.
+        // What comes after is the next snapshot's (since a repaint can be confirmed early, two
+        // snapshots' bytes can both arrive ahead of their announcements), kept for it.
         conn.early_bytes = 0;
-        for (seq, data) in std::mem::take(&mut conn.snap_early) {
-            if conn.snap.is_none() {
+        let mut early = std::mem::take(&mut conn.snap_early).into_iter();
+        while let Some((seq, data)) = early.next() {
+            let done = conn
+                .snap
+                .as_ref()
+                .is_none_or(|s| s.recv.received() == s.info.len);
+            if done {
+                conn.snap_early.push((seq, data));
+                conn.snap_early.extend(early);
+                conn.early_bytes = conn.snap_early.iter().map(|(_, d)| d.len()).sum();
                 break;
             }
             if let Flow::End(s) = self.feed_snapshot(conn, seq, &data)? {
                 return Ok(Flow::End(s));
             }
         }
-        if info.len == 0 && conn.snap.is_some() {
-            return self.finish_snapshot(conn);
+        if conn.snap.is_some() {
+            // A repaint may be waiting for output that already arrived.
+            if let Flow::End(s) = self.drain_terminal(conn)? {
+                return Ok(Flow::End(s));
+            }
+            return self.finish_snapshot_when_due(conn);
         }
         Ok(Flow::Continue)
     }
@@ -1720,8 +1822,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         seq: u64,
         data: &[u8],
     ) -> Result<Flow, ClientError> {
-        if conn.awaiting_reply || conn.snap.is_none() {
-            // The announcement is on another stream and has not arrived: hold the bytes.
+        let current_complete = conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.recv.received() == s.info.len);
+        if conn.awaiting_reply || conn.snap.is_none() || current_complete {
+            // The announcement is on another stream and has not arrived, or the bytes are the
+            // next snapshot's (the current one is complete and held for its position): hold them.
             if conn.early_bytes + data.len() > self.cfg.max_held_output {
                 return Self::reconnect("too much snapshot data before its announcement");
             }
@@ -1744,12 +1851,46 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let Ok(fresh) = snap.recv.accept(seq, data) else {
             return Self::reconnect("a gap in the snapshot");
         };
-        snap.buf.extend_from_slice(fresh);
-        let len = snap.buf.len() as u64;
+        if !snap.stale {
+            snap.buf.extend_from_slice(fresh);
+        }
+        let len = snap.recv.received();
         if len > snap.info.len {
             return Self::reconnect("a snapshot longer than announced");
         }
         if len == snap.info.len {
+            return self.finish_snapshot_when_due(conn);
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// A repaint's position: the snapshot waits until the terminal stream has reached it.
+    fn repaint_at(conn: &Conn) -> Option<u64> {
+        conn.snap
+            .as_ref()
+            .filter(|s| s.info.reason == SnapshotReason::Repaint && !s.stale)
+            .map(|s| s.info.at)
+    }
+
+    /// Finishes a complete snapshot, unless it is a repaint whose position the terminal stream
+    /// has not reached yet: then the output before it is applied first, as it arrives.
+    fn finish_snapshot_when_due(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
+        let complete = conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.recv.received() == s.info.len);
+        if complete && conn.snap.as_ref().is_some_and(|s| s.stale) {
+            // All of a stale repaint's bytes are read: drop it, and ask again, unless a snapshot
+            // is waiting to begin (it may repair the screen; if it does not, it asks).
+            conn.snap = None;
+            self.repair.stale_repaint();
+            if conn.snap_next.is_none() {
+                self.send_repaint();
+            }
+            return self.begin_next_snapshot(conn);
+        }
+        let reached = Self::repaint_at(conn).is_none_or(|at| self.sess.recv.received() >= at);
+        if complete && reached {
             return self.finish_snapshot(conn);
         }
         Ok(Flow::Continue)
@@ -1763,7 +1904,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let first = !self.first_attached;
         if first {
             self.enter_session_screen()?;
-        } else if let Some(d) = self.display.as_ref() {
+        }
+        // Any snapshot rendered at the size the client has now repairs the screen, whatever it is
+        // for (the size is final here: the first attach has just read the window).
+        self.repair.snapshot(snap.info.size_gen, self.size_gen);
+        if !first && let Some(d) = self.display.as_ref() {
             // The terminal still shows the old stream: it may be on the alternate screen, with
             // mouse reporting or a character set or a pen the fresh shadow does not assume. The
             // snapshot writer turns modes on and never off, so start from all-off (also what
@@ -1775,12 +1920,23 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // once it lands. What the overlay had drawn is cleared with it.
         let (cols, rows) = self.size;
         let rebase = std::mem::take(&mut self.rebase_input);
+        let current = snap.info.size_gen == self.size_gen;
         let d = self.display_mut(cols, rows)?;
         d.reset();
         if rebase {
             d.rebase_input();
         }
-        let bytes = d.server(&snap.buf);
+        let mut bytes = d.server(&snap.buf);
+        if current {
+            // Drawn at the size the terminal has: the core may trust the screen again.
+            d.repainted();
+        } else {
+            // Drawn at a size the terminal no longer has (the window changed while it was on its
+            // way): the screen stays untrusted for the core too, which writes no guess until a
+            // snapshot at the current size lands (the repaint `Repair` asks for). A reset alone
+            // would not do it on the first attach: a new display trusts its screen.
+            bytes.extend_from_slice(&d.untrusted());
+        }
         self.write(&bytes)?;
         // The PTY mode in force at the snapshot's point (the last report below it).
         self.apply_modes(snap.info.at)?;
@@ -1795,8 +1951,26 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if let Flow::End(s) = self.drain_terminal(conn)? {
             return Ok(Flow::End(s));
         }
+        if conn.snap_next.is_some() {
+            return self.begin_next_snapshot(conn);
+        }
         self.link_became_ready(conn)?;
         Ok(Flow::Continue)
+    }
+
+    /// Begins the snapshot that was announced while the last one's bytes were still arriving.
+    fn begin_next_snapshot(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
+        match conn.snap_next.take() {
+            Some(info) => self.on_snapshot_announced(conn, info),
+            None => {
+                // The terminal data held behind the snapshot, and what waited for the screen.
+                if let Flow::End(s) = self.drain_terminal(conn)? {
+                    return Ok(Flow::End(s));
+                }
+                self.link_became_ready(conn)?;
+                Ok(Flow::Continue)
+            }
+        }
     }
 
     fn on_terminal(&mut self, conn: &mut Conn, seq: u64, data: &[u8]) -> Result<Flow, ClientError> {
@@ -1814,13 +1988,22 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// Applies the held terminal segments that are next in line. They wait while the reply or a
     /// snapshot is outstanding, and while a gap (which a not-yet-arrived `Snapshot` will
     /// explain) separates them from the terminal position.
+    ///
+    /// Behind a repaint the output below its position is applied (it was sent before the
+    /// snapshot was rendered), and the snapshot once it is reached.
     fn drain_terminal(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
-        if conn.awaiting_reply || conn.snap.is_some() {
+        let limit = Self::repaint_at(conn);
+        // Output goes on while a stale repaint's bytes are read and dropped.
+        let holding = conn.snap.as_ref().is_some_and(|s| !s.stale);
+        if conn.awaiting_reply || (holding && limit.is_none()) {
             return Ok(Flow::Continue);
         }
-        while let Some(&seq) = conn.term_held.keys().next() {
-            if seq > self.sess.recv.received() {
+        while let Some((&seq, data)) = conn.term_held.iter().next() {
+            if seq > self.sess.recv.received() || limit.is_some_and(|at| seq >= at) {
                 break;
+            }
+            if limit.is_some_and(|at| seq + data.len() as u64 > at) {
+                return Self::reconnect("terminal data across a repaint's position");
             }
             let data = conn.term_held.remove(&seq).expect("just seen");
             conn.held_bytes -= data.len();
@@ -1841,6 +2024,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // Also when nothing was new: a resend of what the terminal already has (a swap's) is
         // still owed an ack on this link.
         self.after_output();
+        if limit.is_some() {
+            return self.finish_snapshot_when_due(conn);
+        }
         Ok(Flow::Continue)
     }
 
@@ -1955,8 +2141,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
     }
 
-    /// Acks, when due, after output was applied.
+    /// Acks, when due, after output was applied; and asks for a repaint if the output made the
+    /// overlay draw on an untrusted screen.
     fn after_output(&mut self) {
+        self.send_repaint();
         if let Some(upto) = self.sess.ack_if_due() {
             self.send_ctl(&ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
@@ -2075,22 +2263,52 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// data, never the control writer, which is a different queue and on QUIC a different stream.
     /// Only where keystrokes may go: after the daemon's `Resume`, which says where its stream
     /// stands. Until then the attach (or the next record) carries the size.
+    ///
+    /// A repaint the screen needs goes right after it ([`Core::send_repaint`]).
     fn send_size(&mut self) {
-        if self.told_gen >= self.size_gen
+        if self.tx.is_none() || !self.sess.input_ready || !self.link_ok {
+            return;
+        }
+        if self.told_gen < self.size_gen {
+            let record = InputRecord::Resize {
+                at: self.sess.input.next_seq(),
+                size_gen: self.size_gen,
+                size: term_size(self.size),
+            };
+            if let (Some(tx), Ok(payload)) = (&self.tx, record.encode()) {
+                tx.data(ChannelId::TERMINAL, payload);
+                self.told_gen = self.size_gen;
+            }
+        }
+        self.send_repaint();
+    }
+
+    /// Asks the daemon to repaint the screen, if a resize left it needing one ([`Repair`]): an
+    /// in-band `Repaint` record, after the resize record of the size the client has now, so the
+    /// daemon renders at that size (a control message would overtake the resize record). Only
+    /// once the daemon on this link has been told that size, and only where keystrokes may go.
+    /// The daemon renders it where its stream is; the client applies the output still in flight
+    /// before it (`drain_terminal`).
+    fn send_repaint(&mut self) {
+        // The prediction core holds a guess on an untrusted screen instead of writing it, and
+        // says so (rule 9): it writes nothing, so this is where it is heard.
+        if let Some(d) = self.display.as_mut()
+            && d.take_repaint_request()
+        {
+            self.repair.guess_held(self.size_gen);
+        }
+        if self.told_gen < self.size_gen
             || self.tx.is_none()
             || !self.sess.input_ready
             || !self.link_ok
+            || !self.repair.should_ask(self.size_gen)
         {
             return;
         }
-        let record = InputRecord::Resize {
-            at: self.sess.input.next_seq(),
-            size_gen: self.size_gen,
-            size: term_size(self.size),
-        };
-        if let (Some(tx), Ok(payload)) = (&self.tx, record.encode()) {
+        if let (Some(tx), Ok(payload)) = (&self.tx, InputRecord::Repaint.encode()) {
+            tracing::debug!("the screen needs a repaint after a resize; asking for one");
             tx.data(ChannelId::TERMINAL, payload);
-            self.told_gen = self.size_gen;
+            self.repair.asked(self.size_gen);
         }
     }
 
@@ -2166,14 +2384,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         self.set_size((cols, rows));
         if let Some(d) = self.display.as_mut() {
-            let (bytes, damaged) = d.resize(cols, rows);
-            self.write(&bytes)?;
-            if damaged {
-                // The window narrowed under something we had drawn; the terminal re-wrapped it
-                // and the erase cannot undo that. The next resume repaints from a snapshot.
-                tracing::debug!("window narrowed under the overlay; the next resume repaints");
-                self.sess.want_snapshot = true;
+            // A terminal that reflows has done so before this event: it re-wrapped whatever was
+            // drawn, in either direction, and the erase runs on the geometry it has left. The
+            // screen needs a repaint (asked for after the resize record below, or by the next
+            // resume while the link is down).
+            let drawn = d.is_painted();
+            let (bytes, _) = d.resize(cols, rows);
+            self.repair.resized(drawn);
+            if drawn {
+                tracing::debug!("the window changed size under the overlay; repainting");
             }
+            self.write(&bytes)?;
         }
         self.send_size();
         self.refresh_display()
@@ -2514,14 +2735,22 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         self.write(text.as_bytes())
     }
 
+    /// Writes to the user's terminal. Everything the overlay draws or removes comes through here,
+    /// so this is where [`Repair`] learns of it.
     fn write(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.out.write_all(bytes).map_err(ClientError::Terminal)
+        self.out.write_all(bytes).map_err(ClientError::Terminal)?;
+        if let Some(d) = &self.display {
+            self.repair
+                .drawn(self.size_gen, d.is_painted(), self.status_shown);
+        }
+        Ok(())
     }
 
     fn show_lines(&mut self, lines: Vec<String>) -> Result<(), ClientError> {
+        self.status_shown = !lines.is_empty();
         if let Some(d) = self.display.as_mut() {
             let bytes = d.set_lines(lines);
             self.write(&bytes)?;
@@ -2625,7 +2854,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         if let Some(p) = &self.ports {
             lines.extend(p.iter().cloned());
         }
-        self.show_lines(lines)
+        self.show_lines(lines)?;
+        // A status line drawn on an untrusted screen may just have gone.
+        self.send_repaint();
+        Ok(())
     }
 
     // ---- timers ------------------------------------------------------------------------

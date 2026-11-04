@@ -107,8 +107,11 @@ fn recording(seen: &Arc<Mutex<Seen>>) -> PredictorFactory {
 
 /// A client with the recording predictor, against a fresh scripted daemon.
 fn start_predicting(cfg: ClientConfig) -> (Rig, Arc<Mutex<Seen>>) {
+    start_predicting_with(FakeDaemon::new(8 * 1024 * 1024), cfg)
+}
+
+fn start_predicting_with(daemon: Arc<FakeDaemon>, cfg: ClientConfig) -> (Rig, Arc<Mutex<Seen>>) {
     let seen: Arc<Mutex<Seen>> = Arc::default();
-    let daemon = FakeDaemon::new(8 * 1024 * 1024);
     let (dialer, dial) = test_dialer(&daemon);
     let (terminal, term) = fake_terminal(80, 24, "xterm-256color");
     let client = tokio::spawn(fil_client::run_with(
@@ -658,4 +661,84 @@ async fn reports_at_offsets_never_reached_are_never_applied() {
     settle().await;
     assert_eq!(seen.lock().unwrap().acks.len(), 1, "only the warm-up's");
     assert_eq!(shown(&rig), 1, "the far-off mode report was not applied");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The screen after a resize (W1's repaint)
+
+/// After a resize the core holds a guess instead of writing it on a screen that may have
+/// reflowed, and the engine asks for a repaint; once the repaint (a snapshot at the client's size)
+/// lands, the screen is trusted again and guesses are written as before.
+#[tokio::test(start_paused = true)]
+async fn after_a_resize_guesses_wait_for_the_repaint_and_resume_after_it() {
+    let (rig, _) = start_predicting(predicting());
+    rig.attached().await;
+    warm(&rig).await;
+    rig.term.resize(100, 30);
+    settle().await;
+    assert!(
+        rig.daemon.repaint_requests().await.is_empty(),
+        "nothing drawn, nothing asked"
+    );
+    rig.daemon.hold_repaints(true).await;
+    // Acknowledged and not echoed, so the next epoch's prior-ack rule is met.
+    rig.daemon.set_echo(Echo::Silent).await;
+    rig.type_str("b");
+    settle().await;
+    assert_eq!(shown(&rig), 0, "a guess written on an untrusted screen");
+    assert_eq!(
+        rig.daemon.repaint_requests().await.len(),
+        1,
+        "the held guess asks"
+    );
+    rig.daemon.hold_repaints(false).await;
+    settle().await;
+    assert_eq!(rig.daemon.repaints().await.len(), 1);
+    // A new epoch (the repaint is a snapshot), confirmed by an echo; then guesses show again.
+    rig.daemon.set_echo(Echo::Faithful).await;
+    rig.type_str("c");
+    settle().await;
+    rig.daemon.set_echo(Echo::Off).await;
+    rig.type_str("d");
+    settle().await;
+    assert_eq!(shown(&rig), 1, "the repaint did not restore trust");
+}
+
+/// A snapshot rendered at a size the terminal no longer has (the window changed while the first
+/// attach's snapshot was on its way) leaves the screen untrusted for the core as well: a new
+/// display would trust its screen, so nothing would stop a guess before the repaint lands.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_from_an_older_size_leaves_the_screen_untrusted() {
+    let daemon = FakeDaemon::new(8 * 1024 * 1024);
+    daemon
+        .set_snapshot_delay(Some(Duration::from_millis(200)))
+        .await;
+    daemon.hold_repaints(true).await;
+    let (rig, _) = start_predicting_with(daemon, predicting());
+    until_async("the attach", 5, || async {
+        rig.daemon.attaches().await.len() == 1
+    })
+    .await;
+    rig.term.resize_quietly(100, 30);
+    rig.attached().await;
+    assert_eq!(rig.daemon.attaches().await[0].size_gen, 0);
+    warm(&rig).await;
+    // Acknowledged and not echoed, so the next epoch's prior-ack rule is met.
+    rig.daemon.set_echo(Echo::Silent).await;
+    rig.type_str("b");
+    settle().await;
+    assert_eq!(shown(&rig), 0, "a guess on a screen drawn at the old size");
+    assert!(
+        !rig.daemon.repaint_requests().await.is_empty(),
+        "a repaint is asked for"
+    );
+    rig.daemon.hold_repaints(false).await;
+    settle().await;
+    rig.daemon.set_echo(Echo::Faithful).await;
+    rig.type_str("c");
+    settle().await;
+    rig.daemon.set_echo(Echo::Off).await;
+    rig.type_str("d");
+    settle().await;
+    assert_eq!(shown(&rig), 1, "trusted again after the repaint");
 }

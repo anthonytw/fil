@@ -70,6 +70,8 @@ pub enum TermLog {
         size_gen: u64,
         size: (u16, u16),
     },
+    /// An in-band `Repaint`, and the size generation in force when it arrived.
+    Repaint { size_gen: u64 },
 }
 
 struct Conn {
@@ -167,6 +169,47 @@ pub struct DState {
     pending_jump: Option<u64>,
     /// Catch-ups that were held back for want of that ack.
     pub blocked_catch_ups: u32,
+    /// `Repaint` records are logged and not answered (a daemon that has not got to them yet).
+    hold_repaints: bool,
+    /// A held request is owed.
+    repaint_owed: bool,
+    /// Output the next repaint is rendered after, but whose bytes reach the client only after
+    /// the snapshot (the announcement, on control, overtook them).
+    repaint_tail: Vec<u8>,
+    /// Output produced after the next repaint was rendered, whose bytes (from `at` on the
+    /// terminal channel) reach the client before the announcement: QUIC, a control packet lost.
+    repaint_after: Vec<u8>,
+    /// The next repaint is rendered this many bytes into `repaint_tail`, and the tail is sent as
+    /// one segment across `at`: a daemon that breaks the rule that `at` is where its stream was.
+    repaint_straddle: Option<usize>,
+    /// The link dies after the next repaint's snapshot, before the tail below its `at` is sent.
+    repaint_kill: bool,
+    /// After the next repaint is announced, catch-ups over these outputs are announced too,
+    /// before any snapshot bytes are sent: the repaint was confirmed early (an ack of `at` the
+    /// client sent before it saw the announcement), and the catch-up's announcement (control)
+    /// overtook the repaint's bytes on channel 2.
+    repaint_then_catch_ups: Vec<Vec<u8>>,
+    /// After the next repaint is announced, a second repaint (after a line more of output) is
+    /// announced too, before any snapshot bytes; both snapshots' bytes go before the output below
+    /// their positions.
+    repaint_twice: bool,
+    /// The next repaint and the snapshot after it (a repaint, or with `true` a catch-up over 60
+    /// lines) send all their bytes before either announcement: the repaint was confirmed early,
+    /// and on QUIC a lost control packet held both announcements back while channel 2 went on.
+    repaint_bytes_first: Option<bool>,
+    /// The next repaint is complete and held for its position (its tail not sent) when a
+    /// catch-up is announced and sent; the tail comes last.
+    repaint_held_then_catch_up: bool,
+    /// Repaint snapshots sent, with the generation each was rendered at.
+    pub repaints: Vec<u64>,
+}
+
+/// The numbered lines `range` (as `common::lines`; this file is also included by other crates'
+/// tests, whose `common` has no such helper).
+fn numbered_lines(range: std::ops::Range<usize>) -> Vec<u8> {
+    range
+        .flat_map(|i| format!("line {i:04}\r\n").into_bytes())
+        .collect()
 }
 
 fn key_of(link: &Arc<MemLink>) -> usize {
@@ -249,6 +292,17 @@ impl FakeDaemon {
                 reply_delay: None,
                 pending_jump: None,
                 blocked_catch_ups: 0,
+                hold_repaints: false,
+                repaint_owed: false,
+                repaint_tail: Vec::new(),
+                repaint_after: Vec::new(),
+                repaint_straddle: None,
+                repaint_kill: false,
+                repaint_then_catch_ups: Vec::new(),
+                repaint_twice: false,
+                repaint_bytes_first: None,
+                repaint_held_then_catch_up: false,
+                repaints: Vec::new(),
             }),
         })
     }
@@ -386,6 +440,16 @@ impl FakeDaemon {
                                 size: (size.cols(), size.rows()),
                             };
                             st.term_log.push(rec);
+                            continue;
+                        }
+                        TerminalInput::Record(InputRecord::Repaint) => {
+                            let size_gen = st.size_gen;
+                            st.term_log.push(TermLog::Repaint { size_gen });
+                            if st.hold_repaints {
+                                st.repaint_owed = true;
+                            } else if st.is_current(&link) {
+                                me.repaint(&mut st).await;
+                            }
                             continue;
                         }
                         TerminalInput::Keys(seg) => seg,
@@ -552,6 +616,7 @@ impl FakeDaemon {
                     len: bytes.len() as u64,
                     skipped,
                     reason,
+                    size_gen: st.size_gen,
                 };
                 snapshot_bytes = Some(bytes);
                 StartPoint::Snapshot(info)
@@ -639,6 +704,351 @@ impl FakeDaemon {
         self.fwd
             .attach(&link, matches!(mode, AttachMode::Resumed(_)));
         true
+    }
+
+    /// Answers a `Repaint`: a mid-stream snapshot of the screen at the size in force, no
+    /// history, at the end of the log (what was not sent yet is sent first, as the real daemon
+    /// repaints only where the stream is).
+    async fn repaint(&self, st: &mut DState) {
+        self.pump(st).await;
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        let tail = std::mem::take(&mut st.repaint_tail);
+        let tail_at = st.log.end();
+        let cut = st
+            .repaint_straddle
+            .take()
+            .unwrap_or(tail.len())
+            .min(tail.len());
+        st.log.append(&tail);
+        st.emu.feed(&tail[..cut]);
+        let bytes = fil_term::snapshot::snapshot(&st.emu.state(0));
+        st.emu.feed(&tail[cut..]);
+        let at = tail_at + cut as u64;
+        st.flows.insert(key_of(&link), at);
+        st.pending_jump = Some(at);
+        st.sent = at;
+        st.snapshots += 1;
+        let size_gen = st.size_gen;
+        st.repaints.push(size_gen);
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: 0,
+            reason: fil_proto::msg::SnapshotReason::Repaint,
+            size_gen,
+        };
+        let after = std::mem::take(&mut st.repaint_after);
+        if !after.is_empty() {
+            st.log.append(&after);
+            st.emu.feed(&after);
+            st.sent = at + after.len() as u64;
+            st.flows.insert(key_of(&link), st.sent);
+            let seg = Segment {
+                seq: at,
+                data: after.clone(),
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if cut < tail.len() {
+            st.sent = tail_at + tail.len() as u64;
+        }
+        if let Some(catch_up) = st.repaint_bytes_first.take() {
+            let extra = if catch_up {
+                numbered_lines(100..160)
+            } else {
+                b"more output\r\n".to_vec()
+            };
+            st.log.append(&extra);
+            st.emu.feed(&extra);
+            let b2 = fil_term::snapshot::snapshot(&st.emu.state(if catch_up { 1000 } else { 0 }));
+            let at2 = st.log.end();
+            st.flows.insert(key_of(&link), at2);
+            st.pending_jump = Some(at2);
+            st.sent = at2;
+            st.snapshots += 1;
+            let info2 = if catch_up {
+                SnapshotInfo {
+                    at: at2,
+                    len: b2.len() as u64,
+                    skipped: extra.len() as u64,
+                    reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+                    size_gen: st.size_gen,
+                }
+            } else {
+                st.repaints.push(size_gen);
+                SnapshotInfo {
+                    at: at2,
+                    len: b2.len() as u64,
+                    ..info
+                }
+            };
+            for snap in [&bytes, &b2] {
+                let mut off = 0u64;
+                for chunk in snap.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            let _ = send(&link, &ControlMsg::Snapshot(info2)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Output below the first one's position, if any, still on its way (it is held).
+            for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+                let seg = Segment {
+                    seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                    data: chunk.to_vec(),
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
+            if !catch_up {
+                let seg = Segment {
+                    seq: at,
+                    data: extra,
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
+            return;
+        }
+        if std::mem::take(&mut st.repaint_held_then_catch_up) {
+            let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+            let mut off = 0u64;
+            for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+                let seg = Segment {
+                    seq: off,
+                    data: chunk.to_vec(),
+                };
+                off += chunk.len() as u64;
+                let _ = link
+                    .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let skip = numbered_lines(100..160);
+            st.log.append(&skip);
+            st.emu.feed(&skip);
+            let b = fil_term::snapshot::snapshot(&st.emu.state(1000));
+            let bat = st.log.end();
+            st.flows.insert(key_of(&link), bat);
+            st.pending_jump = Some(bat);
+            st.sent = bat;
+            st.snapshots += 1;
+            let binfo = SnapshotInfo {
+                at: bat,
+                len: b.len() as u64,
+                skipped: skip.len() as u64,
+                reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+                size_gen: st.size_gen,
+            };
+            let _ = send(&link, &ControlMsg::Snapshot(binfo)).await;
+            let mut off = 0u64;
+            for chunk in b.chunks(MAX_DATA_PAYLOAD) {
+                let seg = Segment {
+                    seq: off,
+                    data: chunk.to_vec(),
+                };
+                off += chunk.len() as u64;
+                let _ = link
+                    .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+                let seg = Segment {
+                    seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                    data: chunk.to_vec(),
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
+            return;
+        }
+        let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+        if std::mem::take(&mut st.repaint_twice) {
+            // The second repaint comes after a little more output, so its bytes differ.
+            let extra = b"more output\r\n".to_vec();
+            st.log.append(&extra);
+            st.emu.feed(&extra);
+            let b2 = fil_term::snapshot::snapshot(&st.emu.state(0));
+            let at2 = st.log.end();
+            st.flows.insert(key_of(&link), at2);
+            st.pending_jump = Some(at2);
+            st.sent = at2;
+            st.snapshots += 1;
+            st.repaints.push(size_gen);
+            let info2 = SnapshotInfo {
+                at: at2,
+                len: b2.len() as u64,
+                ..info
+            };
+            let _ = send(&link, &ControlMsg::Snapshot(info2)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for snap in [&bytes, &b2] {
+                let mut off = 0u64;
+                for chunk in snap.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+                let seg = Segment {
+                    seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                    data: chunk.to_vec(),
+                };
+                let _ = link
+                    .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                    .await;
+            }
+            let seg = Segment {
+                seq: at,
+                data: extra,
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+            return;
+        }
+        let catch_ups = std::mem::take(&mut st.repaint_then_catch_ups);
+        if !catch_ups.is_empty() {
+            let mut all = vec![bytes];
+            for skip in catch_ups {
+                st.log.append(&skip);
+                st.emu.feed(&skip);
+                let b = fil_term::snapshot::snapshot(&st.emu.state(1000));
+                let bat = st.log.end();
+                st.flows.insert(key_of(&link), bat);
+                st.pending_jump = Some(bat);
+                st.sent = bat;
+                st.snapshots += 1;
+                let binfo = SnapshotInfo {
+                    at: bat,
+                    len: b.len() as u64,
+                    skipped: skip.len() as u64,
+                    reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+                    size_gen: st.size_gen,
+                };
+                let _ = send(&link, &ControlMsg::Snapshot(binfo)).await;
+                all.push(b);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for b in all {
+                let mut off = 0u64;
+                for chunk in b.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+            return;
+        }
+        let mut off = 0u64;
+        for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+            let seg = Segment {
+                seq: off,
+                data: chunk.to_vec(),
+            };
+            off += chunk.len() as u64;
+            let _ = link
+                .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                .await;
+        }
+        if std::mem::take(&mut st.repaint_kill) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+                c.control.kill(DownReason::Dead);
+            }
+            return;
+        }
+        for (i, chunk) in tail.chunks(MAX_DATA_PAYLOAD).enumerate() {
+            let seg = Segment {
+                seq: tail_at + (i * MAX_DATA_PAYLOAD) as u64,
+                data: chunk.to_vec(),
+            };
+            let _ = link
+                .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                .await;
+        }
+    }
+
+    /// The next repaint is rendered after `tail`, whose bytes reach the client after the
+    /// snapshot: what a real daemon's output in flight looks like when the announcement, on the
+    /// control channel, overtakes it.
+    pub async fn set_repaint_tail(&self, tail: &[u8]) {
+        self.st.lock().await.repaint_tail = tail.to_vec();
+    }
+
+    /// The output after the next repaint overtakes its announcement (QUIC, a lost control
+    /// packet): `after` is sent from `at` on the terminal channel first.
+    pub async fn set_repaint_after(&self, after: &[u8]) {
+        self.st.lock().await.repaint_after = after.to_vec();
+    }
+
+    /// The next repaint is rendered `cut` bytes into its tail, which is then sent as one segment
+    /// across `at`: a broken daemon.
+    pub async fn set_repaint_straddle(&self, cut: usize) {
+        self.st.lock().await.repaint_straddle = Some(cut);
+    }
+
+    /// After the next repaint's announcement, catch-ups over each of `skips` are announced, all
+    /// ahead of the snapshot bytes (see `DState::repaint_then_catch_ups`).
+    pub async fn set_repaint_then_catch_ups(&self, skips: Vec<Vec<u8>>) {
+        self.st.lock().await.repaint_then_catch_ups = skips;
+    }
+
+    /// The next repaint is announced twice (the second confirmed early, as for a catch-up), both
+    /// ahead of their bytes, and the tail below their `at` comes last.
+    /// The next repaint and the snapshot after it (a second repaint, or with `catch_up` a
+    /// catch-up) send all their bytes ahead of both announcements (see
+    /// `DState::repaint_bytes_first`).
+    pub async fn set_repaint_bytes_first(&self, catch_up: bool) {
+        self.st.lock().await.repaint_bytes_first = Some(catch_up);
+    }
+
+    /// The next repaint is complete and held for its position when a catch-up is announced (see
+    /// `DState::repaint_held_then_catch_up`).
+    pub async fn set_repaint_held_then_catch_up(&self) {
+        self.st.lock().await.repaint_held_then_catch_up = true;
+    }
+
+    pub async fn set_repaint_twice(&self) {
+        self.st.lock().await.repaint_twice = true;
+    }
+
+    /// The link dies after the next repaint's snapshot, before its tail is sent.
+    pub async fn set_repaint_kill(&self) {
+        self.st.lock().await.repaint_kill = true;
     }
 
     /// Sends the log from `sent` to the current subscriber.
@@ -737,6 +1147,35 @@ impl FakeDaemon {
 
     pub async fn snapshots(&self) -> u32 {
         self.st.lock().await.snapshots
+    }
+
+    /// The generations of the repaint snapshots sent so far.
+    pub async fn repaints(&self) -> Vec<u64> {
+        self.st.lock().await.repaints.clone()
+    }
+
+    /// While on, `Repaint` records are logged and not answered. Turned off, a held one is
+    /// answered (on the current link).
+    pub async fn hold_repaints(&self, on: bool) {
+        let mut st = self.st.lock().await;
+        st.hold_repaints = on;
+        if !on && std::mem::take(&mut st.repaint_owed) {
+            self.repaint(&mut st).await;
+        }
+    }
+
+    /// The `Repaint` records received, with the generation in force at each.
+    pub async fn repaint_requests(&self) -> Vec<u64> {
+        self.st
+            .lock()
+            .await
+            .term_log
+            .iter()
+            .filter_map(|l| match l {
+                TermLog::Repaint { size_gen } => Some(*size_gen),
+                _ => None,
+            })
+            .collect()
     }
 
     pub async fn acked(&self) -> u64 {
@@ -953,6 +1392,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         let _ = send(&link, &ControlMsg::Snapshot(info)).await;
         if !after.is_empty() {
@@ -1010,6 +1450,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         st.log.append(after);
         st.emu.feed(after);
@@ -1128,6 +1569,7 @@ impl FakeDaemon {
             len: bytes.len() as u64,
             skipped: skip.len() as u64,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
         };
         let mut off = 0u64;
         for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {

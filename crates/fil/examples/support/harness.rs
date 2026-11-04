@@ -739,7 +739,7 @@ mod tests {
             "ok in 1923 ms, peer <ip>:4433 via <ip>, lo 127.0.0.1 [::1], to pi1."
         );
         // A name's addresses never appear in the target list; they are scrubbed all the same.
-        let t = Targets::parse("pi2=u@alpha.example", &[]).unwrap();
+        let t = Targets::parse("pi2=u@devbox2.example", &[]).unwrap();
         assert_eq!(
             t.scrub("dialled 203.0.113.5. Time 10:30:45"),
             "dialled <ip>. Time 10:30:45"

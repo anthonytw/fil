@@ -1827,7 +1827,10 @@ impl<L: Link> Inner<L> {
                 MuxEvent::Closed { channel, why } => {
                     debug!(channel = channel.0, why = ?why, "forward channel closed");
                     // Nothing it sent is still owed: the peer's `Close` says it consumed all
-                    // of it (or gave up on it), and a `Close` ends the peer's acks for it.
+                    // of it (or gave up on it), and a `Close` ends the peer's acks for it. What
+                    // still waits for the data sender is stale, and sent after the pacer
+                    // forgot the channel it would be recorded again, until the channel is released.
+                    st.drop_queued(channel);
                     st.pacer.forget(channel);
                     st.end_slot(channel, why);
                 }

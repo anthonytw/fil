@@ -12,6 +12,7 @@
 //! skipped, never a panic. The file lists every user's sockets; [`split`] is the uid filter that
 //! keeps another user's rows to their address and port before anything else looks at them.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
@@ -25,8 +26,11 @@ const LISTEN: u8 = 0x0A;
 /// (the listeners come first in practice: they are in the hash table's listening half, which the
 /// kernel prints first).
 pub const MAX_LINES: usize = 200_000;
-/// The most listening sockets kept over both files.
+/// The most listening sockets kept over both files, besides the [`Keep`] ones.
 pub const MAX_LISTENERS: usize = 4096;
+/// The most of the user's own sockets kept on the [`Keep`] addresses (another user's are kept one
+/// per address and port, so they need no bound of their own).
+pub const MAX_KEPT_OWN: usize = 1024;
 /// The longest line read; a longer one is skipped. Real lines are about 150 bytes.
 const MAX_LINE: usize = 512;
 
@@ -111,6 +115,15 @@ fn word(hex: &str) -> Option<[u8; 4]> {
     u32::from_str_radix(hex, 16).ok().map(u32::to_ne_bytes)
 }
 
+/// Whether the `st` column (the fourth field) of a line says `LISTEN`: a cheap test before
+/// [`parse_line`].
+fn is_listen_line(line: &[u8]) -> bool {
+    line.split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty())
+        .nth(3)
+        .is_some_and(|st| st.eq_ignore_ascii_case(b"0A"))
+}
+
 /// The listening sockets in the text of one file, in order.
 pub fn listeners(text: &str) -> Vec<Socket> {
     text.lines()
@@ -155,42 +168,116 @@ pub fn split(sockets: Vec<Socket>, uid: u32) -> Split {
     out
 }
 
+/// Listeners that are kept whatever [`MAX_LISTENERS`] says: those that could take a connection
+/// to a `-L` target, on its port and at its address, a loopback or a wildcard. Another local user
+/// can fill the table with cheap listeners that sort before a squat on a target (the table is
+/// world-readable and its order can be watched); the cap must not hide the squat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Keep {
+    ports: HashSet<u16>,
+    addrs: HashSet<IpAddr>,
+}
+
+impl Keep {
+    /// For targets on `ports` at the addresses `targets` (canonical IPs; the loopbacks and the
+    /// wildcards are always included).
+    pub fn new(
+        ports: impl IntoIterator<Item = u16>,
+        targets: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        let ports: HashSet<u16> = ports.into_iter().collect();
+        let mut addrs: HashSet<IpAddr> = targets.into_iter().map(|a| a.to_canonical()).collect();
+        if !ports.is_empty() {
+            addrs.extend([
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ]);
+        }
+        Self { ports, addrs }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ports.is_empty()
+    }
+
+    fn wants(&self, s: &Socket) -> bool {
+        self.ports.contains(&s.port.get()) && self.addrs.contains(&s.addr)
+    }
+}
+
 /// What [`read`] found, and whether it had to stop early.
 #[derive(Debug, Default)]
 pub struct NetRead {
+    /// The [`Keep`] sockets first, then the others, each in table order.
     pub sockets: Vec<Socket>,
     /// `tcp` could not be read: nothing is known about the host's listeners.
     pub missing: bool,
     /// `tcp6` could not be read, or a bound (lines, listeners, time) was reached.
     pub truncated: bool,
+    /// A file was not read to its end (lines, time, an error): a [`Keep`] socket may be missing
+    /// too, so who holds a `-L` target cannot be said.
+    pub cut: bool,
+}
+
+/// What [`read_from`] collects.
+#[derive(Debug, Default)]
+struct Reading {
+    kept: Vec<Socket>,
+    /// Another user's kept sockets, one per address and port.
+    kept_other: HashSet<(IpAddr, u16)>,
+    kept_own: usize,
+    rest: Vec<Socket>,
 }
 
 /// Reads `ROOT/net/tcp` and `ROOT/net/tcp6`, line by line within the bounds and before
 /// `deadline`. A missing `tcp6` is a host without IPv6; a missing `tcp` (a `/proc` mounted with
 /// `subset=pid`, a sandbox) means the listeners cannot be known, which is incomplete, not "none".
-pub fn read(root: &Path, deadline: Instant) -> NetRead {
+/// Past [`MAX_LISTENERS`] the reading goes on (within the line bound and the deadline) for the
+/// `keep` sockets only, when there are any; `uid` is the user's (see [`Keep`]).
+pub fn read(root: &Path, deadline: Instant, keep: &Keep, uid: u32) -> NetRead {
     let mut out = NetRead::default();
+    let mut r = Reading::default();
     for name in ["tcp", "tcp6"] {
         match std::fs::File::open(root.join("net").join(name)) {
-            Ok(f) => read_from(f, deadline, &mut out),
+            Ok(f) => read_from(f, deadline, keep, uid, &mut r, &mut out),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && name == "tcp6" => {}
             Err(_) if name == "tcp" => out.missing = true,
-            Err(_) => out.truncated = true,
+            Err(_) => {
+                out.truncated = true;
+                out.cut = true;
+            }
         }
     }
+    out.sockets = r.kept;
+    out.sockets.extend(r.rest);
     out
 }
 
-fn read_from(f: impl Read, deadline: Instant, out: &mut NetRead) {
+fn read_from(
+    f: impl Read,
+    deadline: Instant,
+    keep: &Keep,
+    uid: u32,
+    r_out: &mut Reading,
+    out: &mut NetRead,
+) {
     let mut r = BufReader::new(f);
     let mut line = Vec::with_capacity(MAX_LINE);
     for n in 0.. {
-        if n == MAX_LINES || out.sockets.len() >= MAX_LISTENERS {
+        let full = r_out.rest.len() >= MAX_LISTENERS;
+        if full {
             out.truncated = true;
-            return;
+            if keep.is_empty() {
+                // Nothing more is wanted from this file: the cut costs nothing.
+                out.cut = true;
+                return;
+            }
         }
-        if n % 1024 == 0 && Instant::now() >= deadline {
+        if n == MAX_LINES || (n % 1024 == 0 && Instant::now() >= deadline) {
             out.truncated = true;
+            out.cut = true;
             return;
         }
         line.clear();
@@ -199,6 +286,7 @@ fn read_from(f: impl Read, deadline: Instant, out: &mut NetRead) {
             Ok(_) => {}
             Err(_) => {
                 out.truncated = true;
+                out.cut = true;
                 return;
             }
         }
@@ -207,16 +295,36 @@ fn read_from(f: impl Read, deadline: Instant, out: &mut NetRead) {
             let mut rest = Vec::new();
             if (&mut r).take(1 << 20).read_until(b'\n', &mut rest).is_err() {
                 out.truncated = true;
+                out.cut = true;
                 return;
             }
             continue;
         }
-        if let Some(s) = std::str::from_utf8(&line)
+        // Past the cap most lines are connections (a host with that many sockets): skip those
+        // without parsing them.
+        if full && !is_listen_line(&line) {
+            continue;
+        }
+        let Some(s) = std::str::from_utf8(&line)
             .ok()
             .and_then(parse_line)
             .and_then(socket)
-        {
-            out.sockets.push(s);
+        else {
+            continue;
+        };
+        if keep.wants(&s) {
+            if s.uid != uid {
+                if r_out.kept_other.insert((s.addr, s.port.get())) {
+                    r_out.kept.push(s);
+                }
+            } else if r_out.kept_own < MAX_KEPT_OWN {
+                r_out.kept_own += 1;
+                r_out.kept.push(s);
+            } else {
+                out.truncated = true;
+            }
+        } else if !full {
+            r_out.rest.push(s);
         }
     }
 }
@@ -325,13 +433,17 @@ mod tests {
             b"   9: 0100007F:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1\n",
         );
         let mut out = NetRead::default();
+        let mut r = Reading::default();
         read_from(
             &raw[..],
             Instant::now() + std::time::Duration::from_secs(5),
+            &Keep::default(),
+            ME,
+            &mut r,
             &mut out,
         );
-        assert_eq!(out.sockets.len(), 2, "{:?}", out.sockets);
-        assert_eq!(out.sockets[1].inode, 777);
+        assert_eq!(r.rest.len(), 2, "{:?}", r.rest);
+        assert_eq!(r.rest[1].inode, 777);
     }
 
     #[test]
@@ -352,17 +464,89 @@ mod tests {
         }
     }
 
+    /// A `/proc/net/tcp` LISTEN row.
+    fn listen_row(ip: [u8; 4], port: u16, uid: u32, inode: u64) -> String {
+        format!(
+            "   0: {:08X}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 {uid:>5}        0 {inode} 1\n",
+            u32::from_ne_bytes(ip)
+        )
+    }
+
+    /// SW4 (security sweep, finding 7): another user fills the table past [`MAX_LISTENERS`]
+    /// with listeners that sort before their squat on a `-L` target. The squat (and the user's
+    /// own socket on the target) are kept whatever the cap; nothing else past it is (mutation:
+    /// stop at the cap as before, and the squat is gone).
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn the_listener_cap_never_hides_a_target() {
+        let mut t = String::from("header\n");
+        for i in 0..MAX_LISTENERS + 500 {
+            t += &listen_row([127, 1, (i >> 8) as u8, i as u8], 5432, THEM, i as u64);
+        }
+        // The user's v6-only wildcard is in tcp6; the squat on 127.0.0.1 comes last in tcp.
+        t += &listen_row([127, 0, 0, 1], 5432, THEM, 99_001);
+        // Duplicates of another user's kept row are kept once.
+        for i in 0..50 {
+            t += &listen_row([127, 0, 0, 1], 5432, THEM, 99_100 + i);
+        }
+        // Not a target: past the cap, dropped.
+        t += &listen_row([127, 0, 0, 1], 6000, THEM, 99_002);
+        let dir = std::env::temp_dir().join(format!("fil-procnet-cap-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("net")).unwrap();
+        std::fs::write(dir.join("net/tcp"), &t).unwrap();
+        let later = Instant::now() + std::time::Duration::from_secs(10);
+        let keep = Keep::new([5432], []);
+        let r = read(&dir, later, &keep, ME);
+        let without = read(&dir, later, &Keep::default(), ME);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let has = |r: &NetRead, inode: u64| r.sockets.iter().any(|s| s.inode == inode);
+        assert!(r.truncated && !r.cut, "bounded, but the targets are known");
+        assert!(has(&r, 99_001), "the squat is kept");
+        assert!(!has(&r, 99_002), "nothing else past the cap");
+        assert_eq!(
+            r.sockets
+                .iter()
+                .filter(|s| s.addr == IpAddr::from([127, 0, 0, 1]))
+                .count(),
+            1,
+            "another user's kept rows are one per address and port"
+        );
+        assert_eq!(r.sockets.len(), MAX_LISTENERS + 1);
+        // Without targets the read stops at the cap, as it always did, and says it was cut.
+        assert!(!has(&without, 99_001) && without.cut);
+    }
+
+    /// The line bound (or the deadline) leaves the rest of a file unread: then a target's holder
+    /// is unknown, and the read says so.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_file_not_read_to_its_end_is_cut() {
+        let mut out = NetRead::default();
+        let mut r = Reading::default();
+        let t = listen_row([127, 0, 0, 1], 5432, THEM, 1);
+        read_from(
+            t.as_bytes(),
+            Instant::now(),
+            &Keep::new([5432], []),
+            ME,
+            &mut r,
+            &mut out,
+        );
+        assert!(out.cut && out.truncated && r.kept.is_empty());
+    }
+
     /// S4 (review of #64): no `net/tcp` is "cannot tell", not "no listeners".
     #[test]
     fn a_missing_tcp_table_is_incomplete_and_a_missing_tcp6_is_not() {
         let later = Instant::now() + std::time::Duration::from_secs(1);
-        let r = read(Path::new("/nonexistent/fil-ports-test"), later);
+        let none = Keep::default();
+        let r = read(Path::new("/nonexistent/fil-ports-test"), later, &none, ME);
         assert!(r.sockets.is_empty());
         assert!(r.missing && !r.truncated);
         let dir = std::env::temp_dir().join(format!("fil-procnet-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("net")).unwrap();
         std::fs::write(dir.join("net/tcp"), fixture("tcp")).unwrap();
-        let r = read(&dir, later);
+        let r = read(&dir, later, &none, ME);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!r.missing && !r.truncated);
         assert_eq!(r.sockets.len(), 5);

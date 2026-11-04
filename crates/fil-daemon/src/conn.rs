@@ -345,7 +345,10 @@ impl Inner {
     /// The answer to a request: one response, or the parts of a `Ports` answer.
     async fn request(self: &Arc<Self>, req: Request) -> Vec<Response> {
         match req {
-            Request::Ports { session } => self.ports(session).await,
+            Request::Ports {
+                session,
+                probe_other,
+            } => self.ports(session, probe_other).await,
             other => vec![self.request_one(other).await],
         }
     }
@@ -419,7 +422,13 @@ impl Inner {
     /// `fil ports [SESSION]`: every session (the discovery needs all of them to tell whose a
     /// listener is) with its forward rows, handed to the listener discovery and probe
     /// ([`crate::ports`]), which answers in parts.
-    async fn ports(self: &Arc<Self>, focus: Option<fil_proto::msg::SessionName>) -> Vec<Response> {
+    /// `probe_other`: `fil ports --probe` (or `[ports] probe_other`) probes the user's listeners
+    /// outside the sessions too.
+    async fn ports(
+        self: &Arc<Self>,
+        focus: Option<fil_proto::msg::SessionName>,
+        probe_other: bool,
+    ) -> Vec<Response> {
         if let Some(name) = &focus
             && self.session(name).is_none()
         {
@@ -450,6 +459,7 @@ impl Inner {
             return vec![Response::NoSuchSession];
         }
         let mut q = PortsQuery::new(sessions, focus, self.cfg.ports_probe);
+        q.probe_other = probe_other || self.cfg.ports_probe_other;
         q.policy = self.host.policy.lines();
         crate::ports::ports(q).await.into_responses()
     }

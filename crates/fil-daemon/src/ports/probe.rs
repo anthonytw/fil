@@ -15,6 +15,10 @@
 //!   with the body dropped (Flask, Express, Django and Rails all do this), so whatever `GET /`
 //!   does on a dev server, a `HEAD` does too. `ports.probe = "full"` sends a `GET` (for the page
 //!   title); `"off"` sends nothing. The server logs the request like any other.
+//! - **Tunnels.** A listener that forwards elsewhere (`ssh -L`, `kubectl port-forward`, a cloud
+//!   database proxy) passes the probe on to whatever it leads to, another host included, which
+//!   logs it. So the caller probes only the `-L` targets and the sessions' listeners unless asked
+//!   for more, and never a known forwarder (`super::FORWARDERS`).
 //! - **One-shot listeners** (`nc -l`, `gdbserver --once`, a script that accepts once) lose their
 //!   one connection to the probe: `nc` prints the request and exits.
 //! - **Postgres** logs `invalid length of startup packet` once (it reads the HTTP request line as

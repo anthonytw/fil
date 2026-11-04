@@ -52,7 +52,9 @@ pub enum ViewError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortsAnswer {
     pub rows: Vec<PortsRow>,
-    /// More rows came than the protocol allows ([`MAX_PORTS_ROWS`]); the rest were dropped.
+    /// The list is cut: the daemon had more rows than an answer holds ([`MAX_PORTS_ROWS`]) and
+    /// said so (`PortsPart::cut`), or more rows came than the protocol allows and the rest were
+    /// dropped here.
     pub truncated: bool,
     /// The last part said no more were coming.
     pub complete: bool,
@@ -77,6 +79,7 @@ impl PortsAnswer {
                 return Err(ViewError::NotPorts(variant_name(p).to_string()));
             };
             incomplete = incomplete.or(part.incomplete);
+            truncated |= part.cut;
             for row in &part.rows {
                 if rows.len() == MAX_PORTS_ROWS {
                     truncated = true;
@@ -491,6 +494,15 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     if let Some(r) = &f.policy {
         detail.push(format!("⚠ refused by server policy: {r}"));
     }
+    if let Some(s) = &f.socks_refused {
+        // A count and the setting: the targets are not named (DESIGN.md section 11.2).
+        detail.push(format!(
+            "⚠ server policy refused {} SOCKS connection{} through it (latest: {})",
+            s.count,
+            if s.count == 1 { "" } else { "s" },
+            s.last
+        ));
+    }
     if f.waiting > 0 {
         detail.push(format!(
             "{} connection{} waiting for the link",
@@ -810,6 +822,15 @@ struct JsonForward {
     target_other_user: bool,
     /// Server policy refuses this forward now: the deciding setting and its source.
     policy: Option<String>,
+    /// A `-D`: the SOCKS connections server policy refused in this client's run.
+    socks_refused: Option<JsonSocksRefused>,
+}
+
+#[derive(Serialize)]
+struct JsonSocksRefused {
+    count: u32,
+    /// The latest one's deciding setting and its source (sanitized); no target.
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -929,6 +950,10 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         probe: f.probe.as_ref().map(json_probe),
         target_other_user: f.target_other_user,
         policy: f.policy.as_ref().map(|r| r.to_string()),
+        socks_refused: f.socks_refused.as_ref().map(|s| JsonSocksRefused {
+            count: s.count,
+            reason: s.last.to_string(),
+        }),
     }
 }
 

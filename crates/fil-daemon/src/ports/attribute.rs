@@ -446,11 +446,16 @@ pub(crate) mod fake {
     impl FakeProc {
         pub fn new(tag: &str) -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!(
+            Self::at(std::env::temp_dir().join(format!(
                 "fil-ports-{tag}-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
-            ));
+            )))
+        }
+
+        /// In `dir` (made, and removed on drop): a child test process builds its fake `/proc`
+        /// where its parent, which removes it whatever the child did, said.
+        pub fn at(dir: PathBuf) -> Self {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("net")).unwrap();
             Self { dir }
@@ -496,9 +501,18 @@ pub(crate) mod fake {
         }
     }
 
+    /// The cleanup fails loudly (it used to hide an `EMFILE` and leave the directory behind),
+    /// except while a test is already failing, where a second panic would abort.
     impl Drop for FakeProc {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            match std::fs::remove_dir_all(&self.dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if !std::thread::panicking() => {
+                    panic!("cannot remove the fake /proc {}: {e}", self.dir.display())
+                }
+                Err(_) => {}
+            }
         }
     }
 }

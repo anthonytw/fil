@@ -98,7 +98,11 @@ async fn run(action: Action, config: &Config) -> u8 {
         }
         Action::DetachHere => cmds::detach_here(config).await,
         Action::Forward { target, op } => cmds::forward(target, op, config).await,
-        Action::Ports { target, json } => cmds::ports(target, json, config).await,
+        Action::Ports {
+            target,
+            json,
+            probe_other,
+        } => cmds::ports(target, json, probe_other, config).await,
         Action::ServerStdio | Action::ServerDaemon => unreachable!("handled before the runtime"),
     }
 }

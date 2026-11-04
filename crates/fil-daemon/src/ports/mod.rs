@@ -18,7 +18,12 @@
 //!   opened ([`attribute`]).
 //! - The scan is bounded in processes, descriptors and time ([`ScanLimits`]).
 //! - The probe touches only loopback, only the user's own listeners, only when asked, within
-//!   [`probe::LIMITS`], with `HEAD` unless `ports.probe = "full"` ([`probe`]).
+//!   [`probe::LIMITS`], with `HEAD` unless `ports.probe = "full"` ([`probe`]). By default it
+//!   reaches only the `-L` targets and the listeners started in a session; the user's other
+//!   listeners are often tunnels to other hosts (`ssh -L`, `kubectl port-forward`), and a probe
+//!   through one reaches whatever it leads to, so they are probed only on request
+//!   (`fil ports --probe`, `[ports] probe_other`). A listener held by a known forwarder
+//!   ([`FORWARDERS`]) is never probed.
 //! - Listeners, process names, working directories and probe results are user data: nothing in
 //!   this module logs any of them, at any level (`tests/ports_log.rs`).
 //! - Nothing here blocks a runtime worker: the `/proc` reads run in `spawn_blocking` under a
@@ -36,12 +41,13 @@ pub mod attribute;
 pub mod probe;
 pub mod procnet;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
     AgentRow, ForwardRow, ListenerOwner, ListenerRow, PolicyLine, PortsIncomplete, PortsRow,
     ProcessInfo, RefusedRow, Response, SessionName, SessionSummary,
@@ -80,6 +86,9 @@ pub struct PortsQuery {
     /// are still listed).
     pub focus: Option<SessionName>,
     pub probe: ProbeMode,
+    /// Probe the user's listeners that no session started too (`fil ports --probe`,
+    /// `[ports] probe_other`); by default only the `-L` targets and the session's listeners are.
+    pub probe_other: bool,
     pub probe_limits: ProbeLimits,
     pub scan: ScanLimits,
     /// The daemon's own pid: its listeners are the `-R` forwards, which have rows of their own
@@ -88,7 +97,7 @@ pub struct PortsQuery {
     /// never attributed at all; they are kept out by their forward rows' ports and because only
     /// attributed listeners are probed.
     pub daemon_pid: Option<u32>,
-    /// What to say about the host's server policy (DESIGN.md section 11.2), after the rest.
+    /// What to say about the host's server policy (DESIGN.md section 11.2), before the rest.
     pub policy: Vec<PolicyLine>,
 }
 
@@ -103,12 +112,113 @@ impl PortsQuery {
             sessions,
             focus,
             probe,
+            probe_other: false,
             probe_limits: LIMITS,
             scan: ScanLimits::default(),
             daemon_pid: Some(std::process::id()),
             policy: Vec::new(),
         }
     }
+}
+
+/// The process names (`comm`, as the kernel cuts them to 15 bytes) of common port forwarders and
+/// tunnels. A listener one of them holds leads somewhere else, often to another host: it is
+/// never probed, whatever `fil ports` asks, because the probe would reach whatever is behind it.
+/// Kept short on purpose: it catches the common tools by their binary's name, not every way to
+/// run one (a forwarder started as `python3 …` is not recognised).
+pub const FORWARDERS: &[&str] = &[
+    "ssh",
+    "autossh",
+    "sshuttle",
+    "kubectl",
+    "oc",
+    "cloud-sql-proxy",
+    "cloudflared",
+    "session-manager-plugin",
+    "socat",
+    "nc",
+    "ncat",
+    "chisel",
+    "ngrok",
+    "tsh",
+];
+
+/// The kernel's longest `comm`.
+const COMM_LEN: usize = 15;
+
+/// Whether `p` is one of the [`FORWARDERS`].
+pub fn is_forwarder(p: &ProcessInfo) -> bool {
+    let name = p.name.as_str();
+    FORWARDERS
+        .iter()
+        .any(|f| name == &f[..f.len().min(COMM_LEN)])
+}
+
+/// Whether `ip` is one of this host's own addresses: a bind to it succeeds (a UDP socket on an
+/// ephemeral port, bound and closed at once; nothing is sent). Loopback and the wildcards always
+/// are. A host that allows non-local binds (`ip_nonlocal_bind`) says yes to anything; then a
+/// target elsewhere is matched to the local listeners as it used to be.
+pub fn is_local(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// What discovery needs from the sessions' forward tables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Targets {
+    /// The ports of every `-L` target: their listeners are kept whatever the scan's cap.
+    pub ports: Vec<NonZeroU16>,
+    /// The `-L` target addresses that are neither loopback nor a wildcard (canonical).
+    pub ips: Vec<IpAddr>,
+    /// The `-R` ports: the daemon's own listeners, which are left out of the scan (the daemon
+    /// is not dumpable, so a search for their holder would walk every process in vain).
+    pub daemon_ports: Vec<NonZeroU16>,
+}
+
+impl Targets {
+    pub fn of(sessions: &[SessionPorts]) -> Self {
+        let mut t = Targets {
+            daemon_ports: remote_ports(sessions),
+            ..Targets::default()
+        };
+        for f in sessions.iter().flat_map(|s| &s.forwards) {
+            if f.spec.kind() != ForwardKind::Local {
+                continue;
+            }
+            let Some(target) = f.spec.target() else {
+                continue;
+            };
+            t.ports.push(target.port);
+            if let TargetHost::Ip(ip) = target.host {
+                let ip = ip.to_canonical();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    t.ips.push(ip);
+                }
+            }
+        }
+        for v in [&mut t.ports, &mut t.daemon_ports] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        t.ips.sort_unstable();
+        t.ips.dedup();
+        t
+    }
+}
+
+/// The `-R` listeners' ports: the daemon's own, with forward rows of their own.
+fn remote_ports(sessions: &[SessionPorts]) -> Vec<NonZeroU16> {
+    sessions
+        .iter()
+        .flat_map(|s| &s.forwards)
+        .filter(|f| f.spec.kind() == ForwardKind::Remote)
+        .filter_map(|f| match f.listen {
+            Some(ListenState::Listening { port }) => Some(port),
+            _ => NonZeroU16::new(f.spec.port()),
+        })
+        .collect()
 }
 
 /// `/proc` on Linux; `None` elsewhere (no discovery: macOS would need libproc).
@@ -172,6 +282,12 @@ pub struct Discovery {
     pub listeners: Vec<Found>,
     /// Some listeners may be missing or unattributed, and why.
     pub incomplete: Option<PortsIncomplete>,
+    /// The `-L` target addresses (of [`Targets::ips`]) that are this host's own ([`is_local`]).
+    /// A target anywhere else is not matched to this host's listeners.
+    pub local: HashSet<IpAddr>,
+    /// The socket tables were not read to their end, so a listener on a `-L` target may be
+    /// missing: no target is given an owner.
+    pub targets_cut: bool,
 }
 
 /// The listeners in `root`, attributed. Blocking, and bounded by `limits`.
@@ -182,10 +298,20 @@ pub fn discover(
     sessions: &[(SessionName, Membership)],
     daemon_pid: Option<u32>,
     limits: &ScanLimits,
+    targets: &Targets,
 ) -> Discovery {
     let deadline = Instant::now() + limits.budget;
-    let net = procnet::read(root.path(), deadline);
-    let split = procnet::split(net.sockets, uid);
+    let keep = procnet::Keep::new(
+        targets.ports.iter().map(|p| p.get()),
+        targets.ips.iter().copied(),
+    );
+    let net = procnet::read(root.path(), deadline, &keep, uid);
+    let targets_cut = net.cut;
+    let mut split = procnet::split(net.sockets, uid);
+    // The daemon's own `-R` listeners: known, never searched for.
+    split
+        .own
+        .retain(|s| !targets.daemon_ports.contains(&s.port));
     let wanted = split.own.iter().map(|s| s.inode).collect();
     let mut membership = attribute::Sessions::new(root, uid, sessions);
     let first = membership.known_pids();
@@ -249,6 +375,13 @@ pub fn discover(
         } else {
             truncated.then_some(PortsIncomplete::Bounded)
         },
+        local: targets
+            .ips
+            .iter()
+            .copied()
+            .filter(|&ip| is_local(ip))
+            .collect(),
+        targets_cut,
     }
 }
 
@@ -309,13 +442,19 @@ struct TargetMatch {
 /// to either loopback: when either reaches another user's listener, the target has no owner and
 /// no probe. A port that is one of the `-R` listeners (the daemon's own) is never probed.
 fn target_listener(d: &Discovery, t: &Target, remote_ports: &[NonZeroU16]) -> TargetMatch {
+    if d.targets_cut {
+        // The listener that takes it may be in the part of the table that was not read.
+        return TargetMatch::default();
+    }
     let candidates: Vec<IpAddr> = match &t.host {
         // A connection to a wildcard address goes to the loopback of its family on Linux.
-        TargetHost::Ip(ip) => vec![match ip.to_canonical() {
-            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ip => ip,
-        }],
+        TargetHost::Ip(ip) => match ip.to_canonical() {
+            IpAddr::V4(v4) if v4.is_unspecified() => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            IpAddr::V6(v6) if v6.is_unspecified() => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+            ip if ip.is_loopback() || d.local.contains(&ip) => vec![ip],
+            // Elsewhere on the network: no listener of this host takes it.
+            _ => return TargetMatch::default(),
+        },
         TargetHost::Name(n) if n.is_localhost() => {
             vec![
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -359,7 +498,9 @@ fn target_listener(d: &Discovery, t: &Target, remote_ports: &[NonZeroU16]) -> Ta
     let (c, i) = bests[0];
     if let Holder::Process { process, .. } = &d.listeners[i].holder {
         m.owner = Some(process.clone());
-        m.probe = c.is_loopback().then(|| SocketAddr::new(c, t.port.get()));
+        // Never through a forwarder: the probe would reach what it leads to.
+        m.probe =
+            (c.is_loopback() && !is_forwarder(process)).then(|| SocketAddr::new(c, t.port.get()));
     }
     m
 }
@@ -372,23 +513,18 @@ pub struct ProbeSlot {
     pub addr: SocketAddr,
 }
 
-/// The rows of the answer, without probes, and where to probe for which row. Pure.
+/// The rows of the answer, without probes, and where to probe for which row, in the order the
+/// probes should go (the forwards' targets and each session's listeners first). Pure.
+/// `probe_other`: the user's listeners that no session started are probed too.
 pub fn layout(
     sessions: &[SessionPorts],
     focus: Option<&SessionName>,
     d: &Discovery,
+    probe_other: bool,
 ) -> (Vec<PortsRow>, Vec<ProbeSlot>) {
     // The `-R` listeners are the daemon's own and have forward rows; a listener on one of their
     // ports is never listed or probed, even if the scan did not find the daemon holding it.
-    let remote_ports: Vec<NonZeroU16> = sessions
-        .iter()
-        .flat_map(|s| &s.forwards)
-        .filter(|f| f.spec.kind() == ForwardKind::Remote)
-        .filter_map(|f| match f.listen {
-            Some(ListenState::Listening { port }) => Some(port),
-            _ => NonZeroU16::new(f.spec.port()),
-        })
-        .collect();
+    let remote_ports = remote_ports(sessions);
     let mut forwarded = vec![false; d.listeners.len()];
     let mut rows = Vec::new();
     let mut slots = Vec::new();
@@ -397,9 +533,16 @@ pub fn layout(
                          mut picked: Vec<(&Found, ListenerOwner)>| {
         picked.sort_by_key(|(f, _)| (f.port, f.addr));
         for (f, owner) in picked {
-            // Only a listener held by one of the user's processes, as found: a socket of the
-            // user's uid whose process was not found may be the daemon's own `-R` listener.
-            if matches!(f.holder, Holder::Process { .. })
+            // Only a listener held by one of the user's processes, as found (a socket of the
+            // user's uid whose process was not found may be the daemon's own `-R` listener), and
+            // not a forwarder's; outside a session, only when asked.
+            let wanted = match &owner {
+                ListenerOwner::Session { process, .. } => !is_forwarder(process),
+                ListenerOwner::Mine(Some(process)) => probe_other && !is_forwarder(process),
+                ListenerOwner::Mine(None) | ListenerOwner::Other => false,
+            };
+            if wanted
+                && matches!(f.holder, Holder::Process { .. })
                 && let Some(addr) = loopback_of(f.addr, f.port)
             {
                 slots.push(ProbeSlot {
@@ -529,6 +672,7 @@ pub async fn ports(q: PortsQuery) -> Answer {
         None => Discovery {
             listeners: Vec::new(),
             incomplete: Some(PortsIncomplete::Unsupported),
+            ..Discovery::default()
         },
         Some(root) => {
             let scopes: Vec<(SessionName, Membership)> = q
@@ -537,6 +681,7 @@ pub async fn ports(q: PortsQuery) -> Answer {
                 .map(|s| (s.summary.name.clone(), s.membership.clone()))
                 .collect();
             let (uid, home, pid, limits) = (q.uid, q.home.clone(), q.daemon_pid, q.scan);
+            let targets = Targets::of(&q.sessions);
             let job = tokio::task::spawn_blocking(move || {
                 discover(
                     &ProcRoot::new(root),
@@ -545,6 +690,7 @@ pub async fn ports(q: PortsQuery) -> Answer {
                     &scopes,
                     pid,
                     &limits,
+                    &targets,
                 )
             });
             match tokio::time::timeout(q.scan.budget + DISCOVERY_SLACK, job).await {
@@ -552,6 +698,7 @@ pub async fn ports(q: PortsQuery) -> Answer {
                 _ => Discovery {
                     listeners: Vec::new(),
                     incomplete: Some(PortsIncomplete::TimedOut),
+                    ..Discovery::default()
                 },
             }
         }
@@ -560,12 +707,29 @@ pub async fn ports(q: PortsQuery) -> Answer {
         // A reason only: no numbers, addresses or names.
         tracing::debug!(?why, "the listener scan is incomplete");
     }
-    let (mut rows, slots) = layout(&q.sessions, q.focus.as_ref(), &d);
-    // At the end, so the probe slots' row numbers stay right.
-    rows.extend(q.policy.iter().cloned().map(PortsRow::Policy));
-    let mut addrs: Vec<SocketAddr> = slots.iter().map(|s| s.addr).collect();
-    addrs.sort();
-    addrs.dedup();
+    let (listed, slots) = layout(&q.sessions, q.focus.as_ref(), &d, q.probe_other);
+    // The host-wide policy lines first, where an answer cut at its row cap keeps them
+    // ([`Answer::into_responses`]); the probe slots move down with the rest, and a row past the
+    // cap is not probed.
+    let mut rows: Vec<PortsRow> = q.policy.iter().cloned().map(PortsRow::Policy).collect();
+    let above = rows.len();
+    rows.extend(listed);
+    let slots: Vec<ProbeSlot> = slots
+        .into_iter()
+        .map(|s| ProbeSlot {
+            row: s.row + above,
+            ..s
+        })
+        .filter(|s| s.row < MAX_PORTS_ROWS)
+        .collect();
+    // In the layout's order, each address once: the probe takes its ports in turn, so the
+    // targets and the sessions' listeners are not left waiting behind the others.
+    let mut seen = HashSet::new();
+    let addrs: Vec<SocketAddr> = slots
+        .iter()
+        .map(|s| s.addr)
+        .filter(|a| seen.insert(*a))
+        .collect();
     let found = probe::probe_all(&addrs, q.probe, q.probe_limits).await;
     let by_addr: HashMap<SocketAddr, _> = addrs.into_iter().zip(found).collect();
     for s in slots {
@@ -590,7 +754,8 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// The parts to send ([`Response::ports_with`]).
+    /// The parts to send ([`Response::ports_with`]): cut at [`MAX_PORTS_ROWS`] rows, and then
+    /// marked as cut. The policy lines come first, so they are never the rows cut.
     pub fn into_responses(self) -> Vec<Response> {
         Response::ports_with(self.rows, self.incomplete)
     }
@@ -652,6 +817,7 @@ mod tests {
             probe: None,
             target_other_user: false,
             policy: None,
+            socks_refused: None,
         }
     }
 
@@ -726,6 +892,7 @@ mod tests {
             &scopes,
             Some(77),
             &ScanLimits::default(),
+            &Targets::of(&sessions()),
         )
     }
 
@@ -774,6 +941,7 @@ mod tests {
             &[],
             None,
             &ScanLimits::default(),
+            &Targets::default(),
         );
         assert!(
             d.listeners.iter().all(|l| l.holder == Holder::Other),
@@ -787,7 +955,7 @@ mod tests {
         let f = host();
         let d = discovered(&f);
         let s = sessions();
-        let (rows, slots) = layout(&s, None, &d);
+        let (rows, slots) = layout(&s, None, &d, false);
         let shape: Vec<String> = rows
             .iter()
             .map(|r| match r {
@@ -828,21 +996,31 @@ mod tests {
                 "listener 0.0.0.0:22 other",
             ]
         );
-        // Probes: the -L target (own, loopback), python's wildcard at its loopback, postgres.
-        // Never sshd (not the user's), never the -R listener (the daemon's), never the
-        // unattributed 7000.
-        let probed: Vec<(usize, String)> =
-            slots.iter().map(|s| (s.row, s.addr.to_string())).collect();
+        // Probes: the -L target (own, loopback), python's wildcard at its loopback. Not
+        // postgres, which no session started (only with `--probe`). Never sshd (not the
+        // user's), never the -R listener (the daemon's), never the unattributed 7000.
+        let probed = |slots: &[ProbeSlot]| -> Vec<(usize, String)> {
+            slots.iter().map(|s| (s.row, s.addr.to_string())).collect()
+        };
         assert_eq!(
-            probed,
+            probed(&slots),
+            vec![
+                (1, "127.0.0.1:5173".to_string()),
+                (3, "127.0.0.1:8000".to_string()),
+            ]
+        );
+        let (_, slots) = layout(&s, None, &d, true);
+        assert_eq!(
+            probed(&slots),
             vec![
                 (1, "127.0.0.1:5173".to_string()),
                 (3, "127.0.0.1:8000".to_string()),
                 (5, "127.0.0.1:5432".to_string()),
-            ]
+            ],
+            "with --probe, postgres too"
         );
         // `fil ports other`: main's rows are left out, its listeners are not "mine" either.
-        let (rows, _) = layout(&s, Some(&name("other")), &d);
+        let (rows, _) = layout(&s, Some(&name("other")), &d, false);
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(matches!(&rows[0], PortsRow::Session(s) if s.name.as_str() == "other"));
     }
@@ -924,6 +1102,7 @@ mod tests {
                 found("127.0.0.1", 18231, Holder::Other),
             ],
             incomplete: None,
+            ..Discovery::default()
         };
         for host in ["127.0.0.1", "localhost"] {
             let s = one_session(vec![forward(
@@ -932,7 +1111,7 @@ mod tests {
                 8080,
                 Some((host, 18231)),
             )]);
-            let (rows, slots) = layout(&s, None, &d);
+            let (rows, slots) = layout(&s, None, &d, false);
             let (fwds, ls) = forwards_and_listeners(&rows, &slots);
             assert_eq!(fwds, vec![(None, None)], "-L to {host}");
             assert_eq!(squats(&rows), vec![true], "the client is told");
@@ -965,13 +1144,14 @@ mod tests {
                 found("0.0.0.0", 5000, proc_in(501, "srv", None)),
             ],
             incomplete: None,
+            ..Discovery::default()
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Local, 1, Some(("0.0.0.0", 18231))),
             forward("main", ForwardKind::Local, 2, Some(("::", 18231))),
             forward("main", ForwardKind::Local, 3, Some(("0.0.0.0", 5000))),
         ]);
-        let (rows, slots) = layout(&s, None, &d);
+        let (rows, slots) = layout(&s, None, &d, false);
         let (fwds, _) = forwards_and_listeners(&rows, &slots);
         assert_eq!(
             fwds,
@@ -994,13 +1174,14 @@ mod tests {
                 found("::1", 5173, Holder::Other),
             ],
             incomplete: None,
+            ..Discovery::default()
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Local, 1, Some(("localhost", 5173))),
             forward("main", ForwardKind::Local, 2, Some(("127.0.0.1", 5173))),
             forward("main", ForwardKind::Local, 3, Some(("::1", 5173))),
         ]);
-        let (rows, slots) = layout(&s, None, &d);
+        let (rows, slots) = layout(&s, None, &d, false);
         let (fwds, ls) = forwards_and_listeners(&rows, &slots);
         assert_eq!(
             fwds,
@@ -1024,6 +1205,7 @@ mod tests {
                 found("127.0.0.1", 6000, Holder::Unattributed),
             ],
             incomplete: None,
+            ..Discovery::default()
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Local, 1, Some(("127.0.0.1", 3000))),
@@ -1031,7 +1213,7 @@ mod tests {
             forward("main", ForwardKind::Local, 3, Some(("127.0.0.1", 4000))),
             forward("main", ForwardKind::Local, 4, Some(("127.0.0.1", 6000))),
         ]);
-        let (rows, slots) = layout(&s, None, &d);
+        let (rows, slots) = layout(&s, None, &d, false);
         let (fwds, ls) = forwards_and_listeners(&rows, &slots);
         assert_eq!(
             fwds,
@@ -1054,12 +1236,13 @@ mod tests {
         let d = Discovery {
             listeners: vec![found("127.0.0.1", 9000, proc_in(77, "fil", None))],
             incomplete: None,
+            ..Discovery::default()
         };
         let s = one_session(vec![
             forward("main", ForwardKind::Remote, 9000, Some(("127.0.0.1", 22))),
             forward("main", ForwardKind::Local, 1, Some(("localhost", 9000))),
         ]);
-        let (rows, slots) = layout(&s, None, &d);
+        let (rows, slots) = layout(&s, None, &d, false);
         let (fwds, ls) = forwards_and_listeners(&rows, &slots);
         assert_eq!(fwds, vec![(None, None), (None, None)]);
         assert!(ls.is_empty() && slots.is_empty(), "{ls:?} {slots:?}");
@@ -1071,6 +1254,7 @@ mod tests {
         let d = Discovery {
             listeners: vec![found("127.0.0.1", 5000, proc_in(9, "srv", Some("a")))],
             incomplete: None,
+            ..Discovery::default()
         };
         let s = vec![
             SessionPorts {
@@ -1093,14 +1277,314 @@ mod tests {
                 refused: vec![],
             },
         ];
-        let (rows, _) = layout(&s, Some(&name("a")), &d);
+        let (rows, _) = layout(&s, Some(&name("a")), &d, false);
         assert!(
             rows.iter()
                 .any(|r| matches!(r, PortsRow::Listener(l) if l.port.get() == 5000)),
             "{rows:?}"
         );
-        let (rows, _) = layout(&s, None, &d);
+        let (rows, _) = layout(&s, None, &d, false);
         assert!(!rows.iter().any(|r| matches!(r, PortsRow::Listener(_))));
+    }
+
+    /// SW4 (privacy sweep, finding 1): a known forwarder is never probed, wherever it is: a
+    /// session's `ssh -L`, the holder of a `-L` target, or one of the user's other listeners
+    /// under `--probe` (mutation: drop the `is_forwarder` checks, and these are probed). The
+    /// rows are still listed, with their owner.
+    #[test]
+    fn a_forwarder_is_never_probed() {
+        let d = Discovery {
+            listeners: vec![
+                found("127.0.0.1", 15432, proc_in(10, "ssh", Some("main"))),
+                found("127.0.0.1", 16443, proc_in(11, "kubectl", None)),
+                found("127.0.0.1", 17000, proc_in(12, "session-manager", None)),
+                found("127.0.0.1", 18000, proc_in(13, "vite", Some("main"))),
+            ],
+            incomplete: None,
+            ..Discovery::default()
+        };
+        let s = one_session(vec![forward(
+            "main",
+            ForwardKind::Local,
+            1,
+            Some(("localhost", 16443)),
+        )]);
+        let (rows, slots) = layout(&s, None, &d, true);
+        let (fwds, ls) = forwards_and_listeners(&rows, &slots);
+        assert_eq!(fwds, vec![(Some(11), None)], "owner shown, not probed");
+        assert_eq!(
+            ls,
+            vec![
+                ("127.0.0.1:15432 own".to_string(), false),
+                ("127.0.0.1:18000 own".to_string(), true),
+                ("127.0.0.1:17000 own".to_string(), false),
+            ]
+        );
+        for name in FORWARDERS {
+            let p = ProcessInfo {
+                pid: 1,
+                name: fil_proto::msg::ProcessName::capped(&name[..name.len().min(15)]),
+                cwd: None,
+            };
+            assert!(is_forwarder(&p), "{name}");
+        }
+        assert!(!is_forwarder(&ProcessInfo {
+            pid: 1,
+            name: fil_proto::msg::ProcessName::capped("sshd"),
+            cwd: None,
+        }));
+    }
+
+    /// SW4 (security sweep, finding 6): a `-L` to an address elsewhere on the network reaches
+    /// that host, not this one's wildcard listener: no owner, no squat warning, and the local
+    /// listener is still listed as unforwarded (mutation: match every IP target, as `serves`
+    /// alone does, and the owner and the squat come back). The same target, when it is one of
+    /// this host's addresses, is matched.
+    #[test]
+    fn a_target_elsewhere_is_not_this_hosts_listener() {
+        let mut d = Discovery {
+            listeners: vec![
+                found("0.0.0.0", 5432, proc_in(500, "postgres", None)),
+                found("::", 6379, Holder::Other),
+            ],
+            incomplete: None,
+            ..Discovery::default()
+        };
+        let s = one_session(vec![
+            forward("main", ForwardKind::Local, 1, Some(("192.0.2.50", 5432))),
+            forward("main", ForwardKind::Local, 2, Some(("2001:db8::50", 6379))),
+        ]);
+        let (rows, slots) = layout(&s, None, &d, false);
+        let (fwds, ls) = forwards_and_listeners(&rows, &slots);
+        assert_eq!(fwds, vec![(None, None), (None, None)]);
+        assert_eq!(squats(&rows), vec![false, false]);
+        assert_eq!(ls.len(), 2, "both still listed: {ls:?}");
+        d.local = ["192.0.2.50", "2001:db8::50"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let (rows, slots) = layout(&s, None, &d, false);
+        let (fwds, _) = forwards_and_listeners(&rows, &slots);
+        // On this host: the owner, but no probe (the probe is loopback only).
+        assert_eq!(fwds, vec![(Some(500), None), (None, None)]);
+        assert_eq!(squats(&rows), vec![false, true]);
+        // The check itself: TEST-NET is nobody's own address; loopback and the wildcards are.
+        assert!(!is_local("192.0.2.50".parse().unwrap()));
+        assert!(!is_local("2001:db8::50".parse().unwrap()));
+        assert!(is_local("127.0.0.1".parse().unwrap()) && is_local("::".parse().unwrap()));
+        let t = Targets::of(&s);
+        assert_eq!(
+            t.ips,
+            vec![
+                "192.0.2.50".parse::<IpAddr>().unwrap(),
+                "2001:db8::50".parse().unwrap()
+            ]
+        );
+    }
+
+    /// SW4 (security sweep, finding 7), end to end on a fake `/proc`: another user fills the
+    /// socket table past its cap with listeners that sort before their squat on the user's `-L`
+    /// target. The forward still says another user holds it (mutation: no `Keep` in the read,
+    /// and the user's own v6 listener is shown as the owner).
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_squat_past_the_listener_cap_is_still_seen() {
+        let f = FakeProc::new("cap");
+        let them = me().wrapping_add(1);
+        let mut tcp = HEADER.to_string();
+        for i in 0..procnet::MAX_LISTENERS + 10 {
+            tcp += &tcp_row(
+                Ipv4Addr::new(127, 1, (i >> 8) as u8, i as u8),
+                5432,
+                them,
+                i as u64,
+            );
+        }
+        tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5432, them, 90_001);
+        f.net("tcp", &tcp);
+        // The user's `[::]:5432` (v6-only, say).
+        f.net(
+            "tcp6",
+            &format!(
+                "{HEADER}   0: 00000000000000000000000000000000:1538 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 {:>5}        0 90002 1\n",
+                me()
+            ),
+        );
+        f.process(4100, 1, "postgres", "/", &[90_002]);
+        let s = one_session(vec![forward(
+            "main",
+            ForwardKind::Local,
+            1,
+            Some(("127.0.0.1", 5432)),
+        )]);
+        let d = discover(
+            &f.root(),
+            me(),
+            None,
+            &[],
+            None,
+            &ScanLimits {
+                budget: Duration::from_secs(10),
+                ..ScanLimits::default()
+            },
+            &Targets::of(&s),
+        );
+        assert_eq!(d.incomplete, Some(PortsIncomplete::Bounded));
+        assert!(!d.targets_cut);
+        let (rows, slots) = layout(&s, None, &d, false);
+        let (fwds, _) = forwards_and_listeners(&rows, &slots);
+        assert_eq!(fwds, vec![(None, None)]);
+        assert_eq!(squats(&rows), vec![true]);
+        // A table not read to its end: nobody is named as the target's owner.
+        let d = Discovery {
+            listeners: vec![found("127.0.0.1", 5432, proc_in(4100, "postgres", None))],
+            targets_cut: true,
+            ..Discovery::default()
+        };
+        let (rows, slots) = layout(&s, None, &d, false);
+        assert_eq!(forwards_and_listeners(&rows, &slots).0, vec![(None, None)]);
+    }
+
+    /// Efficiency sweep, finding 8: the daemon's own `-R` listener (not dumpable, so its holder
+    /// is never found) is known up front and not searched for: the scan stops once the rest are
+    /// found, instead of walking every process (mutation: search for it, and this scan of a
+    /// host with more processes than `max_procs` ends `Bounded`).
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn the_daemons_own_listener_is_not_searched_for() {
+        let f = FakeProc::new("own-r");
+        let mut tcp = HEADER.to_string();
+        tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5173, me(), 301);
+        tcp += &tcp_row(Ipv4Addr::LOCALHOST, 9000, me(), 302);
+        f.net("tcp", &tcp);
+        f.process(10, 1, "vite", "/", &[301]);
+        for pid in 100..150 {
+            f.process(pid, 1, "sh", "/", &[]);
+        }
+        let s = one_session(vec![forward(
+            "main",
+            ForwardKind::Remote,
+            9000,
+            Some(("127.0.0.1", 22)),
+        )]);
+        let limits = ScanLimits {
+            max_procs: 10,
+            ..ScanLimits::default()
+        };
+        // vite is the session's known process, so it is looked at first.
+        let scopes = [(name("main"), Membership::Pids(vec![10]))];
+        let d = discover(
+            &f.root(),
+            me(),
+            None,
+            &scopes,
+            None,
+            &limits,
+            &Targets::of(&s),
+        );
+        assert_eq!(d.incomplete, None, "{d:?}");
+        assert_eq!(d.listeners.len(), 1, "only vite: {:?}", d.listeners);
+    }
+
+    /// SW4 (security sweep, finding 9): the server-policy lines come first, so an answer cut at
+    /// its row cap keeps them, and says it was cut (mutation: put them last, and they are the
+    /// rows cut).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_answer_keeps_the_policy_lines_and_says_so() {
+        let f = FakeProc::new("cut");
+        let them = me().wrapping_add(1);
+        let mut tcp = HEADER.to_string();
+        for i in 0..MAX_PORTS_ROWS as u16 + 20 {
+            tcp += &tcp_row(Ipv4Addr::LOCALHOST, 20_000 + i, them, u64::from(i));
+        }
+        f.net("tcp", &tcp);
+        let mut q = PortsQuery::new(one_session(vec![]), None, ProbeMode::Off);
+        q.proc_root = Some(f.dir.clone());
+        q.policy = vec![PolicyLine::Unreadable {
+            file: fil_proto::msg::PortsPath::new("/etc/ssh/sshd_config").unwrap(),
+        }];
+        let parts = ports(q).await.into_responses();
+        let mut rows = Vec::new();
+        for p in &parts {
+            let Response::Ports { part, .. } = p else {
+                panic!("{p:?}")
+            };
+            assert!(part.cut, "every part says the answer was cut");
+            rows.extend(part.rows.iter().cloned());
+        }
+        assert_eq!(rows.len(), MAX_PORTS_ROWS);
+        assert!(matches!(rows[0], PortsRow::Policy(_)), "{:?}", rows[0]);
+        assert!(matches!(rows[1], PortsRow::Session(_)));
+    }
+
+    /// Efficiency sweep, finding 5: with `--probe`, the probe takes the `-L` targets first, so
+    /// many slow listeners of the user's that no session started cannot use up the budget before
+    /// the target is reached (mutation: probe in address order, and the target, on `[::1]`,
+    /// comes after every `127.0.0.1` port and gets nothing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_targets_are_probed_before_the_other_listeners() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(target) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // No IPv6 loopback here.
+        };
+        let tport = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = target.accept().await {
+                let mut b = [0u8; 1024];
+                let _ = c.read(&mut b).await;
+                let _ = c.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+            }
+        });
+        // Silent servers: each costs the per-port budget.
+        let mut silent = Vec::new();
+        for _ in 0..48 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            silent.push(l.local_addr().unwrap().port());
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((c, _)) = l.accept().await {
+                    held.push(c);
+                }
+            });
+        }
+        let f = FakeProc::new("order");
+        let mut tcp = HEADER.to_string();
+        for (i, p) in silent.iter().enumerate() {
+            tcp += &tcp_row(Ipv4Addr::LOCALHOST, *p, me(), 400 + i as u64);
+        }
+        f.net("tcp", &tcp);
+        f.net(
+            "tcp6",
+            &format!(
+                "{HEADER}   0: 00000000000000000000000001000000:{tport:04X} 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 {:>5}        0 399 1\n",
+                me()
+            ),
+        );
+        let sockets: Vec<u64> = (399..400 + silent.len() as u64).collect();
+        f.process(4100, 1, "srv", "/", &sockets);
+        let s = one_session(vec![forward(
+            "main",
+            ForwardKind::Local,
+            1,
+            Some(("::1", tport)),
+        )]);
+        let mut q = PortsQuery::new(s, None, ProbeMode::Head);
+        q.proc_root = Some(f.dir.clone());
+        q.daemon_pid = None;
+        q.probe_other = true;
+        let rows = ports(q).await.rows;
+        let fwd = rows
+            .iter()
+            .find_map(|r| match r {
+                PortsRow::Forward(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            fwd.probe.as_ref().map(|p| p.kind),
+            Some(ProbeKind::Http { status: 204 }),
+            "{rows:?}"
+        );
     }
 
     /// Each way discovery can fall short says so, with a reason and nothing else.
@@ -1135,11 +1619,18 @@ mod tests {
     /// binary run again), because it lowers the descriptor limit: 300 processes each holding a
     /// listener are all attributed with room for 16 more descriptors (the scan used to keep one
     /// open per holder), and with room for 2 the answer is `Bounded`.
+    ///
+    /// The fake `/proc` is the parent's: it names the directory, and removes it however the child
+    /// ended. The child gives the limit back before its own cleanup, which needs descriptors
+    /// (SW4: the starved child's cleanup hit `EMFILE`, ignored, and left `fil-ports-fds-*`
+    /// behind on every run; mutation: drop the restore, and the child's cleanup fails).
     #[test]
     fn the_scan_holds_few_descriptors_and_says_when_it_runs_out() {
         const CHILD: &str = "FIL_PORTS_FD_CHILD";
+        const DIR: &str = "FIL_PORTS_FD_DIR";
         let Ok(mode) = std::env::var(CHILD) else {
             for mode in ["roomy", "starved"] {
+                let f = FakeProc::new("fds");
                 let out = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -1147,6 +1638,7 @@ mod tests {
                         "--test-threads=1",
                     ])
                     .env(CHILD, mode)
+                    .env(DIR, &f.dir)
                     .output()
                     .unwrap();
                 let text = String::from_utf8_lossy(&out.stdout);
@@ -1155,11 +1647,16 @@ mod tests {
                     "{mode}: {text}{}",
                     String::from_utf8_lossy(&out.stderr)
                 );
+                assert!(!f.dir.exists(), "{mode}: the child cleaned up after itself");
             }
             return;
         };
         const N: u32 = 300;
-        let f = FakeProc::new("fds");
+        let f = FakeProc::at(
+            std::env::var_os(DIR)
+                .expect("the parent names the directory")
+                .into(),
+        );
         let mut tcp = HEADER.to_string();
         for i in 0..N {
             tcp += &tcp_row(
@@ -1212,7 +1709,10 @@ mod tests {
                 budget: std::time::Duration::from_secs(10),
                 ..ScanLimits::default()
             },
+            &Targets::default(),
         );
+        // Back before anything else needs descriptors: the asserts' messages and the cleanup.
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, lim).unwrap();
         let attributed = d
             .listeners
             .iter()
@@ -1262,12 +1762,11 @@ mod tests {
             theirs.local_addr().unwrap().port(),
         );
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for (l, hits) in [(own, None), (theirs, Some(hits.clone()))] {
+        let own_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (l, h) in [(own, own_hits.clone()), (theirs, hits.clone())] {
             tokio::spawn(async move {
                 while let Ok((mut c, _)) = l.accept().await {
-                    if let Some(h) = &hits {
-                        h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let mut b = [0u8; 1024];
                     let _ = c.read(&mut b).await;
                     let _ = c
@@ -1284,14 +1783,22 @@ mod tests {
         f.process(4100, 1, "srv", "/home/u", &[201]);
         let mut q = PortsQuery::new(vec![], None, ProbeMode::Head);
         q.proc_root = Some(f.dir.clone());
+        let probes = |rows: &[PortsRow]| -> Vec<(u16, Option<ProbeKind>)> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    PortsRow::Listener(l) => Some((l.port.get(), l.probe.as_ref().map(|p| p.kind))),
+                    _ => None,
+                })
+                .collect()
+        };
+        // By default a listener no session started is not probed: it may be a tunnel.
         let rows = ports(q.clone()).await.rows;
-        let probes: Vec<(u16, Option<ProbeKind>)> = rows
-            .iter()
-            .filter_map(|r| match r {
-                PortsRow::Listener(l) => Some((l.port.get(), l.probe.as_ref().map(|p| p.kind))),
-                _ => None,
-            })
-            .collect();
+        assert_eq!(probes(&rows), vec![(own_port, None), (their_port, None)]);
+        assert_eq!(own_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // `fil ports --probe`.
+        q.probe_other = true;
+        let rows = ports(q.clone()).await.rows;
+        let probes = probes(&rows);
         assert_eq!(
             probes,
             vec![

@@ -1354,8 +1354,8 @@ mod tests {
     #[test]
     fn a_direct_refusal_revokes_the_key_and_its_binding() {
         use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("fil-dref-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
         std::fs::create_dir_all(base.join("etc/fil")).unwrap();
         for d in ["", "etc", "etc/fil"] {
             std::fs::set_permissions(base.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1381,7 +1381,6 @@ mod tests {
         assert!(host.refuses_direct(&k));
         assert!(!registry.contains(&k), "the key is revoked");
         assert_eq!(host.bound(), 0, "and its binding is gone");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

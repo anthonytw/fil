@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use common::*;
 use fil_proto::msg::{self, ControlMsg, ErrorCode, Request, Response, StartPoint};
+use fil_testkit::eventually;
 use fil_transport::LinkParams;
 use fil_transport::auth::{ClientKey, Fingerprint};
 use fil_transport::quic::QuicLink;
@@ -235,7 +236,10 @@ async fn a_key_does_not_outlive_its_session() {
     };
     assert_eq!(ask(&d, kill).await, Response::Done);
     live.wait_down().await;
-    eventually(|| async { !d.registry.contains(&transport_key(&pk)) }).await;
+    eventually("the killed session's key to leave the registry", || async {
+        !d.registry.contains(&transport_key(&pk))
+    })
+    .await;
     assert!(
         d.registry.is_empty(),
         "no key is left for a session that is gone"
@@ -253,7 +257,10 @@ async fn a_key_does_not_outlive_its_session() {
     let ck = ClientKey::generate().unwrap();
     let c = Client::attach(d.pipe().await, Connect::new("main", proto_key(&ck))).await;
     drop(c);
-    eventually(|| async { d.registry.is_empty() }).await;
+    eventually("the dropped client's key to leave the registry", || async {
+        d.registry.is_empty()
+    })
+    .await;
     assert!(dial(&d, &ck).await.is_err());
     let stale = msg::ResumeRequest {
         incarnation: 1,
@@ -268,7 +275,11 @@ async fn a_key_does_not_outlive_its_session() {
     )
     .await;
     assert_eq!(r.refused, Some(msg::AttachRefusal::SessionReplaced));
-    eventually(|| async { d.registry.is_empty() }).await;
+    eventually(
+        "the replaced client's key to leave the registry",
+        || async { d.registry.is_empty() },
+    )
+    .await;
     d.stop().await;
 }
 

@@ -333,15 +333,6 @@ impl<L: Link> Client<L> {
     }
 }
 
-/// Polls `cond` until it holds.
-pub async fn eventually<F, Fut>(cond: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    fil_testkit::eventually("a condition", cond).await;
-}
-
 impl Running {
     pub async fn sessions_is_empty(&self) -> bool {
         matches!(

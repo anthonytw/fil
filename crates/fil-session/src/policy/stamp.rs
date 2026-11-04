@@ -66,8 +66,8 @@ mod tests {
     /// An edit behind a symbolic link changes the stamp of the link's path.
     #[test]
     fn a_change_behind_a_link_is_seen() {
-        let d = std::env::temp_dir().join(format!("fil-stamp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d_tmp = tempfile::tempdir().unwrap();
+        let d = d_tmp.path().to_path_buf();
         std::fs::create_dir_all(d.join("real")).unwrap();
         std::fs::write(d.join("real/f"), "a").unwrap();
         std::os::unix::fs::symlink(d.join("real/f"), d.join("link")).unwrap();
@@ -79,6 +79,5 @@ mod tests {
         assert!(file.changed(), "the target was edited");
         std::fs::write(d.join("real/new"), "").unwrap();
         assert!(dir.changed(), "a file appeared in the linked directory");
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -89,6 +89,10 @@ pub struct SessionConfig {
     /// The forwards' tunables on the daemon side (DESIGN.md section 8.5: the receive window, the
     /// send buffer, the memory budget, `open_wait`, `linger`, the connect timeout).
     pub forward: MuxConfig,
+    /// The least time a withheld client-origin forward entry outlives its run, whatever `linger`
+    /// says (DESIGN.md section 7.2): [`WITHHELD_MIN_LIFE`] unless a test lowers it. Not a user
+    /// setting.
+    pub withheld_min_life: Duration,
     /// The host's server policy (DESIGN.md section 11.2): what forwards and agent relay it
     /// allows. Default: everything ([`crate::policy::AllowAll`]); the daemon sets its mirror.
     pub policy: Arc<dyn crate::policy::ServerPolicy>,
@@ -96,6 +100,13 @@ pub struct SessionConfig {
     /// every local user by default, as with `ssh -R`.
     pub remote_peers: crate::peers::RemotePeers,
 }
+
+/// The least time a withheld entry outlives its run. `linger` can be set to 0, and then every
+/// fresh attach would remove the entries of a run that has just been taken over before that run
+/// takes the session back (a take-back would get a new id, and a fixed-port `-R` would be closed
+/// and bound again, with a window in which another user could take the port). So the clock is
+/// never shorter than this.
+pub const WITHHELD_MIN_LIFE: Duration = Duration::from_secs(30);
 
 impl SessionConfig {
     pub fn new(name: SessionName, term: TermName, size: TermSize, incarnation: u128) -> Self {
@@ -119,6 +130,7 @@ impl SessionConfig {
             exit_drain: Duration::from_millis(300),
             max_queued_input: 4 * 1024 * 1024,
             forward: MuxConfig::default(),
+            withheld_min_life: WITHHELD_MIN_LIFE,
             policy: crate::policy::AllowAll::arc(),
             remote_peers: crate::peers::RemotePeers::Any,
         }

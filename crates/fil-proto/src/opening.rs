@@ -40,11 +40,6 @@ pub fn hello_of(payload: &[u8]) -> Option<Hello> {
     rest.is_empty().then_some(hello)
 }
 
-/// Whether `payload` is the ping or the pong of the opening.
-pub fn is_opening(payload: &[u8]) -> bool {
-    payload == PING || payload == PONG
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

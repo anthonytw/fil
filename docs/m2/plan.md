@@ -1,5 +1,7 @@
 # M2 plan: forwards, ports, agent
 
+> **Historical work order. `DESIGN.md` is the source of truth.** This file is the plan M2 was built from, kept for its reasoning and the order of work; where it and `DESIGN.md`, the code or the golden differ, they win. The decisions it settled are in `DESIGN.md` §7 to §11 and §14, and the limits in `crates/fil-proto/src/limits.rs`.
+
 > **Status: adopted by the coordinator on 2026-11-03, while the owner runs M1 to M2 autonomously.** Work starts with Wave 0 once M1 closes. The decisions in §4.6 marked **OWNER** stay open, and each of those packages uses the conservative interim default listed there until the owner decides. Written on `origin/main` at `aeb7775`; R2 (#44, wire revision and golden) lands before Wave 0, and §2.12 depends on it. M2 in DESIGN.md §15 covers persistent `-L`/`-R`, `fil forward`, `fil ports` and the agent relay, then the M2 sweep. It is done when port forwards survive a pulled network cable and the sweep is closed. The owner's yardstick also applies: fil should be usable as a drop-in replacement for `ssh -L/-R/-D/-A`, and better than ssh across reconnects.
 
 ## 0. Preconditions (M1 close)

@@ -192,4 +192,40 @@ pub trait Link: Send + Sync + 'static {
     fn close(&self);
 }
 
+/// A link several owners hold: the client loop reads and writes it while the dialer keeps a clone
+/// to close it and watch it die. Every method is the inner link's, so `close` stays idempotent.
+impl<L: Link> Link for std::sync::Arc<L> {
+    fn kind(&self) -> LinkKind {
+        (**self).kind()
+    }
+
+    fn send(
+        &self,
+        channel: ChannelId,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<(), LinkError>> + Send {
+        (**self).send(channel, payload)
+    }
+
+    fn recv(&self) -> impl Future<Output = Result<(ChannelId, Bytes), LinkError>> + Send {
+        (**self).recv()
+    }
+
+    fn status(&self) -> watch::Receiver<LinkStatus> {
+        (**self).status()
+    }
+
+    fn flush(&self) -> impl Future<Output = Result<(), LinkError>> + Send {
+        (**self).flush()
+    }
+
+    fn finish(&self, channel: ChannelId) {
+        (**self).finish(channel);
+    }
+
+    fn close(&self) {
+        (**self).close();
+    }
+}
+
 pub mod mem;

@@ -2,7 +2,6 @@
 //! module documentation above).
 
 use super::stamp::Stamp;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -13,7 +12,7 @@ use super::{Account, ServerPolicy};
 use fil_proto::msg::{PolicyLine, PortsPath};
 use fil_proto::mux::{
     BindAddr, FileFault, FileKey, ForwardKind, ForwardSpec, Permit, PolicyRefusal, PolicySetting,
-    PolicySource, Target, TargetHost, Toggle,
+    PolicySource, Target, Toggle,
 };
 
 use super::file::{self, FilePolicy, Keys, Trust};
@@ -651,10 +650,7 @@ fn disabled(o: &Outcomes<Flag>) -> Result<(), PolicyRefusal> {
 
 /// A target's host as sshd compares it with `PermitOpen` (as the client wrote it).
 fn host_text(t: &Target) -> String {
-    match &t.host {
-        TargetHost::Ip(ip) => ip.to_string(),
-        TargetHost::Name(n) => n.as_str().to_string(),
-    }
+    t.host.to_string()
 }
 
 /// A `-R` bind as sshd compares it with `PermitListen`, as ssh sends it
@@ -665,8 +661,7 @@ fn listen_text(b: BindAddr) -> String {
     match b {
         BindAddr::Loopback => "localhost".to_string(),
         BindAddr::Any => String::new(),
-        BindAddr::Ip(IpAddr::V4(a)) => a.to_string(),
-        BindAddr::Ip(IpAddr::V6(a)) => a.to_string(),
+        BindAddr::Ip(a) => a.to_string(),
         // Never a -R's (it does not decode); a laptop-side bind of another client's.
         BindAddr::Withheld(_) => "(withheld)".to_string(),
     }

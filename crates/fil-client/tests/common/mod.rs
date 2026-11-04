@@ -260,28 +260,16 @@ pub async fn settle() {
 }
 
 /// Waits until `f` is true, polling with the paused clock; panics after `secs` of test time.
-pub async fn until<F: FnMut() -> bool>(what: &str, secs: u64, mut f: F) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while !f() {
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for: {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+pub async fn until<F: FnMut() -> bool>(what: &str, secs: u64, f: F) {
+    fil_testkit::until_within(what, Duration::from_secs(secs), f).await;
 }
 
-pub async fn until_async<F, Fut>(what: &str, secs: u64, mut f: F)
+pub async fn until_async<F, Fut>(what: &str, secs: u64, f: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while !f().await {
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for: {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    fil_testkit::eventually_within(what, Duration::from_secs(secs), f).await;
 }
 
 impl Rig {

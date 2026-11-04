@@ -185,6 +185,48 @@ async fn confirm_yes_and_no() -> Test {
     Ok(())
 }
 
+/// A question the host withdraws (it hangs up) counts toward the refusal rule only once the user
+/// had it on the screen: the engine tells the question when it shows it (`Question::on_screen`).
+/// Three such withdrawals trip the rule, and the overlay says signatures are refused. Without
+/// the engine's call none is ever counted, and no notice comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawals_of_questions_the_user_saw_trip_the_refusal_rule() -> Test {
+    let agent = MiniAgent::start(&sock("withdrawn"), 1);
+    let mut r = relay(&agent);
+    r.confirm = true;
+    let rig = start(Some(r)).await;
+    for round in 0..3 {
+        let mut s = rig.daemon.fwd.open(OpenKind::Agent).await;
+        ask(&mut s, &[REQUEST_IDENTITIES]).await;
+        s.write_all(&framed(&sign_request(&agent.blob(0), b"m")))
+            .await?;
+        until("the question", 10, || {
+            rig.term.text().contains("asks for a signature")
+        })
+        .await;
+        // On the screen past the quiet moment, so the user could have answered; then the host
+        // hangs up.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(s);
+        eventually(
+            &format!("round {round}: the question withdrawn"),
+            10,
+            || !rig.term.text().contains("asks for a signature"),
+        )
+        .await;
+    }
+    until("the rule's notice", 10, || {
+        rig.term.text().contains("refusing signatures")
+    })
+    .await;
+    assert_eq!(
+        agent.types().iter().filter(|t| **t == SIGN_REQUEST).count(),
+        0,
+        "nothing was signed"
+    );
+    Ok(())
+}
+
 /// The host's server policy refuses the agent (the attach reply says so): the overlay says why,
 /// naming the setting and its source (DESIGN.md section 11.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

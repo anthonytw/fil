@@ -196,13 +196,6 @@ impl<L: Link> Client<L> {
         self.held.get_or_insert_with(Vec::new);
     }
 
-    /// Sends what was held, in order.
-    pub async fn release_control(&mut self) {
-        for m in self.held.take().unwrap_or_default() {
-            self.send_ctl(m).await;
-        }
-    }
-
     pub async fn detach(&mut self) {
         self.send_ctl(ControlMsg::Detach).await;
     }

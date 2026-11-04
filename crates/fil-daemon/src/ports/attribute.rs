@@ -413,20 +413,11 @@ impl<'a> Sessions<'a> {
             None => self.root.open(self.uid, pid).and_then(|d| read(&d)),
         };
         let ppid = stat
-            .and_then(|s| parse_ppid(&String::from_utf8_lossy(&s)))
+            .and_then(|s| fil_session::proc::parse_ppid(&String::from_utf8_lossy(&s)))
             .filter(|&pp| pp != 0 && pp != pid);
         self.parent.insert(pid, ppid);
         ppid
     }
-}
-
-/// The parent pid in `/proc/<pid>/stat`. The name may hold anything, spaces and parentheses
-/// included, so the fields are counted from the last `)`.
-fn parse_ppid(stat: &str) -> Option<u32> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let mut f = rest.split_ascii_whitespace();
-    let _state = f.next()?;
-    f.next()?.parse().ok()
 }
 
 /// A fake `/proc` for tests.
@@ -722,11 +713,11 @@ mod tests {
 
     #[test]
     fn odd_proc_content_never_panics() {
-        assert_eq!(parse_ppid("1 (a) S 7 1"), Some(7));
-        assert_eq!(parse_ppid("1 (a) b) c) S 7 1"), Some(7));
-        assert_eq!(parse_ppid("1 (a"), None);
-        assert_eq!(parse_ppid(")"), None);
-        assert_eq!(parse_ppid("1 (a) S x"), None);
+        assert_eq!(fil_session::proc::parse_ppid("1 (a) S 7 1"), Some(7));
+        assert_eq!(fil_session::proc::parse_ppid("1 (a) b) c) S 7 1"), Some(7));
+        assert_eq!(fil_session::proc::parse_ppid("1 (a"), None);
+        assert_eq!(fil_session::proc::parse_ppid(")"), None);
+        assert_eq!(fil_session::proc::parse_ppid("1 (a) S x"), None);
         assert_eq!(socket_inode(b"socket:[12]"), Some(12));
         assert_eq!(socket_inode(b"socket:[]"), None);
         assert_eq!(socket_inode(b"socket:[-1]"), None);

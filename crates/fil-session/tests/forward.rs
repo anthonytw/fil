@@ -758,6 +758,7 @@ async fn a_withheld_entry_outlives_its_run_by_linger() {
     let s = Scratch::new();
     let mut cfg = cat(&s, "linger");
     cfg.forward.linger = linger;
+    cfg.withheld_min_life = Duration::ZERO;
     let h = spawn_plain(cfg).await;
     let to = |host: &str| {
         ForwardSpec::new(
@@ -813,6 +814,47 @@ async fn a_withheld_entry_outlives_its_run_by_linger() {
             h.forward_count()
         );
     }
+}
+
+/// `linger = "0s"` (allowed) must not drop a withheld entry at the next fresh attach, before its
+/// run can take the session back: the entry's clock is never shorter than the floor, so the
+/// take-back adopts the same id and port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_linger_still_keeps_a_withheld_entry_for_the_take_back() {
+    let s = Scratch::new();
+    let mut cfg = cat(&s, "zero-linger");
+    cfg.forward.linger = Duration::ZERO;
+    // The floor stays at its default, which is what the test is about.
+    assert_eq!(
+        cfg.withheld_min_life,
+        Duration::from_secs(30),
+        "the default floor"
+    );
+    let h = spawn_plain(cfg).await;
+    let to = ForwardSpec::new(
+        ForwardKind::Remote,
+        BindAddr::Loopback,
+        0,
+        Some(Target {
+            host: TargetHost::Name("intranet-wiki.example".parse().unwrap()),
+            port: NonZeroU16::new(443).unwrap(),
+        }),
+    )
+    .unwrap();
+    let mut a = FwdClient::attach(&h, key(1), "laptop").await;
+    let id = add(&mut a, to.clone()).await;
+    let port = bound_port(&a, id, 0).await;
+
+    let b = FwdClient::attach(&h, key(2), "desk").await;
+    a.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    assert_eq!(bound_port(&b, id, 0).await, port);
+    // Well past a zero linger, A takes it back: the same entry, on the same port.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.forward_rows().iter().any(|r| r.id == id), "still there");
+    a.take_back(&h).await;
+    b.wait("TakenOver", |s| s.taken_over.is_some()).await;
+    assert_eq!(add(&mut a, to).await, id, "adopted, not re-added");
+    assert_eq!(bound_port(&a, id, 0).await, port);
 }
 
 /// The attached client's spec with an entry's identity (kind, bind, port) and another target

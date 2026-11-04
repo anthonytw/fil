@@ -45,6 +45,8 @@ tracing = "0.1"
 fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }
 fil-session = { path = "../fil-session" }
 fil-term = { path = "../fil-term" }
+# The test-only wait helpers (resize_e2e).
+fil-testkit = { path = "../fil-testkit" }
 # The PTY driver the Pi examples share with ptydrive (examples/support/harness.rs).
 fil-testbins = { path = "../fil-testbins" }
 portable-pty = "0.9"

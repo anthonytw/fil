@@ -1694,8 +1694,8 @@ mod tests {
         use crate::handle::SessionHandle;
         use fil_proto::msg::{Attach, PublicKey, TermSize};
 
-        let out = std::env::temp_dir().join(format!("fil-stale-input-{}", std::process::id()));
-        let _ = std::fs::remove_file(&out);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("input");
         let mut cfg = SessionConfig::new(
             "stale".parse().unwrap(),
             "xterm".parse().unwrap(),
@@ -1763,7 +1763,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let got = std::fs::read_to_string(&out).unwrap_or(got);
         let _ = handle.kill(Duration::from_secs(5)).await;
-        let _ = std::fs::remove_file(&out);
         assert_eq!(got, "live\n", "only the live connection's input is applied");
     }
 }

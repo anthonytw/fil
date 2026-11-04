@@ -27,8 +27,8 @@
 //! # Links are shared
 //!
 //! The loop owns the link it serves, but the manager sometimes needs it closed (`ClosePipe` after
-//! the session moved to direct) and needs to know when it died. Every link therefore lives in a
-//! [`Shared`] that the dialer keeps a clone of. A link that has been closed by either side
+//! the session moved to direct) and needs to know when it died. Every link therefore lives in an
+//! `Arc` that the dialer keeps a clone of. A link that has been closed by either side
 //! reports `Down(Closed)`; a manager that hears of the death of a link it already closed
 //! ignores it (the manager drops late reports), and events carry the link's id so that the death
 //! of an old link is never taken for the death of its replacement.
@@ -80,7 +80,6 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::link::Shared;
 use crate::netwatch;
 
 /// How bad a failed pipe run is.
@@ -215,7 +214,7 @@ enum Event<L> {
 /// A link the dialer holds a clone of.
 struct Held<L> {
     id: u64,
-    link: Shared<L>,
+    link: Arc<L>,
     /// What the remote shell printed first (pipe only), until the link is handed out.
     banner: Vec<u8>,
     watcher: AbortHandle,
@@ -322,10 +321,7 @@ impl<C: Connector> PathDialer<C> {
         })
     }
 
-    async fn dial_loop(
-        &mut self,
-        purpose: DialPurpose,
-    ) -> Result<Dialed<Shared<C::Link>>, DialError> {
+    async fn dial_loop(&mut self, purpose: DialPurpose) -> Result<Dialed<Arc<C::Link>>, DialError> {
         // A fresh attach rotates the key, unless nothing has happened yet or the last one failed
         // and this is its retry.
         if purpose == DialPurpose::Attach && self.started && !self.retrying_attach {
@@ -561,7 +557,7 @@ impl<C: Connector> PathDialer<C> {
     fn hold(&mut self, link: C::Link, banner: Vec<u8>) -> Held<C::Link> {
         self.serial += 1;
         let id = self.serial;
-        let link = Shared(Arc::new(link));
+        let link = Arc::new(link);
         let watcher = watch_link(id, &link, self.tx.clone());
         Held {
             id,
@@ -626,7 +622,7 @@ impl<C: Connector> PathDialer<C> {
                 if self.pipe_link.as_ref().is_some_and(|h| h.id == id) {
                     if let Some(h) = self.pipe_link.take()
                         && reason != DownReason::Closed
-                        && let Some(n) = self.connector.diagnostics(&h.link.0)
+                        && let Some(n) = self.connector.diagnostics(&h.link)
                     {
                         tracing::info!("pipe ended");
                         tracing::debug!(note = %n, ?reason, "pipe ended: why");
@@ -706,7 +702,7 @@ impl<C: Connector> PathDialer<C> {
 
     /// `pipe_only`: a fresh attach must arrive on a pipe (the daemon accepts a fresh attach nowhere
     /// else, and the new key is registered through it), so an offer of anything else is dropped.
-    fn take_offer(&mut self, how: Handed, pipe_only: bool) -> Option<Dialed<Shared<C::Link>>> {
+    fn take_offer(&mut self, how: Handed, pipe_only: bool) -> Option<Dialed<Arc<C::Link>>> {
         let kind = self.offer?;
         if pipe_only && kind != LinkKind::Pipe {
             self.offer = None;
@@ -786,11 +782,7 @@ fn public_of(key: &ClientKey) -> PublicKey {
 }
 
 /// Reports the link's death, with the time it was seen.
-fn watch_link<L: Link>(
-    id: u64,
-    link: &Shared<L>,
-    tx: mpsc::UnboundedSender<Event<L>>,
-) -> AbortHandle {
+fn watch_link<L: Link>(id: u64, link: &Arc<L>, tx: mpsc::UnboundedSender<Event<L>>) -> AbortHandle {
     let mut status = link.status();
     tokio::spawn(async move {
         let reason = loop {
@@ -811,7 +803,7 @@ fn watch_link<L: Link>(
 }
 
 impl<C: Connector> Dialer for PathDialer<C> {
-    type Link = Shared<C::Link>;
+    type Link = Arc<C::Link>;
 
     fn public_key(&self) -> PublicKey {
         self.public.clone()
@@ -888,7 +880,7 @@ impl<C: Connector> Dialer for PathDialer<C> {
         if info.kind == LinkKind::Pipe
             && let Some(h) = &self.pipe_link
         {
-            self.connector.session_started(&h.link.0);
+            self.connector.session_started(&h.link);
         }
         if self.handed_dial == Some(info.kind) {
             self.handed_dial = None;

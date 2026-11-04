@@ -400,19 +400,12 @@ pub fn read(main: &Path, account: &Account) -> (Sshd, Watched) {
 /// Reads config text as if it were `name` (tests).
 #[cfg(test)]
 pub fn parse_text(name: &Path, text: &str, account: &Account) -> Settings {
-    let dir = std::env::temp_dir().join(format!(
-        "fil-sshd-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
     let r = read(&path, account).0;
-    let _ = std::fs::remove_dir_all(&dir);
     match r {
         Sshd::Mirrored(s) => *s,
         other => panic!("{other:?}"),
@@ -1273,8 +1266,8 @@ mod tests {
 
     #[test]
     fn include_with_globs_relative_paths_and_match_context() {
-        let dir = std::env::temp_dir().join(format!("fil-inc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("conf.d")).unwrap();
         std::fs::write(dir.join("conf.d/20-b.conf"), "AllowTcpForwarding remote\n").unwrap();
         std::fs::write(
@@ -1400,15 +1393,14 @@ mod tests {
         let (r, _) = read(&f("loop.conf"), &me());
         let Sshd::Mirrored(s) = r else { panic!() };
         assert!(!s.unreadable.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// sshd's `SSHCFG_NEVERMATCH`: a file included from a `Match` block that does not apply
     /// never applies a `Match` of its own; from one that might apply, its blocks only might.
     #[test]
     fn an_include_inside_a_match_block_is_capped_by_it() {
-        let dir = std::env::temp_dir().join(format!("fil-inc-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("inner.conf"),
@@ -1439,7 +1431,6 @@ mod tests {
         );
         // The outer block applies: so does the inner one.
         assert_eq!(tcp("Match User dev"), [(Tcp::All, (2, false))]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `crit=arg` tokens (current OpenSSH) are one criterion each; `all` and `invalid-user` take
@@ -1627,8 +1618,8 @@ mod tests {
     /// is incomplete.
     #[test]
     fn an_include_releases_split_differently_marks_the_mirror_incomplete() {
-        let dir = std::env::temp_dir().join(format!("fil-incq-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a b.conf"), "AllowTcpForwarding yes\n").unwrap();
         std::fs::write(dir.join("sshd_config"), "Include 'a b.conf'\n").unwrap();
@@ -1638,7 +1629,6 @@ mod tests {
         };
         assert_eq!(s.unreadable, vec![dir.join("sshd_config")]);
         assert_eq!(s.tcp.values, vec![(Tcp::All, Src::Default)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An include directory the daemon may not list (sshd, as root, can) is reported like an
@@ -1649,8 +1639,8 @@ mod tests {
         if rustix::process::geteuid().as_raw() == 0 {
             return; // root lists it anyway
         }
-        let dir = std::env::temp_dir().join(format!("fil-incd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("conf.d")).unwrap();
         std::fs::write(
             dir.join("conf.d/10-hardening.conf"),
@@ -1671,7 +1661,6 @@ mod tests {
             panic!("{r:?}")
         };
         assert_eq!(s.unreadable, vec![dir.join("conf.d")]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

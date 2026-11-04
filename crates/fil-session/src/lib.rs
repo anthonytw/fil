@@ -80,6 +80,7 @@ mod handle;
 pub mod nofile;
 pub mod peers;
 pub mod policy;
+pub mod private_dir;
 pub mod proc;
 mod pty;
 pub mod queries;

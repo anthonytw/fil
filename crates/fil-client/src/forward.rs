@@ -56,8 +56,8 @@ use fil_forward::{
 use fil_proto::ChannelId;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
-    BindFailure, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState, MuxMsg,
-    OpenFailure, OpenKind, Origin, Side,
+    BindFailure, CloseReason, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState,
+    MuxMsg, OpenFailure, OpenKind, Origin, Side,
 };
 use fil_transport::{Link, LinkError, LinkState};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -359,6 +359,12 @@ impl ForwardHandle {
     pub(crate) fn agent_on(&self) -> bool {
         self.agent.is_some()
     }
+
+    /// The session went to another machine (taken over, replaced, detached elsewhere) and the
+    /// user is asked whether to take it back: see [`Manager::suspend`].
+    pub(crate) fn suspend(&self) {
+        let _ = self.to_manager.send(ToManager::Suspend);
+    }
 }
 
 enum ToManager {
@@ -371,6 +377,8 @@ enum ToManager {
     },
     /// A link was attached (any: a fresh attach, a reconnect, a swap).
     Attached,
+    /// The session is elsewhere until a take-back (a fresh attach).
+    Suspend,
 }
 
 // ---- the policy and the connector --------------------------------------------------------------
@@ -481,6 +489,7 @@ impl<L: Link> Forwards<L> {
             .collect();
         let current: Current<L> = Arc::new(Mutex::new(None));
         let epoch_lock = Arc::new(Mutex::new(()));
+        let router_grants = grants.clone();
         let mgr = Manager {
             epoch: ep.epoch(),
             epoch_lock: epoch_lock.clone(),
@@ -502,6 +511,7 @@ impl<L: Link> Forwards<L> {
             unanswered_by: None,
             busy_noted: false,
             failed: false,
+            suspended: false,
             dirty: true,
             view: view.clone(),
         };
@@ -517,6 +527,7 @@ impl<L: Link> Forwards<L> {
             to_manager,
             current,
             epoch_lock,
+            grants: router_grants,
         };
         (Self { router, manager }, handle, notes_rx)
     }
@@ -552,6 +563,8 @@ pub(crate) struct Router<L: Link> {
     current: Current<L>,
     /// Held for `new_epoch` here and by the manager while it acts on an event or an answer.
     epoch_lock: Arc<Mutex<()>>,
+    /// Cleared with `new_epoch`: see [`Router::attach`].
+    grants: Arc<Mutex<Grants>>,
 }
 
 /// The link the endpoint is on (shared by the readers and the manager).
@@ -568,6 +581,7 @@ impl<L: Link> Clone for Router<L> {
             to_manager: self.to_manager.clone(),
             current: self.current.clone(),
             epoch_lock: self.epoch_lock.clone(),
+            grants: self.grants.clone(),
         }
     }
 }
@@ -580,8 +594,12 @@ impl<L: Link> Router<L> {
         let before = lock(&self.current).clone();
         if !resumed {
             // Under the manager's epoch lock: it acts on no event of the old epoch after this.
+            // The grants go first: `new_epoch` wakes the queued connections, and one of the old
+            // epoch must not open into the new one under its old id before `Manager::fresh` has
+            // run (it is refused instead).
             {
                 let _g = lock(&self.epoch_lock);
+                lock(&self.grants).clear();
                 self.ep.new_epoch();
             }
             let (done, wait) = oneshot::channel();
@@ -906,6 +924,9 @@ struct Manager<L: Link> {
     busy_noted: bool,
     /// The run is over for the forwards (the host broke the rules): nothing more is done.
     failed: bool,
+    /// The session is elsewhere ([`Manager::suspend`]): nothing of this epoch is acted on until
+    /// the next fresh attach.
+    suspended: bool,
     view: Arc<Mutex<View>>,
     /// The view needs redoing: something it shows changed. A message that only gets an entry
     /// refused and forgotten does not set it, so a flood costs no more than its refusals.
@@ -929,16 +950,21 @@ impl<L: Link> Manager<L> {
                         while events.try_recv().is_ok() {}
                         self.dirty = true;
                         self.epoch = self.ep.epoch();
+                        self.suspended = false;
                         self.fresh();
                         let _ = done.send(());
                     }
                     Some(ToManager::Answer { id, token, yes }) => self.on_answer(id, token, yes),
                     Some(ToManager::Attached) => self.attached(),
+                    Some(ToManager::Suspend) => self.suspend(),
                 },
                 () = at(self.unanswered_by), if self.unanswered_by.is_some() => {
                     let gate = self.epoch_lock.clone();
                     let _g = lock(&gate);
-                    if self.ep.epoch() == self.epoch {
+                    if self.suspended {
+                        // The session is elsewhere: nobody is there to answer (`suspend`).
+                        self.unanswered_by = None;
+                    } else if self.ep.epoch() == self.epoch {
                         self.dirty = true;
                         self.unanswered();
                     }
@@ -987,7 +1013,7 @@ impl<L: Link> Manager<L> {
     /// A link was attached (a reconnect or a swap): own forwards still waiting for their answer
     /// get the full wait again, now that there is a link to answer over.
     fn attached(&mut self) {
-        if self.own.iter().any(|o| o.req.is_some()) {
+        if !self.suspended && self.own.iter().any(|o| o.req.is_some()) {
             self.unanswered_by = Some(tokio::time::Instant::now() + self.answer_wait);
         }
     }
@@ -1003,7 +1029,7 @@ impl<L: Link> Manager<L> {
     fn on_event(&mut self, epoch: u64, ev: EndpointEvent) {
         let gate = self.epoch_lock.clone();
         let _g = lock(&gate);
-        if epoch != self.epoch || self.ep.epoch() != self.epoch {
+        if epoch != self.epoch || self.ep.epoch() != self.epoch || self.suspended {
             debug!("a forward event of an ended epoch; dropped");
             return;
         }
@@ -1025,12 +1051,42 @@ impl<L: Link> Manager<L> {
     fn on_answer(&mut self, id: ForwardId, token: u64, yes: bool) {
         let gate = self.epoch_lock.clone();
         let _g = lock(&gate);
-        if self.ep.epoch() != self.epoch {
+        if self.ep.epoch() != self.epoch || self.suspended {
             debug!("an answer during a fresh attach; dropped");
             return;
         }
         self.dirty = true;
         self.answer(id, token, yes);
+    }
+
+    /// The session went to another machine and the user is asked whether to take it back. The
+    /// daemon dropped its side of every channel with the new epoch, so nothing here can resume:
+    /// the local sockets are reset now, not left hanging until the answer (which has no time
+    /// limit), and the grants go, so the listeners (still bound, holding their ports) refuse what
+    /// they accept instead of opening it into an epoch that is over. A take-back is a fresh
+    /// attach: [`Manager::fresh`] pauses the own listeners until the new table names them, and
+    /// grants them again. A "no" ends the run.
+    fn suspend(&mut self) {
+        let gate = self.epoch_lock.clone();
+        let _g = lock(&gate);
+        self.suspended = true;
+        self.unanswered_by = None;
+        lock(&self.grants).clear();
+        let n = self.ep.close_all(CloseReason::Reset);
+        // One paused for a fresh attach whose answer had not come refuses too, rather than
+        // holding applications in its backlog. One bound before the first answer and never
+        // handed over cannot refuse (nothing accepts on it), so it closes and gives its port up;
+        // the take-back binds it again.
+        for o in &mut self.own {
+            match &o.listener {
+                Listener::On(id) => {
+                    self.ep.resume_listener(*id);
+                }
+                Listener::Prebound(_) => o.listener = Listener::None,
+                Listener::None => {}
+            }
+        }
+        debug!(closed = n, "forwards suspended: the session is elsewhere");
     }
 
     /// The host broke the rules: the run ends with a protocol error, and nothing more is acted
@@ -1701,6 +1757,7 @@ mod tests {
             unanswered_by: None,
             busy_noted: false,
             failed: false,
+            suspended: false,
             dirty: true,
             view: Arc::new(Mutex::new(View::default())),
         };

@@ -5,6 +5,7 @@ FORWARDED
   -L   localhost:5173 →      localhost:5173       vite (pid 41872, ~/app)  2      14 MB / 220 KB  now
        http://localhost:5173 · HTTP 200 "Vite + React"
   -R   localhost:9000 ←      127.0.0.1:9000       your laptop              0      —               10:40
+       2 connections refused: not from your user on the host (remote_peers = same-user)
        1 connection waiting for the link
   -D   *:1080 →              (SOCKS)              —                        0      —               —
        ⚠ not listening on the laptop: the port is already in use

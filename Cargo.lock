@@ -446,6 +446,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fil-daemon",
+ "fil-forward",
  "fil-proto",
  "fil-session",
  "fil-testkit",
@@ -474,6 +475,7 @@ dependencies = [
  "rand",
  "ring",
  "rustix",
+ "serde",
  "tokio",
  "tracing",
 ]

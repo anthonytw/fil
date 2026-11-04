@@ -434,6 +434,9 @@ impl Inner {
             .agent_socket
             .then(|| self.paths.agent_socket(&attach.name));
         sc.policy = self.host.policy.clone();
+        // `[forward]`: the tunables, and who may connect to the -R ports (after the policy).
+        sc.forward = self.cfg.forward.mux_config();
+        sc.remote_peers = self.cfg.remote_peers.clone();
         let host = self.host.clone() as Arc<dyn SessionHost>;
         let delay = self.cfg.spawn_delay;
         let spawn = async move {
@@ -1041,6 +1044,9 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
     let cfg = match DaemonConfig::load(&paths.config) {
         Ok(mut c) => {
             adjust(&mut c);
+            if let Some(w) = c.remote_peers_warning() {
+                tracing::warn!("{w}");
+            }
             c
         }
         Err(e) => {

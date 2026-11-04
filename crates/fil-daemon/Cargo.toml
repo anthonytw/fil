@@ -9,13 +9,15 @@ publish.workspace = true
 
 [dependencies]
 bytes = "1"
+fil-forward = { path = "../fil-forward" }
 fil-proto = { path = "../fil-proto" }
 fil-session = { path = "../fil-session" }
 fil-transport = { path = "../fil-transport" }
 # The CSPRNG for session incarnations; already in the tree through fil-transport.
 ring = "0.17"
 # Safe flock, setsid and uid queries (no unsafe code, DESIGN.md section 13).
-rustix = { version = "1", features = ["fs", "process"] }
+# `net`: the sock_diag netlink lookup of `remote_peers = "same-user"` (ports/diag.rs).
+rustix = { version = "1", features = ["fs", "process", "net"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util"] }

@@ -397,3 +397,53 @@ async fn tee_copies_stderr_to_ours_only_until_it_is_stopped() {
         "silent after the stop: {shown}"
     );
 }
+
+/// The child exits, and the write fails (`EPIPE`) before the end of its output is seen: a
+/// helper it left behind still holds stdout. When the grace for the peer's last words ends, the
+/// child's exit status is the reason, not "write failed: Broken pipe" (the M2 sweep's
+/// `pipe_child` flake, made deterministic).
+#[tokio::test]
+async fn a_write_failure_reports_the_exit_status_of_a_child_that_exited() {
+    let file = hello_file("epipe");
+    let helper = std::env::temp_dir().join(format!("fil-pipe-epipe-helper-{}", std::process::id()));
+    let cmd = sh(&format!(
+        "cat '{}'; sleep 0.5; exec 0<&-; sleep 3 & echo $! > '{}'; exit 3",
+        file.display(),
+        helper.display()
+    ));
+    // The input is closed only after the opening is through (a write of the opening that failed
+    // would be a spawn error instead).
+    let link = PipeLink::spawn(&cmd, cfg()).await.unwrap();
+    let pid = link.child_id().unwrap();
+    let t = Instant::now();
+    // Writes until one fails: the child closed its input.
+    let mut off = 0;
+    while link.send(ChannelId::TERMINAL, seg(off)).await.is_ok()
+        && t.elapsed() < Duration::from_secs(5)
+    {
+        off += 100;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let err = link.recv().await.unwrap_err();
+    let DownReason::Io(why) = &err.0 else {
+        panic!("{err:?}")
+    };
+    assert!(
+        why.contains("pipe command exited") && why.contains("exit status: 3"),
+        "{why}"
+    );
+    // Within the grace (300 ms) and the exit wait, well before the helper lets go of stdout.
+    assert!(
+        t.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        t.elapsed()
+    );
+    link.closed().await;
+    assert!(!exists(pid));
+    // The helper that held stdout is not left running.
+    let helper_pid = std::fs::read_to_string(&helper).unwrap();
+    let helper_pid = helper_pid.trim();
+    let _ = Command::new("kill").arg(helper_pid).status();
+    std::fs::remove_file(&helper).unwrap();
+    std::fs::remove_file(&file).unwrap();
+}

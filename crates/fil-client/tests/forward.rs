@@ -903,3 +903,157 @@ async fn no_link_no_failure_while_an_answer_is_awaited() -> Test {
     assert!(!rig.is_finished());
     Ok(())
 }
+
+/// A SOCKS5 CONNECT to loopback `port` through a `-D` on `via`; the stream, once the reply says
+/// it is connected.
+async fn socks_to(via: u16, port: u16) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = connect(via).await.expect("the -D listens");
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut m = [0u8; 2];
+    s.read_exact(&mut m).await.unwrap();
+    assert_eq!(m, [5, 0]);
+    let p = port.to_be_bytes();
+    s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, p[0], p[1]])
+        .await
+        .unwrap();
+    let mut r = [0u8; 10];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r[1], 0, "the SOCKS reply: {r:?}");
+    s
+}
+
+/// A connection made now on a listener of the old machine's: refused at once (by the kernel,
+/// or accepted and reset), never opened into the ended epoch and left to wait.
+async fn refused_at_once(port: u16) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut n) = connect(port).await else {
+        return true;
+    };
+    let _ = n.write_all(b"x").await;
+    common::fwd::ends_without_data(&mut n, Duration::from_secs(1)).await
+}
+
+/// DESIGN.md section 7.2, takeover: "`-L` connections that started on the old machine end". They
+/// end when the take-back question is shown, not when it is answered (it has no time limit), and
+/// the old machine's listeners refuse new connections meanwhile. A take-back brings them back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn taken_over_forwards_end_at_the_question_and_come_back_with_a_take_back() -> Test {
+    use fil_proto::mux::{BindAddr, ForwardSpec};
+    let server = echo_server().await;
+    let (lp, dp) = (free_port(), free_port());
+    let dynamic = ForwardSpec::new(ForwardKind::Dynamic, BindAddr::Loopback, dp, None)?;
+    let rig = attached(vec![local(lp, server.port), dynamic], Rules::default()).await;
+    eventually("both own forwards in the table", 5, || {
+        own_id(&rig, ForwardKind::Local).is_some() && own_id(&rig, ForwardKind::Dynamic).is_some()
+    })
+    .await;
+    let mut l = connect(lp).await.expect("the -L listens");
+    assert!(round_trip(&mut l, b"through the -L").await);
+    let mut d = socks_to(dp, server.port).await;
+    assert!(round_trip(&mut d, b"through the -D").await);
+
+    rig.daemon.take_over("other").await;
+    until("the take-back question", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    let asked = std::time::Instant::now();
+    let within = Duration::from_millis(1500);
+    assert!(
+        common::fwd::ends_without_data(&mut l, within).await,
+        "the old -L connection still hangs at the question"
+    );
+    assert!(
+        common::fwd::ends_without_data(&mut d, within).await,
+        "the old -D connection still hangs at the question"
+    );
+    assert!(asked.elapsed() < within, "{:?}", asked.elapsed());
+    assert!(refused_at_once(lp).await, "a new -L connection waits");
+    assert!(refused_at_once(dp).await, "a new -D connection waits");
+    assert!(!rig.is_finished());
+
+    rig.answer("y").await;
+    let mut l = None;
+    for _ in 0..100 {
+        if let Some(mut c) = connect(lp).await
+            && round_trip(&mut c, b"after the take-back").await
+        {
+            l = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(l.is_some(), "the -L did not come back");
+    let mut d = socks_to(dp, server.port).await;
+    assert!(round_trip(&mut d, b"-D after the take-back").await);
+    Ok(())
+}
+
+/// The same for the other two questions of a session gone elsewhere: replaced (killed and
+/// recreated, or the daemon restarted) and detached from elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwards_end_at_the_replaced_and_detached_questions_too() -> Test {
+    for (replaced, text) in [
+        (true, "different session now"),
+        (false, "detached from elsewhere"),
+    ] {
+        let server = echo_server().await;
+        let lp = free_port();
+        let rig = attached(vec![local(lp, server.port)], Rules::default()).await;
+        eventually("the own -L in the table", 5, || {
+            own_id(&rig, ForwardKind::Local).is_some()
+        })
+        .await;
+        let mut l = connect(lp).await.expect("the -L listens");
+        assert!(round_trip(&mut l, b"hello").await);
+        if replaced {
+            rig.daemon.replace_session().await;
+        } else {
+            rig.daemon.detach_elsewhere().await;
+        }
+        until("the question", 30, || rig.term.text().contains(text)).await;
+        assert!(
+            common::fwd::ends_without_data(&mut l, Duration::from_millis(1500)).await,
+            "{text}: the old -L connection still hangs at the question"
+        );
+        assert!(refused_at_once(lp).await, "{text}: a new connection waits");
+        assert!(!rig.is_finished());
+    }
+    Ok(())
+}
+
+/// Taken over again while a take-back waits for the new table: the own listener, paused for
+/// that answer, refuses at the second question too, rather than holding applications in its
+/// backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listener_paused_for_a_take_back_refuses_at_the_next_question() -> Test {
+    let server = echo_server().await;
+    let lp = free_port();
+    let rig = attached(vec![local(lp, server.port)], Rules::default()).await;
+    let fwd = rig.daemon.fwd.clone();
+    eventually("the own -L in the table", 5, || !fwd.ids().is_empty()).await;
+    rig.daemon.take_over("other").await;
+    fwd.st.lock().unwrap().hold_adds = true;
+    until("take back?", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.answer("y").await;
+    eventually("asked again", 5, || !fwd.st.lock().unwrap().held.is_empty()).await;
+    until("the question gone", 5, || {
+        !rig.term.text().contains("Take it back?")
+    })
+    .await;
+    rig.daemon.take_over("third").await;
+    until("take back? again", 5, || {
+        rig.term.text().contains("Take it back?")
+    })
+    .await;
+    assert!(
+        refused_at_once(lp).await,
+        "a new connection waits in the backlog"
+    );
+    assert!(!rig.is_finished());
+    Ok(())
+}

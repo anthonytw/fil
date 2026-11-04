@@ -504,6 +504,14 @@ fn forward_row(f: &ForwardRow, o: &ViewOptions<'_>) -> (Vec<String>, Vec<String>
     if let Some(r) = &f.policy {
         detail.push(format!("⚠ refused by server policy: {r}"));
     }
+    if f.peers_refused > 0 {
+        // A count only: the daemon never says whose they were.
+        detail.push(format!(
+            "{} connection{} refused: not from your user on the host (remote_peers = same-user)",
+            f.peers_refused,
+            if f.peers_refused == 1 { "" } else { "s" }
+        ));
+    }
     if let Some(s) = &f.socks_refused {
         // A count and the setting: the targets are not named (DESIGN.md section 11.2).
         detail.push(format!(
@@ -834,6 +842,8 @@ struct JsonForward {
     target_unknown: bool,
     /// Server policy refuses this forward now: the deciding setting and its source.
     policy: Option<String>,
+    /// `-R` connections refused under `remote_peers = "same-user"` (a count only).
+    peers_refused: u32,
     /// A `-D`: the SOCKS connections server policy refused in this client's run.
     socks_refused: Option<JsonSocksRefused>,
 }
@@ -964,6 +974,7 @@ fn json_forward(f: &ForwardRow) -> JsonForward {
         target_other_user: f.target_other_user,
         target_unknown: f.target_unknown,
         policy: f.policy.as_ref().map(|r| r.to_string()),
+        peers_refused: f.peers_refused,
         socks_refused: f.socks_refused.as_ref().map(|s| JsonSocksRefused {
             count: s.count,
             reason: s.last.to_string(),

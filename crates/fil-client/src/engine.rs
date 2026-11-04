@@ -787,6 +787,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 }
                 Served::Refused(prompt) => {
                     let replaced = matches!(prompt, Prompt::Replaced);
+                    // The session is elsewhere now: this run's forwarded connections cannot
+                    // resume, so they end before the question, which has no time limit.
+                    if let Some(h) = &self.fwd {
+                        h.suspend();
+                    }
                     match self.ask(prompt).await? {
                         Ok(()) => {
                             // A fresh attach: new session state, and the dialer installs a new key.

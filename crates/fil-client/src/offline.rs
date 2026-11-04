@@ -66,22 +66,10 @@ impl Default for OfflineInput {
 #[error("{0}")]
 pub struct ParseError(pub String);
 
-/// Parses a size such as `"4KiB"`, `"0"`, `"512"`, `"2 MiB"`, `"8k"` (powers of 1024).
+/// Parses a size such as `"4KiB"`, `"0"`, `"512"`, `"2 MiB"`, `"8k"` (powers of 1024; the forwards'
+/// tunables share it, `fil_forward::tunables`).
 pub fn parse_byte_size(s: &str) -> Result<usize, ParseError> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num, unit) = s.split_at(split);
-    let n: usize = num
-        .parse()
-        .map_err(|_| ParseError(format!("not a size: {s:?}")))?;
-    let mult: usize = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        _ => return Err(ParseError(format!("unknown size unit in {s:?}"))),
-    };
-    n.checked_mul(mult)
-        .ok_or_else(|| ParseError(format!("size too large: {s:?}")))
+    fil_forward::tunables::parse_byte_size(s).map_err(ParseError)
 }
 
 /// Parses the `confirm` setting: `"off"`, or `"after 10s"` / `"after 2m"` / `"after 1500ms"`.

@@ -42,6 +42,20 @@
 //! # tunnels (`ssh -L`, `kubectl port-forward`), and a probe through one reaches whatever it
 //! # leads to, another host included. A listener a known forwarder holds is never probed.
 //! probe_other = false
+//!
+//! [forward]
+//! # Who may connect to the sessions' -R ports (OD-9): "any" local user, as with ssh -R (the
+//! # default), or "same-user": only this user's own sockets. Under "same-user" a connection from
+//! # another uid, or one whose owner cannot be told (a peer that already closed, an off-host peer
+//! # of a non-loopback -R, any peer on macOS, where there is no lookup), is reset before a byte
+//! # reaches the client, and `fil ports` counts it on the forward's row. The host's server policy
+//! # (/etc/fil/policy.toml, the sshd mirror) still decides first; this only narrows.
+//! remote_peers = "any"
+//! # The daemon side's tunables, with the client's `[defaults.forward]` keys and bounds:
+//! # window = "1MiB"         # 16KiB to 4MiB: the receive window per channel
+//! # buffer = "1MiB"         # 16KiB to 16MiB: what a channel's sender keeps unacknowledged
+//! # open_wait = "30s"       # 0 to 1h: how long an -R connection waits for a link
+//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect
 //! ```
 //!
 //! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file
@@ -53,7 +67,9 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::time::Duration;
 
+use fil_forward::tunables::{ForwardTunables, Value};
 use fil_session::ScopeMode;
+use fil_session::peers::RemotePeers;
 use fil_transport::LinkParams;
 use serde::Deserialize;
 
@@ -89,6 +105,18 @@ struct FileConfig {
     scope: Option<String>,
     agent_socket: Option<bool>,
     ports: Option<PortsFile>,
+    forward: Option<ForwardFile>,
+}
+
+/// `[forward]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardFile {
+    remote_peers: Option<String>,
+    window: Option<Value>,
+    buffer: Option<Value>,
+    open_wait: Option<Value>,
+    linger: Option<Value>,
 }
 
 /// `[ports]`.
@@ -147,6 +175,13 @@ pub struct DaemonConfig {
     /// Sessions get the stable `SSH_AUTH_SOCK` and can relay an agent (`agent_socket`, default
     /// true; OD-6).
     pub agent_socket: bool,
+    /// The forwards' tunables on the daemon side (`[forward]`: `window`, `buffer`, `open_wait`,
+    /// `linger`).
+    pub forward: ForwardTunables,
+    /// Who may connect to the `-R` ports (`[forward] remote_peers`, OD-9; default every local
+    /// user). `same-user` carries the host's lookup ([`crate::ports::system_peer_owner`]); tests
+    /// give it another.
+    pub remote_peers: RemotePeers,
     /// The only peer uid the socket accepts (default: this process's). Not in the file; tests
     /// change it to show a foreign user is refused.
     pub allowed_uid: u32,
@@ -182,6 +217,8 @@ impl Default for DaemonConfig {
             ports_probe: ProbeMode::Head,
             ports_probe_other: false,
             agent_socket: true,
+            forward: ForwardTunables::default(),
+            remote_peers: RemotePeers::Any,
             allowed_uid: current_uid(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             lock_wait: Duration::from_secs(3),
@@ -195,6 +232,14 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// A warning for the daemon's log at start: `remote_peers = "same-user"` where no peer can be
+    /// identified, so every `-R` connection is refused. Names nothing of the user's.
+    pub fn remote_peers_warning(&self) -> Option<&'static str> {
+        (!self.remote_peers.is_any() && crate::ports::system_proc_root().is_none()).then_some(
+            "remote_peers = \"same-user\" cannot identify peers on this platform: every -R connection is refused",
+        )
+    }
+
     /// Reads the file at `path`; a missing file gives the defaults.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
@@ -263,6 +308,25 @@ impl DaemonConfig {
         if let Some(o) = ports.probe_other {
             cfg.ports_probe_other = o;
         }
+        if let Some(f) = file.forward {
+            if let Some(p) = f.remote_peers {
+                cfg.remote_peers = match p.as_str() {
+                    "any" => RemotePeers::Any,
+                    "same-user" => RemotePeers::SameUser(crate::ports::system_peer_owner()),
+                    other => {
+                        return Err(format!(
+                            "forward.remote_peers = {other:?}: expected \"any\" or \"same-user\""
+                        ));
+                    }
+                };
+            }
+            cfg.forward.apply(
+                f.window.as_ref(),
+                f.buffer.as_ref(),
+                f.open_wait.as_ref(),
+                f.linger.as_ref(),
+            )?;
+        }
         Ok(cfg)
     }
 }
@@ -291,6 +355,11 @@ mod tests {
                 .agent_socket
         );
         assert!(DaemonConfig::parse("agent_socket = \"no\"").is_err());
+        assert!(
+            c.remote_peers.is_any(),
+            "every local user, as with ssh -R (OD-9)"
+        );
+        assert_eq!(c.forward, ForwardTunables::default());
         assert_eq!(
             c.bind,
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -318,6 +387,36 @@ mod tests {
         assert!(c.ports_probe_other);
     }
 
+    /// `[forward]`: who may connect to the -R ports, and the daemon side's tunables, with the
+    /// client's forms and bounds.
+    #[test]
+    fn the_forward_table() {
+        let c = DaemonConfig::parse(
+            "[forward]\nremote_peers = \"same-user\"\nwindow = \"256KiB\"\nbuffer = 2097152\n\
+             open_wait = \"5s\"\nlinger = 120\n",
+        )
+        .unwrap();
+        assert!(matches!(c.remote_peers, RemotePeers::SameUser(_)));
+        assert_eq!(c.forward.window.get(), 256 * 1024);
+        assert_eq!(c.forward.buffer, 2 * 1024 * 1024);
+        assert_eq!(c.forward.open_wait, Duration::from_secs(5));
+        assert_eq!(c.forward.linger, Duration::from_secs(120));
+        let m = c.forward.mux_config();
+        assert_eq!(
+            (m.open_wait, m.linger),
+            (c.forward.open_wait, c.forward.linger)
+        );
+        // Where no peer can be identified the daemon warns at its start (not on Linux).
+        assert_eq!(
+            c.remote_peers_warning().is_some(),
+            cfg!(not(target_os = "linux"))
+        );
+        let c = DaemonConfig::parse("[forward]\nremote_peers = \"any\"\n").unwrap();
+        assert!(c.remote_peers.is_any());
+        assert!(c.remote_peers_warning().is_none());
+        assert_eq!(c.forward, ForwardTunables::default());
+    }
+
     #[test]
     fn mistakes_are_errors() {
         for bad in [
@@ -333,6 +432,24 @@ mod tests {
             "idle_exit_secs = -1",
             "[ports]\nprobe = \"get\"",
             "[ports]\nprob = \"off\"",
+            "[forward]\nremote_peers = \"me\"",
+            "[forward]\nremote_peers = \"same_user\"",
+            "[forward]\nremote_peers = true",
+            "[forward]\nremote_peer = \"same-user\"",
+            "[forward]\nwindow = \"1KiB\"",
+            "[forward]\nbuffer = \"1GiB\"",
+            "[forward]\nopen_wait = \"2h\"",
+            "[forward]\nlinger = \"forever\"",
+            // The client's keys, not the daemon's.
+            "[forward]\nremote_requests = \"deny\"",
+            "[forward]\nspecs = [\"-R 9000\"]",
+            "forward = [\"-R 9000\"]",
+            // The admin's keys (/etc/fil/policy.toml), which a user's file can neither set nor
+            // loosen.
+            "remote = true",
+            "gateway_ports = true",
+            "[forward]\ngateway_ports = true",
+            "[forward]\npermit_listen = [\"any\"]",
             "[ports]\nprobe_other = \"yes\"",
         ] {
             assert!(DaemonConfig::parse(bad).is_err(), "{bad}");

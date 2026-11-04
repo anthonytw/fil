@@ -80,12 +80,22 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
     let s = Scratch::new();
     fil_daemon::ensure_socket_dir(&s.dir).unwrap();
     // The "daemon": echoes everything until the relay half-closes, then closes.
+    //
+    // Its reads time out and are tried again. macOS can lose the wakeup of a thread blocked in
+    // `read` on a socket whose peer half-closes (about once in a few hundred here, after the 3 MiB
+    // transfer: the end is recorded, only the wakeup is lost), and the relay half-closes toward
+    // the daemon when the client's side ends. The real daemon never blocks in `read` (it waits in
+    // kqueue, and a missed end would still be found by its heartbeat); a blocked echo would hang
+    // this test until its 20 s timeout with every byte echoed.
     let listener = UnixListener::bind(s.paths().socket()).unwrap();
     let echo = thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let mut buf = [0u8; 7919];
         loop {
             match sock.read(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Ok(0) | Err(_) => break,
                 Ok(n) => sock.write_all(&buf[..n]).unwrap(),
             }
@@ -101,9 +111,10 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
     let sent = data.clone();
     let writer = thread::spawn(move || {
         to_relay.write_all(&sent).unwrap();
-        // End of the client's side of the pipe.
-        to_relay.shutdown(std::net::Shutdown::Write).unwrap();
-        to_relay
+        // End of the client's side of the pipe: closed, not half-closed, for the same lost wakeup
+        // in the relay's reader (a full close does not lose it). Where ssh's stdin really is a
+        // socket, on macOS, the relay reads it with a timeout and looks again (`EofWatch`).
+        drop(to_relay);
     });
 
     let got = read_all(&mut from_relay, "the echo through the relay");
@@ -119,7 +130,7 @@ fn passes_bytes_through_exactly_in_both_directions_after_the_preamble() {
     let end = join_within(relay_thread, "the relay").unwrap();
     assert!(matches!(end, RelayEnd::DaemonClosed | RelayEnd::PipeClosed));
     join_within(echo, "the echo daemon");
-    drop(join_within(writer, "the writer"));
+    join_within(writer, "the writer");
 }
 
 #[test]

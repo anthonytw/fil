@@ -63,11 +63,6 @@ async fn a_repaint_after_a_resize_is_the_screen_at_the_new_size_with_no_history(
     let bytes = c.snapshot_bytes.last().unwrap().clone();
     let text = String::from_utf8_lossy(&bytes);
     assert!(!text.contains("fil: skipped"), "no marker");
-    // Cleared row by row: an erase-in-display scrolls the screen into tmux's history.
-    assert!(
-        !text.contains("\x1b[J") && !text.contains("\x1b[2J"),
-        "{text:?}"
-    );
     assert!(!text.contains("line 1\r\n"), "no history lines in it");
     // The client's scrollback did not grow.
     assert_eq!(

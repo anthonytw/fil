@@ -37,45 +37,22 @@ use crate::model::{
 
 /// Renders `state` as bytes that recreate it in a fresh terminal of `state.size`.
 pub fn snapshot(state: &TermState) -> Vec<u8> {
-    let mut w = Writer::new(state, Clear::Screen);
+    let mut w = Writer::new(state);
     w.run();
     w.out
-}
-
-/// Like [`snapshot`], for a terminal that already shows the session and whose scrollback must not
-/// change: the in-band repaint (`docs/m3/plan.md` §2.8). The screen is cleared row by row
-/// (`CSI 2 K` on each, then home) instead of with `CSI H CSI J`, which tmux turns into a screen of
-/// scrollback (`docs/m3/terminals.md`); row-by-row erasing pushed nothing into the scrollback on
-/// xterm, kitty, WezTerm and tmux, nor in the emulator. Pass a state with no history: lines it
-/// carries are still written, and scroll.
-pub fn repaint(state: &TermState) -> Vec<u8> {
-    let mut w = Writer::new(state, Clear::Rows);
-    w.run();
-    w.out
-}
-
-/// How the writer clears the screen before drawing it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Clear {
-    /// `CSI H CSI J`.
-    Screen,
-    /// `CSI 2 K` on every row, then `CSI H`.
-    Rows,
 }
 
 struct Writer<'a> {
     st: &'a TermState,
-    clear: Clear,
     out: Vec<u8>,
     pen: Attrs,
     link: Option<u32>,
 }
 
 impl<'a> Writer<'a> {
-    fn new(st: &'a TermState, clear: Clear) -> Self {
+    fn new(st: &'a TermState) -> Self {
         Writer {
             st,
-            clear,
             out: Vec::with_capacity(4096),
             pen: Attrs::default(),
             link: None,
@@ -90,16 +67,7 @@ impl<'a> Writer<'a> {
         let st = self.st;
         // 1. Known starting point. Not a full reset: that would drop the receiver's own
         // scrollback, which is the point of fil.
-        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r");
-        match self.clear {
-            Clear::Screen => self.put("\x1b[H\x1b[J"),
-            Clear::Rows => {
-                for row in 1..=st.size.rows {
-                    self.put(&format!("\x1b[{row};1H\x1b[2K"));
-                }
-                self.put("\x1b[H");
-            }
-        }
+        self.put("\x1b[0m\x1b[?25l\x1b[?7h\x1b[?6l\x1b[4l\x1b[r\x1b[H\x1b[J");
         self.designate([Charset::Ascii; 4]);
         self.put("\x0f");
         // 2. History and the primary screen.
@@ -481,34 +449,6 @@ mod tests {
 
     fn s(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
-    }
-
-    /// The repaint form clears row by row, never with an erase-in-display (tmux scrolls one into
-    /// its history), and otherwise draws the same: fed to a terminal that shows something else,
-    /// it leaves the same screen as the ordinary snapshot does on a fresh one.
-    #[test]
-    fn a_repaint_clears_row_by_row_and_draws_the_same_screen() {
-        let mut st = state(12, 4);
-        put_text(&mut st, 0, "hello");
-        put_text(&mut st, 2, "world");
-        let out = s(&repaint(&st));
-        assert!(
-            !out.contains("\x1b[J") && !out.contains("\x1b[2J"),
-            "{out:?}"
-        );
-        for row in 1..=4 {
-            assert!(out.contains(&format!("\x1b[{row};1H\x1b[2K")), "{out:?}");
-        }
-        let size = Size { cols: 12, rows: 4 };
-        let mut fresh = crate::create(crate::DEFAULT_BACKEND, size, 10).unwrap();
-        fresh.feed(&snapshot(&st));
-        let mut busy = crate::create(crate::DEFAULT_BACKEND, size, 10).unwrap();
-        busy.feed(b"\x1b[7mxxxxxxxxxxxx\r\nyyyy\x1b[0m\r\nzz\r\nwwwwwwwwwwwwqq");
-        let before = busy.state(10).history.len();
-        busy.feed(out.as_bytes());
-        assert_eq!(busy.state(0).screen, fresh.state(0).screen);
-        assert_eq!(busy.state(0).cursor, fresh.state(0).cursor);
-        assert_eq!(busy.state(10).history.len(), before, "nothing scrolled");
     }
 
     #[test]

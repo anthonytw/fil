@@ -1108,10 +1108,10 @@ impl Core {
             return RepaintAnswer::Behind;
         }
         self.last_repaint = Some(now);
-        // No history, and a clear that leaves the client's scrollback alone on every terminal
-        // (`fil_term::snapshot::repaint`).
-        self.emu.apply_pending();
-        let bytes = fil_term::snapshot::repaint(&self.emu.state(0));
+        // No history lines: the client's scrollback is its own. The clear is the snapshot
+        // writer's (row by row once ST1 lands: `CSI H CSI J` scrolls the screen into tmux's
+        // history, `docs/m3/terminals.md`).
+        let bytes = self.render_snapshot(0, 0);
         RepaintAnswer::Ready(CatchUp {
             info: SnapshotInfo {
                 at,

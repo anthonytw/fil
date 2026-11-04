@@ -1,0 +1,9 @@
+# Code owners (docs/m4/plan.md, REL). The files that decide what a release is, and who may sign it,
+# need the owner's review. This takes effect only with the "require review from Code Owners"
+# setting of the main ruleset, which is the owner's to turn on.
+/.github/release-signers @anthonytw
+/.github/workflows/** @anthonytw
+/.github/CODEOWNERS @anthonytw
+/tests/release/** @anthonytw
+/Cross.toml @anthonytw
+/rust-toolchain.toml @anthonytw

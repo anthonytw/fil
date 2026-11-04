@@ -8,9 +8,28 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/anthonytw/fil"
 publish = false
+# The pinned toolchain (rust-toolchain.toml), because `cargo install --git` does not read that file
+# (docs/m4/release.md section 1). `crates/fil` inherits it; a test in tests/release keeps the two equal.
+rust-version = "1.99.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The release build (DESIGN.md section 13, docs/m4/release.md section 4.4): small, and the same bytes
+# wherever and whenever it is built. Every release job passes `--locked`.
+#
+# Paths: the binary must carry no builder path (`just release-check` greps for one). The profile
+# key for that, `trim-paths = "all"`, is NOT stable in the pinned cargo (1.99.1 refuses it: "feature
+# `trim-paths` is required"), so tests/release/common.sh passes the equivalent `--remap-path-prefix`
+# flags for the workspace, CARGO_HOME and RUSTUP_HOME instead (the fallback docs/m4/plan.md names).
+# When the pinned cargo stabilizes `trim-paths`, set it here and drop the flags; tests/release/
+# selftest.sh fails if the profile and the flags ever disagree about which one is in force. A
+# `cargo install` build is not remapped, and the upload scan (U1) refuses it.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+debug = 0

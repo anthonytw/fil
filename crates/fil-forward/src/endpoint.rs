@@ -805,8 +805,7 @@ impl<L: Link> State<L> {
     /// nothing earlier in the queue and that the pacer lets through anyway (nothing in flight).
     /// What it takes is recorded with the pacer. `None` with a non-empty queue: held.
     fn next_out(&mut self, t: std::time::Instant) -> Option<Out> {
-        let path = self.link.as_ref()?.status().borrow().path_generation;
-        self.pacer.path_changed(path);
+        self.sync_path()?;
         if let Some(ch) = self.finish_out.pop_front() {
             self.pacer.forget(ch);
             return Some(Out::Finish(ch));
@@ -830,6 +829,14 @@ impl<L: Link> State<L> {
         }
         self.sent(ch, &p, t);
         Some(Out::Data(ch, p))
+    }
+
+    /// Tells the pacer which path the link is on now, so it forgets what it measured on the last
+    /// one before it takes the next ack or sends the next payload. `None` without a link.
+    fn sync_path(&mut self) -> Option<()> {
+        let path = self.link.as_ref()?.status().borrow().path_generation;
+        self.pacer.path_changed(path);
+        Some(())
     }
 
     /// Records with the pacer that `payload` of `ch` goes on the link now.
@@ -1352,7 +1359,9 @@ impl<L: Link> Endpoint<L> {
         let taken = before.is_some_and(|i| {
             i.state != ChannelState::Closing && upto > i.acked && upto <= i.sent_high
         });
-        if r.is_ok() && taken && st.link.is_some() {
+        if r.is_ok() && taken && st.sync_path().is_some() {
+            // The path first: an ack that arrives after a path change but before the data sender
+            // next looked at it is still about the old path.
             let threshold = st.mux.info(ch).map_or(u64::MAX, |i| {
                 fil_proto::mux::ack_threshold(u64::from(i.peer_window))
             });

@@ -365,7 +365,8 @@ fn typing(rng: &mut Rng, n: usize, words: &[&str]) -> Script {
             93..=94 => b"\x1b[D".to_vec(),
             95 => b"\x1b[C".to_vec(),
             96 => vec![0x15],
-            97 => "é".as_bytes().to_vec(),
+            // Not from the reserved alphabet, which only secrets use (`crate::oracle::reserved`).
+            97 => "ā".as_bytes().to_vec(),
             98 => "日本".as_bytes().to_vec(),
             _ => vec![0x01],
         };
@@ -484,9 +485,11 @@ fn password_spec(s: &Scratch, _seed: u64) -> Spec {
 fn password_keys(rng: &mut Rng, n: usize) -> Script {
     let mut v = Vec::new();
     while v.len() < n {
-        // Typed ahead of the prompt, the way a fast typist does.
+        // Typed ahead of the prompt, the way a fast typist does, from the reserved alphabet.
+        let secret: Vec<char> = crate::sim::SECRET.chars().collect();
         for _ in 0..rng.range(2, 8) {
-            v.push((rng.range(8, 70), vec![*rng.pick(b"QXZ")]));
+            let c = *rng.pick(&secret);
+            v.push((rng.range(8, 70), c.to_string().into_bytes()));
         }
         if rng.chance(30) {
             v.push((rng.range(8, 70), vec![0x7f]));
@@ -614,7 +617,7 @@ pub fn programs() -> Vec<Program> {
         },
         Program {
             name: "read-s",
-            secret: "QXZ",
+            secret: crate::sim::SECRET,
             spec: password_spec,
             keys: password_keys,
         },

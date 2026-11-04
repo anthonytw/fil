@@ -3,7 +3,10 @@
 //! quick; `just predict-harness` runs the same code at scale.
 //!
 //! Each scenario runs on every compiled-in backend, with the default predictor and with a
-//! hostile one that guesses wildly (the core must hold whatever the predictor does).
+//! hostile one that guesses wildly (the core must hold whatever the predictor does). The fake
+//! remote acknowledges input like the daemon (`EchoAck`), and the secrets typed in the password
+//! and raw-secret scenarios are checked with both predictors: since C1 the core's epochs, not
+//! the predictor, keep them off the screen.
 
 use fil_predict::driver::{PredictorKind, Stats, shrink};
 use fil_predict::sim::{Scenario, SimConfig, run};
@@ -31,12 +34,12 @@ fn scenario(sc: Scenario) {
         for hostile in [false, true] {
             for seed in base()..base() + seeds() {
                 let mut cfg = SimConfig::new(sc, seed, b.name);
-                cfg.keys = 50;
+                // Mixed closes the painting gates often (character sets, insert mode, the
+                // alternate screen) and every disturbance ends an epoch: it needs more keys to
+                // be sure to paint at all.
+                cfg.keys = if sc == Scenario::Mixed { 150 } else { 50 };
                 if hostile {
-                    // Typing ahead of the prompt is predicted by a predictor with no
-                    // epochs; only the core's rule applies to it.
-                    cfg.run.kind = PredictorKind::Hostile { seed, noise: true };
-                    cfg.run.secret = "";
+                    cfg.run.kind = PredictorKind::hostile(seed);
                 }
                 let out = run(&cfg);
                 stats.add(&out.stats);
@@ -84,4 +87,8 @@ scenarios! {
     saved_cursor => Scenario::SavedCursor,
     exotic => Scenario::Exotic,
     mixed => Scenario::Mixed,
+    slow_echo => Scenario::SlowEcho,
+    paste => Scenario::Paste,
+    offline => Scenario::Offline,
+    raw_secret => Scenario::RawSecret,
 }

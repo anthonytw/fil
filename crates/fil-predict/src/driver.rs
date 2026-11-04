@@ -10,21 +10,39 @@ use std::time::Duration;
 use fil_term::{Backend, Size, TermState, backends};
 
 use crate::mosh::{MoshConfig, MoshPredictor};
-use crate::oracle::{Kind, Oracle, PROBE, Violation, check_equal, check_view, common, diffs, dump};
-use crate::overlay::{Config, Guards, Overlay, PtyMode};
-use crate::predictor::Time;
-use crate::sim::{FixedPredictor, HostilePredictor};
+use crate::oracle::{
+    Kind, Oracle, PROBE, Violation, check_equal, check_view, common, diffs, dump, printed, reserved,
+};
+use crate::overlay::{Config, Guards, InputKind, Overlay, PtyMode};
+use crate::predictor::{InputPos, LinkView, Time, WithdrawReason};
+use crate::sim::{Category, FixedPredictor, HostileCfg, HostilePredictor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ev {
-    /// Keystrokes.
+    /// Keystrokes, typed and live.
     Input(Vec<u8>),
+    /// Input that is not typed and live (rule 6): offline input released, an answer, a paste the
+    /// client knows of.
+    Untyped(Vec<u8>, InputKind),
     /// Server bytes.
     Server(Vec<u8>),
     Tick,
     Pty(PtyMode),
     Rtt(Duration),
+    /// The link went down or came back.
+    Down(bool),
     Resize(Size),
+    /// `EchoAck { input_upto }`, applied in order with the output.
+    EchoAck(InputPos),
+    /// A snapshot replaces the screen: the terminal and the shadow start again, blank, and get
+    /// these bytes.
+    Snapshot(Vec<u8>),
+    /// A snapshot rendered at the current size has landed (rule 9).
+    Repainted,
+    /// A resume or a swap.
+    Resumed,
+    /// A lifecycle withdrawal (a takeover, a detach, the exit).
+    Withdraw(WithdrawReason),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +88,27 @@ impl Trace {
     pub fn rtt(self, ms: u64, rtt_ms: u64) -> Self {
         self.push(ms, Ev::Rtt(Duration::from_millis(rtt_ms)))
     }
+    pub fn untyped(self, ms: u64, b: &[u8], kind: InputKind) -> Self {
+        self.push(ms, Ev::Untyped(b.to_vec(), kind))
+    }
+    pub fn down(self, ms: u64, down: bool) -> Self {
+        self.push(ms, Ev::Down(down))
+    }
+    pub fn echo_ack(self, ms: u64, input_upto: InputPos) -> Self {
+        self.push(ms, Ev::EchoAck(input_upto))
+    }
+    pub fn snapshot(self, ms: u64, b: &[u8]) -> Self {
+        self.push(ms, Ev::Snapshot(b.to_vec()))
+    }
+    pub fn repainted(self, ms: u64) -> Self {
+        self.push(ms, Ev::Repainted)
+    }
+    pub fn resumed(self, ms: u64) -> Self {
+        self.push(ms, Ev::Resumed)
+    }
+    pub fn withdraw(self, ms: u64, r: WithdrawReason) -> Self {
+        self.push(ms, Ev::Withdraw(r))
+    }
 
     /// The trace as the builder calls that recreate it, for pasting into a test.
     pub fn to_rust(&self) -> String {
@@ -86,6 +125,18 @@ impl Trace {
                 Ev::Resize(z) => {
                     s.push_str(&format!("\n    .resize({ms}, {}, {})", z.cols, z.rows))
                 }
+                Ev::Untyped(b, k) => s.push_str(&format!(
+                    "\n    .untyped({ms}, b\"{}\", InputKind::{k:?})",
+                    esc(b)
+                )),
+                Ev::Down(d) => s.push_str(&format!("\n    .down({ms}, {d})")),
+                Ev::EchoAck(n) => s.push_str(&format!("\n    .echo_ack({ms}, {n})")),
+                Ev::Snapshot(b) => s.push_str(&format!("\n    .snapshot({ms}, b\"{}\")", esc(b))),
+                Ev::Repainted => s.push_str(&format!("\n    .repainted({ms})")),
+                Ev::Resumed => s.push_str(&format!("\n    .resumed({ms})")),
+                Ev::Withdraw(r) => {
+                    s.push_str(&format!("\n    .withdraw({ms}, WithdrawReason::{r:?})"))
+                }
             }
         }
         s
@@ -97,15 +148,18 @@ impl Trace {
 pub enum PredictorKind {
     /// The default predictor.
     Mosh,
-    /// Shows every guess at once, at the cursor, whatever is there ([`HostilePredictor`]).
-    /// With `noise`, also invents cells out of range and on wide characters.
-    Hostile { seed: u64, noise: bool },
-    /// Shows exactly these cells on the first key typed, and keeps them until they time out
+    /// A predictor that tries everything the core must refuse ([`HostilePredictor`]).
+    Hostile(HostileCfg),
+    /// Guesses the n-th printable key or Backspace at the n-th of these cells
     /// ([`FixedPredictor`]); for deterministic hazard traces.
-    Fixed {
-        cells: Vec<(u16, u16, char)>,
-        cursor: Option<(u16, u16)>,
-    },
+    Fixed { cells: Vec<(u16, u16)> },
+}
+
+impl PredictorKind {
+    /// The hostile predictor with every trick on, seeded.
+    pub fn hostile(seed: u64) -> Self {
+        PredictorKind::Hostile(HostileCfg::noisy(seed))
+    }
 }
 
 /// What a run is made of.
@@ -123,7 +177,12 @@ pub struct RunConfig {
     /// of the default predictor's manners.
     pub kind: PredictorKind,
     /// Characters that must never reach the user's terminal (checked after every flush).
+    /// Besides these, no flush may paint a character of the reserved alphabet
+    /// ([`crate::oracle::reserved`]): the typists' secrets are drawn from it.
     pub secret: &'static str,
+    /// The misprediction bar to hold the run to (`docs/m3/plan.md` §2.5): `Faithful` and `Slow`
+    /// fail on any visible misprediction. `None`: counted, not judged.
+    pub bar: Option<Category>,
 }
 
 impl RunConfig {
@@ -137,6 +196,7 @@ impl RunConfig {
             predictor: MoshConfig::default(),
             kind: PredictorKind::Mosh,
             secret: "",
+            bar: None,
         }
     }
 }
@@ -180,6 +240,8 @@ fn backend(name: &str) -> Backend {
 /// An overlay, the oracle that checks it, and a reference terminal for the final probe.
 pub struct Driver {
     pub overlay: Overlay,
+    backend: Backend,
+    oracle_backend: Backend,
     oracle: Oracle,
     /// Receives the bracketed bytes exactly as sent; emulators that implement synchronized
     /// output hold their state back inside a bracket, so it is only checked between flushes.
@@ -191,6 +253,9 @@ pub struct Driver {
     pub stats: Stats,
     /// The overlay has been told the PTY is canonical with echo off.
     password: bool,
+    /// The next input byte's offset.
+    input_end: InputPos,
+    link: LinkView,
 }
 
 impl Driver {
@@ -199,12 +264,8 @@ impl Driver {
         let ob = backend(cfg.oracle_backend);
         let predictor: Box<dyn crate::predictor::Predictor> = match &cfg.kind {
             PredictorKind::Mosh => Box::new(MoshPredictor::new(cfg.predictor)),
-            PredictorKind::Hostile { seed, noise } => {
-                Box::new(HostilePredictor::new(*seed, *noise))
-            }
-            PredictorKind::Fixed { cells, cursor } => {
-                Box::new(FixedPredictor::new(cells.clone(), *cursor))
-            }
+            PredictorKind::Hostile(h) => Box::new(HostilePredictor::new(h.clone())),
+            PredictorKind::Fixed { cells } => Box::new(FixedPredictor::new(cells.clone())),
         };
         let overlay = Overlay::with_backend(
             &b,
@@ -218,6 +279,8 @@ impl Driver {
         );
         Driver {
             overlay,
+            backend: b,
+            oracle_backend: ob,
             oracle: Oracle::new(&ob, cfg.size, HISTORY),
             sync_oracle: cfg.sync_output.then(|| Oracle::new(&ob, cfg.size, HISTORY)),
             reference: (ob.create)(cfg.size, HISTORY),
@@ -226,6 +289,8 @@ impl Driver {
             failure: None,
             stats: Stats::default(),
             password: false,
+            input_end: 0,
+            link: LinkView::default(),
         }
     }
 
@@ -247,7 +312,44 @@ impl Driver {
         self.trace.events.push(TraceEvent { at, ev: ev.clone() });
         match ev {
             Ev::Input(b) => {
-                let f = self.overlay.on_input(&b, at);
+                let f = self
+                    .overlay
+                    .on_input(&b, self.input_end, InputKind::Typed, at);
+                self.input_end += b.len() as u64;
+                self.flushed(f, None);
+            }
+            Ev::Untyped(b, kind) => {
+                let f = self.overlay.on_input(&b, self.input_end, kind, at);
+                self.input_end += b.len() as u64;
+                self.flushed(f, None);
+            }
+            Ev::EchoAck(n) => {
+                let f = self.overlay.on_echo_ack(n, at);
+                self.flushed(f, None);
+            }
+            Ev::Down(d) => {
+                self.link.down = d;
+                self.overlay.set_link(self.link);
+            }
+            Ev::Repainted => self.overlay.repainted(),
+            Ev::Resumed => self.overlay.resumed(),
+            Ev::Withdraw(r) => {
+                let f = self.overlay.withdraw(r);
+                self.flushed(f, None);
+            }
+            Ev::Snapshot(b) => {
+                // The client writes the snapshot onto a terminal it has reset and cleared: model
+                // that as a fresh terminal, a fresh reference and a fresh shadow.
+                let size = self.overlay.size();
+                self.overlay.reset((self.backend.create)(size, HISTORY), at);
+                self.oracle = Oracle::new(&self.oracle_backend, size, HISTORY);
+                if self.sync_oracle.is_some() {
+                    self.sync_oracle = Some(Oracle::new(&self.oracle_backend, size, HISTORY));
+                }
+                self.reference = (self.oracle_backend.create)(size, HISTORY);
+                let f = self.overlay.on_server(&b, at);
+                self.reference.feed(&b);
+                let _ = self.reference.take_replies();
                 self.flushed(f, None);
             }
             Ev::Server(b) => {
@@ -269,7 +371,10 @@ impl Driver {
                 let f = self.overlay.set_pty_mode(m);
                 self.flushed(f, None);
             }
-            Ev::Rtt(d) => self.overlay.set_rtt(d),
+            Ev::Rtt(d) => {
+                self.link.rtt_hint = Some(d);
+                self.overlay.set_link(self.link);
+            }
             Ev::Resize(z) => {
                 // The erase runs against the old geometry; then the terminal and the
                 // reference change size like the shadow does.
@@ -306,6 +411,14 @@ impl Driver {
         }
         self.oracle.write(&f.server);
         self.oracle.write(&f.paint);
+        // The reserved alphabet (docs/m3/plan.md §5.2): no scenario program prints it, so any
+        // printable write of it in a paint is a typed secret the overlay wrote.
+        if let Some(c) = printed(&f.paint).into_iter().find(|&c| reserved(c)) {
+            return self.fail(Violation {
+                kind: Kind::Secret,
+                detail: format!("the overlay painted {c:?}, a character of the reserved alphabet"),
+            });
+        }
         let view = self.overlay.view(HISTORY);
         self.stats.events += 1;
         self.stats.erases += u64::from(!f.erase.is_empty());
@@ -381,6 +494,15 @@ impl Driver {
                     dump(&a)
                 ),
             });
+        }
+        if let Some(Category::Faithful | Category::Slow) = self.cfg.bar {
+            let m = self.overlay.stats().mispredicted;
+            if m.total() > 0 {
+                self.fail(Violation {
+                    kind: Kind::Mispredict,
+                    detail: format!("visible mispredictions in a {:?} run: {m:?}", self.cfg.bar),
+                });
+            }
         }
         // Failure position for end-of-run checks is the last event.
         if let Some(f) = &mut self.failure {

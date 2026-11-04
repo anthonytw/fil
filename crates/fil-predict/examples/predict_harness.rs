@@ -117,7 +117,7 @@ async fn session(prog: &'static Program, backend: &'static str, seed: u64, o: &O
     run.secret = prog.secret;
     if o.hostile {
         // A predictor with no manners: only the core stands between it and the screen.
-        run.kind = PredictorKind::Hostile { seed, noise: true };
+        run.kind = PredictorKind::hostile(seed);
         run.secret = "";
     }
     for g in &o.guard_off {

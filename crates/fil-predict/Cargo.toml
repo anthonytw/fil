@@ -9,8 +9,11 @@ publish.workspace = true
 
 [features]
 default = []
+# The test harness (oracle, driver, sim): not in the shipped library. Its traces hold keystrokes
+# by design (docs/m3/plan.md §4.3). The tests enable it through the dev-dependency below.
+testkit = []
 # The PTY harness and demo: real programs on a PTY behind fil-netsim (examples/).
-harness = ["dep:fil-netsim", "dep:tokio", "dep:portable-pty", "dep:nix"]
+harness = ["testkit", "dep:fil-netsim", "dep:tokio", "dep:portable-pty", "dep:nix"]
 
 [lints]
 workspace = true
@@ -28,6 +31,8 @@ nix = { version = "0.28", default-features = false, features = ["term"], optiona
 # examples iterate over every backend, so they build it.
 [dev-dependencies]
 fil-term = { path = "../fil-term", features = ["vt100"] }
+# The tests use the harness (oracle, driver, sim).
+fil-predict = { path = ".", features = ["testkit"] }
 # Used only by examples/predict_demo.rs (needs the harness feature).
 rustix = { version = "1", features = ["termios", "stdio"] }
 

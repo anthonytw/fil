@@ -541,7 +541,7 @@ An accepted resume keeps the epoch and drops the subscriber's previous transport
 
 **Messages for the terminal and prediction.**
 - `AttachReply.term` carries the session's `TERM` (§6.4).
-- `PtyMode { canonical, echo, at }` reports a change in the PTY's line discipline at terminal offset `at`, so the client applies it in order with the output. A password prompt is `canonical && !echo`. The daemon reads `ICANON` and `ECHO` once per batch of output it takes from the PTY (a change is positioned at the batch's first byte, which is at or before the true position, the safe direction), after the PTY has taken input, and by polling every 50 ms while a client is attached, because `read -s` changes the mode with no output at all. The poll slows to every 500 ms once there has been no input or output for 2 s, except for a client that asked for `EchoAck` (a predicting client): it keeps the 50 ms poll, so a password prompt that follows a silence is known before the first keystroke is painted. The mode in force is stated again after every `AttachReply` and after every snapshot, the attach-time one and the mid-stream catch-up, since a snapshot resets the client's picture, an open password prompt included. The message is sent once the output below `at` has been.
+- `PtyMode { canonical, echo, at }` reports a change in the PTY's line discipline at terminal offset `at`, so the client applies it in order with the output. A password prompt is `canonical && !echo`. The daemon reads `ICANON` and `ECHO` once per batch of output it takes from the PTY (a change is positioned at the batch's first byte, which is at or before the true position, the safe direction), after the PTY has taken input, and by polling every 50 ms while a client is attached, because `read -s` changes the mode with no output at all. The poll slows to every 500 ms once there has been no input or output for 2 s, for every client: a predicting client (one that asked for `EchoAck`) does not need it faster, because its prediction core makes the first key after 1 s of silence tentative (the `Idle` boundary, §9), and a tentative key is never written, so a password prompt that follows a silence is never painted into, however late its report arrives (M3 C1; it was the 50 ms poll before). The mode in force is stated again after every `AttachReply` and after every snapshot, the attach-time one and the mid-stream catch-up, since a snapshot resets the client's picture, an open password prompt included. The message is sent once the output below `at` has been.
 - `EchoAck { input_upto, output_at }` is mosh's echo acknowledgement. Every keystroke byte below `input_upto` was taken by the PTY (written, not merely queued: a child that is not reading holds the writer back) at least the echo window (50 ms) ago, and any output it caused is below `output_at`. `input_upto` counts the subscriber's input stream, which starts at 0 for a fresh attach and continues on a resume (the daemon sends `Resume { TERMINAL, received }` after the attach reply, and the client sends its input from there). The message is sent once the output below `output_at` has been.
 - **A connection that lost the session is not read again.** On a takeover or detach the daemon stops reading the old link at once (QUIC returns what it had already received), and ignores input from any connection but the live one. Input queued in front of a child that is not reading is bounded: acks stop at 64 KiB, and a connection that sends on past a hard limit (4 MiB by default) is cut off with `Error`.
 - **Graceful close.** `Link::close` discards what is queued, so before dropping a transport the daemon sends the last message (`TakenOver`, `Detach` for `fil detach`, `AttachRefused`, `Error`, `SessionExited`), calls `Link::flush` (§8.1) for at most one second, and only then closes. It no longer waits for the client to hang up.
@@ -564,7 +564,7 @@ The binding and the key end with the subscriber's hold on the session: on takeov
 
 - Terminal sizes are capped: at most 2000 columns, 1000 rows and 1,000,000 cells. Larger sizes are refused when decoded, because the emulator allocates the grid and an unbounded size would let one peer take down every session (M1 security sweep). The client clamps its real size.
 - `Attach.size_gen`: the generation of `Attach.size` (*Size generation*, above). `ControlMsg::Resize` is gone: the size travels as an in-band record. Builds from before and after this change do not interoperate (an old daemon refuses the record as a malformed segment). It is **wire revision 2**: revision 1 was the first numbered wire and still had `ControlMsg::Resize`, and the revision rule above applies to it like any other change (a revision-1 and a revision-2 build refuse each other at the hello, with the direction in the message, instead of one failing on a record or a size the other does not know). The golden holds an `input/` section for the record: its layout, its widest values (`at` and `size_gen` at `u64::MAX`, the widest size), and what the decoder makes of a record with a trailing byte, an unknown kind, a zero size or nothing after the mark.
-- `Attach.echo_ack`: only a predicting client asks for `EchoAck`, so other clients don't pay for them. The daemon also keeps the fast PTY mode poll for such a client. The M3 predictor must set it, or it gets neither.
+- `Attach.echo_ack`: only a predicting client asks for `EchoAck`, so other clients don't pay for them. The M3 predictor must set it, or the core cannot settle its guesses by acknowledgement (§9). The mode poll is the same either way (above).
 - `ResumeRequest.want_snapshot`: resume the session but repaint from a snapshot, for when the client's screen no longer matches its byte position. The snapshot's reason is `Requested`, and `skipped` is what the client had not yet seen (`ready - seq`), so the gap marker appears when it missed output and not when it was current.
 - `ErrorCode::SessionStartFailed`: the daemon could not start the session; the reason is in its log.
 
@@ -646,29 +646,43 @@ Before v1 these changes are made in place, with no compatibility kept.
 
 ## 9. Prediction (optional, pluggable)
 
-Prediction is pluggable **(decided)**.
+Prediction is pluggable **(decided)**. A predictor is untrusted: it *declares* guesses, and the core decides which are written (`docs/m3/plan.md` §2.1, §2.3, §2.4).
 
 **The core does these things, whatever predictor is in use:**
 
 - It keeps a shadow screen in the client, fed only by the authoritative byte stream.
 - It owns the overlay layer.
 - **Erase before write:** before writing server bytes, the client restores every overlaid cell, and the cursor, from the shadow screen.
+- **Written means shown.** What the overlay paints reaches the terminal's recorders even if it is erased at once, so the rules below decide what may be *written*, not how long it stays.
 
-**The core enforces these rules on every predictor:**
+**The core enforces these rules on every predictor** (in `fil-predict`'s `Overlay`, each with a `Guards` switch that a test shows is needed, with a hostile predictor):
 
 - Never paint anything that would scroll the screen or wrap a line.
-- Never predict while the daemon reports the PTY in canonical mode with echo off, which is what a password prompt looks like.
+- Never predict while the daemon reports the PTY in canonical mode with echo off, which is what a password prompt looks like; anything written is retracted when the report arrives.
 - Stay off on the alternate screen unless the predictor opts in.
+- **Epochs.** Every key belongs to the epoch it was typed in, which the core knows from its input offset. After every boundary the epoch is *tentative*: its guesses are recorded and written nowhere. It becomes confirmed only when one output chunk, received after the keys were sent, is explained entirely by its guesses: no guess contradicted and nothing unexplained (both checked first), every glyph it changes (outside the two exemptions below) is a guessed cell now showing exactly its guess, at least one guessed glyph changed in it, and the cursor ends where the core computed. Every key of a tentative epoch must be guessed, in order; a key the predictor declines is a boundary. A tentative epoch that ends is never written. In a confirmed epoch guesses are written as they come and confirmed by their glyph alone; a contradiction ends the epoch.
+- **The predictor cannot choose a guess's glyph or resulting cursor.** A guess names a cell and a key (`Guess { row, col, at }`); the glyph is the key's own (a blank for Backspace) and the cursor after it is the cell plus its width. Only printable keys and Backspace are guessed; only the left and right arrows, Ctrl-B and Ctrl-F are moves (one column). In a tentative epoch only the plain forms are accepted: append at the cursor, a Backspace one column left, a one-column move.
+- **Boundaries** end the epoch (what is written is withdrawn): Enter, Tab, every other control key, every escape sequence but the arrows, and every Alt-key; every PTY mode change; output the guesses do not explain (the cursor elsewhere, a glyph changed on another row, or left of the cursor on its row that is not a guess; glyphs right of the cursor on its row and attribute-only changes are exempt, for fish's autosuggestions, zsh's `RPROMPT` and syntax highlighting); pasted, offline or answer input, and keys past 1,024 outstanding guesses; the first key after 1 s with no input or output; the first key after a resume or swap; and every snapshot (a new overlay always starts tentative). The boundaries hold also while the predictor shows nothing. With nothing outstanding, output costs no screen read: the core checks it at the next key, the cursor and its row against copies, every other row by a per-row stamp (`ScreenView::row_stamp`).
+- **Settling by `EchoAck`.** Once the output below an ack's offset is applied, every guess whose key is below `input_upto` and not confirmed is settled: contradicted if its cell shows something else; if its cell is unchanged, the epoch goes tentative at once and a written guess stays for a 250 ms grace for a late echo, which confirms it (and the epoch again) or it is contradicted. An ack beyond the input sent is ignored. An unsettled guess is withdrawn after 10 s (expired with the link up, the backstop with it down).
+- **Resize.** The screen is untrusted until a snapshot at the current size lands: guesses are recorded and confirmed, none written, and a repaint is asked for only when one would be (or something was drawn at the resize).
 
-**What a predictor sees and returns:** it receives keystrokes, a read-only view of the shadow screen, the RTT, and events that confirm or contradict its guesses. It returns overlay edits.
+What is left after these rules is the raw-mode residual of `docs/m3/plan.md` OQ-1 (the owner's question; §11 records the outcome).
+
+**What a predictor sees and returns** (`fil_predict::Predictor`): keys with their input offsets, a read-only `ScreenView` of the shadow, the link (an RTT hint, degraded, down) and the PTY mode; what the core settled, and each `EchoAck`. It returns declared guesses, moves and withdrawals, and a display policy (`Show::Hide`, `Plain` or `Underline`) that can only hold back.
 
 ```rust
 trait Predictor {
-    fn on_key(&mut self, key: &KeyEvent, screen: &Screen, rtt: Duration) -> Vec<OverlayEdit>;
-    fn on_output(&mut self, screen: &Screen) -> Vec<OverlayEdit>; // confirm or retract
-    fn reset(&mut self);
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit>;
+    fn on_output(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit>; // re-plan; settling is the core's
+    fn on_settled(&mut self, settled: &[Settled], ctx: &Ctx<'_>);
+    fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>);
+    fn show(&self, ctx: &Ctx<'_>) -> Show;
+    // on_tick, next_deadline, reset, has_outstanding, wants_alt_screen
 }
+enum OverlayEdit { Guess { row, col, at }, Move { at }, Withdraw { row, col }, Clear }
 ```
+
+**Mispredictions** are counted by glyph (`PredictStats`): a written guess removed without the shadow showing its glyph, because it was contradicted (by output or by `EchoAck`), expired with the link up, retracted under the password rule, withdrawn by the predictor, or dropped when its epoch ended. A recolored echo is *restyled*, not a misprediction; lifecycle withdrawals (takeover, detach, exit, refusal, snapshot, resize, the backstop) are counted apart.
 
 **The default build** ships a conservative predictor modeled on mosh's:
 
@@ -784,7 +798,7 @@ Everything below that is not marked **(decided)** is proposed: the implementatio
   - sleep past the QUIC idle timeout
   - fill the forward buffers
 - **Fuzzing** (`cargo-fuzz`): the frame parser, control messages and the emulator's input path.
-- **Prediction:** a scripted latency harness compares what the user saw with the authoritative screen. Any mismatch left after confirmation is a failure.
+- **Prediction:** a scripted latency harness compares what the user saw with the authoritative screen after every write, and fails on any corruption, on a character of the secrets' reserved alphabet (Latin-1 letters) written by the overlay, and, where a run's bar asks for it, on a *visible misprediction*: a guessed glyph that was written and later removed without the shadow showing it in that cell (§9; restyled echoes and lifecycle withdrawals are counted apart). Every rule of §9 has a deterministic trace, run with the default predictor and a hostile one, and a guard that the trace shows is needed (`just predict-mutants`).
 
 ## 13. Implementation
 

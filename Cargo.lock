@@ -498,6 +498,7 @@ name = "fil-predict"
 version = "0.0.0"
 dependencies = [
  "fil-netsim",
+ "fil-predict",
  "fil-term",
  "nix",
  "portable-pty",

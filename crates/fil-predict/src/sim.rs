@@ -8,15 +8,39 @@
 //!
 //! The remote is not a terminal emulator. It echoes what a cooked tty would, and
 //! occasionally emits the scenario's escape sequences, which is all the overlay needs to be
-//! exposed to. Whether the overlay survives them is the oracle's business.
+//! exposed to. Whether the overlay survives them is the oracle's business. Like the daemon
+//! (`fil-session/src/echo.rs`), it sends a cumulative `EchoAck` 50 ms after it takes input,
+//! in order with its output.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::driver::{Driver, Ev, Failure, RunConfig, Trace};
 use crate::keys::KeyDecoder;
-use crate::overlay::PtyMode;
-use crate::predictor::KeyEvent;
+use crate::overlay::{InputKind, PtyMode};
+use crate::predictor::{
+    Ctx, InputPos, KeyEvent, Outcome, OverlayEdit, Predictor, Settled, Show, Time,
+};
+
+/// The daemon's echo window (DESIGN.md §8.5): an `EchoAck` follows input this long after the
+/// PTY takes it.
+pub const ECHO_WINDOW: Duration = Duration::from_millis(50);
+
+/// Secrets the typists type: from the reserved alphabet (`crate::oracle::reserved`).
+pub const SECRET: &str = "ØÑÜÅÇ";
+
+/// What a scenario's bar is (`docs/m3/plan.md` §2.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Category {
+    /// The program echoes what is typed, and nothing else writes.
+    Faithful,
+    /// Faithful, but echoing after the 50 ms echo window.
+    Slow,
+    /// The program echoes something else, or another writer shares the terminal.
+    Adversarial,
+    /// Faithful programs with lifecycle faults injected.
+    Fault,
+}
 
 /// SplitMix64: tiny, fast, and the same sequence on every platform and version, which is
 /// what a seed in a bug report needs.
@@ -81,10 +105,19 @@ pub enum Scenario {
     Exotic,
     /// Everything above, shuffled.
     Mixed,
+    /// A program that echoes 60 to 200 ms after it takes the key: the `EchoAck` comes first.
+    SlowEcho,
+    /// Bracketed pastes, and unmarked ones split into a long and a short read.
+    Paste,
+    /// Bursts of offline input released at once.
+    Offline,
+    /// After Enter, a raw-mode program draws a prompt (on its line, or on another row with the
+    /// cursor put back) and reads a secret, echoing an asterisk per key or nothing.
+    RawSecret,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 15] = [
+    pub const ALL: [Scenario; 19] = [
         Scenario::Echo,
         Scenario::Password,
         Scenario::Async,
@@ -100,7 +133,23 @@ impl Scenario {
         Scenario::SavedCursor,
         Scenario::Exotic,
         Scenario::Mixed,
+        Scenario::SlowEcho,
+        Scenario::Paste,
+        Scenario::Offline,
+        Scenario::RawSecret,
     ];
+
+    /// The bar a run of this scenario is held to (`docs/m3/plan.md` §2.5). The M0 scenarios
+    /// besides plain echo and passwords write out of the blue while the user types.
+    pub fn category(self) -> Category {
+        match self {
+            Scenario::Echo | Scenario::Password | Scenario::Paste | Scenario::Offline => {
+                Category::Faithful
+            }
+            Scenario::SlowEcho => Category::Slow,
+            _ => Category::Adversarial,
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -119,6 +168,10 @@ impl Scenario {
             Scenario::SavedCursor => "saved-cursor",
             Scenario::Exotic => "exotic",
             Scenario::Mixed => "mixed",
+            Scenario::SlowEcho => "slow-echo",
+            Scenario::Paste => "paste",
+            Scenario::Offline => "offline",
+            Scenario::RawSecret => "raw-secret",
         }
     }
 
@@ -141,6 +194,7 @@ impl Scenario {
             }
             Scenario::DecGraphics => b"\x1b)0".to_vec(),
             Scenario::ScrollRegion => b"\x1b[2;10r\x1b[10;1H".to_vec(),
+            Scenario::Paste => b"\x1b[?2004h".to_vec(),
             _ => Vec::new(),
         };
         v.extend(self.prompt(cols));
@@ -156,7 +210,12 @@ impl Scenario {
         };
         let b = |s: &[u8]| s.to_vec();
         match self {
-            Scenario::Echo | Scenario::Password => Vec::new(),
+            Scenario::Echo
+            | Scenario::Password
+            | Scenario::SlowEcho
+            | Scenario::Paste
+            | Scenario::Offline
+            | Scenario::RawSecret => Vec::new(),
             Scenario::Async => vec![
                 p(b"\r\n[bg] job 1 done\r\n"),
                 b(b"\x07"),
@@ -279,9 +338,11 @@ impl Scenario {
     }
 }
 
+#[derive(Debug)]
 enum Msg {
     Bytes(Vec<u8>),
     Pty(PtyMode),
+    Ack(InputPos),
 }
 
 /// The fake remote: a tty line discipline plus the scenario's program.
@@ -295,6 +356,10 @@ struct Remote {
     pos: usize,
     echo: bool,
     in_alt: bool,
+    /// RawSecret: reading a secret in raw mode; `Some(true)` echoes asterisks.
+    secret: Option<bool>,
+    /// Input the remote has taken (the `EchoAck` offset).
+    taken: InputPos,
 }
 
 impl Remote {
@@ -310,13 +375,16 @@ impl Remote {
             pos: 0,
             echo: true,
             in_alt: false,
+            secret: None,
+            taken: 0,
         }
     }
 
     fn mode(&self) -> PtyMode {
+        let raw = self.in_alt || self.secret.is_some();
         PtyMode {
-            canonical: !self.in_alt,
-            echo: self.echo && !self.in_alt,
+            canonical: !raw,
+            echo: self.echo && !raw,
         }
     }
 
@@ -355,6 +423,18 @@ impl Remote {
                 continue; // the full-screen program handles keys itself; it draws nothing here
             }
             let mut o = Vec::new();
+            if let Some(stars) = self.secret {
+                if key == KeyEvent::Enter {
+                    self.secret = None;
+                    o.extend_from_slice(b"\r\n");
+                    o.extend_from_slice(&self.prompt);
+                    out.push(Msg::Bytes(o));
+                    out.push(Msg::Pty(self.mode()));
+                } else if stars && matches!(key, KeyEvent::Char(_)) {
+                    out.push(Msg::Bytes(b"*".to_vec()));
+                }
+                continue;
+            }
             if !self.echo {
                 // Password entry: nothing is echoed; Enter ends it.
                 if key == KeyEvent::Enter {
@@ -392,6 +472,18 @@ impl Remote {
                     if self.sc == Scenario::Password {
                         self.echo = false;
                         o.extend_from_slice(b"\r\nPassword: ");
+                        out.push(Msg::Bytes(o));
+                        out.push(Msg::Pty(self.mode()));
+                        continue;
+                    }
+                    if self.sc == Scenario::RawSecret {
+                        self.secret = Some(self.rng.chance(50));
+                        if self.rng.chance(50) {
+                            o.extend_from_slice(b"\r\nSecret: ");
+                        } else {
+                            // On another row, the cursor put back: only the other row changes.
+                            o.extend_from_slice(b"\r\n\x1b7\x1b[1;1HSecret:\x1b8");
+                        }
                         out.push(Msg::Bytes(o));
                         out.push(Msg::Pty(self.mode()));
                         continue;
@@ -456,8 +548,8 @@ pub struct SimConfig {
 impl SimConfig {
     pub fn new(scenario: Scenario, seed: u64, backend: &'static str) -> Self {
         let mut run = RunConfig::new(backend);
-        if scenario == Scenario::Password {
-            run.secret = "QXZ";
+        if matches!(scenario, Scenario::Password | Scenario::RawSecret) {
+            run.secret = SECRET;
         }
         SimConfig {
             scenario,
@@ -471,24 +563,82 @@ impl SimConfig {
     }
 }
 
-fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Vec<u8>> {
+/// One thing the typist does: bytes, of a kind, after a gap (`None`: a typing gap at random).
+struct Item {
+    bytes: Vec<u8>,
+    kind: InputKind,
+    gap_us: Option<u64>,
+}
+
+impl Item {
+    fn key(bytes: Vec<u8>) -> Self {
+        Item {
+            bytes,
+            kind: InputKind::Typed,
+            gap_us: None,
+        }
+    }
+}
+
+fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Item> {
+    let secret: Vec<char> = SECRET.chars().collect();
+    let mut items: Vec<Item> = Vec::new();
+    if matches!(sc, Scenario::Password | Scenario::RawSecret) {
+        // A command, Enter, the secret typed ahead of the prompt, Enter; repeated.
+        while items.len() < keys {
+            for _ in 0..rng.range(2, 6) {
+                items.push(Item::key(vec![*rng.pick(b"abcdefghij")]));
+            }
+            items.push(Item::key(b"\r".to_vec()));
+            for _ in 0..rng.range(2, 7) {
+                let c = *rng.pick(&secret);
+                items.push(Item::key(c.to_string().into_bytes()));
+            }
+            items.push(Item::key(b"\r".to_vec()));
+        }
+        items.truncate(keys);
+        return items;
+    }
+    let v = typist_keys(sc, keys, rng);
+    for k in v {
+        match sc {
+            Scenario::Paste if rng.chance(8) => {
+                let text: Vec<u8> = (0..rng.range(3, 40)).map(|_| *rng.pick(b"pq ")).collect();
+                if rng.chance(50) {
+                    let mut b = b"\x1b[200~".to_vec();
+                    b.extend_from_slice(&text);
+                    b.extend_from_slice(b"\x1b[201~");
+                    items.push(Item::key(b));
+                } else {
+                    // Unmarked: a long read and its short tail 2 ms later.
+                    let long: Vec<u8> =
+                        (0..rng.range(64, 200)).map(|_| *rng.pick(b"pq ")).collect();
+                    items.push(Item::key(long));
+                    items.push(Item {
+                        bytes: text,
+                        kind: InputKind::Typed,
+                        gap_us: Some(2_000),
+                    });
+                }
+            }
+            Scenario::Offline if rng.chance(8) => {
+                let burst: Vec<u8> = (0..rng.range(2, 12)).map(|_| *rng.pick(b"ox")).collect();
+                items.push(Item {
+                    bytes: burst,
+                    kind: InputKind::Offline,
+                    gap_us: None,
+                });
+            }
+            _ => {}
+        }
+        items.push(Item::key(k));
+    }
+    items
+}
+
+fn typist_keys(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Vec<u8>> {
     const COMMON: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789 ,.-_/";
     let mut v: Vec<Vec<u8>> = Vec::new();
-    if sc == Scenario::Password {
-        // A command, Enter, the password typed ahead of the prompt, Enter; repeated.
-        while v.len() < keys {
-            for _ in 0..rng.range(2, 6) {
-                v.push(vec![*rng.pick(b"abcdefghij")]);
-            }
-            v.push(b"\r".to_vec());
-            for _ in 0..rng.range(2, 7) {
-                v.push(vec![*rng.pick(b"QXZ")]);
-            }
-            v.push(b"\r".to_vec());
-        }
-        v.truncate(keys);
-        return v;
-    }
     for _ in 0..keys {
         let k: Vec<u8> = match rng.below(100) {
             0..=69 => vec![*rng.pick(COMMON)],
@@ -502,7 +652,8 @@ fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Vec<u8>> {
             95 | 96 if sc == Scenario::WideChars || sc == Scenario::Mixed => {
                 "あ".as_bytes().to_vec()
             }
-            97 if sc == Scenario::WideChars || sc == Scenario::Mixed => "é".as_bytes().to_vec(),
+            // Not from the reserved alphabet, which only secrets use.
+            97 if sc == Scenario::WideChars || sc == Scenario::Mixed => "ā".as_bytes().to_vec(),
             _ => vec![*rng.pick(COMMON)],
         };
         v.push(k);
@@ -512,12 +663,17 @@ fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Vec<u8>> {
 
 #[derive(Debug)]
 enum Q {
-    Key(Vec<u8>),
+    Key(Vec<u8>, InputKind),
     Tick,
     ToRemote(Vec<u8>),
     Spontaneous,
     ToClient(Vec<u8>),
     Pty(PtyMode),
+    /// The echo window closed: the remote acknowledges what it has taken.
+    AckDue,
+    /// Output the remote sends later than it takes the key (SlowEcho).
+    Later(Vec<Msg>),
+    ToClientAck(InputPos),
 }
 
 pub struct SimOutcome {
@@ -549,15 +705,17 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     link.deliver(&mut q, &mut rng, 0, first);
 
     // The user types.
-    let keys = typist(cfg.scenario, cfg.keys, &mut rng);
+    let items = typist(cfg.scenario, cfg.keys, &mut rng);
     let mut t = 30_000u64;
-    for k in keys {
-        t += if rng.chance(15) {
-            rng.range(150_000, 400_000)
-        } else {
-            rng.range(8_000, 90_000)
-        };
-        q.put(t, Q::Key(k));
+    for it in items {
+        t += it.gap_us.unwrap_or_else(|| {
+            if rng.chance(15) {
+                rng.range(150_000, 400_000)
+            } else {
+                rng.range(8_000, 90_000)
+            }
+        });
+        q.put(t, Q::Key(it.bytes, it.kind));
     }
     let typing_end = t;
     // Output the user did not ask for.
@@ -568,19 +726,41 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     }
     q.put(25_000, Q::Tick);
 
+    let mut ack_due = false;
+    let mut later_at = 0u64;
     while let Some((now, item)) = q.pop() {
         let at = Duration::from_micros(now);
         match item {
-            Q::Key(k) => {
-                d.apply(at, Ev::Input(k.clone()));
+            Q::Key(k, kind) => {
+                let ev = match kind {
+                    InputKind::Typed => Ev::Input(k.clone()),
+                    kind => Ev::Untyped(k.clone(), kind),
+                };
+                d.apply(at, ev);
                 let arrive = (now + link.delay(&mut rng)).max(link.last_c2s);
                 link.last_c2s = arrive;
                 q.put(arrive, Q::ToRemote(k));
             }
             Q::ToRemote(k) => {
+                remote.taken += k.len() as u64;
                 let out = remote.input(&k);
-                link.deliver(&mut q, &mut rng, now, out);
+                if cfg.scenario == Scenario::SlowEcho && !out.is_empty() {
+                    later_at = (now + rng.range(60_000, 200_000)).max(later_at);
+                    q.put(later_at, Q::Later(out));
+                } else {
+                    link.deliver(&mut q, &mut rng, now, out);
+                }
+                if !ack_due {
+                    ack_due = true;
+                    q.put(now + micros(ECHO_WINDOW), Q::AckDue);
+                }
             }
+            Q::Later(out) => link.deliver(&mut q, &mut rng, now, out),
+            Q::AckDue => {
+                ack_due = false;
+                link.deliver(&mut q, &mut rng, now, vec![Msg::Ack(remote.taken)]);
+            }
+            Q::ToClientAck(n) => d.apply(at, Ev::EchoAck(n)),
             Q::Spontaneous => {
                 let out = remote.spontaneous();
                 link.deliver(&mut q, &mut rng, now, out);
@@ -670,211 +850,334 @@ impl Link {
                     q.put(t, Q::Pty(m));
                     self.last_s2c = t + 1;
                 }
+                Msg::Ack(n) => {
+                    let t = (now + self.delay(rng)).max(self.last_s2c);
+                    q.put(t, Q::ToClientAck(n));
+                    self.last_s2c = t + 1;
+                }
             }
         }
     }
 }
 
-/// A predictor that is wrong in every way the core must survive: it shows every guess at
-/// once (no epochs), guesses at the cursor whatever is there (last column, wide cells,
-/// pending wrap), invents cells out of range and on wide characters, moves the cursor
-/// somewhere else, and forgets guesses at random. The core must paint only what is safe.
+/// A forged prompt for [`HostilePredictor`]: after each Enter, the predictor guesses the keys at
+/// the cells of `text` drawn `down` rows below the cursor (from column 0; with `down` 0, from the
+/// cursor on), and tries to give them `text`'s characters (`docs/m3/plan.md` §3 C1, "forged
+/// confirmations": a predictor that guesses `Password: `).
+#[derive(Clone, Debug)]
+pub struct Forge {
+    pub text: &'static str,
+    pub down: u16,
+}
+
+/// What the hostile predictor tries.
+#[derive(Clone, Debug)]
+pub struct HostileCfg {
+    pub seed: u64,
+    /// Random cells, characters, kinds, duplicates and withdrawals besides the plan.
+    pub noise: bool,
+    pub forge: Option<Forge>,
+    /// Declines to guess every n-th key (counted from 1).
+    pub skip_every: Option<u64>,
+    /// Shows nothing below a 20 ms RTT hint, as an adaptive predictor does (and as M0's did
+    /// while it skipped its epochs).
+    pub adaptive: bool,
+}
+
+impl HostileCfg {
+    pub fn noisy(seed: u64) -> Self {
+        HostileCfg {
+            seed,
+            noise: true,
+            forge: None,
+            skip_every: None,
+            adaptive: false,
+        }
+    }
+
+    /// No noise: only the plan (append at its own cursor), the forge and the skips.
+    pub fn quiet(seed: u64) -> Self {
+        HostileCfg {
+            noise: false,
+            ..Self::noisy(seed)
+        }
+    }
+
+    pub fn forging(mut self, text: &'static str, down: u16) -> Self {
+        self.forge = Some(Forge { text, down });
+        self
+    }
+
+    pub fn skipping(mut self, n: u64) -> Self {
+        self.skip_every = Some(n);
+        self
+    }
+
+    pub fn adaptive(mut self) -> Self {
+        self.adaptive = true;
+        self
+    }
+}
+
+/// A predictor that tries everything the core must refuse (`docs/m3/plan.md` §2.1): it wants every
+/// guess shown at once (`Show::Underline`, whatever the link), guesses at its own idea of the
+/// cursor whatever is there (last column, wide cells, pending wrap), forges a prompt's cells and
+/// characters, skips keys, declares edits of the wrong kind and for keys it has guessed already or
+/// never saw, invents cells out of range, and withdraws at random. The core must write only what
+/// its rules allow.
 pub struct HostilePredictor {
+    cfg: HostileCfg,
     rng: Rng,
-    cells: BTreeMap<(u16, u16), (char, crate::predictor::CellStyle)>,
     cursor: Option<(u16, u16)>,
-    born: Option<Duration>,
-    noise: bool,
+    /// The cursor at the first key after the last Enter (the forge's origin).
+    anchor: Option<(u16, u16)>,
+    since_enter: usize,
+    keys: u64,
+    ats: Vec<InputPos>,
 }
 
 impl HostilePredictor {
-    pub fn new(seed: u64, noise: bool) -> Self {
+    pub fn new(cfg: HostileCfg) -> Self {
         HostilePredictor {
-            noise,
-            rng: Rng::new(seed ^ 0x4057_11E5),
-            cells: BTreeMap::new(),
+            rng: Rng::new(cfg.seed ^ 0x4057_11E5),
+            cfg,
             cursor: None,
-            born: None,
+            anchor: None,
+            since_enter: 0,
+            keys: 0,
+            ats: Vec::new(),
         }
     }
 
-    fn edits(&self) -> Vec<crate::predictor::OverlayEdit> {
-        use crate::predictor::OverlayEdit;
-        let mut v = vec![OverlayEdit::Clear];
-        for (&(row, col), &(ch, style)) in &self.cells {
-            v.push(OverlayEdit::Put {
-                row,
-                col,
-                ch,
-                style,
+    fn noise(&mut self, at: InputPos, ctx: &Ctx<'_>, v: &mut Vec<OverlayEdit>) {
+        let size = ctx.screen.size();
+        if self.rng.chance(20) {
+            let row = self.rng.below(u64::from(size.rows) + 2) as u16;
+            let col = self.rng.below(u64::from(size.cols) + 2) as u16;
+            v.push(OverlayEdit::Guess { row, col, at });
+        }
+        if self.rng.chance(10) {
+            v.push(OverlayEdit::Move { at });
+        }
+        if self.rng.chance(20) {
+            let ch = *self
+                .rng
+                .pick(&['a', '日', 'é', ' ', '\u{301}', '\x1b', '😀', 'Ø']);
+            let (row, col) = self.cursor.unwrap_or((0, 0));
+            v.push(OverlayEdit::Forged { row, col, at, ch });
+        }
+        if let Some(&old) = self.ats.first()
+            && self.rng.chance(10)
+        {
+            v.push(OverlayEdit::Guess {
+                row: 0,
+                col: 0,
+                at: old,
             });
         }
-        v.push(OverlayEdit::Cursor(self.cursor));
-        v
+        if self.rng.chance(5) {
+            v.push(OverlayEdit::Guess {
+                row: 0,
+                col: 0,
+                at: at + 1000,
+            });
+        }
     }
 }
 
-impl crate::predictor::Predictor for HostilePredictor {
-    fn on_key(
-        &mut self,
-        key: &KeyEvent,
-        ctx: &crate::predictor::Ctx<'_>,
-    ) -> Vec<crate::predictor::OverlayEdit> {
-        use crate::predictor::CellStyle;
-        let (r, c) = self
-            .cursor
-            .unwrap_or((ctx.screen.cursor.row, ctx.screen.cursor.col));
-        let style = if !self.noise || self.rng.chance(80) {
-            CellStyle::Underline
-        } else {
-            CellStyle::Plain
-        };
+impl Predictor for HostilePredictor {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let mut v = Vec::new();
+        let sc = ctx.screen.cursor();
+        let (r, c) = self.cursor.unwrap_or((sc.row, sc.col));
+        let anchor = *self.anchor.get_or_insert((sc.row, sc.col));
+        self.keys += 1;
+        let skip = self
+            .cfg
+            .skip_every
+            .is_some_and(|n| self.keys.is_multiple_of(n));
+        if self.cfg.noise {
+            self.noise(at, ctx, &mut v);
+        }
         match key {
-            KeyEvent::Char(ch) => {
-                self.cells.insert((r, c), (*ch, style));
-                self.cursor = Some((r, c.saturating_add(1)));
+            KeyEvent::Char(_) | KeyEvent::Backspace if !skip => {
+                if let Some(f) = &self.cfg.forge {
+                    let n = self.since_enter;
+                    let (fr, fc) = if f.down == 0 {
+                        (anchor.0, anchor.1 + n as u16)
+                    } else {
+                        (anchor.0 + f.down, n as u16)
+                    };
+                    if let Some(ch) = f.text.chars().nth(n) {
+                        v.push(OverlayEdit::Forged {
+                            row: fr,
+                            col: fc,
+                            at,
+                            ch,
+                        });
+                    }
+                    v.push(OverlayEdit::Guess {
+                        row: fr,
+                        col: fc,
+                        at,
+                    });
+                }
+                let (cell, after) = if *key == KeyEvent::Backspace {
+                    let c = c.saturating_sub(1);
+                    ((r, c), (r, c))
+                } else {
+                    ((r, c), (r, c.saturating_add(1)))
+                };
+                v.push(OverlayEdit::Guess {
+                    row: cell.0,
+                    col: cell.1,
+                    at,
+                });
+                self.cursor = Some(after);
+                self.ats.push(at);
+                self.since_enter += 1;
             }
-            KeyEvent::Backspace => {
-                let c = c.saturating_sub(1);
-                self.cells.insert((r, c), (' ', style));
-                self.cursor = Some((r, c));
+            KeyEvent::Char(_) | KeyEvent::Backspace => self.since_enter += 1,
+            KeyEvent::Ctrl(2 | 6) | KeyEvent::Sequence(_) => {
+                // A move for anything that looks like one, and a guess too (wrong kind).
+                v.push(OverlayEdit::Move { at });
+                v.push(OverlayEdit::Guess { row: r, col: c, at });
             }
-            _ => {}
+            _ => {
+                // Enter and other controls: a guess of the wrong kind, and a new prompt.
+                v.push(OverlayEdit::Guess { row: r, col: c, at });
+                self.cursor = None;
+                self.anchor = None;
+                self.since_enter = 0;
+            }
         }
-        if self.noise && self.rng.chance(20) {
-            let (rows, cols) = (ctx.screen.size.rows, ctx.screen.size.cols);
-            let row = self.rng.below(u64::from(rows) + 2) as u16;
-            let col = self.rng.below(u64::from(cols) + 2) as u16;
-            let ch = *self
-                .rng
-                .pick(&['a', '日', 'é', ' ', '\u{301}', '\x1b', '😀']);
-            self.cells.insert((row, col), (ch, style));
+        if self.ats.len() > 4096 {
+            self.ats.drain(..2048);
         }
-        if self.noise && self.rng.chance(10) {
-            self.cursor = Some((
-                self.rng.below(u64::from(ctx.screen.size.rows) + 2) as u16,
-                self.rng.below(u64::from(ctx.screen.size.cols) + 2) as u16,
-            ));
-        }
-        self.born.get_or_insert(ctx.now);
-        self.edits()
+        v
     }
 
-    fn on_output(
-        &mut self,
-        _ctx: &crate::predictor::Ctx<'_>,
-    ) -> Vec<crate::predictor::OverlayEdit> {
-        if self.noise && self.rng.chance(30) {
-            self.cells.clear();
-            self.cursor = None;
+    fn on_output(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let mut v = Vec::new();
+        if self.cfg.noise {
+            if self.rng.chance(15) {
+                v.push(OverlayEdit::Clear);
+            }
+            if self.rng.chance(15) {
+                let size = ctx.screen.size();
+                v.push(OverlayEdit::Withdraw {
+                    row: self.rng.below(u64::from(size.rows)) as u16,
+                    col: self.rng.below(u64::from(size.cols)) as u16,
+                });
+            }
+            if let Some(&at) = self.ats.last() {
+                v.push(OverlayEdit::Guess { row: 0, col: 0, at });
+            }
         }
-        self.edits()
+        v
     }
 
-    fn on_tick(&mut self, ctx: &crate::predictor::Ctx<'_>) -> Vec<crate::predictor::OverlayEdit> {
-        if self
-            .born
-            .is_some_and(|b| ctx.now.saturating_sub(b) > Duration::from_millis(300))
-        {
-            self.cells.clear();
-            self.cursor = None;
-            self.born = None;
+    fn on_settled(&mut self, settled: &[Settled], _ctx: &Ctx<'_>) {
+        for s in settled {
+            self.ats.retain(|&a| a != s.at);
+            if s.outcome == Outcome::Contradicted {
+                self.cursor = None;
+            }
         }
-        self.edits()
     }
 
-    fn next_deadline(&self) -> Option<crate::predictor::Time> {
-        self.born.map(|b| b + Duration::from_millis(300))
+    fn on_echo_ack(&mut self, _input_upto: InputPos, _ctx: &Ctx<'_>) {}
+
+    fn on_tick(&mut self, _ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+
+    fn next_deadline(&self) -> Option<Time> {
+        None
+    }
+
+    fn show(&self, ctx: &Ctx<'_>) -> Show {
+        let fast = ctx
+            .link
+            .rtt_hint
+            .is_none_or(|r| r < Duration::from_millis(20));
+        if self.cfg.adaptive && fast {
+            Show::Hide
+        } else {
+            Show::Underline
+        }
     }
 
     fn reset(&mut self) {
-        self.cells.clear();
         self.cursor = None;
-        self.born = None;
+        self.anchor = None;
+        self.since_enter = 0;
+        self.ats.clear();
     }
 
     fn has_outstanding(&self) -> bool {
-        !self.cells.is_empty()
+        !self.ats.is_empty()
     }
 }
 
-/// Shows a fixed set of cells (and cursor) from the first key until 300 ms later.
+/// Guesses the n-th printable key or Backspace at the n-th of a fixed list of cells, and shows
+/// what the core allows. For deterministic hazard traces, which choose the cells.
 pub struct FixedPredictor {
-    cells: Vec<(u16, u16, char)>,
-    cursor: Option<(u16, u16)>,
-    shown: bool,
-    born: Option<Duration>,
+    cells: Vec<(u16, u16)>,
+    next: usize,
+    outstanding: usize,
 }
 
 impl FixedPredictor {
-    pub fn new(cells: Vec<(u16, u16, char)>, cursor: Option<(u16, u16)>) -> Self {
+    pub fn new(cells: Vec<(u16, u16)>) -> Self {
         FixedPredictor {
             cells,
-            cursor,
-            shown: false,
-            born: None,
+            next: 0,
+            outstanding: 0,
         }
-    }
-
-    fn edits(&self) -> Vec<crate::predictor::OverlayEdit> {
-        use crate::predictor::{CellStyle, OverlayEdit};
-        let mut v = vec![OverlayEdit::Clear];
-        if self.shown {
-            for &(row, col, ch) in &self.cells {
-                v.push(OverlayEdit::Put {
-                    row,
-                    col,
-                    ch,
-                    style: CellStyle::Underline,
-                });
-            }
-            v.push(OverlayEdit::Cursor(self.cursor));
-        }
-        v
     }
 }
 
-impl crate::predictor::Predictor for FixedPredictor {
-    fn on_key(
-        &mut self,
-        _key: &KeyEvent,
-        ctx: &crate::predictor::Ctx<'_>,
-    ) -> Vec<crate::predictor::OverlayEdit> {
-        if !self.shown {
-            self.shown = true;
-            self.born = Some(ctx.now);
+impl Predictor for FixedPredictor {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, _ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        if !matches!(key, KeyEvent::Char(_) | KeyEvent::Backspace) {
+            return Vec::new();
         }
-        self.edits()
+        let Some(&(row, col)) = self.cells.get(self.next) else {
+            return Vec::new();
+        };
+        self.next += 1;
+        self.outstanding += 1;
+        vec![OverlayEdit::Guess { row, col, at }]
     }
 
-    fn on_output(
-        &mut self,
-        _ctx: &crate::predictor::Ctx<'_>,
-    ) -> Vec<crate::predictor::OverlayEdit> {
-        self.edits()
+    fn on_output(&mut self, _ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
     }
 
-    fn on_tick(&mut self, ctx: &crate::predictor::Ctx<'_>) -> Vec<crate::predictor::OverlayEdit> {
-        if self
-            .born
-            .is_some_and(|b| ctx.now.saturating_sub(b) >= Duration::from_millis(300))
-        {
-            self.shown = false;
-            self.born = None;
-        }
-        self.edits()
+    fn on_settled(&mut self, settled: &[Settled], _ctx: &Ctx<'_>) {
+        self.outstanding = self.outstanding.saturating_sub(settled.len());
     }
 
-    fn next_deadline(&self) -> Option<crate::predictor::Time> {
-        self.born.map(|b| b + Duration::from_millis(300))
+    fn on_echo_ack(&mut self, _input_upto: InputPos, _ctx: &Ctx<'_>) {}
+
+    fn on_tick(&mut self, _ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+
+    fn next_deadline(&self) -> Option<Time> {
+        None
+    }
+
+    fn show(&self, _ctx: &Ctx<'_>) -> Show {
+        Show::Underline
     }
 
     fn reset(&mut self) {
-        self.shown = false;
-        self.born = None;
+        self.outstanding = 0;
     }
 
     fn has_outstanding(&self) -> bool {
-        self.shown
+        self.outstanding > 0
     }
 }

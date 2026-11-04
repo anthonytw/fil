@@ -348,6 +348,105 @@ fn b2c_an_ack_does_not_take_an_unchanged_blank_for_its_echo() {
     assert!(!run(off("ack_reached")).is_empty());
 }
 
+// ---- B3: superseding instead of withdrawing (re-check) -------------------------------------
+
+/// Guesses the first key at the cursor, then every key at one cell: `Some(cell)` fixed, or
+/// `None` one left of the shadow cursor (so every guess's cursor equals the shadow's).
+struct Chain {
+    cell: Option<(u16, u16)>,
+    first_done: bool,
+}
+
+impl Predictor for Chain {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let KeyEvent::Char(_) = key else {
+            return Vec::new();
+        };
+        let c = ctx.screen.cursor();
+        if !self.first_done {
+            self.first_done = true;
+            return vec![OverlayEdit::Guess {
+                row: c.row,
+                col: c.col,
+                at,
+            }];
+        }
+        let (row, col) = self.cell.unwrap_or((c.row, c.col.saturating_sub(1)));
+        vec![OverlayEdit::Guess { row, col, at }]
+    }
+    fn on_output(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+    fn on_settled(&mut self, _: &[Settled], _: &Ctx<'_>) {}
+    fn on_echo_ack(&mut self, _: InputPos, _: &Ctx<'_>) {}
+    fn on_tick(&mut self, _: &Ctx<'_>) -> Vec<OverlayEdit> {
+        Vec::new()
+    }
+    fn next_deadline(&self) -> Option<Time> {
+        None
+    }
+    fn show(&self, _: &Ctx<'_>) -> Show {
+        Show::Plain
+    }
+    fn reset(&mut self) {}
+    fn has_outstanding(&self) -> bool {
+        false
+    }
+}
+
+/// Confirmed at `$ s`, then a silent raw read: eight secret keys every 100 ms (faster than the
+/// round trip plus the echo window), acks 150 ms after each.
+fn silent_chain(cell: Option<(u16, u16)>, guards: Guards) -> Vec<char> {
+    let mut t = T::new(
+        Box::new(Chain {
+            cell,
+            first_done: false,
+        }),
+        guards,
+    );
+    t.server(b"abcdef\r\n$ ", 0);
+    t.key(b"s", 10);
+    t.server(b"s", 120);
+    t.ack(1, 125);
+    assert!(t.o.epoch_confirmed());
+    let secret = ["Ø", "Ñ", "Ü", "Å", "Ç", "È", "É", "Ê"];
+    let mut acks: Vec<(u64, u64)> = Vec::new();
+    for (i, s) in secret.iter().enumerate() {
+        let t0 = 200 + 100 * i as u64;
+        acks.retain(|&(due, upto)| {
+            if due <= t0 {
+                t.ack(upto, due);
+                false
+            } else {
+                true
+            }
+        });
+        t.key(s.as_bytes(), t0);
+        t.tick(t0 + 5);
+        acks.push((t0 + 150, t.at));
+    }
+    for (due, upto) in acks {
+        t.ack(upto, due);
+    }
+    t.secrets()
+}
+
+#[test]
+fn b3_a_superseding_chain_on_a_remote_cell_is_caught_by_the_ack() {
+    let got = silent_chain(Some((0, 2)), Guards::ALL);
+    assert!(got.len() <= 2, "written: {got:?}");
+    let got = silent_chain(Some((0, 2)), off("superseded_acked"));
+    assert!(got.len() > 2, "superseded_acked off: {got:?}");
+}
+
+#[test]
+fn b3_a_superseding_chain_left_of_the_cursor_is_caught_by_the_ack() {
+    let got = silent_chain(None, Guards::ALL);
+    assert!(got.len() <= 2, "written: {got:?}");
+    let got = silent_chain(None, off("superseded_acked"));
+    assert!(got.len() > 2, "superseded_acked off: {got:?}");
+}
+
 // ---- S1: the unexplained-output checks, one by one ------------------------------------------
 
 fn confirmed_mosh() -> T {

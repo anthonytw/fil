@@ -121,6 +121,21 @@ pub const RULES: &[Rule] = &[
         mosh_breaks: false,
     },
     Rule {
+        // Review B3: each key guessed on the previous key's cell, so the key an ack covers is
+        // already superseded.
+        name: "unechoed key superseded before its ack",
+        guard: Some("superseded_acked"),
+        trace: || {
+            keys(
+                shell().input(100, b"a").input(110, b"b").echo_ack(170, 2),
+                180,
+                "ØÑ",
+            )
+        },
+        adversary: || HostileCfg::quiet(1).superseding(),
+        mosh_breaks: false,
+    },
+    Rule {
         // Review B2b: the key guessed on a cell elsewhere that already shows its character, so the
         // ack would find it "echoed".
         name: "unechoed key guessed on a matching cell",

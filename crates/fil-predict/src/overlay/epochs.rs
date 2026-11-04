@@ -891,8 +891,15 @@ impl Core {
         self.dirty = false;
     }
 
-    /// The input offsets start again at 0 (a fresh attach): no earlier acknowledgement counts.
+    /// The input offsets start again at 0 (a fresh attach): no earlier acknowledgement counts,
+    /// and no key of the old offsets may stay (it is called with a reset, which already dropped
+    /// them; a key left here would bind a new offset to an old guess).
     pub fn rebase_input(&mut self) {
+        debug_assert!(self.keys.is_empty(), "rebase_input without a reset");
+        self.keys.clear();
+        self.state = State::Tentative;
+        self.confirmed_once = false;
+        self.awaiting_ack = None;
         self.acked = 0;
     }
 
@@ -1388,6 +1395,42 @@ impl Core {
                             gm.grace = Some(now + LATE_ECHO_GRACE);
                         }
                     }
+                }
+            }
+        }
+        // A written guess the predictor superseded (another key guessed on its cell) is checked
+        // like a pending one when the ack covers it and no covered later guess holds its cell
+        // (`Guards::superseded_acked`): otherwise a predictor that guesses each key on the
+        // previous key's cell keeps every covered key superseded, and the ack never sees one
+        // unechoed (review B3).
+        if self.g.superseded_acked {
+            for i in 0..self.keys.len() {
+                let k = &self.keys[i];
+                let Some(Guess {
+                    kind:
+                        GKind::Glyph {
+                            row, col, glyph, ..
+                        },
+                    state: GState::Superseded,
+                    written: true,
+                    ..
+                }) = &k.guess
+                else {
+                    continue;
+                };
+                if k.end > input_upto {
+                    continue;
+                }
+                let cell = (*row, *col);
+                let held_later = self.keys[i + 1..].iter().any(|l| {
+                    l.end <= input_upto
+                        && matches!(&l.guess, Some(Guess {
+                            kind: GKind::Glyph { row: r, col: c, .. },
+                            ..
+                        }) if (*r, *c) == cell)
+                });
+                if !held_later && v.cell(cell.0, cell.1).map_or("", |c| c.text) != text_of(*glyph) {
+                    late = true;
                 }
             }
         }

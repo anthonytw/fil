@@ -333,6 +333,51 @@ fn the_prior_ack_rule_counts_from_the_new_epochs_first_key() {
     assert!(t.key(b"d", 410).paint.is_empty());
 }
 
+/// M13: a kept-only chunk settles the kept guesses only if the cursor is where they say. Here a
+/// kept Backspace's echo comes with the cursor moved elsewhere: the chunk is unexplained, and
+/// the new epoch's tentative guess goes with it.
+#[test]
+fn a_kept_guess_echoed_with_the_cursor_elsewhere_ends_the_new_epoch() {
+    let mut t = T::trusted(); // `$ a`, cursor (0, 3)
+    t.key(b"\x7f", 200); // a blank at (0, 2), written
+    t.key(b"\r", 210); // kept
+    t.key(b"y", 220); // the new epoch's guess at the shadow cursor (0, 3)
+    assert_eq!(t.o.outstanding(), 2);
+    t.server(b"\x08 \x08\x1b[5;1H", 300);
+    assert_eq!(t.o.outstanding(), 0, "the cursor jump was absorbed");
+}
+
+/// A blank can re-confirm an epoch after a late echo (only the *first* confirmation needs a
+/// non-blank): `nonblank_first`'s exemption for an epoch confirmed before.
+#[test]
+fn a_late_blank_echo_re_confirms_the_epoch() {
+    let mut t = T::trusted();
+    t.key(b"\x7f", 200); // the blank at (0, 2), written
+    t.ack(300); // unechoed: tentative, in the grace
+    assert!(!t.o.epoch_confirmed());
+    t.server(b"\x08 \x08", 400);
+    assert!(
+        t.o.epoch_confirmed(),
+        "a late Backspace echo did not re-confirm"
+    );
+}
+
+/// `ack_reached` counts the key's own position: a guess whose glyph its cell already showed is
+/// confirmed by the ack when the shadow cursor is where that guess leaves it.
+#[test]
+fn an_ack_counts_the_keys_own_cursor_as_reached() {
+    let mut t = fixed(vec![(0, 2), (0, 2), (0, 3)]);
+    t.server(b"$ ", 0);
+    t.key(b"a", 10);
+    t.server(b"a", 100); // confirmed; (0, 2) shows `a`, the cursor at (0, 3)
+    t.key(b"a", 200); // guessed on (0, 2): its glyph is there, its cursor (0, 3) is the shadow's
+    t.ack(300);
+    assert!(
+        t.o.epoch_confirmed(),
+        "the guess at the cursor was taken as unechoed"
+    );
+}
+
 // ---- settling by EchoAck (rule 5) ----------------------------------------------------
 
 #[test]

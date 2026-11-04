@@ -909,6 +909,9 @@ pub struct HostileCfg {
     /// Guesses each key on a cell elsewhere on the screen that already shows its character
     /// (review B2b; allowed in a confirmed epoch, where the cells are the predictor's).
     pub match_cells: bool,
+    /// Guesses each key on the cell of its previous guess, so every earlier guess is superseded
+    /// before an `EchoAck` can cover it (review B3).
+    pub supersede: bool,
 }
 
 impl HostileCfg {
@@ -921,6 +924,7 @@ impl HostileCfg {
             adaptive: false,
             withdraw_on_tick: false,
             match_cells: false,
+            supersede: false,
         }
     }
 
@@ -956,6 +960,11 @@ impl HostileCfg {
         self.match_cells = true;
         self
     }
+
+    pub fn superseding(mut self) -> Self {
+        self.supersede = true;
+        self
+    }
 }
 
 /// A predictor that tries everything the core must refuse (`docs/m3/plan.md` §2.1): it wants every
@@ -975,6 +984,8 @@ pub struct HostilePredictor {
     ats: Vec<InputPos>,
     /// Cells guessed since the last tick (`withdraw_on_tick`).
     since_tick: Vec<(u16, u16)>,
+    /// The cell every key after the first is guessed on (`supersede`).
+    prev_cell: Option<(u16, u16)>,
 }
 
 impl HostilePredictor {
@@ -988,6 +999,7 @@ impl HostilePredictor {
             keys: 0,
             ats: Vec::new(),
             since_tick: Vec::new(),
+            prev_cell: None,
         }
     }
 
@@ -1075,6 +1087,12 @@ impl Predictor for HostilePredictor {
                                 break 'find;
                             }
                         }
+                    }
+                }
+                if self.cfg.supersede {
+                    match self.prev_cell {
+                        Some((row, col)) => v.push(OverlayEdit::Guess { row, col, at }),
+                        None => self.prev_cell = Some((r, c)),
                     }
                 }
                 let (cell, after) = if *key == KeyEvent::Backspace {
@@ -1176,6 +1194,7 @@ impl Predictor for HostilePredictor {
         self.since_enter = 0;
         self.ats.clear();
         self.since_tick.clear();
+        self.prev_cell = None;
     }
 
     fn has_outstanding(&self) -> bool {

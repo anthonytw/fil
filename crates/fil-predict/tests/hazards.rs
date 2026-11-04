@@ -351,6 +351,7 @@ rules! {
     a_redrawn_masked_prompt_backspace_does_not_confirm => "redrawn masked prompt and a Backspace",
     a_key_withdrawn_before_its_ack_still_stops_the_writing => "unechoed key withdrawn before its ack",
     a_key_on_a_matching_cell_still_stops_the_writing => "unechoed key guessed on a matching cell",
+    a_key_superseded_before_its_ack_still_stops_the_writing => "unechoed key superseded before its ack",
     an_unechoed_space_over_a_blank_stops_the_writing => "unechoed space over a blank",
     a_prompt_left_of_the_cursor_while_idle_is_unexplained => "prompt left of the cursor while idle",
     a_prompt_right_of_a_moved_cursor_while_idle_is_unexplained => "prompt right of a moved cursor while idle",

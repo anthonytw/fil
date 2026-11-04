@@ -201,6 +201,9 @@ pub struct Guards {
     /// An `EchoAck` confirms a guess whose cell already showed its glyph only if the cursor shows
     /// the echo reached it (rule 5; review B2).
     pub ack_reached: bool,
+    /// An `EchoAck` also checks a written guess the predictor superseded, when it covers its key
+    /// and no covered later guess holds its cell (rule 5; review B3).
+    pub superseded_acked: bool,
     /// The first confirmation also needs an `EchoAck` covering every key typed before the
     /// epoch's first key (rule 2, coordinator's call 2026-11-04): until then a matching chunk
     /// can be an earlier key's late echo (typing ahead of a prompt).
@@ -266,6 +269,7 @@ impl Guards {
             "nonblank_first" => &mut self.nonblank_first,
             "withdraw_tentative" => &mut self.withdraw_tentative,
             "ack_reached" => &mut self.ack_reached,
+            "superseded_acked" => &mut self.superseded_acked,
             "prior_acked" => &mut self.prior_acked,
             "key_boundary" => &mut self.key_boundary,
             "mode_boundary" => &mut self.mode_boundary,
@@ -323,6 +327,7 @@ impl Guards {
         nonblank_first: true,
         withdraw_tentative: true,
         ack_reached: true,
+        superseded_acked: true,
         prior_acked: true,
         key_boundary: true,
         mode_boundary: true,
@@ -353,6 +358,7 @@ impl Guards {
         nonblank_first: false,
         withdraw_tentative: false,
         ack_reached: false,
+        superseded_acked: false,
         prior_acked: false,
         key_boundary: false,
         mode_boundary: false,
@@ -384,6 +390,7 @@ impl Guards {
         "nonblank_first",
         "withdraw_tentative",
         "ack_reached",
+        "superseded_acked",
         "prior_acked",
         "key_boundary",
         "mode_boundary",

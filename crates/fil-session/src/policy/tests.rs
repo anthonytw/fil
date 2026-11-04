@@ -38,6 +38,8 @@ impl Host {
                 top: base.clone(),
             },
             recheck: Duration::ZERO,
+            full_reload: FULL_RELOAD,
+            max_age: MAX_AGE,
             account: Some(Account {
                 user: Some("dev".into()),
                 groups: Some(vec!["dev".into()]),
@@ -454,4 +456,126 @@ fn no_sources_allow_everything() {
     assert!(p.forward(&remote(BindAddr::Any, 9000)).is_ok());
     assert!(p.agent().is_ok());
     assert!(p.lines().is_empty());
+}
+
+/// `PermitListen` is matched against the bind as ssh sends it: the empty string for `-R *:port`
+/// (`channel_rfwd_bind_host`), so `?` (one character) does not permit it and `*` does, as in
+/// sshd.
+#[test]
+fn permit_listen_matches_a_wildcard_bind_as_sshd_does() {
+    let h = Host::new(
+        "plq",
+        "GatewayPorts yes\nPermitListen ?:8080 *:9000 0.0.0.?:7000\n",
+        None,
+    );
+    let p = h.policy();
+    assert!(p.forward(&remote(BindAddr::Any, 8080)).is_err(), "?:8080");
+    assert_eq!(says(p.forward(&remote(BindAddr::Any, 9000))), "ok");
+    assert_eq!(
+        says(p.forward(&remote(
+            BindAddr::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            7000
+        ))),
+        "ok"
+    );
+    assert!(p.forward(&remote(BindAddr::Any, 7000)).is_err());
+}
+
+/// Group membership from NSS has no file to watch: everything is read again every
+/// `full_reload` (five minutes on a host), even when no file changed, and not before.
+#[test]
+fn everything_is_read_again_every_full_reload() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_NOFWD: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        let mut groups = vec!["dev".to_string()];
+        if IN_NOFWD.load(Ordering::SeqCst) {
+            groups.push("nofwd".into());
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(groups),
+        }
+    }
+    assert_eq!(
+        PolicySources::system().full_reload,
+        Duration::from_secs(300)
+    );
+    let h = Host::new("full", "Match Group nofwd\n  AllowTcpForwarding no\n", None);
+    let mut src = h.sources.clone();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::from_secs(1);
+    let p = Policy::new(src);
+    IN_NOFWD.store(true, Ordering::SeqCst);
+    // No file changed (the account files are the machine's own, and left alone).
+    assert_eq!(says(p.forward(&local(1, "db", 1))), "ok", "not yet");
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(
+        p.forward(&local(1, "db", 1)).unwrap_err().setting,
+        PolicySetting::AllowTcpForwarding(TcpForwarding::No)
+    );
+}
+
+/// A re-read never runs in a check: with a lookup that hangs (a directory service that does not
+/// answer), checks go on at once with the last read; once that read is older than `max_age`,
+/// they refuse (strict) until the re-read is in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_re_read_blocks_no_check_and_a_stale_read_refuses() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HANG: AtomicBool = AtomicBool::new(false);
+    fn lookup() -> Account {
+        // Hangs while asked to, for at most a few seconds (so a broken build fails, not hangs).
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while HANG.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Account {
+            user: Some("dev".into()),
+            groups: Some(vec!["dev".into()]),
+        }
+    }
+    let h = Host::new("slow", "", None);
+    let mut src = h.sources.clone();
+    src.account = None;
+    src.lookup = lookup;
+    src.full_reload = Duration::ZERO;
+    src.max_age = Duration::from_millis(500);
+    let p = tokio::task::spawn_blocking(move || Policy::new(src))
+        .await
+        .unwrap();
+    HANG.store(true, Ordering::SeqCst);
+    let t = std::time::Instant::now();
+    for _ in 0..10 {
+        assert_eq!(says(p.forward(&local(1, "db", 1))), "ok", "the last read");
+    }
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "the checks waited for the re-read: {:?}",
+        t.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let file = h.base.join("etc/fil/policy.toml").display().to_string();
+    let stale = format!("the policy file cannot be read ({file})");
+    for r in [
+        p.forward(&local(1, "db", 1)),
+        p.dynamic_target(&target("db", 1)),
+        p.agent(),
+        p.direct(),
+    ] {
+        assert_eq!(says(r), stale);
+    }
+    assert!(matches!(p.lines()[..], [PolicyLine::DenyAll(_)]));
+    assert_eq!(
+        says(p.direct_as_read()),
+        "ok",
+        "the port follows reads only"
+    );
+    // The re-read comes in: allowed again.
+    HANG.store(false, Ordering::SeqCst);
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while p.forward(&local(1, "db", 1)).is_err() {
+        assert!(std::time::Instant::now() < end, "the re-read never came in");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

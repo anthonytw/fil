@@ -894,6 +894,53 @@ async fn a_queued_connection_is_checked_when_it_arrives() {
     drop((a, b));
 }
 
+/// A new epoch (a detach, a takeover) re-checks the queued connections at once instead of
+/// leaving them until `open_wait`: on the daemon its policy then refuses them (`Detached` while
+/// nobody holds the session), as plan section 2.7 says a detached listener does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
+    let cfg = MuxConfig {
+        max_open: 1,
+        open_wait: Duration::from_secs(20),
+        ..mux_config()
+    };
+    let hold = serve(|s| async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(s);
+    })
+    .await;
+    let mut w = World::new(Transport::Mem, cfg).await;
+    let port = w.local_forward(1, hold.port);
+    let a = connect(port).await;
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 1
+    })
+    .await;
+    let mut b = connect(port).await;
+    eventually(Duration::from_secs(5), || {
+        w.client
+            .ep
+            .stats(ForwardId(1))
+            .is_some_and(|s| s.waiting == 1)
+    })
+    .await;
+    // Nobody holds the session now: the policy refuses what opens.
+    *w.client.policy.refuse_outgoing.lock().unwrap() = Some(OpenFailure::Detached);
+    let t0 = std::time::Instant::now();
+    w.client.detach();
+    w.client.ep.new_epoch();
+    let r = timeout(Duration::from_secs(10), b.read(&mut [0u8; 8]))
+        .await
+        .expect("the queued connection is refused");
+    assert!(
+        matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{r:?}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(w.client.ep.stats(ForwardId(1)).unwrap().waiting, 0);
+    drop(a);
+}
+
 /// `close_forward` ends the forward's channels and refuses its queued connections too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_forward_also_clears_its_queue() {

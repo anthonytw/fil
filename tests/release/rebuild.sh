@@ -41,10 +41,11 @@ rustup toolchain list | grep -q "^$x86tc" \
 # installing a first toolchain makes it the default; put back what was there
 [ -n "$default_before" ] || rustup default none > /dev/null 2>&1 || true
 # ---- the pinned toolchain must RUN in the pinned image under this VM's emulation. qemu-user (Ubuntu
-# 24.04's 8.2) runs `true` and then kills rustc at startup ("QEMU internal SIGSEGV"); Rosetta runs it.
+# 24.04's 8.2) runs `true`, then crashes rustc at startup ("QEMU internal SIGSEGV") or hangs it;
+# Rosetta runs it. Hence the time limit.
 img=$(awk '$0 == "[target.x86_64-unknown-linux-musl]" { p = 1; next } /^\[/ { p = 0 } p && /^image/ { v = $0; sub(/^image[ ]*=[ ]*"/, "", v); sub(/".*$/, "", v); print v; exit }' Cross.toml)
 x86root=$(dirname "$(dirname "$(rustup which --toolchain "$x86tc" rustc)")")
-docker run --rm --platform linux/amd64 -v "$x86root:/rust:ro" "$img" /rust/bin/rustc --version > /dev/null 2>&1 \
+timeout 120 docker run --rm --platform linux/amd64 -v "$x86root:/rust:ro" "$img" /rust/bin/rustc --version > /dev/null 2>&1 \
   || die "rustc does not run in the amd64 image under this VM's emulation (qemu-user crashes it): enable Rosetta (docs/m4/release.md section 9.3)"
 cross --version 2> /dev/null | grep -q '^cross 0.2.5' || cargo install --locked cross --version 0.2.5
 command -v just > /dev/null || cargo install --locked just --version 1.59.0

@@ -270,3 +270,56 @@ LIC fills in this section: how `THIRD-PARTY-NOTICES.md` is generated and what it
 | LIC | §2 (the first line stays), §4.3 (`THIRD-PARTY-NOTICES.md`), §7 |
 | DOC | §4.3 (the layout of the docs and completions), §5, §6 (for the user guide's removal instructions) |
 | TMP | §6.3 (2.5) and §6.4, item 4 (the lock files that GC reads, and the install directory's refresh on the hourly wake) |
+
+## 9. Building, verifying and signing a release (REL)
+
+The scripts are in `tests/release/`; the workflow is `.github/workflows/release.yml`; the recipes are `just release-build`, `release-check`, `release-verify` and `release-test`.
+
+### 9.1 What the workflow does
+
+- **A tag push `v*`** builds the files of §4.1 and opens a **draft** GitHub Release with the five files (the four archives and `SHA256SUMS`) and a build-provenance attestation for each archive. It never publishes. **A dry run** (`gh workflow run release.yml --ref BRANCH`) does the same builds and checks, uploads the files to the run (artifact `release-files`) and does nothing else: its jobs have no `id-token` or `attestations` permission.
+- **Jobs:** `prepare` (version, `SOURCE_DATE_EPOCH`, the tag checks, `release-deps`, `release-test`), `build-linux` (each Linux target twice, in two jobs), `build-macos` (twice, best effort), `package` (identical-binaries gate, archives assembled twice in the pinned image, identical-archives gate, `release-check`), `smoke-macos` (runs the macOS archive and `release-check` on macOS) and `publish` (tag push only: the only job with `contents: write`, `id-token: write` and `attestations: write`).
+- **The tag checks in `prepare` are not the gate.** On a tag push Actions runs the workflow file of the tagged commit, so whoever can push a `v*` tag controls it. The gates are the tag ruleset (OQ-2), the draft that a person publishes and the owner's `release-verify` and signature.
+- **A release needs the complete layout.** `release-check --complete` (what a tag push runs) fails until every file of §4.3 is in the archives. A dry run lists the files that LIC and DOC have yet to add as pending. LIC and DOC add their files by producing them into a directory laid out like an archive and passing it to `package.sh --extra`.
+- **Version and tag:** the archive names carry the version in `Cargo.toml`; a dry run of a branch is named after it (`0.0.0` before the first release). `release-check` (non-dry) requires the tag to be `v<version>`, a `CHANGELOG.md` section for it and, for a patch release, the wire of the previous tag of the same minor.
+- **Paths.** `trim-paths` is not stable in the pinned cargo, so the builds pass `--remap-path-prefix` flags (`tests/release/common.sh`): the workspace becomes `/build`, `CARGO_HOME` `/cargo-home` and the rustup home `/rustup-home`. `release-check` requires `/cargo-home/registry/src/` to appear in each binary, as proof that the remap was applied. When the pinned cargo stabilizes `trim-paths`, set it in `[profile.release]` and drop the flags.
+
+### 9.2 The owner's steps for one release
+
+**The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
+
+0. **Once: the key goes into the repository.** Before the first release, a PR adds the key's public half to `.github/release-signers` on `main`, two lines (`namespaces="git"` for the tag and `namespaces="fil-release"` for the checksums; the file shows the form), reviewed by a code owner (`.github/CODEOWNERS`, with the "require review from Code Owners" ruleset setting). Until then the file is a placeholder with no key: `release-verify` stops at the tag, and the workflow warns. Publish the key's fingerprint out of band (README, site) so that verifiers can check `.github/release-signers` against it; a verifier may keep its own copy and name it in `FIL_RELEASE_SIGNERS`.
+1. **Candidate.** Run the dry run from `main` (`gh workflow run release.yml --ref main`), then rebuild it in the VM: `just release-verify VERSION --dry-run --from-run RUN --ref SHA` (a commit SHA; §9.3). Nothing from the download is run on the owner's machine in this mode either.
+2. **Tag.** On a clean `main` at the release commit, with the version and `CHANGELOG.md` already merged, make an annotated tag signed with the release key and push that one tag:
+
+   ```sh
+   git -c gpg.format=ssh -c user.signingkey=~/.ssh/fil-release.pub tag -s vX.Y.Z -m "fil X.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
+3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries and the four archives from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
+4. **Sign the verified file.** Sign the copy that step 3 verified (`target/release-verify/X.Y.Z/files/SHA256SUMS`), not a fresh download, because any writer can replace draft assets in between:
+
+   ```sh
+   ssh-keygen -Y sign -f ~/.ssh/fil-release -n fil-release target/release-verify/X.Y.Z/files/SHA256SUMS
+   gh release upload vX.Y.Z target/release-verify/X.Y.Z/files/SHA256SUMS.sig
+   just release-verify X.Y.Z                       # now the signature is checked too
+   gh release edit vX.Y.Z --draft=false            # publish
+   just release-verify X.Y.Z --no-rebuild          # once more, on what is published
+   ```
+
+### 9.3 The rebuild VM
+
+`release-verify` rebuilds in the Lima VM (`docs/dev/vm.md`; `FIL_VM` or `--vm` names it). The `cross` images are linux/amd64 and the VM is aarch64, so the amd64 containers run **under emulation that can run `rustc`: enable Rosetta in the VM.** The stock `qemu-user-static` of Ubuntu 24.04 (8.2) does not: `rustc` dies at startup with `QEMU internal SIGSEGV` while opening `/proc/self/maps`, so every `cross` build fails (found while building REL; hence the requirement). In the VM's `lima.yaml`:
+
+```yaml
+vmType: vz
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+```
+
+Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or create a second instance for the rebuilds and name it with `--vm`. The rebuild installs, in the VM, `cross` 0.2.5 and `just` (`cargo install --locked`) and the pinned toolchain for `x86_64-unknown-linux-gnu` (`rustup toolchain install --force-non-host`; `cross` mounts it into the amd64 image) the first time, and clones the repository over HTTPS: the VM needs the network and nothing from the Mac. The macOS binary is the one input that is not rebuilt: the macOS archive is reassembled around the release's own `bin/fil`.

@@ -14,7 +14,7 @@ use fil_proto::frame::DataSegment;
 use fil_proto::input::InputRecord;
 use fil_proto::msg::{
     AttachRefusal, AttachReply, ControlMsg, ErrorCode, Hello, ResumeRequest, SnapshotInfo,
-    SnapshotReason, StartPoint, TakenOver, TermSize,
+    StartPoint, TakenOver, TermSize,
 };
 use fil_term::{Emulator, Size};
 use fil_transport::Link;
@@ -50,6 +50,17 @@ pub struct Client<L: Link> {
     pub snapshot_bytes: Vec<Vec<u8>>,
     snap_buf: Vec<u8>,
     snap_info: Option<SnapshotInfo>,
+    /// The terminal position the pending snapshot applies at, if it is a mid-stream one: where
+    /// the daemon's stream was (a repaint's `at`, a catch-up's `at − skipped`). Output below it
+    /// was sent before the snapshot and may arrive after the announcement (control goes first):
+    /// it is applied first, as the real client does. `None` for the attach's snapshot.
+    snap_until: Option<u64>,
+    /// Terminal segments past the pending snapshot's position, waiting for it.
+    term_waiting: Vec<(u64, Vec<u8>)>,
+    /// For every mid-stream snapshot, how much output the daemon had sent that had not arrived
+    /// when it was announced (`at − skipped − next`): what a client that jumped at the
+    /// announcement would lose.
+    pub in_flight_at_snapshots: Vec<u64>,
     /// `(canonical, echo, at, terminal offset received when the message arrived)`.
     pub modes: Vec<(bool, bool, u64, u64)>,
     /// `(input_upto, output_at, terminal offset received when the message arrived)`.
@@ -101,6 +112,9 @@ impl<L: Link> Client<L> {
             snapshot_bytes: Vec::new(),
             snap_buf: Vec::new(),
             snap_info: None,
+            snap_until: None,
+            term_waiting: Vec::new(),
+            in_flight_at_snapshots: Vec::new(),
             modes: Vec::new(),
             echo_acks: Vec::new(),
             input_acked: 0,
@@ -289,32 +303,67 @@ impl<L: Link> Client<L> {
             }
             ChannelId::TERMINAL => {
                 let seg = DataSegment::parse(&payload).unwrap();
-                let fresh = self
-                    .recv
-                    .accept(seg.seq, seg.data)
-                    .expect("no gap on the terminal channel")
-                    .to_vec();
-                self.out.extend_from_slice(&fresh);
-                self.emu.feed(&fresh);
-                self.next = self.recv.received();
-                // A repaint waiting for the output before it.
-                self.finish_snapshot().await;
-                if self.auto_ack && !fresh.is_empty() {
-                    self.send_ctl(ControlMsg::Ack {
-                        channel: ChannelId::TERMINAL,
-                        upto: self.next,
-                    })
-                    .await;
+                if let (Some(info), Some(until)) = (self.snap_info, self.snap_until) {
+                    let end = seg.seq + seg.data.len() as u64;
+                    assert!(
+                        seg.seq >= until || end <= until,
+                        "a segment across a snapshot's position: {}..{end}, {info:?}",
+                        seg.seq
+                    );
+                    if seg.seq >= until {
+                        // Output after the snapshot: it waits for it. A catch-up never sends
+                        // what it skipped.
+                        assert!(
+                            seg.seq >= info.at,
+                            "output the catch-up skipped arrived: {}, {info:?}",
+                            seg.seq
+                        );
+                        self.term_waiting.push((seg.seq, seg.data.to_vec()));
+                        return;
+                    }
                 }
+                self.apply_terminal(seg.seq, seg.data).await;
+                // A mid-stream snapshot waiting for the output before it.
+                self.finish_snapshot().await;
             }
             ch if ch == ChannelId::MUX || ch.is_dynamic() => self.forward_traffic += 1,
             other => panic!("data on channel {}", other.0),
         }
     }
 
-    async fn expect_snapshot(&mut self, info: SnapshotInfo) {
+    /// Applies a terminal segment (and acknowledges it, with `auto_ack`).
+    async fn apply_terminal(&mut self, seq: u64, data: &[u8]) {
+        let fresh = self
+            .recv
+            .accept(seq, data)
+            .expect("no gap on the terminal channel")
+            .to_vec();
+        self.out.extend_from_slice(&fresh);
+        self.emu.feed(&fresh);
+        self.next = self.recv.received();
+        if self.auto_ack && !fresh.is_empty() {
+            self.send_ctl(ControlMsg::Ack {
+                channel: ChannelId::TERMINAL,
+                upto: self.next,
+            })
+            .await;
+        }
+    }
+
+    /// `mid_stream`: announced by `ControlMsg::Snapshot`, so rendered where the daemon's stream
+    /// was, with output from before it possibly still on its way; otherwise the attach's.
+    async fn expect_snapshot(&mut self, info: SnapshotInfo, mid_stream: bool) {
         assert!(self.snap_info.is_none(), "a snapshot while one is arriving");
         self.snap_info = Some(info);
+        self.snap_until = mid_stream.then(|| {
+            let until = info
+                .at
+                .checked_sub(info.skipped)
+                .expect("skipped past `at`");
+            self.in_flight_at_snapshots
+                .push(until.saturating_sub(self.next));
+            until
+        });
         self.finish_snapshot().await;
     }
 
@@ -327,13 +376,17 @@ impl<L: Link> Client<L> {
             assert!(self.snap_buf.len() as u64 <= info.len, "snapshot too long");
             return;
         }
-        // A repaint is rendered where the daemon's stream was: the output before it, still on its
-        // way, is applied first (as the real client does), so nothing is skipped.
-        if info.reason == SnapshotReason::Repaint && self.next < info.at {
-            return;
-        }
-        if info.reason == SnapshotReason::Repaint {
-            assert_eq!(self.next, info.at, "a repaint not where the stream is");
+        // A mid-stream snapshot (a repaint or a catch-up) is rendered where the daemon's stream
+        // was: the output before it, still on its way, is applied first (as the real client
+        // does), so nothing the daemon sent is lost. A catch-up then jumps over what it skipped.
+        if let Some(until) = self.snap_until {
+            if self.next < until {
+                return;
+            }
+            assert_eq!(
+                self.next, until,
+                "a snapshot not where the stream is: {info:?}"
+            );
         }
         let bytes = std::mem::take(&mut self.snap_buf);
         self.emu.feed(&bytes);
@@ -342,12 +395,19 @@ impl<L: Link> Client<L> {
         self.recv = RecvChannel::starting_at(info.at);
         self.next = info.at;
         self.snap_info = None;
+        self.snap_until = None;
         if self.auto_ack {
             self.send_ctl(ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,
                 upto: info.at,
             })
             .await;
+        }
+        // The output that waited for it.
+        let mut waiting = std::mem::take(&mut self.term_waiting);
+        waiting.sort_by_key(|(seq, _)| *seq);
+        for (seq, data) in waiting {
+            self.apply_terminal(seq, &data).await;
         }
     }
 
@@ -363,7 +423,7 @@ impl<L: Link> Client<L> {
                         self.recv = RecvChannel::starting_at(from);
                         self.next = from;
                     }
-                    StartPoint::Snapshot(info) => self.expect_snapshot(info).await,
+                    StartPoint::Snapshot(info) => self.expect_snapshot(info, false).await,
                 }
                 self.reply = Some(r);
             }
@@ -372,7 +432,7 @@ impl<L: Link> Client<L> {
             ControlMsg::Detach => self.detached = true,
             ControlMsg::Snapshot(info) => {
                 self.mid_snapshots.push(info);
-                self.expect_snapshot(info).await;
+                self.expect_snapshot(info, true).await;
             }
             ControlMsg::PtyMode {
                 canonical,

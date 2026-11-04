@@ -259,8 +259,9 @@ pi-e2e *args:
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
 # real client on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
-# --allow-missing, --allow-skip, --strict. `--local` runs against a private daemon on this machine
-# instead (no targets needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
+# --allow-missing, --allow-skip, --strict, --dump DIR (where the transcript of a client whose output
+# check fails goes). `--local` runs against a private daemon on this machine instead (no targets
+# needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
 # this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
 dropin *args:

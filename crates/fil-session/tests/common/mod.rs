@@ -206,6 +206,18 @@ impl Client {
         Self::connect_wrapped(h, c, 256, move |l| DelayLink::new(l, delay))
     }
 
+    /// A link like QUIC's on a slow path: control goes at once and overtakes the data, and at
+    /// most `slots` data segments are in flight (each takes `delay`), so the daemon's sends block
+    /// once they are, and a backlog it has not sent builds up behind them.
+    pub fn connect_in_flight(
+        h: &SessionHandle,
+        c: Connect,
+        slots: usize,
+        delay: Duration,
+    ) -> Client {
+        Self::connect_wrapped(h, c, 256, move |l| DelayLink::bounded(l, delay, slots))
+    }
+
     pub fn connect_wrapped<L: Link>(
         h: &SessionHandle,
         c: Connect,
@@ -257,15 +269,24 @@ impl Client {
 }
 
 /// The daemon's end of a link that delivers control messages at once and everything else after
-/// `delay` (per channel in order), and whose `flush` waits for what is held back.
+/// `delay` (per channel in order), and whose `flush` waits for what is held back. A `bounded`
+/// one holds at most `slots` data payloads: `send` waits for room.
 pub struct DelayLink {
     inner: Arc<MemLink>,
     held: tokio::sync::mpsc::UnboundedSender<(ChannelId, Bytes, tokio::time::Instant)>,
     pending: Arc<tokio::sync::watch::Sender<usize>>,
     delay: Duration,
+    slots: usize,
 }
 
 impl DelayLink {
+    pub fn bounded(inner: MemLink, delay: Duration, slots: usize) -> Self {
+        DelayLink {
+            slots: slots.max(1),
+            ..Self::new(inner, delay)
+        }
+    }
+
     pub fn new(inner: MemLink, delay: Duration) -> Self {
         let inner = Arc::new(inner);
         let (held, mut rx) =
@@ -284,6 +305,7 @@ impl DelayLink {
             held,
             pending,
             delay,
+            slots: usize::MAX,
         }
     }
 }
@@ -299,6 +321,10 @@ impl Link for DelayLink {
     ) -> Result<(), fil_transport::LinkError> {
         if channel == ChannelId::CONTROL {
             return self.inner.send(channel, payload).await;
+        }
+        let mut room = self.pending.subscribe();
+        while *room.borrow_and_update() >= self.slots {
+            let _ = room.changed().await;
         }
         if let fil_transport::LinkState::Down(r) = self.inner.status().borrow().state.clone() {
             return Err(fil_transport::LinkError(r));

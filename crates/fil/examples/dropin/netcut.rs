@@ -16,6 +16,15 @@
 //! announced port against [`Cut::covers`] before any QUIC goes through the relay. The two paths can
 //! be cut separately (`set_udp` alone is a UDP outage, which moves a session to the
 //! pipe).
+//!
+//! **Delay** (`set_delay`, M3's T3): every byte and every datagram is held for that long in each
+//! direction before it goes on, so a host on the LAN can be reached at a chosen round trip (the
+//! prediction scenarios, `docs/m3/plan.md` §5.6). Order is kept: each direction is a queue, and
+//! what was read first goes first. The delay in force when a byte or datagram arrives is the one
+//! it gets. A datagram that finds its direction's queue full (4,096 waiting) is dropped, as a
+//! router's queue drops; TCP's queue holds at most 256 reads (16 MiB) and then stops reading,
+//! which TCP's own flow control passes back. A datagram still waiting when the cable is pulled is
+//! dropped when its time comes; bytes still waiting are held, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -25,16 +34,29 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::Instant;
 
 /// The daemon's UDP port range (`fil_transport::quic::DEFAULT_PORT_RANGE`).
 const UDP_LO: u16 = 60000;
 const UDP_HI: u16 = 61000;
 
+/// Reads of a TCP direction that may wait out the delay at once (64 KiB each).
+const TCP_QUEUE: usize = 256;
+/// Datagrams of a UDP direction that may wait out the delay at once.
+const UDP_QUEUE: usize = 4096;
+
+/// The last stretch of a delay is waited out by yielding instead of on tokio's timer, which
+/// rounds a deadline up to its next millisecond tick (on macOS it woke 1.5 ms late on average,
+/// against a 2 ms bound).
+const FINE_WAIT: Duration = Duration::from_millis(2);
+
 #[derive(Default)]
 struct Flags {
     tcp_cut: AtomicBool,
     udp_cut: AtomicBool,
+    /// The one-way delay, in microseconds.
+    delay_us: AtomicU64,
     /// Datagrams dropped while cut, and TCP connections refused while cut (for the notes).
     dropped: AtomicU64,
     refused: AtomicU64,
@@ -50,6 +72,26 @@ pub struct Cut {
     pub udp_bound: usize,
 }
 
+impl Flags {
+    /// When something that arrives now may go on.
+    fn due(&self) -> Instant {
+        Instant::now() + Duration::from_micros(self.delay_us.load(Ordering::Relaxed))
+    }
+}
+
+/// Waits until `due`: on the timer to within [`FINE_WAIT`] of it, then by yielding. Only a
+/// delay makes anything wait; the cost is a busy worker for the last [`FINE_WAIT`] of each wait.
+async fn wait_until(due: Instant) {
+    if let Some(coarse) = due.checked_sub(FINE_WAIT)
+        && coarse > Instant::now()
+    {
+        tokio::time::sleep_until(coarse).await;
+    }
+    while Instant::now() < due {
+        tokio::task::yield_now().await;
+    }
+}
+
 impl Cut {
     /// A relay to `host` (a name or an address; port 22 for ssh, the daemon's range for UDP).
     pub fn start(host: &str) -> Result<Cut, String> {
@@ -59,6 +101,15 @@ impl Cut {
             .map(|a| a.ip())
             .find(IpAddr::is_ipv4)
             .ok_or("netcut: the host has no IPv4 address")?;
+        let udp = (UDP_LO..=UDP_HI)
+            .map(|p| (p, SocketAddr::new(up_ip, p)))
+            .collect();
+        Self::start_to(SocketAddr::new(up_ip, 22), udp)
+    }
+
+    /// The relay: TCP on an ephemeral port of 127.0.0.1 to `tcp_up`, and UDP on each local port of
+    /// `udp` (0 for any) to its address. A local port another process holds is left out.
+    fn start_to(tcp_up: SocketAddr, udp: Vec<(u16, SocketAddr)>) -> Result<Cut, String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -70,16 +121,14 @@ impl Cut {
                 .await
                 .map_err(|e| format!("netcut: tcp bind: {e}"))?;
             let port = l.local_addr().map_err(|e| e.to_string())?.port();
-            tokio::spawn(tcp_accept(l, SocketAddr::new(up_ip, 22), flags.clone()));
+            tokio::spawn(tcp_accept(l, tcp_up, flags.clone()));
             let mut bound = HashSet::new();
-            for p in UDP_LO..=UDP_HI {
-                if let Ok(s) = UdpSocket::bind((Ipv4Addr::LOCALHOST, p)).await {
-                    bound.insert(p);
-                    tokio::spawn(udp_port(
-                        Arc::new(s),
-                        SocketAddr::new(up_ip, p),
-                        flags.clone(),
-                    ));
+            for (p, up) in udp {
+                if let Ok(s) = UdpSocket::bind((Ipv4Addr::LOCALHOST, p)).await
+                    && let Ok(local) = s.local_addr()
+                {
+                    bound.insert(local.port());
+                    tokio::spawn(udp_port(Arc::new(s), up, flags.clone()));
                 }
             }
             Ok::<_, String>((port, bound))
@@ -112,6 +161,13 @@ impl Cut {
 
     pub fn set_udp(&self, cut: bool) {
         self.flags.udp_cut.store(cut, Ordering::SeqCst);
+    }
+
+    /// Holds every byte and datagram for `delay` in each direction from now on (zero: none), so the
+    /// round trip through the relay grows by twice that.
+    pub fn set_delay(&self, delay: Duration) {
+        let us = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.flags.delay_us.store(us, Ordering::Relaxed);
     }
 
     /// (datagrams dropped, TCP connections refused) while cut, so far.
@@ -161,34 +217,84 @@ async fn held(flags: &Flags) {
     }
 }
 
-/// Copies one direction; holds what it has read (and an end of stream) while the cable is out.
+/// Copies one direction: what it reads waits out the delay in a queue, then is written; it holds
+/// what it has read (and an end of stream) while the cable is out.
 async fn pump(
-    mut from: tokio::net::tcp::OwnedReadHalf,
+    from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     flags: Arc<Flags>,
 ) {
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
+    // `None` is the end of the stream.
+    let (tx, mut rx) = mpsc::channel::<(Instant, Option<Vec<u8>>)>(TCP_QUEUE);
+    tokio::spawn(read_side(from, tx, flags.clone()));
+    while let Some((due, bytes)) = rx.recv().await {
+        wait_until(due).await;
         held(&flags).await;
-        let n = match from.read(&mut buf).await {
-            Ok(0) | Err(_) => {
-                held(&flags).await;
-                let _ = to.shutdown().await;
-                return;
-            }
-            Ok(n) => n,
+        let Some(bytes) = bytes else {
+            let _ = to.shutdown().await;
+            return;
         };
-        held(&flags).await;
-        if to.write_all(&buf[..n]).await.is_err() {
+        if to.write_all(&bytes).await.is_err() {
             return;
         }
     }
 }
 
+/// The reading half of [`pump`]: stamps each read with the time it may go on. It ends when the
+/// writing half has (so the socket is not kept open by a read that nobody will write).
+async fn read_side(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    tx: mpsc::Sender<(Instant, Option<Vec<u8>>)>,
+    flags: Arc<Flags>,
+) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        held(&flags).await;
+        let read = tokio::select! {
+            r = from.read(&mut buf) => r,
+            () = tx.closed() => return,
+        };
+        let bytes = match read {
+            Ok(0) | Err(_) => None,
+            Ok(n) => Some(buf[..n].to_vec()),
+        };
+        let end = bytes.is_none();
+        if tx.send((flags.due(), bytes)).await.is_err() || end {
+            return;
+        }
+    }
+}
+
+/// A queue that sends each datagram on `sock` once its time has come: to `to`, or to the socket's
+/// connected peer. A datagram that finds the queue full is dropped.
+fn delay_line(
+    sock: Arc<UdpSocket>,
+    to: Option<SocketAddr>,
+    flags: Arc<Flags>,
+) -> mpsc::Sender<(Instant, Vec<u8>)> {
+    let (tx, mut rx) = mpsc::channel::<(Instant, Vec<u8>)>(UDP_QUEUE);
+    tokio::spawn(async move {
+        while let Some((due, d)) = rx.recv().await {
+            wait_until(due).await;
+            if flags.udp_cut.load(Ordering::SeqCst) {
+                flags.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let _ = match to {
+                Some(a) => sock.send_to(&d, a).await,
+                None => sock.send(&d).await,
+            };
+        }
+    });
+    tx
+}
+
 /// One UDP port of the range: datagrams from clients go on to the host's same port, each client
 /// address through an upstream socket of its own, and the answers come back.
 async fn udp_port(local: Arc<UdpSocket>, up: SocketAddr, flags: Arc<Flags>) {
-    let ups: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::default();
+    // Each client address's way up: the queue into its upstream socket.
+    type Ups = HashMap<SocketAddr, mpsc::Sender<(Instant, Vec<u8>)>>;
+    let ups: Arc<Mutex<Ups>> = Arc::default();
     let mut buf = vec![0u8; 65536];
     loop {
         let Ok((n, from)) = local.recv_from(&mut buf).await else {
@@ -198,10 +304,10 @@ async fn udp_port(local: Arc<UdpSocket>, up: SocketAddr, flags: Arc<Flags>) {
             flags.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let sock = {
+        let line = {
             let mut map = ups.lock().await;
             match map.get(&from) {
-                Some(s) => s.clone(),
+                Some(l) => l.clone(),
                 None => {
                     let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
                         continue;
@@ -210,17 +316,19 @@ async fn udp_port(local: Arc<UdpSocket>, up: SocketAddr, flags: Arc<Flags>) {
                         continue;
                     }
                     let s = Arc::new(s);
-                    map.insert(from, s.clone());
-                    tokio::spawn(udp_back(s.clone(), local.clone(), from, flags.clone()));
-                    s
+                    let l = delay_line(s.clone(), None, flags.clone());
+                    map.insert(from, l.clone());
+                    tokio::spawn(udp_back(s, local.clone(), from, flags.clone()));
+                    l
                 }
             }
         };
-        let _ = sock.send(&buf[..n]).await;
+        let _ = line.try_send((flags.due(), buf[..n].to_vec()));
     }
 }
 
 async fn udp_back(up: Arc<UdpSocket>, local: Arc<UdpSocket>, to: SocketAddr, flags: Arc<Flags>) {
+    let line = delay_line(local, Some(to), flags.clone());
     let mut buf = vec![0u8; 65536];
     loop {
         let Ok(n) = up.recv(&mut buf).await else {
@@ -233,6 +341,202 @@ async fn udp_back(up: Arc<UdpSocket>, local: Arc<UdpSocket>, to: SocketAddr, fla
             flags.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let _ = local.send_to(&buf[..n], to).await;
+        let _ = line.try_send((flags.due(), buf[..n].to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Instant as Clock;
+
+    const DELAY: Duration = Duration::from_millis(30);
+    /// T3's bound: the median of a direction within 2 ms of the setting.
+    const WITHIN: Duration = Duration::from_millis(2);
+    const SAMPLES: usize = 40;
+    /// A loaded machine can deschedule any of the threads for milliseconds; it rarely does so to
+    /// the median of all three runs (the pattern of `fil-daemon/tests/log_blocking.rs`).
+    const RUNS: usize = 3;
+
+    /// One run's one-way delays: (up, down), one per sample, in the order sent.
+    type Run = (Vec<Duration>, Vec<Duration>);
+
+    fn median(v: &[Duration]) -> Duration {
+        let mut v = v.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    }
+
+    /// Judges the runs of both directions: nothing is ever early (a byte or datagram that skipped
+    /// the queue), and in at least one run both medians are within [`WITHIN`] of the setting.
+    fn judge(what: &str, runs: &[Run]) {
+        let summary: Vec<String> = runs
+            .iter()
+            .map(|(up, down)| format!("up {:?} down {:?}", median(up), median(down)))
+            .collect();
+        eprintln!("netcut {what}: delay {DELAY:?}, medians of {SAMPLES} samples: {summary:?}");
+        for (up, down) in runs {
+            let early = up.iter().chain(down).min().unwrap();
+            assert!(
+                *early >= DELAY,
+                "{what}: a sample took {early:?} < {DELAY:?}"
+            );
+        }
+        assert!(
+            runs.iter()
+                .any(|(up, down)| median(up) - DELAY <= WITHIN && median(down) - DELAY <= WITHIN),
+            "{what}: no run had both medians within {WITHIN:?} of {DELAY:?}: {summary:?}"
+        );
+    }
+
+    /// Repeats `one` until a run is within the bound, at most [`RUNS`] times.
+    fn runs(mut one: impl FnMut() -> Run) -> Vec<Run> {
+        let mut all = Vec::new();
+        for _ in 0..RUNS {
+            let r = one();
+            let good = median(&r.0) - DELAY <= WITHIN && median(&r.1) - DELAY <= WITHIN;
+            all.push(r);
+            if good {
+                break;
+            }
+        }
+        all
+    }
+
+    /// Times one byte (or datagram) at a time, 5 ms apart: sent, read by the host and sent back
+    /// at once, read again here.
+    struct Times {
+        sent: Vec<Clock>,
+        at_host: Vec<Clock>,
+        back: Vec<Clock>,
+    }
+
+    impl Times {
+        fn one_way(self) -> Run {
+            let up = (0..SAMPLES)
+                .map(|i| self.at_host[i] - self.sent[i])
+                .collect();
+            let down = (0..SAMPLES)
+                .map(|i| self.back[i] - self.at_host[i])
+                .collect();
+            (up, down)
+        }
+    }
+
+    #[test]
+    fn tcp_bytes_are_held_for_the_delay_each_way() {
+        let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cut = Cut::start_to(host.local_addr().unwrap(), Vec::new()).unwrap();
+        cut.set_delay(DELAY);
+        let all = runs(|| {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", cut.tcp_port)).unwrap();
+            c.set_nodelay(true).unwrap();
+            let (mut h, _) = host.accept().unwrap();
+            h.set_nodelay(true).unwrap();
+            let mut reader = c.try_clone().unwrap();
+            std::thread::scope(|sc| {
+                // The host: every byte back at once, stamped when it was read.
+                let at_host = sc.spawn(move || {
+                    let mut at = Vec::new();
+                    let mut buf = [0u8; 64];
+                    while at.len() < SAMPLES {
+                        let n = h.read(&mut buf).unwrap();
+                        assert!(n > 0, "the relay closed the connection");
+                        let t = Clock::now();
+                        h.write_all(&buf[..n]).unwrap();
+                        at.extend(std::iter::repeat_n(t, n));
+                    }
+                    at
+                });
+                let back = sc.spawn(move || {
+                    let mut at = Vec::new();
+                    let mut buf = [0u8; 64];
+                    while at.len() < SAMPLES {
+                        let n = reader.read(&mut buf).unwrap();
+                        assert!(n > 0, "the relay closed the connection");
+                        let t = Clock::now();
+                        // In order, nothing lost or added: TCP's bytes are the indices.
+                        for (k, b) in buf[..n].iter().enumerate() {
+                            assert_eq!(usize::from(*b), at.len() + k);
+                        }
+                        at.extend(std::iter::repeat_n(t, n));
+                    }
+                    at
+                });
+                let mut sent = Vec::new();
+                for i in 0..SAMPLES {
+                    sent.push(Clock::now());
+                    c.write_all(&[i as u8]).unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Times {
+                    sent,
+                    at_host: at_host.join().unwrap(),
+                    back: back.join().unwrap(),
+                }
+                .one_way()
+            })
+        });
+        judge("tcp", &all);
+    }
+
+    #[test]
+    fn udp_datagrams_are_held_for_the_delay_each_way() {
+        let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // A TCP side is always there; nothing connects to it here.
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cut = Cut::start_to(
+            unused.local_addr().unwrap(),
+            vec![(0, host.local_addr().unwrap())],
+        )
+        .unwrap();
+        assert_eq!(cut.udp_bound, 1);
+        let port = *cut.udp.iter().next().unwrap();
+        assert!(cut.covers(port));
+        cut.set_delay(DELAY);
+        let all = runs(|| {
+            let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            c.connect(("127.0.0.1", port)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            std::thread::scope(|sc| {
+                let host = &host;
+                let at_host = sc.spawn(move || {
+                    let mut at = vec![None; SAMPLES];
+                    let mut buf = [0u8; 16];
+                    for _ in 0..SAMPLES {
+                        let (n, from) = host.recv_from(&mut buf).unwrap();
+                        let t = Clock::now();
+                        host.send_to(&buf[..n], from).unwrap();
+                        at[usize::from(buf[0])] = Some(t);
+                    }
+                    at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+                });
+                let reader = c.try_clone().unwrap();
+                let back = sc.spawn(move || {
+                    let mut at = vec![None; SAMPLES];
+                    let mut buf = [0u8; 16];
+                    for _ in 0..SAMPLES {
+                        reader.recv(&mut buf).unwrap();
+                        at[usize::from(buf[0])] = Some(Clock::now());
+                    }
+                    at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+                });
+                let mut sent = Vec::new();
+                for i in 0..SAMPLES {
+                    sent.push(Clock::now());
+                    c.send(&[i as u8]).unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Times {
+                    sent,
+                    at_host: at_host.join().unwrap(),
+                    back: back.join().unwrap(),
+                }
+                .one_way()
+            })
+        });
+        judge("udp", &all);
     }
 }

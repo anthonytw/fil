@@ -13,7 +13,8 @@
 //! - `pipe-probe`: the same for the real `PipeLink`, on a pipe command.
 //! - `pipe-detach`: the daemon side and a slow ssh stand-in for the detach-delivery test.
 //! - `fwdprobe`: the TCP end for port-forward tests (serve and connect, seeded streams, sha256).
-//! - `keyprobe`: keystroke-to-echo latency on a pty, and the catch-up drain.
+//! - `keyprobe`: keystroke-to-echo (or, through an emulator, key-to-glyph) latency on a pty, and
+//!   the catch-up drain.
 //!
 //! Shared by the programs: [`keys`] (the key bootstrap of the two QUIC programs) and [`pty`] (a
 //! program on a pseudo-terminal, shared by `ptydrive` and the Pi examples).

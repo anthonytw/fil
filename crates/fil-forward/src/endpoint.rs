@@ -1314,7 +1314,9 @@ impl<L: Link> Endpoint<L> {
             inner.kick();
         } else if control {
             // Data lands in a buffer and wakes its pump through `drain`; neither sender has
-            // work unless the payload was a violation (a `Close` record).
+            // work unless the payload was a violation (data past the window, or before the
+            // `OpenOk`): the mux queued `Close(Violation)`, which the peer, the one at fault,
+            // never answers with a record of its own that would wake the control sender.
             inner.kick_ctl();
         }
         r
@@ -1336,10 +1338,14 @@ impl<L: Link> Endpoint<L> {
         inner.drain(&mut st);
         let control = st.mux.control_pending();
         drop(st);
-        // Credit and a smaller send buffer: the data sender's, and the pacer's. A `Close` the ack
-        // completed (or any other record) is the control sender's.
+        // Credit and a smaller send buffer: the data sender's, and the pacer's. A record the
+        // ack queued is the control sender's. That kick is needed: an ack beyond what was sent is
+        // a violation, answered with `Close(Violation)`, and the peer that sent it never closes,
+        // so on an idle endpoint nothing else would wake the control sender to send it
+        // (`a_violation_on_an_idle_endpoint_is_answered_at_once`). A `Close` for a graceful end
+        // the ack completes is also answered by the peer's own, which wakes both.
         inner.kick_data();
-        if control || ch == ChannelId::MUX {
+        if control {
             inner.kick_ctl();
         }
         r

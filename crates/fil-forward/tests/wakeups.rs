@@ -132,3 +132,33 @@ async fn each_event_wakes_only_the_task_that_has_work_body() {
         "the control senders ran {ctl} times for {segments} segments"
     );
 }
+
+/// A peer's violation is answered with a `Close(Violation)` record, and on an idle endpoint
+/// nothing but the ack handler can wake the control sender to send it: the peer never closes (it
+/// is the one misbehaving), so no MUX record comes in to do it. Here the peer acknowledges bytes
+/// that were never sent on a connection that has been quiet for a while.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_violation_on_an_idle_endpoint_is_answered_at_once() {
+    bounded(a_violation_on_an_idle_endpoint_is_answered_at_once_body()).await
+}
+
+async fn a_violation_on_an_idle_endpoint_is_answered_at_once_body() {
+    use fil_proto::ChannelId;
+    let server = echo_server().await;
+    let w = World::new(Transport::Mem, mux_config()).await;
+    let port = w.local_forward(1, server.port);
+    let mut s = connect(port).await;
+    s.write_all(b"hello").await.unwrap();
+    let mut b = [0u8; 5];
+    s.read_exact(&mut b).await.unwrap();
+    // Quiet: every ack and deadline of the exchange has passed, and the senders sleep.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The client's channel 16, as the daemon sees it: an ack for a billion bytes it never sent.
+    w.daemon.ep.on_ack(ChannelId(16), 1 << 30).unwrap();
+    // The daemon's `Close(Violation)` reaches the client, which ends the application's connection.
+    let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await;
+    assert!(
+        matches!(r, Ok(Ok(0) | Err(_))),
+        "the connection was not closed: {r:?}"
+    );
+}

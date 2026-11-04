@@ -131,7 +131,7 @@ fuzz-deny:
 # table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
 # tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports.
 forward-soak mib="256" seq="20000":
-    FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
+    FIL_FORWARD_TEST_LIMIT=3600 FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
@@ -265,6 +265,18 @@ dropin *args:
     cargo build -q --release -p fil-testbins --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
     "{{target_dir}}/release/examples/dropin" {{args}}
+
+# macOS as the REMOTE host (DESIGN.md §16.9, docs/m4/plan.md MAC): the real release `fil` serves a
+# session over a real ssh login to this Mac (an sshd of its own on a high loopback port with
+# throwaway keys; MACOS_SSHD=system uses the system sshd, on a throwaway runner only), driven by the
+# client on a pty. Scenarios: `just macos-remote --list`; narrow with names. It starts and stops a
+# `fil` daemon of its own and refuses to run beside one of yours (tests/macos/remote.sh). macOS
+# only; never part of `ci`. `fil` is built in an invocation of its own, so it has no test hooks.
+macos-remote *args:
+    cargo build -q --release -p fil --bins
+    cargo build -q --release -p fil-testbins --bin ptydrive --bin fwdprobe
+    just no-test-hooks "{{target_dir}}/release/fil"
+    FIL_BIN_DIR="{{target_dir}}/release" tests/macos/remote.sh {{args}}
 
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil

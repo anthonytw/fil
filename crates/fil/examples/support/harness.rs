@@ -739,7 +739,7 @@ mod tests {
             "ok in 1923 ms, peer <ip>:4433 via <ip>, lo 127.0.0.1 [::1], to pi1."
         );
         // A name's addresses never appear in the target list; they are scrubbed all the same.
-        let t = Targets::parse("pi2=u@alpha.example", &[]).unwrap();
+        let t = Targets::parse("pi2=u@devbox2.example", &[]).unwrap();
         assert_eq!(
             t.scrub("dialled 203.0.113.5. Time 10:30:45"),
             "dialled <ip>. Time 10:30:45"
@@ -748,9 +748,9 @@ mod tests {
 
     #[test]
     fn real_host_names_are_scrubbed_to_labels() {
-        let t = Targets::parse("pi1=fil-test@alpha.lab.example", &[]).unwrap();
-        let s = t.scrub("fil-test@alpha-pi:~ $ and alpha.lab.example");
-        assert!(!s.contains("alpha"), "{s}");
+        let t = Targets::parse("pi1=fil-test@devbox.example", &[]).unwrap();
+        let s = t.scrub("fil-test@devbox-pi:~ $ and devbox.example");
+        assert!(!s.contains("devbox"), "{s}");
         assert!(s.contains("pi1"));
     }
 

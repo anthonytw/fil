@@ -48,6 +48,12 @@ pub enum PolicySetting {
     /// Everything is refused until the re-read is in; nothing in the host's config refused it,
     /// so the source says nothing ([`PolicySource::Default`], not shown).
     Pending,
+    /// The sshd config holds a line fil cannot evaluate the way sshd would (an `Include` pattern
+    /// whose meaning differs between `glob(3)` implementations, one that is not valid UTF-8,
+    /// or a file with a NUL byte, which sshd reads as gluing two lines together), so what the
+    /// config says is not known and everything is refused, unless fil's policy file sets the
+    /// key itself. The source is that line (never what it says).
+    Unevaluable,
 }
 
 /// The `AllowTcpForwarding` value in force when it refused.
@@ -190,6 +196,10 @@ impl fmt::Display for PolicySetting {
             PolicySetting::Pending => {
                 f.write_str("the server policy is being read again; try again shortly")
             }
+            PolicySetting::Unevaluable => f.write_str(
+                "a line of the sshd config that fil cannot evaluate as sshd would, \
+                 so its settings are not known",
+            ),
         }
     }
 }
@@ -256,6 +266,20 @@ mod tests {
         assert_eq!(
             r.to_string(),
             "the server policy is being read again; try again shortly"
+        );
+    }
+
+    /// An sshd config line fil cannot evaluate is named by file and line, never by what it says.
+    #[test]
+    fn an_unevaluable_refusal_names_the_line() {
+        let r = PolicyRefusal {
+            setting: PolicySetting::Unevaluable,
+            source: sshd(12, false),
+        };
+        assert_eq!(
+            r.to_string(),
+            "a line of the sshd config that fil cannot evaluate as sshd would, so its settings \
+             are not known (/etc/ssh/sshd_config:12)"
         );
     }
 

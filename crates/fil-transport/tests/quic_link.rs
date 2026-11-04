@@ -402,7 +402,7 @@ async fn a_stalled_channel_does_not_block_the_others() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn nat_rebind_mid_transfer_keeps_the_link_up_and_bumps_the_daemons_path_generation() {
+async fn a_nat_rebind_keeps_the_link_up_and_only_a_new_ip_bumps_the_daemons_path_generation() {
     let w = World::new(5);
     let nat = w
         .net
@@ -428,8 +428,13 @@ async fn nat_rebind_mid_transfer_keeps_the_link_up_and_bumps_the_daemons_path_ge
         })
     };
     for n in 0..200u32 {
-        if n == 60 || n == 120 {
+        if n == 60 {
+            // The port only: the same host behind the same address, which quinn keeps its
+            // estimates for, so the layers above keep theirs.
             nat.rebind();
+        }
+        if n == 120 {
+            nat.rebind_to_ip("198.51.100.8".parse().unwrap());
         }
         let (ch, p) = daemon.recv().await.unwrap();
         assert_eq!((ch, seq_of(&p)), (FWD, n));
@@ -443,7 +448,10 @@ async fn nat_rebind_mid_transfer_keeps_the_link_up_and_bumps_the_daemons_path_ge
     );
     let st = daemon_status.borrow_and_update().clone();
     assert!(matches!(st.state, LinkState::Up), "{st:?}");
-    assert_eq!(st.path_generation, 2, "one per rebind");
+    assert_eq!(
+        st.path_generation, 1,
+        "the new IP counts, the port-only rebind does not"
+    );
     assert!(matches!(client.status().borrow().state, LinkState::Up));
     // The client cannot see a NAT rebind, so its own generation stays 0 (documented limit).
     assert_eq!(client.status().borrow().path_generation, 0);

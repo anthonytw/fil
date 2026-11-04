@@ -15,7 +15,7 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `tests/wire_golden.rs` holds a committed encoding of every message and fails if the encoding
 /// changes without this number changing. Regenerate with `just wire-golden`. 0 is reserved for
 /// builds from before revisions existed (their hello said `minor: 0`).
-pub const PROTOCOL_REVISION: u16 = 11;
+pub const PROTOCOL_REVISION: u16 = 12;
 const _: () = assert!(PROTOCOL_REVISION >= 1);
 
 /// Most data bytes in one data frame. DESIGN.md section 8.2 caps forward frames at this size so a

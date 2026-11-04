@@ -351,6 +351,11 @@ impl Paths {
     }
 }
 
+/// `(device, inode)` of the file `path` names (links followed), or none.
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
 /// If `exe` (this daemon's executable) is `fil` in a version directory that `fil install` made,
 /// `<home>/.local/share/fil/<ver>-w<major>.<rev>/fil`, sets that directory's times to now, so
 /// the install's garbage collection, which keeps a version directory modified within the last
@@ -358,13 +363,19 @@ impl Paths {
 /// else does nothing: a daemon run from another place, a path that is only a link to one, a
 /// directory that is not a real directory of ours, a name that is not a version directory's.
 /// The path is canonical, so a link is never followed to a directory it is not in; the
-/// directory is touched, never the file, and without following a link. Returns whether it did.
+/// directory is touched, never the file, and without following a link. `running` is the
+/// identity ([`file_identity`]) of the executable when the daemon started: a file at the path
+/// that is another one now (the build was replaced) or none (deleted) is not the build this
+/// daemon runs, and nothing is touched. Returns whether it did.
 /// No path is logged here or by the caller above debug.
-pub fn refresh_install_dir(exe: &Path, home: &Path) -> bool {
+pub fn refresh_install_dir(exe: &Path, home: &Path, running: Option<(u64, u64)>) -> bool {
     use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, utimensat};
     let Ok(exe) = std::fs::canonicalize(exe) else {
         return false;
     };
+    if running.is_none() || file_identity(&exe) != running {
+        return false;
+    }
     let Ok(root) = std::fs::canonicalize(home.join(".local/share/fil")) else {
         return false;
     };
@@ -740,7 +751,11 @@ mod tests {
             d
         };
         let good = make("0.1.0-w1.12", "fil");
-        assert!(refresh_install_dir(&good.join("fil"), &home));
+        assert!(refresh_install_dir(
+            &good.join("fil"),
+            &home,
+            file_identity(&good.join("fil"))
+        ));
         assert!(mtime(&good) > 1_500_000_000);
 
         // Not a version directory's name, or not named `fil`.
@@ -752,7 +767,10 @@ mod tests {
             ("0.2.0-w1.12", "other"),
         ] {
             let d = make(name, file);
-            assert!(!refresh_install_dir(&d.join(file), &home), "{name}/{file}");
+            assert!(
+                !refresh_install_dir(&d.join(file), &home, file_identity(&d.join(file))),
+                "{name}/{file}"
+            );
             assert_eq!(mtime(&d), 1_000_000_000, "{name}/{file}");
         }
         // Somewhere else entirely, and outside the home.
@@ -760,26 +778,55 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("fil"), b"").unwrap();
         utimensat(CWD, &elsewhere, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
-        assert!(!refresh_install_dir(&elsewhere.join("fil"), &home));
+        assert!(!refresh_install_dir(
+            &elsewhere.join("fil"),
+            &home,
+            file_identity(&elsewhere.join("fil"))
+        ));
         assert_eq!(mtime(&elsewhere), 1_000_000_000);
         // A link in the install root to a directory elsewhere: its canonical path is not in the
         // root, so neither the link nor the target is touched. A link to the good file from
         // elsewhere resolves to the good directory, which is the running executable's.
         let link = root.join("1.0.0-w1.13");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-        assert!(!refresh_install_dir(&link.join("fil"), &home));
+        assert!(!refresh_install_dir(
+            &link.join("fil"),
+            &home,
+            file_identity(&link.join("fil"))
+        ));
         assert_eq!(mtime(&elsewhere), 1_000_000_000);
         let via = elsewhere.join("fil-link");
         std::os::unix::fs::symlink(good.join("fil"), &via).unwrap();
         utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
-        assert!(refresh_install_dir(&via, &home));
+        assert!(refresh_install_dir(&via, &home, file_identity(&via)));
         assert!(mtime(&good) > 1_500_000_000);
         // A missing install root or executable.
         assert!(!refresh_install_dir(
             &good.join("fil"),
-            &tmp.path().join("nohome")
+            &tmp.path().join("nohome"),
+            file_identity(&good.join("fil"))
         ));
-        assert!(!refresh_install_dir(&good.join("gone"), &home));
+        assert!(!refresh_install_dir(&good.join("gone"), &home, None));
+        // The build was replaced under the running daemon (another file at the path), or deleted:
+        // not the build this daemon runs, so its directory is not kept for it.
+        let running = file_identity(&good.join("fil"));
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        std::fs::remove_file(good.join("fil")).unwrap();
+        assert!(
+            !refresh_install_dir(&good.join("fil"), &home, running),
+            "deleted"
+        );
+        std::fs::write(good.join("fil"), b"new").unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        // (A new file can reuse the freed inode on some systems; give it another.)
+        let other = good.join("fil2");
+        std::fs::write(&other, b"x").unwrap();
+        utimensat(CWD, &good, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(
+            !refresh_install_dir(&good.join("fil"), &home, file_identity(&other)),
+            "replaced"
+        );
+        assert_eq!(mtime(&good), 1_000_000_000);
     }
 
     /// The agent directory's clean-up never touches a directory that fails the socket

@@ -43,13 +43,17 @@
 //! counts when it is written, and a wrong guess does not count at all. Once the echoes are in and
 //! the output has been quiet for 300 ms the final screen is checked: `final_wrong` keys whose cell
 //! does not hold their glyph, `final_extra` glyphs after the last key (on its row and every row
-//! below), `final_cursor=1` if the cursor is right after the last key. The byte matcher still runs
+//! below), `final_cursor=1` if the cursor is right after the last key. A key stays watched after
+//! it counts: `vanished` is the measured keys whose glyph later went away (a guess taken back and
+//! drawn again by the echo); their time is still the first appearance. The byte matcher still runs
 //! on the same reads; its line comes first, and `vs_bytes_max_ms` is the largest difference between
-//! the two times of a measured key that both saw:
+//! the two times of a measured key that both saw. **Both mean an echo time only with prediction
+//! off:** the client writes a guess's glyph as a plain byte, so with prediction on the bytes line
+//! times the guess (and the digits of its escape sequences can match keys):
 //!
 //! ```text
 //! KEYPROBE-BYTES rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=..
-//! KEYPROBE mode=screen rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=.. vs_bytes_max_ms=.. final_wrong=0 final_extra=0 final_cursor=1
+//! KEYPROBE mode=screen rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=.. vs_bytes_max_ms=.. vanished=0 final_wrong=0 final_extra=0 final_cursor=1
 //! ```
 //!
 //! `--fast-ms MS` adds `fast=N fast_p50_ms=.. fast_p99_ms=..`: the measured keys whose glyph
@@ -477,6 +481,9 @@ struct ScreenMatcher {
     held: Vec<bool>,
     /// Every key below this has its time.
     lo: usize,
+    /// Keys whose cell lost their glyph after they were counted (a guess taken back, then drawn
+    /// again by the echo, say): their time is the first appearance, which the user saw go.
+    vanished: Vec<bool>,
     /// The scrollback filled up, so lines can no longer be counted from the top.
     overflow: bool,
 }
@@ -534,6 +541,7 @@ impl ScreenMatcher {
             lat: vec![None; keys],
             held: vec![false; keys],
             lo: 0,
+            vanished: vec![false; keys],
             overflow: false,
         };
         for j in 0..keys {
@@ -552,10 +560,10 @@ impl ScreenMatcher {
         glyph_at(s, line, col).as_bytes() == [key_for(j)]
     }
 
-    /// The screen `s` after the read at `at`. Looks at the keys from the first without a time to
-    /// one cycle of the alphabet past the last key sent by then: a later key's cell cannot have
-    /// changed to its glyph unless something else drew it there, and that would show the next time
-    /// the key is looked at.
+    /// The screen `s` after the read at `at`. Looks at every key up to one cycle of the alphabet
+    /// past the last key sent by then: a later key's cell cannot have changed to its glyph unless
+    /// something else drew it there, and that would show the next time the key is looked at. A
+    /// counted key is still looked at, so a glyph that goes away is seen (`vanished`).
     fn feed(&mut self, sent: &[(u8, Instant)], at: Instant, s: &TermState) {
         if s.history.len() >= HISTORY {
             self.overflow = true;
@@ -565,11 +573,15 @@ impl ScreenMatcher {
         }
         let typed = sent.partition_point(|k| k.1 <= at);
         let end = (typed + ALPHABET.len()).min(self.lat.len());
-        for j in self.lo..end {
+        for j in 0..end {
+            let now = self.shows(s, j);
             if self.lat[j].is_some() {
+                if self.held[j] && !now {
+                    self.vanished[j] = true;
+                }
+                self.held[j] = now;
                 continue;
             }
-            let now = self.shows(s, j);
             if now && !self.held[j] && j < typed {
                 self.lat[j] = Some(at - sent.get(j).map_or(at, |k| k.1));
             }
@@ -776,6 +788,7 @@ fn keys(a: &Args) -> Result<u8, Fail> {
         .max()
         .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
     let fin = fin.expect("read with the screen");
+    let vanished = sm.vanished[warmup..].iter().filter(|v| **v).count();
     let fast_field = fast_ms.map_or(String::new(), |limit| {
         let fast: Vec<f64> = screen_ms
             .iter()
@@ -793,7 +806,7 @@ fn keys(a: &Args) -> Result<u8, Fail> {
         }
     });
     println!(
-        "KEYPROBE mode=screen {} vs_bytes_max_ms={vs_bytes:.2} final_wrong={} final_extra={} final_cursor={}{fast_field}{quit_field}",
+        "KEYPROBE mode=screen {} vs_bytes_max_ms={vs_bytes:.2} vanished={vanished} final_wrong={} final_extra={} final_cursor={}{fast_field}{quit_field}",
         line(&screen_ms, &s),
         fin.wrong,
         fin.extra,
@@ -1033,6 +1046,25 @@ mod tests {
             sm.lat,
             [3, 30, 20].map(|ms| Some(Duration::from_millis(ms)))
         );
+        assert!(sm.final_check(&e.state(HISTORY)).cursor);
+    }
+
+    #[test]
+    fn a_guess_taken_back_and_drawn_again_by_the_echo_has_vanished() {
+        let b = Instant::now();
+        let mut e = screen(5, 20, b"");
+        let sent = sent_every_10ms(b, 2);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        let chunks: [(Instant, &[u8]); 3] = [
+            // A guess for `a`, then the overlay erases it (a withdrawal), then the echo.
+            (t(b, 1), b"a\x1b[1;1H"),
+            (t(b, 20), b" \x1b[1;1H"),
+            (t(b, 40), b"ab"),
+        ];
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        // Counted at the guess, and seen to go: `b` was never taken back.
+        assert_eq!(sm.lat, [1, 30].map(|ms| Some(Duration::from_millis(ms))));
+        assert_eq!(sm.vanished, [true, false]);
         assert!(sm.final_check(&e.state(HISTORY)).cursor);
     }
 

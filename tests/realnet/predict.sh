@@ -16,24 +16,38 @@
 #   p_shells  fil, adaptive, 75 ms each way: typing at the prompt of bash, zsh and fish (those
 #             installed; bash is required)
 #
-# **The prediction mode.** The client gets `--predict MODE` when it has that flag (M3's E1b). Until
-# then fil never predicts, so the `off` cells run and the others are noted as not run; when the
-# flag arrives they run with nothing changed here. A cell named adaptive in the list above runs as
-# `off` until then (its tag says which ran).
+# **The prediction mode.** Every fil cell reads a config file of its own with `[defaults] predict =
+# "off"` (the built-in default is adaptive), so an off cell is off whatever else happens. The client
+# also gets `--predict MODE` when `fil --help` lists that flag (M3's E1b). Until then fil never
+# predicts, so the `off` cells run and the others are noted as not run; when the flag arrives they
+# run with nothing changed here. A cell named adaptive in the list above runs as `off` until then
+# (its tag says which ran). A help text that does not look like fil's fails the setup, and a client
+# that logs prediction counts while no flag was found fails its cell: the detection is wrong.
 #
 # **What a cell checks.** Every key's glyph appeared (`lost=0`; a KNOWN-BUG otherwise, as in
 # latency.sh); the final screen holds the keys and nothing after them, with the cursor right after
 # the last (fails otherwise); the path (a QUIC cell on QUIC before the first measured key, a pipe
 # cell never on QUIC). The fil client then detaches (`~.`), so it logs its prediction counts at
-# exit (debug); with prediction on they must be there, with no visible misprediction, and in
-# p_fast nothing written; with it off, nothing written.
+# exit (debug); with prediction on they must be there, with no visible misprediction, no more
+# `fast` keys than guesses written, and in p_fast nothing written; with it off (and in the ssh
+# cells) nothing written and no `fast` key, which also checks that half the round trip still
+# separates a guess from an echo (raise PR_JITTER_MS to half the delay and it would not).
 #
 # **Measured**, per cell, in $OUT/results-predict-cells.tsv (and the job summary): key-to-glyph p50
 # and p99 over all measured keys, and over the `fast` ones (shown within half the round trip: the
-# keys a guess showed, as no echo comes back that soon); the byte-echo p50 of the same run; the
+# keys a guess showed, as no echo comes back that soon); `vanished`, the keys whose glyph went away
+# after it first showed (a guess taken back and redrawn by the echo: their time is still the
+# guess's); the byte-echo p50 of the same run, with prediction off only (`-` otherwise: the client
+# writes a guess's glyph as a byte, so the bytes line then times the guess, not the echo); the
 # client's counts (guesses written, visible mispredictions). Knobs (environment):
 #   PR_RATE=20 PR_COUNT=200   keys per second and measured keys per cell (10 more are a warm-up)
 #   PR_JITTER_MS=5            netem jitter each way (not in p_fast)
+#
+# For V1 (docs/m3/plan.md §5.5, §5.6): fish, when it is added, must run as `fish --no-config
+# --private`: the `\r~.` that ends a cell runs the typed line at the prompt, and a fish that keeps
+# history would offer it back as an autosuggestion on the next run (every key lost). The client
+# logs here are debug logs, kept in the run's artifact: fine for the throwaway runner, but debug
+# logs from the Pis must never be uploaded anywhere public.
 set -uo pipefail
 # shellcheck source=latency.sh
 source "$(dirname "${BASH_SOURCE[0]}")/latency.sh"
@@ -43,25 +57,33 @@ PR_COUNT=${PR_COUNT:-200}
 PR_JITTER_MS=${PR_JITTER_MS:-5}
 PR_CELLS=$OUT/results-predict-cells.tsv
 PR_DELAYS=(25 75 200)
+# The client config of every fil cell: prediction off unless `--predict` says otherwise.
+PR_CONFIG=$PD/predict-off.toml
 
 # ---------------------------------------------------------------------------------------------
 # Setup, teardown, the network
 
 pr_setup() {
   udp_setup
+  client_exec_on x mkdir -p "$PD"
   # Whether the client under test has `--predict` (written down for the scenario processes, which
   # read the part's env file).
   local help has=0
-  help=$(client_exec_on x fil --help 2>&1 || true)
-  [[ $help != *--predict* ]] || has=1
+  if ! help=$(client_exec_on x fil --help 2>&1) || [[ $help != *--transport* ]]; then
+    echo "realnet: \`fil --help\` failed or is not fil's (no --transport), so --predict cannot be detected: $help" >&2
+    exit 1
+  fi
+  if grep -qE -- '(^|[[:space:],])--predict([[:space:]=<,]|$)' <<< "$help"; then has=1; fi
+  # The off cells' prediction setting, whatever the flag detection says.
+  printf '[defaults]\npredict = "off"\n' > "$OUT/run/predict-off.toml"
+  as_root install -o rnclient -g rnclient -m 600 "$OUT/run/predict-off.toml" "$PR_CONFIG"
   { cat "$OUT/udp.env"; printf 'PR_HAS_FLAG=%s\n' "$has"; } > "$OUT/predict.env"
   if [[ $has == 1 ]]; then
     log "fil has --predict: every prediction mode runs"
   else
     log "fil has no --predict yet (M3's E1b): only the cells with prediction off run"
   fi
-  printf 'cell\ttransport\tpredict\tdelay_ms\tloss\tsent\tshown\tlost\tp50_ms\tp99_ms\tfast\tfast_p50_ms\tbytes_p50_ms\twritten\tmispredicted\n' > "$PR_CELLS"
-  client_exec_on x mkdir -p "$PD"
+  printf 'cell\ttransport\tpredict\tdelay_ms\tloss\tsent\tshown\tlost\tp50_ms\tp99_ms\tfast\tfast_p50_ms\tvanished\tbytes_p50_ms\twritten\tmispredicted\n' > "$PR_CELLS"
 }
 
 pr_teardown() {
@@ -74,8 +96,10 @@ pr_cells_summary() {
   {
     echo '### prediction cells: key-to-glyph (ms)'
     echo
-    echo '| cell | transport | predict | delay | loss | sent | shown | lost | p50 | p99 | fast | fast p50 | bytes p50 | written | mispredicted |'
-    echo '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+    echo 'bytes p50 is the byte-echo time, with prediction off only (with it on, the bytes line times the guess).'
+    echo
+    echo '| cell | transport | predict | delay | loss | sent | shown | lost | p50 | p99 | fast | fast p50 | vanished | bytes p50 | written | mispredicted |'
+    echo '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
     tail -n +2 "$PR_CELLS" | awk -F'\t' '{ printf "|"; for (i = 1; i <= NF; i++) printf " %s |", $i; printf "\n" }'
   } >> "$GITHUB_STEP_SUMMARY"
 }
@@ -105,18 +129,19 @@ pr_modes() { if [[ ${PR_HAS_FLAG:-0} == 1 ]]; then echo off adaptive always; els
 
 # pr_kp TAG KIND MODE DELAY_MS KEYPROBE_OPTIONS...: keyprobe --screen in the client namespace,
 # typing through KIND: ssh (`ssh -tt -o ObscureKeystrokeTiming=no`), pipe, quic or auto (fil, with
-# `--predict MODE` when it has the flag; the session is named TAG). The options pick the program
+# `--config` with prediction off, and `--predict MODE` when it has the flag; the session is named
+# TAG). The options pick the program
 # (`--shell` for a raw `cat`) and may override the rate and the counts. Output in
 # $OUT/run/SCENARIO-TAG.keyprobe (and .err); the fil client logs at debug into a state directory of
 # its own. Returns keyprobe's status.
 pr_kp() {
-  local tag=$1 kind=$2 mode=$3 delay=$4 settle=500 flag=() cmd
+  local tag=$1 kind=$2 mode=$3 delay=$4 settle=500 flag=(--config "$PR_CONFIG") cmd
   shift 4
-  if [[ ${PR_HAS_FLAG:-0} == 1 ]]; then flag=(--predict "$mode"); fi
+  if [[ ${PR_HAS_FLAG:-0} == 1 ]]; then flag+=(--predict "$mode"); fi
   case $kind in
     ssh) cmd=(ssh -tt -o ObscureKeystrokeTiming=no srv) ;;
-    pipe) cmd=(fil --transport pipe "${flag[@]}" srv "$tag") ;;
-    quic) cmd=(fil --transport direct "${flag[@]}" srv "$tag") settle=3000 ;;
+    pipe) cmd=(fil "${flag[@]}" --transport pipe srv "$tag") ;;
+    quic) cmd=(fil "${flag[@]}" --transport direct srv "$tag") settle=3000 ;;
     auto) cmd=(fil "${flag[@]}" srv "$tag") settle=3000 ;;
     *) fail "pr_kp: unknown kind $kind" ;;
   esac
@@ -155,16 +180,20 @@ pr_record() {
     pr_stats "$tag"
     cx_fk "$tag"
   fi
-  local sent shown lost p50 p99
+  local sent shown lost p50 p99 fast vanished bytes_p50=-
+  fast=$(kv "$line" fast)
+  vanished=$(kv "$line" vanished)
+  # With prediction on, the bytes line times the guess's byte, not the echo.
+  if [[ $mode == off || $kind == ssh ]]; then bytes_p50=$(kv "$bytes" p50_ms || echo -); fi
   sent=$(kv "$line" sent)
   shown=$(kv "$line" echoed)
   lost=$(kv "$line" lost)
   p50=$(kv "$line" p50_ms)
   p99=$(kv "$line" p99_ms)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$kind" "$mode" "$delay" "$loss" \
-    "$sent" "$shown" "$lost" "$p50" "$p99" "$(kv "$line" fast)" "$(kv "$line" fast_p50_ms)" \
-    "$(kv "$bytes" p50_ms || echo -)" "$PR_WRITTEN" "$PR_MISS" >> "$PR_CELLS"
-  note "$tag.p50_ms=$p50 $tag.p99_ms=$p99 $tag.fast=$(kv "$line" fast) $tag.lost=$lost $tag.written=$PR_WRITTEN $tag.mispredicted=$PR_MISS"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$kind" "$mode" "$delay" "$loss" \
+    "$sent" "$shown" "$lost" "$p50" "$p99" "$fast" "$(kv "$line" fast_p50_ms)" "$vanished" \
+    "$bytes_p50" "$PR_WRITTEN" "$PR_MISS" >> "$PR_CELLS"
+  note "$tag.p50_ms=$p50 $tag.p99_ms=$p99 $tag.fast=$fast $tag.vanished=$vanished $tag.lost=$lost $tag.bytes_p50_ms=$bytes_p50 $tag.written=$PR_WRITTEN $tag.mispredicted=$PR_MISS"
 
   case $kind in
     pipe | quic) lat_check_path "$tag" "$kind" "$(kv "$line" first_key_ms)" ;;
@@ -172,15 +201,19 @@ pr_record() {
   [[ $(kv "$line" final_wrong) == 0 && $(kv "$line" final_extra) == 0 && $(kv "$line" final_cursor) == 1 ]] \
     || fail "$tag: the final screen is not the keys typed: $line"
   ok "$tag: the final screen holds the keys typed and nothing after them"
-  if [[ $kind != ssh ]]; then
-    if [[ $mode == off ]]; then
-      [[ $PR_WRITTEN == - || $PR_WRITTEN == 0 ]] || fail "$tag: $PR_WRITTEN guesses written with prediction off"
-    else
-      [[ $PR_WRITTEN != - ]] || fail "$tag: no prediction counts in the client log (quit=$(kv "$line" quit)): $(fc_log "$tag" | tail -n 3)"
-      [[ $PR_MISS == 0 ]] || fail "$tag: $PR_MISS visible mispredictions ($PR_WRITTEN written)"
-      [[ $expect != quiet || $PR_WRITTEN == 0 ]] || fail "$tag: $PR_WRITTEN guesses written on a fast link"
-      ok "$tag: $PR_WRITTEN guesses written, no visible misprediction"
-    fi
+  if [[ $kind != ssh && ${PR_HAS_FLAG:-0} != 1 && $PR_WRITTEN != - ]]; then
+    fail "$tag: the client logged prediction counts, but no --predict was found in \`fil --help\`: fix the detection"
+  fi
+  if [[ $kind == ssh || $mode == off ]]; then
+    [[ $PR_WRITTEN == - || $PR_WRITTEN == 0 ]] || fail "$tag: $PR_WRITTEN guesses written with prediction off"
+    # No guess, so a key shown within half the round trip was an echo: the split does not hold.
+    [[ $fast == 0 ]] || fail "$tag: $fast keys shown within $delay ms with no prediction: half the round trip no longer separates guesses from echoes"
+  else
+    [[ $PR_WRITTEN != - ]] || fail "$tag: no prediction counts in the client log (quit=$(kv "$line" quit)): $(fc_log "$tag" | tail -n 3)"
+    [[ $PR_MISS == 0 ]] || fail "$tag: $PR_MISS visible mispredictions ($PR_WRITTEN written)"
+    [[ $expect != quiet || $PR_WRITTEN == 0 ]] || fail "$tag: $PR_WRITTEN guesses written on a fast link"
+    [[ $fast -le $PR_WRITTEN ]] || fail "$tag: $fast keys shown within $delay ms but only $PR_WRITTEN guesses written: some were echoes"
+    ok "$tag: $PR_WRITTEN guesses written ($fast keys shown by one, $vanished vanished), no visible misprediction"
   fi
   if [[ $lost != 0 ]]; then known_bug "$tag: $lost of $sent keys never showed on the screen"; fi
 }

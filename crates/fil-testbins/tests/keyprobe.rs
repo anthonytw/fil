@@ -108,6 +108,7 @@ fn the_screen_agrees_with_the_bytes_on_a_raw_cat() {
         assert!(d < 1.0, "{k} differs by {d} ms:\n{bytes}\n{screen}");
     }
     assert!(val(&screen, "vs_bytes_max_ms") < 1.0, "{screen}");
+    assert_eq!(val(&screen, "vanished"), 0.0, "{screen}");
     assert_eq!(val(&screen, "final_wrong"), 0.0, "{screen}");
     assert_eq!(val(&screen, "final_extra"), 0.0, "{screen}");
     assert_eq!(val(&screen, "final_cursor"), 1.0, "{screen}");

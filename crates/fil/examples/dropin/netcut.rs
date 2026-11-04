@@ -22,9 +22,13 @@
 //! prediction scenarios, `docs/m3/plan.md` §5.6). Order is kept: each direction is a queue, and
 //! what was read first goes first. The delay in force when a byte or datagram arrives is the one
 //! it gets. A datagram that finds its direction's queue full (4,096 waiting) is dropped, as a
-//! router's queue drops; TCP's queue holds at most 256 reads (16 MiB) and then stops reading,
-//! which TCP's own flow control passes back. A datagram still waiting when the cable is pulled is
-//! dropped when its time comes; bytes still waiting are held, as before.
+//! router's queue drops, and counted (`queue_dropped`; the relay also says so on stderr when it
+//! goes); TCP's queue holds at most 256 reads (16 MiB) and then stops reading, which TCP's own flow
+//! control passes back. A datagram still waiting when the cable is pulled is dropped when its time
+//! comes; bytes still waiting are held, as before. The last 2 ms of each wait is spent yielding,
+//! so traffic that keeps the queues busy (a bulk transfer) costs up to the relay's two worker
+//! threads of CPU while a delay is set: fine for typing, but do not time the client on this
+//! machine while a big transfer goes through a delayed relay.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -60,6 +64,8 @@ struct Flags {
     /// Datagrams dropped while cut, and TCP connections refused while cut (for the notes).
     dropped: AtomicU64,
     refused: AtomicU64,
+    /// Datagrams dropped because their direction's delay queue was full.
+    queue_dropped: AtomicU64,
 }
 
 pub struct Cut {
@@ -170,6 +176,12 @@ impl Cut {
         self.flags.delay_us.store(us, Ordering::Relaxed);
     }
 
+    /// Datagrams dropped so far because a delay queue was full (none without a delay that the
+    /// traffic outruns).
+    pub fn queue_dropped(&self) -> u64 {
+        self.flags.queue_dropped.load(Ordering::Relaxed)
+    }
+
     /// (datagrams dropped, TCP connections refused) while cut, so far.
     pub fn counts(&self) -> (u64, u64) {
         (
@@ -183,6 +195,10 @@ impl Drop for Cut {
     fn drop(&mut self) {
         // The runtime (and with it every task and socket) goes with the struct.
         self.set(false);
+        let lost = self.queue_dropped();
+        if lost > 0 {
+            eprintln!("netcut: {lost} datagrams dropped on a full delay queue");
+        }
     }
 }
 
@@ -265,6 +281,13 @@ async fn read_side(
     }
 }
 
+/// Queues a datagram on its way; one that finds the queue full is dropped and counted.
+fn send_delayed(line: &mpsc::Sender<(Instant, Vec<u8>)>, flags: &Flags, d: &[u8]) {
+    if line.try_send((flags.due(), d.to_vec())).is_err() {
+        flags.queue_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A queue that sends each datagram on `sock` once its time has come: to `to`, or to the socket's
 /// connected peer. A datagram that finds the queue full is dropped.
 fn delay_line(
@@ -323,7 +346,7 @@ async fn udp_port(local: Arc<UdpSocket>, up: SocketAddr, flags: Arc<Flags>) {
                 }
             }
         };
-        let _ = line.try_send((flags.due(), buf[..n].to_vec()));
+        send_delayed(&line, &flags, &buf[..n]);
     }
 }
 
@@ -341,7 +364,7 @@ async fn udp_back(up: Arc<UdpSocket>, local: Arc<UdpSocket>, to: SocketAddr, fla
             flags.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let _ = line.try_send((flags.due(), buf[..n].to_vec()));
+        send_delayed(&line, &flags, &buf[..n]);
     }
 }
 
@@ -384,10 +407,18 @@ mod tests {
             );
         }
         assert!(
-            runs.iter()
-                .any(|(up, down)| median(up) - DELAY <= WITHIN && median(down) - DELAY <= WITHIN),
+            runs.iter().any(within),
             "{what}: no run had both medians within {WITHIN:?} of {DELAY:?}: {summary:?}"
         );
+    }
+
+    /// Both medians of a run are within [`WITHIN`] of the setting (an early one is not: the early
+    /// check in [`judge`] reports it).
+    fn within(r: &Run) -> bool {
+        [&r.0, &r.1].iter().all(|v| {
+            let m = median(v);
+            m >= DELAY && m - DELAY <= WITHIN
+        })
     }
 
     /// Repeats `one` until a run is within the bound, at most [`RUNS`] times.
@@ -395,7 +426,7 @@ mod tests {
         let mut all = Vec::new();
         for _ in 0..RUNS {
             let r = one();
-            let good = median(&r.0) - DELAY <= WITHIN && median(&r.1) - DELAY <= WITHIN;
+            let good = within(&r);
             all.push(r);
             if good {
                 break;
@@ -538,5 +569,44 @@ mod tests {
             })
         });
         judge("udp", &all);
+        assert_eq!(cut.queue_dropped(), 0);
+    }
+
+    #[test]
+    fn datagrams_that_find_the_delay_queue_full_are_counted() {
+        let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cut = Cut::start_to(
+            unused.local_addr().unwrap(),
+            vec![(0, host.local_addr().unwrap())],
+        )
+        .unwrap();
+        let port = *cut.udp.iter().next().unwrap();
+        // Nothing leaves the queue within the test.
+        cut.set_delay(Duration::from_secs(30));
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.connect(("127.0.0.1", port)).unwrap();
+        const SENT: u64 = 3 * UDP_QUEUE as u64;
+        for i in 0..SENT {
+            c.send(&i.to_le_bytes()).unwrap();
+            // Paced, so the relay reads them rather than the kernel dropping them.
+            if i % 64 == 63 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Until the count has stopped moving.
+        let mut seen = u64::MAX;
+        while cut.queue_dropped() != seen {
+            seen = cut.queue_dropped();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("netcut: {seen} of {SENT} datagrams counted as dropped");
+        // At least half of what did not fit was read and counted (the kernel may drop some
+        // before the relay reads them), and never more than did not fit.
+        let lost = cut.queue_dropped();
+        assert!(
+            lost >= (SENT - UDP_QUEUE as u64) / 2 && lost <= SENT - UDP_QUEUE as u64,
+            "{lost} of {SENT} counted as dropped on a queue of {UDP_QUEUE}"
+        );
     }
 }

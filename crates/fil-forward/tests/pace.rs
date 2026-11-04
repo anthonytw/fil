@@ -237,6 +237,10 @@ async fn parallel_downloads_keep_the_link_full() {
         );
         assert!(rate >= 0.9 * RATE as f64, "{n}: {rate}");
         assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");
+        // The ack clock: the peer acks on drain, so nearly every sample is trusted. Without
+        // ack on drain, half or more of them are timer-bound (405 trusted, 579 bounded at 16).
+        let st = w.daemon.ep.pace_state();
+        assert!(st.bounded * 10 <= st.samples, "{n}: {st:?}");
     }
 }
 
@@ -367,4 +371,159 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     // instant on the plain links.
     held.iter().for_each(|h| h.abort());
     (echo_took, rtts[10])
+}
+
+per_transport!(
+    a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent,
+    a_stuck_forward_writing_small_chunks_does_not_hold_the_agent
+);
+
+/// **A reader that stopped, written to in small chunks** (B-new-1 of the re-check): an
+/// application writes 256 bytes a millisecond into a `-L` whose target never reads. Its channel
+/// is parked at its limit, and once its many small payloads filled the data sender's queue past
+/// the scan for a payload that may go, every other channel stopped behind them for good. Now
+/// the queue holds only payloads that may go: a live forward's echoes and the agent's
+/// request-and-answer go on beside it.
+async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent(
+    t: Transport,
+) {
+    // A deaf target with a tiny receive buffer, so the channel is stuck within a second.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(2048).unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = sock.listen(16).unwrap();
+    let deaf_port = l.local_addr().unwrap().port();
+    let deaf = tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            keep.push(s);
+        }
+    });
+    let echo = echo_server().await;
+    let agent = echo_server().await;
+    let w = World::new(t, mux_config()).await;
+    w.client.targets.set_agent(agent.port);
+    let stuck_port = w.local_forward(1, deaf_port);
+    let echo_port = w.local_forward(3, echo.port);
+    let mut s = connect(stuck_port).await;
+    let writer = tokio::spawn(async move {
+        let buf = vec![5u8; 256];
+        while s.write_all(&buf).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    // Live echoes now and then (their acks park the stuck channel): each must come back.
+    for i in 0..12 {
+        timeout(Duration::from_secs(5), echo_once(echo_port, 4096, i))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{t:?}: echo #{i} stalled beside the trickling channel: client {:?} {:?}",
+                    w.client.ep.pace_state(),
+                    w.client.ep.snapshot()
+                )
+            });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let t0 = std::time::Instant::now();
+    timeout(Duration::from_secs(5), echo_once(echo_port, 256 * 1024, 99))
+        .await
+        .expect("a 256 KiB echo beside the trickling channel");
+    let echo_took = t0.elapsed();
+    // The agent: the daemon opens an agent channel, a process on the host asks and waits for
+    // the answer; the answer goes back through the client's data sender, behind the trickle.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+    let (theirs, _) = l.accept().await.unwrap();
+    w.daemon
+        .ep
+        .open_stream(
+            OpenKind::Agent,
+            Box::new(theirs),
+            fil_forward::LocalPeer::Unix(None),
+        )
+        .expect("the agent channel opens");
+    let req = vec![3u8; 1024];
+    let mut back = vec![0u8; 1024];
+    let mut worst = Duration::ZERO;
+    for _ in 0..10 {
+        let t1 = std::time::Instant::now();
+        asker.write_all(&req).await.unwrap();
+        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+            .await
+            .expect("the agent answered beside the trickling channel")
+            .unwrap();
+        worst = worst.max(t1.elapsed());
+    }
+    eprintln!(
+        "{t:?}: beside a trickling stuck channel: 256 KiB echo in {echo_took:?}, agent at most {worst:?}; client {:?} {:?}",
+        w.client.ep.pace_state(),
+        w.client.ep.snapshot()
+    );
+    assert!(echo_took <= Duration::from_secs(2), "{echo_took:?}");
+    assert!(worst <= Duration::from_millis(500), "{worst:?}");
+    writer.abort();
+    deaf.abort();
+}
+
+/// The agent alone beside the trickling channel of the test above: a request every 500 ms (whose
+/// acks park the stuck channel), each answered; the answers go back through the client's data
+/// sender, which the trickle's payloads once filled for good.
+async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transport) {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(2048).unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = sock.listen(16).unwrap();
+    let deaf_port = l.local_addr().unwrap().port();
+    let deaf = tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            keep.push(s);
+        }
+    });
+    let agent = echo_server().await;
+    let w = World::new(t, mux_config()).await;
+    w.client.targets.set_agent(agent.port);
+    let stuck_port = w.local_forward(1, deaf_port);
+    let mut s = connect(stuck_port).await;
+    let writer = tokio::spawn(async move {
+        let buf = vec![5u8; 256];
+        while s.write_all(&buf).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+    let (theirs, _) = l.accept().await.unwrap();
+    w.daemon
+        .ep
+        .open_stream(
+            OpenKind::Agent,
+            Box::new(theirs),
+            fil_forward::LocalPeer::Unix(None),
+        )
+        .expect("the agent channel opens");
+    let req = vec![3u8; 1024];
+    let mut back = vec![0u8; 1024];
+    let mut worst = Duration::ZERO;
+    for i in 0..16 {
+        let t1 = std::time::Instant::now();
+        asker.write_all(&req).await.unwrap();
+        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{t:?}: agent request #{i} stalled beside the trickling channel: client {:?} {:?}",
+                    w.client.ep.pace_state(),
+                    w.client.ep.snapshot()
+                )
+            })
+            .unwrap();
+        worst = worst.max(t1.elapsed());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    eprintln!("{t:?}: the agent beside a trickling stuck channel: at most {worst:?}");
+    assert!(worst <= Duration::from_millis(500), "{worst:?}");
+    writer.abort();
+    deaf.abort();
 }

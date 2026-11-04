@@ -1021,12 +1021,11 @@ fn an_ack_that_may_have_waited_for_the_timer_is_not_a_sample() {
 }
 
 /// A bulk channel whose records take longer than the presumption age (a slow start's queue,
-/// QUIC serving a request flow's stream first) is parked, and its next acks still give samples:
-/// the current delay follows the real round trip, the age with it, and the channel stays unparked.
-/// (Leaving parked channels' samples out kept the current delay frozen, the channel parked at
-/// every ack, and about 100 ms of queue standing in realnet's QUIC cell.)
+/// QUIC serving a request flow's stream first) is parked, and the acks of its records still
+/// counted unpark it, so it does not stay held at what it had outstanding. (That a parked
+/// channel's ack is a sample is `a_parked_channels_counted_record_gives_a_sample`.)
 #[test]
-fn a_parked_channel_that_keeps_up_gives_samples_and_stays_unparked() {
+fn a_parked_channel_that_keeps_up_is_unparked() {
     let t0 = Instant::now();
     let mut p = Pacer::new(PaceConfig::default(), t0);
     let (bulk, rr) = (ch(16), ch(18));
@@ -1135,4 +1134,59 @@ fn a_moment_of_delay_does_not_leave_a_bulk_transfer_parked() {
     );
     assert!(q <= TARGET + Duration::from_millis(15), "{q:?}");
     assert!(mbit >= 0.9 * 20.0, "{mbit}");
+}
+
+/// A drain whose probe is due while the only channel with data is parked at its limit: the next
+/// deadline is never a time already past (the data sender would sleep until it and spin until the
+/// drain's limit); it is the drain's limit (the re-check's S-new-1).
+#[test]
+fn a_due_probe_with_only_a_parked_channel_has_no_past_deadline() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let (stuck, other) = (ch(16), ch(18));
+    p.on_sent(stuck, 0, PAYLOAD, false, t0);
+    let mut off = 0;
+    let mut t = t0 + Duration::from_millis(5);
+    for _ in 0..10 {
+        exchange(&mut p, other, &mut off, t, 40, false);
+        t += Duration::from_millis(40);
+    }
+    p.advance(t);
+    assert!(p.chans[&16].parked);
+    assert!(p.holds(stuck, false), "parked at its limit");
+    p.start_drain(t, "test");
+    let later = t + Duration::from_millis(300);
+    p.advance(later);
+    assert!(p.state().draining, "{:?}", p.state());
+    assert!(p.holds(stuck, false), "still held: {:?}", p.state());
+    let d = p.next_deadline().expect("the drain's limit");
+    assert!(d > later, "a deadline in the past: the held sender spins");
+    assert!(d <= t + DRAIN_LIMIT);
+}
+
+/// A parked channel's ack of a record still counted is a sample (the re-check's S-new-2: leaving
+/// those out froze the current delay in realnet's QUIC cell).
+#[test]
+fn a_parked_channels_counted_record_gives_a_sample() {
+    let t0 = Instant::now();
+    let mut p = Pacer::new(PaceConfig::default(), t0);
+    let (bulk, other) = (ch(16), ch(18));
+    p.on_sent(bulk, 0, PAYLOAD, false, t0);
+    let mut off = 0;
+    let mut t = t0 + Duration::from_millis(5);
+    for _ in 0..10 {
+        exchange(&mut p, other, &mut off, t, 40, false);
+        t += Duration::from_millis(40);
+    }
+    p.advance(t);
+    assert!(p.chans[&16].parked);
+    p.on_sent(bulk, PAYLOAD, 2 * PAYLOAD, false, t);
+    let before = p.state();
+    p.on_ack(bulk, 2 * PAYLOAD, ACK_AFTER, t + Duration::from_millis(90));
+    let after = p.state();
+    assert_eq!(
+        after.samples + after.bounded,
+        before.samples + before.bounded + 1,
+        "{after:?}"
+    );
 }

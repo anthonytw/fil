@@ -343,9 +343,15 @@ impl Pacer {
     /// time limit. `None`: only an ack or a send changes anything. A held sender sleeps until
     /// then (or the next ack) and calls [`Pacer::advance`].
     pub fn next_deadline(&self) -> Option<Instant> {
-        let drain = self.drain.map(|d| match d.low_at {
-            None => d.probe_at,
-            Some(_) => d.started + DRAIN_LIMIT,
+        // The probe's time only while it is still ahead (once due, sending it is up to a channel
+        // that may go: if every queued one waits for its reader, nothing can, and a past deadline
+        // would spin the sender until the limit); never past the drain's limit.
+        let drain = self.drain.map(|d| {
+            let limit = d.started + DRAIN_LIMIT;
+            match d.low_at {
+                None if d.probe_at > self.clock => d.probe_at.min(limit),
+                _ => limit,
+            }
         });
         match (self.next_prune, drain) {
             (Some(a), Some(b)) => Some(a.min(b)),

@@ -308,8 +308,9 @@ pub fn check_seq(
 }
 
 /// Writes the client's whole plain and raw output to `--dump DIR`, if given: `.plain` and `.raw`
-/// files named for this process and a counter. The check started at byte `from` of the plain
-/// output; it is the first line of the `.plain` file.
+/// files named for this process and a counter, both with real host names and addresses scrubbed
+/// out (`Targets::scrub`). The first line of the `.plain` file says at which of its bytes the
+/// check started (byte `from` of the plain output).
 fn dump(c: &Client, from: usize) -> Option<PathBuf> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = DUMP_DIR.get()?;
@@ -318,7 +319,8 @@ fn dump(c: &Client, from: usize) -> Option<PathBuf> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let plain = format!("(the check starts at byte {from})\n{}", c.text());
+    let (plain, at) = c.plain_text(from);
+    let plain = format!("(the check starts at byte {at})\n{plain}");
     let ok = std::fs::create_dir_all(dir).is_ok()
         && std::fs::write(base.with_extension("plain"), plain).is_ok()
         && std::fs::write(base.with_extension("raw"), c.raw_text()).is_ok();

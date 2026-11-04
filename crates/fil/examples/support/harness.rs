@@ -172,6 +172,16 @@ impl Targets {
     }
 }
 
+/// Plain output with real host names and addresses swapped out (`Targets::scrub`): what comes
+/// before the shell's `PS1` is set holds the login banner, the first prompt (`user@host`) and
+/// "Last login ... from <address>". Also returns where byte `from` of `plain` is in the result
+/// (scrubbing changes lengths).
+pub fn scrub_plain(t: &Targets, plain: &[u8], from: usize) -> (String, usize) {
+    let from = from.min(plain.len());
+    let at = t.scrub(&String::from_utf8_lossy(&plain[..from])).len();
+    (t.scrub(&String::from_utf8_lossy(plain)), at)
+}
+
 /// Every IP address in the text except loopback and the unspecified address becomes `<ip>`: a
 /// hostname target resolves to addresses the target list never named, and logs print them.
 fn scrub_addresses(s: &str) -> String {
@@ -430,6 +440,12 @@ impl Client {
     /// The plain output from a mark.
     pub fn text_from(&self, from: usize) -> String {
         self.with_plain(|p| String::from_utf8_lossy(&p[from.min(p.len())..]).into_owned())
+    }
+
+    /// The plain output with real host names and addresses scrubbed out ([`scrub_plain`]), and
+    /// where byte `from` of the plain output is in it.
+    pub fn plain_text(&self, from: usize) -> (String, usize) {
+        self.with_plain(|p| scrub_plain(&self.scrub, p, from))
     }
 
     /// The raw output (escapes and all), with real host names scrubbed out.
@@ -732,6 +748,20 @@ mod tests {
         assert!(Targets::parse("pi1=-oProxyCommand=x", &[]).is_err());
         assert!(Targets::parse("pi1=u@h;rm", &[]).is_err());
         assert!(Targets::parse("pi1", &[]).is_err());
+    }
+
+    #[test]
+    fn the_plain_transcript_is_scrubbed_and_its_offset_kept() {
+        let t = Targets::parse("pi1=fil-test@host.example", &[]).unwrap();
+        let plain = b"Linux host 6.1.0 aarch64\nLast login: Tue Nov  4 from 198.51.100.7\n\
+                      fil-test@host:~ $ PS1='fil$ '\nfil$ seq 3\n1\n2\n3\n";
+        let from = plain.windows(5).position(|w| w == b"\nfil$").unwrap() + 1;
+        let (text, at) = scrub_plain(&t, plain, from);
+        for leak in ["host", "198.51.100.7"] {
+            assert!(!text.contains(leak), "{leak:?} in {text:?}");
+        }
+        assert!(text.starts_with("Linux pi1 "), "{text:?}");
+        assert!(text[at..].starts_with("fil$ seq 3\n"), "{:?}", &text[at..]);
     }
 
     #[test]

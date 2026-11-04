@@ -10,6 +10,10 @@
 //!   of a setting wins; `Include` takes globs, relative to the main config's directory
 //!   (`/etc/ssh`), in sorted order, at most 16 deep, and a file included from a `Match` block
 //!   is inside it.
+//! - **Two pattern languages** ([`super::pattern`]): `Match` criteria use OpenSSH's `match_pattern`
+//!   (`*`, `?` one byte, `!` in comma lists; no brackets), `Include` uses `glob(3)` (brackets, escapes).
+//!   An `Include` glob whose meaning differs between `glob(3)` implementations is skipped and the
+//!   mirror marked incomplete; a `Match` list fil cannot read as sshd does might apply.
 //! - **`Match`:** `User` and `Group` (pattern lists with `*`, `?` and `!`) are evaluated against
 //!   the daemon's user. Every other criterion (`Address`, `Host`, `LocalAddress`, `LocalPort`,
 //!   `RDomain`, `all`, ...) and every line fil cannot read **might apply**: its value is one of
@@ -29,6 +33,9 @@ use std::path::{Path, PathBuf};
 use fil_proto::mux::{Permit, TcpForwarding, Toggle};
 
 use super::Account;
+use super::pattern::{
+    GlobComp, ListMatch, Unevaluable, glob_check, match_pattern, match_pattern_list,
+};
 use super::stamp::Stamp;
 
 /// How deep `Include`s may nest (sshd's `SERVCONF_MAX_DEPTH`).
@@ -502,6 +509,11 @@ impl Parser<'_> {
                 self.base.join(pattern)
             };
             let g = glob(&pattern);
+            if g.unevaluable {
+                // A pattern whose meaning differs between globs: fil includes none of it and
+                // says the mirror is incomplete (the strict side is not a guess).
+                self.unreadable.push(pattern.clone());
+            }
             self.watched.extend(g.dirs);
             self.unreadable.extend(g.unlistable);
             if g.truncated {
@@ -579,11 +591,11 @@ impl Parser<'_> {
                 // Missing, as sshd reads it: a config it refuses.
                 (_, Some(a)) if a.is_empty() => Applies::Maybe,
                 ("user", Some(a)) => match &self.account.user {
-                    Some(u) => yes_no(match_pattern_list(u, &a) == Some(true)),
+                    Some(u) => list_applies(match_pattern_list(u, &a)),
                     None => Applies::Maybe,
                 },
                 ("group", Some(a)) => match &self.account.groups {
-                    Some(g) => yes_no(group_match(g, &a)),
+                    Some(g) => group_match(g, &a),
                     None => Applies::Maybe,
                 },
                 // A criterion fil cannot evaluate, one without its argument, a line sshd would
@@ -795,85 +807,36 @@ fn strdelim_split(s: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// OpenSSH's `match_pattern`: `*` any run, `?` any one character, the rest literally.
-pub fn match_pattern(s: &str, pattern: &str) -> bool {
-    // `None` is a `*`; `Some(None)` is a `?`; `Some(Some(b))` is the byte `b`.
-    let toks: Vec<Option<Option<u8>>> = pattern
-        .bytes()
-        .map(|b| match b {
-            b'*' => None,
-            b'?' => Some(None),
-            b => Some(Some(b)),
-        })
-        .collect();
-    wild(s.as_bytes(), &toks, |k, c| k.is_none_or(|b| b == c))
-}
-
-/// Matches `s` against a pattern of `*` (`None`) and items that each consume exactly one input
-/// element (`Some`, which `one` checks). The walk keeps the one place it can back up to, the last
-/// `*`, so it is linear in the product of the lengths however many `*` there are. A recursive
-/// match is exponential in them: the fuzzer found `Match User` and `Include` lines that never
-/// finished, and both are read again whenever the config changes.
-fn wild<T: Copy, K>(s: &[T], toks: &[Option<K>], one: impl Fn(&K, T) -> bool) -> bool {
-    let (mut i, mut j) = (0, 0);
-    // After the last `*`: the token just past it, and the input index its run has reached.
-    let mut back: Option<(usize, usize)> = None;
-    while i < s.len() {
-        match toks.get(j) {
-            Some(None) => {
-                back = Some((j + 1, i));
-                j += 1;
-            }
-            Some(Some(k)) if one(k, s[i]) => {
-                i += 1;
-                j += 1;
-            }
-            _ => match back {
-                Some((tj, si)) => {
-                    // The star takes one more element.
-                    back = Some((tj, si + 1));
-                    i = si + 1;
-                    j = tj;
-                }
-                None => return false,
-            },
-        }
+/// What a `Match User` pattern list says about whether the block applies: a match without a
+/// negated one does, any other answer sshd gives does not, and an answer fil cannot give as
+/// sshd would (a subpattern of 1023 bytes or more, see [`match_pattern_list`]) *might*.
+fn list_applies(m: ListMatch) -> Applies {
+    match m {
+        ListMatch::Positive => Applies::Yes,
+        ListMatch::NoMatch | ListMatch::Negated => Applies::No,
+        ListMatch::Unsure => Applies::Maybe,
     }
-    toks[j..].iter().all(Option::is_none)
-}
-
-/// OpenSSH's `match_pattern_list` (case-sensitive): `Some(true)` if a pattern matches and no
-/// negated one does, `Some(false)` if none does, `None` if a negated one does (which beats
-/// everything).
-pub fn match_pattern_list(s: &str, list: &str) -> Option<bool> {
-    let mut positive = false;
-    for p in list.split(',') {
-        let (neg, p) = match p.strip_prefix('!') {
-            Some(p) => (true, p),
-            None => (false, p),
-        };
-        if match_pattern(s, p) {
-            if neg {
-                return None;
-            }
-            positive = true;
-        }
-    }
-    Some(positive)
 }
 
 /// OpenSSH's `ga_match_pattern_list`: one of the user's groups matches, and none matches a
-/// negated pattern.
-fn group_match(groups: &[String], list: &str) -> bool {
-    let mut found = false;
+/// negated pattern. A negated match is sshd's answer at once, whatever a long subpattern after
+/// it would have said; a group on which fil is [`ListMatch::Unsure`] makes the answer *might*
+/// unless a negated one settles it.
+fn group_match(groups: &[String], list: &str) -> Applies {
+    let (mut found, mut unsure) = (false, false);
     for g in groups {
         match match_pattern_list(g, list) {
-            None => return false,
-            Some(true) => found = true,
-            Some(false) => {}
+            ListMatch::Negated => return Applies::No,
+            ListMatch::Positive => found = true,
+            ListMatch::NoMatch => {}
+            ListMatch::Unsure => unsure = true,
         }
     }
-    found
+    if unsure {
+        Applies::Maybe
+    } else {
+        yes_no(found)
+    }
 }
 
 /// What a glob found.
@@ -882,151 +845,117 @@ struct Globbed {
     files: Vec<PathBuf>,
     /// The directories it listed, stamped before they were listed.
     dirs: Vec<Stamp>,
-    /// Directories it had to list and could not (not a missing one): what they hold is unknown.
+    /// Directories it had to list and could not (not a missing one), or whose entries it could
+    /// not match as sshd's glob would ([`Unevaluable`]): what they hold is unknown.
     unlistable: Vec<PathBuf>,
     /// It named more than [`MAX_FILES`]; the rest were dropped.
     truncated: bool,
+    /// The pattern uses a construct fil cannot evaluate as sshd's `glob(3)` does (see
+    /// `pattern::compile`): it names nothing, and the include is one fil could not read.
+    unevaluable: bool,
 }
 
-/// The files a glob names. `*`, `?`, `[...]` and backslash escapes in any component; a leading
-/// `.` is matched only by a pattern that starts with one. A path without a wildcard names
-/// itself, whether or not it exists.
+/// The files a glob names, as sshd's `glob(3)` (called with no flags) does: `*`, `?`, `[...]` and
+/// backslash escapes in any component; a leading `.` is matched only by a pattern that starts
+/// with one (glob(7)); the result sorted by `strcmp` on the whole path. A path without a
+/// wildcard names itself, whether or not it exists. A pattern whose meaning differs between
+/// `glob(3)` implementations is not guessed at ([`Globbed::unevaluable`]).
 fn glob(pattern: &Path) -> Globbed {
-    let mut dirs = Vec::new();
-    let mut unlistable = Vec::new();
-    let mut truncated = false;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut g = Globbed {
+        files: Vec::new(),
+        dirs: Vec::new(),
+        unlistable: Vec::new(),
+        truncated: false,
+        unevaluable: false,
+    };
+    let comps: Result<Vec<GlobComp>, Unevaluable> = glob_check(pattern.as_os_str().as_bytes())
+        .and_then(|()| {
+            pattern
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.as_bytes()),
+                    std::path::Component::ParentDir => Some(&b".."[..]),
+                    _ => None,
+                })
+                .map(GlobComp::new)
+                .collect()
+        });
+    let Ok(comps) = comps else {
+        g.unevaluable = true;
+        return g;
+    };
     let mut paths = vec![PathBuf::from("/")];
-    let comps: Vec<_> = pattern
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            std::path::Component::ParentDir => Some("..".to_string()),
-            _ => None,
-        })
-        .collect();
+    let mut listed = false;
     for comp in &comps {
-        let wild = comp.contains(['*', '?', '[', '\\']);
         let mut next = Vec::new();
-        for base in &paths {
-            if !wild {
-                next.push(base.join(comp));
-                continue;
+        if let Some(name) = comp.literal() {
+            next.extend(paths.iter().map(|b| b.join(OsStr::from_bytes(name))));
+        } else {
+            listed = true;
+            for base in &paths {
+                g.dirs.push(Stamp::of(base));
+                let rd = match std::fs::read_dir(base) {
+                    Ok(rd) => rd,
+                    // Nothing there: sshd's glob finds nothing either.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        continue;
+                    }
+                    // There, but fil may not list it (sshd, as root, can): what it holds is not
+                    // mirrored, and the mirror says so.
+                    Err(_) => {
+                        g.unlistable.push(base.clone());
+                        continue;
+                    }
+                };
+                // Names as bytes, not as text: a name that is not UTF-8 is still a name. sshd's
+                // `readdir` also yields `.` and `..`, which only a component that starts with
+                // a `.` can match (`.*` includes them, as a directory the pattern goes through).
+                let mut names: Vec<Vec<u8>> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().as_bytes().to_vec())
+                    .collect();
+                if comp.starts_with_dot() {
+                    names.push(b".".to_vec());
+                    names.push(b"..".to_vec());
+                }
+                let mut unsure = false;
+                names.retain(|n| match comp.matches(n) {
+                    Ok(m) => m,
+                    // A name the readings of the pattern disagree on: not included, and the
+                    // directory is reported as one fil could not read all of.
+                    Err(Unevaluable) => {
+                        unsure = true;
+                        false
+                    }
+                });
+                if unsure {
+                    g.unlistable.push(base.clone());
+                }
+                names.sort();
+                next.extend(names.into_iter().map(|n| base.join(OsString::from_vec(n))));
             }
-            dirs.push(Stamp::of(base));
-            let rd = match std::fs::read_dir(base) {
-                Ok(rd) => rd,
-                // Nothing there: sshd's glob finds nothing either.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    continue;
-                }
-                // There, but fil may not list it (sshd, as root, can): what it holds is not
-                // mirrored, and the mirror says so.
-                Err(_) => {
-                    unlistable.push(base.clone());
-                    continue;
-                }
-            };
-            let mut names: Vec<String> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| (!n.starts_with('.') || comp.starts_with('.')) && glob_match(n, comp))
-                .collect();
-            names.sort();
-            next.extend(names.into_iter().map(|n| base.join(n)));
         }
         paths = next;
         if paths.len() > MAX_FILES {
             paths.truncate(MAX_FILES);
-            truncated = true;
+            g.truncated = true;
         }
+    }
+    if listed {
+        // glob(3) sorts the whole result with `strcmp`, not directory by directory, and a path
+        // compares as a string (`a-b/x` comes before `a/z`; `Path`'s ordering would not).
+        paths.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
     }
     // Only files: a directory a glob names is not a config.
-    let files = paths
-        .into_iter()
-        .filter(|p| !p.is_dir())
-        .collect::<Vec<_>>();
-    Globbed {
-        files,
-        dirs,
-        unlistable,
-        truncated,
-    }
-}
-
-/// A bracket class: `p` starts after the `[`; returns whether `c` is in it and the length consumed,
-/// the `]` included, or `None` for an unclosed one.
-fn glob_class(c: char, p: &[char]) -> Option<(bool, usize)> {
-    let mut i = 0;
-    let neg = matches!(p.first(), Some('!') | Some('^'));
-    if neg {
-        i += 1;
-    }
-    let mut hit = false;
-    let mut first = true;
-    while i < p.len() {
-        if p[i] == ']' && !first {
-            return Some((hit != neg, i + 1));
-        }
-        first = false;
-        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
-            if p[i] <= c && c <= p[i + 2] {
-                hit = true;
-            }
-            i += 3;
-        } else {
-            if p[i] == c {
-                hit = true;
-            }
-            i += 1;
-        }
-    }
-    None
-}
-
-/// One glob component: `*`, `?` and bracket classes (`[abc]`, `[a-z]`, `[!x]`).
-fn glob_match(s: &str, p: &str) -> bool {
-    /// One pattern item that consumes one character.
-    enum Item {
-        Any,
-        Lit(char),
-        /// The bracket class whose body starts at this index of the pattern.
-        Class(usize),
-    }
-    let s: Vec<char> = s.chars().collect();
-    let p: Vec<char> = p.chars().collect();
-    let mut toks: Vec<Option<Item>> = Vec::new();
-    let mut i = 0;
-    while i < p.len() {
-        match p[i] {
-            '*' => toks.push(None),
-            '?' => toks.push(Some(Item::Any)),
-            '[' => match glob_class('\0', &p[i + 1..]) {
-                Some((_, n)) => {
-                    toks.push(Some(Item::Class(i + 1)));
-                    i += n;
-                }
-                // An unclosed bracket is a literal `[`.
-                None => toks.push(Some(Item::Lit('['))),
-            },
-            // `glob(3)` without `GLOB_NOESCAPE`: a backslash makes the next character literal.
-            '\\' if i + 1 < p.len() => {
-                toks.push(Some(Item::Lit(p[i + 1])));
-                i += 1;
-            }
-            c => toks.push(Some(Item::Lit(c))),
-        }
-        i += 1;
-    }
-    wild(&s, &toks, |item, c| match item {
-        Item::Any => true,
-        Item::Lit(l) => *l == c,
-        Item::Class(at) => glob_class(c, &p[*at..]).is_some_and(|(hit, _)| hit),
-    })
+    g.files = paths.into_iter().filter(|p| !p.is_dir()).collect();
+    g
 }
 
 #[cfg(test)]
@@ -1714,107 +1643,224 @@ mod tests {
         assert_eq!(s.unreadable, vec![dir.join("conf.d")]);
     }
 
-    /// The recursive matchers this module had: exponential in the stars, and the reference the
-    /// linear ones are checked against on small inputs.
-    fn slow_pattern(s: &[u8], p: &[u8]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some((b'*', rest)) => (0..=s.len()).any(|i| slow_pattern(&s[i..], rest)),
-            Some((b'?', rest)) => !s.is_empty() && slow_pattern(&s[1..], rest),
-            Some((c, rest)) => s.first() == Some(c) && slow_pattern(&s[1..], rest),
-        }
-    }
-
-    fn slow_glob(s: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('*') => (0..=s.len()).any(|i| slow_glob(&s[i..], &p[1..])),
-            Some('?') => !s.is_empty() && slow_glob(&s[1..], &p[1..]),
-            Some('[') => match (
-                s.first(),
-                glob_class(s.first().copied().unwrap_or('\0'), &p[1..]),
-            ) {
-                (Some(_), Some((true, n))) => slow_glob(&s[1..], &p[1 + n..]),
-                (Some(_), Some((false, _))) | (None, _) => false,
-                (Some(c), None) => *c == '[' && slow_glob(&s[1..], &p[1..]),
-            },
-            Some('\\') if p.len() > 1 => s.first() == Some(&p[1]) && slow_glob(&s[1..], &p[2..]),
-            Some(c) => s.first() == Some(c) && slow_glob(&s[1..], &p[1..]),
-        }
-    }
-
-    /// Every string of up to `max` characters from `alphabet`.
-    fn strings(alphabet: &[char], max: usize) -> Vec<String> {
-        let mut all = vec![String::new()];
-        let mut layer = all.clone();
-        for _ in 0..max {
-            layer = layer
-                .iter()
-                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
-                .collect();
-            all.extend(layer.iter().cloned());
-        }
-        all
-    }
-
+    /// A `Match User` or `Match Group` list with a subpattern of 1023 bytes or more: sshd answers
+    /// "no match" for the whole list (a 1024-byte buffer), the permissive reading of a `Match`
+    /// (the block does not apply). fil reads it as a block that *might* apply, so the stricter
+    /// value wins; a negated match met before it still settles the block as not applying.
     #[test]
-    fn the_linear_matchers_agree_with_the_recursive_ones() {
-        // Every pattern of up to 4 items over the metacharacters and two letters, against every
-        // input of up to 3 characters over the letters and the characters that are special.
-        let pats = strings(&['*', '?', 'a', 'b', '[', ']', '!', '-', '\\'], 4);
-        let inputs = strings(&['a', 'b', '*', '[', '-'], 3);
-        for p in &pats {
-            let pc: Vec<char> = p.chars().collect();
-            for s in &inputs {
-                let sc: Vec<char> = s.chars().collect();
+    fn a_long_match_subpattern_might_apply() {
+        let long = |n: usize| "x".repeat(n);
+        let might = vec![(Tcp::No, 3, true), (Tcp::All, 1, false)];
+        let not = vec![(Tcp::All, 1, false)];
+        let cases: Vec<(String, Vec<Outcome>)> = vec![
+            // 1022 bytes fits: read as a pattern, `dev` does not match it.
+            (format!("User {}", long(1022)), not.clone()),
+            // 1023 does not fit: sshd gives up on the whole list.
+            (format!("User {}", long(1023)), might.clone()),
+            (format!("User {}", long(2000)), might.clone()),
+            // Even after a positive.
+            (format!("User dev,{}", long(1023)), might.clone()),
+            // A negated match before it is sshd's answer at once ...
+            (format!("User !dev,{}", long(1023)), not.clone()),
+            // ... one after it is never reached.
+            (format!("User {},!dev", long(1023)), might.clone()),
+            // The same for groups (the account is in `staff`).
+            (format!("Group staff,{}", long(1023)), might.clone()),
+            (format!("Group {}", long(1023)), might.clone()),
+            (format!("Group {}", long(1022)), not.clone()),
+            (format!("Group !docker,{}", long(1023)), not.clone()),
+            // Every criterion must hold: a surely-failing one still settles the block.
+            (format!("User {} Group wheel", long(1023)), not.clone()),
+            (format!("User {} Group staff", long(1023)), might.clone()),
+        ];
+        for (crit, want) in cases {
+            let text = format!("AllowTcpForwarding yes\nMatch {crit}\n AllowTcpForwarding no\n");
+            let short = crit.chars().take(24).collect::<String>();
+            assert_eq!(tcp_of(&text), want, "Match {short}...");
+        }
+    }
+
+    /// A scratch config directory with `conf.d`.
+    fn scratch(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("conf.d")).unwrap();
+        for (name, text) in files {
+            std::fs::write(t.path().join("conf.d").join(name), text).unwrap();
+        }
+        t
+    }
+
+    /// What `Include pattern` does in `dir`: the first `AllowTcpForwarding` (file name, or
+    /// `main` when it is the one after the include) and the unreadable list.
+    fn include_in(dir: &Path, pattern: &str) -> (Vec<(Tcp, String)>, Vec<PathBuf>) {
+        std::fs::write(
+            dir.join("sshd_config"),
+            format!("Include {pattern}\nAllowTcpForwarding local\n"),
+        )
+        .unwrap();
+        let (r, _) = read(&dir.join("sshd_config"), &me());
+        let Sshd::Mirrored(s) = r else {
+            panic!("{r:?}")
+        };
+        let got = s
+            .tcp
+            .values
+            .iter()
+            .map(|(v, src)| match src {
+                Src::Line { file, .. } => {
+                    (*v, file.strip_prefix(dir).unwrap().display().to_string())
+                }
+                Src::Default => (*v, "default".into()),
+            })
+            .collect();
+        (got, s.unreadable)
+    }
+
+    /// An `Include` whose glob means something different to another `glob(3)` than to
+    /// OpenBSD's is skipped and the mirror says it is incomplete; its evaluable twin is read.
+    #[test]
+    fn an_include_glob_fil_cannot_evaluate_is_skipped_and_marks_the_mirror_incomplete() {
+        let t = scratch(&[("a.conf", "AllowTcpForwarding no\n"), ("5.conf", "")]);
+        let d = t.path();
+        // (pattern, evaluable?)
+        for (pattern, ok) in [
+            // `[^x]` negates in glibc and not in OpenBSD's glob.
+            ("conf.d/[^x]*.conf", false),
+            ("conf.d/[!x]*.conf", true),
+            // POSIX classes.
+            ("conf.d/[[:alpha:]]*.conf", false),
+            ("conf.d/[a-z]*.conf", true),
+            // A backslash inside a set.
+            ("conf.d/[\\a]*.conf", false),
+            ("conf.d/[a]\\*.conf", true),
+            // A set that spans two path components.
+            ("conf.d/[a/b]*.conf", false),
+            ("conf.d/a\\/b.conf", false),
+            // A set fil reads one way and another glob another.
+            ("conf.d/[a-C]*.conf", false),
+            ("conf.d/[aé]*.conf", false),
+            // The common case.
+            ("conf.d/*.conf", true),
+            ("conf.d/a.conf", true),
+            ("conf.d/?.conf", true),
+        ] {
+            let (got, unreadable) = include_in(d, pattern);
+            if ok {
+                assert!(unreadable.is_empty(), "{pattern}: {unreadable:?}");
+            } else {
+                // Skipped: nothing of the include is in force, and the pattern is named.
+                assert_eq!(unreadable, vec![d.join(pattern)], "{pattern}");
                 assert_eq!(
-                    match_pattern(s, p),
-                    slow_pattern(s.as_bytes(), p.as_bytes()),
-                    "match_pattern({s:?}, {p:?})"
-                );
-                assert_eq!(
-                    glob_match(s, p),
-                    slow_glob(&sc, &pc),
-                    "glob_match({s:?}, {p:?})"
+                    got,
+                    vec![(Tcp::Local, "sshd_config".to_string())],
+                    "{pattern}"
                 );
             }
         }
+        // The evaluable twins are read.
+        assert_eq!(
+            include_in(d, "conf.d/[!x]*.conf").0,
+            vec![(Tcp::No, "conf.d/a.conf".to_string())]
+        );
+    }
+
+    /// A name `?` or a set cannot be matched identically on by bytes and by characters leaves
+    /// the directory marked unreadable and the name out; the rest of the directory is read.
+    #[test]
+    fn a_multibyte_name_a_wildcard_reads_two_ways_marks_the_directory() {
+        let t = scratch(&[
+            ("a.conf", "AllowTcpForwarding no\n"),
+            ("é.conf", "AllowTcpForwarding yes\n"),
+        ]);
+        let d = t.path();
+        // `?` is one byte or one character: `é.conf` is in doubt, `a.conf` is not.
+        let (got, unreadable) = include_in(d, "conf.d/?.conf");
+        assert_eq!(got, vec![(Tcp::No, "conf.d/a.conf".to_string())]);
+        assert_eq!(unreadable, vec![d.join("conf.d")]);
+        // `*` is the same either way: both are read, sorted by bytes (`a` before `é`).
+        let (got, unreadable) = include_in(d, "conf.d/*.conf");
+        assert_eq!(got, vec![(Tcp::No, "conf.d/a.conf".to_string())]);
+        assert!(unreadable.is_empty());
+    }
+
+    /// glob(3) sorts the whole result with `strcmp`: `a-b/x.conf` comes before `a/x.conf` (`-` is
+    /// before `/`), where sorting directory by directory would put `a` first. The first value
+    /// wins, so the order decides.
+    #[test]
+    fn include_results_are_sorted_as_whole_paths() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        for (dir, v) in [("a", "yes"), ("a-b", "no")] {
+            std::fs::create_dir_all(d.join("conf.d").join(dir)).unwrap();
+            std::fs::write(
+                d.join("conf.d").join(dir).join("x.conf"),
+                format!("AllowTcpForwarding {v}\n"),
+            )
+            .unwrap();
+        }
+        let (got, _) = include_in(d, "conf.d/*/x.conf");
+        assert_eq!(got[0], (Tcp::No, "conf.d/a-b/x.conf".to_string()));
+        let g = glob(&d.join("conf.d/*/x.conf"));
+        let names: Vec<_> = g
+            .files
+            .iter()
+            .map(|f| f.strip_prefix(d).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["conf.d/a-b/x.conf", "conf.d/a/x.conf"]);
+    }
+
+    /// sshd's `readdir` yields `.` and `..`, which a component that starts with a dot matches:
+    /// `.*` goes through them.
+    #[test]
+    fn a_dot_star_component_goes_through_dot_and_dot_dot() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        std::fs::create_dir_all(d.join("sub/.hidden")).unwrap();
+        for f in ["x.conf", "sub/x.conf", "sub/.hidden/x.conf"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        let g = glob(&d.join("sub/.*/x.conf"));
+        let names: Vec<_> = g
+            .files
+            .iter()
+            .map(|f| f.strip_prefix(d).unwrap().display().to_string())
+            .collect();
+        // Sorted by bytes: `..` before `.` before `.hidden`.
+        assert_eq!(
+            names,
+            ["sub/../x.conf", "sub/./x.conf", "sub/.hidden/x.conf"]
+        );
+        // And a pattern without a leading dot matches none of them.
+        let g = glob(&d.join("sub/*/x.conf"));
+        assert!(g.files.iter().all(|f| !f.exists()));
+    }
+
+    /// A name that is not UTF-8 is still a name (a lossy conversion would name a file that does
+    /// not exist, and the include would be skipped without a word). Skipped where the file
+    /// system refuses such names (APFS).
+    #[test]
+    fn a_file_name_that_is_not_utf8_is_included() {
+        use std::os::unix::ffi::OsStringExt;
+        let t = scratch(&[]);
+        let d = t.path();
+        let name = std::ffi::OsString::from_vec(b"\xff1.conf".to_vec());
+        if std::fs::write(d.join("conf.d").join(&name), "AllowTcpForwarding no\n").is_err() {
+            return;
+        }
+        let g = glob(&d.join("conf.d/*.conf"));
+        assert_eq!(g.files, vec![d.join("conf.d").join(&name)]);
+        let (got, unreadable) = include_in(d, "conf.d/*.conf");
+        assert_eq!(got[0].0, Tcp::No);
+        assert!(unreadable.is_empty());
     }
 
     #[test]
-    fn many_stars_cost_no_more_than_the_length_of_the_input() {
+    fn many_stars_through_a_match_line_cost_no_more_than_the_length_of_the_input() {
         // The fuzzer's finding: a recursive match of this many stars against a name that does
-        // not match never finished (it is exponential in the stars).
+        // not match never finished (it is exponential in the stars); the matchers themselves
+        // are tested in `pattern`.
         let pattern = format!("{}b", "a*".repeat(40));
-        let name = "a".repeat(200);
-        assert!(!match_pattern(&name, &pattern));
-        assert!(!glob_match(&name, &pattern));
-        assert!(match_pattern(&format!("{name}b"), &pattern));
-        assert!(glob_match(&format!("{name}b"), &pattern));
-        let stars = "*".repeat(100);
-        assert!(!match_pattern("conf", &format!("{stars}x")));
-        assert!(!glob_match("conf", &format!("{stars}x")));
-        assert!(match_pattern("", &stars) && glob_match("", &stars));
-        // And through a `Match User` line, which is read whenever the config changes.
         let s = parse(&format!("Match User {pattern}\nDisableForwarding yes\n"));
         assert!(s.disable.values.iter().all(|(f, _)| *f == Flag::No));
-    }
-
-    #[test]
-    fn glob_components() {
-        for (s, p, want) in [
-            ("10-a.conf", "*.conf", true),
-            ("10-a.conf", "1?-a.conf", true),
-            ("10-a.conf", "[0-9]*", true),
-            ("x.conf", "[!x]*", false),
-            ("a]", "[]a]]", true),
-            ("[x", "[x", true),
-            ("a.conf", "*.txt", false),
-            ("a*b", "a\\*b", true),
-            ("axb", "a\\*b", false),
-            ("[x]", "\\[x\\]", true),
-        ] {
-            assert_eq!(glob_match(s, p), want, "{s} {p}");
-        }
     }
 }

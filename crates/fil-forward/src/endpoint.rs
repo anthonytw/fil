@@ -2889,25 +2889,54 @@ mod tests {
         assert_eq!(r.failed(t0).unwrap(), NOMEM_FIRST);
     }
 
+    /// Fails every `step` from `from` up to and including `to`, returning the last answer.
+    fn fail_until(
+        r: &mut NoMemoryRetry,
+        from: Instant,
+        to: Instant,
+        step: Duration,
+    ) -> Option<Duration> {
+        let mut t = from;
+        loop {
+            let w = r.failed(t);
+            if t >= to {
+                return w;
+            }
+            t = (t + step).min(to);
+        }
+    }
+
     #[test]
     fn it_gives_up_after_the_limit_of_continuous_failure_only() {
         let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Failures every 100 ms (the longest wait): one run, over at the limit.
         let mut r = NoMemoryRetry::new();
-        assert!(r.failed(t0).is_some());
-        assert!(
-            r.failed(t0 + NOMEM_LIMIT - Duration::from_millis(1))
-                .is_some()
-        );
+        assert!(fail_until(&mut r, t0, t0 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
         assert!(r.failed(t0 + NOMEM_LIMIT).is_none());
         // A success in between restarts the clock.
         let mut r = NoMemoryRetry::new();
-        assert!(r.failed(t0).is_some());
+        assert!(fail_until(&mut r, t0, t0 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
         r.succeeded();
-        assert!(r.failed(t0 + NOMEM_LIMIT).is_some());
+        let t1 = t0 + NOMEM_LIMIT;
+        assert!(fail_until(&mut r, t1, t1 + NOMEM_LIMIT - ms(1), NOMEM_CAP).is_some());
+        assert!(r.failed(t1 + NOMEM_LIMIT).is_none());
+    }
+
+    #[test]
+    fn a_failure_after_a_quiet_gap_starts_a_new_run() {
+        let t0 = Instant::now();
+        let mut r = NoMemoryRetry::new();
+        assert!(fail_until(&mut r, t0, t0 + Duration::from_secs(29), NOMEM_CAP).is_some());
+        // The call then waited (`Pending`) for longer than the gap: not a failure.
+        let t1 = t0 + Duration::from_secs(29) + NOMEM_GAP + Duration::from_millis(1);
+        assert_eq!(r.failed(t1), Some(NOMEM_FIRST));
         assert!(
-            r.failed(t0 + NOMEM_LIMIT * 2 - Duration::from_millis(1))
-                .is_some()
+            r.failed(t1 + Duration::from_secs(2))
+                .is_some_and(|w| w == NOMEM_FIRST)
         );
-        assert!(r.failed(t0 + NOMEM_LIMIT * 2).is_none());
+        // Within the gap, the run goes on and the wait keeps growing.
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(r.failed(t2 + NOMEM_GAP), Some(Duration::from_millis(2)));
     }
 }

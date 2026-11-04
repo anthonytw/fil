@@ -189,11 +189,16 @@ just vm-run tests/terminals/run.sh
 
 ### Run times
 
-| | xterm | kitty | WezTerm | tmux |
-|---|---|---|---|---|
-| In the VM (aarch64, 6 cores), 89 traces | 134 to 140 s | 64 to 246 s (varies with other work in the VM) | 47 to 112 s | 16 to 33 s |
+89 traces, about 520 checkpoints per terminal.
 
-The GitHub run times are in the PR.
+| | xterm | kitty | WezTerm | tmux | Whole job |
+|---|---|---|---|---|---|
+| GitHub runner, `linux-check -f suite=terminals` (run 41801078111, x86_64) | 125 s | 108 s | 44 s | 17 s | 5 min 42 s, with the apt packages, the WezTerm download and a cached cargo build |
+| Lima VM (aarch64, 6 cores) | 134 to 140 s | 64 to 246 s (varies with other work in the VM) | 47 to 112 s | 16 to 33 s | about 5 to 9 min |
+
+xterm is the slowest because each scrollback read sends a key with `xdotool` and waits for the file; the rest is the cost of a fresh terminal per trace (about 0.5 s for kitty and WezTerm).
+
+Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `libEGL`; xterm and kitty were green), 41798691924 (green except two checks of the intermittent WezTerm scroll-region trace), 41801078111 (green).
 
 ## Files
 

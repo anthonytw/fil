@@ -13,7 +13,7 @@ default:
 
 # The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
 # failure (the advisory database) shows up at once, not after the whole test suite.
-ci: deny fmt-check clippy check-default release-deps test
+ci: deny fmt-check clippy check-default release-deps release-test test
 
 fmt-check:
     cargo fmt --all --check
@@ -303,3 +303,56 @@ no-test-hooks +binaries:
         *) echo "no-test-hooks: could not read $b (grep status $rc)" >&2; exit 1 ;;
       esac
     done
+
+# ---- Releases (docs/m4/release.md; the scripts are in tests/release/) ----
+
+# The release scripts' own tests: the workflow lint (permissions, pins, no secrets or caches) with a
+# mutation for each rule, tag verification (the signers come from main, never from the tag),
+# release-check on synthetic releases, and the checksums. Part of `ci`. With FIL_RELEASE_TEST_DOCKER=1
+# it also assembles archives twice in the pinned image and requires identical hashes (pulls the image).
+release-test:
+    tests/release/selftest.sh
+
+# Build the release the way release.yml does: both Linux binaries in the digest-pinned `cross`
+# images (needs `cross` 0.2.5 and Docker; on an arm64 host see docs/m4/release.md section 9), the
+# universal macOS binary when run on macOS, then the archives, the source archive and SHA256SUMS
+# into OUT/files (assembled by the GNU tar and gzip inside the pinned image). Off macOS, name a macOS
+# binary with FIL_MACOS_BINARY=path (a dry run's, for example) or the archives are not assembled.
+release-build out="target/release-dist":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="{{out}}"
+    rm -rf "$out"
+    for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+      tests/release/build-binary.sh "$t" "$out/bins"
+    done
+    if [ "$(uname -s)" = Darwin ]; then
+      tests/release/macos-build.sh "$out/bins"
+    elif [ -n "${FIL_MACOS_BINARY:-}" ]; then
+      mkdir -p "$out/bins/universal-apple-darwin"
+      cp "$FIL_MACOS_BINARY" "$out/bins/universal-apple-darwin/fil"
+    else
+      echo "release-build: built the Linux binaries in $out/bins; no macOS binary (set FIL_MACOS_BINARY), so no archives" >&2
+      exit 0
+    fi
+    tests/release/package.sh --bins "$out/bins" --out "$out/files"
+    echo "release-build: the release files are in $out/files; run: just release-check --dry-run $out/files" >&2
+
+# Everything a release candidate must satisfy: `just release-check --dry-run DIR` for a build of a
+# branch, `just release-check --tag vX.Y.Z --complete DIR` for a release. One top-level entry per
+# archive, the section 4.3 layout, byte-identical bundle copies, SHA256SUMS exactly the four archives,
+# no builder path (/Users/, /home/) or FIL_TEST_ string in a binary, the path remap applied,
+# `no-test-hooks` and `release-deps`, static Linux binaries, `fil --version` where it can run, the tag,
+# the changelog and the wire. See tests/release/check.sh.
+[positional-arguments]
+release-check *args:
+    tests/release/check.sh "$@"
+
+# The owner's check before signing, and anyone's afterwards: `just release-verify 0.1.0`. Tag and
+# SHA256SUMS.sig against .github/release-signers on main, the attestations (narrowly), release-check,
+# then an independent rebuild of every Linux binary and archive in the Lima VM under amd64 emulation
+# (Rosetta), compared hash for hash. `--dry-run --from-run RUN --ref SHA` checks a dry run instead.
+# See tests/release/verify.sh and docs/m4/release.md section 9.
+[positional-arguments]
+release-verify version *args:
+    tests/release/verify.sh "$@"

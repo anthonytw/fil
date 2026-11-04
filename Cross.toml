@@ -1,4 +1,15 @@
-# Used by `cross` in the `aarch64` job of .github/workflows/linux-check.yml (docs/m1/pi.md).
-# The image is pinned by digest (it is the one cross 0.2.5 pulls for this target).
+# The images `cross` builds the release binaries in (.github/workflows/release.yml, the `aarch64`
+# job of .github/workflows/linux-check.yml, `just release-build` and `just release-verify`;
+# docs/m1/pi.md, docs/m4/release.md section 4.4).
+#
+# Both images are pinned by the digest of their multi-architecture index (they are the ones cross
+# 0.2.5 pulls for these targets): the same commit builds the same binary, and `just release-verify`
+# rebuilds in exactly these images. The x86_64 image is linux/amd64 only, and it is also the image
+# the release archives are assembled in (GNU tar and gzip from inside it, not the runner's own).
+# To bump an image: resolve the new tag's index digest, change it here, and re-run a release dry run
+# and `just release-verify`. `cross` itself is pinned in the workflows (0.2.5).
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+
 [target.aarch64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"

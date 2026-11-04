@@ -411,7 +411,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Done when:** the resize result (both directions) is written in `docs/m3/harness.md`, which gates W1, and the baseline is recorded.
 
 **T2: real terminals** (parallel with C1; riskiest, so first)
-- **Owns:** `tests/terminals/**` (new), `crates/fil-predict/examples/trace_export.rs` (new: a scenario's flush stream with checkpoints and the expected screen at each), a `terminals` suite in `.github/workflows/linux-check.yml` (its own job; the shared suite list is a one-line addition), the `suite=all` sentence in `CLAUDE.md`, `docs/m3/terminals.md` (new).
+- **Owns:** `tests/terminals/**` (new), `tests/terminals/exporter/` (new, its own cargo workspace: a scenario's flush stream with checkpoints and the expected screen at each; it was planned as `crates/fil-predict/examples/trace_export.rs`), a `terminals` suite in `.github/workflows/linux-check.yml` (its own job; the shared suite list is a one-line addition), the `suite=all` sentence in `CLAUDE.md`, `docs/m3/terminals.md` (new).
 - **Builds:** replays exported traces (the spike's hazard traces, the scripted scenarios, status lines, resizes) into real terminals under Xvfb on GitHub's Linux runner, and reads the screen back at each checkpoint (after an erase, at the end), with no access change needed:
   - **xterm:** `CSI i` with `printerCommand` and `printAttributes`;
   - **kitty:** `allow_remote_control` and `--listen-on`, `kitty @ get-text --ansi`, Mesa's llvmpipe for OpenGL 3.3;

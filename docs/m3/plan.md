@@ -129,6 +129,11 @@ pub trait ScreenView {
     fn cursor(&self) -> Cursor;                // row, col, pending wrap, visible, pen
     fn modes(&self) -> &Modes;                 // alt screen, insert, origin, autowrap, paste, ...
     fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>>; // text, width, attrs
+    /// A value that changes whenever a glyph on `row` changes (§2.4 rule 3). It may also change
+    /// when nothing visible did (stricter is allowed); it must never stay the same across a glyph
+    /// change. C1's implementation hashes the row's glyphs from `TermState`; P2's is a write
+    /// counter or damage tracking in the backend.
+    fn row_stamp(&self, row: u16) -> u64;
 }
 
 pub struct LinkView {
@@ -143,14 +148,15 @@ pub struct Ctx<'a> {
     pub now: Time,
 }
 
-/// What a predictor proposes. Nothing here is written by itself: the core records every guess
-/// and writes one only in an epoch it has confirmed (§2.4).
+/// What a predictor proposes. Nothing here is written by itself: the core checks every guess,
+/// records it, and writes one only in an epoch it has confirmed (§2.4).
 pub enum OverlayEdit {
-    /// The key at input offset `at` will put `ch` in this cell (a space: a predicted erase) and
-    /// leave the cursor at `after`.
-    Guess { row: u16, col: u16, ch: char, at: InputPos, after: (u16, u16) },
-    /// The key at `at` moves the cursor only (a left or right arrow).
-    Move { at: InputPos, to: (u16, u16) },
+    /// The key at input offset `at` will put its own character in this cell (for a Backspace: a
+    /// blank). The core knows the key's character and computes where the cursor ends up.
+    Guess { row: u16, col: u16, at: InputPos },
+    /// The key at `at` (a left or right arrow, Ctrl-B, Ctrl-F) moves the cursor only; the core
+    /// computes where to.
+    Move { at: InputPos },
     /// The predictor no longer expects this cell's guess (a backspace over it, a shift).
     Withdraw { row: u16, col: u16 },
     /// Withdraw every guess.
@@ -183,8 +189,12 @@ pub trait Predictor: Send {
 }
 ```
 
-- The core derives the cursor it draws from the latest written guess's `after` (or `Move`'s `to`); there is no separate cursor edit.
-- The core checks every edit: `at` must be a typed key the core has seen and not yet settled, at most one glyph guess per input offset, cells and characters as in M0's rules. Anything else is ignored and counted (`rejected`).
+- **The core checks every edit** (anything else is ignored and counted as `rejected`):
+  - `at` is a typed key the core has seen, of the current epoch, not yet settled; at most one edit per input offset;
+  - a `Guess`'s glyph is the key's own character (a blank for Backspace), and it must be one the core may paint (M0's character and cell rules); a predictor cannot choose the glyph;
+  - the cursor after a guess is computed by the core (the cell plus the glyph's width, on the same row; the cell itself for a Backspace blank); a `Move`'s target is the cursor one column left or right;
+  - **in a tentative epoch only the plain forms are accepted:** the first key's guess at the shadow cursor and each later key's at the cursor the previous guess leaves (append), a Backspace blank one column left, a `Move` one column either way. Mid-line insert, with its shifted cells, is accepted only in a confirmed epoch.
+- The core derives the cursor it draws from the latest written guess or move; there is no separate cursor edit.
 - `KeyEvent` and `CellStyle` stay as in M0. Paste, kitty keys and the key boundaries are the core's (§2.4).
 - `Overlay` gains `on_input(bytes, at: InputPos, kind: InputKind, now)`, `on_echo_ack(input_upto, now)` (the caller orders it), `set_link(LinkView)` (replacing `set_rtt`), `resized()` and `repainted()` (§2.4 rule 9), and `stats() -> PredictStats` (§2.5).
 - Predictors are compiled in (§8.4). The factory stays `PredictorFactory` in `fil-client`.
@@ -196,15 +206,26 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 1. **Password rule (§9, unchanged):** nothing is written while the PTY is canonical with echo off; anything written is retracted when the report arrives.
 2. **Epochs are the core's.**
    - Every guess belongs to the epoch its key was typed in; the core knows that from `at`, never from the predictor.
-   - After a boundary the new epoch is **tentative**: its guesses are recorded and written nowhere.
-   - A tentative epoch becomes **confirmed** when the shadow shows a guess of that epoch at its cell, **and** the shadow cursor is at that guess's `after` (or at a later guess's of the same epoch), **and** the change came in output received after the key was sent (the client knows the terminal offset it had received when it sent each key). The cursor and timing conditions keep a prompt that happens to contain the guessed letter at that column from confirming the epoch.
+   - After a boundary the new epoch is **tentative**: its guesses are recorded and written nowhere. A tentative epoch that has ended (a later boundary) is never written.
+   - **Every key is guessed.** A tentative epoch's guesses must cover its keys contiguously in `at`: a key the predictor declined to guess (no edit for it before the next key or output) is a boundary. So one guess that happens to match cannot stand in for keys the predictor skipped.
+   - **The first confirmation needs the whole chunk explained.** An output chunk (one call of `on_server`) confirms a tentative epoch only if, in that chunk:
+     - no guess of the epoch is contradicted, and the chunk is not `Unexplained` (rule 3); both are checked **before** confirmation, so a chunk that does both ends the epoch;
+     - every glyph it changes, outside rule 3's two exemptions, is one of the epoch's guessed cells and now shows exactly its guess;
+     - at least one guessed cell's glyph **changed** to the guess in this chunk (a cell that already showed it, such as a fish autosuggestion under the cursor, does not count for the first confirmation; it can in a confirmed epoch);
+     - the shadow cursor ends where the core computed it would be after one of the guesses this chunk confirms (or after a later declared guess of the epoch);
+     - the chunk was received after the key of the first confirmed guess was sent (the client knows the terminal offset it had received when it sent each key).
+
+     A chunk that breaks any of these is `Unexplained`, and the tentative epoch ends unwritten. So a prompt (`Password: `) cannot confirm an epoch: it changes cells no guess covers, and no guess can hold `:` unless `:` was typed.
    - In a confirmed epoch, later guesses are written as they come (in the predictor's `Show` style) and confirmed by their glyph alone.
    - A contradiction (the guess's cell shows something that is neither the guess, nor what was there, nor an earlier guess for the cell) withdraws what is written and starts a new tentative epoch.
 3. **Boundaries** end the current epoch (what is written is withdrawn; the next guesses are tentative):
    - `Key`: Enter, Tab, every C0 control except Backspace and DEL, a bare Esc, every escape sequence except the left and right arrows (`CSI C`/`D`, `SS3 C`/`D`), and every Alt-key; Ctrl-B and Ctrl-F are arrows here.
    - `ModeChange`: every `PtyMode` change. A raw-mode program that turns echo off (sudo with `pwfeedback`) therefore never has its first key written.
    - `Unpredicted`: input that is not typed and live (rule 6), and keys typed while the outstanding cap holds (rule 8).
-   - `Unexplained`: output that moves the cursor anywhere but where the written guesses say, changes a glyph on another row, or changes a glyph left of the cursor that is not a guess. A prompt printed before a secret is read therefore makes the next key tentative. Glyphs right of the cursor (fish's autosuggestion, zsh's `RPROMPT`) and attributes (syntax highlighting) do not count. While nothing is outstanding the core only notes that output arrived, and checks once, at the next key, against a copy of the cursor's row taken when the last guess was settled, so a flood costs nothing.
+   - `Unexplained`: output that leaves the cursor anywhere but where the epoch's guesses say (the written ones in a confirmed epoch, the declared ones in a tentative epoch, where nothing is written), changes a glyph on any other row, or changes a glyph left of the cursor on its row that is not a guess. A prompt printed before a secret is read therefore makes the next key tentative, wherever on the screen it is drawn, with the cursor put back or not.
+     - **Two exemptions, kept on purpose:** glyphs right of the cursor on the cursor's row (fish's autosuggestion, zsh's `RPROMPT`, both redrawn at every key), and attribute-only changes anywhere (syntax highlighting recolors the line at every key). Counting either would end every epoch in fish and in a highlighting zsh, so prediction would never show there. What they leave open is OQ-1 case 4.
+     - **Cost:** while nothing is outstanding the core only notes that output arrived, and checks once, at the next key: the cursor against where the last settled guess left it, the cursor's row against a copy of its glyphs taken then, and every other row by its `ScreenView::row_stamp` against the stamps taken then. A flood costs nothing per chunk.
+     - **The seam C1 needs** is only `row_stamp` (§2.3). C1 implements it by hashing each row's glyphs from one `TermState` read at that next key (correct, slower); P2 replaces it with the backend's write counter or damage tracking, which may be stricter but never misses a glyph change (a stricter stamp may also count an attribute-only write on another row; that only makes more keys tentative). C1 does not wait for P2.
    - `Idle`: the first key after 1 s with no input sent and no output received. Shorter than the daemon's 2 s quiet window (`ACTIVE_WINDOW`), so one-way delay cannot leave the daemon on its slow mode poll while the client still counts the session as active (§2.10).
    - `Resumed`: the first key after a resume or a swap.
    - The boundaries are kept whenever `predict` is not `off`, also while the predictor's `Show` is `Hide` (adaptive on a fast link). A key typed while prediction was quiet therefore still ends the epoch when prediction turns on.
@@ -219,7 +240,12 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
    - **answers** to the client's own questions, and escapes (`~.`, `~#`, `~?`), which never reach the session.
 7. **Kitty keyboard protocol:** an unmodified printable key reported as `CSI codepoint u` is decoded as that character; a release event (`CSI ... ; m:3 u`, flag 2) is ignored; every other `CSI ... u` is a `Key` boundary. Proposed.
 8. **Bounded state:** at most 1,024 guesses outstanding; past that the core stops asking the predictor, and the keys typed meanwhile are recorded as unpredicted ranges (rule 6) until guesses settle.
-9. **Resize.** After any resize the core writes no guess until the screen has been repainted at the new size (W1's `Repaint`, §2.8): a terminal may reflow differently from the shadow, which makes the shadow untrustworthy even where nothing was drawn. With prediction off, only a resize while something is drawn asks for a repaint. Status lines are still drawn after a resize (the user must see what is happening while disconnected); an untrusted screen is repaired by the repaint, or by the next resume's snapshot while disconnected.
+9. **Resize.** A resize marks the screen **untrusted**: a terminal may reflow differently from the shadow, so the shadow no longer says what the terminal shows, even where nothing was drawn. While it is untrusted the core still records and confirms guesses (from the shadow, which is the daemon's view) but writes none. The repaint is asked for **lazily** (W1, §2.8), so a user whose predictions never show (adaptive on a fast link) never gets one:
+   - when the core next has a guess it would write: it asks for a repaint and holds the guess; the guess is written after the repaint lands, if it is still good;
+   - when the overlay has something drawn at the resize (a status line, a question, written guesses): at once, as today's `want_snapshot` case does at the next resume;
+   - when a status line or question is drawn on an untrusted screen (the user must still see what is happening while disconnected): once it is removed.
+
+   Trust comes back with **any** snapshot rendered at the client's current size generation (W1). While the link is down the repair is the resume's snapshot (`want_snapshot`).
 
 ### 2.5 Misprediction: definition, accounting, bar
 
@@ -250,7 +276,7 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 | **Link `Down`** | Keys are offline input (§4.3), never predicted. What was written stays until it is settled or the backstop (10 s, or the next snapshot) withdraws it, so a key typed just before a drop still shows. |
 | **Takeover, `fil detach` from elsewhere, refusal, `SessionExited`** | Withdrawn at once, before any question or message is drawn. The old client's later keys are not the session's. |
 | **Fresh attach after a take-back** | New predictor; input offsets rebase to 0 (§8.5). |
-| **Resize** | Erase and reset, as today, then no guess is written until the repaint lands (§2.4 rule 9, W1). |
+| **Resize** | Erase and reset, as today; the screen is untrusted, and no guess is written until a snapshot at the new size lands, asked for only when something would be written (§2.4 rule 9, W1). |
 | **Native scrollback** | Untouched: nothing is painted that scrolls (§9), `Enter` is never predicted, and a guess never reaches the last column. W1's repaint renders no history, so the scrollback is not duplicated. |
 | **Offline input confirmation and questions** | Their keys are answers (§2.4 rule 6). |
 | **`~.` and exit** | Withdrawn before the terminal restore (`restore_sequence`). |
@@ -273,13 +299,16 @@ M0's rules stay (spike C's hazard table: pending wrap, pen, hyperlink, insert mo
 **W1: an in-band `Repaint`, one bump (revision 11 to 12, or past main at the time).**
 
 - **`InputRecord::Repaint`** (variant 1, appended; client to daemon, on the terminal channel's keystroke direction, no fields): repaint my screen at the size I have told you. As an in-band record it takes no input space (§8.5) and is ordered after the `InputRecord::Resize` before it by the channel's own order, so the daemon has applied that size before it reads the request. (A control message would overtake the resize record, §8.1, and the daemon would render at the old size.)
-- **`SnapshotReason::Repaint { size_gen }`**: the daemon answers with a mid-stream `Snapshot` announcement, as for catch-up, rendering **the screen and the modes with no history lines** (the client's native scrollback already holds the history) and `skipped` 0 (no marker), and says which size generation it rendered at.
+- **`SnapshotReason::Repaint`**: the daemon answers with a mid-stream `Snapshot` announcement, as for catch-up, rendering **the screen and the modes with no history lines** (the client's native scrollback already holds the history) and `skipped` 0 (no marker).
+- **`SnapshotInfo.size_gen`**: **every** snapshot (attach, catch-up, `want_snapshot`, repaint) says the size generation it was rendered at. The client trusts its screen again after applying any snapshot whose `size_gen` is its current one, so a catch-up or a resume snapshot rendered after the resize repairs it too, and prediction does not stay off until the next resize.
 - **Coalesced, never dropped.** A request the daemon cannot serve at once becomes one *owed* repaint, served as soon as it can be:
   - while a snapshot is in flight (it was rendered before the resize, at the old size): after the client has acknowledged it (§6.2's one-at-a-time rule);
   - within 1 s of the last repaint served: when the second has passed (a trailing repaint, so the final size of a window drag is always repainted);
   - any number of requests meanwhile owe one repaint.
+- **Across links:** a repaint owed or in flight when the link dies is asked for again: a client that is still untrusted resumes with `want_snapshot`, whose snapshot carries `size_gen` like any other.
 - A `Repaint` from a connection that no longer holds the session is ignored, as its keys are.
-- **The client** sends it after the resize record whenever §2.4 rule 9 asks (a predicting client: every resize; any client: a resize while something is drawn), and trusts its screen again when it has applied a `Repaint` snapshot whose `size_gen` is its current one. While disconnected, `want_snapshot` stays the repair (§4.2).
+- **The client** sends it lazily, as §2.4 rule 9 says: when the core would write a guess on an untrusted screen, or when something was drawn at the resize, never just because the window changed. While disconnected, `want_snapshot` stays the repair (§4.2).
+- **The clear.** The snapshot writer starts with `CSI H CSI J` (`fil-term/src/snapshot.rs`). If T2 finds a terminal where that pushes the screen into the scrollback, W1 uses a clear that T2 finds safe on all four terminals; if there is none, a repaint on such a terminal costs one screen of scrollback per repaint, which the lazy rule keeps to resizes during active prediction, and `docs/m3/terminals.md` records it as a known limit.
 - **Why a wire change:** without it the only repair is a resume, which on the pipe is a new ssh login.
 - **Gate:** T1's true-order reproduction lands first and shows damage under the overlay on alacritty as the oracle. T1 cannot show a real terminal reflowing unlike the shadow (its oracle is the same emulator), so T2's reflow finding (§3) is the second trigger. If neither shows damage, W1 is dropped, §4.2's text stays, and rule 9 becomes "no guess after a resize while something is drawn, until the next snapshot".
 - **W1 also updates** §2 goal 1 ("while connected, the screen is never redrawn from a model": the repaint is the second exception after catch-up), §4.2, §6.2 and §8.5.
@@ -314,7 +343,7 @@ After W1, no package changes the wire. A wire change found in review becomes a s
 - **Output with nothing outstanding:** no screen read, as today (`has_outstanding`); `cat` of 100 MB costs within 3 % of `predict = "off"` in client CPU, compared as the medians of 10 runs each, with the spread reported.
 - **Output with guesses outstanding:** at most one screen read per output chunk, and no grid copy (P2's `ScreenView`). Unexplained output ends the epoch (§2.4 rule 3), so a flood stops the reads after its first chunk.
 - **Memory:** bounded by §2.4 rule 8; no allocation per key in steady state beyond the edit list.
-- **Wire:** at most one `EchoAck` per 50 ms window while typing, none while idle; at most one repaint per second, and only after resizes.
+- **Wire:** at most one `EchoAck` per 50 ms window while typing, none while idle; at most one repaint per second, and only after a resize during active prediction or with something drawn (§2.4 rule 9).
 - **Daemon wakeups (C1):** today an attached session of a predicting client polls the PTY mode every 50 ms for as long as it is attached (`poll_interval` with `predicting = true`), 20 wakeups a second; with `adaptive` the default, that would be every session. The fast idle poll existed so that a password prompt after a silence is known before the first key is painted. The core's `Idle` boundary (§2.4 rule 3) now makes that first key tentative, and a tentative key is never written, so C1 gives predicting clients the normal idle slowdown (500 ms after 2 s of quiet), in the same PR as the rule, with a test. Target: at most 2 wakeups a second for an idle session.
 
 ## 3. Packages
@@ -349,19 +378,19 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 
 **C1: the core's epochs and rules, the contract, the daemon's poll**
 - **Owns:** `crates/fil-predict/src/{predictor.rs, overlay.rs, keys.rs, tracker.rs, oracle.rs, driver.rs, sim.rs, mosh.rs, lib.rs}`, `crates/fil-predict/tests/*`, `crates/fil-predict/Cargo.toml`; a compile fix in `crates/fil-client/src/display.rs` (`NoPrediction` and the new calls, behavior unchanged); in `crates/fil-session/src/core.rs`, `poll_interval` and its test only; `DESIGN.md` §8.5 (the mode poll sentence), §9 and §12.
-- **Builds:** §2.3 (the trait, `ScreenView` over `TermState`, `Overlay`'s new inputs); §2.4 rules 2 to 9 with a `Guards` switch each; `InputKind`; `PredictStats` and §2.5's classification; the oracle's new kind `Mispredict` with the suite categories; the reserved-alphabet secret check (§5.2); `oracle`, `driver` and `sim` behind a cargo feature that the `harness` feature and the tests enable (`just predict-harness --seeds 2 --keys 60` keeps working with the same flags); the M0 `MoshPredictor` and the hostile predictor ported to declared guesses with their behavior otherwise unchanged (P1 improves the first); §2.10's daemon poll change.
+- **Builds:** §2.3 (the trait, `ScreenView` over `TermState` with C1's `row_stamp`, the core's checks on every edit, `Overlay`'s new inputs); §2.4 rules 2 to 9 with a `Guards` switch each; `InputKind`; `PredictStats` and §2.5's classification; the oracle's new kind `Mispredict` with the suite categories; the reserved-alphabet secret check (§5.2); `oracle`, `driver` and `sim` behind a cargo feature that the `harness` feature and the tests enable (`just predict-harness --seeds 2 --keys 60` keeps working with the same flags); the M0 `MoshPredictor` and the hostile predictor ported to declared guesses with their behavior otherwise unchanged (P1 improves the first); §2.10's daemon poll change.
 - **Tests:** a deterministic trace per new rule in `hazards.rs`, each run with the mosh predictor **and the hostile one**:
   - `sudo` typed ahead: a password typed right after Enter, before the echo-off report, is never written; also with the adaptive gate off at the Enter and on by the password (the case where M0's predictor skipped its own epoch bookkeeping);
   - a shown guess withdrawn on a mode change; an asterisk-echo raw program never writes a typed key;
-  - a prompt that contains the guessed letter at the guessed column does not confirm the epoch;
+  - **forged confirmations, with a hostile predictor that guesses the prompt:** after `sudo true⏎` it declares guesses for the password keys at the cells and characters of `Password: `; the prompt arrives; nothing is written. Also: a guess whose cell holds the typed key's character but whose chunk changes other cells (the rest of a prompt) does not confirm; a key with no guess between two that match does not let them confirm; a prompt drawn on another row with the cursor put back (DECSC/DECRC) is `Unexplained` at the next key; a fish autosuggestion under the cursor does not give the first confirmation;
   - a bracketed paste, an unmarked 1 KiB paste split into a 1,000-byte and a 24-byte read, and released offline bytes: never written, offsets kept, the next key tentative;
   - the first key after 1 s idle tentative; kitty `CSI 97 u` decoded as `a`, its release event ignored; the outstanding cap with its unpredicted range;
   - settling by `EchoAck`: an unechoed guess contradicted after the grace, a late echo within the grace confirmed, an ack beyond the input sent ignored;
-  - no guess written after a resize until `repainted()`;
+  - after a resize no guess is written until a snapshot at the current size generation lands, and the repaint is asked for only when a guess would be written or something is drawn;
   - accounting: confirmed, restyled, contradicted, expired, each withdrawal reason, rejected edits.
 
   `sim.rs` gains the fake daemon's `EchoAck` (an echo window over its tty model) and the M3 scenarios (paste, offline release, raw echo-off, slow echo, async writer), on both backends. A session test for the poll: a predicting client's idle session polls at the slow rate after 2 s.
-- **Mutation** (each with both predictors): let a tentative guess be written (`Secret` in the `sudo` trace); drop the `Key` boundary for Enter (same); confirm by glyph alone after a boundary (the prompt trace); skip the mode-change boundary (the asterisk trace); predict inside a paste; drop the idle boundary (`read -s` after silence); classify by attributes (the restyle test counts a misprediction); count a tentative drop as a misprediction; keep the fast poll (the poll test).
+- **Mutation** (each with both predictors): let a tentative guess be written (`Secret` in the `sudo` trace); drop the `Key` boundary for Enter (same); accept a guess's character from the predictor (the forged-prompt trace); accept a predictor-chosen cell in a tentative epoch (same); confirm from a chunk with other changes (the rest-of-prompt trace); allow a gap in `at` (the skipped-key trace); check confirmation before contradiction in a chunk (a chunk that does both confirms); write an ended tentative epoch; check only the cursor's row when nothing is outstanding (the DECSC trace); count an unchanged glyph as the first confirmation (the autosuggestion trace); ask for a repaint on every resize (the lazy-repaint test); skip the mode-change boundary (the asterisk trace); predict inside a paste; drop the idle boundary (`read -s` after silence); classify by attributes (the restyle test counts a misprediction); count a tentative drop as a misprediction; keep the fast poll (the poll test).
 - **Done when:** the above pass; `just predict-mutants` shows every new guard needed with the hostile predictor; the M0 suites pass unchanged; `just predict-harness --seeds 2 --keys 60` runs.
 
 **T1 part 1: the full-stack harness, and true-order resize** (parallel with C1)
@@ -390,23 +419,24 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 - **Owns:** `crates/fil-proto/src/{input.rs, msg.rs, limits.rs}`, `crates/fil-proto/tests/{wire_golden.rs, golden/wire.txt}`, `crates/fil-session/src/{core.rs, serve.rs}` (the repaint path only; `core.rs` after C1's `poll_interval` line), `crates/fil-session/tests/repaint.rs` (new), `crates/fil-client/src/engine.rs` (send the record and track the trusted size generation; one seam, rebased onto E1a if E1a merges first), `crates/fil-client/tests/resize_order.rs` (additions), `DESIGN.md` §2 goal 1, §4.2, §6.2, §8.5.
 - **Builds:** §2.8.
 - **Tests:**
-  - the golden regenerated: the new record kind in `input/`, the new reason with its widest `size_gen`;
+  - the golden regenerated: the new record kind in `input/`, the new reason, `SnapshotInfo.size_gen` at its widest;
   - a session test: a `Repaint` after a resize record gives a snapshot rendered at the new size, with no history lines and no marker, and the client's scrollback (an emulator fed its stream) does not grow;
   - a drag: ten resizes and repaints in 300 ms end with one repaint at the final size, served within a second of the last;
   - a catch-up snapshot announced before the resize and still in flight: the repaint waits for its ack and then renders at the new size;
   - a `Repaint` from a connection that lost the session is ignored;
-  - a client test: a predicting client sends the record after every resize and writes no guess until the matching `size_gen` lands; a non-predicting client sends it only with something drawn;
+  - a client test: after a resize a predicting client sends the record only when it next has a guess to write (an adaptive client on a fast link sends none), and writes nothing until a snapshot at its current `size_gen` lands; a catch-up snapshot at that generation restores trust as well as a repaint; a non-predicting client sends it only with something drawn;
+  - a repaint owed across a swap and across a link drop: the untrusted client resumes with `want_snapshot`, and trust returns with that snapshot;
   - T1's true-order cases end with the oracle equal to the shadow.
-- **Mutation:** send it as a control message (the ordering test renders at the old size); drop a request instead of owing it (the drag test ends damaged); serve it behind the pre-resize snapshot (the catch-up test renders at the old size); render history (the scrollback test grows); bump nothing (the golden test fails).
+- **Mutation:** send it as a control message (the ordering test renders at the old size); send it on every resize (the fast-link test sees a repaint); trust only `Repaint` snapshots (the catch-up-restores-trust test fails); forget an owed repaint on a link drop (the swap test stays untrusted); drop a request instead of owing it (the drag test ends damaged); serve it behind the pre-resize snapshot (the catch-up test renders at the old size); render history (the scrollback test grows); bump nothing (the golden test fails).
 - **Done when:** the above pass, T1's resize cases are clean, and §2 goal 1, §4.2, §6.2 and §8.5 say what the repaint does.
 
 ### Wave 1 (after C1)
 
 **P1: the default predictor**
 - **Owns** (from C1's merge): `crates/fil-predict/src/{mosh.rs, predictor.rs, sim.rs, oracle.rs, driver.rs}`, `crates/fil-predict/tests/predictor.rs` (new), `DESIGN.md` §9 (the default predictor's paragraph) and §16.7's prediction threshold. A `Ctx` field P1 needs is its change, coordinated with P2 (which owns `overlay.rs`).
-- **Builds** (mosh's design, conservative; the core enforces the epochs, so P1 decides only what to guess and how to show it):
+- **Builds** (mosh's design, conservative; the core enforces the epochs and fixes each guess's character and resulting cursor, so P1 decides only where to guess, whether to guess at all, and how to show it):
   - **append** at the cursor when the cells from the cursor to the margin are blank, or hold a suggestion the shell draws (fish's autosuggestion: dim text after the cursor; a typed character overwrites one cell and is right whether the suggestion stays or goes);
-  - **mid-line insert** (shift right) only when the row to the right of the cursor ends at least two columns before the last column, and not when the row ends in a right-aligned run (zsh's `RPROMPT`, detected as a run separated by at least two blanks and ending at the margin); proposed;
+  - **mid-line insert** (shift right) only when the row to the right of the cursor ends at least two columns before the last column, and not when the row ends in a right-aligned run (zsh's `RPROMPT`, detected as a run separated by at least two blanks and ending at the margin); in confirmed epochs only, since the core accepts only the plain forms in a tentative one (§2.3); proposed;
   - **backspace** only over a guess of this epoch or a confirmed character this predictor typed on this row since the last boundary, never over the prompt (M0's "stray blank" case);
   - **left and right arrows and Ctrl-B/Ctrl-F** move the predicted cursor within this epoch's confirmed typed span;
   - **the adaptive switch and the underline rule** of §2.7, from its own echo-time estimate;
@@ -437,9 +467,9 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 
 **P2: the screen view and the budget**
 - **Owns:** `crates/fil-term/src/{lib.rs, backends/*}` (a borrowed screen view: cursor, modes and a row's cells without building a `TermState`), from C1's merge `crates/fil-predict/src/{overlay.rs, keys.rs, tracker.rs, lib.rs}` and `crates/fil-predict/Cargo.toml` (internal reads, plus T2's guards if any), `crates/fil-predict/benches/` or a counting test (new).
-- **Builds:** `ScreenView` without a grid copy on both backends; the overlay reads through it; the measurements of §2.10.
-- **Tests:** a counting test (no `state()` call per key or per output chunk while predicting); the `cat` 100 MB comparison; the keystroke cost at 200x50 on the three machines of done-when 7; `just fidelity` unchanged.
-- **Mutation:** read a full `state(0)` per key (the counting test fails).
+- **Builds:** `ScreenView` without a grid copy on both backends, including a `row_stamp` from the backend (a per-row write counter, or `alacritty_terminal`'s damage tracking) that replaces C1's hash (§2.4 rule 3); the overlay reads through it; the measurements of §2.10.
+- **Tests:** `row_stamp` changes on every glyph change of its row on both backends (a randomized test against C1's hash: never the same stamp across a glyph change); a counting test (no `state()` call per key or per output chunk while predicting); the `cat` 100 MB comparison; the keystroke cost at 200x50 on the three machines of done-when 7; `just fidelity` unchanged.
+- **Mutation:** read a full `state(0)` per key (the counting test fails); leave the stamp unchanged on a write that replaces a glyph with another (the stamp test fails).
 - **Done when:** §2.10's numbers are met and recorded in `docs/m3/harness.md`.
 
 **T3: latency and drop-in tooling** (parallel; no product code)
@@ -458,7 +488,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 ### Wave 2
 
 **T1 part 2: the prediction suites** (after P1 and E1a)
-- **Owns:** T1's files, and from P1's merge the test-only flush tap in `crates/fil-client/src/display.rs` (behind `fil-client`'s test feature, which `just release-deps` and `just no-test-hooks` keep out of the release binary).
+- **Owns:** T1's files, and from E1a's merge the test-only flush tap in `crates/fil-client/src/display.rs`, behind `fil-client`'s test feature. The tap compiles in a marker string, `FIL_TEST_FLUSH_TAP`, so the existing `just no-test-hooks` (which fails on any `FIL_TEST_*` string in a binary, and runs in the recipes that install `fil`) keeps it out of the release binary with no change to the recipe; T1 part 2 adds a test that the marker is present only with the feature.
 - **Builds:** the faithful, slow, adversarial and fault categories of §2.5 on real programs (bash, zsh with `RPROMPT`, fish, dash, Python 3.13+ in both REPLs, raw and canonical `cat`, `read`, `read -s`, a Python `getpass`, an asterisk-echo program, a slow-echo program, the M0 adversary, a background writer), at 50, 150 and 400 ms RTT, jitter, 2 % loss on QUIC, both transports, macOS and Linux; the faults of §2.6 injected mid-typing: a killed link (resume), a swap, a catch-up snapshot, a takeover by a second in-process client, true-order resizes (repaired by W1), offline typing with and without the confirmation.
 - **The independent classifier (§5.4):** the oracle terminal gets the structured flush (erase, server bytes, paint) through the tap, feeds a reference emulator the server parts only, and classifies every written glyph itself. A count that differs from `PredictStats` fails the run.
 - **Tests:** the classifier's own unit tests (a confirmed, a contradicted and a withdrawn glyph, each classified right from bytes alone).
@@ -476,6 +506,7 @@ Owned in sequence, never in parallel:
 - `crates/fil-predict/src/{overlay.rs, keys.rs, tracker.rs, lib.rs}`, `Cargo.toml`: C1, then P2 (T2's guards go through whichever holds `overlay.rs`).
 - `crates/fil-predict/src/{mosh.rs, predictor.rs, sim.rs, oracle.rs, driver.rs}`: C1, then P1.
 - `crates/fil-client/src/display.rs`: C1 (compile fix), then E1a, then T1 part 2 (the tap).
+- `ScreenView::row_stamp`: defined and hashed by C1, replaced by P2.
 - `crates/fil-client/src/engine.rs`: E1a and W1's one seam, whichever is second merges main.
 - `crates/fil-client/tests/common/mod.rs`: one-line registrations by T1 and E1a, merged by the second.
 - `crates/fil-session/src/core.rs`: C1 (`poll_interval`), then W1, then K1.
@@ -491,7 +522,7 @@ Owned in sequence, never in parallel:
 ### 4.1 Secrets
 
 - **Hard rule (core):** nothing is written while the PTY is canonical with echo off (§9), which is what `sudo`, `ssh`, `passwd`, `read -s` and `getpass` look like.
-- **Raw mode with echo off** is also what every line editor looks like (readline, zsh's ZLE, fish), which do their own echo: forbidding prediction there would turn it off in every shell. Raw-mode secrets are therefore protected by the core's epochs (§2.4 rules 2 to 4): a key is written only in an epoch the core has confirmed itself, from the program's own echo, at the guessed cell, with the cursor where the guess put it, in output that came after the key was sent; and every Enter or control key, mode change, unexplained output, paste or other unpredicted input, resume and pause of 1 s starts a new, unconfirmed epoch. None of this depends on the predictor, and the guards' tests run with the hostile one.
+- **Raw mode with echo off** is also what every line editor looks like (readline, zsh's ZLE, fish), which do their own echo: forbidding prediction there would turn it off in every shell. Raw-mode secrets are therefore protected by the core's epochs (§2.4 rules 2 to 4): a key is written only in an epoch the core has confirmed itself, from output that changed nothing but that epoch's guessed cells, to exactly the characters typed, with the cursor where the core computed, after the keys were sent; and every Enter or control key, mode change, unexplained output (anywhere on the screen), paste or other unpredicted input, resume and pause of 1 s starts a new, unconfirmed epoch. The predictor cannot choose a guess's character, its resulting cursor, or (in a tentative epoch) its cell, and cannot skip a key. None of this depends on the predictor, and the guards' tests run with a hostile one that guesses the prompt.
 - **What remains** is OQ-1 (§4.4).
 - **Every suite checks it:** the `Secret` oracle kind, and the reserved-alphabet check on everything written (§5.2).
 
@@ -509,15 +540,16 @@ Nothing new: prediction is local to the client. `EchoAck` and `PtyMode` already 
 
 Only where the answer is a §11 trade-off or the milestone's own done-when. Each has an interim default that the packages build to.
 
-**OQ-1: the raw-mode secret residual (§11).** After C1, a typed key is written only in an epoch the core has confirmed: since the last Enter or other control key (anything but Backspace and the left and right arrows), PTY mode change, unexplained output, paste or other unpredicted input, resume, or pause of 1 s, the program has echoed one of this epoch's guesses at its cell, with the cursor where the guess put it, in output that arrived after that key was sent. What can still be written:
+**OQ-1: the raw-mode secret residual (§11).** After C1, a typed key is written only in an epoch the core has confirmed. An epoch starts at every Enter or other control key (anything but a printable key, Backspace, the left and right arrows, Ctrl-B and Ctrl-F), PTY mode change, unexplained output (§2.4 rule 3), paste or other unpredicted input, resume, and pause of 1 s. It is confirmed only by one output chunk, received after the keys were sent, that changes no glyph except the epoch's guessed cells (right of the cursor on its row and attribute-only changes aside), puts exactly the typed characters in them, changes at least one of them, and leaves the cursor where the core computed. The core fixes each guess's character and resulting cursor, and a predictor can neither skip a key nor choose a cell in an unconfirmed epoch, so nothing below depends on the predictor. What can still be written:
 
-1. **A program that starts reading a secret inside a confirmed epoch without changing the terminal mode or printing anything first.** For example, a raw-mode editor that echoes normal text and then, on a printable key, starts taking the following keys as a secret without echoing them. The keys typed before the core learns of it are written: it learns at the first `EchoAck` that shows a key unechoed (about one round trip plus the 50 ms echo window), and writes nothing new from then on.
-2. **A mode change not yet reported.** For example, `sleep 3; read -s` with the password typed ahead while the kernel still echoes (canonical, echo on, which confirms the epoch): keys typed between `read -s` turning echo off and the report reaching the client (the daemon's poll, 50 ms while active, plus the one-way delay) are written.
-3. **Output that happens to match.** Output that puts exactly the guessed character at the guessed cell, leaves the cursor exactly where the guess said, and arrives after the key was sent confirms the epoch as an echo would. This needs a one-character prompt equal to the typed key at the cursor's column, so it is rare.
+1. **A program that starts reading a secret inside a confirmed epoch, on a key that is not a boundary** (a printable key, Backspace, a left or right arrow, Ctrl-B or Ctrl-F), without changing the terminal mode or drawing anything first. For example, a raw-mode editor that echoes normal text and then, on a printable key, takes the following keys as a secret without echoing them. The keys typed before the core learns of it are written: it learns at the first `EchoAck` that shows a key unechoed (about one round trip plus the 50 ms echo window after that key), and writes nothing new from then on.
+2. **A mode change not yet reported.** For example, `sleep 3; read -s` with the password typed ahead while the kernel still echoes (canonical, echo on, which confirms the epoch). The keys written are those typed from about one one-way delay before `read -s` turns echo off (they are already on their way and the kernel will not echo them) until the report reaches the client (the daemon's poll, 50 ms while active, plus the one-way delay back): about one round trip plus the poll.
+3. **Output that equals the typed keys.** A program that, in one chunk after the keys were sent, writes exactly the characters typed into exactly the cells the core computed, nothing else outside the two exemptions, and leaves the cursor after them, confirms the epoch as an echo would. Only an echo, or a program that reproduces the user's own keys at the cursor, does that.
+4. **A secret prompt drawn only where the core does not look.** Inside a confirmed epoch, a program that announces secret entry only by drawing to the right of the cursor on the cursor's row, or only by changing attributes (on any row), and leaves the cursor where the guesses say, is not `Unexplained`: those two exemptions are what let fish's autosuggestions, zsh's `RPROMPT` and syntax highlighting be predicted at all (§2.4 rule 3). Its keys are then exposed as in case 1. Changes on other rows are seen (`row_stamp`), with the cursor put back or not.
 
-In every case a guess once written is written: how long it stays on the screen does not matter, because the terminal, its recorders and anything sharing the screen have it, whether it is withdrawn at the next output, kept through a link drop until the 10 s backstop, or confirmed. mosh has the same exposure, with fewer boundaries.
+In every case a guess once written is written: how long it stays on the screen does not matter, because the terminal, its recorders and anything sharing the screen have it, whether it is withdrawn at the next output, kept through a link drop until the 10 s backstop, or confirmed. mosh has the same exposure, with fewer boundaries and no checks on its predictor.
 
-- **Recommendation:** accept it, with the core's boundaries of §2.4; document it in the §11 table next to the offline-input log; `predict = "off"` per host for anyone who disagrees. The strict alternative, never predicting with echo off, disables prediction in every shell.
+- **Recommendation:** accept it, with the core's rules of §2.4; document it in the §11 table next to the offline-input log; `predict = "off"` per host for anyone who disagrees. The strict alternative, never predicting with echo off, disables prediction in every shell.
 - **Interim:** accepted and documented; the owner can veto it before V1.
 
 **OQ-2: what "no visible mispredictions in the harness" means** (§15's done-when). Zero corruption and zero secrets everywhere; zero visible mispredictions on programs that echo faithfully, including ones that echo late; at most one written epoch per contradiction on programs that echo something else or share the terminal with another writer; lifecycle withdrawals (takeover, exit, snapshot, resize, a link drop's backstop) counted apart (§2.5)? Or zero on everything, which no predictor can meet when a program echoes something else or another process writes to the terminal?
@@ -534,7 +566,7 @@ In every case a guess once written is written: how long it stays on the screen d
 | PC-3 | The core's boundaries and the strict first confirmation (§2.4). |
 | PC-4 | Visible misprediction is by glyph, not attributes; lifecycle withdrawals counted apart (§2.5). |
 | PC-5 | No prediction of offline input, answers or escapes; written guesses kept through a link drop with a 10 s backstop (§2.6). |
-| PC-6 | W1's repaint is in-band, owed and coalesced, screen only (§2.8). |
+| PC-6 | W1's repaint is in-band, asked for lazily, owed and coalesced, screen only; every snapshot carries its size generation (§2.8). |
 | PC-7 | `--predict` flag; tunables stay constants (§2.7). |
 | PC-8 | mosh's adaptive thresholds, on P1's own `EchoAck`-based estimate (§2.7). |
 | PC-9 | No alternate-screen prediction in M3 (§1). |
@@ -611,7 +643,7 @@ Five independent read-only audits of the whole tree, then fix PRs, then a verifi
 
 ### Risks
 
-1. **Writing a secret.** A rule gap writes typed secret characters to the terminal, where recorders keep them. *Mitigations:* the epochs and boundaries in the core, not the predictor, each with a guard and a trace run with the hostile predictor; the strict first confirmation; the reserved-alphabet check in every suite; OQ-1 settled before V1.
+1. **Writing a secret.** A rule gap writes typed secret characters to the terminal, where recorders keep them. *Mitigations:* the epochs and boundaries in the core, not the predictor, each with a guard and a trace run with a hostile predictor that guesses prompts; the core fixes each guess's character, cursor and (in a tentative epoch) cell; the first confirmation needs a whole chunk explained; other rows watched by `row_stamp`; the reserved-alphabet check in every suite; OQ-1 settled before V1.
 2. **Real terminals disagree with the emulators.** The core was proved only against alacritty and vt100. A terminal that keeps a pending wrap across `CUP`, reflows differently, or measures a glyph differently makes the erase wrong, which is corruption, not a misprediction. *Mitigations:* T2 first, on four terminals; a guard per disagreement; §2.4 rule 9 and W1 for reflow.
 3. **Resize damage**, now frequent. *Mitigations:* T1's true-order reproduction in both directions; W1's in-band, coalesced repaint; no guess written until it lands.
 4. **"Zero visible mispredictions" on real shells.** Syntax highlighting, autosuggestions, right prompts, vi modes, late echoes and redisplays can contradict good guesses. *Mitigations:* the faithful and slow suites include them from P1's start; the late-echo grace; conservative scope (§1 non-goals); OQ-2's split bar; the epochs.

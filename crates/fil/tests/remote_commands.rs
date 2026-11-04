@@ -35,16 +35,18 @@ const FIL: &str = env!("CARGO_BIN_EXE_fil");
 const HOST: &str = "devbox";
 
 /// The fake `ssh`: records its arguments (one file per run, one argument per NUL-terminated
-/// record), then, with no remote `HOME` configured, exits 255 with nothing printed, as ssh does
+/// record, written under a dot name and renamed into place whole, so the test never reads a
+/// record half written), then, with no remote `HOME` configured, exits 255 with nothing printed, as ssh does
 /// for a host it cannot reach. With one, it runs the remote part as the host's login shell would
 /// (ssh joins the words with spaces and hands them to the shell's `-c`), under a umask of 027,
 /// recording its process id (the relay's, after the `exec`s) for the test to kill. With
 /// `FAKE_SSH_FORCE` set it runs `fil server --stdio` whatever it was asked, as a forced command
 /// does; with `FAKE_SSH_TRUE` it prints nothing and exits 0, as a forced `/bin/true` does.
 const FAKE_SSH: &str = r#"#!/bin/sh
-f="$FAKE_SSH_LOG/call.$$"
+f="$FAKE_SSH_LOG/.call.$$"
 : > "$f"
 for a in "$@"; do printf '%s\0' "$a" >> "$f"; done
+mv "$f" "$FAKE_SSH_LOG/call.$$"
 [ -z "$FAKE_SSH_TRUE" ] || exit 0
 [ -n "$FAKE_REMOTE_HOME" ] || exit 255
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
@@ -297,11 +299,14 @@ impl World {
     /// log is emptied, and the runs are kept in [`World::seen`].
     fn calls(&self) -> Vec<Vec<String>> {
         let dir = self.root.join("log");
+        // Only whole records: one still being written has a dot name.
         let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
             .unwrap()
-            .map(|e| {
-                let p = e.unwrap().path();
-                (std::fs::metadata(&p).unwrap().modified().unwrap(), p)
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .filter_map(|e| {
+                let p = e.path();
+                Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))
             })
             .collect();
         files.sort();
@@ -323,25 +328,68 @@ impl World {
 
     /// Kills the relays the fake started that are still running: the pipe drops, as when a
     /// network path dies, and the client reconnects in the background. Only processes this
-    /// world's fake recorded, and only while `ps` still shows them as a relay.
+    /// world's fake recorded, and their descendants, never a daemon (`fil server --daemon`,
+    /// which a relay may have started, with its sessions below it).
+    ///
+    /// The recorded process is the login shell that runs the remote part, and whether that
+    /// shell `exec`s its last command differs: bash and zsh do, dash (Debian's and Ubuntu's
+    /// `/bin/sh`) does not, so there the relay is its child. So the whole tree goes, or the relay
+    /// would keep the pipe open.
     fn kill_relays(&self) -> usize {
-        let mut killed = 0;
-        for e in std::fs::read_dir(self.root.join("pids")).unwrap().flatten() {
-            let pid = e.file_name().to_string_lossy().into_owned();
-            let _ = std::fs::remove_file(e.path());
-            let Ok(out) = Command::new("ps")
-                .args(["-o", "command=", "-p", &pid])
-                .output()
-            else {
-                continue;
-            };
-            let cmdline = String::from_utf8_lossy(&out.stdout);
-            if cmdline.contains("server --stdio") {
-                let _ = Command::new("kill").args(["-KILL", &pid]).status();
-                killed += 1;
+        let roots: Vec<u32> = std::fs::read_dir(self.root.join("pids"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let _ = std::fs::remove_file(e.path());
+                e.file_name().to_string_lossy().parse().ok()
+            })
+            .collect();
+        let Ok(out) = Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,args="])
+            .output()
+        else {
+            return 0;
+        };
+        let table: Vec<(u32, u32, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let pid = f.next()?.parse().ok()?;
+                let ppid = f.next()?.parse().ok()?;
+                Some((pid, ppid, f.collect::<Vec<_>>().join(" ")))
+            })
+            .collect();
+        let is_daemon = |args: &str| args.contains("server --daemon");
+        let mut doomed = Vec::new();
+        let mut todo: Vec<u32> = roots
+            .iter()
+            .copied()
+            // Only a recorded process that is still a relay or its shell, never a process that
+            // took over a recorded number since.
+            .filter(|r| {
+                table
+                    .iter()
+                    .any(|(p, _, a)| p == r && !is_daemon(a) && a.contains("server --stdio"))
+            })
+            .collect();
+        while let Some(pid) = todo.pop() {
+            doomed.push(pid);
+            for (p, pp, a) in &table {
+                if *pp == pid && !is_daemon(a) && !doomed.contains(p) {
+                    todo.push(*p);
+                }
             }
         }
-        killed
+        let relays = table
+            .iter()
+            .filter(|(p, _, a)| doomed.contains(p) && a.contains("server --stdio"))
+            .count();
+        for pid in &doomed {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        relays
     }
 
     /// Waits until a recorded run satisfies `pred`, and classifies it.

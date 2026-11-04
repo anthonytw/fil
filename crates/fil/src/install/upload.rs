@@ -274,12 +274,15 @@ pub fn choose(
             return check(bytes, Source::Bundle(dir));
         }
     }
+    // A build that is not marked as a release is never sent as itself, whatever its size or
+    // target: said first, and without reading the file (a development build with its debug
+    // information is larger than the cap on Linux).
+    if !release {
+        return Err(Refusal::NotRelease);
+    }
     let bytes = read(exe)?;
     if !fits(&bytes, remote) {
         return Err(Refusal::NoBinary(remote.describe()));
-    }
-    if !release {
-        return Err(Refusal::NotRelease);
     }
     check(bytes, Source::Itself)
 }
@@ -443,6 +446,17 @@ mod tests {
             choose(Remote::MacArm64, None, &l.exe(), true),
             Err(Refusal::NoBinary(_))
         ));
+        // Not a release: said before the file is read, whatever its size.
+        let big = l.exe().with_file_name("big-fil");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_UPLOAD + 1)
+            .unwrap();
+        assert_eq!(
+            choose(Remote::LinuxAarch64, None, &big, false),
+            Err(Refusal::NotRelease)
+        );
+        let _ = std::fs::remove_file(&big);
     }
 
     #[test]

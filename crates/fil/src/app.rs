@@ -108,7 +108,6 @@ async fn run(action: Action, config: &Config) -> u8 {
             json,
             probe_other,
         } => cmds::ports(target, json, probe_other, config).await,
-        #[cfg(feature = "install-bootstrap")]
         Action::Install { host, request } => {
             crate::install::client::run(&host, &request, &config.for_host(&host)).await
         }
@@ -221,7 +220,8 @@ async fn attach(
 /// `ClientError::VersionMismatch` (or `VersionRefused`, without the numbers), and it arrives
 /// before the terminal goes raw, which happens only once the first attach's snapshot is complete
 /// (`fil_client::engine`, `enter_session_screen`). So the fallback needs no change in
-/// `fil-client`. Gated on M4 OQ-1: nothing acts on it yet.
+/// `fil-client`. Nothing acts on it yet: the attach wiring that uses it is still to come
+/// (`docs/m4/install.md`).
 pub fn fallback_outcome(e: &ClientError) -> Option<crate::install::fallback::Outcome> {
     match e {
         ClientError::VersionMismatch(_) | ClientError::VersionRefused => {

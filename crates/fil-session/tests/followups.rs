@@ -297,18 +297,33 @@ async fn a_takeover_between_the_catch_up_decision_and_its_answer_is_announced() 
     let sc = Scratch::new();
     let h = spawn_plain(flood_config(&sc, "a")).await;
     let gate = h.gate_catch_up();
-    let mut a = Client::connect(&h, Connect::new(&h, key(1)));
+    // A link of two segments: the connection blocks sending as soon as the client stops reading.
+    let mut a = Client::connect_with(&h, Connect::new(&h, key(1)), 2);
     a.wait("the attach reply", |c| c.reply.is_some()).await;
     // It acknowledges READY (which confirms the attach snapshot: no catch-up is announced
-    // before that), and nothing after, so it falls behind.
+    // before that), and nothing after.
     a.wait_screen("READY").await;
     a.auto_ack = false;
     a.type_bytes(b"\n").await;
+    // The flood piles up unsent while the client does not read.
+    wait_log_end(&h, 600_000).await;
 
-    // The connection reaches the point of asking the core for a snapshot, and waits there.
-    timeout(Duration::from_secs(15), gate.arrived.notified())
-        .await
-        .expect("the connection decided to catch up");
+    // The client reads; the connection gets to send again, finds far more than the threshold
+    // unsent, reaches the point of asking the core for a snapshot, and waits there.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        a.drain(Duration::from_millis(20)).await;
+        if timeout(Duration::from_millis(1), gate.arrived.notified())
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the connection decided to catch up"
+        );
+    }
     // The takeover is handled by the core while it waits.
     let _b = Client::attach(&h, Connect::new(&h, key(2)).host("desktop")).await;
     gate.proceed.notify_one();

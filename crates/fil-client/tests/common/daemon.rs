@@ -52,6 +52,19 @@ impl Segment {
     }
 }
 
+/// Where the output in flight at a catch-up goes ([`FakeDaemon::catch_up_in_flight`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InFlight {
+    /// Behind the announcement, ahead of the snapshot's bytes (the pipe; QUIC's control first).
+    BeforeSnapshot,
+    /// Behind the snapshot's bytes too (QUIC: channel 2 is a stream of its own).
+    AfterSnapshot,
+    /// Never: the link dies after the snapshot's bytes, before the output arrives.
+    Lost,
+    /// Never, and the link stays up: a peer or transport that lost what it accepted.
+    Withheld,
+}
+
 pub const NOW_MS: u64 = 1_700_000_000_000;
 
 /// What reached the daemon on the terminal channel, in arrival order. The effective size is the
@@ -1357,6 +1370,8 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        // As the real daemon states it: everything from what it has sent to `at`.
+        let skipped = at - st.sent;
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.pending_jump = Some(at);
         st.sent = at;
@@ -1364,7 +1379,7 @@ impl FakeDaemon {
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
-            skipped: skip.len() as u64,
+            skipped,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
             size_gen: st.size_gen,
         };
@@ -1394,6 +1409,118 @@ impl FakeDaemon {
         }
     }
 
+    /// A catch-up while output the daemon has sent is still on its way (PR #110's B1):
+    /// `in_flight` was sent before the jump and has not reached the client yet, and `skip` is
+    /// never sent. The announcement goes on control, which overtakes the output on every
+    /// transport (the pipe's scheduler, QUIC's stream priority). The snapshot is what the real
+    /// daemon renders for a catch-up: the gap prologue (the client's screen scrolled into its
+    /// scrollback, then a marker line), then `history` lines of history (`unseen_history`: only
+    /// what scrolled off since the client's position) and the screen.
+    pub async fn catch_up_in_flight(
+        &self,
+        in_flight: &[u8],
+        skip: &[u8],
+        history: usize,
+        order: InFlight,
+    ) {
+        let mut st = self.st.lock().await;
+        assert!(st.pending_jump.is_none(), "one snapshot at a time");
+        let Some(link) = st
+            .current
+            .and_then(|id| st.conns.get(&id))
+            .map(|c| c.link.clone())
+        else {
+            return;
+        };
+        self.pump(&mut st).await;
+        let mut flight = Vec::new();
+        st.log.append(in_flight);
+        st.emu.feed(in_flight);
+        for chunk in in_flight.chunks(MAX_DATA_PAYLOAD) {
+            flight.push(Segment {
+                seq: st.sent,
+                data: chunk.to_vec(),
+            });
+            st.sent += chunk.len() as u64;
+        }
+        st.log.append(skip);
+        st.emu.feed(skip);
+        let state = st.emu.state(history);
+        let mut bytes = format!(
+            "\x1b[{};1H\r\n-- skipped --{}\x1b[H",
+            state.size.rows,
+            "\r\n".repeat(usize::from(state.size.rows))
+        )
+        .into_bytes();
+        bytes.extend(fil_term::snapshot::snapshot(&state));
+        let at = st.log.end();
+        let info = SnapshotInfo {
+            at,
+            len: bytes.len() as u64,
+            skipped: at - st.sent,
+            reason: fil_proto::msg::SnapshotReason::TooFarBehind,
+            size_gen: st.size_gen,
+        };
+        st.flows.insert(key_of(&link), at); // as `Flow::jump`
+        st.pending_jump = Some(at);
+        st.sent = at;
+        st.snapshots += 1;
+        let terminal = |segs: Vec<Segment>| {
+            let link = link.clone();
+            async move {
+                for seg in segs {
+                    let _ = link
+                        .send(ChannelId::TERMINAL, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+        };
+        let snapshot = || {
+            let link = link.clone();
+            let bytes = bytes.clone();
+            async move {
+                let mut off = 0u64;
+                for chunk in bytes.chunks(MAX_DATA_PAYLOAD) {
+                    let seg = Segment {
+                        seq: off,
+                        data: chunk.to_vec(),
+                    };
+                    off += chunk.len() as u64;
+                    let _ = link
+                        .send(ChannelId::SNAPSHOT, Bytes::from(seg.payload()))
+                        .await;
+                }
+            }
+        };
+        match order {
+            InFlight::BeforeSnapshot => {
+                // Sent before the jump, still queued: the announcement overtakes it.
+                terminal(flight).await;
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+                snapshot().await;
+            }
+            InFlight::AfterSnapshot => {
+                // On QUIC the snapshot's bytes are a stream of their own and can overtake it too.
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+                snapshot().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                terminal(flight).await;
+            }
+            InFlight::Lost => {
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+                snapshot().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if let Some(c) = st.current.and_then(|id| st.conns.get(&id)) {
+                    c.control.kill(DownReason::Dead);
+                }
+            }
+            InFlight::Withheld => {
+                let _ = send(&link, &ControlMsg::Snapshot(info)).await;
+                snapshot().await;
+            }
+        }
+    }
+
     /// REVIEW: terminal data past `at` arrives *before* the `Snapshot` announcement (control is
     /// a separate QUIC stream, so the Link contract allows it).
     pub async fn catch_up_announcement_overtaken(&self, skip: &[u8], after: &[u8]) {
@@ -1416,13 +1543,15 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        // As the real daemon states it: everything from what it has sent to `at`.
+        let skipped = at - st.sent;
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
-            skipped: skip.len() as u64,
+            skipped,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
             size_gen: st.size_gen,
         };
@@ -1535,13 +1664,15 @@ impl FakeDaemon {
         };
         let bytes = fil_term::snapshot::snapshot(&st.emu.state(1000));
         let at = st.log.end();
+        // As the real daemon states it: everything from what it has sent to `at`.
+        let skipped = at - st.sent;
         st.flows.insert(key_of(&link), at); // as `Flow::jump`
         st.pending_jump = Some(at);
         st.snapshots += 1;
         let info = SnapshotInfo {
             at,
             len: bytes.len() as u64,
-            skipped: skip.len() as u64,
+            skipped,
             reason: fil_proto::msg::SnapshotReason::TooFarBehind,
             size_gen: st.size_gen,
         };

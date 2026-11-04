@@ -74,6 +74,15 @@ const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
 /// How long output may sit behind a gap in the terminal stream before the link is given up on.
 const GAP_PATIENCE: Duration = Duration::from_secs(5);
+/// How long a mid-stream snapshot may be held with no progress at all, neither in the terminal
+/// stream below its position nor in its own bytes, before the link is given up on (DESIGN.md
+/// section 6.2). Progress comes a segment (up to 16 KiB) at a time, so a live link trips this
+/// only below about 4.4 kbit/s of terminal and snapshot data combined (reachable when many busy
+/// forwards share a slow QUIC link); a dead one goes `Down` long before (`dead_after`, 5 s, is
+/// not configurable). It is meant for a link that stays up but has lost what it accepted, and a
+/// false trip costs one exact resume (a held snapshot has not moved the position). Six times
+/// `dead_after`, for margin.
+const SNAPSHOT_PATIENCE: Duration = Duration::from_secs(30);
 /// After `SessionExited`, how long the link may stay up while its last output is read. The daemon
 /// flushes and closes right after sending it, so this is only a bound for a daemon that does not.
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
@@ -234,6 +243,9 @@ struct Conn {
     /// next one waits here until they have. One at a time leaves room for one more, no more.
     snap_next: Option<SnapshotInfo>,
     early_bytes: usize,
+    /// While a mid-stream snapshot is held: what it last progressed to (its `at`, the terminal
+    /// position, its bytes received) and when ([`SNAPSHOT_PATIENCE`]).
+    snap_progress: Option<((u64, u64, u64), Instant)>,
 }
 
 impl Conn {
@@ -249,12 +261,38 @@ impl Conn {
             snap_early: Vec::new(),
             snap_next: None,
             early_bytes: 0,
+            snap_progress: None,
+        }
+    }
+
+    /// When a held mid-stream snapshot is given up on if nothing moves before then
+    /// ([`SNAPSHOT_PATIENCE`]); `terminal` is the terminal stream's position.
+    fn snapshot_stall_deadline(&mut self, terminal: u64) -> Option<Instant> {
+        let Some(s) = self.snap.as_ref().filter(|s| s.until.is_some()) else {
+            self.snap_progress = None;
+            return None;
+        };
+        let now = (s.info.at, terminal, s.recv.received());
+        match self.snap_progress {
+            Some((seen, since)) if seen == now => Some(since + SNAPSHOT_PATIENCE),
+            _ => {
+                let since = Instant::now();
+                self.snap_progress = Some((now, since));
+                Some(since + SNAPSHOT_PATIENCE)
+            }
         }
     }
 }
 
 struct Snap {
     info: SnapshotInfo,
+    /// For a mid-stream snapshot, the terminal position it applies at: where the daemon's stream
+    /// was when it was rendered. The output below it was sent before the snapshot and may still
+    /// be on its way (control goes ahead of data), so it is applied first, as it arrives, and the
+    /// snapshot once the terminal has reached this point. A repaint's is its `at`; a catch-up's
+    /// is `at − skipped`, and the stream continues at `at` after it. `None` for the attach's
+    /// snapshot: the position was reset to `at` with the reply.
+    until: Option<u64>,
     recv: RecvChannel,
     buf: Vec<u8>,
     /// A repaint whose position the terminal stream had already passed when it was announced
@@ -1029,10 +1067,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let result: Result<Served, ClientError> = async {
             Ok(loop {
                 let gap_deadline = primary.conn.gap_since.map(|t| t + GAP_PATIENCE);
-                let wake = match (self.next_wake(), gap_deadline) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                let stall_deadline = primary
+                    .conn
+                    .snapshot_stall_deadline(self.sess.recv.received());
+                let wake = [self.next_wake(), gap_deadline, stall_deadline]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 // No swap before the reply and any snapshot are in, and none without a session
                 // to resume (a fresh attach would reuse the key). None once the session has
                 // exited either: the new path would only hear `SessionGone` and lose the status.
@@ -1166,6 +1207,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             tracing::warn!("terminal data stayed out of order; reconnecting");
                             ended = Some(Served::Reconnect);
                         }
+                        if stall_deadline.is_some_and(|t| Instant::now() >= t) {
+                            tracing::warn!("a held snapshot made no progress; reconnecting");
+                            ended = Some(Served::Reconnect);
+                        }
                     }
                 }
 
@@ -1234,12 +1279,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             .conn
             .snap
             .as_ref()
-            .is_some_and(|s| s.info.reason != SnapshotReason::Repaint)
+            .is_some_and(|s| s.until.is_none())
         {
-            // The snapshot never landed: the terminal and the daemon disagree about the
-            // position, and a snapshot is not resumable. The next attach starts afresh. A
-            // repaint moves no position (the terminal is still where it was), so a resume is
-            // still exact: the repaint it was for is asked for again by `want_snapshot`.
+            // The attach's snapshot never landed: the position was reset to its `at` with the
+            // reply, so the terminal and the daemon disagree about it, and a snapshot is not
+            // resumable. The next attach starts afresh. A mid-stream snapshot moves the position
+            // only when it is written (`finish_snapshot`), so the terminal is still where it
+            // was and a resume is exact: a catch-up's daemon resends or jumps again, and a
+            // repaint is asked for again by `want_snapshot`.
             self.sess.established = false;
         }
         if promoted.is_some() {
@@ -1629,7 +1676,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // has never reached).
                 self.sess.recv = RecvChannel::starting_at(info.at);
                 self.sess.start_acks(info.at);
-                return self.begin_snapshot(conn, info, false);
+                return self.begin_snapshot(conn, info, false, None);
             }
         }
         // A resume: the screen is current as soon as the daemon continues.
@@ -1681,19 +1728,24 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 // repaint is asked for again (the daemon serves at most one a second). No
                 // reconnect: nothing is inconsistent.
                 tracing::debug!("a repaint behind the terminal position; asking again");
-                return self.begin_snapshot(conn, info, true);
+                return self.begin_snapshot(conn, info, true, Some(info.at));
             }
             return Self::reconnect("a mid-stream snapshot behind the terminal position");
         }
-        if info.reason != SnapshotReason::Repaint {
-            // A catch-up jump: what is in flight below `at` is covered by the snapshot.
-            self.sess.recv.skip_to(info.at);
-        }
-        // A repaint is rendered where the daemon's stream was: nothing is skipped, and what is
-        // still in flight below `at` is applied first (`drain_terminal`), so the scrollback loses
-        // nothing. Acks below `at` mean nothing to the daemon's flow either way.
+        // Either kind is rendered where the daemon's stream was, and what it sent before is
+        // still on its way: the announcement (control) overtakes it on every transport. So that
+        // output is applied first (`drain_terminal`), and the snapshot once the terminal has
+        // reached the point: the scrollback loses nothing. A repaint skips nothing; a catch-up
+        // skips `skipped` bytes the daemon never sent, and the terminal position jumps over them
+        // only when the snapshot is written (`finish_snapshot`). Acks below `at` mean nothing to
+        // the daemon's flow either way (it is at `at`).
+        let until = if info.reason == SnapshotReason::Repaint {
+            info.at
+        } else {
+            info.at.saturating_sub(info.skipped)
+        };
         self.sess.start_acks(info.at);
-        self.begin_snapshot(conn, info, false)
+        self.begin_snapshot(conn, info, false, Some(until))
     }
 
     fn begin_snapshot(
@@ -1701,6 +1753,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         conn: &mut Conn,
         info: SnapshotInfo,
         stale: bool,
+        until: Option<u64>,
     ) -> Result<Flow, ClientError> {
         let cap = if stale {
             0
@@ -1709,6 +1762,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         };
         conn.snap = Some(Snap {
             info,
+            until,
             recv: RecvChannel::new(),
             buf: Vec::with_capacity(cap),
             stale,
@@ -1734,7 +1788,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
         }
         if conn.snap.is_some() {
-            // A repaint may be waiting for output that already arrived.
+            // A mid-stream snapshot may be waiting for output that already arrived.
             if let Flow::End(s) = self.drain_terminal(conn)? {
                 return Ok(Flow::End(s));
             }
@@ -1791,16 +1845,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(Flow::Continue)
     }
 
-    /// A repaint's position: the snapshot waits until the terminal stream has reached it.
-    fn repaint_at(conn: &Conn) -> Option<u64> {
+    /// A mid-stream snapshot's position (`Snap::until`): the snapshot waits until the terminal
+    /// stream has reached it.
+    fn snapshot_until(conn: &Conn) -> Option<u64> {
         conn.snap
             .as_ref()
-            .filter(|s| s.info.reason == SnapshotReason::Repaint && !s.stale)
-            .map(|s| s.info.at)
+            .filter(|s| !s.stale)
+            .and_then(|s| s.until)
     }
 
-    /// Finishes a complete snapshot, unless it is a repaint whose position the terminal stream
-    /// has not reached yet: then the output before it is applied first, as it arrives.
+    /// Finishes a complete snapshot, unless it is a mid-stream one whose position the terminal
+    /// stream has not reached yet: then the output before it is applied first, as it arrives.
     fn finish_snapshot_when_due(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
         let complete = conn
             .snap
@@ -1816,7 +1871,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             return self.begin_next_snapshot(conn);
         }
-        let reached = Self::repaint_at(conn).is_none_or(|at| self.sess.recv.received() >= at);
+        let reached = Self::snapshot_until(conn).is_none_or(|at| self.sess.recv.received() >= at);
         if complete && reached {
             return self.finish_snapshot(conn);
         }
@@ -1850,6 +1905,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         d.reset();
         let bytes = d.server(&snap.buf);
         self.write(&bytes)?;
+        // The terminal stream continues at `at`: a catch-up jumps over the bytes it skipped
+        // (never sent); for the others the position is there already.
+        self.sess.recv.skip_to(snap.info.at);
         // The PTY mode in force at the snapshot's point (the last report below it).
         self.apply_modes(snap.info.at)?;
         // The snapshot is on the screen: say so at once. The daemon waits for this ack (not for
@@ -1901,10 +1959,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// snapshot is outstanding, and while a gap (which a not-yet-arrived `Snapshot` will
     /// explain) separates them from the terminal position.
     ///
-    /// Behind a repaint the output below its position is applied (it was sent before the
-    /// snapshot was rendered), and the snapshot once it is reached.
+    /// Behind a mid-stream snapshot (a repaint or a catch-up) the output below its position is
+    /// applied (it was sent before the snapshot was rendered), and the snapshot once it is
+    /// reached.
     fn drain_terminal(&mut self, conn: &mut Conn) -> Result<Flow, ClientError> {
-        let limit = Self::repaint_at(conn);
+        let limit = Self::snapshot_until(conn);
         // Output goes on while a stale repaint's bytes are read and dropped.
         let holding = conn.snap.as_ref().is_some_and(|s| !s.stale);
         if conn.awaiting_reply || (holding && limit.is_none()) {
@@ -1915,7 +1974,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 break;
             }
             if limit.is_some_and(|at| seq + data.len() as u64 > at) {
-                return Self::reconnect("terminal data across a repaint's position");
+                return Self::reconnect("terminal data across a snapshot's position");
             }
             let data = conn.term_held.remove(&seq).expect("just seen");
             conn.held_bytes -= data.len();
@@ -1928,14 +1987,32 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.apply_output(pos, &fresh)?;
             }
         }
+        if limit.is_some_and(|until| self.sess.recv.received() < until)
+            && !conn.term_held.is_empty()
+        {
+            // Output past what is still missing below the snapshot's position has arrived. The
+            // terminal channel keeps its order on every link, so the missing bytes will never
+            // come on this one: the resume is exact (the position has not moved).
+            return Self::reconnect("output below a snapshot's position was lost");
+        }
         conn.gap_since = match (conn.term_held.is_empty(), conn.gap_since) {
+            // Output past a snapshot's position waits for the snapshot, which is announced: not
+            // a gap. (On a slow link the output before a catch-up's position can take many
+            // seconds to arrive, §6.2.) So does output past one announced behind a stale repaint.
+            _ if holding || conn.snap_next.is_some() => None,
             (true, _) => None,
             (false, None) => Some(Instant::now()),
             (false, since) => since,
         };
         // Also when nothing was new: a resend of what the terminal already has (a swap's) is
-        // still owed an ack on this link.
-        self.after_output();
+        // still owed an ack on this link. No repaint is asked for behind a snapshot rendered at
+        // the client's size: it repairs the screen when it lands (one at an older size asks
+        // once it has).
+        let repairs = conn
+            .snap
+            .as_ref()
+            .is_some_and(|s| !s.stale && s.info.size_gen >= self.size_gen);
+        self.after_output(!repairs);
         if limit.is_some() {
             return self.finish_snapshot_when_due(conn);
         }
@@ -1984,10 +2061,12 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(())
     }
 
-    /// Acks, when due, after output was applied; and asks for a repaint if the output made the
-    /// overlay draw on an untrusted screen.
-    fn after_output(&mut self) {
-        self.send_repaint();
+    /// Acks, when due, after output was applied; and, with `repaint`, asks for a repaint if the
+    /// output made the overlay draw on an untrusted screen.
+    fn after_output(&mut self, repaint: bool) {
+        if repaint {
+            self.send_repaint();
+        }
         if let Some(upto) = self.sess.ack_if_due() {
             self.send_ctl(&ControlMsg::Ack {
                 channel: ChannelId::TERMINAL,

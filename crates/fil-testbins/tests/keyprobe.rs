@@ -68,6 +68,82 @@ fn keys_through_a_raw_cat_are_all_echoed_with_sane_latency() {
     assert!(val(&l, "max_ms") < 1000.0, "{l}");
 }
 
+/// `--screen` on the same raw `cat`, with no prediction anywhere: every glyph appears in the read
+/// that carries its byte, so the screen and the bytes agree on every key (within 1 ms, `T3` in
+/// `docs/m3/plan.md`), and the final screen holds exactly the keys typed. 300 keys from column 11
+/// (the raw tty does not return the carriage after `KP-READY-42`) wrap the 100 columns three times.
+#[test]
+fn the_screen_agrees_with_the_bytes_on_a_raw_cat() {
+    let out = run(&[
+        "keys",
+        "--screen",
+        "--rate",
+        "200",
+        "--count",
+        "300",
+        "--warmup",
+        "5",
+        "--ready",
+        "KP-READY-42",
+        "--settle-ms",
+        "100",
+        "--drain-ms",
+        "3000",
+        "--fast-ms",
+        "1000",
+        "--",
+        "/bin/sh",
+        "-c",
+        ECHO,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let bytes = line(&out, "KEYPROBE-BYTES ");
+    let screen = line(&out, "KEYPROBE mode=screen ");
+    for l in [&bytes, &screen] {
+        assert_eq!(val(l, "echoed"), 300.0, "{l}");
+        assert_eq!(val(l, "lost"), 0.0, "{l}");
+    }
+    for k in ["p50_ms", "p99_ms", "max_ms"] {
+        let d = (val(&screen, k) - val(&bytes, k)).abs();
+        assert!(d < 1.0, "{k} differs by {d} ms:\n{bytes}\n{screen}");
+    }
+    assert!(val(&screen, "vs_bytes_max_ms") < 1.0, "{screen}");
+    assert_eq!(val(&screen, "vanished"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_wrong"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_extra"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_cursor"), 1.0, "{screen}");
+    // Every local echo is within a second.
+    assert_eq!(val(&screen, "fast"), 300.0, "{screen}");
+}
+
+/// `--quit` types its text at the end and waits for the program to end by itself.
+#[test]
+fn quit_ends_the_program_and_says_so() {
+    let out = run(&[
+        "keys",
+        "--screen",
+        "--rate",
+        "100",
+        "--count",
+        "20",
+        "--warmup",
+        "0",
+        "--ready",
+        "KP-READY-42",
+        "--settle-ms",
+        "100",
+        "--quit",
+        "Q",
+        "--",
+        "/bin/sh",
+        "-c",
+        // An echo, byte by byte, that ends at a `Q`.
+        "stty raw -echo; echo KP-READY-$((6*7)); while c=$(dd bs=1 count=1 2>/dev/null) && [ \"$c\" != Q ]; do printf %s \"$c\"; done",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(val(&line(&out, "KEYPROBE mode=screen "), "quit"), 1.0);
+}
+
 #[test]
 fn the_shell_setup_is_typed_into_an_interactive_shell() {
     let out = run(&[

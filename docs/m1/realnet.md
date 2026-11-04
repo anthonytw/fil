@@ -18,7 +18,7 @@ The first two drive the real binary; the rest are the stand-ins. The PTY side of
 |---|---|---|
 | `ptydrive serve NAME -- COMMAND...` and `ptydrive ctl NAME VERB` | The terminal for the real `fil` client. `serve` runs COMMAND on a pseudo-terminal (200 rows by 100 columns, so a test's whole output stays on the screen) and keeps a headless screen of what it prints. `ctl` types (`send '\r~.'` is Enter, then the detach escape), waits for text on the screen or in the raw output, prints the screen, and reads the exit status. Scenarios call it between `docker exec`s and `kill`s | `portable-pty`, `vt100` |
 | `sockprobe PATH` | What a stranger sees when connecting to a Unix socket: refused, hung up on, or greeted | |
-| `keyprobe keys` / `keyprobe drain` | The latency lab's probe (`docs/m2/latency.md`): types keys at a fixed rate on a pty and timestamps each echo; or reads and discards a big output, counting catch-up markers | `portable-pty` |
+| `keyprobe keys` / `keyprobe drain` | The latency lab's probe (`docs/m2/latency.md`): types keys at a fixed rate on a pty and timestamps each echo (with `--screen`, each glyph's first appearance in its cell on an emulated screen, so a written prediction counts; M3's `predict` part); or reads and discards a big output, counting catch-up markers | `portable-pty`, `fil-term` |
 | `pipe-echo` (no arguments) | stand-in for `fil server --stdio`: writes the preamble, then echoes every frame it decodes | `preamble::encode`, `FrameDecoder` |
 | `pipe-echo client [options] -- COMMAND...` | the client end of the pipe: runs `ssh ...`, finds the preamble, checks every echoed byte | `PreambleScanner`, `FrameDecoder`, `DataSegment` |
 | `pipe-probe` (no arguments) | `fil server --stdio` once the daemon exists: writes the preamble, then runs a real `PipeLink` on stdio and echoes every payload | `PipeLink::accept_halves` |
@@ -110,6 +110,7 @@ just realnet ssh        # Docker topology only
 just realnet udp        # namespaces only
 just realnet sysd       # the systemd host only
 just realnet latency    # the latency lab (docs/m2/latency.md); not part of the default run
+just realnet predict    # M3's prediction cells (docs/m3/plan.md §5.5); not part of the default run
 just realnet udp f_upgrade f_nat_rebind   # named scenarios
 ```
 

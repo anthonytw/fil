@@ -1,4 +1,4 @@
-//! Server policy end to end (DESIGN.md section 11.2; `docs/m2/plan.md`, S1): a session with the
+//! Server policy end to end (DESIGN.md section 11.2): a session with the
 //! daemon's real mirror ([`fil_session::policy::Policy`]) over an `sshd_config` and a policy file
 //! written for the test, and a scripted client with a real client-side endpoint. The refusals are
 //! made on the remote side and name the setting and its source.

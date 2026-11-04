@@ -1,4 +1,4 @@
-//! The agent socket's peer-UID check with a real second user (`docs/m2/plan.md` A1, the
+//! The agent socket's peer-UID check with a real second user (DESIGN.md section 10, the
 //! mutation "skip the peer-UID check"). Linux only, and it needs root, so it is ignored and run
 //! by hand in the VM, with root visible on the command line:
 //!

@@ -1,0 +1,11 @@
+# sshd for the install part's hosts (Dockerfile.shells). Each user's keys are copied in by
+# install.sh at run time, one root-owned file per user.
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /etc/fil-realnet/keys/%u
+StrictModes no
+PermitTTY yes
+LogLevel VERBOSE

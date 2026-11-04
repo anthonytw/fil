@@ -1,6 +1,6 @@
 //! Forwards end to end: both endpoints in one process over each transport (`link::mem`,
 //! `PipeLink` on fil-netsim streams, `QuicLink` on fil-netsim datagrams), with real loopback TCP
-//! applications and servers (`docs/m2/plan.md`, F1 tests).
+//! applications and servers (DESIGN.md sections 7 and 8.5).
 //!
 //! The heavy sizes run scaled down here and at full size with `just forward-soak`:
 //! `FIL_FORWARD_BULK_MIB` (default 8, soak 256), `FIL_FORWARD_SEQ` (default 2,000, soak 20,000),
@@ -1012,7 +1012,7 @@ async fn a_queued_connection_is_checked_when_it_arrives_body() {
 
 /// A new epoch (a detach, a takeover) re-checks the queued connections at once instead of
 /// leaving them until `open_wait`: on the daemon its policy then refuses them (`Detached` while
-/// nobody holds the session), as plan section 2.7 says a detached listener does.
+/// nobody holds the session), as DESIGN.md section 7.2 says a detached listener does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
     bounded(a_new_epoch_rechecks_the_queued_connections_at_once_body()).await
@@ -1064,10 +1064,16 @@ async fn a_new_epoch_rechecks_the_queued_connections_at_once_body() {
 /// `close_forward` ends the forward's channels and refuses its queued connections too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_forward_also_clears_its_queue() {
-    bounded(close_forward_also_clears_its_queue_body()).await
+    bounded(close_forward_also_clears_its_queue_body(true)).await
 }
 
-async fn close_forward_also_clears_its_queue_body() {
+/// The same with the first channel's open still unanswered: it is ended too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_forward_also_ends_an_unanswered_open() {
+    bounded(close_forward_also_clears_its_queue_body(false)).await
+}
+
+async fn close_forward_also_clears_its_queue_body(answered: bool) {
     let cfg = MuxConfig {
         max_open: 1,
         ..mux_config()
@@ -1078,11 +1084,23 @@ async fn close_forward_also_clears_its_queue_body() {
     })
     .await;
     let w = World::new(Transport::Mem, cfg).await;
+    if !answered {
+        // The daemon's connect outlasts the test: the client's open stays unanswered.
+        *w.daemon.targets.delay.lock().unwrap() = Duration::from_secs(60);
+    }
     let port = w.local_forward(1, hold.port);
     let mut conns = Vec::new();
     conns.push(connect(port).await);
+    // `waiting` counts an unanswered open as well as the queue. So the first channel's state is
+    // settled before the others connect, and `waiting` then says how many of them are queued
+    // (waiting for `waiting == 2` with the open still unanswered would be one queued, the
+    // other perhaps not yet accepted).
     eventually(Duration::from_secs(5), || {
-        w.client.ep.snapshot().channels == 1
+        let ep = &w.client.ep;
+        ep.snapshot().channels == 1
+            && ep
+                .stats(ForwardId(1))
+                .is_some_and(|s| s.waiting == u32::from(!answered))
     })
     .await;
     conns.push(connect(port).await);
@@ -1091,7 +1109,7 @@ async fn close_forward_also_clears_its_queue_body() {
         w.client
             .ep
             .stats(ForwardId(1))
-            .is_some_and(|s| s.waiting == 2)
+            .is_some_and(|s| s.waiting == 2 + u32::from(!answered))
     })
     .await;
     assert_eq!(

@@ -1,4 +1,4 @@
-//! Forwards on the client side (DESIGN.md section 7, `docs/m2/plan.md` F3).
+//! Forwards on the client side (DESIGN.md section 7).
 //!
 //! # Where things run
 //!

@@ -1,4 +1,4 @@
-//! The client end of the agent relay (DESIGN.md section 10, `docs/m2/plan.md` A1).
+//! The client end of the agent relay (DESIGN.md section 10).
 //!
 //! When this run relays its agent (`-A`, `agent = "on"` or `"confirm"`), an `Open Agent` from the
 //! daemon is connected to the local agent: `SSH_AUTH_SOCK` **as it was when fil started**, never a

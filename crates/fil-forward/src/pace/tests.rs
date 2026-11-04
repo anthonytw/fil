@@ -1020,35 +1020,42 @@ fn an_ack_that_may_have_waited_for_the_timer_is_not_a_sample() {
     assert_eq!(st.samples, 2 + u64::from(DRAIN_PROOFS), "{st:?}");
 }
 
-/// A parked channel (bytes presumed delivered, its reader not keeping up) gives no samples: its
-/// acks measure its reader.
+/// A bulk channel whose records take longer than the presumption age (a slow start's queue,
+/// QUIC serving a request flow's stream first) is parked, and its next acks still give samples:
+/// the current delay follows the real round trip, the age with it, and the channel stays unparked.
+/// (Leaving parked channels' samples out kept the current delay frozen, the channel parked at
+/// every ack, and about 100 ms of queue standing in realnet's QUIC cell.)
 #[test]
-fn a_parked_channel_gives_no_samples() {
+fn a_parked_channel_that_keeps_up_gives_samples_and_stays_unparked() {
     let t0 = Instant::now();
     let mut p = Pacer::new(PaceConfig::default(), t0);
-    let (slow, live) = (ch(16), ch(18));
-    p.on_sent(slow, 0, PAYLOAD, false, t0);
-    let mut off = 0;
-    // The live channel's acks come; the slow one's do not.
-    let mut t = t0 + Duration::from_millis(5);
-    for _ in 0..10 {
-        exchange(&mut p, live, &mut off, t, 40, false);
-        t += Duration::from_millis(40);
+    let (bulk, rr) = (ch(16), ch(18));
+    let (mut boff, mut roff) = (0, 0);
+    // A base of 50 ms from the request flow.
+    let mut t = t0;
+    for _ in 0..4 {
+        exchange(&mut p, rr, &mut roff, t, 50, false);
+        t += Duration::from_millis(50);
     }
-    p.advance(t);
-    assert_eq!(
-        p.state().in_flight,
-        0,
-        "the slow channel's payload is presumed delivered"
-    );
-    // One more payload of it, then its reader takes both, seconds later.
-    p.on_sent(slow, PAYLOAD, 2 * PAYLOAD, false, t);
-    let before = p.state();
-    p.on_ack(slow, 2 * PAYLOAD, ACK_AFTER, t + Duration::from_secs(3));
-    let after = p.state();
-    assert_eq!(after.samples, before.samples, "{after:?}");
-    assert_eq!(after.current, before.current);
-    assert_eq!(after.parked_acks, before.parked_acks + 1);
+    // Then a queue: the bulk's records take 140 ms, and the request (sent 5 ms after each)
+    // passes them on the way, as QUIC's other stream does, in 100 ms.
+    let mut parked_seen = false;
+    for _ in 0..40 {
+        p.on_sent(bulk, boff, boff + PAYLOAD, false, t);
+        boff += PAYLOAD;
+        let r = t + Duration::from_millis(5);
+        p.on_sent(rr, roff, roff + PAYLOAD, false, r);
+        roff += PAYLOAD;
+        p.on_ack(rr, roff, ACK_AFTER, r + Duration::from_millis(100));
+        p.advance(t + Duration::from_millis(125));
+        parked_seen |= p.chans.get(&16).is_some_and(|c| c.parked);
+        p.on_ack(bulk, boff, ACK_AFTER, t + Duration::from_millis(140));
+        t += Duration::from_millis(200);
+    }
+    let st = p.state();
+    assert!(parked_seen, "the case did not arise: {st:?}");
+    assert!(!p.chans[&16].parked, "{st:?}");
+    assert!(st.current.unwrap() >= Duration::from_millis(100), "{st:?}");
 }
 
 /// The agent's reserve is its own: with the forward passes spent, an agent request still goes.

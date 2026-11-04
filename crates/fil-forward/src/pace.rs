@@ -35,8 +35,11 @@
 //! acknowledged it (two round trips from a peer that acknowledges on drain; a round trip and
 //! [`ACK_SLACK`] from one that may wait for its timer). Such a record waits at a reader that is
 //! not reading; without the rule a slow reader would keep its whole window counted and stop every
-//! other forward. A channel with bytes presumed delivered is *parked*: its acks give no round-trip
-//! samples (they measure its reader) until it has acknowledged everything sent. The age gate keeps the presumption from running ahead of a transport that does
+//! other forward. A channel with bytes presumed delivered is *parked*: it sends only as its reader
+//! consumes, until an ack of it covers a record still counted (its reader keeps up after all) or
+//! everything sent. Samples come only from records still counted, so a reader's backlog (presumed
+//! bytes) never gives one; the current delay is the smallest across channels, and the age is
+//! bounded, so one slow reader's late acks cannot stretch it. The age gate keeps the presumption from running ahead of a transport that does
 //! not deliver in order across channels: QUIC round-robins its streams, so a light channel's ack
 //! can overtake a bulk channel's bytes still in quinn's buffer.
 //!
@@ -184,8 +187,8 @@ struct Chan {
     acked: u64,
     /// One past the highest byte handed to this link.
     sent: u64,
-    /// Bytes of it were presumed delivered (its reader is not keeping up): its acks give no
-    /// samples, since they measure its reading, until it has acknowledged everything sent.
+    /// Bytes of it were presumed delivered (its reader may not be keeping up): it sends only as
+    /// its reader consumes, until an ack covers a record still counted or everything sent.
     parked: bool,
     /// While parked, it keeps no more unacknowledged than it had when it was parked: it sends
     /// as its reader consumes (a reader that stopped, nothing more), and leaves the cap to the
@@ -227,7 +230,7 @@ pub struct PaceState {
     /// Samples used in full, and bounded ones (their ack may have waited for the peer's timer).
     pub samples: u64,
     pub bounded: u64,
-    /// Acks of channels whose reader is not keeping up, which give no sample.
+    /// Acks of channels that were parked when they came.
     pub parked_acks: u64,
 }
 
@@ -524,7 +527,11 @@ impl Pacer {
         }
         c.acked = upto;
         let parked = c.parked;
-        if c.acked >= c.sent {
+        // Unparked once its reader shows it keeps up: an ack that covers a record still counted
+        // (not already presumed delivered), or everything sent acknowledged. A record can also be
+        // presumed delivered while it is only slow to arrive (a burst's queue, QUIC serving
+        // another stream first); a reader that stopped or lags acknowledges only presumed ones.
+        if newest.is_some() || c.acked >= c.sent {
             c.parked = false;
         }
         for (via, n) in freed {
@@ -552,9 +559,13 @@ impl Pacer {
                 || age.is_some_and(|a| a < base + ACK_DELAY);
             if parked {
                 self.parked_acks += 1;
-            } else {
-                self.on_sample(rtt, prompt, at, acked, now);
             }
+            // A sample even from a channel that was parked: it comes from a record still counted
+            // (a presumed one gives none), so from a reader that kept up with it. Leaving such
+            // samples out froze the current delay while a bulk channel's records took longer than
+            // the presumption age (QUIC beside a request flow): the age stayed short, the channel
+            // was parked again at every ack, and the controller never saw the queue.
+            self.on_sample(rtt, prompt, at, acked, now);
             // After the sample, so the age a record must reach uses the current round trip.
             self.prune(now);
         }

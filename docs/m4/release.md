@@ -412,7 +412,7 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 
 ### 10.4 The .rpm and .deb packages: signed on the owner's Mac
 
-**Decided (owner 2026-11-04, D3):** the packages are signed, and the signing key never lives in CI (N4), as for notarization (§10.3). **Everything below is the design, proposed by PKG;** `just release-sign-packages` (`tests/release/sign-packages.sh`) is built and tested on fakes, and once on a real rpm with a throwaway key in a Fedora 45 container (rpm 6.1.0, gpg 2.4.9).
+**Decided (owner 2026-11-04, D3):** the packages are signed, and the signing key never lives in CI (N4), as for notarization (§10.3). **Everything below is the design, proposed by PKG;** `just release-sign-packages` (`tests/release/sign-packages.sh`) is built, tested on fakes in `just release-test`, and was run end to end on the rpms of a dry run's Linux binaries with a throwaway key in a Fedora 45 container (rpm 6.1.0, gpg 2.4.9): each signed rpm's body equalled that of an independent unsigned build, and the signed arm64 rpm installed with its signature checked (`install-packages.sh --key`), while the unsigned one was refused.
 
 - **What is signed, and why only that.**
   - **The two .rpm files get an embedded signature** (`rpmsign --addsign`, an OpenPGP signature over the rpm's header, which carries the payload's digest). rpm and dnf check it on install once the key is imported (`rpm --import`; dnf asks for it, or the user imports it first), and Fedora's rpm refuses an unsigned package outright without `--nosignature`.

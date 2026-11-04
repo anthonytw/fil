@@ -246,7 +246,10 @@ else /usr/bin/file "$@"; fi
 EOT
 chmod +x "$tmp/shim/file"
 tar_flags=
-tar --version 2> /dev/null | grep -q 'GNU tar' && tar_flags='--owner=0 --group=0 --numeric-owner'
+# GNU tar keeps the files' modes, and release-check (with GNU tar) refuses group or other write: fix
+# them, so that a umask of 002 (Ubuntu's default for a login) does not fail the clean cases. bsdtar
+# (macOS) is not checked for modes.
+tar --version 2> /dev/null | grep -q 'GNU tar' && tar_flags='--owner=0 --group=0 --numeric-owner --mode=u=rwX,go=rX'
 
 stage_release() { # uses $tree $stage $VER
   local lbl kind d saved=$ROOT

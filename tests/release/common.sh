@@ -209,7 +209,7 @@ clean_build_env() {
 rewrite_sums() {
   local dir=$1 v=$2 f
   (
-    cd "$dir"
+    cd "$dir" || exit 1
     for f in $({ printf '%s\n' "fil-$v-aarch64-linux-musl.tar.gz" "fil-$v-source.tar.gz" "fil-$v-universal-apple-darwin.tar.gz" "fil-$v-x86_64-linux-musl.tar.gz"; package_names "$v"; } | LC_ALL=C sort); do
       [ -f "$f" ] || die "rewrite_sums: no $f in $dir"
       printf '%s  %s\n' "$(sha256 "$f")" "$f"

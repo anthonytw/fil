@@ -1021,6 +1021,8 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
         return ExitCode::FAILURE;
     }
     crate::logging::init(&paths.log, true);
+    // However this function ends, the log's writer gets a moment to write what is queued.
+    let _flush_log = crate::logging::flush_at_exit();
     tracing::info!(
         detached,
         pid = std::process::id(),

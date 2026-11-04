@@ -172,6 +172,8 @@ async fn attach(
         }
     };
     logging::init_client();
+    // However this function ends, the log's writer gets a moment to write what is queued.
+    let _flush_log = fil_daemon::logging::flush_at_exit();
     // Which host and which session is a record of the user's habits: debug, not the default.
     tracing::info!(?setting, "starting");
     tracing::debug!(host, %session, "starting for");

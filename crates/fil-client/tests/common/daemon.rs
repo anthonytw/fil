@@ -183,6 +183,14 @@ pub struct DState {
     pub repaints: Vec<u64>,
 }
 
+/// The numbered lines `range` (as `common::lines`; this file is also included by other crates'
+/// tests, whose `common` has no such helper).
+fn numbered_lines(range: std::ops::Range<usize>) -> Vec<u8> {
+    range
+        .flat_map(|i| format!("line {i:04}\r\n").into_bytes())
+        .collect()
+}
+
 fn key_of(link: &Arc<MemLink>) -> usize {
     Arc::as_ptr(link) as usize
 }
@@ -729,7 +737,7 @@ impl FakeDaemon {
         }
         if let Some(catch_up) = st.repaint_bytes_first.take() {
             let extra = if catch_up {
-                super::lines(100..160)
+                numbered_lines(100..160)
             } else {
                 b"more output\r\n".to_vec()
             };
@@ -809,7 +817,7 @@ impl FakeDaemon {
                     .await;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let skip = super::lines(100..160);
+            let skip = numbered_lines(100..160);
             st.log.append(&skip);
             st.emu.feed(&skip);
             let b = fil_term::snapshot::snapshot(&st.emu.state(1000));

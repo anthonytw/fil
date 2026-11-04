@@ -65,6 +65,13 @@ pub(crate) const QUEUE_BUDGET: Duration = Duration::from_millis(250);
 pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// A sample over less time than this says nothing about a rate (a burst of acks).
 const MIN_INTERVAL: Duration = Duration::from_millis(1);
+/// While the pipe is not known to be full (startup), the window is at least this many times the
+/// rate's bandwidth-delay product, so it doubles every round trip as TCP's and quinn's slow start
+/// do, and the window is never the slower one of the two.
+const STARTUP_GAIN: u64 = 2;
+/// The pipe is full once the rate has not grown by a quarter (`FULL_GROWTH`) for this many
+/// round trips of the link's rate being sampled (BBR's full-pipe test).
+const FULL_ROUNDS: u32 = 3;
 
 /// Whether the terminal is paced: yes, unless the environment says `FIL_TERMINAL_PACING=off`
 /// (the switch for measuring "before", as `FIL_FORWARD_PACING` is for the forwards). Read when a
@@ -83,6 +90,15 @@ pub(crate) struct Pacer {
     rates: VecDeque<(Instant, u64)>,
     /// The QUIC path generation the samples belong to.
     path_generation: u64,
+    /// The rate measured has stopped growing (BBR's "full pipe"): it is the link's (or the
+    /// client's terminal's), not the window's while it ramps up. Only then does the catch-up
+    /// rule trust a drain time from it.
+    full: bool,
+    /// The full-pipe test: the rate at the last growth, the round trips since without one, and
+    /// when the current round began.
+    full_rate: u64,
+    full_count: u32,
+    round_start: Option<Instant>,
 }
 
 impl Pacer {
@@ -92,6 +108,10 @@ impl Pacer {
             rtprop: None,
             rates: VecDeque::new(),
             path_generation: 0,
+            full: false,
+            full_rate: 0,
+            full_count: 0,
+            round_start: None,
         }
     }
 
@@ -122,6 +142,38 @@ impl Pacer {
             self.rates.pop_back();
         }
         self.rates.push_back((now, rate));
+        if !app_limited {
+            self.full_pipe_round(now);
+        }
+    }
+
+    /// One round of BBR's full-pipe test, at most once a round trip, on samples that measure
+    /// the link (not app-limited): the pipe is full once the largest rate has not grown by a
+    /// quarter for [`FULL_ROUNDS`] rounds.
+    fn full_pipe_round(&mut self, now: Instant) {
+        let (Some(rtprop), Some(&(_, max))) = (self.rtprop, self.rates.front()) else {
+            return;
+        };
+        let start = *self.round_start.get_or_insert(now);
+        if self.full || now.saturating_duration_since(start) < rtprop {
+            return;
+        }
+        self.round_start = Some(now);
+        if max >= self.full_rate.saturating_add(self.full_rate / 4) {
+            self.full_rate = max;
+            self.full_count = 0;
+        } else {
+            self.full_count += 1;
+            self.full = self.full_count >= FULL_ROUNDS;
+        }
+    }
+
+    /// Back to startup: no rate is known to be the link's.
+    fn restart(&mut self) {
+        self.full = false;
+        self.full_rate = 0;
+        self.full_count = 0;
+        self.round_start = None;
     }
 
     /// The link moved to another path (QUIC migration to a new address): its round trip and rate
@@ -131,6 +183,7 @@ impl Pacer {
             self.path_generation = generation;
             self.rtprop = None;
             self.rates.clear();
+            self.restart();
         }
     }
 
@@ -141,6 +194,10 @@ impl Pacer {
             .is_some_and(|&(t, _)| now.saturating_duration_since(t) > RATE_WINDOW)
         {
             self.rates.pop_front();
+        }
+        if self.rates.is_empty() {
+            // Quiet for the rate window: the next burst ramps up again.
+            self.restart();
         }
     }
 
@@ -153,13 +210,34 @@ impl Pacer {
         self.rates.front().map(|&(_, r)| r).filter(|&r| r > 0)
     }
 
-    /// How long `bytes` take to drain at the delivery rate: zero when unpaced or not measured.
+    /// How long `bytes` take to drain at the delivery rate: zero when unpaced, not measured,
+    /// or measured only while the window was still ramping up (before the pipe is full the rate
+    /// is the window's, a lower bound that grows each round trip: on a 200 ms path a burst read
+    /// 34 kB/s on a 12.5 MB/s link, and the drain estimate made a 420 kB output jump).
     pub(crate) fn drain_time(&mut self, bytes: u64, now: Instant) -> Duration {
-        self.rate(now).map_or(Duration::ZERO, |r| {
+        let rate = self.rate(now);
+        if !self.full {
+            return Duration::ZERO;
+        }
+        rate.map_or(Duration::ZERO, |r| {
             Duration::from_micros(
                 u64::try_from(u128::from(bytes) * 1_000_000 / u128::from(r)).unwrap_or(u64::MAX),
             )
         })
+    }
+
+    /// Test support: samples of a steady `rate` (bytes a second) over a round trip of `rtt`, one
+    /// a round trip from `from` until the pipe is full. Returns the time of the last.
+    #[cfg(test)]
+    pub(crate) fn fill(&mut self, rtt: Duration, rate: u64, from: Instant) -> Instant {
+        let mut t = from;
+        for _ in 0..=FULL_ROUNDS + 1 {
+            let bytes = u64::try_from(u128::from(rate) * rtt.as_micros() / 1_000_000).unwrap();
+            self.on_sample(rtt, bytes, rtt, false, t);
+            t += rtt;
+        }
+        assert!(self.full, "the pipe did not fill");
+        t - rtt
     }
 
     /// How much may be in flight now. Unpaced: no limit.
@@ -172,8 +250,13 @@ impl Pacer {
             return MIN_WINDOW;
         };
         let budget = (rtprop + QUEUE_BUDGET).as_micros();
-        let w = u64::try_from(u128::from(rate) * budget / 1_000_000).unwrap_or(u64::MAX);
-        w.clamp(MIN_WINDOW, MAX_WINDOW)
+        let mut w = u128::from(rate) * budget / 1_000_000;
+        if !self.full {
+            w = w.max(u128::from(rate) * u128::from(STARTUP_GAIN) * rtprop.as_micros() / 1_000_000);
+        }
+        u64::try_from(w)
+            .unwrap_or(u64::MAX)
+            .clamp(MIN_WINDOW, MAX_WINDOW)
     }
 }
 
@@ -238,7 +321,8 @@ mod tests {
         p.path_changed(1);
         assert_eq!(p.window(now), MIN_WINDOW);
         p.on_sample(ms(400), 1_000_000, ms(100), false, now);
-        assert_eq!(p.window(now), 6_500_000);
+        // In startup: twice the bandwidth-delay product, 10 MB/s * 400 ms * 2, above the budget.
+        assert_eq!(p.window(now), 8_000_000);
     }
 
     #[test]
@@ -288,6 +372,72 @@ mod tests {
         let mut p = Pacer::new(true);
         assert_eq!(p.drain_time(1_000_000, now), Duration::ZERO, "no rate yet");
         p.on_sample(ms(50), 125_000, ms(1000), false, now);
-        assert_eq!(p.drain_time(250_000, now), ms(2000));
+        assert_eq!(
+            p.drain_time(250_000, now),
+            Duration::ZERO,
+            "the pipe is not full yet"
+        );
+        let t = p.fill(ms(50), 125_000, now);
+        assert_eq!(p.drain_time(250_000, t), ms(2000));
+    }
+
+    /// BBR's full-pipe test: a rate that keeps growing (the window ramping up) is not the
+    /// link's; three round trips without a quarter's growth are; app-limited samples do not
+    /// count a round, and quiet for the rate window, or a path change, starts over.
+    #[test]
+    fn the_pipe_is_full_once_the_rate_stops_growing() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(true);
+        let mut t = t0;
+        let mut rate = 100_000u64;
+        for _ in 0..10 {
+            p.on_sample(ms(200), rate / 5, ms(200), false, t);
+            assert!(!p.full, "full while the rate doubles");
+            rate *= 2;
+            t += ms(200);
+        }
+        // Steady: the first steady round is still the last growth; full three rounds later.
+        for round in 0..=FULL_ROUNDS {
+            p.on_sample(ms(200), rate / 5, ms(200), false, t);
+            assert_eq!(p.full, round == FULL_ROUNDS, "round {round}");
+            t += ms(200);
+        }
+        assert!(p.drain_time(1_000_000, t) > Duration::ZERO);
+        // Quiet for longer than the rate window: startup again.
+        let later = t + RATE_WINDOW + ms(100);
+        assert_eq!(p.drain_time(1_000_000, later), Duration::ZERO);
+        assert!(!p.full);
+        // App-limited samples never count a round.
+        let mut q = Pacer::new(true);
+        q.on_sample(ms(200), 20_000, ms(200), false, t0);
+        let mut t = t0;
+        for _ in 0..10 {
+            t += ms(200);
+            q.on_sample(ms(200), 20_000, ms(200), true, t);
+        }
+        assert!(!q.full);
+        // A path change starts over.
+        let t = p.fill(ms(200), 1_000_000, later);
+        p.path_changed(1);
+        assert_eq!(p.drain_time(1_000_000, t), Duration::ZERO);
+    }
+
+    /// In startup the window doubles each round trip while it limits (twice the
+    /// bandwidth-delay product); once the pipe is full it is the rate times the round trip and
+    /// the budget.
+    #[test]
+    fn the_startup_window_doubles_and_the_full_one_keeps_the_budget() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(true);
+        // 64 kB a 600 ms round trip: about 109 kB/s.
+        p.on_sample(ms(600), 65_536, ms(600), false, t0);
+        assert!(
+            (131_000..=2 * 65_536).contains(&p.window(t0)),
+            "{}",
+            p.window(t0)
+        );
+        let t = p.fill(ms(600), 12_500_000, t0);
+        // 12.5 MB/s * (600 + 250) ms.
+        assert_eq!(p.window(t), 10_625_000);
     }
 }

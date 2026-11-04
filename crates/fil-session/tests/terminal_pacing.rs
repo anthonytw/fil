@@ -309,31 +309,120 @@ async fn ctrl_c_during_a_flood_on_a_slow_pipe_is_fast_and_loses_nothing() {
     );
 }
 
-/// A healthy fast link with the default catch-up rule: a few typed lines (small outputs, the
-/// pacer's app-limited samples, with quiet between them), then 480 kB of output. Nothing may
-/// jump: the link takes it in well under the rule's 2 s. (The review of #128 found 2 catch-ups
-/// a run here on both transports when an echo's sample, one byte over the time since the last
-/// ack, made the drain estimate hours.)
-async fn typing_then_output_cell(t: Transport, path: Path) -> usize {
+/// The 1 Mbit/s path with a round trip of `rtt_ms`.
+fn slow_path(rtt_ms: u64) -> Path {
+    Path {
+        one_way: Duration::from_millis(rtt_ms / 2),
+        ..SLOW_PATH
+    }
+}
+
+/// The same at a 200 ms round trip (a US to Asia session): still within the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_during_a_flood_on_a_slow_long_quic_path_is_fast_and_loses_nothing() {
+    let r = ctrl_c_cell(Transport::Quic, slow_path(200), true).await;
+    report("quic 1 Mbit/s 200 ms paced", &r);
+    assert!(r.catch_ups > 0, "the flood never outran the link");
+    assert!(r.took <= CTRL_C_LIMIT, "Ctrl-C took {:?}", r.took);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_nothing() {
+    let r = ctrl_c_cell(Transport::Pipe, slow_path(200), true).await;
+    report("pipe 1 Mbit/s 200 ms paced", &r);
+    assert!(r.catch_ups > 0, "the flood never outran the link");
+    assert!(r.took <= CTRL_C_LIMIT, "Ctrl-C took {:?}", r.took);
+}
+
+/// Ctrl-C at 1 Mbit/s over every round trip of the matrix, paced and unpaced, both transports.
+/// A measurement (`just pacing`); 600 ms is beyond K1's bound, which is stated for 1 Mbit/s up
+/// to a 200 ms round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: just pacing"]
+async fn ctrl_c_over_round_trips() {
+    for rtt in [10u64, 40, 200, 600] {
+        for t in [Transport::Quic, Transport::Pipe] {
+            for paced in [true, false] {
+                let r = ctrl_c_cell(t, slow_path(rtt), paced).await;
+                report(
+                    &format!(
+                        "CTRLC {t:?} {rtt} ms {}",
+                        if paced { "paced" } else { "unpaced" }
+                    ),
+                    &r,
+                );
+            }
+        }
+    }
+}
+
+/// What a cell of the healthy-link checks types and prints, with the default catch-up rule.
+#[derive(Clone, Copy, Debug)]
+enum Workload {
+    /// One typed line and its reply, then 420 kB of output (7000 lines).
+    LineThen420k,
+    /// 42 kB of output, 300 ms of quiet, then 960 kB.
+    Small42kThen960k,
+    /// Five typed lines with their replies, 150 ms apart (the pacer's app-limited samples),
+    /// then 480 kB.
+    TypingThen480k,
+}
+
+impl Workload {
+    const ALL: [Workload; 3] = [
+        Workload::LineThen420k,
+        Workload::Small42kThen960k,
+        Workload::TypingThen480k,
+    ];
+    /// The bytes of the largest output: whether the link can drain it within the catch-up
+    /// rule's 2 s says whether the link is healthy for this output.
+    fn burst(self) -> u64 {
+        60 * match self {
+            Workload::LineThen420k => 7000,
+            Workload::Small42kThen960k => 16_000,
+            Workload::TypingThen480k => 8000,
+        }
+    }
+}
+
+/// Runs `w` and counts the catch-ups (`TooFarBehind` jumps), the default rule on.
+async fn workload_cell(t: Transport, path: Path, paced: bool, w: Workload) -> usize {
     let sc = Scratch::new();
     let script = format!(
-        "stty -echo; echo READY; while read l; do if [ \"$l\" = go ]; then \
-         seq -f 'L%07g {PAD}' 1 8000; echo END; else echo ok-$l; fi; done"
+        "stty -echo; echo READY; while read l; do case \"$l\" in \
+         t*) echo ok-$l;; \
+         a) seq -f 'A%07g {PAD}' 1 700; echo DONE-A;; \
+         b*) seq -f 'L%07g {PAD}' 1 ${{l#b}}; echo END;; esac; done"
     );
     let mut cfg = sh_config(&sc, "main", &script);
-    cfg.terminal_pacing = true;
+    cfg.terminal_pacing = paced;
     let h = spawn_plain(cfg).await;
-    async fn run<L: Link>(mut c: fil_testkit::Client<L>) -> usize {
+    async fn run<L: Link>(mut c: fil_testkit::Client<L>, w: Workload) -> usize {
         c.wait_screen("READY").await;
-        for i in 0..5 {
-            c.type_bytes(format!("{i}\n").as_bytes()).await;
-            c.wait_screen(&format!("ok-{i}")).await;
-            let _ = c.try_wait(Duration::from_millis(150), |_| false).await;
+        let lines = w.burst() / 60;
+        match w {
+            Workload::LineThen420k => {
+                c.type_bytes(b"t0\n").await;
+                c.wait_screen("ok-t0").await;
+            }
+            Workload::Small42kThen960k => {
+                c.type_bytes(b"a\n").await;
+                c.wait_screen("DONE-A").await;
+                let _ = c.try_wait(Duration::from_millis(300), |_| false).await;
+            }
+            Workload::TypingThen480k => {
+                for i in 0..5 {
+                    c.type_bytes(format!("t{i}\n").as_bytes()).await;
+                    c.wait_screen(&format!("ok-t{i}")).await;
+                    let _ = c.try_wait(Duration::from_millis(150), |_| false).await;
+                }
+            }
         }
-        c.type_bytes(b"go\n").await;
+        c.type_bytes(format!("b{lines}\n").as_bytes()).await;
         assert!(
-            c.try_wait(Duration::from_secs(60), |c| c.screen().contains("END"))
-                .await
+            c.try_wait(Duration::from_secs(120), |c| c.screen().contains("END"))
+                .await,
+            "the output never ended"
         );
         c.mid_snapshots
             .iter()
@@ -343,25 +432,103 @@ async fn typing_then_output_cell(t: Transport, path: Path) -> usize {
     let n = match t {
         Transport::Quic => {
             let (client, daemon, _keep) = quic_pair(path).await;
-            run(attach(&h, client, daemon)).await
+            run(attach(&h, client, daemon), w).await
         }
         Transport::Pipe => {
             let (client, daemon) = pipe_pair(path).await;
-            run(attach(&h, client, daemon)).await
+            run(attach(&h, client, daemon), w).await
         }
     };
     let _ = h.kill(Duration::from_secs(5)).await;
     n
 }
 
+/// A path of `rtt` and `mbit`: a queue of half a second of the rate (at least 64 kB) on QUIC,
+/// ssh's 2 MiB window on the pipe.
+fn path_of(t: Transport, rtt_ms: u64, mbit: u64) -> Path {
+    let rate = mbit * 125_000;
+    Path {
+        one_way: Duration::from_millis(rtt_ms / 2),
+        rate: Some(rate),
+        queue: match t {
+            Transport::Quic => usize::try_from((rate / 2).max(64_000)).unwrap(),
+            Transport::Pipe => 2 * 1024 * 1024,
+        },
+    }
+}
+
+/// A healthy fast link with the default catch-up rule: nothing may jump. The review of #128
+/// found 2 catch-ups a run after typing (an echo's sample, one byte over the time since the last
+/// ack, made the drain estimate hours), and 1 on a 200 ms path from the window's ramp (a rate of
+/// 34 kB/s measured on a 12.5 MB/s link while the window grew from its floor).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typing_then_a_medium_output_on_a_fast_quic_link_never_jumps() {
-    assert_eq!(typing_then_output_cell(Transport::Quic, WAN_PATH).await, 0);
+    let n = workload_cell(Transport::Quic, WAN_PATH, true, Workload::TypingThen480k).await;
+    assert_eq!(n, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typing_then_a_medium_output_on_a_fast_pipe_never_jumps() {
-    assert_eq!(typing_then_output_cell(Transport::Pipe, WAN_PATH).await, 0);
+    let n = workload_cell(Transport::Pipe, WAN_PATH, true, Workload::TypingThen480k).await;
+    assert_eq!(n, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_medium_output_on_a_long_fast_quic_path_never_jumps() {
+    let n = workload_cell(
+        Transport::Quic,
+        path_of(Transport::Quic, 200, 100),
+        true,
+        Workload::LineThen420k,
+    )
+    .await;
+    assert_eq!(n, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_medium_output_on_a_long_fast_pipe_never_jumps() {
+    let n = workload_cell(
+        Transport::Pipe,
+        path_of(Transport::Pipe, 200, 100),
+        true,
+        Workload::LineThen420k,
+    )
+    .await;
+    assert_eq!(n, 0);
+}
+
+/// The matrix behind the PR's table: round trip × rate × transport × workload, catch-ups paced
+/// against unpaced, `runs` times each. On a healthy link (the output drains within the rule's
+/// 2 s at the link's rate) paced must never jump more than unpaced; on a saturated one paced
+/// jumps by design (that is what makes Ctrl-C fast). `just pacing`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: just pacing"]
+async fn healthy_link_matrix() {
+    let runs: usize = std::env::var("FIL_PACING_RUNS").map_or(1, |v| v.parse().unwrap());
+    let mut worse = Vec::new();
+    eprintln!("MATRIX rtt_ms mbit transport workload healthy unpaced paced");
+    for rtt in [10u64, 40, 200, 600] {
+        for mbit in [1u64, 10, 100] {
+            for t in [Transport::Quic, Transport::Pipe] {
+                for w in Workload::ALL {
+                    let healthy = w.burst() < mbit * 125_000 * 2;
+                    let (mut u, mut p) = (0, 0);
+                    for _ in 0..runs {
+                        u += workload_cell(t, path_of(t, rtt, mbit), false, w).await;
+                        p += workload_cell(t, path_of(t, rtt, mbit), true, w).await;
+                    }
+                    eprintln!("MATRIX {rtt} {mbit} {t:?} {w:?} {healthy} {u} {p}");
+                    if healthy && p > u {
+                        worse.push(format!("{rtt} ms {mbit} Mbit/s {t:?} {w:?}: {u} -> {p}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        worse.is_empty(),
+        "paced jumped more on a healthy link: {worse:#?}"
+    );
 }
 
 /// "Before": unpaced, the jump waits for everything QUIC holds. Not in the default run (it

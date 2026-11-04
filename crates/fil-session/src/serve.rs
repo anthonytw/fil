@@ -240,6 +240,13 @@ struct Flow {
     last_ack_at: Instant,
     /// The link's path generation the pacer's samples belong to.
     generation: u64,
+    /// The unconfirmed snapshot as a record (it ends at its `at`): its confirmation gives a
+    /// sample like any segment's. In a flood the stream is mostly snapshots, one at a time, and
+    /// without these samples the pacer measured nothing while it mattered most.
+    snapshot_rec: Option<SentRec>,
+    /// Output sent before the last jump and not yet acknowledged, `[acked, next)` of then: its
+    /// acknowledgements (below the jump's `at`) still count as delivered.
+    pre_jump: Option<(u64, u64)>,
     /// The terminal pacer (DESIGN.md section 8.5, "Pacing the terminal"). Kept across jumps.
     pacer: Pacer,
 }
@@ -256,6 +263,8 @@ impl Flow {
             delivered: 0,
             last_ack_at: Instant::now(),
             generation: 0,
+            snapshot_rec: None,
+            pre_jump: None,
             pacer,
         }
     }
@@ -334,19 +343,33 @@ impl Flow {
             });
         }
         let before = self.delivered;
+        if let Some((from, to)) = &mut self.pre_jump {
+            let reached = upto.min(*to);
+            self.delivered += reached.saturating_sub(*from);
+            *from = (*from).max(reached);
+        }
         self.delivered += upto.saturating_sub(self.acked);
         self.acked = self.acked.max(upto);
+        let mut snapshot = None;
         if self.unconfirmed.is_some_and(|at| upto >= at) {
             self.unconfirmed = None;
+            // The client applied everything before the snapshot first.
+            if let Some((from, to)) = self.pre_jump.take() {
+                self.delivered += to.saturating_sub(from);
+            }
             self.delivered += self.snapshot_len;
             self.snapshot_len = 0;
+            snapshot = self.snapshot_rec.take();
         }
         // The newest segment this ack covers gives the pacer its sample.
         let mut newest = None;
         while self.sent.front().is_some_and(|r| r.end <= self.acked) {
             newest = self.sent.pop_front();
         }
-        if let Some(r) = newest.filter(|r| r.generation == self.generation) {
+        if let Some(r) = newest
+            .or(snapshot)
+            .filter(|r| r.generation == self.generation)
+        {
             self.pacer.on_sample(
                 now.saturating_duration_since(r.began),
                 self.delivered.saturating_sub(r.delivered),
@@ -382,7 +405,19 @@ impl Flow {
 
     /// After a snapshot of `len` bytes the stream continues at `at` and nothing earlier is owed.
     /// The pacer keeps what it has measured: the link is the same.
-    fn jump(&mut self, at: u64, len: u64) {
+    fn jump(&mut self, at: u64, len: u64, now: Instant) {
+        if self.in_flight() == 0 {
+            self.last_ack_at = now;
+        }
+        self.pre_jump = (self.acked < self.next).then_some((self.acked, self.next));
+        self.snapshot_rec = Some(SentRec {
+            end: at,
+            began: now,
+            delivered: self.delivered,
+            delivered_at: self.last_ack_at,
+            app_limited: false,
+            generation: self.generation,
+        });
         self.next = at;
         self.acked = at;
         self.high = at;
@@ -981,7 +1016,8 @@ impl<'a, L: Link> Conn<'a, L> {
         // may acknowledge `at` as soon as it has applied the snapshot, and that ack must not be
         // taken for one beyond what was sent. Changes before the snapshot are folded into its
         // mode.
-        self.flow().jump(c.info.at, c.bytes.len() as u64);
+        self.flow()
+            .jump(c.info.at, c.bytes.len() as u64, Instant::now());
         out.modes.retain(|m| m.0 > c.info.at);
         let down = |e: LinkError| ServeEnd::LinkDown(e.0);
         self.ctl(&ControlMsg::Snapshot(c.info))
@@ -1083,7 +1119,7 @@ mod tests {
         let mut f = Flow::new(0, Pacer::new(true));
         f.record_send(500, Instant::now(), false);
         assert!(!f.awaiting_snapshot());
-        f.jump(1000, 300);
+        f.jump(1000, 300, Instant::now());
         assert!(f.awaiting_snapshot());
         // Acks of what was sent before the jump say nothing about the snapshot.
         f.ack(500, Instant::now()).unwrap();
@@ -1143,11 +1179,14 @@ mod tests {
         assert_eq!(f.pacer.window(t1), 3_500_000);
         assert!(f.may_send(t1, 0));
         // A snapshot of 4 MB is in flight until confirmed: nothing more goes.
-        f.jump(2_000_000, 4_000_000);
+        f.jump(2_000_000, 4_000_000, t1);
         assert!(!f.may_send(t1, 0));
-        f.ack(2_000_000, t1).unwrap();
+        // Its confirmation is a sample too: 4 MB over 400 ms, 10 MB/s again, same round trip
+        // bound.
+        let t2 = t1 + Duration::from_millis(400);
+        f.ack(2_000_000, t2).unwrap();
         assert_eq!(f.in_flight(), 0);
-        assert_eq!(f.pacer.window(t1), 3_500_000);
+        assert_eq!(f.pacer.rate(t2), Some(10_000_000));
     }
 
     /// The catch-up's wait counts how long the backlog takes to drain at the measured rate,
@@ -1157,8 +1196,9 @@ mod tests {
     fn the_wait_counts_the_drain_of_the_backlog() {
         let t0 = Instant::now();
         let mut f = Flow::new(0, Pacer::new(true));
+        // 125 kB/s measured, and steady: 1 Mbit/s, the pipe full.
+        let t0 = f.pacer.fill(Duration::from_millis(50), 125_000, t0);
         f.last_ack_at = t0;
-        // 125 kB/s measured: 1 Mbit/s.
         f.record_send(125_000, t0, false);
         let t1 = t0 + Duration::from_secs(1);
         f.ack(125_000, t1).unwrap();
@@ -1171,6 +1211,29 @@ mod tests {
         u.record_send(125_000, t0, false);
         u.ack(125_000, t1).unwrap();
         assert_eq!(u.wait(625_000, t1, 0), Duration::ZERO);
+    }
+
+    /// In a flood the stream is mostly snapshots: a confirmed one gives the pacer its sample,
+    /// counting the output that was in flight before the jump, so the rate is measured and the
+    /// pipe can fill.
+    #[test]
+    fn snapshots_alone_give_the_pacer_its_samples() {
+        let t0 = Instant::now();
+        let mut f = Flow::new(0, Pacer::new(true));
+        let mut t = t0;
+        let mut at = 0;
+        f.record_send(64 * 1024, t, false);
+        for _ in 0..8 {
+            // A 60 kB snapshot every 600 ms, 64 kB of output in flight before each.
+            at += 2_000_000;
+            f.jump(at, 60_000, t);
+            f.record_send(at + 64 * 1024, t, false);
+            t += Duration::from_millis(600);
+            f.ack(at, t).unwrap();
+        }
+        let rate = f.pacer.rate(t).expect("a rate from the snapshots");
+        assert!((150_000..=300_000).contains(&rate), "{rate}");
+        assert!(f.pacer.drain_time(1_000_000, t) > Duration::ZERO, "the pipe never filled");
     }
 
     #[test]
@@ -1239,12 +1302,13 @@ mod tests {
         let t0 = Instant::now();
         let mut f = Flow::new(0, Pacer::new(true));
         f.record_send(100_000, t0, false);
-        f.jump(1_000_000, 400_000);
+        f.jump(1_000_000, 400_000, t0);
         // Output after the jump, sent while the snapshot is on its way.
         f.record_send(1_100_000, t0, false);
         let t1 = t0 + Duration::from_millis(500);
         f.ack(1_100_000, t1).unwrap();
-        // 400 kB of snapshot and 100 kB of output in 0.5 s: 1 MB/s, not 200 kB/s.
-        assert_eq!(f.pacer.rate(t1), Some(1_000_000));
+        // 100 kB sent before the jump, 400 kB of snapshot and 100 kB after it, in 0.5 s:
+        // 1.2 MB/s, not the 200 kB/s of the output after the jump alone.
+        assert_eq!(f.pacer.rate(t1), Some(1_200_000));
     }
 }

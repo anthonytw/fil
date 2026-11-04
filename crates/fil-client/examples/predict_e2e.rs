@@ -12,7 +12,7 @@
 //! - `secret`: a secret typed at a password prompt, and the full-stack mutation (the daemon's
 //!   `PtyMode` withheld), which must leak.
 //!
-//! Flags: `--transport pipe|quic|both` (both), `--seeds N` (8), `--one-way-ms N` (75, each way),
+//! Flags: `--transport pipe|quic|both` (both), `--seeds N` (5, as `docs/m3/harness.md` uses), `--one-way-ms N` (75, each way),
 //! `--filter TEXT` (only cases whose label contains it), `--verbose` (show the two screens for
 //! every case that differs).
 
@@ -41,7 +41,7 @@ fn parse() -> Args {
     let mut a = Args {
         cmd: String::new(),
         transports: vec![Transport::Pipe, Transport::Quic],
-        seeds: 8,
+        seeds: 5,
         one_way: Duration::from_millis(75),
         filter: None,
         verbose: false,
@@ -322,7 +322,7 @@ async fn baseline(a: &Args) {
                         total.adapter.shown += r.adapter.shown;
                         total.adapter.confirmed += r.adapter.confirmed;
                         total.adapter.mispredicted += r.adapter.mispredicted;
-                        total.adapter.withdrawn_on_key += r.adapter.withdrawn_on_key;
+                        total.adapter.withdrawn += r.adapter.withdrawn;
                         let c = rig.compare_to_snapshot().await;
                         if !c.clean() {
                             dirty += 1;
@@ -339,7 +339,7 @@ async fn baseline(a: &Args) {
                         total.adapter.shown,
                         total.adapter.confirmed,
                         total.adapter.mispredicted,
-                        total.adapter.withdrawn_on_key,
+                        total.adapter.withdrawn,
                         if dirty == 0 {
                             "= snapshot".to_string()
                         } else {

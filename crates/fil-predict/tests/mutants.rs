@@ -1,11 +1,21 @@
-//! Does the harness notice? Each safety rule in [`Guards`] is switched off in turn and the
-//! scripted scenarios must produce a violation, with a hostile predictor so that the core's
-//! checks are what is being tested. A guard that no scenario can break would be untested
-//! code; one that is missing from this table is a gap to explain in the report.
+//! Does the harness notice? Each safety rule in [`Guards`] is switched off in turn and must
+//! produce a violation, with a hostile predictor so that the core's checks are what is being
+//! tested. A guard that nothing can break would be untested code; one that is missing from
+//! these tables is a gap to explain in the report.
+//!
+//! - **M0's painting guards:** the scripted scenarios, on M0's core ([`Guards::M0`]: with C1's
+//!   epochs on, far fewer guesses are written, and the painting guard is what is under test).
+//! - **C1's rules:** the deterministic rule traces (`support/rules.rs`), with each rule's
+//!   adversary; [`Guards::C1`] lists the switches, and every one must be in the table.
 //!
 //! The guards for graphics, double-size lines, left/right margins and single shifts
 //! (`other_blockers`) are not here: neither backend implements those features, so the
-//! oracle cannot see the damage (see the hazard table).
+//! oracle cannot see the damage (see the hazard table). `cap` (rule 8) is shown needed in
+//! `tests/overlay.rs` (`at_most_1024_guesses_are_outstanding`): no adversary fits 1,024 guesses
+//! on a scenario's screen. `keep_on_boundary` keeps what is already written, so it is no secrecy
+//! rule: it is shown needed by the faithful bar (`tests/sim.rs`) and in `tests/overlay.rs`.
+
+mod support;
 
 use fil_predict::driver::{PredictorKind, Stats, shrink};
 use fil_predict::oracle::Kind;
@@ -108,8 +118,9 @@ fn every_guard_is_needed() {
             for b in backends() {
                 for seed in 0..10 {
                     let mut cfg = SimConfig::new(*sc, seed, b.name);
+                    cfg.run.guards = Guards::M0;
                     (m.off)(&mut cfg.run.guards);
-                    cfg.run.kind = PredictorKind::Hostile { seed, noise: true };
+                    cfg.run.kind = PredictorKind::hostile(seed);
                     cfg.run.secret = "";
                     cfg.keys = 50;
                     let out = run(&cfg);
@@ -142,4 +153,42 @@ fn every_guard_is_needed() {
         missed.is_empty(),
         "guards no scenario could break: {missed:?}"
     );
+}
+
+#[test]
+#[ignore = "run with `just predict-mutants` when changing the core's rules"]
+fn every_c1_guard_is_needed() {
+    use support::rules::{RULES, needed};
+    for name in Guards::C1 {
+        let rules: Vec<_> = RULES.iter().filter(|r| r.guard == Some(*name)).collect();
+        if *name == "cap" {
+            println!("{name:<20} caught: tests/overlay.rs at_most_1024_guesses_are_outstanding");
+            continue;
+        }
+        if *name == "prior_acked" {
+            // A quality rule that also narrows OQ-1 case 3: shown needed by the faithful bar
+            // typed ahead of the prompt; tests/sim.rs also checks it never writes earlier.
+            println!(
+                "{name:<20} caught: tests/sim.rs faithful_commands_at_150_ms_show_no_visible_misprediction"
+            );
+            continue;
+        }
+        if *name == "keep_on_boundary" {
+            // Not a secrecy rule: it keeps what is already written, so it is shown needed by the
+            // faithful bar, not by a secret.
+            println!(
+                "{name:<20} caught: tests/sim.rs faithful_commands_at_150_ms_show_no_visible_misprediction, \
+                 tests/overlay.rs without_keep_on_boundary_enter_erases_the_written_guess"
+            );
+            continue;
+        }
+        assert!(!rules.is_empty(), "guard {name} has no rule trace");
+        for r in rules {
+            needed(r);
+            println!(
+                "{name:<20} caught: {:?} (hostile; default predictor too: {})",
+                r.name, r.mosh_breaks
+            );
+        }
+    }
 }

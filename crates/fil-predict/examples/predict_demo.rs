@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fil_predict::pty::{Frame, LinkConfig, Spec, spawn};
-use fil_predict::{CellStyle, Config, MoshConfig, MoshPredictor, Overlay};
+use fil_predict::{CellStyle, Config, InputKind, LinkView, MoshConfig, MoshPredictor, Overlay};
 use fil_term::{DEFAULT_BACKEND, Size, backends};
 use rustix::stdio::{stdin, stdout};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
@@ -138,7 +138,11 @@ fn main() {
                 ..Config::default()
             },
         );
-        overlay.set_rtt(one_way * 2);
+        overlay.set_link(LinkView {
+            rtt_hint: Some(one_way * 2),
+            ..LinkView::default()
+        });
+        let mut input_at = 0;
 
         let _raw = RawMode::enter()?;
         std::panic::set_hook(Box::new(|info| {
@@ -169,7 +173,8 @@ fn main() {
             tokio::select! {
                 keys = key_rx.recv() => match keys {
                     Some(k) => {
-                        let f = overlay.on_input(&k, start.elapsed());
+                        let f = overlay.on_input(&k, input_at, InputKind::Typed, start.elapsed());
+                        input_at += k.len() as u64;
                         write(&f.to_bytes());
                         if !remote.send(&k).await {
                             break;

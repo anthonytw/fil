@@ -202,10 +202,11 @@ echo "== release-check"
 # and archives made with whatever tar the machine has.
 mk_tree() { # DIR VER
   local d=$1
-  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden"
+  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden" "$d/crates/fil-transport/src/pipe"
   cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/justfile" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$d/"
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
+  cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
   git init -q -b main "$d"
   set_version "$d" "$2"
   git -C "$d" add -A
@@ -221,6 +222,8 @@ fake_bin() { # FILE KIND
 # FAKE-$2 /cargo-home/registry/src/index.crates.io-0/dep-1/src/lib.rs
 echo "fil $VER (wire $(wire_major).$(wire_revision))"
 EOT
+  # The install bootstrap, as a real build holds it (release-check requires it, and no other `sh -c`).
+  printf '# %s\n' "$(release_bootstrap "$VER" "$(wire_major)" "$(wire_revision)")" >> "$1"
   chmod 755 "$1"
 }
 mkdir -p "$tmp/shim"
@@ -340,8 +343,14 @@ mutated "the bundle's SHA256SUMS is wrong" \
   "echo 'deadbeef  x86_64-linux/fil' > fil-0.9.0-x86_64-linux-musl/libexec/fil/remote/SHA256SUMS"
 mutated_msg "a vt100 source path is in bin/fil" "vt100" \
   "echo '# /cargo-home/registry/src/index.crates.io-0/vt100-0.18.0/src/lib.rs' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
-mutated_msg "the install-bootstrap feature is in bin/fil" "install-bootstrap" \
-  "echo '# Remove the copies fil installed on HOST' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "bin/fil has no install bootstrap" "does not hold the approved install bootstrap" \
+  "perl -ni -e 'print unless /^# sh -c /' fil-0.9.0-x86_64-linux-musl/bin/fil"
+mutated_msg "bin/fil's install bootstrap is altered" "does not hold the approved install bootstrap" \
+  "perl -pi -e 's/rm -rf/rm -fr/ if /^# sh -c /' fil-0.9.0-universal-apple-darwin/bin/fil"
+mutated_msg "bin/fil's install bootstrap is for another wire" "does not hold the approved install bootstrap" \
+  "perl -pi -e 's/\\(wire (\\d+)\\.(\\d+)\\)/(wire \$1.9\$2)/ if /^# sh -c /' fil-0.9.0-aarch64-linux-musl/bin/fil"
+mutated_msg "bin/fil holds a second remote command line" "other than the pinned one" \
+  "echo \"# bash -c 'fil server --stdio'\" >> fil-0.9.0-universal-apple-darwin/bin/fil"
 mutated_msg "an ELF is not stripped" "is not stripped" "perl -pi -e 's/FAKE-ELF-X86/FAKE-NOTSTRIPPED/' fil-0.9.0-x86_64-linux-musl/bin/fil"
 # test-fixture host names and addresses: the list comes from the tree's test directories
 new_case 0.9.0

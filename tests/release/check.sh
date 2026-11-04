@@ -194,6 +194,8 @@ fixture_leaks() { # BINARY: the fixture strings found in it, as whole tokens (a 
 is_gnu_tar() { tar --version 2> /dev/null | grep -q 'GNU tar'; }
 
 x86_bin='' aarch_bin=''
+# The install bootstrap this release's binaries must hold (common.sh, from the golden).
+boot=$(release_bootstrap "$V" "$major" "$rev")
 for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source; do
   name=fil-$V-$label
   arc=$dir/$name.tar.gz
@@ -264,10 +266,24 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   done
   # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
   if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
-  # The install bootstrap's sending side is gated on M4 OQ-1 (feature `install-bootstrap`; `release-deps`
-  # checks the graph). Its help text is in the binary only if it was built in. Drop this when the
-  # owner approves the feature and the release is meant to carry it.
-  if grep -aqF 'Remove the copies fil installed on HOST' "$b"; then fail "$name: bin/fil was built with the install-bootstrap feature (gated on M4 OQ-1)"; fi
+  # The remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner 2026-11-04): the
+  # install bootstrap is in the binary, byte for byte as the golden pins it for this version and
+  # wire, and it is the only shell command line: every `sh -c` in the binary (which also catches
+  # `bash -c`, `zsh -c` and the like) is the start of that text. A universal binary holds one per
+  # architecture. `fil server --stdio` is assembled from separate words and has no line to find.
+  if [ -z "$boot" ]; then
+    fail "$name: no install bootstrap to compare with (crates/fil-transport/src/pipe/remote-commands.txt)"
+  else
+    n_boot=$({ grep -aoF -- "$boot" "$b" || true; } | wc -l | tr -d ' ')
+    n_sh=$({ grep -aoF -- 'sh -c' "$b" || true; } | wc -l | tr -d ' ')
+    if [ "$n_boot" -ge 1 ] && [ "$n_sh" = "$n_boot" ]; then
+      ok "$name: bin/fil holds the approved install bootstrap ($n_boot) and no other shell command line"
+    elif [ "$n_boot" -lt 1 ]; then
+      fail "$name: bin/fil does not hold the approved install bootstrap for $V on wire $major.$rev (remote-commands.txt)"
+    else
+      fail "$name: bin/fil has $n_sh 'sh -c' texts but $n_boot copies of the approved install bootstrap: a remote command line other than the pinned one (first: $({ grep -aoE '[ -~]{0,30}sh -c[ -~]{0,30}' "$b" || true; } | head -n 3 | tr '\n' ' '))"
+    fi
+  fi
   # Fixture hosts and addresses (the list is derived from the test directories of the tree).
   leak=$(fixture_leaks "$b")
   if [ -n "$leak" ]; then fail "$name: bin/fil contains test-fixture host names or addresses: $leak"; else ok "$name: bin/fil has none of the $(printf '%s\n' "$fixtures" | grep -c .) test-fixture host names and addresses"; fi

@@ -1,8 +1,6 @@
 //! `fil install HOST`, `fil install --check HOST` and `fil install --remove HOST`: the bootstrap
 //! over ssh, in its three modes (`docs/m4/plan.md` §3 U1).
 //!
-//! **Gated on M4 OQ-1**: compiled only with the `install-bootstrap` feature.
-//!
 //! The remote command is the constant bootstrap and nothing else (`PipeCommand::bootstrap`); a
 //! host whose config names its own `pipe` is refused, since a custom pipe is never rewritten.
 //! Nothing about the host is written on this machine.

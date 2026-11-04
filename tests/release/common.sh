@@ -92,6 +92,17 @@ toolchain_channel() {
 # [history] (crates/fil-proto/tests/golden/wire.txt): the revision the golden ends at.
 wire_major() { sed -n 's/^pub const PROTOCOL_MAJOR: u16 = \([0-9][0-9]*\);.*/\1/p' "$ROOT/crates/fil-proto/src/limits.rs"; }
 wire_revision() { sed -n 's/^pub const PROTOCOL_REVISION: u16 = \([0-9][0-9]*\);.*/\1/p' "$ROOT/crates/fil-proto/src/limits.rs"; }
+# release_bootstrap VER MAJOR REV: the install bootstrap a build of version VER on wire MAJOR.REV
+# holds, from the golden of the remote commands (crates/fil-transport/src/pipe/remote-commands.txt,
+# which shows it for 0.1.0 on wire 1.12; only the version and the wire differ between builds).
+# Prints nothing if the golden is missing or its line does not start as the bootstrap does.
+release_bootstrap() {
+  local golden head
+  golden=$(sed -n 's/^bootstrap = //p' "$ROOT/crates/fil-transport/src/pipe/remote-commands.txt" 2> /dev/null) || return 0
+  head="sh -c 'v=0.1.0-w1.12; w=\"(wire 1.12)\"; "
+  case $golden in "$head"*) ;; *) return 0 ;; esac
+  printf "sh -c 'v=%s-w%s.%s; w=\"(wire %s.%s)\"; %s" "$1" "$2" "$3" "$2" "$3" "${golden#"$head"}"
+}
 golden_last_revision() {
   awk '/^\[history\]/ { h = 1; next } h && /^[0-9]+ = / { last = $1 } END { print last }' "${1:-$ROOT/crates/fil-proto/tests/golden/wire.txt}"
 }

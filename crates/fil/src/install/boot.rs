@@ -2,8 +2,6 @@
 //! reading of what the script prints, and the upload in lockstep. Over any byte stream, so the
 //! tests drive it against the real script in a scratch `HOME` and against fakes.
 //!
-//! **Gated on M4 OQ-1**: compiled only with the `install-bootstrap` feature.
-//!
 //! The rules it keeps:
 //!
 //! - **The mode line first, and nothing else** until the script has answered: the binary is

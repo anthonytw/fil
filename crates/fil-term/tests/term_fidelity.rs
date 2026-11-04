@@ -249,3 +249,42 @@ fn a_snapshot_after_decstr_writes_nothing_the_reset_cleared() {
     assert_eq!(after.modes, st.modes);
     assert_eq!(after.charsets, st.charsets);
 }
+
+/// Feeds `before` to an emulator, snapshots it, feeds the snapshot to a fresh one, then `after`
+/// to both: the program carries on, and must find the same terminal either way.
+fn carries_on_the_same(before: &[u8], after: &[u8]) -> (TermState, TermState) {
+    let mut source = create("alacritty", SIZE, 100).unwrap();
+    source.feed(before);
+    let mut receiver = create("alacritty", SIZE, 100).unwrap();
+    receiver.feed(&snapshot(&source.state(100)));
+    source.feed(after);
+    receiver.feed(after);
+    (source.state(100), receiver.state(100))
+}
+
+#[test]
+fn a_snapshot_in_the_alternate_screen_keeps_the_primary_screens_saved_origin_mode() {
+    // `1049 h` saved origin mode on; the program turned it off in the alternate screen. Leaving
+    // brings it back, and the cursor is placed in the region.
+    let (source, receiver) = carries_on_the_same(
+        b"\x1b[3;6r\x1b[?6h\x1b[?1049h\x1b[?6l",
+        b"\x1b[?1049l\x1b[1;1HY",
+    );
+    assert!(source.modes.origin);
+    assert_eq!(marker_row(&source), Some(2));
+    assert_eq!(marker_row(&receiver), Some(2));
+    assert_eq!(receiver, source);
+}
+
+#[test]
+fn a_saved_cursor_outside_the_current_region_keeps_its_origin_mode() {
+    // Saved with origin mode on at the top of region 3-6, then the region moved below it.
+    let (source, receiver) = carries_on_the_same(
+        b"\x1b[3;6r\x1b[?6h\x1b[1;1H\x1b7\x1b[?6l\x1b[5;7r",
+        b"\x1b8\x1b[1;1HY",
+    );
+    assert!(source.modes.origin);
+    assert_eq!(marker_row(&source), Some(4));
+    assert_eq!(marker_row(&receiver), Some(4));
+    assert_eq!(receiver, source);
+}

@@ -14,9 +14,10 @@
 //!    exactly `history.len()` lines scroll into the receiver's scrollback. Lines that wrapped
 //!    are written without a newline and left to autowrap, which restores the wrap flag;
 //! 3. if the alternate screen is active: park the primary cursor, `CSI ? 1049 h` (which saves
-//!    it for the eventual `1049 l`), then the alternate grid by absolute positioning;
-//! 4. tab stops, the scroll region, the saved cursor with the origin mode and the character
-//!    sets it saved, origin mode, the cursor (with the pending-wrap flag), the pen;
+//!    it, with its origin mode, for the eventual `1049 l`), then the alternate grid by absolute positioning;
+//! 4. tab stops, the saved cursor with the origin mode and the character sets it saved (before
+//!    the scroll region, so its position is absolute), the scroll region, origin mode, the
+//!    cursor (with the pending-wrap flag), the pen;
 //! 5. the live character sets, input modes, mouse, kitty keyboard flags, title, cursor shape
 //!    and visibility.
 //!
@@ -122,13 +123,23 @@ impl<'a> Writer<'a> {
         rows.extend(primary_rows.iter());
         self.flow_lines(&rows);
         if st.modes.alt_screen {
-            // 3. Park the primary cursor, then switch. `1049 h` saves it and clears the
-            // alternate screen.
+            // 3. Park the primary cursor, then switch. `1049 h` saves it, with the origin mode
+            // (which is on only for as long as the save needs it; no region is set yet, so the
+            // position stays absolute), and clears the alternate screen. The `CSI J` there is
+            // not the clear of step 1: it is redundant after `1049 h`, and an alternate screen
+            // has no scrollback to push into, so it is left as it is.
+            let saved_origin = st
+                .primary_behind_alt
+                .as_ref()
+                .is_some_and(|p| p.saved_origin);
             self.end_link();
             self.set_pen(Attrs::default());
+            if saved_origin {
+                self.put("\x1b[?6h");
+            }
             self.cup(primary_cursor.row, primary_cursor.col);
             self.set_pen(primary_cursor.pen);
-            self.put("\x1b[?1049h\x1b[0m\x1b[H\x1b[J");
+            self.put("\x1b[?1049h\x1b[?6l\x1b[0m\x1b[H\x1b[J");
             self.pen = Attrs::default();
             self.positioned_lines(&st.screen);
         }
@@ -141,41 +152,27 @@ impl<'a> Writer<'a> {
         for &c in stops {
             self.put(&format!("\x1b[{}G\x1bH", u32::from(c) + 1));
         }
-        // Scroll region, origin, cursor, pen.
-        match st.modes.scroll_region {
-            Some((top, bottom)) => {
-                self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
-            }
-            None => self.put("\x1b[r"),
-        }
-        // DECSC. It saves the origin mode and the character sets with the position, so a DECRC
-        // by the program later does what it would have done without the snapshot. The origin
-        // mode is set to the saved one first, and the position written in its coordinates (the
-        // region is already set); if the saved row is outside the region it cannot be written
-        // in origin mode, and the save is made without it. The character sets are the saved
-        // ones, then the ASCII ones after (the pending-wrap rewrite below prints a cell and
-        // must not go through line drawing).
+        // DECSC, before the scroll region is set: with none, the position is absolute in origin
+        // mode too, so the saved row is always writable, whatever region the screen has now. It
+        // saves the origin mode and the character sets with the position, so a DECRC by the
+        // program later does what it would have done without the snapshot. The character sets
+        // are the saved ones, then the ASCII ones after (the pending-wrap rewrite below prints a
+        // cell and must not go through line drawing).
         if let Some(sv) = st.saved_cursor {
-            let (top, bottom) = st
-                .modes
-                .scroll_region
-                .unwrap_or((0, st.size.rows.saturating_sub(1)));
-            if sv.origin && (top..=bottom).contains(&sv.row) {
-                self.put("\x1b[?6h");
-                self.put(&format!(
-                    "\x1b[{};{}H",
-                    u32::from(sv.row - top) + 1,
-                    u32::from(sv.col) + 1
-                ));
-            } else {
-                self.put("\x1b[?6l");
-                self.cup(sv.row, sv.col);
-            }
+            self.put(if sv.origin { "\x1b[?6h" } else { "\x1b[?6l" });
+            self.cup(sv.row, sv.col);
             self.set_pen(sv.pen);
             self.designate(sv.charsets);
             self.put("\x1b7");
             self.designate([Charset::Ascii; 4]);
             self.set_pen(Attrs::default());
+        }
+        // Scroll region (which homes the cursor), origin, cursor, pen.
+        match st.modes.scroll_region {
+            Some((top, bottom)) => {
+                self.put(&format!("\x1b[{};{}r", top + 1, bottom + 1));
+            }
+            None => self.put("\x1b[r"),
         }
         self.put(if st.modes.origin {
             "\x1b[?6h"
@@ -787,6 +784,7 @@ mod tests {
                 col: 4,
                 ..Cursor::default()
             },
+            saved_origin: false,
         });
         let out = s(&snapshot(&st));
         let p = out.find('P').unwrap();
@@ -871,24 +869,42 @@ mod tests {
             origin: true,
             ..SavedCursor::default()
         });
+        // Origin mode on, the position absolute (no region is set yet), DECSC; then the region.
         let out = s(&snapshot(&st));
-        // Origin mode on, the position relative to the region (row 3 is region row 2), DECSC.
-        assert!(out.contains("\x1b[3;5r\x1b[?6h\x1b[2;2H\x1b("), "{out:?}");
-        // Saved without origin mode, it is absolute and the mode is off while saving.
+        let save = out.find("\x1b[?6h\x1b[4;2H").expect("origin save position");
+        let decsc = out[save..].find("\x1b7").expect("DECSC") + save;
+        assert!(out.find("\x1b[3;5r").unwrap() > decsc, "{out:?}");
+        // Saved without origin mode, the mode is off while saving.
         st.saved_cursor = Some(SavedCursor {
             origin: false,
             ..st.saved_cursor.unwrap()
         });
         let out = s(&snapshot(&st));
-        assert!(out.contains("\x1b[3;5r\x1b[?6l\x1b[4;2H\x1b("), "{out:?}");
-        // A saved row outside the region cannot be written in origin mode: saved without it.
+        let save = out.find("\x1b[?6l\x1b[4;2H").expect("plain save position");
+        assert!(out[save..].find("\x1b7").unwrap() < out.find("\x1b[3;5r").unwrap() - save);
+        // A saved row outside the region keeps the bit, which is the point of the order.
         st.saved_cursor = Some(SavedCursor {
             row: 0,
             origin: true,
             ..st.saved_cursor.unwrap()
         });
         let out = s(&snapshot(&st));
-        assert!(out.contains("\x1b[3;5r\x1b[?6l\x1b[1;2H\x1b("), "{out:?}");
+        assert!(out.contains("\x1b[?6h\x1b[1;2H"), "{out:?}");
+    }
+
+    #[test]
+    fn the_primary_screens_saved_origin_mode_is_set_around_the_alternate_screen_switch() {
+        let mut st = state(10, 2);
+        st.modes.alt_screen = true;
+        st.primary_behind_alt = Some(PrimaryScreen {
+            screen: vec![Line::blank(10), Line::blank(10)],
+            cursor: Cursor::default(),
+            saved_origin: true,
+        });
+        let out = s(&snapshot(&st));
+        assert!(out.contains("\x1b[?6h\x1b[1;1H"), "{out:?}");
+        assert!(out.contains("\x1b[?1049h\x1b[?6l"), "{out:?}");
+        assert!(out.find("\x1b[?6h").unwrap() < out.find("\x1b[?1049h").unwrap());
     }
 
     #[test]

@@ -310,6 +310,7 @@ impl Emulator for Alacritty {
                 Some(PrimaryScreen {
                     screen: p_screen,
                     cursor: p_cursor,
+                    saved_origin: self.region.saved_origin(false),
                 }),
                 saved,
             )

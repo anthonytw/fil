@@ -180,6 +180,9 @@ pub struct Hyperlink {
 pub struct PrimaryScreen {
     pub screen: Vec<Line>,
     pub cursor: Cursor,
+    /// The origin mode the primary screen's cursor save holds: `CSI ? 1049 h` saved it, and
+    /// `CSI ? 1049 l` brings it back (as in xterm).
+    pub saved_origin: bool,
 }
 
 /// A character set that can be designated into G0 to G3. Only the two programs actually use:

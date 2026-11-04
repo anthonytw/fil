@@ -18,6 +18,9 @@ if [ -f "$ROOT/CHANGELOG.md" ]; then
     p { print }
   ' "$ROOT/CHANGELOG.md"
 fi
+# TODO (docs/m4/release.md section 10.3, the notarization work item): v1 macOS binaries are signed and
+# notarized by `just release-sign-macos`; when that lands, replace the "ad-hoc signed ... not notarized"
+# sentence below. Until then it is true of what CI builds, so it stays.
 cat << EOT
 
 ## Verify what you downloaded

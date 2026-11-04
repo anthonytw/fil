@@ -83,10 +83,10 @@ pub async fn run_with(argv: &[OsString], host: &str, request: &Request, exe: &Pa
     judge(result, status, &shown)
 }
 
-/// The outcome, given how ssh ended. `check` mode's output has no end marker (the approved script
-/// prints its findings and exits 0), so a login that failed (ssh exits 255 with nothing printed)
-/// or a shell that could not run the script would otherwise read as "nothing installed": success
-/// needs ssh's exit status 0. A failure says ssh's status when it was not 0.
+/// The outcome, given how ssh ended: success needs ssh's exit status 0 as well, so a login that
+/// failed (ssh exits 255) is a failure even where its output looked complete. (`check`'s report
+/// also ends with its own marker, N6, so a host that exits 0 having said nothing is no answer
+/// either: `boot::read_check`.) A failure says ssh's status when it was not 0.
 pub fn judge(result: Said, status: Option<std::process::ExitStatus>, host: &str) -> Said {
     let failed = match status {
         Some(s) if s.success() => None,
@@ -197,6 +197,11 @@ async fn exchange(
             if let Some(r) = report.filter(|r| r.removed > 0) {
                 out.push_str(&format!(" (and removed {} old copies)", r.removed));
             }
+            // If the plain command finds no fil there, each run would take two logins.
+            out.push_str(&format!(
+                "\n{host}: {}",
+                super::attach::config_line_if_needed(host)
+            ));
             Ok(out)
         }
     }
@@ -264,8 +269,8 @@ mod tests {
         Some(ExitStatus::from_raw(code << 8))
     }
 
-    /// A report that looked complete counts only if ssh exited 0: `check` has no end marker, so a
-    /// failed login (255, nothing printed) would otherwise read as "nothing installed".
+    /// A report that looked complete counts only if ssh exited 0: a failed login (255) is a
+    /// failure whatever was printed before it.
     #[test]
     fn success_needs_ssh_to_exit_0() {
         let ok: Said = Ok("devbox: fine".into());

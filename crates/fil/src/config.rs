@@ -12,12 +12,11 @@
 //! agent_keys = []             # SHA256 fingerprints the relay answers for; empty is every key
 //! remote_requests = "ask"     # ask | deny: `fil forward` run on the host (section 7.3)
 //! forward_failure = "warn"    # warn | exit: a forward that cannot bind (ssh ExitOnForwardFailure)
-//! remote = "auto"             # auto | plain | installed: the remote command (docs/m4/install.md);
-//!                             # until the attach wiring lands, attaches always run
-//!                             # `fil server --stdio`, and "installed" is refused
+//! remote = "auto"             # auto | plain | installed: the remote command (docs/m4/install.md):
+//!                             # `fil server --stdio` first, the install bootstrap if it finds
+//!                             # no fil; plain: never the bootstrap; installed: the bootstrap
 //! install = "ask"             # ask | never | always: offering to install fil on a host that has
-//!                             # none (the offer comes with the attach wiring; `fil install HOST`
-//!                             # works now)
+//!                             # none, on an interactive first attach only
 //!
 //! [defaults.forward]          # instead of the list above, when tunables are set:
 //! # specs = ["-L 5173"]       #   the same list
@@ -412,11 +411,9 @@ pub struct HostSettings {
     pub offline: OfflineInput,
     /// Where to dial UDP when it is not the host name (an ssh alias, a different interface).
     pub direct_address: Option<String>,
-    /// Which remote command a run uses (`crate::install::fallback`). Until the attach wiring
-    /// lands every attach and management connection runs `fil server --stdio`, whatever this says.
+    /// Which remote command a run uses (`crate::install::fallback`).
     pub remote: RemoteMode,
-    /// Whether an attach that finds no fil offers to install it (not yet: the offer comes with
-    /// the attach wiring).
+    /// Whether an attach that finds no fil offers to install it (`crate::install::attach`).
     pub install: InstallMode,
 }
 
@@ -606,9 +603,6 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
         }
     }
     if let Some(r) = s.remote {
-        if r == RemoteMode::Installed {
-            return Err(REMOTE_INSTALLED.into());
-        }
         out.remote = r;
     }
     if let Some(i) = s.install {
@@ -710,11 +704,6 @@ fn check_label(l: &str) -> Result<String, String> {
     }
     Ok(l.to_string())
 }
-
-/// Why `remote = "installed"` is refused for now: it would run the install bootstrap from a run's
-/// first connection, and no attach runs it until the attach path can send it (the owner approved
-/// the bootstrap in M4 OQ-1; `fil install` runs it on its own).
-const REMOTE_INSTALLED: &str = "remote = \"installed\" is not available in this version of fil (every connection runs `fil server --stdio`); use \"auto\" or \"plain\"";
 
 const DAEMON_SETTING: &str = "KEY is a setting of the daemon, not of the client: put it in ~/.config/fil/daemon.toml on the host where the daemon runs";
 
@@ -828,15 +817,11 @@ install = "always"
         assert_eq!(cfg.for_host("other").install, InstallMode::Never);
     }
 
-    /// Until the attach wiring lands no attach runs the bootstrap, so the one value that asks
-    /// for it from the start is refused, naming the key, rather than silently meaning "plain".
     #[test]
-    fn remote_installed_is_refused_until_the_bootstrap_runs() {
-        let e = parse("[host.devbox]\nremote = \"installed\"\n").unwrap_err();
-        assert!(
-            e.contains("[host.devbox]") && e.contains("remote = \"installed\""),
-            "{e}"
-        );
+    fn remote_installed_is_accepted_and_unknown_values_are_not() {
+        let cfg = parse("[host.devbox]\nremote = \"installed\"\n").unwrap();
+        assert_eq!(cfg.for_host("devbox").remote, RemoteMode::Installed);
+        assert_eq!(cfg.for_host("other").remote, RemoteMode::Auto);
         assert!(parse("[defaults]\nremote = \"sometimes\"\n").is_err());
         assert!(parse("[defaults]\ninstall = \"yes\"\n").is_err());
     }

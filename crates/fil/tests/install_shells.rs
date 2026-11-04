@@ -769,6 +769,12 @@ fn cases() -> Vec<Case> {
                     out.contains(&format!("FIL-LOCAL fil 0.0.0 (wire {})\n", wire())),
                     "the first line of --version only",
                     &out,
+                )?;
+                // N6: the report ends with its marker, and only there.
+                expect(
+                    out.ends_with("FIL-CHECK-END\n") && out.matches("FIL-CHECK-END").count() == 1,
+                    "check ends with FIL-CHECK-END",
+                    &out,
                 )
             },
         ),

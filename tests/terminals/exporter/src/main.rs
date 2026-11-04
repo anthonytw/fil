@@ -103,6 +103,7 @@ mod selfcheck {
             "u" => "u",
             "ur" => "ur",
             "bfgu" => "bfgu",
+            "bfgusk" => "bfgusk",
             "bdiursfg" => "bdiursfg",
             other => panic!("unknown attrs {other}"),
         };

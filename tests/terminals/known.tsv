@@ -32,6 +32,8 @@ kitty	ov-clear-screen/end/flush	ED2-NO-PUSH	e0ea351514c7
 kitty	ov-clear-screen/probe	ED2-NO-PUSH	8fb22fa645e6
 kitty	ov-origin-nosync/probe	FIL-DECRC-ORIGIN	71e1db9ab175
 kitty	ov-origin/probe	FIL-DECRC-ORIGIN	71e1db9ab175
+kitty	ov-pen-colon-nosync/probe	KITTY-DECRC-PEN	3486f10a6637
+kitty	ov-pen-colon/probe	KITTY-DECRC-PEN	3486f10a6637
 kitty	ov-pen-nosync/probe	KITTY-DECRC-PEN	3486f10a6637
 kitty	ov-pen/probe	KITTY-DECRC-PEN	3486f10a6637
 kitty	ov-resize-narrow-nosync/e2/client-erased	REFLOW	f6222d5ef829
@@ -111,6 +113,15 @@ wezterm	ov-decstr-nosync/probe	FIL-DECSTR	445f44e162af
 wezterm	ov-decstr/probe	FIL-DECSTR	445f44e162af
 wezterm	ov-origin-nosync/probe	WEZTERM-MARGINS	18e2c14d987a
 wezterm	ov-origin/probe	WEZTERM-MARGINS	18e2c14d987a
+wezterm	ov-pen-colon-nosync/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e2/erase	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon-nosync/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon-nosync/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
+wezterm	ov-pen-colon/e2/flush	WEZTERM-NO-CURLY	ce71fca9d0de
+wezterm	ov-pen-colon/end/flush	WEZTERM-NO-CURLY	ce71fca9d0de
 wezterm	ov-pen-nosync/e0/flush	WEZTERM-NO-CURLY	28cbff26368f
 wezterm	ov-pen-nosync/e1/flush	WEZTERM-NO-CURLY	28cbff26368f
 wezterm	ov-pen-nosync/e2/erase	WEZTERM-NO-CURLY	28cbff26368f
@@ -128,6 +139,8 @@ wezterm	ov-resize-narrow/e2/client-erased	REFLOW	f6222d5ef829
 wezterm	ov-resize-narrow/e2/terminal-resized	REFLOW	09561058879b
 wezterm	ov-resize-narrow/e3/flush	REFLOW	cab5c0650f0b
 wezterm	ov-resize-narrow/probe	REFLOW	e6d6d39b1705
+wezterm	ov-scroll-region-nosync/*	WEZTERM-REGION	*
+wezterm	ov-scroll-region/*	WEZTERM-REGION	*
 wezterm	rf-after-snapshot/40x24	REFLOW	f7a5cf88ed1b
 wezterm	rf-blank-below/30x24	REFLOW	926eba84f2c7
 wezterm	rf-both/50x10	REFLOW	5d4941925a1a
@@ -165,6 +178,15 @@ xterm	ov-decstr-nosync/probe	FIL-DECSTR	445f44e162af
 xterm	ov-decstr/probe	FIL-DECSTR	445f44e162af
 xterm	ov-origin-nosync/probe	FIL-DECRC-ORIGIN	d4320ad022d2
 xterm	ov-origin/probe	FIL-DECRC-ORIGIN	d4320ad022d2
+xterm	ov-pen-colon-nosync/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon-nosync/e1/flush	FIL-SGR58	8bf48ca6b774
+xterm	ov-pen-colon-nosync/e2/erase	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon-nosync/e2/flush	FIL-SGR58	3d01d63a739d
+xterm	ov-pen-colon-nosync/end/flush	FIL-SGR58	89f0dedd401f
+xterm	ov-pen-colon/e0/flush	FIL-SGR58	d5752c054726
+xterm	ov-pen-colon/e1/flush	FIL-SGR58	8bf48ca6b774
+xterm	ov-pen-colon/e2/flush	FIL-SGR58	3d01d63a739d
+xterm	ov-pen-colon/end/flush	FIL-SGR58	89f0dedd401f
 xterm	ov-pen-nosync/e0/flush	FIL-SGR58	d5752c054726
 xterm	ov-pen-nosync/e1/flush	FIL-SGR58	d5752c054726
 xterm	ov-pen-nosync/e2/erase	FIL-SGR58	d5752c054726
@@ -212,5 +234,3 @@ xterm	sn-styles/snapshot	FIL-SGR58	acd654c325d4
 xterm	sn-wide/probe	XTERM-PRINT-NORM	89daf1b5a585
 xterm	sn-wide/snapshot	XTERM-PRINT-NORM	576c570d1029
 xterm	wd-widths/soft-hyphen	WIDTH	def618a0db86
-wezterm	ov-scroll-region/*	WEZTERM-REGION	*
-wezterm	ov-scroll-region-nosync/*	WEZTERM-REGION	*

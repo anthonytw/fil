@@ -87,6 +87,17 @@ pub fn runs() -> Vec<Run> {
             "bfgu",
         ),
         hz(
+            "ov-pen-colon",
+            "Hazard 2, with the program sending the safe colon forms (`4:3`, `58:5:9`): the overlay's pen restore writes the same pen with semicolons (`58;5;9`), which a terminal that does not know 58 reads as blink and strikethrough. Compares strikethrough and blink too.",
+            Script::new()
+                .server(0, b"\x1b[1;31;48;5;4;4:3;58:5:9mhi")
+                .input(10, b"x")
+                .server(20, b"!"),
+            &[(2, 2, 'z')],
+            None,
+            "bfgusk",
+        ),
+        hz(
             "ov-hyperlink",
             "Hazard 3: the program's open hyperlink stays open across a paint.",
             Script::new()

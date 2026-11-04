@@ -6,11 +6,11 @@ Until now the prediction core, the snapshot writer and the status line were chec
 
 ## What is replayed
 
-`tests/terminals/exporter` (its own cargo workspace; not part of `just ci`) writes one JSON trace per scenario. A trace is a list of steps: bytes to write, resizes, and checkpoints with the expected screen, cursor, cell attributes and scrollback taken from the model fed the same bytes. 92 traces, about 540 checkpoints:
+`tests/terminals/exporter` (its own cargo workspace; not part of `just ci`) writes one JSON trace per scenario. A trace is a list of steps: bytes to write, resizes, and checkpoints with the expected screen, cursor, cell attributes and scrollback taken from the model fed the same bytes. 94 traces, about 560 checkpoints:
 
 | Group | Traces | What the terminal is fed |
 |---|---|---|
-| `ov-*` | 20 hazard traces of the spike (`crates/fil-predict/tests/hazards.rs`, one per row of the hazard table), each with synchronized output on and off; `ov-typing`, a typing session with the default predictor at 200 ms | The real `Overlay`'s output: the erase, the server bytes, the paint, and the `?2026` markers, with a checkpoint after each flush and, where the erase is at rest, right after the erase |
+| `ov-*` | 21 hazard traces (the spike's 20 and `ov-pen-colon`; `crates/fil-predict/tests/hazards.rs`, one per row of the hazard table), each with synchronized output on and off; `ov-typing`, a typing session with the default predictor at 200 ms | The real `Overlay`'s output: the erase, the server bytes, the paint, and the `?2026` markers, with a checkpoint after each flush and, where the erase is at rest, right after the erase |
 | `st-*` | 6 status-line scenarios (`crates/fil-predict/tests/status.rs`), with and without synchronized output | The same, for the pinned status (inverse video) |
 | `sn-*` | 9 snapshots: plain, history, wrapped lines, styles, wide characters, alternate screen, scroll region with origin mode and tab stops and DEC graphics, pending wrap, autowrap off | `fil_term::snapshot::snapshot` of a state, then the probe |
 | `as-*` | 11 micro-tests of the assumptions `docs/spikes/prediction.md` lists as unverified, and `as-scroll-region`, the overlay-free control for `ov-scroll-region` | Hand-written bytes |
@@ -57,12 +57,14 @@ These are not findings about fil; each is handled in `player.py`, and each is a 
 
 `tests/terminals/known.tsv` lists every disagreement the run knows about: the terminal, the checkpoint, a reason, and a hash of the **exact differences** found there (their text is deterministic). A disagreement passes only if it is the listed one. An unlisted checkpoint fails, a listed checkpoint with a different or an added difference fails (so a new bug at a checkpoint that already has a known difference is not hidden), and a listed difference that no longer occurs is reported as `STALE` and fails. The one exception is a `trace/*` wildcard for an intermittent trace (WezTerm's scroll region). `TERMINALS_STRICT=1` ignores the list. Reasons tagged `[fil-term fix PR: ...]` are fil-side bugs the follow-up fix PR removes, not terminal quirks. Today: **no unlisted or changed disagreement, no stale entry, no read-back error, the canary caught on all four.**
 
-| Terminal | Checkpoints | Agree | Disagree (all listed) |
+Run 41810202004 on GitHub (before `ov-pen-colon` was added; the counts include the canary's checkpoint only as agreeing):
+
+| Terminal | Agree | Disagree (all listed) | Informational |
 |---|---|---|---|
-| xterm | 521 | 454 | 67 |
-| kitty | 521 | 481 | 40 |
-| WezTerm | 521 | 468 | 52 (and 1 informational) |
-| tmux | 521 | 492 | 29 |
+| xterm | 462 | 67 | 0 |
+| kitty | 488 | 40 | 1 (the cursor report held inside a `?2026` bracket) |
+| WezTerm | 472 (470 to 474 across runs: the intermittent traces) | 56 | 1 |
+| tmux | 498 | 31 | 0 |
 
 **The overlay's own writes agree on all four terminals**, with synchronized output on and off, at every flush checkpoint and at every erase point where the erase is at rest, for the 20 hazard traces, the typing session and the 6 status-line scenarios, with these exceptions: across a resize (finding 1); on xterm, where the pen restore and the program's own pen carry `58;5;N` and `4:3`, which xterm 390 misreads (finding 6); on WezTerm, where `get-text` cannot show a curly underline (a read-back limit, not a verdict); at the probe after `ov-origin` on every terminal (finding 2: the shadow, not the terminal, is wrong); and WezTerm's intermittent partial scroll region trace (finding 8). That is the answer to "can the erase be wrong on a real terminal": not outside a resize, on what was measured.
 
@@ -147,7 +149,7 @@ tmux alone behaves like the shadow here; do not take it as evidence about the ot
 
 ### 6. fil writes SGR 58 with semicolons; xterm 390 misreads it (and `4:3`)
 
-`sn-styles`, `ov-pen`, `as-pen`. `fil_term::snapshot::sgr`, which the snapshot writer and the overlay's pen restore (`set_pen`) both use, writes the underline color as `58;5;N` and `58;2;R;G;B` **with semicolons**, and a curly underline as `4:3`. A terminal that does not know 58 reads the `5` and the `9` of `58;5;9` as blink and strikethrough (the xterm cells print as `0;1;5;9;90;44`), and xterm 390 reads `4:3` as a black foreground (`sn-styles` reads back `f0`, `ov-pen` `f8`, bold black): the text goes black rather than just losing its underline. alacritty parses the colon form, so a program that sends the safe `58:5:9` has it rewritten by fil into the unsafe form in every snapshot and every erase. The traces cannot show that last part: `ov-pen` and `as-pen` send the semicolon form from the program itself, and `ov-pen` compares `bfgu` but not `s` and `k`. This is a fil encoding choice, not an xterm bug: the follow-up writes `58:5:N` / `58:2::R:G:B`, and `4` instead of `4:3` unless the terminal advertises `Smulx`. Programs normally send curly underlines only when terminfo advertises them, which `xterm-256color` does not.
+`sn-styles`, `ov-pen`, `as-pen`. `fil_term::snapshot::sgr`, which the snapshot writer and the overlay's pen restore (`set_pen`) both use, writes the underline color as `58;5;N` and `58;2;R;G;B` **with semicolons**, and a curly underline as `4:3`. A terminal that does not know 58 reads the `5` and the `9` of `58;5;9` as blink and strikethrough (the xterm cells print as `0;1;5;9;90;44`), and xterm 390 reads `4:3` as a black foreground (`sn-styles` reads back `f0`, `ov-pen` `f8`, bold black): the text goes black rather than just losing its underline. alacritty parses the colon form, so a program that sends the safe `58:5:9` has it rewritten by fil into the unsafe form in every snapshot and every erase. `ov-pen` and `as-pen` send the semicolon form from the program itself (and `ov-pen` compares `bfgu`, not `s` and `k`), so they cannot show that part; `ov-pen-colon` does: the program sends `4:3;58:5:9`, and on xterm the cells fil writes after its pen restore (the cell the program writes next, and the guess) read back with blink and strikethrough (`b,f1,g4,k,s`), which the program's own bytes did not cause. This is a fil encoding choice, not an xterm bug: the follow-up writes `58:5:N` / `58:2::R:G:B`, and `4` instead of `4:3` unless the terminal advertises `Smulx`. Programs normally send curly underlines only when terminfo advertises them, which `xterm-256color` does not.
 
 ### 7. Smaller observations
 
@@ -209,16 +211,16 @@ just vm-run tests/terminals/run.sh
 
 ### Run times
 
-92 traces, about 540 checkpoints per terminal.
+94 traces, about 560 checkpoints per terminal.
 
 | | xterm | kitty | WezTerm | tmux | Whole job |
 |---|---|---|---|---|---|
-| GitHub runner, `linux-check -f suite=terminals` (run 41801078111, x86_64) | 125 s | 108 s | 44 s | 17 s | 5 min 42 s, with the apt packages, the WezTerm download and a cached cargo build |
-| Lima VM (aarch64, 6 cores) | 134 to 140 s | 64 to 246 s (varies with other work in the VM) | 47 to 112 s | 16 to 33 s | about 5 to 9 min |
+| GitHub runner, `linux-check -f suite=terminals` (run 41810202004, x86_64) | 127 s | 120 s | 46 s | 17 s | 6 min 20 s, with the apt packages, the WezTerm download, a cached cargo build and the exporter's lint |
+| Lima VM (aarch64, 6 cores) | 143 to 158 s | 64 to 246 s (varies with other work in the VM) | 44 to 112 s | 16 to 33 s | about 5 to 9 min |
 
 xterm is the slowest because each scrollback read sends a key with `xdotool` and waits for the file; the rest is the cost of a fresh terminal per trace (about 0.5 s for kitty and WezTerm).
 
-Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `libEGL`; xterm and kitty were green), 41798691924 (green except two checks of the intermittent WezTerm scroll-region trace), 41801078111 (green).
+Workflow runs of this branch: 41797985187 (WezTerm failed to start for want of `libEGL`), 41798691924 (one intermittent WezTerm trace), 41801078111 (green, before the review fixes), 41809456777 (WezTerm's cursor report in origin mode, accepted since), 41810202004 (green, with the pinned `known.tsv`). `ov-pen-colon` was added after it and checked in the VM.
 
 ## Files
 

@@ -20,7 +20,12 @@ def load(out):
     for t in ORDER:
         path = os.path.join(out, f"{t}.jsonl")
         if os.path.exists(path):
-            res[t] = [json.loads(x) for x in open(path) if x.strip()]
+            recs = [json.loads(x) for x in open(path) if x.strip()]
+            # A WezTerm trace that was run again has several attempts; the last one counts.
+            last = OrderedDict()
+            for r in recs:
+                last[(r.get("trace"), r.get("check"), "error" in r, "done" in r)] = r
+            res[t] = list(last.values())
     return res
 
 

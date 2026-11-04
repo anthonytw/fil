@@ -388,9 +388,13 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
         PipeErrorKind::NoPreamble { .. } => (
             Severity::Permanent,
             format!(
-                "fil did not start on the remote host ({}); is it installed, and on the PATH of a non-interactive login?",
+                "fil did not start on the remote host ({}): {NOT_INSTALLED}",
                 e.kind
             ),
+        ),
+        PipeErrorKind::Closed if fil_missing(&e) => (
+            Severity::Permanent,
+            format!("fil is not installed on the remote host: {NOT_INSTALLED}"),
         ),
         PipeErrorKind::InvalidCommand(_) | PipeErrorKind::Spawn(_) => {
             (Severity::Permanent, e.to_string())
@@ -413,6 +417,22 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
         severity,
         note,
     }
+}
+
+/// Where fil looks on the host, and what to do (the manual install, `docs/m4/install.md`): the
+/// remote command is `fil server --stdio`, which the login shell finds on its `PATH`, and a
+/// non-interactive ssh login often has a shorter `PATH` than an interactive one.
+pub const NOT_INSTALLED: &str = "the remote command `fil server --stdio` found no `fil` on the PATH of a non-interactive ssh login there (`ssh HOST 'echo $PATH'` shows that PATH). Copy a release's bin/fil into a directory on it, such as /usr/local/bin, or add its directory to the PATH that your shell sets for non-interactive logins (~/.bashrc above its interactive check, ~/.zshenv, ~/.config/fish/config.fish), then run fil again";
+
+/// Whether a pipe that ended before fil's preamble ended because the login shell found no `fil`:
+/// status 127 (sh, bash, zsh, dash, ksh, fish), or what csh and tcsh say (status 1).
+fn fil_missing(e: &PipeError) -> bool {
+    let status_127 = e
+        .exit
+        .as_deref()
+        .is_some_and(|x| x.trim_end().ends_with("exit status: 127"));
+    let csh = e.stderr_text().contains("fil: Command not found.");
+    status_127 || csh
 }
 
 /// The last non-empty line, cut to a length the status line can show.
@@ -648,7 +668,7 @@ mod tests {
             stderr: Vec::new(),
         });
         assert_eq!(n.severity, Severity::Permanent);
-        assert!(n.message.contains("installed"));
+        assert!(n.message.contains("fil server --stdio") && n.message.contains("non-interactive"));
         assert_eq!(n.skipped, b"bash: fil: command not found\n");
         let c = failure(PipeError {
             kind: PipeErrorKind::Closed,
@@ -658,6 +678,41 @@ mod tests {
         });
         assert_eq!(c.severity, Severity::Transient);
         assert!(c.message.contains("255"));
+        // A login shell that found no fil: where fil looks and what to do, once (not retried).
+        for (exit, stderr) in [
+            (
+                "exited: exit status: 127",
+                &b"bash: fil: command not found\n"[..],
+            ),
+            ("exited: exit status: 127", b"fish: Unknown command: fil\n"),
+            ("exited: exit status: 1", b"fil: Command not found.\n"),
+        ] {
+            let m = failure(PipeError {
+                kind: PipeErrorKind::Closed,
+                skipped: Vec::new(),
+                exit: Some(exit.into()),
+                stderr: stderr.to_vec(),
+            });
+            assert_eq!(m.severity, Severity::Permanent, "{exit}");
+            assert!(
+                m.message
+                    .starts_with("fil is not installed on the remote host: "),
+                "{}",
+                m.message
+            );
+            assert!(m.message.contains("PATH of a non-interactive ssh login"));
+        }
+        let other = failure(PipeError {
+            kind: PipeErrorKind::Closed,
+            skipped: Vec::new(),
+            exit: Some("exited: exit status: 1".into()),
+            stderr: b"fil: cannot use /tmp/fil-1000\n".to_vec(),
+        });
+        assert_eq!(
+            other.severity,
+            Severity::Transient,
+            "a relay's own failure is not a missing fil"
+        );
     }
 
     #[test]

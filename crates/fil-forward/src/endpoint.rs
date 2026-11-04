@@ -897,15 +897,16 @@ impl<L: Link> State<L> {
         ids
     }
 
-    /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
-    /// that the pacer lets go now, taken with `Mux::poll_transmit_channel`.
-    fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
-        let ids = self.sendable_ids();
+    /// The next payload, in turn over `ids` (the channels with bytes to send, in order) from the
+    /// one after the last taken, of the first channel the pacer lets go now: taken with
+    /// `Mux::poll_transmit_channel`, which says whether credit and the gates allow one.
+    /// `unqueued_only` skips channels that already have a payload in the data queue (the pass
+    /// from the mux; the queue itself keeps one channel's payloads in order).
+    fn take_in_turn(&mut self, ids: &[u32], unqueued_only: bool) -> Option<(ChannelId, Bytes)> {
         let start = ids.partition_point(|&id| id <= self.pass_rr);
-        let mut found = None;
         for k in 0..ids.len() {
             let id = ids[(start + k) % ids.len()];
-            if self.queued.contains_key(&id) {
+            if unqueued_only && self.queued.contains_key(&id) {
                 continue;
             }
             let ch = ChannelId(id);
@@ -914,10 +915,17 @@ impl<L: Link> State<L> {
             }
             if let Some(payload) = self.mux.poll_transmit_channel(ch) {
                 self.pass_rr = id;
-                found = Some((ch, payload));
-                break;
+                return Some((ch, payload));
             }
         }
+        None
+    }
+
+    /// The next payload, in turn over the mux's channels, of one with nothing in the data queue
+    /// that the pacer lets go now.
+    fn next_from_mux(&mut self) -> Option<(ChannelId, Bytes)> {
+        let ids = self.sendable_ids();
+        let found = self.take_in_turn(&ids, true);
         self.scratch_ids = ids;
         found
     }
@@ -934,29 +942,11 @@ impl<L: Link> State<L> {
             return;
         }
         let ids = self.sendable_ids();
-        // Rounds over the channels from the one after the last taken, one payload each, until
-        // the queue is full or a round finds nothing.
-        let mut k = ids.partition_point(|&id| id <= self.pass_rr);
-        let mut idle = 0;
-        while !ids.is_empty()
-            && idle < ids.len()
-            && self.data_out_bytes < DATA_AHEAD
-            && self.data_out.len() < PASS_SCAN
-        {
-            let id = ids[k % ids.len()];
-            k += 1;
-            let ch = ChannelId(id);
-            let payload = if self.pacer.may_go(ch, self.is_agent(ch)) {
-                self.mux.poll_transmit_channel(ch)
-            } else {
-                None
+        // One payload per channel in turn, until the queue is full or a round finds nothing.
+        while self.data_out_bytes < DATA_AHEAD && self.data_out.len() < PASS_SCAN {
+            let Some((ch, payload)) = self.take_in_turn(&ids, false) else {
+                break;
             };
-            let Some(payload) = payload else {
-                idle += 1;
-                continue;
-            };
-            idle = 0;
-            self.pass_rr = id;
             self.data_out_bytes += payload.len();
             *self.queued.entry(ch.0).or_default() += 1;
             self.data_out.push_back((ch, payload));
@@ -1074,6 +1064,7 @@ impl<L: Link> Endpoint<L> {
         let max_held_mux = cfg.mux_buffer;
         let connect_timeout = cfg.connect_timeout;
         let open_wait = cfg.open_wait;
+        let pace_cfg = PaceConfig::from_env();
         let inner = Arc::new(Inner {
             side,
             state: Mutex::new(State {
@@ -1085,8 +1076,8 @@ impl<L: Link> Endpoint<L> {
                 data_out: VecDeque::new(),
                 data_out_bytes: 0,
                 finish_out: VecDeque::new(),
-                pacer: Pacer::new(PaceConfig::from_env(), now()),
-                pace_cfg: PaceConfig::from_env(),
+                pacer: Pacer::new(pace_cfg, now()),
+                pace_cfg,
                 queued: HashMap::new(),
                 pass_rr: 0,
                 scratch_ids: Vec::new(),

@@ -25,10 +25,6 @@
 name: macos-check
 
 on:
-  # TEMPORARY (removed before merge): a workflow that is not on main cannot be dispatched, so the
-  # branch's own pushes run it while it is being written.
-  push:
-    branches: [m4-mac, m4-mac-seam]
   workflow_dispatch:
     inputs:
       ref:

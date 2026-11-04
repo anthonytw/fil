@@ -154,3 +154,35 @@ How to read them for OD-10/H1:
 - **QUIC: about 273 ms, almost exactly the bottleneck queue.** The 500-packet queue at 20 Mbit/s holds about 300 ms; the keystroke rides its own stream but the same congestion window, so each one waits behind the queue the bulk keeps full. The p99 is tight (320 ms): nothing but the router's queue is in the way. A forward that is paced to keep the queue short (the plan's delay-based cap) is the only thing that would bring this down.
 - **The pipe: about 432 ms, the queue plus what sits in TCP and ssh's buffers in front of it.** Half of ssh -L's 850 ms. Most likely because fil's channel window is 1 MiB against ssh's 2 MiB (at 20 Mbit/s, about 420 ms against 840), so less forward data waits in front of a keystroke; that is an inference from the sizes, not a measurement of the buffers. Either way it waits behind the bytes already in the one TCP connection.
 - **The idle cells are fil's own cost: none.** 41.6 and 41.8 ms idle against ssh's 40.9 without batching: the network's 40 ms plus a millisecond and a half, as in L1.
+
+### After H1: forward pacing
+
+H1 (`fil_forward::pace`, DESIGN §8.5 "Pacing") caps the forward data each side has in flight on a link, LEDBAT-style on fil's own acknowledgements, aiming at 25 ms of queueing delay. Measured in the Lima VM (aarch64) on a local merge of H1 with this harness. "Before" is the same build with pacing off in both ends, interleaved cell by cell with the paced one; it matches main (pipe upload 432.9 / 715 ms on main). Keystrokes at 20 keys/s for 20 s; goodput is what the application received; "bulk only" is the same transfer with 1 key/s. ms as p50 / p99, Mbit/s.
+
+**Where the queue was, before** (medians of 250 ms samples during the upload; the download is the mirror image). Pipe: fil had its whole 1 MiB window in flight (1,015,808 bytes), and the client's TCP socket held 1.03 MB of it (Send-Q), 370 KB not yet sent; the router held 630 KB. ssh's process and fil's own queues held almost nothing (fil's in-flight bytes equal the socket's Send-Q, plus ssh's framing). So V1's inference holds: the window bounds the queue, in the socket's send buffer and the router. QUIC: the router's queue, 620 to 675 KB. ssh -L: 2.03 MB in its socket (1.35 MB unsent) and 630 KB in the router.
+
+**V1's cell** (`delay 20ms 5ms rate 20mbit limit 500`):
+
+| Path | idle | upload | download | goodput up / down, typing | goodput up / down, bulk only |
+|---|---|---|---|---|---|
+| pipe, before | 50.2 / 61.3 | 433 / 700 | 434 / 705 | 19.06 / 18.88 | 19.07 / 19.06 |
+| **pipe, paced** | 50.2 / 60.4 | **81 / 92** | **86 / 98** | 19.00 / 18.99 | 18.99 / 18.80 |
+| QUIC, before | 49.7 / 62.6 | 272 / 319 | 274 / 324 | 18.97 / 18.90 | 18.98 / 18.93 |
+| **QUIC, paced** | 49.6 / 64.6 | **75 / 87** | **76 / 86** | 18.92 / 18.84 | 18.90 / 18.86 |
+| ssh -tt -L | 58.8 / 80.4 | 850 / 1133 | 845 / 1119 | 19.10 / 19.07 | |
+| ssh -tt -o ObscureKeystrokeTiming=no -L | 50.5 / 64.9 | 852 / 1124 | 850 / 1089 | 19.10 / 19.06 | |
+
+- **H1's rule holds on both transports:** p50 under load 75 to 86 ms against a line of about 110 ms (2 x idle + 10), and p99 under 100 ms (from 700 and 320). Goodput is within 1.4 % of before in every cell. A 150 s download with typing (base periods and their drains included) gave pipe 80.5 / 93.0 at 18.96 Mbit/s and QUIC 78.7 / 96.9 at 18.87: no creep.
+- **What is left queued, paced:** in the router 125 to 155 KB (about 55 ms at 20 Mbit/s; the target plus the controller's swing), in the client's socket about 190 KB with nothing unsent, and in flight for fil 230 to 245 KB.
+- **This harness's `f_fwd_vs_ssh`**, unchanged, on the same build: pipe 81.2 / 128.4 up and 80.1 / 91.4 down, QUIC 86.9 / 99.6 and 74.8 / 86.5, `h1_rule_exceeded=no` in all four; with pacing off 433.3 / 684.2, 434.4 / 666.2, 273.3 / 320.5 and 216.0 / 321.1, exceeded in all four.
+
+**A fast LAN** (`delay 1ms rate 1gbit limit 1000`) **and no netem** (veth): the queue stays under the target, the cap grows to the window, and nothing changes.
+
+| Path | download with typing | download goodput | upload goodput, bulk only |
+|---|---|---|---|
+| LAN pipe, before / paced | p50 9.0 to 13.7 / 9.0 to 11.8 (7 pairs) | medians of 7 pairs 921 / 919 | 945 / 945 |
+| LAN QUIC, before / paced | 5.5 / 8.7, 5.1 / 9.2 | 943 / 941 | 943 / 944 |
+| veth pipe, before / paced | 1.3 / 14, 1.3 / 8.1 | 3444 / 3427 | 3529 / 3531 |
+| veth QUIC, before / paced | 1.0 / 3.1, 1.0 / 3.1 | 3529 / 3503 | 3385 / 3394 |
+
+The LAN pipe download is noisy in this shared VM in both builds (paced 674 to 944, unpaced 603 to 946 Mbit/s over seven interleaved pairs); the pacer's trace in the low paced cells has the cap at the window, so it was not what limited them.

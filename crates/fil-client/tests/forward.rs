@@ -1,4 +1,4 @@
-//! Forwards on the client side (`docs/m2/plan.md` F3) against the scripted daemon, whose
+//! Forwards on the client side (DESIGN.md sections 7.2 and 7.3) against the scripted daemon, whose
 //! forwards are a real daemon-side endpoint: byte-exact `-L` across a swap and a reconnect, the
 //! table after a takeover, the consent prompts, bind failures. Real sockets, so a real clock.
 

@@ -413,7 +413,7 @@ l_keys_bulk() {
     lat_finish "ssh-L" "$tag" "$load" "$rate"
   done
 
-  # H1's rule (docs/m2/plan.md): p50 under a bulk forward above 2x idle plus 10 ms.
+  # H1's rule (DESIGN.md §8.5 "Pacing"): p50 under a bulk forward above 2x idle plus 10 ms.
   local idle p50
   idle=$(lat_cell_field sLidle p50_ms)
   for load in up down; do

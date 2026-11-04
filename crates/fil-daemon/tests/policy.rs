@@ -1,4 +1,4 @@
-//! Server policy through the daemon (DESIGN.md section 11.2; `docs/m2/plan.md`, S1): the daemon
+//! Server policy through the daemon (DESIGN.md section 11.2): the daemon
 //! reads its policy sources ([`DaemonConfig::policy`]) once for every session; `fil forward` is
 //! refused naming the setting, `fil ports` lists the refusal and the policy's lines, and the
 //! direct transport is not offered where the policy file refuses it.

@@ -1,4 +1,4 @@
-//! The agent relay (DESIGN.md section 10, `docs/m2/plan.md` A1): the message [`filter`] the
+//! The agent relay (DESIGN.md section 10): the message [`filter`] the
 //! client applies (the trusted end) and the [`relay`] between an `Agent` channel and a local
 //! socket. The session's socket (`fil-session`) and the client's wiring (`fil-client`) use these.
 

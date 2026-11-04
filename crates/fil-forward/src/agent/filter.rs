@@ -1,5 +1,5 @@
 //! The agent message filter: what the remote host may ask of the laptop's ssh-agent (DESIGN.md
-//! section 10, `docs/m2/plan.md` section 4.3, OD-3). Pure functions over one message, with no IO.
+//! section 10). Pure functions over one message, with no IO.
 //!
 //! **This runs on the client, the trusted end.** The daemon relays agent bytes without reading
 //! them; any process of the user's uid on the remote can write to the agent socket, so every

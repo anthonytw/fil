@@ -1,5 +1,5 @@
 //! The session's forwards: its forward table, its `-R` listeners and the daemon side of every
-//! forwarded connection (DESIGN.md sections 7.2 and 8.5; `docs/m2/plan.md`, package F2).
+//! forwarded connection (DESIGN.md sections 7.2 and 8.5).
 //!
 //! **One endpoint for the session's life.** [`Forwards`] owns a `fil_forward::Endpoint` on the
 //! daemon side. It outlives subscribers and links: the serve task of each attached connection

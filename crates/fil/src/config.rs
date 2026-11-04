@@ -171,7 +171,7 @@ pub enum ForwardFailure {
     Exit,
 }
 
-/// The `[defaults.forward]` tunables (`docs/m2/plan.md` section 2.9), checked: the same keys and
+/// The `[defaults.forward]` tunables (DESIGN.md section 14), checked: the same keys and
 /// bounds as the daemon's `[forward]` (`fil_forward::tunables`).
 pub use fil_forward::tunables::ForwardTunables;
 use fil_forward::tunables::Value as TunableValue;

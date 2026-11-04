@@ -1,4 +1,4 @@
-//! Nothing `fil ports` finds reaches the log, at any level (M2 plan section 4.4, DESIGN.md
+//! Nothing `fil ports` finds reaches the log, at any level (DESIGN.md
 //! section 11.1 principle 2): not the probe's results, the process names, the working
 //! directories, the addresses or the ports. Alone in this test binary: it installs the global
 //! subscriber, at `trace`, for every crate.

@@ -1,0 +1,46 @@
+# The cargo-fuzz targets of the daemon's and the client's configuration parsers: the sshd_config
+# mirror, `policy.toml` (both fil-session) and the client's `config.toml` (the `fil` crate, whose
+# `Config::parse` is public; the target sits here beside the other two parsers). Not part of the
+# workspace and not run by `just ci` (it needs a nightly toolchain):
+#   just fuzz TARGET SECONDS             (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run TARGET fuzz/corpus/TARGET fuzz/seeds/TARGET   (from crates/fil-session)
+# The seeds in seeds/ are sample configurations, written by hand.
+[package]
+name = "fil-session-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil = { path = "../../fil" }
+fil-session = { path = ".." }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "sshd"
+path = "fuzz_targets/sshd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

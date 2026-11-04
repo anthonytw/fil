@@ -797,15 +797,49 @@ fn strdelim_split(s: &str) -> Option<Vec<String>> {
 
 /// OpenSSH's `match_pattern`: `*` any run, `?` any one character, the rest literally.
 pub fn match_pattern(s: &str, pattern: &str) -> bool {
-    fn go(s: &[u8], p: &[u8]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some((b'*', rest)) => (0..=s.len()).any(|i| go(&s[i..], rest)),
-            Some((b'?', rest)) => !s.is_empty() && go(&s[1..], rest),
-            Some((c, rest)) => s.first() == Some(c) && go(&s[1..], rest),
+    // `None` is a `*`; `Some(None)` is a `?`; `Some(Some(b))` is the byte `b`.
+    let toks: Vec<Option<Option<u8>>> = pattern
+        .bytes()
+        .map(|b| match b {
+            b'*' => None,
+            b'?' => Some(None),
+            b => Some(Some(b)),
+        })
+        .collect();
+    wild(s.as_bytes(), &toks, |k, c| k.is_none_or(|b| b == c))
+}
+
+/// Matches `s` against a pattern of `*` (`None`) and items that each consume exactly one input
+/// element (`Some`, which `one` checks). The walk keeps the one place it can back up to, the last
+/// `*`, so it is linear in the product of the lengths however many `*` there are. A recursive
+/// match is exponential in them: the fuzzer found `Match User` and `Include` lines that never
+/// finished, and both are read again whenever the config changes.
+fn wild<T: Copy, K>(s: &[T], toks: &[Option<K>], one: impl Fn(&K, T) -> bool) -> bool {
+    let (mut i, mut j) = (0, 0);
+    // After the last `*`: the token just past it, and the input index its run has reached.
+    let mut back: Option<(usize, usize)> = None;
+    while i < s.len() {
+        match toks.get(j) {
+            Some(None) => {
+                back = Some((j + 1, i));
+                j += 1;
+            }
+            Some(Some(k)) if one(k, s[i]) => {
+                i += 1;
+                j += 1;
+            }
+            _ => match back {
+                Some((tj, si)) => {
+                    // The star takes one more element.
+                    back = Some((tj, si + 1));
+                    i = si + 1;
+                    j = tj;
+                }
+                None => return false,
+            },
         }
     }
-    go(s.as_bytes(), pattern.as_bytes())
+    toks[j..].iter().all(Option::is_none)
 }
 
 /// OpenSSH's `match_pattern_list` (case-sensitive): `Some(true)` if a pattern matches and no
@@ -924,58 +958,75 @@ fn glob(pattern: &Path) -> Globbed {
     }
 }
 
-/// One glob component: `*`, `?` and bracket classes (`[abc]`, `[a-z]`, `[!x]`).
-fn glob_match(s: &str, p: &str) -> bool {
-    fn class(c: char, p: &[char]) -> Option<(bool, usize)> {
-        // p starts after '['; returns (matched, length consumed including ']')
-        let mut i = 0;
-        let neg = matches!(p.first(), Some('!') | Some('^'));
-        if neg {
+/// A bracket class: `p` starts after the `[`; returns whether `c` is in it and the length consumed,
+/// the `]` included, or `None` for an unclosed one.
+fn glob_class(c: char, p: &[char]) -> Option<(bool, usize)> {
+    let mut i = 0;
+    let neg = matches!(p.first(), Some('!') | Some('^'));
+    if neg {
+        i += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while i < p.len() {
+        if p[i] == ']' && !first {
+            return Some((hit != neg, i + 1));
+        }
+        first = false;
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if p[i] <= c && c <= p[i + 2] {
+                hit = true;
+            }
+            i += 3;
+        } else {
+            if p[i] == c {
+                hit = true;
+            }
             i += 1;
         }
-        let mut hit = false;
-        let mut first = true;
-        while i < p.len() {
-            if p[i] == ']' && !first {
-                return Some((hit != neg, i + 1));
-            }
-            first = false;
-            if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
-                if p[i] <= c && c <= p[i + 2] {
-                    hit = true;
-                }
-                i += 3;
-            } else {
-                if p[i] == c {
-                    hit = true;
-                }
-                i += 1;
-            }
-        }
-        None
     }
-    fn go(s: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('*') => (0..=s.len()).any(|i| go(&s[i..], &p[1..])),
-            Some('?') => !s.is_empty() && go(&s[1..], &p[1..]),
-            Some('[') => match (
-                s.first(),
-                class(s.first().copied().unwrap_or('\0'), &p[1..]),
-            ) {
-                (Some(_), Some((true, n))) => go(&s[1..], &p[1 + n..]),
-                (Some(_), Some((false, _))) | (None, _) => false,
-                // An unclosed bracket is a literal `[`.
-                (Some(c), None) => *c == '[' && go(&s[1..], &p[1..]),
-            },
-            // `glob(3)` without `GLOB_NOESCAPE`: a backslash makes the next character literal.
-            Some('\\') if p.len() > 1 => s.first() == Some(&p[1]) && go(&s[1..], &p[2..]),
-            Some(c) => s.first() == Some(c) && go(&s[1..], &p[1..]),
-        }
+    None
+}
+
+/// One glob component: `*`, `?` and bracket classes (`[abc]`, `[a-z]`, `[!x]`).
+fn glob_match(s: &str, p: &str) -> bool {
+    /// One pattern item that consumes one character.
+    enum Item {
+        Any,
+        Lit(char),
+        /// The bracket class whose body starts at this index of the pattern.
+        Class(usize),
     }
     let s: Vec<char> = s.chars().collect();
     let p: Vec<char> = p.chars().collect();
-    go(&s, &p)
+    let mut toks: Vec<Option<Item>> = Vec::new();
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '*' => toks.push(None),
+            '?' => toks.push(Some(Item::Any)),
+            '[' => match glob_class('\0', &p[i + 1..]) {
+                Some((_, n)) => {
+                    toks.push(Some(Item::Class(i + 1)));
+                    i += n;
+                }
+                // An unclosed bracket is a literal `[`.
+                None => toks.push(Some(Item::Lit('['))),
+            },
+            // `glob(3)` without `GLOB_NOESCAPE`: a backslash makes the next character literal.
+            '\\' if i + 1 < p.len() => {
+                toks.push(Some(Item::Lit(p[i + 1])));
+                i += 1;
+            }
+            c => toks.push(Some(Item::Lit(c))),
+        }
+        i += 1;
+    }
+    wild(&s, &toks, |item, c| match item {
+        Item::Any => true,
+        Item::Lit(l) => *l == c,
+        Item::Class(at) => glob_class(c, &p[*at..]).is_some_and(|(hit, _)| hit),
+    })
 }
 
 #[cfg(test)]
@@ -1661,6 +1712,92 @@ mod tests {
             panic!("{r:?}")
         };
         assert_eq!(s.unreadable, vec![dir.join("conf.d")]);
+    }
+
+    /// The recursive matchers this module had: exponential in the stars, and the reference the
+    /// linear ones are checked against on small inputs.
+    fn slow_pattern(s: &[u8], p: &[u8]) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some((b'*', rest)) => (0..=s.len()).any(|i| slow_pattern(&s[i..], rest)),
+            Some((b'?', rest)) => !s.is_empty() && slow_pattern(&s[1..], rest),
+            Some((c, rest)) => s.first() == Some(c) && slow_pattern(&s[1..], rest),
+        }
+    }
+
+    fn slow_glob(s: &[char], p: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('*') => (0..=s.len()).any(|i| slow_glob(&s[i..], &p[1..])),
+            Some('?') => !s.is_empty() && slow_glob(&s[1..], &p[1..]),
+            Some('[') => match (
+                s.first(),
+                glob_class(s.first().copied().unwrap_or('\0'), &p[1..]),
+            ) {
+                (Some(_), Some((true, n))) => slow_glob(&s[1..], &p[1 + n..]),
+                (Some(_), Some((false, _))) | (None, _) => false,
+                (Some(c), None) => *c == '[' && slow_glob(&s[1..], &p[1..]),
+            },
+            Some('\\') if p.len() > 1 => s.first() == Some(&p[1]) && slow_glob(&s[1..], &p[2..]),
+            Some(c) => s.first() == Some(c) && slow_glob(&s[1..], &p[1..]),
+        }
+    }
+
+    /// Every string of up to `max` characters from `alphabet`.
+    fn strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut layer = all.clone();
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            all.extend(layer.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn the_linear_matchers_agree_with_the_recursive_ones() {
+        // Every pattern of up to 4 items over the metacharacters and two letters, against every
+        // input of up to 3 characters over the letters and the characters that are special.
+        let pats = strings(&['*', '?', 'a', 'b', '[', ']', '!', '-', '\\'], 4);
+        let inputs = strings(&['a', 'b', '*', '[', '-'], 3);
+        for p in &pats {
+            let pc: Vec<char> = p.chars().collect();
+            for s in &inputs {
+                let sc: Vec<char> = s.chars().collect();
+                assert_eq!(
+                    match_pattern(s, p),
+                    slow_pattern(s.as_bytes(), p.as_bytes()),
+                    "match_pattern({s:?}, {p:?})"
+                );
+                assert_eq!(
+                    glob_match(s, p),
+                    slow_glob(&sc, &pc),
+                    "glob_match({s:?}, {p:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_stars_cost_no_more_than_the_length_of_the_input() {
+        // The fuzzer's finding: a recursive match of this many stars against a name that does
+        // not match never finished (it is exponential in the stars).
+        let pattern = format!("{}b", "a*".repeat(40));
+        let name = "a".repeat(200);
+        assert!(!match_pattern(&name, &pattern));
+        assert!(!glob_match(&name, &pattern));
+        assert!(match_pattern(&format!("{name}b"), &pattern));
+        assert!(glob_match(&format!("{name}b"), &pattern));
+        let stars = "*".repeat(100);
+        assert!(!match_pattern("conf", &format!("{stars}x")));
+        assert!(!glob_match("conf", &format!("{stars}x")));
+        assert!(match_pattern("", &stars) && glob_match("", &stars));
+        // And through a `Match User` line, which is read whenever the config changes.
+        let s = parse(&format!("Match User {pattern}\nDisableForwarding yes\n"));
+        assert!(s.disable.values.iter().all(|(f, _)| *f == Flag::No));
     }
 
     #[test]

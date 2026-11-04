@@ -157,10 +157,11 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
 - **Garbage collection.** An install removes the other fil-installed directories, except:
   - the current one;
   - any whose wire still has a running daemon, found through the lock files, as `fil ls` finds other daemons (§5.3 of DESIGN);
-  - any whose wire's `.start` lock is held, so GC never races a relay that is starting a daemon from that directory.
+  - any whose wire's `.start` lock is held, so GC never races a relay that is starting a daemon from that directory;
+  - any that was **recently used**: its directory's modification time is less than 7 days old, or in the future. `--install-finish` stamps the directory when it installs it, and a running daemon started from a fil-installed copy refreshes its own install directory's time on its hourly wake (TMP). This covers what the lock files cannot see: a daemon on another host that shares the home, a copy installed by `fil install` with no attach yet, and a concurrent install.
 
-  Because these rules rest on the lock files, they depend on TMP keeping those files alive. `fil install --remove HOST` runs the same collection over every fil-installed directory and installs nothing. It does so through the client's exact version only (§3, U1), and the `--install-gc` contract (names and age bound) is frozen in R0's `release.md`.
-- **Leftovers.** A bootstrap killed mid-upload leaves its `.new-*` directory, which GC collects once it is an hour old, and any of `~/.local` and `~/.local/share` (mode 0700) that it had created. Those stay, as an empty directory a user would expect to have anyway.
+  Because these rules rest on the lock files, they depend on TMP keeping those files alive. `fil install --remove HOST` runs the same collection over every fil-installed directory and installs nothing. It is the *forced* pass of `docs/m4/release.md` §6.3: it skips the recently-used rule and no other (the lock rules still protect a running daemon's copy). It does so through the client's exact version only (§3, U1), and the `--install-gc` contract (names and age bound) is frozen in R0's `release.md`.
+- **Leftovers.** A bootstrap killed mid-upload leaves its `.new-*` directory, which GC collects once it is more than 24 hours old, and any of `~/.local` and `~/.local/share` (mode 0700) that it had created. Those stay, as an empty directory a user would expect to have anyway.
 
 ### 2.5 The constant remote command
 
@@ -168,7 +169,7 @@ The bootstrap command (§3, U1) is a compile-time constant. A const check in `cr
 
 - it is one line;
 - the quoted body contains no `'`, `\` or `!`;
-- the version and wire it embeds use only `[0-9A-Za-z.+-]`.
+- the version and wire it embed follow the install directory's name pattern exactly (`docs/m4/release.md` §6.2): the version starts with a digit, is at most 64 characters and uses only `[0-9A-Za-z.-]` (no `+`), and the wire numbers are 1 to 65535. A build that would install a directory the garbage collection never recognizes does not compile.
 
 A second check, in the same test, rejects any `umask` outside a subshell, any `LC_ALL` assignment that is not a command prefix, and any `echo` of a value read from input.
 
@@ -307,7 +308,7 @@ Every package keeps M2's rules:
   9. **Only then is anything run.** The script `exec`s the new binary as `fil server --install-finish <ver-wire> <sha256> <created>`, where `<created>` says which parents this run made. That Rust code:
      - checks the chain again with `lstat` (and undoes only this run's directories if it refuses);
      - renames the fresh directory into place (a copy of the same version that is already there is kept, and the new one is discarded);
-     - collects old copies (§2.4), and only those `.new-*` directories that are more than an hour old, so it never removes another client's upload in flight. A process ID alone cannot tell them apart: IDs repeat across hosts that share an NFS home, and across containers;
+     - collects old copies (§2.4), and only those `.new-*` directories that are more than 24 hours old (a bound that survives clock skew between hosts that share an NFS home), so it never removes another client's upload in flight. A process ID alone cannot tell them apart: IDs repeat across hosts that share an NFS home, and across containers;
      - prints `FIL-BOOT1 ok <wire>`, which the client compares with its own wire, and reads one more line. `go` prints `FIL-BOOT1 exec` and `exec`s the installed `fil server --stdio`, so the install login is also the first attach. `done` ends the run (`fil install`).
 
      The exchange is in lockstep: the client sends nothing after the bytes until it has read that result line, so `head` cannot read past them. macOS's `head -c` reads through stdio and could otherwise swallow later input. This is an invariant of the client.
@@ -323,7 +324,7 @@ Every package keeps M2's rules:
 - **Known limits:**
   - **A `$HOME` that is itself a symbolic link** (some NFS and automount setups) is refused by the chain check, so install through fil does not work there. That is a safe failure. Manual install still works, and the troubleshooting page (DOC) says so.
   - **A symbolic link at `~/.local/bin/fil`** is refused and never followed, so the install docs say to copy the binary there, not link it.
-  - **A script killed mid-upload** (it has no `trap`) leaves its `.new-*` directory, which GC collects once it is an hour old, and any parent directories it created (§2.4).
+  - **A script killed mid-upload** (it has no `trap`) leaves its `.new-*` directory, which GC collects once it is more than 24 hours old, and any parent directories it created (§2.4).
   - **Visible to other users.** Other users on the host can see the bootstrap's command line, with its version, in `ps`, as they can see `fil server --stdio` today (§4).
 - **Security and privacy (§11, §11.1):**
   - the bootstrap contains no user input;
@@ -348,7 +349,7 @@ Every package keeps M2's rules:
     - a symbolic-link `$HOME`: refused, with the troubleshooting message;
     - a `noexec` home and a read-only home: clean errors;
     - a bad hash, and a short upload: refused, with the fresh directory and this run's parents removed;
-    - an interrupted upload: no binary under the final name, and the fresh directory is collected once it is an hour old;
+    - an interrupted upload: no binary under the final name, and the fresh directory is collected once it is more than 24 hours old;
     - two clients installing at once, **with a GC running while the other upload is in flight:** one rename wins, the other upload is not touched, and both attach;
     - an old wire's `fil` on `PATH`: the exact version wins, and the old daemon keeps its sessions;
     - a `ForceCommand` gate that allows only `fil server --stdio`: the plain first try still works, and `remote = "installed"` is refused cleanly (an unmarked preamble), without writing the binary to the relay;
@@ -467,7 +468,7 @@ Every package keeps M2's rules:
 **TMP: survive temporary-file cleaners**
 - **Owns:** `crates/fil-daemon/src/{paths.rs, daemon.rs}` (the hourly maintenance hook and the directory lock; `daemon.rs` after LOG's PR merges), `crates/fil-daemon/tests/tmp_clean.rs` (new), and the socket-directory paragraph of DESIGN §5.3 (after LOG).
 - **Builds (proposed):**
-  - **Fresh times.** Every hour, on the wake it already has for log maintenance, the daemon sets fresh times on its socket directory, its socket, its lock and start files, and its agent directory and sockets. Setting the times also renews the change time, so neither cleaner sees an old entry.
+  - **Fresh times.** Every hour, on the wake it already has for log maintenance, the daemon sets fresh times on its socket directory, its socket, its lock and start files, and its agent directory and sockets. If its executable is a conforming version directory under `~/.local/share/fil` (`docs/m4/release.md` §6), it also refreshes that directory's modification time, which GC's "recently used" rule reads. Setting the times also renews the change time, so neither cleaner sees an old entry.
   - **A shared lock.** The daemon holds a shared `flock` on the socket directory for its whole life, which systemd-tmpfiles honors by skipping the directory.
   - **The order at start.** A relay never removes a socket while any daemon's lock is held. The existing order stays: try the socket, take the start lock, try again. TMP adds a check that a daemon whose lock file is gone, but whose socket still answers, is found by connecting before any cleanup.
 - **Tests:**
@@ -785,7 +786,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 
 1. **The commands.** There would be exactly two remote commands, and no others:
    - **A, unchanged:** `fil server --stdio`. It stays the first try on every run, and the only command when the user's config says `remote = "plain"`.
-   - **B, new:** the bootstrap. It is one compile-time constant line, holding only the build's version and wire (`v` and `w` below, checked at compile time to be `[0-9A-Za-z.+-]`), with no `'`, `\` or `!` in its body, and pinned by a golden. Its mode (`attach`, `check` or `remove`) is the first line the client writes on stdin, never part of the command.
+   - **B, new:** the bootstrap. It is one compile-time constant line, holding only the build's version and wire (`v` and `w` below, checked at compile time against the install directory's name pattern, `docs/m4/release.md` §6.2: a leading digit, at most 64 characters of `[0-9A-Za-z.-]`, and wire numbers 1 to 65535), with no `'`, `\` or `!` in its body, and pinned by a golden. Its mode (`attach`, `check` or `remove`) is the first line the client writes on stdin, never part of the command.
 
      **What it does** (§3, U1):
      - **It changes nothing it hands on:** no `umask` outside the upload's subshell, and `LC_ALL=C` only as a prefix of `expr`. Every `exec … server --stdio` therefore runs with the login's own umask and environment.

@@ -783,6 +783,7 @@ impl Forwards {
                     owner: None,
                     probe: None,
                     target_other_user: false,
+                    target_unknown: false,
                     policy: st.blocked.get(&e.id).cloned(),
                     socks_refused: st.socks_refused.get(&e.id).cloned(),
                 }

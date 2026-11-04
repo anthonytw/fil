@@ -51,6 +51,7 @@
             "label": "Vite + React"
           },
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -79,6 +80,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -104,6 +106,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -132,6 +135,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": "AllowTcpForwarding local (/etc/ssh/sshd_config:3)",
           "socks_refused": null
         },
@@ -157,6 +161,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -185,6 +190,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -213,6 +219,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         },
@@ -241,6 +248,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": false,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         }
@@ -332,6 +340,7 @@
           "owner": null,
           "probe": null,
           "target_other_user": true,
+          "target_unknown": false,
           "policy": null,
           "socks_refused": null
         }

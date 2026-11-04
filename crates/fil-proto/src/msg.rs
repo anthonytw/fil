@@ -790,6 +790,10 @@ pub struct ForwardRow {
     /// client warns. `owner` and `probe` are `None` then: fil neither reads nor probes another
     /// user's process.
     pub target_other_user: bool,
+    /// The `-L` target is on the remote host, but its socket table was not read to its end (a
+    /// bound of the scan, a timeout, no table): who holds it cannot be told, so `owner`,
+    /// `probe` and `target_other_user` say nothing either way. The client says so.
+    pub target_unknown: bool,
     /// Server policy refuses this entry, though it allowed it when it was added: its `-R`
     /// listener is closed, or its connections are refused (DESIGN.md section 11.2).
     pub policy: Option<PolicyRefusal>,

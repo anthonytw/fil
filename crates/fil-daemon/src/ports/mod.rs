@@ -125,7 +125,8 @@ impl PortsQuery {
 /// tunnels. A listener one of them holds leads somewhere else, often to another host: it is
 /// never probed, whatever `fil ports` asks, because the probe would reach whatever is behind it.
 /// Kept short on purpose: it catches the common tools by their binary's name, not every way to
-/// run one (a forwarder started as `python3 …` is not recognised).
+/// run one. A forwarder an interpreter runs is not recognised: `gcloud compute start-iap-tunnel`
+/// and `az network bastion tunnel` are `python3` (DESIGN.md section 7.4).
 pub const FORWARDERS: &[&str] = &[
     "ssh",
     "autossh",
@@ -138,6 +139,15 @@ pub const FORWARDERS: &[&str] = &[
     "socat",
     "nc",
     "ncat",
+    "netcat",
+    "nc.openbsd",
+    "nc.traditional",
+    "stunnel",
+    "stunnel4",
+    "dbclient",
+    "k3s",
+    "k9s",
+    "cloud_sql_proxy",
     "chisel",
     "ngrok",
     "tsh",
@@ -156,21 +166,47 @@ pub fn is_forwarder(p: &ProcessInfo) -> bool {
 
 /// Whether `ip` is one of this host's own addresses: a bind to it succeeds (a UDP socket on an
 /// ephemeral port, bound and closed at once; nothing is sent). Loopback and the wildcards always
-/// are. A host that allows non-local binds (`ip_nonlocal_bind`) says yes to anything; then a
-/// target elsewhere is matched to the local listeners as it used to be.
+/// are; multicast and the IPv4 broadcast never are (a bind to them succeeds, but no TCP
+/// connection goes there). A host that allows non-local binds (`ip_nonlocal_bind`) says yes to
+/// anything else; then a target elsewhere is matched to the local listeners as it used to be.
 pub fn is_local(ip: IpAddr) -> bool {
     let ip = ip.to_canonical();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+    let never = match ip {
+        IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V6(v6) => v6.is_multicast(),
+    };
+    !never
+        && (ip.is_loopback()
+            || ip.is_unspecified()
+            || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok())
+}
+
+/// The addresses a connection to `host` goes to on this host, if it is one of them: the IP
+/// itself (a wildcard is the loopback of its family, on Linux), or both loopbacks for
+/// `localhost`. Nothing for any other name (fil never resolves one). Whether an IP is this
+/// host's own is [`is_local`]'s question.
+fn candidates(host: &TargetHost) -> Vec<IpAddr> {
+    match host {
+        TargetHost::Ip(ip) => vec![match ip.to_canonical() {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        }],
+        TargetHost::Name(n) if n.is_localhost() => vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ],
+        TargetHost::Name(_) => Vec::new(),
+    }
 }
 
 /// What discovery needs from the sessions' forward tables.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Targets {
-    /// The ports of every `-L` target: their listeners are kept whatever the scan's cap.
-    pub ports: Vec<NonZeroU16>,
-    /// The `-L` target addresses that are neither loopback nor a wildcard (canonical).
+    /// Where every `-L` target goes ([`candidates`], loopbacks included): the listeners that
+    /// could take them are kept whatever the scan's cap.
+    pub keep: Vec<(IpAddr, NonZeroU16)>,
+    /// The `-L` target addresses that are not loopback, to ask [`is_local`] about.
     pub ips: Vec<IpAddr>,
     /// The `-R` ports: the daemon's own listeners, which are left out of the scan (the daemon
     /// is not dumpable, so a search for their holder would walk every process in vain).
@@ -190,18 +226,17 @@ impl Targets {
             let Some(target) = f.spec.target() else {
                 continue;
             };
-            t.ports.push(target.port);
-            if let TargetHost::Ip(ip) = target.host {
-                let ip = ip.to_canonical();
-                if !ip.is_loopback() && !ip.is_unspecified() {
-                    t.ips.push(ip);
+            for c in candidates(&target.host) {
+                t.keep.push((c, target.port));
+                if !c.is_loopback() {
+                    t.ips.push(c);
                 }
             }
         }
-        for v in [&mut t.ports, &mut t.daemon_ports] {
-            v.sort_unstable();
-            v.dedup();
-        }
+        t.daemon_ports.sort_unstable();
+        t.daemon_ports.dedup();
+        t.keep.sort_unstable();
+        t.keep.dedup();
         t.ips.sort_unstable();
         t.ips.dedup();
         t
@@ -285,8 +320,9 @@ pub struct Discovery {
     /// The `-L` target addresses (of [`Targets::ips`]) that are this host's own ([`is_local`]).
     /// A target anywhere else is not matched to this host's listeners.
     pub local: HashSet<IpAddr>,
-    /// The socket tables were not read to their end, so a listener on a `-L` target may be
-    /// missing: no target is given an owner.
+    /// The socket tables were not read to their end (or not at all), so a listener on a `-L`
+    /// target may be missing: no target is given an owner, and its row says the owner is
+    /// unknown (`ForwardRow::target_unknown`).
     pub targets_cut: bool,
 }
 
@@ -301,10 +337,7 @@ pub fn discover(
     targets: &Targets,
 ) -> Discovery {
     let deadline = Instant::now() + limits.budget;
-    let keep = procnet::Keep::new(
-        targets.ports.iter().map(|p| p.get()),
-        targets.ips.iter().copied(),
-    );
+    let keep = procnet::Keep::new(targets.keep.iter().map(|&(a, p)| (a, p.get())));
     let net = procnet::read(root.path(), deadline, &keep, uid);
     let targets_cut = net.cut;
     let mut split = procnet::split(net.sockets, uid);
@@ -434,6 +467,8 @@ struct TargetMatch {
     probe: Option<SocketAddr>,
     /// Another user's listener takes it.
     other_user: bool,
+    /// It is on this host, but the table was not read to its end: who holds it is unknown.
+    unknown: bool,
 }
 
 /// The listeners a `-L` target reaches, ranked over *every* listener on the port, other users'
@@ -442,27 +477,22 @@ struct TargetMatch {
 /// to either loopback: when either reaches another user's listener, the target has no owner and
 /// no probe. A port that is one of the `-R` listeners (the daemon's own) is never probed.
 fn target_listener(d: &Discovery, t: &Target, remote_ports: &[NonZeroU16]) -> TargetMatch {
-    if d.targets_cut {
-        // The listener that takes it may be in the part of the table that was not read.
+    let candidates = candidates(&t.host);
+    if candidates.is_empty()
+        // Elsewhere on the network: no listener of this host takes it.
+        || candidates
+            .iter()
+            .any(|c| !c.is_loopback() && !d.local.contains(c))
+    {
         return TargetMatch::default();
     }
-    let candidates: Vec<IpAddr> = match &t.host {
-        // A connection to a wildcard address goes to the loopback of its family on Linux.
-        TargetHost::Ip(ip) => match ip.to_canonical() {
-            IpAddr::V4(v4) if v4.is_unspecified() => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            IpAddr::V6(v6) if v6.is_unspecified() => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
-            ip if ip.is_loopback() || d.local.contains(&ip) => vec![ip],
-            // Elsewhere on the network: no listener of this host takes it.
-            _ => return TargetMatch::default(),
-        },
-        TargetHost::Name(n) if n.is_localhost() => {
-            vec![
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ]
-        }
-        TargetHost::Name(_) => return TargetMatch::default(),
-    };
+    if d.targets_cut {
+        // The listener that takes it may be in the part of the table that was not read.
+        return TargetMatch {
+            unknown: true,
+            ..TargetMatch::default()
+        };
+    }
     // The most specific listener for each candidate address.
     let bests: Vec<(IpAddr, usize)> = candidates
         .iter()
@@ -582,6 +612,7 @@ pub fn layout(
                 }
                 f.owner = m.owner;
                 f.target_other_user = m.other_user;
+                f.target_unknown = m.unknown;
                 probe_at = m.probe;
             }
             v.push((f, probe_at));
@@ -698,6 +729,7 @@ pub async fn ports(q: PortsQuery) -> Answer {
                 _ => Discovery {
                     listeners: Vec::new(),
                     incomplete: Some(PortsIncomplete::TimedOut),
+                    targets_cut: true,
                     ..Discovery::default()
                 },
             }
@@ -816,6 +848,7 @@ mod tests {
             owner: None,
             probe: None,
             target_other_user: false,
+            target_unknown: false,
             policy: None,
             socks_refused: None,
         }
@@ -1320,6 +1353,20 @@ mod tests {
                 ("127.0.0.1:17000 own".to_string(), false),
             ]
         );
+        // The ones the review of #79 asked for, among the rest.
+        for name in [
+            "ssh",
+            "kubectl",
+            "cloud_sql_proxy",
+            "k3s",
+            "k9s",
+            "dbclient",
+            "stunnel",
+            "stunnel4",
+            "netcat",
+        ] {
+            assert!(FORWARDERS.contains(&name), "{name}");
+        }
         for name in FORWARDERS {
             let p = ProcessInfo {
                 pid: 1,
@@ -1368,9 +1415,18 @@ mod tests {
         // On this host: the owner, but no probe (the probe is loopback only).
         assert_eq!(fwds, vec![(Some(500), None), (None, None)]);
         assert_eq!(squats(&rows), vec![false, true]);
-        // The check itself: TEST-NET is nobody's own address; loopback and the wildcards are.
-        assert!(!is_local("192.0.2.50".parse().unwrap()));
-        assert!(!is_local("2001:db8::50".parse().unwrap()));
+        // The check itself: TEST-NET is nobody's own address (unless the host binds anything,
+        // `ip_nonlocal_bind`); loopback and the wildcards are; multicast and broadcast never are,
+        // though a bind to them succeeds.
+        let nonlocal_bind = std::fs::read_to_string("/proc/sys/net/ipv4/ip_nonlocal_bind")
+            .is_ok_and(|v| v.trim() != "0");
+        if !nonlocal_bind {
+            assert!(!is_local("192.0.2.50".parse().unwrap()));
+            assert!(!is_local("2001:db8::50".parse().unwrap()));
+        }
+        for never in ["255.255.255.255", "224.0.0.1", "ff02::1"] {
+            assert!(!is_local(never.parse().unwrap()), "{never}");
+        }
         assert!(is_local("127.0.0.1".parse().unwrap()) && is_local("::".parse().unwrap()));
         let t = Targets::of(&s);
         assert_eq!(
@@ -1389,60 +1445,85 @@ mod tests {
     #[test]
     #[cfg(target_endian = "little")]
     fn a_squat_past_the_listener_cap_is_still_seen() {
-        let f = FakeProc::new("cap");
-        let them = me().wrapping_add(1);
-        let mut tcp = HEADER.to_string();
-        for i in 0..procnet::MAX_LISTENERS + 10 {
-            tcp += &tcp_row(
-                Ipv4Addr::new(127, 1, (i >> 8) as u8, i as u8),
-                5432,
-                them,
-                i as u64,
+        // Any loopback target, `127.0.0.2` too (review of #79, B1), and its IPv4-mapped form.
+        for (target, squat) in [
+            ("127.0.0.1", Ipv4Addr::LOCALHOST),
+            ("127.0.0.2", Ipv4Addr::new(127, 0, 0, 2)),
+            ("::ffff:127.0.0.2", Ipv4Addr::new(127, 0, 0, 2)),
+        ] {
+            let f = FakeProc::new("cap");
+            let them = me().wrapping_add(1);
+            let mut tcp = HEADER.to_string();
+            for i in 0..procnet::MAX_LISTENERS + 10 {
+                tcp += &tcp_row(
+                    Ipv4Addr::new(127, 1, (i >> 8) as u8, i as u8),
+                    5432,
+                    them,
+                    i as u64,
+                );
+            }
+            tcp += &tcp_row(squat, 5432, them, 90_001);
+            f.net("tcp", &tcp);
+            // The user's `[::]:5432` (v6-only, say).
+            f.net(
+                "tcp6",
+                &format!(
+                    "{HEADER}   0: 00000000000000000000000000000000:1538 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 {:>5}        0 90002 1\n",
+                    me()
+                ),
             );
+            f.process(4100, 1, "postgres", "/", &[90_002]);
+            let s = one_session(vec![forward(
+                "main",
+                ForwardKind::Local,
+                1,
+                Some((target, 5432)),
+            )]);
+            let d = discover(
+                &f.root(),
+                me(),
+                None,
+                &[],
+                None,
+                &ScanLimits {
+                    budget: Duration::from_secs(10),
+                    ..ScanLimits::default()
+                },
+                &Targets::of(&s),
+            );
+            assert_eq!(d.incomplete, Some(PortsIncomplete::Bounded));
+            assert!(!d.targets_cut);
+            let (rows, slots) = layout(&s, None, &d, false);
+            let (fwds, _) = forwards_and_listeners(&rows, &slots);
+            assert_eq!(fwds, vec![(None, None)], "{target}: no owner, no probe");
+            assert_eq!(squats(&rows), vec![true], "{target}: the squat is seen");
         }
-        tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5432, them, 90_001);
-        f.net("tcp", &tcp);
-        // The user's `[::]:5432` (v6-only, say).
-        f.net(
-            "tcp6",
-            &format!(
-                "{HEADER}   0: 00000000000000000000000000000000:1538 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 {:>5}        0 90002 1\n",
-                me()
-            ),
-        );
-        f.process(4100, 1, "postgres", "/", &[90_002]);
-        let s = one_session(vec![forward(
-            "main",
-            ForwardKind::Local,
-            1,
-            Some(("127.0.0.1", 5432)),
-        )]);
-        let d = discover(
-            &f.root(),
-            me(),
-            None,
-            &[],
-            None,
-            &ScanLimits {
-                budget: Duration::from_secs(10),
-                ..ScanLimits::default()
-            },
-            &Targets::of(&s),
-        );
-        assert_eq!(d.incomplete, Some(PortsIncomplete::Bounded));
-        assert!(!d.targets_cut);
-        let (rows, slots) = layout(&s, None, &d, false);
-        let (fwds, _) = forwards_and_listeners(&rows, &slots);
-        assert_eq!(fwds, vec![(None, None)]);
-        assert_eq!(squats(&rows), vec![true]);
-        // A table not read to its end: nobody is named as the target's owner.
+        // A table not read to its end: nobody is named as the target's owner, and the row says
+        // the owner is unknown (review of #79, S2). A target elsewhere is not "unknown": it is
+        // simply not this host's.
+        let s = one_session(vec![
+            forward("main", ForwardKind::Local, 1, Some(("127.0.0.1", 5432))),
+            forward("main", ForwardKind::Local, 2, Some(("192.0.2.50", 5432))),
+            forward("main", ForwardKind::Local, 3, Some(("db.example", 5432))),
+        ]);
         let d = Discovery {
             listeners: vec![found("127.0.0.1", 5432, proc_in(4100, "postgres", None))],
             targets_cut: true,
             ..Discovery::default()
         };
         let (rows, slots) = layout(&s, None, &d, false);
-        assert_eq!(forwards_and_listeners(&rows, &slots).0, vec![(None, None)]);
+        assert_eq!(
+            forwards_and_listeners(&rows, &slots).0,
+            vec![(None, None); 3]
+        );
+        let unknown: Vec<bool> = rows
+            .iter()
+            .filter_map(|r| match r {
+                PortsRow::Forward(f) => Some(f.target_unknown),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unknown, vec![true, false, false]);
     }
 
     /// Efficiency sweep, finding 8: the daemon's own `-R` listener (not dumpable, so its holder

@@ -111,6 +111,7 @@ fn fwd(
         owner: None,
         probe: None,
         target_other_user: false,
+        target_unknown: false,
         policy: None,
         socks_refused: None,
     }
@@ -437,6 +438,7 @@ fn the_json_matches_the_golden_and_keeps_its_layout() {
             "spec",
             "target",
             "target_other_user",
+            "target_unknown",
             "waiting"
         ]
     );
@@ -940,4 +942,28 @@ fn refused_socks_connections_are_a_count_on_the_d_row() {
     assert!(json.contains("\"socks_refused\": {"), "{json}");
     assert!(json.contains("\"count\": 3"), "{json}");
     assert!(json.contains("\"policy\": null"), "{json}");
+}
+
+/// Review of #79, S2: a `-L` whose target's holder could not be told (the scan was cut) says
+/// so on its row, instead of looking clean (mutation: drop the line, and it looks clean).
+#[test]
+fn a_target_whose_owner_is_unknown_says_so() {
+    let mut f = fwd(
+        "main",
+        1,
+        ForwardKind::Local,
+        "5432:127.0.0.1:5432",
+        listening(5432),
+        Origin::Client,
+        true,
+    );
+    f.target_unknown = true;
+    let a = answer(vec![
+        PortsRow::Session(summary("main", None, 1, false)),
+        PortsRow::Forward(f),
+    ]);
+    let text = render_text(&a, &opts(None));
+    assert!(text.contains("unknown (scan incomplete)"), "{text}");
+    assert!(text.contains("owner unknown: the host's socket table was not read to its end"));
+    assert!(render_json(&a, &opts(None)).contains("\"target_unknown\": true"));
 }

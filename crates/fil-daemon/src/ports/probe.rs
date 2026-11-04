@@ -107,8 +107,10 @@ const HEAD_CAP: usize = 4096;
 const GET_CAP: usize = 16 * 1024;
 const SMALL_CAP: usize = 256;
 
-/// Probes each of `addrs` (in order; the answer has one entry per address). Returns within
-/// `limits.total` (and a little scheduling slack); a port not reached in time has no probe.
+/// Probes each of `addrs`, in that order (the answer has one entry per address): a port starts
+/// only once every port before it has started, so the first ones are never left waiting behind
+/// later ones. Returns within `limits.total` (and a little scheduling slack); a port not reached
+/// in time has no probe.
 pub async fn probe_all(
     addrs: &[SocketAddr],
     mode: ProbeMode,
@@ -122,11 +124,13 @@ pub async fn probe_all(
     let permits = Arc::new(Semaphore::new(limits.parallel.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     for (i, &addr) in addrs.iter().enumerate() {
-        let permits = permits.clone();
+        // The permit is taken here, in order, not in the task: tasks are not polled in the
+        // order they were spawned.
+        let Ok(Ok(permit)) = timeout_at(overall, permits.clone().acquire_owned()).await else {
+            break;
+        };
         tasks.spawn(async move {
-            let Ok(Ok(_permit)) = timeout_at(overall, permits.acquire_owned()).await else {
-                return (i, None);
-            };
+            let _permit = permit;
             let deadline = overall.min(Instant::now() + limits.per_port);
             (i, probe_one(addr, mode, deadline).await)
         });

@@ -923,6 +923,7 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: Some(process(4, 5)),
             probe: Some(probes()[1].clone()),
             target_other_user: false,
+            target_unknown: false,
             policy: None,
             socks_refused: None,
         }),
@@ -942,6 +943,7 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: None,
             probe: None,
             target_other_user: true,
+            target_unknown: true,
             policy: Some(policy_refusals()[1].clone()),
             socks_refused: None,
         }),
@@ -961,6 +963,7 @@ fn ports_rows() -> Vec<PortsRow> {
             owner: None,
             probe: None,
             target_other_user: false,
+            target_unknown: false,
             policy: None,
             socks_refused: Some(SocksRefused {
                 count: 3,
@@ -1082,6 +1085,7 @@ fn widest_forward_row() -> PortsRow {
             label: Some(ProbeLabel::new("l".repeat(MAX_PROBE_LABEL)).unwrap()),
         }),
         target_other_user: true,
+        target_unknown: true,
         policy: Some(widest_policy_refusal()),
         socks_refused: Some(SocksRefused {
             count: u32::MAX,

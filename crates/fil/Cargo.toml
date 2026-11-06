@@ -33,6 +33,11 @@ test = true
 name = "pi_e2e"
 test = true
 
+# `just docs`: the man page and the completions, written into a tree laid out like an archive.
+[[example]]
+name = "gen_docs"
+test = true
+
 [dependencies]
 bytes = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -56,6 +61,10 @@ toml = "0.9"
 tracing = "0.1"
 
 [dev-dependencies]
+# The man page and the shell completions (examples/gen_docs.rs, tests/docs_sync.rs; docs/m4/plan.md,
+# DOC). Dev-dependencies only: they are not in the released build, and `just release-deps` checks.
+clap_complete = "4"
+clap_mangen = "0.3"
 # The test hooks (FIL_TEST_WIRE_REVISION, FIL_TEST_SOCKET_DIR) for the `fil` binary the integration
 # tests run. Dev-dependencies are not in the released build: `just release-deps` checks.
 fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }

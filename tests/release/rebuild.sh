@@ -70,5 +70,12 @@ mkdir -p "$work/bins/universal-apple-darwin"
 cp "$work/in/universal-apple-darwin/fil" "$work/bins/universal-apple-darwin/fil"
 extra=()
 [ -d "$work/in/extra" ] && extra=(--extra "$work/in/extra")
+# The man pages, completions and example configs (docs/man/build.sh): made here, from the commit,
+# with the pinned pandoc, as release.yml's package job makes them.
+if [ ${#extra[@]} -eq 0 ] && [ -x docs/man/build.sh ]; then
+  docs/man/install-pandoc.sh "$work/pandoc"
+  PATH="$work/pandoc/bin:$PATH" docs/man/build.sh "$work/docs-out"
+  extra=(--extra "$work/docs-out")
+fi
 tests/release/package.sh --bins "$work/bins" --out "$work/out" ${extra[@]+"${extra[@]}"}
 log "done: $work/out"

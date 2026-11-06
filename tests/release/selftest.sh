@@ -247,20 +247,19 @@ main"
 
 # the files that decide what a release is need the owner's review
 echo "== CODEOWNERS"
-for path in /justfile /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock /docs/man/install-pandoc.sh /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml; do
+for path in /justfile /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock /docs/man/install-pandoc.sh /docs/man/build.sh /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml; do
   expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
 done
 # ...and every path it lists that has no glob exists (a rename would silently drop the protection),
-# except those that may not exist yet: the man-page installer (the DOC package adds it), and
-# .cargo/ and .gitattributes, which are listed so that adding one needs the owner
+# except .cargo/ and .gitattributes, which are listed so that adding one needs the owner
 codeowners_missing() { # FILE: the non-glob paths in a CODEOWNERS file that do not exist
   local cpath
   while read -r cpath _; do
-    case $cpath in '#'* | '' | *'*'* | /docs/man/install-pandoc.sh | /docs/man/build.sh | /.cargo/ | /.gitattributes) continue ;; esac
+    case $cpath in '#'* | '' | *'*'* | /.cargo/ | /.gitattributes) continue ;; esac
     [ -e "$REPO_ROOT$cpath" ] || echo "$cpath"
   done < "$1"
 }
-expect_pass "every CODEOWNERS path exists (but the may-not-exist-yet ones)" test -z "$(codeowners_missing "$REPO_ROOT/.github/CODEOWNERS")"
+expect_pass "every CODEOWNERS path exists (but .cargo/ and .gitattributes)" test -z "$(codeowners_missing "$REPO_ROOT/.github/CODEOWNERS")"
 { cat "$REPO_ROOT/.github/CODEOWNERS"; echo "/no-such-file @anthonytw"; } > "$tmp/CODEOWNERS.mut"
 expect_pass "mutation: a CODEOWNERS path that does not exist is caught" test "$(codeowners_missing "$tmp/CODEOWNERS.mut")" = /no-such-file
 
@@ -330,6 +329,13 @@ stage_release() { # uses $tree $stage $VER
     fake_bin "$d/libexec/fil/remote/aarch64-linux/fil" ELF-AARCH64
     (cd "$d/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS)
     cp "$tree/README.md" "$tree/LICENSE" "$tree/THIRD-PARTY-NOTICES.md" "$d/share/doc/fil/"
+    # DOC's files (docs/man/build.sh): man pages, completions, example configs, the changelog.
+    mkdir -p "$d/share/man/man1" "$d/share/man/man5" "$d/share/bash-completion/completions" "$d/share/zsh/site-functions" "$d/share/fish/vendor_completions.d"
+    printf '# Changelog\n\n## [0.9.0]\n' > "$d/share/doc/fil/CHANGELOG.md"
+    for f in config daemon policy; do echo "# $f" > "$d/share/doc/fil/$f.example.toml"; done
+    for f in man/man1/fil.1 man/man5/fil-config.5 man/man5/fil-policy.5 bash-completion/completions/fil zsh/site-functions/_fil fish/vendor_completions.d/fil.fish; do
+      echo "stub" > "$d/share/$f"
+    done
   done
   ROOT=$saved
 }
@@ -437,7 +443,7 @@ mutated_msg() {
 new_case 0.9.0
 expect_pass "a clean dry run passes" check --dry-run --no-tree "$rel"
 expect_pass "a clean tag run passes (changelog, tag, wire)" check --tag v0.9.0 --no-tree "$rel"
-expect_fail "--complete fails while DOC's files are pending" check --tag v0.9.0 --complete --no-tree "$rel"
+expect_pass "a clean complete run passes" check --tag v0.9.0 --complete --no-tree "$rel"
 cp "$rel/$(ci_archive_name 0.9.0)" "$tmp/ci.keep"
 rm "$rel/$(ci_archive_name 0.9.0)"
 write_sums
@@ -497,6 +503,9 @@ pack_release
 expect_pass "loopback, a longer address and a different name are not the fixtures" check --dry-run --no-tree "$rel"
 mutated "bin/fil is missing" "rm fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated "the license is missing" "rm fil-0.9.0-x86_64-linux-musl/share/doc/fil/LICENSE"
+mutated "a man page is missing" "rm fil-0.9.0-x86_64-linux-musl/share/man/man1/fil.1"
+mutated "a completion is missing" "rm fil-0.9.0-universal-apple-darwin/share/zsh/site-functions/_fil"
+mutated "an example config is missing" "rm fil-0.9.0-aarch64-linux-musl/share/doc/fil/daemon.example.toml"
 mutated "the notices are missing" "rm fil-0.9.0-aarch64-linux-musl/share/doc/fil/THIRD-PARTY-NOTICES.md"
 mutated_msg "an archive's notices are not the source archive's" "differs from the source archive's THIRD-PARTY-NOTICES.md" \
   "echo '- stale' >> fil-0.9.0-universal-apple-darwin/share/doc/fil/THIRD-PARTY-NOTICES.md"

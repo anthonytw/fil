@@ -23,3 +23,4 @@
 /flake.nix @anthonytw
 /flake.lock @anthonytw
 /docs/man/install-pandoc.sh @anthonytw
+/docs/man/build.sh @anthonytw

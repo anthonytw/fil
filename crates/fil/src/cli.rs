@@ -15,7 +15,7 @@
 //!
 //! With no HOST, `forward`, `ports` and `detach` talk to the daemon on this machine and work on
 //! the session named by `$FIL_SESSION` (set inside every session). A host or session named like
-//! a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`) is attached
+//! a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`, `config`) is attached
 //! with `--`:
 //! `fil -- ls`, `fil devbox -- ls`.
 
@@ -74,7 +74,7 @@ Examples:
 
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 
-Configuration: ~/.config/fil/config.toml (see DESIGN.md section 14).
+Configuration: ~/.config/fil/config.toml (see fil-config(5), or `fil config show HOST`).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);

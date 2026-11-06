@@ -23,8 +23,8 @@
 #     owner's approval. Approve it after publishing the GitHub Release: it refuses a release that
 #     is still a draft or has no SHA256SUMS.sig.
 # A workflow file on some other branch could still ask for an `id-token`. The attestation's real
-# check is the narrow one in `just release-verify` (`gh attestation verify --signer-workflow
-# --source-ref`), plus the tag ruleset that keeps anyone else from creating a `v*` tag. The tag
+# check is the narrow one in `just release-verify` (`gh attestation verify --repo --cert-identity
+# --source-ref --source-digest --signer-digest --deny-self-hosted-runners`), plus the tag ruleset that keeps anyone else from creating a `v*` tag. The tag
 # checks in `prepare` catch mistakes; they are not the gate (tests/release/prepare.sh).
 name: release
 

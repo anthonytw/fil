@@ -2,29 +2,28 @@
 # The body of the draft release: the changelog section of the version (if CHANGELOG.md has one) and
 # how to verify what was downloaded. Printed to stdout.
 #
-#   notes.sh VERSION [OWNER/REPO [COMMIT]]
+#   notes.sh VERSION OWNER/REPO COMMIT
 #
-# COMMIT (a full 40-hex SHA) is the commit the tag names: the attestation commands then also pin
+# COMMIT (a full lowercase 40-hex SHA) is the commit the tag names: the attestation commands pin
 # --source-digest and --signer-digest to it, as `release-verify` does (tests/release/verify.sh).
-# Without it the commands pin the repository, the workflow and the tag only.
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-v=${1:?usage: notes.sh VERSION [OWNER/REPO [COMMIT]]}
-repo=${2:-anthonytw/fil}
-commit=${3:-}
-if [ -n "$commit" ] && ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
-  echo "notes.sh: COMMIT must be a full 40-hex commit SHA: $commit" >&2
+v=${1:?usage: notes.sh VERSION OWNER/REPO COMMIT}
+repo=${2:?usage: notes.sh VERSION OWNER/REPO COMMIT}
+commit=${3:?usage: notes.sh VERSION OWNER/REPO COMMIT}
+if ! [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
+  echo "notes.sh: COMMIT must be a full lowercase 40-hex commit SHA: $commit" >&2
   exit 2
 fi
 # The attestation flags, narrowest first: this repository, this workflow at this tag (the exact
-# certificate identity), the tag ref, the commit when known, and no self-hosted runner.
+# certificate identity), the tag ref, the tag's commit, and no self-hosted runner.
 attest_flags="--repo $repo \\
   --cert-identity https://github.com/$repo/.github/workflows/release.yml@refs/tags/v$v \\
-  --source-ref refs/tags/v$v"
-if [ -n "$commit" ]; then attest_flags="$attest_flags --source-digest $commit --signer-digest $commit"; fi
-attest_flags="$attest_flags --deny-self-hosted-runners"
+  --source-ref refs/tags/v$v \\
+  --source-digest $commit --signer-digest $commit \\
+  --deny-self-hosted-runners"
 vre=$(printf '%s' "$v" | sed 's/[.]/[.]/g')
 
 if [ -f "$ROOT/CHANGELOG.md" ]; then

@@ -15,7 +15,7 @@
 #      `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')` (an `||` or any other
 #      edit fails); a job's `permissions:` is a block, never `write-all` or an inline { ... };
 #   4. every `uses:` is pinned by a full 40-hex commit SHA;
-#   5. no secret (`secrets.X`, `secrets['X']`, `toJSON(secrets)`, `secrets: inherit`), no cache of any kind, no `pull_request_target`;
+#   5. no secret (the word `secrets` in any case: `Secrets.X`, `secrets ['X']`, `toJSON( secrets )`, `secrets: inherit`), no cache of any kind, no `pull_request_target`;
 #   6. every checkout sets `persist-credentials: false`;
 #   7. the only triggers are a tag push (no branches) and workflow_dispatch, and workflow_dispatch
 #      takes no `inputs:` (an input that reached a step would be attacker-chosen text);
@@ -115,8 +115,9 @@ awk '
       if (u ~ /^actions\/checkout@/) { in_checkout = 1; checkout_ok = 0; checkout_line = NR; match(line, /^ *(- )?/); checkout_indent = RLENGTH - (line ~ /^ *- / ? 2 : 0) }
     }
     if (in_checkout && line ~ /persist-credentials:[ ]*false/) checkout_ok = 1
-    # secrets by any spelling: secrets.X, secrets['X'], toJSON(secrets), `secrets: inherit`
-    if (line ~ /secrets\./ || line ~ /secrets\[/ || line ~ /\(secrets\)/ || line ~ /^ *secrets:/) bad("a secret is referenced: " line)
+    # the word `secrets` in any case, with or without spaces around it: secrets.X, Secrets.X,
+    # SECRETS['X'], secrets ['X'], toJSON( secrets ), format('{0}', secrets), `secrets: inherit`
+    if (tolower(line) ~ /(^|[^a-z0-9_])secrets([^a-z0-9_]|$)/) bad("a secret is referenced: " line)
     if (line ~ /pull_request_target/) bad("pull_request_target: " line)
     if (line ~ /actions\/cache/ || line ~ /rust-cache/ || line ~ /^ *cache:/ || line ~ /[ ]cache-[a-z-]*:/) bad("a cache: " line)
   }

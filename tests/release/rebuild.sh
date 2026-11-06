@@ -18,7 +18,7 @@
 set -euo pipefail
 
 repo=$1 ref=$2
-printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$' || { echo "rebuild: the ref must be a full 40-hex commit SHA, not: $ref" >&2; exit 1; }
+[[ $ref =~ ^[0-9a-f]{40}$ ]] || { echo "rebuild: the ref must be a full lowercase 40-hex commit SHA, not: $ref" >&2; exit 1; }
 # The third argument is relative to $HOME (the VM user's), so the caller need not expand it.
 work=$HOME/$3
 export PATH="$HOME/.cargo/bin:$PATH"

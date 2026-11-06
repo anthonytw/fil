@@ -1,7 +1,6 @@
 [defaults]
 transport = "auto"
 host_label = "laptop"
-predict = "adaptive"
 
 [defaults.offline_input]
 buffer = "4KiB"

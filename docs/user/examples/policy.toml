@@ -1,0 +1,11 @@
+# /etc/fil/policy.toml: the host administrator's policy. Owned by root, not writable by group or
+# world, in directories only root can write; a file that fails that, or does not parse, refuses
+# everything. Each key overrides what fil mirrors from sshd_config; a key left out keeps the mirror.
+
+local = true              # -L and -D (instead of AllowTcpForwarding and DisableForwarding)
+remote = true             # -R
+agent = true              # the agent relay (instead of AllowAgentForwarding and DisableForwarding)
+direct = true             # fil's direct (QUIC) transport; false: no UDP port, attaches use the pipe
+permit_open = ["any"]     # -L and -D targets, as PermitOpen: "any", "none", or "host:port" ("*" for either)
+permit_listen = ["any"]   # -R binds, as PermitListen: "any", "none", "port" or "host:port"
+gateway_ports = false     # -R beyond loopback (as GatewayPorts clientspecified when true)

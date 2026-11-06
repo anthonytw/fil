@@ -196,6 +196,26 @@ pub enum Command {
     /// Install this fil on HOST over ssh, into ~/.local/share/fil (or check what is there, or
     /// remove what fil installed)
     Install(InstallArgs),
+    /// Look at the configuration
+    Config(ConfigArgs),
+}
+
+/// `fil config`.
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Show the settings that apply to HOST and where each value comes from (the default,
+    /// [defaults] or [host.NAME]), like `ssh -G`. Reads only the config file; never contacts
+    /// the host
+    Show {
+        #[arg(value_name = "HOST")]
+        host: String,
+    },
 }
 
 /// `fil install` (M4 OQ-1, approved by the owner 2026-11-04).
@@ -499,6 +519,10 @@ pub enum Action {
         host: String,
         request: crate::install::client::Request,
     },
+    /// `fil config show HOST`.
+    ConfigShow {
+        host: String,
+    },
 }
 
 /// Where `fil forward` and `fil ports` reach the daemon.
@@ -565,6 +589,7 @@ impl Cli {
             Command::Ports(_) => "ports",
             Command::Server(_) => "server",
             Command::Install(_) => "install",
+            Command::Config(_) => "config",
         };
         Err(usage_error(
             name,
@@ -641,6 +666,9 @@ impl Cli {
                     request,
                 })
             }
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Show { host },
+            })) => Ok(Action::ConfigShow { host }),
             None => {
                 let a = self.attach;
                 let forwards = a.forwards();
@@ -1277,6 +1305,18 @@ mod tests {
                 forwards: Default::default()
             }
         );
+    }
+
+    #[test]
+    fn config_show_takes_a_host() {
+        assert_eq!(
+            action(&["config", "show", "devbox"]),
+            Action::ConfigShow {
+                host: "devbox".into()
+            }
+        );
+        assert!(parse(&["config", "show"]).is_err());
+        assert!(parse(&["config"]).is_err());
     }
 
     #[test]

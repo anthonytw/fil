@@ -334,6 +334,8 @@ release-test:
 # universal macOS binary when run on macOS, then the archives, the source archive and SHA256SUMS
 # into OUT/files (assembled by the GNU tar and gzip inside the pinned image). Off macOS, name a macOS
 # binary with FIL_MACOS_BINARY=path (a dry run's, for example) or the archives are not assembled.
+# The archives here have no man pages or completions: `just docs OUT` makes them and package.sh takes
+# them with --extra, as release.yml does.
 release-build out="target/release-dist":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -528,3 +530,16 @@ _notices mode:
       diff -u -L THIRD-PARTY-NOTICES.md -L rendered THIRD-PARTY-NOTICES.md "$scratch/notices.md" | head -n 40 >&2 || true
       exit 1
     fi
+
+# ---- Documentation (docs/m4/plan.md, DOC; docs/man/build.sh) ----
+
+# The generated documentation, laid out like an archive under OUT: fil(1), fil-config(5) and
+# fil-policy(5), the completions for bash, zsh and fish, and the example configs. release.yml builds
+# the same tree and gives it to package.sh --extra. Needs pandoc, at the version docs/man/build.sh pins.
+docs out=(target_dir / "docs"):
+    docs/man/build.sh "{{out}}"
+
+# Rewrite the committed docs/man/fil.1 after a change to the command line (tests/docs_sync.rs
+# fails until you do), then commit it.
+docs-man:
+    cargo run --quiet -p fil-shell --example gen_docs -- --man-page > docs/man/fil.1

@@ -1,12 +1,12 @@
 # Packaging channels (M4 PKG)
 
-> **Status: M4 package PKG** (`docs/m4/plan.md` §3 PKG, goal 3; the channels are the owner's, `docs/m4/release.md` §10.2). This page says how each v1 channel is built, checked and updated, and what is still the owner's. The user guide (DOC, `docs/user/install.md`) does not exist yet; when DOC writes its skeleton, the "Installing" section below moves there and this page keeps the maintainer's side.
+> **Status: M4 package PKG** (`docs/m4/plan.md` §3 PKG, goal 3; the channels are the owner's, `docs/m4/release.md` §10.2). This page says how each v1 channel is built, checked and updated, and what is still the owner's. The user-facing install instructions are in the guide (`docs/user/install.md`); this page keeps the maintainer's side.
 
 ## 1. Installing
 
 | Channel | Command | What you get |
 |---|---|---|
-| GitHub Releases | download, check, unpack (below) | the client, the remote bundle for `fil install`, man pages and completions (once DOC adds them) |
+| GitHub Releases | download, check, unpack (below) | the client, the remote bundle for `fil install`, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive, unpacked into the Cellar |
 | Debian, Ubuntu | `sudo apt install ./fil_<ver>_amd64.deb` (or `_arm64`) | the same files under `/usr`, from the release's Linux archive |
 | Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc`, then `sudo dnf install ./fil-<ver>-1.x86_64.rpm` (or `.aarch64`) | the same |

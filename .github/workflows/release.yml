@@ -207,6 +207,10 @@ jobs:
           else
             echo "::warning::the two macOS builds differ (best effort, not gated): $(sha256sum sets/a/universal-apple-darwin/fil sets/b/universal-apple-darwin/fil | tr '\n' ' ')"
           fi
+      - name: Man pages, completions and example configs (docs/man/build.sh; pandoc is a pinned build tool, not a dependency)
+        run: |
+          docs/man/install-pandoc.sh "$RUNNER_TEMP/pandoc"
+          PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out
       - name: Archives, source archive, .deb and .rpm packages and SHA256SUMS (in the pinned images), twice
         env:
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
@@ -216,8 +220,8 @@ jobs:
           {
             docker version --format 'docker {{.Server.Version}}'
             cargo --version
-            tests/release/package.sh --bins sets/a --out out
-            tests/release/package.sh --bins sets/b --out out-b
+            tests/release/package.sh --bins sets/a --out out --extra docs-out
+            tests/release/package.sh --bins sets/b --out out-b --extra docs-out
           } 2>&1 | tee info/build-info.txt
           # The archives and packages must not depend on which job built the binaries. The macOS
           # archive differs when the two macOS builds do (best effort); the others are gated.

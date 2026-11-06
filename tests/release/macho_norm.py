@@ -13,7 +13,8 @@ comparison itself, from the bytes alone. For every slice of a thin or fat 64-bit
 Mach-O it:
 
   * cuts the slice at LC_CODE_SIGNATURE's dataoff (the signature is the last thing in the file;
-    anything else there is refused),
+    anything else there is refused; no segment but __LINKEDIT and no load command may reach into it,
+    and __LINKEDIT's vmsize must be its file size rounded up to a page),
   * removes the LC_CODE_SIGNATURE load command (later commands move up, ncmds and sizeofcmds drop,
     the freed bytes are zero, as they are in a binary that was never signed),
   * sets __LINKEDIT's filesize to end where the signature began, and its vmsize to that rounded up to
@@ -121,6 +122,36 @@ def parse_slice(s):
     return {"cputype": cputype, "ncmds": ncmds, "sizeofcmds": sizeofcmds, "lcs": lcs, "sig": sig, "linkedit": linkedit}
 
 
+# load commands that point into __LINKEDIT: (cmd, [(offset field, size field or None)]) at byte offsets
+# of the command; a size of None means the offset alone is checked
+LINKEDIT_REFS = {
+    0x2: [(8, 12), (16, 20)],  # LC_SYMTAB: symoff/nsyms, stroff/strsize
+    0xB: [(32 + 4 * i, 36 + 4 * i) for i in (0, 2, 4, 6, 8, 10)],  # LC_DYSYMTAB: toc, modtab, extrefsym, indirectsym, extrel, locrel
+    0x22: [(8 + 8 * i, 12 + 8 * i) for i in range(5)],  # LC_DYLD_INFO: rebase, bind, weak bind, lazy bind, export
+    0x80000022: [(8 + 8 * i, 12 + 8 * i) for i in range(5)],
+}
+for _c in (0x1E, 0x26, 0x29, 0x2B, 0x2E, 0x80000033, 0x80000034):  # linkedit_data_command
+    LINKEDIT_REFS[_c] = [(8, 12)]
+
+
+def check_inert_signature(s, p, dataoff):
+    """The signature must be inert data: no segment but __LINKEDIT and no load command reaches into it."""
+    for off, cmd, size in p["lcs"]:
+        if cmd == LC_SEGMENT_64 and s[off + 8 : off + 24].rstrip(b"\0") != b"__LINKEDIT":
+            if u64(s, off + 40) + u64(s, off + 48) > dataoff:
+                refuse("a segment reaches into the signature")
+        for o_off, o_size in LINKEDIT_REFS.get(cmd, ()):
+            if o_off + 4 > size or o_size + 4 > size:
+                continue
+            start, length = u32(s, off + o_off), u32(s, off + o_size)
+            if cmd in (0xB,):
+                # DYSYMTAB: (offset, entry count): an offset past the signature's start is enough to refuse
+                if length and start >= dataoff:
+                    refuse("a load command refers to data in or after the signature")
+            elif length and start + length > dataoff:
+                refuse("a load command refers to data in or after the signature")
+
+
 def normalize_slice(s):
     p = parse_slice(s)
     if p["sig"] is None:
@@ -137,6 +168,10 @@ def normalize_slice(s):
         refuse("the signature is not the end of __LINKEDIT")
     if sig["dataoff"] < le["fileoff"]:
         refuse("the signature starts before __LINKEDIT")
+    check_inert_signature(s, p, sig["dataoff"])
+    # every signer sets vmsize to the signed file size rounded up to a page (4 KiB or 16 KiB): nothing else
+    if le["vmsize"] not in (round_up(le["filesize"], 0x1000), round_up(le["filesize"], 0x4000)):
+        refuse("__LINKEDIT's vmsize (0x%x) is not its file size (0x%x) rounded up to a page" % (le["vmsize"], le["filesize"]))
     out = bytearray(s[: sig["dataoff"]])
     # drop the LC_CODE_SIGNATURE command: later commands move up, the freed bytes become zero
     lc = sig["lc"]
@@ -191,6 +226,9 @@ def normalize(b):
     if f is None:
         return normalize_slice(b)
     archs, wide = f
+    for cpu, _sub, _align, s in archs:
+        if parse_slice(s)["cputype"] != cpu:
+            refuse("a fat architecture's cputype (0x%x) is not its slice's (0x%x)" % (cpu, parse_slice(s)["cputype"]))
     parts = [(cpu, sub, align, normalize_slice(s)) for cpu, sub, align, s in archs]
     esize = 32 if wide else 20
     out = bytearray(struct.pack(">II", FAT_MAGIC_64 if wide else FAT_MAGIC, len(parts)))
@@ -296,32 +334,50 @@ def member_key(m):
     return (m.name, m.type, m.mode, m.uid, m.gid, m.uname, m.gname, m.mtime, m.linkname)
 
 
+def tar_headers(raw):
+    """The (typeflag, magic) of every 512-byte tar header in RAW, including pax and GNU long-name ones."""
+    out, pos = [], 0
+    while pos + 512 <= len(raw) and raw[pos : pos + 512].strip(b"\0"):
+        size = int(raw[pos + 124 : pos + 136].strip(b"\0 ") or b"0", 8)
+        out.append((raw[pos + 156 : pos + 157], raw[pos + 257 : pos + 265]))
+        pos += 512 + round_up(size, 512)
+    return out
+
+
 def cmd_archives(ci, signed):
+    import gzip
+
     def load(p):
-        out = {}
-        with tarfile.open(p, "r:gz") as t:
-            names = []
+        out, names = {}, []
+        with gzip.open(p, "rb") as g:
+            raw = g.read()
+        import io
+
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as t:
             for m in t.getmembers():
                 names.append(m.name)
-                data = t.extractfile(m).read() if m.isfile() else None
-                out[m.name] = (m, data)
-        return names, out
+                out[m.name] = (m, t.extractfile(m).read() if m.isfile() else None)
+            fmt, end = tar_headers(raw), t.offset
+        if raw[end:].strip(b"\0"):
+            refuse("%s: data after the end of the tar archive" % p)
+        return names, out, fmt
 
-    n1, a = load(ci)
-    n2, b = load(signed)
+    n1, a, f1 = load(ci)
+    n2, b, f2 = load(signed)
+    if f1 != f2:
+        refuse("the tar formats or extended headers differ")
     if n1 != n2:
         refuse("the member lists differ: %s" % sorted(set(n1) ^ set(n2))[:6])
-    bins = [n for n in n1 if n.count("/") == 1 and n.endswith("/bin/fil")] or [n for n in n1 if n.endswith("/bin/fil")]
+    bins = [n for n in n1 if n.endswith("/bin/fil")]
     if len(bins) != 1:
         refuse("expected exactly one bin/fil, found %d" % len(bins))
     binname = bins[0]
     for n in n1:
         (m1, d1), (m2, d2) = a[n], b[n]
-        if n == binname:
-            if member_key(m1) != member_key(m2):
-                refuse("%s: tar metadata differs (mode, owner, mtime)" % n)
-            continue
-        if member_key(m1) != member_key(m2) or d1 != d2:
+        # tar metadata, including the extended (pax) headers that carry xattrs and ACLs
+        if member_key(m1) != member_key(m2) or m1.pax_headers != m2.pax_headers:
+            refuse("%s: tar metadata differs (mode, owner, mtime, extended headers)" % n)
+        if n != binname and d1 != d2:
             refuse("%s differs between the CI archive and the signed archive" % n)
     na, nb = normalize(a[binname][1]), normalize(b[binname][1])
     if na != nb:

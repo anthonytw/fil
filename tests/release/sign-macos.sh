@@ -2,7 +2,10 @@
 # `just release-sign-macos X.Y.Z`: the owner signs and notarizes the macOS binary on their own Mac,
 # never in CI (decided, owner 2026-11-04: N4; docs/m4/release.md section 10.3).
 #
-#   sign-macos.sh VERSION [--repo OWNER/REPO] [--work DIR]
+#   sign-macos.sh VERSION [--repo OWNER/REPO] [--work DIR] [--force]
+#
+# --force signs again a release this script has already signed (it says so in DIR/verified); a second
+# run costs a notarization and gives an equivalent result.
 #
 # CI builds the macOS binary (ad hoc signed) into a DRAFT, which carries two copies of its archive:
 # fil-X-universal-apple-darwin.ci.tar.gz, the one CI attested, which stays as it is, and
@@ -36,31 +39,32 @@
 # Environment: FIL_CODESIGN_IDENTITY (the certificate's name, as in the keychain; default below; `-`
 # is ad hoc, for trying the script), FIL_RELEASE_KEY (default ~/.ssh/fil-release), FIL_NOTARY_PROFILE
 # (default fil-notary), FIL_MACOS_TEAM_ID (default .github/macos-team-id). Test-only overrides, each
-# of which prints a NOTE and none of which may be set unless FIL_GH is too (nothing real is ever
-# uploaded by a faked run): FIL_RELEASE_VERIFY, FIL_NOTARYTOOL, FIL_GH, FIL_CODESIGN, FIL_DITTO,
+# of which prints a NOTE and none of which is accepted unless the self-test's FIL_RELEASE_SELFTEST=1
+# is set (a real signing and upload with a faked step is refused): FIL_RELEASE_VERIFY, FIL_NOTARYTOOL, FIL_GH, FIL_CODESIGN, FIL_DITTO,
 # FIL_RELEASE_PACK_CMD, FIL_RELEASE_SIGNERS. Needs Docker (the CI packing), codesign, ditto, xcrun, gh.
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-version='' repo=anthonytw/fil work=''
+version='' repo=anthonytw/fil work='' force=0
 while [ $# -gt 0 ]; do
   case $1 in
     --repo) repo=$2; shift 2 ;;
     --work) work=$2; shift 2 ;;
+    --force) force=1; shift ;;
     -*) die "unknown option: $1" ;;
     *) version=$1; shift ;;
   esac
 done
-[ -n "$version" ] || die "usage: sign-macos.sh VERSION [--repo OWNER/REPO] [--work DIR]"
+[ -n "$version" ] || die "usage: sign-macos.sh VERSION [--repo OWNER/REPO] [--work DIR] [--force]"
 version=${version#v}
 tag=v$version
 
 # ---- the test-only overrides: a NOTE each, and no upload for real while any of them replaces a step
 test_override_notes
-if [ -z "${FIL_GH:-}" ]; then
-  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT; do
-    [ -z "${!v:-}" ] || die "STOP: $v is set (a test-only override) and FIL_GH is not: a real upload with a faked step is refused. Unset $v."
+if [ "${FIL_RELEASE_SELFTEST:-}" != 1 ]; then
+  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_GH FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT; do
+    [ -z "${!v:-}" ] || die "STOP: $v is set (a test-only override): a real signing and upload with a faked step is refused. Unset $v. (The self-test sets FIL_RELEASE_SELFTEST=1; nothing else should.)"
   done
 fi
 
@@ -89,6 +93,9 @@ mkdir -p "$logs"
 for l in rebuild=1 dry=0 "sums=$(sha256 "$dl/SHA256SUMS" 2> /dev/null || echo none)"; do
   grep -qx "$l" "$work/verified" || die "STOP: $work/verified does not say '$l': the files in $dl are not the ones the full 'just release-verify $version --pre-sign' verified. Run it again."
 done
+if grep -qx 'macos=signed' "$work/verified" && [ "$force" = 0 ]; then
+  die "STOP: this release is already signed (macos=signed in $work/verified); pass --force to sign and notarize again"
+fi
 [ -f "$dl/$archive" ] && [ -f "$dl/$ci_archive" ] || die "STOP: $dl has no $archive and $ci_archive (a release built before the .ci archive existed cannot be signed)"
 verifier=${FIL_RELEASE_VERIFY:-$RELEASE_DIR/verify.sh}
 "$verifier" "$version" --pre-sign --no-rebuild --from-dir "$dl" --work "$work" --repo "$repo" || die "STOP: release-verify failed: nothing was signed"
@@ -164,6 +171,7 @@ else
   want ' kind=signed ' "a Developer ID signature"
   want ' flags=0x10000 ' "exactly the hardened runtime flag (0x10000)"
   want " team=$team " "the Team ID $team"
+  cs --verify --strict -R="$(dev_id_requirement "$team")" "$signed" || die "STOP: $signed does not satisfy 'Developer ID Application certificate whose OU is $team': the certificate named '$identity' is not that team's"
   dvv=$(cs -dvv "$signed" 2>&1) || die "STOP: cannot read the signature of $signed"
   grep -qxF "Authority=$identity" <<< "$dvv" || die "STOP: $signed is not signed by '$identity' (a certificate is chosen by its name; a SHA-1 hash is not accepted here):
 $dvv"

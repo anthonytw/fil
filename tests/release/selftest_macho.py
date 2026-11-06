@@ -115,12 +115,18 @@ def cmd_build(out, seed, linker):
         f.write(fat([(CPU_X86_64, x86), (mn.CPU_ARM64, arm)], [12, 14]))
 
 
-def cms_text(identity, ts):
-    return ("DEVID:%s:ts=%s" % (identity, "yes" if ts else "no")).encode().ljust(3000, b"\0")
+def cms_text(identity, certteam, ts):
+    return ("DEVID:%s|%s|ts=%s" % (identity, certteam, "yes" if ts else "no")).encode().ljust(3000, b"\0")
+
+
+def cms_fields(b):
+    text = b[b.index(b"DEVID:") :].split(b"\0")[0].decode()
+    name, certteam, tsf = text[len("DEVID:") :].split("|")
+    return name, certteam, tsf
 
 
 def cmd_codesign(argv):
-    mode, ident, opts, ts, idr, f, page = "sign", "", "", True, "fil", "", None
+    mode, ident, opts, ts, idr, f, page, req = "sign", "", "", True, "fil", "", None, ""
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -140,6 +146,8 @@ def cmd_codesign(argv):
             idr = argv[i + 1]; i += 1
         elif a == "--sign":
             ident = argv[i + 1]; i += 1
+        elif a.startswith("-R="):
+            req = a[3:]
         elif a == "--pagesize":
             page = int(argv[i + 1]); i += 1
         else:
@@ -154,7 +162,16 @@ def cmd_codesign(argv):
             infos = [mn.info_slice(s) for _, s in slices_of(b)]
         except mn.Refused:
             return 1
-        return 0 if all(x["kind"] in ("adhoc", "signed") for x in infos) else 1
+        if not all(x["kind"] in ("adhoc", "signed") for x in infos):
+            return 1
+        if req:
+            # the designated requirement: a Developer ID signature whose CERTIFICATE (not the
+            # CodeDirectory) names the team the requirement asks for
+            if infos[0]["kind"] != "signed" or "certificate 1[field.1.2.840.113635.100.6.2.6]" not in req:
+                return 3
+            want = req.split('subject.OU] = "')[1].split('"')[0]
+            return 0 if cms_fields(b)[1] == want else 3
+        return 0
     if mode == "display":
         sys.stderr.write("Identifier=%s\n" % idr)
         infos = [mn.info_slice(s) for _, s in slices_of(b)]
@@ -165,9 +182,7 @@ def cmd_codesign(argv):
         if infos[0]["kind"] == "adhoc":
             sys.stderr.write("Signature=adhoc\n")
         else:
-            text = b[b.index(b"DEVID:") :].split(b"\0")[0].decode()
-            body, tsf = text.rsplit(":", 1)
-            name = body[len("DEVID:"):]
+            name, _certteam, tsf = cms_fields(b)
             sys.stderr.write("Authority=%s\nTeamIdentifier=%s\n" % (name, infos[0]["team"]))
             if tsf == "ts=yes":
                 sys.stderr.write("Timestamp=Nov 6, 2026\n")
@@ -183,7 +198,7 @@ def cmd_codesign(argv):
     if opts == "runtime" and not env.get("FAKE_CODESIGN_NORUNTIME"):
         flags |= 0x10000
     team = "" if adhoc else env.get("FAKE_CODESIGN_TEAM", "6X3PT3FXGA")
-    cms = b"" if adhoc else cms_text(ident, ts)
+    cms = b"" if adhoc else cms_text(ident, env.get("FAKE_CODESIGN_CERT_TEAM", team), ts)
     out = []
     for cpu, s in slices_of(b):
         if env.get("FAKE_CODESIGN_TAMPER") and not adhoc:
@@ -194,8 +209,58 @@ def cmd_codesign(argv):
     return 0
 
 
+def cmd_mutate(src, kind, out):
+    """A deliberately malformed copy of a signed fat file (the normalizer must refuse it)."""
+    b = bytearray(open(src, "rb").read())
+    archs, _ = mn.split_fat(bytes(b))
+    f = mn.split_fat(bytes(b))
+    # file offset of the arm64 slice: the fat entries are 20 bytes after the 8-byte header
+    entries = [struct.unpack_from(">iiIII", b, 8 + 20 * i) for i in range(len(archs))]
+    arm = [e for e in entries if (e[0] & 0xFFFFFFFF) == mn.CPU_ARM64][0]
+    base = arm[2]
+    p = mn.parse_slice(bytes(b[base : base + arm[3]]))
+    if kind == "vmsize":  # __LINKEDIT's vmsize 1 MiB too large
+        struct.pack_into("<Q", b, base + p["linkedit"]["lc"] + 32, p["linkedit"]["vmsize"] + (1 << 20))
+    elif kind == "segment":  # __TEXT reaches into the signature
+        text = [o for o, c, sz in p["lcs"] if c == mn.LC_SEGMENT_64 and b[base + o + 8 : base + o + 14] == b"__TEXT"][0]
+        struct.pack_into("<Q", b, base + text + 48, p["sig"]["dataoff"] + 16)
+    elif kind == "ref":  # a linkedit-data command (LC_FUNCTION_STARTS) that points into the signature
+        uuid = [o for o, c, sz in p["lcs"] if c == 0x1B][0]
+        struct.pack_into("<IIII", b, base + uuid, 0x26, 24, p["sig"]["dataoff"], 8)
+    elif kind == "cputype":  # the fat entry of the arm64 slice says x86_64
+        i = entries.index(arm)
+        struct.pack_into(">i", b, 8 + 20 * i, CPU_X86_64)
+    else:
+        raise SystemExit("unknown mutation")
+    open(out, "wb").write(bytes(b))
+
+
+def cmd_tarmutate(src, kind, out):
+    """A copy of a release archive that differs in what tarfile's members do not show."""
+    import gzip, io, tarfile
+    raw = gzip.open(src, "rb").read()
+    if kind == "trailing":
+        raw = raw.rstrip(b"\0") + b"\0" * 1024 + b"extra data after the archive"
+    elif kind == "pax":
+        t = tarfile.open(fileobj=io.BytesIO(raw))
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as o:
+            for m in t.getmembers():
+                if m.name.endswith("README.md"):
+                    m.pax_headers = {"SCHILY.xattr.user.x": "y"}
+                o.addfile(m, t.extractfile(m) if m.isfile() else None)
+        raw = buf.getvalue()
+    with open(out, "wb") as f:
+        with gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename="") as g:
+            g.write(raw)
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "build":
         cmd_build(sys.argv[2], int(sys.argv[3]), "--linker" in sys.argv)
+    elif sys.argv[1] == "mutate":
+        cmd_mutate(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif sys.argv[1] == "tarmutate":
+        cmd_tarmutate(sys.argv[2], sys.argv[3], sys.argv[4])
     elif sys.argv[1] == "codesign":
         sys.exit(cmd_codesign(sys.argv[2:]))

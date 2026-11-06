@@ -93,6 +93,14 @@ cs_ok=0
 command -v "${FIL_CODESIGN:-codesign}" > /dev/null 2>&1 && cs_ok=1
 if [ "$cs_ok" = 1 ]; then
   if cs --verify --strict "$t/fil" > "$t/verify.log" 2>&1; then ok "codesign --verify --strict"; else cat "$t/verify.log" >&2; fail "codesign --verify --strict failed on the macOS binary"; fi
+  if [ "$kinds" = "signed " ]; then
+    if cs --verify --strict -R="$(dev_id_requirement "$team")" "$t/fil" > "$t/req.log" 2>&1; then
+      ok "macOS binary: the designated requirement holds (Developer ID CA, Developer ID Application leaf, certificate OU $team)"
+    else
+      cat "$t/req.log" >&2
+      fail "macOS binary: it does not satisfy 'Developer ID Application certificate whose OU is $team'"
+    fi
+  fi
   cs -dvv "$t/fil" > "$t/dvv.log" 2>&1 || true
   grep -E '^(Authority|TeamIdentifier|Timestamp)=' "$t/dvv.log" | sed 's/^/release-verify:   /' >&2 || true
   if [ "$kinds" = "signed " ]; then
@@ -100,7 +108,7 @@ if [ "$cs_ok" = 1 ]; then
     grep -q '^Authority=Developer ID Application:' "$t/dvv.log" && ok "macOS binary: signed by a Developer ID Application certificate" || fail "macOS binary: no Developer ID Application authority"
   fi
 else
-  note "not checked here (no codesign; needs a Mac): codesign --verify --strict, the certificate chain and the signing time"
+  note "not checked here (no codesign; needs a Mac): codesign --verify --strict, the designated requirement that ties the signature to a Developer ID certificate whose OU is the Team ID, the certificate chain and the signing time"
 fi
 [ "$kinds" != "signed " ] || note "not checked by any script: that Apple notarized it (a bare binary has no ticket to staple; Gatekeeper asks Apple online the first time it runs)"
 

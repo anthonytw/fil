@@ -283,11 +283,21 @@ macho() { python3 -I "$RELEASE_DIR/macho_norm.py" "$@"; }
 # 2026-11-06, section 4.1): the release carries it unchanged next to the archive the owner signs.
 ci_archive_name() { printf 'fil-%s-universal-apple-darwin.ci.tar.gz' "$1"; }
 
+# dev_id_requirement TEAM: the code requirement that ties a signature to the certificate and not only
+# to the Team ID written in the CodeDirectory: Apple's anchor with the Developer ID CA, a Developer ID
+# Application leaf (the two OIDs are Apple's, as in the requirement codesign itself prints for such
+# a binary) and the team as the leaf certificate's OU. `codesign --verify -R="$(dev_id_requirement
+# TEAM)"` fails for anyone else's certificate (checked on a Developer-ID-signed app: the right team
+# passes, another fails, an ad hoc binary fails).
+dev_id_requirement() {
+  printf 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "%s"' "$1"
+}
+
 # test_override_notes: a NOTE for each test-only override that is set. They replace a real tool with
 # a fake or skip a check; a shell that still has one exported must never go unnoticed.
 test_override_notes() {
   local v
-  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT; do
+  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT FIL_RELEASE_SELFTEST; do
     [ -z "${!v:-}" ] || echo "release: NOTE: $v is set ($(printf '%s' "${!v}" | cut -c1-60)): a test-only override; this run does NOT use the real tool or check it replaces" >&2
   done
 }

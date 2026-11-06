@@ -230,6 +230,9 @@ fake_bin() { # FILE KIND
 #!/bin/sh
 # FAKE-$2 /cargo-home/registry/src/index.crates.io-0/dep-1/src/lib.rs
 echo "fil $VER (wire $(wire_major).$(wire_revision))"
+echo "Copyright (C) 2026 Anthony Wertz"
+echo "License GPL-3.0-or-later <https://gnu.org/licenses/gpl.html>"
+echo "There is NO WARRANTY, to the extent permitted by law."
 EOT
   # The install bootstrap, as a real build holds it (release-check requires it, and no other `sh -c`).
   printf '# %s\n' "$(release_bootstrap "$VER" "$(wire_major)" "$(wire_revision)")" >> "$1"
@@ -394,6 +397,8 @@ mutated "a bundled copy differs from the target's own binary" \
   "echo '# changed' >> fil-0.9.0-universal-apple-darwin/libexec/fil/remote/aarch64-linux/fil; (cd fil-0.9.0-universal-apple-darwin/libexec/fil/remote && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' \"\$(shasum -a 256 \$f | cut -d' ' -f1)\" \$f; done > SHA256SUMS)"
 mutated "the bundle's SHA256SUMS is wrong" \
   "echo 'deadbeef  x86_64-linux/fil' > fil-0.9.0-x86_64-linux-musl/libexec/fil/remote/SHA256SUMS"
+mutated_msg "bin/fil lacks the legal lines of --version" "lacks the copyright, license or warranty line" \
+  "perl -pi -e 's/Anthony Wertz/Someone/' fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated_msg "a vt100 source path is in bin/fil" "vt100" \
   "echo '# /cargo-home/registry/src/index.crates.io-0/vt100-0.18.0/src/lib.rs' >> fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated_msg "bin/fil has no install bootstrap" "does not hold the approved install bootstrap" \

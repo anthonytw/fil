@@ -269,6 +269,13 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   done
   # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
   if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
+  # The legal lines of `--version` (section 7 of release.md; GPLv3's Appropriate Legal Notices) are
+  # compiled in; read from the file, because a downloaded binary is not run under --no-exec.
+  if grep -aqF -- 'Copyright (C) 2026 Anthony Wertz' "$b" && grep -aqF -- 'License GPL-3.0-or-later <https://gnu.org/licenses/gpl.html>' "$b" && grep -aqF -- 'There is NO WARRANTY, to the extent permitted by law.' "$b"; then
+    ok "$name: bin/fil carries the copyright, license and warranty lines of --version"
+  else
+    fail "$name: bin/fil lacks the copyright, license or warranty line of --version (crates/fil/src/cli.rs)"
+  fi
   # A tripwire on the remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner
   # 2026-11-04): the install bootstrap is in the binary, byte for byte as the golden pins it for
   # this version and wire, and every `sh -c` in the binary (which also catches `bash -c`, `zsh -c`

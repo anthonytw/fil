@@ -1,5 +1,5 @@
 # Manual macOS check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
-# Run with `gh workflow run macos-check` (optionally `-f ref=BRANCH -f suite=check|remote|all`),
+# Run with `gh workflow run macos-check` (optionally `-f ref=BRANCH -f suite=check|remote|brew|all`),
 # then `gh run watch`. Never runs on pull_request: the ref's build scripts and tests run on the
 # runner, and a fork's must not. No secrets are used.
 #
@@ -10,6 +10,15 @@
 #           to the runner itself (tests/macos/remote.sh, `just macos-remote`), once with a
 #           user-mode sshd and once with the system sshd. It includes the in-place-upgrade
 #           (trampoline) case, which records a known finding rather than failing unless `strict`.
+#
+#   brew    the Homebrew formula (packaging/homebrew/fil.rb.in, docs/m4/packaging.md section 4), on
+#           Apple silicon and Intel: rendered against the archives of a release dry run, put in a
+#           scratch tap, then `brew install`, `brew test` and `brew audit --strict`. The archives
+#           come from a dry run named by the `release_run` input (a `release` workflow run on this
+#           repository, downloaded with the job's own token, which has `actions: read` and nothing
+#           else), not from a build here: building the universal binary and both Linux archives
+#           takes the release workflow about 20 minutes, and the formula is what is under test.
+#           In `all` it runs only when `release_run` is given.
 #
 # Runner images. Apple silicon is `macos-15` (the newest image this was written against; macOS 14
 # images were retired on 2026-11-02). Intel is `macos-15-intel`, GitHub's LAST Intel image: it
@@ -32,10 +41,14 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses, Apple silicon and Intel), remote (macOS as the remote host, over a real ssh login to the runner) or all"
+        description: "check (just ci and the on-demand harnesses, Apple silicon and Intel), remote (macOS as the remote host, over a real ssh login to the runner), brew (the Homebrew formula; needs release_run) or all"
         type: choice
-        options: [all, check, remote]
+        options: [all, check, remote, brew]
         default: all
+      release_run:
+        description: "brew: ID of a successful `release` workflow run (a dry run) whose release-files artifact the formula is tested against"
+        required: false
+        default: ""
       strict:
         description: "remote: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
         type: boolean
@@ -46,7 +59,7 @@ permissions:
 
 jobs:
   check:
-    if: inputs.suite != 'remote'
+    if: inputs.suite == 'check' || inputs.suite == 'all'
     name: check (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
@@ -139,7 +152,7 @@ jobs:
           retention-days: 14
 
   remote:
-    if: inputs.suite != 'check'
+    if: inputs.suite == 'remote' || inputs.suite == 'all'
     name: remote (${{ matrix.sshd }} sshd)
     runs-on: macos-15
     timeout-minutes: 45
@@ -196,3 +209,69 @@ jobs:
             ~/.local/state/fil
           if-no-files-found: ignore
           retention-days: 14
+
+  brew:
+    if: inputs.suite == 'brew' || (inputs.suite == 'all' && inputs.release_run != '')
+    name: brew (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # Reading another run's artifacts is `actions: read`; nothing here writes.
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: arm64, os: macos-15 }
+          - { label: x86_64, os: macos-15-intel }
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_RUN: ${{ inputs.release_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: The dry run's release files
+        run: |
+          case "$RELEASE_RUN" in ''|*[!0-9]*) echo "release_run must be a release workflow run ID" >&2; exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/release"
+          gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name release-files --dir "$RUNNER_TEMP/release"
+          ls -l "$RUNNER_TEMP/release"
+      - name: Render the formula against those files
+        run: |
+          rel=$RUNNER_TEMP/release
+          archive=$(ls "$rel"/fil-*-universal-apple-darwin.tar.gz)
+          version=${archive##*/fil-}; version=${version%-universal-apple-darwin.tar.gz}
+          echo "version $version"
+          packaging/render.sh brew "$version" "$rel/SHA256SUMS" "$RUNNER_TEMP/formula" "file://$rel"
+          cat "$RUNNER_TEMP/formula/fil.rb"
+      - name: Scratch tap
+        run: |
+          brew tap-new --no-git fil-check/tap
+          mkdir -p "$(brew --repository fil-check/tap)/Formula"
+          cp "$RUNNER_TEMP/formula/fil.rb" "$(brew --repository fil-check/tap)/Formula/fil.rb"
+      - name: brew install
+        run: brew install --formula fil-check/tap/fil
+      - name: brew test
+        if: ${{ !cancelled() }}
+        run: brew test fil-check/tap/fil
+      - name: brew audit --strict
+        if: ${{ !cancelled() }}
+        run: brew audit --strict --formula fil-check/tap/fil
+      - name: The installed layout
+        if: ${{ !cancelled() }}
+        run: |
+          prefix=$(brew --prefix fil-check/tap/fil)
+          "$prefix/bin/fil" --version
+          find "$prefix" -type f | sort | head -50
+      - name: Uninstall
+        if: always()
+        run: |
+          brew uninstall --formula fil-check/tap/fil || true
+          brew untap fil-check/tap || true

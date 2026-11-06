@@ -16,8 +16,10 @@
 #   p_shells  fil, adaptive, 75 ms each way: typing at the prompt of bash, zsh and fish (those
 #             installed; bash is required)
 #
-# **The prediction mode.** Every fil cell reads a config file of its own with `[defaults] predict =
-# "off"` (the built-in default is adaptive), so an off cell is off whatever else happens. The client
+# **The prediction mode.** Every fil cell reads a config file of its own: with `[defaults] predict =
+# "off"` when the client has the flag (the built-in default is adaptive), so an off cell is off
+# whatever else happens; empty when it has none (0.1.0 never predicts and refuses a `predict` key,
+# N9). The client
 # also gets `--predict MODE` when `fil --help` lists that flag (M3's E1b). Until then fil never
 # predicts, so the `off` cells run and the others are noted as not run; when the flag arrives they
 # run with nothing changed here. A cell named adaptive in the list above runs as `off` until then
@@ -74,8 +76,14 @@ pr_setup() {
     exit 1
   fi
   if grep -qE -- '(^|[[:space:],])--predict([[:space:]=<,]|$)' <<< "$help"; then has=1; fi
-  # The off cells' prediction setting, whatever the flag detection says.
-  printf '[defaults]\npredict = "off"\n' > "$OUT/run/predict-off.toml"
+  # The off cells' prediction setting, whatever the flag detection says. A build without the flag
+  # (0.1.0) has no `predict` key either (N9: the parser refuses it), and never predicts: an empty
+  # config. The key is written only for a build that has the flag.
+  if [[ $has == 1 ]]; then
+    printf '[defaults]\npredict = "off"\n' > "$OUT/run/predict-off.toml"
+  else
+    : > "$OUT/run/predict-off.toml"
+  fi
   as_root install -o rnclient -g rnclient -m 600 "$OUT/run/predict-off.toml" "$PR_CONFIG"
   { cat "$OUT/udp.env"; printf 'PR_HAS_FLAG=%s\n' "$has"; } > "$OUT/predict.env"
   if [[ $has == 1 ]]; then

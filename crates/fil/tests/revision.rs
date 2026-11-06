@@ -201,10 +201,23 @@ fn version_prints_the_wire() {
         out.status.success()
             && text.starts_with("fil ")
             && text
-                .trim_end()
+                .lines()
+                .next()
+                .unwrap_or("")
                 .ends_with(&format!("(wire {}.7)", fil_proto::limits::PROTOCOL_MAJOR)),
         "{text}"
     );
+    // The GNU-style legal lines follow (GPLv3's Appropriate Legal Notices), for -V too.
+    assert!(text.contains("Copyright (C) 2026 Anthony Wertz"), "{text}");
+    assert!(text.contains("License GPL-3.0-or-later"), "{text}");
+    assert!(text.contains("NO WARRANTY"), "{text}");
+    let short = Command::new(FIL)
+        .arg("-V")
+        .env_clear()
+        .env("FIL_TEST_WIRE_REVISION", "7")
+        .output()
+        .unwrap();
+    assert_eq!(short.stdout, out.stdout);
 }
 
 /// The client is older than the host's `fil` and no daemon of its wire is running: `fil ls`

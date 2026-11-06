@@ -63,6 +63,7 @@ The name other clients are shown when you take a session over, 1 to 128 bytes of
 Forwards for every attach to the host: a list of the same specs the flags take.
 
 ```toml
+[defaults]
 forward = ["-L 5173", "-R 9000", "-D 1080"]
 ```
 
@@ -121,8 +122,10 @@ How much typing is held while the link is down, as a size (`"4KiB"`) or a number
 Keeps everything typed while disconnected. Off by default, because it can capture passwords. A path (absolute, or starting with `~/`) is appended to with mode 0600; a list is a command that receives the bytes on its standard input, never through a shell.
 
 ```toml
+[defaults.offline_input]
 log = "~/.local/state/fil/offline-input.log"
-log = ["logger", "-t", "fil"]
+# or a command:
+# log = ["logger", "-t", "fil"]
 ```
 
 ### `direct`

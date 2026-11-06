@@ -1,6 +1,6 @@
 # Getting fil onto a remote host
 
-> **Status: M4 package U1** (`docs/m4/plan.md` §3 U1). fil gets onto a host by hand (section 1) or through fil: with `fil install HOST`, or when the first attach finds no fil and the user says yes (section 3). The owner approved the second fixed remote command, the constant install bootstrap, and the install directory `~/.local/share/fil` (M4 OQ-1, 2026-11-04), and every build carries them. The user guide (DOC, `docs/user/`) will take the user-facing parts of this page.
+> **Status: M4 package U1** (`docs/m4/plan.md` §3 U1). fil gets onto a host by hand (section 1) or through fil: with `fil install HOST`, or when the first attach finds no fil and the user says yes (section 3). The owner approved the second fixed remote command, the constant install bootstrap, and the install directory `~/.local/share/fil` (M4 OQ-1, 2026-11-04), and every build carries them. The user guide (`docs/user/install.md` and `troubleshooting.md`) has the user-facing parts of this page; this page keeps the mechanism and the tests.
 
 ## 1. By hand
 

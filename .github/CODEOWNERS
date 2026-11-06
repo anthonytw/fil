@@ -8,3 +8,4 @@
 /tests/release/** @anthonytw
 /Cross.toml @anthonytw
 /rust-toolchain.toml @anthonytw
+/.github/macos-team-id @anthonytw

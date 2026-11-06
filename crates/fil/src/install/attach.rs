@@ -67,20 +67,7 @@ fn ask_on_terminal(question: &str) -> bool {
 /// The words for a host with no usable fil, after the bootstrap looked too.
 pub const NO_COPY: &str = "fil is not installed on the remote host: neither the PATH of a non-interactive ssh login nor fil's install directory there has a fil of this version";
 
-/// How a host's config entry is written: `devbox` as it is, anything with other characters
-/// quoted (`"box.example.net"`). The host has passed the pipe's host-name check, so it holds no
-/// quote or backslash.
-fn toml_key(host: &str) -> String {
-    if !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        host.to_string()
-    } else {
-        format!("\"{host}\"")
-    }
-}
+use crate::config::toml_key;
 
 /// The one config line that saves a host with only a fil-installed copy the plain command's
 /// login, for the user to add (`docs/m4/plan.md` §3 U1, "The cost in logins"). Said after an

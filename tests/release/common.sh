@@ -204,18 +204,102 @@ clean_build_env() {
 }
 
 # rewrite_sums DIR VERSION: DIR/SHA256SUMS for the release files of VERSION in DIR (section 4.2):
-# the four archives and the four packages, sorted bytewise. package.sh writes it, and the owner's
+# the five archives (the macOS one twice, section 4.1) and the four packages, sorted bytewise. package.sh writes it, and the owner's
 # signing step (sign-packages.sh) rewrites it after signing the rpms.
 rewrite_sums() {
   local dir=$1 v=$2 f
   (
     cd "$dir" || exit 1
-    for f in $({ printf '%s\n' "fil-$v-aarch64-linux-musl.tar.gz" "fil-$v-source.tar.gz" "fil-$v-universal-apple-darwin.tar.gz" "fil-$v-x86_64-linux-musl.tar.gz"; package_names "$v"; } | LC_ALL=C sort); do
+    for f in $({ printf '%s\n' "fil-$v-aarch64-linux-musl.tar.gz" "fil-$v-source.tar.gz" "fil-$v-universal-apple-darwin.tar.gz" "$(ci_archive_name "$v")" "fil-$v-x86_64-linux-musl.tar.gz"; package_names "$v"; } | LC_ALL=C sort); do
       [ -f "$f" ] || die "rewrite_sums: no $f in $dir"
       printf '%s  %s\n' "$(sha256 "$f")" "$f"
     done > SHA256SUMS.new
     mv SHA256SUMS.new SHA256SUMS
   )
+}
+
+# pack_archives STAGE OUT: every directory fil-* of STAGE becomes OUT/<dir>.tar.gz, with the recipe of
+# section 4.4 and the GNU tar and gzip of the digest-pinned x86_64 image, never the host's. The
+# stage is mounted read-only and the container has no network; the files it writes belong to the
+# caller. SOURCE_DATE_EPOCH must be set. package.sh packs the release with it, and the owner's
+# macOS signing (sign-macos.sh) repacks the macOS archive with it, so that the two are packed
+# exactly alike. FIL_RELEASE_PACK_CMD is test-only (the self-test has no Docker): a command run as
+# `$FIL_RELEASE_PACK_CMD STAGE OUT` in its place.
+pack_archives() {
+  local stage=$1 out=$2 image
+  [ -d "$stage" ] && [ -d "$out" ] || die "pack_archives: $stage and $out must be directories"
+  [ -n "${SOURCE_DATE_EPOCH:-}" ] || die "pack_archives: SOURCE_DATE_EPOCH is not set"
+  export SOURCE_DATE_EPOCH
+  if [ -n "${FIL_RELEASE_PACK_CMD:-}" ]; then
+    "$FIL_RELEASE_PACK_CMD" "$stage" "$out"
+    return
+  fi
+  image=$(tools_image)
+  [ -n "$image" ] || die "Cross.toml has no x86_64 image"
+  command -v docker > /dev/null && docker info > /dev/null 2>&1 || die "Docker is needed (the archives are packed by the GNU tar and gzip of a pinned image) and is not running"
+  docker run --rm --platform linux/amd64 --network none \
+    --user "$(id -u):$(id -g)" \
+    -e SOURCE_DATE_EPOCH -e LC_ALL=C \
+    -v "$stage:/stage:ro" -v "$out:/out" \
+    "$image" sh -ec '
+      tar --version | head -n 1 >&2
+      gzip --version | head -n 1 >&2
+      cd /stage
+      for d in fil-*; do
+        tar --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
+          --numeric-owner --mode="u=rwX,go=rX" -cf - "$d" | gzip -n -9 > "/out/$d.tar.gz"
+      done
+    '
+}
+
+# ---- macOS code signing (docs/m4/release.md section 10.3). FIL_CODESIGN is test-only: the self-test
+# runs on Linux, with a fake.
+cs() { "${FIL_CODESIGN:-codesign}" "$@"; }
+
+# repack_macos_archive ARCHIVE BIN OUT: ARCHIVE (the macOS release archive) with bin/fil replaced
+# by BIN, packed by pack_archives into the file OUT. SOURCE_DATE_EPOCH is the mtime of the archive's
+# own entries (every entry carries it: section 4.4), so the repack is the CI packing but for the
+# binary: repacking with the archive's own binary gives back the archive byte for byte.
+repack_macos_archive() {
+  local archive=$1 bin=$2 out=$3 st name sde
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fil-repack.XXXXXX")
+  mkdir "$st/in" "$st/out"
+  tar -xzpf "$archive" -C "$st/in" || { rm -rf "$st"; die "cannot unpack $archive"; }
+  name=$(ls "$st/in")
+  case $name in fil-*-universal-apple-darwin) ;; *) rm -rf "$st"; die "$archive does not hold one fil-*-universal-apple-darwin directory" ;; esac
+  [ -f "$st/in/$name/bin/fil" ] || { rm -rf "$st"; die "$archive has no bin/fil"; }
+  sde=$(perl -e 'print((stat $ARGV[0])[9])' "$st/in/$name/bin/fil")
+  install -m 755 "$bin" "$st/in/$name/bin/fil"
+  SOURCE_DATE_EPOCH=$sde pack_archives "$st/in" "$st/out" || { rm -rf "$st"; die "cannot pack the macOS archive"; }
+  mv "$st/out/$name.tar.gz" "$out"
+  rm -rf "$st"
+}
+# macho ARGS: the portable Mach-O normalizer (macho_norm.py, python3 stdlib only, any OS). It cuts a
+# signature off a binary and normalizes what the signer changes with it, so the CI binary, the same
+# binary with a Developer ID signature and a rebuild compare equal; see its header and section 10.3.
+macho() { python3 -I "$RELEASE_DIR/macho_norm.py" "$@"; }
+
+# ci_archive_name VERSION: the macOS archive exactly as CI built and attested it (decided, coordinator
+# 2026-11-06, section 4.1): the release carries it unchanged next to the archive the owner signs.
+ci_archive_name() { printf 'fil-%s-universal-apple-darwin.ci.tar.gz' "$1"; }
+
+# dev_id_requirement TEAM: the code requirement that ties a signature to the certificate and not only
+# to the Team ID written in the CodeDirectory: Apple's anchor with the Developer ID CA, a Developer ID
+# Application leaf (the two OIDs are Apple's, as in the requirement codesign itself prints for such
+# a binary) and the team as the leaf certificate's OU. `codesign --verify -R="$(dev_id_requirement
+# TEAM)"` fails for anyone else's certificate (checked on a Developer-ID-signed app: the right team
+# passes, another fails, an ad hoc binary fails).
+dev_id_requirement() {
+  printf 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "%s"' "$1"
+}
+
+# test_override_notes: a NOTE for each test-only override that is set. They replace a real tool with
+# a fake or skip a check; a shell that still has one exported must never go unnoticed.
+test_override_notes() {
+  local v
+  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT FIL_RELEASE_SELFTEST; do
+    [ -z "${!v:-}" ] || echo "release: NOTE: $v is set ($(printf '%s' "${!v}" | cut -c1-60)): a test-only override; this run does NOT use the real tool or check it replaces" >&2
+  done
 }
 
 # package_key_fingerprint FILE: the fingerprint of the one OpenPGP public key in FILE (the package

@@ -6,7 +6,6 @@
 //! pipe = ["fil", "server", "--stdio"]   # an argv; default: ssh -T -- HOST fil server --stdio
 //! host_label = "laptop"      # what other clients are shown when you take a session over;
 //!                             # default: this machine's short host name
-//! predict = "adaptive"        # off | adaptive | always; accepted, used from M3
 //! forward = ["-L 5173", "-R 9000", "-D 1080"]   # forwards for every attach (section 7.1)
 //! agent = "off"               # off | on | confirm: relay the local ssh-agent (section 10)
 //! agent_keys = []             # SHA256 fingerprints the relay answers for; empty is every key
@@ -118,15 +117,6 @@ fn invalid(origin: &str, message: impl fmt::Display) -> ConfigError {
         origin: origin.to_string(),
         message: message.to_string(),
     }
-}
-
-/// How eager prediction is. Parsed now so the file is valid; the predictor arrives in M3.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Predict {
-    Off,
-    Adaptive,
-    Always,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -302,7 +292,6 @@ struct RawSection {
     /// A daemon setting; only here to be refused with a pointer to `daemon.toml`.
     history_lines: Option<toml::Value>,
     host_label: Option<String>,
-    predict: Option<Predict>,
     forward: Option<ForwardValue>,
     agent: Option<AgentMode>,
     agent_keys: Option<Vec<String>>,
@@ -346,7 +335,6 @@ impl RawSection {
                 .clone()
                 .or_else(|| base.history_lines.clone()),
             host_label: self.host_label.clone().or_else(|| base.host_label.clone()),
-            predict: self.predict.or(base.predict),
             forward: match (&self.forward, &base.forward) {
                 (Some(a), Some(b)) => {
                     let (a, b) = (a.clone().into_table(), b.clone().into_table());
@@ -398,7 +386,6 @@ pub struct HostSettings {
     pub pipe: Option<Vec<String>>,
     /// What other clients are shown for this machine; `None` is the short host name.
     pub host_label: Option<String>,
-    pub predict: Predict,
     /// The file's `forward` specs, parsed and checked (`-L`, `-R` and `-D`; the command line
     /// adds to them, see `forward_spec::ForwardPlan`).
     pub forward: Vec<ForwardSpec>,
@@ -423,7 +410,6 @@ impl Default for HostSettings {
             transport: TransportSetting::Auto,
             pipe: None,
             host_label: None,
-            predict: Predict::Adaptive,
             forward: Vec::new(),
             agent: AgentMode::Off,
             agent_keys: Vec::new(),
@@ -522,22 +508,263 @@ impl Config {
     /// The settings for `host` as typed on the command line. `user@name` matches `[host."user@name"]`
     /// first and then `[host.name]`.
     pub fn for_host(&self, host: &str) -> HostSettings {
-        let section = self.hosts.get(host).or_else(|| {
-            host.rsplit_once('@')
-                .and_then(|(_, name)| self.hosts.get(name))
-        });
-        let merged = match section {
-            Some(s) => s.over(&self.defaults),
+        let merged = match self.section_for(host) {
+            Some((_, s)) => s.over(&self.defaults),
             None => self.defaults.clone(),
         };
         // Everything was checked when the file was parsed.
         resolve(&merged).expect("sections were validated when the file was read")
     }
 
+    /// The `[host.NAME]` section that `host` selects, with its name: `user@name` matches
+    /// `[host."user@name"]` first and then `[host.name]`.
+    fn section_for(&self, host: &str) -> Option<(&str, &RawSection)> {
+        let exact = self.hosts.get_key_value(host);
+        let bare = || {
+            host.rsplit_once('@')
+                .and_then(|(_, name)| self.hosts.get_key_value(name))
+        };
+        exact.or_else(bare).map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// The effective settings for `host`, one row per key, each with where its value came from:
+    /// the built-in default, `[defaults]` or the `[host.NAME]` section (`fil config show`).
+    /// Nothing here touches the network or the host. The command line (`-L`, `-A`,
+    /// `--transport`) is applied after this and is not in it.
+    pub fn explain(&self, host: &str) -> Vec<Explained> {
+        let section = self.section_for(host);
+        let settings = self.for_host(host);
+        EXPLAINED_KEYS
+            .iter()
+            .map(|&key| {
+                let source = if section.is_some_and(|(_, s)| is_set(key, s)) {
+                    let (name, _) = section.expect("checked above");
+                    format!("[host.{}]", escape_unprintable(&toml_key(name)))
+                } else if is_set(key, &self.defaults) {
+                    "[defaults]".to_string()
+                } else {
+                    "default".to_string()
+                };
+                Explained {
+                    key,
+                    value: show_value(key, host, &settings),
+                    source,
+                }
+            })
+            .collect()
+    }
+
     /// The `[defaults]` alone: what the daemon uses, since it serves every host.
     pub fn defaults(&self) -> HostSettings {
         resolve(&self.defaults).expect("sections were validated when the file was read")
     }
+}
+
+/// The keys of `config.toml`, by table, as the parser accepts them. Kept beside the parser: a
+/// test asks serde for the keys each table accepts and compares them with these lists, and
+/// another compares these with `docs/user/config.md`, so a key cannot be added to one and not
+/// the others. `history_lines` and `direct.port_range` are accepted only to be refused with a
+/// pointer to `daemon.toml`.
+pub mod keys {
+    /// The top level of the file.
+    pub const FILE: &[&str] = &["defaults", "host"];
+    /// `[defaults]` and each `[host.NAME]`.
+    pub const SECTION: &[&str] = &[
+        "transport",
+        "pipe",
+        "history_lines",
+        "host_label",
+        "forward",
+        "agent",
+        "agent_keys",
+        "remote_requests",
+        "forward_failure",
+        "offline_input",
+        "direct",
+        "remote",
+        "install",
+    ];
+    /// `forward` written as a table.
+    pub const FORWARD: &[&str] = &["specs", "window", "buffer", "open_wait", "linger"];
+    /// `[offline_input]`.
+    pub const OFFLINE_INPUT: &[&str] = &["buffer", "confirm", "log"];
+    /// `[direct]`.
+    pub const DIRECT: &[&str] = &["address", "port_range"];
+}
+
+/// One row of `fil config show`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Explained {
+    /// The key, `table.key` for the nested ones.
+    pub key: &'static str,
+    /// The effective value, written as it would be in the file (`unset` where there is none).
+    pub value: String,
+    /// `default`, `[defaults]` or `[host.NAME]`.
+    pub source: String,
+}
+
+/// The rows `fil config show` prints, in this order. `history_lines` and `direct.port_range`
+/// are daemon settings and not shown.
+const EXPLAINED_KEYS: &[&str] = &[
+    "transport",
+    "pipe",
+    "host_label",
+    "remote",
+    "install",
+    "forward",
+    "forward.window",
+    "forward.buffer",
+    "forward.open_wait",
+    "forward.linger",
+    "agent",
+    "agent_keys",
+    "remote_requests",
+    "forward_failure",
+    "offline_input.buffer",
+    "offline_input.confirm",
+    "offline_input.log",
+    "direct.address",
+];
+
+/// Whether `s` itself (not what it inherits) sets `key`.
+fn is_set(key: &str, s: &RawSection) -> bool {
+    let fwd = |f: fn(&RawForward) -> bool| match &s.forward {
+        None => false,
+        Some(ForwardValue::List(_)) => key == "forward",
+        Some(ForwardValue::Table(t)) => f(t),
+    };
+    match key {
+        "transport" => s.transport.is_some(),
+        "pipe" => s.pipe.is_some(),
+        "host_label" => s.host_label.is_some(),
+        "remote" => s.remote.is_some(),
+        "install" => s.install.is_some(),
+        "forward" => fwd(|t| t.specs.is_some()),
+        "forward.window" => fwd(|t| t.window.is_some()),
+        "forward.buffer" => fwd(|t| t.buffer.is_some()),
+        "forward.open_wait" => fwd(|t| t.open_wait.is_some()),
+        "forward.linger" => fwd(|t| t.linger.is_some()),
+        "agent" => s.agent.is_some(),
+        "agent_keys" => s.agent_keys.is_some(),
+        "remote_requests" => s.remote_requests.is_some(),
+        "forward_failure" => s.forward_failure.is_some(),
+        "offline_input.buffer" => s.offline_input.as_ref().is_some_and(|o| o.buffer.is_some()),
+        "offline_input.confirm" => s
+            .offline_input
+            .as_ref()
+            .is_some_and(|o| o.confirm.is_some()),
+        "offline_input.log" => s.offline_input.as_ref().is_some_and(|o| o.log.is_some()),
+        "direct.address" => s.direct.as_ref().is_some_and(|d| d.address.is_some()),
+        _ => false,
+    }
+}
+
+/// A host name as a TOML key: bare if it can be, else quoted.
+fn toml_key(name: &str) -> String {
+    if !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        name.to_string()
+    } else {
+        format!("{name:?}")
+    }
+}
+
+fn list(items: impl IntoIterator<Item = String>) -> String {
+    let items: Vec<String> = items.into_iter().map(|i| format!("{i:?}")).collect();
+    format!("[{}]", items.join(", "))
+}
+
+fn bytes(n: usize) -> String {
+    const KIB: usize = 1024;
+    if n != 0 && n.is_multiple_of(KIB * KIB) {
+        format!("\"{}MiB\"", n / (KIB * KIB))
+    } else if n != 0 && n.is_multiple_of(KIB) {
+        format!("\"{}KiB\"", n / KIB)
+    } else {
+        n.to_string()
+    }
+}
+
+fn span(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s != 0 && s.is_multiple_of(3600) {
+        format!("\"{}h\"", s / 3600)
+    } else if s != 0 && s.is_multiple_of(60) {
+        format!("\"{}m\"", s / 60)
+    } else {
+        format!("\"{s}s\"")
+    }
+}
+
+/// The value of `key` in `s`, written as in the file.
+fn show_value(key: &str, host: &str, s: &HostSettings) -> String {
+    let word = |v: &dyn fmt::Debug| format!("\"{}\"", format!("{v:?}").to_lowercase());
+    let out = match key {
+        "transport" => word(&s.transport),
+        "pipe" => match &s.pipe {
+            Some(argv) => list(argv.iter().cloned()),
+            // What the dialer runs when nothing is configured (`PipeCommand::ssh`).
+            None => list(
+                ["ssh", "-T", "--", host, "fil", "server", "--stdio"]
+                    .iter()
+                    .map(|a| a.to_string()),
+            ),
+        },
+        "host_label" => match &s.host_label {
+            Some(l) => format!("{l:?}"),
+            None => "unset".to_string(),
+        },
+        "remote" => word(&s.remote),
+        "install" => word(&s.install),
+        "forward" => list(s.forward.iter().map(forward_spec::format_flag)),
+        "forward.window" => bytes(s.forward_tunables.window.get() as usize),
+        "forward.buffer" => bytes(s.forward_tunables.buffer),
+        "forward.open_wait" => span(s.forward_tunables.open_wait),
+        "forward.linger" => span(s.forward_tunables.linger),
+        "agent" => word(&s.agent),
+        "agent_keys" => list(s.agent_keys.iter().cloned()),
+        "remote_requests" => word(&s.remote_requests),
+        "forward_failure" => word(&s.forward_failure),
+        "offline_input.buffer" => bytes(s.offline.buffer),
+        "offline_input.confirm" => match s.offline.confirm_after {
+            None => "\"off\"".to_string(),
+            Some(d) => format!("\"after {}s\"", d.as_secs()),
+        },
+        "offline_input.log" => match &s.offline.log {
+            None => "unset".to_string(),
+            Some(OfflineLog::File(p)) => format!("{:?}", p.display().to_string()),
+            Some(OfflineLog::Command(argv)) => list(argv.iter().cloned()),
+        },
+        "direct.address" => match &s.direct_address {
+            Some(a) => format!("{a:?}"),
+            None => "unset".to_string(),
+        },
+        _ => unreachable!("every row of EXPLAINED_KEYS is handled"),
+    };
+    escape_unprintable(&out)
+}
+
+/// The text of `fil config show HOST`: a header line, then `key = value  # source` rows.
+pub fn render_show(host: &str, file: &str, rows: &[Explained]) -> String {
+    let width = rows
+        .iter()
+        .map(|r| r.key.len() + 3 + r.value.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = format!(
+        "# effective settings for {}, from {}\n# the command line (-L -R -D -A -a --transport) is applied on top; the host is not contacted\n",
+        escape_unprintable(host),
+        escape_unprintable(file)
+    );
+    for r in rows {
+        let left = format!("{} = {}", r.key, r.value);
+        let pad = width - left.chars().count();
+        out.push_str(&format!("{left}{}  # {}\n", " ".repeat(pad), r.source));
+    }
+    out
 }
 
 fn resolve(s: &RawSection) -> Result<HostSettings, String> {
@@ -553,9 +780,6 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
     }
     if let Some(l) = &s.host_label {
         out.host_label = Some(check_label(l)?);
-    }
-    if let Some(p) = s.predict {
-        out.predict = p;
     }
     if let Some(f) = &s.forward {
         resolve_forward(&f.clone().into_table(), &mut out)?;
@@ -761,7 +985,6 @@ mod tests {
 [defaults]
 transport = "auto"
 host_label = "laptop"
-predict = "adaptive"
 
 [defaults.offline_input]
 buffer = "4KiB"
@@ -951,7 +1174,15 @@ offline_input.log = ["logger", "-t", "fil"]
                 "[defaults]\nhistory_lines = 500",
                 vec!["[defaults]", "history_lines", "daemon.toml"],
             ),
-            ("[defaults]\npredict = \"maybe\"", vec!["unknown variant"]),
+            // 0.1.0 has no prediction: `predict` is an unknown key (N9). 0.2.0's E1b brings it back.
+            (
+                "[defaults]\npredict = \"adaptive\"",
+                vec!["unknown field `predict`"],
+            ),
+            (
+                "[host.devbox]\npredict = \"off\"",
+                vec!["unknown field `predict`"],
+            ),
             ("[defaults\n", vec!["test.toml"]),
         ] {
             let err = parse(text).expect_err(text);
@@ -1145,14 +1376,8 @@ forward = ["-L 1:h:2\u001b[2J"]"#,
     #[test]
     fn errors_never_carry_a_terminal_escape_whatever_key_they_come_from() {
         // Serde quotes the file's value in its own words: a title-setting escape, a bidi
-        // override. `predict` is an old key, the others are new.
-        for key in [
-            "predict",
-            "agent",
-            "remote_requests",
-            "forward_failure",
-            "transport",
-        ] {
+        // override.
+        for key in ["agent", "remote_requests", "forward_failure", "transport"] {
             let text = format!("[defaults]\n{key} = \"x\\u001b]0;pwned\\u0007\\u202e\"");
             let err = parse(&text).expect_err(&text);
             assert!(
@@ -1167,5 +1392,147 @@ forward = ["-L 1:h:2\u001b[2J"]"#,
         // A path with an escape in it, too.
         let e = Config::load(Path::new("/nonexistent/\x1b[2J/c.toml"), true).unwrap_err();
         assert!(!e.to_string().contains('\x1b'), "{e}");
+    }
+    /// The keys serde says a table accepts, from its "unknown field" error.
+    fn accepted(table: &str) -> Vec<String> {
+        let err = parse(&format!("{table}\nzz_not_a_key = 1\n")).expect_err(table);
+        let line = err
+            .lines()
+            .find(|l| l.contains("unknown field"))
+            .unwrap_or_else(|| panic!("no unknown-field error for {table:?}: {err}"));
+        let (_, rest) = line.split_once("expected").expect("lists the keys");
+        let mut out: Vec<String> = rest
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn sorted(keys: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn the_key_lists_are_the_keys_the_parser_accepts() {
+        assert_eq!(accepted(""), sorted(keys::FILE));
+        assert_eq!(accepted("[defaults]"), sorted(keys::SECTION));
+        assert_eq!(accepted("[host.a]"), sorted(keys::SECTION));
+        assert_eq!(accepted("[defaults.forward]"), sorted(keys::FORWARD));
+        assert_eq!(
+            accepted("[defaults.offline_input]"),
+            sorted(keys::OFFLINE_INPUT)
+        );
+        assert_eq!(accepted("[defaults.direct]"), sorted(keys::DIRECT));
+    }
+
+    #[test]
+    fn predict_is_an_unknown_key_in_0_1_0() {
+        // N9: 0.1.0 has no prediction. 0.2.0's E1b brings the key back.
+        assert!(!keys::SECTION.contains(&"predict"));
+        for text in [
+            "[defaults]\npredict = \"off\"",
+            "[host.devbox]\npredict = \"adaptive\"",
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.contains("unknown field `predict`"), "{e}");
+        }
+    }
+
+    /// The names the reference documents: one `### `key`` heading each, `table.key` for nested.
+    fn documented() -> Vec<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/user/config.md");
+        let text = std::fs::read_to_string(&path).expect("docs/user/config.md");
+        let mut out: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("### `")?.strip_suffix('`'))
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_reference_documents_every_key_and_only_those() {
+        let mut want = Vec::new();
+        for k in keys::FILE.iter().chain(keys::SECTION) {
+            want.push(k.to_string());
+        }
+        for (table, list) in [
+            ("forward", keys::FORWARD),
+            ("offline_input", keys::OFFLINE_INPUT),
+            ("direct", keys::DIRECT),
+        ] {
+            want.extend(list.iter().map(|k| format!("{table}.{k}")));
+        }
+        want.sort();
+        assert_eq!(documented(), want);
+    }
+
+    #[test]
+    fn config_show_says_where_each_value_comes_from() {
+        let cfg = parse(
+            r#"
+[defaults]
+transport = "auto"
+host_label = "laptop"
+forward = { window = "2MiB" }
+
+[defaults.offline_input]
+buffer = "4KiB"
+
+[host.devbox]
+forward = ["-L 5173"]
+agent = "confirm"
+direct.address = "devbox.example.net"
+"#,
+        )
+        .unwrap();
+        let rows = cfg.explain("me@devbox");
+        let get = |k: &str| {
+            let r = rows
+                .iter()
+                .find(|r| r.key == k)
+                .unwrap_or_else(|| panic!("{k}"));
+            (r.value.as_str(), r.source.as_str())
+        };
+        assert_eq!(get("transport"), ("\"auto\"", "[defaults]"));
+        assert_eq!(get("host_label"), ("\"laptop\"", "[defaults]"));
+        assert_eq!(
+            get("forward"),
+            ("[\"-L 5173:localhost:5173\"]", "[host.devbox]")
+        );
+        assert_eq!(get("forward.window"), ("\"2MiB\"", "[defaults]"));
+        assert_eq!(get("forward.linger"), ("\"10m\"", "default"));
+        assert_eq!(get("agent"), ("\"confirm\"", "[host.devbox]"));
+        assert_eq!(get("offline_input.buffer"), ("\"4KiB\"", "[defaults]"));
+        assert_eq!(get("offline_input.confirm"), ("\"off\"", "default"));
+        assert_eq!(
+            get("direct.address"),
+            ("\"devbox.example.net\"", "[host.devbox]")
+        );
+        assert_eq!(
+            get("pipe"),
+            (
+                "[\"ssh\", \"-T\", \"--\", \"me@devbox\", \"fil\", \"server\", \"--stdio\"]",
+                "default"
+            )
+        );
+        // A host with no section gets the defaults, and every row names a source.
+        let other = cfg.explain("elsewhere");
+        let agent = other.iter().find(|r| r.key == "agent").unwrap();
+        assert_eq!(
+            (agent.value.as_str(), agent.source.as_str()),
+            ("\"off\"", "default")
+        );
+        let text = render_show("devbox", "test.toml", &rows);
+        assert!(
+            text.contains("# [host.devbox]") && text.contains("# default"),
+            "{text}"
+        );
     }
 }

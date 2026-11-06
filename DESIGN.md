@@ -893,6 +893,8 @@ fil forward [HOST [SESSION]] -L|-R|-D SPEC | --rm [-L|-R|-D] PORT
 fil detach [HOST SESSION]                  with no arguments, inside a session
 fil install [--check|--remove] [--binary FILE] HOST
                                            install this fil on HOST over ssh (or check, or remove what fil installed)
+fil config show HOST                       the effective settings for HOST and where each came from (default, [defaults],
+                                           [host.NAME]), like ssh -G; reads only the config file, never contacts the host
 fil server --stdio                         remote side; run by the pipe, not by people
 ```
 
@@ -932,7 +934,6 @@ It can only narrow what `/etc/fil/policy.toml` and the sshd mirror allow, never 
 [defaults]
 transport = "auto"        # auto | pipe | direct
 host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
-predict = "adaptive"      # off | adaptive | always; from 0.2.0, not in 0.1.0 (N9)
 
 [defaults.offline_input]  # keystrokes typed while disconnected (§4.3)
 buffer = "4KiB"           # 0 drops them
@@ -999,7 +1000,8 @@ M4's release contract (versioning and the wire, targets, artifact names and layo
 5. ~~**Server binary**~~ Resolved: both. Manual install always (`docs/m4/install.md`), and upload by the client through the constant bootstrap into `~/.local/share/fil` (M4 OQ-1, yes, owner 2026-11-04; §8.2, §11, `docs/m4/plan.md` §3 U1, §7).
 6. **Daemon upgrades with live sessions:** side-by-side daemons per protocol version (proposed), or file-descriptor handover?
 7. **Defaults to tune:**
-   - heartbeat interval and dead-link timeout
+   - heartbeat interval and dead-link timeout: **resolved for v1, kept** (M4 CFG): 1 s and 5 s. A silent black hole is found at 4.9 s over the pipe and 5.07 s over QUIC (`docs/m1/realnet.md`); with the 5 s idle timeout a 3 s blackout survives in 20 of 20 runs, and 4.5 s or longer costs one 0.2 to 0.7 s handshake after the link returns, not a hang; ssh's own keepalive alone took 7.5 s. A shorter dead-after would drop the 3 s blackouts that now survive; a longer one only delays the fallback. They are not in the wire golden, and `PathConfig`'s defaults are pinned by a test beside them.
+   - the path manager's timers (`fil_transport::path::PathConfig`): **resolved for v1, kept** (M4 CFG): `fallback_after` 3 s (the pipe is re-run 3 s after a healthy direct link is lost; a redial after a blackout took 0.3 to 1.1 s, an ssh login 0.4 to 0.5 s, `docs/m1/realnet.md` and `docs/m1/pi.md`, so direct gets several tries before a login), `direct_patience` 10 s, the retry delays (direct 1 s doubling to 120 s, pipe 1 s doubling to 30 s; return to direct 11 to 16 s after a block was lifted, a killed ssh restarted in 0.9 to 1.2 s and, killed again at once, 2.2 to 2.3 s), `stable_after` 10 s, the hint limits (2 s cooldown, 5 s gap, 4 in 60 s) and `quick_refusal` 1 s
    - catch-up threshold
    - forward buffer size
    - forward pacing: the target queueing delay (25 ms), the floor of the cap (64 KiB), the pass budget and the agent's reserve (32 KiB each)

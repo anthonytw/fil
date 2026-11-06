@@ -1342,3 +1342,43 @@ fn a_healthy_world_converges_to_direct_and_stays_there() {
         assert!(!w.pipe_up && !w.pipe_running, "the pipe was closed");
     }
 }
+
+/// DESIGN.md section 16.7: these numbers were reviewed for v1 against the real-network and Pi
+/// runs and kept. Changing one means redoing that review (and the DESIGN text), not editing the
+/// test.
+#[test]
+fn the_reviewed_defaults_are_pinned() {
+    use fil_proto::limits::{DEAD_AFTER, HEARTBEAT_INTERVAL};
+    let c = PathConfig::default();
+    assert_eq!(c.setting, TransportSetting::Auto);
+    assert_eq!(
+        [
+            c.fallback_after,
+            c.direct_patience,
+            c.retry_min,
+            c.retry_max,
+            c.pipe_retry_min,
+            c.pipe_retry_max,
+            c.stable_after,
+            c.hint_cooldown,
+            c.hint_pipe_gap,
+            c.hint_window,
+            c.quick_refusal,
+        ],
+        [
+            S(3),
+            S(10),
+            S(1),
+            S(120),
+            S(1),
+            S(30),
+            S(10),
+            S(2),
+            S(5),
+            S(60),
+            S(1)
+        ]
+    );
+    assert_eq!(c.hint_budget, 4);
+    assert_eq!((HEARTBEAT_INTERVAL, DEAD_AFTER), (S(1), S(5)));
+}

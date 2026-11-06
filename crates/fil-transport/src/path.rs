@@ -122,6 +122,9 @@ pub struct PathConfig {
     pub jitter_seed: u64,
 }
 
+/// The values were reviewed for v1 against `docs/m1/realnet.md`, `docs/m1/pi.md` and
+/// `docs/m2/latency.md` (DESIGN.md section 16.7) and kept; `the_reviewed_defaults_are_pinned`
+/// fails if one changes without that review being redone.
 impl Default for PathConfig {
     fn default() -> Self {
         Self {

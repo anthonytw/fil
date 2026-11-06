@@ -65,6 +65,19 @@ pub fn main() -> ExitCode {
             return ExitCode::from(FAILED);
         }
     };
+    if let Action::ConfigShow { host } = &action {
+        // Reads the file only: no runtime, no ssh, no host.
+        let file = match &located {
+            Some(l) if l.path.exists() => l.path.display().to_string(),
+            Some(l) => format!("{} (not found: the built-in defaults)", l.path.display()),
+            None => "the built-in defaults (no config directory)".to_string(),
+        };
+        print!(
+            "{}",
+            config::render_show(host, &file, &config.explain(host))
+        );
+        return ExitCode::from(OK);
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -114,7 +127,8 @@ async fn run(action: Action, config: &Config) -> u8 {
         Action::Install { host, request } => {
             crate::install::client::run(&host, &request, &config.for_host(&host)).await
         }
-        Action::ServerStdio
+        Action::ConfigShow { .. }
+        | Action::ServerStdio
         | Action::ServerDaemon
         | Action::ServerInstallFinish(_)
         | Action::ServerInstallGc => unreachable!("handled before the runtime"),

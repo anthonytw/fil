@@ -660,17 +660,6 @@ struct Agent {
     resets: Vec<String>,
 }
 
-/// The most resets for want of kernel memory an agent's requests may take (see [`Agent`]).
-const NO_MEMORY_RESETS: usize = 3;
-
-/// The local socket errors, at both ends, that were a shortage of kernel memory.
-fn no_memory_errors(w: &World) -> Vec<fil_forward::LocalError> {
-    let (mut v, _) = w.client.ep.local_errors();
-    v.extend(w.daemon.ep.local_errors().0);
-    v.retain(|e| matches!(e.errno, Some(55 | 12)));
-    v
-}
-
 impl Agent {
     async fn open(w: &World) -> Self {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -699,7 +688,7 @@ impl Agent {
         limit: Duration,
     ) -> Result<Duration, String> {
         loop {
-            let before = no_memory_errors(w).len();
+            let before = kernel_memory_resets(w).len();
             let t = std::time::Instant::now();
             let e = match timeout(limit, ask(&mut self.asker, req, back)).await {
                 Ok(Ok(())) => return Ok(t.elapsed()),
@@ -708,10 +697,8 @@ impl Agent {
             };
             // The endpoint's own record comes with the reset: a moment for it to land.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let new = no_memory_errors(w);
-            let ours = cfg!(target_os = "macos")
-                && e.kind() == std::io::ErrorKind::ConnectionReset
-                && new.len() > before;
+            let new = kernel_memory_resets(w);
+            let ours = e.kind() == std::io::ErrorKind::ConnectionReset && new.len() > before;
             if !ours || self.resets.len() == NO_MEMORY_RESETS {
                 return Err(format!(
                     "{e} (after {} resets for want of kernel memory: {:?})",

@@ -537,9 +537,14 @@ async fn stuck_consumer(t: Transport) {
 /// pauses at the open cap, and nothing beyond the configured budget is ever held.
 ///
 /// Nothing may end while the buffers fill: every application and server writes for ever. A
-/// connection that ends (its socket failed: on macOS, `ENOBUFS` when the mbuf pool runs out
-/// resets the channel) leaves fewer than 16 open once more than 8 have, and the fill would
-/// never finish; the test fails at once instead, with the error and the endpoints' state.
+/// connection that ends for any other reason fails the test at once, with the error and the
+/// endpoints' state, but one: on macOS a local socket call that fails with `ENOBUFS` or `ENOMEM`
+/// (the mbuf pool running short across some 80 loopback sockets that are never read; the
+/// x86_64 runner does) may have queued part of its bytes, so the endpoint resets that channel
+/// instead of retrying it (DESIGN.md section 8.5, [`kernel_memory_resets`]). Up to
+/// [`NO_MEMORY_RESETS`] such resets are taken, each ending at most its two writers (the server's
+/// and the application's, with `EPIPE` or `ECONNRESET`); a waiting application's connection
+/// takes the freed place (24 connect for 16 places), so the fill still finishes.
 async fn budget(t: Transport) {
     let budget = 4 << 20;
     let cfg = MuxConfig {
@@ -548,8 +553,9 @@ async fn budget(t: Transport) {
         ..mux_config()
     };
     let denied = mbufs_denied();
-    // Why each writer that stopped stopped: none may, until the end.
-    let ended = Arc::new(Mutex::new(Vec::<String>::new()));
+    // Why each writer that stopped stopped: none may, until the end, but those of a channel
+    // reset for want of kernel memory (above).
+    let ended = Arc::new(Mutex::new(Vec::<(String, std::io::ErrorKind)>::new()));
     // Every socket that is never read has small kernel buffers: the test is about the endpoint's
     // budget, and the OS's autotuning (4 MiB each on macOS) across some 80 loopback sockets
     // can take a small runner's whole mbuf pool.
@@ -564,7 +570,11 @@ async fn budget(t: Transport) {
                     break e;
                 }
             };
-            ended.lock().unwrap().push(format!("a server's write: {e}"));
+            let kind = e.kind();
+            ended
+                .lock()
+                .unwrap()
+                .push((format!("a server's write: {e}"), kind));
         }
     })
     .await;
@@ -589,10 +599,11 @@ async fn budget(t: Transport) {
                     break e;
                 }
             };
+            let kind = e.kind();
             ended
                 .lock()
                 .unwrap()
-                .push(format!("application {i}'s write: {e}"));
+                .push((format!("application {i}'s write: {e}"), kind));
         }));
     }
     let failure = |what: &str| -> String {
@@ -610,12 +621,27 @@ async fn budget(t: Transport) {
             assert!(s.reserved <= budget, "{who}: {s:?}");
             assert!(s.channels <= 16, "{who}: {s:?}");
         }
-        let stopped = !ended.lock().unwrap().is_empty();
+        // `ended` first: an endpoint records its error before it resets the socket, so every
+        // writer the reset ended is matched by a record read after it.
+        let ended = ended.lock().unwrap().clone();
         let errors = w.client.ep.local_errors().1 + w.daemon.ep.local_errors().1;
-        if stopped || errors > 0 {
+        let resets = kernel_memory_resets(&w).len();
+        let by_reset = ended.iter().all(|(_, k)| {
+            matches!(
+                k,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            )
+        });
+        if errors as usize > resets
+            || resets > NO_MEMORY_RESETS
+            || ended.len() > 2 * resets
+            || !by_reset
+        {
             panic!(
                 "{}",
-                failure("a connection ended while the buffers filled (none may)")
+                failure(&format!(
+                    "a connection ended while the buffers filled (none may, but at most {NO_MEMORY_RESETS} reset for want of kernel memory on macOS; {resets} were)"
+                ))
             );
         }
     };
@@ -638,7 +664,11 @@ async fn budget(t: Transport) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (c, d) = (w.client.ep.snapshot(), w.daemon.ep.snapshot());
-    eprintln!("{t:?}: client {c:?}, daemon {d:?}; {}", mbufs_note(&denied));
+    eprintln!(
+        "{t:?}: client {c:?}, daemon {d:?}; channels reset for want of kernel memory: {:?}; {}",
+        kernel_memory_resets(&w),
+        mbufs_note(&denied)
+    );
     for a in &apps {
         a.abort();
     }

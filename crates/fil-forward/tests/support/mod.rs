@@ -776,6 +776,31 @@ pub fn is_no_buffers(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
 }
 
+/// The most channels a test lets the endpoints reset for want of kernel memory before the
+/// resets are the test's failure (see [`kernel_memory_resets`]).
+pub const NO_MEMORY_RESETS: usize = 3;
+
+/// The channels the endpoints, at both ends, reset at once because a local socket call failed
+/// with `ENOBUFS` or `ENOMEM`: on macOS only, where such a call may have moved part of its bytes
+/// and the endpoint cannot retry it without risking repeating them
+/// (`ForwardStream::no_memory_moves_nothing`, DESIGN.md section 8.5). That reset is fil's
+/// documented answer to the kernel's shortage, not a bug: a test whose subject is not the
+/// kernel's memory may tolerate up to [`NO_MEMORY_RESETS`] of them, and only these. A shortage
+/// the endpoint gave up on after waiting (`gave_up`, Linux) is not one of them.
+pub fn kernel_memory_resets(w: &World) -> Vec<fil_forward::LocalError> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let (mut v, _) = w.client.ep.local_errors();
+    v.extend(w.daemon.ep.local_errors().0);
+    v.retain(|e| {
+        use rustix::io::Errno;
+        !e.gave_up
+            && matches!(e.errno, Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
+    });
+    v
+}
+
 /// `e` with its errno in the message (the kind is kept, so `is_reset` and the like still see it).
 pub fn with_errno(e: io::Error, what: &str) -> io::Error {
     io::Error::new(
@@ -1125,6 +1150,18 @@ impl Flaky {
     }
 }
 
+/// A failure of the real socket under a [`Flaky`]. The wrapper says its failures move nothing,
+/// which is true of its own; the kernel's `ENOBUFS` or `ENOMEM` from a real socket is that only
+/// on Linux. Elsewhere it is passed on as another error, so that the endpoint resets the channel
+/// as it would on the bare socket (a retry could repeat bytes and pass for fil's bug).
+fn real_failure(e: io::Error) -> io::Error {
+    if cfg!(target_os = "linux") || !is_no_buffers(&e) {
+        e
+    } else {
+        io::Error::other(format!("the real socket under a Flaky: {e}"))
+    }
+}
+
 impl AsyncRead for Flaky {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1136,7 +1173,9 @@ impl AsyncRead for Flaky {
         if (self.fail[0])(n) {
             return Poll::Ready(Err(self.enobufs()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map_err(real_failure)
     }
 }
 
@@ -1160,7 +1199,9 @@ impl AsyncWrite for Flaky {
             }
             return Poll::Ready(Err(self.enobufs()));
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_write(cx, buf)
+            .map_err(real_failure)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

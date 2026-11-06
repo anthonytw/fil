@@ -5,8 +5,8 @@
 //! name are accepted), and no host or address but a documentation example appears.
 //!
 //! `config.toml`'s page (`docs/user/config.md`, with `docs/user/examples/`) belongs to M4's CFG:
-//! its keys are checked against `config::keys` in CFG's own test (`tests/examples.rs`), and this
-//! file only parses its TOML examples and applies the host rules to it.
+//! its keys are checked against `config::keys` by a unit test in `config.rs`, and this file only
+//! parses its TOML examples and applies the link and host rules to it.
 
 use std::path::{Path, PathBuf};
 
@@ -165,8 +165,10 @@ fn the_command_line_has_what_the_test_looks_for() {
 fn there_is_no_prediction_in_0_1_0() {
     // N9: 0.1.0 has no `predict` key and no `--predict` flag, and the guide has no page on it.
     for (path, text) in pages() {
+        // config.md says, in a section of its own, that the key is not there in 0.1.0.
+        let says_so = name_of(&path) == "config.md";
         assert!(
-            !text.contains("--predict") && !text.contains("`predict`"),
+            !text.contains("--predict") && (says_so || !text.contains("`predict`")),
             "{}: names a predict key or flag",
             name_of(&path)
         );
@@ -358,9 +360,6 @@ fn policy_md_names_every_key_the_policy_file_accepts() {
 
 // ---- links
 
-/// Pages that CFG (PR 131) adds; links to them are fine before it merges.
-const PENDING_CFG: [&str; 1] = ["config.md"];
-
 #[test]
 fn relative_links_in_the_guide_resolve() {
     for (path, text) in pages() {
@@ -370,9 +369,6 @@ fn relative_links_in_the_guide_resolve() {
                 continue;
             }
             let file = target.split('#').next().unwrap();
-            if PENDING_CFG.contains(&file) {
-                continue;
-            }
             let resolved = path.parent().unwrap().join(file);
             assert!(
                 resolved.exists(),

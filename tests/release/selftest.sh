@@ -928,6 +928,210 @@ else
   echo "== reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
 fi
 
+# ============================================================== macOS signing (sign-macos.sh)
+echo "== macOS signing"
+# sign-macos.sh on fakes: codesign (a trailer line stands for the signature), ditto (zip), notarytool,
+# gh, the verifier, and a packer (python3 tarfile) in place of the Docker one. The keys are real
+# (ssh-keygen). Nothing here is uploaded anywhere: FIL_GH is a stub that logs its arguments.
+ms=$tmp/macsign
+mkdir -p "$ms/bin"
+cat > "$ms/bin/codesign" << 'EOF2'
+#!/bin/bash
+# fake codesign: the "signature" is a last line "SIGNATURE <identity> <rt|nort> <timestamp> <identifier>"
+mode=sign ident='' flags='' ts=yes idr=fil f=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --remove-signature) mode=remove ;;
+    --verify) mode=verify ;;
+    -dvv) mode=display ;;
+    --force | --strict | --verbose=2) ;;
+    --options) flags=$2; shift ;;
+    --timestamp) ts=yes ;;
+    --timestamp=none) ts=no ;;
+    --identifier) idr=$2; shift ;;
+    --sign) ident=$2; shift ;;
+    *) f=$1 ;;
+  esac
+  shift
+done
+[ -f "$f" ] || { echo "no such file $f" >&2; exit 1; }
+strip() { perl -0pi -e 's/\nSIGNATURE [^\n]*\n\z//' "$1"; }
+case $mode in
+  remove) strip "$f" ;;
+  verify) [ -z "$FAKE_CODESIGN_VERIFYBAD" ] && tail -n 1 "$f" | grep -q '^SIGNATURE ' ;;
+  display)
+    sig=$(tail -n 1 "$f" | grep '^SIGNATURE ') || { echo "$f: code object is not signed at all" >&2; exit 1; }
+    set -- $sig
+    echo "Identifier=$5" >&2
+    rt=none
+    [ "$3" = rt ] && rt=runtime
+    if [ "$2" = - ]; then
+      echo "CodeDirectory v=20500 flags=0x2(adhoc,$rt)" >&2
+      echo "Signature=adhoc" >&2
+    else
+      echo "CodeDirectory v=20500 flags=0x10000($rt)" >&2
+      echo "Authority=${2//_/ }" >&2
+      [ "$4" = yes ] && echo "Timestamp=Nov 6, 2026" >&2
+    fi
+    exit 0
+    ;;
+  sign)
+    [ -z "$FAKE_CODESIGN_WRONGFILE" ] || { cp "$f" "$f.other"; f=$f.other; }
+    [ -z "$FAKE_CODESIGN_IGNORE_IDENTITY" ] || ident=-
+    [ -z "$FAKE_CODESIGN_TAMPER" ] || [ "$ident" = - ] || printf 'tampered' >> "$f"
+    [ -z "$FAKE_CODESIGN_LOG" ] || echo "sign $ident $flags ts=$ts id=$idr" >> "$FAKE_CODESIGN_LOG"
+    strip "$f"
+    rt=nort
+    [ "$flags" = runtime ] && [ -z "$FAKE_CODESIGN_NORUNTIME" ] && rt=rt
+    printf '\nSIGNATURE %s %s %s %s\n' "${ident// /_}" "$rt" "$ts" "$idr" >> "$f"
+    ;;
+esac
+EOF2
+cat > "$ms/bin/ditto" << 'EOF2'
+#!/usr/bin/env python3
+import sys, zipfile, os
+a = [x for x in sys.argv[1:] if x not in ("-c", "-k", "-x")]
+if "-c" in sys.argv:
+    with zipfile.ZipFile(a[1], "w") as z:
+        z.write(a[0], os.path.basename(a[0]))
+else:
+    with zipfile.ZipFile(a[0]) as z:
+        z.extractall(a[1])
+EOF2
+cat > "$ms/bin/notarytool" << 'EOF2'
+#!/bin/sh
+echo "notarytool $*" >> "$FAKE_LOG"
+printf '{"id": "abc", "status": "%s"}\n' "${FAKE_NOTARY_STATUS:-Accepted}"
+EOF2
+cat > "$ms/bin/gh" << 'EOF2'
+#!/bin/sh
+echo "gh $*" >> "$FAKE_LOG"
+case "$*" in "release view"*) echo "${FAKE_GH_DRAFT:-true}" ;; esac
+EOF2
+cat > "$ms/bin/verify" << 'EOF2'
+#!/bin/sh
+echo "verify $*" >> "$FAKE_LOG"
+exit "${FAKE_VERIFY_EXIT:-0}"
+EOF2
+cat > "$ms/bin/pack" << 'EOF2'
+#!/usr/bin/env python3
+# fake pack_archives: the same tar.gz for the same tree, on whatever host
+import sys, os, tarfile, gzip, io
+stage, out = sys.argv[1:3]
+sde = int(os.environ["SOURCE_DATE_EPOCH"])
+for d in sorted(os.listdir(stage)):
+    if not d.startswith("fil-"):
+        continue
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as t:
+        for root, dirs, files in os.walk(os.path.join(stage, d)):
+            dirs.sort()
+            for n in [""] + sorted(files):
+                p = os.path.join(root, n) if n else root
+                ti = t.gettarinfo(p, os.path.relpath(p, stage))
+                ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = sde, 0, 0, "", ""
+                ti.mode = 0o755 if (ti.mode & 0o100 or ti.isdir()) else 0o644
+                if ti.isdir():
+                    t.addfile(ti)
+                else:
+                    t.addfile(ti, open(p, "rb"))
+    with open(os.path.join(out, d + ".tar.gz"), "wb") as f:
+        with gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename="") as g:
+            g.write(buf.getvalue())
+EOF2
+chmod +x "$ms/bin"/*
+ssh-keygen -q -t ed25519 -N '' -f "$ms/key" -C t
+ssh-keygen -q -t ed25519 -N '' -f "$ms/otherkey" -C t
+printf 'owner namespaces="fil-release" %s\n' "$(cut -d' ' -f1,2 "$ms/key.pub")" > "$ms/signers"
+MV=0.9.0
+MAC=fil-$MV-universal-apple-darwin
+# macsign_fixture: the work directory of a verified draft: the CI macOS archive (its binary signed ad hoc) and the rest
+macsign_fixture() {
+  local w=$ms/work f
+  rm -rf "$w" "$ms/stage" "$ms/packed"
+  mkdir -p "$w/files" "$ms/stage/$MAC/bin" "$ms/stage/$MAC/share" "$ms/packed"
+  printf 'MACHO-CODE\n' > "$ms/stage/$MAC/bin/fil"
+  chmod 755 "$ms/stage/$MAC/bin/fil"
+  echo readme > "$ms/stage/$MAC/share/README.md"
+  FIL_CODESIGN=$ms/bin/codesign bash -c 'source "$1/common.sh"; adhoc_sign_macos "$2"' sh "$RELEASE_DIR" "$ms/stage/$MAC/bin/fil"
+  SOURCE_DATE_EPOCH=1700000000 "$ms/bin/pack" "$ms/stage" "$ms/packed"
+  cp "$ms/packed/$MAC.tar.gz" "$w/files/"
+  for f in fil-$MV-aarch64-linux-musl.tar.gz fil-$MV-source.tar.gz fil-$MV-x86_64-linux-musl.tar.gz $(package_names "$MV"); do echo "$f" > "$w/files/$f"; done
+  rewrite_sums "$w/files" "$MV"
+  cp "$ms/signers" "$w/signers"
+  cp "$w/files/SHA256SUMS" "$ms/sums.ci"
+  cp "$w/files/$MAC.tar.gz" "$ms/archive.ci"
+  : > "$ms/log"
+  : > "$ms/cslog"
+}
+# sm [ENV=VALUE ...]: sign-macos.sh on the fixture, on the fakes
+sm() {
+  env FAKE_LOG="$ms/log" FAKE_CODESIGN_LOG="$ms/cslog" FIL_RELEASE_VERIFY="$ms/bin/verify" FIL_GH="$ms/bin/gh" FIL_NOTARYTOOL="$ms/bin/notarytool" \
+    FIL_CODESIGN="$ms/bin/codesign" FIL_DITTO="$ms/bin/ditto" FIL_RELEASE_PACK_CMD="$ms/bin/pack" FIL_RELEASE_KEY="$ms/key" \
+    FIL_CODESIGN_IDENTITY="Developer ID Application: Test (ABC123)" "$@" "${MACSIGN_SCRIPT:-$RELEASE_DIR/sign-macos.sh}" "$MV" --work "$ms/work"
+}
+nothing_sent() { no_notarization && no_upload; }
+no_upload() { ! grep -q 'release upload' "$ms/log"; }
+no_notarization() { ! grep -q 'notarytool' "$ms/log"; }
+not_signed_with_id() { ! grep -q 'Developer' "$ms/cslog"; }
+unchanged() { cmp -s "$ms/work/files/$MAC.tar.gz" "$ms/archive.ci" && cmp -s "$ms/work/files/SHA256SUMS" "$ms/sums.ci"; }
+
+macsign_fixture
+expect_pass "sign-macos: the happy path" sm
+expect_pass "sign-macos: ...verified first, with --pre-sign" grep -q 'verify .*--pre-sign' "$ms/log"
+expect_pass "sign-macos: ...signed with the identity, the hardened runtime and a timestamp" grep -q 'sign Developer ID Application: Test (ABC123) runtime ts=yes id=fil' "$ms/cslog"
+expect_pass "sign-macos: ...notarized with the fil-notary profile" grep -q 'notarytool submit --wait --keychain-profile fil-notary --output-format json' "$ms/log"
+expect_pass "sign-macos: ...uploaded to the draft, with --clobber, the archive, SHA256SUMS and its signature" grep -q "release upload v$MV --repo anthonytw/fil --clobber $MAC.tar.gz SHA256SUMS SHA256SUMS.sig" "$ms/log"
+expect_pass "sign-macos: ...SHA256SUMS checks" sums_check "$ms/work/files" SHA256SUMS
+expect_pass "sign-macos: ...the archive changed" sh -c '! cmp -s "$1" "$2"' sh "$ms/work/files/$MAC.tar.gz" "$ms/archive.ci"
+expect_pass "sign-macos: ...its binary is signed with the identity" sh -c 'tar -xzOf "$1" "$2/bin/fil" | tail -n 1 | grep -q "^SIGNATURE Developer_ID"' sh "$ms/work/files/$MAC.tar.gz" "$MAC"
+expect_pass "sign-macos: ...SHA256SUMS.sig verifies against the signers" sh -c 'ssh-keygen -Y verify -f "$1/signers" -I owner -n fil-release -s "$1/files/SHA256SUMS.sig" < "$1/files/SHA256SUMS"' sh "$ms/work"
+# The verifier can rebuild what CI attested from the signed archive.
+expect_pass "rebuild_ci_macos_archive: the signed archive gives back CI's archive byte for byte" \
+  env FIL_CODESIGN="$ms/bin/codesign" FIL_RELEASE_PACK_CMD="$ms/bin/pack" bash -c 'source "$1/common.sh"; rebuild_ci_macos_archive "$2" "$3" && cmp "$3" "$4"' sh "$RELEASE_DIR" "$ms/work/files/$MAC.tar.gz" "$ms/rebuilt.tar.gz" "$ms/archive.ci"
+
+macsign_fixture
+expect_fail "sign-macos: a failed verification stops everything" sm FAKE_VERIFY_EXIT=1
+expect_pass "sign-macos: ...nothing was signed, notarized or uploaded" sh -c '! grep -q "release" "$1" && [ ! -s "$2" ]' sh "$ms/log" "$ms/cslog"
+macsign_fixture
+expect_fail "sign-macos: a release that is not a draft is refused" sm FAKE_GH_DRAFT=false
+expect_pass "sign-macos: ...nothing was signed or uploaded" sh -c '! grep -q "release upload" "$1" && [ ! -s "$2" ]' sh "$ms/log" "$ms/cslog"
+macsign_fixture
+expect_fail "sign-macos: the signature on the wrong file is caught" sm FAKE_CODESIGN_WRONGFILE=1
+expect_pass "sign-macos: ...nothing was notarized or uploaded" nothing_sent
+macsign_fixture
+expect_fail "sign-macos: an identity that was not applied is caught" sm FAKE_CODESIGN_IGNORE_IDENTITY=1
+expect_pass "sign-macos: ...nothing was notarized or uploaded" nothing_sent
+macsign_fixture
+expect_fail "sign-macos: no hardened runtime is caught" sm FAKE_CODESIGN_NORUNTIME=1
+macsign_fixture
+expect_fail "sign-macos: a signature that does not verify is caught" sm FAKE_CODESIGN_VERIFYBAD=1
+macsign_fixture
+expect_fail "sign-macos: signing that changes more than the signature is caught (the stripped binaries differ)" sm FAKE_CODESIGN_TAMPER=1
+expect_pass "sign-macos: ...nothing was notarized or uploaded" nothing_sent
+macsign_fixture
+expect_fail "sign-macos: notarization rejected (Invalid, with exit status 0) uploads nothing" sm FAKE_NOTARY_STATUS=Invalid
+expect_pass "sign-macos: ...nothing was uploaded" no_upload
+expect_pass "sign-macos: ...and the files are as downloaded" unchanged
+macsign_fixture
+expect_fail "sign-macos: a SHA256SUMS signature that does not verify against the signers uploads nothing" sm FIL_RELEASE_KEY="$ms/otherkey"
+expect_pass "sign-macos: ...nothing was uploaded" no_upload
+macsign_fixture
+expect_fail "sign-macos: a packing that is not CI's stops before signing" sm FIL_RELEASE_PACK_CMD="$ms/bin/verify"
+expect_pass "sign-macos: ...nothing was signed with the identity" not_signed_with_id
+# mutation: SHA256SUMS is not rebuilt
+MACSIGN_SCRIPT=$RELEASE_DIR/.macsign-mutant.sh
+sed '/^rewrite_sums /d' "$RELEASE_DIR/sign-macos.sh" > "$MACSIGN_SCRIPT"
+chmod +x "$MACSIGN_SCRIPT"
+trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh" "$RELEASE_DIR/.pkg-mutant.sh" "$RELEASE_DIR/.macsign-mutant.sh"' EXIT INT TERM
+if cmp -s "$RELEASE_DIR/sign-macos.sh" "$MACSIGN_SCRIPT"; then flunk "mutation 'SHA256SUMS not rebuilt' did not change sign-macos.sh (the test is stale)"; else
+  macsign_fixture
+  expect_fail "mutation: SHA256SUMS not rebuilt is caught before anything is uploaded" sm
+  expect_pass "mutation: ...nothing was uploaded" no_upload
+fi
+rm -f "$MACSIGN_SCRIPT"
+unset MACSIGN_SCRIPT
+
 echo
 echo "release-test: $passed passed, $failed failed"
 [ "$failed" = 0 ]

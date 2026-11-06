@@ -218,6 +218,106 @@ rewrite_sums() {
   )
 }
 
+# pack_archives STAGE OUT: every directory fil-* of STAGE becomes OUT/<dir>.tar.gz, with the recipe of
+# section 4.4 and the GNU tar and gzip of the digest-pinned x86_64 image, never the host's. The
+# stage is mounted read-only and the container has no network; the files it writes belong to the
+# caller. SOURCE_DATE_EPOCH must be set. package.sh packs the release with it, and the owner's
+# macOS signing (sign-macos.sh) repacks the macOS archive with it, so that the two are packed
+# exactly alike. FIL_RELEASE_PACK_CMD is test-only (the self-test has no Docker): a command run as
+# `$FIL_RELEASE_PACK_CMD STAGE OUT` in its place.
+pack_archives() {
+  local stage=$1 out=$2 image
+  [ -d "$stage" ] && [ -d "$out" ] || die "pack_archives: $stage and $out must be directories"
+  [ -n "${SOURCE_DATE_EPOCH:-}" ] || die "pack_archives: SOURCE_DATE_EPOCH is not set"
+  export SOURCE_DATE_EPOCH
+  if [ -n "${FIL_RELEASE_PACK_CMD:-}" ]; then
+    "$FIL_RELEASE_PACK_CMD" "$stage" "$out"
+    return
+  fi
+  image=$(tools_image)
+  [ -n "$image" ] || die "Cross.toml has no x86_64 image"
+  docker run --rm --platform linux/amd64 --network none \
+    --user "$(id -u):$(id -g)" \
+    -e SOURCE_DATE_EPOCH -e LC_ALL=C \
+    -v "$stage:/stage:ro" -v "$out:/out" \
+    "$image" sh -ec '
+      tar --version | head -n 1 >&2
+      gzip --version | head -n 1 >&2
+      cd /stage
+      for d in fil-*; do
+        tar --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
+          --numeric-owner --mode="u=rwX,go=rX" -cf - "$d" | gzip -n -9 > "/out/$d.tar.gz"
+      done
+    '
+}
+
+# ---- macOS code signing (docs/m4/release.md section 10.3). FIL_CODESIGN is test-only: the self-test
+# runs on Linux, with a fake.
+cs() { "${FIL_CODESIGN:-codesign}" "$@"; }
+
+# strip_macos_signature IN OUT: OUT is IN's canonical UNSIGNED form: remove the signature, sign
+# ad hoc, remove it again. The detour is needed because removing a signature leaves the file as the
+# signer made it, and the signer fixes one header field (the __LINKEDIT segment's vmsize) from the
+# SIZE of the signature it wrote: the linker's ad hoc signature leaves a different value than
+# codesign's, and a Developer ID signature (with its timestamp) another. A plain strip of a rebuilt
+# binary and of the released one therefore differ by that one byte. Both ad hoc steps are
+# deterministic (no certificate, no clock), so the same pipeline on either side gives the same
+# bytes whenever the code is the same.
+strip_macos_signature() {
+  local in=$1 out=$2 t
+  t=$(mktemp "${TMPDIR:-/tmp}/fil-strip.XXXXXX")
+  cp "$in" "$t" && chmod u+w "$t"
+  cs --remove-signature "$t" || { rm -f "$t"; die "codesign --remove-signature failed on $in"; }
+  cs --force --sign - --identifier fil "$t" 2> /dev/null || { rm -f "$t"; die "ad hoc codesign failed on $in"; }
+  cs --remove-signature "$t" || { rm -f "$t"; die "codesign --remove-signature failed on $in"; }
+  mv "$t" "$out"
+}
+# adhoc_sign_macos FILE: what CI does to the macOS binary (macos-build.sh): lipo keeps the linker's
+# signature and an arm64 binary needs one, so the file is signed ad hoc with a fixed identifier.
+# Done from the canonical unsigned form, so that the result is a pure function of the code: the
+# same bytes whether FILE came from lipo or had a Developer ID signature stripped off.
+adhoc_sign_macos() {
+  local f=$1 t
+  t=$(mktemp "${TMPDIR:-/tmp}/fil-adhoc.XXXXXX")
+  strip_macos_signature "$f" "$t"
+  cs --force --sign - --identifier fil "$t" || { rm -f "$t"; die "ad hoc codesign failed on $f"; }
+  cs --verify --strict "$t" || { rm -f "$t"; die "the ad hoc signature on $f does not verify"; }
+  chmod 755 "$t"
+  mv "$t" "$f"
+}
+
+# repack_macos_archive ARCHIVE BIN OUT: ARCHIVE (the macOS release archive) with bin/fil replaced
+# by BIN, packed by pack_archives into the file OUT. SOURCE_DATE_EPOCH is the mtime of the archive's
+# own entries (every entry carries it: section 4.4), so the repack is the CI packing but for the
+# binary: repacking with the archive's own binary gives back the archive byte for byte.
+repack_macos_archive() {
+  local archive=$1 bin=$2 out=$3 st name sde
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fil-repack.XXXXXX")
+  mkdir "$st/in" "$st/out"
+  tar -xzpf "$archive" -C "$st/in" || { rm -rf "$st"; die "cannot unpack $archive"; }
+  name=$(ls "$st/in")
+  case $name in fil-*-universal-apple-darwin) ;; *) rm -rf "$st"; die "$archive does not hold one fil-*-universal-apple-darwin directory" ;; esac
+  [ -f "$st/in/$name/bin/fil" ] || { rm -rf "$st"; die "$archive has no bin/fil"; }
+  sde=$(perl -e 'print((stat $ARGV[0])[9])' "$st/in/$name/bin/fil")
+  install -m 755 "$bin" "$st/in/$name/bin/fil"
+  SOURCE_DATE_EPOCH=$sde pack_archives "$st/in" "$st/out" || { rm -rf "$st"; die "cannot pack the macOS archive"; }
+  mv "$st/out/$name.tar.gz" "$out"
+  rm -rf "$st"
+}
+# rebuild_ci_macos_archive ARCHIVE OUT: the macOS archive as CI built it, from a released one whose
+# binary may since have been signed with a Developer ID: the archive repacked around the binary
+# signed ad hoc (adhoc_sign_macos). The CI attestation (an attestation is of exact bytes) covers
+# that archive and not the signed one, so the verifier checks the attestation against this.
+rebuild_ci_macos_archive() {
+  local archive=$1 out=$2 t name
+  t=$(mktemp -d "${TMPDIR:-/tmp}/fil-ci.XXXXXX")
+  name=$(basename "$archive" .tar.gz)
+  tar -xzpf "$archive" -C "$t" "$name/bin/fil" || { rm -rf "$t"; die "cannot read bin/fil of $archive"; }
+  adhoc_sign_macos "$t/$name/bin/fil"
+  repack_macos_archive "$archive" "$t/$name/bin/fil" "$out"
+  rm -rf "$t"
+}
+
 # package_key_fingerprint FILE: the fingerprint of the one OpenPGP public key in FILE (the package
 # signing key, .github/package-signing-key.asc; section 10.4). Fails unless FILE holds exactly one.
 package_key_fingerprint() {

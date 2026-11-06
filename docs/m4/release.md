@@ -317,7 +317,7 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 **Repository settings** (the `v*` tag ruleset that only the owner passes, immutable releases, the code-owner review below, and the others of `docs/m4/plan.md` §5): the owner sets them before the first tag (owner, 2026-11-04).
 
-**Once, before the first release: the crates.io names are reserved** (published by the coordinator; `just reserve-crate-names` is the script, §10.1), the `crates-io` environment exists and each of the nine crates has a trusted publisher (N8, §10.1), and, for v1, sign the macOS binary (`just release-sign-macos`, §10.3, not built yet).
+**Once, before the first release: the crates.io names are reserved** (published by the coordinator; `just reserve-crate-names` is the script, §10.1), the `crates-io` environment exists and each of the nine crates has a trusted publisher (N8, §10.1), and, for v1, sign and notarize the macOS binary (`just release-sign-macos`, §10.3; it needs the Developer ID certificate and the `fil-notary` notarytool profile on the owner's Mac).
 
 **The release key.** It is a **dedicated** ed25519 key on the owner's account, used for nothing else, never the agent seat's `~/.ssh/id_ed25519` (which signs agent commits globally). Give it a passphrase (or use an `ed25519-sk` hardware key) and keep a backup. The signing commands below name it explicitly, so a global signing key is never used by accident. The key never leaves the owner's machine, and CI has no signing key and no secret.
 
@@ -332,7 +332,7 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
    The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
 3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries, the four archives and the four packages from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
-4. **Sign the verified files.** Sign the copies that step 3 verified (`target/release-verify/X.Y.Z/files/`), not a fresh download, because any writer can replace draft assets in between. First the two rpms (§10.4), which rewrites `SHA256SUMS` and writes `SHA256SUMS.asc` (after macOS signing, §10.3, when that is built: both rewrite `SHA256SUMS`, packages last); then `SHA256SUMS` with the release key; then upload what changed:
+4. **Sign the verified files.** Sign the copies that step 3 verified (`target/release-verify/X.Y.Z/files/`), not a fresh download, because any writer can replace draft assets in between. First the two rpms (§10.4), which rewrites `SHA256SUMS` and writes `SHA256SUMS.asc` (after macOS signing, §10.3, for v1: both rewrite `SHA256SUMS` and `SHA256SUMS.sig`, packages last, so sign `SHA256SUMS` again here); then `SHA256SUMS` with the release key; then upload what changed:
 
    ```sh
    just release-sign-packages X.Y.Z                # the rpms, SHA256SUMS, SHA256SUMS.asc (gpg asks for the passphrase)
@@ -402,13 +402,37 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 
 ### 10.3 macOS: signed and notarized on the owner's Mac
 
-**Decided (owner 2026-11-04, round 2):** v1 is signed and notarized on the owner's Mac, and Apple keys are never in CI. **Everything below that sentence is proposed by the coordinator**, as the design only; the recipe is a work item, built later.
+**Decided (owner 2026-11-04, round 2; N4):** v1 is signed and notarized on the owner's Mac, and Apple keys are never in CI. `just release-sign-macos` (`tests/release/sign-macos.sh`) is built and tested on fakes in `just release-test`; its parts were run for real on an Apple-silicon Mac with an ad hoc identity (below).
 
-1. **CI** (proposed, coordinator) builds the macOS binary unsigned and reproducibly (§9) into a draft release, as for any release.
-2. **The owner runs `just release-sign-macos vX.Y.Z`** (proposed, coordinator). It downloads the draft and verifies it (as `release-verify` does before signing), signs the macOS binary with the Developer ID (hardened runtime, secure timestamp), submits it with `notarytool`, rebuilds the macOS archive and `SHA256SUMS` around the signed binary, signs those with the release key (§9.2) and uploads them to the draft. The owner then publishes as in §9.2.
-3. **Verifiability** (proposed, coordinator). Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
-4. **Stapling** (proposed, coordinator). A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
-5. **The release key** (proposed, coordinator) on a hardware token is optional, not chosen (§9.2).
+**What CI leaves.** CI builds the macOS binary reproducibly (§9) and signs it **ad hoc** with the fixed identifier `fil` (lipo keeps only the linker's signature and an arm64 binary without one is killed), into a draft release. No certificate, no secret.
+
+**The owner's steps**, after `just release-verify X.Y.Z --pre-sign` has passed (§9.2, step 3) and before the packages are signed (§10.4):
+
+```sh
+just release-sign-macos vX.Y.Z      # Developer ID signature, notarization, new archive and SHA256SUMS, signed, uploaded to the DRAFT
+```
+
+It needs, on the owner's Mac: the "Developer ID Application: Anthony Wertz (6X3PT3FXGA)" certificate and key in the login keychain (`FIL_CODESIGN_IDENTITY` names another), a `notarytool` keychain profile named `fil-notary` (`xcrun notarytool store-credentials fil-notary`, once), the release key `~/.ssh/fil-release` (`FIL_RELEASE_KEY`; it asks for the passphrase), `gh`, and Docker (the archive is repacked by the same pinned GNU tar and gzip that CI uses, `pack_archives` in `common.sh`). In order:
+
+1. **Verify.** `release-verify vX.Y.Z --pre-sign --no-rebuild` (the tag against the signers on main, `SHA256SUMS`, the attestations, `release-check`). Nothing is signed if it fails.
+2. **Draft only.** A release that is not a draft is refused.
+3. **Extract and check the packing.** The macOS binary comes out of the draft's archive. The draft's archive is repacked with its own, unchanged binary and must come back byte for byte: this machine packs as CI does, found out before the notarization, which cannot be taken back.
+4. **Sign.** `codesign --force --options runtime --timestamp --identifier fil --sign IDENTITY` (`--timestamp=none` for the identity `-`, an ad hoc run to try the script). It then checks, on the file that was signed, that the signature verifies, names the identity, enables the hardened runtime and carries a secure timestamp.
+5. **Only the signature changed.** The signed binary with its signature stripped must equal the CI binary with its signature stripped (see "Verifiability" for what stripping is).
+6. **Notarize.** The binary goes in a zip made by `ditto` (checked to hold the signed binary) to `xcrun notarytool submit --wait --keychain-profile fil-notary --output-format json`. The verdict must read `"status": "Accepted"`: `notarytool` can exit 0 for an `Invalid` submission, so the exit status is not trusted. Until Apple accepts, the downloaded files are untouched.
+7. **Rebuild.** The macOS archive is repacked around the signed binary, `SHA256SUMS` is rewritten (`sums_check` must pass) and signed with the release key (`ssh-keygen -Y sign -n fil-release`).
+8. **Check the signature** against the signers (`.github/release-signers` on main, as `release-verify` fetched it).
+9. **Upload** the archive, `SHA256SUMS` and `SHA256SUMS.sig` to the draft with `gh release upload --clobber`.
+
+The files are changed in place in `target/release-verify/X.Y.Z/files/`, so `just release-sign-packages X.Y.Z` (§10.4) continues from them; it rewrites `SHA256SUMS`, so sign that again (§9.2, step 4) and upload it. Then publish as in §9.2.
+
+**Verifiability.** Anyone can strip the signature and compare with their own build, but a plain strip is not byte-exact: removing a signature leaves a header field, the `__LINKEDIT` segment's `vmsize`, at the value the signer chose from the size of the signature it wrote (the linker's, `codesign`'s ad hoc and a Developer ID one with its timestamp each leave a different one). Measured on this Mac, a stripped ad hoc binary and a stripped linker-signed binary of the same code differ in exactly that one byte. So `strip_macos_signature` (in `common.sh`) takes the canonical unsigned form: remove the signature, sign ad hoc with the identifier `fil`, remove it again. Both ad hoc steps are deterministic, and for the arm64 and the universal binary the canonical forms of the linker-signed, the CI (ad hoc) and a runtime-flagged ad hoc binary were identical. `release-verify` reports who signed the macOS binary and the stripped binary's hash, and with `--mac-rebuild FILE` (a macOS `fil` you built from the tag) compares the two canonical forms and says whether they are byte-identical; if not, it says so, counts the differing bytes and compares each architecture, which is a comparison of everything except the signature. A signed binary is therefore reproducible up to its signature, never byte for byte, and the signature is Apple's and the owner's to give.
+
+**The attestation.** The CI attestation covers the ad hoc signed archive, not the Developer-ID-signed one the owner uploads. After signing, `release-verify` rebuilds CI's archive from the released one (the binary canonicalized and signed ad hoc, as CI does it, then repacked by `pack_archives`; this needs a Mac and Docker) and checks the attestation against that. CI's macOS signing goes through the same canonical form (`adhoc_sign_macos`, used by `macos-build.sh`) so that the rebuilt archive equals CI's byte for byte; the self-test and a run on this Mac check it. On a machine without `codesign` the macOS archive's attestation is skipped with a note.
+
+**Stapling.** A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
+
+**What was run for real (ad hoc identity, no Developer ID on the build Mac).** An arm64 and an x86_64 release build, joined by `lipo`: the CI archive, the whole `sign-macos.sh` with the ad hoc identity and stub `gh`, verifier and `notarytool`, then CI's archive rebuilt from the signed one: identical. The notarization itself (Apple's service, the real certificate) has not been run; the first run is the owner's, on a draft, and changes nothing but that draft.
 
 ### 10.4 The .rpm and .deb packages: signed on the owner's Mac
 

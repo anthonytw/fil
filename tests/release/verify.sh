@@ -4,6 +4,7 @@
 #
 #   verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] [--repo OWNER/REPO]
 #                     [--ref REF] [--vm NAME] [--no-rebuild] [--pre-sign] [--work DIR]
+#                     [--mac-rebuild FILE]
 #
 # Release (default): download the draft or published release v<VERSION> (`gh release download`),
 # then, STOPPING at the first failure of steps 1-3 (nothing from the download is looked at, let alone
@@ -26,6 +27,13 @@
 #      aarch64, source) and the four packages are reproduced from the source; the macOS archive is
 #      only REASSEMBLED around the released macOS binary, which is not rebuilt and is ad-hoc signed.
 #
+# The macOS binary (docs/m4/release.md section 10.3) is Developer-ID signed after CI, so the macOS
+# archive is not the bytes CI attested: step 3 then checks the attestation against the archive
+# rebuilt as CI built it (the signature stripped, the binary signed ad hoc as CI does, repacked; on
+# a Mac with Docker). A further step reports who signed the binary, strips the signature and, with
+# --mac-rebuild FILE (a macOS `fil` you built from the tag yourself, universal), compares the two
+# stripped files and says plainly whether they are byte-identical and, if not, how they differ.
+#
 # --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
 # or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (a commit SHA: the run's
 # commit). Nothing from the download is run in this mode either. The VM needs Docker and amd64
@@ -34,7 +42,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 presign=0 work=''
+version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 presign=0 work='' mac_rebuild=''
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;
@@ -46,6 +54,7 @@ while [ $# -gt 0 ]; do
     --no-rebuild) rebuild=0; shift ;;
     --pre-sign) presign=1; shift ;;
     --work) work=$2; shift 2 ;;
+    --mac-rebuild) mac_rebuild=$2; shift 2 ;;
     -*) die "unknown option: $1" ;;
     *) version=$1; shift ;;
   esac
@@ -63,6 +72,17 @@ sha256_stdin() { if command -v sha256sum > /dev/null; then sha256sum | cut -d' '
 fails=0
 fail() { echo "release-verify: FAIL: $*" >&2; fails=$((fails + 1)); }
 ok() { echo "release-verify: ok: $*" >&2; }
+
+# mac_archive_signed ARCHIVE: the macOS binary in ARCHIVE carries a signature other than ad hoc
+# (a Developer ID one). Without codesign it cannot tell, and says no.
+mac_archive_signed() {
+  local a=$1 t info
+  t=$(mktemp -d "${TMPDIR:-/tmp}/fil-macsig.XXXXXX")
+  tar -xzOf "$a" "$(basename "$a" .tar.gz)/bin/fil" > "$t/fil" 2> /dev/null || { rm -rf "$t"; return 1; }
+  info=$(cs -dvv "$t/fil" 2>&1) || { rm -rf "$t"; return 1; }
+  rm -rf "$t"
+  ! grep -q '^Signature=adhoc' <<< "$info" && grep -q '^Authority=' <<< "$info"
+}
 
 # ---- the files
 dl=$work/files
@@ -148,7 +168,19 @@ if [ "$dry" = 0 ]; then
   # and no self-hosted runner. After signing, the rpms are not the bytes CI attested (their
   # signature header is new): their provenance is then the signature (2b) and the rebuild (5), which
   # compares everything after the signature header.
+  mac_archive=fil-$version-universal-apple-darwin.tar.gz
   for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|"); do
+    if [ "$presign" = 0 ] && [ "$a" = "$dl/$mac_archive" ] && mac_archive_signed "$a"; then
+      # Developer ID signed (section 10.3): CI attested the archive before that. Rebuild CI's.
+      if [ "$(uname -s)" != Darwin ] && [ -z "${FIL_CODESIGN:-}" ]; then
+        echo "release-verify: note: $mac_archive is Developer-ID signed: its attestation (of CI's ad hoc signed build) can only be checked on a Mac, which can strip and re-sign; not checked here" >&2
+        continue
+      fi
+      mkdir -p "$work/ci-mac"
+      rebuild_ci_macos_archive "$a" "$work/ci-mac/$mac_archive" || die "STOP: cannot rebuild CI's macOS archive from $mac_archive"
+      echo "release-verify: note: $mac_archive is Developer-ID signed; checking the attestation of the archive as CI built it (signature stripped, signed ad hoc, repacked)" >&2
+      a=$work/ci-mac/$mac_archive
+    fi
     if [ "$presign" = 0 ] && [ "${a%.rpm}" != "$a" ]; then
       echo "release-verify: note: $(basename "$a") is signed: its attestation (of the unsigned build) is not checked; the rebuild checks it" >&2
       continue
@@ -171,6 +203,45 @@ if [ "$dry" = 1 ]; then
   "$RELEASE_DIR/check.sh" --dry-run --no-tree --no-exec "$dl" || fail "release-check"
 else
   "$RELEASE_DIR/check.sh" --tag "$tag" --complete --no-tree --no-exec "$dl" || fail "release-check"
+fi
+
+# ---- the macOS binary's signature (section 10.3)
+if [ "$(uname -s)" = Darwin ] || [ -n "${FIL_CODESIGN:-}" ]; then
+  mdir=$work/mac-signed
+  rm -rf "$mdir"
+  mkdir -p "$mdir"
+  tar -xzOf "$dl/fil-$version-universal-apple-darwin.tar.gz" "fil-$version-universal-apple-darwin/bin/fil" > "$mdir/fil" || fail "cannot read the macOS binary"
+  chmod 755 "$mdir/fil"
+  minfo=$(cs -dvv "$mdir/fil" 2>&1) || minfo=''
+  if grep -q '^Signature=adhoc' <<< "$minfo"; then
+    log "macOS binary: ad hoc signed (CI's signature; not yet Developer-ID signed and notarized)"
+  elif [ -n "$minfo" ]; then
+    log "macOS binary signed by: $(grep -E '^(Authority|TeamIdentifier|Timestamp)=' <<< "$minfo" | tr '\n' ';')"
+    grep -Eq '^CodeDirectory .*flags=[^ ]*runtime' <<< "$minfo" && ok "macOS binary: hardened runtime" || fail "macOS binary: hardened runtime is not enabled"
+  else
+    fail "macOS binary: codesign cannot read its signature"
+  fi
+  strip_macos_signature "$mdir/fil" "$mdir/stripped"
+  log "macOS binary with the signature stripped: sha256 $(sha256 "$mdir/stripped")"
+  if [ -n "$mac_rebuild" ]; then
+    [ -f "$mac_rebuild" ] || die "no --mac-rebuild file: $mac_rebuild"
+    strip_macos_signature "$mac_rebuild" "$mdir/rebuild-stripped"
+    if cmp -s "$mdir/stripped" "$mdir/rebuild-stripped"; then
+      ok "macOS binary: BYTE-IDENTICAL to $mac_rebuild once the signature is stripped from both"
+    else
+      nd=$({ cmp -l "$mdir/stripped" "$mdir/rebuild-stripped" 2> /dev/null || true; } | wc -l | tr -d ' ')
+      fail "macOS binary: NOT byte-identical to $mac_rebuild with the signatures stripped ($nd bytes differ, sizes $(wc -c < "$mdir/stripped" | tr -d ' ') and $(wc -c < "$mdir/rebuild-stripped" | tr -d ' ')); everything except the signature was compared, so the code differs"
+      for arch in x86_64 arm64; do
+        if lipo -thin "$arch" "$mdir/stripped" -output "$mdir/a1" 2> /dev/null && lipo -thin "$arch" "$mdir/rebuild-stripped" -output "$mdir/a2" 2> /dev/null; then
+          if cmp -s "$mdir/a1" "$mdir/a2"; then log "  slice $arch: identical"; else log "  slice $arch: DIFFERS"; fi
+        fi
+      done
+    fi
+  else
+    log "macOS binary: no --mac-rebuild FILE, so it was not compared with a build of your own"
+  fi
+else
+  echo "release-verify: note: not on macOS: the macOS binary's signature was not examined" >&2
 fi
 
 # ---- 5. the independent rebuild in the Linux VM

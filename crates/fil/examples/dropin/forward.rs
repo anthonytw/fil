@@ -257,10 +257,12 @@ fn sess_wait(c: &mut Client, out: &str, timeout: Duration) -> Result<(), String>
 /// session. The daemon is not dumpable (`hardening.rs`), which makes `/proc/PID/fd` root's, so the
 /// count is `FDSize` from `/proc/PID/status`: the table's size, which the kernel grows (in powers
 /// of two) as descriptors are opened and never shrinks, so a leak shows as growth. On a host
-/// without `/proc` (macOS on `--local`) it is `-1`.
+/// without `/proc` (macOS on `--local`) it is `-1`. The daemon is an ancestor of the session's
+/// shell, and macOS's (BSD) `pgrep` leaves its own ancestors out unless given `-a`; Linux's
+/// `pgrep` has no such rule, and its `-a` means something else (list the command lines).
 fn daemon_stats(c: &mut Client) -> Result<(u32, u64, i64), String> {
     let out = c.run(
-        "p=$(pgrep -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(awk '/^FDSize:/ { print $2 }' /proc/$p/status 2>/dev/null || echo -1)\"",
+        "a=; [ \"$(uname)\" = Darwin ] && a=-a; p=$(pgrep $a -u $(id -u) -f '[f]il server --daemon|[f]il-daemon-dev.*daemon' | head -n 1); printf 'S%s %s %s %s\\n' $((6*7)) \"$p\" \"$(ps -o rss= -p \"$p\" | tr -d ' ')\" \"$(awk '/^FDSize:/ { print $2 }' /proc/$p/status 2>/dev/null || echo -1)\"",
         CMD_TIMEOUT,
     )?;
     let line = out
@@ -271,7 +273,7 @@ fn daemon_stats(c: &mut Client) -> Result<(u32, u64, i64), String> {
     let pid = w
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or("no daemon pid")?;
+        .ok_or_else(|| format!("no daemon pid: {out:?}"))?;
     let rss = w.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let fds = w.next().and_then(|s| s.parse().ok()).unwrap_or(-1);
     Ok((pid, rss, fds))
@@ -834,8 +836,25 @@ pub fn fwd_local_http(ctx: &Ctx, host: &str) -> Res {
     Ok(notes)
 }
 
+/// Bytes each burst connection sends and gets back.
+const BURST_BYTES: u64 = 1000;
+
 /// fwdprobe burst through the -L (from here to an echo server in the session) or the -R (from the
 /// session to an echo server here). Returns (ok, failed, ms, first error).
+///
+/// `server_first`, for the long sequential runs: the echo server closes first (`--close-after`,
+/// and the burst's `--no-shutdown`), so each connection's TIME_WAIT is on a fixed port: the
+/// server's and the forward's listener. Were the burst to half-close first, the TIME_WAITs would
+/// be on ephemeral ports, two per connection (the burst's and the forward's connect to the
+/// server), and macOS gives no port in TIME_WAIT out again for 2 x MSL (30 s) whatever the
+/// destination: 10,000 sequential connections ran out of its 16,384 after 8,188, and every
+/// scenario for the next 30 s failed with `addrnotavailable`. The client's own FIN then comes
+/// last, after the echo, so the burst no longer sees it delivered; the server checks it instead:
+/// every connection must bring exactly [`BURST_BYTES`] and end at the client's EOF (no
+/// `ECHO_EXTRA=` or `ECHO_NO_EOF=` in its output), or it counts as failed. Without
+/// `server_first` (a few hundred concurrent connections, no port shortage) the burst half-closes
+/// first and the echo comes back after its EOF, as before.
+#[allow(clippy::too_many_arguments)]
 fn burst(
     ctx: &Ctx,
     host: &str,
@@ -844,51 +863,175 @@ fn burst(
     remote: bool,
     count: u64,
     par: u64,
+    server_first: bool,
 ) -> Result<(u64, u64, u64, String), String> {
     let fp = ctx.fp(host);
-    let text = if !remote {
+    let close_after = if server_first {
+        format!(" --close-after {BURST_BYTES}")
+    } else {
+        String::new()
+    };
+    let mut burst_args = vec![
+        "--count".to_string(),
+        count.to_string(),
+        "--parallel".into(),
+        par.to_string(),
+        "--bytes".into(),
+        BURST_BYTES.to_string(),
+    ];
+    if server_first {
+        burst_args.push("--no-shutdown".into());
+    }
+    let (text, server) = if !remote {
         let _ = c.run("rm -f \"$D\"/echo.out*", CMD_TIMEOUT)?;
-        sess_bg(c, &format!("{fp} serve 127.0.0.1:{PL} echo"), "echo.out")?;
-        sess_listening(c, "echo.out")?;
-        let mut b = Mac::spawn(
-            ctx,
-            "burst",
-            &[
-                "connect".into(),
-                format!("127.0.0.1:{}", p.l),
-                "burst".into(),
-                "--count".into(),
-                count.to_string(),
-                "--parallel".into(),
-                par.to_string(),
-            ],
+        sess_bg(
+            c,
+            &format!("{fp} serve 127.0.0.1:{PL} echo{close_after}"),
+            "echo.out",
         )?;
+        sess_listening(c, "echo.out")?;
+        let mut args = vec![
+            "connect".to_string(),
+            format!("127.0.0.1:{}", p.l),
+            "burst".into(),
+        ];
+        args.extend(burst_args);
+        let mut b = Mac::spawn(ctx, "burst", &args)?;
         b.wait(Duration::from_secs(1800))
             .ok_or("the burst did not end within 30 min")?;
+        let text = b.text();
+        let server = if server_first {
+            let ok = kv(&text, "OK").parse::<u64>().unwrap_or(0);
+            Some(echo_check(ok, || sess_echo_counts(c))?)
+        } else {
+            None
+        };
         let _ = c.run("kill %% 2>/dev/null; true", CMD_TIMEOUT)?;
-        b.text()
+        (text, server)
     } else {
-        let _e = Mac::serve(
-            ctx,
-            "echo",
-            &["serve".into(), format!("127.0.0.1:{}", p.r), "echo".into()],
-        )?;
+        let mut serve = vec![
+            "serve".to_string(),
+            format!("127.0.0.1:{}", p.r),
+            "echo".into(),
+        ];
+        if server_first {
+            serve.extend(["--close-after".into(), BURST_BYTES.to_string()]);
+        }
+        let e = Mac::serve(ctx, "echo", &serve)?;
         let _ = c.run("rm -f \"$D\"/burst.out*", CMD_TIMEOUT)?;
         sess_bg(
             c,
-            &format!("{fp} connect 127.0.0.1:{PR} burst --count {count} --parallel {par}"),
+            &format!("{fp} connect 127.0.0.1:{PR} burst {}", burst_args.join(" ")),
             "burst.out",
         )?;
         sess_wait(c, "burst.out", Duration::from_secs(1800))?;
-        sess_cat(c, "burst.out")?
+        let text = sess_cat(c, "burst.out")?;
+        let server = if server_first {
+            let ok = kv(&text, "OK").parse::<u64>().unwrap_or(0);
+            Some(echo_check(ok, || Ok(echo_counts(&e.text())))?)
+        } else {
+            None
+        };
+        (text, server)
     };
     let num = |k: &str| kv(&text, k).parse::<u64>().unwrap_or(u64::MAX);
-    Ok((
-        num("OK"),
-        num("FAILED"),
-        num("MS"),
-        kv(&text, "FIRST_ERROR"),
-    ))
+    let (mut ok, mut failed, mut first) = (num("OK"), num("FAILED"), kv(&text, "FIRST_ERROR"));
+    if let Some(bad) = server.filter(|b| b.count > 0) {
+        // A connection the client counted as echoed that the server saw end wrongly.
+        ok = ok.saturating_sub(bad.count);
+        failed = failed.saturating_add(bad.count);
+        if first.is_empty() {
+            first = bad.first;
+        }
+    }
+    Ok((ok, failed, num("MS"), first))
+}
+
+/// What a `serve echo --close-after` output says: connections ended, and the anomalies
+/// (`ECHO_EXTRA=`, `ECHO_NO_EOF=`) with the first of them.
+#[derive(Default)]
+struct EchoCounts {
+    ended: u64,
+    bad: u64,
+    first: String,
+}
+
+/// [`EchoCounts`] of an output read here.
+fn echo_counts(text: &str) -> EchoCounts {
+    let mut c = EchoCounts::default();
+    for l in text.lines().map(str::trim) {
+        if l.starts_with("CONN_END=") {
+            c.ended += 1;
+        } else if l.starts_with("ECHO_EXTRA=") || l.starts_with("ECHO_NO_EOF=") {
+            c.bad += 1;
+            if c.first.is_empty() {
+                c.first = format!("the echo server saw {l}");
+            }
+        }
+    }
+    c
+}
+
+/// [`EchoCounts`] of the session's `echo.out`, counted by the shell (a 10,000-connection output
+/// is megabytes; only the counts and the first anomaly come back).
+fn sess_echo_counts(c: &mut Client) -> Result<EchoCounts, String> {
+    let out = c.run(
+        "f=\"$D/echo.out\"; printf 'E%s %s %s %s\\n' $((6*7)) \"$(grep -c '^CONN_END=' \"$f\")\" \"$(grep -c -e '^ECHO_EXTRA=' -e '^ECHO_NO_EOF=' \"$f\")\" \"$(grep -m 1 -e '^ECHO_EXTRA=' -e '^ECHO_NO_EOF=' \"$f\")\"",
+        CMD_TIMEOUT,
+    )?;
+    let line = out
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("E42 "))
+        .ok_or_else(|| format!("no echo counts: {out:?}"))?;
+    let mut w = line.splitn(3, ' ');
+    let mut n = || w.next().and_then(|s| s.trim().parse::<u64>().ok());
+    let (ended, bad) = (n().unwrap_or(0), n().unwrap_or(0));
+    let first = w.next().unwrap_or_default().trim();
+    Ok(EchoCounts {
+        ended,
+        bad,
+        first: if first.is_empty() {
+            String::new()
+        } else {
+            format!("the echo server saw {first}")
+        },
+    })
+}
+
+/// The connections a server-first burst's server saw end wrongly, and the first of them.
+struct EchoBad {
+    count: u64,
+    first: String,
+}
+
+/// A server-first burst's check on the server's side: waits (up to 10 s) until the server has
+/// ended at least the `ok` connections the client counted (the client's FIN reaches it after the
+/// client is done), then returns how many connections it saw end wrongly: extra bytes, no EOF, or
+/// never ended at all.
+fn echo_check(
+    ok: u64,
+    mut counts: impl FnMut() -> Result<EchoCounts, String>,
+) -> Result<EchoBad, String> {
+    let t0 = Instant::now();
+    let c = loop {
+        let c = counts()?;
+        if c.ended >= ok || t0.elapsed() > Duration::from_secs(10) {
+            break c;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let missing = ok.saturating_sub(c.ended);
+    let mut first = c.first;
+    if first.is_empty() && missing > 0 {
+        first = format!(
+            "the echo server ended {} of the {ok} connections echoed (no EOF from the rest in 10 s)",
+            c.ended
+        );
+    }
+    Ok(EchoBad {
+        count: c.bad + missing,
+        first,
+    })
 }
 
 /// 10,000 sequential short connections over QUIC: all succeed, and the link never goes down
@@ -904,12 +1047,13 @@ pub fn fwd_many_short(ctx: &Ctx, host: &str) -> Res {
     })
     .ok_or_else(|| format!("the client never moved to QUIC\n{}", c.dump()))?;
     let downs = link_downs(&c);
-    let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, false, 10_000, 1)?;
+    let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, false, 10_000, 1, true)?;
     let mut notes = vec![format!(
-        "10000 sequential -L connections over QUIC: {ok} echoed, {failed} failed, in {} ({:.0}/s); link downs during it: {}",
+        "10000 sequential -L connections over QUIC: {ok} echoed, {failed} failed, in {} ({:.0}/s); link downs during it: {}{}",
         ms(Duration::from_millis(t)),
         ok as f64 * 1000.0 / t.max(1) as f64,
-        link_downs(&c) - downs
+        link_downs(&c) - downs,
+        ephemeral_note()
     )];
     if ok != 10_000 || failed != 0 {
         notes.push(format!(
@@ -925,6 +1069,33 @@ pub fn fwd_many_short(ctx: &Ctx, host: &str) -> Res {
     Ok(notes)
 }
 
+/// This machine's ephemeral port range and TIME_WAIT, for a note (macOS; empty elsewhere): what
+/// bounds how many connections a burst can make in 30 s (see [`burst`]).
+fn ephemeral_note() -> String {
+    if !cfg!(target_os = "macos") {
+        return String::new();
+    }
+    let keys = [
+        "net.inet.ip.portrange.first",
+        "net.inet.ip.portrange.last",
+        "net.inet.tcp.msl",
+    ];
+    let v: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            Command::new("/usr/sbin/sysctl")
+                .args(["-n", k])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    format!(
+        "; here: ephemeral ports {}-{}, MSL {} ms (TIME_WAIT is twice that)",
+        v[0], v[1], v[2]
+    )
+}
+
 /// 200 concurrent connections each way: all exact.
 pub fn fwd_parallel(ctx: &Ctx, host: &str) -> Res {
     let p = mac_ports();
@@ -935,7 +1106,7 @@ pub fn fwd_parallel(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();
     for remote in [false, true] {
         let dir = if remote { "-R" } else { "-L" };
-        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, remote, 200, 200)?;
+        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, remote, 200, 200, false)?;
         notes.push(format!(
             "200 concurrent {dir} connections: {ok} echoed exactly, {failed} failed, {}",
             ms(Duration::from_millis(t))
@@ -1448,17 +1619,17 @@ pub fn fwd_churn(ctx: &Ctx, host: &str) -> Res {
         };
         let downs = link_downs(&c);
         // A first burst warms the allocator and the tables up; the bound is on growth after it.
-        let (ok0, failed0, _, first0) = burst(ctx, host, &mut c, &p, false, 2000, 1)?;
+        let (ok0, failed0, _, first0) = burst(ctx, host, &mut c, &p, false, 2000, 1, true)?;
         let (_, rss0, fds0) = daemon_stats(&mut c)?;
         let crss0 = client_rss(&c);
-        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, false, 20_000, 1)?;
+        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, false, 20_000, 1, true)?;
         thread::sleep(Duration::from_secs(2));
         let (_, rss1, fds1) = daemon_stats(&mut c)?;
         let crss1 = client_rss(&c);
         let grew = rss1 as i64 - rss0 as i64;
         // A second round: growth that repeats is per connection (a leak); growth that flattens
         // is the allocator's high-water mark.
-        let (ok2, failed2, _, first2) = burst(ctx, host, &mut c, &p, false, 20_000, 1)?;
+        let (ok2, failed2, _, first2) = burst(ctx, host, &mut c, &p, false, 20_000, 1, true)?;
         thread::sleep(Duration::from_secs(2));
         let (_, rss2, fds2) = daemon_stats(&mut c)?;
         let crss2 = client_rss(&c);

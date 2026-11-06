@@ -10,8 +10,8 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fil_forward::LocalPeer;
@@ -535,6 +535,17 @@ async fn stuck_consumer(t: Transport) {
 /// Buffered bytes stay within the budget, whatever the applications do: here every connection
 /// is stuck both ways (the application and the server write and never read). The listener
 /// pauses at the open cap, and nothing beyond the configured budget is ever held.
+///
+/// Nothing may end while the buffers fill: every application and server writes for ever. A
+/// connection that ends for any other reason fails the test at once, with the error and the
+/// endpoints' state, but one: on macOS a local socket call that fails with `ENOBUFS` or `ENOMEM`
+/// (the mbuf pool running short across some 80 loopback sockets that are never read; the
+/// x86_64 runner does) may have queued part of its bytes, so the endpoint resets that channel
+/// instead of retrying it (DESIGN.md section 8.5, [`kernel_memory_resets`]). Up to
+/// [`NO_MEMORY_RESETS`] such channels are taken, matched by id: every close by either mux is a
+/// `Reset` of one of them, no other connection ends, and each ends at most its two writers (the
+/// server's and the application's, with `EPIPE` or `ECONNRESET`). A waiting application's
+/// connection takes the freed place (24 connect for 16 places), so the fill still finishes.
 async fn budget(t: Transport) {
     let budget = 4 << 20;
     let cfg = MuxConfig {
@@ -542,13 +553,30 @@ async fn budget(t: Transport) {
         max_open: 16,
         ..mux_config()
     };
+    let denied = mbufs_denied();
+    // Why each writer that stopped stopped: none may, until the end, but those of a channel
+    // reset for want of kernel memory (above).
+    let ended = Arc::new(Mutex::new(Vec::<(String, std::io::ErrorKind)>::new()));
     // Every socket that is never read has small kernel buffers: the test is about the endpoint's
     // budget, and the OS's autotuning (4 MiB each on macOS) across some 80 loopback sockets
     // can take a small runner's whole mbuf pool.
-    let server = serve(|mut s| async move {
-        shrink_buffers(&s);
-        let buf = vec![1u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
+    let server_ended = ended.clone();
+    let server = serve(move |mut s| {
+        let ended = server_ended.clone();
+        async move {
+            shrink_buffers(&s);
+            let buf = vec![1u8; 64 * 1024];
+            let e = loop {
+                if let Err(e) = write_all_retry(&mut s, &buf).await {
+                    break e;
+                }
+            };
+            let kind = e.kind();
+            ended
+                .lock()
+                .unwrap()
+                .push((format!("a server's write: {e}"), kind));
+        }
     })
     .await;
     let w = World::new(t, cfg).await;
@@ -562,13 +590,31 @@ async fn budget(t: Transport) {
     w.daemon.ep.set_pacing(off);
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
-    for _ in 0..24 {
+    for i in 0..24 {
         let mut s = connect_small(port).await;
+        let ended = ended.clone();
         apps.push(tokio::spawn(async move {
             let buf = vec![2u8; 64 * 1024];
-            while write_all_retry(&mut s, &buf).await.is_ok() {}
+            let e = loop {
+                if let Err(e) = write_all_retry(&mut s, &buf).await {
+                    break e;
+                }
+            };
+            let kind = e.kind();
+            ended
+                .lock()
+                .unwrap()
+                .push((format!("application {i}'s write: {e}"), kind));
         }));
     }
+    let failure = |what: &str| -> String {
+        format!(
+            "{t:?}: {what}; writers that stopped: {:?}{}\n{}",
+            ended.lock().unwrap(),
+            w.report(),
+            mbufs_note(&denied)
+        )
+    };
     let check = || {
         for (who, ep) in [("client", &w.client.ep), ("daemon", &w.daemon.ep)] {
             let s = ep.snapshot();
@@ -576,20 +622,79 @@ async fn budget(t: Transport) {
             assert!(s.reserved <= budget, "{who}: {s:?}");
             assert!(s.channels <= 16, "{who}: {s:?}");
         }
+        // Read in this order: the writers that stopped, then the connections that ended, then
+        // the records. An endpoint records a local error, or a close by its mux, before it
+        // resets the socket, and counts the connection ended no later than that, so whatever
+        // ended a writer, or a connection, is in the records read after it.
+        let ended = ended.lock().unwrap().clone();
+        let gone: Vec<u64> = [&w.client.ep, &w.daemon.ep]
+            .iter()
+            .map(|ep| {
+                ep.stats(ForwardId(1))
+                    .map_or(0, |s| s.total - u64::from(s.open))
+            })
+            .collect();
+        let errors = w.client.ep.local_errors().1 + w.daemon.ep.local_errors().1;
+        let resets = kernel_memory_resets(&w);
+        // The channels reset for want of kernel memory (ids are the wire's, the same at both
+        // ends). Empty on Linux, where none may be.
+        let reset: std::collections::BTreeSet<u32> = resets.iter().map(|e| e.channel).collect();
+        let (cc, cn) = w.client.ep.abnormal_closes();
+        let (dc, dn) = w.daemon.ep.abnormal_closes();
+        // Every close by a mux is the peer's answer to one of those resets.
+        let closes_ok = cn + dn <= reset.len() as u64
+            && cc
+                .iter()
+                .chain(&dc)
+                .all(|c| c.why == CloseReason::Reset && reset.contains(&c.channel));
+        let by_reset = ended.iter().all(|(_, k)| {
+            matches!(
+                k,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            )
+        });
+        // Every local error is such a reset; no connection ended but those channels' (so every
+        // writer that stopped was one of theirs, two at most each: the server and the
+        // application), and there are few of them.
+        if errors as usize > resets.len()
+            || reset.len() > NO_MEMORY_RESETS
+            || gone.iter().any(|&g| g > reset.len() as u64)
+            || ended.len() > 2 * reset.len()
+            || !closes_ok
+            || !by_reset
+        {
+            panic!(
+                "{}",
+                failure(&format!(
+                    "a connection ended while the buffers filled (none may, but the channels reset for want of kernel memory on macOS, at most {NO_MEMORY_RESETS}: {reset:?}; connections ended (client, daemon): {gone:?})"
+                ))
+            );
+        }
     };
-    // Fill up: both sides end up holding (nearly) all they reserved.
+    // Fill up: both sides end up holding (nearly) all they reserved. Seconds on any machine; the
+    // deadline is below the test's limit so that this failure, with its report, comes first.
     let full = || {
         let s = w.client.ep.snapshot();
         check();
         s.channels == 16 && s.buffered * 10 >= s.reserved * 9
     };
-    eventually(Duration::from_secs(120), full).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while !full() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{}", failure("the buffers did not fill within 90 s"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     for _ in 0..50 {
         check();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (c, d) = (w.client.ep.snapshot(), w.daemon.ep.snapshot());
-    eprintln!("{t:?}: client {c:?}, daemon {d:?}");
+    eprintln!(
+        "{t:?}: client {c:?}, daemon {d:?}; channels reset for want of kernel memory: {:?}; {}",
+        kernel_memory_resets(&w),
+        mbufs_note(&denied)
+    );
     for a in &apps {
         a.abort();
     }
@@ -1482,6 +1587,7 @@ async fn a_socks_flood_does_not_stall_the_other_forwards() {
 
 async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
     let _one_at_a_time = heavy().await;
+    let denied = mbufs_denied();
     let server = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     let lport = w.local_forward(1, server.port);
@@ -1505,17 +1611,47 @@ async fn a_socks_flood_does_not_stall_the_other_forwards_body() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Two in a row: the listener was already waiting in its accept when the flood began, so the
     // first gets in either way; the second is accepted only if the bound leaves room for it.
-    for i in 0..2 {
+    //
+    // The TCP connect is timed apart from the echo. The `-L` listener's backlog is nearly empty,
+    // so the kernel completes the connect whether or not fil accepts: a slow connect is the
+    // kernel's (a SYN or SYN-ACK it dropped and sent again on its timer, 1 s on macOS, as when
+    // the mbuf pool runs out), and fil's accept is in the echo after it, which is what is bounded.
+    for i in 0..2u64 {
         let t0 = std::time::Instant::now();
-        timeout(Duration::from_secs(20), echo_once(lport, 10, i))
+        let mut s = timeout(Duration::from_secs(20), connect(lport))
+            .await
+            .expect("the kernel completed the connect");
+        let connected = t0.elapsed();
+        let echo = async {
+            let mut out = vec![0u8; 10];
+            fill(i, 0, &mut out);
+            s.write_all(&out).await.unwrap();
+            s.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            s.read_to_end(&mut back).await.unwrap();
+            assert!(back == out, "reply of {} bytes", back.len());
+        };
+        timeout(Duration::from_secs(20), echo)
             .await
             .expect("the -L connection went through");
-        let took = t0.elapsed();
+        let took = t0.elapsed() - connected;
         eprintln!(
-            "-L connection {i} beside {} silent SOCKS clients took {took:?}",
+            "-L connection {i} beside {} silent SOCKS clients: connected in {connected:?}, \
+             echoed in {took:?}",
             held.len()
         );
-        assert!(took < Duration::from_secs(2), "connection {i}: {took:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "connection {i}: echoed in {took:?} after a connect of {connected:?}; {}",
+            mbufs_note(&denied)
+        );
+        if connected >= Duration::from_secs(1) {
+            eprintln!(
+                "connection {i}: the kernel took {connected:?} to connect (not fil's: its \
+                 accept comes after); {}",
+                mbufs_note(&denied)
+            );
+        }
     }
     drop(held);
 }

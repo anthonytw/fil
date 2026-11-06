@@ -38,7 +38,14 @@
 //! `ACCEPTS=N` (the accept counter) before it exits. Without it the count is the last `ACCEPT=`.
 //!
 //! Modes:
-//! - `echo`: returns every byte; at EOF it half-closes its side.
+//! - `echo [--close-after N]`: returns every byte; at EOF it half-closes its side. With
+//!   `--close-after N` it half-closes its side as soon as it has returned N bytes, before the
+//!   peer's EOF, and then reads (and discards) to that EOF. The end that closes first keeps the
+//!   connection in TIME_WAIT, so this puts it on the server's fixed port instead of the peer's
+//!   ephemeral one; see `burst --no-shutdown`. A peer that sends exactly N bytes leaves nothing
+//!   to discard: a connection that brought more adds `ECHO_EXTRA=BYTES` to its report, and one
+//!   whose read side ended other than at the peer's EOF adds `ECHO_NO_EOF=END`, so a caller can
+//!   `grep` a long run's output for both.
 //! - `source N [--seed S]`: sends N seeded bytes at once, then half-closes its side and keeps
 //!   reading (so the peer can still talk after seeing EOF).
 //! - `sink [--reply]`: reads to EOF. With `--reply` it then answers `SINK_BYTES=` and
@@ -71,6 +78,12 @@
 //!   connections, P at a time, each sending S seeded bytes (default 1000 each; the seed differs
 //!   per connection). `--expect echo` (the default) needs the same bytes back. Prints `COUNT=`,
 //!   `OK=`, `FAILED=`, `FIRST_ERROR=` (when something failed) and `MS=`; exits 1 on any failure.
+//!   `--no-shutdown` leaves each connection's write side open: the server must close first
+//!   (`serve echo --close-after S`). Then no connection leaves a TIME_WAIT on an ephemeral port
+//!   (each forwarded one would leave two, on the client's and on the forward's connect), which
+//!   matters on macOS: an ephemeral port in TIME_WAIT is not given out again, whatever the
+//!   destination, for 2 x MSL (30 s), and there are 16,384 of them, so ten thousand
+//!   connections in a row ran out after 8,188.
 //!
 //! Options: `--timeout SECS` (give up after that long without a byte; default never, except 30 for
 //! `burst`; 0 = never), `--rate BYTES_PER_SEC`. A paced transfer that falls more than a second behind
@@ -262,6 +275,8 @@ struct Report {
     out: Half,
     ms: u128,
     reply: Vec<u8>,
+    /// Lines of the mode's own, each ending in a newline (`echo --close-after`'s anomalies).
+    notes: String,
 }
 
 impl Report {
@@ -271,12 +286,13 @@ impl Report {
             out,
             ms: 0,
             reply: Vec::new(),
+            notes: String::new(),
         }
     }
 
     fn render(&self) -> String {
         format!(
-            "IN_BYTES={}\nIN_SHA256={}\nIN_END={}\nOUT_BYTES={}\nOUT_SHA256={}\nOUT_END={}\nMS={}\n",
+            "IN_BYTES={}\nIN_SHA256={}\nIN_END={}\nOUT_BYTES={}\nOUT_SHA256={}\nOUT_END={}\nMS={}\n{}",
             self.inn.bytes,
             self.inn.sha,
             self.inn.end.text(),
@@ -284,6 +300,7 @@ impl Report {
             self.out.sha,
             self.out.end.text(),
             self.ms,
+            self.notes,
         )
     }
 }
@@ -465,6 +482,7 @@ fn exchange(stream: TcpStream, plan: &Plan) -> Report {
         out,
         ms: start.elapsed().as_millis(),
         reply,
+        notes: String::new(),
     }
 }
 
@@ -546,18 +564,33 @@ impl Opts {
 
 #[derive(Clone)]
 enum Mode {
-    Echo,
-    Source { n: u64, seed: u64 },
-    Sink { reply: bool },
-    Hold { for_: Option<Duration> },
-    HalfClose { response: u64, seed: u64 },
-    Rst { after_read: u64 },
+    /// Half-closes after returning this many bytes, if set.
+    Echo {
+        close_after: Option<u64>,
+    },
+    Source {
+        n: u64,
+        seed: u64,
+    },
+    Sink {
+        reply: bool,
+    },
+    Hold {
+        for_: Option<Duration>,
+    },
+    HalfClose {
+        response: u64,
+        seed: u64,
+    },
+    Rst {
+        after_read: u64,
+    },
 }
 
 impl Mode {
     fn name(&self) -> &'static str {
         match self {
-            Self::Echo => "echo",
+            Self::Echo { .. } => "echo",
             Self::Source { .. } => "source",
             Self::Sink { .. } => "sink",
             Self::Hold { .. } => "hold",
@@ -586,13 +619,19 @@ fn serve_main(args: &[String]) -> Result<ExitCode, String> {
             "--for",
             "--response",
             "--after-read",
+            "--close-after",
         ],
     )?;
     let addr: String = o.positional(0, "ADDR")?;
     let mode_name: String = o.positional(1, "MODE")?;
     let seed = o.or("--seed", DEFAULT_SEED)?;
     let (mode, used) = match mode_name.as_str() {
-        "echo" => (Mode::Echo, 2),
+        "echo" => (
+            Mode::Echo {
+                close_after: o.get("--close-after")?,
+            },
+            2,
+        ),
         "source" => (
             Mode::Source {
                 n: o.positional(2, "N")?,
@@ -675,7 +714,20 @@ fn handle(n: u64, mut stream: TcpStream, cfg: &Serve) {
     let _ = stream.set_write_timeout(cfg.idle);
     let mut pacer = Pacer::new(cfg.rate);
     let mut report = match &cfg.mode {
-        Mode::Echo => echo(&mut stream, &mut pacer, cfg.idle),
+        Mode::Echo { close_after } => {
+            let mut r = echo(&mut stream, &mut pacer, cfg.idle, *close_after);
+            if let Some(n) = close_after {
+                let extra = r.inn.bytes.saturating_sub(*n);
+                if extra > 0 {
+                    r.notes.push_str(&format!("ECHO_EXTRA={extra}\n"));
+                }
+                if r.inn.end != End::Eof {
+                    r.notes
+                        .push_str(&format!("ECHO_NO_EOF={}\n", r.inn.end.text()));
+                }
+            }
+            r
+        }
         Mode::Source { n, seed } => exchange(
             stream,
             &Plan {
@@ -757,23 +809,43 @@ fn handle(n: u64, mut stream: TcpStream, cfg: &Serve) {
     ));
 }
 
-fn echo(stream: &mut TcpStream, pacer: &mut Pacer, idle: Option<Duration>) -> Report {
+fn echo(
+    stream: &mut TcpStream,
+    pacer: &mut Pacer,
+    idle: Option<Duration>,
+    close_after: Option<u64>,
+) -> Report {
     let (mut inn, mut out) = (Tally::new(), Tally::new());
     let mut buf = vec![0u8; CHUNK];
     let _ = stream.set_read_timeout(idle);
     let (mut in_end, mut out_end) = (End::Eof, End::Done);
+    // `--close-after`: what is still to return before this side half-closes.
+    let mut left = close_after;
+    if left == Some(0) {
+        let _ = stream.shutdown(Shutdown::Write);
+    }
     loop {
         let k = pacer.chunk();
         match stream.read(&mut buf[..k]) {
             Ok(0) => break,
             Ok(n) => {
                 inn.add(&buf[..n]);
-                if let Err(e) = stream.write_all(&buf[..n]) {
-                    out_end = classify(&e);
-                    in_end = End::Skipped;
-                    break;
+                // Past `--close-after` the bytes are read and counted, not returned.
+                let back = left.map_or(n, |l| n.min(usize::try_from(l).unwrap_or(usize::MAX)));
+                if back > 0 {
+                    if let Err(e) = stream.write_all(&buf[..back]) {
+                        out_end = classify(&e);
+                        in_end = End::Skipped;
+                        break;
+                    }
+                    out.add(&buf[..back]);
+                    if let Some(l) = &mut left {
+                        *l -= back as u64;
+                        if *l == 0 {
+                            let _ = stream.shutdown(Shutdown::Write);
+                        }
+                    }
                 }
-                out.add(&buf[..n]);
                 pacer.after(n);
             }
             Err(e) if is_interrupt(&e) => {}
@@ -783,7 +855,8 @@ fn echo(stream: &mut TcpStream, pacer: &mut Pacer, idle: Option<Duration>) -> Re
             }
         }
     }
-    if in_end == End::Eof {
+    // Unless `--close-after` half-closed already.
+    if in_end == End::Eof && left != Some(0) {
         let _ = stream.shutdown(Shutdown::Write);
     }
     Report::new(inn.half(in_end), out.half(out_end))
@@ -929,6 +1002,7 @@ fn burst(addr: &str, o: &Opts, idle: Option<Duration>, seed: u64) -> Result<Exit
         other => return Err(format!("--expect: bad value {other:?}")),
     };
     let rate: Option<u64> = o.get("--rate")?;
+    let shutdown = !o.switch("--no-shutdown");
     let next = AtomicU64::new(0);
     let (ok, failed) = (AtomicU64::new(0), AtomicU64::new(0));
     let first_error: Mutex<Option<String>> = Mutex::new(None);
@@ -942,7 +1016,7 @@ fn burst(addr: &str, o: &Opts, idle: Option<Duration>, seed: u64) -> Result<Exit
                         break;
                     }
                     let s = seed.wrapping_add(i);
-                    let verdict = one_burst_conn(addr, bytes, s, rate, idle, expect_echo);
+                    let verdict = one_burst_conn(addr, bytes, s, rate, idle, expect_echo, shutdown);
                     match verdict {
                         Ok(()) => ok.fetch_add(1, Ordering::SeqCst),
                         Err(why) => {
@@ -979,13 +1053,14 @@ fn one_burst_conn(
     rate: Option<u64>,
     idle: Option<Duration>,
     expect_echo: bool,
+    shutdown: bool,
 ) -> Result<(), String> {
     let (stream, _) = open(addr).map_err(|e| e.replace('\n', " "))?;
     let r = exchange(
         stream,
         &Plan {
             send: Some((bytes, seed)),
-            shutdown_after: true,
+            shutdown_after: shutdown,
             rate,
             idle,
             keep_reply: false,

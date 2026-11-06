@@ -129,11 +129,7 @@ const RATE: u64 = 2_500_000;
 /// (median probe round trip, bulk bytes per second, most payloads the daemon's endpoint held
 /// queued for the link) on the slow pipe.
 async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
-    let source = serve(|mut s| async move {
-        let buf = vec![9u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
-    })
-    .await;
+    let source = endless_source().await;
     let stream = StreamConfig {
         latency: Duration::from_millis(20),
         jitter: Duration::ZERO,
@@ -141,6 +137,10 @@ async fn slow_pipe_cell(cfg: PaceConfig) -> (Duration, f64, usize) {
         buffer: 1 << 20,
     };
     let mut w = World::new_pipe_on(mux_config(), stream).await;
+    // The kernel buffers between the endless source and the daemon are not what is measured
+    // (the link is the bottleneck) and unbounded they hold megabytes per connection
+    // (`bounded_buffers`).
+    *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
     w.client.ep.set_pacing(cfg);
     w.daemon.ep.set_pacing(cfg);
     let port = w.local_forward(1, source.port);
@@ -205,13 +205,13 @@ async fn parallel_downloads_keep_the_link_full() {
 }
 
 async fn parallel_downloads_keep_the_link_full_body() {
+    let denied = mbufs_denied();
     for n in [16, 32] {
-        let source = serve(|mut s| async move {
-            let buf = vec![9u8; 64 * 1024];
-            while write_all_retry(&mut s, &buf).await.is_ok() {}
-        })
-        .await;
+        let source = endless_source().await;
         let mut w = World::new_pipe_on(mux_config(), slow_pipe()).await;
+        // As in `slow_pipe_cell`: 16 and 32 endless sources held 187 MiB of kernel buffers
+        // unbounded, more than a small macOS runner's mbuf pool.
+        *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
         let port = w.local_forward(1, source.port);
         let got = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::new();
@@ -229,22 +229,46 @@ async fn parallel_downloads_keep_the_link_full_body() {
             }));
         }
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
-        let mut rtts = Vec::new();
-        for i in 0..15 {
-            rtts.push(probe(&mut w, i).await);
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
+        // The rate is measured over a window; a window across which the process itself stood
+        // still (`StallWatch`: 100 ms or more, which only the machine causes) is measured once
+        // more, up to twice, and every window's figures are in the failure.
+        let mut windows = Vec::new();
+        let (rate, p50) = loop {
+            let stalls = StallWatch::start();
+            let (b0, t0) = (got.load(Ordering::Relaxed), std::time::Instant::now());
+            let mut rtts = Vec::new();
+            for i in 0..15 {
+                rtts.push(probe(&mut w, i).await);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let rate = (got.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64();
+            let stalled = stalls.worst();
+            drop(stalls);
+            rtts.sort();
+            let p50 = rtts[rtts.len() / 2];
+            windows.push(format!(
+                "{:.0} KB/s, probe p50 {p50:?}, the process stood still {stalled:?} at most",
+                rate / 1e3
+            ));
+            if rate >= 0.9 * RATE as f64
+                || stalled < Duration::from_millis(100)
+                || windows.len() == 3
+            {
+                break (rate, p50);
+            }
+        };
         readers.iter().for_each(|r| r.abort());
-        rtts.sort();
-        let p50 = rtts[rtts.len() / 2];
         eprintln!(
-            "{n} parallel downloads: {:.0} KB/s, probe p50 {p50:?}, daemon {:?}",
-            rate / 1e3,
+            "{n} parallel downloads: {}, daemon {:?}",
+            windows.join("; then "),
             w.daemon.ep.pace_state()
         );
-        assert!(rate >= 0.9 * RATE as f64, "{n}: {rate}");
+        assert!(
+            rate >= 0.9 * RATE as f64,
+            "{n}: {rate}; windows: {}; {}",
+            windows.join("; "),
+            mbufs_note(&denied)
+        );
         assert!(p50 <= Duration::from_millis(150), "{n}: {p50:?}");
         // The ack clock: the peer acks on drain, so nearly every sample is trusted. Without
         // ack on drain, half or more of them are timer-bound (405 trusted, 579 bounded at 16).
@@ -381,15 +405,17 @@ const STUCK_BUFFER: u32 = 4096;
 
 /// (the live forward's 1 MiB echo, the agent's median request-and-answer).
 async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duration) {
+    let denied = mbufs_denied();
     let (deaf_port, deaf) = deaf_target().await;
-    let source = serve(|mut s| async move {
-        let buf = vec![9u8; 64 * 1024];
-        while write_all_retry(&mut s, &buf).await.is_ok() {}
-    })
-    .await;
+    let source = endless_source().await;
     let echo = echo_server().await;
     let agent = echo_server().await;
     w.client.targets.set_agent(agent.port);
+    // The downloads end at sockets nobody reads, so what the kernel buffers between the endless
+    // source and the daemon is never drained; it is not what is tested (the endpoints' state
+    // and the live forward are), and unbounded it held megabytes per connection
+    // (`bounded_buffers`).
+    *w.daemon.targets.wrap.lock().unwrap() = Some(bounded_buffers());
     let up_port = w.local_forward(1, deaf_port);
     let down_port = w.local_forward(2, source.port);
     let echo_port = w.local_forward(3, echo.port);
@@ -438,34 +464,29 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
     );
     // The agent: the daemon opens an agent channel for a process on the host, which asks and
     // waits for the answer, 20 times.
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
-    let (theirs, _) = l.accept().await.unwrap();
-    w.daemon
-        .ep
-        .open_stream(
-            OpenKind::Agent,
-            Box::new(theirs),
-            fil_forward::LocalPeer::Unix(None),
-        )
-        .expect("the agent channel opens");
+    let mut agent = Agent::open(w).await;
     let mut rtts = Vec::new();
     let req = vec![3u8; 1024];
     let mut back = vec![0u8; 1024];
-    for _ in 0..20 {
-        let t = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(10), asker.read_exact(&mut back))
+    for i in 0..20 {
+        let took = agent
+            .ask(w, &req, &mut back, Duration::from_secs(10))
             .await
-            .expect("the agent answered beside stuck forwards")
-            .unwrap();
-        rtts.push(t.elapsed());
+            .unwrap_or_else(|e| {
+                panic!(
+                    "agent request #{i} beside stuck forwards: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
+                )
+            });
+        rtts.push(took);
     }
     rtts.sort();
     eprintln!(
-        "{k} stuck each way ({moved} bytes moved): 1 MiB echo in {echo_took:?}, agent p50 {:?} max {:?}; client {:?}, daemon {:?}",
+        "{k} stuck each way ({moved} bytes moved): 1 MiB echo in {echo_took:?}, agent p50 {:?} max {:?}{}; client {:?}, daemon {:?}",
         rtts[10],
         rtts[19],
+        agent.note(),
         w.client.ep.pace_state(),
         w.daemon.ep.pace_state()
     );
@@ -540,6 +561,7 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
 async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent(
     t: Transport,
 ) {
+    let denied = mbufs_denied();
     // A deaf target with a tiny receive buffer, so the channel is stuck within a second.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(2048).unwrap();
@@ -585,31 +607,26 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     let echo_took = t0.elapsed();
     // The agent: the daemon opens an agent channel, a process on the host asks and waits for
     // the answer; the answer goes back through the client's data sender, behind the trickle.
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
-    let (theirs, _) = l.accept().await.unwrap();
-    w.daemon
-        .ep
-        .open_stream(
-            OpenKind::Agent,
-            Box::new(theirs),
-            fil_forward::LocalPeer::Unix(None),
-        )
-        .expect("the agent channel opens");
+    let mut agent = Agent::open(&w).await;
     let req = vec![3u8; 1024];
     let mut back = vec![0u8; 1024];
     let mut worst = Duration::ZERO;
-    for _ in 0..10 {
-        let t1 = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+    for i in 0..10 {
+        let took = agent
+            .ask(&w, &req, &mut back, Duration::from_secs(5))
             .await
-            .expect("the agent answered beside the trickling channel")
-            .unwrap();
-        worst = worst.max(t1.elapsed());
+            .unwrap_or_else(|e| {
+                panic!(
+                    "agent request #{i} beside the trickling channel: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
+                )
+            });
+        worst = worst.max(took);
     }
     eprintln!(
-        "{t:?}: beside a trickling stuck channel: 256 KiB echo in {echo_took:?}, agent at most {worst:?}; client {:?} {:?}",
+        "{t:?}: beside a trickling stuck channel: 256 KiB echo in {echo_took:?}, agent at most {worst:?}{}; client {:?} {:?}",
+        agent.note(),
         w.client.ep.pace_state(),
         w.client.ep.snapshot()
     );
@@ -623,10 +640,119 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     deaf.abort();
 }
 
+/// A process on the daemon's host that asks the agent through an `Agent` channel the daemon
+/// opened (as `fil-session`'s socket does), and its requests.
+///
+/// **A reset for want of kernel memory is the kernel's, not the test's subject.** On macOS a
+/// local socket call that fails with `ENOBUFS` or `ENOMEM` may have moved part of its bytes, so
+/// the endpoint resets the channel instead of retrying (`ForwardStream::no_memory_moves_nothing`,
+/// DESIGN.md section 8.5), and the asker sees `ECONNRESET`. The macOS 15 Intel runner's kernel
+/// fails such calls now and then with 2 to 3 % of its network memory in use (`netstat -m`:
+/// "requests for memory delayed"); run 41898064507 recorded `LocalError { write: true, errno:
+/// Some(55) }` on the agent channel at both ends' resets, beside the tests' own sockets' retries.
+/// So a request whose channel an endpoint reset for exactly that reason (its own record of the
+/// errno on that channel's id, off Linux only) is asked again on a new channel, at most [`NO_MEMORY_RESETS`] times in
+/// all; the time to the answer that counts is that of the request that got one. Any other
+/// failure, or a reset with no such record, fails the test as before.
+struct Agent {
+    asker: TcpStream,
+    /// The agent channel's id (the wire's, the same at both ends).
+    channel: u32,
+    /// The resets taken for kernel memory, for the note.
+    resets: Vec<String>,
+}
+
+impl Agent {
+    async fn open(w: &World) -> Self {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (theirs, _) = l.accept().await.unwrap();
+        let before = w.daemon.ep.channels();
+        w.daemon
+            .ep
+            .open_stream(
+                OpenKind::Agent,
+                Box::new(theirs),
+                fil_forward::LocalPeer::Unix(None),
+            )
+            .expect("the agent channel opens");
+        // The one channel the daemon opened just now (the forwards' are the client's).
+        let mine: Vec<u32> = w
+            .daemon
+            .ep
+            .channels()
+            .into_iter()
+            .filter(|c| !before.contains(c))
+            .filter(|&c| w.daemon.ep.channel_info(c).is_some_and(|i| i.ours))
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "the agent channel among the new ones: {mine:?}"
+        );
+        Self {
+            asker,
+            channel: mine[0],
+            resets: Vec::new(),
+        }
+    }
+
+    /// One request: the time to its answer, within `limit`.
+    async fn ask(
+        &mut self,
+        w: &World,
+        req: &[u8],
+        back: &mut [u8],
+        limit: Duration,
+    ) -> Result<Duration, String> {
+        loop {
+            let t = std::time::Instant::now();
+            let e = match timeout(limit, ask(&mut self.asker, req, back)).await {
+                Ok(Ok(())) => return Ok(t.elapsed()),
+                Err(_) => return Err(format!("no answer in {limit:?}")),
+                Ok(Err(e)) => e,
+            };
+            // The endpoint's own record comes with the reset: a moment for it to land.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let new = kernel_memory_resets(w);
+            // Only a reset of this request's own channel, for want of kernel memory.
+            let own: Vec<_> = new.iter().filter(|r| r.channel == self.channel).collect();
+            let ours = e.kind() == std::io::ErrorKind::ConnectionReset && !own.is_empty();
+            if !ours || self.resets.len() == NO_MEMORY_RESETS {
+                return Err(format!(
+                    "{e} (after {} resets for want of kernel memory: {:?})",
+                    self.resets.len(),
+                    self.resets
+                ));
+            }
+            self.resets.push(format!("{own:?}"));
+            *self = Self {
+                resets: std::mem::take(&mut self.resets),
+                ..Self::open(w).await
+            };
+        }
+    }
+
+    /// The resets taken, for a line of output.
+    fn note(&self) -> String {
+        if self.resets.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; asked again after {} resets for want of kernel memory: {:?}",
+                self.resets.len(),
+                self.resets
+            )
+        }
+    }
+}
+
 /// The agent alone beside the trickling channel of the test above: a request every 500 ms (whose
 /// acks park the stuck channel), each answered; the answers go back through the client's data
 /// sender, which the trickle's payloads once filled for good.
 async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transport) {
+    let denied = mbufs_denied();
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(2048).unwrap();
     sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -649,39 +775,36 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut asker = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
-    let (theirs, _) = l.accept().await.unwrap();
-    w.daemon
-        .ep
-        .open_stream(
-            OpenKind::Agent,
-            Box::new(theirs),
-            fil_forward::LocalPeer::Unix(None),
-        )
-        .expect("the agent channel opens");
+    let mut agent = Agent::open(&w).await;
     let req = vec![3u8; 1024];
     let mut back = vec![0u8; 1024];
     let mut worst = Duration::ZERO;
     for i in 0..16 {
-        let t1 = std::time::Instant::now();
-        asker.write_all(&req).await.unwrap();
-        timeout(Duration::from_secs(5), asker.read_exact(&mut back))
+        let took = agent
+            .ask(&w, &req, &mut back, Duration::from_secs(5))
             .await
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|e| {
                 panic!(
-                    "{t:?}: agent request #{i} stalled beside the trickling channel: client {:?} {:?}",
-                    w.client.ep.pace_state(),
-                    w.client.ep.snapshot()
+                    "{t:?}: agent request #{i}: {e}; {}{}",
+                    mbufs_note(&denied),
+                    w.report()
                 )
-            })
-            .unwrap();
-        worst = worst.max(t1.elapsed());
+            });
+        worst = worst.max(took);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    eprintln!("{t:?}: the agent beside a trickling stuck channel: at most {worst:?}");
-    // Milliseconds on these links; a wait for a timer (100 ms and more) must fail this.
-    assert!(worst <= Duration::from_millis(60), "{worst:?}");
+    eprintln!(
+        "{t:?}: the agent beside a trickling stuck channel: at most {worst:?}{}",
+        agent.note()
+    );
+    // Milliseconds on these links; a wait for a timer (100 ms and more) must fail this. So does
+    // a loopback segment the kernel dropped for want of mbufs and sent again on its retransmit
+    // timer (macOS), which the note shows.
+    assert!(
+        worst <= Duration::from_millis(60),
+        "{worst:?}; {}",
+        mbufs_note(&denied)
+    );
     writer.abort();
     deaf.abort();
 }

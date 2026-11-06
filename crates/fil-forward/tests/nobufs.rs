@@ -52,9 +52,14 @@ per_transport!(
 const N: u64 = 1 << 20;
 
 /// A server that reads to the end and answers with the SHA-256 of what it got and its length.
+/// A connection that is reset instead (as the endpoint resets it on purpose in
+/// [`a_channel_that_ends_during_the_wait_releases_its_pump`]) gets no answer: the server drops
+/// it, and a test that expected the answer fails on its own side ([`send_and_check`]).
 async fn digest_server() -> Server {
     serve(|mut s| async move {
-        let (digest, len) = read_stream(&mut s, None).await.unwrap();
+        let Ok((digest, len)) = read_stream(&mut s, None).await else {
+            return;
+        };
         let mut answer = digest;
         answer.extend_from_slice(&len.to_be_bytes());
         write_all_retry(&mut s, &answer).await.unwrap();
@@ -72,6 +77,7 @@ async fn send_and_check(port: u16, seed: u64, n: u64) {
     s.read_to_end(&mut answer)
         .await
         .expect("the connection was not reset");
+    assert_eq!(answer.len(), 40, "the server's answer: {answer:?}");
     let (digest, len) = answer.split_at(32);
     assert_eq!(len, n.to_be_bytes(), "the server got {len:?} bytes");
     assert!(digest == sent, "the server got other bytes than were sent");

@@ -26,8 +26,12 @@ class Fil < Formula
     # The remote bundle that `fil install` uploads; the client finds it at ../libexec/fil/remote
     # from its own canonical path, which in the Cellar is prefix/libexec/fil/remote.
     libexec.install "libexec/fil"
-    man1.install Dir["share/man/man1/*.1"]
-    man5.install Dir["share/man/man5/*.5"]
+    # Man pages and completions arrive with DOC; until the archive has them, install nothing
+    # (Homebrew warns about installing an empty list).
+    pages = Dir["share/man/man1/*.1"]
+    man1.install pages unless pages.empty?
+    pages = Dir["share/man/man5/*.5"]
+    man5.install pages unless pages.empty?
     {
       bash_completion => "share/bash-completion/completions/fil",
       zsh_completion  => "share/zsh/site-functions/_fil",
@@ -35,7 +39,8 @@ class Fil < Formula
     }.each do |dir, file|
       dir.install file if File.exist?(file)
     end
-    doc.install Dir["share/doc/fil/*"]
+    docs = Dir["share/doc/fil/*"]
+    doc.install docs unless docs.empty?
   end
 
   def caveats

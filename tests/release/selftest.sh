@@ -220,7 +220,7 @@ for badref in 314e5bc main v1 "$(printf 'A%.0s' {1..40})" "$(printf 'a%.0s' {1..
   grep -q '40-hex commit SHA' "$tmp/out.log" && pass "...with the 40-hex message" || { flunk "...with the 40-hex message"; sed "s/^/       | /" "$tmp/out.log"; }
 done
 # a release (not a dry run) rebuilds the tag's commit: another --ref is refused, the tag's own is fine
-tagcommit=$(git -C "$tmp/origin" rev-parse refs/tags/v1^{commit})
+tagcommit=$(git -C "$tmp/origin" rev-parse "refs/tags/v1^{commit}")
 expect_fail "release-verify refuses a --ref that is not the tag's commit" rv 1 --ref "$(printf 'c%.0s' {1..40})"
 grep -q "is not the commit of v1" "$tmp/out.log" && pass "...with that message" || { flunk "...with that message"; sed "s/^/       | /" "$tmp/out.log"; }
 rv 1 --ref "$tagcommit" > "$tmp/out.log" 2>&1 || true

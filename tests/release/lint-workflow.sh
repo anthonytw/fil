@@ -116,7 +116,7 @@ awk '
     }
     if (in_checkout && line ~ /persist-credentials:[ ]*false/) checkout_ok = 1
     # the word `secrets` in any case, with or without spaces around it: secrets.X, Secrets.X,
-    # SECRETS['X'], secrets ['X'], toJSON( secrets ), format('{0}', secrets), `secrets: inherit`
+    # SECRETS['X'], secrets ['X'], toJSON( secrets ), format(.., secrets), `secrets: inherit`
     if (tolower(line) ~ /(^|[^a-z0-9_])secrets([^a-z0-9_]|$)/) bad("a secret is referenced: " line)
     if (line ~ /pull_request_target/) bad("pull_request_target: " line)
     if (line ~ /actions\/cache/ || line ~ /rust-cache/ || line ~ /^ *cache:/ || line ~ /[ ]cache-[a-z-]*:/) bad("a cache: " line)

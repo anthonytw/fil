@@ -5,13 +5,10 @@
 class Fil < Formula
   desc "Remote shell for development over SSH that keeps your place"
   homepage "https://github.com/anthonytw/fil"
-  version "@VERSION@"
+  # macOS: the universal archive. (Homebrew does not allow url in on_macos; Linux overrides it.)
+  url "@URL_BASE@/fil-@VERSION@-universal-apple-darwin.tar.gz"
+  sha256 "@SHA256_UNIVERSAL_APPLE_DARWIN@"
   license "GPL-3.0-or-later"
-
-  on_macos do
-    url "@URL_BASE@/fil-@VERSION@-universal-apple-darwin.tar.gz"
-    sha256 "@SHA256_UNIVERSAL_APPLE_DARWIN@"
-  end
 
   on_linux do
     on_intel do
@@ -29,12 +26,21 @@ class Fil < Formula
     # The remote bundle that `fil install` uploads; the client finds it at ../libexec/fil/remote
     # from its own canonical path, which in the Cellar is prefix/libexec/fil/remote.
     libexec.install "libexec/fil"
-    man1.install Dir["share/man/man1/*.1"]
-    man5.install Dir["share/man/man5/*.5"]
-    bash_completion.install "share/bash-completion/completions/fil" if File.exist?("share/bash-completion/completions/fil")
-    zsh_completion.install "share/zsh/site-functions/_fil" if File.exist?("share/zsh/site-functions/_fil")
-    fish_completion.install "share/fish/vendor_completions.d/fil.fish" if File.exist?("share/fish/vendor_completions.d/fil.fish")
-    doc.install Dir["share/doc/fil/*"]
+    # Man pages and completions arrive with DOC; until the archive has them, install nothing
+    # (Homebrew warns about installing an empty list).
+    pages = Dir["share/man/man1/*.1"]
+    man1.install pages unless pages.empty?
+    pages = Dir["share/man/man5/*.5"]
+    man5.install pages unless pages.empty?
+    {
+      bash_completion => "share/bash-completion/completions/fil",
+      zsh_completion  => "share/zsh/site-functions/_fil",
+      fish_completion => "share/fish/vendor_completions.d/fil.fish",
+    }.each do |dir, file|
+      dir.install file if File.exist?(file)
+    end
+    docs = Dir["share/doc/fil/*"]
+    doc.install docs unless docs.empty?
   end
 
   def caveats

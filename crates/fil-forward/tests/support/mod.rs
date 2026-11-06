@@ -578,6 +578,27 @@ pub struct World {
     pub link: Option<LinkPair>,
 }
 
+impl World {
+    /// Both endpoints' [`endpoint_report_timed`], with what each side's harness saw (endpoint and
+    /// receive-loop errors, `LinkFailed`s), for a failure message.
+    pub fn report(&self) -> String {
+        let harness = |e: &End| {
+            format!(
+                "harness errors {:?}, LinkFailed {}",
+                e.errors.lock().unwrap_or_else(PoisonError::into_inner),
+                e.link_failed.load(Ordering::SeqCst)
+            )
+        };
+        format!(
+            "\n  client: {}; {}\n  daemon: {}; {}",
+            harness(&self.client),
+            endpoint_report_timed(&self.client.ep),
+            harness(&self.daemon),
+            endpoint_report_timed(&self.daemon.ep)
+        )
+    }
+}
+
 /// Raises this process's soft `RLIMIT_NOFILE` toward its hard limit, once: a test holds
 /// thousands of loopback sockets (both ends of every connection live in this process), more than
 /// the default soft limits (256 on macOS, 1,024 on Linux) allow.
@@ -755,6 +776,31 @@ pub fn is_no_buffers(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
 }
 
+/// The most channels a test lets the endpoints reset for want of kernel memory before the
+/// resets are the test's failure (see [`kernel_memory_resets`]).
+pub const NO_MEMORY_RESETS: usize = 3;
+
+/// The channels the endpoints, at both ends, reset at once because a local socket call failed
+/// with `ENOBUFS` or `ENOMEM`: on macOS only, where such a call may have moved part of its bytes
+/// and the endpoint cannot retry it without risking repeating them
+/// (`ForwardStream::no_memory_moves_nothing`, DESIGN.md section 8.5). That reset is fil's
+/// documented answer to the kernel's shortage, not a bug: a test whose subject is not the
+/// kernel's memory may tolerate up to [`NO_MEMORY_RESETS`] of them, and only these. A shortage
+/// the endpoint gave up on after waiting (`gave_up`, Linux) is not one of them.
+pub fn kernel_memory_resets(w: &World) -> Vec<fil_forward::LocalError> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let (mut v, _) = w.client.ep.local_errors();
+    v.extend(w.daemon.ep.local_errors().0);
+    v.retain(|e| {
+        use rustix::io::Errno;
+        !e.gave_up
+            && matches!(e.errno, Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
+    });
+    v
+}
+
 /// `e` with its errno in the message (the kind is kept, so `is_reset` and the like still see it).
 pub fn with_errno(e: io::Error, what: &str) -> io::Error {
     io::Error::new(
@@ -771,8 +817,13 @@ pub fn with_errno(e: io::Error, what: &str) -> io::Error {
 /// between, before the failure is the test's: the shortage is not passing.
 const NO_BUFFERS_LIMIT: Duration = Duration::from_secs(60);
 
+/// How many times the tests' own socket calls were tried again for want of kernel memory, in
+/// this process: for failure messages (macOS's mbuf pool running short shows here first).
+pub static NO_BUFFERS_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The wait before the `k`th retry of a call that failed with `ENOBUFS`: 1 ms doubling to 50 ms.
 async fn no_buffers_wait(since: &mut Option<tokio::time::Instant>, wait: &mut Duration) -> bool {
+    NO_BUFFERS_RETRIES.fetch_add(1, Ordering::Relaxed);
     let t0 = *since.get_or_insert_with(tokio::time::Instant::now);
     if t0.elapsed() >= NO_BUFFERS_LIMIT {
         return false;
@@ -809,6 +860,25 @@ pub async fn read_retry<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::
             r => return r,
         }
     }
+}
+
+/// One request and its answer of `back.len()` bytes, as an application asks: [`write_all_retry`]
+/// and [`read_retry`], so a test's own socket rides out a moment's `ENOBUFS` as the endpoint's
+/// do (the time it takes still counts in what the caller measures).
+pub async fn ask<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    req: &[u8],
+    back: &mut [u8],
+) -> io::Result<()> {
+    write_all_retry(s, req).await?;
+    let mut got = 0;
+    while got < back.len() {
+        match read_retry(s, &mut back[got..]).await? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            k => got += k,
+        }
+    }
+    Ok(())
 }
 
 /// Writes `n` deterministic bytes of stream `seed` to `w`, returning their SHA-256. A write
@@ -974,6 +1044,43 @@ pub fn shrink_buffers(s: &TcpStream) {
     rustix::net::sockopt::set_socket_send_buffer_size(s, STUCK_BUFFER as usize).unwrap();
 }
 
+/// The kernel buffers of a socket that carries data, bounded ([`bounded_buffers`],
+/// [`endless_source`]). Not [`STUCK_BUFFER`]: on Linux a receive buffer below loopback's MSS
+/// (65,483 bytes) leaves a window smaller than one segment, and the sender then waits for the
+/// 40 ms delayed ack each time (linux-check run 41905536060: 54 KB/s through the pace tests'
+/// downloads, against the 2.5 MB/s link). 128 KiB (Linux doubles it) keeps two segments in
+/// flight, and on macOS 32 downloads hold 8 MiB this way, not the 187 MiB of the defaults.
+pub const SOURCE_BUFFER: u32 = 128 * 1024;
+
+fn bound_buffers(s: &TcpStream) {
+    rustix::net::sockopt::set_socket_recv_buffer_size(s, SOURCE_BUFFER as usize).unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(s, SOURCE_BUFFER as usize).unwrap();
+}
+
+/// A [`Wrap`] that bounds the kernel buffers of every stream the endpoint connects to a target
+/// ([`SOURCE_BUFFER`]). For a forward whose target writes without end while the endpoint reads
+/// only as its window allows: the default (autotuned to 4 MiB a side on macOS) parks megabytes
+/// per connection in the kernel, which the tests never count, and a few dozen such connections
+/// take a small runner's whole mbuf pool (macOS: `parallel_downloads_keep_the_link_full` held
+/// 187 MiB on its own, beside tests whose sends then failed with `ENOBUFS`).
+pub fn bounded_buffers() -> Wrap {
+    Arc::new(|s| {
+        bound_buffers(&s);
+        Box::new(s)
+    })
+}
+
+/// A server that writes 64 KiB pieces to each connection for ever, with the socket's buffers
+/// bounded (see [`bounded_buffers`]).
+pub async fn endless_source() -> Server {
+    serve(|mut s| async move {
+        bound_buffers(&s);
+        let buf = vec![9u8; 64 * 1024];
+        while write_all_retry(&mut s, &buf).await.is_ok() {}
+    })
+    .await
+}
+
 // ---- a local socket that runs out of memory -----------------------------------------------------
 
 /// A local stream whose reads and writes fail with `ENOBUFS` when told to, as a kernel short of
@@ -1043,6 +1150,18 @@ impl Flaky {
     }
 }
 
+/// A failure of the real socket under a [`Flaky`]. The wrapper says its failures move nothing,
+/// which is true of its own; the kernel's `ENOBUFS` or `ENOMEM` from a real socket is that only
+/// on Linux. Elsewhere it is passed on as another error, so that the endpoint resets the channel
+/// as it would on the bare socket (a retry could repeat bytes and pass for fil's bug).
+fn real_failure(e: io::Error) -> io::Error {
+    if cfg!(target_os = "linux") || !is_no_buffers(&e) {
+        e
+    } else {
+        io::Error::other(format!("the real socket under a Flaky: {e}"))
+    }
+}
+
 impl AsyncRead for Flaky {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1054,7 +1173,9 @@ impl AsyncRead for Flaky {
         if (self.fail[0])(n) {
             return Poll::Ready(Err(self.enobufs()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map_err(real_failure)
     }
 }
 
@@ -1078,7 +1199,9 @@ impl AsyncWrite for Flaky {
             }
             return Poll::Ready(Err(self.enobufs()));
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_write(cx, buf)
+            .map_err(real_failure)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1162,6 +1285,52 @@ pub async fn probe(w: &mut World, i: u64) -> Duration {
     }
 }
 
+/// How late an OS thread of its own wakes from 5 ms sleeps, at worst, while it runs: a stall of
+/// the whole process or of the machine (a CI runner's VM descheduled), which no tokio task can
+/// cause, since the thread is not one of the runtime's. A rate measured across a stall of a few
+/// hundred milliseconds measures the runner: the simulated links lose the time no one sent in.
+pub struct StallWatch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worst: Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StallWatch {
+    pub fn start() -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, w) = (stop.clone(), worst.clone());
+        let thread = std::thread::spawn(move || {
+            let tick = Duration::from_millis(5);
+            while !s.load(Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                std::thread::sleep(tick);
+                let late = t.elapsed().saturating_sub(tick).as_micros() as u64;
+                w.fetch_max(late, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            worst,
+            thread: Some(thread),
+        }
+    }
+
+    /// The worst lateness so far.
+    pub fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for StallWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The scale knobs: heavy runs set them (`just forward-soak`).
 pub fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -1193,29 +1362,164 @@ pub fn test_limit() -> Duration {
 /// `multi_thread` tests, which cannot pause the clock, are wrapped.
 pub async fn bounded<F: Future>(body: F) -> F::Output {
     let limit = test_limit();
+    let denied = mbufs_denied();
     let mut body = std::pin::pin!(body);
     tokio::select! {
         v = &mut body => v,
         () = tokio::time::sleep(limit) => {
             // The body is still alive here, so its endpoints are in `WATCHED`. The name goes out
-            // first: a snapshot takes the endpoint's state lock, and if that is what the test is
-            // stuck on, the report never comes. The endpoints are cloned out of `WATCHED` so that
-            // a panic in a snapshot leaves the list unheld.
+            // first, in case the report never comes. Everything else goes in the panic message,
+            // which the test harness keeps (it captures what is printed).
             let name = thread_name();
-            eprintln!("{name}: still running after {limit:?}; taking the endpoints' snapshots");
-            let mine: Vec<_> = watched()
+            eprintln!("{name}: still running after {limit:?}; taking the endpoints' reports");
+            let (mine, others): (Vec<_>, Vec<_>) = watched()
                 .iter()
-                .filter(|(_, who, ..)| *who == name)
-                .map(|(_, _, side, ep)| (*side, ep.clone()))
-                .collect();
+                .filter(|(_, who, ..)| *who == name || !is_test_thread(who))
+                .map(|(_, who, side, ep)| (*who == name, *side, ep.clone()))
+                .partition(|(m, ..)| *m);
             let mut report = String::new();
-            for (side, ep) in mine {
-                report.push_str(&format!("\n  {side:?}: {:?}", ep.snapshot()));
+            let groups = [
+                ("endpoints", &mine),
+                ("endpoints built off a test thread (maybe another test's)", &others),
+            ];
+            for (title, eps) in groups {
+                if eps.is_empty() {
+                    continue;
+                }
+                report.push_str(&format!("\n{title}:"));
+                for (_, side, ep) in eps.iter() {
+                    report.push_str(&format!("\n  {side:?}: {}", endpoint_report_timed(ep)));
+                }
             }
-            if report.is_empty() {
-                report.push_str("\n  (no endpoint to report)");
+            if mine.is_empty() {
+                report.push_str("\n(no endpoint built on this test's thread)");
             }
-            panic!("{name}: still running after {limit:?}; endpoints:{report}");
+            report.push_str(&format!("\n{}", mbufs_note(&denied)));
+            panic!("{name}: still running after {limit:?}{report}");
         }
     }
+}
+
+/// Whether a thread is a test's own (named after the test) rather than a runtime's worker.
+fn is_test_thread(name: &str) -> bool {
+    !(name.starts_with("tokio-") || name == "?" || name == "main")
+}
+
+/// Where an endpoint stands, for a test's failure: its snapshot, its pacer, every pump alive with
+/// what its halves are doing and its channel's state, and the local socket errors that ended
+/// channels (with their errnos). Counts and states only.
+pub fn endpoint_report(ep: &Endpoint<TestLink>) -> String {
+    let (errors, seen) = ep.local_errors();
+    let mut r = format!(
+        "{:?}\n    pace {:?}\n    wakeups {:?}\n    local socket errors that ended channels: {seen}",
+        ep.snapshot(),
+        ep.pace_state(),
+        ep.wakeups(),
+    );
+    for e in &errors {
+        r.push_str(&format!("\n      {e:?}"));
+    }
+    let (closes, seen) = ep.abnormal_closes();
+    r.push_str(&format!(
+        "\n    channels the mux closed other than Done: {seen}"
+    ));
+    for c in &closes {
+        r.push_str(&format!("\n      {c:?}"));
+    }
+    let pumps = ep.pumps();
+    r.push_str(&format!("\n    pumps alive: {}", pumps.len()));
+    for p in &pumps {
+        r.push_str(&format!(
+            "\n      ch {} up {:?} down {:?} end {:?} {:?}",
+            p.channel, p.up, p.down, p.end, p.info
+        ));
+    }
+    r
+}
+
+/// [`endpoint_report`] on a thread of its own, given 10 s: an endpoint whose state lock is held
+/// for good (a deadlock) is reported as such instead of hanging the report.
+pub fn endpoint_report_timed(ep: &Endpoint<TestLink>) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ep = ep.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(endpoint_report(&ep));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|e| {
+            format!("(no report in 10 s: {e}; the endpoint's state lock is held, a deadlock?)")
+        })
+}
+
+/// What the kernel says about its socket memory, at one moment (macOS): see [`mbufs_denied`].
+pub struct KernelMemory {
+    /// The count of mbuf requests the kernel denied, ever (`netstat -m`), or why not.
+    denied: Result<u64, String>,
+    /// How many times the kernel made sockets defunct, ever (`kern.ipc.sodefunct_calls`): it
+    /// does so to a process's sockets under memory pressure, among other reasons, and the peer of
+    /// a defunct socket sees a reset.
+    defunct: Option<u64>,
+}
+
+/// The kernel's count of mbuf requests it denied, ever (`netstat -m`, macOS): what rises when
+/// the mbuf pool runs out and loopback sends fail with `ENOBUFS` or, inside TCP, are dropped and
+/// retransmitted on a timer. Why not, elsewhere or if it cannot be read: the macOS 15 Intel
+/// runner's `netstat -m` has no such line, so then the note carries the whole output. With it,
+/// the kernel's count of defunct sockets.
+pub fn mbufs_denied() -> KernelMemory {
+    if !cfg!(target_os = "macos") {
+        return KernelMemory {
+            denied: Err("not measured on this OS".into()),
+            defunct: None,
+        };
+    }
+    let defunct = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.ipc.sodefunct_calls"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
+    let denied = (|| {
+        let out = std::process::Command::new("/usr/sbin/netstat")
+            .arg("-m")
+            .output()
+            .map_err(|e| format!("netstat -m: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find(|l| l.contains("requests for memory denied"))
+            .and_then(|l| l.split_whitespace().next()?.parse().ok())
+            .ok_or_else(|| {
+                format!(
+                    "netstat -m ({}) has no count of denied requests: {:?} {:?}",
+                    out.status,
+                    text.lines().map(str::trim).collect::<Vec<_>>().join(" | "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )
+            })
+    })();
+    KernelMemory { denied, defunct }
+}
+
+/// A line for a failure message: the mbuf requests the kernel denied since `before` (from
+/// [`mbufs_denied`]), machine-wide, so other tests running at the same time count too.
+pub fn mbufs_note(before: &KernelMemory) -> String {
+    let retried = NO_BUFFERS_RETRIES.load(Ordering::Relaxed);
+    let now = mbufs_denied();
+    let denied = match (&before.denied, &now.denied) {
+        (Ok(b), Ok(a)) => format!(
+            "kernel mbuf requests denied since the test began: {} (machine-wide; {a} ever)",
+            a.saturating_sub(*b)
+        ),
+        (Err(e), _) | (_, Err(e)) => format!("kernel mbuf denials: {e}"),
+    };
+    let defunct = match (before.defunct, now.defunct) {
+        (Some(b), Some(a)) => format!(
+            "; sockets made defunct by the kernel since the test began: {} (machine-wide)",
+            a.saturating_sub(b)
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "{denied}{defunct}; the tests' own socket calls in this process were retried {retried} \
+         times for want of kernel memory"
+    )
 }

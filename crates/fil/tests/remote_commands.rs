@@ -757,7 +757,14 @@ fn a_failed_login_is_a_failure_in_every_install_mode() {
     ] {
         let out = w.run(args);
         let err = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "fil {args:?}: {err}");
+        // The status's text says which signal, if one ended the run (macOS Intel runner, once:
+        // no exit code and nothing on stderr).
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "fil {args:?} ({}): {err}",
+            out.status
+        );
         assert!(err.contains("status 255"), "fil {args:?}: {err}");
         assert!(
             out.stdout.is_empty(),

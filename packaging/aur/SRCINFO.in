@@ -1,0 +1,18 @@
+pkgbase = fil-shell-bin
+	pkgdesc = Remote shell for development over SSH that keeps your place: sessions survive reconnects, forwards outlive the link
+	pkgver = @PKGVER@
+	pkgrel = 1
+	url = https://github.com/anthonytw/fil
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	provides = fil-shell
+	conflicts = fil-shell
+	options = !strip
+	options = !debug
+	source_x86_64 = @URL_BASE@/fil-@VERSION@-x86_64-linux-musl.tar.gz
+	sha256sums_x86_64 = @SHA256_X86_64_LINUX_MUSL@
+	source_aarch64 = @URL_BASE@/fil-@VERSION@-aarch64-linux-musl.tar.gz
+	sha256sums_aarch64 = @SHA256_AARCH64_LINUX_MUSL@
+
+pkgname = fil-shell-bin

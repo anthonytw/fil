@@ -1,4 +1,6 @@
-//! Real programs on a PTY behind a `fil-netsim` link (feature `harness`).
+//! Real programs on a PTY behind a `fil-netsim` link: the module of the two harness examples
+//! (feature `harness`), which each include it. Not part of the library, so that the published
+//! crate does not depend on the unpublished test crates (docs/m4/packaging.md).
 //!
 //! The server side of the spike: a program on a PTY, a pump that frames its output for the
 //! client over a simulated pipe (with latency in both directions), and a termios sampler
@@ -25,8 +27,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::overlay::PtyMode;
-use crate::sim::Rng;
+use fil_predict::PtyMode;
+use fil_predict::sim::Rng;
 
 /// What to run.
 #[derive(Clone, Debug)]
@@ -365,7 +367,7 @@ fn typing(rng: &mut Rng, n: usize, words: &[&str]) -> Script {
             93..=94 => b"\x1b[D".to_vec(),
             95 => b"\x1b[C".to_vec(),
             96 => vec![0x15],
-            // Not from the reserved alphabet, which only secrets use (`crate::oracle::reserved`).
+            // Not from the reserved alphabet, which only secrets use (`fil_predict::oracle::reserved`).
             97 => "ā".as_bytes().to_vec(),
             98 => "日本".as_bytes().to_vec(),
             _ => vec![0x01],
@@ -486,7 +488,7 @@ fn password_keys(rng: &mut Rng, n: usize) -> Script {
     let mut v = Vec::new();
     while v.len() < n {
         // Typed ahead of the prompt, the way a fast typist does, from the reserved alphabet.
-        let secret: Vec<char> = crate::sim::SECRET.chars().collect();
+        let secret: Vec<char> = fil_predict::sim::SECRET.chars().collect();
         for _ in 0..rng.range(2, 8) {
             let c = *rng.pick(&secret);
             v.push((rng.range(8, 70), c.to_string().into_bytes()));
@@ -617,7 +619,7 @@ pub fn programs() -> Vec<Program> {
         },
         Program {
             name: "read-s",
-            secret: crate::sim::SECRET,
+            secret: fil_predict::sim::SECRET,
             spec: password_spec,
             keys: password_keys,
         },

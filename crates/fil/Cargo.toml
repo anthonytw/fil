@@ -1,12 +1,24 @@
 [package]
-name = "fil"
-description = "The fil binary: the CLI, the config file, the client's dialer (pipe and direct QUIC under the path manager) and the remote-side entry points (DESIGN.md sections 8, 14)"
+name = "fil-shell"
+# The package is `fil-shell` (`fil` on crates.io is someone else's: docs/m4/release.md section 10.1); the
+# binary and the library keep the name `fil`, and the directory stays crates/fil. The binary: the CLI,
+# the config file, the client's dialer (pipe and direct QUIC under the path manager) and the
+# remote-side entry points (DESIGN.md sections 8, 14).
+description = "fil, a remote shell for development over SSH: sessions that survive reconnects, roaming and sleep, take-over from another machine, port forwards that outlive the link, and direct QUIC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
+readme = "../../README.md"
+keywords = ["ssh", "shell", "terminal", "remote", "mosh"]
+categories = ["command-line-utilities", "network-programming"]
 rust-version.workspace = true
+
+# `use fil::...` in the tests, examples and fuzz target, as before the rename.
+[lib]
+name = "fil"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fil"
@@ -24,11 +36,11 @@ test = true
 [dependencies]
 bytes = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
-fil-client = { path = "../fil-client" }
-fil-daemon = { path = "../fil-daemon" }
-fil-forward = { path = "../fil-forward" }
-fil-proto = { path = "../fil-proto" }
-fil-transport = { path = "../fil-transport" }
+fil-client.workspace = true
+fil-daemon.workspace = true
+fil-forward.workspace = true
+fil-proto.workspace = true
+fil-transport.workspace = true
 # `localtime_r`, for the time zone of `fil ports` (rustix has no time zone calls): one narrow
 # `unsafe` in src/localtime.rs.
 libc = "0.2"

@@ -39,7 +39,7 @@ cd "$ROOT"
 
 for t in $DARWIN_TARGETS; do
   rustup target add "$t" >&2
-  cargo build --locked --release -p fil --target "$t"
+  cargo build --locked --release -p fil-shell --target "$t"
 done
 
 tdir=${CARGO_TARGET_DIR:-$ROOT/target}

@@ -20,11 +20,11 @@
 #   4. `release-check --no-exec` passes on the files (--tag v<VERSION> --complete): the files are
 #      unpacked, hashed, grepped and inspected, and NOTHING that came from the download is run
 #      (no `cargo` in the source archive, no `--version` of a binary);
-#   5. the Linux VM rebuilds the Linux binaries and the four archives from that commit in the
-#      digest-pinned images, and the hashes are compared with the release's. The rebuild judges the
-#      source archive byte for byte. Three archives (x86_64, aarch64, source) are reproduced from the
-#      source; the macOS archive is only REASSEMBLED around the released macOS binary, which is not
-#      rebuilt and is ad-hoc signed.
+#   5. the Linux VM rebuilds the Linux binaries, the four archives and the four .deb and .rpm
+#      packages from that commit in the digest-pinned images, and the hashes are compared with the
+#      release's. The rebuild judges the source archive byte for byte. Three archives (x86_64,
+#      aarch64, source) and the four packages are reproduced from the source; the macOS archive is
+#      only REASSEMBLED around the released macOS binary, which is not rebuilt and is ad-hoc signed.
 #
 # --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
 # or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (a commit SHA: the run's
@@ -117,10 +117,42 @@ if [ "$dry" = 0 ]; then
   sums_check "$dl" SHA256SUMS || die "STOP: the files do not match SHA256SUMS"
   ok "sha256sum -c SHA256SUMS"
 
+  # ---- 2b. the signed rpms and SHA256SUMS.asc (section 10.4), with the package key as it is on
+  # main. --pre-sign checks neither: the draft's rpms are not signed yet.
+  if [ "$presign" = 0 ]; then
+    pkey=$work/package-signing-key.asc
+    if [ -n "${FIL_PACKAGE_KEY_FILE:-}" ]; then
+      echo "release-verify: NOTE: FIL_PACKAGE_KEY_FILE is set: the rpm and SHA256SUMS.asc signatures are checked against $FIL_PACKAGE_KEY_FILE, NOT against .github/package-signing-key.asc on main" >&2
+      cp "$FIL_PACKAGE_KEY_FILE" "$pkey"
+    else git -C "$tagrepo" show "refs/remotes/origin/main:.github/package-signing-key.asc" > "$pkey" 2> /dev/null || : > "$pkey"; fi
+    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pkey" || die "STOP: .github/package-signing-key.asc on main holds no key: the rpm signatures cannot be verified"
+    command -v rpmkeys > /dev/null || die "STOP: rpmkeys is needed to verify the rpm signatures (macOS: brew install rpm)"
+    rm -rf "$work/rpmdb" && mkdir -m 700 "$work/rpmdb"
+    rpmkeys --dbpath "$work/rpmdb" --import "$pkey" || die "STOP: rpmkeys cannot import the package key"
+    for a in x86_64 aarch64; do
+      p=$(package_file rpm "$a" "$version")
+      rpmkeys --dbpath "$work/rpmdb" --checksig "$dl/$p" | grep -q 'signatures OK' || die "STOP: $p is not signed by the package key on main"
+      ok "$p carries a valid signature by the package key"
+    done
+    [ -f "$dl/SHA256SUMS.asc" ] || die "STOP: no SHA256SUMS.asc in the release"
+    gk=$work/pkgkey.kbx
+    rm -f "$gk"
+    gpg --no-default-keyring --keyring "$gk" --import "$pkey" 2> /dev/null || die "STOP: gpg cannot import the package key"
+    gpg --no-default-keyring --keyring "$gk" --verify "$dl/SHA256SUMS.asc" "$dl/SHA256SUMS" 2> /dev/null \
+      || die "STOP: SHA256SUMS.asc is not a valid signature of SHA256SUMS by the package key"
+    ok "SHA256SUMS.asc is a valid signature by the package key"
+  fi
+
   # ---- 3. attestations: this repository, this exact workflow identity at this tag, this commit
   # (--source-digest is the commit that was built, --signer-digest the commit of the workflow file),
-  # and no self-hosted runner.
-  for a in "$dl"/fil-"$version"-*.tar.gz; do
+  # and no self-hosted runner. After signing, the rpms are not the bytes CI attested (their
+  # signature header is new): their provenance is then the signature (2b) and the rebuild (5), which
+  # compares everything after the signature header.
+  for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|"); do
+    if [ "$presign" = 0 ] && [ "${a%.rpm}" != "$a" ]; then
+      echo "release-verify: note: $(basename "$a") is signed: its attestation (of the unsigned build) is not checked; the rebuild checks it" >&2
+      continue
+    fi
     if gh attestation verify "$a" --repo "$repo" \
       --cert-identity "https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag" \
       --source-ref "refs/tags/$tag" --source-digest "$commit" --signer-digest "$commit" \
@@ -164,13 +196,19 @@ if [ "$rebuild" = 1 ]; then
   limactl shell --workdir / "$vm" -- bash -c 'cd "$HOME/$1/out" && tar -cf - .' vm-sh "$vwork" | tar -xf - -C "$rb" || fail "could not copy the rebuilt files out of the VM"
   if [ -f "$rb/SHA256SUMS" ]; then
     echo "release-verify: rebuilt vs. released SHA256SUMS:" >&2
-    for kind in x86_64-linux-musl aarch64-linux-musl source universal-apple-darwin; do
-      n=fil-$version-$kind.tar.gz
+    for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz $(package_names "$version"); do
       h1=$(grep -F "  $n" "$dl/SHA256SUMS" | cut -d' ' -f1)
       h2=$(grep -F "  $n" "$rb/SHA256SUMS" | cut -d' ' -f1)
-      if [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
+      if [ "$presign" = 0 ] && [ "$dry" = 0 ] && [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "${n%.rpm}" != "$n" ] && [ -f "$dl/$n" ] && [ -f "$rb/$n" ]; then
+        # A signed rpm (after the owner's signing step only; before it, and in a dry run, an rpm must
+        # be the rebuild byte for byte): the rebuild is unsigned, so its lead and everything after the
+        # signature header must match.
+        b1=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$dl/$n" "$work/px1" | sed -n 's/^body //p')
+        b2=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$rb/$n" "$work/px2" | sed -n 's/^body //p')
+        if [ -n "$b1" ] && [ "$b1" = "$b2" ]; then ok "$n is REPRODUCED from source byte for byte apart from its signature header ($b1)"; else fail "$n: released body $b1, rebuilt body $b2"; fi
+      elif [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
         fail "$n: released $h1, rebuilt $h2"
-      elif [ "$kind" = universal-apple-darwin ]; then
+      elif [ "$n" = "fil-$version-universal-apple-darwin.tar.gz" ]; then
         ok "$n is REASSEMBLED identically around the released macOS binary (that binary was not rebuilt)"
       else
         ok "$n is REPRODUCED from source byte for byte ($h1)"

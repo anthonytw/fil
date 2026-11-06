@@ -90,6 +90,15 @@ mutate_wf "publish's if: loses its event check" "s/github.event_name == 'push' &
 mutate_wf "an expression in a one-line run:" 's/run: tests\/release\/prepare.sh/run: tests\/release\/prepare.sh \$\{\{ github.ref_name \}\}/'
 mutate_wf "an expression inside a run: block" 's/(          set -euo pipefail\n          for set in a b)/          echo \$\{\{ github.ref_name \}\}\n$1/'
 mutate_wf "workflow_dispatch takes inputs" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch:\n    inputs:\n      ref:\n        required: false\n/'
+mutate_wf "crates-io runs outside its environment" 's/(  crates-io:.*?)    environment: crates-io\n/$1/s'
+mutate_wf "crates-io runs in another environment" 's/    environment: crates-io\n/    environment: release\n/'
+mutate_wf "crates-io stops requiring a tag" 's/(  crates-io:.*?    if: github.event_name == .push.) && startsWith\(github.ref, .refs\/tags\/v.\)/$1/s'
+mutate_wf "crates-io gets attestations: write" 's/(      id-token: write # trusted publishing only\n)/$1      attestations: write\n/'
+mutate_wf "crates-io gets contents: write" 's/(  crates-io:.*?    permissions:\n      contents: )read/${1}write/s'
+mutate_wf "another job names the crates-io environment" 's/(  packages-arm64:\n.*?    runs-on: ubuntu-24.04-arm\n)/$1    environment: crates-io\n/s'
+mutate_wf "crates-io's actions: read becomes write" 's/(  crates-io:.*?      actions: )read/${1}write/s'
+mutate_wf "prepare's actions: read becomes write" 's/(  prepare:.*?      actions: )read/${1}write/s'
+mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -239,7 +248,10 @@ else /usr/bin/file "$@"; fi
 EOT
 chmod +x "$tmp/shim/file"
 tar_flags=
-tar --version 2> /dev/null | grep -q 'GNU tar' && tar_flags='--owner=0 --group=0 --numeric-owner'
+# GNU tar keeps the files' modes, and release-check (with GNU tar) refuses group or other write: fix
+# them, so that a umask of 002 (Ubuntu's default for a login) does not fail the clean cases. bsdtar
+# (macOS) is not checked for modes.
+tar --version 2> /dev/null | grep -q 'GNU tar' && tar_flags='--owner=0 --group=0 --numeric-owner --mode=u=rwX,go=rX'
 
 stage_release() { # uses $tree $stage $VER
   local lbl kind d saved=$ROOT
@@ -282,9 +294,48 @@ pack_release() { # uses $tree $stage $rel $VER
     # shellcheck disable=SC2086
     (cd "$stage" && tar $tar_flags -czf "$rel/fil-$VER-$lbl.tar.gz" "fil-$VER-$lbl" $extra)
   done
+  pack_packages
   write_sums
 }
-write_sums() { (cd "$rel" && for f in $(printf '%s\n' fil-"$VER"-*.tar.gz | LC_ALL=C sort); do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS); }
+# The four packages, from the staged Linux trees (selftest_pkg.py; the real ones come from nfpm).
+# Mutations, as files in the stage: .pkg-owner (a uid for every entry), .pkg-extra (one more file in
+# every package), .pkg-bin (a different bin/fil in every package), .pkg-version (another version),
+# .pkg-depends (a dependency), .pkg-script (a maintainer script), .pkg-rpm-dir (one more directory
+# the rpm owns).
+pack_packages() {
+  local a lbl kind arch d m f dst mode owner=0 pv=$VER dep='' scr=''
+  [ -f "$stage/.pkg-owner" ] && owner=$(cat "$stage/.pkg-owner")
+  [ -f "$stage/.pkg-version" ] && pv=$(cat "$stage/.pkg-version")
+  [ -f "$stage/.pkg-depends" ] && dep=$(cat "$stage/.pkg-depends")
+  [ -f "$stage/.pkg-script" ] && scr=1
+  pv=$(printf '%s' "$pv" | sed 's/-/~/')
+  for a in x86_64 aarch64; do
+    lbl=$a-linux-musl
+    d=$stage/fil-$VER-$lbl
+    for kind in deb rpm; do
+      m=$tmp/manifest
+      : > "$m"
+      while IFS= read -r f; do
+        dst=$(package_path "$kind" "$f")
+        if [ -x "$d/$f" ]; then mode=755; else mode=644; fi
+        src=$d/$f
+        [ "$f" = bin/fil ] && [ -f "$stage/.pkg-bin" ] && src=$stage/.pkg-bin
+        printf '%s\t%s\t%s\n' "$src" "$dst" "$mode" >> "$m"
+      done < <(cd "$d" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+      [ -f "$stage/.pkg-extra" ] && printf '%s\t%s\t%s\n' "$stage/.pkg-extra" /usr/bin/extra 755 >> "$m"
+      if [ "$kind" = rpm ]; then
+        # An rpm owns its own directories, as linux-packages.sh lists them.
+        (cd "$d" && find libexec/fil share/doc/fil -type d) | sed -e "s|^share/doc/fil|/usr/share/doc/$PACKAGE_NAME|" -e 's|^libexec|/usr/libexec|' \
+          | while IFS= read -r dst; do printf -- '-\t%s\t755\n' "$dst"; done >> "$m"
+        [ -f "$stage/.pkg-rpm-dir" ] && printf -- '-\t/usr/bin\t755\n' >> "$m"
+      fi
+      f=$(package_file "$kind" "$a" "$VER")
+      arch=$(package_arch "$kind" "$a")
+      SELFTEST_PKG_DEPENDS=$dep SELFTEST_PKG_SCRIPT=$scr python3 -I "$RELEASE_DIR/selftest_pkg.py" "$kind" "$rel/$f" "$PACKAGE_NAME" "$pv" 1 "$arch" "$owner" "$m"
+    done
+  done
+}
+write_sums() { (cd "$rel" && for f in $({ printf '%s\n' fil-"$VER"-*.tar.gz; package_names "$VER"; } | LC_ALL=C sort); do if [ -f "$f" ]; then printf '%s  %s\n' "$(sha256 "$f")" "$f"; fi; done > SHA256SUMS); }
 
 case_n=0
 new_case() { # VER: a tree, a stage and the packed release; sets $tree $stage $rel $VER
@@ -378,6 +429,100 @@ mutated_msg "an archive's notices are not the source archive's" "differs from th
   "echo '- stale' >> fil-0.9.0-universal-apple-darwin/share/doc/fil/THIRD-PARTY-NOTICES.md"
 mutated_msg "the source archive lacks the notices" "fil-0.9.0-source.tar.gz lacks THIRD-PARTY-NOTICES.md" "touch .source-drop-notices"
 mutated "the binary is not static" "perl -pi -e 's/FAKE-ELF-X86/FAKE-DYNAMIC/' fil-0.9.0-x86_64-linux-musl/bin/fil"
+# the .deb and .rpm packages
+mutated_msg "a package's files are not root's" "not those of" "echo 1000 > .pkg-owner"
+mutated_msg "a package holds a file its archive does not" "not those of" "echo x > .pkg-extra"
+mutated_msg "a package's bin/fil is not the archive's" "files differ from the archive's" "cp fil-0.9.0-x86_64-linux-musl/bin/fil .pkg-bin && echo '# other' >> .pkg-bin"
+mutated_msg "a package says another version" "not 'fil 0.9.0-1" "echo 0.9.1 > .pkg-version"
+mutated_msg "a package has a dependency" "maintainer scripts or dependencies" "echo libc6 > .pkg-depends"
+mutated_msg "a package has a maintainer script" "maintainer scripts or dependencies" "touch .pkg-script"
+mutated_msg "an rpm owns a directory that is not its own" "owns the directories" "touch .pkg-rpm-dir"
+new_case 0.9.0-rc.1
+expect_pass "a pre-release's packages carry the version 0.9.0~rc.1-1" check --dry-run --no-tree "$rel"
+new_case 0.9.0
+rm "$rel/fil_0.9.0_arm64.deb"
+write_sums
+expect_fail "mutation: a package is missing" check --dry-run --no-tree "$rel"
+new_case 0.9.0
+cp "$rel/fil_0.9.0_amd64.deb" "$rel/fil_0.9.0_arm64.deb"
+write_sums
+mutated_check_msg() { if check --dry-run --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "$1 (it should have failed)"; elif grep -qF -- "$2" "$tmp/out.log"; then pass "$1"; else flunk "$1 (failed, but not with '$2')"; sed 's/^/       | /' "$tmp/out.log" | tail -5; fi; }
+mutated_check_msg "mutation: the arm64 .deb is the amd64 one" "not 'fil 0.9.0-1 arm64'"
+new_case 0.9.0
+printf 'not a package' > "$rel/fil-0.9.0-1.x86_64.rpm"
+write_sums
+mutated_check_msg "mutation: an rpm that is not one" "cannot be read"
+# A signed rpm: only its signature header changes, which pkg_inspect sees, and its body does not.
+new_case 0.9.0
+r=$rel/fil-0.9.0-1.x86_64.rpm
+body() { python3 -I "$RELEASE_DIR/pkg_inspect.py" "$1" "$tmp/pi-$RANDOM" | sed -n "s/^$2 //p"; }
+b0=$(body "$r" body)
+cp "$r" "$tmp/signed.rpm"
+python3 -I "$RELEASE_DIR/selftest_pkg.py" sign "$tmp/signed.rpm"
+expect_pass "pkg_inspect: an unsigned rpm says signed no" test "$(body "$r" signed)" = no
+expect_pass "pkg_inspect: a signed rpm says signed yes" test "$(body "$tmp/signed.rpm" signed)" = yes
+expect_pass "pkg_inspect: signing changes the file" sh -c '! cmp -s "$1" "$2"' sh "$r" "$tmp/signed.rpm"
+expect_pass "pkg_inspect: ...and not the body (header and payload)" test "$(body "$tmp/signed.rpm" body)" = "$b0"
+python3 -I "$RELEASE_DIR/selftest_pkg.py" tamper "$tmp/signed.rpm"
+expect_fail "pkg_inspect: a changed payload changes the body" test "$(body "$tmp/signed.rpm" body)" = "$b0"
+cp "$r" "$tmp/s2.rpm" && python3 -I "$RELEASE_DIR/selftest_pkg.py" sign "$tmp/s2.rpm" && cp "$tmp/s2.rpm" "$r" && write_sums
+expect_pass "release-check passes a release whose rpm is signed" check --dry-run --no-tree "$rel"
+# Versions the packages can carry (nfpm's semver): X.Y.Z and X.Y.Z-PRE.
+for v in 0.1.0 0.1.0-rc.1 1.20.3-beta.2; do expect_pass "package version $v is accepted" package_version_ok "$v"; done
+for v in 1.0 0.1 0.1.0-rc-2 0.1.0+b 0.1.0-; do expect_fail "package version $v is refused" package_version_ok "$v"; done
+expect_pass "package_version: 0.1.0-rc.1 is 0.1.0~rc.1-1" test "$(package_version 0.1.0-rc.1)" = "0.1.0~rc.1-1"
+
+# The owner's package signing (sign-packages.sh), on fake gpg, rpmsign and rpmkeys.
+st=$tmp/sign
+mkdir -p "$st"
+printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake\n-----END PGP PUBLIC KEY BLOCK-----\n' > "$st/key.asc"
+cat > "$st/gpg" << 'EOF2'
+#!/bin/sh
+case " $* " in
+  *" --show-keys "*) printf 'pub:u:4096:1:AAAA:1:::u:::sc:\nfpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n' ;;
+  *" --detach-sign "*) while [ $# -gt 0 ]; do [ "$1" = --output ] && o=$2; shift; done; echo SIG > "$o" ;;
+  *" --verify "*) [ -z "$FAKE_GPG_BAD" ] ;;
+  *) exit 0 ;;
+esac
+EOF2
+cat > "$st/rpmsign" << EOF2
+#!/bin/sh
+for a; do f=\$a; done
+python3 -I "$RELEASE_DIR/selftest_pkg.py" sign "\$f"
+[ -z "\$FAKE_TAMPER" ] || python3 -I "$RELEASE_DIR/selftest_pkg.py" tamper "\$f"
+EOF2
+cat > "$st/rpmkeys" << 'EOF2'
+#!/bin/sh
+case " $* " in
+  *" --checksig "*) for a; do f=$a; done; if [ -n "$FAKE_RPMKEYS_BAD" ]; then echo "$f: digests SIGNATURES NOT OK"; else echo "$f: digests signatures OK"; fi ;;
+  *) exit 0 ;;
+esac
+EOF2
+chmod +x "$st/gpg" "$st/rpmsign" "$st/rpmkeys"
+sp() { env FIL_GPG="$st/gpg" FIL_RPMSIGN="$st/rpmsign" FIL_RPMKEYS="$st/rpmkeys" FIL_PACKAGE_KEY_FILE="$st/key.asc" FIL_RELEASE_ROOT="$tree" "$@" "$RELEASE_DIR/sign-packages.sh" 0.9.0 "$rel"; }
+new_case 0.9.0
+cp "$rel/SHA256SUMS" "$tmp/sums.before"
+b_before=$(body "$rel/fil-0.9.0-1.aarch64.rpm" body)
+expect_pass "sign-packages: signs the two rpms" sp
+expect_pass "sign-packages: ...which then say signed yes, with the same body" sh -c 'test "$1" = yes && test "$2" = "$3"' sh "$(body "$rel/fil-0.9.0-1.aarch64.rpm" signed)" "$(body "$rel/fil-0.9.0-1.aarch64.rpm" body)" "$b_before"
+expect_pass "sign-packages: ...the .debs are untouched" sh -c 'grep "_amd64.deb\$" "$1" | cmp -s - "$2"' sh "$rel/SHA256SUMS" <(grep '_amd64.deb$' "$tmp/sums.before")
+expect_pass "sign-packages: ...SHA256SUMS is rewritten and checks" sh -c '! cmp -s "$1" "$2"' sh "$rel/SHA256SUMS" "$tmp/sums.before"
+expect_pass "sign-packages: ...sums_check passes" sums_check "$rel" SHA256SUMS
+expect_pass "sign-packages: ...and SHA256SUMS.asc is written" test -s "$rel/SHA256SUMS.asc"
+expect_pass "release-check passes the signed release" check --dry-run --no-tree "$rel"
+new_case 0.9.0
+cp "$rel/fil-0.9.0-1.x86_64.rpm" "$tmp/x86.before"
+expect_fail "sign-packages: an rpmsign that changes more than the signature header is refused" sp FAKE_TAMPER=1
+expect_pass "sign-packages: ...and the rpm in the release directory is left as it was" cmp "$rel/fil-0.9.0-1.x86_64.rpm" "$tmp/x86.before"
+new_case 0.9.0
+expect_fail "sign-packages: a signature rpmkeys does not verify is refused" sp FAKE_RPMKEYS_BAD=1
+new_case 0.9.0
+expect_fail "sign-packages: a SHA256SUMS.asc that does not verify is refused" sp FAKE_GPG_BAD=1
+new_case 0.9.0
+printf '# placeholder\n' > "$st/nokey.asc"
+expect_fail "sign-packages: no key in the key file, no signing" env FIL_GPG="$st/gpg" FIL_RPMSIGN="$st/rpmsign" FIL_RPMKEYS="$st/rpmkeys" FIL_PACKAGE_KEY_FILE="$st/nokey.asc" FIL_RELEASE_ROOT="$tree" "$RELEASE_DIR/sign-packages.sh" 0.9.0 "$rel"
+echo tampered >> "$rel/fil_0.9.0_amd64.deb"
+expect_fail "sign-packages: files that do not match SHA256SUMS are refused" sp
 
 # --no-exec: nothing from the download runs. The source archive's own cargo config names a rustc
 # wrapper; `cargo metadata` runs it (so the fixture is sensitive), --no-exec must not.
@@ -487,6 +632,71 @@ expect_fail "a v<version> tag whose commit is not on main is refused" prep v0.9.
 tree=$main_tree
 expect_pass "a workflow_dispatch run is a dry run (release=false)" bash -c "cd '$tmp' && : > gho && FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/x GITHUB_OUTPUT='$tmp/gho' '$RELEASE_DIR/prepare.sh' && grep -q '^release=false' gho"
 expect_fail "a push that is not a v* tag is refused" bash -c "FIL_RELEASE_ROOT='$tree' GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main '$RELEASE_DIR/prepare.sh'"
+# The tag moved after the run started (deleted and pushed again on another commit): the run's
+# checked-out commit is the old one, and a waiting job must not build or publish it.
+new_case 0.9.0
+git -C "$tree" tag -a -m "fil 0.9.0" v0.9.0
+rm -rf "$tmp/w"
+git clone -q "$tree" "$tmp/w"
+echo later > "$tree/later"
+git -C "$tree" add later
+git -C "$tree" commit -q -m "a fix"
+git -C "$tree" tag -f -a -m "fil 0.9.0, again" v0.9.0 > /dev/null
+: > "$tmp/gho"
+expect_fail "a tag that now names another commit than the run's is refused" env FIL_RELEASE_ROOT="$tmp/w" GITHUB_EVENT_NAME=push GITHUB_REF=refs/tags/v0.9.0 GITHUB_REF_NAME=v0.9.0 GITHUB_OUTPUT="$tmp/gho" "$RELEASE_DIR/prepare.sh"
+grep -q 'is now commit' "$tmp/out.log" && pass "...and says so" || { flunk "...and says so"; sed 's/^/       | /' "$tmp/out.log" | tail -3; }
+
+# ============================================================== 4b'. the crates-io job's gate (crates-io-gate.sh)
+echo "== crates-io-gate.sh"
+gate=$RELEASE_DIR/crates-io-gate.sh
+gt=$tmp/gate
+mkdir -p "$gt/files"
+# A repository whose main lists the release key, and a release whose SHA256SUMS that key signed.
+git init -q -b main "$gt/repo"
+mkdir -p "$gt/repo/.github"
+signer_line "$keys/release" | sed 's/namespaces="git,fil-release"/namespaces="fil-release"/' > "$gt/repo/.github/release-signers"
+git -C "$gt/repo" add -A && git -C "$gt/repo" commit -q -m main
+git -C "$gt/repo" update-ref refs/remotes/origin/main HEAD
+echo "sums" > "$gt/files/SHA256SUMS"
+ssh-keygen -q -Y sign -f "$keys/release" -n fil-release "$gt/files/SHA256SUMS"
+cat > "$gt/gh" << 'EOF2'
+#!/bin/sh
+# FAKE_ENV: the environment's user reviewers (owner, bot, none, missing); FAKE_DRAFT: true, false or missing
+case "$1 $2" in
+  "api repos/"*)
+    case $FAKE_ENV in owner) echo "splarg-bot anthonytw" ;; bot) echo splarg-bot ;; none) echo ;; *) echo "HTTP 403" >&2; exit 1 ;; esac ;;
+  "release view")
+    [ "$FAKE_DRAFT" = missing ] && exit 1
+    echo "$FAKE_DRAFT" ;;
+  "release download")
+    while [ $# -gt 0 ]; do [ "$1" = -D ] && d=$2; shift; done
+    cp "$FAKE_FILES"/SHA256SUMS "$FAKE_FILES"/SHA256SUMS.sig "$d"/ ;;
+  *) exit 2 ;;
+esac
+EOF2
+chmod +x "$gt/gh"
+g_run() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY=o/r FAKE_FILES="$gt/files" "$@" "$gate" v0.9.0; }
+expect_pass "gate: a protected environment, a published release, a valid signature" g_run FAKE_ENV=owner FAKE_DRAFT=false
+expect_fail "gate: an environment with no required reviewer is refused" g_run FAKE_ENV=none FAKE_DRAFT=false
+expect_fail "gate: an environment whose only reviewer is not the owner is refused" g_run FAKE_ENV=bot FAKE_DRAFT=false
+g_env() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY=o/r "$@"; }
+expect_pass "gate --environment-only: the owner reviews" g_env FAKE_ENV=owner "$gate" --environment-only
+expect_fail "gate --environment-only: an environment the token cannot read is an error on a tag push" g_env FAKE_ENV=missing "$gate" --environment-only
+expect_pass "gate --environment-only --warn: ...and a warning on a dry run" g_env FAKE_ENV=missing "$gate" --environment-only --warn
+grep -q '::warning::cannot read the crates-io environment' "$tmp/out.log" && pass "...which says so" || { flunk "...which says so"; sed 's/^/       | /' "$tmp/out.log"; }
+expect_fail "gate: an environment that cannot be read is refused" g_run FAKE_ENV=missing FAKE_DRAFT=false
+expect_fail "gate: a draft is refused" g_run FAKE_ENV=owner FAKE_DRAFT=true
+expect_fail "gate: a release the job cannot see is refused" g_run FAKE_ENV=owner FAKE_DRAFT=missing
+cp "$gt/files/SHA256SUMS.sig" "$gt/good.sig"
+echo "other" > "$gt/files/SHA256SUMS"
+expect_fail "gate: a SHA256SUMS.sig that does not match SHA256SUMS is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false
+echo "sums" > "$gt/files/SHA256SUMS"
+rm "$gt/files/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -f "$keys/attacker" -n fil-release "$gt/files/SHA256SUMS"
+expect_fail "gate: a signature by a key that main does not list is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false
+rm -f "$gt/files/SHA256SUMS.sig"
+cp "$gt/good.sig" "$gt/files/SHA256SUMS.sig"
+expect_pass "gate: (the good signature again passes)" g_run FAKE_ENV=owner FAKE_DRAFT=false
 
 # ============================================================== 4c. crates.io name reservation
 echo "== reserve-crate-names.sh"
@@ -614,6 +824,67 @@ expect_pass "reserve-crate-names: any other failure is not retried" test "$(rc_r
 expect_pass "reserve-crate-names: a bare 429 in the text is not a rate limit" test "$(rc_retry 2 'error: crate size 4290 bytes exceeds')" = "1 101"
 expect_pass "reserve-crate-names: a 429 that does not clear gives up" test "$(rc_retry 99 'status 429 Too Many Requests')" = "4 101"
 
+# ============================================================== 4d. the published crates (publish-crates.sh)
+echo "== publish-crates.sh"
+pc=$RELEASE_DIR/publish-crates.sh
+pc_order=$("$pc" --list)
+expect_pass "publish-crates: the crates with publish = [\"crates-io\"] are the nine reserved names" \
+  test "$(printf '%s\n' $pc_order | LC_ALL=C sort | tr '\n' ' ')" = "$(printf '%s\n' $rc_names | LC_ALL=C sort | tr '\n' ' ')"
+expect_pass "publish-crates: fil-proto first, fil-shell last" sh -c 'case "$1" in "fil-proto "*" fil-shell") exit 0 ;; *) exit 1 ;; esac' sh "$pc_order"
+for n in $rc_names; do
+  d=$n
+  [ "$n" != fil-shell ] || d=fil
+  expect_pass "crates: $n's LICENSE is a link to the root LICENSE (cargo packages its text)" test "$(readlink "$REPO_ROOT/crates/$d/LICENSE")" = ../../LICENSE
+done
+for c in fil-netsim fil-testkit fil-testbins; do
+  expect_pass "publish-crates: $c is publish = false" grep -qx 'publish = false' "$REPO_ROOT/crates/$c/Cargo.toml"
+done
+wsv=$(cargo_version)
+expect_pass "every [workspace.dependencies] version is the workspace's, exactly (=$wsv)" \
+  sh -c '! awk "/^\[workspace.dependencies\]/ { p = 1; next } /^\[/ { p = 0 } p && /version/" "$1" | grep -v "version = \"=$2\"" | grep -q .' sh "$REPO_ROOT/Cargo.toml" "$wsv"
+# --publish on fakes: fil-proto's version is already there, fil-term's lookup fails.
+mkdir -p "$tmp/pc"
+cat > "$tmp/pc/curl" << 'EOF2'
+#!/bin/sh
+for a; do u=$a; done
+case $u in
+  */crates/fil-proto/*) printf 200 ;;
+  */crates/"${FAKE_PC_500:-none}"/*) printf 503 ;;
+  *) printf 404 ;;
+esac
+EOF2
+printf '#!/bin/sh\necho "$*" >> "$FAKE_PC_LOG"\n' > "$tmp/pc/cargo"
+chmod +x "$tmp/pc/curl" "$tmp/pc/cargo"
+pc_run() { env FIL_PUBLISH_CARGO="$tmp/pc/cargo" FIL_PUBLISH_CURL="$tmp/pc/curl" FAKE_PC_LOG="$tmp/pc/log" "$@" "$pc" --publish; }
+: > "$tmp/pc/log"
+expect_fail "publish-crates: --publish without a token stops" pc_run -u CARGO_REGISTRY_TOKEN
+expect_pass "publish-crates: ...and calls no cargo" test ! -s "$tmp/pc/log"
+expect_pass "publish-crates: --publish skips a version already on crates.io and publishes the other eight" pc_run CARGO_REGISTRY_TOKEN=fake
+expect_pass "publish-crates: ...one at a time, in order" test "$(awk '{ print $NF }' "$tmp/pc/log" | tr '\n' ' ')" = "$(printf '%s\n' $pc_order | grep -v '^fil-proto$' | tr '\n' ' ')"
+expect_pass "publish-crates: ...each with --no-verify (nothing compiles beside the token) and --locked" test "$(grep -c -- '^publish --locked --no-verify -p ' "$tmp/pc/log")" = 8
+: > "$tmp/pc/log"
+expect_fail "publish-crates: an unexpected answer from crates.io stops the run" pc_run CARGO_REGISTRY_TOKEN=fake FAKE_PC_500=fil-forward
+expect_pass "publish-crates: ...after the crates before fil-forward" grep -qE ' fil-transport$' "$tmp/pc/log"
+expect_fail "publish-crates: ...and before fil-forward and what depends on it" grep -qE ' (fil-forward|fil-client|fil-shell)$' "$tmp/pc/log"
+
+# ============================================================== 4e. the packaging templates (packaging/render.sh)
+echo "== packaging/render.sh (Homebrew formula, AUR PKGBUILD)"
+render=$REPO_ROOT/packaging/render.sh
+mkdir -p "$tmp/render"
+h() { printf '%064d' "$1"; }
+printf '%s  %s\n' "$(h 1)" fil-0.9.0-rc.1-aarch64-linux-musl.tar.gz "$(h 2)" fil-0.9.0-rc.1-source.tar.gz \
+  "$(h 3)" fil-0.9.0-rc.1-universal-apple-darwin.tar.gz "$(h 4)" fil-0.9.0-rc.1-x86_64-linux-musl.tar.gz > "$tmp/render/SUMS"
+expect_pass "render: the formula" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS" "$tmp/render/out"
+expect_pass "render: ...takes each archive's checksum from SHA256SUMS" sh -c 'grep -q "sha256 \"$2\"" "$1" && grep -q "sha256 \"$3\"" "$1" && grep -q "sha256 \"$4\"" "$1" && grep -q "/v0.9.0-rc.1/fil-0.9.0-rc.1-universal-apple-darwin.tar.gz" "$1"' sh "$tmp/render/out/fil.rb" "$(h 1)" "$(h 3)" "$(h 4)"
+if command -v ruby > /dev/null; then expect_pass "render: the formula is valid Ruby" ruby -c "$tmp/render/out/fil.rb"; fi
+expect_pass "render: the PKGBUILD and .SRCINFO" "$render" aur 0.9.0-rc.1 "$tmp/render/SUMS" "$tmp/render/out"
+expect_pass "render: ...pkgver has no '-' (0.9.0rc.1), _ver is the release's" sh -c 'grep -qx "pkgver=0.9.0rc.1" "$1/PKGBUILD" && grep -qx "_ver=0.9.0-rc.1" "$1/PKGBUILD" && grep -q "pkgver = 0.9.0rc.1" "$1/.SRCINFO"' sh "$tmp/render/out"
+expect_pass "render: ...the x86_64 and aarch64 checksums in both files" sh -c 'grep -q "sha256sums_x86_64=(.$2.)" "$1/PKGBUILD" && grep -q "sha256sums_aarch64=(.$3.)" "$1/PKGBUILD" && grep -q "sha256sums_x86_64 = $2" "$1/.SRCINFO"' sh "$tmp/render/out" "$(h 4)" "$(h 1)"
+expect_pass "render: the PKGBUILD is valid bash" bash -n "$tmp/render/out/PKGBUILD"
+grep -v x86_64 "$tmp/render/SUMS" > "$tmp/render/SUMS.short"
+expect_fail "render: a release without one of the archives is refused" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS.short" "$tmp/render/o2"
+expect_fail "render: a version that is not a release version is refused" "$render" brew '0.9.0+x' "$tmp/render/SUMS" "$tmp/render/o3"
+
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   echo "== reproducible archives (Docker)"
@@ -641,6 +912,18 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   PK="$RELEASE_DIR/.package-mutant.sh" pk "$tmp/m2" > /dev/null 2>&1 || true
   rm -f "$RELEASE_DIR/.package-mutant.sh"
   expect_fail "mutation: tar mtimes left alone, and the two assemblies' SHA256SUMS then differ" cmp "$tmp/m1/SHA256SUMS" "$tmp/m2/SHA256SUMS"
+  expect_pass "the assembly writes the four packages too" test "$(grep -cE '\.(deb|rpm)$' "$tmp/r1/SHA256SUMS")" = 4
+  # mutation: nfpm without the fixed mtime (and without SOURCE_DATE_EPOCH, which it also reads) stamps the packages with the time of the run
+  sed -e '/mtime: /d' -e 's/-e SOURCE_DATE_EPOCH //' "$RELEASE_DIR/linux-packages.sh" > "$RELEASE_DIR/.pkg-mutant.sh"
+  chmod +x "$RELEASE_DIR/.pkg-mutant.sh"
+  trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh" "$RELEASE_DIR/.pkg-mutant.sh"' EXIT INT TERM
+  if cmp -s "$RELEASE_DIR/linux-packages.sh" "$RELEASE_DIR/.pkg-mutant.sh"; then flunk "mutation 'package mtime' did not change linux-packages.sh (the test is stale)"; fi
+  mkdir -p "$tmp/p1" "$tmp/p2"
+  env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p1" > /dev/null 2>&1 || true
+  sleep 2
+  env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p2" > /dev/null 2>&1 || true
+  rm -f "$RELEASE_DIR/.pkg-mutant.sh"
+  expect_fail "mutation: packages without the fixed mtime, and two builds then differ" cmp "$tmp/p1/fil_0.9.0_amd64.deb" "$tmp/p2/fil_0.9.0_amd64.deb"
 else
   echo "== reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
 fi

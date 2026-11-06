@@ -11,7 +11,8 @@
 # It clones REPO_URL, checks out the COMMIT (a SHA: never a name that can move), builds both Linux
 # binaries in the digest-pinned `cross` images, takes the macOS binary from
 # WORKDIR/in/universal-apple-darwin/fil (sent by verify.sh: it comes from the release, so the
-# macOS binary is the one input not rebuilt) and assembles the four archives. The result is in
+# macOS binary is the one input not rebuilt) and assembles the four archives and the four .deb and
+# .rpm packages. The result is in
 # WORKDIR/out. Written for Ubuntu on aarch64 with Docker, rustup and amd64 emulation (Rosetta:
 # docs/m4/release.md section 9.3).
 set -euo pipefail

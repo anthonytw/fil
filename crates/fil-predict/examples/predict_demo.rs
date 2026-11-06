@@ -16,12 +16,17 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use fil_predict::pty::{Frame, LinkConfig, Spec, spawn};
 use fil_predict::{Config, InputKind, LinkView, MoshConfig, MoshPredictor, Overlay};
 use fil_term::{DEFAULT_BACKEND, Size, backends};
 use rustix::stdio::{stdin, stdout};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use tokio::sync::mpsc;
+
+// Each example uses part of the module (support/pty.rs).
+#[allow(dead_code)]
+#[path = "support/pty.rs"]
+mod pty;
+use pty::{Frame, LinkConfig, Spec, spawn};
 
 static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);
 

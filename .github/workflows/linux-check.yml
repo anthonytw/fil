@@ -148,7 +148,7 @@ jobs:
           # binary. Bump both together.
           tool: cross@0.2.5
       - name: Build fil for aarch64-unknown-linux-musl
-        run: cross build --locked --release -p fil --target aarch64-unknown-linux-musl
+        run: cross build --locked --release -p fil-shell --target aarch64-unknown-linux-musl
       # A separate build, so `fil` above is built exactly as before.
       - name: Build fwdprobe for aarch64-unknown-linux-musl
         run: cross build --locked --release -p fil-testbins --bin fwdprobe --target aarch64-unknown-linux-musl

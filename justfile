@@ -25,7 +25,7 @@ clippy:
 # Default-feature build of `fil`, as released. The other recipes use --all-features, which also
 # compiles the vt100 backend and the test hooks; this proves `fil` builds without them.
 check-default:
-    cargo check -p fil
+    cargo check -p fil-shell
 
 # The vt100 emulator backend must stay out of the release binary (only alacritty ships; DESIGN.md
 # §6.5). `cargo tree -i` exits 0 even when it prints "nothing to print" to stderr, so test its
@@ -33,13 +33,13 @@ check-default:
 release-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=$(cargo tree -q -p fil -e normal,build --target all -i vt100)
+    out=$(cargo tree -q -p fil-shell -e normal,build --target all -i vt100)
     test -z "$out" || { echo "release-deps: vt100 is in the release build graph of fil" >&2; exit 1; }
     # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
     # production fil must never honor an environment variable that changes what wire it speaks.
     # fil-forward is checked once fil depends on it (until then `cargo tree -i` finds no such package).
     for c in fil-proto fil-daemon fil-transport fil-session fil-forward; do
-      if ! tree=$(cargo tree -q -p fil -e normal,build,features --target all -i "$c" 2>&1); then
+      if ! tree=$(cargo tree -q -p fil-shell -e normal,build,features --target all -i "$c" 2>&1); then
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
       fi
@@ -245,7 +245,7 @@ local transport="pipe" session=("local-" + transport):
       pipe | auto | direct) ;;
       *) echo "usage: just local [pipe|auto|direct] [session]" >&2; exit 2 ;;
     esac
-    cargo build -q -p fil
+    cargo build -q -p fil-shell
     mkdir -p target/local
     config=target/local/config-{{transport}}.toml
     {
@@ -261,8 +261,8 @@ local transport="pipe" session=("local-" + transport):
 # installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
 # Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
 pi-e2e *args:
-    cargo build --release -p fil --bins
-    cargo build --release -p fil --example pi_e2e
+    cargo build --release -p fil-shell --bins
+    cargo build --release -p fil-shell --example pi_e2e
     just no-test-hooks "{{target_dir}}/release/fil"
     "{{target_dir}}/release/examples/pi_e2e" {{args}}
 
@@ -275,8 +275,8 @@ pi-e2e *args:
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
 # this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
 dropin *args:
-    cargo build -q --release -p fil --bins
-    cargo build -q --release -p fil --example dropin
+    cargo build -q --release -p fil-shell --bins
+    cargo build -q --release -p fil-shell --example dropin
     cargo build -q --release -p fil-daemon --bin fil-daemon-dev
     cargo build -q --release -p fil-testbins --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
@@ -289,14 +289,14 @@ dropin *args:
 # `fil` daemon of its own and refuses to run beside one of yours (tests/macos/remote.sh). macOS
 # only; never part of `ci`. `fil` is built in an invocation of its own, so it has no test hooks.
 macos-remote *args:
-    cargo build -q --release -p fil --bins
+    cargo build -q --release -p fil-shell --bins
     cargo build -q --release -p fil-testbins --bin ptydrive --bin fwdprobe
     just no-test-hooks "{{target_dir}}/release/fil"
     FIL_BIN_DIR="{{target_dir}}/release" tests/macos/remote.sh {{args}}
 
 # Fails if a binary contains the test hooks' variable names (FIL_TEST_*): such a build reads the
 # environment to change what wire it speaks and where its sockets are, and must never be the fil
-# that is installed or released. Building an example or a test with `-p fil` unifies the dev-
+# that is installed or released. Building an example or a test with `-p fil-shell` unifies the dev-
 # dependencies' `test-hooks` features into every target of that invocation, which is why the
 # recipes that install `target/release/fil` build the binary in an invocation of its own.
 no-test-hooks +binaries:
@@ -310,7 +310,7 @@ no-test-hooks +binaries:
       grep -aq 'FIL_TEST_' "$b" || rc=$?
       case $rc in
         0)
-          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil --bins'" >&2
+          echo "no-test-hooks: $b was built with the test hooks (FIL_TEST_*); rebuild it with its own 'cargo build --release -p fil-shell --bins'" >&2
           exit 1
           ;;
         1) ;;
@@ -322,8 +322,10 @@ no-test-hooks +binaries:
 
 # The release scripts' own tests: the workflow lint (permissions, pins, no secrets or caches) with a
 # mutation for each rule, tag verification (the signers come from main, never from the tag),
-# release-check on synthetic releases, and the checksums. Part of `ci`. With FIL_RELEASE_TEST_DOCKER=1
-# it also assembles archives twice in the pinned image and requires identical hashes (pulls the image).
+# release-check on synthetic releases (archives and .deb and .rpm packages), the checksums, the crate
+# publishing script on fakes, and the packaging templates. Part of `ci`. With FIL_RELEASE_TEST_DOCKER=1
+# it also assembles archives and packages twice in the pinned images and requires identical hashes
+# (pulls the images).
 release-test:
     tests/release/selftest.sh
 
@@ -354,7 +356,8 @@ release-build out="target/release-dist":
 
 # Everything a release candidate must satisfy: `just release-check --dry-run DIR` for a build of a
 # branch, `just release-check --tag vX.Y.Z --complete DIR` for a release. One top-level entry per
-# archive, the section 4.3 layout, byte-identical bundle copies, SHA256SUMS exactly the four archives,
+# archive, the section 4.3 layout, byte-identical bundle copies, the .deb and .rpm packages (exactly
+# their archive's files), SHA256SUMS exactly the four archives and the four packages,
 # no builder path (/Users/, /home/) or FIL_TEST_ string in a binary, the path remap applied,
 # `no-test-hooks` and `release-deps`, static Linux binaries, `fil --version` where it can run, the tag,
 # the changelog and the wire. See tests/release/check.sh.
@@ -379,6 +382,50 @@ release-verify version *args:
 reserve-crate-names *args:
     tests/release/reserve-crate-names.sh "$@"
 
+# ---- Packaging channels (docs/m4/packaging.md) ----
+
+# The nine published crates package and build for crates.io, in dependency order against a local
+# overlay of each other (`cargo publish --workspace --dry-run`); the packaged fil-shell must build.
+# Nothing is uploaded and no token is needed (needs network for the crates.io index). Real releases
+# are published by release.yml's `crates-io` job, by trusted publishing (N8).
+crates-check:
+    tests/release/publish-crates.sh --dry-run
+
+# Install-test the .deb and .rpm packages in DIR (a release's files, or `release-build`'s) in Debian
+# and Fedora containers: install, `fil --version`, the bundle, the package manager's verify, remove.
+# `--arch all` also runs the other architecture where Docker can (Rosetta).
+[positional-arguments]
+packages-install *args:
+    tests/release/install-packages.sh "$@"
+
+# The owner signs the release's two .rpm packages with the package key, on their own machine (never
+# CI), in the verified files of `just release-verify VERSION --pre-sign`, then rewrites SHA256SUMS
+# and writes SHA256SUMS.asc (docs/m4/release.md section 10.4). Needs gpg and rpm (brew install gnupg rpm).
+release-sign-packages version *args:
+    tests/release/sign-packages.sh "{{version}}" {{args}}
+
+# Set the one package version (docs/m4/release.md section 1): [workspace.package] version and the
+# exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock.
+set-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{version}}"
+    printf '%s' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || { echo "set-version: '$v' is not X.Y.Z or X.Y.Z-PRE" >&2; exit 1; }
+    perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]*"/${1}'"$v"'"/; s/(version = ")=[^"]*(")/${1}='"$v"'${2}/g' Cargo.toml
+    cargo update -w --offline -q
+    grep -nE '^version = |version = "=' Cargo.toml
+
+# The Homebrew formula for VERSION, from the release's SHA256SUMS: by default the copy that
+# `just release-verify VERSION` verified (and the owner signed). Writes OUT/homebrew/fil.rb, for the
+# tap anthonytw/homebrew-tap (docs/m4/packaging.md says how it gets there).
+brew-formula version sums=("target/release-verify/" + version + "/files/SHA256SUMS") out="target/packaging":
+    packaging/render.sh brew "{{version}}" "{{sums}}" "{{out}}/homebrew"
+
+# The AUR package fil-shell-bin for VERSION: OUT/aur/PKGBUILD and .SRCINFO, from the same verified
+# SHA256SUMS. Prepared, not published (docs/m4/packaging.md).
+aur-pkgbuild version sums=("target/release-verify/" + version + "/files/SHA256SUMS") out="target/packaging":
+    packaging/render.sh aur "{{version}}" "{{sums}}" "{{out}}/aur"
+
 # ---- Notices (docs/m4/release.md section 7) ----
 
 # The cargo-about that renders THIRD-PARTY-NOTICES.md. Pinned: another version can render other
@@ -387,7 +434,7 @@ reserve-crate-names *args:
 about_version := "0.9.3"
 
 # THIRD-PARTY-NOTICES.md is current: re-rendered from about.hbs and about.toml for the release graph
-# (`-p fil`, default features, normal and build edges, the four release targets of about.toml), it
+# (`-p fil-shell`, default features, normal and build edges, the four release targets of about.toml), it
 # is byte for byte the committed file. Fails if a crate in that graph has a license outside the
 # allowed list, if about.toml's list is not deny.toml's, if cargo-about warns (a clarify checksum
 # that no longer matches) or falls back to a template text ("<year> <copyright holders>"), if a
@@ -436,6 +483,12 @@ _notices mode:
       echo "notices: cargo-about warned (a [CRATE.clarify] in about.toml that no longer matches its file?); fix it before rendering" >&2
       exit 1
     fi
+    # The workspace's published crates are in cargo-about's data (about.toml, [private]); about.hbs
+    # leaves out each crate and license entry without a registry source. That is exact only if no
+    # license entry, and no license kind, holds both workspace crates and registry crates.
+    cargo about generate --frozen --format json -m crates/fil/Cargo.toml -c about.toml -o "$scratch/about.json" 2> "$scratch/about-json.log" \
+      || { cat "$scratch/about-json.log" >&2; echo "notices: cargo-about's JSON render failed" >&2; exit 1; }
+    python3 -I tests/release/notice_workspace.py "$scratch/about.json"
     # A license file it does not recognize gets the canonical text, with its template fields.
     if grep -nE '<year>|<copyright holders>|<owner>|<name of author>' "$scratch/raw.md" > "$scratch/placeholders"; then
       echo "notices: a license text is a template, not the crate's own notice (add a [CRATE.clarify] to about.toml):" >&2
@@ -459,7 +512,7 @@ _notices mode:
     sed -n '/^| Crate | Version | License |$/,/^$/p' "$scratch/notices.md" | tail -n +3 | awk -F' [|] ' 'NF >= 3 { sub(/^[|] /, "", $1); print $1 " v" $2 }' | LC_ALL=C sort -u > "$scratch/listed"
     tflags=$(for t in $targets; do printf -- '--target %s ' "$t"; done)
     # shellcheck disable=SC2086
-    cargo tree -q --locked -p fil -e normal,build $tflags --prefix none --format '{p}' | grep -v ' (/' | sed -E 's/( \((\*|proc-macro)\))+$//' | sed '/^$/d' | LC_ALL=C sort -u > "$scratch/graph"
+    cargo tree -q --locked -p fil-shell -e normal,build $tflags --prefix none --format '{p}' | grep -v ' (/' | sed -E 's/( \((\*|proc-macro)\))+$//' | sed '/^$/d' | LC_ALL=C sort -u > "$scratch/graph"
     if [[ ! -s "$scratch/graph" ]] || ! diff "$scratch/graph" "$scratch/listed" > "$scratch/cover.diff"; then
       echo "notices: the notices' crates are not the release graph's (< cargo tree, > notices):" >&2
       cat "$scratch/cover.diff" >&2

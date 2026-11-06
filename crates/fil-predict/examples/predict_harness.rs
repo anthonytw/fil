@@ -14,10 +14,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fil_predict::driver::{Driver, Ev, Failure, PredictorKind, RunConfig, Stats, Trace, shrink};
-use fil_predict::pty::{Frame, LinkConfig, Program, Scratch, programs, spawn};
 use fil_predict::sim::Rng;
 use fil_term::{Size, backends};
 use tokio::sync::Semaphore;
+
+// Each example uses part of the module (support/pty.rs).
+#[allow(dead_code)]
+#[path = "support/pty.rs"]
+mod pty;
+use pty::{Frame, LinkConfig, Program, Scratch, programs, spawn};
 
 struct Opts {
     seeds: u64,

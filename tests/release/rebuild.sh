@@ -18,6 +18,7 @@
 set -euo pipefail
 
 repo=$1 ref=$2
+[[ $ref =~ ^[0-9a-f]{40}$ ]] || { echo "rebuild: the ref must be a full lowercase 40-hex commit SHA, not: $ref" >&2; exit 1; }
 # The third argument is relative to $HOME (the VM user's), so the caller need not expand it.
 work=$HOME/$3
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -32,6 +33,7 @@ rm -rf "$work/src" "$work/out" "$work/bins" "$work/target"
 mkdir -p "$work"
 git clone -q "$repo" "$work/src"
 git -C "$work/src" checkout -q --detach "$ref"
+[ "$(git -C "$work/src" rev-parse HEAD)" = "$ref" ] || die "checked out $(git -C "$work/src" rev-parse HEAD), not $ref"
 cd "$work/src"
 chan=$(sed -n 's/^channel[ ]*=[ ]*"\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)
 [ -n "$chan" ] || die "no channel in rust-toolchain.toml"

@@ -97,6 +97,16 @@ mutate_wf "crates-io gets attestations: write" 's/(      id-token: write # trust
 mutate_wf "crates-io gets contents: write" 's/(  crates-io:.*?    permissions:\n      contents: )read/${1}write/s'
 mutate_wf "another job names the crates-io environment" 's/(  packages-arm64:\n.*?    runs-on: ubuntu-24.04-arm\n)/$1    environment: crates-io\n/s'
 mutate_wf "crates-io's actions: read becomes write" 's/(  crates-io:.*?      actions: )read/${1}write/s'
+mutate_wf "workflow_dispatch is inline with inputs" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch: { inputs: { x: { type: string } } }\n/'
+mutate_wf "the push trigger is inline with a branch" 's/\n  push:\n    tags: \["v\*"\]\n/\n  push: { branches: [main], tags: ["v*"] }\n/'
+mutate_wf "a secret by index" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ secrets[\x27RELEASE_TOKEN\x27] \}\}/'
+mutate_wf "all secrets through toJSON" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ toJSON(secrets) \}\}/'
+mutate_wf "a secret in capitals by index" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ SECRETS[\x27X\x27] \}\}/'
+mutate_wf "a secret with a capital letter" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ Secrets.RELEASE_TOKEN \}\}/'
+mutate_wf "a secret, space before the bracket" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ secrets [\x27X\x27] \}\}/'
+mutate_wf "a secret inside toJSON with spaces" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ toJSON( secrets ) \}\}/'
+mutate_wf "a secret passed to format" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ format(\x27{0}\x27, secrets) \}\}/'
+mutate_wf "secrets: inherit" 's/(  prepare:\n)/$1    secrets: inherit\n/'
 mutate_wf "prepare's actions: read becomes write" 's/(  prepare:.*?      actions: )read/${1}write/s'
 mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 # --locked: scripts in a copy of the directory
@@ -203,6 +213,56 @@ cp "$tmp/SHA256SUMS" "$tmp/dl/SHA256SUMS"
 expect_fail "release-verify stops when the files do not match the signed SHA256SUMS" rv 1
 grep -q 'STOP: the files do not match' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
   && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+
+# --ref (the commit that is rebuilt) must be a full 40-hex SHA, checked before anything else
+for badref in 314e5bc main v1 "$(printf 'A%.0s' {1..40})" "$(printf 'a%.0s' {1..41})"; do
+  expect_fail "release-verify refuses --ref $badref" rv 1 --dry-run --ref "$badref"
+  grep -q '40-hex commit SHA' "$tmp/out.log" && pass "...with the 40-hex message" || { flunk "...with the 40-hex message"; sed "s/^/       | /" "$tmp/out.log"; }
+done
+# a release (not a dry run) rebuilds the tag's commit: another --ref is refused, the tag's own is fine
+tagcommit=$(git -C "$tmp/origin" rev-parse "refs/tags/v1^{commit}")
+expect_fail "release-verify refuses a --ref that is not the tag's commit" rv 1 --ref "$(printf 'c%.0s' {1..40})"
+grep -q "is not the commit of v1" "$tmp/out.log" && pass "...with that message" || { flunk "...with that message"; sed "s/^/       | /" "$tmp/out.log"; }
+rv 1 --ref "$tagcommit" > "$tmp/out.log" 2>&1 || true
+if grep -q "is not the commit of" "$tmp/out.log"; then flunk "release-verify accepts --ref equal to the tag's commit"; else pass "release-verify accepts --ref equal to the tag's commit"; fi
+goodref=$(printf 'a%.0s' {1..40})
+rv 1 --dry-run --ref "$goodref" > "$tmp/out.log" 2>&1 || true
+if grep -q '40-hex commit SHA' "$tmp/out.log"; then flunk "release-verify accepts a full 40-hex --ref"; else pass "release-verify accepts a full 40-hex --ref"; fi
+expect_fail "rebuild.sh refuses a short ref" bash "$RELEASE_DIR/rebuild.sh" /nonexistent 314e5bc rebuild-x
+grep -q '40-hex commit SHA' "$tmp/out.log" && pass "...before touching Docker or the repo" || { flunk "...before touching Docker or the repo"; sed "s/^/       | /" "$tmp/out.log"; }
+
+# the draft release's attestation commands are the narrow ones
+echo "== release notes (notes.sh)"
+sha=$(printf 'b%.0s' {1..40})
+"$RELEASE_DIR/notes.sh" 9.9.9 o/r "$sha" > "$tmp/notes.md"
+for flag in '--repo o/r' '--cert-identity https://github.com/o/r/.github/workflows/release.yml@refs/tags/v9.9.9' '--source-ref refs/tags/v9.9.9' "--source-digest $sha" "--signer-digest $sha" '--deny-self-hosted-runners'; do
+  expect_pass "notes.sh: every attestation command has $flag" test "$(grep -c -F -- "$flag" "$tmp/notes.md")" = "$(grep -c '^gh attestation verify' "$tmp/notes.md")"
+done
+expect_pass "notes.sh: there are two attestation commands" test "$(grep -c '^gh attestation verify' "$tmp/notes.md")" = 2
+expect_fail "notes.sh: no commit is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r
+expect_fail "notes.sh: a short commit is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r abc123
+expect_fail "notes.sh: an uppercase commit is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r "$(printf 'B%.0s' {1..40})"
+expect_fail "notes.sh: a commit with a second line is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r "$sha
+main"
+
+# the files that decide what a release is need the owner's review
+echo "== CODEOWNERS"
+for path in /justfile /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock /docs/man/install-pandoc.sh /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml; do
+  expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
+done
+# ...and every path it lists that has no glob exists (a rename would silently drop the protection),
+# except those that may not exist yet: the man-page installer (the DOC package adds it), and
+# .cargo/ and .gitattributes, which are listed so that adding one needs the owner
+codeowners_missing() { # FILE: the non-glob paths in a CODEOWNERS file that do not exist
+  local cpath
+  while read -r cpath _; do
+    case $cpath in '#'* | '' | *'*'* | /docs/man/install-pandoc.sh | /docs/man/build.sh | /.cargo/ | /.gitattributes) continue ;; esac
+    [ -e "$REPO_ROOT$cpath" ] || echo "$cpath"
+  done < "$1"
+}
+expect_pass "every CODEOWNERS path exists (but the may-not-exist-yet ones)" test -z "$(codeowners_missing "$REPO_ROOT/.github/CODEOWNERS")"
+{ cat "$REPO_ROOT/.github/CODEOWNERS"; echo "/no-such-file @anthonytw"; } > "$tmp/CODEOWNERS.mut"
+expect_pass "mutation: a CODEOWNERS path that does not exist is caught" test "$(codeowners_missing "$tmp/CODEOWNERS.mut")" = /no-such-file
 
 # ============================================================== 4. release-check on synthetic releases
 echo "== release-check"

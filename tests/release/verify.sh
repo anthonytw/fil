@@ -63,6 +63,9 @@ while [ $# -gt 0 ]; do
 done
 test_override_notes
 [ -n "$version" ] || die "usage: verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] ..."
+# --ref names the commit that is rebuilt: a full 40-hex SHA, never a branch, a tag or an abbreviation
+# (those can name another commit tomorrow, or in the clone).
+if [ -n "$ref" ] && ! [[ $ref =~ ^[0-9a-f]{40}$ ]]; then die "--ref must be a full lowercase 40-hex commit SHA, not: $ref"; fi
 version=${version#v}
 tag=v$version
 repo_url=${FIL_RELEASE_REPO_URL:-https://github.com/$repo.git}
@@ -105,6 +108,8 @@ if [ "$dry" = 0 ]; then
   # The one commit everything below is bound to.
   commit=$(git -C "$tagrepo" rev-parse "refs/tags/$tag^{commit}")
   log "$tag is commit $commit"
+  # A release rebuilds the tag's commit and nothing else; --ref is for --dry-run (a branch's run).
+  if [ "$dry" = 0 ] && [ -n "$ref" ] && [ "$ref" != "$commit" ]; then die "STOP: --ref $ref is not the commit of $tag ($commit); a release rebuilds the tag's commit"; fi
 
   # ---- 2. SHA256SUMS.sig, with the same signers (main's, or the verifier's own copy), and the sums
   signers=$work/signers

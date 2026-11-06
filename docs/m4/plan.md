@@ -449,7 +449,7 @@ Every package keeps M2's rules:
   - It downloads a release.
   - It checks the tag with `git verify-tag` against the allowed-signers file **from `main` (or the verifier's own copy), never from the tag**, and checks that the tag is on `main`.
   - It checks `SHA256SUMS.sig` with `ssh-keygen -Y verify`, then the checksums.
-  - It checks the attestations narrowly: `gh attestation verify --repo anthonytw/fil --signer-workflow anthonytw/fil/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z`. The repository alone is not enough. The install page gives the same command.
+  - It checks the attestations narrowly: `gh attestation verify --repo anthonytw/fil --cert-identity https://github.com/anthonytw/fil/.github/workflows/release.yml@refs/tags/vX.Y.Z --source-ref refs/tags/vX.Y.Z --source-digest COMMIT --signer-digest COMMIT --deny-self-hosted-runners` (COMMIT is the tag's commit). The repository alone is not enough. The install page and the release notes give the same command.
   - It rebuilds the Linux targets in the same `cross` images and compares. The images are linux/amd64 and the VM (`docs/dev/vm.md`) is aarch64, so the rebuild runs under amd64 emulation (Rosetta for Linux in the Lima VM, or qemu binfmt). REL sets that up and runs it once against a dry run, so that the owner's check is known to work before the first tag.
 - **Tests:**
   - a dry run on main whose artifacts unpack to the layout, run `fil --version` on Linux and macOS runners, and pass `release-check`;

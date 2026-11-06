@@ -368,7 +368,7 @@ release-check *args:
 # The owner's check before signing, and anyone's afterwards: `just release-verify 0.1.0`. Tag and
 # SHA256SUMS.sig against .github/release-signers on main, the attestations (narrowly), release-check,
 # then an independent rebuild of every Linux binary and archive in the Lima VM under amd64 emulation
-# (Rosetta), compared hash for hash. `--dry-run --from-run RUN --ref SHA` checks a dry run instead.
+# (Rosetta), compared hash for hash. `--dry-run --from-run RUN --ref SHA` (SHA: the full 40-hex commit) checks a dry run instead.
 # See tests/release/verify.sh and docs/m4/release.md section 9.
 [positional-arguments]
 release-verify version *args:

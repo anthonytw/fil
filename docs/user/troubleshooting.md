@@ -8,7 +8,7 @@ fil install --check devbox     # what fil is installed on devbox, and the fil on
 ssh devbox fil --version       # what a fil login there finds
 ```
 
-`fil install --check HOST` changes nothing. It lists the copies fil installed under `~/.local/share/fil`, the `fil` on the `PATH` and `~/.local/bin/fil`, and ends with a fixed line. A report without that line is "no answer from the host", an error: a forced command that prints nothing and exits 0 fails `--check` on purpose.
+`fil install --check HOST` changes nothing. It lists the copies fil installed under `~/.local/share/fil`, the `fil` on the `PATH` and `~/.local/bin/fil`, and prints them. If the host's report is cut short, or a forced command prints nothing and exits 0, `--check` fails with "no answer from the host" rather than claiming nothing is installed.
 
 ## Logs
 
@@ -45,7 +45,7 @@ Your sessions will end when your last login does, which is the opposite of what 
 
 ## Your home directory is a symbolic link
 
-`fil install` refuses a `$HOME` that is itself a symbolic link, and the install directory's parents must be real directories owned by you that only you can write. Install by hand instead: copy `bin/fil` to a directory on the non-interactive `PATH`. See [install](install.md).
+`fil install` refuses a `$HOME` that is itself a symbolic link, and the install directory's parents must be real directories owned by you (or root) that nobody else can write. Install by hand instead: copy `bin/fil` to a directory on the non-interactive `PATH`. See [install](install.md).
 
 ## Hosts that allow only the plain command
 
@@ -59,7 +59,7 @@ The upload arrives and passes its checks, but the script can't run it. fil says 
 
 ## ssh needs an interactive login
 
-Once a session is attached, fil's reconnects run ssh in the background, where it can't ask you anything. If that login needs a password, a passphrase or a host-key answer, the status line says `ssh needs an interactive login: detach (~.) and run fil again`, and shows ssh's own last line. fil keeps retrying, so unlocking your agent elsewhere recovers it. A key in an agent, a certificate or `ControlMaster` avoids it.
+Once a session is attached, fil's reconnects run ssh in the background, where it can't ask you anything. If that login needs a password, a passphrase or a host-key answer, the status line says “ssh needs an interactive login: detach (~.) and run fil again”, and shows ssh's own last line. fil keeps retrying, so unlocking your agent elsewhere recovers it. A key in an agent, a certificate or `ControlMaster` avoids it.
 
 ## It stays on the pipe: direct mode never starts
 

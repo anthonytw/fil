@@ -17,7 +17,7 @@ fil can carry a session over two transports and moves between them by itself.
 
 - Both transports send a heartbeat every second. A link that is silent for five seconds is declared dead.
 - **On QUIC,** a change of your IP address (Wi-Fi to a phone, a new network) is absorbed without a new handshake. If the connection is gone altogether, for example after the laptop slept, the client makes a new QUIC handshake with its key from memory. **No ssh is involved.**
-- **If QUIC can't be re-established** within a few seconds, fil runs the pipe again, which is a new ssh login. In the background that login can't ask you anything: if it needs a password, passphrase or host-key answer, the status line says `ssh needs an interactive login: detach (~.) and run fil again`, and fil keeps retrying so an agent you unlock elsewhere recovers it.
+- **If QUIC can't be re-established** within a few seconds, fil runs the pipe again, which is a new ssh login. In the background that login can't ask you anything: if it needs a password, passphrase or host-key answer, the status line says “ssh needs an interactive login: detach (~.) and run fil again”, and fil keeps retrying so an agent you unlock elsewhere recovers it.
 - Retries back off, with jitter. A link that dies right after coming up counts as a failure, so a flapping network slows fil down instead of making it cycle.
 - Whichever transport carries it, the client says "resume this session from byte N" and the daemon sends everything after it.
 

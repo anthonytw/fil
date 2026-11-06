@@ -21,11 +21,11 @@ fil devbox build -L 5173      # the same, for the session "build"
 The specs are written as in ssh, with these differences:
 
 - `-L PORT` and `-R PORT` mean the same port on the other side's localhost. (ssh's `-R PORT` alone is a SOCKS proxy on the remote; fil has none.)
-- **A bare port binds loopback**, on both ends. A `BIND` of `*`, an empty one, `0.0.0.0` or `::` is every interface, and must be written.
-- `-R` with port `0` asks the host for a free port.
+- **A bare port binds loopback**, on both ends. A `BIND` of `*` or an empty one is every interface, IPv4 and IPv6, and must be written. `0.0.0.0` is every IPv4 interface only, and `[::]` every IPv6 one; `localhost` is loopback on both.
+- `-R 0:HOST:HOSTPORT` asks the host for a free port.
 - Hosts may be an IPv4 address, a bracketed IP address (`[2001:db8::1]`), or a plain host name. There are no Unix-socket forms, no service names, and `127.1` is refused.
-- Repeat a flag for more forwards. A run carries at most 64. Two that would listen on the same port are an error.
-- A port that can't be bound is reported before your terminal goes raw. The `forward_failure` setting in your [config](config.md) decides whether that is only a warning (the default) or ends the run with status 255, like ssh's `ExitOnForwardFailure`.
+- Repeat a flag for more forwards. A run carries at most 64. Repeating a spec keeps it once, and a later one with the same bind and port but another target replaces it. Two different entries that would listen on the same port are an error.
+- A `-L` or `-D` port that can't be bound is reported before your terminal goes raw (a `-R` that the host can't bind is reported later, when the host tries). The `forward_failure` setting in your [config](config.md) decides whether that is only a warning (the default) or ends the run with status 255, like ssh's `ExitOnForwardFailure`.
 
 The list of forwards a host should have can also live in your config; see [`config.toml`](config.md).
 
@@ -38,7 +38,7 @@ fil forward devbox --rm 5173      # remove the forward that listens on 5173
 fil forward devbox --rm -L 5173   # when a -L and a -R share the port, say which
 ```
 
-Inside a session, leave the host out: `fil forward -L 5173` works on this session, which is `$FIL_SESSION`. The attached client **asks you once** before it listens or connects for a forward added this way, since it may have been asked for by a process on the host. `remote_requests` in your config can answer `deny` instead.
+Inside a session, leave the host out: `fil forward -L 5173` works on this session, which is `$FIL_SESSION`. The attached client **asks you once** before it listens or connects for a forward added this way, since it may have been asked for by a process on the host. `remote_requests` in your config can answer `deny` instead. Some requests are refused **without asking**: a `-L` or `-D` bound beyond loopback, a `-R` bound beyond loopback, and a `-R` to a target beyond loopback. After three refusals in a run, every further request of this kind is refused silently.
 
 ## `fil ports`
 

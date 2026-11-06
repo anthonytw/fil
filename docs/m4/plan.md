@@ -147,7 +147,7 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
   - `--owner=0 --group=0 --numeric-owner` and fixed modes;
   - `gzip -n`.
 
-  The tools that generate content are pinned by version and installed the way `linux-check` installs its tools (install-action with a version): `cargo-about` (LIC) and pandoc (DOC).
+  The tools that generate content are pinned by version and installed the way `linux-check` installs its tools (install-action with a version): `cargo-about` (LIC) and pandoc (DOC). Pandoc is the exception: DOC installs the pinned release tarball from jgm/pandoc's GitHub release with `docs/man/install-pandoc.sh`, which checks the tarball's SHA-256 (per architecture) before unpacking it, and `docs/man/build.sh` refuses any other version.
 
 ### 2.4 The remote install layout
 
@@ -603,7 +603,7 @@ Every package keeps M2's rules:
     - fil compared with ssh, ET and mosh.
   - **Man pages:**
     - `fil(1)`, generated from the clap definitions;
-    - `fil-config(5)` and `fil-policy(5)`, generated from `docs/user/config.md` and `policy.md` by pandoc. Pandoc is a build tool, not a dependency, and is pinned by version in the release workflow.
+    - `fil-config(5)` and `fil-policy(5)`, generated from `docs/user/config.md` and `policy.md` by pandoc. Pandoc is a build tool, not a dependency, and is pinned by version and SHA-256 in `docs/man/install-pandoc.sh` (called by the release workflow and the rebuild VM).
   - **Completions** for bash, zsh and fish.
   - **The README:** what fil is, then install, then the quick start. The development status moves to the end.
   - **The changelog** starts at 0.1.0. Earlier work is summarized as "development history (archived)", in line with the README's note on the old PR numbers.

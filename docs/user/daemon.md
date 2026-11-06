@@ -10,7 +10,7 @@ The daemon is the program on the host that holds your sessions (`fil server --da
 
 ## Example
 
-Every key at its default (the three in the last block are commented out because they take the defaults of the client's `[defaults.forward]`):
+Every key at its default (the four in the last block are commented out because they take the defaults of the client's `[defaults.forward]`):
 
 ```toml
 # Direct mode (QUIC over UDP). false: no UDP port is opened and every client stays on the pipe.

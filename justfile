@@ -334,8 +334,8 @@ release-test:
 # universal macOS binary when run on macOS, then the archives, the source archive and SHA256SUMS
 # into OUT/files (assembled by the GNU tar and gzip inside the pinned image). Off macOS, name a macOS
 # binary with FIL_MACOS_BINARY=path (a dry run's, for example) or the archives are not assembled.
-# The archives here have no man pages or completions: `just docs OUT` makes them and package.sh takes
-# them with --extra, as release.yml does.
+# With the pinned pandoc on PATH (docs/man/build.sh) the archives carry the man pages, completions and
+# example configs, as release.yml's do; without it they do not (and `just release-check` then fails on the missing files).
 release-build out="target/release-dist":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -353,7 +353,13 @@ release-build out="target/release-dist":
       echo "release-build: built the Linux binaries in $out/bins; no macOS binary (set FIL_MACOS_BINARY), so no archives" >&2
       exit 0
     fi
-    tests/release/package.sh --bins "$out/bins" --out "$out/files"
+    extra=()
+    if command -v pandoc > /dev/null && docs/man/build.sh "$out/docs"; then
+      extra=(--extra "$out/docs")
+    else
+      echo "release-build: no docs tree (needs the pinned pandoc, docs/man/install-pandoc.sh): the archives have no man pages or completions" >&2
+    fi
+    tests/release/package.sh --bins "$out/bins" --out "$out/files" ${extra[@]+"${extra[@]}"}
     echo "release-build: the release files are in $out/files; run: just release-check --dry-run $out/files" >&2
 
 # Everything a release candidate must satisfy: `just release-check --dry-run DIR` for a build of a
@@ -542,4 +548,5 @@ docs out=(target_dir / "docs"):
 # Rewrite the committed docs/man/fil.1 after a change to the command line (tests/docs_sync.rs
 # fails until you do), then commit it.
 docs-man:
-    cargo run --quiet -p fil-shell --example gen_docs -- --man-page > docs/man/fil.1
+    cargo run --quiet --locked -p fil-shell --example gen_docs -- --man-page > docs/man/fil.1.new
+    mv docs/man/fil.1.new docs/man/fil.1

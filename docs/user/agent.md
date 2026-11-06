@@ -26,7 +26,7 @@ The risk is the same as `ssh -A` while you are attached: root, or any process of
 - **Only listing keys and signing** reach your agent (and ssh's `session-bind` and `query` extensions). Adding, removing, locking and the rest are refused.
 - A signature is made only with a key your agent itself listed.
 - `agent_keys` in your config limits the relay to the SHA256 fingerprints you list (`ssh-add -l` shows them); the others are neither listed nor signed with.
-- `agent = "confirm"` asks you on your terminal before **every** signature, showing the key's type, fingerprint and comment. A question you don't answer within 30 seconds is refused.
+- `agent = "confirm"` asks you on your terminal before **every** signature, showing the key's type, fingerprint and comment. A question you don't answer within 30 seconds is refused. At most 4 questions wait at once and at most 6 are asked per minute, and after 3 denials in a row signatures are refused **without asking** for 60 seconds.
 - Keys that your agent confirms per use (Touch ID, a hardware key) still prompt for each signature.
 - **Destination-constrained keys fail closed.** fil binds every agent connection as ssh would, so a key limited to one destination (`ssh-add -h`) can't be used by the host for anything else.
 - A local agent that doesn't answer within 60 seconds is given up on, and the host gets a failure.

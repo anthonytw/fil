@@ -39,30 +39,26 @@ if [ "$have" != "$PANDOC_VERSION" ] && [ "${FIL_DOCS_ANY_PANDOC:-}" != 1 ]; then
 fi
 
 # One man page from one guide page. No date, so the bytes do not depend on when it ran; the
-# relative links of the guide are dropped by the filter (they lead to other guide pages).
+# relative links of the guide are rewritten by the filter. A NAME section goes first, in the
+# form whatis and apropos read: "name - description".
 mkdir -p "$out/share/man/man5"
-man5() { # NAME SOURCE
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+man5() { # NAME DESCRIPTION SOURCE
+  printf '# NAME\n\n%s - %s\n\n' "$1" "$2" > "$scratch/$1.name.md"
   pandoc --from gfm --to man --standalone \
     --lua-filter docs/man/strip-links.lua \
     --metadata "title=$1" --metadata section=5 --metadata date= \
     --metadata footer=fil --metadata "header=fil manual" \
-    --output "$out/share/man/man5/$1.5" "$2"
+    --output "$out/share/man/man5/$1.5" "$scratch/$1.name.md" "$3"
 }
-man5 fil-policy docs/user/policy.md
-if [ -f docs/user/config.md ]; then
-  man5 fil-config docs/user/config.md
-else
-  echo "docs: docs/user/config.md is not there yet: no fil-config(5)" >&2
-fi
+man5 fil-policy "the fil server policy file and its mirror of the sshd forwarding settings" docs/user/policy.md
+man5 fil-config "the fil client configuration file" docs/user/config.md
 
-# The examples (M4 CFG) ship in the archive's doc directory.
+# The examples ship in the archive's doc directory.
 mkdir -p "$out/share/doc/fil"
 for kind in config daemon policy; do
-  if [ -f "docs/user/examples/$kind.toml" ]; then
-    install -m 644 "docs/user/examples/$kind.toml" "$out/share/doc/fil/$kind.example.toml"
-  else
-    echo "docs: docs/user/examples/$kind.toml is not there yet" >&2
-  fi
+  install -m 644 "docs/user/examples/$kind.toml" "$out/share/doc/fil/$kind.example.toml"
 done
 
 # Modes: the archive's files are 644 whatever the umask.

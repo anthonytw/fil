@@ -68,7 +68,7 @@ fil install --check devbox         # show what is installed, and the fil on the 
 fil install --remove devbox        # remove what fil installed, except a copy a running daemon uses
 ```
 
-`fil install` logs in with ssh, as `fil devbox` would, and sends the right Linux program for the host (chosen from its `uname`) over that login. Nothing is downloaded. Before anything on the host runs, it checks the size and the SHA-256 of what arrived. The copy goes into `~/.local/share/fil/<version>-w<wire>/`, which is private to you. Older copies that nothing uses are removed.
+`fil install` logs in with ssh, as `fil devbox` would, and sends the right Linux program for the host (chosen from its `uname`) over that login. Nothing is downloaded. Before anything on the host runs, it checks the size and the SHA-256 of what arrived. The copy goes into `~/.local/share/fil/<version>-w<wire>/`, which is private to you. After an install, old copies are cleaned up, except any that a running daemon holds or that were used or changed within the last 7 days.
 
 Which file is sent: the one named with `--binary`; otherwise the bundled program beside your `fil` for the host's system and architecture (checked against the bundle's `SHA256SUMS`); otherwise your own `fil`, if it is a release build for that system. A build from source is never sent; name a release file with `--binary`.
 
@@ -92,4 +92,4 @@ Install the new version on your machine and on each host. Two builds talk to eac
 
 ## Removing fil
 
-`fil install --remove HOST` removes the copies fil installed on a host. Sessions in use are left alone until they end; run it again afterwards. fil leaves nothing else on the host except its state directory (`~/.local/state/fil`, the logs) and its socket directory under `/tmp`. Remove a copy you installed by hand the way you put it there, and delete `~/.config/fil` if you made one.
+`fil install --remove HOST` removes the copies fil installed on a host. Sessions in use are left alone until they end; run it again afterwards. `--remove` runs from the copy of **this version** of fil that is installed on the host; with another version of fil it fails and says to run it with that version. fil leaves on the host only its state directory (`~/.local/state/fil`, the logs), its socket directory under `/tmp`, and the empty directories `~/.local/share/fil`, `~/.local/share` and `~/.local` if the install made them. Remove a copy you installed by hand the way you put it there, and delete `~/.config/fil` if you made one.

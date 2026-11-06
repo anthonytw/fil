@@ -68,4 +68,4 @@ When a link drops and comes back, the client says where it stopped and the daemo
 - `1` on an error, or if the session was taken over, replaced or detached elsewhere;
 - `2` on a usage error.
 
-A host or session named like a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`) is attached with `--`: `fil -- ls`, `fil devbox -- ls`.
+A host or session named like a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`, `config`) is attached with `--`: `fil -- ls`, `fil devbox -- ls`.

@@ -8,9 +8,14 @@ use clap_complete::Shell;
 /// The command, as the generated files describe it: without the version text. The version is
 /// not in a committed file, because the wire revision in it changes with the protocol and the
 /// package version with every release; `fil --version` is where it belongs.
+fn unbuilt() -> clap::Command {
+    fil::cli::Cli::command()
+        .version(None::<&str>)
+        .long_version(None::<&str>)
+}
+
 fn command() -> clap::Command {
-    let mut cmd = fil::cli::Cli::command();
-    cmd = cmd.version(None::<&str>).long_version(None::<&str>);
+    let mut cmd = unbuilt();
     cmd.build();
     cmd
 }
@@ -70,6 +75,36 @@ fn visible_arguments(cmd: &clap::Command) -> impl Iterator<Item = &clap::Arg> {
         .filter(|a| !a.is_hide_set() && !a.is_global_set() && a.get_id() != "help")
 }
 
+/// One subcommand as a `.SS` section, and the ones below it (`fil config show`) after it.
+fn subcommand(sub: &clap::Command, parent: &str, out: &mut String) {
+    let name = sub.get_name();
+    let path = format!("{parent} {name}");
+    out.push_str(&format!(".SS \"{}\"\n", roff(&path)));
+    if let Some(about) = sub.get_about() {
+        out.push_str(&roff(&about.to_string()));
+        out.push_str("\n.PP\n");
+    }
+    let mut usage = sub.clone().disable_help_flag(true);
+    usage.build();
+    // `fil server` has options only the program itself uses, which clap's usage line lists.
+    let line = if name == "server" {
+        "fil server --stdio".to_string()
+    } else {
+        usage.render_usage().to_string().replace("Usage: ", "")
+    };
+    out.push_str(&format!("Usage: \\fB{}\\fR\n", roff(&line)));
+    for arg in visible_arguments(sub) {
+        // A positional with no help text would be an empty entry.
+        if arg.is_positional() && arg.get_help().is_none() {
+            continue;
+        }
+        argument(arg, out);
+    }
+    for below in sub.get_subcommands().filter(|s| !s.is_hide_set()) {
+        subcommand(below, &path, out);
+    }
+}
+
 /// `fil(1)`: one page for the whole command line. The attach form and its options first, then
 /// one section per subcommand (there is no page per subcommand: an archive carries `fil.1` alone).
 pub fn man_page() -> Vec<u8> {
@@ -79,7 +114,10 @@ pub fn man_page() -> Vec<u8> {
     cmd.build();
     let mut out: Vec<u8> = Vec::new();
     let man = clap_mangen::Man::new(cmd.clone()).source("fil");
-    man.render_title(&mut out).expect("memory");
+    // The .TH line by hand: clap_mangen's has no date, and roff then reads the source as the date.
+    out.extend_from_slice(
+        b".ie \\n(.g .ds Aq \\(aq\n.el .ds Aq '\n.TH \"FIL\" \"1\" \"\" \"fil\" \"fil manual\"\n",
+    );
     man.render_name_section(&mut out).expect("memory");
     man.render_synopsis_section(&mut out).expect("memory");
     man.render_description_section(&mut out).expect("memory");
@@ -87,24 +125,7 @@ pub fn man_page() -> Vec<u8> {
 
     let mut rest = String::from(".SH COMMANDS\n");
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
-        let name = sub.get_name();
-        rest.push_str(&format!(".SS \"fil {}\"\n", roff(name)));
-        if let Some(about) = sub.get_about() {
-            rest.push_str(&roff(&about.to_string()));
-            rest.push_str("\n.PP\n");
-        }
-        let mut usage = sub.clone().disable_help_flag(true);
-        usage.build();
-        // `fil server` has options only the program itself uses, which clap's usage line lists.
-        let line = if name == "server" {
-            "fil server --stdio".to_string()
-        } else {
-            usage.render_usage().to_string().replace("Usage: ", "")
-        };
-        rest.push_str(&format!("Usage: \\fB{}\\fR\n", roff(&line)));
-        for arg in visible_arguments(sub) {
-            argument(arg, &mut rest);
-        }
+        subcommand(sub, "fil", &mut rest);
     }
     out.extend_from_slice(rest.as_bytes());
 
@@ -125,7 +146,11 @@ pub fn man_page() -> Vec<u8> {
 /// The completion script of one shell.
 pub fn completion(shell: Shell) -> Vec<u8> {
     let mut out = Vec::new();
-    clap_complete::generate(shell, &mut command(), "fil", &mut out);
+    // `fil server` is for the program itself and its flags are hidden; clap_complete would offer
+    // them anyway, so the subcommand goes (hidden, without its arguments).
+    let mut cmd = unbuilt().mut_subcommand("server", |_| clap::Command::new("server").hide(true));
+    cmd.build();
+    clap_complete::generate(shell, &mut cmd, "fil", &mut out);
     out
 }
 

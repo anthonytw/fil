@@ -63,10 +63,8 @@ fn guide() -> String {
 }
 
 fn name_of(path: &Path) -> String {
-    path.strip_prefix(root().join("docs/user"))
-        .unwrap()
-        .display()
-        .to_string()
+    let relative = path.strip_prefix(root().join("docs/user")).unwrap_or(path);
+    relative.display().to_string()
 }
 
 // ---- the man page and the completions
@@ -90,6 +88,12 @@ fn every_shell_gets_a_completion_script() {
             "{shell}: the script knows the flags"
         );
         assert!(path.contains("fil"), "{shell}: {path}");
+        for hidden in ["--install-finish", "--install-gc", "--daemon"] {
+            assert!(
+                !script.contains(hidden),
+                "{shell}: offers the hidden {hidden}"
+            );
+        }
     }
 }
 
@@ -258,14 +262,24 @@ fn daemon_keys(table: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// The top-level keys that are tables: those that accept `[key]` with keys of their own.
+fn daemon_tables() -> Vec<String> {
+    daemon_keys(None)
+        .into_iter()
+        .filter(|k| {
+            fil_daemon::DaemonConfig::parse(&format!("[{k}]\nzz_not_a_key = 1"))
+                .is_err_and(|e| e.contains("unknown field `zz_not_a_key`"))
+        })
+        .collect()
+}
+
 #[test]
 fn daemon_md_names_every_key_the_daemon_accepts() {
     let page = page("daemon.md");
+    let tables = daemon_tables();
+    assert!(tables.len() >= 2, "found the tables: {tables:?}");
     let mut keys = daemon_keys(None);
-    // The tables are keys of the file too; their own keys follow.
-    let tables = ["ports", "forward"];
-    for t in tables {
-        assert!(keys.iter().any(|k| k == t), "{t} is a table of daemon.toml");
+    for t in &tables {
         keys.retain(|k| k != t);
         keys.extend(daemon_keys(Some(t)));
     }
@@ -276,7 +290,7 @@ fn daemon_md_names_every_key_the_daemon_accepts() {
             "daemon.md does not name `{key}`, which daemon.toml accepts"
         );
     }
-    for t in tables {
+    for t in &tables {
         assert!(
             page.contains(&format!("[{t}]")),
             "daemon.md: the [{t}] table"
@@ -289,8 +303,9 @@ fn daemon_md_names_only_keys_the_daemon_accepts() {
     // The key column of every table in the page: `name` in the first cell.
     let accepted: Vec<String> = {
         let mut v = daemon_keys(None);
-        v.extend(daemon_keys(Some("ports")));
-        v.extend(daemon_keys(Some("forward")));
+        for t in daemon_tables() {
+            v.extend(daemon_keys(Some(&t)));
+        }
         v
     };
     for line in page("daemon.md").lines() {
@@ -307,17 +322,16 @@ fn daemon_md_names_only_keys_the_daemon_accepts() {
 
 #[test]
 fn policy_md_names_every_key_the_policy_file_accepts() {
-    // The exhaustive pattern fails to compile when a key is added to `Keys`, so this list and
-    // the page cannot fall behind the parser unnoticed.
-    let Keys {
-        local: _,
-        remote: _,
-        agent: _,
-        direct: _,
-        permit_open: _,
-        permit_listen: _,
-        gateway_ports: _,
-    } = file::parse("").expect("an empty file parses");
+    // The fields of `Keys`, from its Debug form: a key added to the parser has no sample below
+    // until someone writes one, and this test fails until then.
+    let debug = format!("{:?}", Keys::default());
+    let fields: std::collections::BTreeSet<&str> = debug
+        .split(['{', '}', ','])
+        .skip(1)
+        .filter_map(|f| f.split(':').next())
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
     let samples = [
         ("local", "local = false"),
         ("remote", "remote = false"),
@@ -327,6 +341,11 @@ fn policy_md_names_every_key_the_policy_file_accepts() {
         ("permit_listen", "permit_listen = [\"8080\"]"),
         ("gateway_ports", "gateway_ports = true"),
     ];
+    let sampled: std::collections::BTreeSet<&str> = samples.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        sampled, fields,
+        "a sample for every key of policy.toml, and no other"
+    );
     let page = page("policy.md");
     for (key, sample) in samples {
         assert!(
@@ -385,12 +404,21 @@ const DOC_TLDS: [&str; 3] = ["invalid", "test", "example"];
 const DOC_DOMAINS: [&str; 3] = ["example.net", "example.com", "example.org"];
 /// Words after an `@` that are placeholders or the one example host.
 const DOC_HOSTS: [&str; 4] = ["devbox", "name", "host", "HOST"];
-/// Names that look like hosts and are not: a crate registry.
-const NOT_HOSTS: [&str; 1] = ["crates.io"];
+/// Names that look like hosts and are not: the project's own public sites (registry, forge, the
+/// two specifications the changelog cites).
+const NOT_HOSTS: [&str; 4] = [
+    "crates.io",
+    "github.com",
+    "keepachangelog.com",
+    "semver.org",
+];
 /// Last labels that make a dotted word a domain name, not a file name.
-const TLDS: [&str; 24] = [
+const TLDS: &[&str] = &[
     "com", "net", "org", "io", "dev", "lan", "lab", "home", "local", "internal", "edu", "gov",
-    "me", "us", "uk", "de", "co", "app", "xyz", "info", "cloud", "corp", "test", "invalid",
+    "me", "us", "uk", "de", "co", "app", "xyz", "info", "cloud", "corp", "test", "invalid", "ai",
+    "ca", "au", "fr", "nl", "jp", "cn", "ru", "br", "eu", "tv", "cc", "ch", "se", "es", "pl",
+    "biz", "pro", "tech", "site", "online", "mil", "int", "arpa", "ws", "cz", "be", "dk", "fi",
+    "kr", "mx", "nz", "za", "sg", "hk", "tw",
 ];
 
 fn ipv4_is_documentation(parts: [u8; 4]) -> bool {
@@ -398,6 +426,67 @@ fn ipv4_is_documentation(parts: [u8; 4]) -> bool {
         parts,
         [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _] | [127, ..] | [0, 0, 0, 0]
     )
+}
+
+/// Words after a command in code (`ssh devbox`, `fil ls devbox`) that stand for a host.
+const PLACEHOLDERS: [&str; 6] = ["devbox", "HOST", "FILE", "SESSION", "NAME", "COMMAND"];
+const SUBCOMMANDS: [&str; 9] = [
+    "ls", "kill", "detach", "forward", "ports", "server", "install", "config", "show",
+];
+
+/// The commands in a Markdown text: shell blocks line by line, and inline `spans`. Blocks of
+/// output (`text`) and of TOML are not commands.
+fn code_segments(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    let mut shell = false;
+    for line in text.lines() {
+        if let Some(info) = line.trim_start().strip_prefix("```") {
+            fenced = !fenced;
+            shell = fenced && matches!(info.trim(), "sh" | "bash" | "");
+        } else if fenced {
+            if shell {
+                out.push(line.to_string());
+            }
+        } else {
+            out.extend(line.split('`').skip(1).step_by(2).map(str::to_string));
+        }
+    }
+    out
+}
+
+/// Host names without a dot, which the scan of dotted names cannot see: the first word after
+/// `ssh` or `fil` in code that is not a flag, a subcommand, a number or a placeholder.
+fn single_label_hosts(text: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for segment in code_segments(text) {
+        // A comment (`# ...`) is prose.
+        let code = segment.split(" #").next().unwrap_or("");
+        if code.trim_start().starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = code.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let starts = i == 0 || matches!(words[i - 1], "$" | "|" | "&&" | "sudo");
+            if !starts || !matches!(*word, "ssh" | "fil") {
+                continue;
+            }
+            for next in &words[i + 1..] {
+                let next = next.trim_end_matches([',', '.', ';', ')', '\'', '"']);
+                if next.starts_with('-') || !next.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                    continue;
+                }
+                if SUBCOMMANDS.contains(&next) {
+                    continue;
+                }
+                if !PLACEHOLDERS.contains(&next) && !next.contains(['@', '/', '=']) {
+                    bad.push(format!("{word} {next}"));
+                }
+                break;
+            }
+        }
+    }
+    bad
 }
 
 /// What `text` names that is not a documentation example: host names, IPv4 and IPv6 addresses.
@@ -488,9 +577,27 @@ fn the_host_scan_knows_a_documentation_host_from_a_real_one() {
 }
 
 #[test]
+fn the_scan_sees_a_host_without_a_dot() {
+    assert!(single_label_hosts("run `ssh myserver` now").contains(&"ssh myserver".to_string()));
+    assert!(
+        !single_label_hosts("```sh\nfil ls devbox\nfil -- ls\nfil forward -L 5173\n```")
+            .iter()
+            .any(|_| true)
+    );
+    assert!(single_label_hosts("`fil build-box -L 80`").len() == 1);
+}
+
+#[test]
 fn only_documentation_hosts_appear_in_the_guide() {
-    for (path, text) in pages() {
-        let bad = foreign_hosts(&text);
+    // The guide, and the two files that ship beside it in the archive.
+    let mut texts = pages();
+    for name in ["README.md", "CHANGELOG.md"] {
+        let path = root().join(name);
+        texts.push((path.clone(), std::fs::read_to_string(&path).unwrap()));
+    }
+    for (path, text) in texts {
+        let mut bad = foreign_hosts(&text);
+        bad.extend(single_label_hosts(&text));
         assert!(
             bad.is_empty(),
             "{}: names hosts or addresses that are not documentation examples: {bad:?}",

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH fil 1  fil 
+.TH "FIL" "1" "" "fil" "fil manual"
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH NAME
@@ -63,24 +63,14 @@ The session to attach to; it is created if it does not exist
 List the sessions on HOST
 .PP
 Usage: \fBfil ls [OPTIONS] <HOST>\fR
-.TP
-\fIHOST\fR
 .SS "fil kill"
 End a session: its shell and everything it started are killed
 .PP
 Usage: \fBfil kill [OPTIONS] <HOST> <SESSION>\fR
-.TP
-\fIHOST\fR
-.TP
-\fISESSION\fR
 .SS "fil detach"
 Detach whoever is attached to a session; it keeps running (inside a session, with no arguments: this one)
 .PP
 Usage: \fBfil detach [OPTIONS] [HOST] [SESSION]\fR
-.TP
-\fIHOST\fR
-.TP
-\fISESSION\fR
 .SS "fil forward"
 Add a forward to a running session, or remove one. The attached client asks its user before it listens or connects for a forward added this way
 .PP
@@ -146,6 +136,10 @@ Upload this file instead of the bundled or this fil\*(Aqs own binary (it must be
 Look at the configuration
 .PP
 Usage: \fBfil config [OPTIONS] <COMMAND>\fR
+.SS "fil config show"
+Show the settings that apply to HOST and where each value comes from (the default, [defaults] or [host.NAME]), like `ssh \-G`. Reads only the config file; never contacts the host
+.PP
+Usage: \fBfil config show [OPTIONS] <HOST>\fR
 .SH NOTES
 .nf
 Examples:
@@ -158,7 +152,7 @@ Examples:
 .PP
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 .PP
-Configuration: ~/.config/fil/config.toml (see DESIGN.md section 14).
+Configuration: ~/.config/fil/config.toml (see fil\-config(5), or `fil config show HOST`).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 .PP
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);

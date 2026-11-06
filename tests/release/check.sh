@@ -9,8 +9,7 @@
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
 #   --tag TAG   the tag being released: it must be v<Cargo.toml version>, CHANGELOG.md must have a
 #               section for the version, and a patch release must keep its minor's wire
-#   --complete  every file of the section 4.3 layout must be present. Without it, the files that
-#               LIC and DOC add later are listed as pending (a dry run before they land)
+#   --complete  accepted and implied: every file of the section 4.3 layout is always required
 #   --no-tree   skip the checks that read the dependency graph (`just release-deps`)
 #   --no-exec   run NOTHING that came from DIR: no `cargo metadata` in the extracted source archive
 #               (its .cargo/config.toml can name a rustc wrapper, which cargo runs) and no
@@ -27,13 +26,14 @@ while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;
     --tag) tag=$2; shift 2 ;;
-    --complete) complete=1; shift ;;
+    --complete) complete=1; shift ;; # kept for the callers; the whole layout is required either way
     --no-tree) tree=0; shift ;;
     --no-exec) exec=0; shift ;;
     -*) die "unknown option: $1" ;;
     *) dir=$1; shift ;;
   esac
 done
+[ "$complete" = 1 ] || true
 [ -n "$dir" ] || die "usage: check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR"
 if [ "$dry" = 0 ] && [ -z "$tag" ]; then
   die "name the release with --tag vX.Y.Z (or pass --dry-run for a build that is not a release)"
@@ -150,16 +150,15 @@ done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
 # ---- the archives
-# Layout (section 4.3). `pending` are files DOC adds (and the changelog, which a release needs);
-# they are required with --complete.
+# Layout (section 4.3): every file of it, DOC's (man pages, completions, examples, changelog) too.
 required="bin/fil
 libexec/fil/remote/x86_64-linux/fil
 libexec/fil/remote/aarch64-linux/fil
 libexec/fil/remote/SHA256SUMS
 share/doc/fil/README.md
 share/doc/fil/LICENSE
-share/doc/fil/THIRD-PARTY-NOTICES.md"
-pending="share/doc/fil/CHANGELOG.md
+share/doc/fil/THIRD-PARTY-NOTICES.md
+share/doc/fil/CHANGELOG.md
 share/doc/fil/config.example.toml
 share/doc/fil/daemon.example.toml
 share/doc/fil/policy.example.toml
@@ -238,13 +237,6 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   for f in $required; do
     [ -f "$root/$f" ] || fail "$name.tar.gz lacks $f"
   done
-  missing=
-  for f in $pending; do
-    if [ ! -f "$root/$f" ]; then
-      if [ "$complete" = 1 ]; then fail "$name.tar.gz lacks $f"; else missing="$missing $f"; fi
-    fi
-  done
-  [ -z "$missing" ] || note "$name.tar.gz: pending (DOC), not yet in the archive:$missing"
   # The bundle's list is the sha256sum of its two binaries, sorted, relative paths.
   if [ -f "$root/libexec/fil/remote/SHA256SUMS" ]; then
     if [ "$(cat "$root/libexec/fil/remote/SHA256SUMS")" = "$(cd "$root/libexec/fil/remote" && for f in aarch64-linux/fil x86_64-linux/fil; do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done)" ] && sums_check "$root/libexec/fil/remote" SHA256SUMS; then

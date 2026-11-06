@@ -1,0 +1,21 @@
+# ~/.config/fil/daemon.toml, on the host where the daemon runs. Every key is optional.
+# The daemon reads it when it starts; a running daemon keeps the settings it started with.
+
+direct = true             # offer the direct (QUIC) transport; false: attaches use the pipe
+bind = "::"               # the address the UDP port binds; "::" also takes IPv4
+port_range = [60000, 61000]   # the UDP port is chosen from here: open it in the host's firewall
+history_lines = 1000      # scrollback kept per session
+idle_exit_secs = 300      # the daemon exits this long after its last session ends; 0: never
+scope = "auto"            # auto | systemd | tree: how a session's processes are grouped for `fil kill`
+agent_socket = true       # false: no SSH_AUTH_SOCK in sessions
+
+[ports]
+probe = "head"            # head | full | off: what `fil ports` may send to a listener to label it
+probe_other = false       # true: also probe other users' listeners on loopback
+
+[forward]
+remote_peers = "any"      # any | same-user: who may connect to the sessions' -R ports
+# window = "1MiB"         # the daemon side's forward tunables, with the client's keys and bounds
+# buffer = "1MiB"
+# open_wait = "30s"
+# linger = "10m"

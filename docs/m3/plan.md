@@ -490,7 +490,7 @@ Every package keeps the M2 rules: one PR from its own branch; `just ci` gated on
 
 **T3: latency and drop-in tooling** (parallel; no product code)
 - **Owns:** `crates/fil-testbins/src/bin/keyprobe.rs` (a `--screen` mode: the output through an emulator; a key counts when its glyph first appears at its cell, so a written guess counts, and the final screen is checked too), `crates/fil/examples/dropin/netcut.rs` (a delay knob: hold bytes and datagrams for N ms each way, so the Pis can be reached at a chosen RTT), `tests/realnet/predict.sh` (new realnet part with the prediction cells of §5.5; one line in `run.sh`'s part list and in the workflow's `latency` part list), their unit tests.
-- **Tests:** keyprobe's `--screen` on a raw `cat` with no prediction agrees with its byte mode within 1 ms; netcut's delay measured within 2 ms of the setting both ways.
+- **Tests:** keyprobe's `--screen` on a raw `cat` with no prediction agrees with its byte mode within 1 ms; netcut's delay, TCP and UDP, both ways: no sample under the setting, the median at most 10 ms over it, and an interquartile range of at most 3 ms (so a relay that rounds its hold to a tick fails; the 10 ms is the measurement's three thread wake-ups on a shared VM, which were 2.5 ms on GitHub's arm64 macOS runner).
 - **Done when:** both hold, and the `predict` part runs (with fil's prediction still off, until E1a) in `linux-check -f suite=latency`.
 
 **K1: pace the terminal channel** (on the critical path for v0.1.0 since 2026-11-04; carried from M2 and PR #110; after W1, which owns `core.rs` before it)

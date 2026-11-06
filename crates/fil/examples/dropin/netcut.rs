@@ -51,8 +51,9 @@ const TCP_QUEUE: usize = 256;
 const UDP_QUEUE: usize = 4096;
 
 /// The last stretch of a delay is waited out by yielding instead of on tokio's timer, which
-/// rounds a deadline up to its next millisecond tick (on macOS it woke 1.5 ms late on average,
-/// against a 2 ms bound).
+/// rounds a deadline up to its next millisecond tick (on macOS it woke 1.5 ms late on average).
+/// That is a precise delay for the drop-in suite's chosen round trips, which is why it stays, even
+/// though the delay tests' bounds (median and spread, see `tests`) no longer need it.
 const FINE_WAIT: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
@@ -375,8 +376,27 @@ mod tests {
     use std::time::Instant as Clock;
 
     const DELAY: Duration = Duration::from_millis(30);
-    /// T3's bound: the median of a direction within 2 ms of the setting.
-    const WITHIN: Duration = Duration::from_millis(2);
+    /// T3's bound, as a scheduling allowance: the median of a direction is never under the
+    /// setting (the relay releases nothing early: [`judge`] checks every sample) and is over it by
+    /// at most this. The relay's own wait is a deadline and precise; what the allowance covers is
+    /// what the measurement adds. A one-way sample spans the relay's reader waking, its delay
+    /// task waking at the deadline and the stamping thread waking to read the bytes: three
+    /// thread wake-ups. On GitHub's arm64 macOS runner (a shared VM) the medians were steadily
+    /// 32.4 to 32.6 ms against 30 ms (macos-check run 42264764177), so 2 ms was under that
+    /// machine's wake-up cost, not a sign of a late relay. 10 ms is about four times that cost.
+    /// It is a median bound and so catches a relay that holds twice (30 ms more), not one that
+    /// rounds its hold up to a tick: a 10 ms tick adds U[0, 10) ms, a median of about 5 ms
+    /// over, inside this. That case is [`SPREAD`]'s. The UDP test shares both bounds: the same
+    /// three wake-ups sit between the stamps, and the same relay code holds the datagrams.
+    const WITHIN: Duration = Duration::from_millis(10);
+    /// The most the interquartile range of a direction's samples may be. A steady relay on a
+    /// busy VM shifts all samples together (the medians above moved 0.2 ms between runs), while
+    /// one that rounds its hold up to a tick spreads them over the whole tick: an IQR of 5 ms
+    /// for 10 ms, more for a coarser one. 3 ms is far above a healthy relay's IQR (0.02 to 0.1
+    /// ms locally, printed with every run) and under what a 10 ms tick makes. Checked by
+    /// mutation: a hold rounded up to a 10 ms wall-clock tick gives medians of 35 ms (inside
+    /// [`WITHIN`]) and IQRs of 5 ms, and fails.
+    const SPREAD: Duration = Duration::from_millis(3);
     const SAMPLES: usize = 40;
     /// A loaded machine can deschedule any of the threads for milliseconds; it rarely does so to
     /// the median of all three runs (the pattern of `fil-daemon/tests/log_blocking.rs`).
@@ -391,12 +411,28 @@ mod tests {
         v[v.len() / 2]
     }
 
+    /// The interquartile range: the spread of the middle half of the samples.
+    fn iqr(v: &[Duration]) -> Duration {
+        let mut v = v.to_vec();
+        v.sort();
+        v[v.len() * 3 / 4] - v[v.len() / 4]
+    }
+
     /// Judges the runs of both directions: nothing is ever early (a byte or datagram that skipped
-    /// the queue), and in at least one run both medians are within [`WITHIN`] of the setting.
+    /// the queue), and in at least one run both medians are between the setting and [`WITHIN`]
+    /// over it, with an interquartile range of at most [`SPREAD`].
     fn judge(what: &str, runs: &[Run]) {
         let summary: Vec<String> = runs
             .iter()
-            .map(|(up, down)| format!("up {:?} down {:?}", median(up), median(down)))
+            .map(|(up, down)| {
+                format!(
+                    "up {:?} (iqr {:?}) down {:?} (iqr {:?})",
+                    median(up),
+                    iqr(up),
+                    median(down),
+                    iqr(down)
+                )
+            })
             .collect();
         eprintln!("netcut {what}: delay {DELAY:?}, medians of {SAMPLES} samples: {summary:?}");
         for (up, down) in runs {
@@ -408,16 +444,18 @@ mod tests {
         }
         assert!(
             runs.iter().any(within),
-            "{what}: no run had both medians within {WITHIN:?} of {DELAY:?}: {summary:?}"
+            "{what}: no run had both medians within {WITHIN:?} over {DELAY:?} and spreads within \
+                 {SPREAD:?}: {summary:?}"
         );
     }
 
-    /// Both medians of a run are within [`WITHIN`] of the setting (an early one is not: the early
-    /// check in [`judge`] reports it).
+    /// Both directions of a run have a median at the setting or over it by at most [`WITHIN`]
+    /// (an early one is not: the early check in [`judge`] reports it) and an IQR within
+    /// [`SPREAD`].
     fn within(r: &Run) -> bool {
         [&r.0, &r.1].iter().all(|v| {
             let m = median(v);
-            m >= DELAY && m - DELAY <= WITHIN
+            m >= DELAY && m - DELAY <= WITHIN && iqr(v) <= SPREAD
         })
     }
 

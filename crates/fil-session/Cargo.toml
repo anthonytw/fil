@@ -46,6 +46,8 @@ fil-session = { path = ".", features = ["test-hooks"] }
 fil-testkit = { path = "../fil-testkit" }
 # Real transports on simulated links (tests/terminal_pacing.rs).
 fil-netsim = { path = "../fil-netsim" }
+# quinn's counters for the Ctrl-C test's failure message (tests/terminal_pacing.rs).
+fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustix = { version = "1", features = ["process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }

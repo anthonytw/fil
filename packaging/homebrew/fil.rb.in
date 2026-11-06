@@ -5,11 +5,10 @@
 class Fil < Formula
   desc "Remote shell for development over SSH that keeps your place"
   homepage "https://github.com/anthonytw/fil"
-  license "GPL-3.0-or-later"
-
   # macOS: the universal archive. (Homebrew does not allow url in on_macos; Linux overrides it.)
   url "@URL_BASE@/fil-@VERSION@-universal-apple-darwin.tar.gz"
   sha256 "@SHA256_UNIVERSAL_APPLE_DARWIN@"
+  license "GPL-3.0-or-later"
 
   on_linux do
     on_intel do

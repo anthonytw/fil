@@ -1,7 +1,7 @@
 # cargo-about's config for THIRD-PARTY-NOTICES.md (docs/m4/release.md section 7). `just notices`
 # checks the committed file and `just notices-update` rewrites it; never edit the file by hand.
 #
-# The graph is the release binary's: `-p fil` with its default features (the recipe passes the
+# The graph is the release binary's: `-p fil-shell` with its default features (the recipe passes the
 # manifest), normal and build edges, on the four release targets (docs/m4/release.md section 3).
 # A crate only another target links (Windows, wasm, UEFI) is not in any release binary and is left
 # out; `just notices` checks the list against `cargo tree` for the same targets.
@@ -36,7 +36,12 @@ accepted = [
     "GPL-3.0-only",
 ]
 
-# The workspace's own crates are fil, under the root LICENSE (every one is `publish = false`).
+# The workspace's own crates are fil, under the root LICENSE. cargo-about skips the `publish = false`
+# ones (the test-only crates) here. The nine that are published to crates.io (docs/m4/packaging.md)
+# it cannot skip by config: `private.registries` would also skip every registry crate whose own
+# manifest says `publish = ["crates-io"]` (serial2 does). So it lists them, and about.hbs leaves out
+# every crate and license entry that has no registry source; `just notices` checks that no license
+# entry mixes the workspace's crates with registry crates, so that nothing else is left out.
 [private]
 ignore = true
 

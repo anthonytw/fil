@@ -74,7 +74,7 @@ install_setup() {
   log "building a release-marked fil for $target"
   (cd "$REPO_ROOT" && CARGO_TARGET_DIR=$tdir FIL_RELEASE_BUILD=1 \
     RUSTFLAGS="--remap-path-prefix=$HOME=/build-home --remap-path-prefix=$REPO_ROOT=/src" \
-    cargo build --release --locked --target "$target" -p fil) || exit 1
+    cargo build --release --locked --target "$target" -p fil-shell) || exit 1
   cp "$tdir/$target/release/fil" "$IN_DIR/fil"
   # The terminal the attach scenarios drive the client on.
   (cd "$REPO_ROOT" && CARGO_TARGET_DIR=$tdir \

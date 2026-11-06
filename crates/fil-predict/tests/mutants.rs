@@ -165,6 +165,12 @@ fn every_c1_guard_is_needed() {
             println!("{name:<20} caught: tests/overlay.rs at_most_1024_guesses_are_outstanding");
             continue;
         }
+        if *name == "cursor_clause" {
+            println!(
+                "{name:<20} caught: tests/overlay.rs the_first_confirmation_needs_the_cursor_where_the_core_computed_it"
+            );
+            continue;
+        }
         if *name == "prior_acked" {
             // A quality rule that also narrows OQ-1 case 3: shown needed by the faithful bar
             // typed ahead of the prompt; tests/sim.rs also checks it never writes earlier.

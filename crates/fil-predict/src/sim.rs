@@ -9,8 +9,8 @@
 //! The remote is not a terminal emulator. It echoes what a cooked tty would, and
 //! occasionally emits the scenario's escape sequences, which is all the overlay needs to be
 //! exposed to. Whether the overlay survives them is the oracle's business. Like the daemon
-//! (`fil-session/src/echo.rs`), it sends a cumulative `EchoAck` 50 ms after it takes input,
-//! in order with its output.
+//! (`fil-session/src/echo.rs`), it sends a cumulative `EchoAck` for each stretch of input once
+//! that stretch has been taken for 50 ms, in order with its output.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -28,6 +28,18 @@ pub const ECHO_WINDOW: Duration = Duration::from_millis(50);
 
 /// Secrets the typists type: from the reserved alphabet (`crate::oracle::reserved`).
 pub const SECRET: &str = "ØÑÜÅÇ";
+
+/// The zsh scenario's right prompt.
+const RPROMPT: &str = "[ok]";
+
+/// The commands the fish scenario's history starts with, and its typist types.
+const FISH_HISTORY: &[&str] = &[
+    "git status",
+    "git stash",
+    "ls -la",
+    "cargo test",
+    "make all",
+];
 
 /// What a scenario's bar is (`docs/m3/plan.md` §2.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,10 +129,21 @@ pub enum Scenario {
     /// Short commands and Enter at a shell that echoes faithfully: the faithful bar's own case
     /// (`docs/m3/plan.md` §2.5), with no key the default predictor cannot follow.
     Commands,
+    /// fish: a grey autosuggestion from the history after the typed text, redrawn as it changes;
+    /// Right at the end of the line takes it.
+    Fish,
+    /// zsh with a right prompt (`RPROMPT`, taken away when the line comes near it) and syntax
+    /// highlighting that colors the command word as it is typed (a restyle, not a misprediction).
+    Zsh,
+    /// readline's vi mode: Esc to normal mode, where keys are commands (`h`, `l`, `x`, `0`,
+    /// `$`, `i`, `a`, `A`), not text.
+    ViMode,
+    /// A program that echoes every letter upper-cased (adversarial: it echoes something else).
+    Upcase,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 20] = [
+    pub const ALL: [Scenario; 24] = [
         Scenario::Echo,
         Scenario::Password,
         Scenario::Async,
@@ -141,6 +164,10 @@ impl Scenario {
         Scenario::Offline,
         Scenario::RawSecret,
         Scenario::Commands,
+        Scenario::Fish,
+        Scenario::Zsh,
+        Scenario::ViMode,
+        Scenario::Upcase,
     ];
 
     /// The bar a run of this scenario is held to (`docs/m3/plan.md` §2.5). The M0 scenarios
@@ -151,7 +178,10 @@ impl Scenario {
             | Scenario::Password
             | Scenario::Paste
             | Scenario::Offline
-            | Scenario::Commands => Category::Faithful,
+            | Scenario::Commands
+            | Scenario::Fish
+            | Scenario::Zsh
+            | Scenario::ViMode => Category::Faithful,
             Scenario::SlowEcho => Category::Slow,
             _ => Category::Adversarial,
         }
@@ -179,6 +209,10 @@ impl Scenario {
             Scenario::Offline => "offline",
             Scenario::RawSecret => "raw-secret",
             Scenario::Commands => "commands",
+            Scenario::Fish => "fish",
+            Scenario::Zsh => "zsh",
+            Scenario::ViMode => "vi-mode",
+            Scenario::Upcase => "upcase",
         }
     }
 
@@ -188,6 +222,11 @@ impl Scenario {
                 let mut p = vec![b'.'; usize::from(cols).saturating_sub(7)];
                 p.extend_from_slice(b"$ ");
                 p
+            }
+            // The right prompt ends one column before the margin (`ZLE_RPROMPT_INDENT=1`).
+            Scenario::Zsh => {
+                let skip = cols.saturating_sub(3 + RPROMPT.len() as u16);
+                format!("$ \x1b[{skip}C{RPROMPT}\r\x1b[2C").into_bytes()
             }
             _ => b"$ ".to_vec(),
         }
@@ -223,7 +262,11 @@ impl Scenario {
             | Scenario::Paste
             | Scenario::Offline
             | Scenario::RawSecret
-            | Scenario::Commands => Vec::new(),
+            | Scenario::Commands
+            | Scenario::Fish
+            | Scenario::Zsh
+            | Scenario::ViMode
+            | Scenario::Upcase => Vec::new(),
             Scenario::Async => vec![
                 p(b"\r\n[bg] job 1 done\r\n"),
                 b(b"\x07"),
@@ -360,8 +403,17 @@ struct Remote {
     pool: Vec<Vec<u8>>,
     rng: Rng,
     decoder: KeyDecoder,
-    len: usize,
+    cols: u16,
+    /// The line being edited, and the cursor in it.
+    line: Vec<char>,
     pos: usize,
+    /// fish: the suggestion drawn after the line, and the history it comes from.
+    suggestion: Vec<char>,
+    history: Vec<Vec<char>>,
+    /// zsh: the right prompt is on the screen.
+    rprompt: bool,
+    /// vi mode: in normal (command) mode.
+    normal: bool,
     echo: bool,
     in_alt: bool,
     /// RawSecret: reading a secret in raw mode; `Some(true)` echoes asterisks.
@@ -379,8 +431,13 @@ impl Remote {
             prompt,
             rng: Rng::new(seed ^ 0xA5A5),
             decoder: KeyDecoder::default(),
-            len: 0,
+            cols,
+            line: Vec::new(),
             pos: 0,
+            suggestion: Vec::new(),
+            history: FISH_HISTORY.iter().map(|h| h.chars().collect()).collect(),
+            rprompt: sc == Scenario::Zsh,
+            normal: false,
             echo: true,
             in_alt: false,
             secret: None,
@@ -415,7 +472,231 @@ impl Remote {
     }
 
     fn setup(&self) -> Vec<Msg> {
-        vec![Msg::Bytes(self.sc.setup(40))]
+        vec![Msg::Bytes(self.sc.setup(self.cols))]
+    }
+
+    /// Back to an empty line (Enter, Ctrl-C, Ctrl-U).
+    fn new_line(&mut self) {
+        if self.sc == Scenario::Fish && !self.line.is_empty() {
+            self.history.push(std::mem::take(&mut self.line));
+        }
+        self.line.clear();
+        self.pos = 0;
+        self.suggestion.clear();
+        self.normal = false;
+        self.rprompt = self.sc == Scenario::Zsh;
+    }
+
+    fn enter(&mut self, o: &mut Vec<u8>, out: &mut Vec<Msg>) {
+        self.new_line();
+        if self.sc == Scenario::Password {
+            self.echo = false;
+            o.extend_from_slice(b"\r\nPassword: ");
+            out.push(Msg::Bytes(std::mem::take(o)));
+            out.push(Msg::Pty(self.mode()));
+            return;
+        }
+        if self.sc == Scenario::RawSecret {
+            self.secret = Some(self.rng.chance(50));
+            if self.rng.chance(50) {
+                o.extend_from_slice(b"\r\nSecret: ");
+            } else {
+                // On another row, the cursor put back: only the other row changes.
+                o.extend_from_slice(b"\r\n\x1b7\x1b[1;1HSecret:\x1b8");
+            }
+            out.push(Msg::Bytes(std::mem::take(o)));
+            out.push(Msg::Pty(self.mode()));
+            return;
+        }
+        o.extend_from_slice(b"\r\n");
+        out.push(Msg::Bytes(std::mem::take(o)));
+        if self.rng.chance(30) {
+            self.disturbance(out);
+        }
+        o.extend_from_slice(&self.prompt);
+        out.push(Msg::Bytes(std::mem::take(o)));
+    }
+
+    /// How a typed character is echoed: as typed, upper-cased (Upcase), or in the command word's
+    /// color (zsh's syntax highlighting).
+    fn put_char(&self, c: char, at: usize, o: &mut Vec<u8>) {
+        let c = if self.sc == Scenario::Upcase {
+            c.to_ascii_uppercase()
+        } else {
+            c
+        };
+        let mut b = [0u8; 4];
+        let command_word = self.sc == Scenario::Zsh && !self.line[..at].contains(&' ');
+        if command_word && c != ' ' {
+            o.extend_from_slice(b"\x1b[32m");
+        }
+        o.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        if command_word && c != ' ' {
+            o.extend_from_slice(b"\x1b[m");
+        }
+    }
+
+    /// readline's insert: the character at the cursor, the rest of the line shifted right.
+    fn insert(&mut self, c: char, o: &mut Vec<u8>) {
+        let at = self.pos;
+        self.line.insert(at, c);
+        self.pos += 1;
+        self.put_char(c, at, o);
+        if at + 1 < self.line.len() {
+            for i in at + 1..self.line.len() {
+                self.put_char(self.line[i], i, o);
+            }
+            let back = self.line.len() - self.pos;
+            o.extend_from_slice(format!("\x1b[{back}D").as_bytes());
+        }
+        // zsh takes the right prompt away when the line comes within a column of it.
+        if self.rprompt {
+            let rstart = usize::from(self.cols) - 1 - RPROMPT.len();
+            if 2 + self.line.len() + 2 >= rstart {
+                o.extend_from_slice(b"\x1b[K");
+                self.rprompt = false;
+            }
+        }
+        self.suggest(o);
+    }
+
+    fn backspace(&mut self, o: &mut Vec<u8>) {
+        if self.pos == 0 {
+            o.push(0x07);
+            return;
+        }
+        if self.pos == self.line.len() {
+            o.extend_from_slice(b"\x08 \x08");
+        } else {
+            o.extend_from_slice(b"\x08\x1b[P");
+        }
+        self.pos -= 1;
+        self.line.remove(self.pos);
+        self.suggest(o);
+    }
+
+    fn left(&mut self, o: &mut Vec<u8>) {
+        if self.pos > 0 {
+            if self.pos == self.line.len() && !self.suggestion.is_empty() {
+                o.extend_from_slice(b"\x1b[K");
+                self.suggestion.clear();
+            }
+            self.pos -= 1;
+            o.extend_from_slice(b"\x1b[D");
+        }
+    }
+
+    fn right(&mut self, o: &mut Vec<u8>) {
+        if self.pos < self.line.len() {
+            self.pos += 1;
+            o.extend_from_slice(b"\x1b[C");
+        } else if !self.suggestion.is_empty() {
+            // fish: Right at the end of the line takes the suggestion.
+            let s = std::mem::take(&mut self.suggestion);
+            for &c in &s {
+                let mut b = [0u8; 4];
+                o.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+            self.line.extend(s);
+            self.pos = self.line.len();
+        }
+    }
+
+    /// fish: the suggestion after the line (the first history entry it is a prefix of), redrawn
+    /// when it changes. A typed character that is the suggestion's next one only overwrites it.
+    fn suggest(&mut self, o: &mut Vec<u8>) {
+        if self.sc != Scenario::Fish || self.pos != self.line.len() {
+            return;
+        }
+        let new: Vec<char> = if self.line.is_empty() {
+            Vec::new()
+        } else {
+            self.history
+                .iter()
+                .rev()
+                .find(|h| h.len() > self.line.len() && h.starts_with(&self.line))
+                .map(|h| h[self.line.len()..].to_vec())
+                .unwrap_or_default()
+        };
+        if new == self.suggestion {
+            return;
+        }
+        o.extend_from_slice(b"\x1b[K");
+        if !new.is_empty() {
+            o.extend_from_slice(b"\x1b[90m");
+            for &c in &new {
+                let mut b = [0u8; 4];
+                o.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+            o.extend_from_slice(format!("\x1b[m\x1b[{}D", new.len()).as_bytes());
+        }
+        self.suggestion = new;
+    }
+
+    /// readline's vi normal mode. True when the key's output is already pushed (Enter).
+    fn vi_normal(&mut self, key: &KeyEvent, o: &mut Vec<u8>, out: &mut Vec<Msg>) -> bool {
+        let len = self.line.len();
+        match key {
+            KeyEvent::Enter => {
+                self.enter(o, out);
+                return true;
+            }
+            KeyEvent::Char('h') | KeyEvent::Backspace if self.pos > 0 => {
+                self.pos -= 1;
+                o.push(0x08);
+            }
+            KeyEvent::Sequence(s) if s == b"\x1b[D" && self.pos > 0 => {
+                self.pos -= 1;
+                o.push(0x08);
+            }
+            KeyEvent::Char('l' | ' ') if self.pos + 1 < len => {
+                self.pos += 1;
+                o.extend_from_slice(b"\x1b[C");
+            }
+            KeyEvent::Sequence(s) if s == b"\x1b[C" && self.pos + 1 < len => {
+                self.pos += 1;
+                o.extend_from_slice(b"\x1b[C");
+            }
+            KeyEvent::Char('x') if self.pos < len => {
+                self.line.remove(self.pos);
+                o.extend_from_slice(b"\x1b[P");
+                if self.pos == self.line.len() && self.pos > 0 {
+                    self.pos -= 1;
+                    o.push(0x08);
+                }
+            }
+            KeyEvent::Char('0') => {
+                if self.pos > 0 {
+                    o.extend_from_slice(format!("\x1b[{}D", self.pos).as_bytes());
+                }
+                self.pos = 0;
+            }
+            KeyEvent::Char('$') if len > 0 => {
+                let to = len - 1;
+                if to > self.pos {
+                    o.extend_from_slice(format!("\x1b[{}C", to - self.pos).as_bytes());
+                }
+                self.pos = to;
+            }
+            KeyEvent::Char('i') => self.normal = false,
+            KeyEvent::Char('a') => {
+                self.normal = false;
+                if len > 0 {
+                    self.pos += 1;
+                    o.extend_from_slice(b"\x1b[C");
+                }
+            }
+            KeyEvent::Char('A') => {
+                self.normal = false;
+                if len > self.pos {
+                    o.extend_from_slice(format!("\x1b[{}C", len - self.pos).as_bytes());
+                }
+                self.pos = len;
+            }
+            KeyEvent::Escape => {}
+            _ => o.push(0x07),
+        }
+        false
     }
 
     fn spontaneous(&mut self) -> Vec<Msg> {
@@ -454,78 +735,41 @@ impl Remote {
                 }
                 continue;
             }
-            match key {
-                KeyEvent::Char(c) => {
-                    let mut b = [0u8; 4];
-                    o.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
-                    self.pos += 1;
-                    self.len = self.len.max(self.pos);
+            if self.sc == Scenario::ViMode && self.normal {
+                if self.vi_normal(&key, &mut o, &mut out) {
+                    continue;
                 }
-                KeyEvent::Backspace => {
-                    if self.pos == 0 {
-                        o.push(0x07);
-                    } else if self.pos == self.len {
-                        o.extend_from_slice(b"\x08 \x08");
-                        self.pos -= 1;
-                        self.len -= 1;
-                    } else {
-                        o.extend_from_slice(b"\x08\x1b[P");
-                        self.pos -= 1;
-                        self.len -= 1;
-                    }
-                }
-                KeyEvent::Enter => {
-                    self.len = 0;
-                    self.pos = 0;
-                    if self.sc == Scenario::Password {
-                        self.echo = false;
-                        o.extend_from_slice(b"\r\nPassword: ");
-                        out.push(Msg::Bytes(o));
-                        out.push(Msg::Pty(self.mode()));
-                        continue;
-                    }
-                    if self.sc == Scenario::RawSecret {
-                        self.secret = Some(self.rng.chance(50));
-                        if self.rng.chance(50) {
-                            o.extend_from_slice(b"\r\nSecret: ");
-                        } else {
-                            // On another row, the cursor put back: only the other row changes.
-                            o.extend_from_slice(b"\r\n\x1b7\x1b[1;1HSecret:\x1b8");
+            } else {
+                match key {
+                    KeyEvent::Char(c) => self.insert(c, &mut o),
+                    KeyEvent::Backspace => self.backspace(&mut o),
+                    KeyEvent::Escape if self.sc == Scenario::ViMode => {
+                        self.normal = true;
+                        if self.pos > 0 {
+                            self.pos -= 1;
+                            o.push(0x08);
                         }
-                        out.push(Msg::Bytes(o));
-                        out.push(Msg::Pty(self.mode()));
+                    }
+                    KeyEvent::Enter => {
+                        self.enter(&mut o, &mut out);
                         continue;
                     }
-                    o.extend_from_slice(b"\r\n");
-                    out.push(Msg::Bytes(std::mem::take(&mut o)));
-                    if self.rng.chance(30) {
-                        self.disturbance(&mut out);
+                    KeyEvent::Ctrl(3) => {
+                        self.new_line();
+                        o.extend_from_slice(b"^C\r\n");
+                        o.extend_from_slice(&self.prompt);
                     }
-                    o.extend_from_slice(&self.prompt);
-                }
-                KeyEvent::Ctrl(3) => {
-                    self.len = 0;
-                    self.pos = 0;
-                    o.extend_from_slice(b"^C\r\n");
-                    o.extend_from_slice(&self.prompt);
-                }
-                KeyEvent::Ctrl(21) => {
-                    self.len = 0;
-                    self.pos = 0;
-                    o.extend_from_slice(b"\r\x1b[K");
-                    o.extend_from_slice(&self.prompt);
-                }
-                KeyEvent::Sequence(s) if s == b"\x1b[D" => {
-                    if self.pos > 0 {
-                        self.pos -= 1;
-                        o.extend_from_slice(b"\x1b[D");
+                    KeyEvent::Ctrl(21) => {
+                        self.new_line();
+                        o.extend_from_slice(b"\r\x1b[K");
+                        o.extend_from_slice(&self.prompt);
                     }
+                    KeyEvent::Ctrl(2) => self.left(&mut o),
+                    KeyEvent::Ctrl(6) => self.right(&mut o),
+                    KeyEvent::Sequence(s) if s == b"\x1b[D" => self.left(&mut o),
+                    KeyEvent::Sequence(s) if s == b"\x1b[C" => self.right(&mut o),
+                    _ => {}
                 }
-                KeyEvent::Sequence(s) if s == b"\x1b[C" && self.pos < self.len => {
-                    self.pos += 1;
-                    o.extend_from_slice(b"\x1b[C");
-                }
-                _ => {}
             }
             if !o.is_empty() {
                 out.push(Msg::Bytes(o));
@@ -550,6 +794,12 @@ pub struct SimConfig {
     pub jitter: Duration,
     /// Server output is delivered in chunks of 1 to this many bytes (at random).
     pub max_chunk: usize,
+    /// Cut the program's writes at arbitrary bytes (`true`), or deliver each write whole, as a
+    /// PTY read of a keystroke's echo nearly always is (`false`; consecutive writes still arrive
+    /// as separate chunks). The faithful bar is measured with whole writes: the core checks the
+    /// cursor after every chunk, so an echo cut where it passes the cursor through a place no
+    /// guess leaves it (a Backspace's `\b \b`, an insert's shifted rest) ends the epoch.
+    pub split_writes: bool,
     pub run: RunConfig,
 }
 
@@ -566,6 +816,7 @@ impl SimConfig {
             one_way: Duration::from_millis(60),
             jitter: Duration::from_millis(20),
             max_chunk: 7,
+            split_writes: true,
             run,
         }
     }
@@ -620,6 +871,48 @@ fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Item> {
         items.truncate(keys);
         return items;
     }
+    if sc == Scenario::Fish {
+        // Commands from the history, typed in full or in part, sometimes off it, with a
+        // Backspace, a Right that takes the suggestion, and Enter.
+        while items.len() < keys {
+            let cmd: Vec<u8> = rng.pick(FISH_HISTORY).bytes().collect();
+            let n = rng.range(1, cmd.len() as u64) as usize;
+            for &b in &cmd[..n] {
+                items.push(Item::key(vec![b]));
+            }
+            match rng.below(4) {
+                0 => items.push(Item::key(b"\x1b[C".to_vec())),
+                1 => {
+                    items.push(Item::key(vec![0x7f]));
+                    items.push(Item::key(vec![*rng.pick(b"xyz")]));
+                }
+                2 => items.push(Item::key(vec![*rng.pick(b"qwz")])),
+                _ => {}
+            }
+            items.push(Item::key(b"\r".to_vec()));
+        }
+        items.truncate(keys);
+        return items;
+    }
+    if sc == Scenario::ViMode {
+        // Text, then now and then Esc, a few normal-mode commands and back to insert mode.
+        while items.len() < keys {
+            for _ in 0..rng.range(2, 8) {
+                items.push(Item::key(vec![*rng.pick(b"abcdefgh jk")]));
+            }
+            if rng.chance(60) {
+                items.push(Item::key(b"\x1b".to_vec()));
+                for _ in 0..rng.range(1, 4) {
+                    items.push(Item::key(vec![*rng.pick(b"hlx0$hhl")]));
+                }
+                items.push(Item::key(vec![*rng.pick(b"iaA")]));
+            } else if rng.chance(30) {
+                items.push(Item::key(b"\r".to_vec()));
+            }
+        }
+        items.truncate(keys);
+        return items;
+    }
     let v = typist_keys(sc, keys, rng);
     for k in v {
         match sc {
@@ -665,8 +958,10 @@ fn typist_keys(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Vec<u8>> {
             0..=69 => vec![*rng.pick(COMMON)],
             70..=81 => vec![0x7f],
             82..=86 => vec![b'\r'],
-            87..=89 => b"\x1b[D".to_vec(),
-            90..=91 => b"\x1b[C".to_vec(),
+            87..=88 => b"\x1b[D".to_vec(),
+            89 => vec![0x02], // Ctrl-B
+            90 => b"\x1b[C".to_vec(),
+            91 => vec![0x06], // Ctrl-F
             92 => vec![0x15],
             93 => vec![0x03],
             94 => b"\x1b[A".to_vec(),
@@ -701,6 +996,8 @@ pub struct SimOutcome {
     pub trace: Trace,
     pub failure: Option<Failure>,
     pub stats: crate::driver::Stats,
+    /// What the core counted (`docs/m3/plan.md` §2.5).
+    pub predict: crate::overlay::PredictStats,
 }
 
 /// Runs one session to completion (or to its first violation).
@@ -717,7 +1014,11 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     let mut link = Link {
         one_way: micros(cfg.one_way),
         jitter: micros(cfg.jitter),
-        max_chunk: cfg.max_chunk as u64,
+        max_chunk: if cfg.split_writes {
+            cfg.max_chunk as u64
+        } else {
+            u64::MAX / 2
+        },
         last_s2c: 0,
         last_c2s: 0,
     };
@@ -747,7 +1048,9 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     }
     q.put(25_000, Q::Tick);
 
-    let mut ack_due = false;
+    // The daemon's echo window (`fil-session/src/echo.rs`): each stretch of input is acknowledged
+    // once it has been in the PTY for the window, never before.
+    let mut taken: std::collections::VecDeque<(InputPos, u64)> = Default::default();
     let mut later_at = 0u64;
     while let Some((now, item)) = q.pop() {
         let at = Duration::from_micros(now);
@@ -771,15 +1074,27 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
                 } else {
                     link.deliver(&mut q, &mut rng, now, out);
                 }
-                if !ack_due {
-                    ack_due = true;
+                if taken.is_empty() {
                     q.put(now + micros(ECHO_WINDOW), Q::AckDue);
                 }
+                taken.push_back((remote.taken, now));
             }
             Q::Later(out) => link.deliver(&mut q, &mut rng, now, out),
             Q::AckDue => {
-                ack_due = false;
-                link.deliver(&mut q, &mut rng, now, vec![Msg::Ack(remote.taken)]);
+                let mut upto = None;
+                while let Some(&(end, at)) = taken.front() {
+                    if now < at + micros(ECHO_WINDOW) {
+                        break;
+                    }
+                    upto = Some(end);
+                    taken.pop_front();
+                }
+                if let Some(&(_, at)) = taken.front() {
+                    q.put(at + micros(ECHO_WINDOW), Q::AckDue);
+                }
+                if let Some(upto) = upto {
+                    link.deliver(&mut q, &mut rng, now, vec![Msg::Ack(upto)]);
+                }
             }
             Q::ToClientAck(n) => d.apply(at, Ev::EchoAck(n)),
             Q::Spontaneous => {
@@ -802,6 +1117,7 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     let end = d.trace.events.last().map_or(Duration::ZERO, |e| e.at);
     d.finish(end);
     SimOutcome {
+        predict: d.overlay.stats(),
         trace: d.trace,
         failure: d.failure,
         stats: d.stats,
@@ -855,7 +1171,7 @@ impl Link {
                     let mut t = (now + self.delay(rng)).max(self.last_s2c);
                     let mut rest = &b[..];
                     while !rest.is_empty() {
-                        let n = if rng.chance(40) {
+                        let n = if rng.chance(40) || self.max_chunk >= u64::MAX / 2 {
                             rest.len()
                         } else {
                             (1 + rng.below(self.max_chunk) as usize).min(rest.len())

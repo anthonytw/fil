@@ -26,6 +26,12 @@ if [ "$event" = push ] && [[ $ref == refs/tags/v* ]]; then
   # fetch the tag object itself, and main, anonymously (the repository is public).
   git -C "$ROOT" fetch --force --no-tags origin "+refs/tags/$tag:refs/tags/$tag" "+refs/heads/main:refs/remotes/origin/main"
   [ "$(git -C "$ROOT" cat-file -t "refs/tags/$tag")" = tag ] || die "$tag is not an annotated tag"
+  # The tag must still name the commit this run checked out. A job that waits (the crates-io job
+  # waits for the owner's approval) or is re-run after the tag was deleted and pushed again on
+  # another commit would otherwise check the new tag and build or publish the old commit.
+  tagged=$(git -C "$ROOT" rev-parse "refs/tags/$tag^{commit}")
+  head=$(git -C "$ROOT" rev-parse HEAD)
+  [ "$tagged" = "$head" ] || die "$tag is now commit $tagged, not this run's commit $head"
   git -C "$ROOT" merge-base --is-ancestor "$(git -C "$ROOT" rev-parse "refs/tags/$tag^{commit}")" refs/remotes/origin/main \
     || die "$tag is not on main"
   # The signature, against the signers on main. While the file is the placeholder (no key yet) there

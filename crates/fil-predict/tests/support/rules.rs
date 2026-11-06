@@ -82,7 +82,8 @@ pub const RULES: &[Rule] = &[
         guard: Some("nonblank_first"),
         trace: masked_prompt,
         adversary: plain,
-        mosh_breaks: true,
+        // P1 never guesses a Backspace over text it did not type (the prompt's `*`).
+        mosh_breaks: false,
     },
     Rule {
         // Review B1, inquirer-style: the line redrawn at every key, with no mode change at all.
@@ -103,7 +104,8 @@ pub const RULES: &[Rule] = &[
                 .server(650, b"\r? Password: *\x1b[K")
         },
         adversary: plain,
-        mosh_breaks: true,
+        // P1 never guesses a Backspace over text it did not type.
+        mosh_breaks: false,
     },
     Rule {
         // Review B2a: OQ-1 case 1's bound against a predictor that withdraws each written guess
@@ -315,7 +317,8 @@ pub const RULES: &[Rule] = &[
             keys(t, 100, "xØÑ").server(200, b"\x1b[C")
         },
         adversary: plain,
-        mosh_breaks: true,
+        // P1 keeps one guess in flight in front of a suggestion: `Ø` is never declared.
+        mosh_breaks: false,
     },
     Rule {
         // A raw-mode program turns echo off without drawing anything.
@@ -464,6 +467,7 @@ pub fn holds(rule: &Rule) {
     for b in backends() {
         let mut kinds = vec![
             ("mosh", PredictorKind::Mosh),
+            ("mosh always", PredictorKind::MoshAlways),
             ("adversary", PredictorKind::Hostile((rule.adversary)())),
         ];
         for seed in 0..4 {
@@ -483,7 +487,7 @@ pub fn holds(rule: &Rule) {
 }
 
 /// With the rule's guard off, the adversary gets a secret written on every backend; the default
-/// predictor does exactly when the table says so.
+/// predictor (adaptive or always on) does exactly when the table says so.
 pub fn needed(rule: &Rule) {
     let Some(guard) = rule.guard else { return };
     let trace = (rule.trace)();
@@ -498,7 +502,14 @@ pub fn needed(rule: &Rule) {
             rule.name,
             b.name
         );
-        let mosh = run(&trace, b.name, PredictorKind::Mosh, g);
+        // Adaptive, and always on: the traces' acknowledgements come at once, which the adaptive
+        // switch reads as a fast link, so where the default predictor guesses is asked with it
+        // always on; the quiet-boundary trace needs it adaptive.
+        let mosh = [PredictorKind::Mosh, PredictorKind::MoshAlways]
+            .into_iter()
+            .map(|k| run(&trace, b.name, k, g))
+            .find(|m| *m == Some(Kind::Secret))
+            .flatten();
         assert_eq!(
             mosh == Some(Kind::Secret),
             rule.mosh_breaks,

@@ -8,7 +8,7 @@ Examples use package version `0.1.0` and wire `1.12`. The wire on `main` at the 
 
 ## 1. Versioning and the wire
 
-- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The first release is **0.1.0**, an ssh/et drop-in without prediction (decided, owner 2026-11-04, 10:28 ET: N9; it has no `predict` key and no `--predict` flag, and prediction is 0.2.0's headline), then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
+- **The package version** is SemVer, in `[workspace.package] version` in the root `Cargo.toml`. It is the one version of every crate. The published crates also pin each other at exactly that version (`=X.Y.Z` in `[workspace.dependencies]`, `docs/m4/packaging.md` §3), so a bump changes those lines and `Cargo.lock` too: `just set-version X.Y.Z` does all of it (cargo refuses a tree where they disagree). A release version is `X.Y.Z` or `X.Y.Z-PRE` with PRE of `[0-9A-Za-z.]`, which the .deb and .rpm need (nfpm's semver; `release-check` refuses another). The first release is **0.1.0**, an ssh/et drop-in without prediction (decided, owner 2026-11-04, 10:28 ET: N9; it has no `predict` key and no `--predict` flag, and prediction is 0.2.0's headline), then 1.0.0 "after real use" (decided, owner 2026-11-04: the option "0.1.0 first, 1.0.0 after real use"); one or two 0.x releases in between, and 1.0 once the config and flags have met real use, is the recommendation they accepted. Under SemVer, 0.x means the config, flags and exit statuses may still change.
 - **The wire** is `PROTOCOL_MAJOR`.`PROTOCOL_REVISION` (`crates/fil-proto/src/limits.rs`). It is independent of the package version. Two builds talk only when their wires are equal (`DESIGN.md` §5.3, §8.5).
 - **A patch release never changes the wire.** REL's `release-check` compares the revision on the last line of the golden's `[history]` with that of the previous tag of the same minor.
 - **A release that changes the wire bumps the minor version** (0.1 to 0.2 before 1.0, 1.2 to 1.3 after). Its release notes say "upgrade fil on both ends". Daemons of different wires coexist on a host, so this is an upgrade, not a breakage.
@@ -54,16 +54,19 @@ Each release carries exactly these files:
 | `fil-<ver>-aarch64-linux-musl.tar.gz` | the Linux aarch64 archive |
 | `fil-<ver>-universal-apple-darwin.tar.gz` | the macOS archive |
 | `fil-<ver>-source.tar.gz` | the tagged tree with every dependency vendored (`cargo vendor`), which builds offline. It is the Corresponding Source for the binaries (LIC) |
-| `SHA256SUMS` | the checksums of the four files above it: the three binary archives and the source archive |
+| `fil_<ver>_amd64.deb`, `fil-<ver>-1.x86_64.rpm` | the x86_64 Linux archive's files as a Debian and an RPM package named `fil` (decided, owner 2026-11-04: D1; PKG, `docs/m4/packaging.md` §2). The rpm is signed with the package key (§10.4) |
+| `fil_<ver>_arm64.deb`, `fil-<ver>-1.aarch64.rpm` | the same for aarch64 |
+| `SHA256SUMS` | the checksums of the eight files above it: the three binary archives, the source archive and the four packages |
 | `SHA256SUMS.sig` | an SSH signature over `SHA256SUMS`, made with `ssh-keygen -Y sign -n fil-release` by the release identity, the owner's own SSH key (M4 OQ-2; decided, owner 2026-11-04) |
+| `SHA256SUMS.asc` | an OpenPGP signature over the same `SHA256SUMS`, by the package key (§10.4), for those who verify with gpg |
 
-The GitHub build-provenance attestation for each archive is attached to the release by the workflow. It is not a file in the list.
+The GitHub build-provenance attestation for each archive and each package is attached to the release by the workflow. It is not a file in the list. The attestations of the two rpms are of the unsigned bytes CI built; after the owner signs them (§10.4), their provenance is the signature and the rebuild, which compares everything but the signature header.
 
 ### 4.2 `SHA256SUMS`
 
 - **Format:** the output of GNU `sha256sum`: 64 lowercase hex digits, two spaces, then the file name with no directory part, one line per file, LF line endings.
 - **Order:** sorted by file name, bytewise (`LC_ALL=C sort`).
-- **Coverage:** exactly four files: the three binary archives and the source archive of §4.1. Not `SHA256SUMS` or `SHA256SUMS.sig`.
+- **Coverage:** exactly eight files: the three binary archives, the source archive and the four packages of §4.1. Not `SHA256SUMS` or `SHA256SUMS.sig`.
 - **Check:** `sha256sum -c SHA256SUMS` (or `shasum -a 256 -c SHA256SUMS`) in the download directory. The signature is checked with `ssh-keygen -Y verify -n fil-release` against the allowed-signers file from `main`, never from the tag (REL's `release-verify`).
 
 ### 4.3 The archive layout
@@ -115,6 +118,7 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
   - `SOURCE_DATE_EPOCH` is the tagged commit's committer time.
 - **Pinned tools:** the tools that generate content are pinned by version and installed the way `linux-check` installs its tools (install-action with a version): `cargo-about` (LIC; it runs in `just notices`, never while packaging, §7) and pandoc (DOC).
 - **The Linux binaries and archives must reproduce:** the two CI builds of a candidate give identical SHA-256s, and the owner's independent rebuild (`just release-verify`, in the VM) reproduces the binaries. macOS is best effort.
+- **The .deb and .rpm packages** are made from the two Linux archives by nfpm 2.48.0 in its digest-pinned image (`tests/release/linux-packages.sh`), with every time set to `SOURCE_DATE_EPOCH`, and must reproduce like the archives: identical in the two assemblies, and in the rebuild (`docs/m4/packaging.md` §2).
 
 ## 5. The remote install layout
 
@@ -260,7 +264,7 @@ That cost is **accepted** for 0.1.0, given its preconditions: a home shared acro
 
 - **The file.** `THIRD-PARTY-NOTICES.md` is committed at the root of the tree. Every binary archive carries it as `share/doc/fil/THIRD-PARTY-NOTICES.md`, beside `LICENSE` (§4.3), and the source archive carries it at its root.
 - **What it covers.**
-  - **The release graph:** the `fil` package with its default features, its normal and build dependencies, on the four release targets of §3 (`targets` in `about.toml`). That is the graph `release-deps` checks (`cargo tree -p fil -e normal,build`), narrowed from `--target all` to the targets fil ships: a crate that only Windows, wasm or UEFI links is in no release binary. For each crate: its name, version and the license expression its manifest declares. Then the license texts, taken from the crates' own files, so the copyright lines are theirs, each with the crates it covers. Where a crate offers a choice (`MIT OR Apache-2.0`), fil takes the first license of `about.toml`'s list that it offers, and the file carries that text.
+  - **The release graph:** the `fil-shell` package (`crates/fil`) with its default features, its normal and build dependencies, on the four release targets of §3 (`targets` in `about.toml`). That is the graph `release-deps` checks (`cargo tree -p fil-shell -e normal,build`), narrowed from `--target all` to the targets fil ships: a crate that only Windows, wasm or UEFI links is in no release binary. For each crate: its name, version and the license expression its manifest declares. Then the license texts, taken from the crates' own files, so the copyright lines are theirs, each with the crates it covers. Where a crate offers a choice (`MIT OR Apache-2.0`), fil takes the first license of `about.toml`'s list that it offers, and the file carries that text.
   - **Clarifications:** a crate whose license file cargo-about does not recognize gets a `[CRATE.clarify]` in `about.toml`, pinned by the checksum of the text it takes. Today that is rcgen, whose one `LICENSE` file holds both its MIT and its Apache-2.0 text. Without the clarify, cargo-about would print the canonical MIT text with `<year> <copyright holders>` in place of rcgen's own copyright line. `deny.toml` needs none: cargo-deny reads rcgen's license from its manifest.
   - **Copyright notices in source files:** the crates whose license includes ISC (ring, rustls-webpki, untrusted, and rustls, which offers it) carry copyright lines in their files' headers from more authors than their license files name: Google, Intel, David Judd, Trent Clarke, Simon Sapin, Rafael Fernández López, Daniel McCarney and others. `tests/release/notice_scan.py` collects every `Copyright` line of every file with the ISC permission notice in each crate whose license includes ISC, and the recipe writes them into their own section. A new holder therefore makes the committed file stale. Files under Apache-2.0 headers (ring's OpenSSL and BoringSSL code) need nothing more in object form than the license text and a NOTICE file, and none of the crates has one (below).
   - **More than one binary holds:** build scripts and procedural macros, which run while fil is built, are listed too, and a crate that one target alone uses is only in that target's binary. The workspace's own crates are not listed: they are fil, under `LICENSE`.
@@ -302,8 +306,8 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
 
 ### 9.1 What the workflow does
 
-- **A tag push `v*`** builds the files of §4.1 and opens a **draft** GitHub Release with the five files (the four archives and `SHA256SUMS`) and a build-provenance attestation for each archive. It never publishes. **A dry run** (`gh workflow run release.yml --ref BRANCH`) does the same builds and checks, uploads the files to the run (artifact `release-files`) and does nothing else: its jobs have no `id-token` or `attestations` permission.
-- **Jobs:** `prepare` (version, `SOURCE_DATE_EPOCH`, the tag checks, `release-deps`, `notices`, `release-test`), `build-linux` (each Linux target twice, in two jobs), `build-macos` (twice, best effort), `package` (identical-binaries gate, archives assembled twice in the pinned image, identical-archives gate, `release-check`), `smoke-macos` (runs the macOS archive and `release-check` on macOS) and `publish` (tag push only: the only job with `contents: write`, `id-token: write` and `attestations: write`).
+- **A tag push `v*`** builds the files of §4.1 and opens a **draft** GitHub Release with the nine files (the four archives, the four packages and `SHA256SUMS`) and a build-provenance attestation for each archive and package. It never publishes. **A dry run** (`gh workflow run release.yml --ref BRANCH`) does the same builds and checks, uploads the files to the run (artifact `release-files`) and does nothing else: its jobs have no `id-token` or `attestations` permission.
+- **Jobs:** `prepare` (version, `SOURCE_DATE_EPOCH`, the tag checks, `release-deps`, `notices`, `release-test`, `crates-check`), `build-linux` (each Linux target twice, in two jobs), `build-macos` (twice, best effort), `package` (identical-binaries gate, archives and packages assembled twice in the pinned images, identical-files gate, `release-check`, the amd64 packages' install test), `smoke-macos` (runs the macOS archive and `release-check` on macOS), `packages-arm64` (the arm64 packages' install test, on an arm64 runner), `publish` (tag push only: the only job with `contents: write`, `id-token: write` and `attestations: write`) and `crates-io` (tag push only, after `publish`: the nine crates by trusted publishing, in the `crates-io` environment that the owner approves, with `id-token: write` and nothing else; §10.1, `docs/m4/packaging.md` §3).
 - **The tag checks in `prepare` are not the gate.** On a tag push Actions runs the workflow file of the tagged commit, so whoever can push a `v*` tag controls it. The gates are the tag ruleset (OQ-2), the draft that a person publishes and the owner's `release-verify` and signature.
 - **A release needs the complete layout.** `release-check --complete` (what a tag push runs) fails until every file of §4.3 is in the archives. A dry run lists the files that DOC has yet to add (and `CHANGELOG.md`) as pending. DOC adds its files by producing them into a directory laid out like an archive and passing it to `package.sh --extra`. LIC's `THIRD-PARTY-NOTICES.md` is committed and comes from the tree, like `LICENSE` (§7), and is required in every archive already.
 - **Version and tag:** the archive names carry the version in `Cargo.toml`; a dry run of a branch is named after it (`0.0.0` before the first release). `release-check` (non-dry) requires the tag to be `v<version>`, a `CHANGELOG.md` section for it and, for a patch release, the wire of the previous tag of the same minor.
@@ -327,16 +331,22 @@ The scripts are in `tests/release/`; the workflow is `.github/workflows/release.
    ```
 
    The workflow builds the draft. If the `publish` job has to be re-run, delete the stale draft first, or there will be two.
-3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries and the four archives from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
-4. **Sign the verified file.** Sign the copy that step 3 verified (`target/release-verify/X.Y.Z/files/SHA256SUMS`), not a fresh download, because any writer can replace draft assets in between:
+3. **Verify, before signing.** `just release-verify X.Y.Z --pre-sign`. It downloads the draft and **stops at the first failure of its first three steps**, before looking at, let alone running, anything in it: the tag against `.github/release-signers` **on main** (annotated, signed, on main; its commit is resolved once and every later step is bound to that commit), `SHA256SUMS` against the files, and the attestations (`gh attestation verify` pinned to the repository, the workflow identity `…/release.yml@refs/tags/vX.Y.Z`, the commit as source and signer digest, and no self-hosted runner). `--pre-sign` skips only the signature, which does not exist yet. Then it runs `release-check --tag vX.Y.Z --complete --no-exec` (the files are unpacked, hashed, grepped and inspected; nothing from the download is run: no `cargo` in the source archive, no `--version` of a binary) and rebuilds the Linux binaries, the four archives and the four packages from that commit in the VM and compares hashes with the draft's. The macOS archive is only *reassembled* around the released macOS binary, which is not rebuilt.
+4. **Sign the verified files.** Sign the copies that step 3 verified (`target/release-verify/X.Y.Z/files/`), not a fresh download, because any writer can replace draft assets in between. First the two rpms (§10.4), which rewrites `SHA256SUMS` and writes `SHA256SUMS.asc` (after macOS signing, §10.3, when that is built: both rewrite `SHA256SUMS`, packages last); then `SHA256SUMS` with the release key; then upload what changed:
 
    ```sh
+   just release-sign-packages X.Y.Z                # the rpms, SHA256SUMS, SHA256SUMS.asc (gpg asks for the passphrase)
    ssh-keygen -Y sign -f ~/.ssh/fil-release -n fil-release target/release-verify/X.Y.Z/files/SHA256SUMS
-   gh release upload vX.Y.Z target/release-verify/X.Y.Z/files/SHA256SUMS.sig
+   cd target/release-verify/X.Y.Z/files
+   gh release upload vX.Y.Z --clobber fil-X.Y.Z-1.x86_64.rpm fil-X.Y.Z-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig
+   cd -
    just release-verify X.Y.Z                       # now the signature is checked too
    gh release edit vX.Y.Z --draft=false            # publish
    just release-verify X.Y.Z --no-rebuild          # once more, on what is published
    ```
+
+5. **crates.io.** Approve the waiting `crates-io` deployment of the tag's run (Actions, the run, "Review deployments"). The job refuses to run unless the `crates-io` environment has a required reviewer, the tag still names the run's commit, and the release is published with a `SHA256SUMS.sig` that verifies against `.github/release-signers` on main; then it publishes the nine crates in dependency order without compiling anything (`docs/m4/packaging.md` §3).
+6. **Homebrew and the rest.** `just brew-formula X.Y.Z` and `just aur-pkgbuild X.Y.Z` render the formula and the PKGBUILD from the `SHA256SUMS` that step 3 verified; the formula goes to the tap as a PR (`docs/m4/packaging.md` §4).
 
 ### 9.3 The rebuild VM
 
@@ -359,11 +369,13 @@ Apply it with `limactl stop fil`, `limactl edit fil` and `limactl start fil`, or
 
 **Decided (owner 2026-11-04, round 2):** each published crate gets a 0.0.1 placeholder now, to reserve its name. (Round 2 also said "no crates.io token goes to CI"; N8 below replaces that, as the coordinator's choice on the owner's delegation: trusted publishing puts a short-lived OIDC token in CI, and there is no long-lived token anywhere.) The test-only crates (`fil-testkit`, `fil-testbins`, `fil-netsim`) stay unpublished. On the AUR the package is `fil-shell-bin`, because `fil` is taken there (decided, owner 2026-11-04).
 
+**The rename (built by PKG).** `crates/fil` is the package `fil-shell`; its binary and its library are still `fil`, and the directory is unchanged, so `cargo build -p fil-shell` builds `target/*/fil`. The test-only crates are `publish = false`; the nine published ones are `publish = ["crates-io"]` and depend on each other with exact versions (`docs/m4/packaging.md` §3).
+
 **The names.** The owner's list began with `fil` and eight `fil-*` libraries (`fil-proto`, `fil-transport`, `fil-session`, `fil-daemon`, `fil-client`, `fil-term`, `fil-predict`, `fil-forward`). **`fil` is unavailable on crates.io:** an unrelated crate (a random-number helper) took it on 2026-11-04 at 08:24 ET. The user-facing crate is therefore **`fil-shell`** (`cargo install fil-shell` installs the `fil` binary, matching `fil-shell-bin` on the AUR), reserved by the coordinator. **The name is not marked decided:** the owner can pick another. The workspace's `crates/fil` package must be renamed to match before it is published; the binary stays `fil`. Until then no document may suggest `cargo install fil`, which installs the wrong crate.
 
 **Who publishes.** The owner first meant to publish the placeholders from their own account on their Mac. Later on 2026-11-04 the owner changed that: the coordinator published the placeholders from the `splarg-bot` crates.io account and invited `anthonytw` as an owner of each crate. That account's token has since been revoked and removed.
 
-**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag:** create the `crates-io` environment (required reviewer: the owner), and add a trusted publisher (this repository, the release workflow, the `crates-io` environment) on each of the nine crates: `fil-shell` and the eight `fil-*`.
+**How releases are published (N8; owner delegated the choice, 2026-11-04; coordinator chose trusted publishing).** crates.io releases use trusted publishing. A publish job in the release workflow uses `rust-lang/crates-io-auth-action`, which exchanges the job's GitHub OIDC identity for a short-lived crates.io token that is revoked when the job ends. The job runs behind a `crates-io` GitHub environment that only the owner can approve, from the signed `v*` tag. **No long-lived crates.io token exists anywhere**, neither on the owner's Mac nor in CI. This replaces N2's "v1 is published the same way, from the owner's Mac"; N2's other parts stand (the nine crates, the unpublished test-only crates, `fil-shell`). **Owner steps before the first tag, in this order:** (1) create the `crates-io` environment and protect it (required reviewer: the owner; deployment branches and tags: `v*` tags only). Do this first: GitHub creates a missing environment that a workflow names, with no protection, and a trusted publisher pins only the workflow file and the environment, not the ref, so an unprotected `crates-io` environment would let any writer's branch mint a token. (2) Then add a trusted publisher (this repository, the workflow `release.yml`, the environment `crates-io`) on each of the nine crates: `fil-shell` and the eight `fil-*`. The job also checks (1) itself, with `actions: read`, and fails unless the environment's required reviewers include the owner (`anthonytw`, a user reviewer); `prepare` makes the same check on every run (a warning on a dry run, an error on a tag push), so a dry run proves that the job's token can read the environment. The job is release.yml's `crates-io` (built by PKG, `docs/m4/packaging.md` §3).
 
 **The script** (`tests/release/reserve-crate-names.sh`, `just reserve-crate-names`) does the same job and is resumable, for the case that a run is interrupted or a name is added:
 
@@ -385,6 +397,7 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 - `.deb` and `.rpm` for x86_64 and arm64, built by CI and attached to the release;
 - the AUR package `fil-shell-bin`;
 - a Nix flake in the repository, plus a nixpkgs PR;
+- how each channel is built, checked and updated: `docs/m4/packaging.md` (PKG);
 - the start of the official distro submissions: Debian (an ITP, then an RFS; Ubuntu inherits Debian's package) and Fedora (a package review). These need owner accounts and a sponsor and finish whenever the distros finish. **v1 does not wait on their acceptance** (coordinator's reading, not the owner's words).
 
 ### 10.3 macOS: signed and notarized on the owner's Mac
@@ -396,3 +409,44 @@ Each placeholder is built in a fresh temporary directory outside the repository 
 3. **Verifiability** (proposed, coordinator). Anyone can strip the signature from the macOS binary and compare it with a rebuild. If that cannot be made byte-exact, `release-verify` compares everything except the signature and says so.
 4. **Stapling** (proposed, coordinator). A bare command-line binary cannot be stapled, so macOS checks Apple's service online the first time it runs.
 5. **The release key** (proposed, coordinator) on a hardware token is optional, not chosen (§9.2).
+
+### 10.4 The .rpm and .deb packages: signed on the owner's Mac
+
+**Decided (owner 2026-11-04, D3):** the packages are signed, and the signing key never lives in CI (N4), as for notarization (§10.3). **Everything below is the design, proposed by PKG;** `just release-sign-packages` (`tests/release/sign-packages.sh`) is built, tested on fakes in `just release-test`, and was run end to end on the rpms of a dry run's Linux binaries with a throwaway key in a Fedora 45 container (rpm 6.1.0, gpg 2.4.9): each signed rpm's body equalled that of an independent unsigned build, and the signed arm64 rpm installed with its signature checked (`install-packages.sh --key`), while the unsigned one was refused.
+
+- **What is signed, and why only that.**
+  - **The two .rpm files get an embedded signature** (`rpmsign --addsign`, an OpenPGP signature over the rpm's header, which carries the payload's digest). rpm and dnf check it on install once the key is imported (`rpm --import`; dnf asks for it, or the user imports it first), and Fedora's rpm refuses an unsigned package outright without `--nosignature`.
+  - **The .deb files are not signed.** dpkg and apt never verify a signature inside a .deb (`debsig-verify` is not installed or enforced anywhere by default); apt verifies only the signed `Release` file of a repository, and fil has no apt repository. A .deb's integrity is `SHA256SUMS` with its two signatures. A signed apt repository (on the site, say) is possible later and would reuse the package key.
+  - **`SHA256SUMS.asc`:** an OpenPGP detached signature over the final `SHA256SUMS`, by the same key, so that a user who has only gpg can verify every file of the release, the .debs included. `SHA256SUMS.sig` (the release key, SSH) stays the release's primary signature.
+- **The key.** One OpenPGP key, used only for this: RSA 4096, sign-only, with an expiry date. RSA, not Ed25519, because every rpm that fil's users run verifies RSA (the rpm 4.14 of RHEL 8 and openSUSE Leap 15 does not verify EdDSA; Fedora's own keys are RSA 4096). rpm 6.1's `--addsign` writes both its OpenPGP signature (tag 278) and the v4 RSA header signature (tag 268) that rpm 4.14 reads: checked on 2026-11-04, a package signed by Fedora 45's rpmsign verified with `rpm -K` ("Header V4 RSA/SHA512 Signature: OK") in a Rocky Linux 8 container (rpm 4.14.3). `pkg_inspect.py` counts an rpm as signed only with the v4 header signature, so `sign-packages.sh` refuses a signing that drops it. Its user ID carries no e-mail address, because the public key is committed to this repository.
+- **Where the public key lives:** `.github/package-signing-key.asc` (armored), reviewed by a code owner (`.github/CODEOWNERS`), and read from **main** by `release-verify`, never from a tag, like `.github/release-signers`. Its fingerprint is published outside the repository: in the README and on the site's install page, where users get the `rpm --import` command. Until the file holds a key it is a placeholder, and `release-verify` fails after signing.
+- **The tooling on the Mac:** Homebrew's `gnupg` (2.5) and `rpm` (6.1.0, which ships `rpmsign` and `rpmkeys`): `brew install gnupg rpm`. **Not yet tried on the Mac;** the flow was checked in Fedora's rpm 6.1.0.
+- **The signing step** (`just release-sign-packages X.Y.Z`, step 4 of §9.2), on the files that `release-verify --pre-sign` verified:
+  1. it refuses files that do not match their `SHA256SUMS`, and a key file with no key;
+  2. for each rpm: `rpmsign --addsign` with the key's fingerprint (gpg asks for the passphrase), then it requires that the rpm now carries a signature, that **everything after the signature header is byte for byte what it was** (the "body": the header and the payload; `pkg_inspect.py`), and that `rpmkeys` verifies the signature with the repository's key in a scratch database;
+  3. it rewrites `SHA256SUMS` (the same eight files, sorted, §4.2) and writes `SHA256SUMS.asc`, and checks it with the key.
+
+  Then the owner signs the new `SHA256SUMS` with the release key and uploads the two rpms, `SHA256SUMS`, `SHA256SUMS.asc` and `SHA256SUMS.sig` to the draft with `--clobber` (§9.2, step 4).
+- **Reproducibility stays verifiable,** as for the signed macOS binary (§10.3): strip the signature and compare. rpm's signing changes only the signature header, so `release-verify` compares the released rpm's body (everything after the signature header) with the rebuilt, unsigned rpm's body: identical means the signed rpm is the reproducible build plus a signature. After signing, `release-verify` also requires both rpm signatures to verify (`rpmkeys --checksig`) and `SHA256SUMS.asc` to verify (gpg) against the key on main, and it skips the rpms' attestations (of the unsigned bytes) with a note. `release-check` reads signed and unsigned rpms alike and reports which.
+- **The owner's key steps** (once, before the first tag; then a PR adds the public key):
+
+  ```sh
+  brew install gnupg rpm
+  # 1. The key: RSA 4096, sign only, two years; gpg asks for a passphrase (use a long one).
+  gpg --quick-generate-key "fil package signing key (Anthony Wertz)" rsa4096 sign 2y
+  gpg --list-secret-keys --with-colons "fil package signing key" | awk -F: '$1 == "fpr" { print $10; exit }'   # FPR
+  # 2. Backups, offline (an encrypted USB stick, say): the secret key and the revocation
+  #    certificate gpg wrote to ~/.gnupg/openpgp-revocs.d/FPR.rev.
+  gpg --armor --export-secret-keys FPR > fil-package-key.secret.asc
+  cp ~/.gnupg/openpgp-revocs.d/FPR.rev fil-package-key.rev
+  # 3. The public key, for the PR to main (and its fingerprint for the README and the site).
+  gpg --armor --export FPR > .github/package-signing-key.asc
+  gpg --show-keys --with-fingerprint .github/package-signing-key.asc
+  # 4. The check: sign a scratch file and verify it with the exported public key only.
+  echo test > /tmp/fil-key-check && gpg --local-user FPR --armor --detach-sign /tmp/fil-key-check
+  gpg --no-default-keyring --keyring /tmp/fil-key-check.kbx --import .github/package-signing-key.asc
+  gpg --no-default-keyring --keyring /tmp/fil-key-check.kbx --verify /tmp/fil-key-check.asc /tmp/fil-key-check
+  rm -f /tmp/fil-key-check /tmp/fil-key-check.asc /tmp/fil-key-check.kbx
+  ```
+
+  Extend the expiry before it lapses (`gpg --quick-set-expire FPR 2y`), then re-export the public key and send it in a PR: rpm checks a signature against the key's validity, so users re-import the extended key (`rpm --import`). If the secret key is lost or exposed, publish the revocation certificate in a PR (`gpg --import` the `.rev`, re-export) and make a new key.

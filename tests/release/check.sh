@@ -4,7 +4,8 @@
 #
 #   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR
 #
-#   DIR         the four archives and SHA256SUMS that package.sh wrote (or a downloaded release)
+#   DIR         the four archives, the four .deb and .rpm packages and SHA256SUMS that package.sh
+#               wrote (or a downloaded release)
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
 #   --tag TAG   the tag being released: it must be v<Cargo.toml version>, CHANGELOG.md must have a
 #               section for the version, and a patch release must keep its minor's wire
@@ -123,7 +124,8 @@ fi
 
 # ---- SHA256SUMS (section 4.2)
 sums=$dir/SHA256SUMS
-names="fil-$V-aarch64-linux-musl.tar.gz fil-$V-source.tar.gz fil-$V-universal-apple-darwin.tar.gz fil-$V-x86_64-linux-musl.tar.gz"
+packages=$(package_names "$V" | tr '\n' ' ')
+names=$(printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "fil-$V-x86_64-linux-musl.tar.gz" $packages | LC_ALL=C sort | tr '\n' ' ')
 if [ ! -f "$sums" ]; then
   fail "no SHA256SUMS in $dir"
 else
@@ -132,9 +134,9 @@ else
       [ -f "$dir/$n" ] && printf '%s  %s\n' "$(sha256 "$dir/$n")" "$n"
     done
   )" ]; then
-    ok "SHA256SUMS lists exactly the four archives, sorted, in sha256sum format"
+    ok "SHA256SUMS lists exactly the four archives and the four packages, sorted, in sha256sum format"
   else
-    fail "SHA256SUMS is not exactly the four archives ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
+    fail "SHA256SUMS is not exactly the four archives and the four packages ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
   fi
   if sums_check "$dir" SHA256SUMS; then ok "sha256sum -c SHA256SUMS"; else fail "sha256sum -c SHA256SUMS"; fi
   [ -z "$(tail -c 1 "$sums")" ] || fail "SHA256SUMS does not end with a newline"
@@ -143,7 +145,7 @@ fi
 extras=
 for f in "$dir"/*; do
   b=${f##*/}
-  case " SHA256SUMS SHA256SUMS.sig $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
+  case " SHA256SUMS SHA256SUMS.sig SHA256SUMS.asc $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
 done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
 
@@ -330,6 +332,67 @@ if [ -n "$x86_bin" ] && [ -n "$aarch_bin" ]; then
       || fail "fil-$V-$label: the remote bundle differs from the Linux archives' bin/fil"
   done
 fi
+
+# ---- the .deb and .rpm packages (section 4.1; docs/m4/packaging.md): read by pkg_inspect.py, which
+# runs nothing from them. Each holds exactly the files of its Linux archive, byte for byte, at the
+# places package_path gives, owned by root, 0755 or 0644, under the name fil (PACKAGE_NAME), the
+# version and the architecture its file name says, with no maintainer script and no dependency, and
+# an rpm owns no directory but its own. An rpm may carry the owner's signature (section 10.4) or not
+# (the draft, before signing): which, is reported here and required by release-verify.
+package_version_ok "$V" || fail "version '$V' is not X.Y.Z or X.Y.Z-PRE (PRE of [0-9A-Za-z.]): nfpm cannot package it"
+pkg_version=$(package_version "$V")
+for kind in deb rpm; do for a in x86_64 aarch64; do
+  p=$(package_file "$kind" "$a" "$V")
+  arch=$(package_arch "$kind" "$a")
+  label=$a-linux-musl
+  aroot=$work/x-$label/fil-$V-$label
+  if [ ! -f "$dir/$p" ]; then
+    fail "missing package $p"
+    continue
+  fi
+  px=$work/p-$p
+  if ! python3 -I "$RELEASE_DIR/pkg_inspect.py" "$dir/$p" "$px" > "$work/p.list" 2> "$work/p.err"; then
+    fail "$p cannot be read: $(cat "$work/p.err")"
+    continue
+  fi
+  meta="$(sed -n 's/^name //p' "$work/p.list") $(sed -n 's/^version //p' "$work/p.list") $(sed -n 's/^arch //p' "$work/p.list")"
+  if [ "$meta" = "$PACKAGE_NAME $pkg_version $arch" ]; then ok "$p is $PACKAGE_NAME $pkg_version for $arch"; else fail "$p says '$meta', not '$PACKAGE_NAME $pkg_version $arch'"; fi
+  extra=$(grep -E '^(script|depends) ' "$work/p.list" | tr '\n' ';' || true)
+  if [ -z "$extra" ]; then ok "$p has no maintainer script and no dependency"; else fail "$p has maintainer scripts or dependencies: $extra"; fi
+  if [ "$kind" = rpm ]; then
+    dirs=$(sed -n 's/^dir [^ ]* [^ ]* //p' "$work/p.list" | LC_ALL=C sort | tr '\n' ' ')
+    wantdirs=$(cd "$aroot" 2> /dev/null && find libexec/fil share/doc/fil -type d | sed -e 's|^share/doc/fil|/usr/share/doc/'"$PACKAGE_NAME"'|' -e 's|^libexec|/usr/libexec|' | LC_ALL=C sort | tr '\n' ' ')
+    if [ "$dirs" = "$wantdirs" ]; then ok "$p owns only its own directories"; else fail "$p owns the directories '$dirs', not '$wantdirs'"; fi
+    note "$p: signed $(sed -n 's/^signed //p' "$work/p.list")"
+  fi
+  aroot=$work/x-$label/fil-$V-$label
+  if [ ! -d "$aroot" ]; then
+    fail "$p: no archive fil-$V-$label to compare it with"
+    continue
+  fi
+  want=$(
+    cd "$aroot"
+    find . -type f | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do
+      dst=$(package_path "$kind" "$f") || dst="(no place for $f)"
+      if [ -x "$f" ]; then m=755; else m=644; fi
+      echo "file $m root:root $dst"
+    done | LC_ALL=C sort
+  )
+  have=$(grep '^file ' "$work/p.list" | LC_ALL=C sort)
+  if [ "$have" = "$want" ]; then
+    ok "$p holds exactly the files of fil-$V-$label.tar.gz, root-owned, at their places"
+  else
+    fail "$p's files are not those of fil-$V-$label.tar.gz (< package, > archive): $(diff <(printf '%s\n' "$have") <(printf '%s\n' "$want") | grep '^[<>]' | head -n 6 | tr '\n' ' ')"
+  fi
+  bad=$({ grep "^dir " "$work/p.list" || true; } | awk '$2 != "755" || $3 != "root:root"' | head -n 3)
+  [ -z "$bad" ] || fail "$p has a directory that is not 0755 root:root: $bad"
+  differ=
+  while IFS= read -r f; do
+    dst=$(package_path "$kind" "$f") || continue
+    cmp -s "$aroot/$f" "$px$dst" || differ="$differ $f"
+  done < <(cd "$aroot" && find . -type f | sed 's|^\./||')
+  if [ -z "$differ" ]; then ok "$p: every file is byte for byte the archive's"; else fail "$p: files differ from the archive's:$differ"; fi
+done; done
 
 # ---- run the binary where it can run (section 2): the first line is FROZEN
 smoke() {

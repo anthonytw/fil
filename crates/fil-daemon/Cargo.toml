@@ -5,14 +5,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
 
 [dependencies]
 bytes = "1"
-fil-forward = { path = "../fil-forward" }
-fil-proto = { path = "../fil-proto" }
-fil-session = { path = "../fil-session" }
-fil-transport = { path = "../fil-transport" }
+fil-forward.workspace = true
+fil-proto.workspace = true
+fil-session.workspace = true
+fil-transport.workspace = true
 # The CSPRNG for session incarnations; already in the tree through fil-transport.
 ring = "0.17"
 # Safe flock, setsid and uid queries (no unsafe code, DESIGN.md section 13).

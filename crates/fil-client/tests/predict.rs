@@ -105,9 +105,11 @@ fn recording(seen: &Arc<Mutex<Seen>>) -> PredictorFactory {
     let seen = seen.clone();
     Box::new(move || {
         Box::new(Recording {
+            // Always shown, and always underlined: these tests read a written guess off the
+            // screen by its underline, which the default predictor draws only above 80 ms.
             inner: MoshPredictor::new(MoshConfig {
-                rtt_threshold: Duration::ZERO,
-                ..MoshConfig::default()
+                underline_above: Duration::ZERO,
+                ..MoshConfig::always()
             }),
             seen: seen.clone(),
         })
@@ -180,6 +182,30 @@ fn drawn_since(rig: &Rig, from: usize) -> usize {
     n
 }
 
+/// Whether `glyph` appeared anywhere on the screen in the writes from index `from` on, underlined
+/// or not (the configured predictor draws plain below 80 ms).
+fn glyph_drawn_since(rig: &Rig, from: usize, glyph: &str) -> bool {
+    let mut emu = fil_term::create(
+        fil_term::DEFAULT_BACKEND,
+        fil_term::Size { cols: 80, rows: 24 },
+        0,
+    )
+    .unwrap();
+    for (i, w) in rig.term.writes().iter().enumerate() {
+        emu.feed(w);
+        if i >= from
+            && emu
+                .state(0)
+                .screen
+                .iter()
+                .any(|l| l.cells.iter().any(|c| c.text == glyph))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// The program echoes, and one key has confirmed an epoch: the next key's guess is written.
 async fn warm(rig: &Rig) {
     rig.daemon.set_echo(Echo::Faithful).await;
@@ -232,7 +258,8 @@ async fn run_predicts_with_the_configured_predictor() {
         rig.daemon.set_echo(Echo::Off).await;
         rig.type_str("bc");
         settle().await;
-        assert_eq!(drawn_since(&rig, from) > 0, want, "{predict:?}");
+        // The program echoes nothing now: a `b` on the screen is a guess.
+        assert_eq!(glyph_drawn_since(&rig, from, "b"), want, "{predict:?}");
     }
 }
 

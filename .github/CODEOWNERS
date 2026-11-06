@@ -2,6 +2,7 @@
 # need the owner's review. This takes effect only with the "require review from Code Owners"
 # setting of the main ruleset, which is the owner's to turn on.
 /.github/release-signers @anthonytw
+/.github/package-signing-key.asc @anthonytw
 /.github/workflows/** @anthonytw
 /.github/CODEOWNERS @anthonytw
 /tests/release/** @anthonytw

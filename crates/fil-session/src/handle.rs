@@ -33,6 +33,7 @@ struct Inner {
     scope: Scope,
     agent_socket: Option<std::path::PathBuf>,
     catch_up: CatchUpParams,
+    terminal_pacing: bool,
     tx: mpsc::Sender<Cmd>,
     shared: Arc<Shared>,
     forwards: Arc<Forwards>,
@@ -111,11 +112,12 @@ impl SessionHandle {
         host: Arc<dyn SessionHost>,
     ) -> Result<SessionHandle, SpawnError> {
         let incarnation = config.incarnation;
-        let (name, term, agent_socket, catch_up) = (
+        let (name, term, agent_socket, catch_up, terminal_pacing) = (
             config.name.clone(),
             config.term.clone(),
             config.agent_socket.clone(),
             config.catch_up,
+            config.terminal_pacing,
         );
         // The forwards' endpoint runs on this runtime and outlives every subscriber.
         let forwards = Forwards::new(
@@ -147,6 +149,7 @@ impl SessionHandle {
                 scope: started.scope,
                 agent_socket,
                 catch_up,
+                terminal_pacing,
                 tx: started.tx,
                 shared: started.shared,
                 forwards,
@@ -380,6 +383,10 @@ impl SessionHandle {
 
     pub(crate) fn catch_up_params(&self) -> &CatchUpParams {
         &self.inner.catch_up
+    }
+
+    pub(crate) fn terminal_pacing(&self) -> bool {
+        self.inner.terminal_pacing
     }
 
     pub(crate) fn shared(&self) -> &Arc<Shared> {

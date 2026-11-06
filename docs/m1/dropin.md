@@ -190,7 +190,7 @@ The review of PR #41 found three scenarios that still passed with the thing they
 | `client_sleep` | nothing is stopped | FAIL, the client never logged its link going down: it was not a disconnect (Pi) |
 | `killed_ssh_midcommand` | the ssh is not killed | FAIL, the client never logged its link going down (Pi) |
 | realnet `dp_finish_vim` | `ROW-5` typed twice | FAIL, `EXACT-42` never appears (local run of the shell helpers) |
-| `check_seq` | ticks 13..40 lost with a gap marker; a repeated line; reordered lines; a jump with no marker; two jumps for one marker; a complete run with a marker | each rejected where it must be, by unit tests (`cargo test -p fil --example dropin`, part of `just ci`) |
+| `check_seq` | ticks 13..40 lost with a gap marker; a repeated line; reordered lines; a jump with no marker; two jumps for one marker; a complete run with a marker | each rejected where it must be, by unit tests (`cargo test -p fil-shell --example dropin`, part of `just ci`) |
 
 ## Planned (M2)
 

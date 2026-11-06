@@ -67,6 +67,10 @@ pub struct SessionConfig {
     pub log_capacity: usize,
     /// When a subscriber is too far behind to be sent the backlog (DESIGN.md section 6.2).
     pub catch_up: CatchUpParams,
+    /// Whether each connection paces its terminal channel to the link's drain rate (DESIGN.md
+    /// section 8.5, "Pacing the terminal"). On unless the environment said
+    /// `FIL_TERMINAL_PACING=off` when the config was made: the switch for measuring "before".
+    pub terminal_pacing: bool,
     /// How long after a keystroke reached the PTY its echo is expected, before the daemon
     /// reports "no echo is coming" (mosh uses 50 ms).
     pub echo_window: Duration,
@@ -125,6 +129,7 @@ impl SessionConfig {
             history_lines: 1000,
             log_capacity: DEFAULT_LOG_CAPACITY,
             catch_up: CatchUpParams::default(),
+            terminal_pacing: crate::pace::enabled_from_env(),
             echo_window: Duration::from_millis(50),
             mode_poll: Duration::from_millis(50),
             exit_drain: Duration::from_millis(300),

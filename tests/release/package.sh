@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Assemble the release files (docs/m4/release.md section 4) from the three built binaries:
-# the three binary archives, the vendored source archive and SHA256SUMS.
+# the three binary archives, the vendored source archive, the four .deb and .rpm packages (made
+# from the two Linux archives by linux-packages.sh) and SHA256SUMS.
 #
 #   package.sh --bins DIR --out DIR [--extra DIR]
 #
@@ -104,11 +105,9 @@ docker run --rm --platform linux/amd64 --network none \
     done
   '
 
-# ---- SHA256SUMS: exactly the four archives, sorted bytewise (section 4.2)
-(
-  cd "$out"
-  for f in $(printf '%s\n' fil-"$V"-*.tar.gz | LC_ALL=C sort); do
-    printf '%s  %s\n' "$(sha256 "$f")" "$f"
-  done > SHA256SUMS
-  cat SHA256SUMS >&2
-)
+# ---- the .deb and .rpm packages, from the two Linux archives just written (section 4.1)
+"$RELEASE_DIR/linux-packages.sh" --archives "$out" --out "$out"
+
+# ---- SHA256SUMS: exactly the four archives and the four packages, sorted bytewise (section 4.2)
+rewrite_sums "$out" "$V"
+cat "$out/SHA256SUMS" >&2

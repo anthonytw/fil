@@ -8,8 +8,10 @@
 # Rules:
 #   1. the workflow's own `permissions:` is `contents: read` and nothing else;
 #   2. every job declares `permissions:`; only the job `publish` may have `id-token`, `attestations`
-#      or `contents: write`;
-#   3. `publish` runs only for a push of a `v*` tag: its `if:` is EXACTLY
+#      or `contents: write`, except that the job `crates-io` (trusted publishing, N8) may have
+#      `id-token: write`, and must then run in the `environment: crates-io`, which the owner approves;
+#      no other job names an environment;
+#   3. `publish` and `crates-io` run only for a push of a `v*` tag: each `if:` is EXACTLY
 #      `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')` (an `||` or any other
 #      edit fails); a job's `permissions:` is a block, never `write-all` or an inline { ... };
 #   4. every `uses:` is pinned by a full 40-hex commit SHA;
@@ -90,13 +92,15 @@ awk '
       if (indent == 4) in_perm = 0
       if (in_perm && indent == 6) {
         k = line; sub(/^ */, "", k); v = k; sub(/:.*/, "", k); sub(/^[^:]*:[ ]*/, "", v)
-        if (job != "publish") {
+        if (job == "crates-io" && k == "id-token") { if (v != "write") bad("job crates-io has id-token: " v) }
+        else if (job != "publish") {
           if (k == "id-token" || k == "attestations") bad("job " job " has " k " (only publish may)")
           if (k == "contents" && v ~ /write/) bad("job " job " has contents: write (only publish may)")
           if (v ~ /write/) bad("job " job " has " k ": write (only publish may)")
         }
       }
       if (indent == 4 && line ~ /^    if:/) job_if[job] = line
+      if (indent == 4 && line ~ /^    environment:/) { e = line; sub(/^    environment:[ ]*/, "", e); job_env[job] = e }
     }
     # whole-file rules
     if (line ~ /uses:/) {
@@ -111,12 +115,18 @@ awk '
     if (line ~ /actions\/cache/ || line ~ /rust-cache/ || line ~ /^ *cache:/ || line ~ /[ ]cache-[a-z-]*:/) bad("a cache: " line)
   }
   END {
+    tag_if = "    if: github.event_name == '"'"'push'"'"' && startsWith(github.ref, '"'"'refs/tags/v'"'"')"
     finish_checkout()
     if (!top_perm_seen) bad("no top-level permissions: contents: read")
     if (!tags_seen) bad("no tag push trigger")
     for (j in jobs) if (!has_perm[j]) bad("job " j " declares no permissions")
     if (!("publish" in jobs)) bad("no publish job")
-    else if (job_if["publish"] != "    if: github.event_name == '"'"'push'"'"' && startsWith(github.ref, '"'"'refs/tags/v'"'"')") bad("publish does not run only for a push of a v* tag: " job_if["publish"])
+    else if (job_if["publish"] != tag_if) bad("publish does not run only for a push of a v* tag: " job_if["publish"])
+    if ("crates-io" in jobs) {
+      if (job_if["crates-io"] != tag_if) bad("crates-io does not run only for a push of a v* tag: " job_if["crates-io"])
+      if (job_env["crates-io"] != "crates-io") bad("crates-io does not run in the environment crates-io: " job_env["crates-io"])
+    }
+    for (j in job_env) if (j != "crates-io") bad("job " j " names an environment (" job_env[j] "); only crates-io may")
     exit fails ? 1 : 0
   }
 ' "$wf"

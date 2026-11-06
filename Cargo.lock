@@ -396,35 +396,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "fil"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "clap",
- "fil-client",
- "fil-daemon",
- "fil-forward",
- "fil-proto",
- "fil-session",
- "fil-term",
- "fil-testbins",
- "fil-testkit",
- "fil-transport",
- "libc",
- "nix",
- "portable-pty",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "toml",
- "tracing",
- "vt100",
-]
-
-[[package]]
 name = "fil-client"
 version = "0.0.0"
 dependencies = [
@@ -534,6 +505,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fil-forward",
+ "fil-netsim",
  "fil-proto",
  "fil-session",
  "fil-term",
@@ -541,6 +513,7 @@ dependencies = [
  "fil-transport",
  "nix",
  "portable-pty",
+ "quinn",
  "rustix",
  "serde",
  "tempfile",
@@ -549,6 +522,35 @@ dependencies = [
  "toml",
  "tracing",
  "vte",
+]
+
+[[package]]
+name = "fil-shell"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "fil-client",
+ "fil-daemon",
+ "fil-forward",
+ "fil-proto",
+ "fil-session",
+ "fil-term",
+ "fil-testbins",
+ "fil-testkit",
+ "fil-transport",
+ "libc",
+ "nix",
+ "portable-pty",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "vt100",
 ]
 
 [[package]]

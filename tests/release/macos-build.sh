@@ -47,11 +47,14 @@ mkdir -p "$out/$UNIVERSAL"
 lipo -create -output "$out/$UNIVERSAL/fil" \
   "$tdir/aarch64-apple-darwin/release/fil" "$tdir/x86_64-apple-darwin/release/fil"
 lipo -info "$out/$UNIVERSAL/fil" >&2
-# lipo drops the linker's signatures, and an arm64 binary without one is killed on Apple silicon
-# ("code object is not signed at all": found by the first dry run's smoke-macos job). Sign it
-# ad hoc, with a fixed identifier: no certificate, no timestamp and no secret, so the signature is a
-# pure function of the file. (Developer ID signing and notarization are done after CI by
-# `just release-sign-macos` (docs/m4/release.md section 10.3).)
+# lipo's output is not reliably signed (the first dry run's smoke-macos job found an arm64 binary
+# killed as "not signed at all"; on a recent lipo the arm64 slice keeps its linker signature and
+# the x86_64 slice has none). Sign the whole file ad hoc, with a fixed identifier: no
+# certificate, no timestamp and no secret, so the signature is a pure function of the file on one
+# runner. It need not match anyone else's `codesign`: the release-verify of a signed release
+# compares the binaries through macho_norm.py, which normalizes the signature away
+# (docs/m4/release.md section 10.3). (Developer ID signing and notarization are done after CI by
+# `just release-sign-macos`.)
 codesign --force --sign - --identifier fil "$out/$UNIVERSAL/fil" >&2
 codesign --verify --strict --verbose=2 "$out/$UNIVERSAL/fil" >&2
 just no-test-hooks "$out/$UNIVERSAL/fil"

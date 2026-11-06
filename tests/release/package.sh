@@ -41,9 +41,8 @@ V=$(cargo_version)
 [ -n "$V" ] || die "no version in Cargo.toml"
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(source_date_epoch)}
 export SOURCE_DATE_EPOCH
-IMAGE=$(tools_image)
-[ -n "$IMAGE" ] || die "Cross.toml has no x86_64 image"
-log "version $V, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, tools image $IMAGE"
+test_override_notes
+log "version $V, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, tools image $(tools_image)"
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
@@ -89,21 +88,11 @@ if [ ! -s "$stage/$name/.cargo/config.toml" ]; then
   log "the tree has no external dependency: nothing vendored"
 fi
 
-# ---- tar and gzip, inside the image
-# The container sees the stage read-only and no network; the files it writes belong to the caller.
-docker run --rm --platform linux/amd64 --network none \
-  --user "$(id -u):$(id -g)" \
-  -e SOURCE_DATE_EPOCH -e LC_ALL=C \
-  -v "$stage:/stage:ro" -v "$out:/out" \
-  "$IMAGE" sh -ec '
-    tar --version | head -n 1 >&2
-    gzip --version | head -n 1 >&2
-    cd /stage
-    for d in fil-*; do
-      tar --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
-        --numeric-owner --mode="u=rwX,go=rX" -cf - "$d" | gzip -n -9 > "/out/$d.tar.gz"
-    done
-  '
+# ---- tar and gzip, inside the image (common.sh: pack_archives)
+pack_archives "$stage" "$out"
+# The macOS archive is signed after CI by the owner (docs/m4/release.md section 10.3); the release
+# carries CI's own, unchanged, next to it, for the attestation and the comparison (section 4.1).
+cp "$out/fil-$V-universal-apple-darwin.tar.gz" "$out/$(ci_archive_name "$V")"
 
 # ---- the .deb and .rpm packages, from the two Linux archives just written (section 4.1)
 "$RELEASE_DIR/linux-packages.sh" --archives "$out" --out "$out"

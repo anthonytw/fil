@@ -233,6 +233,8 @@ jobs:
           done
           cmp out/fil-*-universal-apple-darwin.tar.gz out-b/fil-*-universal-apple-darwin.tar.gz \
             || echo "::warning::the two macOS archives differ (the macOS builds do; best effort)"
+          cmp out/fil-*-universal-apple-darwin.ci.tar.gz out-b/fil-*-universal-apple-darwin.ci.tar.gz \
+            || echo "::warning::the two .ci macOS archives differ (the macOS builds do; best effort)"
       - name: Release check (a tag push also needs the complete layout, the changelog and the tag)
         env:
           RELEASE: ${{ needs.prepare.outputs.release }}

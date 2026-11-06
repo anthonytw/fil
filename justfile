@@ -412,6 +412,14 @@ packages-install *args:
 release-sign-packages version *args:
     tests/release/sign-packages.sh "{{version}}" {{args}}
 
+# The owner signs the macOS binary with the Developer ID and notarizes it, on their own Mac (never
+# CI; N4): verifies the draft, signs, requires the stripped result to equal CI's, notarizes, and only
+# after Apple accepts rebuilds the macOS archive and SHA256SUMS, signs SHA256SUMS with the release
+# key and uploads the three files to the DRAFT (docs/m4/release.md section 10.3). Needs Docker, gh
+# and the `fil-notary` notarytool profile. Run it after `just release-verify VERSION --pre-sign`.
+release-sign-macos version *args:
+    tests/release/sign-macos.sh "{{version}}" {{args}}
+
 # Set the one package version (docs/m4/release.md section 1): [workspace.package] version and the
 # exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock.
 set-version version:

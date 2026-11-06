@@ -4,7 +4,7 @@
 #
 #   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR
 #
-#   DIR         the four archives, the four .deb and .rpm packages and SHA256SUMS that package.sh
+#   DIR         the five archives (the macOS one twice: CI's own and the one the owner signs), the four .deb and .rpm packages and SHA256SUMS that package.sh
 #               wrote (or a downloaded release)
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
 #   --tag TAG   the tag being released: it must be v<Cargo.toml version>, CHANGELOG.md must have a
@@ -125,7 +125,7 @@ fi
 # ---- SHA256SUMS (section 4.2)
 sums=$dir/SHA256SUMS
 packages=$(package_names "$V" | tr '\n' ' ')
-names=$(printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "fil-$V-x86_64-linux-musl.tar.gz" $packages | LC_ALL=C sort | tr '\n' ' ')
+names=$(printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "$(ci_archive_name "$V")" "fil-$V-x86_64-linux-musl.tar.gz" $packages | LC_ALL=C sort | tr '\n' ' ')
 if [ ! -f "$sums" ]; then
   fail "no SHA256SUMS in $dir"
 else
@@ -134,9 +134,9 @@ else
       [ -f "$dir/$n" ] && printf '%s  %s\n' "$(sha256 "$dir/$n")" "$n"
     done
   )" ]; then
-    ok "SHA256SUMS lists exactly the four archives and the four packages, sorted, in sha256sum format"
+    ok "SHA256SUMS lists exactly the five archives and the four packages, sorted, in sha256sum format"
   else
-    fail "SHA256SUMS is not exactly the four archives and the four packages ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
+    fail "SHA256SUMS is not exactly the five archives and the four packages ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
   fi
   if sums_check "$dir" SHA256SUMS; then ok "sha256sum -c SHA256SUMS"; else fail "sha256sum -c SHA256SUMS"; fi
   [ -z "$(tail -c 1 "$sums")" ] || fail "SHA256SUMS does not end with a newline"
@@ -269,6 +269,13 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   done
   # vt100 (the test emulator) must not be in the binary, whatever the dependency graph said.
   if grep -aqE 'registry/src/[^/]+/vt100-' "$b"; then fail "$name: bin/fil contains source paths of the vt100 crate"; fi
+  # The legal lines of `--version` (section 7 of release.md; GPLv3's Appropriate Legal Notices) are
+  # compiled in; read from the file, because a downloaded binary is not run under --no-exec.
+  if grep -aqF -- 'Copyright (C) 2026 Anthony Wertz' "$b" && grep -aqF -- 'License GPL-3.0-or-later <https://gnu.org/licenses/gpl.html>' "$b" && grep -aqF -- 'There is NO WARRANTY, to the extent permitted by law.' "$b"; then
+    ok "$name: bin/fil carries the copyright, license and warranty lines of --version"
+  else
+    fail "$name: bin/fil lacks the copyright, license or warranty line of --version (crates/fil/src/cli.rs)"
+  fi
   # A tripwire on the remote commands (DESIGN.md section 8.2; M4 OQ-1, approved by the owner
   # 2026-11-04): the install bootstrap is in the binary, byte for byte as the golden pins it for
   # this version and wire, and every `sh -c` in the binary (which also catches `bash -c`, `zsh -c`
@@ -308,6 +315,24 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
     universal-apple-darwin) grep -Eq 'Mach-O universal binary with 2 architectures.*x86_64.*arm64|Mach-O universal binary with 2 architectures.*arm64.*x86_64' <<< "$desc" && ok "$name: bin/fil is a universal Mach-O (x86_64, arm64)" || fail "$name: bin/fil is not a two-architecture Mach-O: $desc" ;;
   esac
 done
+
+# The macOS archive is signed after CI (section 10.3); CI's own, unchanged, is the .ci archive. Before
+# signing the two are the same file. After, they differ in bin/fil alone, and the two bin/fil are the
+# same code: they normalize (macho_norm.py) to the same bytes.
+ci=$dir/$(ci_archive_name "$V")
+mac=$dir/fil-$V-universal-apple-darwin.tar.gz
+if [ ! -f "$ci" ]; then
+  fail "missing archive $(ci_archive_name "$V") (CI's own macOS archive, section 4.1)"
+elif [ -f "$mac" ]; then
+  if cmp -s "$ci" "$mac"; then
+    ok "fil-$V-universal-apple-darwin.tar.gz is CI's archive, not yet signed"
+  elif macho archives "$ci" "$mac" > "$work/macho.log" 2>&1; then
+    ok "fil-$V-universal-apple-darwin.tar.gz is CI's archive with the macOS binary signed: $(cat "$work/macho.log")"
+  else
+    cat "$work/macho.log" >&2
+    fail "fil-$V-universal-apple-darwin.tar.gz differs from CI's archive by more than the signature of bin/fil"
+  fi
+fi
 
 # The notices (section 7): every binary archive carries the THIRD-PARTY-NOTICES.md of the tree it
 # was built from, which is the one in the source archive (`just notices` checked it is current).

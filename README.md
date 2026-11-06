@@ -16,4 +16,11 @@ It has no panes: your terminal already does that.
 
 PR numbers (#NN) in docs and comments refer to the repository's earlier history, which is archived.
 
+## Release keys
+
+Check these fingerprints against the copies in the repository before you trust a release:
+
+- **Release signing key** (SSH, Ed25519; signs the release tags and `SHA256SUMS`; `.github/release-signers`): `SHA256:sEx4DtGI9gdaVhgsYWwuIC0xwkYJ8BLIVhVktPHINvQ`
+- **Package signing key** (OpenPGP, RSA 4096; signs the `.rpm` packages and `SHA256SUMS.asc`; `.github/package-signing-key.asc`): `8BD8 1C03 EC58 8C5E FD85  04C8 8C14 2300 4B6D DA01`
+
 **License:** [GPL-3.0-or-later](LICENSE).

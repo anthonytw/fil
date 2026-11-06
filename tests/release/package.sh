@@ -41,6 +41,7 @@ V=$(cargo_version)
 [ -n "$V" ] || die "no version in Cargo.toml"
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(source_date_epoch)}
 export SOURCE_DATE_EPOCH
+test_override_notes
 log "version $V, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, tools image $(tools_image)"
 
 stage=$(mktemp -d)
@@ -89,6 +90,9 @@ fi
 
 # ---- tar and gzip, inside the image (common.sh: pack_archives)
 pack_archives "$stage" "$out"
+# The macOS archive is signed after CI by the owner (docs/m4/release.md section 10.3); the release
+# carries CI's own, unchanged, next to it, for the attestation and the comparison (section 4.1).
+cp "$out/fil-$V-universal-apple-darwin.tar.gz" "$out/$(ci_archive_name "$V")"
 
 # ---- the .deb and .rpm packages, from the two Linux archives just written (section 4.1)
 "$RELEASE_DIR/linux-packages.sh" --archives "$out" --out "$out"

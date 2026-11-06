@@ -63,6 +63,9 @@ while [ $# -gt 0 ]; do
 done
 test_override_notes
 [ -n "$version" ] || die "usage: verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] ..."
+# --ref names the commit that is rebuilt: a full 40-hex SHA, never a branch, a tag or an abbreviation
+# (those can name another commit tomorrow, or in the clone).
+if [ -n "$ref" ] && ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then die "--ref must be a full 40-hex commit SHA, not: $ref"; fi
 version=${version#v}
 tag=v$version
 repo_url=${FIL_RELEASE_REPO_URL:-https://github.com/$repo.git}

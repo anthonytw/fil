@@ -9,3 +9,16 @@
 /Cross.toml @anthonytw
 /rust-toolchain.toml @anthonytw
 /.github/macos-team-id @anthonytw
+# What else decides what a release is: the recipes `ci` and the release run, the workspace manifest
+# and lock (profile, version, dependencies), the crates' manifests, the dependency and notice policy,
+# the packaging templates and the Nix flake, and the man-page toolchain installer (docs/m4/plan.md, DOC).
+/justfile @anthonytw
+/Cargo.toml @anthonytw
+/Cargo.lock @anthonytw
+/crates/*/Cargo.toml @anthonytw
+/deny.toml @anthonytw
+/about.toml @anthonytw
+/packaging/** @anthonytw
+/flake.nix @anthonytw
+/flake.lock @anthonytw
+/docs/man/install-pandoc.sh @anthonytw

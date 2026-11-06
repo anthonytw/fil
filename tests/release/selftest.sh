@@ -97,6 +97,11 @@ mutate_wf "crates-io gets attestations: write" 's/(      id-token: write # trust
 mutate_wf "crates-io gets contents: write" 's/(  crates-io:.*?    permissions:\n      contents: )read/${1}write/s'
 mutate_wf "another job names the crates-io environment" 's/(  packages-arm64:\n.*?    runs-on: ubuntu-24.04-arm\n)/$1    environment: crates-io\n/s'
 mutate_wf "crates-io's actions: read becomes write" 's/(  crates-io:.*?      actions: )read/${1}write/s'
+mutate_wf "workflow_dispatch is inline with inputs" 's/\n  workflow_dispatch:\n/\n  workflow_dispatch: { inputs: { x: { type: string } } }\n/'
+mutate_wf "the push trigger is inline with a branch" 's/\n  push:\n    tags: \["v\*"\]\n/\n  push: { branches: [main], tags: ["v*"] }\n/'
+mutate_wf "a secret by index" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ secrets[\x27RELEASE_TOKEN\x27] \}\}/'
+mutate_wf "all secrets through toJSON" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ toJSON(secrets) \}\}/'
+mutate_wf "secrets: inherit" 's/(  prepare:\n)/$1    secrets: inherit\n/'
 mutate_wf "prepare's actions: read becomes write" 's/(  prepare:.*?      actions: )read/${1}write/s'
 mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 # --locked: scripts in a copy of the directory
@@ -203,6 +208,44 @@ cp "$tmp/SHA256SUMS" "$tmp/dl/SHA256SUMS"
 expect_fail "release-verify stops when the files do not match the signed SHA256SUMS" rv 1
 grep -q 'STOP: the files do not match' "$tmp/out.log" && ! grep -q 'release-check' "$tmp/out.log" \
   && pass "...and ran nothing after it" || { flunk "...and ran nothing after it"; sed "s/^/       | /" "$tmp/out.log"; }
+
+# --ref (the commit that is rebuilt) must be a full 40-hex SHA, checked before anything else
+for badref in 314e5bc main v1 "$(printf 'A%.0s' {1..40})" "$(printf 'a%.0s' {1..41})"; do
+  expect_fail "release-verify refuses --ref $badref" rv 1 --dry-run --ref "$badref"
+  grep -q 'full 40-hex commit SHA' "$tmp/out.log" && pass "...with the 40-hex message" || { flunk "...with the 40-hex message"; sed "s/^/       | /" "$tmp/out.log"; }
+done
+goodref=$(printf 'a%.0s' {1..40})
+rv 1 --dry-run --ref "$goodref" > "$tmp/out.log" 2>&1 || true
+if grep -q 'full 40-hex commit SHA' "$tmp/out.log"; then flunk "release-verify accepts a full 40-hex --ref"; else pass "release-verify accepts a full 40-hex --ref"; fi
+expect_fail "rebuild.sh refuses a short ref" bash "$RELEASE_DIR/rebuild.sh" /nonexistent 314e5bc rebuild-x
+grep -q 'full 40-hex commit SHA' "$tmp/out.log" && pass "...before touching Docker or the repo" || { flunk "...before touching Docker or the repo"; sed "s/^/       | /" "$tmp/out.log"; }
+
+# the draft release's attestation commands are the narrow ones
+echo "== release notes (notes.sh)"
+sha=$(printf 'b%.0s' {1..40})
+"$RELEASE_DIR/notes.sh" 9.9.9 o/r "$sha" > "$tmp/notes.md"
+"$RELEASE_DIR/notes.sh" 9.9.9 o/r > "$tmp/notes-nosha.md"
+for flag in '--repo o/r' '--cert-identity https://github.com/o/r/.github/workflows/release.yml@refs/tags/v9.9.9' '--source-ref refs/tags/v9.9.9' "--source-digest $sha" "--signer-digest $sha" '--deny-self-hosted-runners'; do
+  expect_pass "notes.sh: every attestation command has $flag" test "$(grep -c -F -- "$flag" "$tmp/notes.md")" = "$(grep -c '^gh attestation verify' "$tmp/notes.md")"
+done
+expect_pass "notes.sh: there are two attestation commands" test "$(grep -c '^gh attestation verify' "$tmp/notes.md")" = 2
+expect_pass "notes.sh: without a commit, no digest flag but the rest stay" sh -c '! grep -q -- "--source-digest" "$1" && grep -q -- "--cert-identity" "$1" && grep -q -- "--source-ref" "$1"' sh "$tmp/notes-nosha.md"
+expect_fail "notes.sh: a short commit is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r abc123
+
+# the files that decide what a release is need the owner's review
+echo "== CODEOWNERS"
+for path in /justfile /Cargo.toml /Cargo.lock '/crates/*/Cargo.toml' /deny.toml /about.toml '/packaging/**' /flake.nix /flake.lock /docs/man/install-pandoc.sh /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml; do
+  expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
+done
+# ...and every path it lists that has no glob exists (a rename would silently drop the protection),
+# except the man-page installer, which the DOC package adds
+while read -r cpath _; do
+  case $cpath in '#'* | '' | *'*'* | /docs/man/install-pandoc.sh) continue ;; esac
+  expect_pass "CODEOWNERS path exists: $cpath" test -e "$REPO_ROOT$cpath"
+done < "$REPO_ROOT/.github/CODEOWNERS"
+mutated=$tmp/CODEOWNERS.mut
+grep -vxF '/justfile @anthonytw' "$REPO_ROOT/.github/CODEOWNERS" > "$mutated"
+expect_fail "mutation: CODEOWNERS without /justfile is caught" grep -qxF '/justfile @anthonytw' "$mutated"
 
 # ============================================================== 4. release-check on synthetic releases
 echo "== release-check"

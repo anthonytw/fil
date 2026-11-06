@@ -529,29 +529,30 @@ impl Config {
 
     /// The effective settings for `host`, one row per key, each with where its value came from:
     /// the built-in default, `[defaults]` or the `[host.NAME]` section (`fil config show`).
-    /// Nothing here touches the network or the host. The command line (`-L`, `-A`,
+    /// Nothing here touches the network or the host. A host name that connect would refuse
+    /// (with the default ssh pipe) is refused here with the same words. The command line (`-L`, `-A`,
     /// `--transport`) is applied after this and is not in it.
-    pub fn explain(&self, host: &str) -> Vec<Explained> {
+    pub fn explain(&self, host: &str) -> Result<Vec<Explained>, String> {
         let section = self.section_for(host);
         let settings = self.for_host(host);
-        EXPLAINED_KEYS
-            .iter()
-            .map(|&key| {
-                let source = if section.is_some_and(|(_, s)| is_set(key, s)) {
-                    let (name, _) = section.expect("checked above");
-                    format!("[host.{}]", escape_unprintable(&toml_key(name)))
-                } else if is_set(key, &self.defaults) {
-                    "[defaults]".to_string()
-                } else {
-                    "default".to_string()
-                };
-                Explained {
-                    key,
-                    value: show_value(key, host, &settings),
-                    source,
-                }
-            })
-            .collect()
+        let mut rows = Vec::new();
+        for &key in EXPLAINED_KEYS {
+            let source = if let Some((name, _)) = section.filter(|(_, s)| is_set(key, s)) {
+                format!("[host.{}]", escape_unprintable(&toml_key(name)))
+            } else if is_set(key, &self.defaults) {
+                "[defaults]".to_string()
+            } else {
+                "default".to_string()
+            };
+            let (value, note) = show_value(key, host, &settings)?;
+            rows.push(Explained {
+                key,
+                value,
+                source,
+                note,
+            });
+        }
+        Ok(rows)
     }
 
     /// The `[defaults]` alone: what the daemon uses, since it serves every host.
@@ -601,6 +602,8 @@ pub struct Explained {
     pub value: String,
     /// `default`, `[defaults]` or `[host.NAME]`.
     pub source: String,
+    /// What else applies at connect time (an unset value's fallback, what `remote` changes).
+    pub note: Option<String>,
 }
 
 /// The rows `fil config show` prints, in this order. `history_lines` and `direct.port_range`
@@ -655,12 +658,12 @@ fn is_set(key: &str, s: &RawSection) -> bool {
             .is_some_and(|o| o.confirm.is_some()),
         "offline_input.log" => s.offline_input.as_ref().is_some_and(|o| o.log.is_some()),
         "direct.address" => s.direct.as_ref().is_some_and(|d| d.address.is_some()),
-        _ => false,
+        _ => unreachable!("every row of EXPLAINED_KEYS is handled"),
     }
 }
 
-/// A host name as a TOML key: bare if it can be, else quoted.
-fn toml_key(name: &str) -> String {
+/// A host name as a TOML key: bare if it can be, else a quoted string (`"box.example.net"`).
+pub(crate) fn toml_key(name: &str) -> String {
     if !name.is_empty()
         && name
             .chars()
@@ -668,7 +671,7 @@ fn toml_key(name: &str) -> String {
     {
         name.to_string()
     } else {
-        format!("{name:?}")
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -688,34 +691,42 @@ fn bytes(n: usize) -> String {
     }
 }
 
-fn span(d: std::time::Duration) -> String {
+/// A duration the parsers read back: milliseconds when there are any, else whole seconds
+/// (minutes and hours for `forward` values, which take `m` and `h`).
+fn dur_text(d: std::time::Duration, long_units: bool) -> String {
     let s = d.as_secs();
-    if s != 0 && s.is_multiple_of(3600) {
-        format!("\"{}h\"", s / 3600)
-    } else if s != 0 && s.is_multiple_of(60) {
-        format!("\"{}m\"", s / 60)
+    if d.subsec_millis() != 0 || d.subsec_nanos() != 0 {
+        format!("{}ms", d.as_millis())
+    } else if long_units && s != 0 && s.is_multiple_of(3600) {
+        format!("{}h", s / 3600)
+    } else if long_units && s != 0 && s.is_multiple_of(60) {
+        format!("{}m", s / 60)
     } else {
-        format!("\"{s}s\"")
+        format!("{s}s")
     }
 }
 
-/// The value of `key` in `s`, written as in the file.
-fn show_value(key: &str, host: &str, s: &HostSettings) -> String {
+fn span(d: std::time::Duration) -> String {
+    format!("\"{}\"", dur_text(d, true))
+}
+
+/// The value of `key` in `s`, written as in the file, and a note on what applies at connect time.
+fn show_value(key: &str, host: &str, s: &HostSettings) -> Result<(String, Option<String>), String> {
     let word = |v: &dyn fmt::Debug| format!("\"{}\"", format!("{v:?}").to_lowercase());
+    let mut note = None;
     let out = match key {
         "transport" => word(&s.transport),
-        "pipe" => match &s.pipe {
-            Some(argv) => list(argv.iter().cloned()),
-            // What the dialer runs when nothing is configured (`PipeCommand::ssh`).
-            None => list(
-                ["ssh", "-T", "--", host, "fil", "server", "--stdio"]
-                    .iter()
-                    .map(|a| a.to_string()),
-            ),
-        },
+        "pipe" => {
+            let (argv, n) = pipe_argv(host, s)?;
+            note = n;
+            list(argv)
+        }
         "host_label" => match &s.host_label {
             Some(l) => format!("{l:?}"),
-            None => "unset".to_string(),
+            None => {
+                note = Some("unset: this machine's short host name is used".to_string());
+                "unset".to_string()
+            }
         },
         "remote" => word(&s.remote),
         "install" => word(&s.install),
@@ -731,7 +742,7 @@ fn show_value(key: &str, host: &str, s: &HostSettings) -> String {
         "offline_input.buffer" => bytes(s.offline.buffer),
         "offline_input.confirm" => match s.offline.confirm_after {
             None => "\"off\"".to_string(),
-            Some(d) => format!("\"after {}s\"", d.as_secs()),
+            Some(d) => format!("\"after {}\"", dur_text(d, false)),
         },
         "offline_input.log" => match &s.offline.log {
             None => "unset".to_string(),
@@ -740,11 +751,66 @@ fn show_value(key: &str, host: &str, s: &HostSettings) -> String {
         },
         "direct.address" => match &s.direct_address {
             Some(a) => format!("{a:?}"),
-            None => "unset".to_string(),
+            None => {
+                note = Some("unset: the host's address as `ssh -G` reports it is used".to_string());
+                "unset".to_string()
+            }
         },
         _ => unreachable!("every row of EXPLAINED_KEYS is handled"),
     };
-    escape_unprintable(&out)
+    Ok((
+        escape_unprintable(&out),
+        note.map(|n| escape_unprintable(&n)),
+    ))
+}
+
+/// The pipe command as the dialer builds it: the configured argv, or `PipeCommand::ssh(host)`,
+/// each with the ssh keepalive options spliced in as connect does. `remote` decides the first
+/// command of the default pipe; the install bootstrap script is shown as a marker.
+fn pipe_argv(host: &str, s: &HostSettings) -> Result<(Vec<String>, Option<String>), String> {
+    use fil_transport::LinkParams;
+    use fil_transport::pipe::PipeCommand;
+    let params = LinkParams::default();
+    let text = |c: &PipeCommand| -> Vec<String> {
+        c.effective_argv(&params)
+            .iter()
+            .map(|a| {
+                let a = a.to_string_lossy().into_owned();
+                if a == PipeCommand::BOOTSTRAP {
+                    "<the install bootstrap>".to_string()
+                } else {
+                    a
+                }
+            })
+            .collect()
+    };
+    if let Some(argv) = &s.pipe {
+        let c = PipeCommand::custom(argv).map_err(|e| e.to_string())?;
+        return Ok((text(&c), None));
+    }
+    match s.remote {
+        RemoteMode::Installed => {
+            let c = PipeCommand::bootstrap(host).map_err(|e| e.to_string())?;
+            Ok((
+                text(&c),
+                Some("remote = \"installed\": the install bootstrap runs first".to_string()),
+            ))
+        }
+        RemoteMode::Plain => {
+            let c = PipeCommand::ssh(host).map_err(|e| e.to_string())?;
+            Ok((text(&c), None))
+        }
+        RemoteMode::Auto => {
+            let c = PipeCommand::ssh(host).map_err(|e| e.to_string())?;
+            Ok((
+                text(&c),
+                Some(
+                    "then the install bootstrap if the host has no fil (remote = \"auto\")"
+                        .to_string(),
+                ),
+            ))
+        }
+    }
 }
 
 /// The text of `fil config show HOST`: a header line, then `key = value  # source` rows.
@@ -762,7 +828,16 @@ pub fn render_show(host: &str, file: &str, rows: &[Explained]) -> String {
     for r in rows {
         let left = format!("{} = {}", r.key, r.value);
         let pad = width - left.chars().count();
-        out.push_str(&format!("{left}{}  # {}\n", " ".repeat(pad), r.source));
+        let note = r
+            .note
+            .as_ref()
+            .map(|n| format!("; {n}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{left}{}  # {}{note}\n",
+            " ".repeat(pad),
+            r.source
+        ));
     }
     out
 }
@@ -1492,7 +1567,7 @@ direct.address = "devbox.example.net"
 "#,
         )
         .unwrap();
-        let rows = cfg.explain("me@devbox");
+        let rows = cfg.explain("me@devbox").unwrap();
         let get = |k: &str| {
             let r = rows
                 .iter()
@@ -1515,15 +1590,25 @@ direct.address = "devbox.example.net"
             get("direct.address"),
             ("\"devbox.example.net\"", "[host.devbox]")
         );
-        assert_eq!(
-            get("pipe"),
-            (
-                "[\"ssh\", \"-T\", \"--\", \"me@devbox\", \"fil\", \"server\", \"--stdio\"]",
-                "default"
-            )
+        // The real constructor's argv, keepalive options and all, and what `remote` adds.
+        let (pipe, source) = get("pipe");
+        assert_eq!(source, "default");
+        assert!(
+            pipe.starts_with("[\"ssh\", \"-o\", \"ServerAliveInterval=")
+                && pipe
+                    .contains("\"-T\", \"--\", \"me@devbox\", \"fil\", \"server\", \"--stdio\"]"),
+            "{pipe}"
+        );
+        let pipe_row = rows.iter().find(|r| r.key == "pipe").unwrap();
+        assert!(
+            pipe_row
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("install bootstrap")
         );
         // A host with no section gets the defaults, and every row names a source.
-        let other = cfg.explain("elsewhere");
+        let other = cfg.explain("elsewhere").unwrap();
         let agent = other.iter().find(|r| r.key == "agent").unwrap();
         assert_eq!(
             (agent.value.as_str(), agent.source.as_str()),
@@ -1534,5 +1619,142 @@ direct.address = "devbox.example.net"
             text.contains("# [host.devbox]") && text.contains("# default"),
             "{text}"
         );
+    }
+    #[test]
+    fn config_show_agrees_with_connect_about_the_pipe_and_the_host() {
+        let cfg = parse("[host.a]\nremote = \"installed\"\n[host.b]\nremote = \"plain\"\n[host.c]\npipe = [\"kubectl\", \"exec\"]\n[host.\"c;x\"]\npipe = [\"kubectl\"]").unwrap();
+        let pipe = |h: &str| {
+            let rows = cfg.explain(h).unwrap();
+            let r = rows.iter().find(|r| r.key == "pipe").unwrap().clone();
+            (r.value, r.note)
+        };
+        let (v, n) = pipe("a");
+        assert!(
+            v.contains("<the install bootstrap>") && !v.contains("\"fil\""),
+            "{v}"
+        );
+        assert!(n.unwrap().contains("bootstrap runs first"));
+        let (v, n) = pipe("b");
+        assert!(
+            v.contains("\"fil\", \"server\", \"--stdio\"") && n.is_none(),
+            "{v}"
+        );
+        assert_eq!(pipe("c"), ("[\"kubectl\", \"exec\"]".to_string(), None));
+        // Connect refuses a host name the pipe cannot use; so does `config show`.
+        let e = cfg.explain("a b;x").unwrap_err();
+        assert!(e.contains("not a usable host name"), "{e}");
+        // With a custom pipe the host is not checked, as in connect.
+        assert!(cfg.explain("c;x").is_ok());
+    }
+
+    #[test]
+    fn config_show_prints_durations_the_parsers_read_back() {
+        let cfg = parse(
+            "[defaults]\nforward = { open_wait = \"1500ms\", linger = \"2h\" }\n[defaults.offline_input]\nconfirm = \"after 500ms\"",
+        )
+        .unwrap();
+        let rows = cfg.explain("devbox").unwrap();
+        let get = |k: &str| rows.iter().find(|r| r.key == k).unwrap().value.clone();
+        assert_eq!(get("forward.open_wait"), "\"1500ms\"");
+        assert_eq!(get("forward.linger"), "\"2h\"");
+        assert_eq!(get("offline_input.confirm"), "\"after 500ms\"");
+        // Copied back into a file, every shown duration gives the same setting.
+        let copy = format!(
+            "[defaults]\nforward = {{ open_wait = {}, linger = {} }}\n[defaults.offline_input]\nconfirm = {}",
+            get("forward.open_wait"),
+            get("forward.linger"),
+            get("offline_input.confirm")
+        );
+        assert_eq!(
+            parse(&copy)
+                .unwrap()
+                .for_host("devbox")
+                .offline
+                .confirm_after,
+            cfg.for_host("devbox").offline.confirm_after
+        );
+        assert_eq!(
+            parse(&copy).unwrap().for_host("devbox").forward_tunables,
+            cfg.for_host("devbox").forward_tunables
+        );
+    }
+
+    #[test]
+    fn unset_values_say_what_applies_at_connect_time() {
+        let rows = parse("").unwrap().explain("devbox").unwrap();
+        for k in ["host_label", "direct.address"] {
+            let r = rows.iter().find(|r| r.key == k).unwrap();
+            assert_eq!(r.value, "unset");
+            assert!(r.note.as_deref().unwrap().starts_with("unset:"), "{k}");
+        }
+    }
+
+    #[test]
+    fn config_show_covers_every_key_the_parser_has() {
+        // Every key of the file's tables is a row, except the table names themselves, the two
+        // daemon settings that are refused here, and `forward.specs` (the `forward` row).
+        let mut want: Vec<String> = Vec::new();
+        for k in keys::SECTION {
+            if !matches!(*k, "history_lines" | "forward" | "offline_input" | "direct") {
+                want.push(k.to_string());
+            }
+        }
+        want.push("forward".into());
+        for (table, list) in [
+            ("forward", keys::FORWARD),
+            ("offline_input", keys::OFFLINE_INPUT),
+            ("direct", keys::DIRECT),
+        ] {
+            for k in list {
+                if !matches!(*k, "specs" | "port_range") {
+                    want.push(format!("{table}.{k}"));
+                }
+            }
+        }
+        want.sort();
+        let mut have: Vec<String> = EXPLAINED_KEYS.iter().map(|k| k.to_string()).collect();
+        have.sort();
+        assert_eq!(have, want);
+        // And `is_set` and `show_value` know every row (neither has a silent fall-through).
+        let cfg = parse("").unwrap();
+        assert_eq!(cfg.explain("devbox").unwrap().len(), EXPLAINED_KEYS.len());
+        for k in EXPLAINED_KEYS {
+            assert!(!is_set(k, &RawSection::default()));
+        }
+    }
+
+    /// The sketch of DESIGN.md section 14, as the document has it.
+    fn design_sketch() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../DESIGN.md");
+        let text = std::fs::read_to_string(path).expect("DESIGN.md");
+        let after = text
+            .split("`~/.config/fil/config.toml`:")
+            .nth(1)
+            .expect("the config sketch");
+        let block = after.split("```toml\n").nth(1).expect("its toml block");
+        block.split("\n```").next().unwrap().to_string()
+    }
+
+    #[test]
+    fn config_show_over_the_design_sketch() {
+        let cfg = parse(&design_sketch()).unwrap();
+        let rows = cfg.explain("devbox").unwrap();
+        let get = |k: &str| {
+            let r = rows.iter().find(|r| r.key == k).unwrap();
+            (r.value.clone(), r.source.clone())
+        };
+        assert_eq!(get("transport"), ("\"auto\"".into(), "[defaults]".into()));
+        assert_eq!(get("host_label").1, "[defaults]");
+        assert_eq!(get("offline_input.buffer").1, "[defaults]");
+        assert_eq!(get("agent"), ("\"off\"".into(), "[host.devbox]".into()));
+        assert_eq!(get("remote").1, "[host.devbox]");
+        assert_eq!(get("install").1, "[host.devbox]");
+        assert_eq!(get("direct.address").0, "\"devbox.example.net\"");
+        assert!(get("forward").0.contains("-D 1080"));
+        let k = cfg.explain("k8s-dev").unwrap();
+        let pipe = k.iter().find(|r| r.key == "pipe").unwrap();
+        assert_eq!(pipe.source, "[host.k8s-dev]");
+        assert!(pipe.value.starts_with("[\"kubectl\""));
+        assert!(!design_sketch().contains("predict"));
     }
 }

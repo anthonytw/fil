@@ -72,11 +72,16 @@ pub fn main() -> ExitCode {
             Some(l) => format!("{} (not found: the built-in defaults)", l.path.display()),
             None => "the built-in defaults (no config directory)".to_string(),
         };
-        print!(
-            "{}",
-            config::render_show(host, &file, &config.explain(host))
-        );
-        return ExitCode::from(OK);
+        return match config.explain(host) {
+            Ok(rows) => {
+                print!("{}", config::render_show(host, &file, &rows));
+                ExitCode::from(OK)
+            }
+            Err(e) => {
+                eprintln!("fil: {e}");
+                ExitCode::from(FAILED)
+            }
+        };
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -14,7 +14,7 @@ fn example(name: &str) -> (PathBuf, String) {
 fn the_client_example_parses_and_shows() {
     let (path, text) = example("config.toml");
     let cfg = fil::config::Config::parse(&text, &path.display().to_string()).unwrap();
-    let rows = cfg.explain("devbox");
+    let rows = cfg.explain("devbox").unwrap();
     let agent = rows.iter().find(|r| r.key == "agent").unwrap();
     assert_eq!(agent.source, "[host.devbox]");
     assert_eq!(

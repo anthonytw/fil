@@ -28,6 +28,8 @@ fil config show devbox
 
 prints the effective value of each key for `devbox` and where it came from: `default` (nothing in the file sets it), `[defaults]` or `[host.devbox]`. It reads only the config file. It does not contact the host, start ssh or touch the daemon, so it is safe to run anywhere, as `ssh -G` is. The command line options are not in its answer.
 
+The output names your hosts, the config file's path, key fingerprints and log paths. Review it before pasting it into a bug report.
+
 ## Keys
 
 Keys go in `[defaults]` or in a `[host.NAME]` section.
@@ -112,7 +114,7 @@ How much typing is held while the link is down, as a size (`"4KiB"`) or a number
 
 ### `offline_input.confirm`
 
-`"off"` (default) or `"after 10s"` (any whole number of seconds): after a disconnect that long, show what was typed and ask before sending it.
+`"off"` (default) or `"after 10s"` (a whole number with `ms`, `s` or `m`; `s` if no unit): after a disconnect that long, show what was typed and ask before sending it.
 
 ### `offline_input.log`
 

@@ -225,6 +225,166 @@ struct CtrlC {
     took: Duration,
     catch_ups: usize,
     flood_bytes: u64,
+    /// What a failure needs to say where the time went (see [`Diag`]).
+    diag: Diag,
+}
+
+/// Evidence kept for the failure message of the Ctrl-C bound: the bound was once missed on a
+/// Linux runner (7.7 s against 3 s, linux-check run 42236135347) and nothing recorded whether the
+/// runner stood still, QUIC stalled on a loss at 200 ms, or K1's pacing regressed. The causes
+/// have different signatures:
+///
+/// - a runner stall shows in `stall` (the watcher's OS thread or the clock jumped) and the
+///   client's longest silence is about the same;
+/// - a runtime stall shows as a large `runtime gap` with a small `thread gap` (the test's own
+///   tasks were starved or blocked while the machine ran);
+/// - a QUIC loss stall shows in `quic` (lost packets, a small congestion window, a large RTT)
+///   with a quiet watcher;
+/// - a pacing regression shows as a big `backlog` at the Ctrl-C (bytes the session held for the
+///   client, which the catch-up should have skipped) with no stall at all.
+#[derive(Clone, Debug, Default)]
+struct Diag {
+    stall: StallReport,
+    /// Bytes of terminal output the session had logged that the client had not received when the
+    /// Ctrl-C was typed.
+    backlog: u64,
+    /// The client's longest stretch with no terminal progress after the Ctrl-C, and when it began
+    /// (after the Ctrl-C).
+    silence: (Duration, Duration),
+    /// `(seconds after the Ctrl-C, bytes received, catch-ups so far)`, about once a second.
+    progress: Vec<(f64, u64, usize)>,
+    /// The client's QUIC counters at the end (path RTT, congestion window, loss), if QUIC.
+    quic: String,
+}
+
+impl Diag {
+    fn describe(&self) -> String {
+        format!(
+            "backlog at Ctrl-C {} bytes; longest client silence {:?} at +{:?}; progress {:?}; \
+             {}; {}",
+            self.backlog,
+            self.silence.0,
+            self.silence.1,
+            self.progress,
+            self.stall.describe(),
+            if self.quic.is_empty() {
+                "no QUIC counters (pipe)"
+            } else {
+                &self.quic
+            }
+        )
+    }
+}
+
+/// How often the stall watch ticks.
+const WATCH_TICK: Duration = Duration::from_millis(10);
+
+/// The result of a [`StallWatch`].
+#[derive(Clone, Debug, Default)]
+struct StallReport {
+    /// The longest a tick of a plain OS thread was late (the machine, or the VM, did not run it).
+    thread_gap: Duration,
+    /// The longest a tick of a task on the test's tokio runtime was late.
+    runtime_gap: Duration,
+    /// The largest disagreement between the wall clock and the monotonic clock over one tick
+    /// (a wall-clock step, or a monotonic clock that paused while the wall clock ran).
+    clock_jump: Duration,
+    /// How long the watch ran.
+    watched: Duration,
+}
+
+impl StallReport {
+    /// A tick this late means the machine or the runtime stood still (the threshold of
+    /// `fil-forward`'s timing checks for a stalled runner).
+    const STALLED: Duration = Duration::from_millis(100);
+
+    fn stalled(&self) -> bool {
+        self.thread_gap >= Self::STALLED
+            || self.runtime_gap >= Self::STALLED
+            || self.clock_jump >= Self::STALLED
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "stall watch over {:?}: thread gap {:?}, runtime gap {:?}, clock jump {:?} ({})",
+            self.watched,
+            self.thread_gap,
+            self.runtime_gap,
+            self.clock_jump,
+            if self.stalled() {
+                "the runner or runtime stood still"
+            } else {
+                "no stall seen"
+            }
+        )
+    }
+}
+
+/// Records how late the ticks of an OS thread and of a tokio task come, and the largest
+/// disagreement of the wall clock with the monotonic one, while it lives.
+struct StallWatch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<(Duration, Duration)>>,
+    task: tokio::task::JoinHandle<Duration>,
+    started: Instant,
+}
+
+impl StallWatch {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (mut gap, mut jump) = (Duration::ZERO, Duration::ZERO);
+                let (mut last, mut last_wall) = (Instant::now(), std::time::SystemTime::now());
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(WATCH_TICK);
+                    let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+                    let mono = now - last;
+                    gap = gap.max(mono.saturating_sub(WATCH_TICK));
+                    match wall.duration_since(last_wall) {
+                        Ok(w) => jump = jump.max(w.abs_diff(mono)),
+                        // The wall clock went backwards.
+                        Err(_) => jump = jump.max(mono),
+                    }
+                    (last, last_wall) = (now, wall);
+                }
+                (gap, jump)
+            })
+        };
+        let task = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut gap = Duration::ZERO;
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(WATCH_TICK).await;
+                    let now = Instant::now();
+                    gap = gap.max((now - last).saturating_sub(WATCH_TICK));
+                    last = now;
+                }
+                gap
+            })
+        };
+        StallWatch {
+            stop,
+            thread: Some(thread),
+            task,
+            started: Instant::now(),
+        }
+    }
+
+    async fn finish(mut self) -> StallReport {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (thread_gap, clock_jump) = self.thread.take().unwrap().join().unwrap();
+        StallReport {
+            thread_gap,
+            runtime_gap: (&mut self.task).await.unwrap_or_default(),
+            clock_jump,
+            watched: self.started.elapsed(),
+        }
+    }
 }
 
 /// The cell: flood for 3 s, Ctrl-C, time to `ALIVE-42` on the screen.
@@ -236,11 +396,11 @@ async fn ctrl_c_cell(t: Transport, path: Path, paced: bool) -> CtrlC {
     match t {
         Transport::Quic => {
             let (client, daemon, _keep) = quic_pair(path).await;
-            run_ctrl_c(&h, attach(&h, client, daemon)).await
+            run_ctrl_c(&h, attach(&h, client, daemon), quic_counters).await
         }
         Transport::Pipe => {
             let (client, daemon) = pipe_pair(path).await;
-            run_ctrl_c(&h, attach(&h, client, daemon)).await
+            run_ctrl_c(&h, attach(&h, client, daemon), |_| String::new()).await
         }
     }
 }
@@ -253,7 +413,29 @@ fn flood_time() -> Duration {
     )
 }
 
-async fn run_ctrl_c<L: Link>(h: &SessionHandle, mut c: fil_testkit::Client<L>) -> CtrlC {
+/// The client's QUIC counters: the path's RTT as quinn measures it, the congestion window, and
+/// the packets quinn counts lost and the datagrams it moved (the client's side of the path: the
+/// daemon's link is owned by the session).
+fn quic_counters(c: &fil_testkit::Client<QuicLink>) -> String {
+    let s = c.link.quic_stats();
+    format!(
+        "quic (client side): rtt {:?}, cwnd {}, lost packets {}, lost bytes {}, \
+         rx datagrams {}, tx datagrams {}",
+        s.path.rtt,
+        s.path.cwnd,
+        s.path.lost_packets,
+        s.path.lost_bytes,
+        s.udp_rx.datagrams,
+        s.udp_tx.datagrams
+    )
+}
+
+async fn run_ctrl_c<L: Link>(
+    h: &SessionHandle,
+    mut c: fil_testkit::Client<L>,
+    counters: fn(&fil_testkit::Client<L>) -> String,
+) -> CtrlC {
+    let watch = StallWatch::start();
     c.wait_screen("READY").await;
     c.type_bytes(b"\n").await;
     // The flood: reading all along, as a terminal does.
@@ -262,31 +444,77 @@ async fn run_ctrl_c<L: Link>(h: &SessionHandle, mut c: fil_testkit::Client<L>) -
             .await
     );
     let flood_bytes = log_end(h).await;
+    let mut diag = Diag {
+        backlog: flood_bytes.saturating_sub(c.next),
+        ..Diag::default()
+    };
     let t = Instant::now();
     c.type_bytes(b"\x03").await;
-    let back = c
-        .try_wait(Duration::from_secs(60), |c| c.screen().contains("ALIVE-42"))
-        .await;
+    // Waits in slices to see where the client stood still, if it did.
+    let (mut seen, mut since, mut next_sample) = (c.next, Duration::ZERO, Duration::ZERO);
+    let mut back = false;
+    while t.elapsed() < Duration::from_secs(60) && !back {
+        back = c
+            .try_wait(Duration::from_millis(20), |c| {
+                c.screen().contains("ALIVE-42")
+            })
+            .await;
+        let now = t.elapsed();
+        if c.next != seen {
+            seen = c.next;
+            since = now;
+        } else if now - since > diag.silence.0 {
+            diag.silence = (now - since, since);
+        }
+        if now >= next_sample {
+            diag.progress
+                .push((now.as_secs_f64(), c.next, c.mid_snapshots.len()));
+            next_sample = now + Duration::from_secs(1);
+        }
+    }
     let took = t.elapsed();
-    assert!(back, "ALIVE-42 never came: {}", c.screen());
+    diag.quic = counters(&c);
+    assert!(
+        back,
+        "ALIVE-42 never came: {}\n{}",
+        c.screen(),
+        diag.describe()
+    );
     // Everything after it too: the client reaches the end of the log.
     let end = log_end(h).await;
     c.wait("the end of the log", |c| c.next >= end).await;
     let catch_ups = assert_no_loss(&c);
     let _ = h.kill(Duration::from_secs(5)).await;
+    diag.stall = watch.finish().await;
     CtrlC {
         took,
         catch_ups,
         flood_bytes,
+        diag,
     }
 }
 
 fn report(what: &str, r: &CtrlC) {
     eprintln!(
-        "{what}: Ctrl-C to its output {:.2} s, {} catch-ups, {:.1} MB flooded before it",
+        "{what}: Ctrl-C to its output {:.2} s, {} catch-ups, {:.1} MB flooded before it; {}",
         r.took.as_secs_f64(),
         r.catch_ups,
-        r.flood_bytes as f64 / 1e6
+        r.flood_bytes as f64 / 1e6,
+        r.diag.describe()
+    );
+}
+
+/// The Ctrl-C bound, with the evidence of [`Diag`] in the message when it is missed. The bound is
+/// not widened and nothing is re-measured: a miss is either a real regression or a runner stall,
+/// and the message says which.
+fn assert_within_limit(what: &str, r: &CtrlC) {
+    assert!(
+        r.took <= CTRL_C_LIMIT,
+        "{what}: Ctrl-C took {:?} (limit {CTRL_C_LIMIT:?}); {} catch-ups, {} bytes flooded; {}",
+        r.took,
+        r.catch_ups,
+        r.flood_bytes,
+        r.diag.describe()
     );
 }
 
@@ -297,11 +525,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_quic_link_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Quic, SLOW_PATH, true).await;
     report("quic 1 Mbit/s paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
-    assert!(
-        r.took <= CTRL_C_LIMIT,
-        "Ctrl-C took {:?} (limit {CTRL_C_LIMIT:?})",
-        r.took
-    );
+    assert_within_limit("quic 1 Mbit/s", &r);
 }
 
 /// The same on the pipe: no worse than K1's bound either.
@@ -310,11 +534,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_pipe_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Pipe, SLOW_PATH, true).await;
     report("pipe 1 Mbit/s paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
-    assert!(
-        r.took <= CTRL_C_LIMIT,
-        "Ctrl-C took {:?} (limit {CTRL_C_LIMIT:?})",
-        r.took
-    );
+    assert_within_limit("pipe 1 Mbit/s", &r);
 }
 
 /// The 1 Mbit/s path with a round trip of `rtt_ms`.
@@ -331,7 +551,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_long_quic_path_is_fast_and_loses_nothin
     let r = ctrl_c_cell(Transport::Quic, slow_path(200), true).await;
     report("quic 1 Mbit/s 200 ms paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
-    assert!(r.took <= CTRL_C_LIMIT, "Ctrl-C took {:?}", r.took);
+    assert_within_limit("quic 1 Mbit/s 200 ms", &r);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -339,7 +559,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Pipe, slow_path(200), true).await;
     report("pipe 1 Mbit/s 200 ms paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
-    assert!(r.took <= CTRL_C_LIMIT, "Ctrl-C took {:?}", r.took);
+    assert_within_limit("pipe 1 Mbit/s 200 ms", &r);
 }
 
 /// Ctrl-C at 1 Mbit/s over every round trip of the matrix, paced and unpaced, both transports.

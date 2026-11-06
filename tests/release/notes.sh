@@ -18,9 +18,8 @@ if [ -f "$ROOT/CHANGELOG.md" ]; then
     p { print }
   ' "$ROOT/CHANGELOG.md"
 fi
-# TODO (docs/m4/release.md section 10.3, the notarization work item): v1 macOS binaries are signed and
-# notarized by `just release-sign-macos`; when that lands, replace the "ad-hoc signed ... not notarized"
-# sentence below. Until then it is true of what CI builds, so it stays.
+# The macOS paragraph below is true of the published release: the owner signs and notarizes the macOS
+# binary after CI (`just release-sign-macos`, docs/m4/release.md section 10.3), before publishing.
 cat << EOT
 
 ## Verify what you downloaded
@@ -39,7 +38,24 @@ ssh-keygen -Y verify -f SIGNERS -I release -n fil-release -s SHA256SUMS.sig < SH
 **on main**. fil is GPL-3.0-or-later: each archive carries \`share/doc/fil/LICENSE\` and the
 third-party notices, \`share/doc/fil/THIRD-PARTY-NOTICES.md\`. \`fil-$v-source.tar.gz\` is the
 Corresponding Source with every dependency vendored; it builds offline. The Linux binaries and
-archives are reproducible (\`just release-verify\` rebuilds them in a pinned image). The macOS
-binary is **ad-hoc signed** (no Developer ID, not notarized) and is not independently reproduced;
-the macOS archive is checked only around that binary.
+archives are reproducible (\`just release-verify\` rebuilds them in a pinned image).
+
+**macOS.** Download \`fil-$v-universal-apple-darwin.tar.gz\`: its \`bin/fil\` is signed with the
+owner's Developer ID (hardened runtime) and notarized by Apple, which a bare command-line binary
+cannot staple, so macOS asks Apple online the first time it runs. The release also holds
+\`fil-$v-universal-apple-darwin.ci.tar.gz\`: CI's own build, ad hoc signed and **not notarized**, kept
+only so that the signed archive can be checked. Do not install it. GitHub attests that one (CI never
+saw the signed archive), and the signed archive is checked against it, from a checkout of the tag
+and in the directory you downloaded to (this needs python3, nothing else):
+
+\`\`\`sh
+gh attestation verify fil-$v-universal-apple-darwin.ci.tar.gz --repo $repo \\
+  --signer-workflow $repo/.github/workflows/release.yml --source-ref refs/tags/v$v
+# the signed archive is that archive with only the signature of bin/fil changed
+tests/release/verify-macos.sh agree . $v
+\`\`\`
+
+\`just release-verify $v\` does all of this, and more (it also rebuilds the other archives). The macOS
+binary itself is not independently reproduced from source by CI; \`--mac-rebuild FILE\` compares a
+build of your own with it once both signatures are normalized away.
 EOT

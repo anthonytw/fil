@@ -215,7 +215,9 @@ async fn the_daemon_process_gives_its_sessions_the_limit_it_was_started_with() {
         .await
         .unwrap();
     let mut a = Client::attach(link, Connect::new("main", key(1))).await;
-    a.wait_out(&format!("limit={soft}.")).await;
+    // On the screen, not in the output: the shell echoes at once, so a slow attach gets it in the
+    // attach snapshot.
+    a.wait_screen(&format!("limit={soft}.")).await;
     // And the daemon itself runs with more, when the hard limit allows it.
     let pid = s.daemon_pid().expect("the daemon's pid");
     if mine.maximum.is_none_or(|h| h > soft) && cfg!(target_os = "linux") {

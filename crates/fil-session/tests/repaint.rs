@@ -38,7 +38,9 @@ async fn a_repaint_after_a_resize_is_the_screen_at_the_new_size_with_no_history(
     let h = spawn_plain(sh_config(&sc, "main", LINES_THEN_QUIET)).await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
     let zeros = "0".repeat(70);
-    c.wait_out(&zeros).await;
+    // On the screen, not in the output: the shell prints at once, so a slow attach gets it in the
+    // attach snapshot.
+    c.wait_screen(&zeros).await;
     c.drain(Duration::from_millis(100)).await;
 
     // The terminal reflows at the resize (the scripted client's emulator resizes as it sends the

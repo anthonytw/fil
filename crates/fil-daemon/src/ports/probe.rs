@@ -667,9 +667,11 @@ mod tests {
     }
 
     /// Redis answers the request line, and (answering in time, as here) is left before it sees a
-    /// `Host:` header, which it logs as an attack: one connection, no `Host:`.
+    /// `Host:` header, which it logs as an attack: one connection, no `Host:`. A wall-clock test
+    /// (T): the answer must come within `LINE_WAIT` (30 ms), which a loaded host can miss
+    /// (Orin run 66).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redis_is_known_from_the_request_line_alone() {
+    async fn wallclock_redis_is_known_from_the_request_line_alone() {
         let s = server(Behaviour::Redis).await;
         assert_eq!(
             kind(&probe(s.addr, ProbeMode::Head).await),

@@ -160,16 +160,27 @@ impl Pacer {
         let (Some(rtprop), Some(&(_, max))) = (self.rtprop, self.rates.front()) else {
             return;
         };
-        let start = *self.round_start.get_or_insert(now);
+        let Some(start) = self.round_start else {
+            // The first sample starts the first round and is its baseline.
+            self.round_start = Some(now);
+            self.full_rate = max;
+            return;
+        };
         if self.full || now.saturating_duration_since(start) < rtprop {
             return;
         }
+        // Samples can be a second apart (a flood's come one to a catch-up): a sample after a gap
+        // of several round trips with no growth in the rate has seen them all, so the gap counts
+        // as the rounds it spans, not as one. A ramping window grows every round, so it cannot
+        // pass for steady this way.
+        let rounds = now.saturating_duration_since(start).as_micros() / rtprop.as_micros().max(1);
         self.round_start = Some(now);
         if max >= self.full_rate.saturating_add(self.full_rate / 4) {
             self.full_rate = max;
             self.full_count = 0;
         } else {
-            self.full_count += 1;
+            let rounds = u32::try_from(rounds.min(u128::from(FULL_ROUNDS))).unwrap_or(FULL_ROUNDS);
+            self.full_count += rounds;
             self.full = self.full_count >= FULL_ROUNDS;
         }
     }
@@ -426,6 +437,20 @@ mod tests {
         let later = t + RATE_WINDOW + ms(100);
         assert_eq!(p.drain_time(1_000_000, later), Duration::ZERO);
         assert!(!p.full);
+        // Samples a second apart (a flood's, one to a catch-up) count the round trips between
+        // them: steady across a gap is full, but a gap with growth is not.
+        let mut g = Pacer::new(true);
+        g.on_sample(ms(200), 20_000, ms(200), false, t0);
+        g.on_sample(ms(200), 20_000, ms(200), false, t0 + ms(1000));
+        assert!(g.full, "steady across five round trips");
+        let mut g = Pacer::new(true);
+        g.on_sample(ms(200), 20_000, ms(200), false, t0);
+        g.on_sample(ms(200), 40_000, ms(200), false, t0 + ms(1000));
+        g.on_sample(ms(200), 80_000, ms(200), false, t0 + ms(2000));
+        assert!(
+            !g.full,
+            "a rate that doubles over each gap is still ramping"
+        );
         // App-limited samples never count a round.
         let mut q = Pacer::new(true);
         q.on_sample(ms(200), 20_000, ms(200), false, t0);

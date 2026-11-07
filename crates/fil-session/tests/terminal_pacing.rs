@@ -400,6 +400,11 @@ impl Drop for StallWatch {
 
 /// The cell: flood for 3 s, Ctrl-C, time to `ALIVE-42` on the screen.
 async fn ctrl_c_cell(t: Transport, path: Path, paced: bool) -> CtrlC {
+    ctrl_c_cell_after(t, path, paced, flood_time()).await
+}
+
+/// [`ctrl_c_cell`] with the Ctrl-C after `flood` of output.
+async fn ctrl_c_cell_after(t: Transport, path: Path, paced: bool, flood: Duration) -> CtrlC {
     let sc = Scratch::new();
     let mut cfg = sh_config(&sc, "main", &flood_script());
     cfg.terminal_pacing = paced;
@@ -407,11 +412,11 @@ async fn ctrl_c_cell(t: Transport, path: Path, paced: bool) -> CtrlC {
     match t {
         Transport::Quic => {
             let (client, daemon, _keep) = quic_pair(path).await;
-            run_ctrl_c(&h, attach(&h, client, daemon), quic_counters).await
+            run_ctrl_c(&h, attach(&h, client, daemon), quic_counters, flood).await
         }
         Transport::Pipe => {
             let (client, daemon) = pipe_pair(path).await;
-            run_ctrl_c(&h, attach(&h, client, daemon), |_| String::new()).await
+            run_ctrl_c(&h, attach(&h, client, daemon), |_| String::new(), flood).await
         }
     }
 }
@@ -445,15 +450,13 @@ async fn run_ctrl_c<L: Link>(
     h: &SessionHandle,
     mut c: fil_testkit::Client<L>,
     counters: fn(&fil_testkit::Client<L>) -> String,
+    flood: Duration,
 ) -> CtrlC {
     let watch = StallWatch::start();
     c.wait_screen("READY").await;
     c.type_bytes(b"\n").await;
     // The flood: reading all along, as a terminal does.
-    assert!(
-        !c.try_wait(flood_time(), |c| c.screen().contains("ALIVE"))
-            .await
-    );
+    assert!(!c.try_wait(flood, |c| c.screen().contains("ALIVE")).await);
     let flood_bytes = log_end(h).await;
     let mut diag = Diag {
         backlog: flood_bytes.saturating_sub(c.next),
@@ -586,6 +589,24 @@ async fn wallclock_ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_n
     report("pipe 1 Mbit/s 200 ms paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
     assert_within_limit("pipe 1 Mbit/s 200 ms", &r);
+}
+
+/// An early Ctrl-C: two seconds into the flood the pacer has seen only a few samples (a flood's
+/// come one to a catch-up, a second apart), and the full-pipe test must not need more than
+/// that, or the catch-up rule's time half is off and the tail drains at the link's rate. This
+/// missed K1 (2.8 to 4.0 s) before the test counted the round trips a gap between samples spans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wallclock_an_early_ctrl_c_on_a_slow_long_quic_path_is_fast_and_loses_nothing() {
+    let r = ctrl_c_cell_after(
+        Transport::Quic,
+        slow_path(200),
+        true,
+        Duration::from_secs(2),
+    )
+    .await;
+    report("quic 1 Mbit/s 200 ms paced, Ctrl-C after 2 s", &r);
+    assert!(r.catch_ups > 0, "the flood never outran the link");
+    assert_within_limit("quic 1 Mbit/s 200 ms, early", &r);
 }
 
 /// Ctrl-C at 1 Mbit/s over every round trip of the matrix, paced and unpaced, both transports.

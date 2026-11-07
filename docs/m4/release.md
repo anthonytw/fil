@@ -143,6 +143,8 @@ The bootstrap script (`docs/m4/plan.md` §3, U1; the exact text is M4 OQ-1) buil
 
 `fil server --install-gc` (the `remove` mode of the bootstrap, `fil install --remove HOST`) and the collection that `fil server --install-finish` runs after an install both select what to remove with **one** function, which implements this section. This section fixes what any copy of fil, now or later, may rely on when it judges another copy's directories. 0.1.0 is the only release whose rules every later copy has to honor, so a keep reason that 0.1.0 lacks can never be relied on later. That is why §6.3 has a "recently used" rule.
 
+The other FROZEN contract between copies of fil on one host, the arguments of the session trampoline, is §11.
+
 ### 6.1 What GC looks at
 
 GC looks at the entries of exactly one directory, `$HOME/.local/share/fil`, and at two files per wire in the socket directory. It lists nothing else.
@@ -300,6 +302,7 @@ That cost is **accepted** for 0.1.0, given its preconditions: a home shared acro
 | PKG | §3, §4 |
 | LIC | §2 (the first line stays), §4.3 (`THIRD-PARTY-NOTICES.md`), §7 |
 | DOC | §4.3 (the layout of the docs and completions), §5, §6 (for the user guide's removal instructions) |
+| MAC | §11 (the trampoline's arguments) |
 | TMP | §6.3 (2.5) and §6.4, item 4 (the lock files that GC reads, and the install directory's refresh on the hourly wake) |
 
 ## 9. Building, verifying and signing a release (REL)
@@ -487,3 +490,29 @@ It needs, on the owner's Mac: the "Developer ID Application: Anthony Wertz (6X3P
   ```
 
   Extend the expiry before it lapses (`gpg --quick-set-expire FPR 2y`), then re-export the public key and send it in a PR: rpm checks a signature against the key's validity, so users re-import the extended key (`rpm --import`). If the secret key is lost or exposed, publish the revocation certificate in a PR (`gpg --import` the `.rev`, re-export) and make a new key.
+
+## 11. FROZEN: the session trampoline's arguments
+
+A daemon starts each session's child through its own executable, the **trampoline**, which restores the descriptor limit the daemon had before it raised its own and then `exec`s the real program (`DESIGN.md` §7.2, "Descriptors"; `fil_session::nofile`). On Linux the trampoline is `/proc/self/exe`, the daemon's own image. On macOS it is `current_exe()`, a **path**: when a package manager replaces that file while a daemon runs (`brew upgrade`, an in-place upgrade; plan §1, the trampoline item), the running daemon starts its next sessions through the **other release's** binary, and a downgrade does the reverse. A patch keeps the wire, so the new relay routes new sessions into the old daemon (§1). `tests/macos/remote.sh` (`upgrade_in_place`) shows both halves: the replaced file is used, and a trampoline that refuses its arguments leaves the new session with no shell.
+
+So the argument list is frozen **for every later release, including after a change of `PROTOCOL_MAJOR`**, in both directions: every release builds exactly this list, and every release accepts exactly this list. A new major is no way out. Daemons of different wires coexist on a host (§1), and a new major's relay starts a daemon of its own and leaves the old one running for the old clients. That old daemon still starts its sessions through whatever binary is at its path. As with §6, 0.1.0 is the release whose list every later copy has to build and accept.
+
+| Item | Value |
+|---|---|
+| The command line | `<trampoline> __fil-exec-nofile <soft> <program> <argv0> [<arg>...]` |
+| The marker | `__fil-exec-nofile`, as `argv[1]`. Every binary that can run a daemon (`fil`, `fil-daemon-dev`) checks for it first thing in `main`, before it parses its command line or does anything else |
+| `<soft>` | the soft `RLIMIT_NOFILE` to set: one or more ASCII decimal digits, no sign, at most `u64::MAX` (leading zeros are accepted; a daemon writes none). The daemon passes the soft limit it started with (`fdlimit::original`), which is at most the hard limit |
+| `<program>` | an absolute path to an executable regular file, `exec`ed as given (no `PATH` search; the daemon resolves the program first, as portable-pty would) |
+| `<argv0>` | the program's `argv[0]`: `-` and the shell's base name for a login shell (`-zsh`), the command's first word as typed otherwise |
+| `<arg>...` | the command's other words, in order, unchanged (an empty word included) |
+| Inherited | the environment, the working directory and the descriptors, unchanged |
+| Success | the limit is set and the program `exec`ed (the same pid), with nothing printed |
+| Refusal | anything else (a missing or malformed argument, a relative or missing program, a limit that cannot be set, a failed `exec`): a message on stderr, which is the session's terminal, and exit status 127, with nothing run |
+
+**The test.** `crates/fil/tests/trampoline.rs` pins both sides with literals, not values read from the code: the argument list `fil_session::nofile::wrap_with` builds for a login shell and for a command (a bare name resolved on `PATH`, an absolute one), and what the real `fil` binary does with the pinned list (the same pid, `argv[0]`, limit, directory, environment and arguments) and with each malformed one (127, nothing run). The table is also kept as a golden file, `crates/fil/tests/golden/trampoline.txt`, with a `[history]` like §6.5's (FNV-1a of the pinned block, only ever growing), so an edit to a frozen item fails the test and shows in review.
+
+The test calls `wrap_with` with a fixed executable and limit; which executable and which limit `wrap` picks (`own_executable`, the original soft limit) are pinned by the table above, not by that test. It also checks that `wrap_with` leaves the command's environment and working directory as they were, and runs `fil` with a cleared environment holding one variable, so a trampoline that starts to need something else from either fails it.
+
+**Changing it.** An addition is allowed only if no older copy has to build or accept it, and goes under the golden's `[extensions]`. Anything else (another marker, another order, another argument a daemon passes or a trampoline requires, an environment variable or directory it relies on) is not allowed in any later version, a new `PROTOCOL_MAJOR` included. The way out is a trampoline that does not depend on the file at the path, such as an executable descriptor the daemon opens at its start: it would have to ship first, and the list would stay accepted for as long as a daemon from before it may still run.
+
+**What it does not fix.** The finding stays (DESIGN §16, item 9; `upgrade_in_place` reports it as a known bug): an old daemon still starts new sessions through the file now at its path. The freeze makes that file accept the old daemon's arguments. If the path no longer holds a fil (a `brew uninstall`, a relink in progress), new sessions in that daemon have no shell until fil is back, as §6.6 already accepts for GC.

@@ -24,6 +24,17 @@
 //! builds itself from its own configuration. Missing or malformed arguments, or a program that
 //! cannot be executed, end it with status 127 and nothing run.
 //!
+//! **FROZEN: the trampoline's arguments** (`docs/m4/release.md` §11). On macOS the trampoline is
+//! `current_exe()`, a path, and a package upgrade replaces the file it names while a daemon runs
+//! (Linux uses `/proc/self/exe`, the daemon's own image). A running daemon of one release then
+//! starts its new sessions through another release's binary, and the reverse after a downgrade,
+//! whatever the two wires are: daemons of different wires, even of different `PROTOCOL_MAJOR`s,
+//! run side by side, so a new major does not retire an old daemon. So every later release, across
+//! majors too, builds exactly the argument list that [`wrap`] builds now and accepts exactly what
+//! [`run_trampoline_if_asked`] accepts now: the marker [`TRAMPOLINE`] as the first argument, then
+//! `SOFT PROGRAM ARGV0 [ARGS...]`. Neither may change; `crates/fil/tests/trampoline.rs` pins both
+//! with literals and a golden file.
+//!
 //! Nothing happens until [`set_trampoline`] is called and the limit was raised: a process that
 //! did neither (the session tests, a host that embeds sessions otherwise) starts its children
 //! unchanged.
@@ -36,7 +47,8 @@ use fil_transport::fdlimit;
 use portable_pty::CommandBuilder;
 
 /// The first argument that makes a binary the trampoline (see the module docs). Not a
-/// subcommand anyone types; a binary that sees it never parses its command line.
+/// subcommand anyone types; a binary that sees it never parses its command line. FROZEN for every
+/// later release, across `PROTOCOL_MAJOR`s too, with the arguments after it (module docs).
 pub const TRAMPOLINE: &str = "__fil-exec-nofile";
 
 /// The executable a session's child is started through.
@@ -70,6 +82,13 @@ pub(crate) fn wrap(cmd: &mut CommandBuilder) -> Result<(), String> {
     let Some(soft) = original.current else {
         return Ok(());
     };
+    wrap_with(cmd, exe, soft)
+}
+
+/// What [`wrap`] does once this process has raised its limit: puts `exe` as the trampoline, with
+/// `soft` as the limit to restore, in front of `cmd`'s program. The argument list it builds is
+/// FROZEN (module docs); public so that the contract's test can pin it.
+pub fn wrap_with(cmd: &mut CommandBuilder, exe: &Path, soft: u64) -> Result<(), String> {
     let (program, argv0, rest): (OsString, OsString, Vec<OsString>) = if cmd.is_default_prog() {
         let shell = cmd.get_shell();
         let base = shell.rsplit('/').next().unwrap_or(&shell).to_string();
@@ -82,7 +101,7 @@ pub(crate) fn wrap(cmd: &mut CommandBuilder) -> Result<(), String> {
         (resolved, first, argv[1..].to_vec())
     };
     let mut argv = vec![
-        exe.clone().into_os_string(),
+        exe.as_os_str().to_os_string(),
         TRAMPOLINE.into(),
         soft.to_string().into(),
         program,
@@ -147,7 +166,7 @@ fn executable(p: &Path) -> bool {
 /// descriptor limit it was given and becomes the real program, with its `argv[0]`. It returns
 /// only when the process is not a trampoline. Call it first thing in `main`.
 ///
-/// Its arguments are `SOFT PROGRAM ARGV0 [ARGS...]`, where `PROGRAM` is an absolute path to an
+/// Its arguments (FROZEN, module docs) are `SOFT PROGRAM ARGV0 [ARGS...]`, where `PROGRAM` is an absolute path to an
 /// executable file. Anything else (a missing or malformed argument, a relative or missing
 /// program, a limit that cannot be set, a failed `exec`) is said on stderr (the session's
 /// terminal) and ends the process with status 127, as a shell does for a command it cannot run.
@@ -165,9 +184,13 @@ pub fn run_trampoline_if_asked() {
 /// Returns only on failure.
 fn trampoline(mut args: impl Iterator<Item = OsString>) -> String {
     use std::os::unix::process::CommandExt;
-    let soft = args
-        .next()
-        .and_then(|s| s.to_str().and_then(|s| s.parse::<u64>().ok()));
+    // Decimal digits only, as a daemon writes them (`u64`'s `to_string`): `parse` alone would
+    // also take a leading `+`, which the frozen contract does not allow.
+    let soft = args.next().and_then(|s| {
+        s.to_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+    });
     let (Some(soft), Some(program), Some(argv0)) = (soft, args.next(), args.next()) else {
         return "bad arguments".into();
     };

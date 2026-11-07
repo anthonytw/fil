@@ -402,7 +402,7 @@ EOF
   fc_show_pid c
   [[ $(the_daemon) == "$d1" ]] || fail "the new session did not start in the old daemon"
   if [[ -s $mark ]]; then
-    known_bug "current_exe() on macOS: the old daemon (pid $d1) started a NEW session through the REPLACED binary's trampoline ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...). DESIGN/plan §1: freeze the trampoline's argument contract within a PROTOCOL_MAJOR, pinned by a test (fil-session::nofile); U1's versioned install directories avoid the case for fil-installed copies"
+    known_bug "current_exe() on macOS: the old daemon (pid $d1) started a NEW session through the REPLACED binary's trampoline ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...). Mitigated, not fixed: docs/m4/release.md section 11 freezes the trampoline's arguments for every later release, so a newer fil at the path accepts them; residual: a path that no longer holds a fil (uninstall, relink). Fix: a trampoline that does not depend on the path. U1's versioned install directories avoid the case for fil-installed copies"
     note "trampoline_via_replaced_path=yes"
   else
     note "trampoline_via_replaced_path=no"
@@ -410,7 +410,7 @@ EOF
   fi
   fc_detach b
   fc_detach c
-  # The consequence, if a release ever changed the trampoline's arguments: the replaced file refuses
+  # Why the arguments are frozen: if a release ever changed them, the replaced file would refuse
   # them (status 127, as a trampoline given malformed arguments does). A new session in the old
   # daemon then has no shell.
   cat > "$W/stub.sh" << EOF

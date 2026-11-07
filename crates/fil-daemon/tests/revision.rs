@@ -152,6 +152,13 @@ fn a_stale_socket_is_not_reported_and_a_live_legacy_daemon_is() {
     assert!(flock(&lock, FlockOperation::NonBlockingLockShared).is_ok());
     drop(lock);
     assert!(other_daemons(&paths).is_empty(), "gone with its lock");
+
+    // A live daemon of another revision whose socket was removed (it binds it again at its next
+    // check) is still running, and its sessions with it: found by its lock alone.
+    let gap = rev_new() + 3;
+    let held = std::fs::File::create(s.dir.join(format!("fil-1-{gap}.lock"))).unwrap();
+    flock(&held, FlockOperation::NonBlockingLockExclusive).unwrap();
+    assert_eq!(other_daemons(&paths), [other(gap)]);
 }
 
 fn hello_rev(revision: u16) -> ControlMsg {

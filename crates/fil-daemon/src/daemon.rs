@@ -15,8 +15,9 @@
 //!   file that a cleaner or a person removed makes a free lock under a live daemon.
 //! - **Temporary-file cleaners.** The files live in `/tmp`, which some systems age. The daemon
 //!   holds a shared `flock` on its socket directory, sets fresh times on its files every hour
-//!   ([`Keeping`]) and, at each of those looks, repairs what is missing: the directory, its lock
-//!   on it, the lock file and the socket (DESIGN.md section 5.3).
+//!   ([`Keeping`]) and repairs what is missing: the directory, its lock on it, the lock file and
+//!   the socket, at each of those looks and, when a check every 15 seconds finds one gone, at
+//!   once (DESIGN.md section 5.3).
 //! - **Idle exit.** With no session and no connection for `idle_exit` (five minutes by default,
 //!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
 //!   last look for a connection that raced it, and exits. A relay that arrives later starts a
@@ -64,6 +65,7 @@ use crate::paths::{
     socket_identity, something_answers,
 };
 use crate::start::{LockStep, clean_up_files, lock_step, open_lock_file};
+use rustix::fs::{FlockOperation, flock};
 
 /// Most tombstones (names of ended sessions) kept to answer a late resume with `SessionGone`.
 const MAX_TOMBSTONES: usize = 256;
@@ -663,6 +665,7 @@ fn random_incarnation() -> Result<u128, String> {
 pub struct DaemonHandle {
     host: Arc<Host>,
     stop: watch::Sender<Option<bool>>,
+    check_now: Arc<tokio::sync::Notify>,
 }
 
 impl DaemonHandle {
@@ -682,6 +685,13 @@ impl DaemonHandle {
     pub fn shutdown(&self, kill_sessions: bool) {
         self.stop.send_replace(Some(kill_sessions));
     }
+
+    /// Runs the short check of the daemon's files ([`Keeping::check`]) now, as its timer would.
+    /// For tests, which can then keep the timer long and decide when the check comes.
+    #[cfg(feature = "test-hooks")]
+    pub fn check_files_now(&self) {
+        self.check_now.notify_one();
+    }
 }
 
 /// A running daemon. See the [module docs](self).
@@ -695,8 +705,16 @@ pub struct Daemon {
     /// The daemon lock and the directory lock, held for the daemon's life.
     held: Arc<Mutex<Held>>,
     keeping: Keeping,
-    /// Set while an hourly look is running on its own thread (see [`look`]).
+    /// Set while an hourly look is running on its own thread (see [`Daemon::start_look`]).
     looking: Arc<AtomicBool>,
+    /// Set while a repair found by the short check ([`Keeping::check`]) runs on its own thread
+    /// (which, for a daemon that lost its lock file to a successor, waits for the lock).
+    repairing: Arc<AtomicBool>,
+    /// Set once [`run`](Self::run) ends: a repair still waiting for a successor's lock takes
+    /// nothing after that (in-process daemons, the tests, outlive no thread of theirs this way).
+    stopped: Arc<AtomicBool>,
+    /// Runs the short check at once (a test seam: [`DaemonHandle::check_files_now`]).
+    check_now: Arc<tokio::sync::Notify>,
     /// Test seam: runs in the look's thread before the install directory is touched.
     #[cfg(feature = "test-hooks")]
     install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -730,6 +748,14 @@ impl Daemon {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
+        }
+        // A daemon of this revision that lost its lock file to a successor waits to take the
+        // lock back when that one exits, and says so with its claim: it is this lock's rightful
+        // holder, and its sessions are reachable only through it. Step aside (the lock goes when
+        // this returns), as for a daemon that holds the lock.
+        if crate::paths::claim_is_held(&paths.claim()) {
+            tracing::info!("a daemon of this revision is taking its socket back; not starting");
+            return Err(StartError::AlreadyRunning(lock_path));
         }
         lock.set_len(0).map_err(io(lock_path.clone()))?;
         writeln!(lock, "{}", std::process::id()).map_err(io(lock_path.clone()))?;
@@ -812,9 +838,18 @@ impl Daemon {
             paths,
             unix,
             bound,
-            held: Arc::new(Mutex::new(Held { lock, dir_lock })),
+            held: Arc::new(Mutex::new(Held {
+                lock,
+                dir_lock,
+                lost_lock: false,
+                claim: None,
+                refused_dir: false,
+            })),
             keeping,
             looking: Arc::new(AtomicBool::new(false)),
+            repairing: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            check_now: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-hooks")]
             install_hook: None,
             install: std::env::current_exe()
@@ -853,27 +888,67 @@ impl Daemon {
         self.install_hook = Some(hook);
     }
 
-    /// Starts one look after the daemon's files on a thread of its own, unless the last one is
-    /// still running. The look can touch the user's home (the install directory), which may be a
-    /// network mount that hangs, so it never runs on the accept loop; a hung one costs this
-    /// thread and nothing else, and the next hour's look waits for it instead of piling up.
-    fn start_look(&self) -> Option<oneshot::Receiver<Report>> {
-        if self.looking.swap(true, Ordering::AcqRel) {
-            tracing::debug!("the last look at the daemon's files is still running");
+    /// Starts one look after the daemon's files on a thread of its own, unless the last one of
+    /// its kind is still running. The hourly look (`full`) can touch the user's home (the install
+    /// directory), which may be a network mount that hangs, so it never runs on the accept loop;
+    /// a hung one costs this thread and nothing else, and the next hour's look waits for it
+    /// instead of piling up. A repair (not `full`) touches only the socket directory, and has a
+    /// flag of its own, so a hung hourly look does not hold it up. A repair can wait about a
+    /// second for a lock, which is why it is not on the loop either; and one that finds a
+    /// successor holding the lock waits on it for that daemon's whole life, so it gets a thread of
+    /// its own rather than one of the runtime's blocking pool (which shutdown would wait for).
+    fn start_look(&self, full: bool) -> Option<oneshot::Receiver<Report>> {
+        let flag = if full { &self.looking } else { &self.repairing };
+        if flag.swap(true, Ordering::AcqRel) {
+            tracing::debug!(full, "the last look at the daemon's files is still running");
             return None;
         }
         let (tx, rx) = oneshot::channel();
         let job = Look {
             paths: self.paths.clone(),
             keeping: self.keeping.clone(),
+            full,
             held: self.held.clone(),
             install: self.install.clone(),
             #[cfg(feature = "test-hooks")]
             hook: self.install_hook.clone(),
-            done: LookDone(self.looking.clone()),
+            stopped: self.stopped.clone(),
+            done: LookDone(flag.clone()),
         };
-        tokio::task::spawn_blocking(move || job.run(tx));
+        if full {
+            tokio::task::spawn_blocking(move || job.run(tx));
+        } else if let Err(e) = std::thread::Builder::new()
+            .name("fil-repair".into())
+            .spawn(move || job.run(tx))
+        {
+            // The job is dropped with its sender and flag: the loop sees no report.
+            tracing::warn!(error = %e, "cannot start a thread for a repair");
+        }
         Some(rx)
+    }
+
+    /// The short check ([`Keeping::check`]), on the loop: whether the directory, the lock file
+    /// or the socket has gone from its path (or the directory was replaced), so that a repair
+    /// should run now rather than at the next hourly look. A few `stat` calls in the
+    /// socket directory, nothing else; it never waits: while a look holds the locks it answers
+    /// no (that look repairs). A socket at the path that is not ours (a successor's) is not
+    /// something a repair can change, so it does not count.
+    fn needs_repair(&self) -> bool {
+        // A look that panicked holding the locks leaves them poisoned, not wrong: carry on with
+        // them, as the looks do, or the check would be off for good.
+        let held = match self.held.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        let dir_gone = match &held.dir_lock {
+            Some(d) if self.keeping.dir_lock => !dir_lock_is_current(d, &self.paths.dir),
+            _ => std::fs::symlink_metadata(&self.paths.dir).is_err(),
+        };
+        dir_gone
+            || !crate::start::is_current(&held.lock, &self.paths.lock())
+            || std::fs::symlink_metadata(self.paths.socket())
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     }
 
     /// What a look found, applied on the loop: a socket that is gone is bound again, but only
@@ -884,16 +959,75 @@ impl Daemon {
             return;
         }
         let sock = self.paths.socket();
+        // The other kind of look may have bound it since this one looked.
+        if std::fs::symlink_metadata(&sock).is_ok() {
+            return;
+        }
+        // The directory may have gone since the look checked it, and been made again by
+        // somebody else: check it again, right before the bind, or skip this one (the next check
+        // repairs the directory first).
+        if !self.dir_still_ours() {
+            tracing::debug!("the socket directory changed since the look; not binding yet");
+            return;
+        }
         match UnixListener::bind(&sock) {
             Ok(l) => {
                 let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
-                self.unix = l;
+                let old = std::mem::replace(&mut self.unix, l);
                 self.bound = socket_identity(&sock);
                 tracing::warn!("the socket was removed; bound it again");
+                self.drain(old);
             }
             Err(e) => {
                 tracing::error!(error = %e, "the socket was removed and cannot be bound again")
             }
+        }
+    }
+
+    /// The checks of the repair, again, on the loop: the socket directory passes those of
+    /// [`ensure_socket_dir`] and, when the daemon keeps a lock on it, is still the directory that
+    /// lock is on. No wait: if a look holds the locks just now, the answer is no.
+    fn dir_still_ours(&self) -> bool {
+        if ensure_socket_dir(&self.paths.dir).is_err() {
+            return false;
+        }
+        if !self.keeping.dir_lock {
+            return true;
+        }
+        let held = match self.held.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        held.dir_lock
+            .as_ref()
+            .is_none_or(|d| dir_lock_is_current(d, &self.paths.dir))
+    }
+
+    /// Serves what is still queued on a listener that was replaced: its path is gone, so nothing
+    /// new can join its queue, but a client that connected just before the path was removed
+    /// would be reset when it is dropped. Non-blocking accepts until the queue is empty.
+    fn drain(&self, old: UnixListener) {
+        let Ok(old) = old.into_std() else {
+            return;
+        };
+        while let Ok((stream, _)) = old.accept() {
+            if let Ok(stream) = stream
+                .set_nonblocking(true)
+                .and_then(|()| UnixStream::from_std(stream))
+            {
+                self.accept_unix(stream);
+            }
+        }
+    }
+
+    /// Starts a repair when the short check finds something gone (one at a time).
+    fn check_files(&self, repairing: &mut Option<oneshot::Receiver<Report>>) {
+        if repairing.is_none()
+            && self.needs_repair()
+            && let Some(rx) = self.start_look(false)
+        {
+            *repairing = Some(rx);
         }
     }
 
@@ -922,6 +1056,7 @@ impl Daemon {
         DaemonHandle {
             host: self.inner.host.clone(),
             stop: self.stop.clone(),
+            check_now: self.check_now.clone(),
         }
     }
 
@@ -940,16 +1075,35 @@ impl Daemon {
         let every = self.keeping.every.max(Duration::from_millis(10));
         let mut keep = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The short check: the only other timer the daemon keeps for its files, and what bounds
+        // how long a removed socket leaves the daemon unreachable. It wakes the daemon every 15 s
+        // even when nothing else does (an idle shell, or `idle_exit_secs = 0` and no session),
+        // for a few `stat` calls in the socket directory; a thread is started only when something
+        // is missing.
+        let check_every = self.keeping.check.max(Duration::from_millis(10));
+        let mut check =
+            tokio::time::interval_at(tokio::time::Instant::now() + check_every, check_every);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending: Option<oneshot::Receiver<Report>> = None;
+        let mut repairing: Option<oneshot::Receiver<Report>> = None;
+        let check_now = self.check_now.clone();
         let exit = loop {
             tokio::select! {
                 _ = keep.tick() => {
-                    if let Some(rx) = self.start_look() {
+                    if let Some(rx) = self.start_look(true) {
                         pending = Some(rx);
                     }
                 }
+                _ = check.tick() => self.check_files(&mut repairing),
+                () = check_now.notified() => self.check_files(&mut repairing),
                 report = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
                     pending = None;
+                    if let Ok(report) = report {
+                        self.apply(report);
+                    }
+                }
+                report = async { repairing.as_mut().unwrap().await }, if repairing.is_some() => {
+                    repairing = None;
                     if let Ok(report) = report {
                         self.apply(report);
                     }
@@ -971,6 +1125,7 @@ impl Daemon {
                 }
             }
         };
+        self.stopped.store(true, Ordering::Release);
         remove_socket_if_ours(&self.paths.socket(), self.bound);
         if exit == Exit::Shutdown && *self.stop.borrow() == Some(true) {
             self.kill_sessions().await;
@@ -985,8 +1140,9 @@ impl Daemon {
         // Still holding the lock, the sessions gone: an empty agent directory goes too.
         self.paths.remove_agent_dir();
         {
-            let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
             clean_up_files(&self.paths, &held.lock);
+            release_claim(&mut held, &self.paths.claim());
         }
         tracing::info!(?exit, "daemon stopping");
         exit
@@ -1094,6 +1250,16 @@ struct Held {
     lock: File,
     /// The shared lock on the socket directory, which systemd-tmpfiles honors by skipping it.
     dir_lock: Option<File>,
+    /// The lock file was removed and another daemon holds the new one: this daemon has lost the
+    /// path (logged once). A repair then waits on that daemon's lock, without a timer, and takes
+    /// the path back the moment it is free ([`Look::take_back`]).
+    lost_lock: bool,
+    /// While `lost_lock`: the exclusive lock on [`Paths::claim`], which keeps relays from
+    /// starting a third daemon (and a starting daemon from taking the lock) in the moment
+    /// between the successor's exit and this daemon's taking the lock again.
+    claim: Option<File>,
+    /// The socket directory failed its checks at the last look (logged once).
+    refused_dir: bool,
 }
 
 /// The shared lock on the socket directory, or none (logged) when it cannot be taken; the
@@ -1114,6 +1280,9 @@ struct Report {
     socket_missing: bool,
     /// This daemon holds the lock on the lock file that is at its path now.
     holds_lock: bool,
+    /// The socket directory passed its checks: nothing in a directory that did not is touched,
+    /// not even its times.
+    dir_ok: bool,
 }
 
 /// Clears the "a look is running" flag when the look ends, however it ends.
@@ -1129,7 +1298,11 @@ impl Drop for LookDone {
 struct Look {
     paths: Paths,
     keeping: Keeping,
+    /// The hourly look (repair, then fresh times and the install directory); otherwise a repair
+    /// only, after the short check found something gone.
+    full: bool,
     held: Arc<Mutex<Held>>,
+    stopped: Arc<AtomicBool>,
     install: Option<Install>,
     #[cfg(feature = "test-hooks")]
     hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1143,8 +1316,9 @@ impl Look {
     /// path (DESIGN.md section 11.1); the paths are fixed, derived from the uid and the wire.
     fn run(self, tx: oneshot::Sender<Report>) {
         let report = self.repair();
+        let dir_ok = report.dir_ok;
         let _ = tx.send(report);
-        if self.keeping.refresh {
+        if self.full && dir_ok && self.keeping.refresh {
             let n = self.paths.refresh_times();
             tracing::debug!(files = n, "refreshed the times of the daemon's files");
             if let Some(i) = &self.install {
@@ -1163,15 +1337,21 @@ impl Look {
         let none = Report {
             socket_missing: false,
             holds_lock: false,
+            dir_ok: false,
         };
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         // The directory first. One that is now somebody else's or the wrong mode is not ours to
         // touch: leave everything (the sessions still run, their clients still hold connections).
         if let Err(e) = ensure_socket_dir(&self.paths.dir) {
-            tracing::error!("the socket directory cannot be used; leaving it alone");
+            if !std::mem::replace(&mut held.refused_dir, true) {
+                tracing::error!("the socket directory cannot be used; leaving it alone");
+            }
             tracing::debug!(error = %e, "the socket directory");
             return none;
         }
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if std::mem::take(&mut held.refused_dir) {
+            tracing::info!("the socket directory can be used again");
+        }
         if self.keeping.dir_lock
             && !held
                 .dir_lock
@@ -1186,17 +1366,49 @@ impl Look {
         // leaves, see `start`; one that is still checking holds the lock for a moment, so this
         // waits for it a little, as `start` does), and write the pid again.
         let lock_path = self.paths.lock();
-        if !crate::start::is_current(&held.lock, &lock_path) {
-            match self.relock(&lock_path) {
-                Ok(mut f) => {
-                    let _ = f.set_len(0);
-                    let _ = writeln!(f, "{}", std::process::id());
-                    held.lock = f;
+        if !held.lost_lock && !crate::start::is_current(&held.lock, &lock_path) {
+            match self.relock(&lock_path, Duration::from_secs(1)) {
+                Ok(f) => {
+                    install_lock(&mut held, f);
                     tracing::warn!("the lock file was removed; made it again");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    held.lost_lock = true;
+                    tracing::error!(
+                        "the lock file was removed and another daemon holds the new one; \
+                         this daemon's sessions cannot be reached until that one exits"
+                    );
                 }
                 Err(e) => {
                     tracing::error!("the lock file was removed and cannot be made again");
                     tracing::debug!(error = %e, "the lock file");
+                }
+            }
+        }
+        // Lost to a successor: claim the path (again, if the claim file went too), and, in a
+        // repair, wait for it. The hourly look leaves the waiting to the repair.
+        if held.lost_lock {
+            let claim_path = self.paths.claim();
+            match &held.claim {
+                // The hourly look keeps the claim file fresh for the cleaners, through its own
+                // descriptor (a refresh by path would keep a crashed waiter's claim alive too).
+                Some(c) if crate::start::is_current(c, &claim_path) => {
+                    if self.full && self.keeping.refresh {
+                        touch(c);
+                    }
+                }
+                _ => held.claim = take_claim(&claim_path),
+            }
+            if !self.full {
+                // The wait can last hours, during which the directory may be removed and made
+                // again by anyone: everything after it acts only through this descriptor, on a
+                // directory checked again each time.
+                match crate::paths::open_trusted_dir(&self.paths.dir) {
+                    Ok(dir) => {
+                        drop(held);
+                        held = self.take_back(&dir);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "the socket directory"),
                 }
             }
         }
@@ -1207,26 +1419,171 @@ impl Look {
         Report {
             socket_missing,
             holds_lock,
+            dir_ok: true,
         }
     }
 
-    /// A new lock file with the exclusive lock taken, as `Daemon::start` takes it: a file that
-    /// is replaced meanwhile is followed, a busy one waited for about a second.
-    fn relock(&self, path: &std::path::Path) -> std::io::Result<File> {
-        let mut file = open_lock_file(path)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            match lock_step(&mut file, path, || {})? {
-                LockStep::Locked => return Ok(file),
-                LockStep::Replaced => {}
-                LockStep::Busy => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(std::io::ErrorKind::WouldBlock.into());
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
+    /// Waits, without the other locks held and without a timer (a blocking `flock`), for the lock
+    /// on the lock file in `dir`, which a successor holds, and takes it the moment that daemon
+    /// exits. A lock file that is removed or replaced meanwhile (the successor removes it as it
+    /// exits) is followed. The claim keeps relays and starting daemons from taking the lock first
+    /// ([`Paths::claim`]). Once it is held, a socket that nobody answers on is the successor's,
+    /// left by a crash, and is removed so it can be bound again (the rule of `Daemon::start`).
+    ///
+    /// Every file is reached through `dir` (`openat`, `statat`, `unlinkat`, never through a link),
+    /// and the directory is checked again before each open, after the wait and before the
+    /// socket is probed: a directory that was removed, made again (by anyone) or changed ends
+    /// the take-back without touching anything in it; the next check looks again, at whatever is
+    /// at the path then. A daemon that has stopped meanwhile takes nothing. Returns the locks,
+    /// the lock file installed if it was taken.
+    fn take_back(&self, dir: &File) -> std::sync::MutexGuard<'_, Held> {
+        let taken = wait_for_lock(dir, &self.paths, &self.stopped);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        match taken {
+            Ok(f) => {
+                install_lock(&mut held, f);
+                release_claim(&mut held, &self.paths.claim());
+                if crate::paths::dir_still_trusted(dir, &self.paths.dir) {
+                    remove_stale_socket(dir, &self.paths);
                 }
+                tracing::warn!("the daemon that had taken the socket exited; took it back");
+            }
+            Err(WaitEnd::Stopped) => {}
+            Err(WaitEnd::Moved) => tracing::warn!(
+                "the socket directory changed while this daemon waited to take its socket back; \
+                 looking again at the next check"
+            ),
+            Err(WaitEnd::Io(e)) => tracing::debug!(error = %e, "waiting for the lock file"),
+        }
+        held
+    }
+
+    /// A new lock file with the exclusive lock taken, as `Daemon::start` takes it.
+    fn relock(&self, path: &std::path::Path, wait: Duration) -> std::io::Result<File> {
+        lock_within(path, wait)
+    }
+}
+
+/// An exclusive lock on the lock file at `path`, as `Daemon::start` takes one: a file that is
+/// replaced meanwhile is followed, a busy one waited for up to `wait`.
+fn lock_within(path: &std::path::Path, wait: Duration) -> std::io::Result<File> {
+    let mut file = open_lock_file(path)?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock_step(&mut file, path, || {})? {
+            LockStep::Locked => return Ok(file),
+            LockStep::Replaced => {}
+            LockStep::Busy => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+}
+
+/// Fresh access and modification times on an open file (which renews its change time too).
+fn touch(f: &File) {
+    use rustix::fs::{Timespec, Timestamps, UTIME_NOW, futimens};
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    let _ = futimens(
+        f,
+        &Timestamps {
+            last_access: now,
+            last_modification: now,
+        },
+    );
+}
+
+/// Why [`wait_for_lock`] ended without the lock.
+enum WaitEnd {
+    /// The daemon stopped while it waited.
+    Stopped,
+    /// The directory is no longer the one that was checked, or no longer passes the checks.
+    Moved,
+    Io(std::io::Error),
+}
+
+/// The name of `path` in its directory.
+fn name_of(path: &std::path::Path) -> &std::path::Path {
+    path.file_name().map_or(path, std::path::Path::new)
+}
+
+/// A blocking exclusive `flock` on the lock file in `dir`, following a file that is removed or
+/// replaced while it waits (a lock on a file no longer at the path excludes nobody). The
+/// directory is checked again before each open and once the lock is held.
+fn wait_for_lock(dir: &File, paths: &Paths, stopped: &AtomicBool) -> Result<File, WaitEnd> {
+    let lock = paths.lock();
+    let name = name_of(&lock);
+    loop {
+        if !crate::paths::dir_still_trusted(dir, &paths.dir) {
+            return Err(WaitEnd::Moved);
+        }
+        let f = crate::start::open_lock_in(dir, name).map_err(WaitEnd::Io)?;
+        loop {
+            match flock(&f, FlockOperation::LockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(WaitEnd::Io(e.into())),
+            }
+        }
+        if stopped.load(Ordering::Acquire) {
+            return Err(WaitEnd::Stopped);
+        }
+        if !crate::paths::dir_still_trusted(dir, &paths.dir) {
+            return Err(WaitEnd::Moved);
+        }
+        if crate::start::is_current_at(&f, dir, name) {
+            return Ok(f);
+        }
+    }
+}
+
+/// Removes, from `dir`, a socket of ours at the daemon's socket name that nobody answers on
+/// (a crashed successor's): the caller holds the lock, so it is stale, as at `Daemon::start`.
+/// Not through a link, and nothing that is not a socket of ours.
+fn remove_stale_socket(dir: &File, paths: &Paths) {
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+    let sock = paths.socket();
+    let name = name_of(&sock);
+    let ours = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+        FileType::from_raw_mode(st.st_mode) == FileType::Socket
+            && st.st_uid == crate::paths::current_uid()
+    });
+    if ours && !something_answers(&sock) {
+        let _ = unlinkat(dir, name, AtFlags::empty());
+    }
+}
+
+/// `f` is the daemon's lock now: its pid is written again, and the path is no longer lost.
+fn install_lock(held: &mut Held, mut f: File) {
+    let _ = f.set_len(0);
+    let _ = writeln!(f, "{}", std::process::id());
+    held.lock = f;
+    held.lost_lock = false;
+}
+
+/// The exclusive lock on the claim file ([`Paths::claim`]), or none (logged) if it cannot be
+/// taken: another daemon of this revision that lost the path claims it already.
+/// (A relay that is removing a claim nobody held has it locked for a moment: that is waited
+/// for, briefly, as `start` waits.)
+fn take_claim(path: &std::path::Path) -> Option<File> {
+    lock_within(path, Duration::from_secs(1))
+        .inspect_err(|e| tracing::debug!(error = %e, "the claim file"))
+        .ok()
+}
+
+/// Gives the claim up, removing the file if it is still this daemon's (nothing of a daemon that
+/// no longer waits stays in `/tmp`).
+fn release_claim(held: &mut Held, path: &std::path::Path) {
+    if let Some(c) = held.claim.take()
+        && crate::start::is_current(&c, path)
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 

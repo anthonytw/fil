@@ -231,6 +231,7 @@ impl Cleaner {
 fn keeping(refresh: bool, dir_lock: bool) -> Keeping {
     Keeping {
         every: EVERY,
+        check: EVERY,
         refresh,
         dir_lock,
     }
@@ -269,6 +270,7 @@ async fn without_a_defense_the_cleaner_takes_the_files() {
     let tree = Tree::new();
     let off = Keeping {
         every: Duration::from_secs(3600),
+        check: Duration::from_secs(3600),
         refresh: false,
         dir_lock: false,
     };
@@ -385,20 +387,326 @@ async fn a_removed_socket_or_directory_is_made_again() {
     d.stop().await;
 }
 
+/// The repairs between the hourly looks: the short check ([`Keeping::check`]) finds the socket,
+/// or the whole directory, gone and puts it back at once. A relay that meanwhile finds the lock
+/// held and no socket waits for the rebind instead of starting a daemon (which could only find
+/// the lock taken and exit, again and again, until the relay gave up): the launcher here is a
+/// path with nothing at it, so a start would be an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_socket_or_directory_is_back_before_the_hourly_look() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new();
+    let d = run(
+        &tree,
+        Keeping {
+            every: Duration::from_secs(3600),
+            check: EVERY,
+            refresh: true,
+            dir_lock: true,
+        },
+    )
+    .await;
+    let nothing = fil_daemon::DaemonLauncher::new(tree.parent.join("no-such-fil"), ["x"]);
+    let relay = |paths: Paths, launcher: fil_daemon::DaemonLauncher| {
+        tokio::task::spawn_blocking(move || fil_daemon::ensure_daemon(&paths, &launcher))
+    };
+
+    // The socket only, with the relay already waiting when it goes.
+    std::fs::remove_file(d.paths.socket()).unwrap();
+    let ensured = relay(d.paths.clone(), nothing.clone())
+        .await
+        .unwrap()
+        .expect("the relay reaches the daemon that lost its socket");
+    assert!(!ensured.started, "a second daemon was started");
+    drop(ensured);
+    assert!(has_the_session(&d).await, "same daemon, same session");
+
+    // The whole directory: the daemon makes it again (with its checks, and its lock) by itself.
+    std::fs::remove_dir_all(&tree.dir).unwrap();
+    wait_until("the directory, the socket and the lock are back", || {
+        lock_is_held(&d.paths) && std::os::unix::net::UnixStream::connect(d.paths.socket()).is_ok()
+    });
+    let mode = std::fs::metadata(&tree.dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    wait_until("the directory is locked again", || dir_is_locked(&tree.dir));
+    let ensured = relay(d.paths.clone(), nothing).await.unwrap().unwrap();
+    assert!(!ensured.started);
+    drop(ensured);
+    assert!(has_the_session(&d).await);
+    d.stop().await;
+}
+
+/// Whether a daemon holds the claim of one that lost its lock file ([`Paths::claim`]).
+fn claim_is_held(paths: &Paths) -> bool {
+    use rustix::fs::{FlockOperation, flock};
+    std::fs::File::open(paths.claim())
+        .is_ok_and(|f| flock(&f, FlockOperation::NonBlockingLockShared).is_err())
+}
+
+/// A relay as the remote `fil` runs it, with a launcher that cannot start anything: a relay that
+/// tried to start a daemon fails with a spawn error.
+fn relay_that_starts_nothing(
+    tree: &Tree,
+) -> impl Fn(Paths) -> Result<fil_daemon::Ensured, fil_daemon::EnsureError> + Send + 'static {
+    let nothing = fil_daemon::DaemonLauncher::new(tree.parent.join("no-such-fil"), ["x"]);
+    move |paths| fil_daemon::ensure_daemon(&paths, &nothing)
+}
+
+/// A daemon A (timers at an hour) whose lock file and socket were removed, a successor B that
+/// took the path, and A's check run by hand: A has found B and claims the path, waiting on B's
+/// lock. Returns A, and B's handle and task.
+async fn stranded(
+    tree: &Tree,
+) -> (
+    Running,
+    fil_daemon::DaemonHandle,
+    tokio::task::JoinHandle<fil_daemon::Exit>,
+) {
+    let hour = Duration::from_secs(3600);
+    let a = run(
+        tree,
+        Keeping {
+            every: hour,
+            check: hour,
+            refresh: true,
+            dir_lock: true,
+        },
+    )
+    .await;
+    let paths = a.paths.clone();
+    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.socket()).unwrap();
+    let b = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("the successor starts");
+    let b_handle = b.handle();
+    let b_task = tokio::spawn(b.run());
+    a.handle.check_files_now();
+    wait_until("A finds B on the path and claims it", || {
+        claim_is_held(&paths)
+    });
+    // B is the one on the path: A has no session there.
+    assert!(!has_the_session(&a).await, "A took the path from a live B");
+    (a, b_handle, b_task)
+}
+
+/// A daemon whose lock file and socket went, and that a successor replaced before its check came
+/// round (the window DESIGN.md section 5.3 leaves open), takes the path back the moment the
+/// successor exits, and no relay starts a third daemon in between: relays run against the path
+/// the whole time, with a launcher that cannot start one. The check is run by hand (its timer is
+/// an hour here), so A cannot repair before B has the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_daemon_takes_the_path_back_when_its_successor_exits() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let tree = Tree::new();
+    let (a, b_handle, b_task) = stranded(&tree).await;
+    let paths = a.paths.clone();
+
+    let relay = relay_that_starts_nothing(&tree);
+    let done = Arc::new(AtomicBool::new(false));
+    let relays = {
+        let (paths, done) = (paths.clone(), done.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut n = 0u32;
+            while !done.load(Ordering::Relaxed) {
+                let ensured = relay(paths.clone()).expect("a relay reaches B or A");
+                assert!(!ensured.started, "a relay started a daemon");
+                n += 1;
+            }
+            n
+        })
+    };
+    b_handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, b_task).await;
+    wait_until("A holds the lock and answers again", || {
+        lock_is_held(&paths) && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok()
+    });
+    done.store(true, Ordering::Relaxed);
+    assert!(relays.await.unwrap() > 0);
+    assert!(has_the_session(&a).await, "A's session is reachable again");
+    assert!(
+        !paths.claim().exists(),
+        "the claim stays once A holds the lock"
+    );
+    a.stop().await;
+}
+
+/// The take-back waits, possibly for hours, and the directory can be removed meanwhile and made
+/// again by another user, with links planted at the daemon's names. When the successor exits,
+/// the waiting daemon must act in nothing it has not checked: the file a link at the lock path
+/// names is not truncated or written, the socket a link at the socket path names is neither
+/// connected to nor removed. (One user plays both here, so the directory is made with the wrong
+/// mode, which the checks refuse in the same way as another owner.) Then the directory is put
+/// right, and the daemon takes the path back at its next check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_take_back_never_acts_in_a_directory_made_again_by_someone_else() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new();
+    let (a, b_handle, b_task) = stranded(&tree).await;
+    let paths = a.paths.clone();
+    let outside = tree.parent.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let victim = outside.join("file");
+    std::fs::write(&victim, "the user's data\n").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(outside.join("s")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    std::fs::remove_dir_all(&tree.dir).unwrap();
+    std::fs::create_dir(&tree.dir).unwrap();
+    std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&victim, paths.lock()).unwrap();
+    std::os::unix::fs::symlink(outside.join("s"), paths.socket()).unwrap();
+
+    b_handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, b_task).await;
+    // A wakes as B's lock goes. What it must not do happens at once if at all; give it a moment,
+    // and its next check too.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.handle.check_files_now();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "the user's data\n"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the daemon connected to a socket through a link in an untrusted directory"
+    );
+    for p in [paths.lock(), paths.socket()] {
+        assert!(
+            std::fs::symlink_metadata(&p)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    assert!(outside.join("s").exists());
+
+    // The directory as it should be: A takes the path back.
+    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.socket()).unwrap();
+    std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    wait_until(
+        "A takes the path back in the directory once it is right",
+        || {
+            a.handle.check_files_now();
+            lock_is_held(&paths) && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok()
+        },
+    );
+    assert!(has_the_session(&a).await);
+    a.stop().await;
+}
+
+/// A daemon that stops while it waits to take the path back takes nothing once the successor
+/// exits (its waiting thread outlives it in this process): the next daemon starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_waiter_takes_nothing() {
+    let tree = Tree::new();
+    let (a, b_handle, b_task) = stranded(&tree).await;
+    let paths = a.paths.clone();
+    a.stop().await;
+    assert!(!claim_is_held(&paths), "the claim outlived its daemon");
+    assert!(!paths.claim().exists());
+    b_handle.shutdown(true);
+    let _ = tokio::time::timeout(WAIT, b_task).await;
+    let c = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("a daemon starts after the waiter stopped");
+    drop(c);
+}
+
+/// A claim file nobody holds (a waiting daemon crashed) does not keep a daemon from starting,
+/// and goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_nobody_holds_is_removed() {
+    let tree = Tree::new();
+    let paths = tree.paths();
+    fil_daemon::ensure_socket_dir(&tree.dir).unwrap();
+    std::fs::File::create(paths.claim()).unwrap();
+    let d = Daemon::start(paths.clone(), config(CAT))
+        .await
+        .expect("a stale claim stops nothing");
+    assert!(!paths.claim().exists(), "the stale claim stayed");
+    drop(d);
+}
+
+/// The claim alone, held as a waiting daemon holds it, with no lock holder and no socket: a relay
+/// starts nothing and waits, and connects once the socket is bound; a daemon that starts steps
+/// aside. Ordered by hand, so nothing here depends on timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_claim_keeps_relays_and_new_daemons_off_the_lock() {
+    use rustix::fs::{FlockOperation, flock};
+    let tree = Tree::new();
+    let paths = tree.paths();
+    fil_daemon::ensure_socket_dir(&tree.dir).unwrap();
+    let claim = std::fs::File::create(paths.claim()).unwrap();
+    flock(&claim, FlockOperation::NonBlockingLockExclusive).unwrap();
+
+    match Daemon::start(paths.clone(), config(CAT)).await {
+        Err(StartError::AlreadyRunning(_)) => {}
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("a daemon started while another claimed the path"),
+    }
+    assert!(
+        !lock_is_held(&paths),
+        "the daemon that stepped aside kept the lock"
+    );
+
+    let relay = relay_that_starts_nothing(&tree);
+    let waiting = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || relay(paths))
+    };
+    // Let the relay reach its wait (were it not to wait, it would fail to start a daemon now;
+    // the order only makes the case the likely one, the result does not depend on it). Then the
+    // socket, bound by the waiting daemon (here, the test), still claiming: the relay connects.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let listener = std::os::unix::net::UnixListener::bind(paths.socket()).unwrap();
+    let ensured = waiting
+        .await
+        .unwrap()
+        .expect("the relay waits and connects");
+    assert!(!ensured.started);
+    drop((listener, claim));
+}
+
 /// A directory the daemon can no longer trust (wrong mode, as if another user had made it) is not
 /// touched: no file is made in it and no time is set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_directory_that_is_no_longer_ours_is_left_alone() {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
     use std::os::unix::fs::PermissionsExt;
     let tree = Tree::new();
     let d = run(&tree, keeping(true, true)).await;
     std::fs::remove_file(d.paths.lock()).unwrap();
     std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Old times on the directory and the socket: a look that set them would show.
+    let old = Timespec {
+        tv_sec: 1_000_000_000,
+        tv_nsec: 0,
+    };
+    let stamps = Timestamps {
+        last_access: old,
+        last_modification: old,
+    };
+    for p in [tree.dir.clone(), d.paths.socket()] {
+        utimensat(CWD, &p, &stamps, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    }
     tokio::time::sleep(EVERY * 5).await;
     assert!(
         !d.paths.lock().exists(),
         "a file was made in a refused directory"
     );
+    for p in [tree.dir.clone(), d.paths.socket()] {
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        assert_eq!(
+            (m.mtime(), m.atime()),
+            (1_000_000_000, 1_000_000_000),
+            "a time was set in a refused directory: {}",
+            p.display()
+        );
+    }
     std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     wait_until("it carries on once the directory is right", || {
         lock_is_held(&d.paths)
@@ -548,6 +856,7 @@ async fn a_predecessor_leaves_its_successor_alone(every: Duration) {
 fn keeping_every(every: Duration) -> Keeping {
     Keeping {
         every,
+        check: every,
         refresh: true,
         dir_lock: true,
     }

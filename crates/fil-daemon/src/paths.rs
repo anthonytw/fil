@@ -231,6 +231,14 @@ impl Paths {
         self.file("start")
     }
 
+    /// `fil-<major>-<rev>.claim`: held only by a daemon that lost its lock file to a successor
+    /// and waits to take the path back (DESIGN.md section 5.3). While it is held, a relay
+    /// starts no daemon of this revision and a daemon that starts steps aside, so the lock goes
+    /// to the waiting daemon when the successor exits.
+    pub fn claim(&self) -> PathBuf {
+        self.file("claim")
+    }
+
     fn file(&self, ext: &str) -> PathBuf {
         self.dir
             .join(format!("fil-{}-{}.{ext}", self.major, self.revision))
@@ -256,16 +264,26 @@ impl Paths {
 pub struct Keeping {
     /// How often the daemon looks after its files ([`Paths::refresh_times`] and the repairs).
     pub every: Duration,
+    /// How often the daemon checks, between those looks, that its directory, lock file and
+    /// socket are still at their paths (a few `stat` calls on the accept loop, nothing
+    /// in the user's home), and repairs them at once when one has gone. A relay that finds the
+    /// lock held and no socket waits this long, and a little more, for the rebind
+    /// ([`crate::start::ensure_daemon`]).
+    pub check: Duration,
     /// Set fresh times on the daemon's files at every look.
     pub refresh: bool,
     /// Hold a shared `flock` on the socket directory ([`Paths::lock_dir`]).
     pub dir_lock: bool,
 }
 
+/// [`Keeping::check`] as shipped: how long a daemon whose socket was removed can be unreachable.
+pub const CHECK_EVERY: Duration = Duration::from_secs(15);
+
 impl Default for Keeping {
     fn default() -> Self {
         Keeping {
             every: Duration::from_secs(3600),
+            check: CHECK_EVERY,
             refresh: true,
             dir_lock: true,
         }
@@ -309,7 +327,8 @@ impl Paths {
     /// directory to now, which also renews the change time (a cleaner looks at all three, and
     /// the change time cannot be set back by anyone): the directory, the socket, the lock and
     /// start files, and the agent directory with its sockets, when they pass the same checks as
-    /// at start. Only this daemon's own revision: the leftovers of a crashed daemon of another
+    /// at start (a claim file is kept by the daemon that holds it, through its own descriptor).
+    /// Only this daemon's own revision: the leftovers of a crashed daemon of another
     /// are not kept alive, so they still age out. A link is never followed. Returns how many
     /// entries were touched; one that is missing or not ours is skipped.
     pub fn refresh_times(&self) -> usize {
@@ -530,24 +549,23 @@ pub struct DaemonSocket {
     pub path: PathBuf,
 }
 
-impl DaemonSocket {
-    /// This daemon's lock file, next to its socket.
-    fn lock_path(&self) -> PathBuf {
-        self.path.with_extension("lock")
-    }
-}
-
 /// The daemon sockets in `dir`, of every major and revision: `fil-<major>-<rev>.sock` and the
 /// older `fil-<major>.sock`. The directory is not created; a missing one gives an empty list. A
 /// socket may be a crashed daemon's: see [`other_daemons`] for the ones that are alive.
 pub fn list_sockets(dir: &Path) -> Vec<DaemonSocket> {
+    list_named(dir, "sock")
+}
+
+/// The entries of `dir` named `fil-<major>-<rev>.<ext>` or `fil-<major>.<ext>`, sorted, with
+/// the numbers they name. `path` is the entry's own path.
+fn list_named(dir: &Path, ext: &str) -> Vec<DaemonSocket> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<DaemonSocket> = rd
         .filter_map(Result::ok)
         .filter_map(|e| {
-            let (major, revision) = parse_socket_name(&e.file_name())?;
+            let (major, revision) = parse_daemon_name(&e.file_name(), ext)?;
             Some(DaemonSocket {
                 major,
                 revision,
@@ -559,8 +577,12 @@ pub fn list_sockets(dir: &Path) -> Vec<DaemonSocket> {
     out
 }
 
-fn parse_socket_name(name: &OsStr) -> Option<(u16, u16)> {
-    let stem = name.to_str()?.strip_prefix("fil-")?.strip_suffix(".sock")?;
+fn parse_daemon_name(name: &OsStr, ext: &str) -> Option<(u16, u16)> {
+    let stem = name
+        .to_str()?
+        .strip_prefix("fil-")?
+        .strip_suffix(ext)?
+        .strip_suffix('.')?;
     let number = |s: &str| {
         if s.is_empty() || s.len() > 5 || !s.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -578,7 +600,7 @@ fn parse_socket_name(name: &OsStr) -> Option<(u16, u16)> {
 /// connects to nothing, so it cannot disturb a daemon that is starting or exiting (a starter that
 /// meets the probe's instant of lock sees the file busy and tries again, as it does for any
 /// other daemon). No file, or a lock nobody holds, is no daemon.
-fn lock_is_held(lock: &Path) -> bool {
+pub(crate) fn lock_is_held(lock: &Path) -> bool {
     use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
     // Not a way to hang or to read through a link: the directory is ours (0700), but a lock
     // file that is a FIFO would block a plain open until someone opened the other end, and one
@@ -597,14 +619,72 @@ fn lock_is_held(lock: &Path) -> bool {
     )
 }
 
+/// Whether a daemon holds the claim at `claim` ([`Paths::claim`]). A claim file nobody holds is
+/// a crashed waiter's leftover: it is removed (a regular file of ours, the one at the path, not
+/// through a link) while this holds its lock for a moment, so nobody can be claiming it then. A
+/// waiter that meets that moment tries again ([`lock_step`](crate::start::lock_step)).
+pub(crate) fn claim_is_held(claim: &Path) -> bool {
+    use rustix::fs::{CWD, FileType, FlockOperation, Mode, OFlags, flock, fstat, openat};
+    let Ok(fd) = openat(
+        CWD,
+        claim,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+        Err(rustix::io::Errno::WOULDBLOCK) => return true,
+        Err(_) => return false,
+        Ok(()) => {}
+    }
+    let file = File::from(fd);
+    let ours = fstat(&file).is_ok_and(|st| {
+        FileType::from_raw_mode(st.st_mode) == FileType::RegularFile && st.st_uid == current_uid()
+    });
+    if ours && crate::start::is_current(&file, claim) {
+        let _ = std::fs::remove_file(claim);
+        tracing::debug!("removed a claim file nobody held");
+    }
+    false
+}
+
+/// The socket directory opened (a directory, not through a link) and checked as at start
+/// ([`check_dir`]), for a daemon that waits a long time and must act only in the directory it
+/// checked: see [`dir_still_trusted`].
+pub(crate) fn open_trusted_dir(dir: &Path) -> std::io::Result<File> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    let fd = openat(
+        CWD,
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let file = File::from(fd);
+    let m = file.metadata()?;
+    check_dir(dir, DirFacts::of(&m), current_uid()).map_err(std::io::Error::other)?;
+    Ok(file)
+}
+
+/// Whether `held` ([`open_trusted_dir`]) still passes the checks and still is the directory at
+/// `dir`: not removed and made again (possibly by another user), not replaced by a link.
+pub(crate) fn dir_still_trusted(held: &File, dir: &Path) -> bool {
+    held.metadata()
+        .is_ok_and(|m| check_dir(dir, DirFacts::of(&m), current_uid()).is_ok())
+        && dir_lock_is_current(held, dir)
+}
+
 /// The running daemons in `dir` other than the one `paths` names: those of another wire revision
 /// (or major), which a fil of this revision cannot talk to. `fil ls` mentions them
-/// (DESIGN.md section 5.3). Numbers only, at most [`MAX_OTHER_DAEMONS`].
+/// (DESIGN.md section 5.3). They are found by their lock files, which a live daemon holds for its
+/// whole life: a crashed daemon's leftover socket is not one, and a live daemon whose socket was
+/// removed (it binds it again within [`Keeping::check`]) still is. Numbers only, at most
+/// [`MAX_OTHER_DAEMONS`].
 pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
-    list_sockets(&paths.dir)
+    list_named(&paths.dir, "lock")
         .into_iter()
         .filter(|d| (d.major, d.revision) != (paths.major, paths.revision))
-        .filter(|d| lock_is_held(&d.lock_path()))
+        .filter(|d| lock_is_held(&d.path))
         .map(|d| OtherDaemon {
             major: d.major,
             revision: d.revision,
@@ -1031,7 +1111,7 @@ mod tests {
 
     #[test]
     fn socket_names() {
-        let ok = |s: &str| parse_socket_name(OsStr::new(s));
+        let ok = |s: &str| parse_daemon_name(OsStr::new(s), "sock");
         assert_eq!(ok("fil-1-3.sock"), Some((1, 3)));
         assert_eq!(ok("fil-12-40.sock"), Some((12, 40)));
         assert_eq!(ok("fil-1.sock"), Some((1, 0)), "from before revisions");
@@ -1044,6 +1124,13 @@ mod tests {
         assert_eq!(ok("fil-1-3.sock.bak"), None);
         assert_eq!(ok("fil-123456.sock"), None);
         assert_eq!(ok("fil-1-99999.sock"), None, "does not fit a u16");
+        assert_eq!(ok("fil-1-3sock"), None);
+        // Lock files are named the same way.
+        let lock = |s: &str| parse_daemon_name(OsStr::new(s), "lock");
+        assert_eq!(lock("fil-1-3.lock"), Some((1, 3)));
+        assert_eq!(lock("fil-1.lock"), Some((1, 0)));
+        assert_eq!(lock("fil-1-3.start"), None);
+        assert_eq!(lock("fil-1-3.sock"), None);
     }
 
     #[test]

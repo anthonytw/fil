@@ -14,6 +14,11 @@
 //! hand, say), the daemon takes its own lock (`fil-<major>-<rev>.lock`, held for its whole life), so a
 //! second daemon exits at once. The lock is released when the process dies, however it dies, so
 //! a socket file left behind by a crash is known to be stale: only the lock holder removes it.
+//! And a relay that finds the lock held but no socket starts nothing: the holder is starting, on
+//! its way out, or about to bind its socket again after somebody removed it (it checks every
+//! [`CHECK_EVERY`](crate::paths::CHECK_EVERY)), so the relay waits for it ([`REBIND_TIMEOUT`]).
+//! The same goes for a held claim ([`Paths::claim`]): a daemon that lost its lock file to a
+//! successor waits on the lock, and takes it the moment the successor exits.
 //!
 //! The daemon detaches itself (`setsid`) as its first act ([`run_daemon`](crate::run_daemon)),
 //! so it is no longer in the SSH login's session or process group and a hangup of the login does
@@ -21,9 +26,7 @@
 //! matter: see [`crate::linger`].)
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,6 +43,10 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// A daemon that exited cleanly without serving (it lost a race) is replaced this many times.
 const MAX_RESPAWNS: u32 = 3;
+/// How long a relay waits for a daemon that holds the lock but has no socket (it was removed) to
+/// bind it again: the daemon's short check ([`Keeping::check`](crate::paths::Keeping::check)),
+/// and a margin for the repair itself.
+pub const REBIND_TIMEOUT: Duration = Duration::from_secs(crate::paths::CHECK_EVERY.as_secs() + 5);
 
 /// How to start a daemon: the executable and the arguments that make it call
 /// [`run_daemon`](crate::run_daemon).
@@ -149,6 +156,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A relay waiting for a lock holder that never binds its socket (a wedged daemon) gives up
+    /// with `RebindTimeout`, and one whose holder has exited is told to start a daemon. Only the
+    /// first waits, its (short) timeout; nothing here is bounded by real time.
+    #[test]
+    fn a_relay_waiting_for_a_holder_gives_up_or_starts() {
+        let dir = scratch("holder");
+        let paths = Paths::in_dir(&dir);
+        let sock = paths.socket();
+        let holder = open_lock_file(&paths.lock()).unwrap();
+        flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let wait = Duration::from_millis(200);
+        assert!(matches!(
+            wait_for_holder(&paths, &sock, wait),
+            Err(EnsureError::RebindTimeout(d)) if d == wait
+        ));
+
+        // The holder exits (after the relay's first look saw it alive): no stream, start one.
+        assert!(one_is_alive(&paths));
+        drop(holder);
+        assert!(matches!(
+            wait_for_holder(&paths, &sock, Duration::from_secs(60)),
+            Ok(None)
+        ));
+
+        // A claim alone counts as a daemon that is alive.
+        let claim = open_lock_file(&paths.claim()).unwrap();
+        flock(&claim, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(one_is_alive(&paths));
+        drop(claim);
+        assert!(!one_is_alive(&paths));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock or claim file is never opened through a link (a pid is written into a lock file),
+    /// is not a link's target "at the path", and a claim behind a link is neither held nor
+    /// removed.
+    #[test]
+    fn lock_files_are_never_reached_through_a_link() {
+        let dir = scratch("links");
+        let target = dir.join("target");
+        std::fs::write(&target, "data\n").unwrap();
+        let link = dir.join("x.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_lock_file(&link).is_err());
+        let f = std::fs::File::open(&target).unwrap();
+        assert!(!is_current(&f, &link), "a link is not the file it names");
+        assert!(!crate::paths::claim_is_held(&link));
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "data\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn login_variables_are_removed_and_the_log_level_is_not() {
         let mut c = Command::new("true");
@@ -194,6 +253,10 @@ pub enum EnsureError {
     DaemonExited { status: String, log: PathBuf },
     #[error("the fil daemon did not answer within {0:?}")]
     StartTimeout(Duration),
+    #[error(
+        "a fil daemon is running but its socket was removed, and it did not bind it again within {0:?}"
+    )]
+    RebindTimeout(Duration),
 }
 
 /// Connects to the daemon's socket, starting the daemon first if nobody answers. Blocking: it
@@ -214,15 +277,33 @@ pub fn ensure_daemon(paths: &Paths, launcher: &DaemonLauncher) -> Result<Ensured
             spawned_pid: None,
         });
     }
+    // Nobody answered, but a daemon of this revision is alive: it holds the lock (its socket was
+    // removed, by hand or by a cleaner, and it binds it again within its short check; or it is on
+    // its way out, or still starting), or it holds the claim (it lost its lock file to a
+    // successor that has just exited, and is taking the path back). Starting another would only
+    // find the lock taken, or take the path from that daemon for good, so wait for it, without
+    // the start lock (other relays wait the same way, and nobody is held up).
+    let connected = |stream| Ensured {
+        stream,
+        started: false,
+        spawned_pid: None,
+    };
+    if one_is_alive(paths)
+        && let Some(stream) = wait_for_holder(paths, &sock, REBIND_TIMEOUT)?
+    {
+        return Ok(connected(stream));
+    }
 
     // Nobody answered. One starter at a time.
     let _start = StartLock::acquire(&paths.start_lock(), START_LOCK_TIMEOUT)?;
     if let Some(stream) = try_connect(&sock)? {
-        return Ok(Ensured {
-            stream,
-            started: false,
-            spawned_pid: None,
-        });
+        return Ok(connected(stream));
+    }
+    // And the same look as above, now that no other relay is starting one.
+    if one_is_alive(paths)
+        && let Some(stream) = wait_for_holder(paths, &sock, REBIND_TIMEOUT)?
+    {
+        return Ok(connected(stream));
     }
     DaemonConfig::load(&paths.config)?;
 
@@ -231,6 +312,37 @@ pub fn ensure_daemon(paths: &Paths, launcher: &DaemonLauncher) -> Result<Ensured
     // Whatever happened, the last child is reaped when it exits (at once if it already has).
     reap_in_background(child);
     result
+}
+
+/// Whether a daemon of this revision is alive by its locks: it holds the lock file, or the claim
+/// of a daemon waiting to take the path back ([`Paths::claim`]). Probes (see
+/// [`lock_is_held`](crate::paths::lock_is_held)); a claim nobody holds is removed
+/// ([`claim_is_held`](crate::paths::claim_is_held)).
+fn one_is_alive(paths: &Paths) -> bool {
+    crate::paths::lock_is_held(&paths.lock()) || crate::paths::claim_is_held(&paths.claim())
+}
+
+/// Polls the socket while a daemon of this revision is alive ([`one_is_alive`]): the stream once
+/// it answers, or none once nobody holds the lock or the claim (that daemon exited; start one).
+/// Gives up after `timeout`.
+fn wait_for_holder(
+    paths: &Paths,
+    sock: &Path,
+    timeout: Duration,
+) -> Result<Option<UnixStream>, EnsureError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(stream) = try_connect(sock)? {
+            return Ok(Some(stream));
+        }
+        if !one_is_alive(paths) {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Err(EnsureError::RebindTimeout(timeout));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Polls the socket until the daemon `child` answers. A child that exits cleanly without
@@ -389,11 +501,21 @@ pub(crate) fn lock_step(
     }
 }
 
-/// Whether `file` is still the file `path` names (it has not been removed or replaced).
+/// Whether `file` is still the file `path` names (it has not been removed or replaced). The
+/// path's last component is not followed: a link in its place is not the file.
 pub(crate) fn is_current(file: &std::fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), std::fs::metadata(path)) {
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// [`is_current`] for `name` in the directory `dir` is open on (a name without slashes).
+pub(crate) fn is_current_at(file: &std::fs::File, dir: &std::fs::File, name: &Path) -> bool {
+    use rustix::fs::{AtFlags, fstat, statat};
+    match (fstat(file), statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)) {
+        (Ok(a), Ok(b)) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
         _ => false,
     }
 }
@@ -422,16 +544,35 @@ pub(crate) fn clean_up_files(paths: &Paths, own_lock: &std::fs::File) {
         let _ = std::fs::remove_file(paths.lock());
     }
     let _ = std::fs::remove_file(&start_path);
+    // And a crashed waiter's claim (one that is held is a live daemon's, and stays).
+    crate::paths::claim_is_held(&paths.claim());
 }
 
-/// Opens (creating, mode 0600) a lock file. Rust opens files close-on-exec, so a daemon spawned
-/// while a lock is held does not inherit it.
+/// Opens (creating, mode 0600) a lock file, close-on-exec, so a daemon spawned while a lock is
+/// held does not inherit it. Never through a link (`O_NOFOLLOW`), never a FIFO's blocking open
+/// (`O_NONBLOCK`, which `flock` ignores), and only a regular file of ours: the lock file has its
+/// pid written into it, so a link planted at the path must not make that a write to whatever it
+/// names.
 pub(crate) fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)
+    open_lock_in(rustix::fs::CWD, path)
+}
+
+/// [`open_lock_file`] for `name` relative to the directory `dir` (or a path, with `CWD`).
+pub(crate) fn open_lock_in(dir: impl std::os::fd::AsFd, name: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    let fd = openat(
+        dir,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let st = fstat(&fd)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile
+        || st.st_uid != crate::paths::current_uid()
+    {
+        return Err(io::Error::other(
+            "a lock file that is not a regular file of ours",
+        ));
+    }
+    Ok(std::fs::File::from(fd))
 }

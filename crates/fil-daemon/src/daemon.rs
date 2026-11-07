@@ -42,7 +42,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,8 +60,8 @@ use crate::config::{ConfigError, DaemonConfig};
 use crate::conn::Origin;
 use crate::linger;
 use crate::paths::{
-    DirError, Keeping, Paths, dir_lock_is_current, ensure_socket_dir, remove_socket_if_ours,
-    socket_identity, something_answers,
+    DirError, Keeping, Paths, Probe, dir_lock_is_current, ensure_socket_dir, remove_socket_if_ours,
+    something_answers_in,
 };
 use crate::start::{LockStep, clean_up_files, lock_step, open_lock_file};
 use rustix::fs::{FlockOperation, flock};
@@ -765,27 +764,35 @@ impl Daemon {
         // was removed (by a cleaner, or by hand) a daemon that is alive holds a lock on a file
         // nobody can see, and this one took a fresh file. Taking the socket from that daemon
         // would strand every session on it. The check is a connect and a hang-up, as a relay's.
+        // Everything in the socket directory from here on is reached through this handle on it,
+        // checked as `ensure_socket_dir` checked the path (see `bind_socket_in`).
         let sock = paths.socket();
-        if something_answers(&sock) {
-            tracing::warn!(
-                "a daemon answers on the socket without holding the lock file; not starting"
-            );
-            return Err(StartError::AlreadyRunning(lock_path));
+        let dir = crate::paths::open_trusted_dir(&paths.dir).map_err(io(paths.dir.clone()))?;
+        match something_answers_in(&dir, &paths.dir, name_of(&sock)) {
+            Probe::Quiet => {}
+            Probe::Answers => {
+                tracing::warn!(
+                    "a daemon answers on the socket without holding the lock file; not starting"
+                );
+                return Err(StartError::AlreadyRunning(lock_path));
+            }
+            Probe::DirChanged => {
+                tracing::warn!("the socket directory changed while starting; not starting");
+                return Err(StartError::AlreadyRunning(lock_path));
+            }
         }
-        match std::fs::remove_file(&sock) {
+        match rustix::fs::unlinkat(&dir, name_of(&sock), rustix::fs::AtFlags::empty()) {
             Ok(()) => tracing::info!("removed a stale socket"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(sock)(e)),
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(io(sock)(e.into())),
         }
         // A crashed daemon of this revision may have left agent sockets (each names a session).
         let stale = paths.clean_stale_agent_sockets();
         if stale > 0 {
             tracing::debug!(stale, "removed stale agent sockets");
         }
-        let unix = UnixListener::bind(&sock).map_err(io(sock.clone()))?;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
-            .map_err(io(sock.clone()))?;
-        let bound = socket_identity(&sock);
+        let (unix, bound) = bind_socket_in(&dir, &paths).map_err(io(sock.clone()))?;
+        let bound = Some(bound);
 
         let registry = KeyRegistry::new();
         // The first read of the policy, off the async workers: it may wait on NSS.
@@ -970,11 +977,13 @@ impl Daemon {
             tracing::debug!("the socket directory changed since the look; not binding yet");
             return;
         }
-        match UnixListener::bind(&sock) {
-            Ok(l) => {
-                let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        match self
+            .bind_dir()
+            .and_then(|dir| bind_socket_in(&dir, &self.paths))
+        {
+            Ok((l, id)) => {
                 let old = std::mem::replace(&mut self.unix, l);
-                self.bound = socket_identity(&sock);
+                self.bound = Some(id);
                 tracing::warn!("the socket was removed; bound it again");
                 self.drain(old);
             }
@@ -982,6 +991,26 @@ impl Daemon {
                 tracing::error!(error = %e, "the socket was removed and cannot be bound again")
             }
         }
+    }
+
+    /// The socket directory a repair or a retiring daemon binds in: the one this daemon checked
+    /// and keeps its lock on (a descriptor of that very directory), so that a directory put at
+    /// the path since, even one that passes the checks, is not bound in ([`bind_socket_in`]
+    /// then refuses: the path no longer leads to it). Without a directory lock there is no
+    /// checked directory to hold on to, and the one at the path is opened and checked now. No
+    /// wait: while a look holds the locks this is an error, and the next check binds.
+    fn bind_dir(&self) -> std::io::Result<File> {
+        if self.keeping.dir_lock {
+            let held = match self.held.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::other("a look holds the locks"));
+                }
+            };
+            return dir_to_bind(held.dir_lock.as_ref(), &self.paths);
+        }
+        dir_to_bind(None, &self.paths)
     }
 
     /// The checks of the repair, again, on the loop: the socket directory passes those of
@@ -1142,7 +1171,7 @@ impl Daemon {
         {
             let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
             clean_up_files(&self.paths, &held.lock);
-            release_claim(&mut held, &self.paths.claim());
+            release_claim(&mut held, &self.paths, None);
         }
         tracing::info!(?exit, "daemon stopping");
         exit
@@ -1197,11 +1226,13 @@ impl Daemon {
         tracing::info!("a connection arrived as the daemon was retiring; staying");
         // Nothing is left in the old listener's backlog and nothing new can join it (its path
         // is gone), so replacing it loses no connection.
-        match UnixListener::bind(&sock) {
-            Ok(l) => {
-                let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        match self
+            .bind_dir()
+            .and_then(|dir| bind_socket_in(&dir, &self.paths))
+        {
+            Ok((l, id)) => {
                 self.unix = l;
-                self.bound = socket_identity(&sock);
+                self.bound = Some(id);
             }
             Err(e) => tracing::error!(error = %e, "cannot rebind the socket"),
         }
@@ -1442,7 +1473,7 @@ impl Look {
         match taken {
             Ok(f) => {
                 install_lock(&mut held, f);
-                release_claim(&mut held, &self.paths.claim());
+                release_claim(&mut held, &self.paths, Some(dir));
                 if crate::paths::dir_still_trusted(dir, &self.paths.dir) {
                     remove_stale_socket(dir, &self.paths);
                 }
@@ -1554,9 +1585,96 @@ fn remove_stale_socket(dir: &File, paths: &Paths) {
         FileType::from_raw_mode(st.st_mode) == FileType::Socket
             && st.st_uid == crate::paths::current_uid()
     });
-    if ours && !something_answers(&sock) {
+    if ours && something_answers_in(dir, &paths.dir, name) == Probe::Quiet {
         let _ = unlinkat(dir, name, AtFlags::empty());
     }
+}
+
+/// A descriptor of the directory to bind in: `held` (the checked directory, duplicated: the
+/// lock on it is not given up when the copy is closed), or, with none, the directory at the
+/// path, opened and checked now.
+fn dir_to_bind(held: Option<&File>, paths: &Paths) -> std::io::Result<File> {
+    match held {
+        Some(d) => d.try_clone(),
+        None => crate::paths::open_trusted_dir(&paths.dir),
+    }
+}
+
+/// Test seams of [`bind_socket_in`]: run just before the bind and just after it.
+#[cfg(test)]
+#[derive(Default)]
+struct BindHooks {
+    before: Option<Box<dyn FnOnce()>>,
+    after: Option<Box<dyn FnOnce()>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BIND_HOOKS: std::cell::RefCell<BindHooks> = std::cell::RefCell::default();
+}
+
+/// Binds the daemon's socket at its name in `dir` (opened and checked with
+/// [`open_trusted_dir`](crate::paths::open_trusted_dir)), mode 0600, and returns it with its
+/// `(device, inode)`. The bind itself is by path (Unix sockets have no form relative to a
+/// directory descriptor); everything after it goes through `dir`, never a path that may lead
+/// somewhere else by then:
+///
+/// - Linux takes the socket file's mode from the socket at the bind, so it is 0600 from the start
+///   (`fchmod` before the bind; the umask can only narrow it).
+/// - Then the directory is checked again through the held descriptor and the name is looked up in
+///   it (`statat`, not through a link): it must be a socket of ours, or the bind went to a
+///   directory that was put at the path meanwhile, and the socket is given up (nothing is
+///   removed there; the caller looks again at its next check).
+/// - A mode other than 0600 (macOS, which ignores `fchmod` on a socket) is set through `dir` too
+///   (`fchmodat`, not through a link where the platform allows it).
+/// - Only then does the socket listen, so no connection is accepted while its mode is wider.
+fn bind_socket_in(dir: &File, paths: &Paths) -> std::io::Result<(UnixListener, (u64, u64))> {
+    use rustix::fs::{AtFlags, FileType, Mode, chmodat, statat};
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, listen, socket};
+    let moved = || std::io::Error::other("the socket directory changed");
+    if !crate::paths::dir_still_trusted(dir, &paths.dir) {
+        return Err(moved());
+    }
+    let sock = paths.socket();
+    let name = name_of(&sock);
+    let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    #[cfg(target_os = "linux")]
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))?;
+    #[cfg(test)]
+    if let Some(f) = BIND_HOOKS.with(|h| h.borrow_mut().before.take()) {
+        f();
+    }
+    bind(&fd, &SocketAddrUnix::new(sock.as_path())?)?;
+    #[cfg(test)]
+    if let Some(f) = BIND_HOOKS.with(|h| h.borrow_mut().after.take()) {
+        f();
+    }
+    let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| moved())?;
+    if !crate::paths::dir_still_trusted(dir, &paths.dir)
+        || FileType::from_raw_mode(st.st_mode) != FileType::Socket
+        || st.st_uid != crate::paths::current_uid()
+    {
+        return Err(moved());
+    }
+    if st.st_mode & 0o7777 != 0o600 {
+        // Linux has no `fchmodat` that leaves a link alone (rustix refuses the flag); the name
+        // was just found to be a socket, in a directory only this user can change.
+        #[cfg(target_os = "linux")]
+        let flags = AtFlags::empty();
+        #[cfg(not(target_os = "linux"))]
+        let flags = AtFlags::SYMLINK_NOFOLLOW;
+        chmodat(dir, name, Mode::from_raw_mode(0o600), flags)?;
+    }
+    // As std does: the system's largest backlog.
+    listen(&fd, -1)?;
+    let std = std::os::unix::net::UnixListener::from(fd);
+    std.set_nonblocking(true)?;
+    // The field types differ by platform (macOS's device number is an `i32`); `as` matches
+    // `MetadataExt::dev`, which `socket_identity` compares with.
+    #[allow(clippy::unnecessary_cast)]
+    let id = (st.st_dev as u64, st.st_ino as u64);
+    Ok((UnixListener::from_std(std)?, id))
 }
 
 /// `f` is the daemon's lock now: its pid is written again, and the path is no longer lost.
@@ -1578,13 +1696,33 @@ fn take_claim(path: &std::path::Path) -> Option<File> {
 }
 
 /// Gives the claim up, removing the file if it is still this daemon's (nothing of a daemon that
-/// no longer waits stays in `/tmp`).
-fn release_claim(held: &mut Held, path: &std::path::Path) {
-    if let Some(c) = held.claim.take()
-        && crate::start::is_current(&c, path)
+/// no longer waits stays in `/tmp`). The file is looked up and removed through `dir`, the socket
+/// directory as checked (or, with none, as opened and checked now), while its lock is still
+/// held: never through a link, and never a same-named file in a directory put at the path since.
+fn release_claim(held: &mut Held, paths: &Paths, dir: Option<&File>) {
+    use rustix::fs::{AtFlags, unlinkat};
+    let Some(claim) = held.claim.take() else {
+        return;
+    };
+    let opened;
+    let dir = match dir {
+        Some(d) => d,
+        None => match crate::paths::open_trusted_dir(&paths.dir) {
+            Ok(d) => {
+                opened = d;
+                &opened
+            }
+            Err(_) => return,
+        },
+    };
+    let path = paths.claim();
+    let name = name_of(&path);
+    if crate::paths::dir_still_trusted(dir, &paths.dir)
+        && crate::start::is_current_at(&claim, dir, name)
     {
-        let _ = std::fs::remove_file(path);
+        let _ = unlinkat(dir, name, AtFlags::empty());
     }
+    drop(claim);
 }
 
 /// Whether a Unix peer with `peer_uid` may use the socket. The daemon serves one user.
@@ -2210,5 +2348,173 @@ mod tests {
             "revoking closed a live connection"
         );
         client.close();
+    }
+
+    /// A 0700 socket directory of ours, in a temporary directory, with its paths.
+    fn socket_dir(tmp: &tempfile::TempDir) -> Paths {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = tmp.path().join("socket-dir");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        Paths::in_dir(&base)
+    }
+
+    /// The socket is 0600 when it listens, and its identity is that of the file at the path. On
+    /// Linux it is 0600 from the bind itself (the `fchmod` before it): the mode is read between
+    /// the bind and the step that would set it.
+    #[tokio::test]
+    async fn the_socket_is_0600_from_the_bind_on_linux_and_when_it_listens_everywhere() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let dir = crate::paths::open_trusted_dir(&p.dir).unwrap();
+        let at_bind = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (seen, sock) = (at_bind.clone(), p.socket());
+        BIND_HOOKS.with(|h| {
+            h.borrow_mut().after = Some(Box::new(move || {
+                let m = std::fs::symlink_metadata(&sock).unwrap();
+                seen.set(m.permissions().mode() & 0o7777);
+            }));
+        });
+        let (l, id) = bind_socket_in(&dir, &p).unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                at_bind.get(),
+                0o600,
+                "the socket was wider than 0600 at the bind"
+            );
+        }
+        let m = std::fs::symlink_metadata(p.socket()).unwrap();
+        assert!(m.file_type().is_socket());
+        assert_eq!(m.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(Some(id), crate::paths::socket_identity(&p.socket()));
+        assert_eq!((m.dev(), m.ino()), id);
+        let _c = std::os::unix::net::UnixStream::connect(p.socket()).unwrap();
+        let (_s, _) = l.accept().await.unwrap();
+    }
+
+    /// Moves the socket directory away and makes another, which passes the checks, at its path.
+    fn make_dir_again(moved: &std::path::Path, p: &Paths) {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::rename(&p.dir, moved).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p.dir)
+            .unwrap();
+    }
+
+    /// A directory made again between the check and the bind: the bind lands in it (binding is
+    /// by path), the look-up through the held directory then finds no socket there, and the
+    /// socket is given up without listening. Nothing is removed in the new directory.
+    #[tokio::test]
+    async fn a_bind_that_lands_in_a_directory_made_again_is_given_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let dir = crate::paths::open_trusted_dir(&p.dir).unwrap();
+        let (moved, q) = (tmp.path().join("moved"), p.clone());
+        BIND_HOOKS.with(|h| {
+            h.borrow_mut().before = Some(Box::new(move || make_dir_again(&moved, &q)));
+        });
+        assert!(bind_socket_in(&dir, &p).is_err());
+        // The held directory has no socket; the one bound in the new directory never listened.
+        assert!(!tmp.path().join("moved").join(name_of(&p.socket())).exists());
+        assert!(std::fs::symlink_metadata(p.socket()).is_ok());
+        assert!(std::os::unix::net::UnixStream::connect(p.socket()).is_err());
+    }
+
+    /// A repair or a retiring daemon binds in the directory it holds the lock on, not in one put
+    /// at the path since, even one that passes the checks; opening the path again would.
+    #[tokio::test]
+    async fn a_repair_binds_only_in_the_directory_it_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let held = p.lock_dir(Duration::from_secs(1)).unwrap();
+        make_dir_again(&tmp.path().join("moved"), &p);
+        let dir = dir_to_bind(Some(&held), &p).unwrap();
+        assert!(bind_socket_in(&dir, &p).is_err());
+        assert!(std::fs::symlink_metadata(p.socket()).is_err());
+        // Without a held directory the one at the path is opened, checked and bound in.
+        let fresh = dir_to_bind(None, &p).unwrap();
+        assert!(bind_socket_in(&fresh, &p).is_ok());
+    }
+
+    /// A directory that was removed and made again after it was opened is not bound in, and a
+    /// claim is not removed from it: a same-named file there is not this daemon's.
+    #[tokio::test]
+    async fn nothing_is_bound_or_removed_in_a_directory_made_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let dir = crate::paths::open_trusted_dir(&p.dir).unwrap();
+        let claim = open_lock_file(&p.claim()).unwrap();
+        make_dir_again(&tmp.path().join("moved"), &p);
+        std::fs::write(p.claim(), b"not ours").unwrap();
+
+        assert!(bind_socket_in(&dir, &p).is_err());
+        assert!(std::fs::symlink_metadata(p.socket()).is_err());
+
+        let mut held = Held {
+            lock: open_lock_file(&p.lock()).unwrap(),
+            dir_lock: None,
+            lost_lock: true,
+            claim: Some(claim),
+            refused_dir: false,
+        };
+        release_claim(&mut held, &p, Some(&dir));
+        assert!(held.claim.is_none());
+        assert_eq!(std::fs::read(p.claim()).unwrap(), b"not ours");
+        // In the held directory itself, the claim is still there: it was not this one's either.
+        assert!(tmp.path().join("moved").join(name_of(&p.claim())).exists());
+    }
+
+    /// A claim that is still this daemon's goes, through the directory as checked.
+    #[test]
+    fn a_claim_of_ours_is_removed_when_given_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let mut held = Held {
+            lock: open_lock_file(&p.lock()).unwrap(),
+            dir_lock: None,
+            lost_lock: true,
+            claim: Some(open_lock_file(&p.claim()).unwrap()),
+            refused_dir: false,
+        };
+        release_claim(&mut held, &p, None);
+        assert!(std::fs::symlink_metadata(p.claim()).is_err());
+    }
+
+    /// The stale-socket probe asks the held directory, never a directory made again at its path:
+    /// on Linux it reaches the held one (through `/proc`), elsewhere it counts the change as an
+    /// answer, so the socket is left alone.
+    #[test]
+    fn the_probe_never_reaches_a_directory_made_again() {
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let sock = p.socket();
+        let name = name_of(&sock);
+        let dir = crate::paths::open_trusted_dir(&p.dir).unwrap();
+        crate::paths::tests::dead_socket(&sock);
+        assert_eq!(something_answers_in(&dir, &p.dir, name), Probe::Quiet);
+        // The directory is moved away and another, with a live socket at the name, put there.
+        std::fs::rename(&p.dir, tmp.path().join("moved")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p.dir)
+            .unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let found = something_answers_in(&dir, &p.dir, name);
+        if cfg!(target_os = "linux") && std::path::Path::new("/proc/self/fd").exists() {
+            assert_eq!(
+                found,
+                Probe::Quiet,
+                "the probe reached the directory at the path"
+            );
+        } else {
+            assert_eq!(found, Probe::DirChanged);
+        }
+        // The held directory's dead socket is still there either way.
+        assert!(tmp.path().join("moved").join(name).exists());
     }
 }

@@ -95,6 +95,16 @@ impl SyncGate {
     }
 }
 
+/// How [`SessionHandle::kill_reporting`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Killed {
+    /// How the session ended, or `None` if the kill took longer than the timeout.
+    pub exit: Option<ExitInfo>,
+    /// Jobs that left the session could not be checked for: the process table could not be
+    /// read, or the kill did not finish in time. Some may still be running.
+    pub unchecked: bool,
+}
+
 /// One running session. Cheap to clone; every clone refers to the same session.
 ///
 /// The session lives until its shell exits or [`SessionHandle::kill`] ends it, whether or not
@@ -308,16 +318,36 @@ impl SessionHandle {
     /// Returns once the killing is done and the session has ended, or `None` if that takes
     /// longer than `timeout`.
     pub async fn kill(&self, timeout: Duration) -> Option<ExitInfo> {
+        self.kill_reporting(timeout).await.exit
+    }
+
+    /// [`kill`](Self::kill), also saying whether jobs that left the session were checked for.
+    pub async fn kill_reporting(&self, timeout: Duration) -> Killed {
         let (done_tx, done_rx) = oneshot::channel();
         if self.inner.tx.send(Cmd::Kill(done_tx)).await.is_err() {
-            return Some(self.wait_exit().await);
+            return Killed {
+                exit: Some(self.wait_exit().await),
+                unchecked: false,
+            };
         }
-        let all = async {
-            // An error means the shell was already gone, so there was nothing to kill.
-            let _ = done_rx.await;
-            self.wait_exit().await
+        let deadline = tokio::time::Instant::now() + timeout;
+        let read = match tokio::time::timeout_at(deadline, done_rx).await {
+            Ok(Ok(read)) => read,
+            // The shell was already gone, so there was nothing to kill.
+            Ok(Err(_)) => crate::proc::TableRead::Read,
+            Err(_) => {
+                return Killed {
+                    exit: None,
+                    unchecked: true,
+                };
+            }
         };
-        tokio::time::timeout(timeout, all).await.ok()
+        Killed {
+            exit: tokio::time::timeout_at(deadline, self.wait_exit())
+                .await
+                .ok(),
+            unchecked: read == crate::proc::TableRead::Unread,
+        }
     }
 
     /// Test hook: from now on a connection that decides to catch up waits at the returned gate
@@ -373,8 +403,11 @@ impl SessionHandle {
     pub async fn record_processes(&self) {
         let rows = tokio::task::spawn_blocking(crate::proc::scan_processes)
             .await
-            .unwrap_or_default();
-        let _ = self.inner.tx.send(Cmd::ProcessTable(rows)).await;
+            .ok()
+            .flatten();
+        if let Some(rows) = rows {
+            let _ = self.inner.tx.send(Cmd::ProcessTable(rows)).await;
+        }
         // Commands are handled in order: once this one is answered, the table has been recorded.
         let _ = self.info().await;
     }

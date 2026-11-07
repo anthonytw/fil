@@ -144,9 +144,13 @@ pub fn render(
             out.push_str(&other_daemons_note(others));
             Ok(out)
         }
-        (Request::KillSession { name }, Response::Done) => {
+        (Request::KillSession { name }, Response::Killed { unchecked: false }) => {
             Ok(format!("killed session \"{name}\"\n"))
         }
+        (Request::KillSession { name }, Response::Killed { unchecked: true }) => Ok(format!(
+            "killed session \"{name}\"; fil could not check for jobs that left it, so some may \
+             still be running\n"
+        )),
         (Request::DetachSession { name }, Response::Done) => {
             Ok(format!("detached session \"{name}\" (it keeps running)\n"))
         }
@@ -443,9 +447,17 @@ mod tests {
         let kill = Request::KillSession { name: name.clone() };
         let detach = Request::DetachSession { name: name.clone() };
         assert_eq!(
-            render(&kill, &Response::Done, "devbox", NOW).unwrap(),
+            render(&kill, &Response::Killed { unchecked: false }, "devbox", NOW).unwrap(),
             "killed session \"build\"\n"
         );
+        // A kill that could not check for escaped jobs says so rather than claim there were none.
+        assert!(
+            render(&kill, &Response::Killed { unchecked: true }, "devbox", NOW)
+                .unwrap()
+                .contains("could not check for jobs that left it")
+        );
+        // `Done` is not the answer to a kill.
+        assert!(render(&kill, &Response::Done, "devbox", NOW).is_err());
         assert!(
             render(&detach, &Response::Done, "devbox", NOW)
                 .unwrap()

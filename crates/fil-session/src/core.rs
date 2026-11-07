@@ -391,8 +391,9 @@ pub(crate) enum Cmd {
     Attach(Box<Attach>, oneshot::Sender<AttachAnswer>),
     Info(oneshot::Sender<SessionInfo>),
     ForceDetach,
-    /// Hang up, then kill; the sender fires when the killing is done.
-    Kill(oneshot::Sender<()>),
+    /// Hang up, then kill; the sender fires when the killing is done, with how the process table
+    /// was read (dropped unsent when the shell was already gone: nothing to kill).
+    Kill(oneshot::Sender<proc::TableRead>),
     // From connections.
     Input {
         conn: ConnId,
@@ -813,8 +814,8 @@ impl Core {
                 let (pid, scope, tracker) =
                     (self.pty.pid, self.scope.clone(), self.tracker.clone());
                 tokio::task::spawn_blocking(move || {
-                    proc::kill_session(pid, &scope, &tracker, proc::KILL_GRACE);
-                    let _ = done.send(());
+                    let read = proc::kill_session(pid, &scope, &tracker, proc::KILL_GRACE);
+                    let _ = done.send(read);
                 });
             }
             Cmd::Input { conn, seq, data } => self.on_input(conn, seq, data),
@@ -883,7 +884,11 @@ impl Core {
             let not_before = (!self.tracked_once).then_some(self.spawned_at);
             self.tracked_once = true;
             tokio::task::spawn_blocking(move || {
-                let _ = tx.blocking_send(Cmd::ProcessTable(proc::list_processes_since(not_before)));
+                // A table that could not be read is not sent: the recording stays as it was
+                // (the scan logs it), rather than forget every job it holds.
+                if let Some(rows) = proc::list_processes_since(not_before) {
+                    let _ = tx.blocking_send(Cmd::ProcessTable(rows));
+                }
             });
         }
     }

@@ -91,7 +91,7 @@ pub use config::{DirectInfo, NoHost, ScopeMode, SessionConfig, SessionHost};
 pub use core::{ExitInfo, SessionInfo, SubscriberInfo};
 #[cfg(feature = "test-hooks")]
 pub use handle::{CatchUpGate, SyncGate};
-pub use handle::{Gone, SessionHandle};
+pub use handle::{Gone, Killed, SessionHandle};
 pub use proc::Scope;
 pub use pty::SpawnError;
 pub use serve::{ServeEnd, serve_subscriber};

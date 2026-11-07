@@ -375,10 +375,13 @@ impl Inner {
                 Some(h) => {
                     tracing::info!("kill requested");
                     tracing::debug!(session = %name, "kill requested for");
-                    if h.kill(KILL_TIMEOUT).await.is_none() {
+                    let killed = h.kill_reporting(KILL_TIMEOUT).await;
+                    if killed.exit.is_none() {
                         tracing::warn!("the session did not end within {KILL_TIMEOUT:?}");
                     }
-                    Response::Done
+                    Response::Killed {
+                        unchecked: killed.unchecked,
+                    }
                 }
             },
             Request::DetachSession { name } => match self.session(&name) {

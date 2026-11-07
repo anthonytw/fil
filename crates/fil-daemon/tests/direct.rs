@@ -234,7 +234,7 @@ async fn a_key_does_not_outlive_its_session() {
     let kill = Request::KillSession {
         name: "main".parse().unwrap(),
     };
-    assert_eq!(ask(&d, kill).await, Response::Done);
+    assert_eq!(ask(&d, kill).await, Response::Killed { unchecked: false });
     live.wait_down().await;
     eventually("the killed session's key to leave the registry", || async {
         !d.registry.contains(&transport_key(&pk))

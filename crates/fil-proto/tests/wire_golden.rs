@@ -1212,10 +1212,13 @@ fn responses() -> Vec<Response> {
             more: false,
         });
     }
+    all.push(Response::Killed { unchecked: false });
+    all.push(Response::Killed { unchecked: true });
     for c in &all {
         match c {
             Response::Sessions { .. }
             | Response::Done
+            | Response::Killed { .. }
             | Response::NoSuchSession
             | Response::Ports { .. } => {}
             Response::Forward(r) => match r {
@@ -2232,7 +2235,9 @@ fn revisioned() -> Entries {
     e.push(("decode/request-5".into(), outcome::<Request>(&[5, 0])));
     e.push(("decode/response-2".into(), outcome::<Response>(&past(2))));
     e.push(("decode/response-3".into(), outcome::<Response>(&[3, 0, 1])));
+    // `Killed { unchecked: false }`, then the first kind past it.
     e.push(("decode/response-5".into(), outcome::<Response>(&[5, 0, 0])));
+    e.push(("decode/response-6".into(), outcome::<Response>(&[6, 0, 0])));
     // Index 10 was `Reset`: retired, and nothing decodes there.
     e.push((
         "decode/control-10-retired".into(),

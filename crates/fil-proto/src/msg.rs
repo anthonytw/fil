@@ -694,6 +694,12 @@ pub enum Response {
         part: PortsPart,
         more: bool,
     },
+    /// The answer to `KillSession`: the session was killed. `unchecked` is set when the daemon
+    /// could not check for jobs that left the session (its process table could not be read, or
+    /// the kill did not finish in time), so some may still be running. Wire revision 14.
+    Killed {
+        unchecked: bool,
+    },
 }
 
 /// Rows of a `fil ports` answer (DESIGN.md section 7.4). A part is at most one control message
@@ -1313,6 +1319,7 @@ mod tests {
                 name: "main".parse().unwrap(),
             }),
             ControlMsg::Response(Response::Done),
+            ControlMsg::Response(Response::Killed { unchecked: true }),
             ControlMsg::Response(Response::NoSuchSession),
             ControlMsg::Response(Response::sessions(
                 vec![SessionSummary {

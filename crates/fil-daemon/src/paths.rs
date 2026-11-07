@@ -461,6 +461,62 @@ pub(crate) fn something_answers(sock: &Path) -> bool {
     }
 }
 
+/// [`something_answers`] for the socket named `name` in `dir`, the directory a daemon opened and
+/// checked ([`open_trusted_dir`]; `dir_path` is its path), so that the probe never connects to a
+/// socket in another directory that was put at the path meanwhile (which would show that
+/// socket's owner our uid).
+///
+/// Unix `connect` has no form relative to a directory descriptor. On Linux the probe goes
+/// through `/proc/self/fd/<dir>/<name>`, which resolves in the held directory whatever is at the
+/// path now, once that link is checked to be the held directory (`/proc` mounted, this process's
+/// own). Elsewhere, and on a Linux without `/proc`, it connects by path between two checks of the
+/// held directory: a directory that changed before or during the probe is
+/// [`Probe::DirChanged`], which the caller treats as an answer, the safe side (it leaves the
+/// socket alone and looks again at its next check). What that cannot see is a directory moved
+/// away and back again within the one `connect`.
+pub(crate) fn something_answers_in(dir: &File, dir_path: &Path, name: &Path) -> Probe {
+    let of = |answers| {
+        if answers {
+            Probe::Answers
+        } else {
+            Probe::Quiet
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(via) = proc_path_in(dir) {
+        return of(something_answers(&via.join(name)));
+    }
+    if !dir_still_trusted(dir, dir_path) {
+        return Probe::DirChanged;
+    }
+    let answers = something_answers(&dir_path.join(name));
+    if !dir_still_trusted(dir, dir_path) {
+        return Probe::DirChanged;
+    }
+    of(answers)
+}
+
+/// What [`something_answers_in`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// Something answers on the socket (or it cannot be told: the safe side).
+    Answers,
+    /// Nothing answers: the socket, if there is one, is stale.
+    Quiet,
+    /// The directory changed around the probe, so what it found is not about the held one.
+    DirChanged,
+}
+
+/// `/proc/self/fd/<n>` for `dir`, when it leads to that directory (the same device and inode):
+/// a path that resolves in the held directory, whatever is at its own path now.
+#[cfg(target_os = "linux")]
+fn proc_path_in(dir: &File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let via = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let (held, there) = (dir.metadata().ok()?, std::fs::metadata(&via).ok()?);
+    (held.dev() == there.dev() && held.ino() == there.ino()).then_some(via)
+}
+
 /// The socket at `path` is this one, bound earlier: its `(device, inode)`.
 pub(crate) fn socket_identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path)
@@ -694,7 +750,7 @@ pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

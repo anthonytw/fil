@@ -175,7 +175,10 @@ async fn requests_ls_detach_kill() {
     let kill = Request::KillSession {
         name: "main".parse().unwrap(),
     };
-    assert_eq!(ask(&d, kill.clone()).await, Response::Done);
+    assert_eq!(
+        ask(&d, kill.clone()).await,
+        Response::Killed { unchecked: false }
+    );
     eventually("one session left", || async {
         let Response::Sessions { list, .. } = ask(&d, Request::ListSessions).await else {
             return false;

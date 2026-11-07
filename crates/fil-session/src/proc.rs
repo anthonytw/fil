@@ -410,29 +410,30 @@ fn table_from(
     slot: &TableSlot,
     max_age: Duration,
     now: Instant,
-    scan: impl FnOnce() -> Vec<ProcRow>,
-) -> std::sync::Arc<Vec<ProcRow>> {
+    scan: impl FnOnce() -> Option<Vec<ProcRow>>,
+) -> Option<std::sync::Arc<Vec<ProcRow>>> {
     table_from_since(slot, max_age, None, now, scan)
 }
 
-/// [`table_from`], but a stored table taken before `not_before` is not good enough.
+/// [`table_from`], but a stored table taken before `not_before` is not good enough. A scan that
+/// failed (`None`) is not stored: the next caller scans again.
 fn table_from_since(
     slot: &TableSlot,
     max_age: Duration,
     not_before: Option<Instant>,
     now: Instant,
-    scan: impl FnOnce() -> Vec<ProcRow>,
-) -> std::sync::Arc<Vec<ProcRow>> {
+    scan: impl FnOnce() -> Option<Vec<ProcRow>>,
+) -> Option<std::sync::Arc<Vec<ProcRow>>> {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, rows)) = slot.as_ref()
         && now.saturating_duration_since(*at) <= max_age
         && not_before.is_none_or(|t| *at >= t)
     {
-        return rows.clone();
+        return Some(rows.clone());
     }
-    let rows = std::sync::Arc::new(scan());
+    let rows = std::sync::Arc::new(scan()?);
     *slot = Some((now, rows.clone()));
-    rows
+    Some(rows)
 }
 
 /// The process table for the periodic recording of a session's descendants, shared between
@@ -442,7 +443,10 @@ fn table_from_since(
 /// the next recording (5 s) would then escape a kill. Blocking.
 ///
 /// Use [`scan_processes`] where the table must be current (teardown).
-pub fn list_processes_since(not_before: Option<Instant>) -> Vec<ProcRow> {
+///
+/// `None` when the table could not be read ([`scan_processes`]): the caller keeps what it
+/// recorded last rather than taking an empty table for "everything exited".
+pub fn list_processes_since(not_before: Option<Instant>) -> Option<Vec<ProcRow>> {
     table_from_since(
         &SHARED_TABLE,
         SHARED_TABLE_MAX_AGE,
@@ -450,25 +454,85 @@ pub fn list_processes_since(not_before: Option<Instant>) -> Vec<ProcRow> {
         Instant::now(),
         scan_processes,
     )
-    .as_ref()
-    .clone()
+    .map(|rows| rows.as_ref().clone())
 }
 
-/// The process table, read now. Blocking.
-pub fn scan_processes() -> Vec<ProcRow> {
-    if let Ok(dir) = std::fs::read_dir("/proc")
-        && std::path::Path::new("/proc/self/stat").exists()
-    {
-        return dir
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let pid: u32 = e.file_name().to_str()?.parse().ok()?;
-                let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
-                parse_proc_stat(pid, &stat)
-            })
-            .collect();
+/// The process table, read now, or `None` if it could not be read. Blocking.
+///
+/// A table that does not list this process is not the table (a `/proc` of another pid
+/// namespace, a `ps` that printed nothing): it counts as unread. An unread table is logged
+/// at `warn` when the scans start failing and at `info` when they work again, without any
+/// detail of the processes (DESIGN.md section 11.1), so a recording every 5 s does not fill the
+/// log. An empty table must never stand in for one that could not be read: it would make the
+/// recording forget every escaped job and a kill find none.
+pub fn scan_processes() -> Option<Vec<ProcRow>> {
+    let me = std::process::id();
+    let lists_me = |rows: &[ProcRow]| rows.iter().any(|r| r.pid == me);
+    let rows = scan_proc_fs()
+        .filter(|rows| lists_me(rows))
+        .or_else(|| scan_without_proc().filter(|rows| lists_me(rows)));
+    note_scan(rows.is_some());
+    rows
+}
+
+/// Whether the last scan failed: the log says so once, when they start failing, and once when
+/// they work again.
+static SCANS_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_scan(ok: bool) {
+    use std::sync::atomic::Ordering;
+    if ok {
+        if SCANS_FAILING.swap(false, Ordering::AcqRel) {
+            tracing::info!("the process table can be read again");
+        }
+    } else if !SCANS_FAILING.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            "the process table cannot be read; tree sessions keep their last recording, and a \
+             kill cannot check for jobs that left the session"
+        );
+    } else {
+        tracing::debug!("the process table still cannot be read");
     }
-    scan_without_proc()
+}
+
+/// Linux: every `/proc/<pid>/stat`. `None` without a `/proc`.
+fn scan_proc_fs() -> Option<Vec<ProcRow>> {
+    let dir = std::fs::read_dir("/proc").ok()?;
+    if !std::path::Path::new("/proc/self/stat").exists() {
+        return None;
+    }
+    Some(
+        dir.filter_map(|e| {
+            let e = e.ok()?;
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            parse_proc_stat(pid, &stat)
+        })
+        .collect(),
+    )
+}
+
+/// The row of one process, read on its own: for a teardown whose table could not be read, to
+/// check that a recorded pid still is the process recorded (its start time) before it is
+/// signalled. `None` when it is gone or cannot be read (and where there is no way to read one
+/// process: neither `/proc` nor macOS).
+pub fn process_row(pid: u32) -> Option<ProcRow> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return parse_proc_stat(pid, &stat);
+    }
+    process_row_without_proc(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn process_row_without_proc(pid: u32) -> Option<ProcRow> {
+    let pid_i = libc::c_int::try_from(pid).ok()?;
+    let buf = kinfo::read_one(pid_i).ok()?;
+    kinfo::parse(&buf).into_iter().find(|r| r.pid == pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_row_without_proc(_pid: u32) -> Option<ProcRow> {
+    None
 }
 
 /// macOS: the kernel's process table, read in-process with `sysctl(KERN_PROC_ALL)`, which is
@@ -477,26 +541,34 @@ pub fn scan_processes() -> Vec<ProcRow> {
 /// 0.15 ms. `proc_pidinfo` would be the documented alternative, but it refuses other users'
 /// processes, and a session's tree can pass through one (`sudo -u $USER ...`).
 #[cfg(target_os = "macos")]
-fn scan_without_proc() -> Vec<ProcRow> {
+fn scan_without_proc() -> Option<Vec<ProcRow>> {
     match kinfo::read_all() {
-        Ok(buf) => kinfo::parse(&buf),
+        Ok(buf) => Some(kinfo::parse(&buf)),
         Err(e) => {
             tracing::debug!(error = %e, "sysctl(KERN_PROC_ALL) failed");
-            Vec::new()
+            None
         }
     }
 }
 
 /// Elsewhere (no `/proc`, not macOS): `ps`.
 #[cfg(not(target_os = "macos"))]
-fn scan_without_proc() -> Vec<ProcRow> {
+fn scan_without_proc() -> Option<Vec<ProcRow>> {
     let mut ps = Command::new("ps");
     ps.args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
         .env("LC_ALL", "C");
     fil_transport::fdlimit::keep_for_std_child(&mut ps);
-    ps.output()
-        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
+    match ps.output() {
+        Ok(o) if o.status.success() => Some(parse_ps(&String::from_utf8_lossy(&o.stdout))),
+        Ok(o) => {
+            tracing::debug!(status = %o.status, "ps failed");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "ps could not be run");
+            None
+        }
+    }
 }
 
 /// The macOS process table as `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)` returns it: an array
@@ -549,10 +621,11 @@ mod kinfo {
     #[cfg(target_os = "macos")]
     pub(super) fn read_all() -> std::io::Result<Vec<u8>> {
         let mut last = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        const ALL: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
         for _ in 0..4 {
-            let need = sysctl_proc_all(None)?;
+            let need = sysctl_kern_proc(&ALL, None)?;
             let mut buf = vec![0u8; need + need / 8 + 16 * SIZE];
-            match sysctl_proc_all(Some(&mut buf)) {
+            match sysctl_kern_proc(&ALL, Some(&mut buf)) {
                 Ok(len) => {
                     buf.truncate(len);
                     return Ok(buf);
@@ -564,12 +637,23 @@ mod kinfo {
         Err(last)
     }
 
-    /// One `sysctl(KERN_PROC_ALL)` call: with no buffer, the size the table needs; with one, the
-    /// bytes written to it.
+    /// The entry of one process (`KERN_PROC_PID`): empty if there is no such process.
+    #[cfg(target_os = "macos")]
+    pub(super) fn read_one(pid: libc::c_int) -> std::io::Result<Vec<u8>> {
+        let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut buf = vec![0u8; SIZE];
+        let len = sysctl_kern_proc(&mib, Some(&mut buf))?;
+        buf.truncate(len);
+        Ok(buf)
+    }
+
+    /// One `sysctl(CTL_KERN, KERN_PROC, ...)` call (`KERN_PROC_ALL`, or `KERN_PROC_PID` and a
+    /// pid): with no buffer, the size the answer needs; with one, the bytes written to it.
     ///
     /// The `unsafe` block is the FFI call, with:
     ///
-    /// - `mib`, a live local array of the three names passed as its length;
+    /// - `mib`, a copy of the names in a live local array, passed with its length (`sysctl`
+    ///   takes a mutable pointer, though it only reads the names);
     /// - `oldp` either null (a size query) or `buf`'s pointer, and `oldlenp` pointing at a live
     ///   local holding `buf`'s length, so the kernel writes at most that many bytes into it and
     ///   stores the count it wrote;
@@ -580,8 +664,8 @@ mod kinfo {
     /// undefined behavior.
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
-    fn sysctl_proc_all(buf: Option<&mut [u8]>) -> std::io::Result<usize> {
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    fn sysctl_kern_proc(names: &[libc::c_int], buf: Option<&mut [u8]>) -> std::io::Result<usize> {
+        let mut mib = names.to_vec();
         let (ptr, mut len) = match buf {
             Some(b) => (b.as_mut_ptr().cast::<libc::c_void>(), b.len()),
             None => (std::ptr::null_mut(), 0),
@@ -665,8 +749,106 @@ impl Tracker {
         v.remove(&root);
         v.into_iter().collect()
     }
+
+    /// The recorded processes that are still the same process, each looked up on its own with
+    /// `row_of` (the start time must match, and a zombie is left out): the victims when the
+    /// table could not be read. A pid that was reused, or that cannot be looked up, is not
+    /// signalled; a process that left the tree since the last recording is not found.
+    pub fn still_themselves(&self, root: u32, row_of: impl Fn(u32) -> Option<ProcRow>) -> Vec<u32> {
+        self.known
+            .iter()
+            .filter(|(pid, _)| **pid != root)
+            .filter(|(pid, start)| row_of(**pid).is_some_and(|r| !r.zombie && r.start == **start))
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
 }
 
+/// How a teardown read the process table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum TableRead {
+    /// It was read: every process recorded or in the tree was found, and the kill was confirmed.
+    Read,
+    /// It could not be read (or not confirmed after the kill): only the group, the scope and the
+    /// recorded processes that could be checked one by one were signalled, so a job that left
+    /// the session may still be running.
+    Unread,
+}
+
+/// What a teardown reads the process table with: the system's, or a test's.
+struct Table<'a> {
+    scan: &'a dyn Fn() -> Option<Vec<ProcRow>>,
+    row_of: &'a dyn Fn(u32) -> Option<ProcRow>,
+}
+
+impl Table<'_> {
+    /// The victims, each with its start time, from a table read now (tried a few times) or, when
+    /// it cannot be read, the recorded processes checked one by one.
+    fn victims(
+        &self,
+        root: u32,
+        tracker: &Tracker,
+        retries: bool,
+    ) -> (Vec<(u32, String)>, TableRead) {
+        let mut rows = (self.scan)();
+        let mut tries = if retries { 2 } else { 0 };
+        while rows.is_none() && tries > 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            rows = (self.scan)();
+            tries -= 1;
+        }
+        match rows {
+            Some(rows) => {
+                let start: HashMap<u32, &str> =
+                    rows.iter().map(|r| (r.pid, r.start.as_str())).collect();
+                let v = tracker
+                    .victims(root, &rows)
+                    .into_iter()
+                    .filter_map(|p| Some((p, start.get(&p)?.to_string())))
+                    .collect();
+                (v, TableRead::Read)
+            }
+            None => {
+                let v = tracker
+                    .still_themselves(root, self.row_of)
+                    .into_iter()
+                    .filter_map(|p| Some((p, tracker.known.get(&p)?.clone())))
+                    .collect();
+                (v, TableRead::Unread)
+            }
+        }
+    }
+
+    /// The victims that are still the processes chosen, right before SIGKILL: a victim that
+    /// exited on the hangup may have had its pid reused during the grace. From a table read now,
+    /// or, without one, each looked up on its own.
+    fn still_victims(&self, victims: &[(u32, String)]) -> Vec<u32> {
+        let same = |r: &ProcRow, start: &str| !r.zombie && r.start == start;
+        match (self.scan)() {
+            Some(rows) => {
+                let now: HashMap<u32, &ProcRow> = rows.iter().map(|r| (r.pid, r)).collect();
+                victims
+                    .iter()
+                    .filter(|(p, start)| now.get(p).is_some_and(|r| same(r, start)))
+                    .map(|(p, _)| *p)
+                    .collect()
+            }
+            None => victims
+                .iter()
+                .filter(|(p, start)| (self.row_of)(*p).is_some_and(|r| same(&r, start)))
+                .map(|(p, _)| *p)
+                .collect(),
+        }
+    }
+}
+
+const SYSTEM_TABLE: Table<'static> = Table {
+    scan: &scan_processes,
+    row_of: &process_row,
+};
+
+#[cfg(test)]
 fn alive(pid: u32) -> bool {
     // Signal 0 only checks that the process exists (a zombie counts as existing, which the
     // callers account for with the table).
@@ -686,9 +868,22 @@ pub const KILL_GRACE: Duration = Duration::from_millis(600);
 ///
 /// A hangup first, as closing a terminal would send, so shells and their jobs exit cleanly;
 /// then SIGKILL to whatever is left, in the group, in the tree and in the scope.
-pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration) {
-    let rows = scan_processes();
-    let victims = tracker.victims(root, &rows);
+///
+/// Returns [`TableRead::Unread`] when the process table could not be read (or the kill could not
+/// be confirmed with it): `fil kill` then says that jobs that left the session may still run.
+pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration) -> TableRead {
+    kill_session_with(&SYSTEM_TABLE, root, scope, tracker, grace)
+}
+
+fn kill_session_with(
+    table: &Table<'_>,
+    root: u32,
+    scope: &Scope,
+    tracker: &Tracker,
+    grace: Duration,
+) -> TableRead {
+    let (chosen, read) = table.victims(root, tracker, true);
+    let victims: Vec<u32> = chosen.iter().map(|(p, _)| *p).collect();
     let pgid = Pid::from_raw(root as i32);
     let _ = killpg(pgid, Signal::SIGHUP);
     let _ = killpg(pgid, Signal::SIGCONT);
@@ -697,7 +892,14 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
 
     let deadline = Instant::now() + grace;
     loop {
-        let table = scan_processes();
+        // A table that cannot be read just now says nothing: wait out the grace.
+        let Some(table) = (table.scan)() else {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
         let gone = victims
             .iter()
             .all(|v| table.iter().find(|r| r.pid == *v).is_none_or(|r| r.zombie));
@@ -710,11 +912,7 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
     }
 
     let _ = killpg(pgid, Signal::SIGKILL);
-    for v in &victims {
-        if alive(*v) {
-            let _ = kill(Pid::from_raw(*v as i32), Signal::SIGKILL);
-        }
-    }
+    signal_all(&table.still_victims(&chosen), Signal::SIGKILL);
     if let Scope::Systemd { unit } = scope {
         systemctl_kill("systemctl", unit, "SIGKILL", KILL_CALL_TIMEOUT);
     }
@@ -725,7 +923,14 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
     // sleep can outlast any wait, and a stuck victim must not hang the teardown).
     let deadline = Instant::now() + KILL_CONFIRM;
     loop {
-        let table = scan_processes();
+        let Some(table) = (table.scan)() else {
+            // Not confirmed: the leftovers may or may not be gone.
+            if Instant::now() >= deadline {
+                return TableRead::Unread;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
         let left: Vec<u32> = victims
             .iter()
             .copied()
@@ -737,11 +942,11 @@ pub fn kill_session(root: u32, scope: &Scope, tracker: &Tracker, grace: Duration
             })
             .collect();
         if left.is_empty() {
-            return;
+            return read;
         }
         if Instant::now() >= deadline {
-            tracing::warn!(?left, "processes survived SIGKILL");
-            return;
+            tracing::warn!(count = left.len(), "processes survived SIGKILL");
+            return read;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -774,8 +979,8 @@ fn systemctl_kill(systemctl: &str, unit: &str, signal: &str, timeout: Duration) 
 /// Used when the shell exits by itself: what it left running in the background is told, not
 /// killed.
 pub fn hang_up(root: u32, scope: &Scope, tracker: &Tracker) {
-    let rows = scan_processes();
-    let victims = tracker.victims(root, &rows);
+    let (chosen, _) = SYSTEM_TABLE.victims(root, tracker, true);
+    let victims: Vec<u32> = chosen.into_iter().map(|(p, _)| p).collect();
     let _ = killpg(Pid::from_raw(root as i32), Signal::SIGHUP);
     signal_all(&victims, Signal::SIGHUP);
     if let Scope::Systemd { unit } = scope {
@@ -986,7 +1191,7 @@ mod tests {
     #[test]
     fn kill_session_reads_a_fresh_process_table() {
         teardown_ignores_the_shared_table(|root| {
-            kill_session(
+            let _ = kill_session(
                 root,
                 &Scope::Tree,
                 &Tracker::default(),
@@ -995,8 +1200,8 @@ mod tests {
         });
     }
 
-    fn table(n: u32) -> Vec<ProcRow> {
-        vec![row(n, 1, "a")]
+    fn table(n: u32) -> Option<Vec<ProcRow>> {
+        Some(vec![row(n, 1, "a")])
     }
 
     #[test]
@@ -1010,6 +1215,7 @@ mod tests {
                 scans += 1;
                 table(scans)
             })
+            .unwrap()
             .first()
             .unwrap()
             .pid
@@ -1041,20 +1247,20 @@ mod tests {
         let age = Duration::from_secs(2);
         let t0 = Instant::now();
         // Another session scanned at t0; this session was spawned 500 ms later.
-        let first = table_from(&slot, age, t0, || table(1));
+        let first = table_from(&slot, age, t0, || table(1)).unwrap();
         assert_eq!(first[0].pid, 1);
         let spawned = t0 + Duration::from_millis(500);
         let now = t0 + Duration::from_millis(600);
-        let got = table_from_since(&slot, age, Some(spawned), now, || table(2));
+        let got = table_from_since(&slot, age, Some(spawned), now, || table(2)).unwrap();
         assert_eq!(
             got[0].pid, 2,
             "the old table predates the session: scan again"
         );
         // That scan is after the spawn, so a second session spawned before it may share it.
-        let again = table_from_since(&slot, age, Some(spawned), now, || table(3));
+        let again = table_from_since(&slot, age, Some(spawned), now, || table(3)).unwrap();
         assert_eq!(again[0].pid, 2);
         // Without a floor the old behavior stands.
-        let plain = table_from(&slot, age, now, || table(4));
+        let plain = table_from(&slot, age, now, || table(4)).unwrap();
         assert_eq!(plain[0].pid, 2);
     }
 
@@ -1074,6 +1280,173 @@ mod tests {
             }
         });
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_scan_is_not_shared_or_stored() {
+        let slot: TableSlot = Mutex::new(None);
+        let age = Duration::from_secs(60);
+        let t0 = Instant::now();
+        assert!(table_from(&slot, age, t0, || None).is_none());
+        assert!(slot.lock().unwrap().is_none(), "nothing is stored");
+        // The next caller scans again, and a good table is shared as before.
+        assert_eq!(table_from(&slot, age, t0, || table(5)).unwrap()[0].pid, 5);
+        assert_eq!(table_from(&slot, age, t0, || None).unwrap()[0].pid, 5);
+    }
+
+    /// A `sleep` in a process group of its own, so that signalling another group misses it.
+    fn sleeper() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    fn exits_within(child: &mut std::process::Child, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A kill whose process table cannot be read signals the recorded processes that are still
+    /// the ones recorded (checked one by one), never a pid whose start time differs (reused),
+    /// and says the table was not read.
+    #[test]
+    fn a_kill_without_a_table_signals_only_recorded_processes_that_are_still_themselves() {
+        let mut root = sleeper();
+        let mut recorded = sleeper();
+        let mut reused = sleeper();
+        let start = process_row(recorded.id()).map(|r| r.start);
+        if start.is_none() {
+            // No way to read one process here (neither `/proc` nor macOS): nothing to check.
+            for c in [&mut root, &mut recorded, &mut reused] {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return;
+        }
+        let mut tracker = Tracker::default();
+        let (r, a, b) = (root.id(), recorded.id(), reused.id());
+        tracker.refresh(
+            r,
+            &[
+                row(r, 1, "root"),
+                row(a, r, start.as_deref().unwrap()),
+                row(b, r, "another process's start time"),
+            ],
+        );
+        let unread = Table {
+            scan: &|| None,
+            row_of: &process_row,
+        };
+        let read = kill_session_with(
+            &unread,
+            r,
+            &Scope::Tree,
+            &tracker,
+            Duration::from_millis(50),
+        );
+        assert_eq!(read, TableRead::Unread);
+        assert!(
+            exits_within(&mut root, Duration::from_secs(5)),
+            "the group is signalled"
+        );
+        assert!(
+            exits_within(&mut recorded, Duration::from_secs(5)),
+            "the recorded process that is still itself is signalled"
+        );
+        let spared = !exits_within(&mut reused, Duration::from_millis(300));
+        let _ = reused.kill();
+        let _ = reused.wait();
+        assert!(spared, "a pid whose start time differs is not signalled");
+    }
+
+    /// A process in a group of its own that ignores the hangup, so only SIGKILL ends it.
+    /// Returned once the trap is set (it says so before it becomes `sleep`).
+    fn hangup_ignorer() -> std::process::Child {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new("sh")
+            .args(["-c", "trap '' HUP; echo ready; exec sleep 30"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(c.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        c
+    }
+
+    /// SIGKILL goes only to the victims that are still the processes chosen: one whose pid now
+    /// names another process (a different start time, as after a reuse during the grace) is
+    /// spared, and one that is still itself is killed.
+    #[test]
+    fn sigkill_checks_again_that_each_victim_is_still_itself() {
+        let mut root = sleeper();
+        let mut kept = hangup_ignorer();
+        let mut reused = hangup_ignorer();
+        let (r, a, b) = (root.id(), kept.id(), reused.id());
+        let mut tracker = Tracker::default();
+        tracker.refresh(r, &[row(r, 1, "root"), row(a, r, "a"), row(b, r, "b")]);
+        let looked_up_b = std::cell::Cell::new(0);
+        let row_of = |pid: u32| {
+            if pid == a {
+                return Some(row(a, r, "a"));
+            }
+            if pid == b {
+                looked_up_b.set(looked_up_b.get() + 1);
+                // Itself when the victims are chosen, another process by the SIGKILL.
+                let start = if looked_up_b.get() == 1 {
+                    "b"
+                } else {
+                    "someone else"
+                };
+                return Some(row(b, r, start));
+            }
+            None
+        };
+        let unread = Table {
+            scan: &|| None,
+            row_of: &row_of,
+        };
+        let _ = kill_session_with(
+            &unread,
+            r,
+            &Scope::Tree,
+            &tracker,
+            Duration::from_millis(50),
+        );
+        assert!(exits_within(&mut root, Duration::from_secs(5)));
+        assert!(
+            exits_within(&mut kept, Duration::from_secs(5)),
+            "the victim that is still itself is killed"
+        );
+        let spared = !exits_within(&mut reused, Duration::from_millis(300));
+        let _ = reused.kill();
+        let _ = reused.wait();
+        assert!(
+            spared,
+            "a pid that names another process by the SIGKILL is spared"
+        );
+    }
+
+    /// With a table, a kill says so.
+    #[test]
+    fn a_kill_with_a_table_says_it_read_one() {
+        let mut root = sleeper();
+        let read = kill_session(root.id(), &Scope::Tree, &Tracker::default(), KILL_GRACE);
+        assert!(exits_within(&mut root, Duration::from_secs(5)));
+        assert_eq!(read, TableRead::Read);
     }
 
     #[test]
@@ -1179,7 +1552,7 @@ mod tests {
         // running; give it up to 5 s on a loaded machine.
         let deadline = Instant::now() + Duration::from_secs(5);
         let rows = loop {
-            let rows = scan_processes();
+            let rows = scan_processes().expect("the process table is read");
             if rows.iter().any(|r| r.pid == zombie.id() && r.zombie) || Instant::now() > deadline {
                 break rows;
             }
@@ -1261,7 +1634,7 @@ mod tests {
     #[test]
     fn the_process_table_includes_this_process_and_its_child() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let rows = scan_processes();
+        let rows = scan_processes().expect("the process table is read");
         let me = std::process::id();
         let found = rows
             .iter()

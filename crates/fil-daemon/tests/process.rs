@@ -360,7 +360,10 @@ async fn relay_process_to_daemon_process_to_session_and_a_daemon_restart() {
     let kill = Request::KillSession {
         name: name("second"),
     };
-    assert_eq!(manage(&s, kill).await, Response::Done);
+    assert_eq!(
+        manage(&s, kill).await,
+        Response::Killed { unchecked: false }
+    );
     eventually("the second session to be gone", || async {
         !sessions(&s)
             .await

@@ -103,6 +103,7 @@ fn variant_name(r: &Response) -> &'static str {
     match r {
         Response::Sessions { .. } => "Sessions",
         Response::Done => "Done",
+        Response::Killed { .. } => "Killed",
         Response::NoSuchSession => "NoSuchSession",
         Response::Forward(_) => "Forward",
         Response::Ports { .. } => "Ports",

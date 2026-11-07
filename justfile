@@ -270,7 +270,7 @@ local transport="pipe" session=("local-" + transport):
     } > "$config"
     exec "{{target_dir}}/debug/fil" --config "$config" localhost "{{session}}"
 
-# M1 scenarios on the lab Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
+# M1 scenarios on the test Raspberry Pis through the fil-test gate (docs/m1/pi.md): this machine's
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
 # installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
 # Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
@@ -282,7 +282,7 @@ pi-e2e *args:
 
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the
-# real client on the lab Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
+# real client on the test Pis. Flags: --hosts pi1,pi2, --only NAME, --list, --verbose, --require TOOLS,
 # --allow-missing, --allow-skip, --strict, --dump DIR (where the transcript of a client whose output
 # check fails goes). `--local` runs against a private daemon on this machine instead (no targets
 # needed; a development aid). Targets as for pi-e2e. A skipped scenario or a

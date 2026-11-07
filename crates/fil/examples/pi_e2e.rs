@@ -1,5 +1,5 @@
 //! The M1 scenarios on real hardware (docs/m1/pi.md): this machine's `fil` client, driven in a
-//! pseudo-terminal, against `fil server --stdio` on a lab Raspberry Pi reached through the
+//! pseudo-terminal, against `fil server --stdio` on a test Raspberry Pi reached through the
 //! `fil-test` gate. `just pi-e2e`.
 //!
 //! Needs: the Pi binary installed through the gate (docs/m1/pi.md), and ssh reaching the targets

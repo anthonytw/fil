@@ -1,4 +1,4 @@
-# `fwdprobe` on the lab Pis and in realnet (M2 package T1)
+# `fwdprobe` on the test Pis and in realnet (M2 package T1)
 
 > **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
 

@@ -525,9 +525,9 @@ expect_pass "loopback, a longer address and a different name are not the fixture
 new_case 0.9.0
 mkdir -p "$tree/crates/x/tests"
 printf 'let a = "user@build5.corp.acme.io:22"; let b = "ssh://build6.corp.acme.io/x"; let c = ["8080:fd00::6"];\n' > "$tree/crates/x/tests/fixture.rs"
-printf 'host = "orin.lab.gulwertz.net"\nnas = "nas.home.arpa"\nweb = "build.corp.acme.io"\nula = "fd00::1"\nfull = "fe80:0:0:0:1:2:3:4"\nok1 = "fil.anthonywertz.com"\nok2 = "2001:db8::1"\nok3 = "::1"\nok4 = "10:30:45"\nok5 = "38:2::10:200:30"\n' > "$tree/crates/x/tests/fixture.toml"
+printf 'host = "ci.lab.acme.net"\nnas = "nas.home.arpa"\nweb = "build.corp.acme.io"\nula = "fd00::1"\nfull = "fe80:0:0:0:1:2:3:4"\nok1 = "fil.anthonywertz.com"\nok2 = "2001:db8::1"\nok3 = "::1"\nok4 = "10:30:45"\nok5 = "38:2::10:200:30"\n' > "$tree/crates/x/tests/fixture.toml"
 expect_pass "multi-label and IPv6 fixtures that are not in the binaries pass" check --dry-run --no-tree "$rel"
-for leak in build5.corp.acme.io build6.corp.acme.io fd00::6 orin.lab.gulwertz.net nas.home.arpa build.corp.acme.io fd00::1 fe80:0:0:0:1:2:3:4; do
+for leak in build5.corp.acme.io build6.corp.acme.io fd00::6 ci.lab.acme.net nas.home.arpa build.corp.acme.io fd00::1 fe80:0:0:0:1:2:3:4; do
   stage_release
   echo "# connects to $leak" >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
   pack_release
@@ -535,7 +535,7 @@ for leak in build5.corp.acme.io build6.corp.acme.io fd00::6 orin.lab.gulwertz.ne
   grep -qF "$leak" "$tmp/out.log" && pass "...and the failure names it" || flunk "...and the failure names it"
 done
 stage_release
-echo '# fil.anthonywertz.com 2001:db8::1 ::1 10:30:45 fd00::2 orin.lab.gulwertz.org' >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
+echo '# fil.anthonywertz.com 2001:db8::1 ::1 10:30:45 fd00::2 ci.lab.acme.org' >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
 pack_release
 expect_pass "the project's own name, documentation and loopback addresses, and other names are not the fixtures" check --dry-run --no-tree "$rel"
 mutated "bin/fil is missing" "rm fil-0.9.0-aarch64-linux-musl/bin/fil"
@@ -785,7 +785,7 @@ case "$1 $2" in
   "api repos/"*/deployment-branch-policies)
     case ${FAKE_POLICY:-tag} in tag) echo "tag:v*" ;; none) echo ;; branch) echo "branch:main tag:v*" ;; *) echo "HTTP 404" >&2; exit 1 ;; esac ;;
   "api repos/"*)
-    case $FAKE_ENV in owner) echo "splarg-bot anthonytw" ;; bot) echo splarg-bot ;; none) echo ;; *) echo "HTTP 403" >&2; exit 1 ;; esac ;;
+    case $FAKE_ENV in owner) echo "botuser anthonytw" ;; bot) echo botuser ;; none) echo ;; *) echo "HTTP 403" >&2; exit 1 ;; esac ;;
   "release view")
     [ "$FAKE_DRAFT" = missing ] && exit 1
     echo "$FAKE_DRAFT" ;;

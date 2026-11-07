@@ -1,4 +1,4 @@
-# fil on the lab Raspberry Pis (M1 package P7b)
+# fil on the test Raspberry Pis (M1 package P7b)
 
 > **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
 

@@ -1,4 +1,4 @@
-# fil's CI on the lab's Gitea, run by the self-hosted aarch64 runner (label orin-aarch64).
+# fil's CI on the project's Gitea, run by the self-hosted aarch64 runner.
 #
 # Gitea reads .gitea/workflows/ and ignores .github/workflows/ when the former exists, so the
 # GitHub workflows (release, linux-check, macos-check) do not run here. They run on GitHub, when the

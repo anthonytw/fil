@@ -11,7 +11,7 @@
 #
 # SAFETY: the container is --privileged, which is root on the machine it runs on. That is fine on a
 # GitHub-hosted runner (a throwaway VM, no secrets in this job). NEVER run this part on a
-# self-hosted runner, a lab machine or a developer's own computer; the other parts are not like this.
+# self-hosted runner, a test machine or a developer's own computer; the other parts are not like this.
 # sysd_setup refuses (under run.sh: skips) unless RUNNER_ENVIRONMENT=github-hosted and GITHUB_SERVER_URL=https://github.com (GitHub sets both on its own runners; a Gitea runner sets the second to its own URL) or
 # FIL_REALNET_PRIVILEGED_OK=1, which says that this machine may be given a privileged container.
 set -uo pipefail

@@ -21,7 +21,7 @@ pub const ESC: &str = "\x1b";
 
 pub type Res = Result<Vec<String>, String>;
 
-/// Not applicable here (for instance, it needs ssh as the transport). Fails the run on a lab host
+/// Not applicable here (for instance, it needs ssh as the transport). Fails the run on a test host
 /// unless `--allow-skip` is given.
 pub fn skip(why: &str) -> Res {
     Ok(vec![format!("SKIP: {why}")])
@@ -190,7 +190,7 @@ impl Ctx {
     ) -> Result<Client, String> {
         let mut c = self.client_with(host, variant, &format!("dp-{name}"), rows, cols, x);
         c.roundtrip("RDY", ATTACH_TIMEOUT)?;
-        // What an earlier failure left in the lab account's /tmp goes first; on this machine
+        // What an earlier failure left in the test account's /tmp goes first; on this machine
         // nothing is swept (the scenarios remove their own directory).
         let sweep = if Ctx::is_local(host) {
             ""

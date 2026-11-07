@@ -112,7 +112,7 @@ A 4.0 MB file (55000 lines of 73 bytes, `LINE-000001 ...`) is `cat`ted in the se
 
 Two cautions for reading it. A snapshot re-renders recent history, so the `LINE-` tally of a fil run can exceed the lines "kept" (the Pi suite counts lines on the screen instead). And the consumer is a pty reader that parses nothing: a real terminal emulator is slower, so this is the lower bound on how often catch-up fires on real use.
 
-**On the Pis (not run by this package).** The same measurement from this Mac against the two lab Pis, as input for M3. The Pi side needs no new binary: the shell on the Pi has `seq` and `cat`, and `keyprobe` runs here. Nothing below touches the Pis' gate beyond what `docs/m1/pi.md` already uses.
+**On the Pis (not run by this package).** The same measurement from this Mac against the two test Pis, as input for M3. The Pi side needs no new binary: the shell on the Pi has `seq` and `cat`, and `keyprobe` runs here. Nothing below touches the Pis' gate beyond what `docs/m1/pi.md` already uses.
 
 1. Build the client and the probe in separate invocations (the `fil` that is used must not have the test hooks, `just no-test-hooks target/release/fil`):
 

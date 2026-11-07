@@ -1,5 +1,5 @@
 //! The drop-in suite (M1 package P8, docs/m1/dropin.md): everyday ssh, et and mosh work done
-//! through the real `fil` client on a pseudo-terminal, against `fil server --stdio` on the lab
+//! through the real `fil` client on a pseudo-terminal, against `fil server --stdio` on the test
 //! Raspberry Pis (through the `fil-test` gate) or, with `--local`, against a private daemon on this
 //! machine. `just dropin`.
 //!
@@ -807,7 +807,7 @@ fn main() {
     }
 }
 
-/// Strictness lives here: a skip on a lab host and a missing tool fail the run unless allowed.
+/// Strictness lives here: a skip on a test host and a missing tool fail the run unless allowed.
 fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_skip: bool) -> End {
     let xfail = XFAIL.contains(&name);
     match r {
@@ -832,7 +832,7 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
                 // The known bugs need a network (resize order) or are the same everywhere; on
                 // this machine a pass proves nothing either way.
                 let mut notes = notes;
-                notes.push("(a known failure on the lab hosts; passes here)".into());
+                notes.push("(a known failure on the test hosts; passes here)".into());
                 return End::Pass(notes);
             }
             if xfail {
@@ -858,7 +858,7 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
                     return End::Skip(notes);
                 }
                 return End::Fail(format!(
-                    "skipped on a lab host (`--allow-skip` to accept): {}",
+                    "skipped on a test host (`--allow-skip` to accept): {}",
                     notes.join("; ")
                 ));
             }

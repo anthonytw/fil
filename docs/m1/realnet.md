@@ -122,7 +122,7 @@ On macOS (or without the tools) it refuses with a message and exits 2. On an App
 gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet
 ```
 
-`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet`, `aarch64` (the static binary for the lab Pis, `docs/m1/pi.md`) or `all`. The three realnet parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
+`suite` is `check` (default: `just ci` and the on-demand harnesses), `realnet`, `aarch64` (the static binary for the test Pis, `docs/m1/pi.md`) or `all`. The three realnet parts run as parallel jobs; each uploads its logs and per-scenario outputs as an artifact and writes the results table to the job summary. Exit status is non-zero if any scenario fails.
 
 The scripts are in `tests/realnet/`: `run.sh` (entry), `ssh.sh`, `udp.sh` and `sysd.sh` (one bash function per scenario, each run in its own process so `set -euo pipefail` applies), `lib.sh` (assertions, parsing, the summary table), `fil.sh` (driving the real client through `ptydrive`: start, type, wait for text, exit status, the client's log), `build.sh` and `docker/`. `shellcheck` is part of the CI job. The scenarios named `f_*` use the real `fil`; `s_*` are the stand-in scenarios.
 
@@ -296,7 +296,7 @@ The quic-echo blackout result stands: a link that is quiet when the network come
 
 ### A busy link through a 3 s blackout (the window floor)
 
-`s_quiclink_blackouts` expects the 3 s case to survive (`dead_after` is 5 s), and on the seat's aarch64 VM (`docs/dev/vm.md`) it did not, most of the time: `Down(Dead)` about 4.6 to 4.7 s after the cut, then a fresh handshake. A packet-gap log in `quiclink-probe` (quinn's datagram counters sampled every 2 ms, on both ends) showed why, in a lost run (times from the cut, heal at 3.0 s, 20 ms each way):
+`s_quiclink_blackouts` expects the 3 s case to survive (`dead_after` is 5 s), and on the dev machine's aarch64 VM (`docs/dev/vm.md`) it did not, most of the time: `Down(Dead)` about 4.6 to 4.7 s after the cut, then a fresh handshake. A packet-gap log in `quiclink-probe` (quinn's datagram counters sampled every 2 ms, on both ends) showed why, in a lost run (times from the cut, heal at 3.0 s, 20 ms each way):
 
 | | What it sent |
 |---|---|
@@ -339,7 +339,7 @@ The two agree on almost everything, which is the main result: the simulator's nu
 
 ## What the daemon and client should add
 
-Done in M1: the multi-user and permission tests, the systemd scope with and without lingering, the real bootstrap, resume under a killed ssh and a killed daemon, pipe to QUIC and back (P7a), the same scenarios on the lab Raspberry Pis (`docs/m1/pi.md`, `pi_e2e`), and the automated drop-in suite (`docs/m1/dropin.md`). Still open, for M2 or later:
+Done in M1: the multi-user and permission tests, the systemd scope with and without lingering, the real bootstrap, resume under a killed ssh and a killed daemon, pipe to QUIC and back (P7a), the same scenarios on the test Raspberry Pis (`docs/m1/pi.md`, `pi_e2e`), and the automated drop-in suite (`docs/m1/dropin.md`). Still open, for M2 or later:
 
 - **The unauthenticated surface of the UDP port on the wire:** a UDP flood and spoofed Initial packets from the router namespace. The stateless retry and the handshake rate limit have in-process tests (`crates/fil-transport/tests/quic_link.rs`) but no real-network run (DESIGN.md §8.3, "exposure before authentication"). The one-UDP-port-per-user rule with two users.
 - **More faults under the real client:** the relay killed (not only ssh), a blackout of 4 to 5 s under a quiet session, a path-MTU black hole (`ip link set mtu`, drop fragments), IPv6, a NAT that keeps the old mapping, and a user logging out with `KillUserProcesses=yes`.
@@ -353,6 +353,6 @@ Verified on a runner: everything in the tables above, in the run linked at the t
 
 Verified on a runner (stand-ins): Across the runs, one scenario failed once (NAT rebinding in the first run, on a missing `-p udp` in the SNAT rule; fixed), and the first run's 6.9 s heartbeat figure was a driver bug (the timestamp was taken after a 2 s wait for the child to exit; fixed, and it is 4.9 s). The hostile-name scenario has a positive control showing that the canary file would be created if the text reached a shell, so a passing result is not a blind check.
 
-Assumed, not measured, for the real binary: that the four scenarios of the UDP topology behave the same on the lab's networks (the numbers are one runner's); that a systemd container on this runner stands in for a real host (cgroup v2, logind and a user manager are real, but there is no graphical session, no `KillUserProcesses=yes` and no real logout).
+Assumed, not measured, for the real binary: that the four scenarios of the UDP topology behave the same on real networks (the numbers are one runner's); that a systemd container on this runner stands in for a real host (cgroup v2, logind and a user manager are real, but there is no graphical session, no `KillUserProcesses=yes` and no real logout).
 
 Assumed, not measured: the explanation for the blackout cutoff (probe timing, idle-timeout stretching); that the Ubuntu runner's veth and netem behave like a real link at these rates (the throughput numbers are the runner's, not a network's); that other OpenSSH versions behave like the one tested (9.6p1, logged by the harness) (the process title `sshd: USER@notty` that the sshd-kill scenario matches changed in later releases); and that one runner is typical.

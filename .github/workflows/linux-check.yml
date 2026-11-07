@@ -16,7 +16,7 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the lab Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
+        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the test Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
         type: choice
         options: [check, realnet, aarch64, latency, terminals, all]
         default: check
@@ -76,7 +76,7 @@ jobs:
     # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
     # release-target check.
     # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
-    # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or lab
+    # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or shared
     # runner.
     if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
@@ -129,7 +129,7 @@ jobs:
     # The release binary for aarch64 Linux (DESIGN.md §13): static, musl. `ring` needs a musl C
     # cross compiler, which `cross` brings in its Docker image. Uploads `fil`, `fwdprobe` (the TCP
     # test tool for the forward scenarios, docs/m2/pi.md) and their `.sha256` files
-    # for the lab Raspberry Pis (docs/m1/pi.md): `gh run download RUN -n fil-aarch64-musl`.
+    # for the test Raspberry Pis (docs/m1/pi.md): `gh run download RUN -n fil-aarch64-musl`.
     # No rust-cache here: this job produces the artifact that gets installed, and a cache entry
     # saved by a run of any other ref could otherwise seed what a later release build restores.
     if: inputs.suite == 'aarch64' || inputs.suite == 'all'

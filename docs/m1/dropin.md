@@ -10,7 +10,7 @@ It is on demand and never part of `just ci`. (Its unit tests, which pin the exac
 
 | Where | What | How |
 |---|---|---|
-| The lab Raspberry Pis (aarch64, Debian 13) | 30 scenarios, this Mac's client against `fil server --stdio` on each Pi through the `fil-test` gate | `crates/fil/examples/dropin/`, `just dropin` |
+| The test Raspberry Pis (aarch64, Debian 13) | 30 scenarios, this Mac's client against `fil server --stdio` on each Pi through the `fil-test` gate | `crates/fil/examples/dropin/`, `just dropin` |
 | The real-network harness (`udp` part, a Linux runner) | vim while the NAT mapping moves and while UDP is lossy and dead; the same everyday battery through `ssh -tt` and through fil, side by side | `tests/realnet/udp.sh` (`f_dropin_*`), helpers in `tests/realnet/dropin.sh` |
 | This machine (`--local`) | a development aid, not a result: the scenarios against a **private** daemon (`fil-daemon-dev --dir`), never `/tmp/fil-$UID`, so a stale daemon of another tree cannot answer; it is stopped at the end by the pid in its lock file (never by a pattern) and the run fails if it is still alive | `just dropin --local` |
 
@@ -32,7 +32,7 @@ The Pi binary must be installed first (`docs/m1/pi.md`), and it must be built fr
 
 The run is strict by default. It **fails** when:
 
-- a scenario is skipped on a lab host (`--allow-skip` to accept it);
+- a scenario is skipped on a test host (`--allow-skip` to accept it);
 - a required tool is missing (`--require vim,less,top,htop,git` is the default list; `--allow-missing` to accept it): a reimaged Pi must not turn the gate green by quietly dropping the vim scenarios;
 - a gate verb cannot run or exits non-zero, including the final `status` (silence is not "clean");
 - `--only` names a scenario that does not exist (a typo is a usage error, exit 2), or no scenario ran at all (`pi_e2e` is the same);
@@ -213,7 +213,7 @@ Verified, on the Pis and in realnet, as above: every scenario in the tables, wit
 
 Assumed or not covered:
 
-- **ssh behaviour on the Pis** is not measured there: the gate has no shell. ssh's ordered window change (finding 1) is the OpenSSH protocol; its complete scrollback (finding 2) and its leaving the terminal modes as the program had them (finding 4) are from the OpenSSH client and, for the scrollback, the realnet column. **et and mosh** are not installed anywhere in the lab, so claims about them are from their design (mosh skips output as fil does and restores the terminal on exit; et keeps the whole stream).
+- **ssh behaviour on the Pis** is not measured there: the gate has no shell. ssh's ordered window change (finding 1) is the OpenSSH protocol; its complete scrollback (finding 2) and its leaving the terminal modes as the program had them (finding 4) are from the OpenSSH client and, for the scrollback, the realnet column. **et and mosh** are not installed anywhere in the test setup, so claims about them are from their design (mosh skips output as fil does and restores the terminal on exit; et keeps the whole stream).
 - **The terminal is an emulator (`vt100`) behind a pty**, not a real terminal program. Nothing here covers how a particular terminal app renders, scrolls its own scrollback, or handles the mouse, focus events or the clipboard (OSC 52). Terminal queries (device attributes, cursor position) get no answer from the driver, so programs that wait for a reply run on their time-outs.
 - **No second real client machine.** The takeover is two clients on this one Mac.
 - **One network.** The Pis are on the same LAN as the Mac (about 6 ms round trip). Long-haul and mobile cases (Wi-Fi to cellular, a captive portal) exist only as the realnet simulation.

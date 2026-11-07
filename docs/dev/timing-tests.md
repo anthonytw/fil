@@ -46,7 +46,7 @@ Two kinds of bound need telling apart, and they get different treatment.
 
 Tests with a real-time bound under about a second (the ones that can miss on a slow or stalled
 host). Margins are from the Apple-silicon dev Mac at `RUST_TEST_THREADS=4` (quiet) and with six busy
-loops added (burn), the reps listed in the PR. The Orin runner is roughly 2 to 3 times slower per
+loops added (burn), the reps listed in the PR. The aarch64 CI runner is roughly 2 to 3 times slower per
 core than that Mac and cannot be reproduced here: a bound with a margin under 3x on the Mac is at
 risk there even without a stall, and one with a margin of 100x is at risk only from a stall.
 
@@ -80,4 +80,4 @@ a hang misses. Those are left as they are.
 
 The Mac did not miss any bound in 3 quiet runs, 3 runs with six busy loops and 2 runs with sixteen
 (on 14 cores), unchanged or changed alike. It cannot reproduce the runner's failures, which come
-from the container's CPU cap, and the Orin run is the check that counts.
+from the container's CPU cap, and the CI-runner run is the check that counts.

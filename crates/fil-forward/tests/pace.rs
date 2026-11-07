@@ -550,7 +550,7 @@ async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     // A connect the host stalled during (a throttled or descheduled test process: the watcher
     // sees it too) measures the host, not the product, and is not counted: it is tried again. The
     // bound is unchanged, and a sample the host left alone that misses it is a miss. (Run 33 of
-    // the Orin runner: 2 of 200 over 75 ms, with the container throttled.) The target holds each
+    // the aarch64 CI runner: 2 of 200 over 75 ms, with the container throttled.) The target holds each
     // connection for 5 s and a side may have only so many open, so the extra tries are few.
     const MOST_TRIES: usize = CONNECTS + 40;
     const MIN_CLEAN: usize = CONNECTS * 3 / 4;

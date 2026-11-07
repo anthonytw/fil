@@ -882,7 +882,7 @@ fn burst(
     if server_first {
         burst_args.push("--no-shutdown".into());
     }
-    let (text, server) = if !remote {
+    let (text, server, served) = if !remote {
         let _ = c.run("rm -f \"$D\"/echo.out*", CMD_TIMEOUT)?;
         sess_bg(
             c,
@@ -906,8 +906,12 @@ fn burst(
         } else {
             None
         };
+        // A diagnostic only: a failed read leaves it out rather than failing the burst.
+        let served = burst_failed(&text)
+            .then(|| sess_echo_counts(c).ok().map(|e| e.ended))
+            .flatten();
         let _ = c.run("kill %% 2>/dev/null; true", CMD_TIMEOUT)?;
-        (text, server)
+        (text, server, served)
     } else {
         let mut serve = vec![
             "serve".to_string(),
@@ -932,7 +936,8 @@ fn burst(
         } else {
             None
         };
-        (text, server)
+        let served = burst_failed(&text).then(|| echo_counts(&e.text()).ended);
+        (text, server, served)
     };
     let num = |k: &str| kv(&text, k).parse::<u64>().unwrap_or(u64::MAX);
     let (mut ok, mut failed, mut first) = (num("OK"), num("FAILED"), kv(&text, "FIRST_ERROR"));
@@ -944,7 +949,23 @@ fn burst(
             first = bad.first;
         }
     }
+    if let Some(n) = served {
+        // Read as soon as the burst ends, so a lower bound: fewer ended than attempted suggests
+        // the rest never reached the server (lost at the forward's listener, or at its connect
+        // to the server); as many as attempted, that they were lost after it.
+        let note = format!("the echo server had ended {n} connections");
+        first = if first.is_empty() {
+            note
+        } else {
+            format!("{first}; {note}")
+        };
+    }
     Ok((ok, failed, num("MS"), first))
+}
+
+/// A burst output that counts failed connections.
+fn burst_failed(text: &str) -> bool {
+    kv(text, "FAILED").parse::<u64>().is_ok_and(|n| n > 0)
 }
 
 /// What a `serve echo --close-after` output says: connections ended, and the anomalies
@@ -1096,24 +1117,44 @@ fn ephemeral_note() -> String {
     )
 }
 
-/// 200 concurrent connections each way: all exact.
+/// Concurrent connections [`fwd_parallel`] opens each way.
+const PARALLEL: u64 = 200;
+
+/// At most this many of them at once where either end is macOS: its kernel caps every listen
+/// backlog at `kern.ipc.somaxconn` (128 by default, whatever fil asks for) and resets a
+/// connection that arrives at a full one. Each hop's queue holds at most the connections in
+/// flight, so under 128 it cannot overflow. With 200 at once, bursts on an idle Mac sometimes
+/// lost a few dozen; fil's listeners filled no deeper than fwdprobe's own, so it is the
+/// platform's cap, not fil's accept rate (`ssh -L` asks for 128 too).
+const PARALLEL_MACOS: u64 = 100;
+
+/// 200 concurrent connections each way (100 at a time when either end is macOS): all exact.
 pub fn fwd_parallel(ctx: &Ctx, host: &str) -> Res {
     let p = mac_ports();
     let mut c = ctx.fwd_shell(host, Variant::Auto, "fpa", &fwd_args(&p), None)?;
     if !have_fp(ctx, host, &mut c)? {
         return missing("fwdprobe is not installed in the session (docs/m2/pi.md)");
     }
+    let sess_mac = c
+        .run("[ \"$(uname)\" = Darwin ] && echo M$((6*7))", CMD_TIMEOUT)?
+        .lines()
+        .any(|l| l.trim() == "M42");
+    let par = if cfg!(target_os = "macos") || sess_mac {
+        PARALLEL_MACOS
+    } else {
+        PARALLEL
+    };
     let mut notes = Vec::new();
     for remote in [false, true] {
         let dir = if remote { "-R" } else { "-L" };
-        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, remote, 200, 200, false)?;
+        let (ok, failed, t, first) = burst(ctx, host, &mut c, &p, remote, PARALLEL, par, false)?;
         notes.push(format!(
-            "200 concurrent {dir} connections: {ok} echoed exactly, {failed} failed, {}",
+            "{PARALLEL} {dir} connections, {par} at once: {ok} echoed exactly, {failed} failed, {}",
             ms(Duration::from_millis(t))
         ));
-        if ok != 200 || failed != 0 {
+        if ok != PARALLEL || failed != 0 {
             notes.push(format!(
-                "{MISS}200 concurrent {dir}: {ok} ok, {failed} failed ({first})"
+                "{MISS}{PARALLEL} {dir} connections, {par} at once: {ok} ok, {failed} failed ({first})"
             ));
         }
     }

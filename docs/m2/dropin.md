@@ -49,7 +49,7 @@ The client cannot tell the relay from the network: it sees its link go silent, d
 | `fwd_sleep` | the pair across a laptop sleep: the client and its ssh stopped 12 s (`auto`) and 45 s (pipe) | as above (the plan's `fwd_local_sleep`, for `-R` too) |
 | `fwd_local_http` | `-L`; 64 MiB from a server in the session | sha256 equal, one accept; `fil ports --json` from this machine lists the forward with at least 64 MiB down. Measured: MB/s |
 | `fwd_many_short` | 10,000 sequential short connections through `-L` over QUIC | all echoed; no link down, no switch (M1's link died at 1,024) |
-| `fwd_parallel` | 200 concurrent connections through `-L` and through `-R` | all echoed exactly |
+| `fwd_parallel` | 200 concurrent connections through `-L` and through `-R` (100 at a time where either end is macOS, whose kernel caps a listen backlog at 128 and resets what overflows it) | all echoed exactly |
 | `fwd_halfclose` | the client shuts down its write side (both directions) | the server sees EOF after exactly the request; the response arrives exactly |
 | `fwd_rst` | the server resets (both directions) | the client sees a reset, not an EOF |
 | `fwd_remote` | `-R`; a client in the session sends 16 MiB to a server here; then a connection opened 8 s into a 15 s outage on the pipe (the client has seen its link down) | exact, one accept; the late connection waits and goes through, exact, within `open_wait` (30 s) |

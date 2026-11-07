@@ -817,6 +817,13 @@ mod tests {
         rustix::process::getuid().as_raw()
     }
 
+    /// A uid that is not `uid`: root, as on a real host, unless `uid` is root's (tests run as
+    /// root), when it is another (issue #8: as root, root's sshd in [`host`] was the user's own
+    /// listener).
+    fn other_than(uid: u32) -> u32 {
+        if uid == 0 { 1 } else { 0 }
+    }
+
     fn name(s: &str) -> SessionName {
         SessionName::new(s).unwrap()
     }
@@ -878,24 +885,29 @@ mod tests {
 
     const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 
-    /// A fake host: session `main` (scope `fil-aa`) runs vite on 127.0.0.1:5173 and a python
-    /// server on 0.0.0.0:8000; postgres runs outside fil on 127.0.0.1:5432; root runs sshd on
-    /// 0.0.0.0:22; the daemon holds a `-R` listener on 127.0.0.1:9000.
-    fn host() -> FakeProc {
-        let f = FakeProc::new("mod");
-        let me = me();
+    /// [`host`]'s socket table, for a test user `me`.
+    fn host_tcp(me: u32) -> String {
         let mut tcp = HEADER.to_string();
         tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5173, me, 101);
         tcp += &tcp_row(Ipv4Addr::UNSPECIFIED, 8000, me, 102);
         tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5432, me, 103);
-        tcp += &tcp_row(Ipv4Addr::UNSPECIFIED, 22, 0, 104);
+        tcp += &tcp_row(Ipv4Addr::UNSPECIFIED, 22, other_than(me), 104);
         tcp += &tcp_row(Ipv4Addr::LOCALHOST, 9000, me, 105);
         // A second socket on 5173 nobody could attribute (SO_REUSEPORT): still one row.
         tcp += &tcp_row(Ipv4Addr::LOCALHOST, 5173, me, 106);
         // The user's, held by no process found (it exited, or is not dumpable): listed, not
         // probed.
         tcp += &tcp_row(Ipv4Addr::LOCALHOST, 7000, me, 107);
-        f.net("tcp", &tcp);
+        tcp
+    }
+
+    /// A fake host: session `main` (scope `fil-aa`) runs vite on 127.0.0.1:5173 and a python
+    /// server on 0.0.0.0:8000; postgres runs outside fil on 127.0.0.1:5432; root (or, for a test
+    /// run as root, another user: [`other_than`]) runs sshd on 0.0.0.0:22; the daemon holds a
+    /// `-R` listener on 127.0.0.1:9000.
+    fn host() -> FakeProc {
+        let f = FakeProc::new("mod");
+        f.net("tcp", &host_tcp(me()));
         f.process(4100, 1, "vite", "/home/u/app", &[101]);
         f.cgroup(4100, "/user.slice/user@1000.service/app.slice/fil-aa.scope");
         f.process(4200, 4100, "python3", "/home/u/tmp", &[102]);
@@ -941,6 +953,23 @@ mod tests {
             &ScanLimits::default(),
             &Targets::of(&sessions()),
         )
+    }
+
+    /// Issue #8, for the uid this run does not have: [`host`]'s sshd is another user's for a
+    /// test user who is root as much as for anyone else (the socket table's uid filter, which is
+    /// what tests run as root got wrong; CI runs them as an unprivileged user).
+    #[test]
+    fn the_fixtures_other_user_is_never_the_test_user() {
+        for me in [0, 1, 1000, me()] {
+            let f = FakeProc::new("uids");
+            f.net("tcp", &host_tcp(me));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let net = procnet::read(&f.dir, deadline, &procnet::Keep::new([]), me);
+            let split = procnet::split(net.sockets, me);
+            let other: Vec<u16> = split.other.iter().map(|(_, p)| p.get()).collect();
+            assert_eq!(other, vec![22], "test user {me}");
+            assert_eq!(split.own.len(), 6, "test user {me}");
+        }
     }
 
     #[test]

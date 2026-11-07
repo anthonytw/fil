@@ -1644,6 +1644,24 @@ fn bind_direct_with(
     }
 }
 
+/// The most runtime worker threads the daemon starts (fewer on a machine with fewer cores).
+/// tokio's default is one per core, all started up front, and a daemon left for days on a
+/// 64-core build host would hold 64 parked threads for a load that never needs them: the
+/// per-byte work runs on threads of its own (each session's PTY reader, the relay) or in one
+/// task per session or channel, and the workers carry the many small tasks of the attached
+/// sessions and their forwards. Eight leaves room for several busy sessions at once; the test
+/// suites run the whole daemon, its sessions and forwards on 2 to 4 workers, wall-clock bounds
+/// included (`docs/dev/timing-tests.md`), so the cap is above what is tested.
+pub const DAEMON_WORKERS: usize = 8;
+
+/// Runtime worker threads for a process: one per core it may use (as tokio's default counts
+/// them), but at most `cap`, and at least one.
+pub fn worker_threads(cap: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, cap.max(1))
+}
+
 /// The daemon as a process, for `fil server --daemon`. Returns the exit code for `main`.
 ///
 /// In order: detach from the login session (`setsid`; a process that is already a group
@@ -1707,6 +1725,7 @@ pub fn run_daemon_with(paths: &Paths, adjust: impl FnOnce(&mut DaemonConfig)) ->
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(worker_threads(DAEMON_WORKERS))
         .thread_name("fil-daemon")
         .build()
     {

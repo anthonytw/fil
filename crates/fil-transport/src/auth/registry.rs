@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use tokio::sync::watch;
 // tokio's clock, so the listener's sweep and tests on paused time agree on "how long ago".
 use tokio::time::Instant;
 
@@ -29,14 +30,31 @@ struct State {
 /// that already completed their handshake: the listener closes those, a backstop delay after the
 /// revocation (or at once through `QuicListener::revoke`), using [`peer_key`](super::peer_key) to
 /// find the ones that authenticated with the revoked key.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyRegistry {
     state: Arc<Mutex<State>>,
+    /// Bumped after each revocation, so the listener's sweep wakes for one instead of polling.
+    revocations: Arc<watch::Sender<()>>,
+}
+
+impl Default for KeyRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            revocations: Arc::new(watch::Sender::new(())),
+        }
+    }
 }
 
 impl KeyRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Changes after every revocation that removed a key (`revoke`, `revoke_all`). A receiver
+    /// marked seen before it reads the registry misses none (the listener's sweep).
+    pub(crate) fn revocations(&self) -> watch::Receiver<()> {
+        self.revocations.subscribe()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -60,6 +78,10 @@ impl KeyRegistry {
             st.revoked_at.retain(|_, t| t.elapsed() < REVOCATION_MEMORY);
             st.revoked_at.insert(key.clone(), Instant::now());
         }
+        drop(st);
+        if was {
+            self.revocations.send_replace(());
+        }
         was
     }
 
@@ -72,6 +94,10 @@ impl KeyRegistry {
         let now = Instant::now();
         for k in &keys {
             st.revoked_at.insert(k.clone(), now);
+        }
+        drop(st);
+        if !keys.is_empty() {
+            self.revocations.send_replace(());
         }
         keys.len()
     }

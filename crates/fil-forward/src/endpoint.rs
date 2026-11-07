@@ -1049,6 +1049,11 @@ struct Inner<L> {
     pending_kick: Notify,
     /// Events wait for room in the owner's channel.
     events_kick: Notify,
+    /// Signaled where the MUX buffer may have room again for a table message that got
+    /// [`TableError::Full`] (an ack or a resume of the MUX channel, a new epoch), or where
+    /// waiting for room is over (the mux failed, the endpoint shut down): see
+    /// [`Endpoint::table_room`].
+    table_room: Notify,
     /// The current epoch, for the owner's [`EventReceiver`].
     epoch: Arc<std::sync::atomic::AtomicU64>,
     /// This endpoint's share of the process's name resolutions.
@@ -1321,6 +1326,7 @@ impl<L: Link> Endpoint<L> {
             pumps: AtomicUsize::new(0),
             pending_kick: Notify::new(),
             events_kick: Notify::new(),
+            table_room: Notify::new(),
             epoch: epoch_seen.clone(),
             resolvers: crate::connect::endpoint_resolvers(),
             max_held_mux,
@@ -1498,6 +1504,8 @@ impl<L: Link> Endpoint<L> {
         // The queued connections are looked at again now, against the new epoch's policy (a
         // detached session refuses them at once), not when the oldest one's `open_wait` ends.
         inner.pending_kick.notify_one();
+        // The MUX stream starts over, empty.
+        inner.table_room.notify_one();
     }
 
     // ---- what the link delivered --------------------------------------------------------------
@@ -1590,6 +1598,9 @@ impl<L: Link> Endpoint<L> {
         if control {
             inner.kick_ctl();
         }
+        if ch == ChannelId::MUX {
+            inner.table_room.notify_one();
+        }
         r
     }
 
@@ -1603,6 +1614,9 @@ impl<L: Link> Endpoint<L> {
         inner.drain(&mut st);
         drop(st);
         inner.kick();
+        if ch == ChannelId::MUX {
+            inner.table_room.notify_one();
+        }
         r
     }
 
@@ -1623,14 +1637,31 @@ impl<L: Link> Endpoint<L> {
     // ---- the forward table -------------------------------------------------------------------
 
     /// Sends a forward-table message ([`Mux::send_table`]): refused with [`TableError::Full`]
-    /// when the MUX buffer is past three quarters, and nothing changes.
+    /// when the MUX buffer is past three quarters, and nothing changes; with
+    /// [`TableError::Closed`] once the endpoint is shut down.
     pub fn send_table(&self, msg: MuxMsg) -> Result<(), TableError> {
         let inner = self.inner();
         let mut st = lock(&inner.state);
+        if st.closed {
+            // As for a failed mux: a caller waiting for room ([`Endpoint::table_room`]) drops
+            // what it holds instead of waiting for room that never comes.
+            return Err(TableError::Closed);
+        }
         let r = st.mux.send_table(msg);
         drop(st);
         inner.kick();
         r
+    }
+
+    /// Returns when a table message that got [`TableError::Full`] may be worth trying again:
+    /// the MUX buffer may have room (the peer acknowledged or resumed the MUX stream, or a new
+    /// epoch emptied it), or no message will ever wait for room again (the mux failed, the
+    /// endpoint shut down), so the caller's retry gets that error (`Failed`, `Closed`) and
+    /// drops what it holds. Spurious returns happen (a signal from before the caller started
+    /// waiting is kept, as with [`Notify::notify_one`]); none is lost. One waiter at a time: the
+    /// owner of the forward table.
+    pub async fn table_room(&self) {
+        self.inner().table_room.notified().await;
     }
 
     // ---- local connections -------------------------------------------------------------------
@@ -2021,6 +2052,8 @@ impl<L: Link> Inner<L> {
         for (_, h) in st.handshakes.drain() {
             h.abort();
         }
+        drop(st);
+        self.table_room.notify_one();
     }
 
     /// Takes the queued connections accepted on `l` out of the queue.
@@ -2125,6 +2158,7 @@ impl<L: Link> Inner<L> {
             st.failed_told = true;
             debug!(error = %e, "forward mux failed");
             st.emit(EndpointEvent::Failed(e.clone()));
+            self.table_room.notify_one();
         }
     }
 

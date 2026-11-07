@@ -1098,12 +1098,12 @@ async fn revoking_in_the_registry_alone_closes_live_links_only_after_the_backsto
         "{err:?}"
     );
 
-    // Still open just before the backstop (the sweep has run several times by now).
+    // Still open just before the backstop (the sweep woke for the revocation).
     tokio::time::sleep_until(revoked + Duration::from_millis(2900)).await;
     assert!(matches!(client.status().borrow().state, LinkState::Up));
     assert_eq!(w.listener.live_connections(), 1);
 
-    // Closed soon after it: the sweep runs every 500 ms.
+    // Closed soon after it: the sweep wakes when the backstop ends.
     let mut cs = client.status();
     let st = wait_for(&mut cs, "client Down", is_down).await;
     assert_eq!(down_reason(&st), DownReason::Closed);
@@ -1114,30 +1114,37 @@ async fn revoking_in_the_registry_alone_closes_live_links_only_after_the_backsto
     );
 }
 
-/// Efficiency sweep #6: the sweep used to tick twice a second for the life of the daemon, so a
-/// daemon with direct mode on and nothing connected never slept. It now runs only while a
-/// connection is live, and a connection that arrives after a long idle is still swept.
+/// Efficiency sweep #6 and 0.1.0 sweep EFF-3: the sweep used to tick twice a second for the
+/// life of the daemon, then for as long as a connection was live. It now wakes only for a
+/// revocation and when that revocation's backstop ends: not with nothing connected, not for a
+/// live link nobody revokes, and a revocation after a long quiet still closes the link.
 #[tokio::test(start_paused = true)]
-async fn the_listener_sweeps_only_while_connections_are_live() {
+async fn the_listener_sweeps_only_for_revocations() {
     let mut w = World::with(64, |c, _| c.revoke_backstop = Duration::from_secs(2));
     sleep(Duration::from_secs(30)).await;
     assert_eq!(w.listener.sweeps(), 0, "swept with nothing to sweep");
 
     let (client, daemon, key) = w.pair().await;
-    sleep(Duration::from_secs(5)).await;
-    let busy = w.listener.sweeps();
-    assert!(busy >= 4, "the sweep did not run for a live link: {busy}");
+    sleep(Duration::from_secs(30)).await;
+    assert_eq!(w.listener.sweeps(), 0, "swept a live link nobody revoked");
 
-    // A revocation made in the registry alone still closes the link after the backstop, though
-    // the sweep slept for 30 s before this connection woke it.
+    // A revocation made in the registry alone still closes the link after the backstop.
     let mut ds = daemon.status();
+    let revoked = Instant::now();
     w.registry.revoke(key.public_key());
     wait_for(&mut ds, "daemon Down", is_down).await;
+    assert!(
+        revoked.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        revoked.elapsed()
+    );
     drop((client, daemon));
-
-    // Once the connection is gone the sweep goes back to sleep.
+    // Once for the revocation, once when its backstop ended.
     sleep(Duration::from_secs(2)).await;
     let after = w.listener.sweeps();
+    assert!(after <= 3, "{after} sweeps for one revocation");
+
+    // Nothing pending: the sweep sleeps.
     sleep(Duration::from_secs(30)).await;
     assert_eq!(w.listener.sweeps(), after, "the sweep kept ticking");
 }

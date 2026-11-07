@@ -95,8 +95,8 @@ jobs:
           just --version; cargo deny --version; cargo about --version; python3 --version; nproc
           echo "build directory: $CARGO_TARGET_DIR (${{ github.event_name }})"
       - name: just ci (as an unprivileged user, umask 022)
-        # Not root: fil-daemon's /proc tests (ports::tests) assume the tests are not run as root, and
-        # PR code has no business running as root here anyway. The jobs also start with umask 002,
+        # Not root: PR code has no business running as root here (fil-daemon's ports::tests no
+        # longer need it, issue #8, and no test is checked as root). The jobs also start with umask 002,
         # which fil-client's offline-log test cannot take (it refuses a group-writable log directory).
         run: |
           useradd -m -u 1000 ci

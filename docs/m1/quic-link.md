@@ -52,7 +52,7 @@ Defaults: a source gets a burst of 8 and one token a second; the port gets a bur
 
 ### Revocation
 
-The listener keeps every live connection with the key it authenticated with. `QuicListener::revoke(key)` removes the key from the registry and closes that key's connections at once (the client sees `Down(Closed)`). A `registry.revoke` that skips the listener blocks new handshakes at once, and a sweep (every 500 ms) closes the key's live connections once `ListenerConfig::revoke_backstop` (2 s by default) has passed since the revocation, so the layer above can send its last message (a takeover notice) first. This is safe because the session has already stopped reading from and writing to a connection whose subscriber lost the session. A key that is revoked while its handshake is finishing is caught by a check after the handshake.
+The listener keeps every live connection with the key it authenticated with. `QuicListener::revoke(key)` removes the key from the registry and closes that key's connections at once (the client sees `Down(Closed)`). A `registry.revoke` that skips the listener blocks new handshakes at once, and a sweep closes the key's live connections once `ListenerConfig::revoke_backstop` (2 s by default) has passed since the revocation (it wakes for the revocation and again when the backstop ends, never on a period), so the layer above can send its last message (a takeover notice) first. This is safe because the session has already stopped reading from and writing to a connection whose subscriber lost the session. A key that is revoked while its handshake is finishing is caught by a check after the handshake.
 
 ### Channels and priorities
 

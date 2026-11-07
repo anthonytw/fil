@@ -146,6 +146,10 @@ pub enum TableError {
     /// The mux had already failed.
     #[error(transparent)]
     Failed(#[from] MuxError),
+    /// The endpoint the mux belongs to was shut down: nothing will ever carry the message.
+    /// Never returned by [`Mux::send_table`] itself (the endpoint says it).
+    #[error("the endpoint is shut down")]
+    Closed,
 }
 
 /// The smallest send buffer a channel is given when the budget is short.

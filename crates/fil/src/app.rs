@@ -18,6 +18,12 @@ use crate::install::attach::Offer;
 use crate::install::fallback::{Command as InstallCommand, Next, Run};
 use crate::{cmds, logging, server};
 
+/// The most runtime worker threads a client starts (fewer on a machine with fewer cores), rather
+/// than tokio's one per core. A client has a few concurrent tasks (the engine, the terminal, the
+/// link and its dialer, the forwards' pumps), and its per-byte work is one engine task; the
+/// suites run it on 2 to 4 workers, the wall-clock bounds included (`docs/dev/timing-tests.md`).
+const CLIENT_WORKERS: usize = 4;
+
 /// How long the message printed after a run may take to reach the terminal.
 const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -85,6 +91,7 @@ pub fn main() -> ExitCode {
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(fil_daemon::daemon::worker_threads(CLIENT_WORKERS))
         .build()
     {
         Ok(rt) => rt,

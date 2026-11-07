@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, EndpointConfig, Incoming, TokioRuntime};
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -16,9 +16,6 @@ use super::link::QuicLink;
 use super::{DEFAULT_PORT_RANGE, server_config};
 use crate::auth::{self, AuthError, DaemonIdentity, KeyRegistry, PublicKey};
 use crate::link::LinkParams;
-
-/// How often live connections are checked against the key registry.
-const SWEEP_EVERY: Duration = Duration::from_millis(500);
 
 /// The default for [`ListenerConfig::revoke_backstop`].
 pub const DEFAULT_REVOKE_BACKSTOP: Duration = Duration::from_secs(2);
@@ -125,9 +122,7 @@ fn bump(c: &AtomicU64) {
 #[derive(Default)]
 struct Live {
     conns: Mutex<Vec<(PublicKey, Connection)>>,
-    /// Wakes the sweep: a connection was added to an empty list.
-    added: Notify,
-    /// How often the sweep has run (a wakeup counter for tests).
+    /// How often the sweep has woken up (a wakeup counter for tests).
     #[cfg(feature = "test-hooks")]
     sweeps: AtomicU64,
 }
@@ -137,9 +132,12 @@ impl Live {
         self.conns.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Lists a connection, and forgets those that have closed: the sweep wakes only for a
+    /// revocation, so the list is kept short here.
     fn add(&self, key: PublicKey, conn: Connection) {
-        self.lock().push((key, conn));
-        self.added.notify_one();
+        let mut conns = self.lock();
+        conns.retain(|(_, c)| c.close_reason().is_none());
+        conns.push((key, conn));
     }
 }
 
@@ -269,8 +267,8 @@ impl QuicListener {
         closed
     }
 
-    /// How many times the sweep has woken up (feature `test-hooks`): it sleeps while no
-    /// connection is live, and a test keeps that so.
+    /// How many times the sweep has woken up (feature `test-hooks`): it sleeps until a
+    /// revocation, then until that revocation's backstop ends, and a test keeps that so.
     #[cfg(feature = "test-hooks")]
     pub fn sweeps(&self) -> u64 {
         self.0.live.sweeps.load(Ordering::Relaxed)
@@ -406,35 +404,52 @@ impl AcceptLoop {
 /// A key that is not registered and has no recent revocation on record (it never was, or the
 /// record is older than the sweep keeps) is closed at once.
 ///
-/// The sweep only has work while a connection is live, so it sleeps while the list is empty and
-/// the first connection wakes it (efficiency sweep #6). A daemon that holds detached sessions for
-/// days with direct mode on used to wake twice a second for all of that time.
+/// The sweep wakes only for a revocation in the registry and then at the moment the earliest
+/// pending one's backstop ends, never on a period (efficiency sweeps #6 and EFF-3): an attached
+/// QUIC session with no revocation costs it no wakeups. The registry's change signal is marked
+/// seen before the registry is read, so a revocation made while a pass runs wakes the next.
 async fn sweep(registry: KeyRegistry, live: Arc<Live>, backstop: Duration) {
-    let every = SWEEP_EVERY.min(backstop / 2).max(Duration::from_millis(10));
+    let mut revocations = registry.revocations();
     loop {
-        // Wait for a connection to sweep. `notify_one` leaves a permit, so an add between the
-        // check and the wait is not lost.
-        while live.lock().is_empty() {
-            live.added.notified().await;
+        revocations.borrow_and_update();
+        let next = sweep_once(&registry, &live, backstop);
+        tokio::select! {
+            changed = revocations.changed() => {
+                // The sender lives in the registry, which this task holds: never closed.
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(next.unwrap_or_default()), if next.is_some() => {}
         }
-        tokio::time::sleep(every).await;
         #[cfg(feature = "test-hooks")]
         live.sweeps.fetch_add(1, Ordering::Relaxed);
-        live.lock().retain(|(key, conn)| {
-            if conn.close_reason().is_some() {
-                return false;
-            }
-            if registry.contains(key) {
-                return true;
-            }
-            if registry.revoked_ago(key).is_some_and(|ago| ago < backstop) {
-                return true;
-            }
-            QuicLink::close_revoked(conn);
-            false
-        });
-        registry.forget_revocations_older_than(backstop * 2);
     }
+}
+
+/// One pass of [`sweep`]: closes what is due, and returns how long until the next pending
+/// revocation's backstop ends (`None`: nothing is pending).
+fn sweep_once(registry: &KeyRegistry, live: &Live, backstop: Duration) -> Option<Duration> {
+    let mut next: Option<Duration> = None;
+    live.lock().retain(|(key, conn)| {
+        if conn.close_reason().is_some() {
+            return false;
+        }
+        if registry.contains(key) {
+            return true;
+        }
+        if let Some(ago) = registry.revoked_ago(key)
+            && ago < backstop
+        {
+            let left = backstop - ago;
+            next = Some(next.map_or(left, |n| n.min(left)));
+            return true;
+        }
+        QuicLink::close_revoked(conn);
+        false
+    });
+    registry.forget_revocations_older_than(backstop * 2);
+    next
 }
 
 /// Binds a UDP socket. A socket bound to an IPv6 address gets `IPV6_V6ONLY` switched off first,

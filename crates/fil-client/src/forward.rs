@@ -934,14 +934,19 @@ struct Manager<L: Link> {
     /// refused and forgotten does not set it, so a flood costs no more than its refusals.
     dirty: bool,
     /// Table messages the MUX buffer had no room for, in order, sent as room appears
-    /// ([`Manager::flush`]). While any wait, no further event is taken ([`Manager::run`]), so the
-    /// host's flood waits (unacknowledged) in the endpoint instead of here: the queue holds only
-    /// what the one event or answer being handled produced.
+    /// ([`Manager::flush`], woken by [`Endpoint::table_room`], not by a timer). While any wait,
+    /// no further event is taken ([`Manager::run`]), so the host's flood waits (unacknowledged)
+    /// in the endpoint instead of here: the queue holds only what the one event or answer being
+    /// handled produced.
     outbox: VecDeque<MuxMsg>,
 }
 
-/// How long the manager waits before it tries again to send what the MUX buffer had no room for.
-const OUTBOX_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
+#[cfg(test)]
+thread_local! {
+    /// Turns of [`Manager::run`]'s loop on this thread (tests: a manager on a current-thread
+    /// runtime that wakes for nothing shows here).
+    static RUN_TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 impl<L: Link> Manager<L> {
     async fn run(
@@ -981,7 +986,10 @@ impl<L: Link> Manager<L> {
                         self.unanswered();
                     }
                 }
-                () = tokio::time::sleep(OUTBOX_RETRY), if !self.outbox.is_empty() => {}
+                // Room in the MUX buffer (an ack from the host), or a mux that will never have
+                // any: `flush` below tries again. No timer: a host that never acknowledges costs
+                // no wakeups.
+                () = self.ep.table_room(), if !self.outbox.is_empty() => {}
                 // Not while answers wait for room: the host's messages stay unacknowledged in
                 // the endpoint, which is what stops a flood.
                 ev = events.recv_with_epoch(), if self.outbox.is_empty() => match ev {
@@ -989,6 +997,8 @@ impl<L: Link> Manager<L> {
                     Some((epoch, ev)) => self.on_event(epoch, ev),
                 },
             }
+            #[cfg(test)]
+            RUN_TURNS.with(|t| t.set(t.get() + 1));
             self.flush();
             if std::mem::take(&mut self.dirty) {
                 self.refresh_view();
@@ -1764,8 +1774,14 @@ mod tests {
 
     /// A manager with no own forwards, not running: the tests call its handlers.
     fn manager() -> (Manager<MemLink>, NotesRx) {
+        let (m, rx, _events) = manager_and_events();
+        (m, rx)
+    }
+
+    /// [`manager`], and its endpoint's events, for a test that runs it.
+    fn manager_and_events() -> (Manager<MemLink>, NotesRx, EventReceiver) {
         let grants = Arc::new(Mutex::new(Grants::default()));
-        let (ep, _events) = Endpoint::<MemLink>::new(
+        let (ep, events) = Endpoint::<MemLink>::new(
             Side::Client,
             Default::default(),
             Arc::new(ClientConnector(grants.clone(), None)),
@@ -1798,7 +1814,7 @@ mod tests {
             outbox: VecDeque::new(),
             view: Arc::new(Mutex::new(View::default())),
         };
-        (m, rx)
+        (m, rx, events)
     }
 
     fn rspec(port: u16) -> ForwardSpec {
@@ -1858,6 +1874,113 @@ mod tests {
         // Still no room: flushing sends nothing and loses nothing.
         m.flush();
         assert_eq!(m.outbox.len(), 51);
+    }
+
+    /// What waits in the outbox goes as soon as the host acknowledges the MUX stream, woken by
+    /// the ack and not by a timer, and while nothing is acknowledged the manager does not wake
+    /// at all (issue #18: it retried every 2 ms, 500 wakeups a second for as long as the host
+    /// sat on its acks). The clock is paused: a timer in the manager would show as turns of its
+    /// loop while the test sleeps, and the send after the ack takes no time at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_outbox_goes_when_room_appears_and_waits_without_a_timer() {
+        use fil_transport::link::{Link as _, LinkKind, mem};
+
+        let (mut m, _notes, events) = manager_and_events();
+        let mut next = 0u32;
+        while m.outbox.is_empty() {
+            assert!(next < 1_000_000, "the buffer never filled");
+            m.other(ForwardId(next), rspec(22));
+            next += 1;
+        }
+        for _ in 0..50 {
+            m.other(ForwardId(next), rspec(22));
+            next += 1;
+        }
+        // The bytes the 51 waiting refusals take in the MUX stream, in order.
+        let waiting: usize = (next - 51..next)
+            .map(|id| {
+                fil_proto::mux::encode_record(&MuxMsg::Consent {
+                    id: ForwardId(id),
+                    accepted: false,
+                })
+                .unwrap()
+                .len()
+            })
+            .sum();
+        let ep = m.ep.clone();
+        let full = ep.snapshot().mux_buffered;
+        let (_router, from_router) = mpsc::unbounded_channel();
+        let run = tokio::spawn(m.run(from_router, events));
+
+        // Nothing acknowledges: the manager sleeps, the outbox waits, nothing is lost.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let idle_from = RUN_TURNS.with(std::cell::Cell::get);
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            RUN_TURNS.with(std::cell::Cell::get),
+            idle_from,
+            "the manager woke with nothing to do"
+        );
+        assert_eq!(ep.snapshot().mux_buffered, full);
+
+        // The host reads the MUX stream and acknowledges all of it.
+        let (ours, host, _ctl) = mem::pair(LinkKind::Pipe, 1 << 16);
+        ep.attach_link(Arc::new(ours), false);
+        let mut got = 0usize;
+        while got < full {
+            let (ch, payload) = host.recv().await.unwrap();
+            if ch == ChannelId::MUX {
+                // A sequence varint (the offset), then the bytes.
+                let mut skip = 0;
+                while payload[skip] & 0x80 != 0 {
+                    skip += 1;
+                }
+                got += payload.len() - skip - 1;
+            }
+        }
+        assert_eq!(got, full);
+        let before = tokio::time::Instant::now();
+        ep.on_ack(ChannelId::MUX, full as u64).unwrap();
+        for _ in 0..100 {
+            if ep.snapshot().mux_buffered == waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // All 51, at once: the buffer holds exactly them (sent, now unacknowledged).
+        assert_eq!(ep.snapshot().mux_buffered, waiting);
+        assert_eq!(before.elapsed(), std::time::Duration::ZERO);
+        run.abort();
+    }
+
+    /// A shut-down endpoint ends the wait for room: [`Endpoint::table_room`] returns, and the
+    /// retry gets `Closed` and drops what waits, as on a failed mux, instead of the outbox
+    /// waiting for room that never comes (review of PR #35).
+    #[tokio::test(start_paused = true)]
+    async fn a_shut_down_endpoint_empties_the_outbox() {
+        let (mut m, _rx) = manager();
+        let mut next = 0u32;
+        while m.outbox.is_empty() {
+            assert!(next < 1_000_000, "the buffer never filled");
+            m.other(ForwardId(next), rspec(22));
+            next += 1;
+        }
+        let wait = std::time::Duration::from_secs(10);
+        assert!(
+            tokio::time::timeout(wait, m.ep.table_room()).await.is_err(),
+            "room signaled with nothing acknowledged"
+        );
+        m.ep.shutdown();
+        assert!(tokio::time::timeout(wait, m.ep.table_room()).await.is_ok());
+        m.flush();
+        assert!(m.outbox.is_empty());
+        assert_eq!(
+            m.ep.send_table(MuxMsg::Consent {
+                id: ForwardId(next),
+                accepted: false,
+            }),
+            Err(TableError::Closed)
+        );
     }
 
     /// An answer counts only for the question it answers: one given to an earlier question

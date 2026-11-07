@@ -8,6 +8,13 @@
 # JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and may
 # mount only the runner's three named cache volumes. Nothing here uses a secret; the job token is
 # read-only for this repo and is used only for the fetch.
+#
+# The volumes outlive the job, so what PR code (a dependency's build script, say) writes there must
+# not reach a later job: crate sources and downloads are fetched fresh each run (only the registry
+# index is kept; every crate is checked against Cargo.lock again), the tools are installed by root
+# into a root-owned directory the unprivileged user cannot write, a push to main builds in a fresh
+# target directory (no PR's build output can decide main's result), and musl mounts nothing. A PR
+# can still edit this file; that part is the runner's to enforce (#9).
 name: ci
 
 on:
@@ -37,9 +44,11 @@ jobs:
         - fil-ci-cargo-git:/usr/local/cargo/git
         - fil-ci-target:/cache/target
     env:
-      CARGO_TARGET_DIR: /cache/target
-      # The tools live in the registry volume, which survives between jobs.
-      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools
+      # PRs share a warm build cache; a push to main builds from nothing.
+      CARGO_TARGET_DIR: ${{ github.event_name == 'push' && '/tmp/fil-target' || '/cache/target' }}
+      # The tools live in the registry volume, which survives between jobs, in a directory only
+      # root writes (with its own cargo home, so no ci-writable crate source is built as root).
+      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools-root
       CARGO_TERM_COLOR: never
       # The container sees every core of the host but is capped at 6 CPUs: the default (one test
       # thread per core) oversubscribes it and starves tests that wait on real time.
@@ -55,8 +64,20 @@ jobs:
         run: rustup toolchain install && rustc --version
       - name: Packages (systemd-tmpfiles, which crates/fil-daemon/tests/tmp_clean.rs runs for real)
         run: apt-get update -qq && apt-get install -y -qq systemd-standalone-tmpfiles
+      - name: Fresh crate sources (only the registry index survives between jobs)
+        # The registry's own directory stays root's: whoever owns it can rename the tools' directory.
+        run: |
+          chown root:root /usr/local/cargo/registry && chmod 755 /usr/local/cargo/registry
+          rm -rf /usr/local/cargo/registry/src /usr/local/cargo/registry/cache /usr/local/cargo/git/* /usr/local/cargo/registry/fil-tools
       - name: Tools (versions as in .github/workflows/linux-check.yml; cached in the registry volume)
         run: |
+          # Made by root alone: an older one may be ci's (or a link), from before the registry
+          # directory was root's.
+          if [ -L "$CARGO_INSTALL_ROOT" ] || { [ -e "$CARGO_INSTALL_ROOT" ] && [ "$(stat -c %u "$CARGO_INSTALL_ROOT")" != 0 ]; }; then
+            rm -rf "$CARGO_INSTALL_ROOT"
+          fi
+          mkdir -p "$CARGO_INSTALL_ROOT/home"
+          chown -R root:root "$CARGO_INSTALL_ROOT" && chmod -R go-w "$CARGO_INSTALL_ROOT"
           echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
           export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
           install_tool() { # crate version [extra cargo-install args]
@@ -64,20 +85,24 @@ jobs:
             if cargo install --list | grep -q "^$crate v$ver:"; then
               echo "$crate $ver cached"
             else
-              cargo install --locked "$crate" --version "$ver" "$@"
+              # Its own home and target directory: nothing ci wrote is built into a root tool.
+              CARGO_HOME="$CARGO_INSTALL_ROOT/home" CARGO_TARGET_DIR="$(mktemp -d)" cargo install --locked "$crate" --version "$ver" "$@"
             fi
           }
           install_tool just 1.59.0
           install_tool cargo-deny 0.20.2
           install_tool cargo-about 0.9.3 --features cli
           just --version; cargo deny --version; cargo about --version; python3 --version; nproc
+          echo "build directory: $CARGO_TARGET_DIR (${{ github.event_name }})"
       - name: just ci (as an unprivileged user, umask 022)
         # Not root: fil-daemon's /proc tests (ports::tests) assume the tests are not run as root, and
         # PR code has no business running as root here anyway. The jobs also start with umask 002,
         # which fil-client's offline-log test cannot take (it refuses a group-writable log directory).
         run: |
           useradd -m -u 1000 ci
-          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" /usr/local/cargo/registry /usr/local/cargo/git
+          # Everything ci may write, and nothing more: not the tools ($CARGO_INSTALL_ROOT).
+          mkdir -p "$CARGO_TARGET_DIR" /usr/local/cargo/registry/index /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" /usr/local/cargo/registry/index /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git
           chown ci:ci /usr/local/cargo
           HOME=/home/ci setpriv --reuid=ci --regid=ci --init-groups sh -c 'umask 022; just ci'
 
@@ -86,14 +111,9 @@ jobs:
     runs-on: orin-aarch64
     timeout-minutes: 60
     # A smoke test that the static targets still build, not the release path (that is `cross` in
-    # Cross.toml, on GitHub). Only the two cargo caches are mounted; the target directory is fresh
-    # so that no shared build output can end up in these binaries.
-    container:
-      volumes:
-        - fil-ci-cargo-registry:/usr/local/cargo/registry
-        - fil-ci-cargo-git:/usr/local/cargo/git
+    # Cross.toml, on GitHub). It mounts no volume: it runs PR code as root, so nothing it writes may
+    # outlive the job, and no shared build output can end up in these binaries.
     env:
-      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools
       CARGO_TERM_COLOR: never
       ZIG_VERSION: "0.16.0"
       ZIG_SHA256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
@@ -114,11 +134,7 @@ jobs:
           echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
           mkdir -p /opt/zig && tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C /opt/zig --strip-components=1
           echo /opt/zig >> "$GITHUB_PATH"
-          export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
-          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
-          if cargo install --list | grep -q '^cargo-zigbuild v0.24.1:'; then echo "cargo-zigbuild cached"; else
-            cargo install --locked cargo-zigbuild --version 0.24.1
-          fi
+          cargo install --locked cargo-zigbuild --version 0.24.1
           /opt/zig/zig version; cargo install --list | grep '^cargo-zigbuild'
       - name: Build fil, aarch64-unknown-linux-musl (native, musl-gcc)
         env:

@@ -28,6 +28,11 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 tracing = "0.1"
 vte = "0.15"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The process table for the tree scope, `sysctl(KERN_PROC_ALL)` (`proc::kinfo`): rustix has no
+# `sysctl`. Already in the graph (the `fil` crate's `localtime_r`).
+libc = "0.2"
+
 [[bin]]
 # The descriptor-limit trampoline for this crate's tests (`nofile`); never built otherwise.
 name = "fil-session-exec"

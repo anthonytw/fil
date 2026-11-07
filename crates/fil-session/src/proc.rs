@@ -392,7 +392,7 @@ pub fn parse_ps(out: &str) -> Vec<ProcRow> {
 /// How old [`list_processes`] may let the table it returns be.
 ///
 /// The tree fallback records descendants every few seconds, per session. Each scan reads every
-/// process (a `ps` on macOS, `/proc/*/stat` on Linux), so N sessions scanning on their own
+/// process (`/proc/*/stat` on Linux, one `sysctl` on macOS, `ps` elsewhere), so N sessions scanning on their own
 /// clocks cost N scans per interval for the same table. Sessions that ask within this age share
 /// one scan. It is well under the recording interval, so it costs the recording a little
 /// freshness at most; teardown never uses it.
@@ -473,6 +473,28 @@ pub fn scan_processes() -> Vec<ProcRow> {
             })
             .collect();
     }
+    scan_without_proc()
+}
+
+/// macOS: the kernel's process table, read in-process with `sysctl(KERN_PROC_ALL)`, which is
+/// what `ps` reads. Forking `ps` for it took about 25 to 50 ms a scan (on 1,400 processes), every
+/// 5 s for a tree session's whole life and every 10 to 20 ms during a kill; this takes about
+/// 0.15 ms. `proc_pidinfo` would be the documented alternative, but it refuses other users'
+/// processes, and a session's tree can pass through one (`sudo -u $USER ...`).
+#[cfg(target_os = "macos")]
+fn scan_without_proc() -> Vec<ProcRow> {
+    match kinfo::read_all() {
+        Ok(buf) => kinfo::parse(&buf),
+        Err(e) => {
+            tracing::debug!(error = %e, "sysctl(KERN_PROC_ALL) failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Elsewhere (no `/proc`, not macOS): `ps`.
+#[cfg(not(target_os = "macos"))]
+fn scan_without_proc() -> Vec<ProcRow> {
     let mut ps = Command::new("ps");
     ps.args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
         .env("LC_ALL", "C");
@@ -480,6 +502,112 @@ pub fn scan_processes() -> Vec<ProcRow> {
     ps.output()
         .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
+}
+
+/// The macOS process table as `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)` returns it: an array
+/// of `struct kinfo_proc` (`<sys/sysctl.h>`). libc does not define that struct, and rustix has no
+/// `sysctl`, so the buffer is read as bytes at the offsets of the three fields used; the
+/// offsets are the same on arm64 and x86_64 (checked against the SDK headers with
+/// `_Static_assert` for both, and by `the_macos_table_matches_ps` below at run time).
+#[cfg(any(target_os = "macos", test))]
+mod kinfo {
+    use super::ProcRow;
+
+    /// `sizeof(struct kinfo_proc)`.
+    pub(super) const SIZE: usize = 648;
+    /// `kp_proc.p_un.__p_starttime`, a `struct timeval`: `tv_sec` (i64), then `tv_usec` (i32).
+    const START_SEC: usize = 0;
+    const START_USEC: usize = 8;
+    /// `kp_proc.p_stat`, a `char`.
+    const STAT: usize = 36;
+    /// `kp_proc.p_pid`, an `int`.
+    const PID: usize = 40;
+    /// `kp_eproc.e_ppid`, an `int`.
+    const PPID: usize = 560;
+    /// `SZOMB` in `<sys/proc.h>`.
+    const SZOMB: u8 = 5;
+
+    /// Rows from the buffer `sysctl` filled. A trailing partial entry (there is none from the
+    /// kernel) is ignored.
+    pub(super) fn parse(buf: &[u8]) -> Vec<ProcRow> {
+        let i32_at = |k: &[u8], o: usize| i32::from_ne_bytes(k[o..o + 4].try_into().expect("4"));
+        let (entries, _partial) = buf.as_chunks::<SIZE>();
+        entries
+            .iter()
+            .filter_map(|k| {
+                let pid = u32::try_from(i32_at(k, PID)).ok()?;
+                let ppid = u32::try_from(i32_at(k, PPID)).ok()?;
+                let sec = i64::from_ne_bytes(k[START_SEC..START_SEC + 8].try_into().expect("8"));
+                let usec = i32_at(k, START_USEC);
+                Some(ProcRow {
+                    pid,
+                    ppid,
+                    start: format!("{sec}.{usec:06}"),
+                    zombie: k[STAT] == SZOMB,
+                })
+            })
+            .collect()
+    }
+
+    /// The raw table. The size is asked for first; the table can grow before the second call,
+    /// so there is headroom, and `ENOMEM` (it grew past that) is retried a few times.
+    #[cfg(target_os = "macos")]
+    pub(super) fn read_all() -> std::io::Result<Vec<u8>> {
+        let mut last = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        for _ in 0..4 {
+            let need = sysctl_proc_all(None)?;
+            let mut buf = vec![0u8; need + need / 8 + 16 * SIZE];
+            match sysctl_proc_all(Some(&mut buf)) {
+                Ok(len) => {
+                    buf.truncate(len);
+                    return Ok(buf);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// One `sysctl(KERN_PROC_ALL)` call: with no buffer, the size the table needs; with one, the
+    /// bytes written to it.
+    ///
+    /// The `unsafe` block is the FFI call, with:
+    ///
+    /// - `mib`, a live local array of the three names passed as its length;
+    /// - `oldp` either null (a size query) or `buf`'s pointer, and `oldlenp` pointing at a live
+    ///   local holding `buf`'s length, so the kernel writes at most that many bytes into it and
+    ///   stores the count it wrote;
+    /// - no new value (`newp` null, `newlen` 0): this only reads.
+    ///
+    /// Nothing is read from `buf` here; [`parse`] reads it as plain bytes, so no layout is
+    /// assumed by the type system and a wrong offset can only give a wrong number, never
+    /// undefined behavior.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    fn sysctl_proc_all(buf: Option<&mut [u8]>) -> std::io::Result<usize> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+        let (ptr, mut len) = match buf {
+            Some(b) => (b.as_mut_ptr().cast::<libc::c_void>(), b.len()),
+            None => (std::ptr::null_mut(), 0),
+        };
+        // SAFETY: see the function's documentation.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                ptr,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 {
+            Ok(len)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
 }
 
 /// Every process below `root` in the table (not `root` itself).
@@ -1005,6 +1133,97 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].start, "Mon Nov 2 10:01:02 2026");
         assert!(rows[2].zombie);
+    }
+
+    #[test]
+    fn kinfo_proc_entries_are_read_at_their_offsets() {
+        let entry = |pid: i32, ppid: i32, stat: u8, sec: i64, usec: i32| {
+            let mut k = vec![0xAAu8; kinfo::SIZE];
+            k[0..8].copy_from_slice(&sec.to_ne_bytes());
+            k[8..12].copy_from_slice(&usec.to_ne_bytes());
+            k[36] = stat;
+            k[40..44].copy_from_slice(&pid.to_ne_bytes());
+            k[560..564].copy_from_slice(&ppid.to_ne_bytes());
+            k
+        };
+        let mut buf = entry(500, 1, 2, 1_794_000_000, 42);
+        buf.extend(entry(501, 500, 5, 1_794_000_001, 999_999));
+        // A negative pid is not a process; a trailing partial entry is ignored.
+        buf.extend(entry(-1, 1, 2, 0, 0));
+        buf.extend([0u8; 10]);
+        let rows = kinfo::parse(&buf);
+        assert_eq!(
+            rows,
+            [
+                ProcRow {
+                    pid: 500,
+                    ppid: 1,
+                    start: "1794000000.000042".into(),
+                    zombie: false
+                },
+                ProcRow {
+                    pid: 501,
+                    ppid: 500,
+                    start: "1794000001.999999".into(),
+                    zombie: true
+                },
+            ]
+        );
+    }
+
+    /// The offsets in `kinfo` against the real kernel: this process, a running child and a
+    /// zombie child are found with the right parents and states, and the table is the one `ps`
+    /// shows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_table_matches_ps() {
+        let mut zombie = Command::new("true").spawn().unwrap();
+        let mut running = Command::new("sleep").arg("30").spawn().unwrap();
+        let me = std::process::id();
+        // `true` has exited (and is a zombie until waited for) once `ps` no longer shows it
+        // running; give it up to 5 s on a loaded machine.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = scan_processes();
+            if rows.iter().any(|r| r.pid == zombie.id() && r.zombie) || Instant::now() > deadline {
+                break rows;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let find = |pid: u32| rows.iter().find(|r| r.pid == pid).cloned();
+        let z = find(zombie.id()).expect("the zombie child is listed");
+        assert!(z.zombie && z.ppid == me, "{z:?}");
+        let r = find(running.id()).expect("the running child is listed");
+        assert!(!r.zombie && r.ppid == me, "{r:?}");
+        let mine = find(me).expect("this process is listed");
+        assert!(!mine.zombie);
+        // The start time is this process's: within a minute of now, by the wall clock.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let started: f64 = r.start.parse().unwrap();
+        assert!((now - started).abs() < 60.0, "{} vs {now}", r.start);
+        // Every pid `ps` shows a moment later that also is in the table has the same parent.
+        let out = Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let ps = parse_ps(&String::from_utf8_lossy(&out.stdout));
+        let ours: HashMap<u32, u32> = rows.iter().map(|r| (r.pid, r.ppid)).collect();
+        let common: Vec<_> = ps.iter().filter(|p| ours.contains_key(&p.pid)).collect();
+        assert!(
+            common.len() * 10 >= ps.len() * 9,
+            "{} of {} ps rows",
+            common.len(),
+            ps.len()
+        );
+        let moved = common.iter().filter(|p| ours[&p.pid] != p.ppid).count();
+        assert!(moved * 100 <= common.len(), "{moved} parents differ");
+        let _ = running.kill();
+        let _ = running.wait();
+        let _ = zombie.wait();
     }
 
     #[test]

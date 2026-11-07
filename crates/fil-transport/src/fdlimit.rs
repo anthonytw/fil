@@ -14,7 +14,7 @@
 //! with no such hook (portable-pty, for a session's shell) is started through a trampoline that
 //! calls [`set_soft_limit`] before it execs (`fil_session::nofile`).
 //!
-//! This module holds the tree's one `unsafe` function outside tests ([`restore_in_child`]).
+//! This module holds one of the tree's three `unsafe` functions outside tests ([`restore_in_child`]).
 
 use std::sync::OnceLock;
 
@@ -98,8 +98,10 @@ pub fn set_soft_limit(soft: u64) -> std::io::Result<()> {
     .map_err(std::io::Error::from)
 }
 
-/// The one `unsafe` block here, and the only exception to the workspace's `unsafe_code = "deny"`
-/// outside tests. `pre_exec` is unsafe because the closure runs in the forked child, where only
+/// The one `unsafe` block here. The workspace denies `unsafe_code`; outside tests the exceptions
+/// are three `#[allow(unsafe_code)]` functions, each with its soundness argument in its
+/// documentation: this one, `fil::localtime::utc_offset_secs` (`localtime_r`) and, on macOS,
+/// `fil_session::proc::kinfo::sysctl_proc_all` (the process table). `pre_exec` is unsafe because the closure runs in the forked child, where only
 /// async-signal-safe calls are allowed. This closure:
 ///
 /// - makes a single `setrlimit` call: on Linux rustix makes the system call itself; on macOS it

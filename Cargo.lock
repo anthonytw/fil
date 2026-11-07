@@ -530,6 +530,7 @@ dependencies = [
  "fil-term",
  "fil-testkit",
  "fil-transport",
+ "libc",
  "nix",
  "portable-pty",
  "quinn",

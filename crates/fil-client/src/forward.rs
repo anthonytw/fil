@@ -57,7 +57,7 @@ use fil_proto::ChannelId;
 use fil_proto::msg::ControlMsg;
 use fil_proto::mux::{
     BindFailure, CloseReason, ForwardId, ForwardKind, ForwardRefusal, ForwardSpec, ListenState,
-    MuxMsg, OpenFailure, OpenKind, Side,
+    MuxMsg, OpenFailure, OpenKind, Side, TableError,
 };
 use fil_transport::{Link, LinkError, LinkState};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -513,6 +513,7 @@ impl<L: Link> Forwards<L> {
             failed: false,
             suspended: false,
             dirty: true,
+            outbox: VecDeque::new(),
             view: view.clone(),
         };
         let manager = tokio::spawn(mgr.run(from_router, events));
@@ -932,7 +933,15 @@ struct Manager<L: Link> {
     /// The view needs redoing: something it shows changed. A message that only gets an entry
     /// refused and forgotten does not set it, so a flood costs no more than its refusals.
     dirty: bool,
+    /// Table messages the MUX buffer had no room for, in order, sent as room appears
+    /// ([`Manager::flush`]). While any wait, no further event is taken ([`Manager::run`]), so the
+    /// host's flood waits (unacknowledged) in the endpoint instead of here: the queue holds only
+    /// what the one event or answer being handled produced.
+    outbox: VecDeque<MuxMsg>,
 }
+
+/// How long the manager waits before it tries again to send what the MUX buffer had no room for.
+const OUTBOX_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
 
 impl<L: Link> Manager<L> {
     async fn run(
@@ -949,6 +958,8 @@ impl<L: Link> Manager<L> {
                     None => return,
                     Some(ToManager::Fresh(done)) => {
                         while events.try_recv().is_ok() {}
+                        // Said of the old epoch's ids: they may name other entries now.
+                        self.outbox.clear();
                         self.dirty = true;
                         self.epoch = self.ep.epoch();
                         self.suspended = false;
@@ -970,11 +981,15 @@ impl<L: Link> Manager<L> {
                         self.unanswered();
                     }
                 }
-                ev = events.recv_with_epoch() => match ev {
+                () = tokio::time::sleep(OUTBOX_RETRY), if !self.outbox.is_empty() => {}
+                // Not while answers wait for room: the host's messages stay unacknowledged in
+                // the endpoint, which is what stops a flood.
+                ev = events.recv_with_epoch(), if self.outbox.is_empty() => match ev {
                     None => return,
                     Some((epoch, ev)) => self.on_event(epoch, ev),
                 },
             }
+            self.flush();
             if std::mem::take(&mut self.dirty) {
                 self.refresh_view();
             }
@@ -1099,9 +1114,33 @@ impl<L: Link> Manager<L> {
         }
     }
 
-    fn send(&self, msg: MuxMsg) {
-        if let Err(e) = self.ep.send_table(msg) {
-            debug!(error = %e, "forward table message not sent");
+    /// Sends a table message. One the MUX buffer has no room for waits in the outbox (in order)
+    /// and goes when room appears: a refusal or an answer must reach the host, however slowly it
+    /// acknowledges. Any other failure (a failed mux, a dead endpoint) loses it: nothing would
+    /// carry it.
+    fn send(&mut self, msg: MuxMsg) {
+        if self.outbox.is_empty() {
+            match self.ep.send_table(msg.clone()) {
+                Ok(()) => return,
+                Err(TableError::Full) => {}
+                Err(e) => {
+                    debug!(error = %e, "forward table message not sent");
+                    return;
+                }
+            }
+        }
+        self.outbox.push_back(msg);
+    }
+
+    /// Sends what waits in the outbox, as far as the MUX buffer has room.
+    fn flush(&mut self) {
+        while let Some(msg) = self.outbox.front() {
+            match self.ep.send_table(msg.clone()) {
+                Err(TableError::Full) => return,
+                Ok(()) => {}
+                Err(e) => debug!(error = %e, "forward table message not sent"),
+            }
+            self.outbox.pop_front();
         }
     }
 
@@ -1756,6 +1795,7 @@ mod tests {
             failed: false,
             suspended: false,
             dirty: true,
+            outbox: VecDeque::new(),
             view: Arc::new(Mutex::new(View::default())),
         };
         (m, rx)
@@ -1782,6 +1822,42 @@ mod tests {
             }
         }
         v
+    }
+
+    /// A refusal the MUX buffer has no room for is queued, in order, not dropped: a hostile
+    /// host that is slow to acknowledge must not make entries go unanswered (the second flood of
+    /// `an_entry_flood_stays_bounded_in_memory` once stalled on this).
+    #[tokio::test]
+    async fn a_refusal_without_room_waits_in_the_outbox() {
+        let (mut m, _rx) = manager();
+        // Nothing acknowledges: the buffer fills with refusals.
+        let mut next = 0u32;
+        while m.outbox.is_empty() {
+            assert!(next < 1_000_000, "the buffer never filled");
+            m.other(ForwardId(next), rspec(22));
+            next += 1;
+        }
+        // From here every refusal queues, in order, behind the one that found no room.
+        for _ in 0..50 {
+            m.other(ForwardId(next), rspec(22));
+            next += 1;
+        }
+        assert_eq!(m.outbox.len(), 51);
+        let ids: Vec<u32> = m
+            .outbox
+            .iter()
+            .map(|msg| match msg {
+                MuxMsg::Consent {
+                    id,
+                    accepted: false,
+                } => id.0,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, (next - 51..next).collect::<Vec<_>>());
+        // Still no room: flushing sends nothing and loses nothing.
+        m.flush();
+        assert_eq!(m.outbox.len(), 51);
     }
 
     /// An answer counts only for the question it answers: one given to an earlier question

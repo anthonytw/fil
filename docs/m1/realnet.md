@@ -167,6 +167,8 @@ From run 41575537104 (in the pre-recreate repository) (GitHub `ubuntu-24.04`, `f
 
 ### systemd host (`sysd`)
 
+The container is `--privileged`, which is root on the machine that runs it. `sysd.sh` therefore refuses to run unless `RUNNER_ENVIRONMENT=github-hosted` and `GITHUB_SERVER_URL=https://github.com` (GitHub sets both on its own runners) or `FIL_REALNET_PRIVILEGED_OK=1` says the machine may be given a privileged container. Under `just realnet` (all parts) the part is listed as SKIPPED on a machine that is neither, and the others still run; `just realnet sysd` alone exits 2.
+
 | Scenario | What it checks | Result |
 |---|---|---|
 | `f_linger_scope` | `loginctl enable-linger`; a session with a plain background job and one started with `setsid nohup` | pass: a running user scope `fil-<32 hex>.scope` (no session name in it or its description); the shell, the background job and the job that left the process tree are all in it; `fil kill` ended all three, and the scope was gone |

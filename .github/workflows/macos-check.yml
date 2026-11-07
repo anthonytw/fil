@@ -230,7 +230,6 @@ jobs:
       HOMEBREW_NO_INSTALL_FROM_API: "1"
       HOMEBREW_NO_ANALYTICS: "1"
       HOMEBREW_NO_ENV_HINTS: "1"
-      GH_TOKEN: ${{ github.token }}
       RELEASE_RUN: ${{ inputs.release_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -238,8 +237,14 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: The dry run's release files
+        env:
+          # Only this step has the token; the formula steps below run the checked-out ref's scripts.
+          GH_TOKEN: ${{ github.token }}
         run: |
           case "$RELEASE_RUN" in ''|*[!0-9]*) echo "release_run must be a release workflow run ID" >&2; exit 1 ;; esac
+          # It must be a finished dry run (a dispatch) of the release workflow, not any run's artifact.
+          run=$(gh run view "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --json workflowName,event,conclusion --jq '[.workflowName, .event, .conclusion] | join(" ")')
+          [ "$run" = "release workflow_dispatch success" ] || { echo "run $RELEASE_RUN is '$run', not a successful release dry run" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/release"
           gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name release-files --dir "$RUNNER_TEMP/release"
           ls -l "$RUNNER_TEMP/release"

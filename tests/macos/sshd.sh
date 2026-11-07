@@ -35,7 +35,14 @@ EOF
 }
 
 # auth_add PUBKEYFILE: lets that key log in.
-auth_add() { cat "$1" >> "$AUTH_FILE"; }
+# In system mode (the real authorized_keys) the key works from loopback only, with no forwarding.
+auth_add() {
+  if [[ -n ${SYSTEM_DROPIN:-} ]]; then
+    printf 'from="127.0.0.1,::1",restrict %s\n' "$(cat "$1")" >> "$AUTH_FILE"
+  else
+    cat "$1" >> "$AUTH_FILE"
+  fi
+}
 
 sshd_up_user() {
   SSH_PORT=${MACOS_SSH_PORT:-$((22000 + RANDOM % 5000))}
@@ -83,6 +90,12 @@ sshd_down_user() {
 }
 
 sshd_up_system() {
+  # This mode authorizes a passphrase-less key in the real ~/.ssh/authorized_keys and loads the
+  # system sshd, which listens on every interface: only on a throwaway machine. A GitHub-hosted
+  # runner is one; anywhere else it takes MACOS_SSHD_SYSTEM_THROWAWAY=1, which says the machine is.
+  if [[ ${RUNNER_ENVIRONMENT:-}:${GITHUB_SERVER_URL:-} != github-hosted:https://github.com && ${MACOS_SSHD_SYSTEM_THROWAWAY:-} != 1 ]]; then
+    fail "MACOS_SSHD=system changes the real sshd and ~/.ssh/authorized_keys: refused unless this is a GitHub-hosted runner or MACOS_SSHD_SYSTEM_THROWAWAY=1 says the machine is throwaway"
+  fi
   SSH_PORT=22
   mkdir -p "$W/ssh"
   chmod 700 "$W/ssh"
@@ -112,7 +125,8 @@ sshd_up_system() {
   if [[ -f $AUTH_FILE ]]; then cp "$AUTH_FILE" "$W/ssh/authorized_keys.saved"; fi
   touch "$AUTH_FILE"
   chmod 600 "$AUTH_FILE"
-  cat "$W/ssh/client_key.pub" >> "$AUTH_FILE"
+  # Loopback only, so that a key left behind by a killed run is no use from anywhere else.
+  printf 'from="127.0.0.1,::1",restrict,pty %s\n' "$(cat "$W/ssh/client_key.pub")" >> "$AUTH_FILE"
   SSH_KNOWN_HOSTS=$W/ssh/known_hosts
   ssh-keyscan -t ed25519 127.0.0.1 > "$SSH_KNOWN_HOSTS" 2> /dev/null
   [[ -s $SSH_KNOWN_HOSTS ]] || fail "system sshd: ssh-keyscan got no host key"

@@ -70,6 +70,26 @@ mutate_wf() {
     expect_fail "mutation: $name" "$RELEASE_DIR/lint-workflow.sh" "$tmp/wf.yml"
   fi
 }
+# the check profile: the two manual check workflows
+for cw in linux-check macos-check; do
+  expect_pass "the $cw workflow passes the check-profile lint" "$RELEASE_DIR/lint-workflow.sh" --check "$REPO_ROOT/.github/workflows/$cw.yml"
+done
+cw=$REPO_ROOT/.github/workflows/linux-check.yml
+mutate_cw() {
+  local name=$1 expr=$2
+  perl -0pe "$expr" "$cw" > "$tmp/cw.yml"
+  if cmp -s "$cw" "$tmp/cw.yml"; then
+    flunk "check-profile mutation '$name' did not change the workflow (the test is stale)"
+  else
+    expect_fail "check-profile mutation: $name" "$RELEASE_DIR/lint-workflow.sh" --check "$tmp/cw.yml"
+  fi
+}
+mutate_cw "an action is pinned by a tag" 's/(uses: actions\/checkout@)[0-9a-f]{40}/${1}v7/'
+mutate_cw "a checkout keeps credentials" 's/persist-credentials: false/persist-credentials: true/'
+mutate_cw "a pull_request trigger" 's/(on:\n)/${1}  pull_request:\n/'
+mutate_cw "the workflow gets contents: write" 's/(permissions:\n  contents: )read/${1}write/'
+mutate_cw "a matrix value reaches a run: line" 's/run: just realnet "\$PART"/run: just realnet \${{ matrix.part }}/'
+mutate_cw "a secret is used" 's/(PART: )/SECRET_X: \${{ secrets.X }}\n          $1/'
 mutate_wf "the dry-run build job gets id-token: write" 's/(  build-linux:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 mutate_wf "the package job gets attestations: write" 's/(  package:.*?    permissions:\n      contents: read\n)/$1      attestations: write\n/s'
 mutate_wf "a non-publish job gets contents: write" 's/(  smoke-macos:.*?    permissions:\n      contents: )read/${1}write/s'
@@ -501,6 +521,23 @@ stage_release
 echo '# 127.0.0.1 and 198.51.100.77 and sub.box.example.net.invalid' >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
 pack_release
 expect_pass "loopback, a longer address and a different name are not the fixtures" check --dry-run --no-tree "$rel"
+# SEC-2: whole multi-label names under any domain, and IPv6 literals outside the documentation ranges
+new_case 0.9.0
+mkdir -p "$tree/crates/x/tests"
+printf 'let a = "user@build5.corp.acme.io:22"; let b = "ssh://build6.corp.acme.io/x"; let c = ["8080:fd00::6"];\n' > "$tree/crates/x/tests/fixture.rs"
+printf 'host = "orin.lab.gulwertz.net"\nnas = "nas.home.arpa"\nweb = "build.corp.acme.io"\nula = "fd00::1"\nfull = "fe80:0:0:0:1:2:3:4"\nok1 = "fil.anthonywertz.com"\nok2 = "2001:db8::1"\nok3 = "::1"\nok4 = "10:30:45"\nok5 = "38:2::10:200:30"\n' > "$tree/crates/x/tests/fixture.toml"
+expect_pass "multi-label and IPv6 fixtures that are not in the binaries pass" check --dry-run --no-tree "$rel"
+for leak in build5.corp.acme.io build6.corp.acme.io fd00::6 orin.lab.gulwertz.net nas.home.arpa build.corp.acme.io fd00::1 fe80:0:0:0:1:2:3:4; do
+  stage_release
+  echo "# connects to $leak" >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
+  pack_release
+  expect_fail "mutation: the fixture $leak is in bin/fil" check --dry-run --no-tree "$rel"
+  grep -qF "$leak" "$tmp/out.log" && pass "...and the failure names it" || flunk "...and the failure names it"
+done
+stage_release
+echo '# fil.anthonywertz.com 2001:db8::1 ::1 10:30:45 fd00::2 orin.lab.gulwertz.org' >> "$stage/fil-0.9.0-universal-apple-darwin/bin/fil"
+pack_release
+expect_pass "the project's own name, documentation and loopback addresses, and other names are not the fixtures" check --dry-run --no-tree "$rel"
 mutated "bin/fil is missing" "rm fil-0.9.0-aarch64-linux-musl/bin/fil"
 mutated "the license is missing" "rm fil-0.9.0-x86_64-linux-musl/share/doc/fil/LICENSE"
 mutated "a man page is missing" "rm fil-0.9.0-x86_64-linux-musl/share/man/man1/fil.1"
@@ -745,6 +782,8 @@ cat > "$gt/gh" << 'EOF2'
 #!/bin/sh
 # FAKE_ENV: the environment's user reviewers (owner, bot, none, missing); FAKE_DRAFT: true, false or missing
 case "$1 $2" in
+  "api repos/"*/deployment-branch-policies)
+    case ${FAKE_POLICY:-tag} in tag) echo "tag:v*" ;; none) echo ;; branch) echo "branch:main tag:v*" ;; *) echo "HTTP 404" >&2; exit 1 ;; esac ;;
   "api repos/"*)
     case $FAKE_ENV in owner) echo "splarg-bot anthonytw" ;; bot) echo splarg-bot ;; none) echo ;; *) echo "HTTP 403" >&2; exit 1 ;; esac ;;
   "release view")
@@ -761,6 +800,9 @@ g_run() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY
 expect_pass "gate: a protected environment, a published release, a valid signature" g_run FAKE_ENV=owner FAKE_DRAFT=false
 expect_fail "gate: an environment with no required reviewer is refused" g_run FAKE_ENV=none FAKE_DRAFT=false
 expect_fail "gate: an environment whose only reviewer is not the owner is refused" g_run FAKE_ENV=bot FAKE_DRAFT=false
+expect_fail "gate: an environment open to every ref is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false FAKE_POLICY=none
+expect_fail "gate: an environment that also deploys from a branch is refused" g_run FAKE_ENV=owner FAKE_DRAFT=false FAKE_POLICY=branch
+expect_fail "gate: unreadable deployment policies are refused" g_run FAKE_ENV=owner FAKE_DRAFT=false FAKE_POLICY=missing
 g_env() { env FIL_RELEASE_ROOT="$gt/repo" FIL_GATE_GH="$gt/gh" GITHUB_REPOSITORY=o/r "$@"; }
 expect_pass "gate --environment-only: the owner reviews" g_env FAKE_ENV=owner "$gate" --environment-only
 expect_fail "gate --environment-only: an environment the token cannot read is an error on a tag push" g_env FAKE_ENV=missing "$gate" --environment-only

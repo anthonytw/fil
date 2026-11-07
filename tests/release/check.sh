@@ -175,21 +175,53 @@ fixture_dirs=
 for d in "$ROOT"/crates/*/tests "$ROOT"/crates/*/fuzz "$ROOT"/crates/*/examples "$ROOT"/tests/realnet "$ROOT"/tests/macos; do
   if [ -d "$d" ]; then fixture_dirs="$fixture_dirs $d"; fi
 done
+v6_re='[0-9A-Fa-f]{4}(:[0-9A-Fa-f]{0,4}){2,7}'
+# A match may start with a port or other digits (`8080:fd00::6`): keep it and its tails that begin
+# at a four-digit group; a trailing colon is dropped.
+v6_expand() {
+  awk '{ s = $0; if (s !~ /::$/) sub(/:$/, "", s); print s
+    while (match(s, /^[0-9A-Fa-f]{1,4}:/)) { s = substr(s, RLENGTH + 1); if (s ~ /^[0-9A-Fa-f]{4}:/ && s ~ /::/) print s } }'
+}
+v6_filter() { grep -E '::|^([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}$' | grep -viE '^(2001:0?db8|3fff:)' || true; }
 fixtures=
+fixtures6=
+# What is not a fixture even when it looks like a host name: the project's own public identity, file
+# names and sysctl or reverse-DNS names that tests mention.
+host_ok='^(fil\.anthonywertz\.com|anthonytw\.github\.io|github\.com|(com|net)\.(apple|openssh|inet|ipv4)\..*|host\.macremote\.direct)$'
 if [ -n "$fixture_dirs" ]; then
   # shellcheck disable=SC2086
   fixtures=$(
     {
       grep -rhIoE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' $fixture_dirs 2> /dev/null | grep -vE '^(127\.|0\.0\.0\.0$|255\.255\.255\.255$|22[4-9]\.|23[0-9]\.)' || true
-      grep -rhIoE '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.(example|test|invalid|local|lab|home|lan|internal)|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.example\.(com|net|org)' $fixture_dirs 2> /dev/null
+      # Whole names, not a prefix: a documentation-style label anywhere in the name, ...
+      grep -rhIoE '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.(example|test|invalid|local|lab|home|lan|internal)(\.[A-Za-z0-9-]+)*|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.example\.(com|net|org)' $fixture_dirs 2> /dev/null || true
+      # ... and any multi-label name under another domain: quoted in Rust (where `a.b.c` is mostly
+      # code), anywhere in the other files. A name that ends in a file extension is not a host.
+      {
+        # String literals of every file (so `user@host:22`, `ssh://host/x` and `["host"]` are seen
+        # and `self.home.join(` is not), and every token of the files that are not Rust.
+        grep -rhIoE '"[^"]+"' $fixture_dirs 2> /dev/null | grep -oE '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}' || true
+        grep -rhIoE --exclude='*.rs' '[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}' $fixture_dirs 2> /dev/null || true
+      } | grep -E '\.[A-Za-z]{2,}$' | grep -vE '^[0-9]|\.(rs|sh|md|toml|json|txt|log|out|raw|gz|tgz|zip|saved|conf|pub|pem|yml|yaml|lock|so|dylib|tmp|bak|new|old|orig|stdout|stderr)$' || true
       true
-    } | LC_ALL=C sort -u
+    } | { grep -vE "$host_ok" || true; } | LC_ALL=C sort -u
   )
+  # IPv6 literals (at least two colons, and either a "::" or eight groups, so a time or a
+  # colon-separated parameter list is not one). The first group has four digits, which the
+  # documentation prefixes (2001:db8::/32, 3fff::/20), loopback and the unspecified address lack.
+  # shellcheck disable=SC2086
+  fixtures6=$(grep -rhIoE "$v6_re" $fixture_dirs 2> /dev/null | v6_expand | v6_filter | LC_ALL=C sort -u || true)
 fi
 fixture_leaks() { # BINARY: the fixture strings found in it, as whole tokens (a token is [A-Za-z0-9.-]+)
-  [ -n "$fixtures" ] || return 0
+  [ -n "$fixtures$fixtures6" ] || return 0
   LC_ALL=C grep -aoE '[A-Za-z0-9.-]{4,}' "$1" | sed 's/[.-]*$//' | LC_ALL=C sort -u > "$work/tokens"
-  printf '%s\n' "$fixtures" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$work/tokens" | tr '\n' ' '
+  {
+    printf '%s\n' "$fixtures" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$work/tokens"
+    if [ -n "$fixtures6" ]; then
+      { LC_ALL=C grep -aoE "$v6_re" "$1" || true; } | v6_expand | v6_filter | LC_ALL=C sort -u > "$work/tokens6"
+      printf '%s\n' "$fixtures6" | LC_ALL=C comm -12 - "$work/tokens6"
+    fi
+  } | tr '\n' ' '
 }
 
 is_gnu_tar() { tar --version 2> /dev/null | grep -q 'GNU tar'; }

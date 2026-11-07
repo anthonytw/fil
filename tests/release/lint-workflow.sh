@@ -4,6 +4,8 @@
 # so it relies on the file's block style; selftest.sh mutates the workflow to prove each rule bites.
 #
 #   lint-workflow.sh [WORKFLOW]      default .github/workflows/release.yml
+#   lint-workflow.sh --check WORKFLOW...   the profile of the manual check workflows (linux-check.yml,
+#                                    macos-check.yml): rules C1 to C5 at the end of this comment
 #
 # Rules:
 #   1. the workflow's own `permissions:` is `contents: read` and nothing else;
@@ -23,9 +25,83 @@
 #      no `${{ }}` expression inside a `run:` (values reach the shell through `env:`);
 #   8. every `cargo`/`cross` build, install, vendor or metadata command, in the workflow and in
 #      tests/release/*.sh, passes `--locked`.
+#
+# The check profile (--check): these workflows run on a manual dispatch only and hold no secret.
+#   C1. the workflow's `permissions:` is a block holding `contents: read` only; no job names a
+#       `write` or `write-all` permission;
+#   C2. the only trigger is workflow_dispatch (no push, pull_request*, workflow_run or issue_comment);
+#   C3. every `uses:` is pinned by a full 40-hex commit SHA, and every checkout sets
+#       `persist-credentials: false`;
+#   C4. no `${{ }}` expression inside a `run:` (an input or a matrix value reaches the shell through `env:`);
+#   C5. no secret is referenced.
+# (.gitea/workflows/ci.yml is not covered: it runs on pull requests, so C2 does not apply to it.)
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+if [ "${1:-}" = --check ]; then
+  shift
+  [ $# -gt 0 ] || { echo "lint-workflow: --check needs a workflow file" >&2; exit 2; }
+  rc=0
+  for f in "$@"; do
+    [ -f "$f" ] || { echo "lint-workflow: no such file: $f" >&2; exit 2; }
+    awk '
+      function bad(msg) { print "lint-workflow: " FILENAME ":" NR ": " msg; fails++ }
+      function finish_checkout() {
+        if (in_checkout && !checkout_ok) bad("checkout (line " checkout_line ") lacks persist-credentials: false")
+        in_checkout = 0
+      }
+      {
+        raw = $0
+        if (in_run && raw !~ /^[ \t]*$/) {
+          match(raw, /^ */)
+          if (RLENGTH <= run_indent) in_run = 0
+          else if (raw ~ /\$\{\{/) bad("expression inside a run: script (pass it through env:): " raw)
+        }
+        if (!in_run && raw ~ /^ *(- )?run:/) {
+          match(raw, /^ *(- )?/); run_indent = RLENGTH
+          val = raw; sub(/^ *(- )?run:[ ]*/, "", val)
+          if (val ~ /^[|>]/) in_run = 1
+          else if (val ~ /\$\{\{/) bad("expression inside a run: command: " raw)
+        }
+        line = $0
+        sub(/[ \t]+#.*$/, "", line)
+        if (line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/) next
+        match(line, /^ */); indent = RLENGTH
+        if (in_checkout && line ~ /^ *- / && indent <= checkout_indent) finish_checkout()
+        if (indent == 0) {
+          section = line; sub(/:.*/, "", section)
+          if (section == "permissions") { if (line !~ /^permissions:[ ]*$/) bad("top-level permissions must be a block"); top_seen = 1 }
+          next
+        }
+        if (section == "permissions" && indent == 2 && line !~ /^  contents:[ ]*read[ ]*$/) bad("top-level permissions allow more than contents: read: " line)
+        if (section == "on" && indent == 2) {
+          key = line; sub(/^ */, "", key); sub(/:.*/, "", key)
+          if (key != "workflow_dispatch") bad("trigger " key " is not allowed (workflow_dispatch only)")
+          val = line; sub(/^[^:]*:[ ]*/, "", val)
+          if (val != "") bad("trigger " key " must be a block, not inline: " line)
+        }
+        if (section == "jobs" && line ~ /^ *[A-Za-z-]+:[ ]*write(-all)?[ ]*$/) bad("a write permission: " line)
+        if (line ~ /write-all/) bad("write-all: " line)
+        if (line ~ /uses:/) {
+          u = line; sub(/^.*uses:[ ]*/, "", u); gsub(/["]/, "", u)
+          at = index(u, "@"); sha = substr(u, at + 1)
+          if (at == 0 || length(sha) != 40 || sha !~ /^[0-9a-f]+$/ || u !~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._\/-]+@/) bad("action not pinned by a 40-hex commit SHA: " u)
+          if (u ~ /^actions\/checkout@/) { finish_checkout(); in_checkout = 1; checkout_ok = 0; checkout_line = NR; match(line, /^ *(- )?/); checkout_indent = RLENGTH - (line ~ /^ *- / ? 2 : 0) }
+        }
+        if (in_checkout && line ~ /persist-credentials:[ ]*false/) checkout_ok = 1
+        if (tolower(line) ~ /(^|[^a-z0-9_])secrets([^a-z0-9_]|$)/) bad("a secret is referenced: " line)
+      }
+      END {
+        finish_checkout()
+        if (!top_seen) bad("no top-level permissions: contents: read")
+        exit fails ? 1 : 0
+      }
+    ' "$f" || rc=1
+  done
+  exit $rc
+fi
+
 wf=${1:-$here/../../.github/workflows/release.yml}
 [ -f "$wf" ] || { echo "lint-workflow: no such file: $wf" >&2; exit 2; }
 scripts_dir=${FIL_LINT_SCRIPTS:-$here}

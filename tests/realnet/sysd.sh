@@ -12,6 +12,8 @@
 # SAFETY: the container is --privileged, which is root on the machine it runs on. That is fine on a
 # GitHub-hosted runner (a throwaway VM, no secrets in this job). NEVER run this part on a
 # self-hosted runner, a lab machine or a developer's own computer; the other parts are not like this.
+# sysd_setup refuses (under run.sh: skips) unless RUNNER_ENVIRONMENT=github-hosted and GITHUB_SERVER_URL=https://github.com (GitHub sets both on its own runners; a Gitea runner sets the second to its own URL) or
+# FIL_REALNET_PRIVILEGED_OK=1, which says that this machine may be given a privileged container.
 set -uo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -40,6 +42,12 @@ client_bg_on() {
 # Setup and teardown
 
 sysd_setup() {
+  if [[ ${RUNNER_ENVIRONMENT:-}:${GITHUB_SERVER_URL:-} != github-hosted:https://github.com && ${FIL_REALNET_PRIVILEGED_OK:-} != 1 ]]; then
+    echo "realnet: the sysd part SKIPPED: it runs a --privileged container (root on this machine), only on a GitHub-hosted runner or with FIL_REALNET_PRIVILEGED_OK=1 saying the machine may be given one" >&2
+    # Under run.sh (REALNET_SKIP_RC is set) the part is listed as skipped and the others still run;
+    # on its own it is a refusal.
+    exit "${REALNET_SKIP_RC:-2}"
+  fi
   command -v docker > /dev/null || { echo "realnet: docker is required" >&2; exit 2; }
   docker info > /dev/null 2>&1 || { echo "realnet: the docker daemon is not reachable" >&2; exit 2; }
   sysd_teardown quiet

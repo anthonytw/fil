@@ -216,6 +216,8 @@ client-pty:
 # forwards, docs/m2/realnet.md) or `agent`; add scenario names to narrow.
 # `just realnet latency` is the latency lab (docs/m2/latency.md), not part of the default run;
 # nor is `just realnet predict`, M3's prediction cells (docs/m3/plan.md §5.5).
+# The sysd part runs a --privileged container (root on the host) and refuses unless this is a
+# GitHub-hosted runner or FIL_REALNET_PRIVILEGED_OK=1 says the machine may be given one.
 realnet *args:
     tests/realnet/run.sh {{args}}
 
@@ -296,7 +298,8 @@ dropin *args:
 
 # macOS as the REMOTE host (DESIGN.md §16.9, docs/m4/plan.md MAC): the real release `fil` serves a
 # session over a real ssh login to this Mac (an sshd of its own on a high loopback port with
-# throwaway keys; MACOS_SSHD=system uses the system sshd, on a throwaway runner only), driven by the
+# throwaway keys; MACOS_SSHD=system uses the system sshd and refuses to run unless this is a GitHub-hosted runner or
+# MACOS_SSHD_SYSTEM_THROWAWAY=1 says the Mac is throwaway), driven by the
 # client on a pty. Scenarios: `just macos-remote --list`; narrow with names. It starts and stops a
 # `fil` daemon of its own and refuses to run beside one of yours (tests/macos/remote.sh). macOS
 # only; never part of `ci`. `fil` is built in an invocation of its own, so it has no test hooks.

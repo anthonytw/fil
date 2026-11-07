@@ -11,6 +11,7 @@
 #      workflow names and that does not exist, with no protection at all; trusted publishing pins
 #      the workflow file and the environment, not the ref, so an unprotected environment would let
 #      any writer's branch mint a token. A misconfiguration fails here, loudly;
+#      and its deployment refs are exactly the tag pattern v* (deployment-branch-policies);
 #   2. the GitHub Release TAG is published (not a draft);
 #   3. its SHA256SUMS.sig is a valid fil-release signature of its SHA256SUMS by a key in
 #      .github/release-signers as it is on main (ssh-keygen -Y verify).
@@ -55,6 +56,14 @@ case " $reviewers " in
   *" $OWNER "*) log "the crates-io environment requires $OWNER's review" ;;
   *) env_fail "the crates-io environment's required reviewers ('$reviewers') do not include $OWNER: protect it first (docs/m4/release.md section 10.1)" ;;
 esac
+# Which refs may deploy to the environment: v* tags only. Trusted publishing does not pin the ref,
+# so without this a branch's copy of release.yml (with its `if:` dropped) could be dispatched and
+# ask for the owner's approval of a deployment that looks like any other.
+policies=$("$gh" api "repos/$repo/environments/crates-io/deployment-branch-policies" --jq '[.branch_policies[]? | "\(.type):\(.name)"] | sort | join(" ")' 2> /dev/null) \
+  || env_fail "cannot read the crates-io environment's deployment branch policies of $repo (or it has no custom policy; docs/m4/release.md section 10.1)"
+[ "$policies" = 'tag:v*' ] \
+  || env_fail "the crates-io environment's deployment refs are '${policies:-any}', not exactly the tag pattern v*: restrict them first (docs/m4/release.md section 10.1)"
+log "the crates-io environment deploys from v* tags only"
 [ "$env_only" = 0 ] || exit 0
 
 draft=$("$gh" release view "$tag" --repo "$repo" --json isDraft --jq .isDraft 2> /dev/null) \

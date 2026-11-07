@@ -1,0 +1,29 @@
+# The cargo-fuzz target of the daemon's `daemon.toml` parser (`fil_daemon::config::DaemonConfig`).
+# Not part of the workspace and not run by `just ci` (it needs a nightly toolchain):
+#   just fuzz daemon_config SECONDS      (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run daemon_config fuzz/corpus/daemon_config fuzz/seeds/daemon_config   (from crates/fil-daemon)
+# The seeds in seeds/ are sample configurations, written by hand.
+[package]
+name = "fil-daemon-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil-daemon = { path = ".." }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "daemon_config"
+path = "fuzz_targets/daemon_config.rs"
+test = false
+doc = false
+bench = false

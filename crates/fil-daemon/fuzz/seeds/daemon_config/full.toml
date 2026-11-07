@@ -1,0 +1,18 @@
+direct = true
+bind = "127.0.0.1"
+port_range = [50000, 50100]
+history_lines = 5000
+idle_exit_secs = 0
+scope = "tree"
+agent_socket = false
+
+[ports]
+probe = "full"
+probe_other = true
+
+[forward]
+remote_peers = "same-user"
+window = "64KiB"
+buffer = "256KiB"
+open_wait = "5s"
+linger = "1h"

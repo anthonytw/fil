@@ -111,7 +111,8 @@ jobs:
           # f_fwd_ending_stress: 4,000 connections a cell here (20,000 in the VM and on the Pis); at
           # 5,000 nothing differed from 20,000 but the run time (docs/m2/realnet.md).
           FWD_STRESS_COUNT: 4000
-        run: just realnet ${{ matrix.part }}
+          PART: ${{ matrix.part }}
+        run: just realnet "$PART"
       - name: Logs and measurements
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

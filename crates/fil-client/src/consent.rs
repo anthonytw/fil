@@ -25,7 +25,7 @@ use fil_proto::mux::{
 
 use crate::config::RemoteRequests;
 
-/// After this many refused or unanswered requests in one run, further ones are refused without
+/// After this many refused or unanswered requests in a row, further ones are refused without
 /// asking: a process on the host cannot keep the keyboard busy with questions.
 pub const MAX_DENIALS: u32 = 3;
 

@@ -1,5 +1,7 @@
 # Real-network test harness (Tier 1)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 Everything fil was first tested against ran in process: `fil-netsim` stands in for ssh and for UDP. This harness runs the same questions against the real thing, with no mocks between the program and the network:
 
 - **The pipe** over real OpenSSH (`ssh -T -- HOST fil server --stdio`, DESIGN.md section 8.2), through jump hosts, with certificates, ControlMaster and hostile shells.

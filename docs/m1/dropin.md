@@ -1,5 +1,7 @@
 # The drop-in suite (M1 package P8)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 The owner's rule (2026-11-02): no human testing in the pipeline. "If you're able to use fil as more or less a drop-in replacement for ssh, et, or mosh, then you're on the right track. Automate whatever you can." This suite is that checkpoint. An agent drives the real `fil` client on a pseudo-terminal and does what people do with ssh, et and mosh: edits files in vim, pages with less, watches top, uses git, recalls history, completes names, stops jobs, floods the screen, resizes the window, detaches and comes back, takes a session over from a second machine, loses its ssh, kills its client, and puts the laptop to sleep. Each scenario asserts that fil behaves at least as well as ssh would. Where it does not, that is a finding (below), not a tolerance.
 
 It is on demand and never part of `just ci`. (Its unit tests, which pin the exact-sequence rules and the target rules, do run in `just ci`.)

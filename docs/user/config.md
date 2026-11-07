@@ -4,7 +4,7 @@ fil reads `~/.config/fil/config.toml` (or `$XDG_CONFIG_HOME/fil/config.toml`) wh
 
 Every key is optional. An unknown key is an error, so a typo cannot silently do nothing; the message names the file, the section and the key. Every section is checked when the file is read, whichever host you ask for.
 
-A complete example is in [examples/config.toml](examples/config.toml). The host's own settings are in `daemon.toml` ([examples/daemon.toml](examples/daemon.toml)) and, for the host's administrator, `/etc/fil/policy.toml` ([examples/policy.toml](examples/policy.toml)); this page covers the client's file only.
+A complete example is in [examples/config.toml](examples/config.toml). The host's own settings are in `daemon.toml`, with an example in [examples/daemon.toml](examples/daemon.toml), and, for the host's administrator, in `/etc/fil/policy.toml`, with an example in [examples/policy.toml](examples/policy.toml); this page covers the client's file only.
 
 ## How a host's settings are chosen
 

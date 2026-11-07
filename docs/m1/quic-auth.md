@@ -1,5 +1,7 @@
 # QUIC authentication (`fil-transport::auth`)
 
+> **Historical:** the work of this package, as built; where it and `DESIGN.md` or the code differ, they win.
+
 Implements the mutual authentication of DESIGN.md §8.3 for direct mode. Spike B showed quinn and rustls (ring provider) running over the simulated network, but it trusted one exact certificate. The real transport needs fingerprint pinning, plus a client-key check on the daemon. That is what this adds.
 
 ## Handshake flow

@@ -94,6 +94,20 @@ fn every_shell_gets_a_completion_script() {
                 "{shell}: offers the hidden {hidden}"
             );
         }
+        // Subcommands that are not for people: `server` (clap_complete ignores `hide` on
+        // subcommands, so the generator leaves it out) and the generated `help`.
+        for internal in ["server", "help"] {
+            let offered = script
+                .lines()
+                .filter(|l| {
+                    !l.contains("Print help") && !l.contains("-l help") && !l.contains("h/help")
+                })
+                .any(|l| mentions(l, internal));
+            assert!(
+                !offered,
+                "{shell}: offers the internal `{internal}` subcommand"
+            );
+        }
     }
 }
 

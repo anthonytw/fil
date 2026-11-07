@@ -1,5 +1,7 @@
 # The latency lab (M2 package L1)
 
+> **Historical:** the work of this package, as built; where it and `DESIGN.md` or the code differ, they win.
+
 Four measurements that decide two things in `docs/m2/plan.md`:
 
 - **OD-10:** is there a Nagle problem on the pipe (`TCP_NODELAY` is set by OpenSSH only for sessions with a terminal, so `ssh -T` may delay small writes), and is the remedy (`ssh -tt` with the relay setting raw mode before the preamble) worth its costs (a pty, utmp entries, stderr merged into the stream)? The plan's rule: avoid `-tt` unless the keystroke p50 improves by more than 20 ms.

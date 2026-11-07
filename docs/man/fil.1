@@ -1,20 +1,14 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .TH "FIL" "1" "" "fil" "fil manual"
-.ie \n(.g .ds Aq \(aq
-.el .ds Aq '
 .SH NAME
 fil \- A remote shell that keeps your place: reconnect, detach and reattach
-.ie \n(.g .ds Aq \(aq
-.el .ds Aq '
 .SH SYNOPSIS
-\fBfil\fR [\fB\-L \fR] [\fB\-R \fR] [\fB\-D \fR] [\fB\-A \fR] [\fB\-a \fR] [\fB\-\-transport\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIHOST\fR> [\fISESSION\fR] [\fIsubcommands\fR]
-.ie \n(.g .ds Aq \(aq
-.el .ds Aq '
+\fBfil\fR [\fB\-L\fR \fISPEC\fR]... [\fB\-R\fR \fISPEC\fR]... [\fB\-D\fR \fISPEC\fR]... [\fB\-A\fR|\fB\-a\fR] [\fB\-\-transport\fR \fIMODE\fR] [\fB\-\-config\fR \fIFILE\fR] \fIHOST\fR [\fISESSION\fR]
+.br
+\fBfil\fR \fICOMMAND\fR ...
 .SH DESCRIPTION
 A remote shell that keeps your place: reconnect, detach and reattach
-.ie \n(.g .ds Aq \(aq
-.el .ds Aq '
 .SH OPTIONS
 .TP
 \fB\-L\fR \fI<SPEC>\fR
@@ -92,7 +86,7 @@ Add: listen on the host, connect from this machine
 Add: a SOCKS proxy on this machine
 .TP
 \fB\-\-rm\fR \fIPORT\fR
-Remove the forward that listens on PORT. If a \-L and a \-R share the port, say which with the flag instead: `\-\-rm \-L PORT`
+Remove the forward that listens on PORT. If a \-L and a \-R share the port, say which with the flag instead: \-\-rm \-L PORT
 .SS "fil ports"
 Show what is listening on the host and what is forwarded, with the process behind each
 .PP
@@ -137,7 +131,7 @@ Look at the configuration
 .PP
 Usage: \fBfil config [OPTIONS] <COMMAND>\fR
 .SS "fil config show"
-Show the settings that apply to HOST and where each value comes from (the default, [defaults] or [host.NAME]), like `ssh \-G`. Reads only the config file; never contacts the host
+Show the settings that apply to HOST and where each value comes from (the default, [defaults] or [host.NAME]), like ssh \-G. Reads only the config file; never contacts the host
 .PP
 Usage: \fBfil config show [OPTIONS] <HOST>\fR
 .SH NOTES
@@ -152,13 +146,16 @@ Examples:
 .PP
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 .PP
-Configuration: ~/.config/fil/config.toml (see fil\-config(5), or `fil config show HOST`).
+Configuration: ~/.config/fil/config.toml (see fil\-config(5), or fil config show HOST).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 .PP
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell\*(Aqs own status if it exited with one; 128+N if the shell was killed by signal N or
 fil was stopped by signal N;
 1 on an error or if the session was taken over, replaced or detached elsewhere;
-2 on a usage error.
+2 on a usage error;
+255 if a forward failed and forward_failure = "exit".
+.PP
+Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
 .SH "SEE ALSO"
 \fBfil\-config\fR(5), \fBfil\-policy\fR(5)

@@ -1,5 +1,7 @@
 # The `fil` binary in M2 (`crates/fil`)
 
+> **Historical:** the work of this package, as built; where it and `DESIGN.md` or the code differ, they win.
+
 What M2 adds to the binary, by package. The M1 command line, exit statuses and dialer are in `docs/m1/binary.md`.
 
 ## F4 part 1: forward specs, config and `fil ports` rendering

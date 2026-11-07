@@ -25,7 +25,6 @@
 #   agent                -A with a throwaway ssh-agent: a real ssh hop from the session; refused without -A
 #   quic_upgrade         pipe to QUIC on loopback, the session continues with the ssh gone
 #   upgrade_in_place     the binary is replaced under a running daemon (the trampoline, plan §1)
-#   install_acl          PLACEHOLDER: fil install and the macOS ACL cases (U1)
 #   tmp_cleaners         PLACEHOLDER: TMP's mechanism checks and macOS's clean-tmps (TMP)
 set -uo pipefail
 
@@ -56,7 +55,7 @@ eval "$(declare -f print_summary | sed 's/realnet results/macOS remote results/'
 # the installed fil), so nothing may run after it.
 SCENARIOS=(
   attach_type kill_ssh_resume detach_reattach daemon_survives_login takeover
-  forwards_reconnect agent quic_upgrade upgrade_in_place install_acl tmp_cleaners
+  forwards_reconnect agent quic_upgrade upgrade_in_place tmp_cleaners
 )
 
 # ---------------------------------------------------------------------------------------------
@@ -403,7 +402,7 @@ EOF
   fc_show_pid c
   [[ $(the_daemon) == "$d1" ]] || fail "the new session did not start in the old daemon"
   if [[ -s $mark ]]; then
-    known_bug "current_exe() on macOS: the old daemon (pid $d1) started a NEW session through the REPLACED binary's trampoline ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...). DESIGN/plan §1: freeze the trampoline's argument contract within a PROTOCOL_MAJOR, pinned by a test (fil-session::nofile, after M3 closes); U1's versioned install directories avoid the case for fil-installed copies"
+    known_bug "current_exe() on macOS: the old daemon (pid $d1) started a NEW session through the REPLACED binary's trampoline ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...). DESIGN/plan §1: freeze the trampoline's argument contract within a PROTOCOL_MAJOR, pinned by a test (fil-session::nofile); U1's versioned install directories avoid the case for fil-installed copies"
     note "trampoline_via_replaced_path=yes"
   else
     note "trampoline_via_replaced_path=no"
@@ -430,23 +429,6 @@ EOF
   else
     note "new_session_with_refusing_trampoline=NO_SHELL"
     log "with a trampoline that refuses its arguments the new session has no shell: $(fc_screen d | tail -n 3)"
-  fi
-}
-
-# U1 has not landed (no `fil install`). When it does, this scenario is the place for the macOS ACL
-# cases of the install bootstrap (docs/m4/plan.md, U1 "On macOS"): `fil install` to this Mac itself;
-# an inheritable `allow` ACL on ~/.local/share/fil and an `allow` entry on ~/.local/share, both
-# refused; an `allow` ACL together with an extended attribute (`ls -l` shows @, not +) on
-# ~/.local/share/fil, on the version directory and on the binary, all refused, and an upload
-# refused before anything is written; an extended attribute alone, accepted; a home with only the
-# default deny entry, accepted.
-# TODO(U1): write those cases once `fil install` exists.
-scenario_install_acl() {
-  if fil --help 2> /dev/null | grep -q '^  install '; then
-    log "WARNING: this fil has an install command: U1 has landed and the macOS ACL cases are still to be written"
-    note "SKIPPED: fil install exists now; write the macOS ACL cases (TODO U1)"
-  else
-    note "SKIPPED: no fil install yet (TODO U1)"
   fi
 }
 

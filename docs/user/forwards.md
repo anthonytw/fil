@@ -38,7 +38,7 @@ fil forward devbox --rm 5173      # remove the forward that listens on 5173
 fil forward devbox --rm -L 5173   # when a -L and a -R share the port, say which
 ```
 
-Inside a session, leave the host out: `fil forward -L 5173` works on this session, which is `$FIL_SESSION`. The attached client **asks you once** before it listens or connects for a forward added this way, since it may have been asked for by a process on the host. `remote_requests` in your config can answer `deny` instead. Some requests are refused **without asking**: a `-L` or `-D` bound beyond loopback, a `-R` bound beyond loopback, and a `-R` to a target beyond loopback. After three refusals in a run, every further request of this kind is refused silently.
+Inside a session, leave the host out: `fil forward -L 5173` works on this session, which is `$FIL_SESSION`. The attached client **asks you once** before it listens or connects for a forward added this way, since it may have been asked for by a process on the host. `remote_requests` in your config can answer `deny` instead. Some requests are refused **without asking**: a `-L` or `-D` bound beyond loopback, a `-R` bound beyond loopback, and a `-R` to a target beyond loopback. After three requests in a row are refused (answered no, or not answered), every further one in this run is refused without asking. The first few such refusals are still shown on your terminal.
 
 ## `fil ports`
 

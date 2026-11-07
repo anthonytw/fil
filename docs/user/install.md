@@ -11,7 +11,7 @@ fil runs on macOS and Linux (x86_64 and aarch64) as the client, and on Linux as 
 | GitHub Releases | download, check, unpack (below) | the client, the Linux programs `fil install` uploads, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive |
 | Debian, Ubuntu | `sudo apt install ./fil_<version>_amd64.deb` (or `_arm64`) | the same files under `/usr` |
-| Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc`, then `sudo dnf install ./fil-<version>-1.x86_64.rpm` (or `.aarch64`) | the same |
+| Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc` (the `.github/package-signing-key.asc` of the repository), then `sudo dnf install ./fil-<version>-1.x86_64.rpm` (or `.aarch64`) | the same |
 | Arch Linux | `fil-shell-bin` on the AUR | the same (see the release notes for when it is published) |
 | crates.io | `cargo install --locked fil-shell` | a build from source; no man pages, completions or Linux programs to upload |
 | Nix | `nix profile install github:anthonytw/fil/v<version>` | a build from source, as with cargo |
@@ -24,7 +24,7 @@ Every file of a release is listed in `SHA256SUMS`, which is signed. The release 
 
 ```sh
 # with the release signers file from the repository's main branch
-ssh-keygen -Y verify -f release-signers -I <principal> -n fil-release -s SHA256SUMS.sig < SHA256SUMS
+ssh-keygen -Y verify -f release-signers -I release -n fil-release -s SHA256SUMS.sig < SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS      # shasum -a 256 -c on a Mac
 ```
 

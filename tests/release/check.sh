@@ -21,19 +21,18 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-dry=0 tag='' complete=0 tree=1 exec=1 dir=''
+dry=0 tag='' tree=1 exec=1 dir=''
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1; shift ;;
     --tag) tag=$2; shift 2 ;;
-    --complete) complete=1; shift ;; # kept for the callers; the whole layout is required either way
+    --complete) shift ;; # accepted and ignored: kept for the callers; the whole layout is required either way
     --no-tree) tree=0; shift ;;
     --no-exec) exec=0; shift ;;
     -*) die "unknown option: $1" ;;
     *) dir=$1; shift ;;
   esac
 done
-[ "$complete" = 1 ] || true
 [ -n "$dir" ] || die "usage: check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR"
 if [ "$dry" = 0 ] && [ -z "$tag" ]; then
   die "name the release with --tag vX.Y.Z (or pass --dry-run for a build that is not a release)"

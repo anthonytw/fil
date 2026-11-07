@@ -1,5 +1,7 @@
 # The `fil` binary (`crates/fil`)
 
+> **Historical:** the work of this package, as built; where it and `DESIGN.md` or the code differ, they win.
+
 M1 package P6, with the M2 additions noted where they touch it (the forward flags, `fil forward`, `fil ports` and the agent relay are in `docs/m2/binary.md`). One binary, both ends: `fil HOST` is the client; `fil server --stdio` and the daemon are the remote side (DESIGN.md §4, §13, §14). The crate has the command line, the config file, the **dialer** that turns the path manager into links, and the management commands. The client loop is `fil-client`; the transports are `fil-transport`; the remote side is `fil-daemon` (P5).
 
 ## Command line

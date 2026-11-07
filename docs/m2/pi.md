@@ -1,5 +1,7 @@
 # `fwdprobe` on the lab Pis and in realnet (M2 package T1)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 The M2 forward scenarios (`docs/m2/plan.md` §5.2 and §5.3) need a TCP peer that can run *inside the fil session* on a Pi, send and check exact bytes, and misbehave on purpose (half-close, RST, never answer). `fwdprobe` is that peer. It is a static binary in `fil-testbins`, with no Python and no other tool needed on the Pi. The Pi setup (the gate, the verbs, `FIL_PI_TARGETS`) is in `docs/m1/pi.md`; nothing here adds a gate verb.
 
 ## Getting it onto a Pi

@@ -1,5 +1,7 @@
 # fil on the lab Raspberry Pis (M1 package P7b)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 The M1 scenarios, run on real hardware: this Mac's `fil` client, driven in a pseudo-terminal, against `fil server --stdio` on two aarch64 Debian 13 Raspberry Pi 5s, called "pi1" and "pi2" below. It is on demand and never part of `just ci`.
 
 ## Setup

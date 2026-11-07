@@ -66,6 +66,7 @@ When a link drops and comes back, the client says where it stopped and the daemo
 - `0` when you detach or the session ends with nothing to report;
 - the shell's own status if it exited with one, or `128+N` if it was killed by signal N (or fil was stopped by signal N);
 - `1` on an error, or if the session was taken over, replaced or detached elsewhere;
-- `2` on a usage error.
+- `2` on a usage error;
+- `255` if a forward failed and `forward_failure = "exit"`.
 
 A host or session named like a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`, `config`) is attached with `--`: `fil -- ls`, `fil devbox -- ls`.

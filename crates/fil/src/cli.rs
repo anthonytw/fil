@@ -10,7 +10,8 @@
 //! fil forward [HOST [SESSION]] --rm [-L|-R|-D] PORT   remove one
 //! fil ports [HOST [SESSION]] [--json] [--probe]  listeners, forwards and the agent
 //! fil server --stdio                             the remote side of the pipe (not for people)
-//! fil install [--check|--remove] HOST            install fil on HOST over ssh (M4 OQ-1)
+//! fil install [--check|--remove] [--binary FILE] HOST   install fil on HOST over ssh (M4 OQ-1)
+//! fil config show HOST                           the effective settings for HOST
 //! ```
 //!
 //! With no HOST, `forward`, `ports` and `detach` talk to the daemon on this machine and work on
@@ -81,7 +82,10 @@ Exit status: 0 on a normal end (detached, or the session ended with nothing to r
 the shell's own status if it exited with one; 128+N if the shell was killed by signal N or
 fil was stopped by signal N;
 1 on an error or if the session was taken over, replaced or detached elsewhere;
-2 on a usage error.";
+2 on a usage error;
+255 if a forward failed and forward_failure = \"exit\".
+
+Source: every release publishes fil-<version>-source.tar.gz beside the binaries (GPL-3.0 Corresponding Source).";
 
 #[derive(Parser, Debug)]
 #[command(

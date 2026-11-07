@@ -49,7 +49,7 @@ Your sessions will end when your last login does, which is the opposite of what 
 
 ## Hosts that allow only the plain command
 
-Some hosts accept only `fil server --stdio`: a `ForceCommand` in `sshd_config`, or `command=` in `authorized_keys`. The install command can't run there. Set `remote = "plain"` for that host in your [config](config.md) and install fil on it by hand, on the `PATH` the gate uses. With `remote = "installed"` on such a host, fil ends the run at once and tells you to use `auto` or `plain`.
+Some hosts accept only `fil server --stdio`: a `ForceCommand` in `sshd_config`, or `command=` in `authorized_keys`. The install command can't run there. Set `remote = "plain"` for that host in your [config](config.md) and install fil on it by hand, on the `PATH` the gate uses. With `remote = "installed"` on such a host, fil ends the run at once and tells you to install fil there by hand or use `plain`.
 
 A host whose config names its own `pipe` is never rewritten and is never offered an install.
 

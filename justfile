@@ -366,10 +366,12 @@ release-build out="target/release-dist":
       exit 0
     fi
     extra=()
-    if command -v pandoc > /dev/null && docs/man/build.sh "$out/docs"; then
+    if ! command -v pandoc > /dev/null; then
+      echo "release-build: no docs tree (pandoc 3.13 is not installed; docs/man/install-pandoc.sh does it on Linux): the archives have no man pages or completions" >&2
+    elif docs/man/build.sh "$out/docs"; then
       extra=(--extra "$out/docs")
     else
-      echo "release-build: no docs tree (needs the pinned pandoc, docs/man/install-pandoc.sh): the archives have no man pages or completions" >&2
+      echo "release-build: docs/man/build.sh failed (see above): the archives have no man pages or completions" >&2
     fi
     tests/release/package.sh --bins "$out/bins" --out "$out/files" ${extra[@]+"${extra[@]}"}
     echo "release-build: the release files are in $out/files; run: just release-check --dry-run $out/files" >&2
@@ -565,7 +567,7 @@ _notices mode:
 docs out=(target_dir / "docs"):
     docs/man/build.sh "{{out}}"
 
-# Rewrite the committed docs/man/fil.1 after a change to the command line (tests/docs_sync.rs
+# Rewrite the committed docs/man/fil.1 after a change to the command line (crates/fil/tests/docs_sync.rs
 # fails until you do), then commit it.
 docs-man:
     cargo run --quiet --locked -p fil-shell --example gen_docs -- --man-page > docs/man/fil.1.new

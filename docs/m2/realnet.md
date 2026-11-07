@@ -1,5 +1,7 @@
 # Forwards on the real network (M2 package V1, realnet)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 The M2 scenarios of the real-network harness (`docs/m1/realnet.md`): port forwards of the real `fil` binary, with real OpenSSH, real NAT and `tc netem`, in the `udp` part's namespaces. They are the `fwd` part, `tests/realnet/fwd.sh`. The plan's list is `docs/m2/plan.md` §5.3; the Pi half is `docs/m2/dropin.md`.
 
 ## Running it

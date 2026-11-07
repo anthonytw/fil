@@ -30,7 +30,8 @@ fn roff(text: &str) -> String {
         let line = line
             .replace('\\', "\\e")
             .replace('-', "\\-")
-            .replace('\'', "\\*(Aq");
+            .replace('\'', "\\*(Aq")
+            .replace('`', "");
         if line.starts_with('.') || line.starts_with("\\*(Aq") {
             out.push_str("\\&");
         }
@@ -105,6 +106,12 @@ fn subcommand(sub: &clap::Command, parent: &str, out: &mut String) {
     }
 }
 
+const SYNOPSIS: &str = ".SH SYNOPSIS
+\\fBfil\\fR [\\fB\\-L\\fR \\fISPEC\\fR]... [\\fB\\-R\\fR \\fISPEC\\fR]... [\\fB\\-D\\fR \\fISPEC\\fR]... [\\fB\\-A\\fR|\\fB\\-a\\fR] [\\fB\\-\\-transport\\fR \\fIMODE\\fR] [\\fB\\-\\-config\\fR \\fIFILE\\fR] \\fIHOST\\fR [\\fISESSION\\fR]
+.br
+\\fBfil\\fR \\fICOMMAND\\fR ...
+";
+
 /// `fil(1)`: one page for the whole command line. The attach form and its options first, then
 /// one section per subcommand (there is no page per subcommand: an archive carries `fil.1` alone).
 pub fn man_page() -> Vec<u8> {
@@ -118,10 +125,22 @@ pub fn man_page() -> Vec<u8> {
     out.extend_from_slice(
         b".ie \\n(.g .ds Aq \\(aq\n.el .ds Aq '\n.TH \"FIL\" \"1\" \"\" \"fil\" \"fil manual\"\n",
     );
-    man.render_name_section(&mut out).expect("memory");
-    man.render_synopsis_section(&mut out).expect("memory");
-    man.render_description_section(&mut out).expect("memory");
-    man.render_options_section(&mut out).expect("memory");
+    // clap_mangen repeats the `Aq` preamble in every section (the .TH line above has it once),
+    // and its synopsis drops the option values, so that section is written by hand.
+    let mut sections: Vec<u8> = Vec::new();
+    man.render_name_section(&mut sections).expect("memory");
+    sections.extend_from_slice(SYNOPSIS.as_bytes());
+    man.render_description_section(&mut sections)
+        .expect("memory");
+    man.render_options_section(&mut sections).expect("memory");
+    for line in String::from_utf8(sections)
+        .expect("utf-8")
+        .split_inclusive('\n')
+    {
+        if !line.starts_with(".ie \\n(.g .ds Aq") && !line.starts_with(".el .ds Aq") {
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
 
     let mut rest = String::from(".SH COMMANDS\n");
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
@@ -146,9 +165,19 @@ pub fn man_page() -> Vec<u8> {
 /// The completion script of one shell.
 pub fn completion(shell: Shell) -> Vec<u8> {
     let mut out = Vec::new();
-    // `fil server` is for the program itself and its flags are hidden; clap_complete would offer
-    // them anyway, so the subcommand goes (hidden, without its arguments).
-    let mut cmd = unbuilt().mut_subcommand("server", |_| clap::Command::new("server").hide(true));
+    // `fil server` is for the program itself. clap_complete ignores `hide` on subcommands, so the
+    // subcommand is left out: the root is rebuilt from its own name, about and arguments, with
+    // every subcommand but `server`.
+    let full = unbuilt();
+    let mut cmd = clap::Command::new("fil").disable_help_subcommand(true);
+    if let Some(about) = full.get_about() {
+        cmd = cmd.about(about.clone());
+    }
+    cmd = cmd.args(full.get_arguments().cloned()).subcommands(
+        full.get_subcommands()
+            .filter(|s| s.get_name() != "server")
+            .cloned(),
+    );
     cmd.build();
     clap_complete::generate(shell, &mut cmd, "fil", &mut out);
     out

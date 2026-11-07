@@ -1,5 +1,7 @@
 # Forwards in the drop-in suite (M2 package V1, the Pis)
 
+> **Living reference** for the harness it describes; where it and `DESIGN.md` differ, `DESIGN.md` wins.
+
 The M2 half of the drop-in suite (`docs/m1/dropin.md`): this Mac's `fil` client with `-L`, `-R` and `-D`, driven on a pseudo-terminal, against `fil server --stdio` on the two lab Pis through the `fil-test` gate, with `fwdprobe` (`docs/m2/pi.md`) at both ends. The plan's list is `docs/m2/plan.md` §5.2; the real-network half is `docs/m2/realnet.md`.
 
 ## Running it

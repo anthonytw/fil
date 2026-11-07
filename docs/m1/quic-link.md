@@ -1,5 +1,7 @@
 # The QUIC link and the path manager (`fil-transport::quic`, `fil-transport::path`)
 
+> **Historical:** the work of this package, as built; where it and `DESIGN.md` or the code differ, they win.
+
 M1 package P2. `QuicLink` is the `Link` (DESIGN.md §8.1) over quinn, with the stream mapping of §8.5 and the authentication of [quic-auth.md](quic-auth.md). `QuicListener` is the daemon's UDP port. `PathManager` is the client's choice between the pipe and QUIC (§4.1, §4.2), as a state machine with no IO.
 
 ## The link

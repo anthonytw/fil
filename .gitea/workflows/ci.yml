@@ -5,16 +5,16 @@
 # owner pushes there at release time. There is no macOS runner: macOS checks are run by hand.
 #
 # The job image is the runner's default (rust:1.99.1-trixie by digest). It has no Node, so no
-# JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and may
-# mount only the runner's three named cache volumes. Nothing here uses a secret; the job token is
-# read-only for this repo and is used only for the fetch.
+# JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and
+# mount no volume. Nothing here uses a secret; the job token is read-only for this repo and is used
+# only for the fetch.
 #
-# The volumes outlive the job, so what PR code (a dependency's build script, say) writes there must
-# not reach a later job: crate sources and downloads are fetched fresh each run (only the registry
-# index is kept; every crate is checked against Cargo.lock again), the tools are installed by root
-# into a root-owned directory the unprivileged user cannot write, a push to main builds in a fresh
-# target directory (no PR's build output can decide main's result), and musl mounts nothing. A PR
-# can still edit this file; that part is the runner's to enforce (#9).
+# Nothing outlives a job. The runner cannot tell a pull request from a push (a PR can edit this
+# file), so any cache shared between jobs is one a PR could poison for a later run of main. Every
+# job therefore starts from the image alone: a fresh cargo home (crates are downloaded and checked
+# against Cargo.lock each run, a few seconds), a fresh target directory, and the tools downloaded
+# as release binaries pinned by sha256 (a few seconds; building them would take minutes). The
+# shared build cache saved about 30 s of a 25-minute check, so it is not worth what it exposed.
 name: ci
 
 on:
@@ -36,19 +36,10 @@ jobs:
     timeout-minutes: 60
     container:
       # --init: a reaper as PID 1, so that the processes fil's tests orphan do not stay zombies
-      # (which kill(pid, 0) still finds alive).
+      # (which kill(pid, 0) still finds alive). No volumes: see the header.
       options: --init
-      volumes:
-        # Named volumes of the runner's job daemon (the only mounts it admits).
-        - fil-ci-cargo-registry:/usr/local/cargo/registry
-        - fil-ci-cargo-git:/usr/local/cargo/git
-        - fil-ci-target:/cache/target
     env:
-      # PRs share a warm build cache; a push to main builds from nothing.
-      CARGO_TARGET_DIR: ${{ github.event_name == 'push' && '/tmp/fil-target' || '/cache/target' }}
-      # The tools live in the registry volume, which survives between jobs, in a directory only
-      # root writes (with its own cargo home, so no ci-writable crate source is built as root).
-      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools-root
+      CARGO_TARGET_DIR: /tmp/fil-target
       CARGO_TERM_COLOR: never
       # The container sees every core of the host but is capped at 6 CPUs: the default (one test
       # thread per core) oversubscribes it and starves tests that wait on real time.
@@ -64,34 +55,26 @@ jobs:
         run: rustup toolchain install && rustc --version
       - name: Packages (systemd-tmpfiles, which crates/fil-daemon/tests/tmp_clean.rs runs for real)
         run: apt-get update -qq && apt-get install -y -qq systemd-standalone-tmpfiles
-      - name: Fresh crate sources (only the registry index survives between jobs)
-        # The registry's own directory stays root's: whoever owns it can rename the tools' directory.
+      - name: Tools (versions as in .github/workflows/linux-check.yml; release binaries, pinned by sha256)
+        # The upstream aarch64 musl release assets. A hash is that of the .tar.gz, as the release
+        # lists it; to bump a tool, change the version and the hash together.
         run: |
-          chown root:root /usr/local/cargo/registry && chmod 755 /usr/local/cargo/registry
-          rm -rf /usr/local/cargo/registry/src /usr/local/cargo/registry/cache /usr/local/cargo/git/* /usr/local/cargo/registry/fil-tools
-      - name: Tools (versions as in .github/workflows/linux-check.yml; cached in the registry volume)
-        run: |
-          # Made by root alone: an older one may be ci's (or a link), from before the registry
-          # directory was root's.
-          if [ -L "$CARGO_INSTALL_ROOT" ] || { [ -e "$CARGO_INSTALL_ROOT" ] && [ "$(stat -c %u "$CARGO_INSTALL_ROOT")" != 0 ]; }; then
-            rm -rf "$CARGO_INSTALL_ROOT"
-          fi
-          mkdir -p "$CARGO_INSTALL_ROOT/home"
-          chown -R root:root "$CARGO_INSTALL_ROOT" && chmod -R go-w "$CARGO_INSTALL_ROOT"
-          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
-          export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
-          install_tool() { # crate version [extra cargo-install args]
-            local crate=$1 ver=$2; shift 2
-            if cargo install --list | grep -q "^$crate v$ver:"; then
-              echo "$crate $ver cached"
-            else
-              # Its own home and target directory: nothing ci wrote is built into a root tool.
-              CARGO_HOME="$CARGO_INSTALL_ROOT/home" CARGO_TARGET_DIR="$(mktemp -d)" cargo install --locked "$crate" --version "$ver" "$@"
-            fi
+          set -euo pipefail
+          get_tool() { # url sha256 path-in-archive
+            local f
+            f="$RUNNER_TEMP/$(basename "$1")"
+            curl -fsSL --retry 3 -o "$f" "$1"
+            echo "$2  $f" | sha256sum -c -
+            tar -xzf "$f" -C "$RUNNER_TEMP" "$3"
+            install -o root -g root -m 755 "$RUNNER_TEMP/$3" /usr/local/bin/
           }
-          install_tool just 1.59.0
-          install_tool cargo-deny 0.20.2
-          install_tool cargo-about 0.9.3 --features cli
+          gh=https://github.com
+          get_tool $gh/casey/just/releases/download/1.59.0/just-1.59.0-aarch64-unknown-linux-musl.tar.gz \
+            23871b1702bfd550fb5f901778fd4290ecf2ee034a45a889fbe96d89b188086d just
+          get_tool $gh/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz \
+            995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d cargo-deny-0.20.2-aarch64-unknown-linux-musl/cargo-deny
+          get_tool $gh/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-aarch64-unknown-linux-musl.tar.gz \
+            eb4d9ff6ebd2518152a8308729431a04b3836e71d2bd5ead7aea69f91a71162e cargo-about-0.9.3-aarch64-unknown-linux-musl/cargo-about
           just --version; cargo deny --version; cargo about --version; python3 --version; nproc
           echo "build directory: $CARGO_TARGET_DIR (${{ github.event_name }})"
       - name: just ci (as an unprivileged user, umask 022)
@@ -100,9 +83,10 @@ jobs:
         # which fil-client's offline-log test cannot take (it refuses a group-writable log directory).
         run: |
           useradd -m -u 1000 ci
-          # Everything ci may write, and nothing more: not the tools ($CARGO_INSTALL_ROOT).
-          mkdir -p "$CARGO_TARGET_DIR" /usr/local/cargo/registry/index /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git
-          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" /usr/local/cargo/registry/index /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git
+          # Everything ci may write: the checkout, the build directory and cargo's crate download
+          # directories (the tools and the toolchain stay root's).
+          mkdir -p "$CARGO_TARGET_DIR" /usr/local/cargo/registry /usr/local/cargo/git
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" /usr/local/cargo/registry /usr/local/cargo/git
           chown ci:ci /usr/local/cargo
           HOME=/home/ci setpriv --reuid=ci --regid=ci --init-groups sh -c 'umask 022; just ci'
 
@@ -111,8 +95,8 @@ jobs:
     runs-on: orin-aarch64
     timeout-minutes: 60
     # A smoke test that the static targets still build, not the release path (that is `cross` in
-    # Cross.toml, on GitHub). It mounts no volume: it runs PR code as root, so nothing it writes may
-    # outlive the job, and no shared build output can end up in these binaries.
+    # Cross.toml, on GitHub). Like check, it mounts no volume (header). It runs PR code as root,
+    # which is fine only because nothing it writes outlives the job.
     env:
       CARGO_TERM_COLOR: never
       ZIG_VERSION: "0.16.0"

@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tls_redis_and_postgres_are_recognised() {
+    async fn wallclock_tls_redis_and_postgres_are_recognised() {
         for (b, want) in [
             (Behaviour::TlsAlert, ProbeKind::Tls),
             (Behaviour::TlsQuiet, ProbeKind::Tls),
@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn garbage_and_floods_are_unknown_within_budget() {
+    async fn wallclock_garbage_and_floods_are_unknown_within_budget() {
         for b in [Behaviour::Garbage, Behaviour::Flood] {
             let s = server(b).await;
             let t = Instant::now();
@@ -776,16 +776,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_closed_port_and_a_non_loopback_address_have_no_probe() {
+    async fn wallclock_a_closed_port_and_a_non_loopback_address_have_no_probe() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed = l.local_addr().unwrap();
         drop(l);
         assert_eq!(probe(closed, ProbeMode::Head).await, None);
         // TEST-NET-1: never connected to (a connect there would hang until the deadline).
-        let t = Instant::now();
         let far: SocketAddr = "192.0.2.1:80".parse().unwrap();
-        assert_eq!(probe(far, ProbeMode::Full).await, None);
-        assert!(t.elapsed() < Duration::from_millis(50));
+        // Not at once is a miss only on a host that held still (`Stalls`): up to 5 runs.
+        let stalls = fil_testkit::timing::Stalls::start();
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let t = std::time::Instant::now();
+            assert_eq!(probe(far, ProbeMode::Full).await, None);
+            if tries < 5 && stalls.disturbed(t) {
+                continue;
+            }
+            assert!(
+                t.elapsed() < Duration::from_millis(50),
+                "{}",
+                stalls.describe()
+            );
+            break;
+        }
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:80".parse().unwrap();
         assert_eq!(probe(mapped, ProbeMode::Full).await, None);
     }

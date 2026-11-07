@@ -19,7 +19,7 @@ fil is a remote shell for development over SSH:
 ## Conventions
 
 - **Rust:** a cargo workspace, laid out as in `DESIGN.md` §13. Crates live in `crates/`. The toolchain is pinned in `rust-toolchain.toml`.
-- **Tests:** keep them proportionate. Unit-test the logic that is easy to get wrong, such as frame parsing, sequence numbers and the snapshot writer. Heavy harnesses, like the fidelity suite and randomized overlay runs, are commands you run on demand, not part of the merge gate.
+- **Tests:** keep them proportionate. Unit-test the logic that is easy to get wrong, such as frame parsing, sequence numbers and the snapshot writer. Heavy harnesses, like the fidelity suite and randomized overlay runs, are commands you run on demand, not part of the merge gate. A test whose pass or fail depends on real elapsed time is named `wallclock_*` and runs alone in `just test-wallclock` (`docs/dev/timing-tests.md`: P and T bounds, `fil_testkit::timing::Stalls`); a bound that is a DESIGN.md claim is never relaxed to make CI pass.
 - **Logging:** `tracing`, with JSON output.
 - **POSIX calls:** library and binary code uses `rustix`. `nix` is for tests and examples only. The one exception is `fil-session`, which keeps `nix` because portable-pty's API hands over nix types (the PTY master's termios) and its signal and uid calls were not converted separately; new code there uses rustix where it can.
 - **License:** GPL-3.0-or-later. Every dependency must be GPL-3.0-compatible:

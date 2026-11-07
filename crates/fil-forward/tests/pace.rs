@@ -11,6 +11,7 @@ use std::time::Duration;
 use fil_forward::pace::{MIN_CAP, PaceConfig};
 use fil_netsim::stream::StreamConfig;
 use fil_proto::mux::{ForwardId, OpenKind};
+use fil_testkit::timing::{Stalls, percentile};
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -102,11 +103,11 @@ async fn a_stuck_forward_never_holds_the_control_sender_or_a_new_connection(t: T
 /// rolled into one). Unpaced, the terminal's probe waits behind the whole megabyte (about 420
 /// ms); paced, behind about the target. The download keeps most of the rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe() {
-    bounded(a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body()).await
+async fn wallclock_a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe() {
+    bounded(wallclock_a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body()).await
 }
 
-async fn a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body() {
+async fn wallclock_a_bulk_forward_keeps_the_terminal_fast_on_a_slow_pipe_body() {
     let paced = slow_pipe_cell(PaceConfig::default()).await;
     let unpaced = slow_pipe_cell(PaceConfig {
         enabled: false,
@@ -200,11 +201,11 @@ fn slow_pipe() -> StreamConfig {
 /// as full as unpaced (2.5 MB/s, measured in the cell above) with the terminal still fast. Before
 /// that, 16 gave 1.2 MB/s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parallel_downloads_keep_the_link_full() {
-    bounded(parallel_downloads_keep_the_link_full_body()).await
+async fn wallclock_parallel_downloads_keep_the_link_full() {
+    bounded(wallclock_parallel_downloads_keep_the_link_full_body()).await
 }
 
-async fn parallel_downloads_keep_the_link_full_body() {
+async fn wallclock_parallel_downloads_keep_the_link_full_body() {
     let denied = mbufs_denied();
     for n in [16, 32] {
         let source = endless_source().await;
@@ -277,14 +278,14 @@ async fn parallel_downloads_keep_the_link_full_body() {
     }
 }
 
-per_transport!(stuck_forwards_hold_neither_a_live_forward_nor_the_agent);
+per_transport!(wallclock_stuck_forwards_hold_neither_a_live_forward_nor_the_agent);
 
 /// **Readers that stopped** (B2 of the review), on both sides at once: 8 uploads into a `-L` whose
 /// target never reads (the client's pacer) and 8 downloads whose application never reads (the
 /// daemon's). A live forward's 1 MiB echo and the agent's request-and-answer still go at about
 /// their unpaced speed: each stuck channel stops only itself. Before, 8 stuck readers stalled every
 /// other channel for good.
-async fn stuck_forwards_hold_neither_a_live_forward_nor_the_agent(t: Transport) {
+async fn wallclock_stuck_forwards_hold_neither_a_live_forward_nor_the_agent(t: Transport) {
     let w = World::new(t, mux_config()).await;
     let (echo, agent) = stuck_cell(&w, 8, Duration::from_secs(3)).await;
     assert!(echo <= Duration::from_secs(2), "{echo:?}");
@@ -293,11 +294,11 @@ async fn stuck_forwards_hold_neither_a_live_forward_nor_the_agent(t: Transport) 
 
 /// The same on the slow pipe, with pacing and without (for the comparison it prints).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stuck_forwards_on_a_slow_pipe() {
-    bounded(stuck_forwards_on_a_slow_pipe_body()).await
+async fn wallclock_stuck_forwards_on_a_slow_pipe() {
+    bounded(wallclock_stuck_forwards_on_a_slow_pipe_body()).await
 }
 
-async fn stuck_forwards_on_a_slow_pipe_body() {
+async fn wallclock_stuck_forwards_on_a_slow_pipe_body() {
     let mut took = Vec::new();
     for cfg in [OFF, PaceConfig::default()] {
         let w = World::new_pipe_on(mux_config(), slow_pipe()).await;
@@ -498,9 +499,9 @@ async fn stuck_cell(w: &World, k: usize, settle: Duration) -> (Duration, Duratio
 }
 
 per_transport!(
-    a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent,
-    a_stuck_forward_writing_small_chunks_does_not_hold_the_agent,
-    a_server_that_speaks_first_is_heard_at_once
+    wallclock_a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent,
+    wallclock_a_stuck_forward_writing_small_chunks_does_not_hold_the_agent,
+    wallclock_a_server_that_speaks_first_is_heard_at_once
 );
 
 /// **A server that speaks first** (sshd, SMTP, MySQL: a banner on accept; B-new-2 of the second
@@ -510,7 +511,7 @@ per_transport!(
 /// paced or not: 1 in 10 at first, 2 to 5% (3 to 8 in 150) with the kick dropped from the
 /// control sender's loop. 200 connects (fewer than a side may have open at once, since the target
 /// holds each for 5 s), each timed to its banner.
-async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
+async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     const CONNECTS: usize = 200;
     let server = serve(|mut s| async move {
         let _ = s.write_all(b"220 hello\r\n").await;
@@ -519,8 +520,18 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     .await;
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
+    // A connect the host stalled during (a throttled or descheduled test process: the watcher
+    // sees it too) measures the host, not the product, and is not counted: it is tried again. The
+    // bound is unchanged, and a sample the host left alone that misses it is a miss. (Run 33 of
+    // the Orin runner: 2 of 200 over 75 ms, with the container throttled.) The target holds each
+    // connection for 5 s and a side may have only so many open, so the extra tries are few.
+    const MOST_TRIES: usize = CONNECTS + 40;
+    const MIN_CLEAN: usize = CONNECTS * 3 / 4;
+    let stalls = Stalls::start();
     let mut lat = Vec::new();
-    for _ in 0..CONNECTS {
+    let mut tries = 0;
+    while lat.len() < CONNECTS && tries < MOST_TRIES {
+        tries += 1;
         let t0 = std::time::Instant::now();
         let mut c = connect(port).await;
         let mut b = [0u8; 11];
@@ -528,28 +539,37 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
             .await
             .expect("the banner")
             .unwrap();
-        lat.push(t0.elapsed());
+        let took = t0.elapsed();
         drop(c);
+        if !stalls.disturbed(t0) {
+            lat.push(took);
+        }
     }
-    lat.sort();
-    let p99 = lat[CONNECTS * 99 / 100];
+    assert!(
+        lat.len() >= MIN_CLEAN,
+        "only {} of {tries} connects ran undisturbed: this host is too busy to judge a latency ({})",
+        lat.len(),
+        stalls.describe()
+    );
+    let n = lat.len();
+    let p99 = percentile(&mut lat, 99);
     let slow = lat
         .iter()
         .filter(|d| **d > Duration::from_millis(75))
         .count();
     eprintln!(
-        "{t:?}: connect to banner p50 {:?} p99 {p99:?} max {:?}, {slow} of {CONNECTS} over 75 ms",
-        lat[CONNECTS / 2],
-        lat[CONNECTS - 1]
+        "{t:?}: connect to banner p50 {:?} p99 {p99:?} max {:?}, {slow} of {n} over 75 ms ({} of {tries} tries disturbed by the host)",
+        lat[n / 2],
+        lat[n - 1],
+        tries - n
     );
-    // About a millisecond each on these links; one that waits for a timer is 85 ms or more. A
-    // loaded machine (a load average of 70) delays some connects by tens of milliseconds (a p99 of
-    // 38 ms was seen), so the bounds sit between that and the bug, which the sample size makes
-    // sure to catch.
-    // (With 200 connects, at most one over 75 ms already implies the p99 bound; kept for the
-    // message that names it.)
+    // About a millisecond each on these links; one that waits for a timer (the peer's 100 ms ack
+    // timer, DESIGN.md 8.5) is 85 ms or more. The bound sits between the two, and the sample size
+    // makes sure to catch the bug (2 to 5% of connects).
+    // (At most one over 75 ms in 200 already implies the p99 bound; kept for the message that
+    // names it.)
     assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}");
-    assert!(slow <= 1, "{slow} of {CONNECTS} over 75 ms");
+    assert!(slow <= 1, "{slow} of {n} over 75 ms");
 }
 
 /// **A reader that stopped, written to in small chunks** (B-new-1 of the re-check): an
@@ -558,7 +578,7 @@ async fn a_server_that_speaks_first_is_heard_at_once(t: Transport) {
 /// the scan for a payload that may go, every other channel stopped behind them for good. Now
 /// the queue holds only payloads that may go: a live forward's echoes and the agent's
 /// request-and-answer go on beside it.
-async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent(
+async fn wallclock_a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_the_agent(
     t: Transport,
 ) {
     let denied = mbufs_denied();
@@ -611,9 +631,10 @@ async fn a_stuck_forward_writing_small_chunks_holds_neither_a_live_forward_nor_t
     let req = vec![3u8; 1024];
     let mut back = vec![0u8; 1024];
     let mut worst = Duration::ZERO;
+    let stalls = Stalls::start();
     for i in 0..10 {
         let took = agent
-            .ask(&w, &req, &mut back, Duration::from_secs(5))
+            .ask_undisturbed(&w, &req, &mut back, &stalls)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -698,6 +719,27 @@ impl Agent {
         }
     }
 
+    /// [`Agent::ask`] for a latency bound: a request that the host stalled during (`stalls`)
+    /// measures the host, not the product, and is asked again, up to 5 times in all. The bound the
+    /// caller applies is unchanged.
+    async fn ask_undisturbed(
+        &mut self,
+        w: &World,
+        req: &[u8],
+        back: &mut [u8],
+        stalls: &Stalls,
+    ) -> Result<Duration, String> {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let t = std::time::Instant::now();
+            let took = self.ask(w, req, back, Duration::from_secs(5)).await?;
+            if tries == 5 || !stalls.disturbed(t) {
+                return Ok(took);
+            }
+        }
+    }
+
     /// One request: the time to its answer, within `limit`.
     async fn ask(
         &mut self,
@@ -751,7 +793,7 @@ impl Agent {
 /// The agent alone beside the trickling channel of the test above: a request every 500 ms (whose
 /// acks park the stuck channel), each answered; the answers go back through the client's data
 /// sender, which the trickle's payloads once filled for good.
-async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transport) {
+async fn wallclock_a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transport) {
     let denied = mbufs_denied();
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(2048).unwrap();
@@ -779,9 +821,10 @@ async fn a_stuck_forward_writing_small_chunks_does_not_hold_the_agent(t: Transpo
     let req = vec![3u8; 1024];
     let mut back = vec![0u8; 1024];
     let mut worst = Duration::ZERO;
+    let stalls = Stalls::start();
     for i in 0..16 {
         let took = agent
-            .ask(&w, &req, &mut back, Duration::from_secs(5))
+            .ask_undisturbed(&w, &req, &mut back, &stalls)
             .await
             .unwrap_or_else(|e| {
                 panic!(

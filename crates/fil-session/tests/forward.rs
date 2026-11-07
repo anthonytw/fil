@@ -392,7 +392,7 @@ async fn a_change_the_client_cannot_hear_of_is_refused() {
 /// After `~.` the `-R` listener stays bound and refuses at once (in under 50 ms), where a
 /// transient disconnect would make the connection wait for the next link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_detached_remote_refuses_at_once() {
+async fn wallclock_a_detached_remote_refuses_at_once() {
     let s = Scratch::new();
     let h = spawn_plain(cat(&s, "detached")).await;
     let mut c = FwdClient::attach(&h, key(1), "laptop").await;
@@ -415,10 +415,25 @@ async fn a_detached_remote_refuses_at_once() {
 
     // Under 50 ms (the median of five, so one scheduling hiccup on a loaded machine does not
     // decide it; `open_wait`, what a refusal that waited would take, is seconds).
+    // A refusal the host stalled during (`Stalls`) measures the host and is not counted; five
+    // that it left alone are.
+    let stalls = fil_testkit::timing::Stalls::start();
     let mut took = Vec::new();
-    for _ in 0..5 {
-        took.push(refused(port).await);
+    for _ in 0..25 {
+        let t0 = Instant::now();
+        let d = refused(port).await;
+        if !stalls.disturbed(t0) {
+            took.push(d);
+            if took.len() == 5 {
+                break;
+            }
+        }
     }
+    assert!(
+        took.len() == 5,
+        "too few undisturbed runs: {}",
+        stalls.describe()
+    );
     took.sort();
     assert!(
         took[2] < Duration::from_millis(50),
@@ -1093,7 +1108,7 @@ async fn exit_closes_forwards_and_a_resume_gets_the_status() {
 /// promptly. The session's receive loop hands forwarded payloads to the endpoint without
 /// waiting, so a stuck forward cannot hold up the terminal's input behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forward_floods_do_not_slow_the_terminal() {
+async fn wallclock_forward_floods_do_not_slow_the_terminal() {
     let s = Scratch::new();
     let h = spawn_plain(cat(&s, "flood")).await;
     let mut c = FwdClient::attach(&h, key(1), "laptop").await;

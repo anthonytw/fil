@@ -134,7 +134,7 @@ fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'st
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hung_log_file_does_not_stop_the_daemon() {
+async fn wallclock_a_hung_log_file_does_not_stop_the_daemon() {
     let (log, gate, lines) = hung_log(QueueLimits::default());
     let _open = gate.opens_on_drop();
     tracing_subscriber::fmt()
@@ -153,6 +153,7 @@ async fn a_hung_log_file_does_not_stop_the_daemon() {
     // The file hangs. A flood of events, more than the queue holds: every call returns at once.
     gate.shut();
     const FLOOD: usize = 5000;
+    let stalls = fil_testkit::timing::Stalls::start();
     let timed = within(Duration::from_secs(5), || {
         let mut each = Vec::with_capacity(FLOOD);
         let start = Instant::now();
@@ -160,25 +161,39 @@ async fn a_hung_log_file_does_not_stop_the_daemon() {
             let t = Instant::now();
             // The default filter lets only fil's own crates through: log as one of them.
             tracing::info!(target: "fil_daemon::log_blocking", i, "a line while the file hangs");
-            each.push(t.elapsed());
+            each.push((t, t.elapsed()));
         }
         (start.elapsed(), each)
     });
-    let (total, mut each) = timed.expect("a log call blocked on the hung file");
+    let (total, each) = timed.expect("a log call blocked on the hung file");
     // A call that waits for the hung file waits for ever: the first one would hold up the flood
     // past the 5 s above, and the average below would be seconds. What is left to check is that
-    // the calls are quick, and a quick call can still be descheduled for tens of milliseconds on
-    // a loaded machine (a load average over 100 did it to 1 run in 3 with a bound on the slowest
-    // call), so the average has a margin and the tail is judged at the 99th percentile.
+    // the calls are quick. A quick call can still be descheduled for tens of milliseconds on a
+    // loaded machine (a load average over 100 did it to 1 run in 3 with a bound on the slowest
+    // call; a throttled CI container stops every thread for up to 100 ms), and that measures
+    // the host: a call the host stalled during (`Stalls`) is left out of the average and the
+    // percentile. The bounds are unchanged; the calls they judge are the ones the host left alone.
+    let mut each: Vec<Duration> = each
+        .iter()
+        .filter(|(t, d)| !stalls.disturbed_between(*t, *t + *d))
+        .map(|(_, d)| *d)
+        .collect();
     assert!(
-        total / FLOOD as u32 <= Duration::from_micros(200),
-        "{FLOOD} log calls took {total:?}"
+        each.len() >= FLOOD * 9 / 10,
+        "only {} of {FLOOD} log calls ran undisturbed: {}",
+        each.len(),
+        stalls.describe()
     );
-    each.sort();
-    let p99 = each[FLOOD * 99 / 100];
+    let n = each.len();
+    assert!(
+        each.iter().sum::<Duration>() / n as u32 <= Duration::from_micros(200),
+        "{n} undisturbed log calls of {FLOOD} (the flood took {total:?}); {}",
+        stalls.describe()
+    );
+    let p99 = fil_testkit::timing::percentile(&mut each, 99);
     assert!(p99 < Duration::from_millis(50), "99th percentile {p99:?}");
     // Load deschedules a thread for tens of milliseconds, not for a second.
-    assert!(each[FLOOD - 1] < NEVER, "slowest {:?}", each[FLOOD - 1]);
+    assert!(each[n - 1] < NEVER, "slowest {:?}", each[n - 1]);
 
     // The daemon, which logs as it works, goes on within 100 ms each (three runs of each step).
     let mut took = Vec::new();

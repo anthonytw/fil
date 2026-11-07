@@ -91,7 +91,7 @@ async fn a_repaint_after_a_resize_is_the_screen_at_the_new_size_with_no_history(
 /// has passed, at the final size. The final size is always repainted, within a second of the
 /// last request, and no more than two repaints are sent in all.
 #[tokio::test]
-async fn a_drag_ends_with_one_repaint_at_the_final_size() {
+async fn wallclock_a_drag_ends_with_one_repaint_at_the_final_size() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(&sc, "main", LINES_THEN_QUIET)).await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
@@ -224,7 +224,7 @@ async fn a_repaint_waits_for_the_attach_snapshots_ack() {
 /// is applied before it (the scripted client holds the snapshot as the real one does), so the
 /// stream has no gap and not one byte of the output is skipped.
 #[tokio::test]
-async fn a_repaint_is_served_under_steady_output_and_skips_none_of_it() {
+async fn wallclock_a_repaint_is_served_under_steady_output_and_skips_none_of_it() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(
         &sc,

@@ -55,7 +55,7 @@ per_transport!(
     drops_mid_transfer,
     linger_expiry,
     open_wait_expiry,
-    stuck_consumer,
+    wallclock_stuck_consumer,
     budget,
 );
 
@@ -470,7 +470,7 @@ async fn open_wait_expiry(t: Transport) {
 /// else notices. The terminal channel sharing the link still answers at once, and (on the pipe)
 /// the link still notices a dead peer within `dead_after`: the receive loop never waits on the
 /// stuck socket, so the pipe keeps reading and its silence clock keeps running.
-async fn stuck_consumer(t: Transport) {
+async fn wallclock_stuck_consumer(t: Transport) {
     // A server that sends forever.
     let server = serve(|mut s| async move {
         shrink_buffers(&s);
@@ -838,11 +838,11 @@ async fn a_refused_open_never_connects_body() {
 /// The opener's policy refuses (an `-R` listener while detached): reset at once (well within a
 /// second, against an `open_wait` of 30 s), nothing opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_local_connection_is_reset_at_once() {
-    bounded(a_refused_local_connection_is_reset_at_once_body()).await
+async fn wallclock_a_refused_local_connection_is_reset_at_once() {
+    bounded(wallclock_a_refused_local_connection_is_reset_at_once_body()).await
 }
 
-async fn a_refused_local_connection_is_reset_at_once_body() {
+async fn wallclock_a_refused_local_connection_is_reset_at_once_body() {
     let canary = echo_server().await;
     let w = World::new(Transport::Mem, mux_config()).await;
     w.client.targets.set(ForwardId(3), canary.port);
@@ -1129,11 +1129,11 @@ async fn a_queued_connection_is_checked_when_it_arrives_body() {
 /// leaving them until `open_wait`: on the daemon its policy then refuses them (`Detached` while
 /// nobody holds the session), as DESIGN.md section 7.2 says a detached listener does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_epoch_rechecks_the_queued_connections_at_once() {
-    bounded(a_new_epoch_rechecks_the_queued_connections_at_once_body()).await
+async fn wallclock_a_new_epoch_rechecks_the_queued_connections_at_once() {
+    bounded(wallclock_a_new_epoch_rechecks_the_queued_connections_at_once_body()).await
 }
 
-async fn a_new_epoch_rechecks_the_queued_connections_at_once_body() {
+async fn wallclock_a_new_epoch_rechecks_the_queued_connections_at_once_body() {
     let cfg = MuxConfig {
         max_open: 1,
         open_wait: Duration::from_secs(20),

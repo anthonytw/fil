@@ -128,7 +128,7 @@ async fn a_wrapped_log_goes_on_when_the_client_acks_the_snapshot() {
 /// nothing to send and waits for the client's ack. It must still hear a takeover at once, not
 /// after some polling interval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_takeover_is_handled_promptly_while_a_snapshot_is_unconfirmed() {
+async fn wallclock_a_takeover_is_handled_promptly_while_a_snapshot_is_unconfirmed() {
     let sc = Scratch::new();
     let script = format!("stty -echo; echo READY; read go; {YES}; echo END; sleep 30");
     let h = spawn_plain(flood_config(&sc, &script, Some(128 * 1024))).await;
@@ -282,7 +282,7 @@ async fn a_flush_does_not_confirm_a_snapshot_on_a_queueing_link() {
 /// second late (and the flood had wrapped the log by then). Found on the Linux runner, where
 /// `a_dropped_connection_is_reaped_during_an_output_flood` timed out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fast_flood_does_not_starve_the_connection() {
+async fn wallclock_a_fast_flood_does_not_starve_the_connection() {
     let sc = Scratch::new();
     let script =
         "stty raw -echo; yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; sleep 30";

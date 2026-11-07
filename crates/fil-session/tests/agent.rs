@@ -287,7 +287,7 @@ async fn a_bad_directory_is_refused() {
 /// Detached, and attached by a client that does not relay: the socket is gone, and a connection
 /// is refused at once (well under 50 ms).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_at_once_while_detached() {
+async fn wallclock_refused_at_once_while_detached() {
     let dir = Short::new("det");
     let agent = MiniAgent::start(&dir.0.join("mini.sock"), 1);
     let (_scratch, h) = session(&dir).await;
@@ -296,14 +296,26 @@ async fn refused_at_once_while_detached() {
     c.detach().await;
     wait_for("the socket to go", || !dir.socket().exists()).await;
     assert!(!h.agent_relayed());
+    let stalls = fil_testkit::timing::Stalls::start();
     let refused_fast = |label: &'static str| {
         let sock = dir.socket();
+        let stalls = &stalls;
         async move {
-            let t0 = Instant::now();
-            let r = UnixStream::connect(&sock).await;
-            let took = t0.elapsed();
-            assert!(r.is_err(), "{label}: refused");
-            assert!(took < Duration::from_millis(50), "{label}: took {took:?}");
+            // A refusal the host stalled during measures the host: tried again (up to 5 times).
+            // The 50 ms bound is unchanged.
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                let t0 = Instant::now();
+                let r = UnixStream::connect(&sock).await;
+                let took = t0.elapsed();
+                assert!(r.is_err(), "{label}: refused");
+                if tries < 5 && stalls.disturbed(t0) {
+                    continue;
+                }
+                assert!(took < Duration::from_millis(50), "{label}: took {took:?}");
+                break;
+            }
         }
     };
     refused_fast("detached").await;

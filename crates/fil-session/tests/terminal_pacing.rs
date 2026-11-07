@@ -547,7 +547,7 @@ fn assert_within_limit(what: &str, r: &CtrlC) {
 /// K1's requirement: on QUIC at 1 Mbit/s, Ctrl-C during a flood shows its effect within 3 s, and
 /// nothing is lost. Unpaced it takes about 13 s (`ctrl_c_on_a_slow_quic_link_unpaced`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ctrl_c_during_a_flood_on_a_slow_quic_link_is_fast_and_loses_nothing() {
+async fn wallclock_ctrl_c_during_a_flood_on_a_slow_quic_link_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Quic, SLOW_PATH, true).await;
     report("quic 1 Mbit/s paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
@@ -556,7 +556,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_quic_link_is_fast_and_loses_nothing() {
 
 /// The same on the pipe: no worse than K1's bound either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ctrl_c_during_a_flood_on_a_slow_pipe_is_fast_and_loses_nothing() {
+async fn wallclock_ctrl_c_during_a_flood_on_a_slow_pipe_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Pipe, SLOW_PATH, true).await;
     report("pipe 1 Mbit/s paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
@@ -573,7 +573,7 @@ fn slow_path(rtt_ms: u64) -> Path {
 
 /// The same at a 200 ms round trip (a US to Asia session): still within the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ctrl_c_during_a_flood_on_a_slow_long_quic_path_is_fast_and_loses_nothing() {
+async fn wallclock_ctrl_c_during_a_flood_on_a_slow_long_quic_path_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Quic, slow_path(200), true).await;
     report("quic 1 Mbit/s 200 ms paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
@@ -581,7 +581,7 @@ async fn ctrl_c_during_a_flood_on_a_slow_long_quic_path_is_fast_and_loses_nothin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_nothing() {
+async fn wallclock_ctrl_c_during_a_flood_on_a_slow_long_pipe_is_fast_and_loses_nothing() {
     let r = ctrl_c_cell(Transport::Pipe, slow_path(200), true).await;
     report("pipe 1 Mbit/s 200 ms paced", &r);
     assert!(r.catch_ups > 0, "the flood never outran the link");
@@ -719,19 +719,19 @@ fn path_of(t: Transport, rtt_ms: u64, mbit: u64) -> Path {
 /// ack, made the drain estimate hours), and 1 on a 200 ms path from the window's ramp (a rate of
 /// 34 kB/s measured on a 12.5 MB/s link while the window grew from its floor).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typing_then_a_medium_output_on_a_fast_quic_link_never_jumps() {
+async fn wallclock_typing_then_a_medium_output_on_a_fast_quic_link_never_jumps() {
     let n = workload_cell(Transport::Quic, WAN_PATH, true, Workload::TypingThen480k).await;
     assert_eq!(n, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typing_then_a_medium_output_on_a_fast_pipe_never_jumps() {
+async fn wallclock_typing_then_a_medium_output_on_a_fast_pipe_never_jumps() {
     let n = workload_cell(Transport::Pipe, WAN_PATH, true, Workload::TypingThen480k).await;
     assert_eq!(n, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_medium_output_on_a_long_fast_quic_path_never_jumps() {
+async fn wallclock_a_medium_output_on_a_long_fast_quic_path_never_jumps() {
     let n = workload_cell(
         Transport::Quic,
         path_of(Transport::Quic, 200, 100),
@@ -743,7 +743,7 @@ async fn a_medium_output_on_a_long_fast_quic_path_never_jumps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_medium_output_on_a_long_fast_pipe_never_jumps() {
+async fn wallclock_a_medium_output_on_a_long_fast_pipe_never_jumps() {
     let n = workload_cell(
         Transport::Pipe,
         path_of(Transport::Pipe, 200, 100),

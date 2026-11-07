@@ -14,7 +14,7 @@ default:
 # The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
 # failure (the advisory database) shows up at once, not after the whole test suite; `notices` next,
 # so that a missing cargo-about (the Notices section below) does too.
-ci: deny notices fmt-check clippy check-default release-deps release-test test
+ci: deny notices fmt-check clippy check-default release-deps release-test test test-wallclock
 
 fmt-check:
     cargo fmt --all --check
@@ -50,8 +50,20 @@ release-deps:
       test -z "$hooks" || { echo "release-deps: $c has a test-only feature in the release build of fil: $hooks" >&2; exit 1; }
     done
 
+# Every test but the wall-clock ones (named wallclock_*, below), in parallel. --no-fail-fast: one
+# failing test binary does not hide the rest (a CI run reports every failure); the recipe still
+# fails on any.
 test:
-    cargo test --workspace --all-features
+    cargo test --workspace --all-features --no-fail-fast -- --skip wallclock_
+
+# The wall-clock tests, one at a time (docs/dev/timing-tests.md): tests named wallclock_*, whose
+# pass or fail depends on real elapsed time (a latency percentile, "at once", Ctrl-C within 3 s).
+# Run beside the rest of the suite they measure the contention between tests (a CI container
+# capped at a few CPUs is throttled by the kernel in 100 ms periods); alone they measure the
+# product. `test` and this recipe together run every test once: `ci` runs both. Name a new
+# wall-clock test with the prefix and it is in this step and out of the other.
+test-wallclock:
+    cargo test --workspace --all-features --no-fail-fast -- wallclock_ --test-threads=1
 
 # Regenerate the wire golden (crates/fil-proto/tests/golden/wire.txt) after a deliberate wire
 # change. Bump PROTOCOL_REVISION in crates/fil-proto/src/limits.rs FIRST: this refuses to write

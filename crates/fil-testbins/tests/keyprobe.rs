@@ -36,7 +36,7 @@ fn val(line: &str, key: &str) -> f64 {
 const ECHO: &str = "stty raw -echo; echo KP-READY-$((6*7)); exec cat";
 
 #[test]
-fn keys_through_a_raw_cat_are_all_echoed_with_sane_latency() {
+fn wallclock_keys_through_a_raw_cat_are_all_echoed_with_sane_latency() {
     let out = run(&[
         "keys",
         "--rate",
@@ -73,7 +73,7 @@ fn keys_through_a_raw_cat_are_all_echoed_with_sane_latency() {
 /// `docs/m3/plan.md`), and the final screen holds exactly the keys typed. 300 keys from column 11
 /// (the raw tty does not return the carriage after `KP-READY-42`) wrap the 100 columns three times.
 #[test]
-fn the_screen_agrees_with_the_bytes_on_a_raw_cat() {
+fn wallclock_the_screen_agrees_with_the_bytes_on_a_raw_cat() {
     let out = run(&[
         "keys",
         "--screen",

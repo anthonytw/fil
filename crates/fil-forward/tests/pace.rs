@@ -532,8 +532,12 @@ async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     let mut tries = 0;
     while lat.len() < CONNECTS && tries < MOST_TRIES {
         tries += 1;
-        let t0 = std::time::Instant::now();
+        // Timed from the application's connect returning: the kernel's own handshake with the
+        // forward's listener (and the test helper's retry after a reset, which Linux gives a
+        // loopback connect now and then) is not the product's. The product's own connect to the
+        // target retries a reset after 5 ms (`connect.rs`), which is inside the time.
         let mut c = connect(port).await;
+        let t0 = std::time::Instant::now();
         let mut b = [0u8; 11];
         timeout(Duration::from_secs(5), c.read_exact(&mut b))
             .await

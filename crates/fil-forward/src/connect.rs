@@ -161,10 +161,30 @@ pub fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// does when the target's listen queue is full (macOS caps it at 128): a burst of opens to one
 /// local server (a queue of forwarded connections opening at once) is common, so such a
 /// refusal is tried again after a short backoff, a few times, within the caller's timeout.
+/// Linux resets a loopback connect too, now and then (a source port that an earlier, reset
+/// connection used: a retry on the same socket address succeeds at once).
 async fn attempt(addr: SocketAddr) -> io::Result<TcpStream> {
-    let mut backoff = Duration::from_millis(20);
+    retry_reset(|| TcpStream::connect(addr)).await
+}
+
+/// How often a connect reset is tried again, and the wait before the first retry (it doubles
+/// after each: 5, 10, 20, 40, 80, 160 ms, 315 ms in all).
+///
+/// The first wait is short because a reset costs the user's connection that much before the
+/// target answers it: a server that speaks first (a banner on accept) is heard that much later.
+/// With a first wait of 20 ms (the ladder was 20, 40, 80, 160) a connect that was reset once,
+/// twice or thrice took 20, 60 or 140 ms longer, and one reset four times 300 ms longer.
+const RESET_RETRIES: usize = 6;
+const RESET_BACKOFF: Duration = Duration::from_millis(5);
+
+async fn retry_reset<T, F, Fut>(mut connect: F) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let mut backoff = RESET_BACKOFF;
     for _ in 0..RESET_RETRIES {
-        match TcpStream::connect(addr).await {
+        match connect().await {
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
                 tokio::time::sleep(backoff).await;
                 backoff *= 2;
@@ -172,11 +192,8 @@ async fn attempt(addr: SocketAddr) -> io::Result<TcpStream> {
             r => return r,
         }
     }
-    TcpStream::connect(addr).await
+    connect().await
 }
-
-/// How often a connect reset by a full listen queue is tried again (20, 40, 80, 160 ms apart).
-const RESET_RETRIES: usize = 4;
 
 async fn race(addrs: Vec<SocketAddr>, stagger: Duration) -> Result<TcpStream, OpenFailure> {
     let mut attempts = JoinSet::new();
@@ -461,6 +478,48 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits(), 1);
+    }
+
+    /// A connect reset in the handshake is tried again after a few milliseconds, not tens: it
+    /// is what a banner waits for when the first connect to a target is reset (the reset ladder
+    /// used to start at 20 ms, so a reset connect was 20 ms later, and four of them 300 ms).
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_connect_is_retried_within_a_few_milliseconds() {
+        for resets in 1..=RESET_RETRIES {
+            let mut left = resets;
+            let t0 = tokio::time::Instant::now();
+            let r = retry_reset(|| {
+                let reset = left > 0;
+                left = left.saturating_sub(1);
+                async move {
+                    if reset {
+                        Err(io::Error::from(io::ErrorKind::ConnectionReset))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert!(r.is_ok(), "{resets} resets are within the retries");
+            // The k-th reset costs RESET_BACKOFF * 2^(k-1); a single one is a few ms at most.
+            let waited = t0.elapsed();
+            assert_eq!(
+                waited,
+                RESET_BACKOFF * ((1u32 << resets) - 1),
+                "{resets} resets"
+            );
+            if resets == 1 {
+                assert!(waited <= Duration::from_millis(10), "{waited:?}");
+            }
+        }
+        // As patient as before the ladder was shortened (4 retries: 20 + 40 + 80 + 160 ms).
+        let total: Duration = (0..RESET_RETRIES).map(|k| RESET_BACKOFF * (1 << k)).sum();
+        assert!(total >= Duration::from_millis(300), "{total:?}");
+        // Past the retries the reset is the answer.
+        let r: io::Result<()> =
+            retry_reset(|| async { Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionReset)) })
+                .await;
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
     }
 
     /// The policy sees canonical addresses only.

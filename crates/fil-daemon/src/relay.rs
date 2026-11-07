@@ -541,9 +541,11 @@ mod tests {
     fn the_eof_watch_retries_its_timeouts_and_never_spins() {
         let (mut far, near) = UnixStream::pair().unwrap();
         let mut w = EofWatch::new(near, Duration::from_millis(50));
-        assert_eq!(
-            w.sock.read_timeout().unwrap(),
-            Some(Duration::from_millis(50))
+        // The kernel rounds a socket timeout up to a clock tick (52 ms on a 250 Hz aarch64 kernel).
+        let set = w.sock.read_timeout().unwrap().unwrap();
+        assert!(
+            (Duration::from_millis(50)..Duration::from_millis(70)).contains(&set),
+            "{set:?}"
         );
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));

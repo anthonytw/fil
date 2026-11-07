@@ -483,7 +483,9 @@ fn a_change_behind_a_symbolic_link_is_read_again() {
     )
     .unwrap();
     assert!(p.forward(&remote(BindAddr::Loopback, 9000)).is_err());
-    // A new file in the directory a link leads to.
+    // A new file in the directory a link leads to (past a clock tick: a directory's mtime moves
+    // in ticks on some kernels).
+    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(real.join("conf.d/10-x.conf"), "AllowAgentForwarding no\n").unwrap();
     assert!(p.agent().is_err(), "the new include file was read");
 }

@@ -1,0 +1,135 @@
+# fil's CI on the lab's Gitea, run by the self-hosted aarch64 runner (label orin-aarch64).
+#
+# Gitea reads .gitea/workflows/ and ignores .github/workflows/ when the former exists, so the
+# GitHub workflows (release, linux-check, macos-check) do not run here. They run on GitHub, when the
+# owner pushes there at release time. There is no macOS runner: macOS checks are run by hand.
+#
+# The job image is the runner's default (rust:1.99.1-trixie by digest). It has no Node, so no
+# JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and may
+# mount only the runner's three named cache volumes. Nothing here uses a secret; the job token is
+# read-only for this repo and is used only for the fetch.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: orin-aarch64
+    timeout-minutes: 60
+    container:
+      # --init: a reaper as PID 1, so that the processes fil's tests orphan do not stay zombies
+      # (which kill(pid, 0) still finds alive).
+      options: --init
+      volumes:
+        # Named volumes of the runner's job daemon (the only mounts it admits).
+        - fil-ci-cargo-registry:/usr/local/cargo/registry
+        - fil-ci-cargo-git:/usr/local/cargo/git
+        - fil-ci-target:/cache/target
+    env:
+      CARGO_TARGET_DIR: /cache/target
+      # The tools live in the registry volume, which survives between jobs.
+      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools
+      CARGO_TERM_COLOR: never
+      # The container sees every core of the host but is capped at 6 CPUs: the default (one test
+      # thread per core) oversubscribes it and starves tests that wait on real time.
+      RUST_TEST_THREADS: "4"
+    steps:
+      - name: Checkout (plain git; the image has no Node for actions/checkout)
+        run: |
+          git init -q .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Packages (systemd-tmpfiles, which crates/fil-daemon/tests/tmp_clean.rs runs for real)
+        run: apt-get update -qq && apt-get install -y -qq systemd-standalone-tmpfiles
+      - name: Tools (versions as in .github/workflows/linux-check.yml; cached in the registry volume)
+        run: |
+          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+          install_tool() { # crate version [extra cargo-install args]
+            local crate=$1 ver=$2; shift 2
+            if cargo install --list | grep -q "^$crate v$ver:"; then
+              echo "$crate $ver cached"
+            else
+              cargo install --locked "$crate" --version "$ver" "$@"
+            fi
+          }
+          install_tool just 1.59.0
+          install_tool cargo-deny 0.20.2
+          install_tool cargo-about 0.9.3 --features cli
+          just --version; cargo deny --version; cargo about --version; python3 --version; nproc
+      - name: just ci (as an unprivileged user, umask 022)
+        # Not root: fil-daemon's /proc tests (ports::tests) assume the tests are not run as root, and
+        # PR code has no business running as root here anyway. The jobs also start with umask 002,
+        # which fil-client's offline-log test cannot take (it refuses a group-writable log directory).
+        run: |
+          useradd -m -u 1000 ci
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" /usr/local/cargo/registry /usr/local/cargo/git
+          chown ci:ci /usr/local/cargo
+          HOME=/home/ci setpriv --reuid=ci --regid=ci --init-groups sh -c 'umask 022; just ci'
+
+  musl:
+    name: musl (static release binaries, build only)
+    runs-on: orin-aarch64
+    timeout-minutes: 60
+    # A smoke test that the static targets still build, not the release path (that is `cross` in
+    # Cross.toml, on GitHub). Only the two cargo caches are mounted; the target directory is fresh
+    # so that no shared build output can end up in these binaries.
+    container:
+      volumes:
+        - fil-ci-cargo-registry:/usr/local/cargo/registry
+        - fil-ci-cargo-git:/usr/local/cargo/git
+    env:
+      CARGO_INSTALL_ROOT: /usr/local/cargo/registry/fil-tools
+      CARGO_TERM_COLOR: never
+      ZIG_VERSION: "0.16.0"
+      ZIG_SHA256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+    steps:
+      - name: Checkout (plain git)
+        run: |
+          git init -q .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - name: Toolchain (from rust-toolchain.toml, with both musl targets)
+        run: rustup toolchain install && rustc --version
+      - name: Packages (musl-tools for aarch64, xz for the zig tarball)
+        run: apt-get update -qq && apt-get install -y -qq musl-tools xz-utils
+      - name: zig (pinned by hash) and cargo-zigbuild
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-linux-$ZIG_VERSION.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig && tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+          export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
+          if cargo install --list | grep -q '^cargo-zigbuild v0.24.1:'; then echo "cargo-zigbuild cached"; else
+            cargo install --locked cargo-zigbuild --version 0.24.1
+          fi
+          /opt/zig/zig version; cargo install --list | grep '^cargo-zigbuild'
+      - name: Build fil, aarch64-unknown-linux-musl (native, musl-gcc)
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --locked --release -p fil-shell --target aarch64-unknown-linux-musl
+      - name: Build fil, x86_64-unknown-linux-musl (cargo zigbuild)
+        run: cargo zigbuild --locked --release -p fil-shell --target x86_64-unknown-linux-musl
+      - name: Check that both are static
+        run: |
+          for t in aarch64 x86_64; do
+            f=target/$t-unknown-linux-musl/release/fil
+            file "$f" | tee /dev/stderr | grep -E '(statically linked|static-pie linked)'
+          done

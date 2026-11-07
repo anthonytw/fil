@@ -77,6 +77,8 @@ mod tests {
         assert!(!file.changed() && !dir.changed());
         std::fs::write(d.join("real/f"), "bb").unwrap();
         assert!(file.changed(), "the target was edited");
+        // A directory's mtime moves in clock ticks on some kernels (4 ms on a 250 Hz aarch64 one).
+        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(d.join("real/new"), "").unwrap();
         assert!(dir.changed(), "a file appeared in the linked directory");
     }

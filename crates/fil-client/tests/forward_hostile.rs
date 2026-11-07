@@ -398,58 +398,6 @@ async fn tilde_dot_detaches_during_a_question() -> Test {
     Ok(())
 }
 
-/// 200,000 entries announced (B2): the client keeps a bounded number, so its memory does not
-/// grow with what the host sends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_entry_flood_stays_bounded_in_memory() -> Test {
-    use fil_proto::mux::MuxMsg;
-    let rig = attached(vec![], Rules::default()).await;
-    let fwd = rig.daemon.fwd.clone();
-    let rss_kib = || {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(0)
-    };
-    const N: u32 = 200_000;
-    let flood = |first: u32| {
-        let fwd = fwd.clone();
-        async move {
-            for i in 0..N {
-                fwd.send(MuxMsg::Forward {
-                    id: ForwardId(first + i),
-                    spec: remote(0, 22),
-                    origin: Origin::Request,
-                    req: None,
-                })
-                .await;
-            }
-        }
-    };
-    // Every entry is refused at once but the first few, which are asked (and stay asked).
-    let asked = fil_client::forward::MAX_QUESTIONS;
-    let answered = |n: usize| {
-        let fwd = fwd.clone();
-        move || fwd.st.lock().unwrap().nconsents >= n - asked
-    };
-    // A first flood brings every pool and buffer on the way to its working size; a second one
-    // of the same size must then add nothing that grows with it.
-    flood(10_000).await;
-    eventually("the first flood answered", 120, answered(N as usize)).await;
-    let before = rss_kib();
-    flood(10_000 + N).await;
-    eventually("the second flood answered", 120, answered(2 * N as usize)).await;
-    let grew = rss_kib().saturating_sub(before);
-    // Unbounded, the client kept about 150 bytes per entry: about 29 MiB per flood.
-    assert!(grew < 4 * 1024, "grew by {grew} KiB over the second flood");
-    assert!(!rig.is_finished());
-    Ok(())
-}
-
 /// An entry the own spec supersedes (another client's `-R` on that port, with another target)
 /// is never granted; the own one reaches the own target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

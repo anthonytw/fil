@@ -6,6 +6,17 @@
 //! This is the one list of what is removed; the transport (banner, stderr) and the client
 //! (labels, notes) both use it.
 
+/// Lowercase hex of `bytes`, two digits a byte. The one encoder (fingerprints, digests).
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Lossy UTF-8 with everything that could act on the terminal or hide text removed: control
 /// characters (C0, DEL and C1, so escape sequences are defanged), carriage returns, and every
 /// [invisible](is_invisible) character. Newlines and tabs stay; callers that want one line
@@ -63,6 +74,12 @@ pub fn is_invisible(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_is_lowercase_two_digits_a_byte() {
+        assert_eq!(hex(&[0, 1, 0xab, 0xff]), "0001abff");
+        assert_eq!(hex(&[]), "");
+    }
 
     #[test]
     fn controls_and_escape_sequences_are_defanged_but_lines_and_tabs_stay() {

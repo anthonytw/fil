@@ -41,7 +41,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fil_forward::agent::{CountingStream, RequestCounts};
@@ -882,9 +881,7 @@ impl Forwards {
         let stats: HashMap<ForwardId, fil_forward::ForwardStats> =
             self.ep.all_stats().into_iter().collect();
         let now = std::time::Instant::now();
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        let now_ms = crate::core::now_unix_ms();
         st.table
             .iter()
             .map(|e| {

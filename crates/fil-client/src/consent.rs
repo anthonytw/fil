@@ -16,11 +16,11 @@
 //! - It opens no agent channel unless this run turned the agent on.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use fil_proto::mux::{
     BindAddr, ForwardId, ForwardKind, ForwardSpec, OpenFailure, OpenKind, Target, TargetHost,
-    WITHHELD_TARGET, bracketed_ip,
+    WITHHELD_TARGET, bracketed_ip, reaches_loopback,
 };
 
 use crate::config::RemoteRequests;
@@ -29,27 +29,22 @@ use crate::config::RemoteRequests;
 /// asking: a process on the host cannot keep the keyboard busy with questions.
 pub const MAX_DENIALS: u32 = 3;
 
-fn loopback_ip(ip: IpAddr) -> bool {
-    // `::ffff:127.0.0.1` is loopback too.
-    ip.to_canonical().is_loopback()
-}
-
-/// Whether a listener on `bind` is reachable only from this machine.
-pub fn loopback_bind(bind: BindAddr) -> bool {
+/// Whether a listener on `bind` is reachable only from this machine. Canonical (a mapped
+/// `::ffff:127.0.0.1` counts): what consent has always decided on, though the wire's decoder never
+/// lets such a spec through, so only a spec built here can reach it.
+fn loopback_bind(bind: BindAddr) -> bool {
     match bind {
-        BindAddr::Loopback => true,
-        // A withheld bind is another client's beyond loopback.
-        BindAddr::Any | BindAddr::Withheld(_) => false,
-        BindAddr::Ip(ip) => loopback_ip(ip),
+        BindAddr::Ip(ip) => reaches_loopback(ip),
+        other => other.is_loopback(),
     }
 }
 
-/// Whether a target is written as this machine (a loopback address or `localhost`). Only the
-/// first look: the address check runs on every address a name resolves to ([`Grants::address`]).
+/// Whether a `-R` target is written as this machine; the address check runs again on every
+/// address a name resolves to ([`Grants::address`]).
 fn loopback_target(t: &Target) -> bool {
     match &t.host {
-        TargetHost::Ip(ip) => loopback_ip(*ip),
-        TargetHost::Name(n) => n.is_localhost(),
+        TargetHost::Ip(ip) => reaches_loopback(*ip),
+        other => other.is_loopback(),
     }
 }
 
@@ -182,7 +177,7 @@ impl Grants {
     pub fn address(&self, kind: &OpenKind, addr: SocketAddr) -> Result<(), OpenFailure> {
         match kind {
             OpenKind::Remote { forward } => match self.remote.get(forward) {
-                Some(g) if g.own || loopback_ip(addr.ip()) => Ok(()),
+                Some(g) if g.own || reaches_loopback(addr.ip()) => Ok(()),
                 _ => Err(OpenFailure::NotPermitted),
             },
             _ => Err(OpenFailure::NotPermitted),
@@ -277,6 +272,7 @@ pub fn refusal_lines(spec: &ForwardSpec, why: Refusal) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::num::NonZeroU16;
 
     fn target(host: &str, port: u16) -> Target {

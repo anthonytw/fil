@@ -38,10 +38,7 @@ impl Fingerprint {
 /// Lowercase hex, 64 characters.
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
+        f.write_str(&fil_proto::text::hex(&self.0))
     }
 }
 
@@ -89,10 +86,7 @@ impl fmt::Debug for PublicKey {
         // Short, log-safe identifier: the first 8 bytes of the SPKI's SHA-256.
         let d = ring::digest::digest(&ring::digest::SHA256, &self.0);
         write!(f, "PublicKey(")?;
-        for b in &d.as_ref()[..8] {
-            write!(f, "{b:02x}")?;
-        }
-        write!(f, ")")
+        write!(f, "{})", fil_proto::text::hex(&d.as_ref()[..8]))
     }
 }
 

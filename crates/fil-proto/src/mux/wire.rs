@@ -74,13 +74,31 @@ pub enum BindAddr {
     Withheld(Withheld),
 }
 
+/// Loopback as the WIRE and the policies built on it count it (DESIGN §7.2: `localhost`,
+/// 127.0.0.0/8, `::1`): what travels as shown, what the decoder accepts, what consent and the
+/// daemon's policy allow without asking. Strict on purpose: an IPv4-mapped `::ffff:127.0.0.1` is
+/// NOT loopback here (it is withheld or asked about), the stricter reading the decoder has always
+/// had. Use [`reaches_loopback`] for "does a socket on this address stay on this host".
+pub fn is_wire_loopback(ip: IpAddr) -> bool {
+    ip.is_loopback()
+}
+
+/// Whether a socket on `ip` is reachable only from this host: [`is_wire_loopback`] after an
+/// IPv4-mapped IPv6 address is turned into its IPv4 form, so `::ffff:127.0.0.1` counts. For
+/// questions about real reachability (the exposure warning, listener overlap, what the probe may
+/// touch, the addresses a name resolved to), where strict would call a loopback socket exposed.
+/// Not for what goes on the wire.
+pub fn reaches_loopback(ip: IpAddr) -> bool {
+    is_wire_loopback(ip.to_canonical())
+}
+
 impl BindAddr {
     /// Reachable only from this host.
     pub fn is_loopback(&self) -> bool {
         match self {
             BindAddr::Loopback => true,
             BindAddr::Any | BindAddr::Withheld(_) => false,
-            BindAddr::Ip(ip) => ip.is_loopback(),
+            BindAddr::Ip(ip) => is_wire_loopback(*ip),
         }
     }
 }
@@ -192,7 +210,7 @@ impl TargetHost {
     /// A loopback address or a `localhost` name.
     pub fn is_loopback(&self) -> bool {
         match self {
-            TargetHost::Ip(ip) => ip.is_loopback(),
+            TargetHost::Ip(ip) => is_wire_loopback(*ip),
             TargetHost::Name(n) => n.is_localhost(),
         }
     }
@@ -301,7 +319,7 @@ struct RawSpec {
 fn bind_shown(bind: BindAddr) -> bool {
     match bind {
         BindAddr::Loopback | BindAddr::Any => true,
-        BindAddr::Ip(ip) => ip.is_loopback() || ip.is_unspecified(),
+        BindAddr::Ip(ip) => is_wire_loopback(ip) || ip.is_unspecified(),
         BindAddr::Withheld(_) => false,
     }
 }
@@ -835,6 +853,35 @@ mod tests {
         assert!(TargetHost::Ip([127, 0, 0, 1].into()).is_loopback());
         assert!(!TargetHost::Name("example.com".parse().unwrap()).is_loopback());
         assert!(!TargetHost::Ip([192, 0, 2, 5].into()).is_loopback());
+        // Strict: a mapped loopback address is not wire loopback.
+        assert!(!TargetHost::Ip(addr("::ffff:127.0.0.9")).is_loopback());
+        assert!(!BindAddr::Ip(addr("::ffff:127.0.0.1")).is_loopback());
+    }
+
+    /// The two predicates agree on everything but the mapped forms.
+    #[test]
+    fn wire_and_reachability_loopback_differ_only_on_mapped_addresses() {
+        for yes in ["127.0.0.1", "127.255.255.254", "::1"] {
+            assert!(is_wire_loopback(addr(yes)), "{yes}");
+            assert!(reaches_loopback(addr(yes)), "{yes}");
+        }
+        for mapped in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
+            assert!(!is_wire_loopback(addr(mapped)), "{mapped}");
+            assert!(reaches_loopback(addr(mapped)), "{mapped}");
+        }
+        for no in [
+            "0.0.0.0",
+            "::",
+            "128.0.0.1",
+            "192.0.2.5",
+            "2001:db8::5",
+            "::ffff:192.0.2.5",
+            "::ffff:0.0.0.0",
+            "::2",
+        ] {
+            assert!(!is_wire_loopback(addr(no)), "{no}");
+            assert!(!reaches_loopback(addr(no)), "{no}");
+        }
     }
 
     #[test]

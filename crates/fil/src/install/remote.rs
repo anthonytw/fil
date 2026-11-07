@@ -113,10 +113,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hex(ctx.finish().as_ref()))
 }
 
-/// Lowercase hex.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+pub use fil_proto::text::hex;
 
 /// The socket directory GC reads: `/tmp/fil-<uid>` (`fil_daemon::Paths`).
 fn socket_dir() -> PathBuf {

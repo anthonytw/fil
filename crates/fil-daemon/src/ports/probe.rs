@@ -157,7 +157,7 @@ pub async fn probe_one(addr: SocketAddr, mode: ProbeMode, deadline: Instant) -> 
     // `timeout_at` polls what it wraps before the clock, so a loopback connect would still be
     // made past the deadline: check first.
     if mode == ProbeMode::Off
-        || !addr.ip().to_canonical().is_loopback()
+        || !fil_proto::mux::reaches_loopback(addr.ip())
         || Instant::now() >= deadline
     {
         return None;

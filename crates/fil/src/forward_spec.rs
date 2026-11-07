@@ -29,7 +29,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU16;
 
 use fil_proto::limits::MAX_FORWARDS;
-use fil_proto::mux::{BindAddr, DnsName, ForwardKind, ForwardSpec, Target, TargetHost};
+use fil_proto::mux::{
+    BindAddr, DnsName, ForwardKind, ForwardSpec, Target, TargetHost, reaches_loopback,
+};
 
 use crate::config::{AgentMode, ForwardFailure, ForwardTunables, HostSettings, RemoteRequests};
 
@@ -280,8 +282,8 @@ pub fn parse_flag(text: &str) -> Result<ForwardSpec, SpecError> {
 /// Whether the forward's listener is beyond loopback (on whichever machine it binds).
 pub fn is_exposed(spec: &ForwardSpec) -> bool {
     match spec.bind() {
-        // `::ffff:127.0.0.1` is loopback too (the wire's `is_loopback` says no to it).
-        BindAddr::Ip(ip) => !is_loopback_ip(ip),
+        // `::ffff:127.0.0.1` stays on this host even though the wire does not call it loopback.
+        BindAddr::Ip(ip) => !reaches_loopback(ip),
         other => !other.is_loopback(),
     }
 }
@@ -401,7 +403,7 @@ fn binds_overlap(a: BindAddr, b: BindAddr) -> bool {
             // A wildcard address takes every address (dual-stack sockets: of both families).
             unspecified(x) || unspecified(y) || x.to_canonical() == y.to_canonical()
         }
-        (Loopback, Ip(x)) | (Ip(x), Loopback) => unspecified(x) || is_loopback_ip(x),
+        (Loopback, Ip(x)) | (Ip(x), Loopback) => unspecified(x) || reaches_loopback(x),
         // Only the wire withholds a bind: never one of this run's own specs.
         (BindAddr::Withheld(_), _) | (_, BindAddr::Withheld(_)) => false,
     }
@@ -468,9 +470,4 @@ impl ForwardPlan {
     pub fn is_empty(&self) -> bool {
         self.specs.is_empty() && self.agent == AgentMode::Off
     }
-}
-
-/// Whether `ip` is a loopback address, an IPv4-mapped IPv6 loopback included.
-pub fn is_loopback_ip(ip: IpAddr) -> bool {
-    ip.to_canonical().is_loopback()
 }

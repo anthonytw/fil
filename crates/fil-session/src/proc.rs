@@ -389,7 +389,7 @@ pub fn parse_ps(out: &str) -> Vec<ProcRow> {
         .collect()
 }
 
-/// How old [`list_processes`] may let the table it returns be.
+/// How old [`list_processes_since`] may let the table it returns be.
 ///
 /// The tree fallback records descendants every few seconds, per session. Each scan reads every
 /// process (`/proc/*/stat` on Linux, one `sysctl` on macOS, `ps` elsewhere), so N sessions scanning on their own
@@ -436,17 +436,12 @@ fn table_from_since(
 }
 
 /// The process table for the periodic recording of a session's descendants, shared between
-/// sessions: it may be up to [`SHARED_TABLE_MAX_AGE`] old. Blocking.
+/// sessions: it may be up to [`SHARED_TABLE_MAX_AGE`] old (`None`), or never one taken before
+/// `not_before`. A session's first recording passes the instant it was spawned: a shared table
+/// from before that cannot hold the session's processes, and a job that leaves the tree before
+/// the next recording (5 s) would then escape a kill. Blocking.
 ///
 /// Use [`scan_processes`] where the table must be current (teardown).
-pub fn list_processes() -> Vec<ProcRow> {
-    list_processes_since(None)
-}
-
-/// [`list_processes`], but never a table taken before `not_before`. A session's first recording
-/// passes the instant it was spawned: a shared table from before that cannot hold the session's
-/// processes, and a job that leaves the tree before the next recording (5 s) would then escape a
-/// kill.
 pub fn list_processes_since(not_before: Option<Instant>) -> Vec<ProcRow> {
     table_from_since(
         &SHARED_TABLE,
@@ -963,7 +958,7 @@ mod tests {
     /// Teardown must act on the table as it is now. A job that moved into a group of its own is
     /// only found through the table; `killpg` of the shell's group does not reach it. The shared
     /// table is poisoned with an empty one that is still "fresh", so a teardown that read it
-    /// (`list_processes`) would find nobody.
+    /// (`list_processes_since`) would find nobody.
     fn teardown_ignores_the_shared_table(teardown: impl Fn(u32)) {
         let (mut sh, job) = shell_with_a_job_in_its_own_group();
         *SHARED_TABLE.lock().unwrap_or_else(|e| e.into_inner()) =

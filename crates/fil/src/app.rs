@@ -351,11 +351,12 @@ pub fn short_name(host: &str) -> &str {
     }
 }
 
-/// A valid label from anything: control characters are dropped, the length is cut at a
-/// character boundary, and an empty result is "unknown".
+/// A valid label from anything: control and invisible characters are dropped (the one rule,
+/// `fil_proto::text::sanitize_inline`), the length is cut at a character boundary, and an empty
+/// result is "unknown".
 pub fn sanitize_label(raw: &str) -> HostLabel {
-    let mut label: String = raw.chars().filter(|c| !c.is_control()).collect();
-    label = label.trim().to_string();
+    let label = fil_proto::text::sanitize_inline(raw);
+    let mut label = label.trim().to_string();
     while label.len() > MAX_HOST_LABEL {
         label.pop();
     }

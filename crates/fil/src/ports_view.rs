@@ -19,7 +19,8 @@ use fil_proto::msg::{
 use fil_proto::mux::{BindAddr, BindFailure, ForwardKind, ListenState, Origin, PolicySetting};
 use serde::Serialize;
 
-use crate::forward_spec::{self, host_port, is_loopback_ip};
+use crate::forward_spec::{self, host_port};
+use fil_proto::mux::reaches_loopback;
 
 /// The JSON layout's version. A field is never renamed or retyped within a version.
 pub const JSON_SCHEMA: u32 = 1;
@@ -349,7 +350,7 @@ fn listening_port(f: &ForwardRow) -> u16 {
 }
 
 fn exposed_listener(addr: std::net::IpAddr) -> bool {
-    !is_loopback_ip(addr)
+    !reaches_loopback(addr)
 }
 
 fn side_name(s: Side) -> &'static str {

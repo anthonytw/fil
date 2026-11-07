@@ -523,7 +523,9 @@ fn trimmed_len(cells: &[Cell]) -> usize {
         .map_or(0, |i| i + 1)
 }
 
-/// Drops C0 and C1 controls and DEL.
+/// Drops C0 and C1 controls and DEL. Deliberately narrower than `fil_proto::text` (which fil-term
+/// does not depend on): it keeps the format characters (ZWJ, variation selectors) that a title or
+/// a link target legitimately carries; the text is for the emulator, never an overlay.
 pub fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }

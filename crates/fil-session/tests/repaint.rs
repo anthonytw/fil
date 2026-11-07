@@ -95,7 +95,7 @@ async fn a_drag_ends_with_one_repaint_at_the_final_size() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(&sc, "main", LINES_THEN_QUIET)).await;
     let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
-    c.wait_out(&"0".repeat(70)).await;
+    c.wait_screen(&"0".repeat(70)).await;
     c.drain(Duration::from_millis(100)).await;
 
     let mut last = Instant::now();
@@ -296,7 +296,7 @@ async fn a_repaint_from_a_connection_that_lost_the_session_is_ignored() {
     let sc = Scratch::new();
     let h = spawn_plain(sh_config(&sc, "main", LINES_THEN_QUIET)).await;
     let mut old = Client::attach(&h, Connect::new(&h, key(1))).await;
-    old.wait_out(&"0".repeat(70)).await;
+    old.wait_screen(&"0".repeat(70)).await;
     let mut new = Client::attach(
         &h,
         Connect::new(&h, key(2)).host("desktop").size(size(100, 30)),

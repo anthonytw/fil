@@ -301,6 +301,8 @@ pub struct Targets {
     /// How long every connect waits before it starts (none by default): an open that stays
     /// unanswered that long.
     pub delay: Mutex<Duration>,
+    /// Called as every open arrives, before the connect starts (a test's stage timestamps).
+    pub on_open: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// See [`Targets::wrap`].
@@ -331,6 +333,10 @@ pub fn loopback(port: u16) -> Target {
 impl Connector for Targets {
     fn connect(&self, kind: &OpenKind, check: AddressCheck) -> ConnectFuture {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        let hook = self.on_open.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h();
+        }
         let target = match kind {
             OpenKind::Local { forward } | OpenKind::Remote { forward } => {
                 self.map.lock().unwrap().get(forward).cloned()
@@ -605,6 +611,42 @@ impl World {
 pub fn raise_fd_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        raise_soft_limit();
+        pregrow_fd_table();
+    });
+}
+
+/// Makes the kernel grow this process's file descriptor table to 4,096 slots now, not as the
+/// test's sockets pass 64, 128, 256, 512 (four fds a connection: both ends of both sockets).
+/// Growing a table that threads share (`expand_fdtable`) waits for an RCU grace period, which
+/// blocks the thread whose `socket()` or `accept()` crossed the boundary for 5 to 20 ms on a
+/// small aarch64 host (strace: `socket(...) = 128 <0.0095>`), and a task parked behind it (a
+/// worker's LIFO slot) waits too. The latency tests' tail at connects 17, 39, 81 and 167 was that,
+/// not the product (issue 14). The table never shrinks, so one duplicate to a high number, closed
+/// again, does it for good.
+#[cfg(unix)]
+fn pregrow_fd_table() {
+    use rustix::process::{Resource, getrlimit};
+    let room = getrlimit(Resource::Nofile)
+        .current
+        .map_or(4_096, |c| c.min(4_096));
+    if room <= 64 {
+        return;
+    }
+    // From a file of its own, not stdin: a test runner may start the tests with stdin closed.
+    let null = std::fs::File::open("/dev/null").expect("/dev/null");
+    let grown = rustix::io::fcntl_dupfd_cloexec(&null, (room - 1) as i32);
+    assert!(
+        grown.is_ok(),
+        "the fd table did not grow to {room}: {grown:?}"
+    );
+}
+
+#[cfg(not(unix))]
+fn pregrow_fd_table() {}
+
+fn raise_soft_limit() {
+    {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
         let cur = getrlimit(Resource::Nofile);
         // macOS refuses a soft limit above OPEN_MAX (10,240) even when the hard one is unlimited.
@@ -624,7 +666,7 @@ pub fn raise_fd_limit() {
                 return;
             }
         }
-    });
+    }
 }
 
 /// Serializes the tests that open thousands of connections at once.
@@ -1542,4 +1584,139 @@ pub fn mbufs_note(before: &KernelMemory) -> String {
         "{denied}{defunct}; the tests' own socket calls in this process were retried {retried} \
          times for want of kernel memory"
     )
+}
+
+/// Per-connect stage timestamps for a latency test, so a miss names the stage that was slow (the
+/// breakdown goes in the failure message). Connects run one at a time: a stamp belongs to the
+/// connect that began last.
+#[derive(Default)]
+pub struct Trace {
+    runs: Mutex<Vec<Run>>,
+}
+
+struct Run {
+    t0: std::time::Instant,
+    stamps: Vec<(&'static str, std::time::Instant)>,
+    took: Duration,
+    disturbed: bool,
+}
+
+impl Trace {
+    /// A new connect begins now (the application's connect has just returned).
+    pub fn begin(&self) {
+        self.runs.lock().unwrap().push(Run {
+            t0: std::time::Instant::now(),
+            stamps: Vec::new(),
+            took: Duration::ZERO,
+            disturbed: false,
+        });
+    }
+
+    /// Stamps `stage` on the current connect.
+    pub fn mark(&self, stage: &'static str) {
+        let at = std::time::Instant::now();
+        if let Some(r) = self.runs.lock().unwrap().last_mut() {
+            r.stamps.push((stage, at));
+        }
+    }
+
+    /// The current connect is over: banner heard after `took`.
+    pub fn end(&self, took: Duration, disturbed: bool) {
+        if let Some(r) = self.runs.lock().unwrap().last_mut() {
+            r.took = took;
+            r.disturbed = disturbed;
+        }
+    }
+
+    /// The `n` slowest connects, each with its index and every stage as milliseconds from the
+    /// connect's start (negative: before the application's connect returned).
+    pub fn slowest(&self, n: usize) -> String {
+        let runs = self.runs.lock().unwrap();
+        let mut order: Vec<usize> = (0..runs.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(runs[i].took));
+        let ms = |a: std::time::Instant, b: std::time::Instant| {
+            if a >= b {
+                (a - b).as_secs_f64() * 1e3
+            } else {
+                -((b - a).as_secs_f64() * 1e3)
+            }
+        };
+        let mut out = String::new();
+        for &i in order.iter().take(n) {
+            let r = &runs[i];
+            out += &format!(
+                "\n  connect #{i}{}: {:.2} ms;",
+                if r.disturbed { " (host-disturbed)" } else { "" },
+                r.took.as_secs_f64() * 1e3
+            );
+            for (name, at) in &r.stamps {
+                out += &format!(" {name} {:+.2};", ms(*at, r.t0));
+            }
+        }
+        out
+    }
+}
+
+/// A target stream that stamps when the endpoint first reads it and when bytes first arrive.
+pub struct Stamped {
+    inner: TcpStream,
+    trace: Arc<Trace>,
+    polled: bool,
+    heard: bool,
+}
+
+impl Stamped {
+    pub fn new(inner: TcpStream, trace: Arc<Trace>) -> Self {
+        Self {
+            inner,
+            trace,
+            polled: false,
+            heard: false,
+        }
+    }
+}
+
+impl AsyncRead for Stamped {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.polled {
+            self.polled = true;
+            self.trace.mark("daemon first read polled");
+        }
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if !self.heard && matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.heard = true;
+            self.trace.mark("daemon read banner");
+        }
+        r
+    }
+}
+
+impl AsyncWrite for Stamped {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl ForwardStream for Stamped {
+    fn set_reset(&self) -> io::Result<()> {
+        self.inner.set_reset()
+    }
+    fn no_memory_moves_nothing(&self) -> bool {
+        self.inner.no_memory_moves_nothing()
+    }
 }

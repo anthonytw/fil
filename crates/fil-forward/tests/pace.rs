@@ -513,13 +513,40 @@ per_transport!(
 /// holds each for 5 s), each timed to its banner.
 async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     const CONNECTS: usize = 200;
-    let server = serve(|mut s| async move {
-        let _ = s.write_all(b"220 hello\r\n").await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    })
-    .await;
+    // Stage stamps per connect (see `Trace`), reported for the slowest in a failure message.
+    let trace = Arc::new(Trace::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let acceptor = {
+        let trace = trace.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    continue;
+                };
+                trace.mark("server accepted");
+                let trace = trace.clone();
+                tokio::spawn(async move {
+                    trace.mark("server handler started");
+                    let _ = s.write_all(b"220 hello\r\n").await;
+                    trace.mark("server banner written");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        })
+    };
     let w = World::new(t, mux_config()).await;
-    let port = w.local_forward(1, server.port);
+    let port = w.local_forward(1, server_port);
+    {
+        let tr = trace.clone();
+        *w.daemon.targets.on_open.lock().unwrap() =
+            Some(Arc::new(move || tr.mark("daemon open arrived")));
+        let tr = trace.clone();
+        *w.daemon.targets.wrap.lock().unwrap() = Some(Arc::new(move |s| {
+            tr.mark("daemon connected to target");
+            Box::new(Stamped::new(s, tr.clone()))
+        }));
+    }
     // A connect the host stalled during (a throttled or descheduled test process: the watcher
     // sees it too) measures the host, not the product, and is not counted: it is tried again. The
     // bound is unchanged, and a sample the host left alone that misses it is a miss. (Run 33 of
@@ -537,6 +564,7 @@ async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
         // loopback connect now and then) is not the product's. The product's own connect to the
         // target retries a reset after 5 ms (`connect.rs`), which is inside the time.
         let mut c = connect(port).await;
+        trace.begin();
         let t0 = std::time::Instant::now();
         let mut b = [0u8; 11];
         timeout(Duration::from_secs(5), c.read_exact(&mut b))
@@ -544,14 +572,19 @@ async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
             .expect("the banner")
             .unwrap();
         let took = t0.elapsed();
+        trace.mark("client read banner");
         drop(c);
-        if !stalls.disturbed(t0) {
+        let disturbed = stalls.disturbed(t0);
+        trace.end(took, disturbed);
+        if !disturbed {
             lat.push(took);
         }
     }
+    // Offsets are milliseconds from the application's connect returning.
+    let breakdown = format!("slowest connects, by stage:{}", trace.slowest(5));
     assert!(
         lat.len() >= MIN_CLEAN,
-        "only {} of {tries} connects ran undisturbed: this host is too busy to judge a latency ({})",
+        "only {} of {tries} connects ran undisturbed: this host is too busy to judge a latency ({}); {breakdown}",
         lat.len(),
         stalls.describe()
     );
@@ -572,8 +605,10 @@ async fn wallclock_a_server_that_speaks_first_is_heard_at_once(t: Transport) {
     // makes sure to catch the bug (2 to 5% of connects).
     // (At most one over 75 ms in 200 already implies the p99 bound; kept for the message that
     // names it.)
-    assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}");
-    assert!(slow <= 1, "{slow} of {n} over 75 ms");
+    acceptor.abort();
+    eprintln!("{t:?}: {breakdown}");
+    assert!(p99 <= Duration::from_millis(75), "p99 {p99:?}; {breakdown}");
+    assert!(slow <= 1, "{slow} of {n} over 75 ms; {breakdown}");
 }
 
 /// **A reader that stopped, written to in small chunks** (B-new-1 of the re-check): an

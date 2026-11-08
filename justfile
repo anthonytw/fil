@@ -14,7 +14,12 @@ default:
 # The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
 # failure (the advisory database) shows up at once, not after the whole test suite; `notices` next,
 # so that a missing cargo-about (the Notices section below) does too.
-ci: deny notices fmt-check clippy check-default release-deps release-test test test-wallclock
+ci: deny notices ci-workflow-test fmt-check clippy check-default release-deps release-test test test-wallclock
+
+# The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
+# offline fakes of git and the API, under a second. Part of `ci`; needs python3.
+ci-workflow-test:
+    python3 -I -B tests/ci/test_push_skip.py
 
 fmt-check:
     cargo fmt --all --check

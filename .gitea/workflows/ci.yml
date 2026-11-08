@@ -7,7 +7,7 @@
 # The job image is the runner's default (rust:1.99.1-trixie by digest). It has no Node, so no
 # JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and
 # mount no volume. Nothing here uses a secret; the job token is read-only for this repo and is used
-# only for the fetch.
+# only for git fetches and, on a push, one commit-status read (below).
 #
 # Nothing outlives a job. The runner cannot tell a pull request from a push (a PR can edit this
 # file), so any cache shared between jobs is one a PR could poison for a later run of main. Every
@@ -15,6 +15,17 @@
 # against Cargo.lock each run, a few seconds), a fresh target directory, and the tools downloaded
 # as release binaries pinned by sha256 (a few seconds; building them would take minutes). The
 # shared build cache saved about 30 s of a 25-minute check, so it is not worth what it exposed.
+#
+# A push to main whose tree is that of a PR head whose run of the same job passed skips the job's
+# work and reports success (issue #38): a squash merge of a branch that had main merged in repeats
+# a run that already passed on the same bytes, workflow included. tests/ci/push_skip.py decides,
+# with the job token (git fetch and the commit-status API, both read-only) and logs why. Any doubt
+# is a full run: no PR in the subject, another tree, a PR run that did not pass, an API or git
+# error, and every release commit. Its cases are `just ci-workflow-test`. The heavy steps carry
+# `if: steps.push_skip.outputs.skip != 'true'` (a new heavy step needs the same line); a skipped
+# check still installs the toolchain and tools and runs `just deny`, so new advisories still fail
+# main, and each skipped job shows a step named "Skipped: ..." with the reason.
+# The status contexts below ("ci / check (pull_request)") are this name and the job names.
 name: ci
 
 on:
@@ -51,9 +62,19 @@ jobs:
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q --depth 1 origin "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
+      - name: Skip if this tree already passed on its PR (push to main only, issue 38)
+        id: push_skip
+        if: github.event_name == 'push'
+        env:
+          FIL_CI_TOKEN: ${{ github.token }}
+          FIL_CI_CONTEXT: "ci / check (pull_request)"
+        # A crash leaves skip unset (a full run) rather than failing the job.
+        run: |
+          python3 -I -B tests/ci/push_skip.py || echo "push_skip.py failed: full run"
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - name: Packages (systemd-tmpfiles, which crates/fil-daemon/tests/tmp_clean.rs runs for real)
+        if: steps.push_skip.outputs.skip != 'true'
         run: apt-get update -qq && apt-get install -y -qq systemd-standalone-tmpfiles
       - name: Tools (versions as in .github/workflows/linux-check.yml; release binaries, pinned by sha256)
         # The upstream aarch64 musl release assets. A hash is that of the .tar.gz, as the release
@@ -77,7 +98,17 @@ jobs:
             eb4d9ff6ebd2518152a8308729431a04b3836e71d2bd5ead7aea69f91a71162e cargo-about-0.9.3-aarch64-unknown-linux-musl/cargo-about
           just --version; cargo deny --version; cargo about --version; python3 --version; nproc
           echo "build directory: $CARGO_TARGET_DIR (${{ github.event_name }})"
+      - name: "Skipped: tree identical to a green PR head; cargo deny only (see the push_skip step)"
+        # The PR run may be old: the advisory database is fetched now, so a RustSec advisory
+        # published since still fails main. Only the build and the tests are skipped.
+        if: steps.push_skip.outputs.skip == 'true'
+        env:
+          REASON: ${{ steps.push_skip.outputs.reason }}
+        run: |
+          echo "$REASON"
+          just deny
       - name: just ci (as an unprivileged user, umask 022)
+        if: steps.push_skip.outputs.skip != 'true'
         # Not root: PR code has no business running as root here (fil-daemon's ports::tests no
         # longer need it, issue #8, and no test is checked as root). The jobs also start with umask 002,
         # which fil-client's offline-log test cannot take (it refuses a group-writable log directory).
@@ -108,11 +139,23 @@ jobs:
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q --depth 1 origin "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
+      - name: Skip if this tree already passed on its PR (push to main only, issue 38)
+        id: push_skip
+        if: github.event_name == 'push'
+        env:
+          FIL_CI_TOKEN: ${{ github.token }}
+          FIL_CI_CONTEXT: "ci / musl (static release binaries, build only) (pull_request)"
+        # A crash leaves skip unset (a full run) rather than failing the job.
+        run: |
+          python3 -I -B tests/ci/push_skip.py || echo "push_skip.py failed: full run"
       - name: Toolchain (from rust-toolchain.toml, with both musl targets)
+        if: steps.push_skip.outputs.skip != 'true'
         run: rustup toolchain install && rustc --version
       - name: Packages (musl-tools for aarch64, xz for the zig tarball)
+        if: steps.push_skip.outputs.skip != 'true'
         run: apt-get update -qq && apt-get install -y -qq musl-tools xz-utils
       - name: zig (pinned by hash) and cargo-zigbuild
+        if: steps.push_skip.outputs.skip != 'true'
         run: |
           curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-linux-$ZIG_VERSION.tar.xz"
           echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
@@ -121,13 +164,21 @@ jobs:
           cargo install --locked cargo-zigbuild --version 0.24.1
           /opt/zig/zig version; cargo install --list | grep '^cargo-zigbuild'
       - name: Build fil, aarch64-unknown-linux-musl (native, musl-gcc)
+        if: steps.push_skip.outputs.skip != 'true'
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --locked --release -p fil-shell --target aarch64-unknown-linux-musl
       - name: Build fil, x86_64-unknown-linux-musl (cargo zigbuild)
+        if: steps.push_skip.outputs.skip != 'true'
         run: cargo zigbuild --locked --release -p fil-shell --target x86_64-unknown-linux-musl
+      - name: "Skipped: tree identical to a green PR head (see the push_skip step)"
+        if: steps.push_skip.outputs.skip == 'true'
+        env:
+          REASON: ${{ steps.push_skip.outputs.reason }}
+        run: echo "$REASON"
       - name: Check that both are static
+        if: steps.push_skip.outputs.skip != 'true'
         run: |
           for t in aarch64 x86_64; do
             f=target/$t-unknown-linux-musl/release/fil

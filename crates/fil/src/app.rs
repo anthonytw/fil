@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use fil_client::{Backoff, ClientConfig, ClientError, OfflineLog, Outcome};
+use fil_client::{Backoff, ClientConfig, ClientError, OfflineLog, Outcome, Predict};
 use fil_proto::limits::MAX_HOST_LABEL;
 use fil_proto::msg::{HostLabel, Request, SessionName};
 use fil_transport::LinkParams;
@@ -116,9 +116,10 @@ async fn run(action: Action, config: &Config) -> u8 {
             host,
             session,
             transport,
+            predict,
             forwards,
         } => {
-            let settings = config.for_host(&host);
+            let settings = attach_settings(config, &host, predict);
             let run = Run::new(settings.remote, settings.pipe.is_some());
             attach(&host, session, transport, forwards, settings, run).await
         }
@@ -217,11 +218,14 @@ async fn attach(
     tracing::info!(?setting, "starting");
     tracing::debug!(host, %session, "starting for");
 
-    let mut cfg = ClientConfig::new(session.clone(), host_label(settings.host_label.as_deref()));
-    cfg.offline = settings.offline.clone();
+    let mut cfg = client_config(session.clone(), &settings);
     cfg.forwards = forward_set;
-    // Only the path manager backs off; a second layer would double the waits.
-    cfg.reconnect.backoff = Backoff::None;
+    // Counts the mode, never anything typed (`docs/m3/plan.md` §4.3).
+    match cfg.predict {
+        Predict::Off => tracing::debug!(echo_ack = false, "prediction off"),
+        Predict::Adaptive => tracing::info!("prediction on (adaptive)"),
+        Predict::Always => tracing::info!("prediction on (always)"),
+    }
 
     let result = fil_client::run(dialer, term, cfg).await;
     // `remote = "auto"`'s second trigger: the run's first connection reached a relay of another
@@ -252,6 +256,30 @@ async fn attach(
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
     exit_code(&result)
+}
+
+/// The settings an attach to `host` runs with: the config's for the host, with what the command
+/// line replaces (`--predict`; the forward flags and `--transport` are applied later, by the plan
+/// and the dialer). `predict` is the flag over the host's section over `[defaults]` over the
+/// default (`config::DEFAULT_PREDICT`).
+pub fn attach_settings(config: &Config, host: &str, predict: Option<Predict>) -> HostSettings {
+    let mut settings = config.for_host(host);
+    if let Some(p) = predict {
+        settings.predict = p;
+    }
+    settings
+}
+
+/// The client's configuration for an attach with `settings`, as the binary runs it (the forwards
+/// are added by the caller, once their listeners are bound). `Predict::Off` attaches with
+/// `echo_ack = false`: no predictor and no `EchoAck` (`docs/m3/plan.md` §2.7).
+pub fn client_config(session: SessionName, settings: &HostSettings) -> ClientConfig {
+    let mut cfg = ClientConfig::new(session, host_label(settings.host_label.as_deref()));
+    cfg.offline = settings.offline.clone();
+    cfg.predict = settings.predict;
+    // Only the path manager backs off; a second layer would double the waits.
+    cfg.reconnect.backoff = Backoff::None;
+    cfg
 }
 
 /// The seam for `remote = "auto"`'s second trigger (`docs/m4/plan.md` §3 U1): an attach that

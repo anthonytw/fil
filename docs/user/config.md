@@ -18,7 +18,7 @@ transport = "pipe"
 
 - `[host.NAME]` overrides `[defaults]` key by key. The nested tables (`forward`, `offline_input`, `direct`) are merged key by key too. A list replaces the list under it.
 - `fil user@devbox` uses `[host."user@devbox"]` if there is one, and otherwise `[host.devbox]`.
-- The command line is applied over both: `-L`, `-R` and `-D` add to `forward`, `-A` and `-a` set `agent`, `--transport` sets `transport`.
+- The command line is applied over both: `-L`, `-R` and `-D` add to `forward`, `-A` and `-a` set `agent`, `--transport` sets `transport`, `--predict` sets `predict`.
 
 ## Seeing what applies: `fil config show HOST`
 
@@ -49,6 +49,18 @@ Refused here with a message that points to `daemon.toml`. The scrollback kept pe
 ### `host_label`
 
 The name other clients are shown when you take a session over, 1 to 128 bytes of text. Default: this machine's short host name.
+
+### `predict`
+
+`"adaptive"` (default), `"off"` or `"always"`: predictive echo, from 0.2.0 (0.1.0 has no prediction and refuses the key as unknown). While you type, fil shows the characters it expects the host to echo before the echo arrives, and replaces them with what the host really sends. `adaptive` shows its guesses only when the round trip is long enough for them to help (above about 30 ms), and underlines them while it is long (above about 80 ms) or for 30 s after a very late echo (more than 250 ms). `always` shows them at any round trip. `off` predicts nothing and asks the host for no echo acknowledgments.
+
+Nothing is predicted at a password prompt (canonical mode with echo off). In raw-mode programs a few rare cases can still show typed keys: a program that starts hiding what you type without saying so first (a mode change or a prompt fil sees) shows the keys typed before fil learns of it, about one round trip; and output that equals the typed keys, such as an asterisk mask's `*`, confirms the guesses as an echo would. `predict = "off"` for a host is the way out if that matters there. The full list is in §11 of the design document, `DESIGN.md`, in the source repository.
+
+`--predict off|adaptive|always` overrides it for one run:
+
+```
+fil devbox --predict off
+```
 
 ### `remote`
 
@@ -149,7 +161,3 @@ Settings for every host.
 ### `host`
 
 Settings for one host: `[host.NAME]`, where NAME is the HOST argument as typed.
-
-## No `predict` key in 0.1.0
-
-0.1.0 has no predictive echo, so there is no `predict` key. A file that has one is refused as an unknown key. The key comes back with prediction in 0.2.0.

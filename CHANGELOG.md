@@ -2,6 +2,12 @@
 
 All notable changes to fil. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and fil follows [Semantic Versioning](https://semver.org/) with the caveat that before 1.0 the configuration, the flags and the exit statuses may still change. A release that changes the wire (the `wire` number in `fil --version`) bumps the minor version, and both ends need the upgrade.
 
+## [Unreleased]
+
+### Added
+
+- The `predict` setting (`off`, `adaptive` or `always`), in `[defaults]` and `[host.NAME]`, and `--predict MODE` for one run, over the file. The default is `adaptive`: guesses of the echo are shown only when the round trip is long enough for them to help. `fil config show` shows it with its source.
+
 ## [0.1.0] - 2026-11-07
 
 The first release: an ssh/et drop-in. It has no predictive echo and no `predict` setting; that is planned for 0.2.0.

@@ -21,7 +21,13 @@ fn the_client_example_parses_and_shows() {
         cfg.for_host("devbox").direct_address.as_deref(),
         Some("devbox.example.net")
     );
-    assert!(!text.contains("predict"));
+    // The default, written out (`docs/m3/plan.md` PC-1).
+    assert_eq!(
+        cfg.for_host("devbox").predict,
+        fil_client::Predict::Adaptive
+    );
+    let predict = rows.iter().find(|r| r.key == "predict").unwrap();
+    assert_eq!(predict.source, "[defaults]");
 }
 
 #[test]

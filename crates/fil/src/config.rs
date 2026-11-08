@@ -6,6 +6,8 @@
 //! pipe = ["fil", "server", "--stdio"]   # an argv; default: ssh -T -- HOST fil server --stdio
 //! host_label = "laptop"      # what other clients are shown when you take a session over;
 //!                             # default: this machine's short host name
+//! predict = "adaptive"        # off | adaptive | always: predictive echo (section 9); --predict
+//!                             # overrides it for one run
 //! forward = ["-L 5173", "-R 9000", "-D 1080"]   # forwards for every attach (section 7.1)
 //! agent = "off"               # off | on | confirm: relay the local ssh-agent (section 10)
 //! agent_keys = []             # SHA256 fingerprints the relay answers for; empty is every key
@@ -42,7 +44,8 @@
 //!
 //! A `[host.NAME]` section overrides `[defaults]` field by field (`offline_input`, `direct` and
 //! `forward` too; a list replaces the list under it). The command line is over both: `-L`, `-R`
-//! and `-D` add to `forward`, `-A` and `-a` set `agent` (see `forward_spec::ForwardPlan`). A missing file means the defaults. Unknown keys are errors, so a typo does not silently
+//! and `-D` add to `forward`, `-A` and `-a` set `agent` (see `forward_spec::ForwardPlan`),
+//! `--transport` and `--predict` replace `transport` and `predict`. A missing file means the defaults. Unknown keys are errors, so a typo does not silently
 //! do nothing; every section is checked when the file is read, and the error names the file, the
 //! section and the key.
 //!
@@ -53,7 +56,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use fil_client::{OfflineInput, OfflineLog, parse_byte_size, parse_confirm};
+use fil_client::{OfflineInput, OfflineLog, Predict, parse_byte_size, parse_confirm};
 use fil_proto::limits::{MAX_FORWARDS, MAX_HOST_LABEL};
 use fil_proto::mux::ForwardSpec;
 use fil_transport::path::TransportSetting;
@@ -136,6 +139,30 @@ impl From<Transport> for TransportSetting {
         }
     }
 }
+
+/// `predict` as written (DESIGN.md sections 9 and 14, `docs/m3/plan.md` §2.7); the client's
+/// [`Predict`] is what it means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PredictValue {
+    Off,
+    Adaptive,
+    Always,
+}
+
+impl From<PredictValue> for Predict {
+    fn from(p: PredictValue) -> Self {
+        match p {
+            PredictValue::Off => Predict::Off,
+            PredictValue::Adaptive => Predict::Adaptive,
+            PredictValue::Always => Predict::Always,
+        }
+    }
+}
+
+/// The default of `predict` (decided, owner 2026-11-04: `docs/m3/plan.md` PC-1): guesses shown
+/// only when the round trip is long enough for them to help.
+pub const DEFAULT_PREDICT: Predict = Predict::Adaptive;
 
 /// Whether and how the local ssh-agent is relayed (DESIGN.md section 10). Off unless asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -292,6 +319,7 @@ struct RawSection {
     /// A daemon setting; only here to be refused with a pointer to `daemon.toml`.
     history_lines: Option<toml::Value>,
     host_label: Option<String>,
+    predict: Option<PredictValue>,
     forward: Option<ForwardValue>,
     agent: Option<AgentMode>,
     agent_keys: Option<Vec<String>>,
@@ -335,6 +363,7 @@ impl RawSection {
                 .clone()
                 .or_else(|| base.history_lines.clone()),
             host_label: self.host_label.clone().or_else(|| base.host_label.clone()),
+            predict: self.predict.or(base.predict),
             forward: match (&self.forward, &base.forward) {
                 (Some(a), Some(b)) => {
                     let (a, b) = (a.clone().into_table(), b.clone().into_table());
@@ -386,6 +415,8 @@ pub struct HostSettings {
     pub pipe: Option<Vec<String>>,
     /// What other clients are shown for this machine; `None` is the short host name.
     pub host_label: Option<String>,
+    /// Predictive echo; `--predict` replaces it for one run (`app::client_config`).
+    pub predict: Predict,
     /// The file's `forward` specs, parsed and checked (`-L`, `-R` and `-D`; the command line
     /// adds to them, see `forward_spec::ForwardPlan`).
     pub forward: Vec<ForwardSpec>,
@@ -410,6 +441,7 @@ impl Default for HostSettings {
             transport: TransportSetting::Auto,
             pipe: None,
             host_label: None,
+            predict: DEFAULT_PREDICT,
             forward: Vec::new(),
             agent: AgentMode::Off,
             agent_keys: Vec::new(),
@@ -531,7 +563,7 @@ impl Config {
     /// the built-in default, `[defaults]` or the `[host.NAME]` section (`fil config show`).
     /// Nothing here touches the network or the host. A host name that connect would refuse
     /// (with the default ssh pipe) is refused here with the same words. The command line (`-L`, `-A`,
-    /// `--transport`) is applied after this and is not in it.
+    /// `--transport`, `--predict`) is applied after this and is not in it.
     pub fn explain(&self, host: &str) -> Result<Vec<Explained>, String> {
         let section = self.section_for(host);
         let settings = self.for_host(host);
@@ -575,6 +607,7 @@ pub mod keys {
         "pipe",
         "history_lines",
         "host_label",
+        "predict",
         "forward",
         "agent",
         "agent_keys",
@@ -612,6 +645,7 @@ const EXPLAINED_KEYS: &[&str] = &[
     "transport",
     "pipe",
     "host_label",
+    "predict",
     "remote",
     "install",
     "forward",
@@ -640,6 +674,7 @@ fn is_set(key: &str, s: &RawSection) -> bool {
         "transport" => s.transport.is_some(),
         "pipe" => s.pipe.is_some(),
         "host_label" => s.host_label.is_some(),
+        "predict" => s.predict.is_some(),
         "remote" => s.remote.is_some(),
         "install" => s.install.is_some(),
         "forward" => fwd(|t| t.specs.is_some()),
@@ -728,6 +763,7 @@ fn show_value(key: &str, host: &str, s: &HostSettings) -> Result<(String, Option
                 "unset".to_string()
             }
         },
+        "predict" => word(&s.predict),
         "remote" => word(&s.remote),
         "install" => word(&s.install),
         "forward" => list(s.forward.iter().map(forward_spec::format_flag)),
@@ -821,7 +857,7 @@ pub fn render_show(host: &str, file: &str, rows: &[Explained]) -> String {
         .max()
         .unwrap_or(0);
     let mut out = format!(
-        "# effective settings for {}, from {}\n# the command line (-L -R -D -A -a --transport) is applied on top; the host is not contacted\n",
+        "# effective settings for {}, from {}\n# the command line (-L -R -D -A -a --transport --predict) is applied on top; the host is not contacted\n",
         escape_unprintable(host),
         escape_unprintable(file)
     );
@@ -855,6 +891,9 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
     }
     if let Some(l) = &s.host_label {
         out.host_label = Some(check_label(l)?);
+    }
+    if let Some(p) = s.predict {
+        out.predict = p.into();
     }
     if let Some(f) = &s.forward {
         resolve_forward(&f.clone().into_table(), &mut out)?;
@@ -1249,15 +1288,12 @@ offline_input.log = ["logger", "-t", "fil"]
                 "[defaults]\nhistory_lines = 500",
                 vec!["[defaults]", "history_lines", "daemon.toml"],
             ),
-            // 0.1.0 has no prediction: `predict` is an unknown key (N9). 0.2.0's E1b brings it back.
+            // A wrong value is refused with the values there are.
             (
-                "[defaults]\npredict = \"adaptive\"",
-                vec!["unknown field `predict`"],
+                "[defaults]\npredict = \"maybe\"",
+                vec!["unknown variant `maybe`", "`off`", "`adaptive`", "`always`"],
             ),
-            (
-                "[host.devbox]\npredict = \"off\"",
-                vec!["unknown field `predict`"],
-            ),
+            ("[host.devbox]\npredict = true", vec!["predict", "string"]),
             ("[defaults\n", vec!["test.toml"]),
         ] {
             let err = parse(text).expect_err(text);
@@ -1452,7 +1488,13 @@ forward = ["-L 1:h:2\u001b[2J"]"#,
     fn errors_never_carry_a_terminal_escape_whatever_key_they_come_from() {
         // Serde quotes the file's value in its own words: a title-setting escape, a bidi
         // override.
-        for key in ["agent", "remote_requests", "forward_failure", "transport"] {
+        for key in [
+            "predict",
+            "agent",
+            "remote_requests",
+            "forward_failure",
+            "transport",
+        ] {
             let text = format!("[defaults]\n{key} = \"x\\u001b]0;pwned\\u0007\\u202e\"");
             let err = parse(&text).expect_err(&text);
             assert!(
@@ -1506,16 +1548,42 @@ forward = ["-L 1:h:2\u001b[2J"]"#,
     }
 
     #[test]
-    fn predict_is_an_unknown_key_in_0_1_0() {
-        // N9: 0.1.0 has no prediction. 0.2.0's E1b brings the key back.
-        assert!(!keys::SECTION.contains(&"predict"));
-        for text in [
-            "[defaults]\npredict = \"off\"",
-            "[host.devbox]\npredict = \"adaptive\"",
-        ] {
-            let e = parse(text).unwrap_err();
-            assert!(e.contains("unknown field `predict`"), "{e}");
-        }
+    fn predict_defaults_to_adaptive_and_layers_host_over_defaults() {
+        // From 0.2.0 (N9), adaptive by default (PC-1).
+        assert_eq!(Config::default().for_host("x").predict, Predict::Adaptive);
+        let cfg = parse(
+            "[defaults]\npredict = \"always\"\n[host.slow]\npredict = \"off\"\n[host.quick]\nagent = \"on\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.for_host("slow").predict, Predict::Off);
+        assert_eq!(cfg.for_host("me@slow").predict, Predict::Off);
+        assert_eq!(cfg.for_host("quick").predict, Predict::Always);
+        assert_eq!(cfg.for_host("other").predict, Predict::Always);
+        assert_eq!(cfg.defaults().predict, Predict::Always);
+        let only_host = parse("[host.a]\npredict = \"off\"").unwrap();
+        assert_eq!(only_host.for_host("b").predict, Predict::Adaptive);
+    }
+
+    #[test]
+    fn config_show_has_the_predict_row_with_its_source() {
+        let cfg = parse("[defaults]\npredict = \"off\"\n[host.a]\npredict = \"always\"").unwrap();
+        let row = |h: &str| {
+            let rows = cfg.explain(h).unwrap();
+            let r = rows.iter().find(|r| r.key == "predict").unwrap();
+            (r.value.clone(), r.source.clone())
+        };
+        assert_eq!(row("a"), ("\"always\"".into(), "[host.a]".into()));
+        assert_eq!(row("b"), ("\"off\"".into(), "[defaults]".into()));
+        let rows = parse("").unwrap().explain("b").unwrap();
+        let r = rows.iter().find(|r| r.key == "predict").unwrap();
+        assert_eq!(
+            (r.value.as_str(), r.source.as_str()),
+            ("\"adaptive\"", "default")
+        );
+        // The shown value reads back as the same setting.
+        let copy = format!("[defaults]\npredict = {}", row("a").0);
+        assert_eq!(parse(&copy).unwrap().defaults().predict, Predict::Always);
+        assert!(render_show("a", "test.toml", &cfg.explain("a").unwrap()).contains("--predict"));
     }
 
     /// The names the reference documents: one `### `key`` heading each, `table.key` for nested.
@@ -1755,6 +1823,7 @@ direct.address = "devbox.example.net"
         let pipe = k.iter().find(|r| r.key == "pipe").unwrap();
         assert_eq!(pipe.source, "[host.k8s-dev]");
         assert!(pipe.value.starts_with("[\"kubectl\""));
-        assert!(!design_sketch().contains("predict"));
+        // The sketch shows the default, in [defaults].
+        assert_eq!(get("predict"), ("\"adaptive\"".into(), "[defaults]".into()));
     }
 }

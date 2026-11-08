@@ -180,23 +180,17 @@ fn the_command_line_has_what_the_test_looks_for() {
 }
 
 #[test]
-fn there_is_no_prediction_in_0_1_0() {
-    // N9: 0.1.0 has no `predict` key and no `--predict` flag, and the guide has no page on it.
-    for (path, text) in pages() {
-        // config.md says, in a section of its own, that the key is not there in 0.1.0.
-        let says_so = name_of(&path) == "config.md";
-        assert!(
-            !text.contains("--predict") && (says_so || !text.contains("`predict`")),
-            "{}: names a predict key or flag",
-            name_of(&path)
-        );
-        for block in toml_blocks(&text) {
-            assert!(
-                !block.contains("predict"),
-                "{}: predict in TOML",
-                name_of(&path)
-            );
-        }
+fn prediction_is_documented_in_the_config_reference_only() {
+    // From 0.2.0 (N9): `predict` and `--predict` are in config.md, and the guide has no page of
+    // its own on prediction yet (that comes with 0.2.0's docs).
+    let config = page("config.md");
+    assert!(
+        config.contains("### `predict`"),
+        "config.md: no predict key"
+    );
+    assert!(mentions(&config, "--predict"), "config.md: no --predict");
+    for v in ["\"off\"", "\"adaptive\"", "\"always\""] {
+        assert!(config.contains(v), "config.md: {v}");
     }
     assert!(!root().join("docs/user/prediction.md").exists());
 }

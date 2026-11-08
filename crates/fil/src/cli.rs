@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
+//!          [--transport auto|pipe|direct] [--predict off|adaptive|always]
 //!                                                attach (default session: main)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
@@ -23,6 +24,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use fil_client::Predict;
 use fil_proto::msg::{ForwardOp, SessionName};
 use fil_proto::mux::{ForwardKind, ForwardSpec};
 use fil_transport::path::TransportSetting;
@@ -149,6 +151,28 @@ pub struct AttachArgs {
     /// once attached)
     #[arg(long, value_enum, value_name = "MODE")]
     pub transport: Option<TransportArg>,
+
+    /// Predictive echo for this run, over the config's predict setting: off, adaptive (the default:
+    /// guesses shown only on a slow link) or always
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub predict: Option<PredictArg>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PredictArg {
+    Off,
+    Adaptive,
+    Always,
+}
+
+impl From<PredictArg> for Predict {
+    fn from(p: PredictArg) -> Self {
+        match p {
+            PredictArg::Off => Predict::Off,
+            PredictArg::Adaptive => Predict::Adaptive,
+            PredictArg::Always => Predict::Always,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -485,6 +509,8 @@ pub enum Action {
         host: String,
         session: SessionName,
         transport: Option<TransportSetting>,
+        /// `--predict`: over the config's `predict` for this run.
+        predict: Option<Predict>,
         /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked, for the run's plan.
         forwards: CliForwards,
     },
@@ -581,6 +607,9 @@ impl Cli {
         }
         if a.transport.is_some() {
             stray.push("--transport".to_string());
+        }
+        if a.predict.is_some() {
+            stray.push("--predict".to_string());
         }
         if stray.is_empty() {
             return Ok(());
@@ -682,6 +711,7 @@ impl Cli {
                         .expect("clap requires a host when there is no subcommand"),
                     session: a.session.unwrap_or_else(default_session),
                     transport: a.transport.map(Into::into),
+                    predict: a.predict.map(Into::into),
                     forwards,
                 })
             }
@@ -720,6 +750,7 @@ mod tests {
                 host: "devbox".into(),
                 session: name("main"),
                 transport: None,
+                predict: None,
                 forwards: Default::default()
             }
         );
@@ -729,6 +760,7 @@ mod tests {
                 host: "me@devbox".into(),
                 session: name("build"),
                 transport: None,
+                predict: None,
                 forwards: Default::default()
             }
         );
@@ -747,6 +779,7 @@ mod tests {
                     host: "devbox".into(),
                     session: name("main"),
                     transport: Some(want),
+                    predict: None,
                     forwards: Default::default()
                 }
             );
@@ -757,6 +790,44 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidValue
         );
+    }
+
+    #[test]
+    fn predict_override() {
+        for (arg, want) in [
+            ("off", Predict::Off),
+            ("adaptive", Predict::Adaptive),
+            ("always", Predict::Always),
+        ] {
+            assert_eq!(
+                action(&["--predict", arg, "devbox"]),
+                Action::Attach {
+                    host: "devbox".into(),
+                    session: name("main"),
+                    transport: None,
+                    predict: Some(want),
+                    forwards: Default::default()
+                }
+            );
+            // After the host too, like the other attach options.
+            assert!(matches!(
+                action(&["devbox", "--predict", arg]),
+                Action::Attach { predict: Some(p), .. } if p == want
+            ));
+        }
+        // A wrong value is refused with the values there are.
+        let e = parse(&["--predict", "maybe", "devbox"]).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidValue);
+        let text = e.to_string();
+        for v in ["maybe", "off", "adaptive", "always"] {
+            assert!(text.contains(v), "{text}");
+        }
+        // Before a subcommand it would be ignored: a usage error, as `--transport` is.
+        let e = parse(&["--predict", "off", "ls", "devbox"])
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(e.to_string().contains("--predict"), "{e}");
     }
 
     #[test]
@@ -1061,6 +1132,7 @@ mod tests {
                 host: "devbox".into(),
                 session: s.clone(),
                 transport: None,
+                predict: None,
                 forwards: forwards(&["devbox", "-L", "80"]),
             }
         );
@@ -1293,6 +1365,7 @@ mod tests {
                 host: "devbox".into(),
                 session: name("ls"),
                 transport: None,
+                predict: None,
                 forwards: Default::default()
             }
         );
@@ -1306,6 +1379,7 @@ mod tests {
                 host: "ls".into(),
                 session: name("main"),
                 transport: None,
+                predict: None,
                 forwards: Default::default()
             }
         );

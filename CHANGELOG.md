@@ -2,7 +2,7 @@
 
 All notable changes to fil. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and fil follows [Semantic Versioning](https://semver.org/) with the caveat that before 1.0 the configuration, the flags and the exit statuses may still change. A release that changes the wire (the `wire` number in `fil --version`) bumps the minor version, and both ends need the upgrade.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-07
 
 The first release: an ssh/et drop-in. It has no predictive echo and no `predict` setting; that is planned for 0.2.0.
 

@@ -416,7 +416,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fil-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-client",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "fil-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-daemon",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "fil-forward"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-forward",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "fil-netsim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "quinn",
  "rand",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "fil-predict"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "fil-netsim",
  "fil-predict",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "fil-proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-netsim",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "fil-session"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-forward",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "fil-shell"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "fil-term"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "portable-pty",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "fil-testbins"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-proto",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "fil-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-proto",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "fil-transport"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-netsim",

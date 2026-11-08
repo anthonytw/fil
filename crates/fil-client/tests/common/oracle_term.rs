@@ -123,6 +123,10 @@ struct Shared {
     writes: u64,
     bytes: u64,
     last_write: Instant,
+    /// Bytes the user typed since the rig started. It matches the input offsets the session's
+    /// `EchoAck`s count only while the run stays on its first attach (those restart at 0 on a
+    /// fresh attach), and only if every byte reaches the session: see [`Rig::settle_echoed`].
+    typed: u64,
     scan: SecretScan,
     /// The cells that were underlined with a glyph after the previous write.
     underlined: BTreeMap<(u16, u16), String>,
@@ -211,6 +215,7 @@ pub fn oracle_terminal(
         writes: 0,
         bytes: 0,
         last_write: Instant::now(),
+        typed: 0,
         scan: SecretScan::default(),
         underlined: BTreeMap::new(),
         paints: 0,
@@ -264,6 +269,7 @@ impl TermOutput for OracleOut {
 
 impl OracleHandle {
     pub fn type_bytes(&self, b: &[u8]) {
+        self.shared.lock().unwrap().typed += b.len() as u64;
         let _ = self.tx.send(TermEvent::Input(b.to_vec()));
     }
 
@@ -359,6 +365,10 @@ impl OracleHandle {
         self.shared.lock().unwrap().writes
     }
 
+    pub fn typed(&self) -> u64 {
+        self.shared.lock().unwrap().typed
+    }
+
     pub fn quiet_for(&self) -> Duration {
         self.shared.lock().unwrap().last_write.elapsed()
     }
@@ -450,6 +460,11 @@ pub struct AdapterStats {
     /// Calls whose context carried a round-trip estimate from the link itself (before the
     /// adapter puts in its own): the engine passes `LinkStatus.rtt` on (E1a).
     pub link_rtt_seen: u64,
+    /// The highest `EchoAck.input_upto` the core passed on (`Predictor::on_echo_ack`): the input
+    /// the session's PTY took, an echo window ago. It does not say the program echoed it. The
+    /// engine applies an `EchoAck` only once the output below its `output_at` has been written
+    /// to the terminal, so whatever the session had output by then is on the screen.
+    pub echo_acked: u64,
 }
 
 /// The `Predictor`, wrapped: it gives the inner predictor the link's RTT (the stock client passes
@@ -522,6 +537,10 @@ impl Predictor for Adapter {
         self.inner.on_settled(settled, &c);
     }
     fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>) {
+        {
+            let mut st = self.stats.lock().unwrap();
+            st.echo_acked = st.echo_acked.max(input_upto);
+        }
         let c = self.with_rtt(ctx);
         self.inner.on_echo_ack(input_upto, &c);
     }
@@ -1343,12 +1362,44 @@ impl Rig {
     /// Waits until nothing has been written to the terminal for long enough that everything in
     /// flight has arrived (a few round trips and the echo window).
     pub async fn settle(&self) {
+        self.settle_since(None).await;
+    }
+
+    /// Quiet for the settle window, counted from the last write or from `from`, whichever is
+    /// later: a write still owed for something that already happened cannot be mistaken for
+    /// quiet that began before it.
+    async fn settle_since(&self, from: Option<Instant>) {
         let quiet = (self.spec.rtt() * 3 + Duration::from_millis(400)).min(Duration::from_secs(4));
         let end = Instant::now() + Duration::from_secs(60);
-        while self.term.quiet_for() < quiet {
+        let quiet_for = || {
+            let q = self.term.quiet_for();
+            from.map_or(q, |f| q.min(f.elapsed()))
+        };
+        while quiet_for() < quiet {
             assert!(Instant::now() < end, "the terminal never went quiet");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Waits until the session has taken every key typed so far and its output up to then is on
+    /// the user's terminal, then for quiet. [`Rig::settle`] alone is not enough right after a
+    /// key: the terminal has been quiet since before it, so it returns before the echo (or even
+    /// the guess) is written. The condition is the engine applying an `EchoAck` that covers the
+    /// last key. The ack means only that the PTY took the input an echo window ago, not that the
+    /// program echoed it; the engine applies it once the output below its `output_at` is written,
+    /// and the quiet window, counted from then, covers an echo that comes later.
+    ///
+    /// Preconditions (otherwise it panics after 30 s): a predictor runs (an attach without one
+    /// asks for no `EchoAck`); the run is still on its first attach, since the acks restart at 0
+    /// on a fresh one while the count of keys typed does not; and every key typed reached the
+    /// session (none lost to a cut path).
+    pub async fn settle_echoed(&self) {
+        let typed = self.term.typed();
+        self.wait("the EchoAck covering every key typed", 30, || {
+            self.stats.lock().unwrap().echo_acked >= typed
+        })
+        .await;
+        self.settle_since(Some(Instant::now())).await;
     }
 
     /// Cuts the path: the pipe is reset, the datagram network black-holed. Dials fail until
@@ -1743,13 +1794,19 @@ pub async fn resize_trial(case: ResizeCase) -> ResizeOutcome {
     }
     let after = words(&mut rng, case.typed_after);
     rig.type_slowly(&mut rng, &after, case.gap_ms).await;
-    rig.settle().await;
+    if case.spec.predict == Predict::Off {
+        rig.settle().await;
+    } else {
+        rig.settle_echoed().await;
+    }
     let report = rig.report();
     let shadow = if case.spec.predict == Predict::Off {
         None
     } else {
         let c = rig.compare_to_shadow().await;
-        rig.settle().await;
+        // The `z` it typed is echoed on the session's screen, and so in the fresh snapshot:
+        // wait for that echo to reach the terminal too.
+        rig.settle_echoed().await;
         c
     };
     let repaints = rig.faults.repaints.load(Ordering::SeqCst);

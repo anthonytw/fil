@@ -1,0 +1,38 @@
+# The cargo-fuzz targets of the client's `config.toml` parser (`fil::config::Config::parse`) and of the
+# remote host's bootstrap answers (`fil::install::boot`). Not
+# part of the workspace and not run by `just ci` (it needs a nightly toolchain):
+#   just fuzz config SECONDS             (from the repository root; `just fuzz` lists the targets)
+#   cargo +nightly fuzz run config fuzz/corpus/config fuzz/seeds/config   (from crates/fil)
+# The seeds in seeds/ are sample configurations and sample bootstrap answers, written by hand.
+[package]
+name = "fil-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fil = { path = "..", package = "fil-shell" }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+# Its own workspace, so the main workspace's `crates/*` does not claim it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootstrap_answer"
+path = "fuzz_targets/bootstrap_answer.rs"
+test = false
+doc = false
+bench = false

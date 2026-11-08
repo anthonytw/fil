@@ -1,0 +1,49 @@
+[package]
+name = "fil-daemon"
+description = "The fil daemon: the per-user process that holds sessions, its socket and lifecycle, the stdio relay, and the QUIC listener (DESIGN.md sections 4, 5.3, 8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+bytes = "1"
+fil-forward.workspace = true
+fil-proto.workspace = true
+fil-session.workspace = true
+fil-transport.workspace = true
+# The CSPRNG for session incarnations; already in the tree through fil-transport.
+ring = "0.17"
+# Safe flock, setsid and uid queries (no unsafe code, DESIGN.md section 13).
+# `net`: the sock_diag netlink lookup of `remote_peers = "same-user"` (ports/diag.rs).
+rustix = { version = "1", features = ["fs", "process", "net"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std", "registry"] }
+
+[features]
+# Test hooks (never in the released binary: `just release-deps` checks): the wire revision from
+# FIL_TEST_WIRE_REVISION (fil-proto) and the socket directory from FIL_TEST_SOCKET_DIR, so a test can
+# run the real `fil` against a private directory as a build of another revision.
+test-hooks = ["fil-proto/test-hooks"]
+
+[dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
+# Enables `test-hooks` for this crate's own tests and for the dev binary they spawn.
+fil-daemon = { path = ".", features = ["test-hooks"] }
+# The scripted protocol client, shared with fil-session's tests.
+fil-testkit = { path = "../fil-testkit" }
+# A crashed daemon's socket in tests: bound, never listening (`net`).
+rustix = { version = "1", features = ["fs", "process", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "io-util", "process", "test-util"] }
+
+[lints]
+workspace = true

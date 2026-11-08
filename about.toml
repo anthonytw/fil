@@ -1,0 +1,60 @@
+# cargo-about's config for THIRD-PARTY-NOTICES.md (docs/m4/release.md section 7). `just notices`
+# checks the committed file and `just notices-update` rewrites it; never edit the file by hand.
+#
+# The graph is the release binary's: `-p fil-shell` with its default features (the recipe passes the
+# manifest), normal and build edges, on the four release targets (docs/m4/release.md section 3).
+# A crate only another target links (Windows, wasm, UEFI) is not in any release binary and is left
+# out; `just notices` checks the list against `cargo tree` for the same targets.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# The same list as `[licenses] allow` in deny.toml (`just notices` fails if the two differ), in
+# priority order: for a crate that offers a choice (`MIT OR Apache-2.0`), the first one listed here
+# is the license fil takes it under, and the one whose text the notices carry.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "NCSA",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+]
+
+# The workspace's own crates are fil, under the root LICENSE. cargo-about skips the `publish = false`
+# ones (the test-only crates) here. The nine that are published to crates.io (docs/m4/packaging.md)
+# it cannot skip by config: `private.registries` would also skip every registry crate whose own
+# manifest says `publish = ["crates-io"]` (serial2 does). So it lists them, and about.hbs leaves out
+# every crate and license entry that has no registry source; `just notices` checks that no license
+# entry mixes the workspace's crates with registry crates, so that nothing else is left out.
+[private]
+ignore = true
+
+# rcgen ships one LICENSE file that holds both the MIT and the Apache-2.0 text, which cargo-about
+# does not recognize: without this it substitutes the canonical MIT text, with "<year> <copyright
+# holders>" in place of rcgen's own copyright line. The checksum is the sha256 of the start..end
+# range; when an rcgen bump changes that text, cargo-about warns and `just notices` fails.
+[rcgen.clarify]
+license = "MIT OR Apache-2.0"
+
+[[rcgen.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "017986d055737c5ca0f7f41fb1a54e3464924b9b04f430988d8ebe21b6884c40"
+start = "The MIT License (MIT)"
+end = "SOFTWARE."

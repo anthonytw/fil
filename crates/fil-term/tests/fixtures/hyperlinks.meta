@@ -1,0 +1,4 @@
+cols = 40
+rows = 8
+kind = synthetic
+description = OSC 8 hyperlinks: with and without id, ST and BEL terminators, a link spanning a wrap

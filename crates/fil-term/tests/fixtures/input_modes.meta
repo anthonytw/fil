@@ -1,0 +1,4 @@
+cols = 40
+rows = 8
+kind = synthetic
+description = app cursor keys, app keypad, bracketed paste, focus, button-event mouse with SGR encoding, kitty flags 5, bar cursor, hidden cursor, title

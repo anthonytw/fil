@@ -1,0 +1,465 @@
+//! The daemon's configuration: `~/.config/fil/daemon.toml`, all keys optional.
+//!
+//! ```toml
+//! # Direct mode (QUIC over UDP, DESIGN.md section 8.3). On by default. With `false` the daemon
+//! # opens no UDP port and every client stays on the pipe.
+//! direct = true
+//!
+//! # The address the UDP port is bound to. The IPv6 wildcard by default, which also takes IPv4
+//! # (a host without IPv6 falls back to "0.0.0.0"); set a LAN or tailnet address to keep the port
+//! # off other interfaces.
+//! bind = "::"
+//!
+//! # The UDP ports to try (inclusive), from a random starting point. The same range mosh uses.
+//! port_range = [60000, 61000]
+//!
+//! # Lines of scrollback each session keeps for a client that reattaches (1 to 1,000,000).
+//! history_lines = 1000
+//!
+//! # Seconds with no session and no connection after which the daemon exits on its own.
+//! # 0 means never. Default 300.
+//! idle_exit_secs = 300
+//!
+//! # How sessions group their processes: "auto" (a systemd user scope where lingering is on),
+//! # "systemd" (always, failing if it cannot) or "tree" (always the process tree).
+//! scope = "auto"
+//!
+//! # Every session's SSH_AUTH_SOCK is its stable agent socket, /tmp/fil-$UID/a-<major>-<rev>/<session>.sock
+//! # (DESIGN.md section 10), whether or not a client relays its agent: a program started while
+//! # nobody relays finds the path and gets a refusal, and works once a client with -A attaches.
+//! # With `false` sessions get no SSH_AUTH_SOCK and the agent is never relayed.
+//! agent_socket = true
+//!
+//! [ports]
+//! # The protocol probe of `fil ports` (DESIGN.md section 7.4), on the user's own loopback
+//! # listeners only: "head" (TLS, HTTP `HEAD` for the status and `Server`, Postgres, Redis),
+//! # "full" (HTTP `GET`, for the page title too) or "off". A probe is a real connection: most
+//! # web frameworks run the `GET` handler for a `HEAD` too, a one-shot listener (`nc -l`) is
+//! # used up, and Postgres logs a line. "off" if that matters; it also turns `--probe` off.
+//! probe = "head"
+//! # What is probed: the -L targets and the listeners started in a session. With `true`, also
+//! # the user's other listeners (as `fil ports --probe` asks for one answer). They are often
+//! # tunnels (`ssh -L`, `kubectl port-forward`), and a probe through one reaches whatever it
+//! # leads to, another host included. A listener a known forwarder holds is never probed.
+//! probe_other = false
+//!
+//! [forward]
+//! # Who may connect to the sessions' -R ports (OD-9): "any" local user, as with ssh -R (the
+//! # default), or "same-user": only this user's own sockets. Under "same-user" a connection from
+//! # another uid, or one whose owner cannot be told (a peer that already closed, an off-host peer
+//! # of a non-loopback -R, any peer on macOS, where there is no lookup), is reset before a byte
+//! # reaches the client, and `fil ports` counts it on the forward's row. The host's server policy
+//! # (/etc/fil/policy.toml, the sshd mirror) still decides first; this only narrows.
+//! remote_peers = "any"
+//! # The daemon side's tunables, with the client's `[defaults.forward]` keys and bounds:
+//! # window = "1MiB"         # 16KiB to 4MiB: the receive window per channel
+//! # buffer = "1MiB"         # 16KiB to 16MiB: what a channel's sender keeps unacknowledged
+//! # open_wait = "30s"       # 0 to 1h: how long an -R connection waits for a link
+//! # linger = "10m"          # 0 to 24h: how long open connections outlive a disconnect, and how
+//! #                         # long a withheld entry outlives its run (at least 30 s)
+//! ```
+//!
+//! Unknown keys are an error, so a misspelled key does not silently do nothing. A missing file
+//! is the defaults. A file that cannot be read or parsed stops the daemon from starting (and
+//! `ensure_daemon` reports it before it starts one).
+
+use std::net::{IpAddr, Ipv6Addr};
+use std::ops::RangeInclusive;
+use std::path::Path;
+use std::time::Duration;
+
+use fil_forward::tunables::{ForwardTunables, Value};
+use fil_session::ScopeMode;
+use fil_session::peers::RemotePeers;
+use fil_transport::LinkParams;
+use serde::Deserialize;
+
+use crate::paths::current_uid;
+use crate::ports::ProbeMode;
+
+/// How long the daemon with nothing to do waits before it exits (the `idle_exit_secs` default).
+pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
+
+/// The scrollback lines a session keeps (the `history_lines` default).
+pub const DEFAULT_HISTORY_LINES: usize = 1000;
+
+/// The most `history_lines` may be.
+pub const MAX_HISTORY_LINES: usize = 1_000_000;
+
+/// How long creating a session (the PTY, the child, the probes for a systemd scope) may take
+/// before the attach fails.
+pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a connection may take between connecting and having sent `Hello` and its `Attach` or
+/// `Request`.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The file's keys.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    direct: Option<bool>,
+    bind: Option<IpAddr>,
+    port_range: Option<[u16; 2]>,
+    history_lines: Option<usize>,
+    idle_exit_secs: Option<u64>,
+    scope: Option<String>,
+    agent_socket: Option<bool>,
+    ports: Option<PortsFile>,
+    forward: Option<ForwardFile>,
+}
+
+/// `[forward]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardFile {
+    remote_peers: Option<String>,
+    window: Option<Value>,
+    buffer: Option<Value>,
+    open_wait: Option<Value>,
+    linger: Option<Value>,
+}
+
+/// `[ports]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortsFile {
+    probe: Option<String>,
+    probe_other: Option<bool>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path}: {message}")]
+    Invalid {
+        path: std::path::PathBuf,
+        message: String,
+    },
+}
+
+/// What a new session runs, beyond the defaults (a login shell in the home directory). Tests
+/// set these; the daemon's file does not.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDefaults {
+    /// The program and arguments; `None` is the user's login shell.
+    pub command: Option<Vec<String>>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub clear_env: bool,
+}
+
+/// Everything the daemon is configured with.
+#[derive(Clone, Debug)]
+pub struct DaemonConfig {
+    /// Open the UDP port (default true).
+    pub direct: bool,
+    /// The address to bind the UDP port to (default the IPv6 wildcard, which takes IPv4 as well).
+    pub bind: IpAddr,
+    /// The ports to try (default 60000-61000).
+    pub ports: RangeInclusive<u16>,
+    /// Scrollback lines each session keeps (default 1000).
+    pub history_lines: usize,
+    /// Exit after this long with no session and no connection; `None` never (default 5 minutes).
+    pub idle_exit: Option<Duration>,
+    /// How sessions group their processes (default `auto`).
+    pub scope: ScopeMode,
+    /// The `fil ports` probe (`[ports] probe`, default `head`).
+    pub ports_probe: ProbeMode,
+    /// Probe the user's listeners outside the sessions too (`[ports] probe_other`, default
+    /// false; `fil ports --probe` asks for it once).
+    pub ports_probe_other: bool,
+    /// Sessions get the stable `SSH_AUTH_SOCK` and can relay an agent (`agent_socket`, default
+    /// true; OD-6).
+    pub agent_socket: bool,
+    /// The forwards' tunables on the daemon side (`[forward]`: `window`, `buffer`, `open_wait`,
+    /// `linger`).
+    pub forward: ForwardTunables,
+    /// Who may connect to the `-R` ports (`[forward] remote_peers`, OD-9; default every local
+    /// user). `same-user` carries the host's lookup ([`crate::ports::system_peer_owner`]); tests
+    /// give it another.
+    pub remote_peers: RemotePeers,
+    /// The only peer uid the socket accepts (default: this process's). Not in the file; tests
+    /// change it to show a foreign user is refused.
+    pub allowed_uid: u32,
+    /// Time allowed for `Hello` and the first request after a connection is accepted.
+    pub handshake_timeout: Duration,
+    /// How long a starting daemon waits for the lock of one that is on its way out before it
+    /// concludes one is running (default 3 s). Not in the file.
+    pub lock_wait: Duration,
+    /// How long creating a session may take before the attach fails (default 30 s). Not in the
+    /// file.
+    pub spawn_timeout: Duration,
+    /// Extra time every session creation waits before it starts (default none). Not in the file;
+    /// tests use it to make a creation slow.
+    pub spawn_delay: Duration,
+    /// Heartbeat and liveness timing of every link.
+    pub link: LinkParams,
+    pub session: SessionDefaults,
+    /// Where the server policy comes from (DESIGN.md section 11.2): the host's sshd config and
+    /// `/etc/fil/policy.toml`. Not in the file (the user must not be able to point it
+    /// elsewhere); tests change it.
+    pub policy: fil_session::policy::PolicySources,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            direct: true,
+            bind: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ports: fil_transport::quic::DEFAULT_PORT_RANGE,
+            history_lines: DEFAULT_HISTORY_LINES,
+            idle_exit: Some(DEFAULT_IDLE_EXIT),
+            scope: ScopeMode::Auto,
+            ports_probe: ProbeMode::Head,
+            ports_probe_other: false,
+            agent_socket: true,
+            forward: ForwardTunables::default(),
+            remote_peers: RemotePeers::Any,
+            allowed_uid: current_uid(),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            lock_wait: Duration::from_secs(3),
+            spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
+            spawn_delay: Duration::ZERO,
+            link: LinkParams::default(),
+            session: SessionDefaults::default(),
+            policy: fil_session::policy::PolicySources::system(),
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// A warning for the daemon's log at start: `remote_peers = "same-user"` where no peer can be
+    /// identified, so every `-R` connection is refused. Names nothing of the user's.
+    pub fn remote_peers_warning(&self) -> Option<&'static str> {
+        (!self.remote_peers.is_any() && crate::ports::system_proc_root().is_none()).then_some(
+            "remote_peers = \"same-user\" cannot identify peers on this platform: every -R connection is refused",
+        )
+    }
+
+    /// Reads the file at `path`; a missing file gives the defaults.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map_err(|message| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Parses the file's text over the defaults.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let file: FileConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut cfg = Self::default();
+        if let Some(d) = file.direct {
+            cfg.direct = d;
+        }
+        if let Some(b) = file.bind {
+            cfg.bind = b;
+        }
+        if let Some([lo, hi]) = file.port_range {
+            if lo == 0 || lo > hi {
+                return Err(format!(
+                    "port_range = [{lo}, {hi}]: the first port must be at least 1 and not above the second"
+                ));
+            }
+            cfg.ports = lo..=hi;
+        }
+        if let Some(n) = file.history_lines {
+            if !(1..=MAX_HISTORY_LINES).contains(&n) {
+                return Err(format!(
+                    "history_lines = {n}: must be between 1 and {MAX_HISTORY_LINES}"
+                ));
+            }
+            cfg.history_lines = n;
+        }
+        if let Some(s) = file.idle_exit_secs {
+            cfg.idle_exit = (s > 0).then(|| Duration::from_secs(s));
+        }
+        if let Some(s) = file.scope {
+            cfg.scope = match s.as_str() {
+                "auto" => ScopeMode::Auto,
+                "systemd" => ScopeMode::Systemd,
+                "tree" => ScopeMode::Tree,
+                other => {
+                    return Err(format!(
+                        "scope = {other:?}: expected \"auto\", \"systemd\" or \"tree\""
+                    ));
+                }
+            };
+        }
+        if let Some(a) = file.agent_socket {
+            cfg.agent_socket = a;
+        }
+        let ports = file.ports.unwrap_or_default();
+        if let Some(p) = ports.probe {
+            cfg.ports_probe = ProbeMode::parse(&p).ok_or_else(|| {
+                format!("ports.probe = {p:?}: expected \"head\", \"full\" or \"off\"")
+            })?;
+        }
+        if let Some(o) = ports.probe_other {
+            cfg.ports_probe_other = o;
+        }
+        if let Some(f) = file.forward {
+            if let Some(p) = f.remote_peers {
+                cfg.remote_peers = match p.as_str() {
+                    "any" => RemotePeers::Any,
+                    "same-user" => RemotePeers::SameUser(crate::ports::system_peer_owner()),
+                    other => {
+                        return Err(format!(
+                            "forward.remote_peers = {other:?}: expected \"any\" or \"same-user\""
+                        ));
+                    }
+                };
+            }
+            cfg.forward.apply(
+                f.window.as_ref(),
+                f.buffer.as_ref(),
+                f.open_wait.as_ref(),
+                f.linger.as_ref(),
+            )?;
+        }
+        Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_file_is_the_defaults() {
+        let c = DaemonConfig::parse("").unwrap();
+        assert!(c.direct);
+        assert_eq!(c.ports, 60000..=61000);
+        assert_eq!(c.idle_exit, Some(DEFAULT_IDLE_EXIT));
+        assert_eq!(c.scope, ScopeMode::Auto);
+        assert_eq!(c.history_lines, 1000);
+        assert_eq!(c.ports_probe, ProbeMode::Head);
+        assert!(
+            !c.ports_probe_other,
+            "only the -L targets and the sessions' listeners by default"
+        );
+        assert!(c.agent_socket, "the stable SSH_AUTH_SOCK by default (OD-6)");
+        assert!(
+            !DaemonConfig::parse("agent_socket = false")
+                .unwrap()
+                .agent_socket
+        );
+        assert!(DaemonConfig::parse("agent_socket = \"no\"").is_err());
+        assert!(
+            c.remote_peers.is_any(),
+            "every local user, as with ssh -R (OD-9)"
+        );
+        assert_eq!(c.forward, ForwardTunables::default());
+        assert_eq!(
+            c.bind,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "dual-stack by default"
+        );
+    }
+
+    #[test]
+    fn every_key() {
+        let c = DaemonConfig::parse(
+            "direct = false\nbind = \"127.0.0.1\"\nport_range = [50000, 50010]\n\
+             idle_exit_secs = 0\nscope = \"tree\"\nhistory_lines = 250\n\
+             [ports]\nprobe = \"off\"\n",
+        )
+        .unwrap();
+        assert!(!c.direct);
+        assert_eq!(c.bind, IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(c.ports, 50000..=50010);
+        assert_eq!(c.idle_exit, None);
+        assert_eq!(c.scope, ScopeMode::Tree);
+        assert_eq!(c.history_lines, 250);
+        assert_eq!(c.ports_probe, ProbeMode::Off);
+        let c = DaemonConfig::parse("[ports]\nprobe = \"full\"\nprobe_other = true\n").unwrap();
+        assert_eq!(c.ports_probe, ProbeMode::Full);
+        assert!(c.ports_probe_other);
+    }
+
+    /// `[forward]`: who may connect to the -R ports, and the daemon side's tunables, with the
+    /// client's forms and bounds.
+    #[test]
+    fn the_forward_table() {
+        let c = DaemonConfig::parse(
+            "[forward]\nremote_peers = \"same-user\"\nwindow = \"256KiB\"\nbuffer = 2097152\n\
+             open_wait = \"5s\"\nlinger = 120\n",
+        )
+        .unwrap();
+        assert!(matches!(c.remote_peers, RemotePeers::SameUser(_)));
+        assert_eq!(c.forward.window.get(), 256 * 1024);
+        assert_eq!(c.forward.buffer, 2 * 1024 * 1024);
+        assert_eq!(c.forward.open_wait, Duration::from_secs(5));
+        assert_eq!(c.forward.linger, Duration::from_secs(120));
+        let m = c.forward.mux_config();
+        assert_eq!(
+            (m.open_wait, m.linger),
+            (c.forward.open_wait, c.forward.linger)
+        );
+        // Where no peer can be identified the daemon warns at its start (not on Linux).
+        assert_eq!(
+            c.remote_peers_warning().is_some(),
+            cfg!(not(target_os = "linux"))
+        );
+        let c = DaemonConfig::parse("[forward]\nremote_peers = \"any\"\n").unwrap();
+        assert!(c.remote_peers.is_any());
+        assert!(c.remote_peers_warning().is_none());
+        assert_eq!(c.forward, ForwardTunables::default());
+    }
+
+    #[test]
+    fn mistakes_are_errors() {
+        for bad in [
+            "direkt = true",
+            "direct = \"yes\"",
+            "bind = \"not an address\"",
+            "port_range = [2, 1]",
+            "port_range = [0, 10]",
+            "port_range = [1]",
+            "scope = \"docker\"",
+            "history_lines = 0",
+            "history_lines = 1000001",
+            "idle_exit_secs = -1",
+            "[ports]\nprobe = \"get\"",
+            "[ports]\nprob = \"off\"",
+            "[forward]\nremote_peers = \"me\"",
+            "[forward]\nremote_peers = \"same_user\"",
+            "[forward]\nremote_peers = true",
+            "[forward]\nremote_peer = \"same-user\"",
+            "[forward]\nwindow = \"1KiB\"",
+            "[forward]\nbuffer = \"1GiB\"",
+            "[forward]\nopen_wait = \"2h\"",
+            "[forward]\nlinger = \"forever\"",
+            // The client's keys, not the daemon's.
+            "[forward]\nremote_requests = \"deny\"",
+            "[forward]\nspecs = [\"-R 9000\"]",
+            "forward = [\"-R 9000\"]",
+            // The admin's keys (/etc/fil/policy.toml), which a user's file can neither set nor
+            // loosen.
+            "remote = true",
+            "gateway_ports = true",
+            "[forward]\ngateway_ports = true",
+            "[forward]\npermit_listen = [\"any\"]",
+            "[ports]\nprobe_other = \"yes\"",
+        ] {
+            assert!(DaemonConfig::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn missing_file_is_the_defaults() {
+        let c = DaemonConfig::load(Path::new("/nonexistent/fil/daemon.toml")).unwrap();
+        assert!(c.direct);
+    }
+}

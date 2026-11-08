@@ -1,0 +1,4 @@
+cols = 80
+rows = 12
+kind = real
+description = a bash loop redrawing a progress bar with carriage returns, then a spinner, in a real shell

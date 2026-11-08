@@ -1,0 +1,4 @@
+cols = 40
+rows = 8
+kind = synthetic
+description = SO with G1 in DEC graphics left invoked, custom tab stops, DECSC taken in line drawing

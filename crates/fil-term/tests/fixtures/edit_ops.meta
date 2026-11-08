@@ -1,0 +1,4 @@
+cols = 30
+rows = 10
+kind = synthetic
+description = tabs, DCH, ICH, ECH, REP, insert mode, DECSC/DECRC, EL

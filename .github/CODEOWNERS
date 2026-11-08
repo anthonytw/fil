@@ -1,0 +1,26 @@
+# Code owners (docs/m4/plan.md, REL). The files that decide what a release is, and who may sign it,
+# need the owner's review. This takes effect only with the "require review from Code Owners"
+# setting of the main ruleset, which is the owner's to turn on.
+/.github/release-signers @anthonytw
+/.github/package-signing-key.asc @anthonytw
+/.github/workflows/** @anthonytw
+/.github/CODEOWNERS @anthonytw
+/tests/release/** @anthonytw
+/Cross.toml @anthonytw
+/rust-toolchain.toml @anthonytw
+/.github/macos-team-id @anthonytw
+# What else decides what a release is: the recipes `ci` and the release run, the workspace manifest
+# (profile, version, patches), the dependency and notice policy and its template, cargo and git
+# settings that would reach the builds, the packaging templates and the Nix flake, and the man-page toolchain installer (docs/m4/plan.md, DOC).
+/justfile @anthonytw
+/Cargo.toml @anthonytw
+/deny.toml @anthonytw
+/about.toml @anthonytw
+/about.hbs @anthonytw
+/.cargo/ @anthonytw
+/.gitattributes @anthonytw
+/packaging/** @anthonytw
+/flake.nix @anthonytw
+/flake.lock @anthonytw
+/docs/man/install-pandoc.sh @anthonytw
+/docs/man/build.sh @anthonytw

@@ -1,0 +1,15 @@
+[defaults]
+transport = "auto"
+host_label = "laptop"
+
+[defaults.offline_input]
+buffer = "4KiB"
+confirm = "off"
+
+[host.devbox]
+forward = ["-L 5173", "-R 9000"]
+direct.address = "devbox.example.net"
+
+[host.k8s-dev]
+transport = "pipe"
+pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]

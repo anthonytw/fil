@@ -1,0 +1,36 @@
+[package]
+name = "fil-proto"
+description = "fil protocol core: frames, control messages, reliable channels, epochs, scheduling (no IO, no transport)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+thiserror = "2"
+bytes = "1"
+# HMAC for the tags of what a spec withholds (src/mux/wire.rs, `Withheld`), under a key drawn
+# from the system's random source.
+ring = "0.17"
+
+[features]
+# Lets a test override the wire revision with FIL_TEST_WIRE_REVISION (src/version.rs). Never in the
+# released binary: `just release-deps` fails if the feature reaches it.
+test-hooks = []
+
+[dev-dependencies]
+fil-netsim = { path = "../fil-netsim" }
+# For tests/wire_golden.rs only, which pins the QUIC stream layout (fil_transport::quic::pinned)
+# next to the messages. A dev-dependency cycle: fil-transport depends on this crate.
+fil-transport = { path = "../fil-transport" }
+rand = "0.10"
+tokio = { version = "1", features = ["rt", "test-util", "macros", "io-util", "time", "sync"] }
+
+[lints]
+workspace = true

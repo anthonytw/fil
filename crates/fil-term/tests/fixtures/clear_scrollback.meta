@@ -1,0 +1,4 @@
+cols = 30
+rows = 6
+kind = synthetic
+description = CSI 3 J drops scrollback; later output builds fresh history

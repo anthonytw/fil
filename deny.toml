@@ -1,0 +1,46 @@
+# License policy from CLAUDE.md: every dependency must be GPL-3.0-compatible.
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    # libfuzzer-sys, `(MIT OR Apache-2.0) AND NCSA` (the LLVM libFuzzer sources it bundles). The fuzz
+    # crates are workspaces of their own and never reach a release, but `just fuzz` runs this check
+    # on them too (`fuzz-deny`). NCSA is permissive (MIT/BSD-style) and GPL-3.0-compatible.
+    "NCSA",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+]
+confidence-threshold = 0.9
+# The list is policy, not inventory: entries no current dependency uses are fine.
+unused-allowed-license = "allow"
+
+[advisories]
+# Part of `just ci` (the `deny` recipe). The advisory database is fetched on each run, so this
+# needs network access. A yanked crate fails the gate like a RustSec advisory does.
+yanked = "deny"
+# A new RustSec advisory in a dependency fails `just ci` on any PR, by design. If it cannot be fixed
+# by an update yet, acknowledge it here with a reason and a follow-up, never silently:
+#   ignore = [{ id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply, and what removes the entry" }]
+
+[bans]
+multiple-versions = "allow"
+# `*` version requirements would let a dependency float; workspace path dependencies are exempt.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

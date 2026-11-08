@@ -1,0 +1,3 @@
+scope = "magic"
+[forward]
+linger = -1

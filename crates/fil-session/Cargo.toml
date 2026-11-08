@@ -1,0 +1,61 @@
+[package]
+name = "fil-session"
+description = "One fil session: the PTY and its child, the output log, the emulator, and the subscriber protocol over any Link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+bytes = "1"
+fil-forward.workspace = true
+fil-proto.workspace = true
+fil-term = { workspace = true, features = ["alacritty"] }
+fil-transport.workspace = true
+nix = { version = "0.28", default-features = false, features = ["term", "signal", "user", "process"] }
+portable-pty = "0.9"
+# The agent socket: the effective uid its directory and peers are checked against.
+rustix = { version = "1", features = ["fs", "process"] }
+# The policy file, /etc/fil/policy.toml (DESIGN.md section 11.2).
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+tracing = "0.1"
+vte = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The process table for the tree scope, `sysctl(KERN_PROC_ALL)` (`proc::kinfo`): rustix has no
+# `sysctl`. Already in the graph (the `fil` crate's `localtime_r`).
+libc = "0.2"
+
+[[bin]]
+# The descriptor-limit trampoline for this crate's tests (`nofile`); never built otherwise.
+name = "fil-session-exec"
+required-features = ["test-hooks"]
+
+[features]
+# Hooks for tests of races. Not for daemon code: only the test targets enable it.
+test-hooks = []
+
+[dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
+# Enables `test-hooks` for this crate's own tests.
+fil-session = { path = ".", features = ["test-hooks"] }
+# The scripted protocol client, shared with the daemon's tests.
+fil-testkit = { path = "../fil-testkit" }
+# Real transports on simulated links (tests/terminal_pacing.rs).
+fil-netsim = { path = "../fil-netsim" }
+# quinn's counters for the Ctrl-C test's failure message (tests/terminal_pacing.rs).
+fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustix = { version = "1", features = ["process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+[package]
+name = "fil-forward"
+description = "Port forwards and the agent relay above the link: the async endpoint that drives fil-proto's MUX state machine, per-connection pumps, listeners, connects and SOCKS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+bytes = "1"
+fil-proto.workspace = true
+fil-transport.workspace = true
+# SHA-256 for agent key fingerprints (already in the tree through rustls).
+ring = "0.17"
+rustix = { version = "1", features = ["net"] }
+# The tunables' config forms (`tunables::Value`); already in the tree.
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tracing = "0.1"
+
+[features]
+# Hooks for tests of races (`Endpoint::set_after_check_hook`). Only the test targets enable it.
+test-hooks = []
+
+[dev-dependencies]
+# Test scratch directories that are removed even when the test panics.
+tempfile = "3"
+# Enables `test-hooks` for this crate's own tests.
+fil-forward = { path = ".", features = ["test-hooks"] }
+# `channel_state` for the tests that keep the link's per-channel bookkeeping bounded.
+fil-transport = { path = "../fil-transport", features = ["test-hooks"] }
+fil-netsim = { path = "../fil-netsim" }
+# The test-only mini ssh-agent.
+fil-testkit = { path = "../fil-testkit" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.10"
+# SHA-256 for the byte-exact checks (already in the tree through fil-transport; its digest is
+# optimized even in a debug build).
+ring = "0.17"
+# The tests raise their soft RLIMIT_NOFILE (thousands of loopback sockets in one process).
+rustix = { version = "1", features = ["net", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
+
+[lints]
+workspace = true

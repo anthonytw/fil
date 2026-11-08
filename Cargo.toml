@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/anthonytw/fil"
+# The pinned toolchain (rust-toolchain.toml), because `cargo install --git` does not read that file
+# (docs/m4/release.md section 1). `crates/fil` inherits it; a test in tests/release keeps the two equal.
+rust-version = "1.99.1"
+
+# The workspace's own crates, as the published crates depend on each other (docs/m4/packaging.md).
+# A path for the workspace and an EXACT version for crates.io: every crate has the one version of
+# [workspace.package] (docs/m4/release.md section 1), and `fil-shell` X.Y.Z must build against the
+# X.Y.Z of each library, never a later one with another wire. A release bump changes these with
+# `version` above (cargo refuses a requirement that the path crate's version does not meet).
+# Only normal dependencies use them: a dev-dependency stays a bare path, which `cargo publish` drops,
+# so the test-only crates (fil-testkit, fil-testbins, fil-netsim) are never needed on crates.io.
+[workspace.dependencies]
+fil-client = { path = "crates/fil-client", version = "=0.1.0" }
+fil-daemon = { path = "crates/fil-daemon", version = "=0.1.0" }
+fil-forward = { path = "crates/fil-forward", version = "=0.1.0" }
+fil-predict = { path = "crates/fil-predict", version = "=0.1.0" }
+fil-proto = { path = "crates/fil-proto", version = "=0.1.0" }
+fil-session = { path = "crates/fil-session", version = "=0.1.0" }
+# No default features: the shipped crates take only the alacritty backend (DESIGN.md section 6.5).
+fil-term = { path = "crates/fil-term", version = "=0.1.0", default-features = false }
+fil-transport = { path = "crates/fil-transport", version = "=0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The release build (DESIGN.md section 13, docs/m4/release.md section 4.4): small, and the same bytes
+# wherever and whenever it is built. Every release job passes `--locked`.
+#
+# Paths: the binary must carry no builder path (`just release-check` greps for one). The profile
+# key for that, `trim-paths = "all"`, is NOT stable in the pinned cargo (1.99.1 refuses it: "feature
+# `trim-paths` is required"), so tests/release/common.sh passes the equivalent `--remap-path-prefix`
+# flags for the workspace, CARGO_HOME and RUSTUP_HOME instead (the fallback docs/m4/plan.md names).
+# When the pinned cargo stabilizes `trim-paths`, set it here and drop the flags; tests/release/
+# selftest.sh fails if the profile and the flags ever disagree about which one is in force. A
+# `cargo install` build is not remapped, and the upload scan (U1) refuses it.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+debug = 0

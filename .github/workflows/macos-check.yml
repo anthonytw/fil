@@ -1,0 +1,282 @@
+# Manual macOS check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
+# Run with `gh workflow run macos-check` (optionally `-f ref=BRANCH -f suite=check|remote|brew|all`),
+# then `gh run watch`. Never runs on pull_request: the ref's build scripts and tests run on the
+# runner, and a fork's must not. No secrets are used.
+#
+# Two jobs (docs/m4/plan.md, MAC):
+#   check   the suites on macOS, on Apple silicon and on Intel: `just ci`, the PTY tests, the
+#           harnesses, a reduced forward soak, the drop-in suite against a private local daemon.
+#   remote  macOS as the REMOTE host (DESIGN.md §16.9): the real `fil` served over a real ssh login
+#           to the runner itself (tests/macos/remote.sh, `just macos-remote`), once with a
+#           user-mode sshd and once with the system sshd. It includes the in-place-upgrade
+#           (trampoline) case, which records a known finding rather than failing unless `strict`.
+#
+#   brew    the Homebrew formula (packaging/homebrew/fil.rb.in, docs/m4/packaging.md section 4), on
+#           Apple silicon and Intel: rendered against the archives of a release dry run, put in a
+#           scratch tap, then `brew install`, `brew test` and `brew audit --strict`. The archives
+#           come from a dry run named by the `release_run` input (a `release` workflow run on this
+#           repository, downloaded with the job's own token, which has `actions: read` and nothing
+#           else), not from a build here: building the universal binary and both Linux archives
+#           takes the release workflow about 20 minutes, and the formula is what is under test.
+#           In `all` it runs only when `release_run` is given.
+#
+# Runner images. Apple silicon is `macos-15` (the newest image this was written against; macOS 14
+# images were retired on 2026-11-02). Intel is `macos-15-intel`, GitHub's LAST Intel image: it
+# retires in fall 2027, and after that the Intel row has to go (the x86_64 half of the universal
+# binary is then built but untested; docs/m4/plan.md §2.2). A label that no longer exists leaves a
+# job queued rather than failing it, so check the list at https://github.com/actions/runner-images
+# before a release candidate.
+#
+# Supply chain: every action is pinned by full commit SHA (the comment names the release tag), the
+# tools install-action fetches are pinned to a version, and every checkout drops its token. To bump
+# an action, resolve the new tag to its commit (`gh api repos/OWNER/REPO/git/ref/tags/TAG`, and
+# dereference it if it is an annotated tag) and change the SHA and the comment together.
+name: macos-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to check
+        required: false
+        default: main
+      suite:
+        description: "check (just ci and the on-demand harnesses, Apple silicon and Intel), remote (macOS as the remote host, over a real ssh login to the runner), brew (the Homebrew formula; needs release_run) or all"
+        type: choice
+        options: [all, check, remote, brew]
+        default: all
+      release_run:
+        description: "brew: ID of a successful `release` workflow run (a dry run) whose release-files artifact the formula is tested against"
+        required: false
+        default: ""
+      strict:
+        description: "remote: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: inputs.suite == 'check' || inputs.suite == 'all'
+    name: check (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: arm64, os: macos-15 }
+          - { label: x86_64, os: macos-15-intel }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          # The ref's build scripts and tests run in this job; leave no token in .git/config.
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0,cargo-deny@0.20.2
+      # cargo-about, for `just notices` in `just ci`: a pinned prebuilt binary where one exists, and
+      # built from crates.io (same version, locked) on Intel, which cargo-about ships no binary for.
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        if: matrix.label == 'arm64'
+        with:
+          tool: cargo-about@0.9.3
+      - name: cargo-about (built; no prebuilt binary for Intel macOS)
+        if: matrix.label == 'x86_64'
+        run: cargo install --locked cargo-about --version 0.9.3 --features cli
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main (see linux-check).
+          save-if: ${{ inputs.ref == 'main' }}
+      - name: Machine
+        run: |
+          sw_vers
+          uname -a
+          sysctl -n machdep.cpu.brand_string || true
+          xcodebuild -version || true
+          ulimit -Sn; ulimit -Hn
+          sysctl kern.ipc.somaxconn
+      # The steps after `just ci` run even when an earlier one failed, so one run shows every red
+      # step (each is a finding of its own); the job is red if any of them is.
+      - name: just ci
+        run: just ci
+      - name: The release binary has no test hooks
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --release -p fil-shell --bins
+          just no-test-hooks target/release/fil
+          target/release/fil --version
+      - name: Client terminal tests (raw mode, signals and window size on a macOS PTY)
+        if: ${{ !cancelled() }}
+        run: just client-pty
+      - name: Emulator fidelity harness
+        if: ${{ !cancelled() }}
+        run: just fidelity --no-perf
+      - name: Prediction PTY harness (real programs on macOS PTYs)
+        if: ${{ !cancelled() }}
+        run: just predict-harness --seeds 2 --keys 60
+      - name: Forward soak, reduced (macOS's somaxconn is 128)
+        if: ${{ !cancelled() }}
+        run: just forward-soak 32 2000
+      - name: Drop-in tools (htop; the rest ship with macOS)
+        if: ${{ !cancelled() }}
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install htop
+      # The runner's account has /bin/bash 3.2 as its login shell; every Mac a person uses has
+      # zsh (the default since macOS 10.15). bash 3.2 has no bracketed paste, which fails three
+      # drop-in scenarios (terminal_modes, escape_handling, binary_garbage) for a reason that is
+      # the shell's. The runner is a throwaway VM.
+      - name: Login shell zsh, as on a Mac a person uses
+        if: ${{ !cancelled() }}
+        run: sudo dscl . -create "/Users/$USER" UserShell /bin/zsh && dscl . -read "/Users/$USER" UserShell
+      - name: Drop-in suite, local (the daemon on macOS, real PTYs, no ssh)
+        if: ${{ !cancelled() }}
+        env:
+          SHELL: /bin/zsh
+        run: just dropin --local
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-check-${{ matrix.label }}
+          path: |
+            ~/.local/state/fil
+          if-no-files-found: ignore
+          retention-days: 14
+
+  remote:
+    if: inputs.suite == 'remote' || inputs.suite == 'all'
+    name: remote (${{ matrix.sshd }} sshd)
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # user: a user-mode sshd on a high loopback port with throwaway keys (tests/macos/sshd.sh).
+        # system: launchd's own sshd on port 22 under the runner's sudo, the real login path; the
+        # runner is a throwaway VM and the suite removes what it added.
+        sshd: [user, system]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ inputs.ref == 'main' }}
+      - name: Machine
+        run: |
+          sw_vers
+          uname -a
+          ulimit -Sn; ulimit -Hn
+          /usr/sbin/sshd -V 2>&1 | head -n 1 || true
+      - name: macOS as the remote host (${{ matrix.sshd }} sshd)
+        env:
+          MACOS_SSHD: ${{ matrix.sshd }}
+          MACOS_STRICT: ${{ inputs.strict && '1' || '0' }}
+          # tmp_cleaners (once the TMP seam is on the ref): Apple's real tmp_cleaner as root over
+          # /tmp with the clock moved forward, a day at a time, and put back. Once per run, in the
+          # user-mode job; the system-mode job skips it.
+          MACOS_MOVE_CLOCK: ${{ matrix.sshd == 'user' && '1' || '' }}
+        run: just macos-remote
+      # The tmp_cleaners case moves the clock and puts it back. If the suite was killed hard, this
+      # sets the clock from the network before the artifact upload and the end of the job.
+      - name: Clock safety net (hosted runner, throwaway VM)
+        if: ${{ always() && matrix.sshd == 'user' }}
+        run: |
+          date -u
+          sudo sntp -sS time.apple.com || true
+          date -u
+      - name: Logs and results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-remote-${{ matrix.sshd }}
+          path: |
+            target/macos-remote
+            ~/.local/state/fil
+          if-no-files-found: ignore
+          retention-days: 14
+
+  brew:
+    if: inputs.suite == 'brew' || (inputs.suite == 'all' && inputs.release_run != '')
+    name: brew (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # Reading another run's artifacts is `actions: read`; nothing here writes.
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: arm64, os: macos-15 }
+          - { label: x86_64, os: macos-15-intel }
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+      RELEASE_RUN: ${{ inputs.release_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: The dry run's release files
+        env:
+          # Only this step has the token; the formula steps below run the checked-out ref's scripts.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$RELEASE_RUN" in ''|*[!0-9]*) echo "release_run must be a release workflow run ID" >&2; exit 1 ;; esac
+          # It must be a finished dry run (a dispatch) of the release workflow, not any run's artifact.
+          run=$(gh run view "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --json workflowName,event,conclusion --jq '[.workflowName, .event, .conclusion] | join(" ")')
+          [ "$run" = "release workflow_dispatch success" ] || { echo "run $RELEASE_RUN is '$run', not a successful release dry run" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/release"
+          gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name release-files --dir "$RUNNER_TEMP/release"
+          ls -l "$RUNNER_TEMP/release"
+      - name: Render the formula against those files
+        run: |
+          rel=$RUNNER_TEMP/release
+          archive=$(ls "$rel"/fil-*-universal-apple-darwin.tar.gz)
+          version=${archive##*/fil-}; version=${version%-universal-apple-darwin.tar.gz}
+          echo "version $version"
+          packaging/render.sh brew "$version" "$rel/SHA256SUMS" "$RUNNER_TEMP/formula" "file://$rel"
+          cat "$RUNNER_TEMP/formula/fil.rb"
+      - name: Scratch tap
+        run: |
+          brew tap-new --no-git fil-check/tap
+          mkdir -p "$(brew --repository fil-check/tap)/Formula"
+          cp "$RUNNER_TEMP/formula/fil.rb" "$(brew --repository fil-check/tap)/Formula/fil.rb"
+      - name: brew install
+        run: brew install --formula fil-check/tap/fil
+      - name: brew test
+        if: ${{ !cancelled() }}
+        run: brew test fil-check/tap/fil
+      - name: brew audit --strict
+        if: ${{ !cancelled() }}
+        run: brew audit --strict --formula fil-check/tap/fil
+      - name: The installed layout
+        if: ${{ !cancelled() }}
+        run: |
+          prefix=$(brew --prefix fil-check/tap/fil)
+          "$prefix/bin/fil" --version
+          find "$prefix" -type f | sort | head -50
+      - name: Uninstall
+        if: always()
+        run: |
+          brew uninstall --formula fil-check/tap/fil || true
+          brew untap fil-check/tap || true

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# `just release-verify`: the owner's check before signing a release, and anyone's afterward
+# (docs/m4/plan.md, REL; docs/m4/release.md section 4).
+#
+#   verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] [--repo OWNER/REPO]
+#                     [--ref REF] [--vm NAME] [--no-rebuild] [--pre-sign] [--work DIR]
+#                     [--mac-rebuild FILE]
+#
+# Release (default): download the draft or published release v<VERSION> (`gh release download`),
+# then, STOPPING at the first failure of steps 1-3 (nothing from the download is looked at, let alone
+# run, until they pass):
+#   1. the tag is annotated, SSH-signed by a key in .github/release-signers as it is on MAIN (never
+#      the tag's own copy), and on main. Its commit is resolved ONCE here; everything below is bound
+#      to that commit, not to a name that can move;
+#   2. SHA256SUMS.sig verifies (ssh-keygen -Y verify -n fil-release) against the same signers, and
+#      the files match SHA256SUMS. `--pre-sign` skips only the signature, for the run the owner makes
+#      BEFORE signing (the signature does not exist yet); run again without it afterwards;
+#   3. each archive's attestation verifies, pinned to the repository, the exact workflow identity at
+#      the tag, the commit (source and signer digest) and a GitHub-hosted runner;
+# then, in the rest, failures are counted:
+#   4. `release-check --no-exec` passes on the files (--tag v<VERSION> --complete): the files are
+#      unpacked, hashed, grepped and inspected, and NOTHING that came from the download is run
+#      (no `cargo` in the source archive, no `--version` of a binary);
+#   5. the Linux VM rebuilds the Linux binaries, the four archives and the four .deb and .rpm
+#      packages from that commit in the digest-pinned images, and the hashes are compared with the
+#      release's. The rebuild judges the source archive byte for byte. Three archives (x86_64,
+#      aarch64, source) and the four packages are reproduced from the source; the macOS archive is
+#      only REASSEMBLED around the released macOS binary, which is not rebuilt and is ad-hoc signed.
+#
+# The macOS binary (docs/m4/release.md section 10.3) is Developer-ID signed after CI. The release
+# therefore carries CI's own macOS archive too (fil-X-universal-apple-darwin.ci.tar.gz), which step 3
+# checks the attestation of directly; the archive the owner signed must equal it in everything but
+# bin/fil, and the two bin/fil must normalize to the same bytes (macho_norm.py: no codesign, any OS).
+# A further step (verify-macos.sh) reports who signed the binary and what the signature grants, and
+# with --mac-rebuild FILE (a universal macOS `fil` you built from the tag) says whether it is
+# byte-identical to the released one once the signature is normalized away.
+#
+# --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
+# or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (a commit SHA: the run's
+# commit). Nothing from the download is run in this mode either. The VM needs Docker and amd64
+# emulation that can run rustc (Rosetta; qemu-user does not): docs/m4/release.md section 9.3.
+set -euo pipefail
+# shellcheck source=tests/release/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 presign=0 work='' mac_rebuild=''
+gh=${FIL_GH:-gh}
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) dry=1; shift ;;
+    --from-run) from_run=$2; shift 2 ;;
+    --from-dir) from_dir=$2; shift 2 ;;
+    --repo) repo=$2; shift 2 ;;
+    --ref) ref=$2; shift 2 ;;
+    --vm) vm=$2; shift 2 ;;
+    --no-rebuild) rebuild=0; shift ;;
+    --pre-sign) presign=1; shift ;;
+    --work) work=$2; shift 2 ;;
+    --mac-rebuild) mac_rebuild=$2; shift 2 ;;
+    -*) die "unknown option: $1" ;;
+    *) version=$1; shift ;;
+  esac
+done
+test_override_notes
+[ -n "$version" ] || die "usage: verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] ..."
+# --ref names the commit that is rebuilt: a full 40-hex SHA, never a branch, a tag or an abbreviation
+# (those can name another commit tomorrow, or in the clone).
+if [ -n "$ref" ] && ! [[ $ref =~ ^[0-9a-f]{40}$ ]]; then die "--ref must be a full lowercase 40-hex commit SHA, not: $ref"; fi
+version=${version#v}
+tag=v$version
+repo_url=${FIL_RELEASE_REPO_URL:-https://github.com/$repo.git}
+[ -n "$work" ] || work=$REPO_ROOT/target/release-verify/$version
+mkdir -p "$work"
+work=$(cd "$work" && pwd)
+[ "$rebuild" = 0 ] || rm -f "$work/verified"
+
+sha256_stdin() { if command -v sha256sum > /dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+
+fails=0
+fail() { echo "release-verify: FAIL: $*" >&2; fails=$((fails + 1)); }
+ok() { echo "release-verify: ok: $*" >&2; }
+
+# ---- the files
+dl=$work/files
+if [ -n "$from_dir" ]; then
+  dl=$(cd "$from_dir" && pwd)
+else
+  rm -rf "$dl"
+  mkdir -p "$dl"
+  if [ -n "$from_run" ]; then
+    "$gh" run download "$from_run" --repo "$repo" -n release-files -D "$dl"
+  else
+    "$gh" release download "$tag" --repo "$repo" -D "$dl"
+  fi
+fi
+log() { echo "release-verify: $*" >&2; }
+log "files in $dl: $(ls "$dl" | tr '\n' ' ')"
+
+if [ "$dry" = 0 ]; then
+  # ---- 1. the tag, against the signers on main
+  tagrepo=$work/tag-repo
+  rm -rf "$tagrepo"
+  git init -q --bare "$tagrepo"
+  git -C "$tagrepo" fetch -q "$repo_url" "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$tag:refs/tags/$tag" \
+    || die "could not fetch main and $tag from $repo_url"
+  "$RELEASE_DIR/verify-tag.sh" "$tagrepo" "$tag" refs/remotes/origin/main || die "STOP: tag $tag does not verify; nothing from the download was looked at"
+  ok "tag $tag"
+  # The one commit everything below is bound to.
+  commit=$(git -C "$tagrepo" rev-parse "refs/tags/$tag^{commit}")
+  log "$tag is commit $commit"
+  # A release rebuilds the tag's commit and nothing else; --ref is for --dry-run (a branch's run).
+  if [ "$dry" = 0 ] && [ -n "$ref" ] && [ "$ref" != "$commit" ]; then die "STOP: --ref $ref is not the commit of $tag ($commit); a release rebuilds the tag's commit"; fi
+
+  # ---- 2. SHA256SUMS.sig, with the same signers (main's, or the verifier's own copy), and the sums
+  signers=$work/signers
+  if [ -n "${FIL_RELEASE_SIGNERS:-}" ]; then
+    cp "$FIL_RELEASE_SIGNERS" "$signers"
+  else
+    git -C "$tagrepo" show "refs/remotes/origin/main:.github/release-signers" > "$signers"
+  fi
+  if [ "$presign" = 1 ]; then
+    echo "release-verify: NOTE: --pre-sign: SHA256SUMS.sig was NOT checked; run again without it after signing" >&2
+  elif [ ! -f "$dl/SHA256SUMS.sig" ]; then
+    die "STOP: no SHA256SUMS.sig in the release (use --pre-sign for the run before signing)"
+  elif ! grep -Evq '^[[:space:]]*(#|$)' "$signers"; then
+    die "STOP: release-signers has no key: SHA256SUMS.sig cannot be verified"
+  else
+    principal=$(ssh-keygen -Y find-principals -f "$signers" -s "$dl/SHA256SUMS.sig" 2> /dev/null | head -n 1) || true
+    if [ -n "$principal" ] && ssh-keygen -Y verify -f "$signers" -I "$principal" -n fil-release -s "$dl/SHA256SUMS.sig" < "$dl/SHA256SUMS" > /dev/null 2>&1; then
+      ok "SHA256SUMS.sig is a valid fil-release signature by $principal"
+    else
+      die "STOP: SHA256SUMS.sig does not verify (ssh-keygen -Y verify -n fil-release) against the signers on main"
+    fi
+  fi
+  sums_check "$dl" SHA256SUMS || die "STOP: the files do not match SHA256SUMS"
+  ok "sha256sum -c SHA256SUMS"
+
+  # ---- 2b. the signed rpms and SHA256SUMS.asc (section 10.4), with the package key as it is on
+  # main. --pre-sign checks neither: the draft's rpms are not signed yet.
+  if [ "$presign" = 0 ]; then
+    pkey=$work/package-signing-key.asc
+    if [ -n "${FIL_PACKAGE_KEY_FILE:-}" ]; then
+      echo "release-verify: NOTE: FIL_PACKAGE_KEY_FILE is set: the rpm and SHA256SUMS.asc signatures are checked against $FIL_PACKAGE_KEY_FILE, NOT against .github/package-signing-key.asc on main" >&2
+      cp "$FIL_PACKAGE_KEY_FILE" "$pkey"
+    else git -C "$tagrepo" show "refs/remotes/origin/main:.github/package-signing-key.asc" > "$pkey" 2> /dev/null || : > "$pkey"; fi
+    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pkey" || die "STOP: .github/package-signing-key.asc on main holds no key: the rpm signatures cannot be verified"
+    command -v rpmkeys > /dev/null || die "STOP: rpmkeys is needed to verify the rpm signatures (macOS: brew install rpm)"
+    rm -rf "$work/rpmdb" && mkdir -m 700 "$work/rpmdb"
+    rpmkeys --dbpath "$work/rpmdb" --import "$pkey" || die "STOP: rpmkeys cannot import the package key"
+    for a in x86_64 aarch64; do
+      p=$(package_file rpm "$a" "$version")
+      rpmkeys --dbpath "$work/rpmdb" --checksig "$dl/$p" | grep -q 'signatures OK' || die "STOP: $p is not signed by the package key on main"
+      ok "$p carries a valid signature by the package key"
+    done
+    [ -f "$dl/SHA256SUMS.asc" ] || die "STOP: no SHA256SUMS.asc in the release"
+    gk=$work/pkgkey.kbx
+    rm -f "$gk"
+    gpg --no-default-keyring --keyring "$gk" --import "$pkey" 2> /dev/null || die "STOP: gpg cannot import the package key"
+    gpg --no-default-keyring --keyring "$gk" --verify "$dl/SHA256SUMS.asc" "$dl/SHA256SUMS" 2> /dev/null \
+      || die "STOP: SHA256SUMS.asc is not a valid signature of SHA256SUMS by the package key"
+    ok "SHA256SUMS.asc is a valid signature by the package key"
+  fi
+
+  # ---- 3. attestations: this repository, this exact workflow identity at this tag, this commit
+  # (--source-digest is the commit that was built, --signer-digest the commit of the workflow file),
+  # and no self-hosted runner. After signing, the rpms are not the bytes CI attested (their
+  # signature header is new): their provenance is then the signature (2b) and the rebuild (5), which
+  # compares everything after the signature header.
+  mac_archive=fil-$version-universal-apple-darwin.tar.gz
+  [ -f "$dl/$(ci_archive_name "$version")" ] || die "STOP: the release has no $(ci_archive_name "$version") (CI's own macOS archive, the one that is attested)"
+  for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|"); do
+    if [ "$a" = "$dl/$mac_archive" ] && ! cmp -s "$a" "$dl/$(ci_archive_name "$version")"; then
+      echo "release-verify: note: $mac_archive is signed by the owner: its attestation is not checked (CI attested $(ci_archive_name "$version"), which is); it is tied to that one below" >&2
+      continue
+    fi
+    if [ "$presign" = 0 ] && [ "${a%.rpm}" != "$a" ]; then
+      echo "release-verify: note: $(basename "$a") is signed: its attestation (of the unsigned build) is not checked; the rebuild checks it" >&2
+      continue
+    fi
+    if "$gh" attestation verify "$a" --repo "$repo" \
+      --cert-identity "https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag" \
+      --source-ref "refs/tags/$tag" --source-digest "$commit" --signer-digest "$commit" \
+      --deny-self-hosted-runners > "$work/attest.log" 2>&1; then
+      ok "attestation of $(basename "$a")"
+    else
+      cat "$work/attest.log" >&2
+      die "STOP: attestation of $(basename "$a") does not verify"
+    fi
+  done
+  "$RELEASE_DIR/verify-macos.sh" agree "$dl" "$version" || die "STOP: the macOS archive is not CI's attested archive with a signed binary"
+fi
+
+# ---- sha256sum -c and release-check
+if [ "$dry" = 1 ]; then
+  if sums_check "$dl" SHA256SUMS; then ok "sha256sum -c SHA256SUMS"; else fail "sha256sum -c SHA256SUMS"; fi
+  "$RELEASE_DIR/check.sh" --dry-run --no-tree --no-exec "$dl" || fail "release-check"
+else
+  "$RELEASE_DIR/check.sh" --tag "$tag" --complete --no-tree --no-exec "$dl" || fail "release-check"
+fi
+
+# ---- the macOS binary's signature (section 10.3)
+if [ -n "${FIL_MACOS_TEAM_ID:-}" ]; then
+  mteam=$FIL_MACOS_TEAM_ID
+elif [ "$dry" = 0 ]; then
+  mteam=$(git -C "$tagrepo" show "refs/remotes/origin/main:.github/macos-team-id" 2> /dev/null | tr -d '[:space:]') || mteam=''
+else
+  mteam=$(tr -d '[:space:]' < "$ROOT/.github/macos-team-id" 2> /dev/null) || mteam=''
+fi
+mopts=()
+[ "$presign" = 0 ] || mopts+=(--pre-sign)
+[ -z "$mac_rebuild" ] || mopts+=(--mac-rebuild "$mac_rebuild")
+"$RELEASE_DIR/verify-macos.sh" report "$dl" "$version" --team "$mteam" ${mopts[@]+"${mopts[@]}"} || fail "the macOS binary's signature"
+
+# ---- 5. the independent rebuild in the Linux VM
+if [ "$rebuild" = 1 ]; then
+  command -v limactl > /dev/null || die "limactl not found; the rebuild needs the Linux VM (docs/dev/vm.md, docs/m4/release.md section 9.3)"
+  [ "$(limactl list --format '{{.Status}}' "$vm" 2> /dev/null)" = Running ] || die "Lima instance '$vm' is not running (limactl start $vm)"
+  if [ -z "$ref" ]; then
+    if [ "$dry" = 0 ]; then ref=$commit; else die "--dry-run needs --ref (the commit SHA the run built)"; fi
+  fi
+  vwork=release-verify/$version
+  mac=$work/mac-binary
+  rm -rf "$mac"
+  mkdir -p "$mac"
+  # CI's own macOS binary (the one that is attested), not the signed one: the rebuild must
+  # reproduce CI's archives; the signed archive is tied to CI's by `verify-macos.sh agree`.
+  tar -xzf "$dl/$(ci_archive_name "$version")" -C "$mac" "fil-$version-universal-apple-darwin/bin/fil"
+  limactl shell --workdir / "$vm" -- bash -c 'rm -rf "$HOME/$1/in" && mkdir -p "$HOME/$1/in/universal-apple-darwin" && cat > "$HOME/$1/in/universal-apple-darwin/fil"' vm-sh "$vwork" \
+    < "$mac/fil-$version-universal-apple-darwin/bin/fil"
+  log "rebuilding $ref of $repo_url in the VM '$vm' (about 15 to 30 minutes)"
+  limactl shell --workdir / "$vm" -- bash -s -- "$repo_url" "$ref" "$vwork" < "$RELEASE_DIR/rebuild.sh" \
+    || { fail "the rebuild in the VM failed"; }
+  rb=$work/rebuilt
+  rm -rf "$rb"
+  mkdir -p "$rb"
+  limactl shell --workdir / "$vm" -- bash -c 'cd "$HOME/$1/out" && tar -cf - .' vm-sh "$vwork" | tar -xf - -C "$rb" || fail "could not copy the rebuilt files out of the VM"
+  if [ -f "$rb/SHA256SUMS" ]; then
+    echo "release-verify: rebuilt vs. released SHA256SUMS:" >&2
+    for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz "$(ci_archive_name "$version")" $(package_names "$version"); do
+      h1=$(grep -F "  $n" "$dl/SHA256SUMS" | cut -d' ' -f1)
+      h2=$(grep -F "  $n" "$rb/SHA256SUMS" | cut -d' ' -f1)
+      if [ "$n" = "fil-$version-universal-apple-darwin.tar.gz" ] && [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "$h2" = "$(grep -F "  $(ci_archive_name "$version")" "$rb/SHA256SUMS" | cut -d' ' -f1)" ]; then
+        # signed by the owner: the rebuild around CI's binary is CI's archive, which the .ci line
+        # above judges; the signed one is tied to it by `verify-macos.sh agree`
+        ok "$n is the owner's signed archive (the rebuild reproduces CI's, $(ci_archive_name "$version"))"
+      elif [ "$presign" = 0 ] && [ "$dry" = 0 ] && [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "${n%.rpm}" != "$n" ] && [ -f "$dl/$n" ] && [ -f "$rb/$n" ]; then
+        # A signed rpm (after the owner's signing step only; before it, and in a dry run, an rpm must
+        # be the rebuild byte for byte): the rebuild is unsigned, so its lead and everything after the
+        # signature header must match.
+        b1=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$dl/$n" "$work/px1" | sed -n 's/^body //p')
+        b2=$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$rb/$n" "$work/px2" | sed -n 's/^body //p')
+        if [ -n "$b1" ] && [ "$b1" = "$b2" ]; then ok "$n is REPRODUCED from source byte for byte apart from its signature header ($b1)"; else fail "$n: released body $b1, rebuilt body $b2"; fi
+      elif [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
+        fail "$n: released $h1, rebuilt $h2"
+      elif [ "$n" = "fil-$version-universal-apple-darwin.tar.gz" ] || [ "$n" = "$(ci_archive_name "$version")" ]; then
+        ok "$n is REASSEMBLED identically around CI's macOS binary (that binary was not rebuilt)"
+      else
+        ok "$n is REPRODUCED from source byte for byte ($h1)"
+      fi
+    done
+    for t in x86_64-linux-musl aarch64-linux-musl; do
+      a=fil-$version-$t
+      r1=$(tar -xzOf "$dl/$a.tar.gz" "$a/bin/fil" | sha256_stdin)
+      r2=$(tar -xzOf "$rb/$a.tar.gz" "$a/bin/fil" | sha256_stdin)
+      if [ "$r1" = "$r2" ]; then ok "$t binary $r1 reproduces"; else fail "$t binary: released $r1, rebuilt $r2"; fi
+    done
+  else
+    fail "the VM left no SHA256SUMS"
+  fi
+fi
+
+if [ "$fails" -gt 0 ]; then
+  echo "release-verify: $fails check(s) FAILED: do not sign" >&2
+  exit 1
+fi
+# what sign-macos.sh relies on: this work directory was verified in full (the rebuild included), and
+# SHA256SUMS is the one that was verified
+if [ "$rebuild" = 1 ] && [ "$dry" = 0 ]; then
+  printf 'sums=%s\nrebuild=1\npresign=%s\ndry=0\n' "$(sha256 "$dl/SHA256SUMS")" "$presign" > "$work/verified"
+fi
+if [ "$presign" = 1 ]; then
+  echo "release-verify: all checks passed EXCEPT the signature, which --pre-sign did not check" >&2
+else
+  echo "release-verify: all checks passed" >&2
+fi

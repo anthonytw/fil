@@ -1,0 +1,30 @@
+# ~/.config/fil/config.toml: the client's settings. Every key is optional; a file that is
+# missing means the defaults. See docs/user/config.md for each key.
+# `fil config show HOST` prints what applies to HOST and where each value comes from.
+
+[defaults]
+transport = "auto"        # auto | pipe | direct
+host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
+
+[defaults.offline_input]  # keystrokes typed while disconnected
+buffer = "4KiB"           # 0 drops them
+confirm = "off"           # off | "after 10s": ask before sending after a long disconnect
+# log = "~/.local/state/fil/offline-input.log"   # or a command: ["logger", "-t", "fil"]. Off by default; can capture passwords
+
+[defaults.forward]        # tunables for forwards; `forward` is either a list of specs or this table
+# specs = ["-L 5173"]     # the list, when there are tunables too
+# window = "1MiB"         # 16KiB to 4MiB; buffer 16KiB to 16MiB; open_wait 0 to 1h; linger 0 to 24h
+
+[host.devbox]
+forward = ["-L 5173", "-R 9000", "-D 1080"]   # same specs as the flags; a bare port binds loopback
+agent = "off"             # off | on | confirm; -A and -a override
+agent_keys = []           # SHA256 fingerprints the agent relay answers for; empty is every key
+remote_requests = "ask"   # ask | deny: forwards a process on the host asks for with `fil forward`
+forward_failure = "warn"  # warn | exit (status 255, as ssh's ExitOnForwardFailure)
+direct.address = "devbox.example.net"   # where to dial UDP, when it is not what `ssh -G` reports
+remote = "auto"           # auto | plain | installed: which remote command to run
+install = "ask"           # ask | never | always: offer to install fil where there is none
+
+[host.k8s-dev]            # a pipe that is not ssh
+transport = "pipe"
+pipe = ["kubectl", "exec", "-i", "dev-pod", "--", "fil", "server", "--stdio"]

@@ -1,0 +1,40 @@
+[package]
+name = "fil-transport"
+description = "Transports for fil: the Link trait, the pipe (any byte stream, ssh by default) and direct QUIC with its authentication and path manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+bytes = "1"
+fil-proto.workspace = true
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "io-util", "process"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Only to name `RttEstimator` in the congestion controller wrapper (`quic::floor`): quinn does not
+# re-export it. The same crate quinn already uses.
+quinn-proto = { version = "0.11", default-features = false }
+# The ring provider only: aws-lc-rs/aws-lc-sys carry the OpenSSL license (CLAUDE.md, deny.toml).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+ring = "0.17"
+rustix = { version = "1", features = ["process", "net"] }
+thiserror = "2"
+tracing = "0.1"
+
+[features]
+# Hooks for tests of the listener. Not for daemon code: only the test targets enable it.
+test-hooks = []
+
+[dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-transport = { path = ".", features = ["test-hooks"] }
+fil-netsim = { path = "../fil-netsim" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "io-util"] }
+
+[lints]
+workspace = true

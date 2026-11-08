@@ -1,0 +1,4 @@
+cols = 30
+rows = 6
+kind = synthetic
+description = DECSC on the primary at (3,5), cursor moved on, then 1049h: leaving must restore the cursor taken at entry

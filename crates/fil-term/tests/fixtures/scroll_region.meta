@@ -1,0 +1,4 @@
+cols = 40
+rows = 12
+kind = synthetic
+description = DECSTBM, scrolling inside the region, RI, IL/DL, origin mode left on

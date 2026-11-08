@@ -1,0 +1,32 @@
+[package]
+name = "fil-term"
+description = "Headless terminal emulators behind one interface, and session snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[features]
+# One feature per emulator backend (DESIGN.md §6.5). alacritty is the default backend
+# (decided). vt100 is the light alternative, kept for the fidelity suite and the tests: the
+# consumers that ship in the binary (fil-session, fil-client, fil-predict) take only `alacritty`.
+default = ["alacritty", "vt100"]
+alacritty = ["dep:alacritty_terminal", "dep:vte"]
+vt100 = ["dep:vt100", "dep:vte"]
+
+[lints]
+workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "0.26", default-features = false, optional = true }
+vt100 = { version = "0.18", optional = true }
+vte = { version = "0.15", optional = true }
+
+[dev-dependencies]
+portable-pty = "0.9"
+# The boundary scanner is checked against a real parser (src/boundary.rs).
+vte = "0.15"

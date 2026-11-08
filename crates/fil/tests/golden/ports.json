@@ -1,0 +1,401 @@
+{
+  "schema": 1,
+  "host": "devbox",
+  "truncated": false,
+  "complete": true,
+  "incomplete": "bounded",
+  "sessions": [
+    {
+      "name": "main",
+      "term": "xterm-256color",
+      "attached": {
+        "host": "laptop",
+        "since_unix_ms": 1699953120000
+      },
+      "agent": {
+        "connections": 1,
+        "requests": 14,
+        "last_unix_ms": 1699958400000
+      },
+      "forwards": [
+        {
+          "id": 1,
+          "kind": "local",
+          "spec": "-L 5173:localhost:5173",
+          "bind": "loopback",
+          "port": 5173,
+          "target": {
+            "host": "localhost",
+            "port": 5173
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 5173
+          },
+          "exposed": false,
+          "connections": 2,
+          "waiting": 0,
+          "bytes_down": 14300000,
+          "bytes_up": 225280,
+          "last_unix_ms": 1699958429000,
+          "owner": {
+            "pid": 41872,
+            "name": "vite",
+            "cwd": "~/app"
+          },
+          "probe": {
+            "kind": "http",
+            "http_status": 200,
+            "label": "Vite + React"
+          },
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 2,
+          "kind": "remote",
+          "spec": "-R 9000:localhost:9000",
+          "bind": "loopback",
+          "port": 9000,
+          "target": {
+            "host": "localhost",
+            "port": 9000
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 9000
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 1,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": 1699958400000,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 2,
+          "socks_refused": null
+        },
+        {
+          "id": 3,
+          "kind": "dynamic",
+          "spec": "-D *:1080",
+          "bind": "any",
+          "port": 1080,
+          "target": null,
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "failed",
+            "reason": "addr_in_use"
+          },
+          "exposed": true,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 4,
+          "kind": "remote",
+          "spec": "-R 0:localhost:22",
+          "bind": "loopback",
+          "port": 0,
+          "target": {
+            "host": "localhost",
+            "port": 22
+          },
+          "origin": "request",
+          "consented": false,
+          "listen": {
+            "state": "failed",
+            "reason": "policy"
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": "AllowTcpForwarding local (/etc/ssh/sshd_config:3)",
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 5,
+          "kind": "local",
+          "spec": "-L [::1]:8443:web.example.net:443",
+          "bind": "::1",
+          "port": 8443,
+          "target": {
+            "host": "web.example.net",
+            "port": 443
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": null,
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 6,
+          "kind": "local",
+          "spec": "-L 9443:[2001:db8::1]:443",
+          "bind": "loopback",
+          "port": 9443,
+          "target": {
+            "host": "2001:db8::1",
+            "port": 443
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 9443
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 7,
+          "kind": "remote",
+          "spec": "-R 9100:[::1]:3000",
+          "bind": "loopback",
+          "port": 9100,
+          "target": {
+            "host": "::1",
+            "port": 3000
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 9100
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        },
+        {
+          "id": 8,
+          "kind": "local",
+          "spec": "-L [2001:db8::2]:8444:web.example.net:80",
+          "bind": "2001:db8::2",
+          "port": 8444,
+          "target": {
+            "host": "web.example.net",
+            "port": 80
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 8444
+          },
+          "exposed": true,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": false,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        }
+      ],
+      "listeners": [
+        {
+          "addr": "0.0.0.0",
+          "port": 8000,
+          "scope": "session",
+          "exposed": true,
+          "process": {
+            "pid": 42110,
+            "name": "python3",
+            "cwd": "~/tmp"
+          },
+          "since_unix_ms": 1699956180000,
+          "probe": {
+            "kind": "http",
+            "http_status": 200,
+            "label": "Directory listing for /"
+          }
+        },
+        {
+          "addr": "127.0.0.1",
+          "port": 3000,
+          "scope": "session",
+          "exposed": false,
+          "process": {
+            "pid": 42200,
+            "name": "node",
+            "cwd": null
+          },
+          "since_unix_ms": null,
+          "probe": null
+        },
+        {
+          "addr": "2001:db8::5",
+          "port": 7000,
+          "scope": "session",
+          "exposed": true,
+          "process": {
+            "pid": 42300,
+            "name": "deno",
+            "cwd": "~/web"
+          },
+          "since_unix_ms": null,
+          "probe": null
+        }
+      ],
+      "refused": [
+        {
+          "what": "-R *:8080:localhost:80",
+          "reason": "GatewayPorts no (OpenSSH's default)"
+        },
+        {
+          "what": "agent",
+          "reason": "AllowAgentForwarding no (/etc/ssh/sshd_config:12)"
+        }
+      ]
+    },
+    {
+      "name": "build",
+      "term": "xterm-256color",
+      "attached": null,
+      "agent": null,
+      "forwards": [
+        {
+          "id": 9,
+          "kind": "local",
+          "spec": "-L 6379:localhost:6379",
+          "bind": "loopback",
+          "port": 6379,
+          "target": {
+            "host": "localhost",
+            "port": 6379
+          },
+          "origin": "client",
+          "consented": true,
+          "listen": {
+            "state": "listening",
+            "port": 6379
+          },
+          "exposed": false,
+          "connections": 0,
+          "waiting": 0,
+          "bytes_down": 0,
+          "bytes_up": 0,
+          "last_unix_ms": null,
+          "owner": null,
+          "probe": null,
+          "target_other_user": true,
+          "target_unknown": false,
+          "policy": null,
+          "peers_refused": 0,
+          "socks_refused": null
+        }
+      ],
+      "listeners": [],
+      "refused": []
+    }
+  ],
+  "host_listeners": [
+    {
+      "addr": "127.0.0.1",
+      "port": 5432,
+      "scope": "mine",
+      "exposed": false,
+      "process": {
+        "pid": 1201,
+        "name": "postgres",
+        "cwd": null
+      },
+      "since_unix_ms": null,
+      "probe": {
+        "kind": "postgres",
+        "http_status": null,
+        "label": null
+      }
+    },
+    {
+      "addr": "::",
+      "port": 9999,
+      "scope": "mine",
+      "exposed": true,
+      "process": null,
+      "since_unix_ms": null,
+      "probe": null
+    },
+    {
+      "addr": "0.0.0.0",
+      "port": 22,
+      "scope": "other",
+      "exposed": true,
+      "process": null,
+      "since_unix_ms": null,
+      "probe": null
+    }
+  ],
+  "server_policy": [
+    "the sshd mirror is incomplete: fil cannot read /etc/ssh/sshd_config.d/50-cloud-init.conf, which the sshd config includes"
+  ]
+}

@@ -1,0 +1,83 @@
+[package]
+name = "fil-shell"
+# The package is `fil-shell` (`fil` on crates.io is someone else's: docs/m4/release.md section 10.1); the
+# binary and the library keep the name `fil`, and the directory stays crates/fil. The binary: the CLI,
+# the config file, the client's dialer (pipe and direct QUIC under the path manager) and the
+# remote-side entry points (DESIGN.md sections 8, 14).
+description = "fil, a remote shell for development over SSH: sessions that survive reconnects, roaming and sleep, take-over from another machine, port forwards that outlive the link, and direct QUIC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+readme = "../../README.md"
+keywords = ["ssh", "shell", "terminal", "remote", "mosh"]
+categories = ["command-line-utilities", "network-programming"]
+rust-version.workspace = true
+
+# `use fil::...` in the tests, examples and fuzz target, as before the rename.
+[lib]
+name = "fil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fil"
+path = "src/main.rs"
+
+# The drivers are examples; their unit tests (exact sequence checks, target rules) run in `just ci`.
+[[example]]
+name = "dropin"
+test = true
+
+[[example]]
+name = "pi_e2e"
+test = true
+
+# `just docs`: the man page and the completions, written into a tree laid out like an archive.
+[[example]]
+name = "gen_docs"
+test = true
+
+[dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+fil-client.workspace = true
+fil-daemon.workspace = true
+fil-forward.workspace = true
+fil-proto.workspace = true
+fil-transport.workspace = true
+# `localtime_r`, for the time zone of `fil ports` (rustix has no time zone calls): one narrow
+# `unsafe` in src/localtime.rs.
+libc = "0.2"
+# SHA-256 for the install (the bundle's SHA256SUMS, the upload's hash, `--install-finish`'s second
+# check): the crate the QUIC stack already uses.
+ring = "0.17"
+rustix = { version = "1", features = ["system", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+
+[dev-dependencies]
+# The man page and the shell completions (examples/gen_docs.rs, tests/docs_sync.rs; docs/m4/plan.md,
+# DOC). Dev-dependencies only: they are not in the released build, and `just release-deps` checks.
+clap_complete = "4"
+clap_mangen = "0.3"
+# The test hooks (FIL_TEST_WIRE_REVISION, FIL_TEST_SOCKET_DIR) for the `fil` binary the integration
+# tests run. Dev-dependencies are not in the released build: `just release-deps` checks.
+fil-daemon = { path = "../fil-daemon", features = ["test-hooks"] }
+fil-session = { path = "../fil-session" }
+fil-term = { path = "../fil-term" }
+# The test-only wait helpers (resize_e2e).
+fil-testkit = { path = "../fil-testkit" }
+# The PTY driver the Pi examples share with ptydrive (examples/support/harness.rs).
+fil-testbins = { path = "../fil-testbins" }
+portable-pty = "0.9"
+nix = { version = "0.28", default-features = false, features = ["term"] }
+vt100 = "0.18"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
+
+[lints]
+workspace = true

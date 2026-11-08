@@ -1,0 +1,4 @@
+cols = 100
+rows = 30
+kind = real
+description = macOS top (alternate screen, partial scroll regions, reverse index): process names and the clock replaced by placeholders

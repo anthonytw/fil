@@ -1,0 +1,234 @@
+# Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|terminals|all`),
+# then `gh run watch`.
+#
+# Supply chain: every action is pinned by full commit SHA (the comment names the release tag), the
+# tools install-action fetches are pinned to a version, and every checkout drops its token. To bump
+# an action, resolve the new tag to its commit (`gh api repos/OWNER/REPO/git/ref/tags/TAG`, and
+# dereference it if it is an annotated tag) and change the SHA and the comment together.
+name: linux-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to check
+        required: false
+        default: main
+      suite:
+        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the test Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
+        type: choice
+        options: [check, realnet, aarch64, latency, terminals, all]
+        default: check
+      strict:
+        description: "realnet: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'latency' && inputs.suite != 'terminals'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          # The ref's build scripts and tests run in this job; leave no token in .git/config.
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main: a run on any other ref must not seed a cache
+          # that a later run of main restores.
+          save-if: ${{ inputs.ref == 'main' }}
+      - name: just ci
+        run: just ci
+      - name: Emulator fidelity harness
+        run: just fidelity --no-perf
+      - name: Link simulator soak
+        run: just netsim-soak
+      - name: Prediction guard sweep
+        run: just predict-mutants
+      - name: Prediction PTY harness (real programs on Linux PTYs)
+        run: just predict-harness --seeds 2 --keys 60
+      - name: Client terminal tests (raw mode, signals and window size on a Linux PTY)
+        run: just client-pty
+
+  realnet:
+    # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
+    # in Docker containers (ssh part), the real Linux network stack with NAT and tc netem in
+    # network namespaces (udp part), a systemd host in a privileged container (sysd part), the
+    # server-policy mirror of the runner's real sshd_config (policy part, plan S1), and the M2 port
+    # forwards and agent relay in the udp part's topology (docs/m2/realnet.md): the forward part as
+    # two jobs, `fwd-cable` (the done-when's cable pulls, about 13 min) and `fwd-rest` (everything
+    # else, with a smaller MAX_ENDING stress than the VM's and the Pis' 20,000), and the `agent`
+    # part. Seven jobs, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
+    # the parts `latency` (the latency lab, docs/m2/latency.md) and `predict` (M3's prediction cells,
+    # docs/m3/plan.md §5.5) instead. It builds `fil` and the test
+    # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
+    # release-target check.
+    # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
+    # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or shared
+    # runner.
+    if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'terminals'
+    runs-on: ubuntu-24.04
+    # Each part its own limit: about twice its usual time.
+    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45,"predict":45}')[matrix.part] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency","predict"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy","install"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Packages (musl for static binaries; namespace and firewall tools)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server vim less strace
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main (see the check job).
+          save-if: ${{ inputs.ref == 'main' }}
+      - name: Lint the harness scripts
+        run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
+      - name: Real-network suite (${{ matrix.part }})
+        env:
+          # A known finding in fil (KNOWN-BUG in the results) fails the scenario when strict.
+          REALNET_STRICT: ${{ inputs.strict && '1' || '0' }}
+          # f_fwd_ending_stress: 4,000 connections a cell here (20,000 in the VM and on the Pis); at
+          # 5,000 nothing differed from 20,000 but the run time (docs/m2/realnet.md).
+          FWD_STRESS_COUNT: 4000
+          PART: ${{ matrix.part }}
+        run: just realnet "$PART"
+      - name: Logs and measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: realnet-${{ matrix.part }}
+          path: |
+            target/realnet/logs
+            target/realnet/run
+            target/realnet/results-*.tsv
+          if-no-files-found: ignore
+          retention-days: 14
+
+  aarch64:
+    # The release binary for aarch64 Linux (DESIGN.md §13): static, musl. `ring` needs a musl C
+    # cross compiler, which `cross` brings in its Docker image. Uploads `fil`, `fwdprobe` (the TCP
+    # test tool for the forward scenarios, docs/m2/pi.md) and their `.sha256` files
+    # for the test Raspberry Pis (docs/m1/pi.md): `gh run download RUN -n fil-aarch64-musl`.
+    # No rust-cache here: this job produces the artifact that gets installed, and a cache entry
+    # saved by a run of any other ref could otherwise seed what a later release build restores.
+    if: inputs.suite == 'aarch64' || inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          # `cross` mounts the workspace into a third-party image; leave no token in .git/config.
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          # Pinned, with the image in Cross.toml pinned by digest: the same commit builds the same
+          # binary. Bump both together.
+          tool: cross@0.2.5
+      - name: Build fil for aarch64-unknown-linux-musl
+        run: cross build --locked --release -p fil-shell --target aarch64-unknown-linux-musl
+      # A separate build, so `fil` above is built exactly as before.
+      - name: Build fwdprobe for aarch64-unknown-linux-musl
+        run: cross build --locked --release -p fil-testbins --bin fwdprobe --target aarch64-unknown-linux-musl
+      - name: Check and checksum
+        run: |
+          mkdir -p out
+          for b in fil fwdprobe; do
+            cp target/aarch64-unknown-linux-musl/release/$b out/$b
+            file out/$b | tee /dev/stderr | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)'
+            (cd out && sha256sum $b | tee $b.sha256)
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fil-aarch64-musl
+          path: out/
+          retention-days: 14
+
+  terminals:
+    # T2 (docs/m3/plan.md, docs/m3/terminals.md): fil's terminal writes (snapshots, the overlay's
+    # erase and paint, status lines, resizes) replayed into real terminals under Xvfb and read
+    # back by each terminal's own command, compared with the shadow model (alacritty_terminal).
+    # xterm, kitty and tmux come from Ubuntu; WezTerm is the upstream release, pinned by its
+    # SHA-256. Nothing here is privileged and nothing needs a secret.
+    if: inputs.suite == 'terminals' || inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Packages (Xvfb, the terminals, software OpenGL for kitty)
+        run: sudo apt-get update && sudo apt-get install -y xvfb xterm kitty tmux xdotool libgl1-mesa-dri libegl1 libgl1 fonts-dejavu-core python3 shellcheck
+      - name: WezTerm 20240203-110809-5046fc22 (pinned by hash)
+        env:
+          WEZTERM_DEB: wezterm-20240203-110809-5046fc22.Ubuntu22.04.deb
+          WEZTERM_SHA256: 86358dab5794a4fb63f7c91dd68d4fdc3da58faad648a58fc77d2bd51c7b0686
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wezterm.deb" "https://github.com/wez/wezterm/releases/download/20240203-110809-5046fc22/$WEZTERM_DEB"
+          echo "$WEZTERM_SHA256  $RUNNER_TEMP/wezterm.deb" | sha256sum -c -
+          sudo apt-get install -y "$RUNNER_TEMP/wezterm.deb"
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The exporter is its own workspace (tests/terminals/exporter). Restore always, save
+          # only from main (see the check job).
+          workspaces: tests/terminals/exporter
+          save-if: ${{ inputs.ref == 'main' }}
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Lint the harness (the exporter is outside the workspace, so `just ci` never sees it)
+        run: |
+          shellcheck -x -S warning tests/terminals/run.sh
+          python3 -I -m py_compile tests/terminals/ansi.py tests/terminals/player.py tests/terminals/run.py tests/terminals/report.py tests/terminals/mutants.py
+          cargo fmt --check --manifest-path tests/terminals/exporter/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path tests/terminals/exporter/Cargo.toml -- -D warnings
+          cargo deny --manifest-path tests/terminals/exporter/Cargo.toml --config deny.toml check advisories licenses bans sources
+      - name: Real terminals
+        run: tests/terminals/run.sh
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Terminal versions'
+            echo '```'
+            xterm -version
+            kitty --version
+            wezterm --version
+            tmux -V
+            echo '```'
+            python3 -I tests/terminals/report.py target/terminals
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminals
+          path: target/terminals/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14

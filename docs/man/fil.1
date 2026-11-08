@@ -1,0 +1,161 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH "FIL" "1" "" "fil" "fil manual"
+.SH NAME
+fil \- A remote shell that keeps your place: reconnect, detach and reattach
+.SH SYNOPSIS
+\fBfil\fR [\fB\-L\fR \fISPEC\fR]... [\fB\-R\fR \fISPEC\fR]... [\fB\-D\fR \fISPEC\fR]... [\fB\-A\fR|\fB\-a\fR] [\fB\-\-transport\fR \fIMODE\fR] [\fB\-\-config\fR \fIFILE\fR] \fIHOST\fR [\fISESSION\fR]
+.br
+\fBfil\fR \fICOMMAND\fR ...
+.SH DESCRIPTION
+A remote shell that keeps your place: reconnect, detach and reattach
+.SH OPTIONS
+.TP
+\fB\-L\fR \fI<SPEC>\fR
+Listen here, connect from the host: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same port on the host\*(Aqs localhost. A bare port binds loopback; * or an empty BIND is every interface. Repeatable
+.TP
+\fB\-R\fR \fI<SPEC>\fR
+Listen on the host, connect from here: [BIND:]PORT:HOST:HOSTPORT, or PORT for the same port on this machine\*(Aqs localhost (not ssh\*(Aqs reverse SOCKS proxy). PORT 0 asks the host for a free port. Repeatable
+.TP
+\fB\-D\fR \fI<SPEC>\fR
+A SOCKS proxy here that connects from the host: [BIND:]PORT. Repeatable
+.TP
+\fB\-A\fR
+Relay your ssh\-agent to the session while you are attached (the config\*(Aqs agent = "confirm" stays "confirm")
+.TP
+\fB\-a\fR
+Do not relay the agent, whatever the config says (the last of \-A and \-a wins, as in ssh)
+.TP
+\fB\-\-transport\fR \fI<MODE>\fR
+How to reach the host: auto (the pipe first, then QUIC), pipe (ssh only) or direct (QUIC once attached)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto
+.IP \(bu 2
+pipe
+.IP \(bu 2
+direct
+.RE
+.TP
+\fB\-\-config\fR \fI<FILE>\fR
+Read this config file instead of ~/.config/fil/config.toml ($FIL_CONFIG also works)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIHOST\fR>
+The host: a name or alias for ssh, user@name, or a name from your config
+.TP
+[\fISESSION\fR]
+The session to attach to; it is created if it does not exist
+.SH COMMANDS
+.SS "fil ls"
+List the sessions on HOST
+.PP
+Usage: \fBfil ls [OPTIONS] <HOST>\fR
+.SS "fil kill"
+End a session: its shell and everything it started are killed
+.PP
+Usage: \fBfil kill [OPTIONS] <HOST> <SESSION>\fR
+.SS "fil detach"
+Detach whoever is attached to a session; it keeps running (inside a session, with no arguments: this one)
+.PP
+Usage: \fBfil detach [OPTIONS] [HOST] [SESSION]\fR
+.SS "fil forward"
+Add a forward to a running session, or remove one. The attached client asks its user before it listens or connects for a forward added this way
+.PP
+Usage: \fBfil forward [OPTIONS] [HOST] [SESSION]\fR
+.TP
+\fIHOST\fR
+The host the session runs on. Left out inside a session: the session is $FIL_SESSION
+.TP
+\fISESSION\fR
+The session (default: main)
+.TP
+\fB\-L\fR \fISPEC\fR
+Add: listen on this machine, connect from the host (same spec as the attach flag)
+.TP
+\fB\-R\fR \fISPEC\fR
+Add: listen on the host, connect from this machine
+.TP
+\fB\-D\fR \fISPEC\fR
+Add: a SOCKS proxy on this machine
+.TP
+\fB\-\-rm\fR \fIPORT\fR
+Remove the forward that listens on PORT. If a \-L and a \-R share the port, say which with the flag instead: \-\-rm \-L PORT
+.SS "fil ports"
+Show what is listening on the host and what is forwarded, with the process behind each
+.PP
+Usage: \fBfil ports [OPTIONS] [HOST] [SESSION]\fR
+.TP
+\fIHOST\fR
+The host to ask. Left out inside a session: this machine\*(Aqs daemon, for this session
+.TP
+\fISESSION\fR
+Only this session
+.TP
+\fB\-\-json\fR
+Print JSON (schema 1) instead of the table
+.TP
+\fB\-\-probe\fR
+Also probe the listeners no fil session started (by default only the \-L targets and the sessions\*(Aq listeners are). Such a listener is often a tunnel, and the probe reaches whatever it leads to; a known forwarder (ssh, kubectl, ...) is never probed
+.SS "fil server"
+The remote side: run by the pipe command on the host, not by people
+.PP
+Usage: \fBfil server \-\-stdio\fR
+.TP
+\fB\-\-stdio\fR
+Relay this process\*(Aqs stdin and stdout to the daemon (starting it if needed)
+.SS "fil install"
+Install this fil on HOST over ssh, into ~/.local/share/fil (or check what is there, or remove what fil installed)
+.PP
+Usage: \fBfil install [OPTIONS] <HOST>\fR
+.TP
+\fIHOST\fR
+The host: a name or alias for ssh, or user@name
+.TP
+\fB\-\-check\fR
+Show what is installed on HOST, and the fil on its PATH; change nothing
+.TP
+\fB\-\-remove\fR
+Remove the copies fil installed on HOST (not one in use by a running daemon)
+.TP
+\fB\-\-binary\fR \fIFILE\fR
+Upload this file instead of the bundled or this fil\*(Aqs own binary (it must be a release build for the host)
+.SS "fil config"
+Look at the configuration
+.PP
+Usage: \fBfil config [OPTIONS] <COMMAND>\fR
+.SS "fil config show"
+Show the settings that apply to HOST and where each value comes from (the default, [defaults] or [host.NAME]), like ssh \-G. Reads only the config file; never contacts the host
+.PP
+Usage: \fBfil config show [OPTIONS] <HOST>\fR
+.SH NOTES
+.nf
+Examples:
+  fil devbox                 attach to (or create) session "main" on devbox
+  fil devbox build           attach to session "build"
+  fil ls devbox              list the sessions on devbox
+  fil kill devbox build      end session "build"
+  fil detach devbox build    detach whoever is attached to "build"
+.fi
+.PP
+Inside a session, type ~. after a newline to detach; ~? lists the escapes.
+.PP
+Configuration: ~/.config/fil/config.toml (see fil\-config(5), or fil config show HOST).
+Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
+.PP
+Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
+the shell\*(Aqs own status if it exited with one; 128+N if the shell was killed by signal N or
+fil was stopped by signal N;
+1 on an error or if the session was taken over, replaced or detached elsewhere;
+2 on a usage error;
+255 if a forward failed and forward_failure = "exit".
+.PP
+Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
+.SH "SEE ALSO"
+\fBfil\-config\fR(5), \fBfil\-policy\fR(5)

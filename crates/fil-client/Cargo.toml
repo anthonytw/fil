@@ -1,0 +1,51 @@
+[package]
+name = "fil-client"
+description = "The fil client: attach, resume and reconnect over any link, the terminal, escapes, the disconnect status line and offline input (DESIGN.md sections 4, 5.2, 6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+# A library of fil (`fil-shell` on crates.io), published so that `cargo install fil-shell`
+# builds; its API follows fil's needs and carries no stability promise of its own.
+
+[dependencies]
+bytes = "1"
+fil-forward.workspace = true
+fil-predict.workspace = true
+fil-proto.workspace = true
+fil-term = { workspace = true, features = ["alacritty"] }
+fil-transport.workspace = true
+# Safe termios, poll and fd I/O for the real terminal (DESIGN.md section 13).
+rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "process", "pipe"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "process", "io-util"] }
+tracing = "0.1"
+
+[features]
+# A test-only seam: `ClientConfig::predict_guards` sets the prediction core's guards, so a
+# full-stack test can switch one off. It compiles in the `FIL_TEST_` marker that
+# `just no-test-hooks` refuses in a binary that is installed or released.
+test-hooks = []
+
+[dev-dependencies]
+# Enables `test-hooks` for this crate's own tests.
+fil-client = { path = ".", features = ["test-hooks"] }
+# The harness of the prediction tests (fil_predict::sim::Rng, fil_predict::oracle::diffs, the
+# test-only ScreenView::test_state).
+fil-predict = { path = "../fil-predict", features = ["testkit"] }
+# The test-only mini ssh-agent, and the scripted client the full-stack harness takes snapshots with.
+fil-testkit = { path = "../fil-testkit" }
+# The full-stack prediction harness (tests/predict_e2e.rs, examples/predict_e2e.rs): the real session
+# on a real PTY, over simulated pipe and QUIC links. Neither crate depends on fil-client (no cycle).
+fil-session = { path = "../fil-session" }
+fil-netsim = { path = "../fil-netsim" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Builds a spec another run withheld, from its wire bytes.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "pty", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "signal", "process", "io-util", "net"] }
+
+[lints]
+workspace = true

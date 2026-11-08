@@ -1,0 +1,22 @@
+# The FROZEN trampoline contract (docs/m4/release.md section 11), pinned by
+# crates/fil/tests/trampoline.rs, whose literals hold the same values. [pinned] never changes, not
+# even with a new PROTOCOL_MAJOR. It is a safeguard: no 0.1.0 or later daemon names its trampoline
+# by a path an upgrade replaces (Linux uses /proc/self/exe, macOS no trampoline), but one that did
+# would start sessions through whatever release's binary is then at its path.
+# [history] only grows: one line per revision of the contract, the FNV-1a hash of [pinned] as that
+# revision had it. An addition that no older copy has to build or accept goes under [extensions].
+[pinned]
+marker = __fil-exec-nofile
+argv = <trampoline> __fil-exec-nofile <soft> <program> <argv0> [<arg>...]
+trampoline = the daemon's own executable: current_exe() (/proc/self/exe on Linux)
+soft = the soft RLIMIT_NOFILE to set, decimal digits only, at most u64::MAX
+program = an absolute path to an executable regular file, run as given (no PATH search)
+argv0 = the program's argv[0]: -<basename of the shell> for a login shell, the command's first word otherwise
+arg = the command's other words, in order, unchanged
+inherited = environment, working directory and descriptors, unchanged
+success = sets the limit, then execs the program (same pid), printing nothing
+refusal = anything else: a message on stderr, exit status 127, nothing run
+entry = every binary that can run a daemon checks argv[1] for the marker first in main
+[extensions]
+[history]
+1 = 08692ddcbeb7ac6a

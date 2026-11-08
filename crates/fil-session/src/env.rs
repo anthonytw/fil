@@ -1,0 +1,194 @@
+//! The environment a session must not inherit from the login that started the daemon
+//! (DESIGN.md section 11.1, item 4).
+//!
+//! The daemon is started by whichever SSH login came first, and its sessions are used later,
+//! from other machines and other logins. Whatever describes that first login (its connection,
+//! its terminal, its X11 forwarding, its agent, its logind session) must not be stamped onto
+//! every session and onto the programs in them. One list is meant to serve both places that
+//! scrub:
+//!
+//! - the session's PTY child is scrubbed with it today, whichever way the daemon was started;
+//! - the daemon's launcher (`fil_daemon::start`) scrubs the environment of the daemon it starts
+//!   with the same list.
+//!
+//! The list is tmux's `update-environment` set (the variables tmux refreshes per client because
+//! they belong to a login) plus the other SSH connection variables, logind's `XDG_SESSION_*`,
+//! the terminal-identification variables that `SendEnv LC_*` carries, and what a daemon started
+//! by hand inherits from a terminal multiplexer or a local login.
+//!
+//! `FIL_LOG` is deliberately *not* in the list: the daemon reads its own log level from it, so
+//! the daemon's launcher must keep it. Sessions drop it separately (see
+//! [`SESSION_ONLY_DROPPED_VARS`]).
+
+use std::ffi::{OsStr, OsString};
+
+/// Variables that describe one login, dropped by name.
+pub const LOGIN_SESSION_VARS: &[&str] = &[
+    // tmux's default `update-environment`.
+    "DISPLAY",
+    "KRB5CCNAME",
+    "MSYSTEM",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "WINDOWID",
+    "XAUTHORITY",
+    // The rest of what sshd sets for a login.
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "SSH_ORIGINAL_COMMAND",
+    "SSH_USER_AUTH",
+    // Terminal identification that `SendEnv LC_*` (the macOS default) carries, and the
+    // message-of-the-day marker of a login shell.
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "MOTD_SHOWN",
+    // What a daemon started by hand inherits from the terminal session of whoever started it: a
+    // multiplexer (a stale `TMUX` makes `tmux` inside a session refuse to start) or a local
+    // graphical or console login.
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    "XDG_SEAT",
+    "XDG_VTNR",
+    "WAYLAND_DISPLAY",
+    // The terminal emulator of a local login: per-window or per-tab ids and what the emulator is
+    // (`WINDOWID` above is X11's). A sshd login does not carry them, a hand-started daemon does.
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_LOG",
+    "ALACRITTY_SOCKET",
+    "GNOME_TERMINAL_SCREEN",
+    "GNOME_TERMINAL_SERVICE",
+    "KONSOLE_DBUS_SESSION",
+    "KONSOLE_DBUS_WINDOW",
+    "KONSOLE_DBUS_SERVICE",
+    "KONSOLE_VERSION",
+    "VTE_VERSION",
+    // Windows Terminal's tab id (reaches a host through WSL interop).
+    "WT_SESSION",
+    // Not `VSCODE_*` as a family: VS Code's remote CLI integration (`code`, git askpass) uses
+    // some of them, and the ids they carry are not a window handle.
+];
+
+/// Prefixes of variables that are dropped as a family: logind's `XDG_SESSION_ID`,
+/// `XDG_SESSION_TYPE`, `XDG_SESSION_CLASS` and the like (set by `pam_systemd` per login).
+pub const LOGIN_SESSION_PREFIXES: &[&str] = &["XDG_SESSION_"];
+
+/// Variables a session drops that the daemon keeps, because the daemon itself reads them.
+pub const SESSION_ONLY_DROPPED_VARS: &[&str] = &["FIL_LOG"];
+
+/// Whether `name` is one of the login-session variables ([`LOGIN_SESSION_VARS`] or a
+/// [`LOGIN_SESSION_PREFIXES`] family).
+pub fn is_login_session_var(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    LOGIN_SESSION_VARS.contains(&name) || LOGIN_SESSION_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// The names of the login-session variables set in this process's environment, ready for
+/// `Command::env_remove`.
+pub fn login_session_vars_in_env() -> Vec<OsString> {
+    std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| is_login_session_var(k))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is(name: &str) -> bool {
+        is_login_session_var(OsStr::new(name))
+    }
+
+    #[test]
+    fn the_login_variables_are_recognized() {
+        for v in [
+            "DISPLAY",
+            "XAUTHORITY",
+            "WINDOWID",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "TERM_SESSION_ID",
+            "ITERM_SESSION_ID",
+            "KITTY_WINDOW_ID",
+            "KITTY_PID",
+            "WEZTERM_PANE",
+            "WT_SESSION",
+            "ALACRITTY_WINDOW_ID",
+            "GNOME_TERMINAL_SCREEN",
+            "GNOME_TERMINAL_SERVICE",
+            "KONSOLE_DBUS_SESSION",
+            "KONSOLE_DBUS_WINDOW",
+            "KRB5CCNAME",
+            "SSH_ASKPASS",
+            "SSH_AGENT_PID",
+            "SSH_AUTH_SOCK",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "SSH_ORIGINAL_COMMAND",
+            "SSH_USER_AUTH",
+            "XDG_SESSION_ID",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_CLASS",
+            "XDG_SESSION_DESKTOP",
+            "LC_TERMINAL",
+            "LC_TERMINAL_VERSION",
+            "MOTD_SHOWN",
+            "TMUX",
+            "TMUX_PANE",
+            "STY",
+            "WINDOW",
+            "XDG_SEAT",
+            "XDG_VTNR",
+            "WAYLAND_DISPLAY",
+        ] {
+            assert!(is(v), "{v} must be dropped");
+        }
+    }
+
+    #[test]
+    fn the_variables_a_session_needs_are_kept() {
+        // The user manager is reached through these (`systemd-run --user`); the language and
+        // path settings are the user's, not the login's.
+        for v in [
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "FIL_LOG",
+            "SSH_CONFIG",
+        ] {
+            assert!(!is(v), "{v} must be kept");
+        }
+        assert!(!is_login_session_var(OsStr::new("")));
+    }
+
+    #[test]
+    fn the_session_only_list_does_not_overlap_the_shared_one() {
+        for v in SESSION_ONLY_DROPPED_VARS {
+            assert!(
+                !is(v),
+                "{v} is read by the daemon; the shared list must keep it"
+            );
+        }
+    }
+}

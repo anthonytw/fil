@@ -24,9 +24,11 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "
 tracing = "0.1"
 
 [features]
-# A test-only seam: `ClientConfig::predict_guards` sets the prediction core's guards, so a
-# full-stack test can switch one off. It compiles in the `FIL_TEST_` marker that
-# `just no-test-hooks` refuses in a binary that is installed or released.
+# Test-only seams: `ClientConfig::predict_guards` sets the prediction core's guards, so a
+# full-stack test can switch one off, and `ClientConfig::flush_tap` hands every overlay write to
+# a callback (the prediction suites' classifier, docs/m3/harness.md section 9). Each compiles in
+# a `FIL_TEST_` marker (the tap's is `FIL_TEST_FLUSH_TAP`) that `just no-test-hooks` refuses in a
+# binary that is installed or released.
 test-hooks = []
 
 [dev-dependencies]
@@ -45,6 +47,8 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # Builds a spec another run withheld, from its wire bytes.
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 rustix = { version = "1", features = ["termios", "stdio", "event", "fs", "pty", "process"] }
+# The classifier's own count of the glyphs the server's bytes print (tests/common/oracle_term.rs).
+vte = "0.15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "test-util", "macros", "time", "sync", "signal", "process", "io-util", "net"] }
 
 [lints]

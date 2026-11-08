@@ -82,6 +82,12 @@ pub struct ClientConfig {
     /// the marker [`crate::display::TEST_GUARDS_MARKER`], which `just no-test-hooks` refuses.
     #[cfg(feature = "test-hooks")]
     pub predict_guards: Option<fil_predict::Guards>,
+    /// **Test only** (`test-hooks`): every overlay write, in its pieces, also goes to this
+    /// callback (the prediction harness's independent classifier, `docs/m3/plan.md` §5.4). It
+    /// sees what is written to the terminal, so a build with it is not a release build: the
+    /// feature compiles in the marker [`crate::display::TEST_FLUSH_TAP_MARKER`].
+    #[cfg(feature = "test-hooks")]
+    pub flush_tap: Option<crate::display::FlushTap>,
 }
 
 /// Whether, and when, the client paints its guesses of the echo (DESIGN.md section 9).
@@ -170,6 +176,8 @@ impl ClientConfig {
             predict: Predict::Off,
             #[cfg(feature = "test-hooks")]
             predict_guards: None,
+            #[cfg(feature = "test-hooks")]
+            flush_tap: None,
         }
     }
 }

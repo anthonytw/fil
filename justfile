@@ -43,7 +43,9 @@ release-deps:
     # The test hooks (FIL_TEST_WIRE_REVISION and friends) must not reach the released binary: a
     # production fil must never honor an environment variable that changes what wire it speaks.
     # fil-forward is checked once fil depends on it (until then `cargo tree -i` finds no such package).
-    for c in fil-proto fil-daemon fil-transport fil-session fil-forward; do
+    # fil-client's test-hooks carry the prediction guards' seam and the flush tap (which sees what
+    # is written to the terminal: docs/m3/plan.md section 4.3).
+    for c in fil-proto fil-daemon fil-transport fil-session fil-forward fil-client; do
       if ! tree=$(cargo tree -q -p fil-shell -e normal,build,features --target all -i "$c" 2>&1); then
         case "$tree" in *"did not match any packages"*) continue ;; esac
         echo "$tree" >&2; exit 1
@@ -188,6 +190,24 @@ predict-harness *args:
 [positional-arguments]
 predict-e2e *args:
     cargo run --release -p fil-client --example predict_e2e -- "$@"
+
+# T1 part 2's prediction suites (docs/m3/harness.md section 9): every program of docs/m3/plan.md
+# section 2.5 on both transports at 50, 150 and 400 ms, with jitter, loss and the faults, each
+# written glyph classified from the flush tap's bytes and checked against the core's counts.
+# `just predict-suites` runs the matrix; `secrets` the password prompts; `hardening` measures the
+# proposed EchoAck-before-first-write guard; `all` all three. Env filters: FIL_SUITES_FILTER,
+# FIL_SUITES_RTTS, FIL_SUITES_TRANSPORTS, FIL_SUITES_SEEDS, FIL_SUITES_LINES, FIL_SUITES_JOBS.
+predict-suites which="matrix":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{which}}" in
+      matrix) t=matrix_of_the_prediction_suites ;;
+      secrets) t=secrets_of_the_prediction_suites ;;
+      hardening) t=hardening_cost_of_ack_before_write ;;
+      all) t="" ;;
+      *) echo "predict-suites: matrix, secrets, hardening or all" >&2; exit 2 ;;
+    esac
+    cargo test --release -p fil-client --test predict_suites -- --ignored --nocapture --test-threads 1 $t
 
 # Prediction demo in your own terminal: `just predict-demo 200ms` (latency each way).
 # Flags: --backend NAME, --no-predict, --plain, --no-sync.

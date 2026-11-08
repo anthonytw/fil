@@ -2872,6 +2872,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.make_predictor.take(),
                 cfg,
             );
+            #[cfg(feature = "test-hooks")]
+            if let Some(tap) = &self.cfg.flush_tap {
+                tracing::warn!(
+                    "{}: every overlay write goes to a tap (a test build)",
+                    crate::display::TEST_FLUSH_TAP_MARKER
+                );
+                d.set_flush_tap(Some(tap.clone()));
+            }
             d.set_link(self.link_view);
             self.display = Some(d);
         }

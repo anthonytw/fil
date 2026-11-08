@@ -31,6 +31,66 @@ use crate::config::Predict;
 #[cfg(feature = "test-hooks")]
 pub const TEST_GUARDS_MARKER: &str = "FIL_TEST_PREDICT_GUARDS";
 
+/// The marker a build with the test-only flush tap carries ([`FlushTap`],
+/// `ClientConfig::flush_tap`): `just no-test-hooks` fails on any `FIL_TEST_` string in a binary.
+#[cfg(feature = "test-hooks")]
+pub const TEST_FLUSH_TAP_MARKER: &str = "FIL_TEST_FLUSH_TAP";
+
+/// **Test only** (`test-hooks`): what the display did, with the overlay's write kept in its
+/// pieces, for the prediction harness's independent classifier (`docs/m3/plan.md` §3 T1 part 2,
+/// §5.4). The pieces hold what the terminal is given (keystrokes among them, as echoes), which is
+/// why no release build can have it (§4.3).
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // test only, one event at a time
+pub enum TapEvent {
+    /// One overlay write, from the call `kind`, at the display's size after the call, with the
+    /// core's counts after it. The terminal is given `flush.to_bytes()`.
+    Flush {
+        kind: TapKind,
+        flush: fil_predict::Flush,
+        size: Size,
+        stats: PredictStats,
+    },
+    /// Bytes the display built outside the overlay that the engine writes as they are (the
+    /// restore before a snapshot).
+    Raw(Vec<u8>),
+    /// A snapshot is about to land: the shadow starts again, blank, at `size`.
+    Reset { size: Size },
+    /// The link's status, as the core is told it.
+    Link { down: bool },
+}
+
+/// Which [`Display`] call made an overlay write (for the test-only tap's [`TapEvent::Flush`]; in
+/// a build without the tap it only names the call).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapKind {
+    Server,
+    Input,
+    EchoAck,
+    Tick,
+    PtyMode,
+    Status,
+    /// A lifecycle withdrawal (`Display::withdraw`).
+    Withdraw(WithdrawReason),
+    /// A resize to the display's new size; also a snapshot at an older size (`Display::untrusted`).
+    /// The erase is for the geometry before it.
+    Resize,
+}
+
+/// **Test only** (`test-hooks`): a callback given every [`TapEvent`], in order, on the engine's
+/// task. Set with `ClientConfig::flush_tap`.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone)]
+pub struct FlushTap(pub std::sync::Arc<dyn Fn(&TapEvent) + Send + Sync>);
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for FlushTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlushTap")
+    }
+}
+
 /// The shortest wait between two ticks: a deadline the overlay has already passed (a predictor's
 /// own, which the core does not check) does not spin the loop.
 const MIN_TICK: Duration = Duration::from_millis(5);
@@ -94,6 +154,8 @@ pub struct Display {
     kitty_tail: Vec<u8>,
     /// When the overlay was last ticked.
     last_tick: Time,
+    #[cfg(feature = "test-hooks")]
+    tap: Option<FlushTap>,
 }
 
 impl Display {
@@ -133,7 +195,37 @@ impl Display {
             kitty_used: false,
             kitty_tail: Vec::new(),
             last_tick: Duration::ZERO,
+            #[cfg(feature = "test-hooks")]
+            tap: None,
         }
+    }
+
+    /// **Test only** (`test-hooks`): every overlay write from now on also goes to `tap`, in its
+    /// pieces (the prediction harness's classifier).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_flush_tap(&mut self, tap: Option<FlushTap>) {
+        self.tap = tap;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn tap(&self, ev: impl FnOnce() -> TapEvent) {
+        if let Some(t) = &self.tap {
+            (t.0)(&ev());
+        }
+    }
+
+    /// The bytes of an overlay write (and, in a test build with a tap, the write in its pieces).
+    fn emit(&self, kind: TapKind, flush: fil_predict::Flush) -> Vec<u8> {
+        #[cfg(feature = "test-hooks")]
+        self.tap(|| TapEvent::Flush {
+            kind,
+            flush: flush.clone(),
+            size: self.size,
+            stats: self.overlay.stats(),
+        });
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = kind;
+        flush.to_bytes()
     }
 
     fn now(&self) -> Time {
@@ -163,6 +255,8 @@ impl Display {
         let _ = self.overlay.set_status(None);
         let now = self.now();
         let shadow = (self.backend.create)(self.size, 0);
+        #[cfg(feature = "test-hooks")]
+        self.tap(|| TapEvent::Reset { size: self.size });
         self.overlay.reset(shadow, now);
         let _ = self.overlay.set_pty_mode(self.pty);
     }
@@ -213,11 +307,14 @@ impl Display {
     /// and `?1016`, so a program that keeps running would lose them for good; and the cursor is
     /// not shown, because the snapshot hides it again at once (a flash).
     pub fn snapshot_prefix(&self) -> Vec<u8> {
-        restore_sequence(
+        let bytes = restore_sequence(
             &self.overlay.view(0).shadow,
             self.kitty_used,
             Restore::Snapshot,
-        )
+        );
+        #[cfg(feature = "test-hooks")]
+        self.tap(|| TapEvent::Raw(bytes.clone()));
+        bytes
     }
 
     /// Notes whether the stream pushed or set the kitty keyboard protocol (`CSI > flags u`,
@@ -268,7 +365,8 @@ impl Display {
     pub fn server(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.note_kitty(bytes);
         let now = self.now();
-        self.overlay.on_server(bytes, now).to_bytes()
+        let f = self.overlay.on_server(bytes, now);
+        self.emit(TapKind::Server, f)
     }
 
     /// Bytes for the session's input stream at input offset `at` (the offset the bytes get in the
@@ -283,7 +381,8 @@ impl Display {
             return Vec::new();
         }
         let now = self.now();
-        self.overlay.on_input(bytes, at, kind, now).to_bytes()
+        let f = self.overlay.on_input(bytes, at, kind, now);
+        self.emit(TapKind::Input, f)
     }
 
     /// An `EchoAck` (DESIGN.md §8.5), once the output below its `output_at` has been applied.
@@ -293,12 +392,15 @@ impl Display {
             return Vec::new();
         }
         let now = self.now();
-        self.overlay.on_echo_ack(input_upto, now).to_bytes()
+        let f = self.overlay.on_echo_ack(input_upto, now);
+        self.emit(TapKind::EchoAck, f)
     }
 
     /// The link's status (`LinkStatus`): the predictor's round-trip hint, and whether a guess
     /// that does not settle is withdrawn by the backstop (link down) or expired.
     pub fn set_link(&mut self, link: LinkView) {
+        #[cfg(feature = "test-hooks")]
+        self.tap(|| TapEvent::Link { down: link.down });
         self.overlay.set_link(link);
     }
 
@@ -310,7 +412,8 @@ impl Display {
     /// Withdraws every guess at once, for a lifecycle event (`docs/m3/plan.md` §2.6), before any
     /// question or message is drawn. Returns what to write.
     pub fn withdraw(&mut self, reason: WithdrawReason) -> Vec<u8> {
-        self.overlay.withdraw(reason).to_bytes()
+        let f = self.overlay.withdraw(reason);
+        self.emit(TapKind::Withdraw(reason), f)
     }
 
     /// When [`Display::tick`] should next be called, if ever.
@@ -328,7 +431,8 @@ impl Display {
             return Vec::new();
         }
         self.last_tick = now;
-        self.overlay.on_tick(now).to_bytes()
+        let f = self.overlay.on_tick(now);
+        self.emit(TapKind::Tick, f)
     }
 
     /// A snapshot rendered at the client's current size has landed (after [`Display::reset`] and
@@ -343,7 +447,8 @@ impl Display {
     /// screen at a size the terminal no longer has, so the screen is not trusted until one at
     /// the current size lands (nothing is written meanwhile). Returns what to write.
     pub fn untrusted(&mut self) -> Vec<u8> {
-        self.overlay.resize(self.size).to_bytes()
+        let f = self.overlay.resize(self.size);
+        self.emit(TapKind::Resize, f)
     }
 
     /// True while a resize has left the screen untrusted for the overlay.
@@ -371,13 +476,15 @@ impl Display {
         // included, so any narrowing while something is drawn is damage.
         let damaged = self.overlay.has_painted() && cols < self.size.cols;
         self.size = size;
-        (self.overlay.resize(size).to_bytes(), damaged)
+        let f = self.overlay.resize(size);
+        (self.emit(TapKind::Resize, f), damaged)
     }
 
     /// `PtyMode` from the daemon, already ordered with the output.
     pub fn set_pty_mode(&mut self, canonical: bool, echo: bool) -> Vec<u8> {
         self.pty = PtyMode { canonical, echo };
-        self.overlay.set_pty_mode(self.pty).to_bytes()
+        let f = self.overlay.set_pty_mode(self.pty);
+        self.emit(TapKind::PtyMode, f)
     }
 
     /// True while the PTY looks like a password prompt (canonical, echo off).
@@ -403,7 +510,8 @@ impl Display {
                 placement: self.placement,
             })
         };
-        self.overlay.set_status(status).to_bytes()
+        let f = self.overlay.set_status(status);
+        self.emit(TapKind::Status, f)
     }
 
     /// Time since the display was created, for the overlay's clock.

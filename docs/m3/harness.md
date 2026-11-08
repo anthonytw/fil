@@ -1,6 +1,6 @@
 # M3 T1 part 1: the full-stack prediction harness, and resize in the true order
 
-> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this.
+> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this: its first part is in §9, written on `60ab0ee`.
 
 ## 1. What it is
 
@@ -43,6 +43,7 @@ flowchart LR
 | `crates/fil-client/tests/predict_e2e.rs` | the small cases that run in `just ci`; one reproduction is `#[ignore]`d |
 | `crates/fil-client/examples/predict_e2e.rs` | the on-demand runs: `just predict-e2e resize\|baseline\|secret\|all` |
 | `crates/fil-client/tests/common/mod.rs` | one line: `pub mod oracle_term;` |
+| `crates/fil-client/tests/predict_suites.rs` | part 2 (§9): the classifier's unit tests, the tap's marker, small cells in `just ci`; the matrix, the secrets and the hardening measurement `#[ignore]`d (`just predict-suites`) |
 
 `fil-session`, `fil-netsim` and `quinn` are dev-dependencies of `fil-client`. Neither fil crate depends on `fil-client` (`cargo tree -p fil-session -e normal,build,dev` has no `fil-client`), so there is no cycle.
 
@@ -326,3 +327,110 @@ Within the budget, and the damage harvest costs `cat` nothing measurable (P2's "
 **Follow-up (not P2's file):** `fil-client`'s `Display::open_gates` still builds a whole `TermState` to read the cursor (`overlay.view(0).shadow.cursor`). It runs for questions and the offline confirmation, not per key; once `Overlay` exposes the view's cursor it can read that instead (E1a or the sweep).
 
 **Still to measure (done-when 7):** GitHub's Linux x86_64 and arm64 runners, which V1 measures with the Pis (`linux-check`; the bench needs no PTY and runs as is: `cargo bench -p fil-predict --bench budget`).
+
+## 9. T1 part 2: the prediction suites and the independent classifier
+
+`docs/m3/plan.md` §3 "T1 part 2", §2.5, §2.6, §5.4. Built on `60ab0ee` (after #43's `Rig::settle_echoed`, which the suites use to wait for each line's echo), with P1's predictor, E1a's engine, W1's repaint and P2's screen view as merged there. Measured on the macOS development machine (Apple M3 Max, macOS 27.2, shared with other agents' builds, load average 9 to 15), release build.
+
+### The flush tap and the classifier
+
+- **The tap** (`crates/fil-client/src/display.rs`, behind `fil-client`'s `test-hooks` feature): `ClientConfig::flush_tap` takes a callback, and the display calls it with every overlay write in its pieces (`TapEvent::Flush`: which call made it, the erase, the server bytes, the paint, the display's size and the core's `PredictStats` after it), the bytes it builds outside the overlay (`Raw`: the restore before a snapshot), each snapshot's reset (`Reset`) and the link state the core is told (`Link`). Setting it compiles in and logs the marker `FIL_TEST_FLUSH_TAP`, which `just no-test-hooks` refuses in an installed or released binary with no change to the recipe. `the_flush_tap_marker_is_compiled_in_with_the_feature` checks that the marker is in a binary built with the feature; `just release-deps` now also checks that `fil`'s release graph has no `fil-client` `test-hooks` (it already failed on that through `fil-proto`'s inverse tree; the explicit entry says why). A non-test build has no tap and no marker: the display's `emit` is the old `to_bytes`.
+- **The classifier** (`Classifier` in `tests/common/oracle_term.rs`): two emulators, a *reference* fed the server bytes only (the session's screen) and a *user* fed erase, server bytes and paint (the user's terminal in the model). After every write, a **guess on the screen** is a cell where the two differ in text or attributes, leaving out the cells the overlay draws in inverse video (the status line and questions). When one goes it is **confirmed** if the reference shows its glyph there, **superseded** if another guess took the cell in the same write, **withdrawn** if it went in a lifecycle write (`Display::withdraw` for a lifecycle reason, a resize, the first write after a snapshot's reset) or while the link was down, **gated** if it went while its cell on the reference was still blank and the reference's next glyph there is the same one, with no *foreign* glyph printed in between (F1: the glyph went and came back), and **mispredicted** otherwise. A foreign glyph is one the server's bytes print beyond the echoes of the guesses whose cells they fill; the classifier counts prints with a `vte` parser of its own, kept across writes so a sequence cut between two writes is one sequence. A gated guess is *held* from the write that took it off until its cell shows a glyph; a held guess still held at the end of a run is a misprediction. It reads nothing of the core's state. **Independent of the core's accounting, not of everything:** the classifier's two emulators are the same default backend (alacritty) as the client's shadow, so an emulator bug both share is invisible to it; and whether a `Display::withdraw` is a lifecycle write follows the `WithdrawReason` the engine passed, so an engine that labels a predictor's removal as a lifecycle one is counted the same by both. A resize is applied after the erase (the overlay's own contract); the true-order damage is still the oracle terminal's comparison with the shadow.
+- **The comparison** (`Rig::agreement`, `Agreement`): written and withdrawn must equal the core's; every guess the classifier confirmed (the core's confirmed with restyled) and every one it mispredicted must be counted the same by the core, and the core's confirmations and mispredictions beyond those must add up to the gated count exactly (`core confirmed - classifier confirmed + core mispredicted - classifier mispredicted = gated`, both differences at least 0). The slack is the gated count, found from bytes, and is 0 on a cell with no gate; the matrix's table prints how the core filed each cell's gated guesses. There is no other tolerance: `CellResult::known_f1` is gone. Exact agreement needs every written guess to be visible in the bytes, which it is when the predictor underlines: the suites run `MoshAlways` (P1's predictor, shown and underlined at every RTT). A plain guess identical to the cell under it (a typed space over a blank) is invisible from bytes alone, so plain-style runs could only compare mispredictions.
+- **The adversarial bar from bytes:** `written_unconfirmed` counts guesses a keystroke writes after a misprediction with no output since. A new epoch is confirmed only by output (rule 2), so such a guess belongs to the old epoch. `runs` counts the writes that removed a guess as mispredicted.
+
+### Running it
+
+```
+cargo test -p fil-client --test predict_suites           # in just ci: 10 tests, about 11 s
+just predict-suites                                      # the matrix: 137 cells, about 9 min at the default 4 at a time
+FIL_SUITES_JOBS=7 just predict-suites                    # the same, about 6 min (on a quiet machine)
+just predict-suites secrets                              # read -s, getpass and the asterisk mask: 24 cells, about 50 s
+just predict-suites hardening                            # the ack_before_write measurement, about 10 min
+FIL_SUITES_FILTER="quic zsh" FIL_SUITES_RTTS=400 just predict-suites
+FIL_SUITES_GUARD_OFF=tentative just predict-suites       # a mutation run: the cells must fail
+```
+
+Knobs (environment): `FIL_SUITES_FILTER` (a substring of the cell label), `FIL_SUITES_RTTS` (`50,150,400`), `FIL_SUITES_TRANSPORTS` (`pipe,quic`), `FIL_SUITES_SEEDS` (1; 3 for `hardening`), `FIL_SUITES_LINES` (3 lines of 24 letters), `FIL_SUITES_JOBS` (cells at a time, 4), `FIL_SUITES_TYPOS=0` (no typo and Backspace), `FIL_SUITES_GUARD_OFF` (core guards off, comma-separated), `FIL_SUITES_VERBOSE` (each cell's first-write times, the core's stats and the final screen). A cell's typist types each line (`: ` and words for the shells and `cat`, `x = '...'` for Python), with a typo and its Backspace about one key in ten, 60 to 160 ms between keys, then Enter, then waits for the echo of every key (`settle_echoed`); a run ends with the user's terminal against the client's shadow.
+
+In `just ci`: the classifier's unit tests (a confirmed, a contradicted, a gated and a withdrawn glyph, the status line, every comparison field and the gated mapping) from hand-written bytes; the marker; faithful bash on both transports, the upper-case echo and a takeover, each at one RTT with a few keys.
+
+### The matrix on macOS
+
+`just predict-suites`, one seed: 13 programs on both transports at 50, 150 and 400 ms RTT; at 150 ms also with 20 ms of jitter (both transports) and 2 % loss (QUIC); the faults on `cat` and bash at 150 ms on both. 137 cells, 11,932 keys, all at their bar. The first run (`FIL_SUITES_JOBS=7`, about 6 min) was before the gated bucket; the numbers here are from the re-run after #46's review (`just predict-suites`, the default 4 at a time, 546 s), with the gated bucket and the exact comparison.
+
+| Category | Programs | Cells | Keys | Written | Confirmed | Gated | Visible mispredictions | Withdrawn | Classifier = core |
+|---|---|---|---|---|---|---|---|---|---|
+| Faithful | bash, zsh (`RPROMPT`), dash, Python 3.15 pyrepl, the same with `PYTHON_BASIC_REPL=1`, `cat`, raw `cat`, `read` | 72 | 6,471 | 3,453 | 3,453 | **0** | **0** | 0 | every cell |
+| Faithful but slow | an echo 60 to 200 ms after the PTY takes the key | 9 | 801 | 0 | 0 | **0** | **0** | 0 | every cell |
+| Adversarial | upper-case echo, no echo, the M0 adversary, a background writer | 36 | 3,204 | 565 | 484 | 19 | 62 | 0 | every cell (the adversary's 19 gated: the core filed 8 confirmed, 11 mispredicted) |
+| Faults | `cat` and bash: link killed, offline typing (sent at once, and after the confirmation), takeover, true-order narrowing | 20 | 1,456 | 1,291 | 1,275 | **0** | **0** | 16 | every cell |
+
+- **Faithful:** zero visible mispredictions in every cell, both transports, every RTT, with jitter and with loss; the terminal ends equal to the shadow in every cell; nothing of the reserved alphabet written.
+- **Adversarial:** after every misprediction nothing was written before the session wrote again (`written_unconfirmed` 0 in every cell). The upper-case echo shows one or more runs per line (each line's first letter contradicts the epoch `:` confirmed); the adversary 0 or 1 run per cell and 1 or 6 gated guesses; the background writer 0 to 4 runs; no echo writes nothing. Visible mispredictions per 1,000 keys: upper 55, adversary 14 (37 with its gated guesses), background 9.
+- **Faults:** zero mispredictions; what was withdrawn (16 guesses) went in the takeover (3 per cell, the keys typed while it was on its way) and the narrowing (1 per cell, the guess drawn when the window changed). The killed link: on the pipe a reset and a resume; on QUIC a 300 ms blackout the link rides out without a dial (`Degraded`, recovered by itself). Offline: four keys typed with the status line up, sent on resume, or after `y` to the confirmation.
+- **Secrets** (`just predict-suites secrets`): `read -s`, Python's `getpass` and a raw-mode prompt that echoes `*` for every key (`Program::Masked`, `sudo` with `pwfeedback`), typed ahead of the mode report and after it, with P1's predictor and the hostile `Eager`, both transports: 24 cells, nothing written, the classifier and the core agree (0 written).
+
+### Findings
+
+- **F1 (the classifier against the core, for the overlay's owner).** A gate makes the overlay take a written guess off the screen while its echo has not come, and the echo in the next chunk brings the same glyph back: the user saw the glyph go and come back, never a wrong one. The classifier now finds that from bytes and counts it **gated**, apart from both confirmed and mispredicted. The core files the same sight two ways. On the M0 adversary, a guess taken off for insert mode (`CSI 4 h`), or in the write that draws `#` elsewhere, is `mispredicted.ended` at once; one taken off for a character set (`ESC ( 0`) or a synchronized-output batch (`CSI ? 2026 h`) stays pending and is confirmed by its echo. In this run that is 19 gated guesses, all on the adversary: 8 the core confirmed (all at 50 ms, both transports) and 11 it counted mispredicted (at every RTT). §2.5 counts a written guess removed without the shadow showing it as a visible misprediction, so the 8 are the disagreement with §2.5. The comparison maps the gated count onto the core's two buckets exactly (above), and the table prints the split per cell; the faithful bar counts gated guesses as failures, so a gate on a faithful program fails the cell. The decision, still open: either the core counts every gate retraction the same (a new bucket, say `mispredicted.hidden`, or `ended` for all), or §2.5 exempts the go-and-come-back case. Once decided, the comparison can drop the slack and map gated onto one bucket. It does not show on any faithful program here.
+- **F2 (P1's quality, for V1).** A typo and its Backspace end the written epoch for the rest of the line at 150 and 400 ms: faithful bash at 150 ms writes 32 of 80 guesses with typos (42 `tentative_dropped`) and 75 of 79 without (`FIL_SUITES_TYPOS=0`); at 50 ms the epoch re-confirms within the line. Not a misprediction; done-when 3's latency number will show it.
+- **F3 (P1, the slow echo).** A program that echoes 60 to 200 ms late has nothing written at any RTT: the `EchoAck` reaches the client before the echo, so the epoch goes tentative (rule 5) and is never confirmed. The faithful-but-slow bar (zero) holds, but rule 5's grace never comes into play here. Worth a look in P1's soak (`Scenario::SlowEcho`).
+- **The guard mutations through the stack** are in the mutation table below; `unexplained` off showed nothing in this matrix (its traces are the prompt cases of `predict_stack.rs` and the sans-IO suite).
+
+### The proposed hardening: `EchoAck` before an epoch's first write
+
+`FIL_SUITES_SEEDS=2 just predict-suites hardening` (2 seeds of 4 lines; the default is 3 seeds), both transports; each line after the first starts a new epoch (an Enter, and the wait for the echo is over a second, so it is also `Idle`). The first line (the session's first epoch, before any `EchoAck`) is left out. Medians of the time from a line's first key to the first guess written in it, in ms:
+
+| Program | RTT | off | on | extra |
+|---|---|---|---|---|
+| bash, zsh, `cat` | 50 ms | 100 to 102 | 106 to 108 | +4 to +7 |
+| pyrepl | 50 ms | 150 to 151 | 150 | 0 |
+| bash, zsh, `cat`, pyrepl | 150 ms | 153 to 155 | 204 to 207 | +50 to +54 |
+| bash, zsh, `cat`, pyrepl | 400 ms | 403 to 405 | 454 to 456 | +50 to +52 |
+| slow echo | all | nothing written | nothing written | - |
+
+Pipe and QUIC give the same numbers (within 2 ms). With the guard on, faithful cells still show zero visible mispredictions (0 off, 0 on), and no line went unwritten that was written without it. **The cost is the 50 ms echo window, once per epoch, from 150 ms RTT up; at 50 ms it is under 10 ms** (the ack and the second key's echo come close together). That is the number for the coordinator's call (plan §2.4 rule 5).
+
+### The mutation table
+
+Each check broken by hand; the named test fails.
+
+| Mutation | Test that fails |
+|---|---|
+| `FIL_SUITES_GUARD_OFF=password` on the secrets | none: the epochs alone stop it (as `predict_stack.rs` shows) |
+| `FIL_SUITES_GUARD_OFF=password,tentative` on the secrets | `secrets_of_the_prediction_suites`: 16 of 16 reserved characters written on `read -s` and `getpass` after the report, 6 to 16 typed ahead; the classifier agrees with the core on each |
+| `FIL_SUITES_GUARD_OFF=tentative`, the matrix at 150 ms on the pipe | `matrix_of_the_prediction_suites`: 12 of 13 cells (27 to 51 visible mispredictions on every faithful program, 27 to 74 guesses written after a miss on the adversarial ones) |
+| `FIL_SUITES_GUARD_OFF=keep_on_boundary`, the same | the matrix: pyrepl and the basic REPL (1 and 2 visible mispredictions: the closing `'` before Enter) |
+| the core never counts a contradiction (`epochs.rs` `count`) | `an_upper_case_echo_is_counted_the_same_and_bounded` (classifier vs core) |
+| the core counts a contradiction as confirmed (`epochs.rs` `count`: `Outcome::Contradicted => s.confirmed += 1`, #46's review) | `an_upper_case_echo_is_counted_the_same_and_bounded`, 3 runs of 3: "confirmed 2, mispredicted 2 and gated 0 (classifier) do not map onto confirmed 4 and mispredicted 0 (core)". Before the gated bucket, `known_f1` let this pass. Run from a `git archive` copy with a private `CARGO_TARGET_DIR` |
+| the core never counts `written` (`mark_written`) | `faithful_bash_agrees_with_the_core_on_both_transports` |
+| the classifier never confirms | the three classifier unit tests, all three cells in `just ci` |
+| the comparison takes gated guesses as confirmed only (`confirmed + gated = core confirmed`) | `an_agreement_reports_every_count_that_differs`, and the adversary at 150 and 400 ms in the matrix (the core filed their gated guesses mispredicted) |
+| the classifier takes a resize, or a lifecycle withdrawal, for a misprediction | `the_classifier_counts_withdrawn_glyphs` |
+| the classifier never marks a misprediction for the adversarial bar | `the_classifier_counts_a_contradicted_glyph` |
+| the engine never hands the display the tap | `faithful_bash_agrees_with_the_core_on_both_transports` (the tap never fired) |
+| the marker not compiled in (the engine's warning removed) | `the_flush_tap_marker_is_compiled_in_with_the_feature` |
+| `fil` depends on `fil-client` with `test-hooks` | `just release-deps` |
+
+### Not run here, and why
+
+| Cells | Why |
+|---|---|
+| every cell on **Linux** | needs GitHub's `linux-check`, which only the owner dispatches now (the Lima VM of §2 was not used for this PR) |
+| **fish** (with autosuggestions) | not installed on this Mac (`/usr/bin:/bin` and Homebrew have no fish); the suite skips a program the host lacks and says so |
+| the **real-network** cells (`p_keys`, `p_loss`, `p_roam`, `p_shells`, §5.5) | `linux-check -f suite=latency` and `just realnet` (Docker, network namespaces): Linux only; they are V1's |
+| a **swap** mid-typing, and a **catch-up snapshot** | the rig has one transport per run and cannot force a catch-up; follow-ups (below) |
+| the plan's 100,000 predicted faithful keys | this run is 6,471 faithful keys (one seed); `FIL_SUITES_SEEDS=16 FIL_SUITES_JOBS=7 just predict-suites` is about 100,000 faithful keys and 90 minutes, not run here |
+| the asterisk mask (`Program::Masked`) as a **matrix** program | it is in the secrets cells (above). In the matrix it would need its own typist: the suites' typist waits for the echo of every key (`settle_echoed`), and a mask echoes `*`, never the key, so every line would time out; and the predictor writes nothing in a raw no-echo prompt, so the cell would only show `written 0`, which the secrets cells already do |
+
+### Follow-ups (not in this PR)
+
+T1 part 2 merges with these done-when gaps owed (the coordinator's call on #46): fish, Linux, the swap and catch-up-snapshot faults, and the 100,000 faithful keys.
+
+1. A swap fault: a rig with both dialers and `Dialer::swap` mid-typing.
+2. A catch-up snapshot mid-typing (a flood larger than the held-output bound, or a daemon-side trigger).
+3. The Linux runs of the matrix and the secrets (`linux-check`), and fish there: for V1.
+4. The 100,000-key faithful run (16 seeds), and the plain-style (`Mosh`, adaptive) runs with the comparison restricted to mispredictions.
+5. F1's decision (and then the comparison's gated slack goes); F2 and F3 to P1's owner.
+6. An inverse-video guess (a program with an inverse pen) is taken for the status line by the classifier; it would show as a `written` disagreement. When such a program joins the suites, filter the status line by its row instead (#46's review, F5).

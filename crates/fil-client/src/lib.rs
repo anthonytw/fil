@@ -48,6 +48,8 @@ pub use config::{
 };
 pub use dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 pub use display::{Display, NoPrediction, PredictorFactory, predictor_factory};
+#[cfg(feature = "test-hooks")]
+pub use display::{FlushTap, TapEvent, TapKind};
 pub use escape::{Action, EscapeFilter};
 pub use forward::BindReport;
 pub use offline::{OfflineBuffer, OfflineInput, OfflineLog, parse_byte_size, parse_confirm};

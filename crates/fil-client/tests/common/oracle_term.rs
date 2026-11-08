@@ -22,11 +22,15 @@
 //! once the run is quiet the harness attaches a second client, takes the snapshot the daemon
 //! renders from its own emulator, and compares the user's terminal with it.
 //!
-//! What this part cannot do (it is part 2's): classify each written glyph from the structured
-//! flush. The engine writes one buffer per flush (erase, server bytes and paint together), so
-//! from the written bytes alone the paint cannot be told from the server's own output. The
-//! oracle terminal counts underlined glyphs instead, which is what the current predictor's
-//! guesses look like and nothing else in these programs.
+//! 4. **The independent classifier** ([`Classifier`], T1 part 2, `docs/m3/plan.md` §5.4): the
+//!    client's test-only flush tap (`ClientConfig::flush_tap`) hands it every overlay write in
+//!    its pieces (erase, server bytes, paint). It feeds a reference emulator the server bytes
+//!    only, and a second one everything, and classifies every glyph the second shows that the
+//!    first does not, from those bytes alone: written, confirmed, gated, mispredicted,
+//!    withdrawn. Its counts are compared with the core's `PredictStats` ([`Rig::agreement`]).
+//!
+//! The oracle terminal also counts underlined glyphs, which is what a guess looks like when the
+//! predictor underlines (the harness's `MoshAlways` does at every RTT); that count needs no tap.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -37,14 +41,14 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use fil_client::{
-    ClientConfig, ClientError, DialError, DialPurpose, Dialed, Dialer, Outcome, PredictorFactory,
-    TermEvent, TermInput, TermOutput, Terminal,
+    ClientConfig, ClientError, DialError, DialPurpose, Dialed, Dialer, FlushTap, Outcome,
+    PredictorFactory, TapEvent, TapKind, TermEvent, TermInput, TermOutput, Terminal,
 };
 use fil_netsim::{Net, StreamConfig, StreamControl, stream_pair};
 use fil_predict::sim::Rng;
 use fil_predict::{
     Ctx, InputPos, KeyEvent, LinkView, MoshConfig, MoshPredictor, Outcome as Settlement,
-    OverlayEdit, Predictor, Settled, Show,
+    OverlayEdit, PredictStats, Predictor, Settled, Show, WithdrawReason,
 };
 use fil_proto::ChannelId;
 use fil_proto::limits::PROTOCOL_MAJOR;
@@ -268,6 +272,12 @@ impl TermOutput for OracleOut {
 }
 
 impl OracleHandle {
+    /// Keys the client keeps (an answer to its own question): not counted in [`Self::typed`],
+    /// since they never reach the session.
+    pub fn type_answer(&self, b: &[u8]) {
+        let _ = self.tx.send(TermEvent::Input(b.to_vec()));
+    }
+
     pub fn type_bytes(&self, b: &[u8]) {
         self.shared.lock().unwrap().typed += b.len() as u64;
         let _ = self.tx.send(TermEvent::Input(b.to_vec()));
@@ -1016,7 +1026,135 @@ pub enum Program {
     /// no output and no mode change (a raw-mode secret read, review B2a of C1). `ready` once raw
     /// mode is on.
     SilentRead,
+    // T1 part 2's programs (`docs/m3/plan.md` §2.5's suites).
+    /// zsh with its line editor, `PROMPT='$ '` and `RPROMPT='[rp]'` (no global rc files).
+    Zsh,
+    /// dash, interactive: no line editor, so the kernel's canonical echo.
+    Dash,
+    /// Python 3.13 or later: the new REPL (pyrepl), or with `basic` the readline one
+    /// (`PYTHON_BASIC_REPL=1`). Needs a Python of 3.13 or later on the host ([`python313`]).
+    Python { basic: bool },
+    /// `cat` with the terminal in raw mode and echo on: the kernel echoes each byte as it is.
+    CatRaw,
+    /// A shell `read` loop with echo on (`> `, a canonical read).
+    ReadEcho,
+    /// A raw-mode line editor (`$ `) that echoes each key 60 to 200 ms after it takes it, in
+    /// order: faithful but slow (the `EchoAck` comes first). `ready` once raw mode is on.
+    SlowEcho,
+    /// A raw-mode line editor that echoes every letter upper-cased (adversarial).
+    Upper,
+    /// A raw-mode program that echoes nothing (adversarial).
+    NoEcho,
+    /// A raw-mode line editor that echoes faithfully and writes one of the M0 hazards (a saved
+    /// and restored cursor with a glyph drawn elsewhere, insert mode, a character set, a
+    /// synchronized-output batch, a pen left open, a sequence cut between two writes) before
+    /// every fifth echo: the M0 adversary on a real PTY (adversarial).
+    Adversary,
+    /// `cat` with a background job printing a line every 700 ms, twelve times (so the run can
+    /// go quiet at its end): another writer on the screen (adversarial).
+    Background,
+    /// Python's `getpass` (canonical, echo off): a password prompt, a second after the start (so
+    /// the attach's first `PtyMode` is the echoing one). `ready` just before each prompt.
+    Getpass,
 }
+
+/// The first Python of 3.13 or later on the host's `PATH` (the session's own `PATH` is fixed and
+/// short), for pyrepl.
+pub fn python313() -> Option<String> {
+    for name in [
+        "python3.16",
+        "python3.15",
+        "python3.14",
+        "python3.13",
+        "python3",
+    ] {
+        let Ok(out) = std::process::Command::new(name)
+            .args([
+                "-c",
+                "import sys; print(sys.version_info >= (3, 13), sys.executable)",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(path) = text.trim().strip_prefix("True ") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// A Python 3 for the scripted programs (any version): the host's, by absolute path.
+fn python3() -> String {
+    python313()
+        .or_else(|| {
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|p| !p.is_empty())
+        })
+        .unwrap_or_else(|| "/usr/bin/python3".into())
+}
+
+/// The scripted raw-mode line editors (`SlowEcho`, `Upper`, `NoEcho`, `Adversary`): one key at a
+/// time, Backspace as `\b \b`, Enter as a new line and `$ `.
+const ECHO_PY: &str = r#"
+import os, sys, tty, time, select, random
+mode = sys.argv[1]
+tty.setraw(0)
+open(os.environ["T"] + "/ready", "w").close()
+os.write(1, b"$ ")
+rng = random.Random(7)
+HAZ = [
+    [b"\x1b7\x1b[3;60H\x1b[1m#\x1b[0m\x1b8"],
+    [b"\x1b[4h", b"\x1b[4l"],
+    [b"\x1b(0", b"\x1b(B"],
+    [b"\x1b[?2026h", b"\x1b[?2026l"],
+    [b"\x1b[33m"],
+    [b"\x1b[", b"0m"],
+]
+q = []
+n = 0
+while True:
+    timeout = max(0.0, q[0][0] - time.monotonic()) if q else None
+    r, _, _ = select.select([0], [], [], timeout)
+    now = time.monotonic()
+    if r:
+        data = os.read(0, 1024)
+        if not data:
+            break
+        for b in data:
+            if b == 3:
+                sys.exit(0)
+            if b == 0x7F:
+                out = b"\b \b"
+            elif b == 13:
+                out = b"\r\n$ "
+            elif mode == "upper":
+                out = bytes([b]).upper()
+            elif mode == "none":
+                out = b""
+            else:
+                out = bytes([b])
+            chunks = [out]
+            if mode == "adversary" and b not in (13, 0x7F):
+                n += 1
+                if n % 5 == 0:
+                    h = HAZ[(n // 5) % len(HAZ)]
+                    chunks = [h[0], b"".join(h[1:]) + out]
+            delay = rng.uniform(0.06, 0.2) if mode == "slow" else 0.0
+            due = max(now + delay, q[-1][0] if q else 0.0)
+            for i, c in enumerate(chunks):
+                q.append((due + 0.02 * i, c))
+    now = time.monotonic()
+    while q and q[0][0] <= now:
+        c = q.pop(0)[1]
+        if c:
+            os.write(1, c)
+"#;
 
 impl Program {
     pub fn name(&self) -> String {
@@ -1028,6 +1166,18 @@ impl Program {
             Program::Sudo => "sudo".into(),
             Program::Masked => "masked".into(),
             Program::SilentRead => "silent-read".into(),
+            Program::Zsh => "zsh".into(),
+            Program::Dash => "dash".into(),
+            Program::Python { basic: false } => "pyrepl".into(),
+            Program::Python { basic: true } => "python-basic".into(),
+            Program::CatRaw => "cat-raw".into(),
+            Program::ReadEcho => "read".into(),
+            Program::SlowEcho => "slow-echo".into(),
+            Program::Upper => "upper".into(),
+            Program::NoEcho => "no-echo".into(),
+            Program::Adversary => "adversary".into(),
+            Program::Background => "background".into(),
+            Program::Getpass => "getpass".into(),
         }
     }
 
@@ -1036,8 +1186,46 @@ impl Program {
         match self {
             Program::Cat | Program::Fill(_) => "READY",
             Program::Bash => "$",
-            Program::ReadS | Program::Masked => "Password:",
+            Program::ReadS | Program::Masked | Program::Getpass => "Password:",
             Program::Sudo | Program::SilentRead => "$",
+            Program::Zsh | Program::Dash => "$",
+            Program::Python { .. } => ">>>",
+            Program::CatRaw | Program::Background => "READY",
+            Program::ReadEcho => ">",
+            Program::SlowEcho | Program::Upper | Program::NoEcho | Program::Adversary => "$",
+        }
+    }
+
+    /// Whether the host can run it (a missing shell or Python is a cell not run, and says so).
+    pub fn available(&self) -> Result<(), String> {
+        let have = |bin: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {bin} >/dev/null")])
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        match self {
+            Program::Zsh if !have("zsh") => Err("no zsh in /usr/bin:/bin".into()),
+            Program::Dash if !have("dash") => Err("no dash in /usr/bin:/bin".into()),
+            Program::Python { .. } if python313().is_none() => {
+                Err("no Python 3.13 or later on PATH".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Variables this program needs on top of the session's.
+    fn env(&self) -> Vec<(String, String)> {
+        match self {
+            Program::Python { basic } => {
+                let mut v = vec![("PYTHONSTARTUP".to_string(), String::new())];
+                if *basic {
+                    v.push(("PYTHON_BASIC_REPL".into(), "1".into()));
+                }
+                v
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1069,6 +1257,31 @@ impl Program {
             Program::SilentRead => sh("sleep 1; stty raw -echo; : > \"$T/ready\"; printf '$ '; \
                  while :; do c=$(dd bs=1 count=1 2>/dev/null); printf '%s' \"$c\"; \
                  [ \"$c\" = s ] && break; done; exec cat >/dev/null"),
+            Program::Zsh => vec!["zsh".into(), "--no-globalrcs".into(), "-i".into()],
+            Program::Dash => vec!["dash".into(), "-i".into()],
+            Program::Python { .. } => {
+                vec![python313().expect("checked by available()"), "-q".into()]
+            }
+            Program::CatRaw => sh("echo READY; stty raw; exec cat"),
+            Program::ReadEcho => sh("while :; do printf '> '; read line; done"),
+            Program::SlowEcho => vec![python3(), "-c".into(), ECHO_PY.into(), "slow".into()],
+            Program::Upper => vec![python3(), "-c".into(), ECHO_PY.into(), "upper".into()],
+            Program::NoEcho => vec![python3(), "-c".into(), ECHO_PY.into(), "none".into()],
+            Program::Adversary => vec![python3(), "-c".into(), ECHO_PY.into(), "adversary".into()],
+            Program::Background => sh(
+                "(i=0; while [ $i -lt 12 ]; do i=$((i+1)); sleep 0.7; printf 'tick\\n'; done) & \
+                 echo READY; exec cat",
+            ),
+            Program::Getpass => vec![
+                python3(),
+                "-c".into(),
+                "import getpass, os, time\n\
+                 time.sleep(1)\n\
+                 while True:\n    \
+                 open(os.environ['T'] + '/ready', 'w').close()\n    \
+                 getpass.getpass('Password: ')\n    print('done')\n"
+                    .into(),
+            ],
             Program::Fill(n) => sh(&format!(
                 "i=0; while [ $i -lt {n} ]; do i=$((i+1)); \
                  echo \"row $i 0123456789 abcdefghij ABCDEFGHIJ klmnopqrst\"; done; \
@@ -1095,6 +1308,11 @@ pub struct Spec {
     /// Guards of the prediction core switched off for the run (`Guards::disable` names), through
     /// the client's test-only seam (`ClientConfig::predict_guards`): a full-stack mutation.
     pub guards_off: Vec<&'static str>,
+    /// Guards switched on for the run (`Guards::enable` names): the proposed hardening
+    /// `ack_before_write`.
+    pub guards_on: Vec<&'static str>,
+    /// `OfflineInput::confirm_after`: ask before sending what was typed offline.
+    pub offline_confirm: Option<Duration>,
 }
 
 impl Spec {
@@ -1110,6 +1328,8 @@ impl Spec {
             predict: Predict::MoshAlways,
             drop_pty_mode: false,
             guards_off: Vec::new(),
+            guards_on: Vec::new(),
+            offline_confirm: None,
         }
     }
 
@@ -1155,6 +1375,8 @@ pub struct Rig {
     /// The client's shadow screen as the predictor last saw it.
     pub shadow: Arc<Mutex<Option<TermState>>>,
     pub scratch: Scratch,
+    /// The independent classifier, fed by the client's flush tap (none when `Predict::Off`).
+    pub classifier: Arc<Mutex<Classifier>>,
     client: Option<JoinHandle<RunResult>>,
     net: Option<Net>,
     ctls: Arc<Mutex<Vec<StreamControl>>>,
@@ -1192,6 +1414,13 @@ fn session_config(scratch: &Scratch, spec: &Spec) -> SessionConfig {
         ),
         ("LC_ALL".into(), utf8.into()),
     ];
+    cfg.env.extend(spec.program.env());
+    // zsh reads `$HOME/.zshrc` (HOME is the scratch directory; `--no-globalrcs` skips /etc).
+    std::fs::write(
+        scratch.path(".zshrc"),
+        "PROMPT='$ '\nRPROMPT='[rp]'\nunsetopt PROMPT_SP BEEP\n",
+    )
+    .unwrap();
     cfg.cwd = Some(scratch.0.clone());
     cfg.scope = ScopeMode::Tree;
     cfg
@@ -1213,12 +1442,23 @@ impl Rig {
         let (terminal, term) = oracle_terminal(spec.size.0, spec.size.1, "xterm-256color");
         let mut cfg = ClientConfig::new("main".parse().unwrap(), "e2e".parse().unwrap());
         cfg.preserve_screen = false;
-        if !spec.guards_off.is_empty() {
+        if !spec.guards_off.is_empty() || !spec.guards_on.is_empty() {
             let mut g = fil_predict::Guards::ALL;
             for name in &spec.guards_off {
                 assert!(g.disable(name), "no guard named {name}");
             }
+            for name in &spec.guards_on {
+                assert!(g.enable(name), "no guard named {name}");
+            }
             cfg.predict_guards = Some(g);
+        }
+        cfg.offline.confirm_after = spec.offline_confirm;
+        let classifier: Arc<Mutex<Classifier>> = Arc::default();
+        if spec.predict != Predict::Off {
+            let c = classifier.clone();
+            cfg.flush_tap = Some(FlushTap(Arc::new(move |ev| {
+                c.lock().unwrap().on_event(ev);
+            })));
         }
         let shadow: Arc<Mutex<Option<TermState>>> = Arc::default();
         let factory = predictor_factory(spec.predict, spec.rtt(), &stats, &shadow);
@@ -1300,6 +1540,7 @@ impl Rig {
             stats,
             shadow,
             scratch,
+            classifier,
             client: Some(client),
             net,
             ctls,
@@ -1546,10 +1787,26 @@ impl Rig {
         }
     }
 
+    /// The classifier's counts against the core's (`docs/m3/plan.md` §5.4): empty when they
+    /// agree. See [`Agreement`].
+    pub fn agreement(&self) -> Agreement {
+        let c = self.classifier.lock().unwrap();
+        Agreement {
+            classified: c.totals(),
+            core: c.stats,
+        }
+    }
+
     /// What the run showed so far.
     pub fn report(&self) -> Report {
         let (paints, flashes) = self.term.paints();
+        let (classified, core) = {
+            let c = self.classifier.lock().unwrap();
+            (c.totals(), c.stats)
+        };
         Report {
+            classified,
+            core,
             writes: self.term.writes(),
             paints,
             flashes,
@@ -1711,6 +1968,10 @@ pub struct Report {
     pub echo_acks: u64,
     /// The highest `EchoAck.input_upto` seen.
     pub last_echo_ack: u64,
+    /// What the independent classifier counted, from the flush tap's bytes alone.
+    pub classified: Classified,
+    /// The core's own counts, as of the classifier's last event.
+    pub core: PredictStats,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1914,4 +2175,381 @@ pub async fn secret_trial(spec: Spec, ahead: bool) -> Report {
     let r = rig.report();
     rig.abort().await;
     r
+}
+
+// ---------------------------------------------------------------------------------------------
+// The independent classifier (T1 part 2, `docs/m3/plan.md` §5.4)
+
+/// What the classifier counted. A **guess on the screen** is a cell where the emulator fed every
+/// byte of the overlay's writes (the user's terminal, in the classifier's model) shows other text
+/// or other attributes than the reference emulator fed the server's bytes only (the screen the
+/// session drew), leaving out the cells the overlay draws in inverse video (the status line and
+/// its questions). It is classified when it goes, as the core does (`PredictStats`, §2.5):
+///
+/// - **confirmed**: the reference shows its glyph in that cell when it goes (restyled or not);
+/// - **superseded**: another guess's glyph takes the cell in the same write (a Backspace over it);
+/// - **withdrawn**: it goes in a lifecycle write (`Display::withdraw` for a lifecycle reason, a
+///   resize, the first write after a snapshot's reset) or while the link is down (the backstop);
+/// - **gated**: it goes, in a write that is not a `Display::withdraw` and prints no *foreign*
+///   glyph, while the reference shows nothing in its cell, and, with no foreign glyph printed in
+///   between, the reference's next glyph in that cell is the same one. A write's foreign glyphs
+///   are the glyphs its server bytes print (counted by a parser of its own, across writes, so a
+///   sequence cut between two writes is one sequence) beyond the guesses whose cells it fills
+///   with their own glyph (the echoes); a glyph printed over the same glyph counts, though the
+///   screen does not change. The overlay took such a guess off before its echo came (a gate:
+///   insert mode, a character set, a synchronized-output batch) and the echo brought it back
+///   (finding F1, `docs/m3/harness.md` §9). The user saw the glyph go and come back, but
+///   never a wrong one. Such a guess is *held* from the write that removed it until the
+///   reference shows a glyph there (or a foreign glyph is drawn anywhere, a lifecycle write
+///   comes, or the run ends);
+/// - **mispredicted**: any other way: a visible misprediction (a held guess whose cell then
+///   shows another glyph, that a foreign glyph ends, or that is still held at the end, too).
+///
+/// Nothing here reads the core's state: only the tap's bytes, which call made them, and the link
+/// state the core was told. Two things are shared with the core all the same
+/// (`docs/m3/harness.md` §9): the emulator backend (alacritty, as the client's shadow), and the
+/// `WithdrawReason` the engine passed to `Display::withdraw`, which decides a lifecycle write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Classified {
+    pub written: u64,
+    pub confirmed: u64,
+    pub mispredicted: u64,
+    /// Taken off before the echo, then echoed in the same cell (F1): the core counts each as
+    /// confirmed or as mispredicted, depending on the gate (see [`Agreement`]).
+    pub gated: u64,
+    /// Lifecycle withdrawals and supersessions (`superseded` is a part of it).
+    pub withdrawn: u64,
+    pub superseded: u64,
+    /// Writes that removed at least one guess as mispredicted: the shown runs of wrong guesses.
+    pub runs: u64,
+    /// Guesses written by a keystroke after a misprediction, before the session wrote anything
+    /// more: §2.5's adversarial bar ("nothing more is written until the core confirms a new
+    /// epoch"), as far as bytes can show it. A confirmation needs output (rule 2), so a guess
+    /// written with no output since the misprediction was written in the old epoch.
+    pub written_unconfirmed: u64,
+    /// Tap events seen (the tap is live).
+    pub events: u64,
+}
+
+/// See [`Classified`].
+#[derive(Default)]
+pub struct Classifier {
+    user: Option<Box<dyn Emulator>>,
+    reference: Option<Box<dyn Emulator>>,
+    /// The guesses on the screen after the last write: cell to (text, attributes).
+    layer: BTreeMap<(u16, u16), (String, fil_term::model::Attrs)>,
+    /// A snapshot's reset happened: the next write classifies what was on the screen.
+    after_reset: bool,
+    link_down: bool,
+    /// A misprediction was shown and nothing has been confirmed since.
+    tainted: bool,
+    /// Guesses taken off while the reference showed nothing in their cell, not yet classified:
+    /// cell to text (see `gated` in [`Classified`]).
+    held: BTreeMap<(u16, u16), String>,
+    /// Guesses a keystroke wrote while some guess was held: `written_unconfirmed` if the held
+    /// guess turns out mispredicted.
+    written_while_held: u64,
+    /// Counts the glyphs the server's bytes print (state kept across writes).
+    scan: vte::Parser,
+    pub counts: Classified,
+    /// The core's counts carried by the last write.
+    pub stats: PredictStats,
+    /// When each guess appeared on the screen (for the first-write latency).
+    pub write_times: Vec<Instant>,
+    /// The first few misclassifications, for a report (synthetic sessions only).
+    pub notes: Vec<String>,
+}
+
+fn new_emulator(size: fil_term::Size) -> Box<dyn Emulator> {
+    let backend = fil_term::backends()
+        .into_iter()
+        .find(|b| b.name == fil_term::DEFAULT_BACKEND)
+        .expect("default backend");
+    (backend.create)(size, 0)
+}
+
+/// Counts `print`s: the glyphs a stream draws.
+struct Prints(u64);
+
+impl vte::Perform for Prints {
+    fn print(&mut self, _: char) {
+        self.0 += 1;
+    }
+}
+
+fn norm(text: &str) -> &str {
+    if text == " " { "" } else { text }
+}
+
+impl Classifier {
+    pub fn on_event(&mut self, ev: &TapEvent) {
+        self.counts.events += 1;
+        match ev {
+            TapEvent::Raw(bytes) => {
+                for e in [&mut self.user, &mut self.reference].into_iter().flatten() {
+                    e.feed(bytes);
+                    let _ = e.take_replies();
+                }
+            }
+            TapEvent::Reset { size } => {
+                self.user = Some(new_emulator(*size));
+                self.reference = Some(new_emulator(*size));
+                self.after_reset = true;
+            }
+            TapEvent::Link { down } => self.link_down = *down,
+            TapEvent::Flush {
+                kind,
+                flush,
+                size,
+                stats,
+            } => {
+                self.stats = *stats;
+                self.flush(*kind, flush, *size);
+            }
+        }
+    }
+
+    fn flush(&mut self, kind: TapKind, f: &fil_predict::Flush, size: fil_term::Size) {
+        let user = self.user.get_or_insert_with(|| new_emulator(size));
+        let reference = self.reference.get_or_insert_with(|| new_emulator(size));
+        // The erase is for the geometry the guesses were drawn on: the classifier models the
+        // overlay's own contract (the terminal equals the reference whenever nothing is drawn),
+        // so it erases before it resizes; the true-order damage is the oracle terminal's.
+        user.feed(&f.erase);
+        if kind == TapKind::Resize {
+            user.resize(size);
+            reference.resize(size);
+        }
+        let before = reference.state(0);
+        user.feed(&f.server);
+        reference.feed(&f.server);
+        user.feed(&f.paint);
+        let _ = user.take_replies();
+        let _ = reference.take_replies();
+        let (u, r) = (user.state(0), reference.state(0));
+        let mut now: BTreeMap<(u16, u16), (String, fil_term::model::Attrs)> = BTreeMap::new();
+        for (row, (ul, rl)) in u.screen.iter().zip(r.screen.iter()).enumerate() {
+            for (col, (uc, rc)) in ul.cells.iter().zip(rl.cells.iter()).enumerate() {
+                let differs = norm(&uc.text) != norm(&rc.text) || uc.attrs != rc.attrs;
+                // Any inverse-video cell the overlay draws counts as the status line's (F5 of
+                // #46's review). A guess drawn in inverse video (a program with an inverse pen,
+                // such as a highlighted input field) would be left out here, and would show as a
+                // `written` disagreement, which fails loudly. When such a program is in the
+                // suites, filter by the status line's row (the display's placement) instead.
+                let status = uc.attrs.inverse && !rc.attrs.inverse;
+                if differs && !status {
+                    now.insert(
+                        (row as u16, col as u16),
+                        (norm(&uc.text).to_string(), uc.attrs),
+                    );
+                }
+            }
+        }
+        let lifecycle = match kind {
+            TapKind::Withdraw(r) => !matches!(
+                r,
+                WithdrawReason::Predictor
+                    | WithdrawReason::Ended
+                    | WithdrawReason::Password
+                    | WithdrawReason::Expired
+            ),
+            TapKind::Resize => true,
+            _ => false,
+        } || std::mem::take(&mut self.after_reset)
+            || self.link_down;
+        let shown = |pos: (u16, u16)| -> String {
+            r.screen
+                .get(usize::from(pos.0))
+                .and_then(|l| l.cells.get(usize::from(pos.1)))
+                .map_or(String::new(), |c| norm(&c.text).to_string())
+        };
+        // The foreign glyphs (see `gated` in [`Classified`]): what the server's bytes print
+        // beyond the echoes of the guesses that go or are held.
+        let mut prints = Prints(0);
+        self.scan.advance(&mut prints, &f.server);
+        let was = |pos: (u16, u16)| -> &str {
+            before
+                .screen
+                .get(usize::from(pos.0))
+                .and_then(|l| l.cells.get(usize::from(pos.1)))
+                .map_or("", |c| norm(&c.text))
+        };
+        // An echo is a guess's cell the bytes changed to its glyph (a blank echoed over a blank
+        // is not seen, and counts as foreign: a hold ends early, never late).
+        let echoes = self
+            .layer
+            .iter()
+            .map(|(pos, (text, _))| (pos, text))
+            .chain(self.held.iter())
+            .filter(|(pos, text)| shown(**pos) == **text && was(**pos) != text.as_str())
+            .count();
+        let foreign = prints.0 > echoes as u64;
+        let mut mispredicted = 0;
+        // The held guesses first: the reference's glyph in the cell decides, or a lifecycle
+        // write withdraws them (the core still had them pending), or a new guess in the cell
+        // ends the hold as a misprediction.
+        let held = std::mem::take(&mut self.held);
+        for (pos, text) in held {
+            let s = shown(pos);
+            if lifecycle {
+                self.counts.withdrawn += 1;
+            } else if s.is_empty() && !now.contains_key(&pos) && !foreign {
+                self.held.insert(pos, text);
+            } else if s == text {
+                self.counts.gated += 1;
+            } else {
+                mispredicted += 1;
+                if self.notes.len() < 20 {
+                    self.notes.push(format!(
+                        "{kind:?}: {text:?} at {pos:?} (held) went; the screen shows {s:?}"
+                    ));
+                }
+            }
+        }
+        for (pos, (text, _)) in &self.layer {
+            match now.get(pos) {
+                Some((t, _)) if t == text => {}
+                Some(_) => {
+                    self.counts.superseded += 1;
+                    self.counts.withdrawn += 1;
+                }
+                None if shown(*pos) == *text => self.counts.confirmed += 1,
+                None if lifecycle => self.counts.withdrawn += 1,
+                // A predictor's own withdrawal settles the guess there: never held.
+                None if shown(*pos).is_empty()
+                    && !foreign
+                    && !matches!(kind, TapKind::Withdraw(_)) =>
+                {
+                    self.held.insert(*pos, text.clone());
+                }
+                None => {
+                    mispredicted += 1;
+                    if self.notes.len() < 20 {
+                        self.notes.push(format!(
+                            "{kind:?}: {text:?} at {pos:?} went; the screen shows {:?}",
+                            shown(*pos)
+                        ));
+                    }
+                }
+            }
+        }
+        let mut written = 0;
+        for (pos, (text, _)) in &now {
+            if self.layer.get(pos).is_none_or(|(t, _)| t != text) {
+                written += 1;
+            }
+        }
+        self.counts.mispredicted += mispredicted;
+        self.counts.written += written;
+        if mispredicted > 0 {
+            self.counts.runs += 1;
+            if !self.tainted {
+                self.counts.written_unconfirmed += self.written_while_held;
+            }
+            self.tainted = true;
+        }
+        if self.held.is_empty() {
+            self.written_while_held = 0;
+        }
+        if written > 0 {
+            let at = Instant::now();
+            self.write_times
+                .extend(std::iter::repeat_n(at, written as usize));
+            if kind == TapKind::Input && self.tainted {
+                self.counts.written_unconfirmed += written;
+            } else if kind == TapKind::Input && !self.held.is_empty() {
+                self.written_while_held += written;
+            }
+        }
+        // A new epoch is confirmed only by output (rule 2): until the session has written
+        // something after the misprediction, a keystroke may write nothing.
+        if kind == TapKind::Server && !f.server.is_empty() && mispredicted == 0 {
+            self.tainted = false;
+        }
+        self.layer = now;
+    }
+
+    /// Guesses on the screen now, by the classifier's count.
+    pub fn on_screen(&self) -> usize {
+        self.layer.len()
+    }
+
+    /// The counts, with any guess still held counted as mispredicted: it went and its cell
+    /// never showed it.
+    pub fn totals(&self) -> Classified {
+        let mut c = self.counts;
+        let held = self.held.len() as u64;
+        if held > 0 {
+            c.mispredicted += held;
+            c.runs += 1;
+            if !self.tainted {
+                c.written_unconfirmed += self.written_while_held;
+            }
+        }
+        c
+    }
+}
+
+/// The classifier's counts against the core's. Written and withdrawn must be equal. Every guess
+/// the classifier confirmed the core must count confirmed (or restyled), every one it
+/// mispredicted the core must count mispredicted, and the core's remaining confirmations and
+/// mispredictions must be exactly the gated guesses, each in one of the two:
+///
+/// `core confirmed - classifier confirmed` + `core mispredicted - classifier mispredicted`
+/// = `gated`, with both differences at least 0.
+///
+/// The gated guesses are the one place the mapping is not one bucket to one bucket, because the
+/// core files byte-for-byte alike gates differently: on the M0 adversary it counts a guess taken
+/// off for insert mode, or for a glyph drawn elsewhere, as `mispredicted.ended` at once, and one
+/// taken off for a character set or a synchronized-output batch as pending, confirmed by its
+/// echo (F1, `docs/m3/harness.md` §9). The user sees the same thing in each: the glyph goes and
+/// comes back. So the slack is at most the gated count, which the classifier finds from bytes,
+/// and is 0 on any cell without a gate: there a core that files a contradiction as a
+/// confirmation fails (`an_upper_case_echo_is_counted_the_same_and_bounded`).
+///
+/// They agree only when every written guess is visible from the bytes, which it is when the
+/// predictor underlines (the suites run `MoshAlways`, underlined at every RTT): an underlined
+/// guess differs from the cell under it even when it is a blank over a blank. A plain guess
+/// identical to the cell under it (a typed space over a blank) shows no difference, so the core
+/// counts it and the classifier cannot.
+#[derive(Clone, Copy, Debug)]
+pub struct Agreement {
+    pub classified: Classified,
+    pub core: PredictStats,
+}
+
+impl Agreement {
+    /// The gated guesses as the core filed them: (confirmed, mispredicted), or `None` when the
+    /// counts do not fit (see [`Agreement`]).
+    pub fn gated_split(&self) -> Option<(u64, u64)> {
+        let (c, s) = (&self.classified, &self.core);
+        let conf = (s.confirmed + s.restyled).checked_sub(c.confirmed)?;
+        let misp = s.mispredicted.total().checked_sub(c.mispredicted)?;
+        (conf + misp == c.gated).then_some((conf, misp))
+    }
+
+    /// The counts that differ; empty when they agree.
+    pub fn diffs(&self) -> Vec<String> {
+        let (c, s) = (&self.classified, &self.core);
+        let mut d = Vec::new();
+        let mut check = |what: &str, a: u64, b: u64| {
+            if a != b {
+                d.push(format!("{what}: classifier {a}, core {b}"));
+            }
+        };
+        check("written", c.written, s.written);
+        check("withdrawn", c.withdrawn, s.withdrawn.total());
+        if self.gated_split().is_none() {
+            d.push(format!(
+                "confirmed {}, mispredicted {} and gated {} (classifier) do not map onto confirmed \
+                 {} and mispredicted {} (core)",
+                c.confirmed,
+                c.mispredicted,
+                c.gated,
+                s.confirmed + s.restyled,
+                s.mispredicted.total()
+            ));
+        }
+        d
+    }
 }

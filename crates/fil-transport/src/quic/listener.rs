@@ -139,6 +139,12 @@ impl Live {
         conns.retain(|(_, c)| c.close_reason().is_none());
         conns.push((key, conn));
     }
+
+    /// Forgets a connection that has closed (by [`Connection::stable_id`]), so that a daemon
+    /// whose last client left holds no connection until the next one comes.
+    fn forget(&self, id: usize) {
+        self.lock().retain(|(_, c)| c.stable_id() != id);
+    }
 }
 
 struct Inner {
@@ -274,6 +280,13 @@ impl QuicListener {
         self.0.live.sweeps.load(Ordering::Relaxed)
     }
 
+    /// Connections still listed, open or not (feature `test-hooks`): a closed one is forgotten
+    /// when it closes, and a test keeps that so.
+    #[cfg(feature = "test-hooks")]
+    pub fn listed_connections(&self) -> usize {
+        self.0.live.lock().len()
+    }
+
     /// Connections currently open.
     pub fn live_connections(&self) -> usize {
         self.0
@@ -390,11 +403,16 @@ impl AcceptLoop {
             live.add(key.clone(), conn.clone());
             if !registry.contains(&key) {
                 QuicLink::close_revoked(&conn);
-                return;
+            } else {
+                bump(&counters.accepted);
+                let link = QuicLink::accepted(conn.clone(), params);
+                let _ = out.send(link).await;
             }
-            bump(&counters.accepted);
-            let link = QuicLink::accepted(conn, params);
-            let _ = out.send(link).await;
+            // The listener's `accept` ends once it is closed, not once every connection has.
+            drop(out);
+            // Forgotten as it closes, not at the next connection, revocation or sweep.
+            conn.closed().await;
+            live.forget(conn.stable_id());
         });
     }
 }

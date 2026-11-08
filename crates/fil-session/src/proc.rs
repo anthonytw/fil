@@ -892,19 +892,25 @@ fn kill_session_with(
 
     let deadline = Instant::now() + grace;
     loop {
-        // A table that cannot be read just now says nothing: wait out the grace.
-        let Some(table) = (table.scan)() else {
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
+        let group_empty = || nix::sys::signal::killpg(pgid, None).is_err();
+        let (gone, group_gone) = match (table.scan)() {
+            // Every live descendant is a victim here, so a dead (zombie) root is enough for
+            // the group.
+            Some(rows) => (
+                victims
+                    .iter()
+                    .all(|v| rows.iter().find(|r| r.pid == *v).is_none_or(|r| r.zombie)),
+                group_empty() || rows.iter().filter(|r| r.pid == root).all(|r| r.zombie),
+            ),
+            // No table just now: the victims are only the recorded processes, each looked up on
+            // its own, as they were chosen. A member of the group nobody recorded yet still gets
+            // its grace, so only an empty group ends it (the session's waiter reaps the root),
+            // and with a scope, whose members cannot be seen here, the grace is waited out.
+            None => (
+                table.still_victims(&chosen).is_empty(),
+                group_empty() && !matches!(scope, Scope::Systemd { .. }),
+            ),
         };
-        let gone = victims
-            .iter()
-            .all(|v| table.iter().find(|r| r.pid == *v).is_none_or(|r| r.zombie));
-        let group_gone = nix::sys::signal::killpg(pgid, None).is_err()
-            || table.iter().filter(|r| r.pid == root).all(|r| r.zombie);
         if (gone && group_gone) || Instant::now() >= deadline {
             break;
         }
@@ -923,9 +929,11 @@ fn kill_session_with(
     // sleep can outlast any wait, and a stuck victim must not hang the teardown).
     let deadline = Instant::now() + KILL_CONFIRM;
     loop {
-        let Some(table) = (table.scan)() else {
-            // Not confirmed: the leftovers may or may not be gone.
-            if Instant::now() >= deadline {
+        let Some(rows) = (table.scan)() else {
+            // No table: the victims looked up one by one. Their being gone ends the wait, but
+            // the table was not read, so the answer stays `Unread` (and so does one that runs
+            // out of time: the leftovers may or may not be gone).
+            if table.still_victims(&chosen).is_empty() || Instant::now() >= deadline {
                 return TableRead::Unread;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -934,12 +942,7 @@ fn kill_session_with(
         let left: Vec<u32> = victims
             .iter()
             .copied()
-            .filter(|v| {
-                table
-                    .iter()
-                    .find(|r| r.pid == *v)
-                    .is_some_and(|r| !r.zombie)
-            })
+            .filter(|v| rows.iter().find(|r| r.pid == *v).is_some_and(|r| !r.zombie))
             .collect();
         if left.is_empty() {
             return read;
@@ -1366,6 +1369,85 @@ mod tests {
         let _ = reused.kill();
         let _ = reused.wait();
         assert!(spared, "a pid whose start time differs is not signalled");
+    }
+
+    /// A kill whose process table cannot be read ends once its victims and its group are gone,
+    /// each looked up on its own, instead of waiting out the grace and the confirmation (it took
+    /// grace + `KILL_CONFIRM` every time). Bound class T: it separates those fixed waits (7 s
+    /// here) from the time a `sleep` takes to die on a hangup (milliseconds). One sample, no
+    /// `Stalls`: the margin is about 100x and the test runs alone, so only a host stall of
+    /// seconds could miss it.
+    #[test]
+    fn wallclock_a_kill_without_a_table_ends_when_its_victims_do() {
+        let mut root = sleeper();
+        let mut recorded = sleeper();
+        let (r, a) = (root.id(), recorded.id());
+        let Some(start) = process_row(a).map(|r| r.start) else {
+            // No way to read one process here: nothing to check.
+            for c in [&mut root, &mut recorded] {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return;
+        };
+        let mut tracker = Tracker::default();
+        tracker.refresh(r, &[row(r, 1, "root"), row(a, r, &start)]);
+        let unread = Table {
+            scan: &|| None,
+            row_of: &process_row,
+        };
+        // The root is reaped as it dies, as the session's waiter does, so its group empties.
+        let reaper = std::thread::spawn(move || root.wait());
+        let t = Instant::now();
+        let read = kill_session_with(&unread, r, &Scope::Tree, &tracker, Duration::from_secs(5));
+        let took = t.elapsed();
+        let _ = reaper.join();
+        let _ = recorded.wait();
+        assert_eq!(read, TableRead::Unread);
+        assert!(took < Duration::from_secs(2), "the kill took {took:?}");
+    }
+
+    /// Without a table, a member of the session's group that nobody recorded (started since the
+    /// last recording) still gets the whole grace: the root dying on the hangup does not end it,
+    /// only an empty group would. Then SIGKILL to the group ends the member.
+    #[test]
+    fn a_kill_without_a_table_gives_an_unrecorded_group_member_its_grace() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        // The root dies on the hangup; its background child, in the same group, ignores it.
+        let mut root = Command::new("sh")
+            .args(["-c", "(trap '' HUP; echo ready; exec sleep 30) & wait"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(root.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let r = root.id();
+        let reaper = std::thread::spawn(move || root.wait());
+        let unread = Table {
+            scan: &|| None,
+            row_of: &process_row,
+        };
+        let grace = Duration::from_millis(500);
+        let t = Instant::now();
+        let read = kill_session_with(&unread, r, &Scope::Tree, &Tracker::default(), grace);
+        let took = t.elapsed();
+        let _ = reaper.join();
+        assert_eq!(read, TableRead::Unread);
+        assert!(took >= grace, "the grace ended after {took:?}");
+        let pgid = Pid::from_raw(r as i32);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::killpg(pgid, None).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            nix::sys::signal::killpg(pgid, None).is_err(),
+            "the group member survived SIGKILL"
+        );
     }
 
     /// A process in a group of its own that ignores the hangup, so only SIGKILL ends it.

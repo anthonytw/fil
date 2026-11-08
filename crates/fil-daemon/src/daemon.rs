@@ -836,7 +836,13 @@ impl Daemon {
         });
         let (stop, _) = watch::channel(None);
         let keeping = Keeping::default();
-        let dir_lock = hold_dir_lock(&paths, Duration::from_secs(2));
+        // The directory lock goes on the descriptor the socket was just bound through, not on a
+        // second look-up of the path, so the socket and the lock are in the same directory.
+        #[cfg(test)]
+        if let Some(f) = BEFORE_DIR_LOCK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+        let dir_lock = hold_dir_lock_on(dir, Duration::from_secs(2));
         tracing::info!(
             socket = %sock.display(),
             udp_port = inner.host.direct_now().map_or(0, |d| d.udp_port),
@@ -998,9 +1004,10 @@ impl Daemon {
     /// The socket directory a repair or a retiring daemon binds in: the one this daemon checked
     /// and keeps its lock on (a descriptor of that very directory), so that a directory put at
     /// the path since, even one that passes the checks, is not bound in ([`bind_socket_in`]
-    /// then refuses: the path no longer leads to it). Without a directory lock there is no
-    /// checked directory to hold on to, and the one at the path is opened and checked now. No
-    /// wait: while a look holds the locks this is an error, and the next check binds.
+    /// then refuses: the path no longer leads to it). A daemon that keeps a directory lock but
+    /// could not take it has no checked directory, and binds nothing until a look has locked one.
+    /// Only a daemon that keeps no directory lock (a test's) opens and checks the one at the path
+    /// now. No wait: while a look holds the locks this is an error, and the next check binds.
     fn bind_dir(&self) -> std::io::Result<File> {
         if self.keeping.dir_lock {
             let held = match self.held.try_lock() {
@@ -1010,14 +1017,15 @@ impl Daemon {
                     return Err(std::io::Error::other("a look holds the locks"));
                 }
             };
-            return dir_to_bind(held.dir_lock.as_ref(), &self.paths);
+            return dir_to_bind(Some(held.dir_lock.as_ref()), &self.paths);
         }
         dir_to_bind(None, &self.paths)
     }
 
     /// The checks of the repair, again, on the loop: the socket directory passes those of
     /// [`ensure_socket_dir`] and, when the daemon keeps a lock on it, is still the directory that
-    /// lock is on. No wait: if a look holds the locks just now, the answer is no.
+    /// lock is on (with no lock taken, there is no such directory: no). No wait: if a look holds
+    /// the locks just now, the answer is no.
     fn dir_still_ours(&self) -> bool {
         if ensure_socket_dir(&self.paths.dir).is_err() {
             return false;
@@ -1032,7 +1040,7 @@ impl Daemon {
         };
         held.dir_lock
             .as_ref()
-            .is_none_or(|d| dir_lock_is_current(d, &self.paths.dir))
+            .is_some_and(|d| dir_lock_is_current(d, &self.paths.dir))
     }
 
     /// Serves what is still queued on a listener that was replaced: its path is gone, so nothing
@@ -1236,7 +1244,8 @@ impl Daemon {
                 self.unix = l;
                 self.bound = Some(id);
             }
-            Err(e) => tracing::error!(error = %e, "cannot rebind the socket"),
+            // Without a directory lock this is expected: the next check takes it and binds.
+            Err(e) => tracing::warn!(error = %e, "cannot rebind the socket yet"),
         }
         false
     }
@@ -1298,13 +1307,18 @@ struct Held {
 /// The shared lock on the socket directory, or none (logged) when it cannot be taken; the
 /// daemon takes it again at its next look.
 fn hold_dir_lock(paths: &Paths, wait: Duration) -> Option<File> {
-    match paths.lock_dir(wait) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot lock the socket directory");
-            None
-        }
-    }
+    dir_lock_or_log(paths.lock_dir(wait))
+}
+
+/// [`hold_dir_lock`] on a descriptor of the directory that is already open (the one checked and
+/// bound in at start).
+fn hold_dir_lock_on(dir: File, wait: Duration) -> Option<File> {
+    dir_lock_or_log(crate::paths::lock_dir_shared(dir, wait))
+}
+
+fn dir_lock_or_log(r: std::io::Result<File>) -> Option<File> {
+    r.inspect_err(|e| tracing::warn!(error = %e, "cannot lock the socket directory"))
+        .ok()
 }
 
 /// What the part of a look that needs the locks found.
@@ -1592,12 +1606,19 @@ fn remove_stale_socket(dir: &File, paths: &Paths) {
     }
 }
 
-/// A descriptor of the directory to bind in: `held` (the checked directory, duplicated: the
-/// lock on it is not given up when the copy is closed), or, with none, the directory at the
-/// path, opened and checked now.
-fn dir_to_bind(held: Option<&File>, paths: &Paths) -> std::io::Result<File> {
-    match held {
-        Some(d) => d.try_clone(),
+/// A descriptor of the directory to bind in, for a daemon that keeps a directory lock
+/// (`Some(lock)`) or keeps none (`None`):
+///
+/// - the locked directory, duplicated (the lock on it is not given up when the copy is closed);
+/// - an error, when the lock is kept but none could be taken: there is no checked directory, and
+///   the next check binds once a look has locked one;
+/// - with no lock kept, the directory at the path, opened and checked now.
+fn dir_to_bind(lock: Option<Option<&File>>, paths: &Paths) -> std::io::Result<File> {
+    match lock {
+        Some(Some(d)) => d.try_clone(),
+        Some(None) => Err(std::io::Error::other(
+            "the socket directory is not locked yet; the next check binds",
+        )),
         None => crate::paths::open_trusted_dir(&paths.dir),
     }
 }
@@ -1613,6 +1634,9 @@ struct BindHooks {
 #[cfg(test)]
 thread_local! {
     static BIND_HOOKS: std::cell::RefCell<BindHooks> = std::cell::RefCell::default();
+    /// Runs in [`Daemon::start`] after the bind, just before the directory lock is taken.
+    static BEFORE_DIR_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::default();
 }
 
 /// Binds the daemon's socket at its name in `dir` (opened and checked with
@@ -2433,12 +2457,56 @@ mod tests {
         let p = socket_dir(&tmp);
         let held = p.lock_dir(Duration::from_secs(1)).unwrap();
         make_dir_again(&tmp.path().join("moved"), &p);
-        let dir = dir_to_bind(Some(&held), &p).unwrap();
+        let dir = dir_to_bind(Some(Some(&held)), &p).unwrap();
         assert!(bind_socket_in(&dir, &p).is_err());
         assert!(std::fs::symlink_metadata(p.socket()).is_err());
-        // Without a held directory the one at the path is opened, checked and bound in.
+        // A daemon that keeps a directory lock but has none binds nothing, not even in a
+        // directory that passes the checks.
+        assert!(dir_to_bind(Some(None), &p).is_err());
+        assert!(std::fs::symlink_metadata(p.socket()).is_err());
+        // Keeping no directory lock, the one at the path is opened, checked and bound in.
         let fresh = dir_to_bind(None, &p).unwrap();
         assert!(bind_socket_in(&fresh, &p).is_ok());
+    }
+
+    /// At start the directory lock goes on the directory the socket was bound in, even when
+    /// another has been put at the path since: the socket and the lock are never split. And a
+    /// daemon that keeps a directory lock but holds none has no directory of its own to bind in.
+    #[tokio::test]
+    async fn the_start_lock_is_on_the_directory_bound_in() {
+        use rustix::fs::{FlockOperation, flock};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = socket_dir(&tmp);
+        let moved = tmp.path().join("moved");
+        let (m, q) = (moved.clone(), p.clone());
+        BEFORE_DIR_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(move || make_dir_again(&m, &q))));
+        let cfg = DaemonConfig {
+            direct: false,
+            policy: fil_session::policy::PolicySources::none(),
+            ..DaemonConfig::default()
+        };
+        let daemon = Daemon::start(p.clone(), cfg).await.unwrap();
+        assert!(
+            moved.join(name_of(&p.socket())).exists(),
+            "bound in the first"
+        );
+        {
+            let held = daemon.held.lock().unwrap();
+            let lock = held.dir_lock.as_ref().expect("locked");
+            assert!(
+                !dir_lock_is_current(lock, &p.dir),
+                "locked the one at the path"
+            );
+        }
+        // The bound directory is the locked one: an exclusive lock on it is refused.
+        let other = File::open(&moved).unwrap();
+        assert!(flock(&other, FlockOperation::NonBlockingLockExclusive).is_err());
+        let fresh = File::open(&p.dir).unwrap();
+        assert!(flock(&fresh, FlockOperation::NonBlockingLockExclusive).is_ok());
+        drop(fresh);
+        // No lock held: the directory at the path, though it passes the checks, is not ours.
+        daemon.held.lock().unwrap().dir_lock = None;
+        assert!(!daemon.dir_still_ours());
     }
 
     /// A directory that was removed and made again after it was opened is not bound in, and a

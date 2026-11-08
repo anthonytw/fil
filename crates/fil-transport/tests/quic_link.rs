@@ -875,6 +875,26 @@ async fn the_peer_sees_a_close() {
     assert!(client.send(TERM, Bytes::from_static(b"x")).await.is_err());
 }
 
+/// A closed connection leaves the listener's list when it closes, not when the next client
+/// connects (0.1.0 review of #35, nit 5).
+#[tokio::test(start_paused = true)]
+async fn a_closed_connection_is_forgotten_at_once() {
+    let mut w = World::new(91);
+    let (client, daemon, _) = w.pair().await;
+    assert_eq!(w.listener.listed_connections(), 1);
+    let mut ds = daemon.status();
+    client.close();
+    wait_for(&mut ds, "daemon Down", is_down).await;
+    drop((client, daemon));
+    timeout(Duration::from_secs(5), async {
+        while w.listener.listed_connections() != 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the closed connection is still listed");
+}
+
 #[tokio::test(start_paused = true)]
 async fn payloads_received_before_the_close_are_still_returned() {
     let mut w = World::new(32);

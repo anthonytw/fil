@@ -302,25 +302,14 @@ impl Paths {
     /// The lock is on the directory that is there now: [`dir_lock_is_current`] says whether it
     /// still is the one at the path.
     pub fn lock_dir(&self, wait: Duration) -> std::io::Result<File> {
-        use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+        use rustix::fs::{CWD, Mode, OFlags, openat};
         let fd = openat(
             CWD,
             &self.dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let file = File::from(fd);
-        // A cleaner in the middle of a pass holds the lock exclusively for a moment.
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockShared) {
-                Ok(()) => return Ok(file),
-                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        lock_dir_shared(File::from(fd), wait)
     }
 
     /// Sets the access and modification times of everything this daemon keeps in the socket
@@ -530,6 +519,24 @@ pub(crate) fn socket_identity(path: &Path) -> Option<(u64, u64)> {
 /// socket on its way out. Returns whether it removed anything.
 pub(crate) fn remove_socket_if_ours(path: &Path, bound: Option<(u64, u64)>) -> bool {
     bound.is_some() && socket_identity(path) == bound && std::fs::remove_file(path).is_ok()
+}
+
+/// The shared `flock` of [`Paths::lock_dir`], taken on a descriptor of the socket directory
+/// that is already open: the one a starting daemon checked and bound in, so that the lock is on
+/// that very directory and not on whatever a second look-up of the path would find.
+pub(crate) fn lock_dir_shared(file: File, wait: Duration) -> std::io::Result<File> {
+    use rustix::fs::{FlockOperation, flock};
+    // A cleaner in the middle of a pass holds the lock exclusively for a moment.
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => return Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Whether `held` (from [`Paths::lock_dir`]) is still the directory at `dir`: it has not been

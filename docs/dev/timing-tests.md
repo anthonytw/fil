@@ -71,6 +71,7 @@ disturbed samples. All of these are named `wallclock_*`.
 | `repaint` x2 | repaint within 1.4 s / 1.5 s of the request | T | passes |
 | `log_blocking` `a_hung_log_file_does_not_stop_the_daemon` | mean call <= 200 us, p99 < 50 ms, max < 1 s | T (the log never blocks the daemon) | passes; Stalls |
 | `ports::probe` x3 | no probe < 50 ms; < per_port budget + 100 ms | T (the budget itself is P) | passes; Stalls on the first |
+| `proc` (fil-session) `a_kill_without_a_table_ends_when_its_victims_do` | kill returns < 2 s (grace 5 s) | T (separates waiting out the grace and `KILL_CONFIRM`, 7 s, from a `sleep` dying on a hangup) | milliseconds (about 100x); one sample, no Stalls: only a stall of seconds could miss it |
 | `keyprobe` x2 | max echo < 1 s; screen vs bytes p50 within 1 ms | T | passes |
 
 Everything else with a duration in it is either on tokio's paused clock (`start_paused`:

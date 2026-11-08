@@ -187,8 +187,8 @@ async fn forward_requests_and_the_ports_answer() {
 }
 
 /// The real daemon process (`fil-daemon-dev`, started as the relay starts it) raises its own
-/// descriptor limit and starts the session's shell through its trampoline, with the limit the
-/// daemon was started with (`fil_session::nofile`).
+/// descriptor limit and starts the session's shell with the limit the daemon was started with:
+/// through its trampoline, or on macOS directly (`fil_session::nofile`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_daemon_process_gives_its_sessions_the_limit_it_was_started_with() {
     use fil_transport::pipe::{PipeCommand, PipeConfig, PipeLink};

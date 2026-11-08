@@ -72,7 +72,7 @@ LogLevel VERBOSE
 EOF
   ssh_write_client_config
   # The descriptor limit a login gets from launchd is 256 (soft), which is what makes the daemon raise
-  # its own and start sessions through the trampoline (fil_session::nofile). A runner or a developer
+  # its own and give each session's child the original back (fil_session::nofile). A runner or a developer
   # shell may start with more, so give this sshd (and so every login's children) the macOS default.
   (ulimit -S -n "${MACOS_SSHD_NOFILE:-256}" && exec /usr/sbin/sshd -D -e -f "$W/ssh/sshd_config") > "$W/ssh/sshd.log" 2>&1 &
   SSHD_PID=$!

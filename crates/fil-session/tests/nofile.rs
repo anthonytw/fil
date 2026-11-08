@@ -24,8 +24,9 @@ const STOCK: u64 = 1024;
 /// This crate's trampoline binary.
 const EXEC: &str = env!("CARGO_BIN_EXE_fil-session-exec");
 
-/// The stock soft limit, then the daemon's raise (with this crate's trampoline binary). `false`
-/// when this host's hard limit leaves no room above the stock one (nothing to test).
+/// The stock soft limit, then the daemon's raise (with this crate's trampoline binary; on macOS
+/// with `prepare`, which starts the child directly, as the daemon does). `false` when this
+/// host's hard limit leaves no room above the stock one (nothing to test).
 fn setup() -> bool {
     static ROOM: OnceLock<bool> = OnceLock::new();
     *ROOM.get_or_init(|| {
@@ -41,7 +42,11 @@ fn setup() -> bool {
             },
         )
         .unwrap();
-        fil_session::nofile::set_trampoline(EXEC.into());
+        if cfg!(target_os = "macos") {
+            assert!(fil_session::nofile::prepare());
+        } else {
+            fil_session::nofile::set_trampoline(EXEC.into());
+        }
         let raised = fil_transport::fdlimit::raise();
         assert_eq!(
             raised.map(|r| r.from),
@@ -75,7 +80,7 @@ async fn children_start_with_the_original_limit() {
     c.type_bytes(b"\n").await;
     c.wait_out(&format!("limit={STOCK}.")).await;
     assert!(soft() > STOCK, "still raised here: {}", soft());
-    // The login shell keeps its `-` in `argv[0]` through the trampoline.
+    // The login shell keeps its `-` in `argv[0]` (through the trampoline, or started directly).
     let mut login = sh_config(&s, "login", "unused");
     login.command = None;
     login.env.push(("SHELL".into(), "/bin/sh".into()));
@@ -205,9 +210,9 @@ async fn a_flood_on_one_remote_port_leaves_the_daemon_working() {
     let _ = h.kill(Duration::from_secs(5)).await;
 }
 
-/// Through the trampoline a program is found where portable-pty would find it: `./prog` and a
-/// relative `PATH` entry in the session's directory, which is the home directory when none is
-/// configured (not the daemon's own directory).
+/// Through the trampoline (or, on macOS, started directly) a program is found where portable-pty
+/// would find it: `./prog` and a relative `PATH` entry in the session's directory, which is the
+/// home directory when none is configured (not the daemon's own directory).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_trampoline_finds_programs_where_portable_pty_does() {
     use std::os::unix::fs::PermissionsExt;
@@ -287,4 +292,39 @@ fn the_trampoline_refuses_anything_incomplete() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert!(canary.exists());
+}
+
+/// macOS starts a session's child itself, with no trampoline (`nofile::spawn_direct`), and
+/// does what portable-pty's spawn would: the terminal is the child's controlling terminal, an
+/// environment value that is not UTF-8 arrives unchanged, a descriptor the daemon left open
+/// without close-on-exec does not leak, and the limit is the original one.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_started_directly_gets_what_portable_pty_would_give_it() {
+    use std::os::unix::ffi::OsStrExt;
+    if !setup() {
+        eprintln!("the hard limit is the stock one: nothing to raise");
+        return;
+    }
+    // A descriptor that `exec` would pass on.
+    let leak = std::fs::File::open("/dev/null").unwrap();
+    rustix::io::fcntl_setfd(&leak, rustix::io::FdFlags::empty()).unwrap();
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&leak);
+    let s = Scratch::new();
+    let script = format!(
+        "read go; \
+         if [ \"$SSH_AUTH_SOCK\" = \"$(printf '/tmp/caf\\351')\" ]; then e=ok; else e=bad; fi; \
+         if [ -e /dev/fd/{fd} ]; then d=leaked; else d=closed; fi; \
+         if (exec 3</dev/tty) 2>/dev/null; then t=ctty; else t=none; fi; \
+         echo \"env=$e fd=$d tty=$t limit=$(ulimit -Sn).\"; exec cat"
+    );
+    let mut cfg = sh_config(&s, "direct", &script);
+    cfg.agent_socket = Some(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9").into());
+    let h = spawn_plain(cfg).await;
+    let mut c = Client::attach(&h, Connect::new(&h, key(1))).await;
+    c.type_bytes(b"\n").await;
+    c.wait_out(&format!("env=ok fd=closed tty=ctty limit={STOCK}."))
+        .await;
+    drop(leak);
+    let _ = h.kill(Duration::from_secs(5)).await;
 }

@@ -24,7 +24,8 @@
 #   forwards_reconnect   -L, -R and -D, and a transfer through each that outlives a killed ssh
 #   agent                -A with a throwaway ssh-agent: a real ssh hop from the session; refused without -A
 #   quic_upgrade         pipe to QUIC on loopback, the session continues with the ssh gone
-#   upgrade_in_place     the binary is replaced under a running daemon (the trampoline, plan §1)
+#   upgrade_in_place     the binary is replaced under a running daemon: new sessions still start
+#                        and never run the file now at the path (plan §1)
 #   tmp_cleaners         PLACEHOLDER: TMP's mechanism checks and macOS's clean-tmps (TMP)
 set -uo pipefail
 
@@ -363,20 +364,23 @@ scenario_quic_upgrade() {
   fc_detach a
 }
 
-# The plan's trampoline case (§1): a running daemon starts a session's child through the
-# trampoline, `current_exe()` on macOS, a PATH. A package upgrade replaces the file; the old daemon
-# must not start a new session through the NEW file. The replacement here is a script that records
-# every trampoline call and hands on to a copy of the real binary, so the session still starts and
-# the record says whether the replaced path was used.
+# The plan's trampoline case (§1). A package upgrade replaces the file a daemon was started from
+# (`current_exe()` on macOS is a path, not the daemon's image). On macOS the daemon starts a
+# session's child itself (`fil_session::nofile::spawn_direct`), so a new session in the old daemon
+# must start without running the file now at the path. Two replacements, as a package manager
+# makes them (a rename, a new inode): a stub that records every trampoline call and hands on to a
+# copy of the real binary (so the relay still starts), then one that also refuses the trampoline's
+# arguments (status 127, as a fil that did not accept them would). Both must leave the record
+# empty and the new session with a shell.
 scenario_upgrade_in_place() {
   local mark=$W/trampoline.mark d1 d2 exe newfil=$W/fil-new nofile
   rm -f "$mark"
-  # The trampoline is in use only when the daemon raised its descriptor limit: the login's soft
+  # The child gets the original limit back only when the daemon raised its own: the login's soft
   # limit must be below the macOS cap (10,240), as launchd's default of 256 is.
   nofile=$(ssh -F "$SSH_CONFIG" -T macremote 'ulimit -Sn')
   note "login_nofile=$nofile"
   if [[ $nofile =~ ^[0-9]+$ ]] && [[ $nofile -ge 10240 ]]; then
-    fail "the login's soft descriptor limit is $nofile: the daemon would not raise it, there would be no trampoline, and this scenario would test nothing"
+    fail "the login's soft descriptor limit is $nofile: the daemon would not raise it, and this scenario would test nothing"
   fi
   attach a mac-up1
   d1=$(the_daemon)
@@ -401,21 +405,22 @@ EOF
   attach c mac-up2
   fc_show_pid c
   [[ $(the_daemon) == "$d1" ]] || fail "the new session did not start in the old daemon"
+  # The session's shell has the login's limit, not the daemon's raised one.
+  fc_line c 'echo UP2-$((6*7)) LIMIT=$(ulimit -Sn).'
+  fc_wait c "UP2-42 LIMIT=$nofile." 15
   if [[ -s $mark ]]; then
-    known_bug "current_exe() on macOS: the old daemon (pid $d1) started a NEW session through the REPLACED binary's trampoline ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...). Mitigated, not fixed: docs/m4/release.md section 11 freezes the trampoline's arguments for every later release, so a newer fil at the path accepts them; residual: a path that no longer holds a fil (uninstall, relink). Fix: a trampoline that does not depend on the path. U1's versioned install directories avoid the case for fil-installed copies"
     note "trampoline_via_replaced_path=yes"
-  else
-    note "trampoline_via_replaced_path=no"
-    ok "the old daemon started the new session without touching the replaced file"
+    fail "the old daemon (pid $d1) started a NEW session through the REPLACED file at its path ($(head -n 1 "$mark" | cut -d' ' -f1-3) ...)"
   fi
+  note "trampoline_via_replaced_path=no"
+  ok "the old daemon started the new session without running the replaced file"
   fc_detach b
   fc_detach c
-  # Why the arguments are frozen: if a release ever changed them, the replaced file would refuse
-  # them (status 127, as a trampoline given malformed arguments does). A new session in the old
-  # daemon then has no shell.
+  # A file at the path that refuses the trampoline's arguments: a new session in the old daemon
+  # still has its shell.
   cat > "$W/stub.sh" << EOF
 #!/bin/sh
-if [ "\$1" = __fil-exec-nofile ]; then exit 127; fi
+if [ "\$1" = __fil-exec-nofile ]; then echo "\$*" >> "$mark"; exit 127; fi
 exec "$newfil" "\$@"
 EOF
   chmod 755 "$W/stub.sh"
@@ -425,11 +430,14 @@ EOF
   sleep 4
   fc d send 'echo UP3-$((6*7))\r' > /dev/null || true
   if fc d wait --timeout 8 'UP3-42' > /dev/null 2>&1; then
-    note "new_session_with_refusing_trampoline=works"
+    note "new_session_with_refusing_file=works"
   else
-    note "new_session_with_refusing_trampoline=NO_SHELL"
-    log "with a trampoline that refuses its arguments the new session has no shell: $(fc_screen d | tail -n 3)"
+    note "new_session_with_refusing_file=NO_SHELL"
+    fail "with a file at the path that refuses the trampoline's arguments the new session has no shell: $(fc_screen d | tail -n 3)"
   fi
+  [[ $(the_daemon) == "$d1" ]] || fail "the third session did not start in the old daemon"
+  [[ ! -s $mark ]] || fail "the refusing file was run as a trampoline"
+  ok "with a file at the path that refuses the trampoline's arguments, the new session still has its shell"
 }
 
 # Apple's real, unscaled /usr/libexec/tmp_cleaner (the script launchd's com.apple.tmp_cleaner runs

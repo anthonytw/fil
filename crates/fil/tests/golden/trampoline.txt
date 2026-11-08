@@ -1,7 +1,8 @@
 # The FROZEN trampoline contract (docs/m4/release.md section 11), pinned by
 # crates/fil/tests/trampoline.rs, whose literals hold the same values. [pinned] never changes, not
-# even with a new PROTOCOL_MAJOR: a running daemon of one release, of any wire, starts sessions
-# through whatever release's binary is now at its path.
+# even with a new PROTOCOL_MAJOR. It is a safeguard: no 0.1.0 or later daemon names its trampoline
+# by a path an upgrade replaces (Linux uses /proc/self/exe, macOS no trampoline), but one that did
+# would start sessions through whatever release's binary is then at its path.
 # [history] only grows: one line per revision of the contract, the FNV-1a hash of [pinned] as that
 # revision had it. An addition that no older copy has to build or accept goes under [extensions].
 [pinned]

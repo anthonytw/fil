@@ -1,12 +1,12 @@
 //! The FROZEN trampoline contract (`docs/m4/release.md` §11): the arguments a daemon starts a
 //! session's child with, through its own executable, and what that executable accepts.
 //!
-//! On macOS that executable is a path (`current_exe()`), and a package upgrade replaces the file
-//! under a running daemon, so one release's daemon runs another release's trampoline (and the
-//! reverse after a downgrade). Both sides are pinned here with literals, not read from the code
-//! under test, so renaming the marker or reordering the arguments fails this test; they are also
-//! kept in `golden/trampoline.txt` with a `[history]`, so an edit shows in review. The accepting
-//! side is the real `fil` binary.
+//! Linux names it as `/proc/self/exe`, the daemon's own image, and macOS starts the child without
+//! one, so no released daemon runs another release's trampoline; the freeze is a safeguard should
+//! one ever start a child through a file an upgrade replaces. Both sides are pinned here with
+//! literals, not read from the code under test, so renaming the marker or reordering the
+//! arguments fails this test; they are also kept in `golden/trampoline.txt` with a `[history]`, so
+//! an edit shows in review. The accepting side is the real `fil` binary.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -51,8 +51,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 const GOLDEN_HEAD: &str = "\
 # The FROZEN trampoline contract (docs/m4/release.md section 11), pinned by
 # crates/fil/tests/trampoline.rs, whose literals hold the same values. [pinned] never changes, not
-# even with a new PROTOCOL_MAJOR: a running daemon of one release, of any wire, starts sessions
-# through whatever release's binary is now at its path.
+# even with a new PROTOCOL_MAJOR. It is a safeguard: no 0.1.0 or later daemon names its trampoline
+# by a path an upgrade replaces (Linux uses /proc/self/exe, macOS no trampoline), but one that did
+# would start sessions through whatever release's binary is then at its path.
 # [history] only grows: one line per revision of the contract, the FNV-1a hash of [pinned] as that
 # revision had it. An addition that no older copy has to build or accept goes under [extensions].
 ";

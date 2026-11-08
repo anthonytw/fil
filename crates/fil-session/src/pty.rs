@@ -84,6 +84,10 @@ fn drop_login_vars(cmd: &mut CommandBuilder) {
     }
 }
 
+/// Every `cmd.env` here whose value may not be UTF-8 (an `OsStr` or a path, not a `String`) must
+/// have its name in `OS_VALUED_NAMES` too: on macOS the child's environment is read back from
+/// the builder by name (`crate::nofile::spawn_direct`), and a name missing there loses that
+/// variable on macOS only.
 fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, SpawnError> {
     if cfg.command.as_ref().is_some_and(|c| c.is_empty()) {
         return Err(SpawnError::EmptyCommand);
@@ -143,19 +147,47 @@ fn build_command(cfg: &SessionConfig, scope: &Scope) -> Result<CommandBuilder, S
 /// daemon may create sessions concurrently.
 static OPEN_LOCK: Mutex<()> = Mutex::new(());
 
+/// The names [`build_command`] may set to a value that is not UTF-8, which the builder does not
+/// list (`crate::nofile::spawn_direct`): the agent socket's path, and the two variables a
+/// systemd scope keeps from the daemon's environment.
+#[cfg(target_os = "macos")]
+const OS_VALUED_NAMES: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// Starts the session's child on the PTY: on macOS, once the daemon raised its descriptor limit,
+/// by the daemon itself (`crate::nofile::spawn_direct`); otherwise by portable-pty.
+fn spawn_child(
+    pair: &portable_pty::PtyPair,
+    cmd: CommandBuilder,
+) -> Result<Box<dyn Child + Send + Sync>, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(soft) = crate::nofile::direct_limit() {
+        // Deliberately a failed spawn, not a fall back to portable-pty's spawn, whose child would
+        // keep the daemon's raised limit. `ttyname` of a PTY this process just opened does not
+        // fail in practice.
+        let tty = pair
+            .master
+            .tty_name()
+            .ok_or_else(|| "the terminal has no name".to_string())?;
+        let child = crate::nofile::spawn_direct(&tty, &cmd, soft, OS_VALUED_NAMES)?;
+        return Ok(Box::new(child));
+    }
+    pair.slave.spawn_command(cmd).map_err(|e| e.to_string())
+}
+
 pub(crate) fn spawn(cfg: &SessionConfig, scope: &Scope) -> Result<Spawned, SpawnError> {
     let mut cmd = build_command(cfg, scope)?;
     // The child starts with the descriptor limit the daemon had before it raised its own
-    // (`crate::nofile`), through the trampoline.
+    // (`crate::nofile`): through the trampoline, or on macOS started by the daemon itself.
     crate::nofile::wrap(&mut cmd).map_err(SpawnError::Pty)?;
     let _open = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let pair = native_pty_system()
         .openpty(size_of(cfg.size))
         .map_err(|e| SpawnError::Pty(e.to_string()))?;
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| SpawnError::Pty(e.to_string()))?;
+    let child = spawn_child(&pair, cmd).map_err(SpawnError::Pty)?;
     // Our copy of the slave must go, or the master never sees end of file when the child exits.
     drop(pair.slave);
     let pid = child

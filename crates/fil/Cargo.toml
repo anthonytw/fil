@@ -61,6 +61,7 @@ toml = "0.9"
 tracing = "0.1"
 
 [dev-dependencies]
+tempfile = "3"
 # The man page and the shell completions (examples/gen_docs.rs, tests/docs_sync.rs; docs/m4/plan.md,
 # DOC). Dev-dependencies only: they are not in the released build, and `just release-deps` checks.
 clap_complete = "4"

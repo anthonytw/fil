@@ -4,7 +4,7 @@
 # user:
 #
 #   user    a user-mode sshd on a high loopback port: throwaway host key and client key made for the
-#           run, an authorized_keys of its own, PATH set by sshd_config's SetEnv. No sudo, nothing
+#           run, an authorized_keys of its own, PATH and ZDOTDIR (an empty dir, so the user's zsh rc files stay out) set by sshd_config's SetEnv. No sudo, nothing
 #           outside $W is touched. This is the default, and the only mode that is meant for a laptop.
 #   system  the system sshd (launchd's com.openssh.sshd, port 22) under the runner's passwordless
 #           sudo: the real login path (launchd's per-connection sshd and its real session teardown).
@@ -55,6 +55,9 @@ sshd_up_user() {
   chmod 600 "$AUTH_FILE"
   SSH_KNOWN_HOSTS=$W/ssh/known_hosts
   printf '[127.0.0.1]:%s %s\n' "$SSH_PORT" "$(cut -d' ' -f1,2 "$W/ssh/host_key.pub")" > "$SSH_KNOWN_HOSTS"
+  # An empty ZDOTDIR for the sessions: a dev Mac's own zsh rc files (a compinit prompt, say) must not
+  # reach the harness's logins.
+  mkdir -p "$W/ssh/zdotdir"
   cat > "$W/ssh/sshd_config" << EOF
 Port $SSH_PORT
 ListenAddress 127.0.0.1
@@ -67,7 +70,7 @@ PubkeyAuthentication yes
 UsePAM no
 StrictModes no
 AllowUsers $(id -un)
-SetEnv PATH=$(remote_path)
+SetEnv PATH=$(remote_path) ZDOTDIR=$W/ssh/zdotdir
 LogLevel VERBOSE
 EOF
   ssh_write_client_config
@@ -116,6 +119,7 @@ sshd_up_system() {
   # launchd's sshd listens on every interface and the runner's account may have a password: only the
   # key of this run, only this user (Apple's sshd_config includes sshd_config.d first, and the first
   # value of an option wins).
+  # (Unlike user mode, this one does not set ZDOTDIR; the runner is a throwaway VM.)
   printf 'SetEnv PATH=%s\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nAllowUsers %s\n' \
     "$(remote_path)" "$(id -un)" | sudo tee /etc/ssh/sshd_config.d/100-fil-macos-check.conf > /dev/null
   SYSTEM_DROPIN=1

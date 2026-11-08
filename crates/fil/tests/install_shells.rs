@@ -16,7 +16,6 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fil_transport::pipe::PipeCommand;
@@ -118,11 +117,10 @@ fn inners() -> Vec<(&'static str, Option<PathBuf>)> {
     v
 }
 
-static N: AtomicU32 = AtomicU32::new(0);
-
 /// One case's world: a scratch `HOME` (0700), a directory of tools for `PATH`, and the shells.
 struct World {
-    base: PathBuf,
+    /// Owns the scratch directory (unique, 0700); removed in `Drop`, which reports a failure.
+    dir: Option<tempfile::TempDir>,
     home: PathBuf,
     outer: Outer,
     /// Prepended to `PATH`: `sh` when the inner shell is dash.
@@ -134,15 +132,12 @@ struct World {
 
 impl World {
     fn new(outer: &Outer, inner: &Option<PathBuf>) -> World {
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        );
-        let base = std::env::temp_dir().join(format!("fil-boot-{id}"));
-        let _ = std::fs::remove_dir_all(&base);
+        let dir = tempfile::Builder::new()
+            .prefix("fil-boot-")
+            .tempdir()
+            .unwrap();
+        let base = dir.path().to_path_buf();
         let home = base.join("home");
-        mkdir(&base, 0o700);
         mkdir(&home, 0o700);
         let shim = inner.as_ref().map(|dash| {
             let d = base.join("shim");
@@ -151,13 +146,18 @@ impl World {
             d
         });
         World {
-            base,
+            dir: Some(dir),
             home,
             outer: outer.clone(),
             shim,
             path: None,
             umask: "022",
         }
+    }
+
+    /// The scratch directory (alive until `Drop`).
+    fn base(&self) -> &Path {
+        self.dir.as_ref().unwrap().path()
     }
 
     fn b(&self) -> PathBuf {
@@ -185,10 +185,10 @@ impl World {
             .env("HOME", &self.home)
             .env("PATH", path)
             // Shells that keep state (fish) keep it outside HOME, so HOME shows only the script.
-            .env("XDG_DATA_HOME", self.base.join("xdg-data"))
-            .env("XDG_CONFIG_HOME", self.base.join("xdg-config"))
-            .env("XDG_CACHE_HOME", self.base.join("xdg-cache"))
-            .current_dir(&self.base)
+            .env("XDG_DATA_HOME", self.base().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", self.base().join("xdg-config"))
+            .env("XDG_CACHE_HOME", self.base().join("xdg-cache"))
+            .current_dir(self.base())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -255,9 +255,29 @@ impl Drop for World {
     fn drop(&mut self) {
         let _ = Command::new("chmod")
             .args(["-R", "u+rwx"])
-            .arg(&self.base)
+            .arg(self.base())
             .status();
-        let _ = std::fs::remove_dir_all(&self.base);
+        // Some cases leave a "deny delete" ACL on the home (macOS), which `remove_dir_all` cannot
+        // pass; this was the silent leak of `fil-boot-*` directories. `-N` strips ACLs (a no-op
+        // error where `chmod` has no such flag, which the close below then reports if it matters).
+        let _ = Command::new("chmod")
+            .args(["-R", "-N"])
+            .arg(self.base())
+            .stderr(Stdio::null())
+            .status();
+        let path = self.base().to_path_buf();
+        if let Some(dir) = self.dir.take()
+            && let Err(e) = dir.close()
+        {
+            // libtest captures `eprintln!` of a passing test, so a leak would stay invisible:
+            // fail the test unless it is already unwinding (a panic in a drop would abort).
+            let msg = format!("install_shells: could not remove {}: {e}", path.display());
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
     }
 }
 
@@ -455,7 +475,7 @@ fn cases() -> Vec<Case> {
         (
             "a symbolic link at ~/.local/bin/fil is never followed",
             |w| {
-                let real = w.base.join("realfil");
+                let real = w.base().join("realfil");
                 write_exe(&real, &canary(&wire()), 0o755);
                 mkdir(&w.home.join(".local"), 0o700);
                 mkdir(&w.home.join(".local/bin"), 0o755);
@@ -482,7 +502,7 @@ fn cases() -> Vec<Case> {
             },
         ),
         ("no hash tool: refused before anything is created", |w| {
-            let tools = w.base.join("tools");
+            let tools = w.base().join("tools");
             mkdir(&tools, 0o755);
             for t in [
                 "id", "ls", "uname", "grep", "expr", "head", "wc", "mkdir", "rmdir", "rm", "chmod",
@@ -534,7 +554,7 @@ fn cases() -> Vec<Case> {
         (
             "a symbolic link in place of ~/.local/share/fil: refused, its canary never runs",
             |w| {
-                let elsewhere = w.base.join("elsewhere");
+                let elsewhere = w.base().join("elsewhere");
                 mkdir(&elsewhere, 0o700);
                 mkdir(&elsewhere.join(dir_name()), 0o700);
                 write_exe(
@@ -800,7 +820,7 @@ fn cases() -> Vec<Case> {
         (
             "a $HOME that is a symbolic link: refused, nothing created behind it",
             |w| {
-                let real = w.base.join("realhome");
+                let real = w.base().join("realhome");
                 std::fs::rename(&w.home, &real).unwrap();
                 symlink(&real, &w.home).unwrap();
                 w.install_copy(&canary(&wire()));
@@ -840,7 +860,7 @@ fn cases() -> Vec<Case> {
         (
             "an old wire's fil on PATH is never tried: the exact version or an upload wins",
             |w| {
-                let bin = w.base.join("pathbin");
+                let bin = w.base().join("pathbin");
                 mkdir(&bin, 0o755);
                 write_exe(&bin.join("fil"), &canary("1.1"), 0o755);
                 w.path = Some(format!(
@@ -1023,7 +1043,7 @@ fn an_interrupted_upload_leaves_nothing_runnable_and_gc_collects_it() {
     assert!(!names.iter().any(|n| n == dir_name()), "{names:?}");
     assert_eq!(names.len(), 1, "{names:?}");
     let ours = rustix::process::geteuid().as_raw();
-    let none = w.base.join("no-socket-dir");
+    let none = w.base().join("no-socket-dir");
     let now = std::time::SystemTime::now();
     let young =
         fil::install::gc::collect(&w.b(), &none, &fil::install::gc::Pass::Forced, now, ours);

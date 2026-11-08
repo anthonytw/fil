@@ -21,7 +21,9 @@ const MAX_OFFSET_SECS: i64 = 15 * 3600;
 pub fn utc_offset_secs(unix_secs: i64) -> i32 {
     // `time_t` is 64 bits on every platform fil runs on (Linux, macOS); on one where it is not,
     // an instant that does not fit is UTC rather than a different instant.
-    #[allow(clippy::useless_conversion)]
+    // The libc crate marks musl's `time_t` deprecated (its width is to follow musl 1.2's 64-bit
+    // one); on the 64-bit musl targets fil ships it is already 64 bits.
+    #[allow(clippy::useless_conversion, deprecated)]
     let Some(t) = libc::time_t::try_from(unix_secs).ok() else {
         return 0;
     };

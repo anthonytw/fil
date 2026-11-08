@@ -664,6 +664,8 @@ fn random_incarnation() -> Result<u128, String> {
 pub struct DaemonHandle {
     host: Arc<Host>,
     stop: watch::Sender<Option<bool>>,
+    /// Read only by [`DaemonHandle::check_files_now`], a test hook: a release build has it unread.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     check_now: Arc<tokio::sync::Notify>,
 }
 

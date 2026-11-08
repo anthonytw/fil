@@ -1026,27 +1026,30 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   sleep 2
   pk "$tmp/r2" > /dev/null 2>&1
   expect_pass "two assemblies of the same inputs give byte-identical SHA256SUMS" cmp "$tmp/r1/SHA256SUMS" "$tmp/r2/SHA256SUMS"
-  # mutation: leave the tar mtimes alone
-  trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh"' EXIT INT TERM
-  sed 's/--mtime="@\$SOURCE_DATE_EPOCH" //' "$RELEASE_DIR/package.sh" > "$RELEASE_DIR/.package-mutant.sh"
-  chmod +x "$RELEASE_DIR/.package-mutant.sh"
-  if cmp -s "$RELEASE_DIR/package.sh" "$RELEASE_DIR/.package-mutant.sh"; then flunk "mutation 'mtimes' did not change package.sh (the test is stale)"; fi
-  PK="$RELEASE_DIR/.package-mutant.sh" pk "$tmp/m1" > /dev/null 2>&1 || true
+  # mutation: leave the tar mtimes alone. The tar recipe is pack_archives in common.sh, which
+  # package.sh sources from its own directory, so the mutant is a copy of this directory with
+  # common.sh changed (REPO_ROOT, and with it RELEASE_DIR, then points into the copy).
+  mkdir -p "$tmp/mut/tests"
+  cp -R "$RELEASE_DIR" "$tmp/mut/tests/release"
+  sed 's/--mtime="@\$SOURCE_DATE_EPOCH" //' "$RELEASE_DIR/common.sh" > "$tmp/mut/tests/release/common.sh"
+  if cmp -s "$RELEASE_DIR/common.sh" "$tmp/mut/tests/release/common.sh"; then flunk "mutation 'mtimes' did not change common.sh (the test is stale)"; fi
+  PK="$tmp/mut/tests/release/package.sh" pk "$tmp/m1" > /dev/null 2>&1 || true
   sleep 2
-  PK="$RELEASE_DIR/.package-mutant.sh" pk "$tmp/m2" > /dev/null 2>&1 || true
-  rm -f "$RELEASE_DIR/.package-mutant.sh"
+  PK="$tmp/mut/tests/release/package.sh" pk "$tmp/m2" > /dev/null 2>&1 || true
+  expect_pass "the mutant assemblies ran (a broken mutant would pass the next check vacuously)" test -s "$tmp/m1/SHA256SUMS" -a -s "$tmp/m2/SHA256SUMS"
   expect_fail "mutation: tar mtimes left alone, and the two assemblies' SHA256SUMS then differ" cmp "$tmp/m1/SHA256SUMS" "$tmp/m2/SHA256SUMS"
   expect_pass "the assembly writes the four packages too" test "$(grep -cE '\.(deb|rpm)$' "$tmp/r1/SHA256SUMS")" = 4
   # mutation: nfpm without the fixed mtime (and without SOURCE_DATE_EPOCH, which it also reads) stamps the packages with the time of the run
   sed -e '/mtime: /d' -e 's/-e SOURCE_DATE_EPOCH //' "$RELEASE_DIR/linux-packages.sh" > "$RELEASE_DIR/.pkg-mutant.sh"
   chmod +x "$RELEASE_DIR/.pkg-mutant.sh"
-  trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh" "$RELEASE_DIR/.pkg-mutant.sh"' EXIT INT TERM
+  trap 'rm -rf "$tmp" "$RELEASE_DIR/.pkg-mutant.sh"' EXIT INT TERM
   if cmp -s "$RELEASE_DIR/linux-packages.sh" "$RELEASE_DIR/.pkg-mutant.sh"; then flunk "mutation 'package mtime' did not change linux-packages.sh (the test is stale)"; fi
   mkdir -p "$tmp/p1" "$tmp/p2"
   env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p1" > /dev/null 2>&1 || true
   sleep 2
   env FIL_RELEASE_ROOT="$rt/tree" SOURCE_DATE_EPOCH=1700000000 "$RELEASE_DIR/.pkg-mutant.sh" --archives "$tmp/r1" --out "$tmp/p2" > /dev/null 2>&1 || true
   rm -f "$RELEASE_DIR/.pkg-mutant.sh"
+  expect_pass "the mutant package builds ran (a broken mutant would pass the next check vacuously)" test -s "$tmp/p1/fil_0.9.0_amd64.deb" -a -s "$tmp/p2/fil_0.9.0_amd64.deb"
   expect_fail "mutation: packages without the fixed mtime, and two builds then differ" cmp "$tmp/p1/fil_0.9.0_amd64.deb" "$tmp/p2/fil_0.9.0_amd64.deb"
 else
   echo "== reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
@@ -1408,7 +1411,7 @@ expect_pass "sign-macos: a rerun after it completes" sm
 MACSIGN_SCRIPT=$RELEASE_DIR/.macsign-mutant.sh
 sed '/^rewrite_sums /d' "$RELEASE_DIR/sign-macos.sh" > "$MACSIGN_SCRIPT"
 chmod +x "$MACSIGN_SCRIPT"
-trap 'rm -rf "$tmp" "$RELEASE_DIR/.package-mutant.sh" "$RELEASE_DIR/.pkg-mutant.sh" "$RELEASE_DIR/.macsign-mutant.sh"' EXIT INT TERM
+trap 'rm -rf "$tmp" "$RELEASE_DIR/.pkg-mutant.sh" "$RELEASE_DIR/.macsign-mutant.sh"' EXIT INT TERM
 if cmp -s "$RELEASE_DIR/sign-macos.sh" "$MACSIGN_SCRIPT"; then flunk "mutation 'SHA256SUMS not rebuilt' did not change sign-macos.sh (the test is stale)"; else
   macsign_fixture
   expect_fail "mutation: SHA256SUMS not rebuilt is caught before anything is uploaded" sm

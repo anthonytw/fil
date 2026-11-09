@@ -2190,7 +2190,7 @@ pub async fn secret_trial(spec: Spec, ahead: bool) -> Report {
 /// - **superseded**: another guess's glyph takes the cell in the same write (a Backspace over it);
 /// - **withdrawn**: it goes in a lifecycle write (`Display::withdraw` for a lifecycle reason, a
 ///   resize, the first write after a snapshot's reset) or while the link is down (the backstop);
-/// - **gated**: it goes, in a write that is not a `Display::withdraw` and prints no *foreign*
+/// - **gated**: it goes, in a server-output write (`TapKind::Server`) that prints no *foreign*
 ///   glyph, while the reference shows nothing in its cell, and, with no foreign glyph printed in
 ///   between, the reference's next glyph in that cell is the same one. A write's foreign glyphs
 ///   are the glyphs its server bytes print (counted by a parser of its own, across writes, so a
@@ -2294,6 +2294,8 @@ impl Classifier {
             TapEvent::Reset { size } => {
                 self.user = Some(new_emulator(*size));
                 self.reference = Some(new_emulator(*size));
+                // A sequence cut off before the snapshot must not swallow its first print.
+                self.scan = vte::Parser::new();
                 self.after_reset = true;
             }
             TapEvent::Link { down } => self.link_down = *down,
@@ -2415,11 +2417,10 @@ impl Classifier {
                 }
                 None if shown(*pos) == *text => self.counts.confirmed += 1,
                 None if lifecycle => self.counts.withdrawn += 1,
-                // A predictor's own withdrawal settles the guess there: never held.
-                None if shown(*pos).is_empty()
-                    && !foreign
-                    && !matches!(kind, TapKind::Withdraw(_)) =>
-                {
+                // Gates come from output: only a server write can hold a guess. Any other
+                // removal (a predictor's own withdrawal, a `Tick` expiry, an `EchoAck` past its
+                // grace) is a misprediction even if a late echo brings the glyph back (§2.5).
+                None if shown(*pos).is_empty() && !foreign && kind == TapKind::Server => {
                     self.held.insert(*pos, text.clone());
                 }
                 None => {

@@ -130,6 +130,44 @@ fn the_classifier_counts_a_gated_glyph_apart() {
     assert_eq!(c.counts.runs, 1);
 }
 
+/// Only a server write holds a guess (gates come from output, #46's review R1): one a `Tick`
+/// expiry or an `EchoAck` past its grace takes off, with the link up, is a misprediction at
+/// once, even when a late echo then brings the same glyph back.
+#[test]
+fn the_classifier_holds_a_guess_only_in_a_server_write() {
+    for kind in [TapKind::Tick, TapKind::EchoAck] {
+        let mut c = classifier();
+        c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;3H\x1b[4ma\x1b[0m"));
+        c.on_event(&flush(kind, "\x1b[1;3H \x1b[1;3H", "", ""));
+        assert_eq!((c.counts.mispredicted, c.counts.gated), (1, 0), "{kind:?}");
+        assert_eq!(c.totals(), c.counts, "{kind:?}: nothing held");
+        c.on_event(&flush(TapKind::Server, "", "a", ""));
+        assert_eq!(
+            (c.counts.mispredicted, c.counts.gated, c.counts.confirmed),
+            (1, 0, 0),
+            "{kind:?}: the late echo"
+        );
+    }
+}
+
+/// A snapshot's reset also resets the classifier's own parser (#46's review R2): a sequence cut
+/// off before it does not swallow a later print, so a foreign glyph still ends a hold.
+#[test]
+fn the_classifier_resets_its_parser_with_a_snapshot() {
+    let mut c = classifier();
+    c.on_event(&flush(TapKind::Server, "", "\x1b[", ""));
+    c.on_event(&TapEvent::Reset {
+        size: Size { cols: 20, rows: 5 },
+    });
+    c.on_event(&flush(TapKind::Server, "", "", ""));
+    c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;2H\x1b[4mb\x1b[0m"));
+    // `Z` is a foreign print at the home cell (the session's cursor; the erase leaves the
+    // user's there too), not in the guess's; a stale `CSI` would read it as its final byte.
+    c.on_event(&flush(TapKind::Server, "\x1b[1;2H \x1b[1;1H", "Z", ""));
+    assert_eq!((c.counts.mispredicted, c.counts.gated), (1, 0));
+    assert_eq!(c.totals(), c.counts, "nothing held");
+}
+
 /// Withdrawn: a lifecycle write (a takeover), a resize, a snapshot's reset, the link down, and a
 /// Backspace's blank over a guess (superseded). A predictor's own withdrawal or an ended epoch
 /// is a misprediction.

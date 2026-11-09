@@ -484,6 +484,15 @@ release-sign-packages version *args:
 release-sign-macos version *args:
     tests/release/sign-macos.sh "{{version}}" {{args}}
 
+# The release's keys, once per session, on the owner's Mac: `just release-keys unlock` puts the release
+# key into the ssh-agent with a lifetime, presets the package key's passphrase in gpg-agent (proved by
+# a test signature; a reaper forgets it after the TTL) and checks the Developer ID, the notarytool
+# profile and a test codesign (options `--ttl 8h`, `--need ssh,gpg,apple`; the one-time gpg-agent setup is
+# in docs/m4/release.md section 10.4). Unlock once per release session; `status` and `forget` too.
+[positional-arguments]
+release-keys *args:
+    tests/release/release-keys.sh "$@"
+
 # Set the one package version (docs/m4/release.md section 1): [workspace.package] version and the
 # exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock
 # and the terminal exporter's own Cargo.lock (it is outside the workspace; `just exporter-lock`).

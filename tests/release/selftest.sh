@@ -1456,6 +1456,258 @@ fi
 rm -f "$MACSIGN_SCRIPT"
 unset MACSIGN_SCRIPT
 
+
+# ============================================================== release keys (release-keys.sh)
+# A real ssh-agent (started here, killed by its pid), real ssh-keygen keys and, when gpg is
+# installed, real gpg in a throwaway GNUPGHOME; the Apple tools are fakes. Never the caller's
+# agent or keyring: SSH_AUTH_SOCK and GNUPGHOME are always this block's own.
+echo "== release keys"
+rk=$tmp/rk
+mkdir -p "$rk/bin"
+RK_SCRIPT=$RELEASE_DIR/release-keys.sh
+rk_agent_pid='' rk_gpg=0 rk_sock=$rk/none.sock
+rk_cleanup() {
+  [ -z "$rk_agent_pid" ] || kill "$rk_agent_pid" 2> /dev/null || true
+  local p
+  for p in $(cat "$rk"/cache/fil/release-keys/* 2> /dev/null | sed -n 's/^pid=//p'); do
+    if ps -p "$p" -o command= 2> /dev/null | grep -q fil-release-keys-reaper; then kill "$p" 2> /dev/null || true; fi
+  done
+  [ "$rk_gpg" = 0 ] || GNUPGHOME=$rk/gnupg gpgconf --kill all 2> /dev/null || true
+}
+trap 'rk_cleanup; rm -rf "$tmp"' EXIT INT TERM
+# rks ENV=VALUE... -- ARGS...: release-keys.sh in this block's world (its own agent, keyring, state).
+rks() {
+  local envs=()
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  env FIL_RELEASE_SELFTEST=1 SSH_AUTH_SOCK="$rk_sock" GNUPGHOME="$rk/gnupg" XDG_CACHE_HOME="$rk/cache" FIL_RELEASE_KEY="$rk/fil-release" \
+    FIL_SSH_ADD="$rk/bin/ssh-add" FIL_PACKAGE_KEY_FILE="$rk/package-key.asc" ${envs[@]+"${envs[@]}"} \
+    ${RK_SHELL:-} "$RK_SCRIPT" "$@" 2>&1 | tee "$rk/last.log"
+}
+# A logging ssh-add (the real one underneath); RK_NO_T=1 makes it an ssh-add without -T.
+cat > "$rk/bin/ssh-add" << EOF
+#!/bin/sh
+echo "ssh-add \$*" >> "$rk/ssh-add.log"
+if [ "\${RK_NO_T:-}" = 1 ]; then for a; do [ "\$a" = -T ] && { echo "ssh-add: illegal option -- T" >&2; exit 1; }; done; fi
+exec ssh-add "\$@"
+EOF
+chmod +x "$rk/bin/ssh-add"
+
+expect_fail "release-keys: a test-only override outside the self-test is refused" env FIL_SSH_ADD="$rk/bin/ssh-add" FIL_RELEASE_SELFTEST= "$RK_SCRIPT" status --need ssh
+expect_fail "release-keys: an unknown key is refused" env FIL_RELEASE_SELFTEST=1 "$RK_SCRIPT" status --need ssh,pgp
+for t in 0 25h 8x h8 8hh "" 123456 s 1d; do
+  expect_fail "release-keys: --ttl '$t' is refused" env FIL_RELEASE_SELFTEST=1 "$RK_SCRIPT" status --need ssh --ttl "$t"
+done
+
+if command -v ssh-agent > /dev/null && command -v ssh-add > /dev/null; then
+  rk_sock=$rk/agent.sock
+  eval "$(ssh-agent -s -a "$rk_sock")" > /dev/null
+  rk_agent_pid=$SSH_AGENT_PID
+  unset SSH_AGENT_PID
+  ssh-keygen -q -t ed25519 -N '' -C fil-release-test -f "$rk/fil-release"
+  : > "$rk/ssh-add.log"
+  expect_fail "release-keys ssh: status before unlock says locked (exit 1)" rks -- status --need ssh
+  expect_pass "release-keys ssh: ...and names it locked" grep -q '^ssh    locked' "$rk/last.log"
+  expect_pass "release-keys ssh: unlock adds the key" rks -- unlock --need ssh
+  expect_pass "release-keys ssh: ...with the default 8h lifetime" grep -qx "ssh-add -t 28800 $rk/fil-release" "$rk/ssh-add.log"
+  expect_pass "release-keys ssh: ...and the real agent signs with it (ssh-add -T)" env SSH_AUTH_SOCK="$rk_sock" ssh-add -T "$rk/fil-release.pub"
+  expect_pass "release-keys ssh: status says ready" rks -- status --need ssh
+  expect_pass "release-keys ssh: ...with the key's fingerprint" grep -q "^ssh    ready .*$(ssh-keygen -l -f "$rk/fil-release.pub" | cut -d' ' -f2)" "$rk/last.log"
+  expect_pass "release-keys ssh: a second unlock asks nothing" rks -- unlock --need ssh
+  expect_pass "release-keys ssh: ...no second ssh-add of the key" test "$(grep -c '^ssh-add -t' "$rk/ssh-add.log")" = 1
+  expect_pass "release-keys ssh: an ssh-add without -T: a test signature proves the key instead" rks RK_NO_T=1 -- status --need ssh
+  expect_pass "release-keys ssh: ...it did fall back" grep -q '^ssh    ready' "$rk/last.log"
+  expect_pass "release-keys ssh: forget removes the key" rks -- forget --need ssh
+  expect_fail "release-keys ssh: ...the real agent no longer has it" env SSH_AUTH_SOCK="$rk_sock" ssh-add -T "$rk/fil-release.pub"
+  expect_fail "release-keys ssh: ...status says locked" rks -- status --need ssh
+  expect_fail "release-keys ssh: ...and so does the fallback (the private file next to the .pub is not used)" rks RK_NO_T=1 -- status --need ssh
+  expect_pass "release-keys ssh: --ttl 90m is 5400 seconds" rks -- unlock --need ssh --ttl 90m
+  expect_pass "release-keys ssh: ...passed to ssh-add" grep -qx "ssh-add -t 5400 $rk/fil-release" "$rk/ssh-add.log"
+  rks -- forget --need ssh > /dev/null 2>&1
+  expect_pass "release-keys ssh: --ttl 010h is ten hours, in base 10" rks -- unlock --need ssh --ttl 010h
+  expect_pass "release-keys ssh: ...passed to ssh-add" grep -qx "ssh-add -t 36000 $rk/fil-release" "$rk/ssh-add.log"
+  expect_pass "release-keys ssh: a key already in the agent: its lifetime cannot be read" rks -- unlock --need ssh
+  expect_pass "release-keys ssh: ...and the message says so" grep -q 'ssh-add cannot show it' "$rk/last.log"
+  rks -- forget --need ssh > /dev/null 2>&1
+  expect_fail "release-keys ssh: a missing key file is refused" rks FIL_RELEASE_KEY="$rk/nokey" -- unlock --need ssh
+  expect_fail "release-keys ssh: no agent is an error" rks SSH_AUTH_SOCK="$rk/none.sock" -- unlock --need ssh
+  expect_pass "release-keys ssh: ...that says so" grep -q 'no ssh-agent' "$rk/last.log"
+else
+  echo "  skip release-keys ssh: no ssh-agent"
+fi
+
+rk_preset=''
+if command -v gpg > /dev/null && command -v gpgconf > /dev/null && command -v gpg-connect-agent > /dev/null; then
+  rk_preset=$(gpgconf --list-dirs libexecdir 2> /dev/null)/gpg-preset-passphrase
+  [ -x "$rk_preset" ] || rk_preset=''
+fi
+if [ -n "$rk_preset" ]; then
+  rk_gpg=1
+  rk_sock=${rk_sock:-$rk/none.sock}
+  export_gnupg() { GNUPGHOME=$rk/gnupg LC_ALL=C "$@"; }
+  mkdir -m 700 "$rk/gnupg"
+  RK_PASS='correct horse rk-test-passphrase'
+  export_gnupg gpg --batch --pinentry-mode loopback --passphrase "$RK_PASS" --quick-generate-key "fil test package key" ed25519 sign 1y > /dev/null 2>&1
+  rk_fpr=$(export_gnupg gpg -K --with-colons 2> /dev/null | awk -F: '$1 == "fpr" { print $10; exit }')
+  export_gnupg gpg --armor --export "$rk_fpr" > "$rk/package-key.asc" 2> /dev/null
+  # A logging gpg-preset-passphrase (the real one underneath): it records its arguments, never stdin.
+  cat > "$rk/bin/preset" << EOF
+#!/bin/sh
+echo "preset \$*" >> "$rk/preset.log"
+exec "$rk_preset" "\$@"
+EOF
+  chmod +x "$rk/bin/preset"
+  rkg() { rks FIL_GPG_PRESET="$rk/bin/preset" "$@"; }
+  rk_sign() { rm -f "$rk/m.sig" && echo m > "$rk/m" && export_gnupg gpg --batch --pinentry-mode error -u "$rk_fpr" --detach-sign -o "$rk/m.sig" "$rk/m"; }
+  rk_reaper() { cat "$rk"/cache/fil/release-keys/* 2> /dev/null | sed -n 's/^pid=//p'; }
+  rk_alive() { [ -n "$1" ] && kill -0 "$1" 2> /dev/null; }
+
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg > "$tmp/out.log" 2>&1 && flunk "release-keys gpg: without allow-preset-passphrase, unlock stops (it passed)" || pass "release-keys gpg: without allow-preset-passphrase, unlock stops"
+  expect_pass "release-keys gpg: ...and prints the one-time setup" grep -q 'echo allow-preset-passphrase >>' "$rk/last.log"
+  expect_pass "release-keys gpg: ...before any preset" test ! -s "$rk/preset.log"
+  echo allow-preset-passphrase > "$rk/gnupg/gpg-agent.conf"
+  export_gnupg gpgconf --reload gpg-agent 2> /dev/null || true
+
+  expect_fail "release-keys gpg: status before unlock says locked" rkg -- status --need gpg
+  printf 'wrong passphrase\n' | rkg -- unlock --need gpg > "$tmp/out.log" 2>&1 && flunk "release-keys gpg: a wrong passphrase fails (it passed)" || pass "release-keys gpg: a wrong passphrase fails at the test signature"
+  expect_pass "release-keys gpg: ...and says so" grep -q 'wrong passphrase' "$rk/last.log"
+  expect_fail "release-keys gpg: ...and leaves nothing cached" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...the agent says locked (not NO-REAPER)" grep -q '^gpg    locked' "$rk/last.log"
+  expect_pass "release-keys gpg: ...and no reaper" test -z "$(rk_reaper)"
+
+  : > "$rk/preset.log"
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg > "$rk/unlock.log" 2>&1 && pass "release-keys gpg: unlock presets the passphrase" || { flunk "release-keys gpg: unlock presets the passphrase"; sed 's/^/       | /' "$rk/unlock.log"; }
+  expect_pass "release-keys gpg: ...a signature now needs no pinentry" rk_sign
+  rk_pid=$(rk_reaper)
+  expect_pass "release-keys gpg: ...the reaper runs" rk_alive "$rk_pid"
+  expect_pass "release-keys gpg: status says ready, with the time left and the reaper" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...in its line" grep -q "^gpg    ready      the package key $rk_fpr is cached, forgotten in [78]h[0-9][0-9]m (reaper pid $rk_pid)" "$rk/last.log"
+  expect_pass "release-keys gpg: the passphrase is in no argument list" sh -c '! grep -qF "$1" "$2"' sh "$RK_PASS" "$rk/preset.log"
+  expect_pass "release-keys gpg: ...the preset tool was called (with the keygrip only)" grep -q '^preset --preset [0-9A-F]\{40\}$' "$rk/preset.log"
+  expect_pass "release-keys gpg: ...nor in the reaper record or the output" sh -c '! grep -rqF "$1" "$2" "$3"' sh "$RK_PASS" "$rk/cache" "$rk/unlock.log"
+  : > "$rk/preset.log"
+  expect_pass "release-keys gpg: a second unlock within the TTL asks nothing" rkg -- unlock --need gpg < /dev/null
+  expect_pass "release-keys gpg: ...presets nothing" test ! -s "$rk/preset.log"
+  expect_pass "release-keys gpg: ...and keeps the reaper" test "$(rk_reaper)" = "$rk_pid"
+  expect_pass "release-keys gpg: forget" rkg -- forget --need gpg
+  expect_fail "release-keys gpg: ...the reaper is gone" rk_alive "$rk_pid"
+  expect_fail "release-keys gpg: ...a signature fails without a pinentry" rk_sign
+  expect_fail "release-keys gpg: ...status says locked" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...and no reaper record is left" test -z "$(rk_reaper)"
+
+  # xtrace must never print the passphrase: SHELLOPTS=xtrace and bash -x.
+  for mode in shellopts bash-x; do
+    if [ $mode = shellopts ]; then rkx() { rkg SHELLOPTS=xtrace "$@"; }; else rkx() { RK_SHELL="bash -x" rkg "$@"; }; fi
+    printf '%s\n' "$RK_PASS" | rkx -- unlock --need gpg > "$rk/xtrace.log" 2>&1 && pass "release-keys gpg: unlock under xtrace ($mode)" || { flunk "release-keys gpg: unlock under xtrace ($mode)"; tail -5 "$rk/xtrace.log" | sed 's/^/       | /'; }
+    expect_pass "release-keys gpg: ...it did trace ($mode)" grep -q '^+' "$rk/xtrace.log"
+    expect_pass "release-keys gpg: ...and the passphrase is not in the trace ($mode)" sh -c '! grep -qF "$1" "$2"' sh "$RK_PASS" "$rk/xtrace.log"
+    rkg -- forget --need gpg > /dev/null 2>&1
+  done
+
+  # One reaper per keygrip: a preset whose reaper is gone is reported as such, and a new unlock
+  # leaves exactly one reaper.
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg > /dev/null 2>&1
+  rk_pid=$(rk_reaper)
+  kill "$rk_pid" 2> /dev/null || true
+  i=0
+  while kill -0 "$rk_pid" 2> /dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  expect_fail "release-keys gpg: a cached passphrase with no reaper is not ready" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...and says it does not expire" grep -q '^gpg    NO-REAPER .*does not expire' "$rk/last.log"
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg > /dev/null 2>&1
+  rk_pid=$(rk_reaper)
+  expect_pass "release-keys gpg: ...a new unlock starts one reaper" test "$(printf '%s\n' "$rk_pid" | wc -l | tr -d ' ')" = 1
+  rkg -- unlock --need gpg < /dev/null > /dev/null 2>&1
+  expect_pass "release-keys gpg: ...unlock again: still that one" test "$(rk_reaper)" = "$rk_pid"
+  expect_pass "release-keys gpg: ...and status is ready" rkg -- status --need gpg
+  expect_pass "release-keys gpg: the record directory is 700" sh -c 'ls -ld "$1" | grep -q "^drwx------"' sh "$rk/cache/fil/release-keys"
+  expect_pass "release-keys gpg: ...and the record 600" sh -c 'for f in "$1"/*; do ls -l "$f" | grep -q "^-rw-------" || exit 1; done' sh "$rk/cache/fil/release-keys"
+  # A garbled record: status says CORRUPT, with no bash error.
+  rk_rec=$(ls "$rk"/cache/fil/release-keys/* | head -n 1)
+  cp "$rk_rec" "$rk/rec.saved"
+  printf 'pid=x\ndeadline=a[$(touch %s)]\n' "$rk/pwned" > "$rk_rec"
+  expect_fail "release-keys gpg: a garbled reaper record fails status" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...as CORRUPT" grep -q '^gpg    CORRUPT' "$rk/last.log"
+  expect_pass "release-keys gpg: ...with no shell error and nothing run" sh -c '! grep -q "unbound variable\|syntax error\|line [0-9]" "$1" && test ! -e "$2"' sh "$rk/last.log" "$rk/pwned"
+  cp "$rk/rec.saved" "$rk_rec"
+  # Two unlocks at once: they serialize, and one reaper is left.
+  ( printf '%s\n' "$RK_PASS" | rkg -- forget --need gpg > /dev/null 2>&1 )
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg --ttl 5m > /dev/null 2>&1 &
+  rk_u1=$!
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg --ttl 6m > /dev/null 2>&1 &
+  rk_u2=$!
+  wait "$rk_u1" || true
+  wait "$rk_u2" || true
+  expect_pass "release-keys gpg: two concurrent unlocks leave one live reaper" sh -c 'n=0; for p in $(ps -A -ww -o pid= -o command= | grep "[f]il-release-keys-reaper" | grep -F "$1" | awk "{print \$1}"); do n=$((n + 1)); done; test "$n" = 1' sh "$rk/cache"
+  expect_pass "release-keys gpg: ...and no lock is left behind" sh -c '! ls -d "$1"/*.lock > /dev/null 2>&1' sh "$rk/cache/fil/release-keys"
+  rkg -- forget --need gpg > /dev/null 2>&1
+
+  # A TERM while the test signature runs: nothing stays cached (a slowed gpg).
+  cat > "$rk/bin/slowgpg" << EOF
+#!/bin/sh
+for a; do [ "\$a" = --detach-sign ] && { echo \$\$ > "$rk/signing"; sleep 5; }; done
+exec gpg "\$@"
+EOF
+  chmod +x "$rk/bin/slowgpg"
+  rm -f "$rk/signing"
+  printf '%s\n' "$RK_PASS" | env FIL_RELEASE_SELFTEST=1 GNUPGHOME="$rk/gnupg" XDG_CACHE_HOME="$rk/cache" FIL_GPG="$rk/bin/slowgpg" FIL_PACKAGE_KEY_FILE="$rk/package-key.asc" "$RK_SCRIPT" unlock --need gpg > /dev/null 2>&1 &
+  rk_bg=$!
+  i=0
+  while [ ! -f "$rk/signing" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -TERM "$rk_bg" 2> /dev/null || true
+  wait "$rk_bg" 2> /dev/null || true
+  rk_slow=$(cat "$rk/signing" 2> /dev/null || true)
+  if [ -n "$rk_slow" ] && ps -p "$rk_slow" -o command= 2> /dev/null | grep -q slowgpg; then kill "$rk_slow" 2> /dev/null || true; fi
+  expect_pass "release-keys gpg: a TERM during the test signature..." test -f "$rk/signing"
+  expect_fail "release-keys gpg: ...leaves nothing cached" rkg -- status --need gpg
+  expect_pass "release-keys gpg: ...the agent says locked (not NO-REAPER)" grep -q '^gpg    locked' "$rk/last.log"
+  expect_pass "release-keys gpg: ...and no reaper" test -z "$(rk_reaper)"
+
+  # The reaper itself: a 1-second TTL, then the passphrase is gone with no forget (bounded wait).
+  printf '%s\n' "$RK_PASS" | rkg -- unlock --need gpg --ttl 1s > "$tmp/out.log" 2>&1 && pass "release-keys gpg: unlock with --ttl 1s" || flunk "release-keys gpg: unlock with --ttl 1s"
+  rk_pid=$(rk_reaper)
+  i=0
+  while rk_alive "$rk_pid" && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
+  expect_fail "release-keys gpg: ...the reaper finished" rk_alive "$rk_pid"
+  expect_fail "release-keys gpg: ...and forgot the passphrase" rk_sign
+
+  expect_fail "release-keys gpg: a key that is not in the keyring is refused" rkg FIL_PACKAGE_KEY_FILE="$REPO_ROOT/.github/package-signing-key.asc" -- unlock --need gpg < /dev/null
+  expect_pass "release-keys gpg: ...saying so" grep -q 'is not a secret key in this keyring' "$rk/last.log"
+else
+  echo "  skip release-keys gpg: no gpg with gpg-preset-passphrase"
+fi
+
+# Apple: fakes for security, notarytool and codesign, which log their arguments.
+cat > "$rk/bin/security" << EOF
+#!/bin/sh
+echo "security \$*" >> "$rk/apple.log"
+[ "\$1" = find-identity ] && [ "\${RK_NO_ID:-}" != 1 ] && echo '  1) ABCDEF "Developer ID Application: Test (TEAM)"' && echo '     1 valid identities found'
+exit 0
+EOF
+cat > "$rk/bin/notarytool" << EOF
+#!/bin/sh
+echo "notarytool \$*" >> "$rk/apple.log"
+[ "\${RK_NOTARY_FAIL:-}" != 1 ]
+EOF
+cat > "$rk/bin/codesign" << EOF
+#!/bin/sh
+echo "codesign \$*" >> "$rk/apple.log"
+exit 0
+EOF
+chmod +x "$rk/bin/security" "$rk/bin/notarytool" "$rk/bin/codesign"
+rka() { rks FIL_SECURITY="$rk/bin/security" FIL_NOTARYTOOL="$rk/bin/notarytool" FIL_CODESIGN="$rk/bin/codesign" FIL_CODESIGN_IDENTITY="Developer ID Application: Test (TEAM)" "$@"; }
+: > "$rk/apple.log"
+expect_pass "release-keys apple: identity, notary profile and a test codesign" rka SSH_CONNECTION= -- unlock --need apple
+expect_pass "release-keys apple: ...the profile was checked" grep -q '^notarytool history --keychain-profile fil-notary$' "$rk/apple.log"
+expect_pass "release-keys apple: ...the test codesign is hardened and timestamped, of a scratch copy" sh -c 'grep "^codesign --force --sign" "$1" | grep -- "--timestamp --options runtime" | grep -q "/fil-keycheck$"' sh "$rk/apple.log"
+expect_pass "release-keys apple: status" rka -- status --need apple
+expect_fail "release-keys apple: a missing identity is refused" rka RK_NO_ID=1 -- unlock --need apple
+expect_fail "release-keys apple: a notary profile that fails is refused" rka RK_NOTARY_FAIL=1 -- unlock --need apple
+expect_pass "release-keys apple: ...saying which" grep -q "profile 'fil-notary' does not work" "$rk/last.log"
+
+rk_cleanup
+rk_agent_pid='' rk_gpg=0 rk_sock=$rk/none.sock
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
 # ============================================================== 9. release-preflight.sh (stubs only)
 # A clone with a Gitea-like `origin` and a GitHub-like `github` (local bare repos), real git, real
 # ssh-keygen keys and real commit signing; every other tool is a stub driven by FAKE_* variables.

@@ -68,7 +68,7 @@
 ## 6. Open items and owner questions
 
 - **Decided** (owner 2026-11-04): the .deb and .rpm are named `fil` (D1); their Maintainer and Packager is the owner, with the address the owner gave for that field (D2); the rpms are signed on the owner's machine (D3, `docs/m4/release.md` §10.4). **Delegated to the coordinator:** the PKGBUILD keeps `/usr/libexec` for now (Arch prefers `/usr/lib`; the client looks for its bundle at `../libexec/fil/remote`).
-- **The package key** is in `.github/package-signing-key.asc` (the owner's key, fingerprint `8BD8 1C03 EC58 8C5E FD85  04C8 8C14 2300 4B6D DA01`, also in the README). `release-verify` reads it from main.
+- **The package key** is in `.github/package-signing-key.asc` (the owner's key, fingerprint `9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26`, also in the README). `release-verify` reads it from main.
 - **The AUR** is closed to new accounts, so `fil-shell-bin` is prepared and not published: `just aur-pkgbuild VERSION` writes the PKGBUILD and `.SRCINFO` from the verified `SHA256SUMS`. Publishing needs an AUR account (owner) and its SSH key; then each release pushes the rendered PKGBUILD and `.SRCINFO` to the AUR git repository of `fil-shell-bin`.
 - **Debian and Fedora submissions** (an ITP and RFS, a Fedora package review) are owner steps with a sponsor; they package from the source archive, not from these .deb and .rpm files.
 - **Not built here:** the `brew` step of `macos-check.yml` (§4), and a `cargo install --git` test in a clean container (`docs/m4/plan.md` PKG "Tests"; `just crates-check` builds the packaged crate, which covers most of it).

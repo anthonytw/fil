@@ -14,7 +14,7 @@ default:
 # The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
 # failure (the advisory database) shows up at once, not after the whole test suite; `notices` next,
 # so that a missing cargo-about (the Notices section below) does too.
-ci: deny notices ci-workflow-test fmt-check clippy check-default release-deps release-test test test-wallclock
+ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps release-test test test-wallclock
 
 # The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
 # offline fakes of git and the API, under a second. Part of `ci`; needs python3.
@@ -23,6 +23,13 @@ ci-workflow-test:
 
 fmt-check:
     cargo fmt --all --check
+
+# The terminal exporter (tests/terminals/exporter) is outside the workspace and has its own
+# Cargo.lock, which pins the workspace crates' version. Only GitHub's `linux-check` terminals job
+# builds it (`--locked`), so a stale lock went unnoticed until that job ran (0.1.0's set-version
+# left fil-term and fil-predict at 0.0.0 there). This fails fast if the lock needs an update.
+exporter-lock:
+    cargo update -w --locked -q --manifest-path tests/terminals/exporter/Cargo.toml
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -463,7 +470,8 @@ release-sign-macos version *args:
     tests/release/sign-macos.sh "{{version}}" {{args}}
 
 # Set the one package version (docs/m4/release.md section 1): [workspace.package] version and the
-# exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock.
+# exact `=X.Y.Z` requirements of [workspace.dependencies] in the root Cargo.toml, then Cargo.lock
+# and the terminal exporter's own Cargo.lock (it is outside the workspace; `just exporter-lock`).
 set-version version:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -471,6 +479,7 @@ set-version version:
     printf '%s' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || { echo "set-version: '$v' is not X.Y.Z or X.Y.Z-PRE" >&2; exit 1; }
     perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]*"/${1}'"$v"'"/; s/(version = ")=[^"]*(")/${1}='"$v"'${2}/g' Cargo.toml
     cargo update -w --offline -q
+    cargo update -w --offline -q --manifest-path tests/terminals/exporter/Cargo.toml
     grep -nE '^version = |version = "=' Cargo.toml
 
 # The Homebrew formula for VERSION, from the release's SHA256SUMS: by default the copy that

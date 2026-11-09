@@ -207,7 +207,8 @@ else
   mteam=$(tr -d '[:space:]' < "$ROOT/.github/macos-team-id" 2> /dev/null) || mteam=''
 fi
 mopts=()
-[ "$presign" = 0 ] || mopts+=(--pre-sign)
+# a dry run is never signed (CI's ad hoc build is all there is), so it checks the signature as --pre-sign does
+if [ "$presign" = 1 ] || [ "$dry" = 1 ]; then mopts+=(--pre-sign); fi
 [ -z "$mac_rebuild" ] || mopts+=(--mac-rebuild "$mac_rebuild")
 "$RELEASE_DIR/verify-macos.sh" report "$dl" "$version" --team "$mteam" ${mopts[@]+"${mopts[@]}"} || fail "the macOS binary's signature"
 
@@ -278,8 +279,8 @@ fi
 if [ "$rebuild" = 1 ] && [ "$dry" = 0 ]; then
   printf 'sums=%s\nrebuild=1\npresign=%s\ndry=0\n' "$(sha256 "$dl/SHA256SUMS")" "$presign" > "$work/verified"
 fi
-if [ "$presign" = 1 ]; then
-  echo "release-verify: all checks passed EXCEPT the signature, which --pre-sign did not check" >&2
+if [ "$presign" = 1 ] || [ "$dry" = 1 ]; then
+  echo "release-verify: all checks passed EXCEPT the signature, which a dry run or --pre-sign does not check" >&2
 else
   echo "release-verify: all checks passed" >&2
 fi

@@ -26,6 +26,9 @@ log() { echo "rebuild: $*" >&2; }
 die() { log "$*"; exit 1; }
 
 # ---- amd64 containers must run, and run rustc (qemu-user 8.2 segfaults on rustc at startup)
+if ! derr=$(docker info 2>&1 > /dev/null); then
+  die "cannot reach Docker in this VM as $(id -un): $(printf '%s' "$derr" | tail -n 1 | head -c 300) (a new VM: restart it once, limactl stop and start, so you are in the docker group; docs/dev/vm.md)"
+fi
 docker run --rm --platform linux/amd64 busybox:stable true 2> /dev/null \
   || die "Docker cannot run linux/amd64 images in this VM: enable Rosetta (docs/m4/release.md section 9.3)"
 
@@ -43,15 +46,23 @@ chan=$(sed -n 's/^channel[ ]*=[ ]*"\(.*\)"/\1/p' rust-toolchain.toml | head -n 1
 rustup show active-toolchain > /dev/null 2>&1 || rustup toolchain install
 default_before=$(rustup default 2> /dev/null || true)
 x86tc=$chan-x86_64-unknown-linux-gnu
-rustup toolchain list | grep -q "^$x86tc" \
-  || rustup toolchain install "$x86tc" --profile minimal --force-non-host -t x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+# a toolchain can be listed without its rustc (an interrupted install): then `rustup which` prints
+# nothing, and the mount below would mount the current directory. Check the rustc file itself (not
+# `rustup which`, which installs a missing toolchain on its own, without the musl targets), and
+# reinstall. RUSTUP_AUTO_INSTALL=0 on the `rustup which` below keeps it from installing anything.
+if ! [ -x "${RUSTUP_HOME:-$HOME/.rustup}/toolchains/$x86tc/bin/rustc" ]; then
+  if rustup toolchain list | grep -q "^$x86tc"; then rustup toolchain uninstall "$x86tc"; fi
+  rustup toolchain install "$x86tc" --profile minimal --force-non-host -t x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+fi
 # installing a first toolchain makes it the default; put back what was there
 [ -n "$default_before" ] || rustup default none > /dev/null 2>&1 || true
 # ---- the pinned toolchain must RUN in the pinned image under this VM's emulation. qemu-user (Ubuntu
 # 24.04's 8.2) runs `true`, then crashes rustc at startup ("QEMU internal SIGSEGV") or hangs it;
 # Rosetta runs it. Hence the time limit.
 img=$(awk '$0 == "[target.x86_64-unknown-linux-musl]" { p = 1; next } /^\[/ { p = 0 } p && /^image/ { v = $0; sub(/^image[ ]*=[ ]*"/, "", v); sub(/".*$/, "", v); print v; exit }' Cross.toml)
-x86root=$(dirname "$(dirname "$(rustup which --toolchain "$x86tc" rustc)")")
+x86rustc=$(RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$x86tc" rustc) && [ -x "$x86rustc" ] \
+  || die "the $x86tc toolchain has no rustc; repair it with: rustup toolchain uninstall $x86tc (the next run reinstalls it)"
+x86root=$(dirname "$(dirname "$x86rustc")")
 cid=$(docker run -d --platform linux/amd64 -v "$x86root:/rust:ro" "$img" /rust/bin/rustc --version)
 code=$(timeout 120 docker wait "$cid" 2> /dev/null || echo timeout)
 docker rm -f "$cid" > /dev/null 2>&1 || true

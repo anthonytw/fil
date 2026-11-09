@@ -86,7 +86,7 @@ provision:
 
 The rustup bootstrap is the standard unpinned installer; it runs only inside the throwaway VM, and the toolchain itself is pinned by `rust-toolchain.toml`.
 
-Then, once, from a checkout: `just vm-setup`.
+Then restart it once (`limactl stop fil && limactl start fil`): provisioning adds you to the `docker` group, but Lima's ssh session predates that, so until a restart `docker` fails with `permission denied ... docker.sock` (and the release rebuild's amd64 probe reports it as missing Rosetta). Check with `limactl shell fil id`. Then, once, from a checkout: `just vm-setup`.
 
 ## Recipes
 

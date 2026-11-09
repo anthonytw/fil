@@ -1,6 +1,10 @@
-# The release identity's public key (owner, added 2026-11-04). Fingerprint:
-#   SHA256:sEx4DtGI9gdaVhgsYWwuIC0xwkYJ8BLIVhVktPHINvQ (ED25519)
+# The release identity's public key (owner, rotated 2026-11-08). Fingerprint:
+#   SHA256:Q7KfBHSjAFRimlv46rQuCGxsQF0NHQgLTpBcekwvnp0 (ED25519)
 # Check this against the fingerprint published outside the repository before trusting it.
+#
+# Retired 2026-11-08: SHA256:sEx4DtGI9gdaVhgsYWwuIC0xwkYJ8BLIVhVktPHINvQ (ED25519), the key of
+# 2026-11-04. Its passphrase was lost, so nobody can sign with it. It keeps its "git" line only, so
+# the v0.1.0 tag it signed still verifies; it can no longer verify a SHA256SUMS.sig.
 #
 # The format is ssh-keygen's allowed-signers file. One line per key and namespace, ONE KEY PER LINE,
 # no private key ever: namespaces="git" verifies the signed tag (git verify-tag), and
@@ -9,5 +13,6 @@
 # `just release-verify` reads this file from MAIN, never from the tag being checked, so a key added
 # only on a tag's own commit verifies nothing (tests/release/verify-tag.sh). Rotating the key is a PR
 # to main; a tag signed by a retired key stops verifying once main drops it.
+release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILrP95b5kPn5fGzawh/SRaiMekWFgRDDqHjEfnDbuUFY
+release namespaces="fil-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILrP95b5kPn5fGzawh/SRaiMekWFgRDDqHjEfnDbuUFY
 release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILg+u3bSTrzVzYLHidJKcXO+4c8fwegRYNwpSM9cCsip
-release namespaces="fil-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILg+u3bSTrzVzYLHidJKcXO+4c8fwegRYNwpSM9cCsip

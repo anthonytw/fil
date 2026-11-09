@@ -39,7 +39,7 @@ See the [guide](docs/user/README.md): [quick start](docs/user/quick-start.md), [
 
 Check these fingerprints against the copies in the repository before you trust a release:
 
-- **Release signing key** (SSH, Ed25519; signs the release tags and `SHA256SUMS`; `.github/release-signers`): `SHA256:sEx4DtGI9gdaVhgsYWwuIC0xwkYJ8BLIVhVktPHINvQ`
+- **Release signing key** (SSH, Ed25519; signs the release tags and `SHA256SUMS`; `.github/release-signers`): `SHA256:Q7KfBHSjAFRimlv46rQuCGxsQF0NHQgLTpBcekwvnp0` (since 2026-11-08; the retired `SHA256:sEx4DtGI9gdaVhgsYWwuIC0xwkYJ8BLIVhVktPHINvQ` signed only the v0.1.0 tag)
 - **Package signing key** (OpenPGP, RSA 4096; signs the `.rpm` packages and `SHA256SUMS.asc`; `.github/package-signing-key.asc`): `8BD8 1C03 EC58 8C5E FD85  04C8 8C14 2300 4B6D DA01`
 
 ## Status

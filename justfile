@@ -431,6 +431,16 @@ release-check *args:
 release-verify version *args:
     tests/release/verify.sh "$@"
 
+# Everything a release needs, checked before anything is done (docs/m4/release.md section 9.4):
+# the tools, disk, a clean HEAD at Gitea's main, the version and changelog, the lockfiles, GitHub's
+# main, gh and ssh as the owner, commit signing, the crates-io environment, the tag ruleset, the
+# version still free, Docker, the VM (Rosetta), the release and package keys (present, not unlocked)
+# and the Developer ID. Read-only; each failure says what it catches and what to do.
+# `--from STEP` checks only what STEP and later steps need; `--list` shows the map.
+[positional-arguments]
+release-preflight version *args:
+    tests/release/release-preflight.sh "$@"
+
 # Reserve the crates.io names of the nine published crates with a 0.0.1 placeholder each. Whoever holds the
 # publishing account runs it, after `cargo login`; the placeholders are built outside the repository, paced
 # for the new-crate limit, and names already registered are skipped (docs/m4/release.md section 10.1).

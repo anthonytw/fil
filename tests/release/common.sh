@@ -293,11 +293,21 @@ dev_id_requirement() {
   printf 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "%s"' "$1"
 }
 
+# Every test-only override any script here reads: each replaces a real tool with a fake, or a real
+# input with a test's. One list, so that none goes unnoticed (release-preflight.sh refuses them all
+# outside the self-test). A script that adds an override adds it here.
+TEST_OVERRIDES="FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT
+  FIL_GATE_GH FIL_GPG FIL_RPMSIGN FIL_RPMKEYS FIL_PACKAGE_KEY_FILE FIL_RELEASE_REPO_URL FIL_PUBLISH_CARGO FIL_PUBLISH_CURL FIL_RESERVE_CARGO FIL_RESERVE_CURL
+  FIL_DOCKER FIL_LIMACTL FIL_SSH FIL_SECURITY FIL_CARGO FIL_CRATES_CURL FIL_DF FIL_RELEASE_SELFTEST"
+
+# The owner's Developer ID (sign-macos.sh, release-preflight.sh); FIL_CODESIGN_IDENTITY names another.
+DEFAULT_CODESIGN_IDENTITY='Developer ID Application: Anthony Wertz (6X3PT3FXGA)'
+
 # test_override_notes: a NOTE for each test-only override that is set. They replace a real tool with
 # a fake or skip a check; a shell that still has one exported must never go unnoticed.
 test_override_notes() {
   local v
-  for v in FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT FIL_RELEASE_SELFTEST; do
+  for v in $TEST_OVERRIDES; do
     [ -z "${!v:-}" ] || echo "release: NOTE: $v is set ($(printf '%s' "${!v}" | cut -c1-60)): a test-only override; this run does NOT use the real tool or check it replaces" >&2
   done
 }

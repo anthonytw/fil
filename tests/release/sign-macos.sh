@@ -36,7 +36,7 @@
 # `just release-sign-packages` continues from them) only after the upload succeeded. If the upload
 # stops half way, run this script again: the draft still holds CI's .ci archive, which is all it needs.
 #
-# Environment: FIL_CODESIGN_IDENTITY (the certificate's name, as in the keychain; default below; `-`
+# Environment: FIL_CODESIGN_IDENTITY (the certificate's name, as in the keychain; default DEFAULT_CODESIGN_IDENTITY in common.sh; `-`
 # is ad hoc, for trying the script), FIL_RELEASE_KEY (default ~/.ssh/fil-release), FIL_NOTARY_PROFILE
 # (default fil-notary), FIL_MACOS_TEAM_ID (default .github/macos-team-id). Test-only overrides, each
 # of which prints a NOTE and none of which is accepted unless the self-test's FIL_RELEASE_SELFTEST=1
@@ -68,7 +68,7 @@ if [ "${FIL_RELEASE_SELFTEST:-}" != 1 ]; then
   done
 fi
 
-identity=${FIL_CODESIGN_IDENTITY:-Developer ID Application: Anthony Wertz (6X3PT3FXGA)}
+identity=${FIL_CODESIGN_IDENTITY:-$DEFAULT_CODESIGN_IDENTITY}
 profile=${FIL_NOTARY_PROFILE:-fil-notary}
 key=${FIL_RELEASE_KEY:-$HOME/.ssh/fil-release}
 gh=${FIL_GH:-gh}

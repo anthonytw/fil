@@ -1456,6 +1456,239 @@ fi
 rm -f "$MACSIGN_SCRIPT"
 unset MACSIGN_SCRIPT
 
+# ============================================================== 9. release-preflight.sh (stubs only)
+# A clone with a Gitea-like `origin` and a GitHub-like `github` (local bare repos), real git, real
+# ssh-keygen keys and real commit signing; every other tool is a stub driven by FAKE_* variables.
+# Nothing here reaches GitHub, Gitea, crates.io or Docker. Each failure class must fail with its message.
+echo "== release-preflight.sh"
+pf=$tmp/preflight
+PF=$RELEASE_DIR/release-preflight.sh
+mkdir -p "$pf/bin" "$pf/path"
+ssh-keygen -q -t ed25519 -N '' -f "$pf/key" -C t
+ssh-keygen -q -t ed25519 -N '' -f "$pf/otherkey" -C t
+git init -q --bare "$pf/origin.git"
+git init -q --bare "$pf/github.git"
+git init -q -b main "$pf/clone"
+pg() { git -C "$pf/clone" "$@"; }
+mkdir -p "$pf/clone/.github" "$pf/clone/tests/terminals/exporter"
+printf '[workspace.package]\nversion = "0.9.0"\n\n[workspace.dependencies]\nfil-a = { path = "a", version = "=0.9.0" }\nfil-b = { path = "b", version = "=0.9.0" }\n' > "$pf/clone/Cargo.toml"
+printf '# Changelog\n\n## [Unreleased]\n\n## [0.9.0] - 2026-11-09\n\n- x\n' > "$pf/clone/CHANGELOG.md"
+printf 'release namespaces="git" %s\nrelease namespaces="fil-release" %s\n' "$(cut -d' ' -f1,2 "$pf/key.pub")" "$(cut -d' ' -f1,2 "$pf/key.pub")" > "$pf/clone/.github/release-signers"
+echo 'fake key' > "$pf/clone/.github/package-signing-key.asc"
+printf '[target.x86_64-unknown-linux-musl]\nimage = "example.invalid/cross@sha256:%064d"\n' 0 > "$pf/clone/Cross.toml"
+echo '[package]' > "$pf/clone/tests/terminals/exporter/Cargo.toml"
+pg add -A
+pg commit -q -m r
+pg remote add origin "$pf/origin.git"
+pg remote add github "$pf/github.git"
+pg push -q origin main
+pg push -q github main
+pg fetch -q github
+pg config gpg.format ssh
+pg config user.signingkey "$pf/key.pub"
+# The stubs. gh answers by endpoint with what its --jq would print.
+cat > "$pf/bin/gh" << 'EOF2'
+#!/bin/sh
+echo "$*" >> "$FAKE_GH_LOG"
+case "$*" in
+  --version) echo "gh version 2.0 (stub)" ;;
+  "api user"*) echo "${FAKE_GH_USER-anthonytw}" ;;
+  "api repos/o/r/environments/crates-io/deployment-branch-policies"*) echo "tag:v*" ;;
+  "api repos/o/r/environments/crates-io"*prevent_self_review*) echo "${FAKE_SELF_REVIEW:-false}" ;;
+  "api repos/o/r/environments/crates-io"*) echo "${FAKE_REVIEWERS-anthonytw}" ;;
+  "api repos/o/r/rulesets/7"*) echo "${FAKE_RULESET_REF-refs/tags/v*}" ;;
+  "api repos/o/r/rulesets"*) echo 7 ;;
+  "api repos/o/r/immutable-releases"*) [ -z "${FAKE_IMMUTABLE_OFF:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo true ;;
+  "api repos/o/r"*) echo "${FAKE_ADMIN:-true}" ;;
+  "release view"*)
+    [ -z "${FAKE_RELEASE:-}" ] || exit 0
+    [ -z "${FAKE_GH_DOWN:-}" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+    echo "release not found" >&2; exit 1 ;;
+  *) echo "gh stub: unexpected: $*" >&2; exit 2 ;;
+esac
+EOF2
+cat > "$pf/bin/ssh" << 'EOF2'
+#!/bin/sh
+[ "$1" = -V ] && { echo "OpenSSH stub" >&2; exit 0; }
+echo "Hi ${FAKE_SSH_USER:-anthonytw}! You've successfully authenticated, but GitHub does not provide shell access." >&2
+exit 1
+EOF2
+cat > "$pf/bin/docker" << 'EOF2'
+#!/bin/sh
+[ "$1" = --version ] && { echo "Docker stub"; exit 0; }
+[ -z "${FAKE_DOCKER_DOWN:-}" ]
+EOF2
+cat > "$pf/bin/limactl" << 'EOF2'
+#!/bin/sh
+case "$1" in
+  --version) echo "limactl stub" ;;
+  list) echo "${FAKE_VM_STATUS:-Running}" ;;
+  shell)
+    shift 2
+    case "$*" in
+      "docker info") [ -z "${FAKE_VM_DOCKER_DOWN:-}" ] ;;
+      "df -Pk /") printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/vda1 100 1 %s 1%% /\n' "${FAKE_VM_KIB:-104857600}" ;;
+      "docker image inspect"*) [ -z "${FAKE_VM_NO_IMAGE:-}" ] ;;
+      "docker run"*) case "$*" in *--pull=never*) echo "${FAKE_VM_ARCH:-x86_64}" ;; *) exit 3 ;; esac ;;
+      "sh -c"*) echo "${FAKE_BINFMT:-rosetta=enabled qemu=}" ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+EOF2
+cat > "$pf/bin/df" << 'EOF2'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 100 1 %s 1%% /\n' "${FAKE_KIB:-104857600}"
+EOF2
+cat > "$pf/bin/cargo" << 'EOF2'
+#!/bin/sh
+[ "$1" = --version ] && { echo "cargo stub"; exit 0; }
+case "$*" in *"${FAKE_STALE_LOCK:-none}"*) echo "error: the lock file needs to be updated but --locked was passed" >&2; exit 101 ;; esac
+EOF2
+cat > "$pf/bin/curl" << 'EOF2'
+#!/bin/sh
+[ "$1" = --version ] && { echo "curl stub"; exit 0; }
+printf '%s' "${FAKE_CRATES_CODE:-404}"
+EOF2
+cat > "$pf/bin/gpg" << 'EOF2'
+#!/bin/sh
+case "$*" in
+  --version) echo "gpg stub" ;;
+  --show-keys*)
+    printf 'pub:-:255:22:K::::::sc::::\nfpr:::::::::ABCDEF0123456789ABCDEF0123456789ABCDEF01:\n'
+    [ -z "${FAKE_TWO_KEYS:-}" ] || printf 'pub:-:255:22:L::::::sc::::\nfpr:::::::::1111111111111111111111111111111111111111:\n' ;;
+  --list-secret-keys*) [ -z "${FAKE_NO_SECRET:-}" ] && printf 'sec:%s:255:22:K:1:%s::u:::sc::::\n' "${FAKE_KEY_VALID:-u}" "${FAKE_KEY_EXPIRES-}" ;;
+  *) exit 2 ;;
+esac
+EOF2
+cat > "$pf/bin/security" << 'EOF2'
+#!/bin/sh
+[ -n "${FAKE_NO_IDENTITY:-}" ] || echo '  1) ABC "Developer ID Application: Test (TEAM)"'
+EOF2
+cat > "$pf/bin/notarytool" << 'EOF2'
+#!/bin/sh
+[ -z "${FAKE_NOTARY_FAIL:-}" ]
+EOF2
+cat > "$pf/bin/codesign" << 'EOF2'
+#!/bin/sh
+[ -z "${FAKE_CODESIGN_FAIL:-}" ] || { echo "errSecInternalComponent" >&2; exit 1; }
+EOF2
+for t in just rpmsign rpmkeys xcrun ssh-add; do printf '#!/bin/sh\necho %s stub\n' "$t" > "$pf/path/$t"; done
+chmod +x "$pf/bin"/* "$pf/path"/*
+# pfx [ENV=VALUE ...] CMD...: CMD with the fixture's stubs; pfr [ENV=VALUE ...]: the preflight itself
+pfx() {
+  env FAKE_GH_LOG="$pf/gh.log" PATH="$pf/path:$PATH" FIL_RELEASE_SELFTEST=1 FIL_RELEASE_ROOT="$pf/clone" FIL_RELEASE_KEY="$pf/key" \
+    FIL_GH="$pf/bin/gh" FIL_SSH="$pf/bin/ssh" FIL_DOCKER="$pf/bin/docker" FIL_LIMACTL="$pf/bin/limactl" FIL_DF="$pf/bin/df" \
+    FIL_CARGO="$pf/bin/cargo" FIL_CRATES_CURL="$pf/bin/curl" FIL_GPG="$pf/bin/gpg" FIL_SECURITY="$pf/bin/security" \
+    FIL_NOTARYTOOL="$pf/bin/notarytool" FIL_CODESIGN="$pf/bin/codesign" FIL_CODESIGN_IDENTITY="Developer ID Application: Test (TEAM)" \
+    "$@"
+}
+pfr() { pfx "$@" "$PF" 0.9.0 --repo o/r; }
+# pf_class NAME MESSAGE [ENV=VALUE ...]: fails, in exactly one check (the rest of the fixture is
+# sound), and prints MESSAGE (a fixed string)
+pf_class() {
+  local name=$1 msg=$2
+  shift 2
+  if pfr "$@" > "$tmp/out.log" 2>&1; then
+    flunk "preflight: $name (it should have failed)"
+    sed 's/^/       | /' "$tmp/out.log"
+  elif ! grep -Eq '^preflight: (1 of [0-9]+ checks FAILED|stopped: test-only)' "$tmp/out.log"; then
+    flunk "preflight: $name (more than one check failed)"
+    grep '^preflight: FAIL' "$tmp/out.log" | sed 's/^/       | /'
+  elif grep -qF -- "$msg" "$tmp/out.log"; then pass "preflight: $name"; else
+    flunk "preflight: $name (failed, but not with '$msg')"
+    sed 's/^/       | /' "$tmp/out.log" | tail -12
+  fi
+}
+pf_refs() { pg for-each-ref --format='%(refname) %(objectname)' | LC_ALL=C sort; pg status --porcelain; }
+pf_refs > "$pf/refs.before"
+expect_pass "preflight: everything in order passes" pfr
+expect_pass "preflight: ...and changed no ref and no file of the clone" sh -c 'd=$1; pg() { git -C "$d/clone" "$@"; }; { pg for-each-ref --format="%(refname) %(objectname)" | LC_ALL=C sort; pg status --porcelain; } | cmp -s - "$d/refs.before"' sh "$pf"
+expect_pass "preflight: --list shows the step map" sh -c '"$1" --list | grep -q "^sign-packages  *package-key$"' sh "$PF"
+expect_pass "preflight: sourcing it runs nothing and defines the API" bash -c 'source "$1" && pf_init 0.9.0 && test "$(pf_checks_from crates)" = "overrides tools lock disk tree gh github-ssh crates-env"' sh "$PF"
+expect_fail "preflight: an unknown step is refused" pfx "$PF" 0.9.0 --repo o/r --from nosuch
+expect_fail "preflight: an unknown check is refused" pfx "$PF" 0.9.0 --repo o/r --only nosuch
+# the override check (outside the self-test, a fake is fatal)
+pf_class "a test-only override outside the self-test is fatal" "a preflight that asks a fake proves nothing" FIL_RELEASE_SELFTEST=
+# each class
+pf_class "a missing tool" "rpmsign is not installed" FIL_RPMSIGN="$pf/nosuch"
+mkdir -p "$pf/clone/target/release-verify/0.9.0/.lock"
+sleep 300 > /dev/null 2>&1 &
+pf_sleeper=$!
+echo "$pf_sleeper" > "$pf/clone/target/release-verify/0.9.0/.lock/pid"
+pf_class "a live lock" "another release run (pid $pf_sleeper)"
+kill "$pf_sleeper" 2> /dev/null || true
+wait "$pf_sleeper" 2> /dev/null || true
+expect_pass "preflight: the lock of the run that calls it is not another run's" pfx sh -c 'echo $$ > "$1/target/release-verify/0.9.0/.lock/pid" && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
+rm -rf "$pf/clone/target"
+pf_class "low disk on the Mac" "disk full (97% on 2026-11-07)" FAKE_KIB=1048576
+pf_class "low disk in the VM" "GiB free in VM fil" FAKE_VM_KIB=1048576
+echo dirty >> "$pf/clone/CHANGELOG.md"
+pf_class "a dirty tree" "uncommitted changes"
+pg checkout -q -- CHANGELOG.md
+pf_class "HEAD is not Gitea's main" "is not origin's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m x && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
+pg reset -q --hard origin/main
+pg remote set-url origin "$pf/nosuch.git"
+pf_class "Gitea unreachable" "cannot read main on remote 'origin'"
+pg remote set-url origin "$pf/origin.git"
+pf_class "--commit binds the run to another commit" "the release commit this run is bound to" sh -c 'exec "$1" 0.9.0 --repo o/r --commit 0123456789012345678901234567890123456789' sh "$PF"
+pf_class "the wrong version" "Cargo.toml's version is '0.9.0', not 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
+pf_class "...and no changelog section for it" "CHANGELOG.md has no section for 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
+pf_class "a stale exporter lock" "catches: stale exporter lock" FAKE_STALE_LOCK=exporter
+pf_class "gh logged in as someone else" "gh is logged in as 'other'" FAKE_GH_USER=other
+pf_class "gh without admin" "no admin rights" FAKE_ADMIN=false
+pf_class "ssh to GitHub as someone else" "did not say 'Hi anthonytw'" FAKE_SSH_USER=other
+pf_class "crates-io without the owner as reviewer" "catches: crates-io reviewers missing" FAKE_REVIEWERS=
+pf_class "crates-io preventing self-review" "prevents self-review" FAKE_SELF_REVIEW=true
+pf_class "no tag ruleset on v*" "no active tag ruleset" FAKE_RULESET_REF=refs/tags/x*
+pf_class "a release that exists" "already has a release" FAKE_RELEASE=1
+if pfr FAKE_GH_DOWN=1 > "$tmp/out.log" 2>&1 && grep -q 'WARN  tag-free: could not ask GitHub whether a release' "$tmp/out.log"; then pass "preflight: a gh error is not read as no release (a warning)"; else flunk "preflight: a gh error is not read as no release (a warning)"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
+if pfr FAKE_IMMUTABLE_OFF=1 > "$tmp/out.log" 2>&1 && grep -q 'WARN  tag-ruleset: immutable releases are off' "$tmp/out.log"; then pass "preflight: immutable releases off (404) is a warning"; else flunk "preflight: immutable releases off (404) is a warning"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
+pf_class "a crates.io version that exists" "already on crates.io" FAKE_CRATES_CODE=200
+pf_class "Docker down on the Mac" "catches: Docker not started" FAKE_DOCKER_DOWN=1
+pf_class "...says how to start it" "open -a Docker" FAKE_DOCKER_DOWN=1
+pf_class "the VM stopped" "limactl start fil" FAKE_VM_STATUS=Stopped
+pf_class "the VM without the docker group" "catches: VM docker group" FAKE_VM_DOCKER_DOWN=1
+pf_class "the VM under qemu, though uname -m says x86_64" "no enabled Rosetta binfmt registration" FAKE_BINFMT="rosetta= qemu=enabled"
+pf_class "the VM with qemu-x86_64 registered beside Rosetta" "both Rosetta and qemu-x86_64" FAKE_BINFMT="rosetta=enabled qemu=enabled"
+pf_class "the cross image not running as amd64" "does not run as amd64" FAKE_VM_ARCH=aarch64
+if pfr FAKE_VM_NO_IMAGE=1 > "$tmp/out.log" 2>&1 && grep -q 'note  vm: the cross image is not in VM' "$tmp/out.log"; then pass "preflight: no cross image in the VM: nothing pulled, a note"; else flunk "preflight: no cross image in the VM: nothing pulled, a note"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
+pf_class "no release public key" "no release public key" FIL_RELEASE_KEY="$pf/nosuch"
+pf_class "a release key the signers do not list" "is not listed for both git and fil-release" FIL_RELEASE_KEY="$pf/otherkey"
+pf_class "no package secret key" "catches: lost package key" FAKE_NO_SECRET=1
+pf_class "an expired package key" "has expired" FAKE_KEY_EXPIRES=1000
+pf_class "a revoked package key" "is revoked" FAKE_KEY_VALID=r
+pf_class "a package key file with two keys" "is not exactly one OpenPGP key" FAKE_TWO_KEYS=1
+if pfr FAKE_KEY_EXPIRES=$(($(date +%s) + 86400 * 10)) > "$tmp/out.log" 2>&1 && grep -q 'WARN  package-key: .* expires in' "$tmp/out.log"; then pass "preflight: ...it passes with a warning"; else flunk "preflight: ...it passes with a warning"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
+pf_class "no Developer ID" "no valid codesigning identity" FAKE_NO_IDENTITY=1
+pf_class "no notary profile" "store-credentials fil-notary" FAKE_NOTARY_FAIL=1
+pf_class "a codesign that fails (locked keychain)" "security unlock-keychain" FAKE_CODESIGN_FAIL=1
+pf_class "git cannot sign" "git cannot sign a commit" sh -c 'git -C "$1" config user.signingkey "$1/nosuch.pub"; "$2" 0.9.0 --repo o/r; s=$?; git -C "$1" config user.signingkey "$3"; exit $s' sh "$pf/clone" "$PF" "$pf/key.pub"
+pf_class "GitHub's main not fetched" "git fetch github" sh -c 'echo extra > "$1/extra" && git -C "$1" add extra && git -C "$1" commit -q --no-gpg-sign -m m && git -C "$1" push -q github HEAD:main && git -C "$1" reset -q --hard origin/main && git -C "$1" update-ref -d refs/remotes/github/main && git -C "$1" reflog expire --expire=now --all && git -C "$1" gc -q --prune=now && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
+pg fetch -q github
+# github/main differs (a commit with a file the release commit lacks): a note and a warning, no failure
+if pfr > "$tmp/out.log" 2>&1; then
+  pass "preflight: an unmirrored github/main is not a failure"
+else flunk "preflight: an unmirrored github/main is not a failure"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
+pf_class "the tag on GitHub already exists" "already exists on GitHub" sh -c 'git -C "$1" push -q github origin/main:refs/tags/v0.9.0 && "$2" 0.9.0 --repo o/r; s=$?; git -C "$1" push -q github :refs/tags/v0.9.0; exit $s' sh "$pf/clone" "$PF"
+# after the tag: main moves on, and a run bound to the release commit still passes
+R=$(pg rev-parse HEAD)
+echo later > "$pf/clone/later"
+pg add later
+pg commit -q --no-gpg-sign -m later
+pg push -q origin HEAD:main
+pg reset -q --hard "$R"
+expect_pass "preflight: --commit R --from crates passes with Gitea's main ahead of R" pfx "$PF" 0.9.0 --repo o/r --commit "$R" --from crates
+expect_pass "preflight: --from crates without --commit binds to HEAD, on main" pfx "$PF" 0.9.0 --repo o/r --from crates
+pf_class "...but an unbound run before the tag still needs HEAD == main" "is not origin's main"
+pg fetch -q origin
+pf_class "a bound commit that is not on main" "is not on origin's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m side && exec "$2" 0.9.0 --repo o/r --commit "$(git -C "$1" rev-parse HEAD)" --from crates' sh "$pf/clone" "$PF"
+pg reset -q --hard "$R"
+pg push -q -f origin "$R:main"
+# a resume at `crates` needs neither the VM nor Docker nor the keys
+expect_pass "preflight: --from crates does not look at the VM, Docker or the keys" pfx FAKE_VM_STATUS=Stopped FAKE_DOCKER_DOWN=1 FAKE_NO_SECRET=1 FAKE_NO_IDENTITY=1 "$PF" 0.9.0 --repo o/r --from crates
+expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)" "$1"' sh "$pf/gh.log"
+
 echo
 echo "release-test: $passed passed, $failed failed"
 [ "$failed" = 0 ]

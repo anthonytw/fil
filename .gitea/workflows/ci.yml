@@ -28,10 +28,13 @@
 # The status contexts below ("ci / check (pull_request)") are this name and the job names.
 name: ci
 
+# Manual only since 2026-11-09: the merge gate is GitHub's linux-check and macos-check (CLAUDE.md).
+# Restore the two triggers below to run it on every PR and push to main again.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches: [main]
 
 permissions:
   contents: read

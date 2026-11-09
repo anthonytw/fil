@@ -181,7 +181,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_late_tick_disturbs_what_overlaps_it_and_nothing_else() {
+    fn wallclock_a_late_tick_disturbs_what_overlaps_it_and_nothing_else() {
         let s = Stalls::start();
         std::thread::sleep(Duration::from_millis(40));
         let before = Instant::now();
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_run_is_not_disturbed() {
+    fn wallclock_a_quiet_run_is_not_disturbed() {
         let s = Stalls::start();
         std::thread::sleep(Duration::from_millis(40));
         let t0 = Instant::now();

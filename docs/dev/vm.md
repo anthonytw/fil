@@ -96,7 +96,7 @@ All of them are in the `justfile`, run on the Mac, and call `tests/realnet/vm.sh
 |---|---|
 | `just vm-setup` | Installs `conntrack`, the toolchain from `rust-toolchain.toml`, `just`, `cargo-deny` and `cargo-about` in the VM. Run once after creating it. |
 | `just vm-sync` | `rsync` of this worktree to `~/src/<name>` in the VM. It skips `.git`, `.claude`, `target/` and everything `.gitignore` ignores, and deletes files you deleted, so uncommitted work and untracked files arrive and a stale file does not linger. Unchanged files keep their modification time, so cargo rebuilds only what changed. |
-| `just vm-run CMD...` | Sync, then run `CMD` in that directory in the VM with the pinned toolchain (installed on first use). `just vm-run just ci` is the merge gate on Linux; `just vm-run cargo test -p fil-transport` works too. |
+| `just vm-run CMD...` | Sync, then run `CMD` in that directory in the VM with the pinned toolchain (installed on first use). `just vm-run just ci` runs the full local gate on Linux (the merge gate is CLAUDE.md § Delivery); `just vm-run cargo test -p fil-transport` works too. |
 | `just vm-realnet [PART] [SCENARIO...]` | Sync, then `just realnet ...` in the VM. Arguments as for `just realnet`: `udp`, `sysd`, `ssh` or none for all three, and scenario names. |
 | `just vm-clean` | Removes this worktree's copy and build directory from the VM. Do it when a worktree is removed: each build directory is a few GiB. |
 

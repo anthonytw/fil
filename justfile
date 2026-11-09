@@ -11,10 +11,14 @@ target_dir := if env("CARGO_TARGET_DIR", "") == "" { source_directory() / "targe
 default:
     @just --list
 
-# The merge gate: run before every merge (CLAUDE.md § Delivery). `deny` runs first so that a network
-# failure (the advisory database) shows up at once, not after the whole test suite; `notices` next,
-# so that a missing cargo-about (the Notices section below) does too.
-ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps release-test test test-wallclock
+# The per-PR checks (CLAUDE.md § Delivery; GitHub's linux-check and macos-check run it). `deny` runs
+# first so that a network failure (the advisory database) shows up at once, not after the whole test
+# suite; `notices` next, so that a missing cargo-about (the Notices section below) does too. The
+# wall-clock tests are not in it: on a shared CI runner they measure the host (docs/dev/timing-tests.md).
+ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps release-test test
+
+# Before a release (docs/m4/release.md §9.2), on a quiet machine: `ci` and the wall-clock tests.
+ci-release: ci test-wallclock
 
 # The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
 # offline fakes of git and the API, under a second. Part of `ci`; needs python3.
@@ -74,7 +78,7 @@ test:
 # pass or fail depends on real elapsed time (a latency percentile, "at once", Ctrl-C within 3 s).
 # Run beside the rest of the suite they measure the contention between tests (a CI container
 # capped at a few CPUs is throttled by the kernel in 100 ms periods); alone they measure the
-# product. `test` and this recipe together run every test once: `ci` runs both. Name a new
+# product. `test` and this recipe together run every test once: `ci-release` runs both. Name a new
 # wall-clock test with the prefix and it is in this step and out of the other.
 test-wallclock:
     cargo test --workspace --all-features --no-fail-fast -- wallclock_ --test-threads=1
@@ -96,8 +100,8 @@ netsim-soak:
 
 # Terminal pacing (M3 K1, crates/fil-session/tests/terminal_pacing.rs) in release: Ctrl-C during a
 # flood at 1 Mbit/s paced and unpaced (the unpaced QUIC cell takes about 20 s), and throughput
-# paced against unpaced on a fast, a 100 Mbit/s 40 ms and the 1 Mbit/s link. Not part of `ci`,
-# which runs the paced Ctrl-C cells.
+# paced against unpaced on a fast, a 100 Mbit/s 40 ms and the 1 Mbit/s link. Not part of `ci-release`,
+# which runs the paced Ctrl-C cells (`test-wallclock`).
 pacing:
     cargo test --release -p fil-session --test terminal_pacing -- --include-ignored --nocapture --test-threads=1
 
@@ -166,9 +170,10 @@ fuzz-deny:
 # forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
 # tests at 8 MiB and 2,000 (and 300 concurrent off QUIC). Release build. Also runs the SOCKS fuzz
 # table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
-# tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports.
+# tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports. The
+# wall-clock tests are skipped (macos-check runs this on shared runners); `just ci-release` runs them.
 forward-soak mib="256" seq="20000":
-    FIL_FORWARD_TEST_LIMIT=3600 FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1
+    FIL_FORWARD_TEST_LIMIT=3600 FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1 --skip wallclock_
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:

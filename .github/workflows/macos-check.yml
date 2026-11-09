@@ -1,4 +1,4 @@
-# Manual macOS check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
+# macOS check, dispatched by hand. `suite=check` on the PR head is part of the merge gate (CLAUDE.md § Delivery).
 # Run with `gh workflow run macos-check` (optionally `-f ref=BRANCH -f suite=check|remote|brew|all`),
 # then `gh run watch`. Never runs on pull_request: the ref's build scripts and tests run on the
 # runner, and a fork's must not. No secrets are used.

@@ -1,4 +1,4 @@
-# Manual Linux check. Not a merge gate: the gate is `just ci` run locally (CLAUDE.md).
+# Linux check, dispatched by hand. `suite=check` on the PR head is part of the merge gate (CLAUDE.md § Delivery).
 # Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|terminals|all`),
 # then `gh run watch`.
 #

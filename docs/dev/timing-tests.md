@@ -29,9 +29,12 @@ Two kinds of bound need telling apart, and they get different treatment.
 
 1. **Wall-clock tests are named `wallclock_*`.** `just test` runs every other test, in parallel
    (`--skip wallclock_`); `just test-wallclock` runs the `wallclock_` ones, one at a time
-   (`--test-threads=1`), so they do not measure the contention between tests. `just ci` runs both,
-   so nothing is left out, and the CI job (which runs `just ci`) needs no change. Name a new
-   wall-clock test with the prefix and it is in the serial step and out of the parallel one.
+   (`--test-threads=1`), so they do not measure the contention between tests. `just ci` runs only
+   `test` (it is the per-PR check, on shared CI runners whose stalls a wall-clock test would
+   measure); `just ci-release` runs both, on a quiet machine before a release, so nothing is left
+   out. Name a new wall-clock test with the prefix and it is in the serial step and out of the
+   parallel one. Two of `fil_testkit::timing`'s own tests carry the prefix too: they assert that a
+   quiet stretch records no stall, which a busy host cannot promise.
 2. **(T) bounds judge only what the host left alone.** `fil_testkit::timing::Stalls` watches the
    host with an OS thread of its own (never a task of the test's runtime, which the product shares, so a product that blocks a worker is not excused as the host) that ticks every 2 ms and records every
    tick that came more than 8 ms late. A sample whose interval overlaps a stall is measured again
@@ -81,4 +84,6 @@ a hang misses. Those are left as they are.
 
 The Mac did not miss any bound in 3 quiet runs, 3 runs with six busy loops and 2 runs with sixteen
 (on 14 cores), unchanged or changed alike. It cannot reproduce the runner's failures, which come
-from the container's CPU cap, and the CI-runner run is the check that counts.
+from the container's CPU cap. Since 2026-11-09 the wall-clock tests are not part of the per-PR
+checks on shared runners at all; `just ci-release` runs them before a release, on the Mac and in
+the Linux VM (`just vm-run just test-wallclock`).

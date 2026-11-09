@@ -489,7 +489,18 @@ It needs, on the owner's Mac: the "Developer ID Application: Anthony Wertz (6X3P
   rm -f /tmp/fil-key-check /tmp/fil-key-check.asc /tmp/fil-key-check.kbx
   ```
 
-  Extend the expiry before it lapses (`gpg --quick-set-expire FPR 2y`), then re-export the public key and send it in a PR: rpm checks a signature against the key's validity, so users re-import the extended key (`rpm --import`). If the secret key is lost or exposed, publish the revocation certificate in a PR (`gpg --import` the `.rev`, re-export) and make a new key.
+  Extend the expiry before it lapses (`gpg --quick-set-expire FPR 2y`), then re-export the public key and send it in a PR: rpm checks a signature against the key's validity, so users re-import the extended key (`rpm --import`). If the secret key or its passphrase is lost, or the key is exposed, make a new key, and publish the old one revoked in a PR as `.github/package-signing-key-revoked.asc`. That needs no secret key, only the old public key and the revocation certificate of step 2:
+
+  ```sh
+  gpg --import OLD-PUBLIC-KEY.asc      # the old .github/package-signing-key.asc, from git history if need be
+  # gpg starts the certificate's armor line with ":" so that it cannot be imported by accident
+  sed 's/^:-----BEGIN/-----BEGIN/' ~/.gnupg/openpgp-revocs.d/FPR.rev > /tmp/old.rev
+  gpg --import /tmp/old.rev && rm /tmp/old.rev
+  gpg --list-keys FPR                  # [revoked]
+  gpg --armor --export FPR > .github/package-signing-key-revoked.asc
+  ```
+
+  The revocation date gpg shows is the day the certificate was made, with the key. The 2026-11-04 key `8BD8 1C03 … 4B6D DA01` was revoked this way on 2026-11-08, after its passphrase was lost; it signed nothing released.
 
 ## 11. FROZEN: the session trampoline's arguments
 

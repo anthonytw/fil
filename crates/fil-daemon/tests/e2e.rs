@@ -392,12 +392,32 @@ async fn slow_start(
     cfg.spawn_timeout = Duration::from_millis(50);
     cfg.spawn_delay = SPAWN_DELAY;
     cfg.idle_exit = idle_exit;
-    let d = start(s, cfg).await;
+    // The daemon's idle clock runs from its start while no connection exists, so on a slow host
+    // a short `idle_exit` can elapse before the attach below even connects. A connection made
+    // between the bind and `run` (it waits in the socket's backlog; `run` accepts it on its first
+    // poll, before any timer can fire) keeps the daemon busy until the attach has been handled.
+    let paths = s.paths();
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    let daemon = fil_daemon::Daemon::start(paths.clone(), cfg)
+        .await
+        .expect("daemon starts");
+    let hold =
+        std::os::unix::net::UnixStream::connect(paths.socket()).expect("the holding connection");
+    let d = Running {
+        paths,
+        handle: daemon.handle(),
+        udp_port: daemon.udp_port(),
+        fingerprint: daemon.fingerprint(),
+        registry: daemon.registry().clone(),
+        task: tokio::spawn(daemon.run()),
+    };
     // Just before the attach: the creation's delay starts when the daemon handles it, so
     // `began + SPAWN_DELAY` is never later than the moment the shell is created.
     let began = Instant::now();
     let c = Client::attach(d.pipe().await, Connect::new("main", key(1))).await;
     assert!(!c.errors.is_empty(), "the attach gives up: {:?}", c.errors);
+    // From here the idle clock is the creation's and the test's alone.
+    drop(hold);
     (d, marker, began, c)
 }
 

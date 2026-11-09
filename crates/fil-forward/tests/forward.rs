@@ -542,15 +542,25 @@ async fn wallclock_stuck_consumer(t: Transport) {
 /// (the mbuf pool running short across some 80 loopback sockets that are never read; the
 /// x86_64 runner does) may have queued part of its bytes, so the endpoint resets that channel
 /// instead of retrying it (DESIGN.md section 8.5, [`kernel_memory_resets`]). Up to
-/// [`NO_MEMORY_RESETS`] such channels are taken, matched by id: every close by either mux is a
-/// `Reset` of one of them, no other connection ends, and each ends at most its two writers (the
-/// server's and the application's, with `EPIPE` or `ECONNRESET`). A waiting application's
-/// connection takes the freed place (24 connect for 16 places), so the fill still finishes.
+/// as many such channels as there are waiting applications are taken (`APPS - max_open`, 8),
+/// matched by id: every close by either mux is a `Reset` of one of them, no other connection
+/// ends, and each ends at most its two writers (the server's and the application's, with `EPIPE`
+/// or `ECONNRESET`). A waiting application's connection takes each freed place (24 connect for 16
+/// places), so the fill still finishes.
+///
+/// That bound is class T (docs/dev/timing-tests.md), not a DESIGN.md claim: DESIGN.md section 8.5
+/// only says that on macOS these errors reset the channel at once, and does not say how often
+/// the kernel may run short. The figure is the most resets after which the test can still reach
+/// its end state (16 channels open): one more would leave fewer applications than places. It is
+/// not a tuned count: a small x86_64 macOS runner reset four channels where the Apple-silicon
+/// dev Mac resets none. On Linux the endpoint holds and retries instead of resetting, so
+/// [`kernel_memory_resets`] is empty and the allowance there is exactly zero.
 async fn budget(t: Transport) {
     let budget = 4 << 20;
+    const MAX_OPEN: usize = 16;
     let cfg = MuxConfig {
         budget,
-        max_open: 16,
+        max_open: MAX_OPEN,
         ..mux_config()
     };
     let denied = mbufs_denied();
@@ -590,7 +600,11 @@ async fn budget(t: Transport) {
     w.daemon.ep.set_pacing(off);
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
-    for i in 0..24 {
+    // The waiting connections: each channel reset for want of kernel memory frees a place that
+    // one of them takes. The most resets the fill can absorb.
+    const APPS: usize = 24;
+    let max_resets = APPS - MAX_OPEN;
+    for i in 0..APPS {
         let mut s = connect_small(port).await;
         let ended = ended.clone();
         apps.push(tokio::spawn(async move {
@@ -657,7 +671,7 @@ async fn budget(t: Transport) {
         // writer that stopped was one of theirs, two at most each: the server and the
         // application), and there are few of them.
         if errors as usize > resets.len()
-            || reset.len() > NO_MEMORY_RESETS
+            || reset.len() > max_resets
             || gone.iter().any(|&g| g > reset.len() as u64)
             || ended.len() > 2 * reset.len()
             || !closes_ok
@@ -666,7 +680,7 @@ async fn budget(t: Transport) {
             panic!(
                 "{}",
                 failure(&format!(
-                    "a connection ended while the buffers filled (none may, but the channels reset for want of kernel memory on macOS, at most {NO_MEMORY_RESETS}: {reset:?}; connections ended (client, daemon): {gone:?})"
+                    "a connection ended while the buffers filled (none may, but the channels reset for want of kernel memory on macOS, at most {max_resets}: {reset:?}; connections ended (client, daemon): {gone:?})"
                 ))
             );
         }

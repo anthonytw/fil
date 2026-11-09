@@ -629,6 +629,42 @@ expect_pass "sign-packages: ...SHA256SUMS is rewritten and checks" sh -c '! cmp 
 expect_pass "sign-packages: ...sums_check passes" sums_check "$rel" SHA256SUMS
 expect_pass "sign-packages: ...and SHA256SUMS.asc is written" test -s "$rel/SHA256SUMS.asc"
 expect_pass "release-check passes the signed release" check --dry-run --no-tree "$rel"
+expect_pass "sign-packages: ...and marks the directory .signed-locally" test -f "$rel/.signed-locally"
+# release-verify in download mode must move a locally signed directory aside, never delete it; any other
+# earlier download is replaced. A gh that downloads nothing and fails stands in for the network.
+printf '#!/bin/sh\nexit 1\n' > "$st/gh-fail"
+chmod +x "$st/gh-fail"
+kw=$tmp/keepwork
+mkdir -p "$kw"
+cp -R "$rel" "$kw/files"
+rvd() { env FIL_GH="$st/gh-fail" FIL_RELEASE_REPO_URL="$tmp/origin" "$RELEASE_DIR/verify.sh" 0.9.0 --no-rebuild --work "$kw"; }
+expect_fail "release-verify (download mode, nothing to download) over locally signed files" rvd
+grep -q 'were moved to .*files.signed-.*Z' "$tmp/out.log" && pass "...and says where (UTC name)" || { flunk "...and says where (UTC name)"; sed "s/^/       | /" "$tmp/out.log"; }
+expect_pass "...keeps them: moved aside to files.signed-*, rpms and marker intact" sh -c 'cmp -s "$1"/files.signed-*/fil-0.9.0-1.aarch64.rpm "$2/fil-0.9.0-1.aarch64.rpm" && test -f "$1"/files.signed-*/.signed-locally' sh "$kw" "$rel"
+rm -rf "$kw"
+mkdir -p "$kw/files"
+echo old > "$kw/files/x"
+expect_fail "release-verify (download mode) over an unmarked earlier download" rvd
+expect_pass "...replaces it (no files.signed-* appears, x is gone)" sh -c 'test ! -e "$1/x" && ! ls "$2"/files.signed-* > /dev/null 2>&1' sh "$kw/files" "$kw"
+# A gh whose download succeeds, writing the released files (a copy of $rel; with GH_ALTER set, one rpm differs).
+cat > "$st/gh-copy" << EOF2
+#!/bin/sh
+while [ \$# -gt 0 ]; do [ "\$1" = -D ] && d=\$2; shift; done
+cp -R "$rel"/. "\$d"/
+rm -f "\$d"/.signed-locally
+[ -z "\$GH_ALTER" ] || echo altered >> "\$d/fil-0.9.0-1.aarch64.rpm"
+exit 0
+EOF2
+chmod +x "$st/gh-copy"
+rvc() { env FIL_GH="$st/gh-copy" FIL_RELEASE_REPO_URL="$tmp/origin" "$RELEASE_DIR/verify.sh" 0.9.0 --no-rebuild --work "$kw" "$@"; }
+rm -rf "$kw"; mkdir -p "$kw"; cp -R "$rel" "$kw/files"
+rvc > "$tmp/out.log" 2>&1 || true
+grep -q 'identical to the download' "$tmp/out.log" && ! ls "$kw"/files.signed-* > /dev/null 2>&1 \
+  && pass "download identical to the local copy: the moved-aside copy is removed" || { flunk "identical download: aside copy removed"; sed "s/^/       | /" "$tmp/out.log"; }
+rm -rf "$kw"; mkdir -p "$kw"; cp -R "$rel" "$kw/files"
+GH_ALTER=1 rvc > "$tmp/out.log" 2>&1 || true
+grep -q 'differs: ./fil-0.9.0-1.aarch64.rpm' "$tmp/out.log" && ls "$kw"/files.signed-*/.signed-locally > /dev/null 2>&1 \
+  && pass "download differing from the local copy: kept, and the differing file is named" || { flunk "differing download: kept and named"; sed "s/^/       | /" "$tmp/out.log"; }
 new_case 0.9.0
 cp "$rel/fil-0.9.0-1.x86_64.rpm" "$tmp/x86.before"
 expect_fail "sign-packages: an rpmsign that changes more than the signature header is refused" sp FAKE_TAMPER=1

@@ -8,6 +8,9 @@
 #   DIR   the release files that `just release-verify VERSION --pre-sign` verified (default
 #         target/release-verify/VERSION/files). They are changed IN PLACE: the two .rpm files gain
 #         a signature, SHA256SUMS is rewritten and SHA256SUMS.asc is written. Nothing is uploaded.
+#         Before it changes anything it writes DIR/.signed-locally (a dotfile: release-check and
+#         the upload commands do not see it), so that a later `just release-verify` in download
+#         mode moves DIR aside instead of deleting these not-yet-uploaded files (verify.sh).
 #
 # The key is the one .github/package-signing-key.asc holds (its fingerprint is used to pick it from
 # the owner's gpg keyring; gpg asks for the passphrase). Needs gpg, rpmsign and rpmkeys (Homebrew:
@@ -38,6 +41,9 @@ grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$keyfile" 2> /dev/null || die "$keyfile ho
 fpr=$(package_key_fingerprint "$keyfile") || die "$keyfile is not exactly one OpenPGP public key"
 log "package-signing key $fpr (from $keyfile)"
 sums_check "$dir" SHA256SUMS || die "the files in $dir do not match their SHA256SUMS: verify them first"
+
+# Marks DIR as holding locally signed files that may not be uploaded yet (verify.sh keeps such a directory).
+printf 'signed by sign-packages.sh, not necessarily uploaded; release-verify moves this directory aside, never deletes it\n' > "$dir/.signed-locally"
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT

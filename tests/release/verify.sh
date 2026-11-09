@@ -17,6 +17,10 @@
 #      BEFORE signing (the signature does not exist yet); run again without it afterwards;
 #   3. each archive's attestation verifies, pinned to the repository, the exact workflow identity at
 #      the tag, the commit (source and signer digest) and a GitHub-hosted runner;
+# (A download replaces an earlier one in WORK/files, except that a directory holding the
+# `.signed-locally` marker that sign-packages.sh writes, i.e. locally signed files that
+# may not be uploaded yet, is moved aside to WORK/files.signed-<UTC time>Z and, after the download, deleted only if every file in
+# it is byte-identical to the new download; otherwise it is kept and the differences are printed.)
 # then, in the rest, failures are counted:
 #   4. `release-check --no-exec` passes on the files (--tag v<VERSION> --complete): the files are
 #      unpacked, hashed, grepped and inspected, and NOTHING that came from the download is run
@@ -85,12 +89,42 @@ dl=$work/files
 if [ -n "$from_dir" ]; then
   dl=$(cd "$from_dir" && pwd)
 else
-  rm -rf "$dl"
+  # A directory that sign-packages.sh changed holds files that exist nowhere else until they are
+  # uploaded: move it aside first (they were lost once, 0.1.0), and delete that copy below only when
+  # the new download holds the very same files. Any other earlier download is just replaced.
+  kept=''
+  if [ -e "$dl/.signed-locally" ]; then
+    kept=$work/files.signed-$(date -u +%Y%m%dT%H%M%SZ)
+    n=0
+    while [ -e "$kept" ]; do n=$((n + 1)); kept=$work/files.signed-$(date -u +%Y%m%dT%H%M%SZ)-$n; done
+    mv "$dl" "$kept"
+    echo "release-verify: the locally signed files in $dl were moved to $kept (not deleted)" >&2
+  else
+    rm -rf "$dl"
+  fi
   mkdir -p "$dl"
   if [ -n "$from_run" ]; then
     "$gh" run download "$from_run" --repo "$repo" -n release-files -D "$dl"
   else
     "$gh" release download "$tag" --repo "$repo" -D "$dl"
+  fi
+  # The moved-aside copy is redundant once the new download holds the very same files (everything
+  # was uploaded): then delete it. Otherwise keep it and name what differs or is missing.
+  if [ -n "$kept" ]; then
+    differ=$( (cd "$kept" && find . -type f ! -name .signed-locally | sort) > "$work/.aside-list"
+      (cd "$dl" && find . -type f | sort) > "$work/.new-list"
+      diff "$work/.aside-list" "$work/.new-list" | sed -n 's/^< /missing from the download: /p;s/^> /not in the local copy: /p'
+      while IFS= read -r f; do
+        if [ -f "$dl/$f" ] && ! cmp -s "$kept/$f" "$dl/$f"; then echo "differs: $f"; fi
+      done < "$work/.aside-list" )
+    rm -f "$work/.aside-list" "$work/.new-list"
+    if [ -z "$differ" ]; then
+      rm -rf "$kept"
+      echo "release-verify: the locally signed files are identical to the download (already uploaded): removed $kept" >&2
+    else
+      echo "release-verify: KEPT the locally signed files in $kept; they differ from the download (upload them from there, or delete the directory yourself):" >&2
+      printf '%s\n' "$differ" | sed 's/^/  /' >&2
+    fi
   fi
 fi
 log() { echo "release-verify: $*" >&2; }

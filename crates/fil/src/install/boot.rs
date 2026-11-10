@@ -192,10 +192,19 @@ pub enum Greeted {
     Greeting { sys: String, machine: String },
 }
 
-/// Sends the mode line.
+/// Sends the mode line. A broken pipe is not an error here: a host whose login ends at once
+/// (a forced command that prints nothing) is gone before the line lands, and the read that
+/// follows classifies why (no answer, ended); other I/O errors stay errors.
 pub async fn send_mode<W: AsyncWrite + Unpin>(w: &mut W, mode: Mode) -> Result<(), BootError> {
-    w.write_all(mode.line()).await.map_err(io)?;
-    w.flush().await.map_err(io)
+    let sent = async {
+        w.write_all(mode.line()).await?;
+        w.flush().await
+    }
+    .await;
+    match sent {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(io(e)),
+        _ => Ok(()),
+    }
 }
 
 /// Reads the answer to `attach`.
@@ -504,6 +513,48 @@ mod tests {
             sent.ends_with(b"done\n"),
             "a copy of another wire is never started"
         );
+    }
+
+    /// A writer whose far end is gone.
+    struct Gone(std::io::ErrorKind);
+
+    impl AsyncWrite for Gone {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(self.0.into()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mode_line_to_a_gone_host_is_left_to_the_read() {
+        // The host exited before the line landed: the read says why, never "Broken pipe".
+        let mut gone = Gone(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(send_mode(&mut gone, Mode::Check).await, Ok(()));
+        assert_eq!(
+            read_greeting(&mut lines(b"")).await,
+            Err(BootError::Ended(String::new()))
+        );
+        // Any other write error is still an error.
+        let mut bad = Gone(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            send_mode(&mut bad, Mode::Check).await,
+            Err(BootError::Io(_))
+        ));
     }
 
     #[tokio::test]

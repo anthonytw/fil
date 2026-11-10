@@ -339,14 +339,23 @@ pub fn terminal_modes(ctx: &Ctx, host: &str) -> Res {
     c.send("vim -u NONE -c 'set mouse=a ttymouse=sgr' m.txt\r");
     c.want_alt(true, ATTACH_TIMEOUT)?;
     c.want_row("abcdefghij1", ATTACH_TIMEOUT)?;
+    // vim turns mouse reporting on before its first draw, so this passes at once; it makes the
+    // precondition explicit (a mode set while attached must survive the reattach).
+    c.wait_for(ATTACH_TIMEOUT, |c| {
+        modes(c).mouse != vt100::MouseProtocolMode::None
+    })
+    .ok_or_else(|| format!("vim did not turn mouse reporting on\n{}", c.dump()))?;
     c.detach()?;
     drop(c);
     let mut v = ctx.client(host, Variant::Auto, "dp-mouse", 30, 100);
     v.want_alt(true, ATTACH_TIMEOUT)?;
     v.want_row("abcdefghij1", ATTACH_TIMEOUT)?;
-    ensure(modes(&v).mouse != vt100::MouseProtocolMode::None, || {
-        format!("vim's mouse reporting was not restored\n{}", v.dump())
-    })?;
+    // The reattach snapshot writes the screen before the modes, and a slow runner reads it in
+    // small pieces: the row can be on screen before the mouse mode is applied, so wait for it.
+    v.wait_for(ATTACH_TIMEOUT, |c| {
+        modes(c).mouse != vt100::MouseProtocolMode::None
+    })
+    .ok_or_else(|| format!("vim's mouse reporting was not restored\n{}", v.dump()))?;
     // A click on row 3, column 5 (SGR: press then release).
     v.send("\x1b[<0;5;3M\x1b[<0;5;3m");
     thread::sleep(Duration::from_millis(300));

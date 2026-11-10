@@ -665,6 +665,53 @@ rm -rf "$kw"; mkdir -p "$kw"; cp -R "$rel" "$kw/files"
 GH_ALTER=1 rvc > "$tmp/out.log" 2>&1 || true
 grep -q 'differs: ./fil-0.9.0-1.aarch64.rpm' "$tmp/out.log" && ls "$kw"/files.signed-*/.signed-locally > /dev/null 2>&1 \
   && pass "download differing from the local copy: kept, and the differing file is named" || { flunk "differing download: kept and named"; sed "s/^/       | /" "$tmp/out.log"; }
+# --reuse-rebuild: the comparison with an earlier full run's rebuild of the same commit and mode
+# (WORK/rebuilt, named by WORK/rebuilt.commit), without the VM; any other stamp rebuilds (here: no VM)
+rw=$tmp/reusework
+rm -rf "$rw"
+mkdir -p "$rw/rebuilt"
+cp -R "$rel"/. "$rw/rebuilt"/
+rref=$(printf 'e%.0s' {1..40})
+rvr() { env FIL_VM=fil-selftest-no-such-vm "$RELEASE_DIR/verify.sh" 0.9.0 --dry-run --from-dir "$rel" --ref "$rref" --work "$rw" "$@"; }
+echo "$rref dry=1" > "$rw/rebuilt.commit"
+rvr --reuse-rebuild > "$tmp/out.log" 2>&1 || true
+grep -q 'reusing the rebuild of' "$tmp/out.log" && grep -q 'REPRODUCED from source byte for byte' "$tmp/out.log" && ! grep -q 'Lima instance\|limactl not found' "$tmp/out.log" \
+  && pass "release-verify --reuse-rebuild compares with the earlier rebuild of the same commit, without the VM" || { flunk "release-verify --reuse-rebuild reuses the earlier rebuild"; sed "s/^/       | /" "$tmp/out.log" | tail -15; }
+echo "$rref dry=0" > "$rw/rebuilt.commit"
+expect_fail "release-verify --reuse-rebuild: a rebuild of another mode is not reused (it rebuilds: no VM here)" rvr --reuse-rebuild
+grep -q 'no rebuild of .* to reuse' "$tmp/out.log" && pass "...saying so" || { flunk "...saying so"; sed "s/^/       | /" "$tmp/out.log" | tail -5; }
+rm -f "$rw/rebuilt.commit"
+expect_fail "release-verify --reuse-rebuild: no stamp, no reuse" rvr --reuse-rebuild
+expect_fail "release-verify: --reuse-rebuild does not go with --no-rebuild" rvr --reuse-rebuild --no-rebuild
+# the stamp's life, with a limactl stub on PATH (its "VM" rebuild outputs a copy of the release;
+# FAKE_REBUILD_RC fails the rebuild, FAKE_COPYOUT_RC the copy-out): a rebuild writes it, a failed
+# rebuild or copy-out leaves none, a new rebuild removes the old one first, and a reuse runs no VM
+mkdir -p "$rw/bin" "$rw/out"
+cp -R "$rel"/. "$rw/out"/
+cat > "$rw/bin/limactl" << EOF2
+#!/bin/sh
+echo "limactl \$*" >> "$rw/limactl.log"
+case "\$*" in
+  list*) echo Running ;;
+  *"bash -s"*) cat > /dev/null; exit \${FAKE_REBUILD_RC:-0} ;;
+  *"tar -cf"*) [ "\${FAKE_COPYOUT_RC:-0}" = 0 ] || exit 1; tar -cf - -C "$rw/out" . ;;
+  *) cat > /dev/null ;;
+esac
+EOF2
+chmod +x "$rw/bin/limactl"
+rvl() { env PATH="$rw/bin:$PATH" FIL_VM=fil-stub "$RELEASE_DIR/verify.sh" 0.9.0 --dry-run --from-dir "$rel" --ref "$rref" --work "$rw" "$@"; }
+rm -rf "$rw/rebuilt" "$rw/rebuilt.commit"
+rvl > "$tmp/out.log" 2>&1 || true
+expect_pass "release-verify: a rebuild that ran and was copied out writes the stamp" sh -c 'test "$(cat "$1/rebuilt.commit")" = "$2 dry=1" && test -f "$1/rebuilt/SHA256SUMS"' sh "$rw" "$rref"
+: > "$rw/limactl.log"
+rvl --reuse-rebuild > "$rw/reuse.log" 2>&1 || true
+expect_pass "release-verify: ...the next run with --reuse-rebuild reuses it, with no VM call" sh -c 'grep -q "reusing the rebuild of" "$1" && test ! -s "$2"' sh "$rw/reuse.log" "$rw/limactl.log"
+env FAKE_REBUILD_RC=1 PATH="$rw/bin:$PATH" FIL_VM=fil-stub "$RELEASE_DIR/verify.sh" 0.9.0 --dry-run --from-dir "$rel" --ref "$rref" --work "$rw" > "$tmp/out.log" 2>&1 || true
+expect_pass "release-verify: ...a failed rebuild removes the old stamp and writes none" test ! -e "$rw/rebuilt.commit"
+env PATH="$rw/bin:$PATH" FIL_VM=fil-stub "$RELEASE_DIR/verify.sh" 0.9.0 --dry-run --from-dir "$rel" --ref "$rref" --work "$rw" > /dev/null 2>&1 || true
+env FAKE_COPYOUT_RC=1 PATH="$rw/bin:$PATH" FIL_VM=fil-stub "$RELEASE_DIR/verify.sh" 0.9.0 --dry-run --from-dir "$rel" --ref "$rref" --work "$rw" > "$tmp/out.log" 2>&1 || true
+expect_pass "release-verify: ...so does a failed copy-out" test ! -e "$rw/rebuilt.commit"
+rm -rf "$rw"
 new_case 0.9.0
 cp "$rel/fil-0.9.0-1.x86_64.rpm" "$tmp/x86.before"
 expect_fail "sign-packages: an rpmsign that changes more than the signature header is refused" sp FAKE_TAMPER=1
@@ -1941,7 +1988,7 @@ pg push -q -f origin "$R:main"
 expect_pass "preflight: --from crates does not look at the VM, Docker or the keys" pfx FAKE_VM_STATUS=Stopped FAKE_DOCKER_DOWN=1 FAKE_NO_SECRET=1 FAKE_NO_IDENTITY=1 "$PF" 0.9.0 --repo o/r --from crates
 expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)" "$1"' sh "$pf/gh.log"
 
-# ============================================================== 10. release.sh (the state machine, and the actions of steps 1-4)
+# ============================================================== 10. release.sh (the state machine, and the actions of steps 1-12)
 # On the preflight's fixture (the clone, its bare `origin` and `github`, the keys, the stubs): a fake
 # GitHub world (runs, releases, assets, dispatches) in a directory, a tap, synthetic release files.
 # Steps 1-4 are done by the command's actions (failures injected at each, then the same command
@@ -1993,6 +2040,43 @@ def rels(tag):
         if m["tag"] == tag:
             out.append((n, m, os.path.join(d, n, "assets")))
     return out
+def calls(line):
+    with open(os.environ["FAKE_CALLS"], "a") as f:
+        f.write(line + "\n")
+def new_draft(tag, partial):
+    # the publish job's draft: the release files of FAKE_RELEASE_FILES (half of them for a publish
+    # that failed part way)
+    d = os.path.join(w, "releases")
+    # ids are never reused (as on GitHub)
+    nf = os.path.join(w, "next-release-id")
+    n = max([int(x) for x in os.listdir(d)] + [int(open(nf).read()) if os.path.exists(nf) else 0]) + 1
+    open(nf, "w").write(str(n))
+    os.makedirs(os.path.join(d, str(n), "assets"))
+    json.dump(dict(tag=tag, draft=True, created="2099-01-01T01:%02d:00Z" % n), open(os.path.join(d, str(n), "meta.json"), "w"))
+    src = os.environ["FAKE_RELEASE_FILES"]
+    names = sorted(os.listdir(src))
+    for f in (names[: len(names) // 2] if partial else names):
+        shutil.copy(os.path.join(src, f), os.path.join(d, str(n), "assets"))
+    calls("draft create %d%s" % (n, " (partial)" if partial else ""))
+def advance(r):
+    # a tag push's run, one stage per look: prepare, then publish (FAKE_TAG_RUN_FAIL=publish: the
+    # first attempt's publish fails after making half a draft; =build: a build job fails)
+    if not r.get("auto") or r["status"] in ("completed", "waiting") or "next" in r:
+        return
+    fail = os.environ.get("FAKE_TAG_RUN_FAIL", "") if r.get("attempt", 1) == 1 else ""
+    if r["status"] == "queued":
+        r.update(status="in_progress", jobs=[["prepare", "success"], ["publish", "-"], ["crates-io", "-"]])
+    elif fail == "leg" and not r.get("leg"):
+        # a matrix leg fails while the other legs still run: the run stays in progress for a look
+        r.update(leg=True, jobs=[["prepare", "success"], ["build-linux (a)", "failure"], ["build-linux (b)", "-"], ["publish", "-"], ["crates-io", "-"]])
+    elif fail in ("build", "leg"):
+        r.update(status="completed", conclusion="failure", jobs=[["prepare", "success"], ["build-linux", "failure"], ["publish", "skipped"], ["crates-io", "skipped"]])
+    elif fail == "publish":
+        new_draft(r["branch"], True)
+        r.update(status="completed", conclusion="failure", jobs=[["prepare", "success"], ["publish", "failure"], ["crates-io", "skipped"]])
+    else:
+        new_draft(r["branch"], False)
+        r.update(status="waiting", jobs=[["prepare", "success"], ["publish", "success"], ["crates-io", "-"]])
 if a[:2] == ["run", "list"]:
     down()
     out = [dict(databaseId=r["id"], status=r["status"], conclusion=r["conclusion"], createdAt=created(r))
@@ -2019,6 +2103,9 @@ elif a[:2] in (["run", "watch"], ["run", "rerun"]):
     p = run_file(a[2])
     r = load_run(a[2])
     if a[1] == "rerun":
+        if r["status"] != "completed":
+            print("run %s cannot be rerun; its workflow run is still in progress (HTTP 403)" % r["id"], file=sys.stderr); sys.exit(1)
+        r.pop("leg", None)
         r.update(next=dict(status="queued", conclusion="", jobs=[], attempt=r.get("attempt", 1) + 1), lag=1)
     else:
         if os.environ.get("FAKE_WATCH_FAIL"):
@@ -2041,6 +2128,9 @@ elif a[:2] == ["run", "view"] and "--log-failed" in a:
 elif a[:2] == ["run", "view"]:
     down()
     r = load_run(a[2])
+    if r.get("auto"):
+        advance(r)
+        json.dump(r, open(run_file(a[2]), "w"))
     print(json.dumps(dict(headSha=r["head"], event=r["event"], workflowName=r["name"], status=r["status"], conclusion=r["conclusion"], attempt=r.get("attempt", 1),
                           jobs=[dict(name=n, conclusion=c, status="completed") for n, c in r["jobs"]])))
 elif a[:2] == ["release", "view"]:
@@ -2068,7 +2158,25 @@ elif a[:1] == ["api"] and re.match(r"repos/o/r/releases$", a[1]):
     down()
     tag = re.search(r'tag_name == "([^"]*)"', opt("--jq")).group(1)
     for n, m, d in rels(tag):
-        print(n)
+        print("%s\t%s\t%s" % (n, "true" if m["draft"] else "false", m.get("created", "2099-01-01T00:00:%02dZ" % (int(n) % 60))) if "@tsv" in opt("--jq") else n)
+elif a[:1] == ["api"] and re.match(r"repos/o/r/releases/[0-9]+$", a[1]):
+    # what the --jq '.assets[].name' prints
+    d = os.path.join(w, "releases", a[1].rsplit("/", 1)[1], "assets")
+    for f in sorted(os.listdir(d)):
+        print(f)
+elif a[:3] == ["api", "-X", "DELETE"] and re.match(r"repos/o/r/releases/[0-9]+$", a[3]):
+    n = a[3].rsplit("/", 1)[1]
+    shutil.rmtree(os.path.join(w, "releases", n))
+    calls("draft delete %s" % n)
+elif a[:2] == ["release", "upload"]:
+    # from the current directory, into the (oldest) release of the tag; FAKE_UPLOAD_FAIL: the first
+    # file goes up, then the network fails
+    n, m, d = rels(a[2])[0]
+    files = [x for x in a[3:] if not x.startswith("-") and x not in ("o/r",)]
+    for i, f in enumerate(files):
+        if os.environ.get("FAKE_UPLOAD_FAIL") and i == 1:
+            print("HTTP 502: Bad Gateway (upload of %s)" % f, file=sys.stderr); sys.exit(1)
+        shutil.copy(f, os.path.join(d, f))
 else:
     os.execv(os.environ["FAKE_PF_GH"], [os.environ["FAKE_PF_GH"]] + a)
 EOF2
@@ -2109,22 +2217,109 @@ git -C "$rs/tap" remote add origin "$rs/tap.git"
 git -C "$rs/tap" push -q origin main
 git -C "$rs/tap" fetch -q origin
 : > "$pf/gh.log"
-# release-verify: a stub that logs its arguments; FAKE_VERIFY_FAIL makes it fail as verify.sh does
-cat > "$rs/verify" << 'EOF2'
-#!/bin/sh
-echo "verify $*" >> "$FAKE_CALLS"
-case "${FAKE_VERIFY_FAIL:-}" in
-  lima) echo "release-verify: Lima instance 'fil' is not running (limactl start fil)" >&2; exit 1 ;;
-  mismatch) echo "release-verify: FAIL fil-0.9.0-source.tar.gz: released aaaa, rebuilt bbbb" >&2; echo "release-verify: 1 check(s) FAILED: do not sign" >&2; exit 1 ;;
-esac
-echo "release-verify: all checks passed EXCEPT the signature, which a dry run or --pre-sign does not check" >&2
+# The step scripts' stubs (fake.py): release-verify logs its arguments (FAKE_VERIFY_FAIL makes it fail
+# as verify.sh does) and, for the draft, "downloads" it into the work directory and records the
+# verification as verify.sh does; sign-macos and sign-packages change the work directory (and, for
+# sign-macos, the draft) as the scripts do (FAKE_SIGN_FAIL=macos|packages: they fail first); and the
+# tag push's run, made by the github hook.
+cat > "$rs/fake.py" << 'EOF2'
+import hashlib, json, os, shutil, subprocess, sys
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+def calls(line):
+    with open(os.environ["FAKE_CALLS"], "a") as f:
+        f.write(line + "\n")
+cmd, args = sys.argv[1], sys.argv[2:]
+if cmd == "tag-run":
+    w, head = args
+    nf = os.path.join(w, "next-id")
+    nid = int(open(nf).read()) if os.path.exists(nf) else 101
+    open(nf, "w").write(str(nid + 1))
+    json.dump(dict(id=nid, workflow="release.yml", name="release", event="push", branch="v0.9.0", head=head, status="queued", conclusion="",
+                   jobs=[], attempt=1, auto=True), open(os.path.join(w, "runs", "%d.json" % nid), "w"))
+    sys.exit(0)
+W = os.environ["FAKE_RW"]
+F = os.path.join(W, "files")
+world = os.environ["FAKE_WORLD"]
+MAC = "fil-0.9.0-universal-apple-darwin.tar.gz"
+def draft():
+    d = os.path.join(world, "releases")
+    ns = [n for n in sorted(os.listdir(d), key=int) if json.load(open(os.path.join(d, n, "meta.json")))["tag"] == "v0.9.0"]
+    return os.path.join(d, ns[-1], "assets")
+def resum():
+    p = os.path.join(F, "SHA256SUMS")
+    out = []
+    for l in open(p).read().splitlines():
+        h, n = l.split("  ", 1)
+        out.append("%s  %s" % (sha(os.path.join(F, n)), n))
+    open(p, "w").write("\n".join(out) + "\n")
+def set_verified(**kv):
+    p = os.path.join(W, "verified")
+    lines = [l for l in open(p).read().splitlines() if l.split("=", 1)[0] not in kv]
+    open(p, "w").write("\n".join(lines + ["%s=%s" % x for x in kv.items()]) + "\n")
+if cmd == "verify":
+    calls("verify " + " ".join(args))
+    fail = os.environ.get("FAKE_VERIFY_FAIL", "")
+    if fail == "lima":
+        print("release-verify: Lima instance 'fil' is not running (limactl start fil)", file=sys.stderr); sys.exit(1)
+    if fail == "mismatch":
+        print("release-verify: FAIL fil-0.9.0-source.tar.gz: released aaaa, rebuilt bbbb\nrelease-verify: 1 check(s) FAILED: do not sign", file=sys.stderr); sys.exit(1)
+    if "--dry-run" not in args:
+        presign = "--pre-sign" in args
+        shutil.rmtree(F, ignore_errors=True)
+        shutil.copytree(draft(), F)
+        open(os.path.join(W, "verified"), "w").write("sums=%s\nrebuild=1\npresign=%d\ndry=0\n" % (sha(os.path.join(F, "SHA256SUMS")), presign))
+        if not presign:
+            print("release-verify: all checks passed", file=sys.stderr); sys.exit(0)
+    print("release-verify: all checks passed EXCEPT the signature, which a dry run or --pre-sign does not check", file=sys.stderr)
+elif cmd == "sign-macos":
+    calls("sign-macos " + " ".join(args))
+    if os.environ.get("FAKE_SIGN_FAIL") == "macos":
+        print('notarytool: "status": "Invalid"', file=sys.stderr); sys.exit(1)
+    key = os.environ["FIL_RELEASE_KEY"]
+    assert key.endswith(".pub"), key
+    open(os.path.join(F, MAC), "w").write("signed-mac%s\n" % (" again" if "--force" in args else ""))
+    resum()
+    if os.path.exists(os.path.join(F, "SHA256SUMS.sig")):
+        os.remove(os.path.join(F, "SHA256SUMS.sig"))
+    subprocess.check_call(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", "fil-release", os.path.join(F, "SHA256SUMS")], stdin=subprocess.DEVNULL)
+    for f in (MAC, "SHA256SUMS", "SHA256SUMS.sig"):
+        shutil.copy(os.path.join(F, f), draft())
+    set_verified(sums=sha(os.path.join(F, "SHA256SUMS")), macos="signed")
+elif cmd == "sign-packages":
+    calls("sign-packages " + " ".join(args))
+    if os.environ.get("FAKE_SIGN_FAIL") == "packages":
+        print("gpg: signing failed: No pinentry", file=sys.stderr); sys.exit(1)
+    rd = os.environ["FAKE_RELEASE_DIR"]
+    for a in ("x86_64", "aarch64"):
+        p = os.path.join(F, "fil-0.9.0-1.%s.rpm" % a)
+        info = subprocess.check_output(["python3", "-I", os.path.join(rd, "pkg_inspect.py"), p, p + ".x"]).decode()
+        if "signed yes" not in info.splitlines():
+            subprocess.check_call(["python3", "-I", os.path.join(rd, "selftest_pkg.py"), "sign", p])
+        shutil.rmtree(p + ".x", ignore_errors=True)
+    open(os.path.join(F, ".signed-locally"), "w").close()
+    resum()
+    open(os.path.join(F, "SHA256SUMS.asc"), "w").write("gpgsig %s\n" % sha(os.path.join(F, "SHA256SUMS")))
 EOF2
-chmod +x "$rs/verify"
+for t in verify sign-macos sign-packages; do printf '#!/bin/sh\nexec python3 -I "%s" %s "$@"\n' "$rs/fake.py" "$t" > "$rs/$t"; done
+# release-keys.sh: status says ready unless $rs/keys-locked exists; unlock removes it, forget makes it
+cat > "$rs/keys" << 'EOF2'
+#!/bin/sh
+echo "keys $*" >> "$FAKE_CALLS"
+case $1 in
+  status) if [ -e "$FAKE_KEYS_LOCKED" ]; then echo "ssh    locked     (stub)"; exit 1; fi; echo "ssh    ready      (stub)" ;;
+  unlock) [ -z "${FAKE_KEYS_UNLOCK_FAIL:-}" ] || { echo "release-keys: ssh: ssh-add failed (stub)" >&2; exit 1; }; rm -f "$FAKE_KEYS_LOCKED" ;;
+  forget) : > "$FAKE_KEYS_LOCKED" ;;
+esac
+EOF2
+chmod +x "$rs/verify" "$rs/sign-macos" "$rs/sign-packages" "$rs/keys"
 : > "$rs/calls.log"
 RL_SOCK=$rs/none.sock
 rlx() {
   pfx env FIL_GH="$rs/gh" FIL_GPG="$rs/gpg" FIL_CARGO="$rs/cargo" FIL_CRATES_CURL="$rs/curl" FAKE_WORLD="$rs/world" FAKE_PF_GH="$pf/bin/gh" \
     FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" \
+    FIL_SIGN_MACOS="$rs/sign-macos" FIL_SIGN_PACKAGES="$rs/sign-packages" FIL_RELEASE_KEYS="$rs/keys" FIL_RELEASE_POLL=0 \
+    FAKE_RW="$RW" FAKE_RELEASE_FILES="$rs/files0" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_KEYS_LOCKED="$rs/keys-locked" \
     SSH_AUTH_SOCK="$RL_SOCK" GNUPGHOME="$rs/gnupg" "$@"
 }
 # rl [ENV=VALUE ...] [-- ARGS ...]: a run of the command in this world
@@ -2161,9 +2356,12 @@ rl_refs() { pg for-each-ref --format='%(refname) %(objectname)' | grep -v '^refs
 expect_fail "release: a test-only override outside the self-test is refused" rl FIL_RELEASE_SELFTEST=
 last
 expect_pass "release: ...saying so" grep -q 'a release that asks a fake proves nothing' "$rs/last.log"
-expect_fail "release: --redo is not in this version" rlx "$RL" 0.9.0 --redo tag
+expect_fail "release: --redo tag is refused" rlx "$RL" 0.9.0 --redo tag
 last
-expect_pass "release: ...it says the later actions come later" grep -q 'arrive with the later steps, PRs 5-6' "$rs/last.log"
+expect_pass "release: ...it cannot be redone" grep -q 'it cannot be redone' "$rs/last.log"
+for x in mirror tag-run publish crates candidate nosuch; do expect_fail "release: --redo $x is refused" rlx "$RL" 0.9.0 --redo "$x"; done
+expect_fail "release: --redo does not go with --from" rlx "$RL" 0.9.0 --redo upload --from tag
+expect_fail "release: --redo does not go with --status" rlx "$RL" 0.9.0 --redo upload --status
 expect_fail "release: --from names a step" rlx "$RL" 0.9.0 --from nosuch
 expect_fail "release: --status does not go with --from" rlx "$RL" 0.9.0 --status --from mirror
 
@@ -2234,6 +2432,8 @@ trap 'kill "$rs_agent" 2> /dev/null; rm -rf "$tmp"' EXIT INT TERM
 SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q "$rs/agentkey/key" 2> /dev/null
 RL_SOCK=$rs/agent.sock
 pg config user.signingkey "$rs/agentpub/key.pub"
+# A tag push: refused while $rs/reject-tag exists (the tag ruleset); with $rs/tag-run-on-push, it
+# starts the tag's release.yml run in the gh world, which the fake advances one stage per look.
 cat > "$pf/github.git/hooks/pre-receive" << EOF2
 #!/bin/sh
 while read -r old new ref; do
@@ -2241,7 +2441,14 @@ while read -r old new ref; do
     echo "remote: error: GH006: Protected branch update failed for refs/heads/main." >&2
     exit 1
   fi
+  if [ "\$ref" = refs/tags/v0.9.0 ] && [ -e "$rs/reject-tag" ]; then
+    echo "remote: error: GH013: Repository rule violations found for refs/tags/v0.9.0." >&2
+    exit 1
+  fi
   echo "push \$ref \$new" >> "$rs/calls.log"
+  if [ "\$ref" = refs/tags/v0.9.0 ] && [ -e "$rs/tag-run-on-push" ]; then
+    python3 -I "$rs/fake.py" tag-run "$rs/world" "\$(git rev-parse "\$new^{commit}")"
+  fi
 done
 EOF2
 chmod +x "$pf/github.git/hooks/pre-receive"
@@ -2298,7 +2505,7 @@ expect_pass "release actions: ...with the known fix for a ruleset refusal" grep 
 expect_pass "release actions: ...and the log's tail and path" sh -c 'grep -q "GH006" "$1" && grep -q "logs/02-mirror.log" "$1"' sh "$rs/ra.out"
 calls_are 0 0 0 0
 rm -f "$rs/reject-push"
-ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 <<< "0.9.0"
+ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 -- --confirm-each <<< "0.9.0"
 calls_are 1 3 0 1
 expect_pass "release actions: ...and recorded the runs it found by listing" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
 
@@ -2317,7 +2524,8 @@ ra_reset
 ra_expect "release actions: a failed check fails at step 3, the rerun declined" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf '0.9.0\nn')"
 expect_pass "release actions: ...with the failed job's log" grep -q 'Process completed with exit code 1' "$rs/ra.out"
 calls_are 1 3 0 0
-ra_expect "release actions: ...again without a terminal: failed, saying how to rerun" 1 'gh run rerun ID --failed' FIL_RELEASE_TTY= < /dev/null
+ra_expect "release actions: ...again without a terminal: paused (exit 2) for the decision, saying how to rerun" 2 'gh run rerun ID --failed' FIL_RELEASE_TTY= < /dev/null
+expect_pass "release actions: ...and that whether it blocks the release is decided at a terminal" grep -q 'whether they block the release is your decision, at a terminal' "$rs/ra.out"
 calls_are 1 3 0 0
 ra_expect "release actions: ...again, the rerun accepted: on to step 5" 2 'PAUSED at step 5/17 tag' <<< "y"
 calls_are 1 3 1 1
@@ -2383,7 +2591,7 @@ ra_midprompt 'GMOVED=$(gh_move_main "$GMAIN0")'
 ra_check "release actions: main moved during the confirmation: the mirror push fails at step 2" 1 'FAILED at step 2/17 mirror'
 expect_pass "release actions: ...with the known fix for a moved main" grep -q "GitHub's main moved since the fetch" "$rs/ra.out"
 calls_are 0 0 0 0
-ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' <<< "0.9.0"
+ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' -- --confirm-each <<< "0.9.0"
 calls_are 1 3 0 1
 expect_pass "release actions: ...the mirror commit is on the moved main" sh -c 'test "$(git --git-dir="$1" rev-parse "refs/heads/main^")" = "$2"' sh "$pf/github.git" "$GMOVED"
 # the signing key leaves the agent during the confirmation: the commit cannot be signed
@@ -2426,7 +2634,7 @@ expect_pass "release actions: ...recording the new run" grep -qx dry_run=104 "$R
 
 # the happy path, from the start
 ra_reset
-ra_expect "release actions: the happy path through dry-verify, paused at step 5" 2 'PAUSED at step 5/17 tag' <<< "0.9.0"
+ra_expect "release actions: the happy path through dry-verify, paused at step 5 (--confirm-each: the tag asks again)" 2 'PAUSED at step 5/17 tag' -- --confirm-each <<< "0.9.0"
 calls_are 1 3 0 1
 RG=$(git -C "$pf/github.git" rev-parse refs/heads/main)
 expect_pass "release actions: ...the mirror commit has the release commit's tree, on GitHub's old main" sh -c 'test "$(git -C "$1" rev-parse "$2^{tree}")" = "$(git -C "$1" rev-parse "$3^{tree}")" && test "$(git -C "$1" rev-parse "$2^")" = "$4"' sh "$pf/clone" "$RG" "$RR" "$GMAIN0"
@@ -2436,7 +2644,7 @@ expect_pass "release actions: ...dispatched the three on main, the checks suite=
 expect_pass "release actions: ...verified the dry run at the mirror commit" grep -qx "verify 0.9.0 --dry-run --from-run 101 --ref $RG --repo o/r" "$rs/calls.log"
 expect_pass "release actions: ...and recorded it all" sh -c 'grep -qx "github_commit=$2" "$1" && grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1" && grep -Eq "^dry_verify=ok 101 $2 [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$" "$1"' sh "$RSTATE" "$RG"
 expect_pass "release actions: ...one log per step that acted" sh -c 'test -s "$1/02-mirror.log" && test -s "$1/03-dry-run.log" && test -s "$1/04-dry-verify.log"' sh "$RW/logs"
-expect_pass "release actions: ...and says the tag is by hand for now" sh -c 'grep -q "arrive in PRs 5-6" "$1" && grep -q "^  do:    by hand for now: git -c gpg.format=ssh" "$1"' sh "$rs/ra.out"
+expect_pass "release actions: ...and asked for the tag on its own, with nothing pushed" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "not confirmed: nothing was done" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
 ra_expect "release actions: the same command again does nothing new" 2 'PAUSED at step 5/17 tag' < /dev/null
 calls_are 1 3 0 1
 ra_expect "release actions: --from tag with steps 1-4 done is accepted" 2 'PAUSED at step 5/17 tag' -- --from tag < /dev/null
@@ -2464,8 +2672,11 @@ EOF2
 expect_pass "release status: the listing after dry-verify matches its golden" diff "$rs/golden4" "$rs/golden4.out"
 pg config user.signingkey "$pf/key.pub"
 
-# detection, on the world the actions left: GitHub's main moved on to a commit the clone has not
-# fetched: the recorded mirror commit is not proof enough (status does not fetch)
+# detection, on the world the actions left (the later steps by hand, as the owner's scripts leave
+# things; the keys locked, so a run without a terminal pauses at a step that signs): GitHub's main
+# moved on to a commit the clone has not fetched: the recorded mirror commit is not proof enough
+# (status does not fetch)
+: > "$rs/keys-locked"
 rl_kind 2 mirror "done (checked)"
 git clone -q -b main "$pf/github.git" "$rs/other"
 git -C "$rs/other" commit -q --allow-empty --no-gpg-sign -m later
@@ -2534,7 +2745,10 @@ rl_kind 6 tag-run next
 expect_fail "release run: --reset-state after the tag is refused" rl -- --reset-state
 last
 expect_pass "release run: ...the tag binds its commit" grep -q 'reset-state is refused (the tag binds' "$rs/last.log"
-rl_paused 6 tag-run
+expect_fail "release run: the tag's run never appears: fails at 6 after its polls" rl
+last
+expect_pass "release run: ...saying so" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "no release.yml run of the tag push" "$1"' sh "$rs/last.log"
+cp "$rs/last.log" "$rs/run.out"
 expect_pass "release run: ...recorded the tag object" grep -qx "tag_object=$(pg rev-parse v0.9.0-gh)" "$RSTATE"
 expect_pass "release run: ...and the preflight was bound to the release commit" grep -q 'HEAD is the bound release commit' "$rs/run.out"
 
@@ -2561,7 +2775,9 @@ mkdraft 2
 rl_kind 6 tag-run next "two drafts"
 expect_pass "release status: ...names the double-draft trap" grep -q 'double-draft trap' "$rs/status.out"
 rm -rf "$rs/world/releases/2"
-rl_paused 7 verify-presign
+expect_fail "release run: on to verify-presign (the VM down: it fails there)" rl FAKE_VERIFY_FAIL=lima
+last
+expect_pass "release run: ...at step 7, with the fix" sh -c 'grep -q "FAILED at step 7/17 verify-presign" "$1" && grep -q "do: *limactl start fil" "$1"' sh "$rs/last.log"
 expect_pass "release run: ...recorded the tag run" grep -qx tag_run=201 "$RSTATE"
 
 # 6-12, as the owner's scripts leave the work directory
@@ -2601,7 +2817,7 @@ rl_kind 10 sign-sums next "a .sig by a key not on main"
 rm -f "$RW/files/SHA256SUMS.sig"
 ssh-keygen -q -Y sign -f "$pf/key" -n fil-release "$RW/files/SHA256SUMS"
 rl_kind 10 sign-sums "done (checked)"
-rl_paused 11 upload
+rl_kind 11 upload next
 # upload
 for f in fil-0.9.0-1.x86_64.rpm fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc; do cp "$RW/files/$f" "$DA/"; done
 rl_kind 11 upload next "the .sig not uploaded"
@@ -2609,7 +2825,7 @@ cp "$RW/files/SHA256SUMS.sig" "$DA/"
 rl_kind 11 upload "done (checked)"
 rl_kind 7 verify-presign "done (implied)" "the draft moved on"
 rl_kind 11 upload "done (checked)" "with a gh that reports no digests" FAKE_NO_DIGEST=1
-rl_paused 12 verify-signed
+rl_kind 12 verify-signed next
 # verify-signed
 printf 'sums=%s\nrebuild=1\npresign=0\ndry=0\n' "$(sha256 "$RW/files/SHA256SUMS")" > "$RW/verified"
 rl_kind 12 verify-signed "done (checked)"
@@ -2691,11 +2907,241 @@ pg reset -q --hard "$RR"
 pg push -q -f origin "$RR:main"
 rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > /dev/null 2>&1 || true
 echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+# ---- the actions of steps 5-12 (PR 5): the tag, the tag's run and its draft, the verification
+# before signing, the three signing steps, the upload and the verification after it, each on the
+# gh world (the github hook starts the tag's run, which the fake advances one stage per look and whose
+# publish job makes the draft from $rs/files0), the step-script stubs (fake.py) and the keys stub.
+# The release key is the .pub whose private half is only in the test agent (as the owner's is).
+ra5_reset() {
+  ra_reset
+  rm -rf "$rs/world/releases" "$rs/world/next-release-id" "$RW/files" "$RW"/files.signed-* "$RW/verified" "$rs/reject-tag"
+  mkdir "$rs/world/releases"
+  for t in v0.9.0 v0.9.0-gh; do pg tag -d "$t" > /dev/null 2>&1 || true; done
+  rm -f "$rs/keys-locked"
+  touch "$rs/tag-run-on-push"
+}
+r5() {
+  local name=$1 want=$2 pat=$3
+  shift 3
+  ra_expect "$name" "$want" "$pat" FIL_RELEASE_KEY="$rs/agentpub/key" "$@"
+}
+n5() { grep -c "$1" "$2" || true; }
+# calls5_are TAG-PUSHES DRAFTS-MADE DRAFTS-DELETED UPLOADS VERIFIES MAC-SIGNINGS PACKAGE-SIGNINGS
+calls5_are() {
+  local got
+  got="$(n5 '^push refs/tags/v0.9.0 ' "$rs/calls.log") $(n5 '^draft create ' "$rs/calls.log") $(n5 '^draft delete ' "$rs/calls.log") $(n5 '^release upload ' "$pf/gh.log") $(n_verify) $(n5 '^sign-macos ' "$rs/calls.log") $(n5 '^sign-packages ' "$rs/calls.log")"
+  if [ "$got" = "$*" ]; then pass "release draft: ...calls: $1 tag push, $2 drafts made, $3 deleted, $4 uploads, $5 verifies, $6 macOS and $7 package signings"; else
+    flunk "release draft: ...calls: wanted $*; got $got (tag pushes, drafts made, deleted, uploads, verifies, macOS, package signings)"
+  fi
+}
+RK=$rs/agentpub/key.pub
+st5() { rls FIL_RELEASE_KEY="$rs/agentpub/key" 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }'; }
+
+# the happy path, in one invocation from the start (keys locked: unlocked once, up front), with
+# Gitea's marker tag owning v0.9.0 in the clone (the local name is then v0.9.0-gh)
+ra5_reset
+: > "$rs/keys-locked"
+pg tag -a -m marker v0.9.0 "$RR"
+r5 "release draft: the happy path, one invocation from the start through verify-signed, paused at 13 publish" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+calls_are 1 3 0 3
+calls5_are 1 1 0 1 3 1 1
+expect_pass "release draft: ...one confirmation (the tag's covers the mirror and the tag)" test "$(grep -c 'release: CONFIRM ' "$rs/ra.out")" = 1
+expect_pass "release draft: ...the keys unlocked once, up front, all three" sh -c 'test "$(grep -c "^keys unlock " "$1")" = 1 && grep -qx "keys unlock --need ssh,gpg,apple --ttl 8h" "$1" && test "$(grep -n "^keys unlock" "$1" | cut -d: -f1)" -lt "$(grep -n "^push refs/heads/main" "$1" | cut -d: -f1)"' sh "$rs/calls.log"
+RG5=$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)
+git init -q --bare "$rs/tagchk"
+git -C "$rs/tagchk" fetch -q "$pf/github.git" "+refs/tags/v0.9.0:refs/tags/v0.9.0" "+refs/heads/main:refs/remotes/origin/main"
+expect_pass "release draft: ...the tag on GitHub verifies against the signers on main" "$RELEASE_DIR/verify-tag.sh" "$rs/tagchk" v0.9.0
+expect_pass "release draft: ...names the mirror commit, and is the local v0.9.0-gh (Gitea's marker kept v0.9.0)" sh -c 'test "$(git -C "$1" rev-parse "refs/tags/v0.9.0^{commit}")" = "$2" && test "$(git -C "$3" rev-parse refs/tags/v0.9.0-gh)" = "$(git -C "$1" rev-parse refs/tags/v0.9.0)" && test "$(git -C "$3" rev-parse "refs/tags/v0.9.0^{commit}")" = "$4"' sh "$rs/tagchk" "$RG5" "$pf/clone" "$RR"
+rm -rf "$rs/tagchk"
+expect_pass "release draft: ...recorded the tag object and the tag's run" sh -c 'grep -qx "tag_object=$(git -C "$2" rev-parse refs/tags/v0.9.0-gh)" "$1" && grep -qx tag_run=104 "$1"' sh "$RSTATE" "$pf/clone"
+expect_pass "release draft: ...verified before signing and after, the second reusing the rebuild" sh -c 'grep -qx "verify 0.9.0 --pre-sign --repo o/r" "$1" && grep -qx "verify 0.9.0 --repo o/r --reuse-rebuild" "$1" && grep -qx "sign-macos 0.9.0 --repo o/r" "$1" && grep -qx "sign-packages 0.9.0 $2" "$1"' sh "$rs/calls.log" "$RW/files"
+expect_pass "release draft: ...uploaded the five signed files, once" grep -qx 'release upload v0.9.0 --repo o/r --clobber fil-0.9.0-1.x86_64.rpm fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig' "$pf/gh.log"
+expect_pass "release draft: ...SHA256SUMS.sig verifies with the release key" sh -c 'printf "release namespaces=\"fil-release\" %s\n" "$(cut -d" " -f1,2 "$1")" > "$3.signers"; ssh-keygen -Y verify -f "$3.signers" -I release -n fil-release -s "$2/SHA256SUMS.sig" < "$2/SHA256SUMS" > /dev/null 2>&1' sh "$RK" "$rs/world/releases/1/assets" "$rs/tmp5"
+expect_pass "release draft: ...one log per step that acted" sh -c 'for n in 05-tag 06-tag-run 07-verify-presign 08-sign-macos 09-sign-packages 10-sign-sums 11-upload 12-verify-signed; do test -s "$1/$n.log" || exit 1; done' sh "$RW/logs"
+st5 > "$rs/golden5.out"
+cat > "$rs/golden5" << 'EOF2'
+1/17 candidate done (checked)
+2/17 mirror done (checked)
+3/17 dry-run done (checked)
+4/17 dry-verify done (recorded)
+5/17 tag done (checked)
+6/17 tag-run done (checked)
+7/17 verify-presign done (checked)
+8/17 sign-macos done (checked)
+9/17 sign-packages done (checked)
+10/17 sign-sums done (checked)
+11/17 upload done (checked)
+12/17 verify-signed done (checked)
+13/17 publish next
+14/17 verify-published pending
+15/17 crates pending
+16/17 brew pending
+17/17 finish pending
+EOF2
+expect_pass "release status: the listing after verify-signed matches its golden" diff "$rs/golden5" "$rs/golden5.out"
+r5 "release draft: the same command again does nothing new" 2 'PAUSED at step 13/17 publish' < /dev/null
+calls5_are 1 1 0 1 3 1 1
+rl -- --lock-keys > "$rs/lk.out" 2>&1 && st=0 || st=$?
+expect_pass "release draft: --lock-keys forgets the keys (release-keys.sh forget), exit 0, and acts on nothing" sh -c 'test "$3" = 0 && grep -qx "keys forget --need ssh,gpg" "$1" && test "$(grep -c "^push " "$1")" = 2 && ! grep -q "PAUSED\|FAILED" "$2"' sh "$rs/calls.log" "$rs/lk.out" "$st"
+rm -f "$rs/keys-locked"
+
+# a failure injected at each of steps 5-12, then the same command again: each resumes at its step,
+# and the counts show no action done twice (F7: a run that did not confirm `tag` itself asks again)
+ra5_reset
+touch "$rs/reject-tag"
+r5 "release draft: a refused tag push fails at 5" 1 'FAILED at step 5/17 tag' <<< "0.9.0"
+expect_pass "release draft: ...with the known fix for the tag ruleset" grep -q 'the v\* tag ruleset' "$rs/ra.out"
+calls5_are 0 0 0 0 1 0 0
+LT=$(pg rev-parse refs/tags/v0.9.0-gh)
+expect_pass "release draft: ...the local tag is v0.9.0-gh even with no marker in the clone (v0.9.0 is left to Gitea's)" sh -c '! git -C "$1" rev-parse -q --verify refs/tags/v0.9.0 > /dev/null' sh "$pf/clone"
+rm -f "$rs/reject-tag"
+r5 "release draft: ...the same command again asks for the tag again (the confirmation is not kept), EOF: paused" 2 'PAUSED at step 5/17 tag' < /dev/null
+expect_pass "release draft: ...it showed the tag's confirmation" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 5 tag: the tag v0.9.0 on the mirror commit" "$1"' sh "$rs/ra.out"
+expect_pass "release draft: ...and nothing in the state says it was confirmed" sh -c '! grep -qi "confirm" "$1"' sh "$RSTATE"
+calls5_are 0 0 0 0 1 0 0
+r5 "release draft: ...confirmed: the tag is pushed; its publish fails, the rerun declined: fails at 6" 1 'FAILED at step 6/17 tag-run' FAKE_TAG_RUN_FAIL=publish <<< "$(printf '0.9.0\nn')"
+expect_pass "release draft: ...the tag pushed is the one the refused run made (reused, not made again)" sh -c 'test "$(git --git-dir="$1" rev-parse refs/tags/v0.9.0)" = "$2" && grep -q "reusing the local tag v0.9.0-gh" "$3"' sh "$pf/github.git" "$LT" "$RW/logs/05-tag.log"
+expect_pass "release draft: ...the rerun offer named the stale draft" grep -q 'deleting first the stale draft(s) 1 that the failed attempt left' "$rs/ra.out"
+calls5_are 1 1 0 0 1 0 0
+r5 "release draft: ...again, the rerun accepted: the stale draft deleted first; then the VM is down at 7" 1 'FAILED at step 7/17 verify-presign' FAKE_TAG_RUN_FAIL=publish FAKE_VERIFY_FAIL=lima <<< "y"
+expect_pass "release draft: ...one release of the tag left, the second draft" sh -c 'test "$(ls "$1")" = 2' sh "$rs/world/releases"
+calls_are 1 3 1 2
+calls5_are 1 2 1 0 2 0 0
+r5 "release draft: ...again: Apple rejects the notarization at 8" 1 'FAILED at step 8/17 sign-macos' FAKE_SIGN_FAIL=macos < /dev/null
+expect_pass "release draft: ...with the known fix" grep -q 'Apple rejected the notarization' "$rs/ra.out"
+calls5_are 1 2 1 0 3 1 0
+r5 "release draft: ...again: the package key has no passphrase cached at 9" 1 'FAILED at step 9/17 sign-packages' FAKE_SIGN_FAIL=packages < /dev/null
+expect_pass "release draft: ...with the known fix" grep -q "the package key's passphrase is not cached" "$rs/ra.out"
+calls5_are 1 2 1 0 3 2 1
+SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q -d "$RK" 2> /dev/null
+r5 "release draft: ...again: the release key left the agent, sign-sums fails at 10" 1 'FAILED at step 10/17 sign-sums' < /dev/null
+expect_pass "release draft: ...with the known fix" grep -q 'the release key is not in the agent' "$rs/ra.out"
+expect_pass "release draft: ...and no .sig is left behind" test ! -e "$RW/files/SHA256SUMS.sig"
+SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q "$rs/agentkey/key" 2> /dev/null
+calls5_are 1 2 1 0 3 2 2
+r5 "release draft: ...again: the upload fails part way at 11" 1 'FAILED at step 11/17 upload' FAKE_UPLOAD_FAIL=1 < /dev/null
+calls5_are 1 2 1 1 3 2 2
+r5 "release draft: ...again: only what still differs is uploaded; the VM is down at 12" 1 'FAILED at step 12/17 verify-signed' FAKE_VERIFY_FAIL=lima < /dev/null
+expect_pass "release draft: ...the second upload left out the file the first got up" sh -c 'grep "^release upload " "$1" | tail -n 1 | grep -qx "release upload v0.9.0 --repo o/r --clobber fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig"' sh "$pf/gh.log"
+calls5_are 1 2 1 2 4 2 2
+r5 "release draft: ...again: verify-signed passes, paused at 13" 2 'PAUSED at step 13/17 publish' < /dev/null
+calls5_are 1 2 1 2 5 2 2
+r5 "release draft: ...and once more: nothing is repeated" 2 'PAUSED at step 13/17 publish' < /dev/null
+calls_are 1 3 1 5
+calls5_are 1 2 1 2 5 2 2
+st5 > "$rs/golden5.out"
+expect_pass "release status: ...the same listing as the happy path's" diff "$rs/golden5" "$rs/golden5.out"
+
+# --redo verify-presign once the draft is signed: refused (a pre-sign check of signed rpms can only
+# fail, and its fix would burn a good version)
+r5 "release redo: --redo verify-presign after the upload is refused" 1 '--redo verify-presign: the draft is signed already' -- --redo verify-presign < /dev/null
+expect_pass "release redo: ...pointing to --redo verify-signed" grep -q 'redo verify-signed re-verifies the signed draft' "$rs/ra.out"
+calls5_are 1 2 1 2 5 2 2
+# --redo: the step and the ones that consume its output, each once more; nothing else
+r5 "release redo: --redo sign-packages: sign-packages, sign-sums, upload and verify-signed again" 2 'PAUSED at step 13/17 publish' -- --redo sign-packages < /dev/null
+calls5_are 1 2 1 3 6 2 3
+expect_pass "release redo: ...the upload sent all five" sh -c 'grep "^release upload " "$1" | tail -n 1 | grep -qx "release upload v0.9.0 --repo o/r --clobber fil-0.9.0-1.x86_64.rpm fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig"' sh "$pf/gh.log"
+r5 "release redo: --redo sign-macos signs again with --force, and everything after it" 2 'PAUSED at step 13/17 publish' -- --redo sign-macos < /dev/null
+calls5_are 1 2 1 4 7 3 4
+expect_pass "release redo: ...sign-macos got --force" sh -c 'grep "^sign-macos " "$1" | tail -n 1 | grep -qx "sign-macos 0.9.0 --repo o/r --force"' sh "$rs/calls.log"
+r5 "release redo: --redo verify-signed verifies again, and only that" 2 'PAUSED at step 13/17 publish' -- --redo verify-signed < /dev/null
+calls5_are 1 2 1 4 8 3 4
+r5 "release redo: --redo dry-run after the tag is refused" 1 '--redo dry-run: v0.9.0 is on GitHub' -- --redo dry-run < /dev/null
+echo '{"tag": "v0.9.0", "draft": false}' > "$rs/world/releases/2/meta.json"
+r5 "release redo: --redo upload of a published release is refused" 1 '--redo upload: v0.9.0 is not a draft' -- --redo upload < /dev/null
+echo '{"tag": "v0.9.0", "draft": true, "created": "2099-01-01T01:02:00Z"}' > "$rs/world/releases/2/meta.json"
+calls5_are 1 2 1 4 8 3 4
+st5 > "$rs/golden5.out"
+expect_pass "release status: ...after the redos, the same listing" diff "$rs/golden5" "$rs/golden5.out"
+
+# the double-draft trap after a successful publish: the newest by id (GitHub's created_at is the
+# tagged commit's date) is kept if it has every release file, an older draft is deleted after a
+# [y/N]; a published release is never deleted
+mkdir -p "$rs/world/releases/1/assets"
+echo '{"tag": "v0.9.0", "draft": true, "created": "2099-12-31T00:00:00Z"}' > "$rs/world/releases/1/meta.json"
+cp "$rs/files0/SHA256SUMS" "$rs/world/releases/1/assets/"
+rl_kind 6 tag-run next "two drafts" FIL_RELEASE_KEY="$rs/agentpub/key"
+r5 "release stale draft: no terminal: paused at 6, nothing deleted" 2 'PAUSED at step 6/17 tag-run' FIL_RELEASE_TTY= < /dev/null
+r5 "release stale draft: declined: paused, nothing deleted" 2 'stale draft\(s\) 1 not deleted' <<< "n"
+expect_pass "release stale draft: ...both drafts still there" test -d "$rs/world/releases/1"
+r5 "release stale draft: accepted: the older id deleted (whatever its date), the newest kept; on to 13" 2 'PAUSED at step 13/17 publish' <<< "y"
+expect_pass "release stale draft: ...only the newest is left" sh -c 'test "$(ls "$1")" = 2' sh "$rs/world/releases"
+calls5_are 1 2 2 4 8 3 4
+mkdir -p "$rs/world/releases/9/assets"
+echo '{"tag": "v0.9.0", "draft": true}' > "$rs/world/releases/9/meta.json"
+cp "$rs/files0/SHA256SUMS" "$rs/world/releases/9/assets/"
+r5 "release stale draft: the newest draft is incomplete: fails, deleting nothing" 1 'the newest \(9\) lacks:' <<< "y"
+expect_pass "release stale draft: ...both still there" sh -c 'test -d "$1/9" && test -d "$1/2"' sh "$rs/world/releases"
+rm -rf "$rs/world/releases/9"
+mkdir -p "$rs/world/releases/1/assets"
+echo '{"tag": "v0.9.0", "draft": false}' > "$rs/world/releases/1/meta.json"
+r5 "release stale draft: a published release beside the draft: fails, deleting nothing" 1 'one of them published' <<< "y"
+expect_pass "release stale draft: ...both still there" sh -c 'test -d "$1/1" && test -d "$1/2"' sh "$rs/world/releases"
+rm -rf "$rs/world/releases/1"
+calls5_are 1 2 2 4 8 3 4
+
+cp "$pf/gh.log" "$rs/gh5.log"
+# the waiver of red suite=all checks (F5): offered only at a terminal, only with the dry run green,
+# recorded with the run ids and attempts, and honored for exactly those
+ra5_reset
+r5 "release waiver: a red linux-check, the rerun declined, waived: on to the tag" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each <<< "$(printf '0.9.0\nn\ny')"
+expect_pass "release waiver: ...it asked whether they block the release" grep -q 'waive them, i.e. they do NOT block the release' "$rs/ra.out"
+expect_pass "release waiver: ...recorded the failed run and its attempt, nothing for macos-check" grep -Eqx 'checks_waived=102\.1 - [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' "$RSTATE"
+calls_are 1 3 0 1
+rl_kind 3 dry-run "done (waived)"
+expect_pass "release waiver: ...--status names the waived run" grep -q 'WAIVED by you .*linux-check run 102' "$rs/status.out"
+rl_kind 4 dry-verify "done (recorded)" "with the waiver"
+r5 "release waiver: ...the tag's confirmation names it" 2 'the red suite=all checks you waived: 102\.1 -' < /dev/null
+cp "$RSTATE" "$rs/state.w"
+sed 's/^checks_waived=102\.1 /checks_waived=999.1 /' "$rs/state.w" > "$RSTATE"
+rl_kind 3 dry-run next "a waiver of another run does not count"
+rl_kind 4 dry-verify pending "...nor does the dry-verify record without it"
+sed 's/^checks_waived=102\.1 - /checks_waived=- 102.1 /' "$rs/state.w" > "$RSTATE"
+rl_kind 3 dry-run next "a waiver naming the run for the other workflow does not count"
+r5 "release waiver: ...and a run without a terminal pauses at 3 for the decision, not at the tag" 2 'PAUSED at step 3/17 dry-run' FIL_RELEASE_TTY= < /dev/null
+cp "$rs/state.w" "$RSTATE"
+python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); r["attempt"] = 2; json.dump(r, open(sys.argv[1], "w"))' "$rs/world/runs/102.json"
+rl_kind 3 dry-run next "the waived run failed again in a later attempt: not waived"
+python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); r["attempt"] = 1; json.dump(r, open(sys.argv[1], "w"))' "$rs/world/runs/102.json"
+rl_kind 3 dry-run "done (waived)" "...back at the waived attempt"
+st5 | sed -n '3,5p' > "$rs/goldenw.out"
+printf '3/17 dry-run done (waived)\n4/17 dry-verify done (recorded)\n5/17 tag next\n' > "$rs/goldenw"
+expect_pass "release status: the waiver's listing matches its golden" diff "$rs/goldenw" "$rs/goldenw.out"
+# --redo dry-run before the tag: new runs, the waiver and dry-verify forgotten
+r5 "release redo: --redo dry-run before the tag: three new runs and a new dry-verify" 2 'PAUSED at step 5/17 tag' -- --redo dry-run < /dev/null
+calls_are 1 6 0 2
+expect_pass "release redo: ...the waiver is gone and the new runs are recorded" sh -c '! grep -q "^checks_waived=" "$1" && grep -qx dry_run=104 "$1" && grep -qx checks_linux=105 "$1" && grep -q "^dry_verify=ok 104 " "$1"' sh "$RSTATE"
+rl_kind 3 dry-run "done (checked)" "after --redo"
+r5 "release redo: --redo upload before the tag: nothing to redo" 1 '--redo upload: the step is not done' -- --redo upload < /dev/null
+# the waiver in the default mode: the tag confirmation given before the mirror did not know of it,
+# so step 5 asks again, listing it
+ra5_reset
+r5 "release waiver: default mode: waived after the tag confirmation, which step 5 then asks again" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf '0.9.0\nn\ny')"
+expect_pass "release waiver: ...two tag confirmations, the second naming the waiver, nothing pushed" sh -c 'test "$(grep -c "CONFIRM tag, for 0.9.0" "$1")" = 2 && grep -q "the red suite=all checks you waived: 102\.1 -" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
+# a matrix leg of the tag's run fails while the run goes on: waited for, the rerun offered once it
+# has completed
+r5 "release tag-run: a leg fails mid-run: waited for, then the rerun declined: fails at 6" 1 'FAILED at step 6/17 tag-run' FAKE_TAG_RUN_FAIL=leg <<< "$(printf '0.9.0\nn')"
+expect_pass "release tag-run: ...it said it waits for the run to finish, before offering the rerun" sh -c 'a=$(grep -n "waiting for the run to finish before offering a rerun" "$1" | cut -d: -f1 | head -n 1); b=$(grep -n "re-run its failed jobs" "$1" | cut -d: -f1 | head -n 1); test -n "$a" && test -n "$b" && test "$a" -lt "$b"' sh "$rs/ra.out"
+r5 "release tag-run: ...the rerun accepted (of a completed run): on to 13" 2 'PAUSED at step 13/17 publish' <<< "y"
+calls_are 1 3 1 3
+# no terminal at the red checks: paused (exit 2), nothing waived
+ra5_reset
+r5 "release waiver: a red check, no answer at the prompts: failed at 3, nothing waived" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each <<< "0.9.0"
+expect_pass "release waiver: ...said not waived" grep -q 'not re-run, not waived' "$rs/ra.out"
+r5 "release waiver: ...again without a terminal: paused, exit 2" 2 'PAUSED at step 3/17 dry-run' FIL_RELEASE_TTY= < /dev/null
+expect_pass "release waiver: ...no prompt shown, nothing recorded" sh -c '! grep -q "waive them" "$1" && ! grep -q "^checks_waived=" "$2"' sh "$rs/ra.out" "$RSTATE"
+# a red dry run (release.yml) is never offered the waiver
+ra5_reset
+r5 "release waiver: a red release.yml dry run: failed at 3, no waiver offered" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=release.yml -- --confirm-each <<< "$(printf '0.9.0\nn\ny')"
+expect_pass "release waiver: ...no prompt shown, nothing recorded" sh -c '! grep -q "waive them" "$1" && ! grep -q "^checks_waived=" "$2"' sh "$rs/ra.out" "$RSTATE"
+rm -f "$rs/tag-run-on-push"
+
 # the state: identifiers and results only
-expect_pass "release: the state holds only its keys (no reaper pid, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|dry_verify|tag_object|tag_run|verify_published)=" "$1"' sh "$RSTATE"
+expect_pass "release: the state holds only its keys (no reaper pid, no confirmation, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|checks_waived|dry_verify|tag_object|tag_run|verify_published)=" "$1"' sh "$RSTATE"
 # gh's writes are the dispatches of the three workflows on main and reruns of failed jobs (the
 # actions); everything else is a read
-expect_pass "release: gh wrote only dispatches (the three workflows, on main) and reruns --failed" sh -c 'test -s "$1" && ! grep -Ev "^workflow run (release\.yml --repo o/r --ref main|(linux|macos)-check\.yml --repo o/r --ref main -f suite=all -f ref=[0-9a-f]{40})$|^run rerun [0-9]+ --repo o/r --failed$" "$1" | grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow |^run (rerun|cancel)"' sh "$pf/gh.log"
+expect_pass "release: gh wrote only dispatches (the three workflows, on main), reruns --failed, deletions of a release by id and uploads of the five signed files to v0.9.0" sh -c 'cat "$2" "$3" > "$1"; test -s "$1" && ! grep -Ev "^workflow run (release\.yml --repo o/r --ref main|(linux|macos)-check\.yml --repo o/r --ref main -f suite=all -f ref=[0-9a-f]{40})$|^run rerun [0-9]+ --repo o/r --failed$|^api -X DELETE repos/o/r/releases/[0-9]+$|^release upload v0\.9\.0 --repo o/r --clobber( (fil-0\.9\.0-1\.(x86_64|aarch64)\.rpm|SHA256SUMS(\.asc|\.sig)?))+$" "$1" | grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow |^run (rerun|cancel)"' sh "$rs/gh-all.log" "$rs/gh5.log" "$pf/gh.log"
+expect_pass "release: ...and it did upload and delete (the log covers the later actions)" sh -c 'grep -q "^release upload " "$1" && grep -q "^api -X DELETE " "$1"' sh "$rs/gh-all.log"
 expect_pass "release: ...and it did dispatch (the log covers the actions)" grep -q '^workflow run release.yml' "$pf/gh.log"
 
 echo

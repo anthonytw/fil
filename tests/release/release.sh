@@ -2,19 +2,21 @@
 # `just release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). It binds
 # a run to the version and the release commit, takes the lock, runs the preflight, and works out from
 # the world (git refs, GitHub's runs and releases, crates.io, the Homebrew tap) which of the seventeen
-# steps are done. This version ACTS on steps 1-4 (candidate: checks only; mirror; dry-run;
-# dry-verify) and stops at step 5 `tag` with what to do by hand; the later actions arrive in PRs 5
-# (tag to verify-signed) and 6 (publish to finish). Re-run the same command after any failure: every
-# step is detected again first, and no action that is done is repeated.
+# steps are done. This version ACTS on steps 1-12 (candidate: checks only, through verify-signed) and
+# stops at step 13 `publish` with what to do by hand; the later actions arrive in PR 6 (publish to
+# finish). Re-run the same command after any failure: every step is detected again first, and no
+# action that is done is repeated.
 #
-#   release.sh VERSION [--status] [--reset-state] [--from STEP] [--confirm-each] [--repo OWNER/REPO]
-#                      [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]
+#   release.sh VERSION [--status] [--reset-state] [--from STEP | --redo STEP] [--confirm-each]
+#                      [--ttl 8h] [--lock-keys] [--repo OWNER/REPO] [--origin REMOTE]
+#                      [--github REMOTE] [--tap DIR] [--vm NAME]
 #
 #   (default)      fetch `origin` and `github` (no tags), bind the state to VERSION and HEAD, take
 #                  the lock, detect every step, record the identifiers found (the mirror commit,
 #                  run ids, the tag object) in the state, run the preflight for the next step and
-#                  the ones after it, then do the next step's action and the ones after it, through
-#                  dry-verify:
+#                  the ones after it, at a terminal unlock the keys the remaining steps need (one
+#                  block, release-keys.sh unlock --ttl), then do the next step's action and the ones
+#                  after it, through verify-signed:
 #                    mirror      [confirmation] a commit signed by the owner (git commit-tree -S) with
 #                                the release commit's exact tree on top of GitHub's main, pushed there
 #                    dry-run     dispatch release.yml, and linux-check and macos-check with suite=all
@@ -22,20 +24,45 @@
 #                                gh prints, else the new run on the commit) are recorded at once, and
 #                                every run is waited for (Ctrl-C is safe: a re-run re-attaches). A run
 #                                that failed: at a terminal, the command offers `gh run rerun --failed`.
-#                                Not yet: the design's waiver of a red suite=all check ("blocks the
-#                                release? [y/N]", section 3); a red check blocks until a rerun passes
-#                                (PR 5 adds the waiver, before the command can tag). A running run
-#                                the state lost is attached to only if it is this release's
-#                                (triggered by the gh user, not older than the mirror commit)
+#                                Red suite=all checks with a green dry run: at a terminal the command
+#                                asks whether they block the release ([y/N] to waive them; only `y`
+#                                waives; a waiver also voids a `tag` confirmation given before it, so
+#                                step 5 asks again, listing it); a waiver is recorded as checks_waived=<linux-check ID.ATTEMPT
+#                                or -> <macos-check ID.ATTEMPT or -> <utc> and counts only for exactly
+#                                those runs and attempts (--status: "done (waived)"). Without a
+#                                terminal that decision pauses the run (exit 2). A running run the
+#                                state lost is attached to only if it is this release's (triggered by
+#                                the gh user, not older than the mirror commit)
 #                    dry-verify  release-verify --dry-run --from-run RUN --ref G (the VM rebuild); its
 #                                success is recorded in the state (a local result)
+#                    tag         [confirmation, again in every run that did not confirm `tag` itself:
+#                                the answer is never stored] the tag vV on the mirror commit, signed
+#                                with the release key's .pub through the agent (local name always vV-gh:
+#                                vV belongs to Gitea's marker; a vV-gh made by an earlier run is reused),
+#                                checked with verify-tag.sh, pushed to refs/tags/vV
+#                    tag-run     find the tag push's release.yml run (recorded at once) and poll it until
+#                                its publish job succeeded (a heartbeat every 10 polls; a "probably
+#                                stuck" note after 3 h); a failed run, once it has completed: at a
+#                                terminal, one rerun of its failed jobs, deleting first the draft a
+#                                failed publish left (else there are two). Two or more drafts for vV:
+#                                the newest (highest id) is kept if it has every release file, and the
+#                                older are deleted after a [y/N] (a published one is never deleted)
+#                    verify-presign  release-verify --pre-sign (downloads the draft, the VM rebuild)
+#                    sign-macos  sign-macos.sh with FIL_RELEASE_KEY=the .pub (--force on --redo)
+#                    sign-packages  sign-packages.sh on target/release-verify/VERSION/files
+#                    sign-sums   ssh-keygen -Y sign -f the .pub -n fil-release of the signed SHA256SUMS
+#                    upload      gh release upload --clobber of the rpms, SHA256SUMS, .asc and .sig that
+#                                differ from the draft's (all five on --redo)
+#                    verify-signed  release-verify --reuse-rebuild (with the signature; it reuses step
+#                                7's rebuild of the tag's commit)
 #                  Exit 0: every step through `brew` is done; 1: failed (the failure says what, what
 #                  to do, and to run the same command again; the step's log is
 #                  target/release-verify/VERSION/logs/NN-STEP.log); 2: paused for a human (a
-#                  confirmation not given, no terminal at a confirmation, or the next step is not
-#                  automated yet).
-#   --status       per step: done (checked), done (recorded), done (implied), next or pending, with
-#                  the run URLs, and whether the release keys are unlocked (release-keys.sh status).
+#                  confirmation or other prompt not answered yes, no terminal at a prompt, keys
+#                  locked with no terminal to unlock them, or the next step is not automated yet).
+#   --status       per step: done (checked), done (recorded), done (waived), done (implied), next or
+#                  pending, with the run URLs, and whether the release keys are unlocked
+#                  (release-keys.sh status).
 #                  Read-only: no fetch of the clone (the tap is fetched), no lock, no state written,
 #                  no preflight. With no state bound and HEAD not the release commit of a tag on
 #                  GitHub, it shows the commit on origin's main with the tag's tree. Exit 1 only for
@@ -44,22 +71,33 @@
 #                  is on GitHub, which binds the commit forever.
 #   --from STEP    for a step done by hand: every step before STEP must detect as done (else the run
 #                  is refused); then as the default.
+#   --redo STEP    do STEP's action again although it detects as done, and the actions of the steps
+#                  that consume its output (dry-run: dry-verify; verify-presign, sign-macos: sign-packages
+#                  to verify-signed; sign-packages: sign-sums to verify-signed; sign-sums: upload and
+#                  verify-signed; upload: verify-signed). Only for a step that is done (verify-presign
+#                  only before the upload: a signed draft cannot pass a pre-sign check); dry-run and
+#                  dry-verify only before the tag, verify-presign to verify-signed only while the
+#                  release is a draft. Refused for mirror, tag and tag-run (GitHub keeps them; a failed
+#                  tag run is offered a rerun anyway) and for the steps after verify-signed.
 #   --confirm-each one confirmation per irreversible point. The default is two: `tag` (asked before
 #                  the mirror push, it covers the mirror and the tag) and `publish` (PR 6). Each
 #                  shows what becomes public and wants the version typed back; there is no --yes,
 #                  and a run whose input is not a terminal stops (exit 2) at the first one.
+#   --ttl T        the key session for release-keys.sh unlock (default 8h).
+#   --lock-keys    forget the release keys now (release-keys.sh forget), and nothing else.
 #   --tap DIR      the Homebrew tap clone (default ~/dev/homebrew-tap; its `origin` is the tap).
 #
 # The state: target/release-verify/VERSION/release.state, `key=value` lines written atomically
 # (temp file and mv), only identifiers the world cannot be asked for cheaply and the results of
-# purely local checks. Never a secret, and not the gpg reaper (release-keys.sh keeps it in
-# ~/.cache/fil/release-keys/). Real state beats the state file: every recorded identifier is
-# checked against the world before it counts.
+# purely local checks or decisions (dry_verify, checks_waived, verify_published). Never a secret, never
+# a confirmation, and not the gpg reaper (release-keys.sh keeps it in ~/.cache/fil/release-keys/).
+# Real state beats the state file: every recorded identifier is checked against the world before it
+# counts.
 #
 # A step that does not detect as done is "done (implied)" when a later step does: the steps are a
 # pipeline, each detection includes the evidence of the earlier steps it consumes (a recorded
-# dry-verify counts only with the dry run and both checks green), and the steps after `tag` are only
-# looked at once the tag is there (after `publish`, once it is published).
+# dry-verify counts only with the dry run and both checks green or waived), and the steps after `tag`
+# are only looked at once the tag is there (after `publish`, once it is published).
 #
 # A tag on GitHub is BURNED (a hard stop: bump the version) when it does not verify, when the state
 # binds a release commit of another tree, when it is not the tag object the state recorded, or (in a
@@ -67,28 +105,33 @@
 # tree whose commit is on origin's main, with nothing bound, means this checkout is not the release
 # commit: the run says which commit to check out and records nothing.
 #
-# GitHub writes, all in the actions above: the mirror push (git), `gh workflow run` of the three
-# workflows, `gh run rerun --failed` when the owner says so. Everything else is a read. The tools, each
-# a test-only override refused outside the self-test (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG,
-# FIL_CARGO, FIL_CRATES_CURL, FIL_RELEASE_ROOT, FIL_RELEASE_VERIFY (verify.sh), FIL_RELEASE_TTY (=1:
-# treat the input as a terminal), FIL_RELEASE_LOCK_HOLD (hold the lock while a file exists), and the preflight's (release-preflight.sh). Written for bash 3.2.
+# GitHub writes, all in the actions above: the mirror push and the tag push (git), `gh workflow run`
+# of the three workflows, `gh run rerun --failed` when the owner says so, the deletion of a stale
+# DRAFT for the tag (gh api -X DELETE .../releases/ID) when the owner says so, and `gh release upload
+# --clobber` to the draft. Everything else is a read. The tools, each a test-only override refused
+# outside the self-test (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG, FIL_CARGO, FIL_CRATES_CURL,
+# FIL_RELEASE_ROOT, FIL_RELEASE_VERIFY (verify.sh), FIL_SIGN_MACOS (sign-macos.sh), FIL_SIGN_PACKAGES
+# (sign-packages.sh), FIL_RELEASE_KEYS (release-keys.sh), FIL_RELEASE_POLL (seconds between polls of
+# the tag's run, default 30), FIL_RELEASE_TTY (=1: treat the input as a terminal),
+# FIL_RELEASE_LOCK_HOLD (hold the lock while a file exists), and the preflight's
+# (release-preflight.sh). Written for bash 3.2.
 set -euo pipefail
 # shellcheck source=tests/release/release-preflight.sh
 source "$(dirname "${BASH_SOURCE[0]}")/release-preflight.sh"
 
-usage="usage: release.sh VERSION [--status] [--reset-state] [--from STEP] [--confirm-each] [--repo OWNER/REPO] [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]"
-version='' mode=run reset=0 repo=anthonytw/fil origin=origin github=github tap=$HOME/dev/homebrew-tap vm='' from='' confirm_each=0
+usage="usage: release.sh VERSION [--status] [--reset-state] [--from STEP | --redo STEP] [--confirm-each] [--ttl 8h] [--lock-keys] [--repo OWNER/REPO] [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]"
+version='' mode=run reset=0 repo=anthonytw/fil origin=origin github=github tap=$HOME/dev/homebrew-tap vm='' from='' confirm_each=0 redo='' ttl=8h
 while [ $# -gt 0 ]; do
   case $1 in
     --status) mode=status; shift ;;
+    --lock-keys) mode=lock-keys; shift ;;
     --reset-state) reset=1; shift ;;
     --confirm-each) confirm_each=1; shift ;;
-    --repo | --origin | --github | --tap | --vm | --from)
+    --repo | --origin | --github | --tap | --vm | --from | --redo | --ttl)
       [ $# -ge 2 ] || die "$usage"
-      case $1 in --repo) repo=$2 ;; --origin) origin=$2 ;; --github) github=$2 ;; --tap) tap=$2 ;; --vm) vm=$2 ;; --from) from=$2 ;; esac
+      case $1 in --repo) repo=$2 ;; --origin) origin=$2 ;; --github) github=$2 ;; --tap) tap=$2 ;; --vm) vm=$2 ;; --from) from=$2 ;; --redo) redo=$2 ;; --ttl) ttl=$2 ;; esac
       shift 2
       ;;
-    --redo | --lock-keys | --ttl) die "$1: not in this version of the command (it acts on steps 1-4 so far: --redo, --lock-keys and --ttl arrive with the later steps, PRs 5-6 of the one-command release)" ;;
     -*) die "unknown option: $1 ($usage)" ;;
     *) [ -z "$version" ] || die "$usage"; version=$1; shift ;;
   esac
@@ -96,12 +139,34 @@ done
 [ -n "$version" ] || die "$usage"
 V=${version#v}
 package_version_ok "$V" || die "'$version' is not X.Y.Z or X.Y.Z-PRE"
-if [ "$mode" = status ] && { [ "$reset" = 1 ] || [ "$confirm_each" = 1 ] || [ -n "$from" ]; }; then
-  die "--status only reads: --reset-state, --from and --confirm-each do not go with it"
+if [ "$mode" != run ] && { [ "$reset" = 1 ] || [ "$confirm_each" = 1 ] || [ -n "$from" ] || [ -n "$redo" ]; }; then
+  die "--status and --lock-keys do not act on the steps: --reset-state, --from, --redo and --confirm-each do not go with them"
 fi
 if [ -n "$from" ]; then
   case " $PF_STEPS " in *" $from "*) ;; *) die "--from $from: no such step (one of: $PF_STEPS)" ;; esac
 fi
+[ -z "$from" ] || [ -z "$redo" ] || die "--from and --redo do not go together"
+# --redo STEP: REDO_LEFT is STEP and the steps that consume its output, in order; each is acted on
+# again in this run, whatever it detects as.
+REDO_LEFT=''
+if [ -n "$redo" ]; then
+  case $redo in
+    dry-run) REDO_LEFT="dry-run dry-verify" ;;
+    dry-verify) REDO_LEFT="dry-verify" ;;
+    verify-presign) REDO_LEFT="verify-presign sign-packages sign-sums upload verify-signed" ;;
+    sign-macos) REDO_LEFT="sign-macos sign-packages sign-sums upload verify-signed" ;;
+    sign-packages) REDO_LEFT="sign-packages sign-sums upload verify-signed" ;;
+    sign-sums) REDO_LEFT="sign-sums upload verify-signed" ;;
+    upload) REDO_LEFT="upload verify-signed" ;;
+    verify-signed) REDO_LEFT="verify-signed" ;;
+    candidate) die "--redo candidate: it only checks, and every run checks it" ;;
+    mirror | tag) die "--redo $redo: refused, it cannot be redone (GitHub keeps what it pushed; a bad $redo means a new version)" ;;
+    tag-run) die "--redo tag-run: refused (the tag's run is GitHub's: a failed one is offered a rerun of its failed jobs, and a stale draft its deletion, by the command itself)" ;;
+    publish | verify-published | crates | brew | finish) die "--redo $redo: refused (the steps from publish on are not redone by this version of the command; publish and crates cannot be undone)" ;;
+    *) die "--redo $redo: no such step (one of: $PF_STEPS)" ;;
+  esac
+fi
+case $ttl in [1-9]*[smh] | [1-9]*) ;; *) die "--ttl '$ttl': N, Ns, Nm or Nh" ;; esac
 TAG=v$V
 W=$ROOT/target/release-verify/$V
 STATE=$W/release.state
@@ -121,6 +186,22 @@ GH=${FIL_GH:-gh}
 GPG=${FIL_GPG:-gpg}
 CARGO=${FIL_CARGO:-cargo}
 CURL=${FIL_CRATES_CURL:-curl}
+VERIFIER=${FIL_RELEASE_VERIFY:-$RELEASE_DIR/verify.sh}
+SIGN_MACOS=${FIL_SIGN_MACOS:-$RELEASE_DIR/sign-macos.sh}
+SIGN_PACKAGES=${FIL_SIGN_PACKAGES:-$RELEASE_DIR/sign-packages.sh}
+KEYS=${FIL_RELEASE_KEYS:-$RELEASE_DIR/release-keys.sh}
+POLL=${FIL_RELEASE_POLL:-30}
+is_poll() { case $1 in "" | *[!0-9]* | ????*) false ;; *) true ;; esac; }
+is_poll "$POLL" || die "FIL_RELEASE_POLL: seconds, 0 to 999"
+# The release key's public half: every signature (the tag, SHA256SUMS, sign-macos's) names it, so the
+# private key is used only through the agent (release-keys.sh unlock put it there with a lifetime).
+RELEASE_PUB=${FIL_RELEASE_KEY:-$HOME/.ssh/fil-release}
+RELEASE_PUB=${RELEASE_PUB%.pub}.pub
+
+if [ "$mode" = lock-keys ]; then
+  "$KEYS" forget --need ssh,gpg
+  exit
+fi
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/fil-release.XXXXXX")
 LOCK_OWNED=0 REAP_OWNED=0
@@ -140,7 +221,7 @@ tree_of() { rg rev-parse -q --verify "$1^{tree}" 2> /dev/null || true; }
 has_commit() { [ -n "$1" ] && rg cat-file -e "$1^{commit}" 2> /dev/null; }
 
 # ---- the state file
-STATE_KEYS="version release_commit github_commit dry_run checks_linux checks_macos dry_verify tag_object tag_run verify_published"
+STATE_KEYS="version release_commit github_commit dry_run checks_linux checks_macos checks_waived dry_verify tag_object tag_run verify_published"
 # st_get KEY: the value of the last KEY= line ("" if none).
 st_get() {
   [ -f "$STATE" ] || return 0
@@ -345,6 +426,11 @@ for a in d["assets"]:
     print(a["name"], (a.get("digest") or "-").replace("sha256:", ""))' > "$scratch/release" || { REL=unknown; return 0; }
   REL=$(head -n 1 "$scratch/release")
   tail -n +2 "$scratch/release" > "$scratch/assets"
+  # two or more releases of the tag (the double-draft trap): which one `release view` shows is
+  # GitHub's choice, so nothing after tag-run counts until tag-run has left one
+  local rels
+  if ! rels=$(rel_list); then REL=unknown; return 0; fi
+  [ "$(printf '%s\n' "$rels" | grep -c .)" -le 1 ] || REL=multiple
 }
 # asset_digest NAME: the sha256 of the release's asset NAME (downloaded and hashed when the listing
 # has no digest); nothing if there is no such asset or it cannot be read.
@@ -493,8 +579,31 @@ det_mirror() {
   return 1
 }
 
+# The waiver of red suite=all checks (the owner's answer to "do they block the release?", at a
+# terminal): checks_waived=<linux-check ID.ATTEMPT or -> <macos-check ID.ATTEMPT or -> <utc>.
+# waived_run POS WF: the run of WF the waiver names (field POS), printed, if it is still exactly that:
+# the run the state records for WF, on G, completed and not successful, at the waived attempt.
+waived_run() {
+  local f id at
+  f=$(st_get checks_waived | awk -v p="$1" '{ print $p }')
+  case $f in *.*) id=${f%%.*} at=${f#*.} ;; *) return 1 ;; esac
+  is_num "$id" && is_num "$at" || return 1
+  [ "$id" = "$(st_num "$(dr_key "$2")")" ] || return 1
+  run_view "$id" || return 1
+  rv_has "$id" "workflowName ${2%.yml}" && rv_has "$id" "event workflow_dispatch" && rv_has "$id" "headSha $G" \
+    && rv_has "$id" "status completed" && ! rv_has "$id" "conclusion success" && [ "$(rv_attempt "$id")" = "$at" ] || return 1
+  echo "$id"
+}
+# check_holds WF ID POS: ID is a green suite=all run of WF on G, or exactly the waived one.
+check_holds() {
+  [ -n "$2" ] || return 1
+  if run_view "$2" && "$(dr_pred "$1")" "$2"; then return 0; fi
+  [ "$(waived_run "$3" "$1" || true)" = "$2" ]
+}
+WAIVED=''
 det_dry_run() {
-  local rc miss=''
+  local rc miss='' id
+  WAIVED=''
   [ -n "$G" ] || { NOTE="needs the mirror commit (step mirror)"; return 1; }
   rc=0; DRY_RUN=$(find_run pred_dry "$(st_num dry_run)" release.yml workflow_dispatch "$G") || rc=$?
   [ $rc != 2 ] || { UNKNOWN=1 NOTE="cannot ask GitHub for the runs: $(gh_err)"; return 1; }
@@ -502,6 +611,11 @@ det_dry_run() {
   [ $rc != 2 ] || { UNKNOWN=1 NOTE="cannot ask GitHub for the runs: $(gh_err)"; return 1; }
   rc=0; CHECKS_MACOS=$(find_run pred_macos_all "$(st_num checks_macos)" macos-check.yml workflow_dispatch "$G") || rc=$?
   [ $rc != 2 ] || { UNKNOWN=1 NOTE="cannot ask GitHub for the runs: $(gh_err)"; return 1; }
+  # a red check counts only through the waiver, and only with the dry run itself green
+  if [ -n "$DRY_RUN" ]; then
+    if [ -z "$CHECKS_LINUX" ] && id=$(waived_run 1 linux-check.yml); then CHECKS_LINUX=$id WAIVED="$WAIVED, linux-check run $id"; fi
+    if [ -z "$CHECKS_MACOS" ] && id=$(waived_run 2 macos-check.yml); then CHECKS_MACOS=$id WAIVED="$WAIVED, macos-check run $id"; fi
+  fi
   [ -n "$DRY_RUN" ] || miss="$miss, a successful release.yml dry run"
   [ -n "$CHECKS_LINUX" ] || miss="$miss, a successful linux-check suite=all"
   [ -n "$CHECKS_MACOS" ] || miss="$miss, a successful macos-check suite=all"
@@ -510,6 +624,7 @@ det_dry_run() {
     return 1
   fi
   NOTE="dry run $(run_url "$DRY_RUN"), linux-check $(run_url "$CHECKS_LINUX"), macos-check $(run_url "$CHECKS_MACOS")"
+  [ -z "$WAIVED" ] || NOTE="$NOTE; red and WAIVED by you ($(st_get checks_waived | awk '{ print $NF }')):${WAIVED#,}"
 }
 
 det_dry_verify() {
@@ -517,13 +632,14 @@ det_dry_verify() {
   rec=$(st_get dry_verify)
   # The record alone does not prove the checks: they are required too, so that a recorded
   # dry-verify never lets a red or missing check read as done (implied).
-  if [ -n "$DRY_RUN" ] && [ -n "$CHECKS_LINUX" ] && [ -n "$CHECKS_MACOS" ] && [ -n "$G" ]; then
+  # Each check must be green, or exactly the run (and attempt) the waiver names.
+  if [ -n "$DRY_RUN" ] && [ -n "$G" ] && check_holds linux-check.yml "$CHECKS_LINUX" 1 && check_holds macos-check.yml "$CHECKS_MACOS" 2; then
     case $rec in
       "ok $DRY_RUN $G "*) NOTE="recorded: release-verify --dry-run of run $DRY_RUN passed (${rec##* })"; return 0 ;;
     esac
   fi
   if [ -z "$DRY_RUN" ] || [ -z "$CHECKS_LINUX" ] || [ -z "$CHECKS_MACOS" ]; then
-    NOTE="needs the dry run and both suite=all checks green (step dry-run)"
+    NOTE="needs the dry run and both suite=all checks green or waived (step dry-run)"
     return 1
   fi
   NOTE="no recorded release-verify --dry-run of run $DRY_RUN at the mirror commit"
@@ -547,19 +663,35 @@ need_release() {
   case $REL in
     none) NOTE="no release (draft) for $TAG on GitHub"; return 1 ;;
     unknown) UNKNOWN=1 NOTE="cannot ask GitHub for the release $TAG: $(gh_err)"; return 1 ;;
+    multiple) NOTE="more than one release of $TAG on GitHub (step tag-run keeps one)"; return 1 ;;
   esac
 }
 
+# rel_list: "ID DRAFT CREATED" for every release of the tag (draft or not), by id (GitHub's ids grow,
+# so the last is the newest; created_at is the tagged commit's date, shown for information only); 1
+# if GitHub could not be asked.
+rel_list() {
+  local out
+  out=$(gh_read api "repos/$repo/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | [.id, .draft, .created_at] | @tsv") || return 1
+  printf '%s\n' "$out" | python3 -I -c 'import re, sys
+rows = []
+for l in sys.stdin.read().splitlines():
+    f = (l.split("\t") + ["", "", ""])[:3]
+    if re.fullmatch(r"[0-9]{1,19}", f[0]) and f[1] in ("true", "false"):
+        rows.append((f[2] if re.fullmatch(r"[0-9T:Z-]{1,30}", f[2]) else "-", int(f[0]), f[1]))
+for c, i, d in sorted(rows, key=lambda r: r[1]):
+    print(i, d, c)'
+}
 det_tag_run() {
-  local rc ids n f missing=''
+  local rc rels n f missing=''
   need_tag || return 1
   rc=0; TAG_RUN=$(find_run pred_tag_run "$(st_num tag_run)" release.yml push "$G" "$TAG") || rc=$?
   [ $rc != 2 ] || { UNKNOWN=1 NOTE="cannot ask GitHub for the runs: $(gh_err)"; return 1; }
   [ -n "$TAG_RUN" ] || { NOTE="no release.yml run of the tag push on $(short "$G") whose publish job succeeded (yet)"; return 1; }
-  ids=$(gh_read api "repos/$repo/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id") || { UNKNOWN=1 NOTE="cannot list the releases: $(gh_err)"; return 1; }
-  n=$(printf '%s\n' "$ids" | grep -c '[0-9]' || true)
+  rels=$(rel_list) || { UNKNOWN=1 NOTE="cannot list the releases: $(gh_err)"; return 1; }
+  n=$(printf '%s\n' "$rels" | grep -c '[0-9]' || true)
   if [ "$n" -gt 1 ]; then
-    NOTE="$n releases for $TAG (ids $(printf '%s' "$ids" | tr '\n' ' ')): the double-draft trap; delete the stale draft (gh api -X DELETE repos/$repo/releases/ID)"
+    NOTE="$n releases for $TAG (ids $(printf '%s\n' "$rels" | awk '{ printf "%s ", $1 }')): the double-draft trap; the command keeps the newest draft and deletes the stale ones (after a [y/N])"
     return 1
   fi
   need_release || return 1
@@ -614,7 +746,8 @@ asc_verifies() {
 local_signed_packages() {
   local p
   [ -d "$FILES" ] || { NOTE="no $FILES"; return 1; }
-  [ -f "$FILES/.signed-locally" ] || { NOTE="$FILES has no .signed-locally marker (sign-packages writes it)"; return 1; }
+  # (not the .signed-locally marker: after verify-signed, $FILES is a fresh download of the uploaded,
+  # signed files, which the signatures below prove as well)
   for p in $RPMS; do
     [ -f "$FILES/$p" ] || { NOTE="no $FILES/$p"; return 1; }
     [ "$(python3 -I "$RELEASE_DIR/pkg_inspect.py" "$FILES/$p" "$scratch/pi-$p" 2> /dev/null | sed -n 's/^signed //p')" = yes ] \
@@ -732,8 +865,11 @@ det_brew() {
 
 det_finish() { NOTE="the summary, forgetting the keys, the copy for the coordinator"; return 1; }
 
-# ---- detect every step: KIND[i] is checked, recorded, no or unknown, then implied/next/pending.
-KIND=() NOTES=()
+# ---- detect every step: KIND[i] is checked, recorded, waived, no or unknown, then
+# implied/next/pending. A step that --redo still has to do again (REDO_LEFT) reads as no, and is
+# never implied by a later one.
+KIND=() NOTES=() FORCED=() WAS_DONE=()
+in_redo() { case " $REDO_LEFT " in *" $1 "*) true ;; *) false ;; esac; }
 detect_all() {
   local s i=0
   TAG_OK=0 TAG_STATE=unknown HARD='' HARD_STEP='' LAST_DONE=0 G='' REL=unknown
@@ -746,9 +882,18 @@ detect_all() {
   for s in $PF_STEPS; do
     i=$((i + 1))
     NOTE='' UNKNOWN=0
+    FORCED[i]=0 WAS_DONE[i]=0
     if "det_$(printf '%s' "$s" | tr - _)"; then
+      WAS_DONE[i]=1
       case $s in dry-verify | verify-published) KIND[i]=recorded ;; *) KIND[i]=checked ;; esac
-      LAST_DONE=$i
+      [ "$s" != dry-run ] || [ -z "$WAIVED" ] || KIND[i]=waived
+      if in_redo "$s"; then
+        KIND[i]=no FORCED[i]=1 NOTE="--redo $redo: done, and done again now ($NOTE)"
+      else
+        LAST_DONE=$i
+      fi
+    elif in_redo "$s" && [ "$UNKNOWN" = 0 ]; then
+      KIND[i]=no FORCED[i]=1
     elif [ "$UNKNOWN" = 1 ]; then
       KIND[i]=unknown
     else
@@ -760,8 +905,8 @@ detect_all() {
   NEXT=0
   for ((i = 1; i <= NSTEPS; i++)); do
     case ${KIND[i]} in
-      checked | recorded) ;;
-      *) if [ $i -lt "$LAST_DONE" ]; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
+      checked | recorded | waived) ;;
+      *) if [ $i -lt "$LAST_DONE" ] && [ "${FORCED[i]}" = 0 ]; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
     esac
   done
 }
@@ -770,6 +915,7 @@ label() {
   case $1 in
     checked) echo "done (checked)" ;;
     recorded) echo "done (recorded)" ;;
+    waived) echo "done (waived)" ;;
     implied) echo "done (implied)" ;;
     burned) echo "BURNED" ;;
     *) echo "$1" ;;
@@ -797,10 +943,10 @@ print_status() {
     esac
   done
   echo "keys (just release-keys status):"
-  "$RELEASE_DIR/release-keys.sh" status --need ssh,gpg < /dev/null 2>&1 | sed 's/^/  /' || true
+  "$KEYS" status --need ssh,gpg < /dev/null 2>&1 | sed 's/^/  /' || true
 }
 
-# ---- the actions of steps 1-4. Each runs with its step's log open and returns once its action is
+# ---- the actions of steps 1-12. Each runs with its step's log open and returns once its action is
 # done (the loop then detects every step again); any failure stops the run through step_fail.
 utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 STEP_LOG='' STEP_LOG_START=0
@@ -843,15 +989,64 @@ known_fix() {
         echo "GitHub or the network failed for a moment: run it again (it re-attaches to the runs it started)"
       fi
       ;;
-    dry-verify)
+    dry-verify | verify-presign | verify-signed)
       if log_has "Lima instance .* is not running"; then
         echo "limactl start $m"
       elif log_has 'docker\.sock.*permission denied|permission denied.*docker\.sock'; then
         echo "add yourself to the VM's docker group: limactl shell $m sudo usermod -aG docker \$USER, then limactl stop $m && limactl start $m"
       elif log_has 'Cannot connect to the Docker daemon|docker daemon running'; then
         echo "start Docker (on the Mac: open -a Docker; in the VM: limactl shell $m sudo systemctl start docker)"
-      elif log_has 'FAILED: do not sign|released [0-9a-f]*, rebuilt'; then
-        echo "STOP: do NOT tag. The dry run did not verify (a rebuild that differs is a reproducibility bug, not a flake); keep the log and send it to the coordinator. The fix is a new release commit"
+      elif log_has 'FAILED: do not sign|released [0-9a-f]*, rebuilt|STOP: '; then
+        case $1 in
+          dry-verify) echo "STOP: do NOT tag. The dry run did not verify (a rebuild that differs is a reproducibility bug, not a flake); keep the log and send it to the coordinator. The fix is a new release commit" ;;
+          verify-presign) echo "STOP: do NOT sign. The draft did not verify; it stays a draft. Keep the log and send it to the coordinator; the fix is a new patch version (the tag cannot move)" ;;
+          *) echo "STOP: do NOT publish. The signed draft did not verify; the signed files are kept (target/release-verify/$V/files or files.signed-*). Send the log to the coordinator" ;;
+        esac
+      elif log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve'; then
+        echo "GitHub or the network failed for a moment: run it again"
+      fi
+      ;;
+    tag)
+      if log_has 'GH013|rule violation|ruleset|protected|cannot (create|update) (this|a) (protected )?(ref|tag)'; then
+        echo "GitHub refused the tag push: the v* tag ruleset lets only $PF_OWNER's admin bypass create it (ssh -T git@github.com must say Hi $PF_OWNER)"
+      elif log_has 'already exists|\[rejected\]'; then
+        echo "a $TAG appeared on GitHub meanwhile: run it again (it checks that tag; one that is not this release's burns the version)"
+      elif log_has 'permission denied \(publickey\)|could not read from remote'; then
+        echo "ssh-add your GitHub key (ssh -T git@github.com must say Hi $PF_OWNER)"
+      elif log_has 'failed to sign|no private key found|agent refused|could not sign|signing failed|incorrect passphrase|couldn.t find key|ssh-keygen.*(error|failed)'; then
+        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+      fi
+      ;;
+    tag-run | upload)
+      if log_has 'HTTP 401|gh auth login|authentication'; then
+        echo "gh auth status; gh auth refresh -h github.com -s repo,workflow (as $PF_OWNER)"
+      elif log_has 'rate limit|HTTP 429'; then
+        echo "GitHub's API limit: wait (gh api rate_limit says until when)"
+      elif log_has 'HTTP 403|resource not accessible|must have admin rights'; then
+        echo "gh's token lacks a scope or a right: gh auth refresh -h github.com -s repo,workflow (as $PF_OWNER, an admin of $repo)"
+      elif log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve'; then
+        echo "GitHub or the network failed for a moment: run it again (it finishes what is not done, and repeats nothing that is)"
+      fi
+      ;;
+    sign-macos)
+      if log_has 'errSecInternalComponent|user interaction is not allowed|keychain.*locked'; then
+        echo "unlock the login keychain (security unlock-keychain), then run it again"
+      elif log_has '"status": "(Invalid|Rejected)"|status: (Invalid|Rejected)'; then
+        echo "Apple rejected the notarization (its log is in target/release-verify/$V/macsign-logs); nothing was uploaded: send it to the coordinator"
+      elif log_has 'agent refused|couldn.t find key|signing failed|no private key'; then
+        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+      elif log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve|network'; then
+        echo "Apple, GitHub or the network failed for a moment: run it again (sign-macos.sh resumes; nothing is signed twice)"
+      fi
+      ;;
+    sign-packages)
+      if log_has 'no pinentry|bad passphrase|inappropriate ioctl|signing failed|no secret key|cannot open .*/dev/tty'; then
+        echo "the package key's passphrase is not cached in gpg-agent: just release-keys unlock --need gpg --ttl $ttl, or run it again at a terminal (it asks)"
+      fi
+      ;;
+    sign-sums)
+      if log_has 'agent refused|couldn.t find key|no such identity|signing failed|incorrect passphrase|load key|no private key'; then
+        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
       fi
       ;;
   esac
@@ -872,7 +1067,8 @@ step_fail() {
 
 # confirm POINT LINE...: shows what becomes public, then wants the version typed back. Input that is
 # not a terminal, or anything else typed, pauses the run (exit 2) with nothing done. CONFIRMED lists
-# the points confirmed in this run (step tag reads it in PR 5: the default `tag` answer covers it).
+# the points confirmed in this run, in this process only, never in the state: step tag asks again
+# unless this run confirmed `tag` (the default mirror confirmation is `tag`).
 CONFIRMED=''
 is_tty() { [ "${FIL_RELEASE_TTY:-}" = 1 ] || [ -t 0 ]; }
 confirm() {
@@ -1019,10 +1215,38 @@ dr_rerun_started() {
     sleep 5
   done
 }
+# waive_prompt FAILED: at a terminal, the red checks of FAILED ("ID:WF" words; not release.yml) may be
+# waived: recorded as checks_waived with their run ids and attempts. 0 if waived.
+waive_prompt() {
+  local x l=- m=- ans
+  echo "release: the dry run (release.yml) passed, but suite=all checks failed:$list" >&2
+  echo "release: a check that fails for a reason unrelated to what is released (a flaky harness, a runner) may be waived; anything else blocks the release" >&2
+  printf 'release: waive them, i.e. they do NOT block the release (recorded with their run ids)? [y/N] ' >&2
+  ans=''
+  IFS= read -r ans || ans=''
+  case $ans in y | Y | yes) ;; *) return 1 ;; esac
+  for x in $1; do
+    case ${x#*:} in
+      linux-check.yml) l=${x%%:*}.$(rv_attempt "${x%%:*}") ;;
+      macos-check.yml) m=${x%%:*}.$(rv_attempt "${x%%:*}") ;;
+    esac
+  done
+  st_set checks_waived "$l $m $(utc)"
+  # the tag confirmation given before the mirror did not know of this waiver: step 5 asks again,
+  # listing it
+  CONFIRMED=$(printf '%s\n' $CONFIRMED | grep -vx tag | tr '\n' ' ' || true)
+  echo "the red checks waived by the owner: linux-check $l, macos-check $m" >> "$STEP_LOG"
+  log "waived (recorded in $STATE): linux-check $l, macos-check $m"
+}
 act_dry_run() {
-  local wf x watch failed round list a0
+  local wf x watch failed round list a0 only_checks
   step_log dry-run
   watch=''
+  if in_redo dry-run; then
+    # new runs: the recorded ones (and a waiver of them) are forgotten, so nothing is attached to
+    for x in dry_run checks_linux checks_macos checks_waived dry_verify; do st_unset "$x"; done
+    echo "--redo dry-run: the recorded runs, waiver and dry-verify are forgotten; new runs are dispatched" >> "$STEP_LOG"
+  fi
   for wf in $DR_WFS; do
     dr_class "$wf"
     case $DR_CLASS in
@@ -1033,14 +1257,18 @@ act_dry_run() {
     esac
   done
   for x in $watch; do dr_watch "${x%%:*}" "${x#*:}"; done
-  # The results; a failure is offered one re-run of its failed jobs, at a terminal.
+  # The results; a failure is offered one re-run of its failed jobs, at a terminal, and red checks
+  # with a green dry run the waiver.
   for round in first rerun; do
-    failed='' list=''
+    failed='' list='' only_checks=1
     for wf in $DR_WFS; do
       dr_class "$wf"
       case $DR_CLASS in
         passed) ;;
-        failed) failed="$failed $DR_ID:$wf" list="$list $wf $(run_url "$DR_ID")," ;;
+        failed)
+          failed="$failed $DR_ID:$wf" list="$list $wf $(run_url "$DR_ID"),"
+          [ "$wf" != release.yml ] || only_checks=0
+          ;;
         *) step_fail "the $wf run on $(short "$G") ${DR_ID:+($(run_url "$DR_ID")) }is not a successful run of what this step needs" "run it again (it dispatches a new one)" ;;
       esac
     done
@@ -1050,17 +1278,28 @@ act_dry_run() {
       echo "== the failed jobs of ${x#*:} run ${x%%:*} (gh run view --log-failed, the end):" >> "$STEP_LOG"
       "$GH" run view "${x%%:*}" --repo "$repo" --log-failed < /dev/null 2>&1 | tail -n 30 >> "$STEP_LOG" || true
     done
-    if [ "$round" != first ] || ! is_tty; then
+    if ! is_tty; then
+      if [ "$only_checks" = 1 ]; then
+        LAST_DONE=$((NEXT - 1))
+        report PAUSED "$NEXT" "the dry run passed and suite=all checks failed:$list; whether they block the release is your decision, at a terminal: nothing was done (log: $STEP_LOG)" \
+          "run it in a terminal: it offers gh run rerun ID --failed (a transient failure), then asks whether the failures block the release; a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state)"
+      fi
       step_fail "failed:$list" \
         "if it is transient (a runner or the network): gh run rerun ID --failed --repo $repo for each, then the same command (it re-attaches); a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state)"
     fi
     echo "release: failed:$list (the end of each log is in $STEP_LOG)" >&2
-    printf 'release: re-run the failed jobs (for a transient failure: a runner or the network)? [y/N] ' >&2
     x=''
-    IFS= read -r x || x=''
+    if [ "$round" = first ]; then
+      printf 'release: re-run the failed jobs (for a transient failure: a runner or the network)? [y/N] ' >&2
+      IFS= read -r x || x=''
+    fi
     case $x in
       y | Y | yes) ;;
-      *) step_fail "failed:$list; not re-run" "a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state); a transient one: run it again and answer y" ;;
+      *)
+        if [ "$only_checks" = 1 ] && waive_prompt "$failed"; then return 0; fi
+        step_fail "failed:$list; $([ "$round" = first ] && echo "not re-run" || echo "failed again after the rerun")$([ "$only_checks" = 1 ] && echo ", not waived" || true)" \
+          "a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state); a transient one: run it again and answer y"
+        ;;
     esac
     for x in $failed; do
       a0=$(rv_attempt "${x%%:*}")
@@ -1073,7 +1312,7 @@ act_dry_run() {
 }
 
 act_dry_verify() {
-  local verifier=${FIL_RELEASE_VERIFY:-$RELEASE_DIR/verify.sh} rc=0
+  local verifier=$VERIFIER rc=0
   step_log dry-verify
   log "verifying the dry run $DRY_RUN of $(short "$G"): release-verify --dry-run, with the rebuild in the VM (about 15 to 30 minutes)"
   echo "release-verify $V --dry-run --from-run $DRY_RUN --ref $G --repo $repo${vm:+ --vm $vm}" >> "$STEP_LOG"
@@ -1082,7 +1321,284 @@ act_dry_verify() {
   st_set dry_verify "ok $DRY_RUN $G $(utc)"
 }
 
-# do_hint STEP: what to do by hand at a step after dry-verify, until the command does it (PRs 5-6).
+# ---- the keys (release-keys.sh). step_keys STEP: the keys STEP's action signs with.
+step_keys() {
+  case $1 in
+    tag | sign-sums) echo ssh ;;
+    sign-macos) echo ssh,apple ;;
+    sign-packages) echo gpg ;;
+  esac
+}
+# keys_needed: the keys of the steps from NEXT through verify-signed that are still to do.
+keys_needed() {
+  local i k ssh=0 gpg=0 apple=0 out=''
+  for ((i = NEXT; i <= $(step_no verify-signed); i++)); do
+    case ${KIND[i]} in checked | recorded | waived) continue ;; esac
+    for k in $(step_keys "$(step_name $i)" | tr ',' ' '); do eval "$k=1"; done
+  done
+  [ $ssh = 0 ] || out="$out,ssh"
+  [ $gpg = 0 ] || out="$out,gpg"
+  [ $apple = 0 ] || out="$out,apple"
+  echo "${out#,}"
+}
+# keys_ready NEED: the keys are unlocked (release-keys.sh status); else, at a terminal, unlocked now
+# (it asks for the passphrases; no secret passes through this script); else the run pauses.
+keys_ready() {
+  [ -n "$1" ] || return 0
+  if "$KEYS" status --need "$1" < /dev/null > "$scratch/keys.out" 2>&1; then return 0; fi
+  LAST_DONE=$((NEXT - 1))
+  if ! is_tty; then
+    sed 's/^/  /' "$scratch/keys.out" >&2
+    report PAUSED "$NEXT" "the keys $1 are not unlocked (above), and the input is not a terminal to unlock them: nothing was done" \
+      "run it in a terminal (it asks for the passphrases once), or first: just release-keys unlock --need $1 --ttl $ttl"
+  fi
+  log "unlocking the keys the remaining steps need ($1), for $ttl"
+  "$KEYS" unlock --need "$1" --ttl "$ttl" || report FAILED "$NEXT" "release-keys.sh unlock --need $1 failed (it says why above)" "fix that (just release-keys status --need $1), then run it again"
+}
+
+# ---- the actions of steps 5-12.
+# tag_ours NAME: the local tag NAME is one this command made: annotated, on G, signed with the
+# release key.
+tag_ours() {
+  local s=$scratch/tag-signers
+  [ "$(rg cat-file -t "refs/tags/$1" 2> /dev/null)" = tag ] || return 1
+  [ "$(rg rev-parse -q --verify "refs/tags/$1^{commit}" 2> /dev/null)" = "$G" ] || return 1
+  printf 'release namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$RELEASE_PUB")" > "$s"
+  rg -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$s" verify-tag "$1" > /dev/null 2>&1
+}
+act_tag() {
+  local name='' n t
+  step_log tag
+  [ "$TAG_STATE" = none ] || step_fail "$TAG on GitHub is in a state the tag step does not act on: $TAG_MSG" "run it again; if it says the same, send the log to the coordinator"
+  t=$(tree_of "$G")
+  # The confirmation is asked again in every run that did not get it itself (it lives only in this
+  # process: a run that pushed the mirror earlier does not cover the tag now).
+  case " $CONFIRMED " in
+    *" tag "*) echo "the tag confirmation was given in this run" >> "$STEP_LOG" ;;
+    *)
+      set -- "step 5 tag: the tag $TAG on the mirror commit $(short "$G") (tree $(short "$t"), the release commit $(short "$R")'s), signed with the release key ($RELEASE_PUB), pushed to github.com/$repo; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
+        "it starts release.yml on the tag, which makes the draft release (step 6)"
+      [ -z "$(st_get checks_waived)" ] || set -- "$@" "the red suite=all checks you waived: $(st_get checks_waived)"
+      confirm tag "$@"
+      ;;
+  esac
+  keys_ready ssh
+  # The local name is always vV-gh (as in 0.1.0): vV in the clone belongs to Gitea's marker tag,
+  # whether or not this clone has fetched it yet. A vV-gh an earlier run made (and did not get
+  # pushed) is reused, so the tag object stays the same.
+  name=$TAG-gh
+  if rg rev-parse -q --verify "refs/tags/$name" > /dev/null 2>&1; then
+    tag_ours "$name" || step_fail "the local tag $name exists and is not this release's (a signed tag of $(short "$G") by the release key)" \
+      "look at it (git show $name); if it is a leftover: git tag -d $name, then run it again"
+    echo "reusing the local tag $name (made by an earlier run): $(rg rev-parse "refs/tags/$name")" >> "$STEP_LOG"
+  else
+    log "signing the tag $TAG (local name $name) on $(short "$G") with the release key"
+    LC_ALL=C rg -c gpg.format=ssh -c "user.signingkey=$RELEASE_PUB" tag -s -m "fil $V" "$name" "$G" >> "$STEP_LOG" 2>&1 \
+      || step_fail "git tag -s could not make or sign the tag $name"
+    echo "the tag: $name = $(rg rev-parse "refs/tags/$name") on $G" >> "$STEP_LOG"
+  fi
+  "$RELEASE_DIR/verify-tag.sh" "$ROOT" "$name" "refs/remotes/$github/main" >> "$STEP_LOG" 2>&1 \
+    || step_fail "the tag $name does not verify against the signers on $github's main: it is not pushed" \
+      "the release key ($RELEASE_PUB) must be a release signer on GitHub's main (.github/release-signers); git tag -d $name, then run it again"
+  log "pushing $TAG to $github"
+  LC_ALL=C rg push "$github" "refs/tags/$name:refs/tags/$TAG" >> "$STEP_LOG" 2>&1 || step_fail "git push $github $name:refs/tags/$TAG failed"
+  st_set tag_object "$(rg rev-parse "refs/tags/$name")"
+}
+
+# The tag's run: TR_ID, the recorded one if it is still the tag push's release.yml run on G, else the
+# newest such run GitHub lists (none: "").
+TR_ID=''
+tr_find() {
+  local id
+  TR_ID=''
+  id=$(st_num tag_run)
+  if [ -n "$id" ]; then
+    rm -f "$scratch/run-$id"
+    if run_view "$id"; then
+      if rv_has "$id" "workflowName release" && rv_has "$id" "event push" && rv_has "$id" "headSha $G"; then TR_ID=$id; return 0; fi
+      echo "the recorded tag run $id is not the tag push's release.yml run on $(short "$G"): forgotten" >> "$STEP_LOG"
+    else
+      grep -Eqi 'not found|HTTP 404|could not find' "$scratch/gh.err" 2> /dev/null || step_fail "cannot ask GitHub for run $id: $(gh_err)"
+      echo "the recorded tag run $id is not on GitHub: forgotten" >> "$STEP_LOG"
+    fi
+    st_unset tag_run
+  fi
+  id=$(run_ids release.yml push "$G" "$TAG") || step_fail "cannot ask GitHub for the runs of release.yml: $(gh_err)"
+  id=$(printf '%s\n' "$id" | awk 'NR == 1 { print $1 }')
+  ! is_num "$id" || TR_ID=$id
+}
+# tr_delete IDS: deletes the releases IDS, each of which must still be a draft of the tag.
+tr_delete() {
+  local id rels
+  rels=$(rel_list) || step_fail "cannot list the releases of $TAG: $(gh_err)"
+  for id in $1; do
+    printf '%s\n' "$rels" | awk -v i="$id" '$1 == i && $2 == "true" { f = 1 } END { exit !f }' \
+      || step_fail "release $id is no longer a draft of $TAG: it is not deleted" "send the log to the coordinator"
+    echo "gh api -X DELETE repos/$repo/releases/$id (a stale draft of $TAG)" >> "$STEP_LOG"
+    "$GH" api -X DELETE "repos/$repo/releases/$id" < /dev/null >> "$STEP_LOG" 2>&1 || step_fail "gh could not delete the stale draft $id"
+    log "deleted the stale draft $id of $TAG"
+  done
+}
+act_tag_run() {
+  local n=0 rerun=0 rels drafts x a0 keep names missing t0 el stuck=0 failed_seen=0
+  step_log tag-run
+  while :; do
+    tr_find
+    [ -z "$TR_ID" ] || break
+    n=$((n + 1))
+    [ $n -le 20 ] || step_fail "no release.yml run of the tag push of $TAG on $(short "$G") appeared within 20 polls" \
+      "look for it (gh run list --repo $repo --workflow release.yml --event push); if GitHub started none, the tag ruleset or the workflow's tag filter is to blame: send the log to the coordinator"
+    sleep "$POLL"
+  done
+  st_set tag_run "$TR_ID"
+  log "waiting for the tag's run $(run_url "$TR_ID") to publish the draft (about an hour; Ctrl-C is safe: run the same command again to re-attach)"
+  n=0 t0=$(date +%s)
+  while :; do
+    rm -f "$scratch/run-$TR_ID"
+    run_view "$TR_ID" || step_fail "cannot ask GitHub for run $TR_ID: $(gh_err)"
+    rv_has "$TR_ID" "job success publish" && break
+    # still going (a failed matrix leg leaves the run in progress while the others finish): wait;
+    # a rerun is possible only once the run has completed
+    if ! rv_has "$TR_ID" "status completed"; then
+      if ! rv_no_failed_job "$TR_ID" && [ "$failed_seen" = 0 ]; then
+        failed_seen=1
+        echo "$(utc) a job of run $TR_ID failed: $(grep -E '^job (failure|cancelled|timed_out) ' "$scratch/run-$TR_ID" | cut -d' ' -f3- | tr '\n' ' ')" >> "$STEP_LOG"
+        log "a job of the tag's run failed; waiting for the run to finish before offering a rerun"
+      fi
+      n=$((n + 1))
+      if [ $((n % 10)) = 0 ]; then
+        el=$(( ($(date +%s) - t0) / 60 ))
+        x="still waiting for the publish job of run $(run_url "$TR_ID") ($(sed -n 's/^status //p' "$scratch/run-$TR_ID"), ${el} min)"
+        echo "$(utc) $x" >> "$STEP_LOG"
+        log "$x"
+        if [ "$el" -ge 180 ] && [ "$stuck" = 0 ]; then
+          stuck=1
+          log "3 hours and the draft is not out: a job is probably stuck (queued with no runner, or hung); look at $(run_url "$TR_ID"). The wait goes on; Ctrl-C is safe"
+        fi
+      fi
+      sleep "$POLL"
+      continue
+    fi
+    # it failed: its log; a failed publish may have left a draft, which a rerun would double
+    echo "== the failed jobs of the tag's run $TR_ID (gh run view --log-failed, the end):" >> "$STEP_LOG"
+    "$GH" run view "$TR_ID" --repo "$repo" --log-failed < /dev/null 2>&1 | tail -n 30 >> "$STEP_LOG" || true
+    rels=$(rel_list) || step_fail "cannot list the releases of $TAG: $(gh_err)"
+    drafts=$(printf '%s\n' "$rels" | awk '$2 == "true" { printf "%s ", $1 }')
+    if printf '%s\n' "$rels" | grep -q ' false '; then
+      step_fail "the tag's run $(run_url "$TR_ID") failed, and a PUBLISHED release of $TAG exists" "send the log to the coordinator"
+    fi
+    if [ "$rerun" = 1 ] || ! is_tty; then
+      step_fail "the tag's run $(run_url "$TR_ID") failed${drafts:+ (and left the draft(s) $drafts)}" \
+        "if it is transient (a runner or the network): ${drafts:+delete the stale draft(s) first (gh api -X DELETE repos/$repo/releases/ID), then }gh run rerun $TR_ID --failed --repo $repo, then the same command; a real failure: the tag cannot move, so this version is burned: bump to the next patch version"
+    fi
+    echo "release: the tag's run $(run_url "$TR_ID") failed (the end of its log is in $STEP_LOG)" >&2
+    printf 'release: re-run its failed jobs%s? [y/N] ' "${drafts:+, deleting first the stale draft(s) ${drafts% } that the failed attempt left (else publish makes a second one)}" >&2
+    x=''
+    IFS= read -r x || x=''
+    case $x in
+      y | Y | yes) ;;
+      *) step_fail "the tag's run $(run_url "$TR_ID") failed; not re-run" "a transient failure: run it again and answer y; a real one: the tag cannot move, so this version is burned: bump to the next patch version" ;;
+    esac
+    [ -z "$drafts" ] || tr_delete "$drafts"
+    a0=$(rv_attempt "$TR_ID")
+    echo "gh run rerun $TR_ID --failed (attempt ${a0:-?})" >> "$STEP_LOG"
+    "$GH" run rerun "$TR_ID" --repo "$repo" --failed >> "$STEP_LOG" 2>&1 < /dev/null || step_fail "gh run rerun $TR_ID --failed failed"
+    dr_rerun_started "$TR_ID" "${a0:-0}"
+    rerun=1
+  done
+  # publish succeeded: its draft (GitHub may list it a moment later), and no other release of the tag
+  n=0
+  while :; do
+    rels=$(rel_list) || step_fail "cannot list the releases of $TAG: $(gh_err)"
+    [ -z "$rels" ] || break
+    n=$((n + 1))
+    [ $n -le 10 ] || step_fail "the publish job of run $(run_url "$TR_ID") succeeded, but GitHub lists no release of $TAG" "send the log to the coordinator"
+    sleep "$POLL"
+  done
+  [ "$(printf '%s\n' "$rels" | grep -c .)" -gt 1 ] || return 0
+  printf '%s\n' "$rels" | sed 's/^/release of the tag: /' >> "$STEP_LOG"
+  if printf '%s\n' "$rels" | grep -q ' false '; then
+    step_fail "$(printf '%s\n' "$rels" | grep -c .) releases of $TAG, one of them published" "send the log to the coordinator (a published release is never deleted)"
+  fi
+  # the double-draft trap: the newest draft is the last publish's; the older ones are stale
+  drafts=$(printf '%s\n' "$rels" | sed '$d' | awk '{ printf "%s ", $1 }')
+  keep=$(printf '%s\n' "$rels" | tail -n 1 | cut -d' ' -f1)
+  # the one kept must be complete, or nothing is deleted
+  names=$(gh_read api "repos/$repo/releases/$keep" --jq '.assets[].name') || step_fail "cannot list the assets of release $keep: $(gh_err)"
+  missing=''
+  for f in $(release_files) SHA256SUMS; do printf '%s\n' "$names" | grep -qx -- "$f" || missing="$missing $f"; done
+  [ -z "$missing" ] || step_fail "$(printf '%s\n' "$rels" | grep -c .) drafts of $TAG, and the newest ($keep) lacks:$missing; nothing is deleted" \
+    "look at the drafts (gh release list --repo $repo); send the log to the coordinator"
+  LAST_DONE=$((NEXT - 1))
+  echo "release: $(printf '%s\n' "$rels" | grep -c .) drafts of $TAG (the double-draft trap): keeping the newest, $keep, which has every release file" >&2
+  is_tty || report PAUSED "$NEXT" "stale drafts of $TAG to delete (${drafts% }), and the input is not a terminal: nothing was done" "run it in a terminal (it asks before deleting), or delete them yourself: gh api -X DELETE repos/$repo/releases/ID"
+  printf 'release: delete the stale draft(s) %s? [y/N] ' "${drafts% }" >&2
+  x=''
+  IFS= read -r x || x=''
+  case $x in y | Y | yes) ;; *) report PAUSED "$NEXT" "the stale draft(s) ${drafts% } not deleted: nothing was done" "run it again and answer y, or delete them yourself" ;; esac
+  tr_delete "$drafts"
+}
+
+# run_step_cmd WHAT CMD...: CMD, with its output in the step's log and on stderr; a failure is the step's.
+run_step_cmd() {
+  local what=$1 rc=0
+  shift
+  echo "$what: $*" >> "$STEP_LOG"
+  "$@" < /dev/null 2>&1 | tee -a "$STEP_LOG" >&2 || rc=$?
+  [ "$rc" = 0 ] || step_fail "$what exited $rc"
+}
+act_verify_presign() {
+  step_log verify-presign
+  log "verifying the draft before signing: release-verify --pre-sign, with the rebuild in the VM (about 15 to 30 minutes)"
+  run_step_cmd "release-verify $V --pre-sign" "$VERIFIER" "$V" --pre-sign --repo "$repo" ${vm:+--vm "$vm"}
+}
+act_sign_macos() {
+  local -a a=()
+  step_log sign-macos
+  keys_ready ssh,apple
+  # --redo sign-macos signs and notarizes again (the script wants --force for a signed release)
+  ! in_redo sign-macos || a+=(--force)
+  log "signing and notarizing the macOS binary (sign-macos.sh; Apple's verdict takes minutes)"
+  run_step_cmd "sign-macos $V" env FIL_RELEASE_KEY="$RELEASE_PUB" "$SIGN_MACOS" "$V" --repo "$repo" ${a[@]+"${a[@]}"}
+}
+act_sign_packages() {
+  step_log sign-packages
+  keys_ready gpg
+  log "signing the two rpms and SHA256SUMS (sign-packages.sh, with the package key in gpg-agent)"
+  run_step_cmd "sign-packages $V" "$SIGN_PACKAGES" "$V" "$FILES"
+}
+act_sign_sums() {
+  step_log sign-sums
+  keys_ready ssh
+  rm -f "$FILES/SHA256SUMS.sig"
+  log "signing $FILES/SHA256SUMS with the release key"
+  echo "ssh-keygen -Y sign -f $RELEASE_PUB -n fil-release $FILES/SHA256SUMS" >> "$STEP_LOG"
+  LC_ALL=C ssh-keygen -Y sign -f "$RELEASE_PUB" -n fil-release "$FILES/SHA256SUMS" < /dev/null >> "$STEP_LOG" 2>&1 \
+    || { rm -f "$FILES/SHA256SUMS.sig"; step_fail "ssh-keygen -Y sign could not sign SHA256SUMS"; }
+  sig_verifies || step_fail "the new SHA256SUMS.sig does not verify against the signers on GitHub's main" "the release key ($RELEASE_PUB) must be a release signer there; send the log to the coordinator"
+}
+act_upload() {
+  local f up=''
+  step_log upload
+  [ "$REL" = draft ] || step_fail "$TAG is not a draft on GitHub ($REL): nothing is uploaded" "send the log to the coordinator"
+  # only what differs (a partial upload is finished, not repeated); all five on --redo
+  for f in $RPMS SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig; do
+    if in_redo upload || [ "$(asset_digest "$f")" != "$(local_sha "$f")" ]; then up="$up $f"; fi
+  done
+  [ -n "$up" ] || return 0
+  log "uploading to the draft $TAG:$up"
+  echo "gh release upload $TAG --repo $repo --clobber$up (in $FILES)" >> "$STEP_LOG"
+  # shellcheck disable=SC2086 # file names, no spaces
+  (cd "$FILES" && LC_ALL=C "$GH" release upload "$TAG" --repo "$repo" --clobber $up) < /dev/null >> "$STEP_LOG" 2>&1 \
+    || step_fail "gh release upload failed (the files are still in $FILES)"
+}
+act_verify_signed() {
+  step_log verify-signed
+  log "verifying the signed draft: release-verify (with the signature), reusing the rebuild of step verify-presign"
+  run_step_cmd "release-verify $V --reuse-rebuild" "$VERIFIER" "$V" --repo "$repo" --reuse-rebuild ${vm:+--vm "$vm"}
+}
+
+# do_hint STEP: what to do by hand at a step after verify-signed, until the command does it (PR 6).
 do_hint() {
   case $1 in
     tag) echo "git -c gpg.format=ssh -c user.signingkey=\$HOME/.ssh/fil-release.pub tag -s -m 'fil $V' $TAG-gh ${G:-G} && git push $github $TAG-gh:refs/tags/$TAG  (irreversible)" ;;
@@ -1183,13 +1699,34 @@ if [ -n "$from" ]; then
   fn=$(step_no "$from")
   for ((i = 1; i < fn; i++)); do
     case ${KIND[i]} in
-      checked | recorded | implied) ;;
+      checked | recorded | waived | implied) ;;
       *)
         LAST_DONE=$((i - 1))
-        report FAILED "$i" "--from $from: step $i $(step_name $i) is not done (${NOTES[i]})" "do it first: run the command without --from (it does steps 1-4), or do it by hand, then run it again"
+        report FAILED "$i" "--from $from: step $i $(step_name $i) is not done (${NOTES[i]})" "do it first: run the command without --from (it does steps 1-12), or do it by hand, then run it again"
         ;;
     esac
   done
+fi
+# --redo STEP: only a step that is done, and only while its redo can change anything.
+if [ -n "$redo" ]; then
+  rn=$(step_no "$redo")
+  # done: detected as done, or implied by a later step that is
+  rdone=0
+  for ((i = rn; i <= NSTEPS; i++)); do [ "${WAS_DONE[i]}" = 0 ] || rdone=1; done
+  if [ "$rdone" = 0 ]; then
+    LAST_DONE=0
+    report FAILED "$rn" "--redo $redo: the step is not done (${NOTES[rn]}): there is nothing to redo" "run it without --redo"
+  fi
+  case $redo in
+    dry-run | dry-verify) [ "$TAG_OK" = 0 ] || report FAILED "$rn" "--redo $redo: $TAG is on GitHub; the dry run decides nothing any more" "nothing to do: the steps after the tag check the release itself" ;;
+    *) [ "$REL" = draft ] || report FAILED "$rn" "--redo $redo: $TAG is not a draft ($REL); a published release is not changed" "nothing to do" ;;
+  esac
+  # a pre-sign verification judges the unsigned rpms CI built: once the draft carries the package
+  # signatures it can only fail, which would read as a reason to burn a good version
+  if [ "$redo" = verify-presign ] && { has_asset SHA256SUMS.asc || [ "${WAS_DONE[$(step_no upload)]}" = 1 ]; }; then
+    report FAILED "$rn" "--redo verify-presign: the draft is signed already (it has the signed rpms and SHA256SUMS.asc); a pre-sign verification is only meaningful before the upload" \
+      "$AGAIN --redo verify-signed re-verifies the signed draft"
+  fi
 fi
 if [ "$NEXT" = "$NSTEPS" ]; then
   log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
@@ -1206,7 +1743,11 @@ if ! pf_run $(pf_checks_from "$name"); then
   report FAILED "$NEXT" "the preflight for $name and the steps after it failed (each failure above says what to do)" "fix what the preflight lists"
 fi
 
-# The actions, step by step through dry-verify; after each, every step is detected again.
+# The keys the remaining steps sign with, in one block at the start (a terminal only: without one,
+# each step that needs a key pauses there if it is locked); each step checks again before it signs.
+if is_tty && [ "$NEXT" -le "$(step_no verify-signed)" ]; then keys_ready "$(keys_needed)"; fi
+
+# The actions, step by step through verify-signed; after each, every step is detected again.
 while :; do
   if [ "$NEXT" = "$NSTEPS" ]; then
     log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
@@ -1216,9 +1757,11 @@ while :; do
   if [ "${KIND[NEXT]}" = unknown ]; then
     report FAILED "$NEXT" "cannot tell whether $name is done: ${NOTES[NEXT]}" "fix that, then run it again"
   fi
-  case $name in candidate | mirror | dry-run | dry-verify) ;; *) break ;; esac
+  case $name in candidate | mirror | dry-run | dry-verify | tag | tag-run | verify-presign | sign-macos | sign-packages | sign-sums | upload | verify-signed) ;; *) break ;; esac
   prev=$NEXT
   "act_$(printf '%s' "$name" | tr - _)"
+  # this step is redone: it reads as it really is from now on
+  REDO_LEFT=$(printf '%s\n' $REDO_LEFT | grep -vx -- "$name" | tr '\n' ' ' || true)
   detect_all
   hard_stop
   record_found
@@ -1227,4 +1770,4 @@ while :; do
     step_fail "the action of $name finished, but the step does not detect as done: ${NOTES[prev]}" "send the log to the coordinator (a bug in the command or a change in GitHub's answers)"
   fi
 done
-report PAUSED "$NEXT" "$name is next (${NOTES[NEXT]}); this version of the command does steps 1-4 (candidate to dry-verify): $name and the steps after it arrive in PRs 5-6" "by hand for now: $(do_hint "$name")"
+report PAUSED "$NEXT" "$name is next (${NOTES[NEXT]}); this version of the command does steps 1-12 (candidate to verify-signed): $name and the steps after it arrive in PR 6" "by hand for now: $(do_hint "$name")"

@@ -4,7 +4,7 @@
 #
 #   verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] [--repo OWNER/REPO]
 #                     [--ref REF] [--vm NAME] [--no-rebuild] [--pre-sign] [--work DIR]
-#                     [--mac-rebuild FILE]
+#                     [--mac-rebuild FILE] [--reuse-rebuild]
 #
 # Release (default): download the draft or published release v<VERSION> (`gh release download`),
 # then, STOPPING at the first failure of steps 1-3 (nothing from the download is looked at, let alone
@@ -39,6 +39,12 @@
 # with --mac-rebuild FILE (a universal macOS `fil` you built from the tag) says whether it is
 # byte-identical to the released one once the signature is normalized away.
 #
+# --reuse-rebuild: compare with the rebuild an earlier full run left in WORK/rebuilt instead of
+# rebuilding again, when that rebuild is of the same commit in the same mode (WORK/rebuilt.commit,
+# written after a rebuild whose copy-out succeeded); otherwise it rebuilds as usual. `just release`
+# uses it for the verification after signing (step 12), which then reuses step 7's rebuild of the
+# tag's commit (owner, 2026-11-09). Every other check runs as without it.
+#
 # --dry-run: for the output of a release dry run (--from-run RUN, or --from-dir): no tag, signature
 # or attestation exists, so steps 1-3 are skipped; the rebuild uses --ref (a commit SHA: the run's
 # commit). Nothing from the download is run in this mode either. The VM needs Docker and amd64
@@ -47,7 +53,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 presign=0 work='' mac_rebuild=''
+version='' dry=0 from_run='' from_dir='' repo=anthonytw/fil ref='' vm=${FIL_VM:-fil} rebuild=1 presign=0 work='' mac_rebuild='' reuse=0
 gh=${FIL_GH:-gh}
 while [ $# -gt 0 ]; do
   case $1 in
@@ -61,6 +67,7 @@ while [ $# -gt 0 ]; do
     --pre-sign) presign=1; shift ;;
     --work) work=$2; shift 2 ;;
     --mac-rebuild) mac_rebuild=$2; shift 2 ;;
+    --reuse-rebuild) reuse=1; shift ;;
     -*) die "unknown option: $1" ;;
     *) version=$1; shift ;;
   esac
@@ -76,6 +83,7 @@ repo_url=${FIL_RELEASE_REPO_URL:-https://github.com/$repo.git}
 [ -n "$work" ] || work=$REPO_ROOT/target/release-verify/$version
 mkdir -p "$work"
 work=$(cd "$work" && pwd)
+[ "$rebuild" = 1 ] || [ "$reuse" = 0 ] || die "--reuse-rebuild and --no-rebuild do not go together"
 [ "$rebuild" = 0 ] || rm -f "$work/verified"
 
 sha256_stdin() { if command -v sha256sum > /dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
@@ -246,13 +254,13 @@ if [ "$presign" = 1 ] || [ "$dry" = 1 ]; then mopts+=(--pre-sign); fi
 [ -z "$mac_rebuild" ] || mopts+=(--mac-rebuild "$mac_rebuild")
 "$RELEASE_DIR/verify-macos.sh" report "$dl" "$version" --team "$mteam" ${mopts[@]+"${mopts[@]}"} || fail "the macOS binary's signature"
 
-# ---- 5. the independent rebuild in the Linux VM
-if [ "$rebuild" = 1 ]; then
+# rebuild_in_vm: the rebuild of $ref in the VM into $rb ($work/rebuilt); $work/rebuilt.commit names
+# what it rebuilt once it is complete.
+rebuild_in_vm() {
+  local ok_rb=1 vwork mac
   command -v limactl > /dev/null || die "limactl not found; the rebuild needs the Linux VM (docs/dev/vm.md, docs/m4/release.md section 9.3)"
   [ "$(limactl list --format '{{.Status}}' "$vm" 2> /dev/null)" = Running ] || die "Lima instance '$vm' is not running (limactl start $vm)"
-  if [ -z "$ref" ]; then
-    if [ "$dry" = 0 ]; then ref=$commit; else die "--dry-run needs --ref (the commit SHA the run built)"; fi
-  fi
+  rm -f "$work/rebuilt.commit"
   vwork=release-verify/$version
   mac=$work/mac-binary
   rm -rf "$mac"
@@ -264,11 +272,27 @@ if [ "$rebuild" = 1 ]; then
     < "$mac/fil-$version-universal-apple-darwin/bin/fil"
   log "rebuilding $ref of $repo_url in the VM '$vm' (about 15 to 30 minutes)"
   limactl shell --workdir / "$vm" -- bash -s -- "$repo_url" "$ref" "$vwork" < "$RELEASE_DIR/rebuild.sh" \
-    || { fail "the rebuild in the VM failed"; }
-  rb=$work/rebuilt
+    || { fail "the rebuild in the VM failed"; ok_rb=0; }
   rm -rf "$rb"
   mkdir -p "$rb"
-  limactl shell --workdir / "$vm" -- bash -c 'cd "$HOME/$1/out" && tar -cf - .' vm-sh "$vwork" | tar -xf - -C "$rb" || fail "could not copy the rebuilt files out of the VM"
+  limactl shell --workdir / "$vm" -- bash -c 'cd "$HOME/$1/out" && tar -cf - .' vm-sh "$vwork" | tar -xf - -C "$rb" || { fail "could not copy the rebuilt files out of the VM"; ok_rb=0; }
+  # what --reuse-rebuild may reuse: a rebuild that ran and was copied out, of this commit and mode
+  if [ "$ok_rb" = 1 ] && [ -f "$rb/SHA256SUMS" ]; then echo "$stamp" > "$work/rebuilt.commit"; fi
+}
+
+# ---- 5. the independent rebuild in the Linux VM
+if [ "$rebuild" = 1 ]; then
+  if [ -z "$ref" ]; then
+    if [ "$dry" = 0 ]; then ref=$commit; else die "--dry-run needs --ref (the commit SHA the run built)"; fi
+  fi
+  rb=$work/rebuilt
+  stamp="$ref dry=$dry"
+  if [ "$reuse" = 1 ] && [ -f "$rb/SHA256SUMS" ] && [ "$(cat "$work/rebuilt.commit" 2> /dev/null || true)" = "$stamp" ]; then
+    log "reusing the rebuild of $ref in $rb (an earlier full run of this work directory made it; no VM)"
+  else
+    [ "$reuse" = 0 ] || log "no rebuild of $ref (dry=$dry) to reuse in $rb: rebuilding"
+    rebuild_in_vm
+  fi
   if [ -f "$rb/SHA256SUMS" ]; then
     echo "release-verify: rebuilt vs. released SHA256SUMS:" >&2
     for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz "$(ci_archive_name "$version")" $(package_names "$version"); do
@@ -310,6 +334,7 @@ if [ "$fails" -gt 0 ]; then
 fi
 # what sign-macos.sh relies on: this work directory was verified in full (the rebuild included), and
 # SHA256SUMS is the one that was verified
+# (a reused rebuild of the same commit counts: it is the rebuild the comparison above was made with)
 if [ "$rebuild" = 1 ] && [ "$dry" = 0 ]; then
   printf 'sums=%s\nrebuild=1\npresign=%s\ndry=0\n' "$(sha256 "$dl/SHA256SUMS")" "$presign" > "$work/verified"
 fi

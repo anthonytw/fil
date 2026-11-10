@@ -1941,17 +1941,19 @@ pg push -q -f origin "$R:main"
 expect_pass "preflight: --from crates does not look at the VM, Docker or the keys" pfx FAKE_VM_STATUS=Stopped FAKE_DOCKER_DOWN=1 FAKE_NO_SECRET=1 FAKE_NO_IDENTITY=1 "$PF" 0.9.0 --repo o/r --from crates
 expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)" "$1"' sh "$pf/gh.log"
 
-# ============================================================== 10. release.sh (the state machine, detect-only)
+# ============================================================== 10. release.sh (the state machine, and the actions of steps 1-4)
 # On the preflight's fixture (the clone, its bare `origin` and `github`, the keys, the stubs): a fake
-# GitHub world (runs, releases, assets) in a directory, a tap, synthetic release files. The test does
-# each step's action by hand, then requires the command to see it, and nothing more.
-echo "== release.sh (detect-only)"
+# GitHub world (runs, releases, assets, dispatches) in a directory, a tap, synthetic release files.
+# Steps 1-4 are done by the command's actions (failures injected at each, then the same command
+# again); for the later steps the test does each step's action by hand, then requires the command to
+# see it, and nothing more.
+echo "== release.sh"
 rs=$tmp/rel
 RL=$RELEASE_DIR/release.sh
 mkdir -p "$rs/world/runs" "$rs/world/releases" "$rs/gnupg"
 chmod 700 "$rs/gnupg"
 cat > "$rs/gh.py" << 'EOF2'
-import hashlib, json, os, re, shutil, sys
+import hashlib, json, os, re, shutil, subprocess, sys
 a = sys.argv[1:]
 w = os.environ["FAKE_WORLD"]
 with open(os.environ["FAKE_GH_LOG"], "a") as f:
@@ -1964,6 +1966,25 @@ def down():
 def runs():
     d = os.path.join(w, "runs")
     return [json.load(open(os.path.join(d, n))) for n in sorted(os.listdir(d))]
+def created(r):
+    # a run's creation time: "created" if the test set one, else after any mirror commit, ordered by id
+    return r.get("created") or "2099-01-01T00:%02d:00Z" % (r["id"] % 60)
+def run_file(i):
+    return os.path.join(w, "runs", "%s.json" % i)
+def load_run(i):
+    # a rerun shows only after one more look (GitHub's lag): "next" holds what it becomes
+    p = run_file(i)
+    if not os.path.exists(p):
+        print("HTTP 404: Not Found (https://api.github.com/repos/o/r/actions/runs/%s)" % i, file=sys.stderr); sys.exit(1)
+    r = json.load(open(p))
+    if "next" in r:
+        if r.get("lag", 0) > 0:
+            r["lag"] -= 1
+        else:
+            r.update(r.pop("next"))
+            r.pop("lag", None)
+        json.dump(r, open(p, "w"))
+    return r
 def rels(tag):
     d = os.path.join(w, "releases")
     out = []
@@ -1974,14 +1995,53 @@ def rels(tag):
     return out
 if a[:2] == ["run", "list"]:
     down()
-    out = [dict(databaseId=r["id"], status=r["status"], conclusion=r["conclusion"], createdAt="2026-11-09T00:%02d:00Z" % (r["id"] % 60))
+    out = [dict(databaseId=r["id"], status=r["status"], conclusion=r["conclusion"], createdAt=created(r))
            for r in runs() if r["workflow"] == opt("--workflow") and r["event"] == opt("--event") and r["head"] == opt("--commit")
            and (opt("--branch") is None or r["branch"] == opt("--branch"))]
     print(json.dumps(out))
+elif a[:2] == ["workflow", "run"]:
+    # a dispatch: a queued run on GitHub's main, with the next id; gh prints its URL (newer gh)
+    if os.environ.get("FAKE_DISPATCH_FAIL"):
+        print("HTTP 422: Workflow does not have 'workflow_dispatch' trigger", file=sys.stderr); sys.exit(1)
+    wf = a[2]
+    fields = dict(a[i + 1].split("=", 1) for i, x in enumerate(a) if x == "-f")
+    head = subprocess.check_output(["git", "--git-dir", os.environ["FAKE_GITHUB_GIT"], "rev-parse", "refs/heads/main"]).decode().strip()
+    nf = os.path.join(w, "next-id")
+    nid = int(open(nf).read()) if os.path.exists(nf) else 101
+    open(nf, "w").write(str(nid + 1))
+    json.dump(dict(id=nid, workflow=wf, name=wf[:-4], event="workflow_dispatch", branch="main", head=head, status="queued", conclusion="",
+                   jobs=[], suite=fields.get("suite", ""), attempt=1), open(os.path.join(w, "runs", "%d.json" % nid), "w"))
+    if os.environ.get("FAKE_NO_RUN_URL"):
+        print("Created workflow_dispatch event for %s at main" % wf)
+    else:
+        print("https://github.com/o/r/actions/runs/%d" % nid)
+elif a[:2] in (["run", "watch"], ["run", "rerun"]):
+    p = run_file(a[2])
+    r = load_run(a[2])
+    if a[1] == "rerun":
+        r.update(next=dict(status="queued", conclusion="", jobs=[], attempt=r.get("attempt", 1) + 1), lag=1)
+    else:
+        if os.environ.get("FAKE_WATCH_FAIL"):
+            print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
+        if r["status"] != "completed":
+            # the run finishes; FAKE_RUN_FAIL names the workflows whose first attempt fails
+            bad = r["workflow"] in os.environ.get("FAKE_RUN_FAIL", "").split() and r.get("attempt", 1) == 1
+            res = "failure" if bad else "success"
+            allsuite = r.get("suite") == "all"
+            skip = lambda c: c if allsuite else "skipped"
+            r["jobs"] = {"release.yml": [["build-linux", res], ["publish", "skipped"]],
+                         "linux-check.yml": [["check", "success"], ["realnet (a)", skip("success")], ["aarch64", skip("success")], ["terminals", skip(res)]],
+                         "macos-check.yml": [["check (arm64)", res], ["remote (openssh)", skip("success")]]}[r["workflow"]]
+            r.update(status="completed", conclusion=res)
+        print("run %s completed: %s" % (r["id"], r["conclusion"]))
+    json.dump(r, open(p, "w"))
+    sys.exit(0 if a[1] == "rerun" or r["conclusion"] == "success" else 1)
+elif a[:2] == ["run", "view"] and "--log-failed" in a:
+    print("terminals\tRun tests\t##[error]Process completed with exit code 1.")
 elif a[:2] == ["run", "view"]:
     down()
-    r = [r for r in runs() if str(r["id"]) == a[2]][0]
-    print(json.dumps(dict(headSha=r["head"], event=r["event"], workflowName=r["name"], status=r["status"], conclusion=r["conclusion"],
+    r = load_run(a[2])
+    print(json.dumps(dict(headSha=r["head"], event=r["event"], workflowName=r["name"], status=r["status"], conclusion=r["conclusion"], attempt=r.get("attempt", 1),
                           jobs=[dict(name=n, conclusion=c, status="completed") for n, c in r["jobs"]])))
 elif a[:2] == ["release", "view"]:
     down()
@@ -2000,6 +2060,10 @@ elif a[:2] == ["release", "download"]:
     n, m, d = rels(a[2])[0]
     os.makedirs(opt("-D"), exist_ok=True)
     shutil.copy(os.path.join(d, opt("-p")), opt("-D"))
+elif a[:1] == ["api"] and re.match(r"repos/o/r/actions/runs/[0-9]+$", a[1]):
+    # what the --jq of run_ours prints: the triggering actor and the creation time
+    r = load_run(a[1].rsplit("/", 1)[1])
+    print("%s\t%s" % (r.get("actor", "anthonytw"), created(r)))
 elif a[:1] == ["api"] and re.match(r"repos/o/r/releases$", a[1]):
     down()
     tag = re.search(r'tag_name == "([^"]*)"', opt("--jq")).group(1)
@@ -2045,9 +2109,23 @@ git -C "$rs/tap" remote add origin "$rs/tap.git"
 git -C "$rs/tap" push -q origin main
 git -C "$rs/tap" fetch -q origin
 : > "$pf/gh.log"
+# release-verify: a stub that logs its arguments; FAKE_VERIFY_FAIL makes it fail as verify.sh does
+cat > "$rs/verify" << 'EOF2'
+#!/bin/sh
+echo "verify $*" >> "$FAKE_CALLS"
+case "${FAKE_VERIFY_FAIL:-}" in
+  lima) echo "release-verify: Lima instance 'fil' is not running (limactl start fil)" >&2; exit 1 ;;
+  mismatch) echo "release-verify: FAIL fil-0.9.0-source.tar.gz: released aaaa, rebuilt bbbb" >&2; echo "release-verify: 1 check(s) FAILED: do not sign" >&2; exit 1 ;;
+esac
+echo "release-verify: all checks passed EXCEPT the signature, which a dry run or --pre-sign does not check" >&2
+EOF2
+chmod +x "$rs/verify"
+: > "$rs/calls.log"
+RL_SOCK=$rs/none.sock
 rlx() {
   pfx env FIL_GH="$rs/gh" FIL_GPG="$rs/gpg" FIL_CARGO="$rs/cargo" FIL_CRATES_CURL="$rs/curl" FAKE_WORLD="$rs/world" FAKE_PF_GH="$pf/bin/gh" \
-    SSH_AUTH_SOCK="$rs/none.sock" GNUPGHOME="$rs/gnupg" "$@"
+    FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" \
+    SSH_AUTH_SOCK="$RL_SOCK" GNUPGHOME="$rs/gnupg" "$@"
 }
 # rl [ENV=VALUE ...] [-- ARGS ...]: a run of the command in this world
 rl() {
@@ -2085,7 +2163,9 @@ last
 expect_pass "release: ...saying so" grep -q 'a release that asks a fake proves nothing' "$rs/last.log"
 expect_fail "release: --redo is not in this version" rlx "$RL" 0.9.0 --redo tag
 last
-expect_pass "release: ...it says the actions come later" grep -q 'arrive in PRs 4-6' "$rs/last.log"
+expect_pass "release: ...it says the later actions come later" grep -q 'arrive with the later steps, PRs 5-6' "$rs/last.log"
+expect_fail "release: --from names a step" rlx "$RL" 0.9.0 --from nosuch
+expect_fail "release: --status does not go with --from" rlx "$RL" 0.9.0 --status --from mirror
 
 # 0: nothing done but the candidate
 rl_refs > "$rs/refs.before"
@@ -2095,7 +2175,7 @@ rl_kind 3 dry-run pending
 expect_pass "release status: wrote no state" test ! -e "$RSTATE"
 expect_pass "release status: ...and changed no ref or file of the clone" sh -c 'rl_refs() { git -C "$1" for-each-ref --format="%(refname) %(objectname)" | grep -v "^refs/remotes/" | LC_ALL=C sort; git -C "$1" status --porcelain; }; rl_refs "$1" | cmp -s - "$2"' sh "$pf/clone" "$rs/refs.before"
 rl_paused 2 mirror
-expect_pass "release run: ...with the failure format's do and then lines" sh -c 'grep -q "^  do:    G=" "$1" && grep -q "^  then:  just release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
+expect_pass "release run: ...at the confirmation, with no terminal, in the failure format" sh -c 'grep -q "input is not a terminal: nothing was done" "$1" && grep -q "^  do:    run it in a terminal (there is no --yes)" "$1" && grep -q "^  then:  just release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
 expect_pass "release run: ...the preflight ran for mirror and after" grep -q '^preflight: all .* checks passed for 0.9.0' "$rs/run.out"
 expect_pass "release run: ...the state is bound to the version and HEAD" sh -c 'grep -qx "version=0.9.0" "$1" && grep -qx "release_commit=$2" "$1"' sh "$RSTATE" "$RR"
 expect_pass "release run: ...and the lock is gone" test ! -e "$RW/.lock"
@@ -2120,15 +2200,273 @@ kill "$rl_sleeper" 2> /dev/null || true
 wait "$rl_sleeper" 2> /dev/null || true
 rl_paused 2 mirror
 expect_pass "release run: ...a stale lock is removed with a note" grep -q 'removed a stale lock' "$rs/run.out"
+# three runs against a stale lock, all waiting on the held reap mutex, then released together: the
+# mutex lets exactly one reap and take the lock, which it holds (FIL_RELEASE_LOCK_HOLD) until the
+# other two have found it held; then it goes on and pauses at mirror; none leaves a lock behind
+mkdir -p "$RW/.lock" "$RW/.lock.reap"
+echo "$rl_sleeper" > "$RW/.lock/pid"
+touch "$rs/lock-hold"
+for n in 1 2 3; do rm -f "$rs/race.$n.st"; (st=0; rl FIL_RELEASE_LOCK_HOLD="$rs/lock-hold" > "$rs/race.$n" 2>&1 || st=$?; echo $st > "$rs/race.$n.st") & done
+sleep 1
+rmdir "$RW/.lock.reap"
+n=0
+until [ "$(cat "$rs"/race.?.st 2> /dev/null | grep -c .)" -ge 2 ] || [ $n -ge 250 ]; do n=$((n + 1)); sleep 0.1; done
+rm -f "$rs/lock-hold"
+wait
+expect_pass "release run: three runs released together onto a stale lock: exactly one wins (paused at mirror), two find it held" sh -c 'w=0 h=0; for n in 1 2 3; do case $(cat "$1/race.$n.st") in 2) grep -q "PAUSED at step 2/17 mirror" "$1/race.$n" && w=$((w + 1)) ;; 1) grep -q "another release run (pid" "$1/race.$n" && h=$((h + 1)) ;; esac; done; test "$w $h" = "1 2"' sh "$rs"
+expect_pass "release run: ...and left no lock or mutex behind" sh -c '! ls -d "$1"/.lock* > /dev/null 2>&1' sh "$RW"
+mkdir "$RW/.lock.reap"
+expect_fail "release run: a reap mutex left by a killed run is reported (after 10 s)" rl
+last
+expect_pass "release run: ...saying how to remove it" grep -q "rmdir '.*/.lock.reap'" "$rs/last.log"
+rmdir "$RW/.lock.reap"
 
-# 1: the mirror commit
-RG=$(pg commit-tree "$RR^{tree}" -p github/main -m 'fil 0.9.0')
-pg push -q github "$RG:refs/heads/main"
+# ---- the actions of steps 1-4 (PR 4), on a test ssh-agent's commit-signing key (git config names
+# the .pub, whose private half is only in the agent), with a pre-receive hook on the github bare repo
+# that logs each push to main (and refuses it while $rs/reject-push exists), the gh world's dispatch,
+# watch and rerun, and the release-verify stub. Each case starts from GitHub's main before the mirror.
+mkdir -p "$rs/agentkey" "$rs/agentpub"
+cp "$pf/key" "$rs/agentkey/key"
+cp "$pf/key.pub" "$rs/agentpub/key.pub"
+ssh-agent -a "$rs/agent.sock" > "$rs/agent.env"
+rs_agent=$(sed -n 's/^SSH_AGENT_PID=\([0-9]*\);.*/\1/p' "$rs/agent.env")
+trap 'kill "$rs_agent" 2> /dev/null; rm -rf "$tmp"' EXIT INT TERM
+SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q "$rs/agentkey/key" 2> /dev/null
+RL_SOCK=$rs/agent.sock
+pg config user.signingkey "$rs/agentpub/key.pub"
+cat > "$pf/github.git/hooks/pre-receive" << EOF2
+#!/bin/sh
+while read -r old new ref; do
+  if [ "\$ref" = refs/heads/main ] && [ -e "$rs/reject-push" ]; then
+    echo "remote: error: GH006: Protected branch update failed for refs/heads/main." >&2
+    exit 1
+  fi
+  echo "push \$ref \$new" >> "$rs/calls.log"
+done
+EOF2
+chmod +x "$pf/github.git/hooks/pre-receive"
+GMAIN0=$(pg rev-parse github/main)
+cp -R "$pf/github.git" "$rs/github.saved"
+ra_reset() {
+  rm -rf "$pf/github.git" "$rs/world/runs" "$RW/logs" "$rs/reject-push"
+  cp -R "$rs/github.saved" "$pf/github.git"
+  mkdir "$rs/world/runs"
+  rm -f "$rs/world/next-id" "$RSTATE"
+  : > "$rs/calls.log"
+  : > "$pf/gh.log"
+  pg fetch -q github
+}
+# ra_expect NAME STATUS PATTERN [ENV=VALUE ...] [-- ARGS ...]: a run whose input counts as a terminal
+# (stdin answers), exiting STATUS with a line matching PATTERN (extended regex)
+ra_expect() {
+  local name=$1 want=$2 pat=$3 st=0
+  shift 3
+  rl FIL_RELEASE_TTY=1 "$@" > "$rs/ra.out" 2>&1 || st=$?
+  if [ "$st" = "$want" ] && grep -Eq -- "$pat" "$rs/ra.out"; then pass "$name"; else
+    flunk "$name (exit $st, wanted $want and /$pat/)"
+    sed 's/^/       | /' "$rs/ra.out" | tail -25
+  fi
+}
+n_push() { grep -c '^push refs/heads/main ' "$rs/calls.log" || true; }
+n_dispatch() { grep -c '^workflow run ' "$pf/gh.log" || true; }
+n_rerun() { grep -c '^run rerun ' "$pf/gh.log" || true; }
+n_verify() { grep -c '^verify ' "$rs/calls.log" || true; }
+# calls_are PUSHES DISPATCHES RERUNS VERIFIES: the call log, so far in this case
+calls_are() {
+  local got
+  got="$(n_push) $(n_dispatch) $(n_rerun) $(n_verify)"
+  if [ "$got" = "$1 $2 $3 $4" ]; then pass "release actions: ...calls: $1 push, $2 dispatches, $3 reruns, $4 verifies"; else
+    flunk "release actions: ...calls: wanted $1 push, $2 dispatches, $3 reruns, $4 verifies; got $got"
+  fi
+}
+
+ra_reset
+ra_expect "release actions: no terminal at the confirmation: paused, exit 2" 2 'PAUSED at step 2/17 mirror' FIL_RELEASE_TTY= < /dev/null
+calls_are 0 0 0 0
+ra_expect "release actions: a declined confirmation: paused, exit 2" 2 'not confirmed: nothing was done' <<< "yes"
+expect_pass "release actions: ...the confirmation shows what becomes public, mirror and tag" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 2 mirror: a commit signed by you" "$1" && grep -q "step 5 tag (this answer covers it too)" "$1"' sh "$rs/ra.out"
+calls_are 0 0 0 0
+ra_expect "release actions: --confirm-each asks for the mirror on its own" 2 'CONFIRM mirror, for 0.9.0' -- --confirm-each <<< ""
+expect_pass "release actions: ...and says the tag is asked for at step 5" grep -q 'the tag is asked for on its own, at step 5' "$rs/ra.out"
+ra_expect "release actions: --from dry-run with the mirror undone is refused" 1 'FAILED at step 2/17 mirror' -- --from dry-run < /dev/null
+expect_pass "release actions: ...saying the step before is not done" grep -q -- '--from dry-run: step 2 mirror is not done' "$rs/ra.out"
+calls_are 0 0 0 0
+# step 2 fails (GitHub refuses the push), then the same command again
+touch "$rs/reject-push"
+ra_expect "release actions: a refused mirror push fails at step 2" 1 'FAILED at step 2/17 mirror' <<< "0.9.0"
+expect_pass "release actions: ...with the known fix for a ruleset refusal" grep -q 'admin bypass of the main ruleset' "$rs/ra.out"
+expect_pass "release actions: ...and the log's tail and path" sh -c 'grep -q "GH006" "$1" && grep -q "logs/02-mirror.log" "$1"' sh "$rs/ra.out"
+calls_are 0 0 0 0
+rm -f "$rs/reject-push"
+ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 <<< "0.9.0"
+calls_are 1 3 0 1
+expect_pass "release actions: ...and recorded the runs it found by listing" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
+
+# step 3 fails (the wait dies), then the state is lost while the runs are still going
+ra_reset
+ra_expect "release actions: a wait that dies fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+expect_pass "release actions: ...saying a re-run re-attaches" grep -q 're-attaches to the run' "$rs/ra.out"
+calls_are 1 3 0 0
+rm -f "$RSTATE"
+ra_expect "release actions: ...the state deleted, the same command again attaches to the running runs" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 3 0 1
+expect_pass "release actions: ...and re-derived the state" sh -c 'grep -qx "github_commit=$(git -C "$2" rev-parse refs/heads/main)" "$1" && grep -qx dry_run=101 "$1" && grep -q "^dry_verify=ok 101 " "$1"' sh "$RSTATE" "$pf/github.git"
+
+# step 3 fails (a job fails): the rerun offer declined, then no terminal, then accepted
+ra_reset
+ra_expect "release actions: a failed check fails at step 3, the rerun declined" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf '0.9.0\nn')"
+expect_pass "release actions: ...with the failed job's log" grep -q 'Process completed with exit code 1' "$rs/ra.out"
+calls_are 1 3 0 0
+ra_expect "release actions: ...again without a terminal: failed, saying how to rerun" 1 'gh run rerun ID --failed' FIL_RELEASE_TTY= < /dev/null
+calls_are 1 3 0 0
+ra_expect "release actions: ...again, the rerun accepted: on to step 5" 2 'PAUSED at step 5/17 tag' <<< "y"
+calls_are 1 3 1 1
+
+# step 4 fails (a rebuild that differs; the VM down), then the same command again
+ra_reset
+ra_expect "release actions: a dry run that does not verify fails at step 4" 1 'FAILED at step 4/17 dry-verify' FAKE_VERIFY_FAIL=mismatch <<< "0.9.0"
+expect_pass "release actions: ...saying never to tag" grep -q 'STOP: do NOT tag' "$rs/ra.out"
+expect_pass "release actions: ...and recording nothing for it" sh -c '! grep -q "^dry_verify=" "$1"' sh "$RSTATE"
+ra_expect "release actions: ...the VM down fails at step 4 too" 1 'do: +limactl start fil' FAKE_VERIFY_FAIL=lima < /dev/null
+calls_are 1 3 0 2
+ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 3 0 3
+# a state bound to another commit, mid-way: refused, nothing done
+cp "$RSTATE" "$rs/state.mid"
+sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.mid" > "$RSTATE"
+ra_expect "release actions: a state bound to another commit is refused mid-way" 1 'the state is for 0.9.0 at 012345678901' < /dev/null
+calls_are 1 3 0 3
+cp "$rs/state.mid" "$RSTATE"
+
+# ra_midprompt ACTION [ENV=VALUE ...]: a run that waits at the confirmation (after the preflight)
+# while the test changes the world (ACTION, shell code), then gets 0.9.0 typed; RA_ST is its exit
+ra_midprompt() {
+  local act=$1 n=0 pid
+  shift
+  rm -f "$rs/fifo" "$rs/ra.out"
+  mkfifo "$rs/fifo"
+  rl FIL_RELEASE_TTY=1 "$@" < "$rs/fifo" > "$rs/ra.out" 2>&1 &
+  pid=$!
+  exec 8> "$rs/fifo"
+  until grep -q 'type 0.9.0 to go ahead' "$rs/ra.out" 2> /dev/null || [ $n -ge 600 ] || ! kill -0 "$pid" 2> /dev/null; do
+    n=$((n + 1))
+    sleep 0.1
+  done
+  eval "$act"
+  (echo 0.9.0 >&8) 2> /dev/null || true
+  exec 8>&-
+  RA_ST=0
+  wait "$pid" || RA_ST=$?
+}
+# ra_check NAME STATUS PATTERN: the last ra_midprompt exited STATUS with a line matching PATTERN
+ra_check() {
+  if [ "$RA_ST" = "$2" ] && grep -Eq -- "$3" "$rs/ra.out"; then pass "$1"; else
+    flunk "$1 (exit $RA_ST, wanted $2 and /$3/)"
+    sed 's/^/       | /' "$rs/ra.out" | tail -25
+  fi
+}
+# gh_move_main PARENT: GitHub's main moves to a new commit on PARENT, with PARENT's tree (not a push:
+# the hook does not log it)
+gh_move_main() {
+  local c
+  c=$(git --git-dir="$pf/github.git" commit-tree "$1^{tree}" -p "$1" -m moved)
+  git --git-dir="$pf/github.git" update-ref refs/heads/main "$c"
+  echo "$c"
+}
+printf '#!/bin/sh\nfor a; do f=$a; done\n: > "$f.sig"\n' > "$rs/emptysig"
+chmod +x "$rs/emptysig"
+
+# GitHub's main moves between the fetch and the push: refused (fetch first); the same command again
+# makes the mirror commit on the new main, with one push
+ra_reset
+ra_midprompt 'GMOVED=$(gh_move_main "$GMAIN0")'
+ra_check "release actions: main moved during the confirmation: the mirror push fails at step 2" 1 'FAILED at step 2/17 mirror'
+expect_pass "release actions: ...with the known fix for a moved main" grep -q "GitHub's main moved since the fetch" "$rs/ra.out"
+calls_are 0 0 0 0
+ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' <<< "0.9.0"
+calls_are 1 3 0 1
+expect_pass "release actions: ...the mirror commit is on the moved main" sh -c 'test "$(git --git-dir="$1" rev-parse "refs/heads/main^")" = "$2"' sh "$pf/github.git" "$GMOVED"
+# the signing key leaves the agent during the confirmation: the commit cannot be signed
+ra_reset
+ra_midprompt 'SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q -d "$rs/agentpub/key.pub" 2> /dev/null'
+SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q "$rs/agentkey/key" 2> /dev/null
+ra_check "release actions: a key gone from the agent fails at step 2" 1 'could not make or sign the mirror commit'
+expect_pass "release actions: ...with the known fix for signing" grep -q 'git cannot sign the commit: ssh-add' "$rs/ra.out"
+calls_are 0 0 0 0
+# a signing program that signs nothing: git makes an unsigned commit, which is never pushed
+ra_midprompt 'pg config gpg.ssh.program "$rs/emptysig"'
+pg config --unset gpg.ssh.program
+ra_check "release actions: an unsigned mirror commit is refused at step 2" 1 'made an unsigned commit'
+calls_are 0 0 0 0
+# the dispatch refused (422), then GitHub's main moves past the mirror commit (same tree): no dispatch
+ra_expect "release actions: a refused dispatch fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_DISPATCH_FAIL=1 <<< "0.9.0"
+expect_pass "release actions: ...with the known fix for it" grep -q 'needs workflow_dispatch' "$rs/ra.out"
+calls_are 1 1 0 0
+GMOVED=$(gh_move_main "$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)")
+ra_expect "release actions: ...GitHub's main past the mirror commit: no dispatch" 1 'not the mirror commit .*: a dispatch on main would test another commit' < /dev/null
+calls_are 1 1 0 0
+# the state lost while the runs go on: a run someone else dispatched, or one older than the mirror
+# commit, is not attached to (a new one is dispatched); this release's is
+ra_reset
+ra_expect "release actions: a wait that dies, again" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+python3 -I -c 'import json, sys
+for f, k, v in ((sys.argv[1], "actor", "someone-else"), (sys.argv[2], "created", "2020-01-01T00:00:00Z")):
+    r = json.load(open(f)); r[k] = v; json.dump(r, open(f, "w"))' "$rs/world/runs/101.json" "$rs/world/runs/102.json"
+rm -f "$RSTATE"
+ra_expect "release actions: ...the state deleted: foreign and older running runs are not attached to" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 5 0 1
+expect_pass "release actions: ...two new runs, and this release's macos-check run kept" sh -c 'grep -qx dry_run=104 "$1" && grep -qx checks_linux=105 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
+# a recorded run GitHub no longer has: forgotten, and the step goes on as if none was recorded
+ra_reset
+ra_expect "release actions: a wait that dies, once more" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+rm -f "$rs/world/runs/101.json"
+ra_expect "release actions: ...a recorded run deleted on GitHub is forgotten, and dispatched again" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 4 0 1
+expect_pass "release actions: ...recording the new run" grep -qx dry_run=104 "$RSTATE"
+
+# the happy path, from the start
+ra_reset
+ra_expect "release actions: the happy path through dry-verify, paused at step 5" 2 'PAUSED at step 5/17 tag' <<< "0.9.0"
+calls_are 1 3 0 1
+RG=$(git -C "$pf/github.git" rev-parse refs/heads/main)
+expect_pass "release actions: ...the mirror commit has the release commit's tree, on GitHub's old main" sh -c 'test "$(git -C "$1" rev-parse "$2^{tree}")" = "$(git -C "$1" rev-parse "$3^{tree}")" && test "$(git -C "$1" rev-parse "$2^")" = "$4"' sh "$pf/clone" "$RG" "$RR" "$GMAIN0"
+printf 't@example.invalid namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$pf/key.pub")" > "$rs/allowed"
+expect_pass "release actions: ...and is signed by the agent's key" pg -c gpg.ssh.allowedSignersFile="$rs/allowed" verify-commit "$RG"
+expect_pass "release actions: ...dispatched the three on main, the checks suite=all at the mirror commit" sh -c 'grep -qx "workflow run release.yml --repo o/r --ref main" "$1" && grep -qx "workflow run linux-check.yml --repo o/r --ref main -f suite=all -f ref=$2" "$1" && grep -qx "workflow run macos-check.yml --repo o/r --ref main -f suite=all -f ref=$2" "$1"' sh "$pf/gh.log" "$RG"
+expect_pass "release actions: ...verified the dry run at the mirror commit" grep -qx "verify 0.9.0 --dry-run --from-run 101 --ref $RG --repo o/r" "$rs/calls.log"
+expect_pass "release actions: ...and recorded it all" sh -c 'grep -qx "github_commit=$2" "$1" && grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1" && grep -Eq "^dry_verify=ok 101 $2 [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$" "$1"' sh "$RSTATE" "$RG"
+expect_pass "release actions: ...one log per step that acted" sh -c 'test -s "$1/02-mirror.log" && test -s "$1/03-dry-run.log" && test -s "$1/04-dry-verify.log"' sh "$RW/logs"
+expect_pass "release actions: ...and says the tag is by hand for now" sh -c 'grep -q "arrive in PRs 5-6" "$1" && grep -q "^  do:    by hand for now: git -c gpg.format=ssh" "$1"' sh "$rs/ra.out"
+ra_expect "release actions: the same command again does nothing new" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 3 0 1
+ra_expect "release actions: --from tag with steps 1-4 done is accepted" 2 'PAUSED at step 5/17 tag' -- --from tag < /dev/null
+# the status after dry-verify, against its golden
+rls 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }' > "$rs/golden4.out"
+cat > "$rs/golden4" << 'EOF2'
+1/17 candidate done (checked)
+2/17 mirror done (checked)
+3/17 dry-run done (checked)
+4/17 dry-verify done (recorded)
+5/17 tag next
+6/17 tag-run pending
+7/17 verify-presign pending
+8/17 sign-macos pending
+9/17 sign-packages pending
+10/17 sign-sums pending
+11/17 upload pending
+12/17 verify-signed pending
+13/17 publish pending
+14/17 verify-published pending
+15/17 crates pending
+16/17 brew pending
+17/17 finish pending
+EOF2
+expect_pass "release status: the listing after dry-verify matches its golden" diff "$rs/golden4" "$rs/golden4.out"
+pg config user.signingkey "$pf/key.pub"
+
+# detection, on the world the actions left: GitHub's main moved on to a commit the clone has not
+# fetched: the recorded mirror commit is not proof enough (status does not fetch)
 rl_kind 2 mirror "done (checked)"
-rl_paused 3 dry-run
-expect_pass "release run: ...recorded the mirror commit" grep -qx "github_commit=$RG" "$RSTATE"
-# GitHub's main moved on to a commit the clone has not fetched: the recorded mirror commit is not
-# proof enough (status does not fetch)
 git clone -q -b main "$pf/github.git" "$rs/other"
 git -C "$rs/other" commit -q --allow-empty --no-gpg-sign -m later
 git -C "$rs/other" push -q origin HEAD:main
@@ -2136,36 +2474,34 @@ rl_kind 2 mirror "next (unknown)" "github's main not in the clone"
 expect_pass "release status: ...says to fetch it" grep -q 'git fetch github' "$rs/status.out"
 git -C "$rs/other" push -q -f origin "$RG:refs/heads/main"
 rm -rf "$rs/other"
+pg fetch -q github
 
-# 2: the dry run and the two checks (suite=all), and a newer suite=check run that is not one
+# the runs: found again without the state, a newer suite=check run is passed over
 mkrun() { # ID WORKFLOW NAME EVENT BRANCH HEAD STATUS CONCLUSION JOB=CONCLUSION...
   python3 -I -c 'import json, sys
 a = sys.argv[1:]
 print(json.dumps(dict(id=int(a[0]), workflow=a[1], name=a[2], event=a[3], branch=a[4], head=a[5], status=a[6], conclusion=a[7],
                       jobs=[j.split("=", 1) for j in a[8:]])))' "$@" > "$rs/world/runs/$1.json"
 }
-mkrun 101 release.yml release workflow_dispatch main "$RG" completed success build-linux=success publish=skipped
-mkrun 102 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=skipped" aarch64=skipped terminals=skipped
-mkrun 103 macos-check.yml macos-check workflow_dispatch main "$RG" completed success "check (arm64)=success" "remote (openssh)=success" "brew (arm64)=skipped"
-rl_kind 3 dry-run next "without the linux suite=all run"
+cp "$RSTATE" "$rs/state.k"
 mkrun 105 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=skipped" aarch64=skipped terminals=skipped
-mkrun 104 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=success" aarch64=success terminals=success
+grep -v '^checks_linux=' "$rs/state.k" > "$RSTATE"
 rl_kind 3 dry-run "done (checked)" "a newer suite=check run is passed over"
-expect_pass "release status: ...with the runs' URLs" grep -q 'https://github.com/o/r/actions/runs/101' "$rs/status.out"
-rl_paused 4 dry-verify
-expect_pass "release run: ...recorded the three run ids" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=104 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
-# 3: dry-verify is a local result: what PR 4's action will write
-echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
-rl_kind 4 dry-verify "done (recorded)"
+expect_pass "release status: ...with the runs' URLs" sh -c 'grep -q "https://github.com/o/r/actions/runs/101" "$1" && grep -q "actions/runs/102" "$1"' sh "$rs/status.out"
+cp "$rs/world/runs/102.json" "$rs/run102.saved"
+python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); r["actor"] = "someone-else"; json.dump(r, open(sys.argv[1], "w"))' "$rs/world/runs/102.json"
+rl_kind 3 dry-run next "...but not one someone else dispatched"
+cp "$rs/run102.saved" "$rs/world/runs/102.json"
+cp "$rs/state.k" "$RSTATE"
 echo "dry_verify=ok 999 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
 rl_kind 4 dry-verify next "a record for another run does not count"
-echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+cp "$rs/state.k" "$RSTATE"
 # a recorded dry-verify never makes a red check read as done (implied)
-cp "$rs/world/runs/104.json" "$rs/run104.saved"
-mkrun 104 linux-check.yml linux-check workflow_dispatch main "$RG" completed failure check=success "realnet (a)=success" aarch64=success terminals=failure
+cp "$rs/world/runs/102.json" "$rs/run102.saved"
+mkrun 102 linux-check.yml linux-check workflow_dispatch main "$RG" completed failure check=success "realnet (a)=success" aarch64=success terminals=failure
 rl_kind 3 dry-run next "the suite=all check failed, dry-verify recorded"
 rl_kind 4 dry-verify pending "...and dry-verify does not count without it"
-cp "$rs/run104.saved" "$rs/world/runs/104.json"
+cp "$rs/run102.saved" "$rs/world/runs/102.json"
 rl_paused 5 tag
 
 # 4: burned tags: one the signers on main do not list, one on a commit of another tree
@@ -2180,6 +2516,14 @@ pg tag -d v0.9.0-gh > /dev/null
 pg tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG^"
 pg push -q github v0.9.0-gh:refs/tags/v0.9.0
 rl_kind 5 tag BURNED "on a commit without the release commit's tree"
+# the same tag with nothing bound: a run has fetched origin and finds no commit on its main with the
+# tag's tree, so the tag is burned (not a checkout of another commit)
+cp "$RSTATE" "$rs/state.b"
+rm -f "$RSTATE"
+expect_fail "release run: a good tag of a tree no commit on origin's main has, nothing bound, is burned" rl
+last
+expect_pass "release run: ...saying why, and that the version is burned" sh -c 'grep -q "no commit on origin.s main has that tree" "$1" && grep -q "this version is burned: bump to the next patch" "$1"' sh "$rs/last.log"
+cp "$rs/state.b" "$RSTATE"
 pg push -q github :refs/tags/v0.9.0
 pg tag -d v0.9.0-gh > /dev/null
 # the real tag
@@ -2337,15 +2681,22 @@ last
 expect_pass "release run: ...not as burned" sh -c '! grep -qi "burned" "$1"' sh "$rs/last.log"
 expect_pass "release run: ...naming the release commit to check out" grep -q "git checkout $RR" "$rs/last.log"
 expect_pass "release run: ...and recording nothing" test ! -e "$RSTATE"
+rl_heads() { pg rev-parse HEAD; pg symbolic-ref -q HEAD || true; pg for-each-ref --format='%(refname) %(objectname)' | LC_ALL=C sort; pg status --porcelain; }
+rl_heads > "$rs/heads.before"
 rl_kind 5 tag "done (checked)" "status from a later commit finds the tag's release commit" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
 rl_kind 16 brew "done (checked)" "...and shows the whole release" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+rl_heads > "$rs/heads.after"
+expect_pass "release status: ...showing another commit leaves HEAD and every ref unchanged" cmp -s "$rs/heads.before" "$rs/heads.after"
 pg reset -q --hard "$RR"
 pg push -q -f origin "$RR:main"
 rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > /dev/null 2>&1 || true
 echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
 # the state: identifiers and results only
 expect_pass "release: the state holds only its keys (no reaper pid, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|dry_verify|tag_object|tag_run|verify_published)=" "$1"' sh "$RSTATE"
-expect_pass "release: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload; no workflow run)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow run|^run (rerun|cancel)" "$1"' sh "$pf/gh.log"
+# gh's writes are the dispatches of the three workflows on main and reruns of failed jobs (the
+# actions); everything else is a read
+expect_pass "release: gh wrote only dispatches (the three workflows, on main) and reruns --failed" sh -c 'test -s "$1" && ! grep -Ev "^workflow run (release\.yml --repo o/r --ref main|(linux|macos)-check\.yml --repo o/r --ref main -f suite=all -f ref=[0-9a-f]{40})$|^run rerun [0-9]+ --repo o/r --failed$" "$1" | grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow |^run (rerun|cancel)"' sh "$pf/gh.log"
+expect_pass "release: ...and it did dispatch (the log covers the actions)" grep -q '^workflow run release.yml' "$pf/gh.log"
 
 echo
 echo "release-test: $passed passed, $failed failed"

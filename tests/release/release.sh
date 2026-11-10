@@ -1,20 +1,39 @@
 #!/usr/bin/env bash
-# `just release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). This
-# version is the state machine, DETECT-ONLY: it binds a run to the version and the release commit,
-# takes the lock, runs the preflight, and works out from the world (git refs, GitHub's runs and
-# releases, crates.io, the Homebrew tap) which of the seventeen steps are done. It acts on nothing:
-# where a step's action would run, it stops and says what to do by hand. The actions arrive in later
-# PRs (4: mirror, dry-run, dry-verify; 5: tag to verify-signed; 6: publish to finish).
+# `just release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). It binds
+# a run to the version and the release commit, takes the lock, runs the preflight, and works out from
+# the world (git refs, GitHub's runs and releases, crates.io, the Homebrew tap) which of the seventeen
+# steps are done. This version ACTS on steps 1-4 (candidate: checks only; mirror; dry-run;
+# dry-verify) and stops at step 5 `tag` with what to do by hand; the later actions arrive in PRs 5
+# (tag to verify-signed) and 6 (publish to finish). Re-run the same command after any failure: every
+# step is detected again first, and no action that is done is repeated.
 #
-#   release.sh VERSION [--status] [--reset-state] [--repo OWNER/REPO] [--origin REMOTE]
-#                      [--github REMOTE] [--tap DIR] [--vm NAME]
+#   release.sh VERSION [--status] [--reset-state] [--from STEP] [--confirm-each] [--repo OWNER/REPO]
+#                      [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]
 #
 #   (default)      fetch `origin` and `github` (no tags), bind the state to VERSION and HEAD, take
 #                  the lock, detect every step, record the identifiers found (the mirror commit,
 #                  run ids, the tag object) in the state, run the preflight for the next step and
-#                  the ones after it, then stop at that step. Exit 0: every step through `brew` is
-#                  done; 1: failed (a preflight check, a burned tag, a step that could not be
-#                  detected); 2: paused, the next step needs a human (in this version: always).
+#                  the ones after it, then do the next step's action and the ones after it, through
+#                  dry-verify:
+#                    mirror      [confirmation] a commit signed by the owner (git commit-tree -S) with
+#                                the release commit's exact tree on top of GitHub's main, pushed there
+#                    dry-run     dispatch release.yml, and linux-check and macos-check with suite=all
+#                                (ref = the mirror commit), on GitHub's main; the run ids (from the URL
+#                                gh prints, else the new run on the commit) are recorded at once, and
+#                                every run is waited for (Ctrl-C is safe: a re-run re-attaches). A run
+#                                that failed: at a terminal, the command offers `gh run rerun --failed`.
+#                                Not yet: the design's waiver of a red suite=all check ("blocks the
+#                                release? [y/N]", section 3); a red check blocks until a rerun passes
+#                                (PR 5 adds the waiver, before the command can tag). A running run
+#                                the state lost is attached to only if it is this release's
+#                                (triggered by the gh user, not older than the mirror commit)
+#                    dry-verify  release-verify --dry-run --from-run RUN --ref G (the VM rebuild); its
+#                                success is recorded in the state (a local result)
+#                  Exit 0: every step through `brew` is done; 1: failed (the failure says what, what
+#                  to do, and to run the same command again; the step's log is
+#                  target/release-verify/VERSION/logs/NN-STEP.log); 2: paused for a human (a
+#                  confirmation not given, no terminal at a confirmation, or the next step is not
+#                  automated yet).
 #   --status       per step: done (checked), done (recorded), done (implied), next or pending, with
 #                  the run URLs, and whether the release keys are unlocked (release-keys.sh status).
 #                  Read-only: no fetch of the clone (the tap is fetched), no lock, no state written,
@@ -23,6 +42,12 @@
 #                  a burned tag.
 #   --reset-state  forget the state (another release commit before the tag); refused once the tag
 #                  is on GitHub, which binds the commit forever.
+#   --from STEP    for a step done by hand: every step before STEP must detect as done (else the run
+#                  is refused); then as the default.
+#   --confirm-each one confirmation per irreversible point. The default is two: `tag` (asked before
+#                  the mirror push, it covers the mirror and the tag) and `publish` (PR 6). Each
+#                  shows what becomes public and wants the version typed back; there is no --yes,
+#                  and a run whose input is not a terminal stops (exit 2) at the first one.
 #   --tap DIR      the Homebrew tap clone (default ~/dev/homebrew-tap; its `origin` is the tap).
 #
 # The state: target/release-verify/VERSION/release.state, `key=value` lines written atomically
@@ -37,29 +62,33 @@
 # looked at once the tag is there (after `publish`, once it is published).
 #
 # A tag on GitHub is BURNED (a hard stop: bump the version) when it does not verify, when the state
-# binds a release commit of another tree, or when it is not the tag object the state recorded. A
-# good tag of another tree with nothing bound means this checkout is not the release commit: the
-# run says which commit to check out and records nothing.
+# binds a release commit of another tree, when it is not the tag object the state recorded, or (in a
+# run, which has fetched origin) when no commit on origin's main has its tree. A good tag of another
+# tree whose commit is on origin's main, with nothing bound, means this checkout is not the release
+# commit: the run says which commit to check out and records nothing.
 #
-# gh is only READ here (run list/view, release view/download, api GETs). The tools, each a test-only
-# override refused outside the self-test (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG, FIL_CARGO,
-# FIL_CRATES_CURL, FIL_RELEASE_ROOT, and the preflight's (release-preflight.sh). Written for bash 3.2.
+# GitHub writes, all in the actions above: the mirror push (git), `gh workflow run` of the three
+# workflows, `gh run rerun --failed` when the owner says so. Everything else is a read. The tools, each
+# a test-only override refused outside the self-test (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG,
+# FIL_CARGO, FIL_CRATES_CURL, FIL_RELEASE_ROOT, FIL_RELEASE_VERIFY (verify.sh), FIL_RELEASE_TTY (=1:
+# treat the input as a terminal), FIL_RELEASE_LOCK_HOLD (hold the lock while a file exists), and the preflight's (release-preflight.sh). Written for bash 3.2.
 set -euo pipefail
 # shellcheck source=tests/release/release-preflight.sh
 source "$(dirname "${BASH_SOURCE[0]}")/release-preflight.sh"
 
-usage="usage: release.sh VERSION [--status] [--reset-state] [--repo OWNER/REPO] [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]"
-version='' mode=run reset=0 repo=anthonytw/fil origin=origin github=github tap=$HOME/dev/homebrew-tap vm=''
+usage="usage: release.sh VERSION [--status] [--reset-state] [--from STEP] [--confirm-each] [--repo OWNER/REPO] [--origin REMOTE] [--github REMOTE] [--tap DIR] [--vm NAME]"
+version='' mode=run reset=0 repo=anthonytw/fil origin=origin github=github tap=$HOME/dev/homebrew-tap vm='' from='' confirm_each=0
 while [ $# -gt 0 ]; do
   case $1 in
     --status) mode=status; shift ;;
     --reset-state) reset=1; shift ;;
-    --repo | --origin | --github | --tap | --vm)
+    --confirm-each) confirm_each=1; shift ;;
+    --repo | --origin | --github | --tap | --vm | --from)
       [ $# -ge 2 ] || die "$usage"
-      case $1 in --repo) repo=$2 ;; --origin) origin=$2 ;; --github) github=$2 ;; --tap) tap=$2 ;; --vm) vm=$2 ;; esac
+      case $1 in --repo) repo=$2 ;; --origin) origin=$2 ;; --github) github=$2 ;; --tap) tap=$2 ;; --vm) vm=$2 ;; --from) from=$2 ;; esac
       shift 2
       ;;
-    --redo | --from | --confirm-each | --lock-keys | --ttl) die "$1: not in this version of the command (it detects, and acts on nothing yet: the actions and their options arrive in PRs 4-6 of the one-command release)" ;;
+    --redo | --lock-keys | --ttl) die "$1: not in this version of the command (it acts on steps 1-4 so far: --redo, --lock-keys and --ttl arrive with the later steps, PRs 5-6 of the one-command release)" ;;
     -*) die "unknown option: $1 ($usage)" ;;
     *) [ -z "$version" ] || die "$usage"; version=$1; shift ;;
   esac
@@ -67,7 +96,12 @@ done
 [ -n "$version" ] || die "$usage"
 V=${version#v}
 package_version_ok "$V" || die "'$version' is not X.Y.Z or X.Y.Z-PRE"
-[ "$reset" = 0 ] || [ "$mode" = run ] || die "--reset-state and --status do not go together"
+if [ "$mode" = status ] && { [ "$reset" = 1 ] || [ "$confirm_each" = 1 ] || [ -n "$from" ]; }; then
+  die "--status only reads: --reset-state, --from and --confirm-each do not go with it"
+fi
+if [ -n "$from" ]; then
+  case " $PF_STEPS " in *" $from "*) ;; *) die "--from $from: no such step (one of: $PF_STEPS)" ;; esac
+fi
 TAG=v$V
 W=$ROOT/target/release-verify/$V
 STATE=$W/release.state
@@ -89,10 +123,11 @@ CARGO=${FIL_CARGO:-cargo}
 CURL=${FIL_CRATES_CURL:-curl}
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/fil-release.XXXXXX")
-LOCK_OWNED=0
+LOCK_OWNED=0 REAP_OWNED=0
 cleanup() {
   rm -rf "$scratch"
   if [ "$LOCK_OWNED" = 1 ] && [ "$(cat "$LOCK/pid" 2> /dev/null || true)" = "$$" ]; then rm -rf "$LOCK"; fi
+  if [ "$REAP_OWNED" = 1 ]; then rmdir "$LOCK.reap" 2> /dev/null || true; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
@@ -122,6 +157,12 @@ st_set() {
     if [ -f "$STATE" ]; then awk -v k="$1" 'index($0, k "=") != 1' "$STATE"; fi
     printf '%s=%s\n' "$1" "$2"
   } > "$STATE.tmp.$$"
+  mv "$STATE.tmp.$$" "$STATE"
+}
+# st_unset KEY: forget KEY (a recorded identifier the world no longer has).
+st_unset() {
+  [ -f "$STATE" ] || return 0
+  awk -v k="$1" 'index($0, k "=") != 1' "$STATE" > "$STATE.tmp.$$"
   mv "$STATE.tmp.$$" "$STATE"
 }
 st_hex() { local v; v=$(st_get "$1"); if is_hex40 "$v"; then echo "$v"; fi; }
@@ -154,34 +195,39 @@ report() {
 }
 
 # ---- the lock (run mode): a directory holding the pid; a dead pid's lock is removed with a note.
+# Every change of the lock (taking it with its pid, removing a dead run's) happens under a mutex,
+# the directory $LOCK.reap, so a run never sees a lock without its pid, and two runs never both
+# remove a stale lock and both take it (nor can a move nest one lock inside another, as BSD mv does).
+# The mutex is held for a few file operations; one left by a run killed in that instant is reported.
 lock_take() {
   local pid n=0
   mkdir -p "$W"
-  until mkdir "$LOCK" 2> /dev/null; do
-    pid=$(cat "$LOCK/pid" 2> /dev/null || true)
-    if [ -z "$pid" ] && [ $n -lt 3 ]; then
+  while :; do
+    until mkdir "$LOCK.reap" 2> /dev/null; do
       n=$((n + 1))
-      sleep 1
-      continue
+      [ $n -le 20 ] || report FAILED 0 "$LOCK.reap has been held for 10 s (a release run was stopped in the instant it took or removed the lock)" \
+        "if no release run is running (ps -ax | grep release.sh), rmdir '$LOCK.reap'"
+      sleep 0.5
+    done
+    REAP_OWNED=1
+    if mkdir "$LOCK" 2> /dev/null; then
+      echo $$ > "$LOCK/pid"
+      LOCK_OWNED=1
+      rmdir "$LOCK.reap"
+      REAP_OWNED=0
+      return 0
     fi
+    pid=$(cat "$LOCK/pid" 2> /dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
+      rmdir "$LOCK.reap"
+      REAP_OWNED=0
       report FAILED 0 "another release run (pid $pid) holds $LOCK" "wait for it, or stop it (kill $pid)"
     fi
-    # Move it aside (one mover wins), then check it is still the dead run's: a run that took the lock
-    # meanwhile gets it back.
-    if mv "$LOCK" "$LOCK.stale.$$" 2> /dev/null; then
-      if [ "$(cat "$LOCK.stale.$$/pid" 2> /dev/null || true)" = "$pid" ]; then
-        log "removed a stale lock (pid ${pid:-unknown} is not running): $LOCK"
-        rm -rf "$LOCK.stale.$$"
-      elif ! mv "$LOCK.stale.$$" "$LOCK" 2> /dev/null; then
-        rm -rf "$LOCK.stale.$$"
-        report FAILED 0 "two release runs raced for $LOCK" "run it again"
-      fi
-    fi
-    n=0
+    rm -rf "$LOCK"
+    log "removed a stale lock (pid ${pid:-unknown} is not running): $LOCK"
+    rmdir "$LOCK.reap"
+    REAP_OWNED=0
   done
-  echo $$ > "$LOCK/pid"
-  LOCK_OWNED=1
 }
 
 # ---- GitHub reads. Each prints its result; a failure returns 1 with the error in $scratch/gh.err.
@@ -203,16 +249,17 @@ for r in runs:
 run_view() {
   local f=$scratch/run-$1 out
   [ -f "$f" ] && return 0
-  out=$(gh_read run view "$1" --repo "$repo" --json headSha,event,workflowName,status,conclusion,jobs) || return 1
+  out=$(gh_read run view "$1" --repo "$repo" --json headSha,event,workflowName,status,conclusion,attempt,jobs) || return 1
   printf '%s' "$out" | python3 -I -c 'import json, sys
 r = json.load(sys.stdin)
-for k in ("headSha", "event", "workflowName", "status", "conclusion"):
+for k in ("headSha", "event", "workflowName", "status", "conclusion", "attempt"):
     print(k, r.get(k) or "-")
 for j in r.get("jobs") or []:
     print("job", j.get("conclusion") or "-", j.get("name") or "")' > "$f.tmp" || return 1
   mv "$f.tmp" "$f"
 }
 rv_has() { grep -qx -- "$2" "$scratch/run-$1"; }
+rv_attempt() { sed -n 's/^attempt \([0-9][0-9]*\)$/\1/p' "$scratch/run-$1"; }
 rv_job_prefix() { grep -q "^job success $2" "$scratch/run-$1"; }
 rv_no_failed_job() { ! grep -Eq '^job (failure|cancelled|timed_out|action_required|startup_failure) ' "$scratch/run-$1"; }
 # The runs each step needs, as predicates on a viewed run.
@@ -231,11 +278,31 @@ pred_macos_all() {
     && rv_job_prefix "$1" "check (" && rv_job_prefix "$1" "remote (" && rv_no_failed_job "$1"
 }
 pred_tag_run() { rv_has "$1" "workflowName release" && rv_has "$1" "event push" && rv_has "$1" "headSha $G" && rv_has "$1" "job success publish"; }
+# run_ours ID: a dispatched run that is this release's: triggered by the gh user running the command
+# and created no earlier than the mirror commit (5 minutes of clock slack). The workflows' inputs are
+# not reported, so a run found by listing, not dispatched and recorded by the command, needs this.
+# 0 yes, 1 no, 2 GitHub could not be asked.
+GH_USER=''
+run_ours() {
+  local out gt
+  [ -n "$GH_USER" ] || GH_USER=$(gh_read api user --jq .login) || return 2
+  [ -n "$GH_USER" ] || return 2
+  out=$(gh_read api "repos/$repo/actions/runs/$1" --jq '[.triggering_actor.login // "", .created_at // ""] | @tsv') || return 2
+  gt=$(rg show -s --format=%ct "$G" 2> /dev/null) || return 2
+  printf '%s\n' "$out" | python3 -I -c 'import datetime, sys
+user, gt = sys.argv[1], int(sys.argv[2])
+f = (sys.stdin.read().rstrip("\n").split("\t") + ["", ""])[:2]
+try:
+    c = datetime.datetime.strptime(f[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if f[0] == user and c >= gt - 300 else 1)' "$GH_USER" "$gt"
+}
 # find_run PRED RECORDED WORKFLOW EVENT SHA [BRANCH]: the recorded run if it satisfies PRED, else the
-# newest of the listed runs that does (at most five are looked at). Prints the id; returns 1 if
-# none, 2 if GitHub could not be asked.
+# newest of the listed runs that does (at most five are looked at; a dispatched one must also be
+# run_ours). Prints the id; returns 1 if none, 2 if GitHub could not be asked.
 find_run() {
-  local pred=$1 rec=$2 id st concl n=0 ids
+  local pred=$1 rec=$2 id st concl n=0 ids rc
   if [ -n "$rec" ] && run_view "$rec" && "$pred" "$rec"; then
     echo "$rec"
     return 0
@@ -249,6 +316,12 @@ find_run() {
     [ $n -le 5 ] || break
     run_view "$id" || return 2
     if "$pred" "$id"; then
+      if [ "$4" = workflow_dispatch ]; then
+        rc=0
+        run_ours "$id" || rc=$?
+        [ $rc != 2 ] || return 2
+        [ $rc = 0 ] || continue
+      fi
       echo "$id"
       return 0
     fi
@@ -335,7 +408,7 @@ det_candidate() {
 # The tag on GitHub, read into a scratch repository that borrows the clone's objects (nothing in the
 # clone changes; Gitea's marker tag may own vV there), and verified with verify-tag.sh against the
 # signers on GitHub's main.
-TAG_STATE=unknown TAG_MSG='' TAG_TREE='' TAG_FOUND='' TAG_FIX=''
+TAG_STATE=unknown TAG_MSG='' TAG_TREE='' TAG_FOUND='' TAG_FIX='' FETCHED=0
 read_tag() {
   local lines url d objs out
   if ! lines=$(rg ls-remote "$github" "refs/tags/$TAG" 2> "$scratch/git.err"); then
@@ -368,11 +441,16 @@ read_tag() {
     else
       # Nothing is bound: the tag is fine, this checkout is not its release commit.
       TAG_FOUND=$(rg log --format='%H %T' "refs/remotes/$origin/main" 2> /dev/null | awk -v t="$TAG_TREE" '$2 == t { print $1; exit }' || true)
+      if [ -z "$TAG_FOUND" ] && [ "$FETCHED" = 1 ]; then
+        # origin is fetched (a run): no release commit has the tag's tree, so the tag is no release's.
+        TAG_STATE=burned TAG_MSG="$TAG on GitHub names $(short "$TAG_COMMIT") (tree $(short "$TAG_TREE")), and no commit on $origin's main has that tree: it is not the tag of a release commit"
+        return 0
+      fi
       TAG_STATE=mismatch TAG_MSG="$TAG on GitHub names $(short "$TAG_COMMIT") (tree $(short "$TAG_TREE")), and HEAD $(short "$R") is not its release commit"
       if [ -n "$TAG_FOUND" ]; then
         TAG_FIX="git checkout $TAG_FOUND (the commit on $origin/main with the tag's tree)"
       else
-        TAG_FIX="check out the release commit: git log --format='%H %T' $origin/main | awk '\$2 == \"$TAG_TREE\"'"
+        TAG_FIX="git fetch $origin, then check out the release commit: git log --format='%H %T' $origin/main | awk '\$2 == \"$TAG_TREE\"' (if no commit has that tree, $TAG is burned: bump to the next patch version)"
       fi
     fi
   else
@@ -722,13 +800,291 @@ print_status() {
   "$RELEASE_DIR/release-keys.sh" status --need ssh,gpg < /dev/null 2>&1 | sed 's/^/  /' || true
 }
 
-# do_hint STEP: what to do by hand at STEP, until the command does it (PRs 4-6).
+# ---- the actions of steps 1-4. Each runs with its step's log open and returns once its action is
+# done (the loop then detects every step again); any failure stops the run through step_fail.
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+STEP_LOG='' STEP_LOG_START=0
+step_log() {
+  mkdir -p "$W/logs"
+  STEP_LOG=$W/logs/$(printf '%02d' "$(step_no "$1")")-$1.log
+  STEP_LOG_START=0
+  [ ! -f "$STEP_LOG" ] || STEP_LOG_START=$(wc -l < "$STEP_LOG" | tr -d ' ')
+  echo "=== $(utc) step $1 (pid $$)" >> "$STEP_LOG"
+}
+# this_attempt: this run's part of the step's log (the log keeps every run's, appended).
+this_attempt() { tail -n "+$((STEP_LOG_START + 1))" "$STEP_LOG" 2> /dev/null || true; }
+# log_has RE: this run's part of the step's log matches RE (extended, any case).
+log_has() { this_attempt | grep -Eiq -- "$1"; }
+# known_fix STEP: the "do" line for a failure whose log shows a known sign (0.1.0's troubles among them).
+known_fix() {
+  local m=${vm:-${FIL_VM:-fil}}
+  case $1 in
+    mirror)
+      if log_has 'GH006|GH013|protected branch|rule violation|ruleset'; then
+        echo "GitHub refused the push to main: push as $PF_OWNER, whose admin bypass of the main ruleset allows it (ssh -T git@github.com must say Hi $PF_OWNER; the bypass list is in the repository's Settings, Rules)"
+      elif log_has 'non-fast-forward|fetch first|stale info'; then
+        echo "GitHub's main moved since the fetch: run it again (it fetches, and makes the mirror commit on the new main)"
+      elif log_has 'permission denied \(publickey\)|could not read from remote'; then
+        echo "ssh-add your GitHub key (ssh -T git@github.com must say Hi $PF_OWNER)"
+      elif log_has 'failed to sign|no private key found|agent refused|could not sign|signing failed|incorrect passphrase|ssh-keygen.*(error|failed)'; then
+        echo "git cannot sign the commit: ssh-add the key that git config user.signingkey names"
+      fi
+      ;;
+    dry-run)
+      if log_has 'HTTP 401|gh auth login|authentication'; then
+        echo "gh auth status; gh auth refresh -h github.com -s repo,workflow (as $PF_OWNER)"
+      elif log_has 'rate limit|HTTP 429'; then
+        echo "GitHub's API limit: wait (gh api rate_limit says until when)"
+      elif log_has 'HTTP 403|resource not accessible|must have admin rights'; then
+        echo "gh's token lacks a scope or a right: gh auth refresh -h github.com -s repo,workflow (as $PF_OWNER, an admin of $repo)"
+      elif log_has 'workflow_dispatch|HTTP 422'; then
+        echo "GitHub refused the dispatch: the workflow on GitHub's main needs workflow_dispatch (gh workflow list --repo $repo)"
+      elif log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve'; then
+        echo "GitHub or the network failed for a moment: run it again (it re-attaches to the runs it started)"
+      fi
+      ;;
+    dry-verify)
+      if log_has "Lima instance .* is not running"; then
+        echo "limactl start $m"
+      elif log_has 'docker\.sock.*permission denied|permission denied.*docker\.sock'; then
+        echo "add yourself to the VM's docker group: limactl shell $m sudo usermod -aG docker \$USER, then limactl stop $m && limactl start $m"
+      elif log_has 'Cannot connect to the Docker daemon|docker daemon running'; then
+        echo "start Docker (on the Mac: open -a Docker; in the VM: limactl shell $m sudo systemctl start docker)"
+      elif log_has 'FAILED: do not sign|released [0-9a-f]*, rebuilt'; then
+        echo "STOP: do NOT tag. The dry run did not verify (a rebuild that differs is a reproducibility bug, not a flake); keep the log and send it to the coordinator. The fix is a new release commit"
+      fi
+      ;;
+  esac
+}
+# step_fail WHAT [DO]: the failure of the step being acted on (NEXT): the log's tail, the known fix or
+# DO, and exit 1.
+step_fail() {
+  local fix=${2:-}
+  if [ -s "$STEP_LOG" ]; then
+    echo "release: the last lines of this run's part of $STEP_LOG:" >&2
+    this_attempt | tail -n 20 | sed 's/^/  | /' >&2
+  fi
+  [ -n "$fix" ] || fix=$(known_fix "$(step_name "$NEXT")")
+  [ -n "$fix" ] || fix="not a known failure: read the log; if it does not say what to do, send it to the coordinator"
+  LAST_DONE=$((NEXT - 1))
+  report FAILED "$NEXT" "$1 (log: $STEP_LOG)" "$fix"
+}
+
+# confirm POINT LINE...: shows what becomes public, then wants the version typed back. Input that is
+# not a terminal, or anything else typed, pauses the run (exit 2) with nothing done. CONFIRMED lists
+# the points confirmed in this run (step tag reads it in PR 5: the default `tag` answer covers it).
+CONFIRMED=''
+is_tty() { [ "${FIL_RELEASE_TTY:-}" = 1 ] || [ -t 0 ]; }
+confirm() {
+  local point=$1 ans
+  shift
+  LAST_DONE=$((NEXT - 1))
+  {
+    echo "release: CONFIRM $point, for $V. What happens and cannot be undone:"
+    printf '  - %s\n' "$@"
+  } >&2
+  is_tty || report PAUSED "$NEXT" "step $(step_name "$NEXT") needs your confirmation ($point), and the input is not a terminal: nothing was done" \
+    "run it in a terminal (there is no --yes)"
+  printf 'release: type %s to go ahead (anything else stops here): ' "$V" >&2
+  IFS= read -r ans || ans=''
+  [ "$ans" = "$V" ] || report PAUSED "$NEXT" "not confirmed: nothing was done" "run it again when you are ready"
+  CONFIRMED="$CONFIRMED $point"
+}
+
+act_candidate() {
+  LAST_DONE=0
+  report FAILED "$NEXT" "the release commit is not a candidate: ${NOTES[NEXT]}" \
+    "fix it on Gitea (a PR to main), then run it from the new main; there is no tag yet, so $AGAIN --reset-state rebinds the state to the new commit"
+}
+
+act_mirror() {
+  local g point=tag t
+  step_log mirror
+  [ "$confirm_each" = 0 ] || point=mirror
+  t=$(tree_of "$R")
+  set -- "step 2 mirror: a commit signed by you with the exact tree $(short "$t") of the release commit $(short "$R"), on top of GitHub's main $(short "$GMAIN"), pushed to main of github.com/$repo: public history, which GitHub keeps" \
+    "its changes to GitHub's main: $(rg diff --shortstat "$GMAIN" "$R" | sed 's/^ *//')"
+  if [ "$point" = tag ]; then
+    set -- "$@" "step 5 tag (this answer covers it too): the tag $TAG on that commit, signed with the release key; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
+      "between the two: the dry run, the suite=all checks and the dry run's verification, each of which stops the release on its own"
+  else
+    set -- "$@" "(--confirm-each: the tag is asked for on its own, at step 5)"
+  fi
+  confirm "$point" "$@"
+  # LC_ALL=C: known_fix reads git's English messages
+  g=$(LC_ALL=C rg commit-tree -S "$R^{tree}" -p "$GMAIN" -m "fil $V" 2>> "$STEP_LOG") || step_fail "git commit-tree -S could not make or sign the mirror commit"
+  rg cat-file commit "$g" | grep -q '^gpgsig ' || step_fail "git commit-tree -S made an unsigned commit ($g)" "check git config gpg.format and user.signingkey"
+  echo "the mirror commit: $g (tree $t, parent $GMAIN)" >> "$STEP_LOG"
+  log "pushing the mirror commit $(short "$g") to $github's main"
+  LC_ALL=C rg push "$github" "$g:refs/heads/main" >> "$STEP_LOG" 2>&1 || step_fail "git push $github $(short "$g"):main failed"
+  st_set github_commit "$g"
+}
+
+# The dry run's three runs: release.yml, and linux-check and macos-check with suite=all.
+DR_WFS="release.yml linux-check.yml macos-check.yml"
+dr_key() { case $1 in release.yml) echo dry_run ;; linux-check.yml) echo checks_linux ;; *) echo checks_macos ;; esac; }
+dr_pred() { case $1 in release.yml) echo pred_dry ;; linux-check.yml) echo pred_linux_all ;; *) echo pred_macos_all ;; esac; }
+# dr_class WF: DR_CLASS is passed, running, failed or none for WF's run on G, DR_ID its id: the run the
+# state names if it is one of WF on G, else a run of WF on G still in progress (the state was lost
+# while it ran: it is attached to, not dispatched again).
+DR_CLASS='' DR_ID=''
+dr_class() {
+  local wf=$1 id st concl ids rc
+  DR_CLASS=none DR_ID=''
+  id=$(st_num "$(dr_key "$wf")")
+  if [ -n "$id" ]; then
+    rm -f "$scratch/run-$id"
+    if ! run_view "$id"; then
+      grep -Eqi 'not found|HTTP 404|could not find' "$scratch/gh.err" 2> /dev/null || step_fail "cannot ask GitHub for run $id: $(gh_err)"
+      # GitHub no longer has it (deleted): forget it, and look for the run as if none was recorded
+      echo "the recorded $wf run $id is not on GitHub: forgotten" >> "$STEP_LOG"
+      st_unset "$(dr_key "$wf")"
+      id=''
+    fi
+  fi
+  if [ -n "$id" ]; then
+    if rv_has "$id" "workflowName ${wf%.yml}" && rv_has "$id" "event workflow_dispatch" && rv_has "$id" "headSha $G"; then
+      DR_ID=$id
+      if "$(dr_pred "$wf")" "$id"; then DR_CLASS=passed; return 0; fi
+      if ! rv_has "$id" "status completed"; then DR_CLASS=running; return 0; fi
+      if ! rv_has "$id" "conclusion success"; then DR_CLASS=failed; return 0; fi
+      # it succeeded but is not the run this step needs (not suite=all): a new one is dispatched
+      DR_ID=''
+    fi
+  fi
+  ids=$(run_ids "$wf" workflow_dispatch "$G") || step_fail "cannot ask GitHub for the runs of $wf: $(gh_err)"
+  while read -r id st concl; do
+    is_num "$id" || continue
+    [ "$st" != completed ] || continue
+    # only this release's: a run someone else dispatched, or one older than the mirror commit, may
+    # test other inputs (suite, ref)
+    rc=0
+    run_ours "$id" || rc=$?
+    [ $rc != 2 ] || step_fail "cannot ask GitHub about run $id: $(gh_err)"
+    [ $rc = 0 ] || { echo "$wf run $id is running on $(short "$G") but is not this release's: not attached to" >> "$STEP_LOG"; continue; }
+    DR_CLASS=running DR_ID=$id
+    return 0
+  done <<< "$ids"
+}
+# dr_dispatch WF: dispatches WF on GitHub's main (which must be G), finds its run (the URL gh prints,
+# else the new run of WF on G) and records it at once. Sets DR_ID.
+dr_dispatch() {
+  local wf=$1 out id='' n=0 now
+  local -a args=(--ref main)
+  [ "$wf" = release.yml ] || args+=(-f suite=all -f "ref=$G")
+  now=$(rg ls-remote "$github" refs/heads/main 2> /dev/null | awk '{ print $1 }') || now=''
+  [ "$now" = "$G" ] || step_fail "GitHub's main is ${now:-unreadable}, not the mirror commit $(short "$G"): a dispatch on main would test another commit" \
+    "find out who pushed it (git fetch $github; git log $github/main); the dry run needs main at the mirror commit"
+  run_ids "$wf" workflow_dispatch "$G" > "$scratch/before" || step_fail "cannot ask GitHub for the runs of $wf: $(gh_err)"
+  echo "gh workflow run $wf --repo $repo ${args[*]}" >> "$STEP_LOG"
+  if ! out=$("$GH" workflow run "$wf" --repo "$repo" "${args[@]}" 2>&1); then
+    printf '%s\n' "$out" >> "$STEP_LOG"
+    step_fail "gh workflow run $wf failed: $(printf '%s' "$out" | head -n 1 | cut -c1-200)"
+  fi
+  printf '%s\n' "$out" >> "$STEP_LOG"
+  id=$(printf '%s\n' "$out" | sed -n "s|.*github\.com/$repo/actions/runs/\([0-9][0-9]*\).*|\1|p" | head -n 1)
+  while [ -z "$id" ] && [ $n -lt 20 ]; do
+    n=$((n + 1))
+    id=$(run_ids "$wf" workflow_dispatch "$G" 2> /dev/null | awk -v before="$(cut -d' ' -f1 "$scratch/before" | tr '\n' ' ')" '
+      BEGIN { n = split(before, b, " "); for (i = 1; i <= n; i++) seen[b[i]] = 1 }
+      $1 != "" && !($1 in seen) { print $1; exit }' || true)
+    [ -n "$id" ] || sleep 3
+  done
+  is_num "$id" || step_fail "dispatched $wf, but no new run of it on $(short "$G") appeared within a minute" \
+    "find it (gh run list --repo $repo --workflow $wf --event workflow_dispatch), wait for it, then run it again: it finds a successful run by itself"
+  st_set "$(dr_key "$wf")" "$id"
+  DR_ID=$id
+  log "dispatched $wf: $(run_url "$id")"
+}
+# dr_watch ID WF: waits for the run (gh run watch); the run must have completed, whatever its result.
+dr_watch() {
+  log "waiting for the $2 run $(run_url "$1") (Ctrl-C is safe: run the same command again to re-attach)"
+  echo "gh run watch $1 ($2)" >> "$STEP_LOG"
+  "$GH" run watch "$1" --repo "$repo" --exit-status --interval 30 >> "$STEP_LOG" 2>&1 < /dev/null || true
+  rm -f "$scratch/run-$1"
+  run_view "$1" || step_fail "cannot ask GitHub for run $1 after waiting for it: $(gh_err)"
+  rv_has "$1" "status completed" || step_fail "the wait for $(run_url "$1") ended before the run did" "run it again: it re-attaches to the run"
+}
+# dr_rerun_started ID ATTEMPT: GitHub shows a rerun a moment after `gh run rerun`; until then the run
+# still reads as the finished attempt ATTEMPT, which a watch would take for the rerun's result.
+dr_rerun_started() {
+  local n=0 a
+  while :; do
+    rm -f "$scratch/run-$1"
+    run_view "$1" || step_fail "cannot ask GitHub for run $1 after the rerun: $(gh_err)"
+    a=$(rv_attempt "$1")
+    if ! rv_has "$1" "status completed" || [ "${a:-0}" -gt "$2" ]; then return 0; fi
+    n=$((n + 1))
+    [ $n -lt 12 ] || step_fail "a minute after gh run rerun, run $1 still shows its finished attempt $2" "run it again: it re-attaches to the rerun, or offers it again"
+    sleep 5
+  done
+}
+act_dry_run() {
+  local wf x watch failed round list a0
+  step_log dry-run
+  watch=''
+  for wf in $DR_WFS; do
+    dr_class "$wf"
+    case $DR_CLASS in
+      passed) echo "$wf: run $DR_ID passed" >> "$STEP_LOG" ;;
+      running) st_set "$(dr_key "$wf")" "$DR_ID"; watch="$watch $DR_ID:$wf" ;;
+      failed) ;;
+      none) dr_dispatch "$wf"; watch="$watch $DR_ID:$wf" ;;
+    esac
+  done
+  for x in $watch; do dr_watch "${x%%:*}" "${x#*:}"; done
+  # The results; a failure is offered one re-run of its failed jobs, at a terminal.
+  for round in first rerun; do
+    failed='' list=''
+    for wf in $DR_WFS; do
+      dr_class "$wf"
+      case $DR_CLASS in
+        passed) ;;
+        failed) failed="$failed $DR_ID:$wf" list="$list $wf $(run_url "$DR_ID")," ;;
+        *) step_fail "the $wf run on $(short "$G") ${DR_ID:+($(run_url "$DR_ID")) }is not a successful run of what this step needs" "run it again (it dispatches a new one)" ;;
+      esac
+    done
+    [ -n "$failed" ] || return 0
+    list=${list%,}
+    for x in $failed; do
+      echo "== the failed jobs of ${x#*:} run ${x%%:*} (gh run view --log-failed, the end):" >> "$STEP_LOG"
+      "$GH" run view "${x%%:*}" --repo "$repo" --log-failed < /dev/null 2>&1 | tail -n 30 >> "$STEP_LOG" || true
+    done
+    if [ "$round" != first ] || ! is_tty; then
+      step_fail "failed:$list" \
+        "if it is transient (a runner or the network): gh run rerun ID --failed --repo $repo for each, then the same command (it re-attaches); a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state)"
+    fi
+    echo "release: failed:$list (the end of each log is in $STEP_LOG)" >&2
+    printf 'release: re-run the failed jobs (for a transient failure: a runner or the network)? [y/N] ' >&2
+    x=''
+    IFS= read -r x || x=''
+    case $x in
+      y | Y | yes) ;;
+      *) step_fail "failed:$list; not re-run" "a real failure: fix it on Gitea, then release the new commit ($AGAIN --reset-state); a transient one: run it again and answer y" ;;
+    esac
+    for x in $failed; do
+      a0=$(rv_attempt "${x%%:*}")
+      echo "gh run rerun ${x%%:*} --failed (attempt ${a0:-?})" >> "$STEP_LOG"
+      "$GH" run rerun "${x%%:*}" --repo "$repo" --failed >> "$STEP_LOG" 2>&1 < /dev/null || step_fail "gh run rerun ${x%%:*} --failed failed"
+      dr_rerun_started "${x%%:*}" "${a0:-0}"
+    done
+    for x in $failed; do dr_watch "${x%%:*}" "${x#*:}"; done
+  done
+}
+
+act_dry_verify() {
+  local verifier=${FIL_RELEASE_VERIFY:-$RELEASE_DIR/verify.sh} rc=0
+  step_log dry-verify
+  log "verifying the dry run $DRY_RUN of $(short "$G"): release-verify --dry-run, with the rebuild in the VM (about 15 to 30 minutes)"
+  echo "release-verify $V --dry-run --from-run $DRY_RUN --ref $G --repo $repo${vm:+ --vm $vm}" >> "$STEP_LOG"
+  "$verifier" "$V" --dry-run --from-run "$DRY_RUN" --ref "$G" --repo "$repo" ${vm:+--vm "$vm"} < /dev/null 2>&1 | tee -a "$STEP_LOG" >&2 || rc=$?
+  [ "$rc" = 0 ] || step_fail "release-verify --dry-run of run $DRY_RUN exited $rc"
+  st_set dry_verify "ok $DRY_RUN $G $(utc)"
+}
+
+# do_hint STEP: what to do by hand at a step after dry-verify, until the command does it (PRs 5-6).
 do_hint() {
   case $1 in
-    candidate) echo "fix what the preflight lists (a PR on Gitea), then run the same command" ;;
-    mirror) echo "G=\$(git commit-tree -S $(short "$R")^{tree} -p $github/main -m 'fil $V') && git push $github \$G:main  (the mirror commit: the release commit's exact tree on GitHub's main)" ;;
-    dry-run) echo "gh workflow run release.yml --repo $repo --ref main; gh workflow run linux-check.yml --repo $repo --ref main -f suite=all; gh workflow run macos-check.yml --repo $repo --ref main -f suite=all; wait for all three" ;;
-    dry-verify) echo "just release-verify $V --dry-run --from-run ${DRY_RUN:-RUN} --ref ${G:-G}  (by hand it leaves no record: this step reads done once the tag is pushed; PR 4 records it)" ;;
     tag) echo "git -c gpg.format=ssh -c user.signingkey=\$HOME/.ssh/fil-release.pub tag -s -m 'fil $V' $TAG-gh ${G:-G} && git push $github $TAG-gh:refs/tags/$TAG  (irreversible)" ;;
     tag-run) echo "wait for the tag's release.yml run to publish the draft${TAG_RUN:+ ($(run_url "$TAG_RUN"))}; gh run list --repo $repo --workflow release.yml --event push" ;;
     verify-presign) echo "just release-verify $V --pre-sign" ;;
@@ -765,8 +1121,15 @@ if [ "$mode" = status ]; then
 fi
 
 lock_take
+# Self-test only (refused outside it, as every override): hold the lock while this file exists
+# (at most 30 s), so a test can prove that other runs find it held.
+if [ -n "${FIL_RELEASE_LOCK_HOLD:-}" ]; then
+  n=0
+  while [ -e "$FIL_RELEASE_LOCK_HOLD" ] && [ $n -lt 300 ]; do n=$((n + 1)); sleep 0.1; done
+fi
 rg fetch -q --no-tags "$origin" 2> "$scratch/git.err" || report FAILED 0 "git fetch $origin failed: $(head -n 1 "$scratch/git.err" | cut -c1-200)" "check the remote (git remote -v; git fetch $origin)"
 rg fetch -q --no-tags "$github" 2> "$scratch/git.err" || report FAILED 0 "git fetch $github failed: $(head -n 1 "$scratch/git.err" | cut -c1-200)" "check the remote (git remote -v; git fetch $github)"
+FETCHED=1
 if git -C "$tap" rev-parse --git-dir > /dev/null 2>&1; then
   git -C "$tap" fetch -q --no-tags origin 2> /dev/null || log "note: could not fetch the tap ($tap); step brew reads it as it is"
 fi
@@ -791,6 +1154,21 @@ if [ -n "$sr" ] && [ "$sr" != "$R" ]; then
     "git checkout $sr"
 fi
 
+# record_found: the identifiers the detections found, into the state.
+record_found() {
+  [ -z "$G" ] || st_set github_commit "$G"
+  [ -z "$DRY_RUN" ] || st_set dry_run "$DRY_RUN"
+  [ -z "$CHECKS_LINUX" ] || st_set checks_linux "$CHECKS_LINUX"
+  [ -z "$CHECKS_MACOS" ] || st_set checks_macos "$CHECKS_MACOS"
+  [ "$TAG_OK" = 0 ] || st_set tag_object "$TAG_OBJ"
+  [ -z "$TAG_RUN" ] || st_set tag_run "$TAG_RUN"
+}
+hard_stop() {
+  [ -n "$HARD_STEP" ] || return 0
+  LAST_DONE=$((HARD_STEP - 1))
+  report FAILED "$HARD_STEP" "$HARD" "this version is burned: bump to the next patch version (a PR on Gitea: just set-version), and release that"
+}
+
 detect_all
 if [ "$TAG_STATE" = mismatch ]; then
   LAST_DONE=0
@@ -798,17 +1176,20 @@ if [ "$TAG_STATE" = mismatch ]; then
 fi
 st_set version "$V"
 st_set release_commit "$R"
-# Record what was found (identifiers only).
-[ -z "$G" ] || st_set github_commit "$G"
-[ -z "$DRY_RUN" ] || st_set dry_run "$DRY_RUN"
-[ -z "$CHECKS_LINUX" ] || st_set checks_linux "$CHECKS_LINUX"
-[ -z "$CHECKS_MACOS" ] || st_set checks_macos "$CHECKS_MACOS"
-[ "$TAG_OK" = 0 ] || st_set tag_object "$TAG_OBJ"
-[ -z "$TAG_RUN" ] || st_set tag_run "$TAG_RUN"
-
-if [ -n "$HARD_STEP" ]; then
-  LAST_DONE=$((HARD_STEP - 1))
-  report FAILED "$HARD_STEP" "$HARD" "this version is burned: bump to the next patch version (a PR on Gitea: just set-version), and release that"
+record_found
+hard_stop
+# --from STEP: every step before it must be done (by the command or by hand).
+if [ -n "$from" ]; then
+  fn=$(step_no "$from")
+  for ((i = 1; i < fn; i++)); do
+    case ${KIND[i]} in
+      checked | recorded | implied) ;;
+      *)
+        LAST_DONE=$((i - 1))
+        report FAILED "$i" "--from $from: step $i $(step_name $i) is not done (${NOTES[i]})" "do it first: run the command without --from (it does steps 1-4), or do it by hand, then run it again"
+        ;;
+    esac
+  done
 fi
 if [ "$NEXT" = "$NSTEPS" ]; then
   log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
@@ -824,7 +1205,26 @@ PF_COMMIT=''
 if ! pf_run $(pf_checks_from "$name"); then
   report FAILED "$NEXT" "the preflight for $name and the steps after it failed (each failure above says what to do)" "fix what the preflight lists"
 fi
-if [ "${KIND[NEXT]}" = unknown ]; then
-  report FAILED "$NEXT" "cannot tell whether $name is done: ${NOTES[NEXT]}" "fix that, then run it again"
-fi
-report PAUSED "$NEXT" "$name is not done (${NOTES[NEXT]}); this version of the command detects the steps but does not act yet" "$(do_hint "$name")"
+
+# The actions, step by step through dry-verify; after each, every step is detected again.
+while :; do
+  if [ "$NEXT" = "$NSTEPS" ]; then
+    log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
+    exit 0
+  fi
+  name=$(step_name "$NEXT")
+  if [ "${KIND[NEXT]}" = unknown ]; then
+    report FAILED "$NEXT" "cannot tell whether $name is done: ${NOTES[NEXT]}" "fix that, then run it again"
+  fi
+  case $name in candidate | mirror | dry-run | dry-verify) ;; *) break ;; esac
+  prev=$NEXT
+  "act_$(printf '%s' "$name" | tr - _)"
+  detect_all
+  hard_stop
+  record_found
+  if [ "$NEXT" -le "$prev" ]; then
+    NEXT=$prev
+    step_fail "the action of $name finished, but the step does not detect as done: ${NOTES[prev]}" "send the log to the coordinator (a bug in the command or a change in GitHub's answers)"
+  fi
+done
+report PAUSED "$NEXT" "$name is next (${NOTES[NEXT]}); this version of the command does steps 1-4 (candidate to dry-verify): $name and the steps after it arrive in PRs 5-6" "by hand for now: $(do_hint "$name")"

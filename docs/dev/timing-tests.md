@@ -85,5 +85,5 @@ a hang misses. Those are left as they are.
 The Mac did not miss any bound in 3 quiet runs, 3 runs with six busy loops and 2 runs with sixteen
 (on 14 cores), unchanged or changed alike. It cannot reproduce the runner's failures, which come
 from the container's CPU cap. Since 2026-11-09 the wall-clock tests are not part of the per-PR
-checks on shared runners at all; `just ci-release` runs them before a release, on the Mac and in
-the Linux VM (`just vm-run just test-wallclock`).
+checks on shared runners at all; `just ci-release` runs them before a release on the Mac, and the
+Linux VM runs `just vm-run just test-wallclock`.

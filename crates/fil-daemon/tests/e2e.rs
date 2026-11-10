@@ -394,8 +394,9 @@ async fn slow_start(
     cfg.idle_exit = idle_exit;
     // The daemon's idle clock runs from its start while no connection exists, so on a slow host
     // a short `idle_exit` can elapse before the attach below even connects. A connection made
-    // between the bind and `run` (it waits in the socket's backlog; `run` accepts it on its first
-    // poll, before any timer can fire) keeps the daemon busy until the attach has been handled.
+    // between the bind and `run` waits in the socket's backlog. The idle sleep starts at `run`'s
+    // first poll and, when it ends, `retire` serves every connection waiting in the backlog; so
+    // the held connection keeps the daemon from exiting until the attach has been handled.
     let paths = s.paths();
     fil_daemon::ensure_socket_dir(&s.dir).unwrap();
     let daemon = fil_daemon::Daemon::start(paths.clone(), cfg)

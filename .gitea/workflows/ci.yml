@@ -1,8 +1,9 @@
 # fil's CI on the project's Gitea, run by the self-hosted aarch64 runner.
 #
 # Gitea reads .gitea/workflows/ and ignores .github/workflows/ when the former exists, so the
-# GitHub workflows (release, linux-check, macos-check) do not run here. They run on GitHub, when the
-# owner pushes there at release time. There is no macOS runner: macOS checks are run by hand.
+# GitHub workflows (release, linux-check, macos-check) do not run here. They run on GitHub, where
+# agents dispatch linux-check and macos-check on each PR head (the merge gate, CLAUDE.md
+# § Delivery) and the owner pushes the release. There is no macOS runner on Gitea.
 #
 # The job image is the runner's default (rust:1.99.1-trixie by digest). It has no Node, so no
 # JavaScript actions: checkout is plain git. Jobs have no Docker socket (no cross, no realnet) and

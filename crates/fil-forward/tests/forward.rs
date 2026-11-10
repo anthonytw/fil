@@ -541,19 +541,20 @@ async fn wallclock_stuck_consumer(t: Transport) {
 /// endpoints' state, but one: on macOS a local socket call that fails with `ENOBUFS` or `ENOMEM`
 /// (the mbuf pool running short across some 80 loopback sockets that are never read; the
 /// x86_64 runner does) may have queued part of its bytes, so the endpoint resets that channel
-/// instead of retrying it (DESIGN.md section 8.5, [`kernel_memory_resets`]). Up to
-/// as many such channels as there are waiting applications are taken (`APPS - max_open`, 8),
+/// instead of retrying it (DESIGN.md section 8.5, [`kernel_memory_resets`]). Those channels are
 /// matched by id: every close by either mux is a `Reset` of one of them, no other connection
 /// ends, and each ends at most its two writers (the server's and the application's, with `EPIPE`
-/// or `ECONNRESET`). A waiting application's connection takes each freed place (24 connect for 16
-/// places), so the fill still finishes.
+/// or `ECONNRESET`). Each such reset frees a place, so the test connects one more application
+/// for it (a pool of `SPARE` waiting beyond the 16 places, kept topped up), and the fill still
+/// finishes however often the kernel runs short, up to the 64 records an endpoint keeps (past
+/// those, the `errors > resets` check fails: far beyond the 11 the worst runner has made).
 ///
-/// That bound is class T (docs/dev/timing-tests.md), not a DESIGN.md claim: DESIGN.md section 8.5
-/// only says that on macOS these errors reset the channel at once, and does not say how often
-/// the kernel may run short. The figure is the most resets after which the test can still reach
-/// its end state (16 channels open): one more would leave fewer applications than places. It is
-/// not a tuned count: a small x86_64 macOS runner reset four channels where the Apple-silicon
-/// dev Mac resets none. On Linux the endpoint holds and retries instead of resetting, so
+/// How many there may be is not bounded by a count: DESIGN.md section 8.5 only says that on
+/// macOS these errors reset the channel at once, and does not say how often the kernel may run
+/// short (a small x86_64 macOS runner has reset 4 and 11 channels in one fill where the
+/// Apple-silicon dev Mac resets none). A fixed count of 8 failed on such a runner. What stays
+/// exact is the kind: nothing ends but those channels, and the fill must still finish within the
+/// deadline. On Linux the endpoint holds and retries instead of resetting, so
 /// [`kernel_memory_resets`] is empty and the allowance there is exactly zero.
 async fn budget(t: Transport) {
     let budget = 4 << 20;
@@ -600,14 +601,12 @@ async fn budget(t: Transport) {
     w.daemon.ep.set_pacing(off);
     let port = w.local_forward(1, server.port);
     let mut apps = Vec::new();
-    // The waiting connections: each channel reset for want of kernel memory frees a place that
-    // one of them takes. The most resets the fill can absorb.
-    const APPS: usize = 24;
-    let max_resets = APPS - MAX_OPEN;
-    for i in 0..APPS {
-        let mut s = connect_small(port).await;
+    // The waiting connections beyond the places: each channel reset for want of kernel memory
+    // frees a place that one of them takes, and is replaced (below), so `SPARE` stay waiting.
+    const SPARE: usize = 8;
+    let spawn_app = |i: usize, mut s: tokio::net::TcpStream| {
         let ended = ended.clone();
-        apps.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             let buf = vec![2u8; 64 * 1024];
             let e = loop {
                 if let Err(e) = write_all_retry(&mut s, &buf).await {
@@ -619,7 +618,10 @@ async fn budget(t: Transport) {
                 .lock()
                 .unwrap()
                 .push((format!("application {i}'s write: {e}"), kind));
-        }));
+        })
+    };
+    for i in 0..MAX_OPEN + SPARE {
+        apps.push(spawn_app(i, connect_small(port).await));
     }
     let failure = |what: &str| -> String {
         format!(
@@ -634,7 +636,7 @@ async fn budget(t: Transport) {
             let s = ep.snapshot();
             assert!(s.buffered <= s.reserved, "{who}: {s:?}");
             assert!(s.reserved <= budget, "{who}: {s:?}");
-            assert!(s.channels <= 16, "{who}: {s:?}");
+            assert!(s.channels <= MAX_OPEN, "{who}: {s:?}");
         }
         // Read in this order: the writers that stopped, then the connections that ended, then
         // the records. An endpoint records a local error, or a close by its mux, before it
@@ -669,9 +671,8 @@ async fn budget(t: Transport) {
         });
         // Every local error is such a reset; no connection ended but those channels' (so every
         // writer that stopped was one of theirs, two at most each: the server and the
-        // application), and there are few of them.
+        // application).
         if errors as usize > resets.len()
-            || reset.len() > max_resets
             || gone.iter().any(|&g| g > reset.len() as u64)
             || ended.len() > 2 * reset.len()
             || !closes_ok
@@ -680,7 +681,7 @@ async fn budget(t: Transport) {
             panic!(
                 "{}",
                 failure(&format!(
-                    "a connection ended while the buffers filled (none may, but the channels reset for want of kernel memory on macOS, at most {max_resets}: {reset:?}; connections ended (client, daemon): {gone:?})"
+                    "a connection ended while the buffers filled (none may, but the channels reset for want of kernel memory on macOS: {reset:?}; connections ended (client, daemon): {gone:?})"
                 ))
             );
         }
@@ -690,12 +691,16 @@ async fn budget(t: Transport) {
     let full = || {
         let s = w.client.ep.snapshot();
         check();
-        s.channels == 16 && s.buffered * 10 >= s.reserved * 9
+        s.channels == MAX_OPEN && s.buffered * 10 >= s.reserved * 9
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while !full() {
         if tokio::time::Instant::now() >= deadline {
             panic!("{}", failure("the buffers did not fill within 90 s"));
+        }
+        // One more waiting application for each channel reset for want of kernel memory.
+        while apps.len() < MAX_OPEN + SPARE + kernel_memory_resets(&w).len() {
+            apps.push(spawn_app(apps.len(), connect_small(port).await));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

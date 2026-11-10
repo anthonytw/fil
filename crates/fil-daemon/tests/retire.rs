@@ -21,12 +21,16 @@ const OFFSETS_MS: [i64; 12] = [-100, -60, -10, -6, -3, -1, 0, 1, 3, 6, 10, 20];
 
 /// Connects and reads the daemon's `Hello`; `None` if there was nothing to connect to.
 async fn hello_from(sock: std::path::PathBuf) -> Option<std::io::Result<usize>> {
-    let mut st = UnixStream::connect(&sock).await.ok()?;
+    let st = UnixStream::connect(&sock).await.ok()?;
+    Some(read_hello(st).await)
+}
+
+/// Reads the daemon's greeting from a connection the kernel accepted.
+async fn read_hello(mut st: UnixStream) -> std::io::Result<usize> {
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), st.read(&mut buf))
+    tokio::time::timeout(Duration::from_secs(5), st.read(&mut buf))
         .await
-        .expect("a connection that was accepted is answered");
-    Some(n)
+        .expect("a connection that was accepted is answered")
 }
 
 /// Rounds of: a daemon with a short idle time, and a burst of connections timed to land around
@@ -51,11 +55,16 @@ async fn connections_that_race_the_idle_exit_are_all_served() {
         fil_daemon::ensure_socket_dir(&s.dir).unwrap();
         let daemon = Daemon::start(s.paths(), cfg.clone()).await.expect("starts");
         let sock = s.paths().socket();
-        let run = tokio::spawn(daemon.run());
-        // The daemon is well inside its idle time here, so this one is always served.
-        let first = hello_from(sock.clone())
+        // The first connection is made before `run` starts: it waits in the backlog and is
+        // served by the daemon's first accept, or by `retire` if the idle time has elapsed by
+        // then, so a slow runner cannot take the socket away before it connects.
+        let first_conn = UnixStream::connect(&sock)
             .await
-            .expect("the daemon is listening")
+            .expect("the daemon is listening");
+        let run = tokio::spawn(daemon.run());
+        let first = tokio::time::timeout(Duration::from_secs(5), read_hello(first_conn))
+            .await
+            .expect("the first connection is answered")
             .expect("the first connection is answered");
         assert!(first > 0, "round {round}: the first connection was dropped");
         // Its close (the stream is dropped above) restarts the daemon's idle clock, within a

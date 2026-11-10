@@ -818,18 +818,18 @@ pub fn is_no_buffers(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
 }
 
-/// The most channels a test lets the endpoints reset for want of kernel memory before the
-/// resets are the test's failure (see [`kernel_memory_resets`]).
+/// The most channels the paced-send test (`pace.rs`, the only user) lets the endpoints reset for
+/// want of kernel memory before the resets are its failure (see [`kernel_memory_resets`]).
 pub const NO_MEMORY_RESETS: usize = 3;
 
 /// The channels the endpoints, at both ends, reset at once because a local socket call failed
 /// with `ENOBUFS` or `ENOMEM`: off Linux only (macOS here), where such a call may have moved part
-/// of its bytes
-/// and the endpoint cannot retry it without risking repeating them
+/// of its bytes and the endpoint cannot retry it without risking repeating them
 /// (`ForwardStream::no_memory_moves_nothing`, DESIGN.md section 8.5). That reset is fil's
 /// documented answer to the kernel's shortage, not a bug: a test whose subject is not the
-/// kernel's memory may tolerate up to [`NO_MEMORY_RESETS`] of them, and only these. A shortage
-/// the endpoint gave up on after waiting (`gave_up`, Linux) is not one of them.
+/// kernel's memory may tolerate some of them (`pace.rs` caps them at [`NO_MEMORY_RESETS`]), and
+/// only these. A shortage the endpoint gave up on after waiting (`gave_up`, Linux) is not one of
+/// them.
 pub fn kernel_memory_resets(w: &World) -> Vec<fil_forward::LocalError> {
     if cfg!(target_os = "linux") {
         return Vec::new();

@@ -814,12 +814,12 @@ pub fn sha256() -> ring::digest::Context {
 /// failure that a small CI runner's mbuf pool gives to a send when many loopback sockets hold
 /// data. The tests' own socket calls try again, as the endpoint's do; any other error ends them.
 pub fn is_no_buffers(e: &io::Error) -> bool {
-    use rustix::io::Errno;
-    matches!(e.raw_os_error(), Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
+    e.raw_os_error().is_some_and(is_no_buffers_errno)
 }
 
-/// The most channels the paced-send test (`pace.rs`, the only user) lets the endpoints reset for
-/// want of kernel memory before the resets are its failure (see [`kernel_memory_resets`]).
+/// The most channels the paced-send test (`pace.rs`) lets the endpoints reset for want of kernel
+/// memory before the resets are its failure (see [`kernel_memory_resets`]), and the most attempts
+/// the growing-pause test (`nobufs.rs`) runs again for the same reason.
 pub const NO_MEMORY_RESETS: usize = 3;
 
 /// The channels the endpoints, at both ends, reset at once because a local socket call failed
@@ -831,17 +831,25 @@ pub const NO_MEMORY_RESETS: usize = 3;
 /// only these. A shortage the endpoint gave up on after waiting (`gave_up`, Linux) is not one of
 /// them.
 pub fn kernel_memory_resets(w: &World) -> Vec<fil_forward::LocalError> {
+    let mut v = kernel_memory_resets_of(&w.client.ep);
+    v.extend(kernel_memory_resets_of(&w.daemon.ep));
+    v
+}
+
+/// [`kernel_memory_resets`] of one endpoint.
+pub fn kernel_memory_resets_of(ep: &Endpoint<TestLink>) -> Vec<fil_forward::LocalError> {
     if cfg!(target_os = "linux") {
         return Vec::new();
     }
-    let (mut v, _) = w.client.ep.local_errors();
-    v.extend(w.daemon.ep.local_errors().0);
-    v.retain(|e| {
-        use rustix::io::Errno;
-        !e.gave_up
-            && matches!(e.errno, Some(n) if n == Errno::NOBUFS.raw_os_error() || n == Errno::NOMEM.raw_os_error())
-    });
+    let (mut v, _) = ep.local_errors();
+    v.retain(|e| !e.gave_up && e.errno.is_some_and(is_no_buffers_errno));
     v
+}
+
+/// Whether `errno` is the kernel running short of socket memory ([`is_no_buffers`]).
+pub fn is_no_buffers_errno(errno: i32) -> bool {
+    use rustix::io::Errno;
+    errno == Errno::NOBUFS.raw_os_error() || errno == Errno::NOMEM.raw_os_error()
 }
 
 /// `e` with its errno in the message (the kind is kept, so `is_reset` and the like still see it).
@@ -1209,7 +1217,8 @@ impl Flaky {
 /// on Linux. Elsewhere it is passed on without its errno, so that the endpoint resets the channel
 /// as it would on the bare socket (a retry could repeat bytes and pass for fil's bug), and as
 /// `ErrorKind::OutOfMemory`, so that the endpoint's record (`kind`, with `errno` `None`) still
-/// says what it was; [`kernel_memory_resets`] does not count it, so a test fails on it.
+/// says what it was. [`kernel_memory_resets`] does not count it, so a test fails on it, unless
+/// it asks for it by that record (`nobufs.rs`, `only_kernel_memory_resets`).
 fn real_failure(e: io::Error) -> io::Error {
     if cfg!(target_os = "linux") || !is_no_buffers(&e) {
         e

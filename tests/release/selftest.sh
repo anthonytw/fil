@@ -1941,6 +1941,412 @@ pg push -q -f origin "$R:main"
 expect_pass "preflight: --from crates does not look at the VM, Docker or the keys" pfx FAKE_VM_STATUS=Stopped FAKE_DOCKER_DOWN=1 FAKE_NO_SECRET=1 FAKE_NO_IDENTITY=1 "$PF" 0.9.0 --repo o/r --from crates
 expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)" "$1"' sh "$pf/gh.log"
 
+# ============================================================== 10. release.sh (the state machine, detect-only)
+# On the preflight's fixture (the clone, its bare `origin` and `github`, the keys, the stubs): a fake
+# GitHub world (runs, releases, assets) in a directory, a tap, synthetic release files. The test does
+# each step's action by hand, then requires the command to see it, and nothing more.
+echo "== release.sh (detect-only)"
+rs=$tmp/rel
+RL=$RELEASE_DIR/release.sh
+mkdir -p "$rs/world/runs" "$rs/world/releases" "$rs/gnupg"
+chmod 700 "$rs/gnupg"
+cat > "$rs/gh.py" << 'EOF2'
+import hashlib, json, os, re, shutil, sys
+a = sys.argv[1:]
+w = os.environ["FAKE_WORLD"]
+with open(os.environ["FAKE_GH_LOG"], "a") as f:
+    f.write(" ".join(a) + "\n")
+def opt(n):
+    return a[a.index(n) + 1] if n in a else None
+def down():
+    if os.environ.get("FAKE_RL_GH_DOWN"):
+        print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
+def runs():
+    d = os.path.join(w, "runs")
+    return [json.load(open(os.path.join(d, n))) for n in sorted(os.listdir(d))]
+def rels(tag):
+    d = os.path.join(w, "releases")
+    out = []
+    for n in sorted(os.listdir(d), key=int):
+        m = json.load(open(os.path.join(d, n, "meta.json")))
+        if m["tag"] == tag:
+            out.append((n, m, os.path.join(d, n, "assets")))
+    return out
+if a[:2] == ["run", "list"]:
+    down()
+    out = [dict(databaseId=r["id"], status=r["status"], conclusion=r["conclusion"], createdAt="2026-11-09T00:%02d:00Z" % (r["id"] % 60))
+           for r in runs() if r["workflow"] == opt("--workflow") and r["event"] == opt("--event") and r["head"] == opt("--commit")
+           and (opt("--branch") is None or r["branch"] == opt("--branch"))]
+    print(json.dumps(out))
+elif a[:2] == ["run", "view"]:
+    down()
+    r = [r for r in runs() if str(r["id"]) == a[2]][0]
+    print(json.dumps(dict(headSha=r["head"], event=r["event"], workflowName=r["name"], status=r["status"], conclusion=r["conclusion"],
+                          jobs=[dict(name=n, conclusion=c, status="completed") for n, c in r["jobs"]])))
+elif a[:2] == ["release", "view"]:
+    down()
+    rs = rels(a[2])
+    if not rs:
+        print("release not found", file=sys.stderr); sys.exit(1)
+    n, m, d = rs[0]
+    assets = []
+    for f in sorted(os.listdir(d)):
+        e = dict(name=f)
+        if not os.environ.get("FAKE_NO_DIGEST"):
+            e["digest"] = "sha256:" + hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+        assets.append(e)
+    print(json.dumps(dict(isDraft=m["draft"], assets=assets)))
+elif a[:2] == ["release", "download"]:
+    n, m, d = rels(a[2])[0]
+    os.makedirs(opt("-D"), exist_ok=True)
+    shutil.copy(os.path.join(d, opt("-p")), opt("-D"))
+elif a[:1] == ["api"] and re.match(r"repos/o/r/releases$", a[1]):
+    down()
+    tag = re.search(r'tag_name == "([^"]*)"', opt("--jq")).group(1)
+    for n, m, d in rels(tag):
+        print(n)
+else:
+    os.execv(os.environ["FAKE_PF_GH"], [os.environ["FAKE_PF_GH"]] + a)
+EOF2
+printf '#!/bin/sh\nexec python3 -I "%s" "$@"\n' "$rs/gh.py" > "$rs/gh"
+cat > "$rs/cargo" << EOF2
+#!/bin/sh
+case "\$*" in
+  *--no-deps*) echo '{"packages":[{"name":"fil-shell","publish":["crates-io"]},{"name":"fil-proto","publish":["crates-io"]},{"name":"fil-testkit","publish":[]}]}' ;;
+  *) exec "$pf/bin/cargo" "\$@" ;;
+esac
+EOF2
+cat > "$rs/curl" << 'EOF2'
+#!/bin/sh
+[ "$1" = --version ] && { echo "curl stub"; exit 0; }
+for u; do :; done
+c=${u#https://crates.io/api/v1/crates/}; c=${c%%/*}
+case " ${FAKE_CRATES_PUBLISHED:-} " in *" $c "*) printf 200 ;; *) printf '%s' "${FAKE_CRATES_CODE:-404}" ;; esac
+EOF2
+# gpg: a detached "signature" is the line "gpgsig <sha256 of the data>"; the rest is the preflight's stub.
+cat > "$rs/gpg" << EOF2
+#!/bin/sh
+case " \$* " in
+  *" --import "*) exit 0 ;;
+  *" --verify "*)
+    for x; do s=\$d; d=\$x; done
+    [ "\$(cat "\$s")" = "gpgsig \$(shasum -a 256 "\$d" 2> /dev/null | cut -d' ' -f1 || sha256sum "\$d" | cut -d' ' -f1)" ] || exit 1
+    echo "[GNUPG:] VALIDSIG ABCDEF0123456789ABCDEF0123456789ABCDEF01 2026-11-09 0 4 0 22 8 00 ABCDEF0123456789ABCDEF0123456789ABCDEF01" ;;
+  *) exec "$pf/bin/gpg" "\$@" ;;
+esac
+EOF2
+chmod +x "$rs/gh" "$rs/cargo" "$rs/curl" "$rs/gpg"
+# the tap: a bare remote and a clone
+git init -q --bare "$rs/tap.git"
+git init -q -b main "$rs/tap"
+echo tap > "$rs/tap/README.md"
+git -C "$rs/tap" add -A && git -C "$rs/tap" commit -q --no-gpg-sign -m tap
+git -C "$rs/tap" remote add origin "$rs/tap.git"
+git -C "$rs/tap" push -q origin main
+git -C "$rs/tap" fetch -q origin
+: > "$pf/gh.log"
+rlx() {
+  pfx env FIL_GH="$rs/gh" FIL_GPG="$rs/gpg" FIL_CARGO="$rs/cargo" FIL_CRATES_CURL="$rs/curl" FAKE_WORLD="$rs/world" FAKE_PF_GH="$pf/bin/gh" \
+    SSH_AUTH_SOCK="$rs/none.sock" GNUPGHOME="$rs/gnupg" "$@"
+}
+# rl [ENV=VALUE ...] [-- ARGS ...]: a run of the command in this world
+rl() {
+  local -a e=() x=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do e+=("$1"); shift; done
+  [ $# = 0 ] || { shift; x=("$@"); }
+  rlx ${e[@]+"${e[@]}"} "$RL" 0.9.0 --repo o/r --tap "$rs/tap" ${x[@]+"${x[@]}"}
+}
+# last: the output of the last expect_pass/expect_fail, kept before the next one overwrites it
+last() { cp "$tmp/out.log" "$rs/last.log"; }
+rls() { rlx "$@" "$RL" 0.9.0 --repo o/r --tap "$rs/tap" --status; }
+RW=$pf/clone/target/release-verify/0.9.0
+RSTATE=$RW/release.state
+RR=$(pg rev-parse HEAD)
+# rl_status_is N STEP KIND: --status says step N is KIND ("done (checked)", "next", ...)
+rl_line() { rls "${@:3}" > "$rs/status.out" 2>&1; grep -E "^ +$1/17 $2 " "$rs/status.out" | head -n 1; }
+rl_kind() {
+  local line
+  line=$(rl_line "$1" "$2" "${@:5}")
+  case $line in *" $2 "*"$3"*) pass "release status: $2 is $3${4:+ ($4)}" ;; *) flunk "release status: $2 is $3${4:+ ($4)} (it says: ${line:-nothing})"; sed 's/^/       | /' "$rs/status.out" | head -30 ;; esac
+}
+# rl_paused N STEP: a run stops at step N with exit 2
+rl_paused() {
+  local st=0
+  rl "${@:3}" > "$rs/run.out" 2>&1 || st=$?
+  if [ $st = 2 ] && grep -q "^release: PAUSED at step $1/17 $2\$" "$rs/run.out"; then pass "release run: paused at $1 $2"; else
+    flunk "release run: paused at $1 $2 (exit $st)"
+    sed 's/^/       | /' "$rs/run.out" | tail -15
+  fi
+}
+rl_refs() { pg for-each-ref --format='%(refname) %(objectname)' | grep -v '^refs/remotes/' | LC_ALL=C sort; pg status --porcelain; }
+
+expect_fail "release: a test-only override outside the self-test is refused" rl FIL_RELEASE_SELFTEST=
+last
+expect_pass "release: ...saying so" grep -q 'a release that asks a fake proves nothing' "$rs/last.log"
+expect_fail "release: --redo is not in this version" rlx "$RL" 0.9.0 --redo tag
+last
+expect_pass "release: ...it says the actions come later" grep -q 'arrive in PRs 4-6' "$rs/last.log"
+
+# 0: nothing done but the candidate
+rl_refs > "$rs/refs.before"
+rl_kind 1 candidate "done (checked)"
+rl_kind 2 mirror next
+rl_kind 3 dry-run pending
+expect_pass "release status: wrote no state" test ! -e "$RSTATE"
+expect_pass "release status: ...and changed no ref or file of the clone" sh -c 'rl_refs() { git -C "$1" for-each-ref --format="%(refname) %(objectname)" | grep -v "^refs/remotes/" | LC_ALL=C sort; git -C "$1" status --porcelain; }; rl_refs "$1" | cmp -s - "$2"' sh "$pf/clone" "$rs/refs.before"
+rl_paused 2 mirror
+expect_pass "release run: ...with the failure format's do and then lines" sh -c 'grep -q "^  do:    G=" "$1" && grep -q "^  then:  just release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
+expect_pass "release run: ...the preflight ran for mirror and after" grep -q '^preflight: all .* checks passed for 0.9.0' "$rs/run.out"
+expect_pass "release run: ...the state is bound to the version and HEAD" sh -c 'grep -qx "version=0.9.0" "$1" && grep -qx "release_commit=$2" "$1"' sh "$RSTATE" "$RR"
+expect_pass "release run: ...and the lock is gone" test ! -e "$RW/.lock"
+
+# binding
+cp "$RSTATE" "$rs/state.saved"
+sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.saved" > "$RSTATE"
+expect_fail "release run: a state bound to another commit is refused" rl
+last
+expect_pass "release run: ...saying there is no tag yet and --reset-state rebinds" sh -c 'grep -q "no v0.9.0 on GitHub yet" "$1" && grep -q -- "--reset-state (it rebinds)" "$1"' sh "$rs/last.log"
+rl_paused 2 mirror -- --reset-state
+expect_pass "release run: ...--reset-state before the tag rebinds" grep -qx "release_commit=$RR" "$RSTATE"
+# the lock
+mkdir -p "$RW/.lock"
+sleep 300 > /dev/null 2>&1 &
+rl_sleeper=$!
+echo "$rl_sleeper" > "$RW/.lock/pid"
+expect_fail "release run: a live lock stops a second run" rl
+last
+expect_pass "release run: ...naming its pid" grep -q "another release run (pid $rl_sleeper)" "$rs/last.log"
+kill "$rl_sleeper" 2> /dev/null || true
+wait "$rl_sleeper" 2> /dev/null || true
+rl_paused 2 mirror
+expect_pass "release run: ...a stale lock is removed with a note" grep -q 'removed a stale lock' "$rs/run.out"
+
+# 1: the mirror commit
+RG=$(pg commit-tree "$RR^{tree}" -p github/main -m 'fil 0.9.0')
+pg push -q github "$RG:refs/heads/main"
+rl_kind 2 mirror "done (checked)"
+rl_paused 3 dry-run
+expect_pass "release run: ...recorded the mirror commit" grep -qx "github_commit=$RG" "$RSTATE"
+# GitHub's main moved on to a commit the clone has not fetched: the recorded mirror commit is not
+# proof enough (status does not fetch)
+git clone -q -b main "$pf/github.git" "$rs/other"
+git -C "$rs/other" commit -q --allow-empty --no-gpg-sign -m later
+git -C "$rs/other" push -q origin HEAD:main
+rl_kind 2 mirror "next (unknown)" "github's main not in the clone"
+expect_pass "release status: ...says to fetch it" grep -q 'git fetch github' "$rs/status.out"
+git -C "$rs/other" push -q -f origin "$RG:refs/heads/main"
+rm -rf "$rs/other"
+
+# 2: the dry run and the two checks (suite=all), and a newer suite=check run that is not one
+mkrun() { # ID WORKFLOW NAME EVENT BRANCH HEAD STATUS CONCLUSION JOB=CONCLUSION...
+  python3 -I -c 'import json, sys
+a = sys.argv[1:]
+print(json.dumps(dict(id=int(a[0]), workflow=a[1], name=a[2], event=a[3], branch=a[4], head=a[5], status=a[6], conclusion=a[7],
+                      jobs=[j.split("=", 1) for j in a[8:]])))' "$@" > "$rs/world/runs/$1.json"
+}
+mkrun 101 release.yml release workflow_dispatch main "$RG" completed success build-linux=success publish=skipped
+mkrun 102 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=skipped" aarch64=skipped terminals=skipped
+mkrun 103 macos-check.yml macos-check workflow_dispatch main "$RG" completed success "check (arm64)=success" "remote (openssh)=success" "brew (arm64)=skipped"
+rl_kind 3 dry-run next "without the linux suite=all run"
+mkrun 105 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=skipped" aarch64=skipped terminals=skipped
+mkrun 104 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=success" aarch64=success terminals=success
+rl_kind 3 dry-run "done (checked)" "a newer suite=check run is passed over"
+expect_pass "release status: ...with the runs' URLs" grep -q 'https://github.com/o/r/actions/runs/101' "$rs/status.out"
+rl_paused 4 dry-verify
+expect_pass "release run: ...recorded the three run ids" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=104 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
+# 3: dry-verify is a local result: what PR 4's action will write
+echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+rl_kind 4 dry-verify "done (recorded)"
+echo "dry_verify=ok 999 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+rl_kind 4 dry-verify next "a record for another run does not count"
+echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+# a recorded dry-verify never makes a red check read as done (implied)
+cp "$rs/world/runs/104.json" "$rs/run104.saved"
+mkrun 104 linux-check.yml linux-check workflow_dispatch main "$RG" completed failure check=success "realnet (a)=success" aarch64=success terminals=failure
+rl_kind 3 dry-run next "the suite=all check failed, dry-verify recorded"
+rl_kind 4 dry-verify pending "...and dry-verify does not count without it"
+cp "$rs/run104.saved" "$rs/world/runs/104.json"
+rl_paused 5 tag
+
+# 4: burned tags: one the signers on main do not list, one on a commit of another tree
+pg -c user.signingkey="$pf/otherkey.pub" tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG"
+pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+rl_kind 5 tag BURNED "signed by a key not on main"
+expect_fail "release run: a burned tag is a hard stop" rl
+last
+expect_pass "release run: ...this version is burned" grep -q 'this version is burned: bump to the next patch' "$rs/last.log"
+pg push -q github :refs/tags/v0.9.0
+pg tag -d v0.9.0-gh > /dev/null
+pg tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG^"
+pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+rl_kind 5 tag BURNED "on a commit without the release commit's tree"
+pg push -q github :refs/tags/v0.9.0
+pg tag -d v0.9.0-gh > /dev/null
+# the real tag
+pg tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG"
+pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+rl_kind 5 tag "done (checked)"
+rl_kind 6 tag-run next
+expect_fail "release run: --reset-state after the tag is refused" rl -- --reset-state
+last
+expect_pass "release run: ...the tag binds its commit" grep -q 'reset-state is refused (the tag binds' "$rs/last.log"
+rl_paused 6 tag-run
+expect_pass "release run: ...recorded the tag object" grep -qx "tag_object=$(pg rev-parse v0.9.0-gh)" "$RSTATE"
+expect_pass "release run: ...and the preflight was bound to the release commit" grep -q 'HEAD is the bound release commit' "$rs/run.out"
+
+# 5: the tag's run and its draft (synthetic release files)
+mkrun 201 release.yml release push v0.9.0 "$RG" waiting - prepare=success publish=success crates-io=-
+rf=$rs/files0
+mkdir -p "$rf"
+printf 'x\n' > "$rs/payload"
+printf '%s\t/usr/bin/fil\t755\n' "$rs/payload" > "$rs/manifest"
+for f in fil-0.9.0-aarch64-linux-musl.tar.gz fil-0.9.0-source.tar.gz fil-0.9.0-x86_64-linux-musl.tar.gz fil_0.9.0_amd64.deb fil_0.9.0_arm64.deb; do echo "$f" > "$rf/$f"; done
+echo ci-mac > "$rf/fil-0.9.0-universal-apple-darwin.tar.gz"
+cp "$rf/fil-0.9.0-universal-apple-darwin.tar.gz" "$rf/fil-0.9.0-universal-apple-darwin.ci.tar.gz"
+for a in x86_64 aarch64; do python3 -I "$RELEASE_DIR/selftest_pkg.py" rpm "$rf/fil-0.9.0-1.$a.rpm" fil 0.9.0 1 "$a" 0 "$rs/manifest"; done
+rewrite_sums "$rf" 0.9.0
+mkdraft() { # ID
+  mkdir -p "$rs/world/releases/$1/assets"
+  echo '{"tag": "v0.9.0", "draft": true}' > "$rs/world/releases/$1/meta.json"
+  cp "$rf"/* "$rs/world/releases/$1/assets/"
+}
+mkdraft 1
+DA=$rs/world/releases/1/assets
+rl_kind 6 tag-run "done (checked)"
+mkdraft 2
+rl_kind 6 tag-run next "two drafts"
+expect_pass "release status: ...names the double-draft trap" grep -q 'double-draft trap' "$rs/status.out"
+rm -rf "$rs/world/releases/2"
+rl_paused 7 verify-presign
+expect_pass "release run: ...recorded the tag run" grep -qx tag_run=201 "$RSTATE"
+
+# 6-12, as the owner's scripts leave the work directory
+mkdir -p "$RW"
+cp -R "$rf" "$RW/files"
+printf 'sums=%s\nrebuild=1\npresign=1\ndry=0\n' "$(sha256 "$RW/files/SHA256SUMS")" > "$RW/verified"
+rl_kind 7 verify-presign "done (checked)"
+rl_paused 8 sign-macos
+# sign-macos: a new macOS archive, SHA256SUMS and .sig, in the draft and the work directory
+echo signed-mac > "$RW/files/fil-0.9.0-universal-apple-darwin.tar.gz"
+rewrite_sums "$RW/files" 0.9.0
+ssh-keygen -q -Y sign -f "$pf/key" -n fil-release "$RW/files/SHA256SUMS"
+cp "$RW/files/fil-0.9.0-universal-apple-darwin.tar.gz" "$DA/"
+rl_kind 8 sign-macos next "an upload that stopped after the archive"
+cp "$RW/files/SHA256SUMS" "$DA/"
+rl_kind 8 sign-macos pending "...and before the .sig (verify-presign no longer matches the draft either)"
+cp "$RW/files/SHA256SUMS.sig" "$DA/"
+printf 'sums=%s\nrebuild=1\npresign=1\ndry=0\nmacos=signed\n' "$(sha256 "$RW/files/SHA256SUMS")" > "$RW/verified"
+rl_kind 8 sign-macos "done (checked)"
+rl_kind 7 verify-presign "done (checked)" "still, after sign-macos"
+rl_kind 10 sign-sums pending "sign-macos's .sig alone is not sign-sums"
+# sign-packages
+for a in x86_64 aarch64; do python3 -I "$RELEASE_DIR/selftest_pkg.py" sign "$RW/files/fil-0.9.0-1.$a.rpm"; done
+touch "$RW/files/.signed-locally"
+rewrite_sums "$RW/files" 0.9.0
+echo "gpgsig $(sha256 "$RW/files/SHA256SUMS")" > "$RW/files/SHA256SUMS.asc"
+rl_kind 9 sign-packages "done (checked)"
+rl_kind 10 sign-sums next "the old .sig covers the old SHA256SUMS"
+echo "gpgsig 0" > "$RW/files/SHA256SUMS.asc"
+rl_kind 9 sign-packages next "an .asc that does not verify"
+echo "gpgsig $(sha256 "$RW/files/SHA256SUMS")" > "$RW/files/SHA256SUMS.asc"
+rl_paused 10 sign-sums
+# sign-sums
+rm -f "$RW/files/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -f "$pf/otherkey" -n fil-release "$RW/files/SHA256SUMS"
+rl_kind 10 sign-sums next "a .sig by a key not on main"
+rm -f "$RW/files/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -f "$pf/key" -n fil-release "$RW/files/SHA256SUMS"
+rl_kind 10 sign-sums "done (checked)"
+rl_paused 11 upload
+# upload
+for f in fil-0.9.0-1.x86_64.rpm fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc; do cp "$RW/files/$f" "$DA/"; done
+rl_kind 11 upload next "the .sig not uploaded"
+cp "$RW/files/SHA256SUMS.sig" "$DA/"
+rl_kind 11 upload "done (checked)"
+rl_kind 7 verify-presign "done (implied)" "the draft moved on"
+rl_kind 11 upload "done (checked)" "with a gh that reports no digests" FAKE_NO_DIGEST=1
+rl_paused 12 verify-signed
+# verify-signed
+printf 'sums=%s\nrebuild=1\npresign=0\ndry=0\n' "$(sha256 "$RW/files/SHA256SUMS")" > "$RW/verified"
+rl_kind 12 verify-signed "done (checked)"
+rl_paused 13 publish
+# the state file deleted: everything is derived again
+rm -f "$RSTATE"
+rl_kind 12 verify-signed "done (checked)" "with no state file"
+rl_kind 4 dry-verify "done (implied)" "with no state file"
+rl_paused 13 publish
+expect_pass "release run: ...re-derived the identifiers" sh -c 'grep -qx dry_run=101 "$1" && grep -qx tag_run=201 "$1" && grep -qx "github_commit=$2" "$1"' sh "$RSTATE" "$RG"
+echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+# 13: publish
+echo '{"tag": "v0.9.0", "draft": false}' > "$rs/world/releases/1/meta.json"
+rl_kind 13 publish "done (checked)"
+rl_paused 14 verify-published
+echo "verify_published=ok $(sha256 "$DA/SHA256SUMS") 2026-11-09T13:00:00Z" >> "$RSTATE"
+rl_kind 14 verify-published "done (recorded)"
+# 15: crates
+rl_kind 15 crates next "nothing on crates.io"
+rl_kind 15 crates next "one of two crates" FAKE_CRATES_PUBLISHED=fil-shell
+expect_pass "release status: ...names the missing one" grep -q 'not on crates.io at 0.9.0: fil-proto' "$rs/status.out"
+rl_kind 15 crates "next (unknown)" "crates.io down" FAKE_CRATES_CODE=503
+rl_kind 15 crates "done (checked)" "" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+rl_paused 16 brew FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+# 16: the tap
+mkdir -p "$rs/tap/Formula"
+"$REPO_ROOT/packaging/render.sh" brew 0.9.0 "$RW/files/SHA256SUMS" "$rs/brew" > /dev/null 2>&1
+cp "$rs/brew/fil.rb" "$rs/tap/Formula/fil.rb"
+git -C "$rs/tap" add -A && git -C "$rs/tap" commit -q --no-gpg-sign -m 'fil 0.9.0'
+rl_kind 16 brew next "committed, not pushed" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+git -C "$rs/tap" push -q origin main
+rl_kind 16 brew "done (checked)" "" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > "$rs/run.out" 2>&1 && st=0 || st=$?
+if [ $st = 0 ] && grep -q 'steps 1-16 of 17 are done' "$rs/run.out"; then pass "release run: everything through brew done: exit 0"; else flunk "release run: everything through brew done: exit 0 (exit $st)"; tail -8 "$rs/run.out" | sed 's/^/       | /'; fi
+# the whole status, against its golden (the notes after the label are not compared)
+rls FAKE_CRATES_PUBLISHED="fil-shell fil-proto" 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }' > "$rs/golden.out"
+cat > "$rs/golden" << 'EOF2'
+1/17 candidate done (checked)
+2/17 mirror done (checked)
+3/17 dry-run done (checked)
+4/17 dry-verify done (recorded)
+5/17 tag done (checked)
+6/17 tag-run done (checked)
+7/17 verify-presign done (checked)
+8/17 sign-macos done (checked)
+9/17 sign-packages done (checked)
+10/17 sign-sums done (checked)
+11/17 upload done (checked)
+12/17 verify-signed done (checked)
+13/17 publish done (checked)
+14/17 verify-published done (recorded)
+15/17 crates done (checked)
+16/17 brew done (checked)
+17/17 finish next
+EOF2
+expect_pass "release status: the whole listing matches its golden" diff "$rs/golden" "$rs/golden.out"
+expect_pass "release status: ...and it shows the keys" grep -q '^keys (just release-keys status):' "$rs/status.out"
+rl_kind 3 dry-run "done (implied)" "GitHub down: the tag still verifies" FAKE_RL_GH_DOWN=1
+rl_kind 6 tag-run "next (unknown)" "GitHub down" FAKE_RL_GH_DOWN=1
+# a good tag, the state gone, HEAD on a later main commit: not burned; the run names the release
+# commit and records nothing, and --status shows the release the tag names
+rm -f "$RSTATE"
+echo later > "$pf/clone/later2"
+pg add later2
+pg commit -q --no-gpg-sign -m later2
+pg push -q origin HEAD:main
+expect_fail "release run: a good tag on another tree than HEAD, nothing bound, fails" rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+last
+expect_pass "release run: ...not as burned" sh -c '! grep -qi "burned" "$1"' sh "$rs/last.log"
+expect_pass "release run: ...naming the release commit to check out" grep -q "git checkout $RR" "$rs/last.log"
+expect_pass "release run: ...and recording nothing" test ! -e "$RSTATE"
+rl_kind 5 tag "done (checked)" "status from a later commit finds the tag's release commit" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+rl_kind 16 brew "done (checked)" "...and shows the whole release" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
+pg reset -q --hard "$RR"
+pg push -q -f origin "$RR:main"
+rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > /dev/null 2>&1 || true
+echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
+# the state: identifiers and results only
+expect_pass "release: the state holds only its keys (no reaper pid, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|dry_verify|tag_object|tag_run|verify_published)=" "$1"' sh "$RSTATE"
+expect_pass "release: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload; no workflow run)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow run|^run (rerun|cancel)" "$1"' sh "$pf/gh.log"
+
 echo
 echo "release-test: $passed passed, $failed failed"
 [ "$failed" = 0 ]

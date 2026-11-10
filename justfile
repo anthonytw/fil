@@ -446,6 +446,15 @@ release-verify version *args:
 release-preflight version *args:
     tests/release/release-preflight.sh "$@"
 
+# The one-command release (docs/m4/release.md section 9.5), DETECT-ONLY for now: binds the run to
+# VERSION and HEAD, takes the lock, works out from the world (git refs, GitHub's runs and releases,
+# crates.io, the tap) which of the seventeen steps are done, runs the preflight for the rest, and
+# stops at the next step with what to do by hand (exit 2). `--status` is read-only: each step's
+# state and the keys. The actions arrive in later PRs. See tests/release/release.sh.
+[positional-arguments]
+release version *args:
+    tests/release/release.sh "$@"
+
 # Reserve the crates.io names of the nine published crates with a 0.0.1 placeholder each. Whoever holds the
 # publishing account runs it, after `cargo login`; the placeholders are built outside the repository, paced
 # for the new-crate limit, and names already registered are skipped (docs/m4/release.md section 10.1).

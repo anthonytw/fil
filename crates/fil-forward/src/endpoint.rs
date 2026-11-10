@@ -2345,13 +2345,17 @@ impl<L: Link> Inner<L> {
                 }
                 continue;
             }
+            // A pause is looked at first: a connection that arrives after `pause_listener`
+            // returned must stay in the backlog, and an unbiased select picks either branch
+            // when both are ready.
             let accepted = tokio::select! {
+                biased;
+                _ = paused.changed() => continue,
                 a = std::future::poll_fn(|cx| match &*lock(&l.sockets[socket]) {
                     Some(sock) => sock.poll_accept(cx).map(Some),
                     // Closed by `unlisten`.
                     None => Poll::Ready(None),
                 }) => a,
-                _ = paused.changed() => continue,
             };
             match accepted {
                 None => return,

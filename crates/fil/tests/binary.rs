@@ -202,9 +202,18 @@ fn a_taken_forward_port_exits_255_with_forward_failure_exit_and_warns_otherwise(
     );
     assert!(err.contains(PAST_FORWARDS), "{err}");
 
-    // A free port: nothing to fail.
-    let free = format!("\"-L {}\"", free_port());
-    let (_, err) = run("exit", &free);
+    // A free port: nothing to fail. `free_port` only saw it free: a test running beside this one
+    // can take it before fil listens, so a port found in use is replaced (a few times at most).
+    let mut tries = 0;
+    let err = loop {
+        let free = format!("\"-L {}\"", free_port());
+        let (_, err) = run("exit", &free);
+        tries += 1;
+        if tries < 5 && err.contains("the port is in use") {
+            continue;
+        }
+        break err;
+    };
     assert!(
         !err.contains("not attaching") && err.contains(PAST_FORWARDS),
         "{err}"

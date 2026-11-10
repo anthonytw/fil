@@ -159,7 +159,7 @@ l_nodelay() {
   local fcfile=$PD/lat-strace-fil.txt
   client_exec_on x rm -f "$fcfile"
   client_exec_on x keyprobe keys --shell --rate 20 --count 20 --warmup 2 --drain-ms 3000 -- \
-    strace -f -e trace=setsockopt -o "$fcfile" fil --transport pipe srv latnd > "$OUT/run/lat-strace-fil.keyprobe" 2>&1 \
+    strace -f -e trace=setsockopt -o "$fcfile" fil --predict off --transport pipe srv latnd > "$OUT/run/lat-strace-fil.keyprobe" 2>&1 \
     || log "the traced fil run failed: $(tail -n 3 "$OUT/run/lat-strace-fil.keyprobe")"
   cx_fk latnd
   client_exec_on x cat "$fcfile" > "$OUT/run/lat-strace-fil.txt" 2> /dev/null || true
@@ -192,6 +192,11 @@ lat_count() {
   if [[ $n -lt 300 ]]; then n=300; fi
   printf '%s' "$n"
 }
+
+# Every fil cell here (and in fwd.sh) runs with `--predict off`: these cells measure the server's
+# echo, and since adaptive prediction became the default (M3 E1b) an idle cell's echo is otherwise
+# drawn locally in well under a millisecond, which made H1's "2 x idle + 10 ms" line ~10 ms.
+# Prediction's own latency is predict.sh's job.
 
 # lat_kp TAG RATE SETTLE_MS -- COMMAND...: keyprobe in the client namespace, typing into COMMAND on
 # a pty. Output in $OUT/run/SCENARIO-TAG.keyprobe (and .err). Returns keyprobe's status. The fil
@@ -261,8 +266,8 @@ lat_cell() {
   case $kind in
     ssh) tag=s$load$rate cmd=(ssh -tt srv) ;;
     sshno) tag=n$load$rate cmd=(ssh -tt -o ObscureKeystrokeTiming=no srv) ;;
-    pipe) tag=p$load$rate cmd=(fil --transport pipe srv "latp$load$rate") ;;
-    quic) tag=q$load$rate cmd=(fil --transport direct srv "latq$load$rate") settle=3000 ;;
+    pipe) tag=p$load$rate cmd=(fil --predict off --transport pipe srv "latp$load$rate") ;;
+    quic) tag=q$load$rate cmd=(fil --predict off --transport direct srv "latq$load$rate") settle=3000 ;;
   esac
   log "=== cell $tag: $kind at $rate keys/s ($load)"
   lat_kp "$tag" "$rate" "$settle" -- "${cmd[@]}" || fail "$tag: keyprobe failed: $(cat "$OUT/run/$SCENARIO-$tag.err" "$OUT/run/$SCENARIO-$tag.keyprobe" 2> /dev/null | tail -n 5)"
@@ -458,8 +463,8 @@ l_catchup() {
       tag=c$kind$net
       case $kind in
         ssh) cmd=(ssh -tt srv) ;;
-        pipe) cmd=(fil --transport pipe srv "lat$tag") ;;
-        quic) cmd=(fil --transport direct srv "lat$tag") ;;
+        pipe) cmd=(fil --predict off --transport pipe srv "lat$tag") ;;
+        quic) cmd=(fil --predict off --transport direct srv "lat$tag") ;;
       esac
       log "=== catch-up cell $tag"
       local settle=500

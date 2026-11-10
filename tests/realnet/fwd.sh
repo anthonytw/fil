@@ -797,8 +797,8 @@ fwd_bulk_cmd() {
     # The same without OpenSSH's keystroke-timing obfuscation (20 ms batches on a pty session,
     # docs/m2/latency.md): the like-for-like baseline, as fil's pipe never pays it.
     sshno) FWD_CMD=(ssh -tt -o ObscureKeystrokeTiming=no "${l[@]}" srv) ;;
-    pipe) FWD_CMD=(fil --transport pipe "${l[@]}" srv "$name") ;;
-    quic) FWD_CMD=(fil --transport direct "${l[@]}" srv "$name") ;;
+    pipe) FWD_CMD=(fil --predict off --transport pipe "${l[@]}" srv "$name") ;;
+    quic) FWD_CMD=(fil --predict off --transport direct "${l[@]}" srv "$name") ;;
   esac
 }
 
@@ -1058,7 +1058,7 @@ fwd_h1_servers() {
 fwd_h1_start() {
   local tag=$1 kind=$2 pace=$3 t=pipe
   [[ $kind == quic ]] && t=direct
-  local cmd=(env "FIL_FORWARD_PACING=$pace" fil --transport "$t"
+  local cmd=(env "FIL_FORWARD_PACING=$pace" fil --predict off --transport "$t"
     -L "127.0.0.1:$LAT_FWD_DOWN:127.0.0.1:$LAT_SOURCE_PORT"
     -L "127.0.0.1:$FWD_H1_RR:127.0.0.1:$FWD_H1_ECHO"
     -L "127.0.0.1:$FWD_H1_STUCK:127.0.0.1:$FWD_H1_DEAF" srv "h1$tag")

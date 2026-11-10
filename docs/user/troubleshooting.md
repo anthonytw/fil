@@ -19,13 +19,13 @@ Both are JSON lines, private to you, and rotated. They are quiet by default. `FI
 
 ## "fil is not installed on the remote host"
 
-The remote command `fil server --stdio` found no `fil` on the `PATH` of a non-interactive ssh login there. That `PATH` is often shorter than the one you see when you log in; `ssh devbox 'echo $PATH'` shows the one that counts. Either let fil [install itself](install.md) (`fil install devbox`), or copy a release's `bin/fil` into one of those directories, as a file, not a symbolic link.
+Neither the `PATH` of a non-interactive ssh login there nor fil's install directory (`~/.local/share/fil`, and `~/.local/bin`) has a `fil` of this wire. That `PATH` is often shorter than the one you see when you log in; `ssh devbox 'echo $PATH'` shows the one that counts. Either let fil [install itself](install.md) (`fil install devbox`), or copy a release's `bin/fil` into a directory on that `PATH`, or into `~/.local/bin`, as a file, not a symbolic link (`~/.local/share/fil` is for the copies fil installs itself).
 
-With `remote = "plain"` in your [config](config.md), fil never tries to install and gives only this message.
+With `remote = "plain"` in your [config](config.md), only `fil server --stdio` runs, fil never tries to install, and the message names that command. fil explains a missing `fil` in its own words: the remote shell's own "command not found" line is not shown.
 
 ## "Wire version mismatch", or "the fil on the remote host is older"
 
-Two fil builds talk only when their wire numbers (`wire 1.12` in `fil --version`) are equal. The message says which side is newer and which to upgrade. By default, when the host's fil speaks another wire and no daemon of yours at your wire is running there, fil tries its install command once: that starts a copy of the right version if the host has one, and otherwise offers to install it. Otherwise upgrade the older side: [install](install.md) the same version on the host.
+Two fil builds talk only when their wire numbers (`wire 1.12` in `fil --version`) are equal. The message says which side is newer and which to upgrade. By default fil runs its install command first, which never starts a fil of another wire: it starts a copy of the right version if the host has one, and otherwise offers to install it. You see this message with `remote = "plain"`, behind a forced command, or when the copy it started is of another wire. Then upgrade the older side: [install](install.md) the same version on the host.
 
 Daemons of different wires coexist on a host, so an upgrade breaks no running session. Sessions of the old daemon keep running there; the new fil does not list them, and the old fil still reaches them.
 
@@ -49,9 +49,11 @@ Your sessions will end when your last login does, which is the opposite of what 
 
 ## Hosts that allow only the plain command
 
-Some hosts accept only `fil server --stdio`: a `ForceCommand` in `sshd_config`, or `command=` in `authorized_keys`. The install command can't run there. Set `remote = "plain"` for that host in your [config](config.md) and install fil on it by hand, on the `PATH` the gate uses. With `remote = "installed"` on such a host, fil ends the run at once and tells you to install fil there by hand or use `plain`.
+Some hosts accept only `fil server --stdio`: a `ForceCommand` in `sshd_config`, or `command=` in `authorized_keys`. The install command can't run there, and fil can't install itself; install fil on it by hand, on the `PATH` the gate uses. With the default `remote = "auto"`, fil sees the gate answer its install command and runs `fil server --stdio` instead, which costs a second ssh login on each run; set `remote = "plain"` for that host in your [config](config.md) to save it. With `remote = "installed"` on such a host, fil ends the run at once and tells you to install fil there by hand or use `plain`.
 
 A host whose config names its own `pipe` is never rewritten and is never offered an install.
+
+With the default `remote = "auto"`, fil's install command needs `sh`, `id`, `ls`, `grep` and `uname` on the host, and finds `fil` the way `sh` does: a `fil` that is only a shell function or alias in your zsh or fish setup is not found. On such a host set `remote = "plain"`, which runs only `fil server --stdio` through your login shell.
 
 ## A home directory mounted `noexec`
 

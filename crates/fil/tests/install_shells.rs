@@ -67,6 +67,18 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// This process's `PATH` without the directories that have a `fil`: the bootstrap's `attach`
+/// starts a `fil` of this wire on `PATH` (owner, 2026-11-09), and a developer's own install must
+/// not stand in for the copies the cases put in place.
+fn path_without_fil() -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let kept: Vec<&str> = path
+        .split(':')
+        .filter(|d| !d.is_empty() && !Path::new(d).join("fil").exists())
+        .collect();
+    kept.join(":")
+}
+
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -166,10 +178,7 @@ impl World {
 
     /// Runs the bootstrap as a login shell would, with `input` on its stdin (then EOF).
     fn run(&self, input: &[u8]) -> (String, i32) {
-        let base_path = self
-            .path
-            .clone()
-            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        let base_path = self.path.clone().unwrap_or_else(path_without_fil);
         let path = match &self.shim {
             Some(s) => format!("{}:{base_path}", s.display()),
             None => base_path,
@@ -244,6 +253,15 @@ impl World {
         let f = self.home.join(".local/bin/fil");
         write_exe(&f, content, mode);
         f
+    }
+
+    /// A directory with `fil` (of `content`) first on the login's `PATH`.
+    fn with_path_bin(&mut self, content: &str) -> PathBuf {
+        let bin = self.base().join("pathbin");
+        mkdir(&bin, 0o755);
+        write_exe(&bin.join("fil"), content, 0o755);
+        self.path = Some(format!("{}:{}", bin.display(), path_without_fil()));
+        bin
     }
 
     fn canary_ran(&self) -> bool {
@@ -858,27 +876,60 @@ fn cases() -> Vec<Case> {
             )
         }),
         (
-            "an old wire's fil on PATH is never tried: the exact version or an upload wins",
+            "an old wire's fil on PATH never runs as the server: the exact version or an upload wins",
             |w| {
-                let bin = w.base().join("pathbin");
-                mkdir(&bin, 0o755);
-                write_exe(&bin.join("fil"), &canary("1.1"), 0o755);
-                w.path = Some(format!(
-                    "{}:{}",
-                    bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ));
+                let bin = w.with_path_bin(&fake_fil("1.1"));
                 let (out, _) = w.run(b"attach\n");
                 expect(
-                    !w.canary_ran() && out.starts_with("FIL-BOOT1 attach "),
-                    "PATH not tried",
+                    out.starts_with("FIL-BOOT1 attach ") && !out.contains("STDIO"),
+                    "the greeting, not the PATH fil",
                     &out,
                 )?;
                 w.install_copy(&fake_fil(&wire()));
                 let (out, _) = w.run(b"attach\n");
                 expect(
-                    !w.canary_ran() && out.contains("STDIO") && out.contains(dir_name()),
+                    out.contains("STDIO")
+                        && out.contains(dir_name())
+                        && !out.contains(&bin.display().to_string()),
                     "the exact version",
+                    &out,
+                )
+            },
+        ),
+        (
+            "fast path: the fil on PATH of this wire runs, after the marker (owner, 2026-11-09)",
+            |w| {
+                w.umask = "027";
+                let bin = w.with_path_bin(&fake_fil(&wire()));
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    out.starts_with("FIL-BOOT1 exec\n\x1bFIL-CONNECT 1\nSTDIO umask=0027")
+                        && out.contains(&bin.join("fil").display().to_string()),
+                    "exec, then the PATH fil's relay, with the login's umask",
+                    &out,
+                )
+            },
+        ),
+        (
+            "the order: the exact version, then ~/.local/bin/fil, then the PATH fil",
+            |w| {
+                let bin = w.with_path_bin(&fake_fil(&wire()));
+                w.local_bin(&fake_fil(&wire()), 0o755);
+                let d = w.install_copy(&fake_fil(&wire()));
+                let (out, _) = w.run(b"attach\n");
+                expect(out.contains(dir_name()), "the exact version first", &out)?;
+                std::fs::remove_dir_all(&d).unwrap();
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    out.contains(".local/bin/fil"),
+                    "then ~/.local/bin/fil",
+                    &out,
+                )?;
+                std::fs::remove_file(w.home.join(".local/bin/fil")).unwrap();
+                let (out, _) = w.run(b"attach\n");
+                expect(
+                    out.contains(&bin.join("fil").display().to_string()),
+                    "then the PATH fil",
                     &out,
                 )
             },
@@ -965,7 +1016,7 @@ fn an_existing_fresh_directory_is_never_reused() {
         .arg(body)
         .env_clear()
         .env("HOME", &w.home)
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_without_fil())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1008,7 +1059,7 @@ fn an_interrupted_upload_leaves_nothing_runnable_and_gc_collects_it() {
         .arg(body)
         .env_clear()
         .env("HOME", &w.home)
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_without_fil())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1070,7 +1121,7 @@ fn an_upload_whose_directory_vanishes_fails_cleanly() {
         .arg(BOOT)
         .env_clear()
         .env("HOME", &w.home)
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_without_fil())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

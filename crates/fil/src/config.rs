@@ -14,8 +14,9 @@
 //! remote_requests = "ask"     # ask | deny: `fil forward` run on the host (section 7.3)
 //! forward_failure = "warn"    # warn | exit: a forward that cannot bind (ssh ExitOnForwardFailure)
 //! remote = "auto"             # auto | plain | installed: the remote command (docs/m4/install.md):
-//!                             # `fil server --stdio` first, the install bootstrap if it finds
-//!                             # no fil; plain: never the bootstrap; installed: the bootstrap
+//!                             # the install bootstrap first, `fil server --stdio` behind a
+//!                             # forced command; plain: never the bootstrap; installed: never
+//!                             # the plain command
 //! install = "ask"             # ask | never | always: offering to install fil on a host that has
 //!                             # none, on an interactive first attach only
 //!
@@ -829,7 +830,10 @@ fn pipe_argv(host: &str, s: &HostSettings) -> Result<(Vec<String>, Option<String
             let c = PipeCommand::bootstrap(host).map_err(|e| e.to_string())?;
             Ok((
                 text(&c),
-                Some("remote = \"installed\": the install bootstrap runs first".to_string()),
+                Some(
+                    "remote = \"installed\": the install bootstrap runs first, and never `fil server --stdio`"
+                        .to_string(),
+                ),
             ))
         }
         RemoteMode::Plain => {
@@ -837,11 +841,11 @@ fn pipe_argv(host: &str, s: &HostSettings) -> Result<(Vec<String>, Option<String
             Ok((text(&c), None))
         }
         RemoteMode::Auto => {
-            let c = PipeCommand::ssh(host).map_err(|e| e.to_string())?;
+            let c = PipeCommand::bootstrap(host).map_err(|e| e.to_string())?;
             Ok((
                 text(&c),
                 Some(
-                    "then the install bootstrap if the host has no fil (remote = \"auto\")"
+                    "the install bootstrap runs first; `fil server --stdio` once if a forced command answers it (remote = \"auto\")"
                         .to_string(),
                 ),
             ))
@@ -1663,8 +1667,7 @@ direct.address = "devbox.example.net"
         assert_eq!(source, "default");
         assert!(
             pipe.starts_with("[\"ssh\", \"-o\", \"ServerAliveInterval=")
-                && pipe
-                    .contains("\"-T\", \"--\", \"me@devbox\", \"fil\", \"server\", \"--stdio\"]"),
+                && pipe.contains("\"-T\", \"--\", \"me@devbox\", \"<the install bootstrap>\"]"),
             "{pipe}"
         );
         let pipe_row = rows.iter().find(|r| r.key == "pipe").unwrap();
@@ -1690,7 +1693,7 @@ direct.address = "devbox.example.net"
     }
     #[test]
     fn config_show_agrees_with_connect_about_the_pipe_and_the_host() {
-        let cfg = parse("[host.a]\nremote = \"installed\"\n[host.b]\nremote = \"plain\"\n[host.c]\npipe = [\"kubectl\", \"exec\"]\n[host.\"c;x\"]\npipe = [\"kubectl\"]").unwrap();
+        let cfg = parse("[host.a]\nremote = \"installed\"\n[host.b]\nremote = \"plain\"\n[host.c]\npipe = [\"kubectl\", \"exec\"]\n[host.\"c;x\"]\npipe = [\"kubectl\"]\n[host.d]\nremote = \"auto\"").unwrap();
         let pipe = |h: &str| {
             let rows = cfg.explain(h).unwrap();
             let r = rows.iter().find(|r| r.key == "pipe").unwrap().clone();
@@ -1702,6 +1705,9 @@ direct.address = "devbox.example.net"
             "{v}"
         );
         assert!(n.unwrap().contains("bootstrap runs first"));
+        let (v, n) = pipe("d");
+        assert!(v.contains("<the install bootstrap>"), "{v}");
+        assert!(n.unwrap().contains("forced command"));
         let (v, n) = pipe("b");
         assert!(
             v.contains("\"fil\", \"server\", \"--stdio\"") && n.is_none(),

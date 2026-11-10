@@ -64,7 +64,7 @@ fil devbox --predict off
 
 ### `remote`
 
-`"auto"` (default), `"plain"` or `"installed"`: which command runs on the host. `auto` runs `fil server --stdio` first and uses the install bootstrap if the host has no fil. `plain` never uses the bootstrap. `installed` uses the bootstrap from the start.
+`"auto"` (default), `"plain"` or `"installed"`: which command runs on the host. `auto` runs the install bootstrap first, which starts the copy fil installed, `~/.local/bin/fil` or the `fil` on the host's `PATH` (if it is of this wire), or offers an install, all on one ssh login; on a host that allows only `fil server --stdio` (a forced command) it then runs that, once. `plain` runs only `fil server --stdio` and never the bootstrap. `installed` is the bootstrap without that retry (so it too starts a `fil` of this wire on the host's `PATH`); with `auto` going first it is no longer needed, and it still works.
 
 ### `install`
 

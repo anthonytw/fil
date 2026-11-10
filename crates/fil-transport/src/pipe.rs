@@ -145,6 +145,15 @@ pub enum PipeStderr {
     /// and warnings show while the user waits, and from the moment the session owns the terminal
     /// nothing the command prints later (`Connection to host closed.`) is written into the raw
     /// screen. (Password and host-key prompts are not on stderr: ssh uses the terminal itself.)
+    ///
+    /// One line is never shown: a login shell's own report that it found no `fil`
+    /// ([`says_fil_is_missing`]), such as `bash: line 1: fil: command not found`. The client
+    /// explains a missing fil in its own words, and a raw shell line in front of them only
+    /// confuses (owner, 2026-11-09). What comes after that line is held back until the pipe's
+    /// outcome is known: if fil's preamble and first frame then arrive (an rc file ran a missing
+    /// `fil`, and the run went on), the held text is shown and the tee goes on as before; if
+    /// the run fails, nothing more is shown, everything stays captured, and
+    /// [`PipeError::stderr_held`] says so.
     Tee,
 }
 
@@ -221,6 +230,9 @@ pub struct PipeError {
     /// What the command wrote to stderr (the last few KiB), with [`PipeStderr::Capture`].
     /// Untrusted; use [`PipeError::stderr_text`].
     pub stderr: Vec<u8>,
+    /// With [`PipeStderr::Tee`]: the tee held back a login shell's "no `fil`" line and what came
+    /// after it, so part of [`stderr`](Self::stderr) never reached the terminal.
+    pub stderr_held: bool,
     /// The stream ended ([`PipeErrorKind::Closed`]) before fil's preamble: nothing of fil ever
     /// answered, as when the login shell found no `fil`. `false` for a relay that wrote its
     /// preamble and then failed, and for every other kind.
@@ -234,6 +246,7 @@ impl PipeError {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: false,
         }
     }
@@ -291,6 +304,11 @@ pub(crate) struct StderrCapture {
     /// the lock before every write, so setting it needs no lock (and so cannot wait for a write
     /// that is stuck on a stopped terminal).
     quiet: Arc<std::sync::atomic::AtomicBool>,
+    /// The tee holds back a login shell's "no `fil`" line and everything after it
+    /// ([`PipeStderr::Tee`]).
+    held: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by [`release_hold`](Self::release_hold): the tee never starts holding again.
+    released: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The stream, and the state of copying it to the terminal ([`PipeStderr::Tee`]).
@@ -306,6 +324,13 @@ struct Tee {
     sink: Sink,
     /// See [`StderrCapture::silence`].
     quiet: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`StderrCapture::held`]: from a "no `fil`" line on, nothing more is shown until
+    /// [`StderrCapture::release_hold`].
+    held: Arc<std::sync::atomic::AtomicBool>,
+    /// What arrived after the "no `fil`" line while holding (at most [`STDERR_KEEP`]).
+    kept: Vec<u8>,
+    /// The hold was released (the pipe came up): it never starts again.
+    released: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Where a tee writes: gets sanitized text.
@@ -342,6 +367,32 @@ fn incomplete_tail(bytes: &[u8]) -> usize {
         return if need > back { back } else { 0 };
     }
     0
+}
+
+/// Whether one line of a pipe command's stderr is a login shell saying it found no `fil` to run:
+/// `bash: line 1: fil: command not found` (bash), `sh: 1: fil: not found` (dash, busybox),
+/// `ksh: fil: not found [No such file or directory]` (ksh), `mksh: fil: inaccessible or not found`,
+/// `zsh:1: command not found: fil` (zsh), `fil: Command not found.` (csh, tcsh) and
+/// `fish: Unknown command: fil` (fish). The command named must be exactly `fil`: a line about
+/// `nofil` or `fil-helper` is not this.
+pub fn says_fil_is_missing(line: &str) -> bool {
+    let l = line.trim();
+    // `suffix` at the end of the line, as the whole line or after a space.
+    let ends = |suffix: &str| {
+        l.strip_suffix(suffix)
+            .is_some_and(|before| before.is_empty() || before.ends_with(' '))
+    };
+    // `part` anywhere, at the start of the line or after a space.
+    let has = |part: &str| {
+        l.match_indices(part)
+            .any(|(i, _)| i == 0 || l.as_bytes()[i - 1] == b' ')
+    };
+    ends("fil: command not found")
+        || ends("command not found: fil")
+        || ends("Unknown command: fil")
+        || l == "fil: Command not found."
+        || has("fil: not found")
+        || has("fil: inaccessible or not found")
 }
 
 /// Runs `f`, which may block for as long as the terminal does (a write to a flow-controlled
@@ -389,12 +440,55 @@ impl Tee {
         self.open = !clean.ends_with('\n');
     }
 
+    /// Whether a login shell's "no `fil`" line has been seen: nothing is shown from it on,
+    /// until the hold is released.
+    fn holding(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keeps text that arrived while holding, for [`release`](Self::release).
+    fn keep_held(&mut self, text: &[u8]) {
+        let room = STDERR_KEEP.saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&text[..text.len().min(room)]);
+    }
+
+    /// The run went on: shows what was held after the "no `fil`" line (never that line), and
+    /// shows as before from now on.
+    fn release(&mut self) {
+        if !self.holding() {
+            return;
+        }
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        let kept = std::mem::take(&mut self.kept);
+        if self.on {
+            self.show(&kept);
+        }
+    }
+
     /// Takes in what arrived: shows the complete lines, holds back the rest.
     fn feed(&mut self, new: &[u8]) {
         self.line.extend_from_slice(new);
         while let Some(i) = self.line.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = self.line.drain(..=i).collect();
-            self.show(&line);
+            if !self.released.load(std::sync::atomic::Ordering::SeqCst)
+                && !self.holding()
+                && says_fil_is_missing(&fil_proto::text::sanitize(&line))
+            {
+                // `held` then `released`, each SeqCst, against `release_hold`'s `released` then
+                // `held`: at least one side sees the other's store. If the pipe came up
+                // meanwhile, this side ends the hold (it holds the tee lock), so it never
+                // outlives the release.
+                self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+                if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.release();
+                }
+                continue;
+            }
+            if self.holding() {
+                self.keep_held(&line);
+            } else {
+                self.show(&line);
+            }
         }
         if self.line.len() > TEE_LINE_MAX {
             self.show_partial();
@@ -411,7 +505,11 @@ impl Tee {
     fn show_partial(&mut self) {
         let n = self.showable();
         let shown: Vec<u8> = self.line.drain(..n).collect();
-        self.show(&shown);
+        if self.holding() {
+            self.keep_held(&shown);
+        } else {
+            self.show(&shown);
+        }
     }
 
     /// The tee ends: shows what is left and ends the line, so the next thing on the terminal
@@ -421,7 +519,9 @@ impl Tee {
             return;
         }
         let rest = std::mem::take(&mut self.line);
-        self.show(&rest);
+        if !self.holding() {
+            self.show(&rest);
+        }
         if self.open {
             self.show(b"\n");
         }
@@ -435,6 +535,8 @@ impl StderrCapture {
         use std::task::Poll;
         let (done, _) = watch::channel(false);
         let quiet = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cap = Arc::new(Self {
             buf: std::sync::Mutex::new(Vec::new()),
             done,
@@ -445,8 +547,13 @@ impl StderrCapture {
                 open: false,
                 sink,
                 quiet: quiet.clone(),
+                held: held.clone(),
+                kept: Vec::new(),
+                released: released.clone(),
             }),
             quiet,
+            held,
+            released,
         });
         let task = cap.clone();
         tokio::spawn(async move {
@@ -565,6 +672,22 @@ impl StderrCapture {
     /// not shown yet, which is dropped (still captured). A write already under way finishes.
     fn silence(&self) {
         self.quiet.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the tee is holding back what followed a login shell's "no `fil`" line.
+    fn held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The pipe came up: what the tee held back is shown, and it shows as before. Takes the
+    /// tee lock only while holding, when the tee writes nothing (so the lock is never stuck in a
+    /// write to a stopped terminal).
+    fn release_hold(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.held() {
+            self.lock_tee().release();
+        }
     }
 
     /// Waits (briefly) for the stream to end, then returns what was captured.
@@ -770,11 +893,16 @@ impl PipeLink {
                     // the command wrote is shown now and nothing after it. (It may still be
                     // writing: a ProxyCommand grandchild keeps the stream open past the exit.)
                     cap.stop_tee();
+                    err.stderr_held = cap.held();
                 }
                 return Err(err);
             }
         };
 
+        if let Some(cap) = &stderr {
+            // fil started after all (an rc file ran a missing `fil`): what was held is shown.
+            cap.release_hold();
+        }
         let shared = Shared::new(&cfg);
         let (done_tx, done_rx) = watch::channel(false);
         tokio::spawn(
@@ -1095,6 +1223,7 @@ impl Boot {
         if let Some(cap) = &self.stderr {
             err.stderr = cap.finish(Duration::from_millis(200)).await;
             cap.stop_tee();
+            err.stderr_held = cap.held();
         }
         err
     }
@@ -1613,6 +1742,58 @@ mod tests {
         while !String::from_utf8_lossy(&cap.bytes()).contains(what) {
             assert!(std::time::Instant::now() < end, "the capture stalled");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The tee holds back a login shell's "no `fil`" line and what follows it (owner,
+    /// 2026-11-09): ssh's messages before it are shown as they arrive, the line is still
+    /// captured, and the error says something was held.
+    #[tokio::test]
+    async fn the_tee_holds_back_a_shells_no_fil_line() {
+        let (link, _cap, shown) = run_of(
+            "echo 'Warning: Permanently added devbox' >&2; echo 'bash: line 1: fil: command not found' >&2; echo after >&2; exit 127",
+        )
+        .await;
+        let err = link.err().expect("no preamble");
+        assert_eq!(shown.text(), "Warning: Permanently added devbox\n");
+        assert!(err.stderr_held);
+        assert!(err.stderr_text().contains("fil: command not found"));
+        assert!(err.stderr_text().contains("after"));
+        // Any other failure holds nothing.
+        let (link, _cap, shown) = run_of("echo 'Permission denied' >&2; exit 255").await;
+        assert!(!link.err().expect("no preamble").stderr_held);
+        assert_eq!(shown.text(), "Permission denied\n");
+    }
+
+    #[test]
+    fn the_shells_ways_of_saying_fil_is_missing() {
+        for yes in [
+            "bash: line 1: fil: command not found",
+            "bash: fil: command not found",
+            "fil: command not found",
+            "sh: 1: fil: not found",
+            "sh: fil: not found",
+            "ksh: fil: not found [No such file or directory]",
+            "mksh: fil: inaccessible or not found",
+            "zsh:1: command not found: fil",
+            "fil: Command not found.",
+            "fish: Unknown command: fil",
+            "  bash: fil: command not found  ",
+        ] {
+            assert!(says_fil_is_missing(yes), "{yes:?}");
+        }
+        for no in [
+            "bash: nofil: command not found",
+            "bash: fil-helper: command not found",
+            "zsh:1: command not found: fil-helper",
+            "zsh:1: command not found: xfil2",
+            "sh: 1: myfil: not found",
+            "fish: Unknown command: filx",
+            "Permission denied (publickey).",
+            "Connection to devbox closed.",
+            "",
+        ] {
+            assert!(!says_fil_is_missing(no), "{no:?}");
         }
     }
 

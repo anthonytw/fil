@@ -447,3 +447,41 @@ async fn a_write_failure_reports_the_exit_status_of_a_child_that_exited() {
     std::fs::remove_file(&helper).unwrap();
     std::fs::remove_file(&file).unwrap();
 }
+
+/// The tee hides a login shell's "no `fil`" line; when fil starts after all (an rc file ran a
+/// missing `fil`), what came after that line is shown, and the tee goes on as before.
+#[tokio::test]
+async fn tee_shows_what_followed_a_no_fil_line_once_fil_starts() {
+    if std::env::var_os("FIL_TEE_PARENT").is_some() {
+        let script = format!(
+            "echo 'bash: line 1: fil: command not found' >&2; echo rc-after >&2; sleep 0.5; (sleep 0.3; echo later-on >&2) & exec {PROBE}"
+        );
+        let cfg = PipeConfig {
+            stderr: PipeStderr::Tee,
+            ..cfg()
+        };
+        let link = PipeLink::spawn(&sh(&script), cfg).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        link.stop_stderr_tee();
+        assert!(link.stderr_text().contains("command not found"));
+        link.shutdown().await;
+        return;
+    }
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tee_shows_what_followed_a_no_fil_line_once_fil_starts",
+            "--nocapture",
+        ])
+        .env("FIL_TEE_PARENT", "1")
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{shown}");
+    assert!(!shown.contains("command not found"), "{shown}");
+    assert!(shown.contains("rc-after"), "released on success: {shown}");
+    assert!(
+        shown.contains("later-on"),
+        "teed as before after that: {shown}"
+    );
+}

@@ -10,7 +10,8 @@
 //!
 //! [`BOOTSTRAP`] is the one other remote command fil may ever run: a POSIX `sh -c '...'` line,
 //! built at compile time from this build's version and wire and nothing else, that finds an
-//! installed copy of exactly this build or receives one over the pipe (its modes, `attach`,
+//! installed copy of exactly this build, or a `fil` of this build's wire in `~/.local/bin` or on
+//! the login's `PATH`, or receives one over the pipe (its modes, `attach`,
 //! `check` and `remove`, travel on stdin, never in the command). Compile-time checks refuse to
 //! build it unless it is one line, its quoted body holds no `'`, `\` or `!` (fish and tcsh parse
 //! the outer quotes before `sh` does), and its version and wire fit the install directory's name
@@ -24,7 +25,8 @@
 //! background run, and never touches the remote part.) What each check proves:
 //!
 //! - the golden and `the_bootstrap_is_the_text_the_owner_approved` pin the script's **text**
-//!   (a change to it needs the owner's sign-off again);
+//!   (a change to it needs the owner's sign-off again; the last one, 2026-11-09, added the
+//!   `PATH` step to `attach` for `remote = "auto"`'s bootstrap-first order);
 //! - `crates/fil/tests/remote_commands.rs` runs every subcommand that reaches ssh with a
 //!   recording fake `ssh` and requires each remote part to be exactly one of the two: that is
 //!   the check of **behavior**, however a command line is built;
@@ -98,6 +100,7 @@ const BOOT_TAIL: &str = concat!(
     r#"[ "$m" = attach ] || exit 1; "#,
     r#"if chain && own "$b/$v" && exe "$b/$v/fil"; then say FIL-BOOT1 exec; exec "$b/$v/fil" server --stdio; fi; "#,
     r#"if lb && "$f" --version </dev/null | grep -qF "$w"; then say FIL-BOOT1 exec; exec "$f" server --stdio; fi; "#,
+    r#"if command -v fil >/dev/null && fil --version </dev/null | grep -qF "$w"; then say FIL-BOOT1 exec; exec fil server --stdio; fi; "#,
     r#"say FIL-BOOT1 attach "$(uname -s)" "$(uname -m)"; "#,
     r#"IFS=" " read -r c s h || exit 1; "#,
     r#"[ "$c" = put ] || exit 0; "#,
@@ -654,9 +657,19 @@ mod tests {
         r#"lb && say FIL-LOCAL "$("$f" --version </dev/null | head -n 1)"; say FIL-CHECK-END; exit 0; fi; "#,
     );
 
-    /// The text the owner approved in M4 OQ-1 (2026-11-04), with N6 (the same day), as
-    /// `docs/m4/plan.md` section 7 holds it, byte for byte: any other change to the script goes
-    /// back to the owner.
+    /// The third change the owner approved (2026-11-09, explicit sign-off on the text, with
+    /// `remote = "auto"` running the bootstrap first): `attach` also starts a `fil` found on the
+    /// login's `PATH` (`command -v fil`) whose `--version` names this build's wire, after the
+    /// install directory and `~/.local/bin/fil` and before the greeting. Inserted right after the
+    /// `~/.local/bin` step; nothing else changed.
+    const PATH_STEP: (&str, &str) = (
+        r#"exec "$f" server --stdio; fi; say FIL-BOOT1 attach "#,
+        r#"exec "$f" server --stdio; fi; if command -v fil >/dev/null && fil --version </dev/null | grep -qF "$w"; then say FIL-BOOT1 exec; exec fil server --stdio; fi; say FIL-BOOT1 attach "#,
+    );
+
+    /// The text the owner approved in M4 OQ-1 (2026-11-04), with N6 (the same day) and the
+    /// `PATH` step (2026-11-09), as `docs/m4/plan.md` section 7 holds it, byte for byte: any
+    /// other change to the script goes back to the owner.
     #[test]
     fn the_bootstrap_is_the_text_the_owner_approved() {
         let plan = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/m4/plan.md");
@@ -678,6 +691,12 @@ mod tests {
         assert_eq!(ours.matches(is).count(), 1);
         assert!(!ours.contains(was));
         assert_eq!(ours.matches("FIL-CHECK-END").count(), 1);
+        // And the PATH step (2026-11-09): once, between `~/.local/bin` and the greeting, gated on
+        // the wire like the `~/.local/bin` step.
+        let (was, is) = PATH_STEP;
+        assert_eq!(ours.matches(is).count(), 1);
+        assert!(!ours.contains(was));
+        assert_eq!(ours.matches("grep -qF \"$w\"").count(), 2);
     }
 
     /// The rest of §2.5's checks, on the text itself: nothing the script hands on is changed

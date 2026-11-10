@@ -15,7 +15,7 @@ use crate::connect::Connect;
 use crate::dialer::{DialerConfig, PathDialer};
 use crate::forward_spec::{CliForwards, ForwardPlan};
 use crate::install::attach::Offer;
-use crate::install::fallback::{Command as InstallCommand, Next, Run};
+use crate::install::fallback::Run;
 use crate::{cmds, logging, server};
 
 /// The most runtime worker threads a client starts (fewer on a machine with fewer cores), rather
@@ -228,17 +228,6 @@ async fn attach(
     }
 
     let result = fil_client::run(dialer, term, cfg).await;
-    // `remote = "auto"`'s second trigger: the run's first connection reached a relay of another
-    // wire with no daemon of ours. That shows only at the hello, before the terminal went raw;
-    // the run tries the bootstrap once, as a fresh attach (its listeners are bound again).
-    if let Err(e) = &result
-        && fallback_outcome(e).is_some()
-        && run.version_mismatch() == Next::Retry(InstallCommand::Bootstrap)
-    {
-        tracing::info!("the remote host's fil is of another wire; trying the install bootstrap");
-        run.set_trigger(e.to_string());
-        return Box::pin(attach(host, session, transport, forwards, settings, run)).await;
-    }
     // The client has restored the terminal and printed how it ended; an error still needs saying.
     // Through a bounded write: a terminal that stopped reading would hold `eprintln!` for good,
     // and the shell would not get the terminal back.
@@ -280,23 +269,6 @@ pub fn client_config(session: SessionName, settings: &HostSettings) -> ClientCon
     // Only the path manager backs off; a second layer would double the waits.
     cfg.reconnect.backoff = Backoff::None;
     cfg
-}
-
-/// The seam for `remote = "auto"`'s second trigger (`docs/m4/plan.md` §3 U1): an attach that
-/// failed because the host's relay is of another wire and no daemon of this client's wire runs
-/// there. The relay answers such a client with its own `Hello` and `Error(VersionMismatch)`
-/// (DESIGN.md §5.3), and the client checks the `Hello` before anything else: the error is
-/// `ClientError::VersionMismatch` (or `VersionRefused`, without the numbers), and it arrives
-/// before the terminal goes raw, which happens only once the first attach's snapshot is complete
-/// (`fil_client::engine`, `enter_session_screen`). So the fallback needs no change in
-/// `fil-client`: [`attach`] acts on it, once per run, through the run's [`Run`].
-pub fn fallback_outcome(e: &ClientError) -> Option<crate::install::fallback::Outcome> {
-    match e {
-        ClientError::VersionMismatch(_) | ClientError::VersionRefused => {
-            Some(crate::install::fallback::Outcome::VersionMismatch)
-        }
-        _ => None,
-    }
 }
 
 /// The client's forwards from the resolved plan.
@@ -427,31 +399,6 @@ mod tests {
         assert_eq!(short_name(".hidden"), ".hidden");
         assert_eq!(short_name("192.0.2.7"), "192.0.2.7");
         assert_eq!(short_name("2001:db8::1"), "2001:db8::1");
-    }
-
-    #[test]
-    fn only_a_version_mismatch_is_the_seams_trigger() {
-        use crate::install::fallback::Outcome as F;
-        let m = fil_proto::version::VersionMismatch {
-            ours: fil_proto::version::WireVersion {
-                major: 1,
-                revision: 11,
-            },
-            peer: fil_proto::version::WireVersion {
-                major: 1,
-                revision: 12,
-            },
-        };
-        assert_eq!(
-            fallback_outcome(&ClientError::VersionMismatch(m)),
-            Some(F::VersionMismatch)
-        );
-        assert_eq!(
-            fallback_outcome(&ClientError::VersionRefused),
-            Some(F::VersionMismatch)
-        );
-        assert_eq!(fallback_outcome(&ClientError::Dial("x".into())), None);
-        assert_eq!(fallback_outcome(&ClientError::Protocol("x".into())), None);
     }
 
     #[test]

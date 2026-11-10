@@ -14,9 +14,8 @@
 //! - **Every other case declines** the greeting (`end`) and fails with words that say how to
 //!   install.
 //!
-//! Nothing about the host is written on this machine. A successful install prints the one
-//! config line (`remote = "installed"`) that saves the plain command's login next time, for
-//! the user to add themselves.
+//! Nothing about the host is written on this machine. Later runs need no config line: with
+//! `remote = "auto"` the bootstrap goes first and starts the installed copy on its one login.
 
 use fil_transport::pipe::{Greeting, PipeLink};
 
@@ -66,27 +65,6 @@ fn ask_on_terminal(question: &str) -> bool {
 
 /// The words for a host with no usable fil, after the bootstrap looked too.
 pub const NO_COPY: &str = "fil is not installed on the remote host: neither the PATH of a non-interactive ssh login nor fil's install directory there has a fil of this version";
-
-use crate::config::toml_key;
-
-/// The one config line that saves a host with only a fil-installed copy the plain command's
-/// login, for the user to add (`docs/m4/plan.md` §3 U1, "The cost in logins"). Said after an
-/// attach installed fil, where the plain command had just found none.
-pub fn config_line(host: &str) -> String {
-    format!(
-        "to start it with one ssh login next time, add remote = \"installed\" under [host.{}] in fil's config (~/.config/fil/config.toml)",
-        toml_key(&fil_proto::text::sanitize_inline(host))
-    )
-}
-
-/// [`config_line`] for `fil install`, which did not try the plain command: the line helps only
-/// if that finds no fil of this version on the host.
-pub fn config_line_if_needed(host: &str) -> String {
-    format!(
-        "if `fil server --stdio` finds no fil of this version there (a fil of this wire on the host's PATH needs nothing), add remote = \"installed\" under [host.{}] in fil's config (~/.config/fil/config.toml) to start fil with one ssh login",
-        toml_key(&fil_proto::text::sanitize_inline(host))
-    )
-}
 
 /// What a run does when the bootstrap greets (the host has no usable fil).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,9 +230,8 @@ pub async fn greeted(
         Ok(link) => {
             tracing::info!(arch = remote.describe(), "install: done");
             eprintln!(
-                "fil: installed fil {version} into ~/.local/share/fil/{} on {shown}; {}",
-                this_version_dir(),
-                config_line(host)
+                "fil: installed fil {version} into ~/.local/share/fil/{} on {shown}",
+                this_version_dir()
             );
             Ok(link)
         }
@@ -301,13 +278,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn the_config_line_names_the_host_as_toml_would() {
-        assert!(config_line("devbox").contains("[host.devbox]"));
-        assert!(config_line("box.example.net").contains("[host.\"box.example.net\"]"));
-        assert!(config_line("me@box").contains("[host.\"me@box\"]"));
-        assert!(config_line("devbox").contains("remote = \"installed\""));
     }
 }

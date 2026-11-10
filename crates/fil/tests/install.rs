@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use fil::install::fallback::Outcome;
 use fil_transport::LinkParams;
 use fil_transport::pipe::{PipeCommand, PipeLink};
 
@@ -19,10 +18,10 @@ const FIL: &str = env!("CARGO_BIN_EXE_fil");
 static N: AtomicU32 = AtomicU32::new(0);
 
 /// A login shell that cannot find `fil` makes the pipe end with no preamble and a nonzero exit:
-/// 127 from sh, 1 from tcsh and csh. Both are `auto`'s first trigger, and both get the manual
-/// install's words.
+/// 127 from sh, 1 from tcsh and csh. Both get the manual install's words (with `remote =
+/// "plain"`, or a plain try behind a forced command), never the shell's own line.
 #[tokio::test]
-async fn a_missing_fil_is_the_trigger_under_sh_and_tcsh() {
+async fn a_missing_fil_is_not_installed_under_sh_and_tcsh() {
     let mut shells = vec![("/bin/sh", 127)];
     for s in ["/bin/tcsh", "/bin/csh"] {
         if Path::new(s).exists() {
@@ -47,11 +46,6 @@ async fn a_missing_fil_is_the_trigger_under_sh_and_tcsh() {
         assert!(
             exit.ends_with(&format!("exit status: {status}")),
             "{shell}: {exit}"
-        );
-        assert_eq!(
-            Outcome::of_pipe_error(&e),
-            Outcome::NoPreamble { nonzero: true },
-            "{shell}"
         );
         let words = fil::connect::failure(e).message;
         assert!(
@@ -116,6 +110,18 @@ mod bootstrap {
     use tokio::io::AsyncWriteExt;
     use tokio::process::{Child, ChildStdin, ChildStdout};
 
+    /// This process's `PATH` without the directories that have a `fil`: the bootstrap starts a
+    /// `fil` of this wire on `PATH` (as the plain command would), and a developer's own install
+    /// must not stand in for the copy these tests put in place.
+    fn path_without_fil() -> String {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let kept: Vec<&str> = path
+            .split(':')
+            .filter(|d| !d.is_empty() && !Path::new(d).join("fil").exists())
+            .collect();
+        kept.join(":")
+    }
+
     /// The bootstrap, as a login shell runs a remote command: `sh -c "<BOOTSTRAP>"`.
     fn spawn(w: &World) -> (Child, ChildStdin, Lines<ChildStdout>) {
         let mut child = tokio::process::Command::new("/bin/sh")
@@ -123,7 +129,7 @@ mod bootstrap {
             .arg(PipeCommand::BOOTSTRAP)
             .env_clear()
             .env("HOME", &w.home)
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path_without_fil())
             .env("FIL_TEST_SOCKET_DIR", &w.socks)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -392,9 +398,11 @@ mod bootstrap {
     async fn a_development_build_is_never_uploaded() {
         let w = World::new("dev");
         let home = format!("HOME={}", w.home.display());
+        let path = format!("PATH={}", path_without_fil());
         let argv: Vec<OsString> = vec![
             "/usr/bin/env".into(),
             home.into(),
+            path.into(),
             "/bin/sh".into(),
             "-c".into(),
             PipeCommand::BOOTSTRAP.into(),

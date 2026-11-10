@@ -5,11 +5,13 @@
 # through a `ssh` on PATH that adds this part's ssh config. Run: install.sh [SCENARIO...]
 #
 #   i_manual_message   with no fil on the host, `fil ls` says where fil looks and what to do,
-#                      under every login shell (tcsh and csh say a missing command with status 1)
+#                      under every login shell: with `remote = "plain"` (tcsh and csh say a
+#                      missing command with status 1) and with the default (the bootstrap's words)
 #   i_install_SHELL    `fil install`, `--check`, a second install (nothing to do) and `--remove`,
 #                      for each login shell (bash dash zsh fish tcsh ash)
 #   i_forced           a key that allows only `fil server --stdio`: `fil install` says so and
-#                      writes nothing (the bootstrap's marker tells a forced command apart)
+#                      writes nothing (the bootstrap's marker tells a forced command apart);
+#                      `fil ls` falls back to the plain command once and works
 #   i_bundle           a client unpacked like a release archive, whose own binary is not eligible:
 #                      the bundle for the host is checked against its SHA256SUMS and sent; one
 #                      byte changed in it, and nothing is sent
@@ -19,10 +21,10 @@
 # The attach (the real client on a terminal, under ptydrive, as tests/realnet/fil.sh drives it):
 #
 #   i_attach_offer     no fil on the host: the first attach asks (`install = "ask"`), "y"
-#                      uploads, and the install login becomes the session; it prints the
-#                      `remote = "installed"` line; the next attach takes the fast path, unasked
+#                      uploads, and the install login becomes the session, with no shell "command
+#                      not found" on the terminal; the next attach takes the fast path, unasked
 #   i_umask            the session's umask is the login's (027 from ~/.bashrc) whichever way its
-#                      daemon started: the plain command, the bootstrap's fast path, an install
+#                      daemon started: the bootstrap's PATH step, its fast path, an install
 #   i_forced_installed the forced-command key with `remote = "installed"`: `fil ls` and the
 #                      attach end at once (an unmarked preamble), nothing sent or written
 #   i_noexec           a home mounted noexec: the upload arrives, the script cannot run it, and
@@ -137,6 +139,7 @@ EOF
   printf '[defaults]\ntransport = "pipe"\n' > "$IN_DIR/config.toml"
   printf '[defaults]\ntransport = "pipe"\ninstall = "always"\n' > "$IN_DIR/always.toml"
   printf '[defaults]\ntransport = "pipe"\n[host."gated@shells"]\nremote = "installed"\n' > "$IN_DIR/gated.toml"
+  printf '[defaults]\ntransport = "pipe"\nremote = "plain"\n' > "$IN_DIR/plain.toml"
   local i
   for h in u-bash@shells u-ash@alpine; do
     for ((i = 0; i < 100; i++)); do
@@ -196,9 +199,13 @@ dir_name() { "$IN_DIR/fil" --version | head -n 1 | sed -E 's/^fil ([^ ]+) \(wire
 i_manual_message() {
   local u
   for u in "${SHELLS[@]/#/u-}" u-ash; do
-    if in_fil "$IN_DIR/fil" ls "$(at_of "$u")"; then fail "$u: fil ls worked with no fil on the host"; fi
+    if IN_CONFIG=$IN_DIR/plain.toml in_fil "$IN_DIR/fil" ls "$(at_of "$u")"; then fail "$u: fil ls worked with no fil on the host"; fi
     assert "$u: the manual-install words" grep -q "fil is not installed on the remote host" <<< "$IN_OUT"
     assert "$u: where fil looks" grep -q "PATH of a non-interactive ssh login" <<< "$IN_OUT"
+    if grep -qE "ommand not found|fil: not found|Unknown command: fil" <<< "$IN_OUT"; then fail "$u: plain: the shell's own line was shown"; fi
+    if in_fil "$IN_DIR/fil" ls "$(at_of "$u")"; then fail "$u: fil ls worked with no fil on the host (auto)"; fi
+    assert "$u: auto: the bootstrap's words" grep -q "fil install" <<< "$IN_OUT"
+    if grep -q "ommand not found" <<< "$IN_OUT"; then fail "$u: auto: a shell's command-not-found line"; fi
   done
 }
 
@@ -236,7 +243,7 @@ i_forced() {
   # The relay it ran may start its daemon (its state directory is the plain command's own), but
   # no install directory appears and no binary was sent to it.
   assert "no install directory on the host" on gated 'test ! -e "$HOME/.local/share/fil"'
-  # The plain command still works through the gate.
+  # The default still works through the gate: the bootstrap, then the plain command once.
   in_fil "$IN_DIR/fil" ls gated@shells || fail "fil ls through the gate failed"
 }
 
@@ -283,14 +290,14 @@ i_attach_offer() {
   fc_wait_raw a '[y/N]' 60
   fc_line a y
   fc_wait_raw a 'installed fil' 120
-  fc_wait_raw a 'remote = "installed"'
   fc_ready a 60
   assert "the copy, 0700" on "$u" "test \"\$(stat -c %a \"\$HOME/.local/share/fil/$d/fil\")\" = 700"
   assert "the same bytes" cmp -s "$IN_DIR/fil" <(on "$u" "cat \"\$HOME/.local/share/fil/$d/fil\"")
   assert "no upload directory left" on "$u" "! ls -a \"\$HOME/.local/share/fil\" | grep -q '^\.new-'"
-  assert "the bootstrap ran after the plain command" test "$(fc_count_log a 'trying the install bootstrap')" -ge 1
+  fc_not_raw a 'ommand not found'
+  fc_not_raw a 'fil: not found'
   fc_detach a
-  # The next run: the plain command finds no fil, the bootstrap's fast path does, unasked.
+  # The next run: the bootstrap's fast path finds the copy, unasked, on one login.
   kill_user "$u"
   in_attach b "$u@shells" "$IN_DIR/config.toml"
   fc_ready b 60
@@ -316,13 +323,12 @@ i_umask() {
   # for an ssh command).
   on "$u" 'cp "$HOME/.bashrc" "$HOME/.bashrc.rn"; printf "umask 027\nPATH=\$HOME/bin:\$PATH\n" > "$HOME/.bashrc"; rm -rf "$HOME/.local" "$HOME/bin"; mkdir "$HOME/bin"; cp /opt/fil/fil "$HOME/bin/fil"'
   kill_user "$u"
-  umask_of plain "$u"
-  assert "plain: no bootstrap" test "$(fc_count_log plain 'install bootstrap')" -eq 0
+  umask_of path "$u"
+  assert "path: the PATH fil, nothing uploaded" test "$(fc_count_log path 'install: uploading')" -eq 0
   on "$u" 'rm -f "$HOME/bin/fil"'
   in_fil "$IN_DIR/fil" install "$u@shells" || fail "install failed"
   kill_user "$u"
   umask_of fast "$u"
-  assert "fast: the bootstrap's fast path" test "$(fc_count_log fast 'trying the install bootstrap')" -ge 1
   assert "fast: nothing uploaded" test "$(fc_count_log fast 'install: uploading')" -eq 0
   on "$u" 'rm -rf "$HOME/.local"'
   umask_of upload "$u"

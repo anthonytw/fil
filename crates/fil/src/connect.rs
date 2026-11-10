@@ -180,9 +180,10 @@ impl Connect {
                 // The interactive run's stderr was shown as it arrived: not said again.
                 let mut f = failure_with(e, interactive);
                 if forced && self.run.mode() == RemoteMode::Auto {
-                    // Already on auto: the plain command ran, and found no usable fil.
+                    // Only once something had worked in this run (the run falls back to the
+                    // plain command otherwise): a gate put in place since.
                     f.message = format!(
-                        "{}: so only `fil server --stdio` runs there, and it found no fil of this version; install one by hand on the PATH it uses (docs/m4/install.md)",
+                        "{}: run fil again, which then uses `fil server --stdio` for this host",
                         PipeErrorKind::Forced
                     );
                 }
@@ -194,30 +195,6 @@ impl Connect {
             link: AnyLink::Pipe(link),
             banner,
         })
-    }
-
-    /// A run of the bootstrap. If it fails right after a fallback from a relay of another wire,
-    /// the failure says that first: it is why the bootstrap ran.
-    async fn run_bootstrap(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
-        match self.run_one(Command::Bootstrap, interactive).await {
-            Ok(up) => {
-                self.run.take_trigger();
-                self.run.came_up(Command::Bootstrap);
-                Ok(up)
-            }
-            Err((mut f, outcome)) => {
-                self.run.failed(Command::Bootstrap, outcome);
-                if let Some(why) = self.run.take_trigger() {
-                    f.message = format!("{why}; the install bootstrap then failed: {}", f.message);
-                }
-                Err(f)
-            }
-        }
-    }
-
-    /// The run's choice, for whoever sees how a connection ended past the pipe (the hello).
-    pub fn run(&self) -> &Run {
-        &self.run
     }
 
     /// The name to resolve for the UDP dial, or why there is none.
@@ -345,34 +322,28 @@ where
 impl Connector for Connect {
     type Link = AnyLink;
 
-    /// The run's command (`remote = ...`): `fil server --stdio` first, and the bootstrap only
-    /// as `crate::install::fallback` says (at the run's first connection, or from the start with
-    /// `remote = "installed"`), never with a custom pipe or `remote = "plain"`.
+    /// The run's command (`remote = ...`), as `crate::install::fallback` says: the bootstrap
+    /// first, and `fil server --stdio` once if a forced command answers it (`auto`); only the
+    /// plain command with a custom pipe or `remote = "plain"`.
     async fn run_pipe(&self, interactive: bool) -> Result<PipeUp<AnyLink>, PipeFailure> {
-        let which = self.run.next();
-        if which == Command::Bootstrap {
-            // The run's command already (`installed`, what worked, or after a mismatch at the
-            // hello).
-            return self.run_bootstrap(interactive).await;
-        }
-        let (failed, outcome) = match self.run_one(which, interactive).await {
-            Ok(up) => {
-                self.run.came_up(which);
-                return Ok(up);
-            }
-            Err(e) => e,
-        };
-        match self.run.failed(which, outcome) {
-            Next::Retry(Command::Bootstrap) => {
-                if outcome == Outcome::VersionMismatch {
-                    self.run.set_trigger(failed.message.clone());
+        let mut which = self.run.next();
+        loop {
+            let (failed, outcome) = match self.run_one(which, interactive).await {
+                Ok(up) => {
+                    self.run.came_up(which);
+                    return Ok(up);
                 }
-                tracing::info!(
-                    "the plain remote command found no fil of this wire; trying the install bootstrap"
-                );
-                self.run_bootstrap(interactive).await
+                Err(e) => e,
+            };
+            match self.run.failed(which, outcome) {
+                Next::Retry(c) => {
+                    tracing::info!(
+                        "a forced command answered the install bootstrap; trying `fil server --stdio`"
+                    );
+                    which = c;
+                }
+                Next::Fail => return Err(failed),
             }
-            Next::Retry(Command::Plain) | Next::Fail => Err(failed),
         }
     }
 
@@ -510,13 +481,34 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
         }
         _ => (Severity::Transient, e.to_string()),
     };
-    let stderr = if stderr_shown {
+    // The tee held back a login shell's "no `fil`" line (`PipeStderr::Tee`): when the words
+    // above explain a missing fil, that line is not wanted; otherwise it was never shown, so
+    // it is said here as with a captured run.
+    let shown = stderr_shown && !(e.stderr_held && !fil_missing(&e));
+    let stderr = if shown {
         String::new()
     } else {
         e.stderr_text()
     };
-    let note = stderr_note(&stderr);
-    let message = match last_line(&stderr) {
+    // Nor in the status line: a missing fil is said in fil's words only (a background run's
+    // stderr is captured whole, the shell's line included).
+    let note = if fil_missing(&e) {
+        (!stderr.trim().is_empty()).then(|| NOT_INSTALLED_NOTE.to_string())
+    } else {
+        stderr_note(&stderr)
+    };
+    // A held report is said whole (from the shell's line on, a few lines), not only its last
+    // line: it was never on the terminal.
+    // fil's words for a missing fil replace the shell's own line, shown or not (owner,
+    // 2026-11-09).
+    let said = if fil_missing(&e) {
+        None
+    } else if e.stderr_held && !shown {
+        held_report(&stderr).or_else(|| last_line(&stderr))
+    } else {
+        last_line(&stderr)
+    };
+    let message = match said {
         Some(l) => format!("{message} ({l})"),
         None => message,
     };
@@ -533,6 +525,9 @@ pub fn failure_with(e: PipeError, stderr_shown: bool) -> PipeFailure {
 /// non-interactive ssh login often has a shorter `PATH` than an interactive one.
 pub const NOT_INSTALLED: &str = "the remote command `fil server --stdio` found no `fil` on the PATH of a non-interactive ssh login there (`ssh HOST 'echo $PATH'` shows that PATH). Copy a release's bin/fil into a directory on it, such as /usr/local/bin, or add its directory to the PATH that your shell sets for non-interactive logins (~/.bashrc above its interactive check, ~/.zshenv, ~/.config/fish/config.fish), then run fil again";
 
+/// The status-line note for a missing fil (in place of the shell's own line).
+const NOT_INSTALLED_NOTE: &str = "fil is not installed on the remote host any more";
+
 /// Whether a pipe that ended before fil's preamble ended because the login shell found no `fil`:
 /// status 127 (sh, bash, zsh, dash, ksh, fish), or what csh and tcsh say (status 1). Only if the
 /// stream really ended before the preamble: a relay that exits 127 after its preamble is not "not
@@ -547,6 +542,21 @@ fn fil_missing(e: &PipeError) -> bool {
         .is_some_and(|x| x.trim_end().ends_with("exit status: 127"));
     let csh = e.stderr_text().contains("fil: Command not found.");
     status_127 || csh
+}
+
+/// What the tee held back: the login shell's "no `fil`" line and the lines after it, joined
+/// with " / " and cut to 300 characters.
+fn held_report(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| !fil_transport::pipe::says_fil_is_missing(l))
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join(" / ").chars().take(300).collect())
 }
 
 /// The last non-empty line, cut to a length the status line can show.
@@ -727,6 +737,7 @@ mod tests {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: false,
         });
         assert_eq!(v.severity, Severity::Version);
@@ -742,6 +753,7 @@ mod tests {
             skipped: Vec::new(),
             exit: None,
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: false,
         });
         assert!(
@@ -755,6 +767,7 @@ mod tests {
             skipped: b"bash: fil: command not found\n".to_vec(),
             exit: None,
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: false,
         });
         assert_eq!(n.severity, Severity::Permanent);
@@ -765,6 +778,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: true,
         });
         assert_eq!(c.severity, Severity::Transient);
@@ -783,6 +797,7 @@ mod tests {
                 skipped: Vec::new(),
                 exit: Some(exit.into()),
                 stderr: stderr.to_vec(),
+                stderr_held: false,
                 ended_before_preamble: true,
             });
             assert_eq!(m.severity, Severity::Permanent, "{exit}");
@@ -799,6 +814,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited: exit status: 1".into()),
             stderr: b"fil: cannot use /tmp/fil-1000\n".to_vec(),
+            stderr_held: false,
             ended_before_preamble: true,
         });
         assert_eq!(
@@ -812,6 +828,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited: exit status: 127".into()),
             stderr: Vec::new(),
+            stderr_held: false,
             ended_before_preamble: false,
         });
         assert_eq!(after.severity, Severity::Transient, "{}", after.message);
@@ -822,6 +839,7 @@ mod tests {
                 skipped: Vec::new(),
                 exit: None,
                 stderr: Vec::new(),
+                stderr_held: false,
                 ended_before_preamble: false,
             });
             assert_eq!(f.severity, Severity::Permanent, "{}", f.message);
@@ -873,6 +891,75 @@ mod tests {
         assert_eq!(stderr_note(&long).unwrap().len(), 100);
     }
 
+    /// The tee held back a shell's "no `fil`" line: fil's own words, without the line, when
+    /// they explain a missing fil; the line when they do not (it was never shown).
+    #[test]
+    fn a_held_no_fil_line_is_said_only_when_fils_words_do_not_cover_it() {
+        let held = |exit: &str| PipeError {
+            kind: PipeErrorKind::Closed,
+            skipped: Vec::new(),
+            exit: Some(exit.into()),
+            stderr: b"bash: line 1: fil: command not found\n".to_vec(),
+            stderr_held: true,
+            ended_before_preamble: true,
+        };
+        let m = failure_with(held("exited: exit status: 127"), true).message;
+        assert!(m.starts_with("fil is not installed"), "{m}");
+        assert!(!m.contains("command not found"), "{m}");
+        let m = failure_with(held("exited: exit status: 2"), true).message;
+        assert!(m.contains("fil: command not found"), "{m}");
+        // The whole held report, not only its last line.
+        let mut e = held("exited: exit status: 2");
+        e.stderr = b"Warning: shown already\nfish: Unknown command: fil\nfil server --stdio\n^~^\n"
+            .to_vec();
+        let m = failure_with(e, true).message;
+        assert!(
+            m.contains("(fish: Unknown command: fil / fil server --stdio / ^~^)"),
+            "{m}"
+        );
+    }
+
+    /// A background reconnect on the plain command to a host whose fil is gone: the shell's own
+    /// line is in neither the message nor the status-line note (owner, 2026-11-09).
+    #[test]
+    fn a_background_run_that_finds_no_fil_never_says_the_shells_line() {
+        for (exit, stderr) in [
+            (
+                "exited: exit status: 127",
+                &b"bash: line 1: fil: command not found\n"[..],
+            ),
+            ("exited: exit status: 1", b"fil: Command not found.\n"),
+            (
+                "exited: exit status: 127",
+                b"fish: Unknown command: fil\nfish:\nfil server --stdio\n^~^\n",
+            ),
+        ] {
+            let f = failure(PipeError {
+                kind: PipeErrorKind::Closed,
+                skipped: Vec::new(),
+                exit: Some(exit.into()),
+                stderr: stderr.to_vec(),
+                stderr_held: false,
+                ended_before_preamble: true,
+            });
+            let note = f.note.clone().unwrap_or_default();
+            for said in [&f.message, &note] {
+                assert!(
+                    !said.contains("ommand not found")
+                        && !said.contains("Unknown command")
+                        && !said.contains("^~^"),
+                    "{said}"
+                );
+            }
+            assert!(
+                f.message.starts_with("fil is not installed"),
+                "{}",
+                f.message
+            );
+            assert!(note.contains("not installed"), "{note}");
+        }
+    }
+
     #[test]
     fn a_failed_background_run_carries_the_reason_in_message_and_note() {
         let f = failure(PipeError {
@@ -880,6 +967,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited: exit status: 255".into()),
             stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
+            stderr_held: false,
             ended_before_preamble: true,
         });
         assert!(f.message.contains("Permission denied"), "{}", f.message);
@@ -1111,6 +1199,7 @@ mod tests {
             skipped: Vec::new(),
             exit: Some("exited with status 255".into()),
             stderr: b"devbox: Permission denied (publickey).\n".to_vec(),
+            stderr_held: false,
             ended_before_preamble: true,
         };
         let shown = failure_with(err(), true);

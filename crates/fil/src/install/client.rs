@@ -197,11 +197,6 @@ async fn exchange(
             if let Some(r) = report.filter(|r| r.removed > 0) {
                 out.push_str(&format!(" (and removed {} old copies)", r.removed));
             }
-            // If the plain command finds no fil there, each run would take two logins.
-            out.push_str(&format!(
-                "\n{host}: {}",
-                super::attach::config_line_if_needed(host)
-            ));
             Ok(out)
         }
     }

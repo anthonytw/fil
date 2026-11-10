@@ -41,7 +41,10 @@ const HOST: &str = "devbox";
 /// (ssh joins the words with spaces and hands them to the shell's `-c`), under a umask of 027,
 /// recording its process id (the relay's, after the `exec`s) for the test to kill. With
 /// `FAKE_SSH_FORCE` set it runs `fil server --stdio` whatever it was asked, as a forced command
-/// does; with `FAKE_SSH_TRUE` it prints nothing and exits 0, as a forced `/bin/true` does.
+/// does; with `FAKE_SSH_TRUE` it prints nothing and exits 0, as a forced `/bin/true` does. With
+/// `FAKE_SSH_FORCE_GONE` it runs `fil server --stdio` in place of anything else, but the plain
+/// command itself on a `PATH` with no fil (a contrived host, so that the plain retry behind a
+/// forced command finds no fil and its shell says so).
 const FAKE_SSH: &str = r#"#!/bin/sh
 f="$FAKE_SSH_LOG/.call.$$"
 : > "$f"
@@ -54,6 +57,9 @@ while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
 shift 2
 [ $# -gt 0 ] || exit 255
 [ -z "$FAKE_SSH_FORCE" ] || set -- fil server --stdio
+if [ -n "$FAKE_SSH_FORCE_GONE" ]; then
+  if [ "$*" = "fil server --stdio" ]; then FAKE_REMOTE_PATH=/usr/bin:/bin; else set -- fil server --stdio; fi
+fi
 echo $$ > "$FAKE_SSH_PIDS/$$"
 cd "$FAKE_REMOTE_HOME" || exit 255
 umask 027
@@ -108,6 +114,8 @@ struct World {
     remote: Remote,
     socks: PathBuf,
     force: bool,
+    /// [`FAKE_SSH`]'s `FAKE_SSH_FORCE_GONE`.
+    force_gone: bool,
     /// The host's forced command is `/bin/true`.
     silent: bool,
     /// Every recorded run so far, in order (each [`World::calls`] adds what is new).
@@ -184,6 +192,7 @@ impl World {
             remote,
             socks,
             force: false,
+            force_gone: false,
             silent: false,
             seen: Mutex::new(Vec::new()),
         }
@@ -222,6 +231,9 @@ impl World {
         }
         if self.silent {
             v.push(("FAKE_SSH_TRUE".into(), "1".into()));
+        }
+        if self.force_gone {
+            v.push(("FAKE_SSH_FORCE_GONE".into(), "1".into()));
         }
         v
     }
@@ -660,10 +672,9 @@ fn every_subcommand_runs_only_the_approved_remote_commands() {
         &["forward", HOST, "s", "-L", "5173"],
         &["forward", HOST, "s", "--rm", "5173"],
     ] {
-        assert!(
-            logins(&w, args).iter().all(|r| *r == Run::Plain),
-            "fil {args:?}"
-        );
+        // `remote = "auto"`: the bootstrap first (owner, 2026-11-09), and ssh's own failure
+        // (255) is no reason for a second login.
+        assert_eq!(logins(&w, args), [Run::Bootstrap], "fil {args:?}");
     }
     for args in [
         &["install", HOST][..],
@@ -672,12 +683,12 @@ fn every_subcommand_runs_only_the_approved_remote_commands() {
     ] {
         assert_eq!(logins(&w, args), [Run::Bootstrap], "fil {args:?}");
     }
-    // The attach (on a pseudo-terminal). ssh's own failure (255) is not a missing fil, so no
-    // bootstrap follows it.
+    // The attach (on a pseudo-terminal): the bootstrap, and no plain command after ssh's own
+    // failure (255), which is not a forced command.
     w.attach();
     let runs: Vec<Run> = w.calls().iter().map(|c| classify(c).0).collect();
-    assert!(runs.contains(&Run::Plain), "{runs:?}");
-    assert!(!runs.contains(&Run::Bootstrap), "{runs:?}");
+    assert!(runs.contains(&Run::Bootstrap), "{runs:?}");
+    assert!(!runs.contains(&Run::Plain), "{runs:?}");
 }
 
 /// The options check itself: what it lets through and what it does not.
@@ -812,14 +823,21 @@ fn session_umask(a: &mut Attached) -> String {
     t[at..at + 4].to_string()
 }
 
-/// A live session over the plain command: a reconnect in the background, a takeover and its
-/// taking back, `fil ports` and `~#` against the live daemon. Every ssh run on the way is one
-/// of the two approved commands with fil's own options, the background ones included.
+/// A live session with this build's fil on the host's `PATH`: the bootstrap starts it (its
+/// `PATH` step, owner 2026-11-09), on one login. A reconnect in the background, a takeover and
+/// its taking back, `fil ports` and `~#` against the live daemon. Every ssh run on the way is
+/// one of the two approved commands with fil's own options, the background ones included, and
+/// with `remote = "auto"` every one is the bootstrap.
 #[test]
 fn a_live_session_runs_only_the_approved_remote_commands() {
     let w = World::with(PIPE_ONLY, Remote::OnPath);
     let mut a = w.start();
     a.live(1);
+    assert_eq!(
+        logins_of(&w.calls()),
+        [(Run::Bootstrap, false)],
+        "one login, the bootstrap's"
+    );
     // The session sees the login's umask (the fake's 027), not the client's.
     assert_eq!(session_umask(&mut a), "0027");
 
@@ -860,20 +878,23 @@ fn a_live_session_runs_only_the_approved_remote_commands() {
         .iter()
         .filter(|(r, _)| *r != Run::ConfigQuery)
         .collect();
-    assert!(logins.iter().all(|(r, _)| *r == Run::Plain), "{logins:?}");
+    assert!(
+        logins.iter().all(|(r, _)| *r == Run::Bootstrap),
+        "{logins:?}"
+    );
     assert!(
         logins.iter().filter(|(_, bg)| *bg).count() >= 2,
         "the reconnect and the take-back are background runs: {logins:?}"
     );
 }
 
-/// No fil on the host's PATH, a copy in its install directory: the plain command fails, the
-/// bootstrap takes over at the run's first connection (and only then), its fast path starts the
-/// installed copy, and the run's background reconnect uses the bootstrap too. The session's
-/// umask is the login's, as on the plain command. `fil ls` does the same; `remote = "plain"`
-/// never runs the bootstrap; `remote = "installed"` runs it from the start.
+/// No fil on the host's PATH, a copy in its install directory (the case the owner's
+/// bootstrap-first change is for, 2026-11-09): the bootstrap's fast path starts the installed
+/// copy on one login, with no shell "command not found" on the terminal, and the run's
+/// background reconnect uses the bootstrap too. The session's umask is the login's. `fil ls`
+/// does the same; `remote = "plain"` never runs the bootstrap; `remote = "installed"` runs it.
 #[test]
-fn the_bootstrap_takes_over_where_the_plain_command_finds_no_fil() {
+fn the_bootstrap_starts_an_installed_copy_on_one_login() {
     let w = World::with(PIPE_ONLY, Remote::Installed);
     let mut a = w.start();
     a.live(1);
@@ -883,18 +904,15 @@ fn the_bootstrap_takes_over_where_the_plain_command_finds_no_fil() {
         "the fast path hands on the umask"
     );
     let first: Vec<_> = logins_of(&w.calls());
-    assert_eq!(
-        first,
-        [(Run::Plain, false), (Run::Bootstrap, false)],
-        "the plain command first, then the bootstrap once"
-    );
+    assert_eq!(first, [(Run::Bootstrap, false)], "one login");
+    assert!(!a.text().contains("not found"), "{:?}", a.text());
     assert!(w.kill_relays() >= 1, "no relay to kill");
     w.wait_for_call("in the background", |c| {
         c.iter().any(|a| a == "BatchMode=yes")
     });
     a.live(2);
     drop(a);
-    let later: Vec<_> = logins_of(&w.seen.lock().unwrap()[2..]);
+    let later: Vec<_> = logins_of(&w.seen.lock().unwrap()[1..]);
     assert!(
         later.iter().all(|r| *r == (Run::Bootstrap, true)),
         "the run remembers what worked: {later:?}"
@@ -906,10 +924,7 @@ fn the_bootstrap_takes_over_where_the_plain_command_finds_no_fil() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(
-        logins_of(&w.calls()),
-        [(Run::Plain, false), (Run::Bootstrap, false)]
-    );
+    assert_eq!(logins_of(&w.calls()), [(Run::Bootstrap, false)]);
 
     let plain = World::with(
         &format!("{PIPE_ONLY}[host.devbox]\nremote = \"plain\"\n"),
@@ -939,7 +954,8 @@ fn the_bootstrap_takes_over_where_the_plain_command_finds_no_fil() {
 /// A forced command (`ForceCommand`, `command=`) that allows only `fil server --stdio`, with
 /// `remote = "installed"`: the relay answers the bootstrap's place with an unmarked preamble, and
 /// the run ends at once, saying why, with nothing more sent and nothing written on the host.
-/// The default (`auto`) still works through the gate.
+/// The default (`auto`) still works through the gate: the bootstrap, then `fil server --stdio`
+/// once (two logins, the owner's accepted cost there), which the run keeps for its reconnects.
 #[test]
 fn a_forced_command_ends_remote_installed_at_once() {
     let mut w = World::with(
@@ -967,7 +983,48 @@ fn a_forced_command_ends_remote_installed_at_once() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(logins_of(&auto.calls()), [(Run::Plain, false)]);
+    assert_eq!(
+        logins_of(&auto.calls()),
+        [(Run::Bootstrap, false), (Run::Plain, false)]
+    );
+    let mut a = auto.start();
+    a.live(1);
+    assert_eq!(
+        logins_of(&auto.calls()),
+        [(Run::Bootstrap, false), (Run::Plain, false)]
+    );
+    assert!(auto.kill_relays() >= 1, "no relay to kill");
+    auto.wait_for_call("in the background", |c| {
+        c.iter().any(|a| a == "BatchMode=yes")
+    });
+    a.live(2);
+    drop(a);
+    // After `fil ls`'s two logins and the attach's two.
+    let later = logins_of(&auto.seen.lock().unwrap())[4..].to_vec();
+    assert!(
+        !later.is_empty() && later.iter().all(|r| *r == (Run::Plain, true)),
+        "the run keeps the plain command: {later:?}"
+    );
+    assert!(!auto.remote_home().join(".local/share/fil").exists());
+}
+
+/// The owner's second rule (2026-11-09): a plain try whose login shell says it found no fil
+/// never shows that line; fil's own words do. Here the plain retry behind a forced command
+/// finds no fil (a contrived host: the forced command runs fil, the plain command does not).
+#[test]
+fn a_plain_try_never_shows_the_shells_command_not_found() {
+    let mut w = World::with(PIPE_ONLY, Remote::OnPath);
+    w.force_gone = true;
+    let text = w.attach();
+    assert_eq!(
+        logins_of(&w.calls()),
+        [(Run::Bootstrap, false), (Run::Plain, false)]
+    );
+    assert!(text.contains("fil is not installed"), "{text:?}");
+    assert!(
+        !text.contains("fil: command not found") && !text.contains("fil: not found"),
+        "{text:?}"
+    );
 }
 
 /// No fil anywhere on the host: the attach asks once (`install = "ask"`), before the terminal
@@ -982,10 +1039,7 @@ fn the_offer_asks_on_the_first_attach_only() {
     a.type_bytes(b"n\r");
     a.wait_exit();
     assert!(a.text().contains("not installing"), "{:?}", a.text());
-    assert_eq!(
-        logins_of(&w.calls()),
-        [(Run::Plain, false), (Run::Bootstrap, false)]
-    );
+    assert_eq!(logins_of(&w.calls()), [(Run::Bootstrap, false)]);
 
     let mut a = w.start();
     a.wait_for("[y/N]", 0);
@@ -1005,10 +1059,7 @@ fn the_offer_asks_on_the_first_attach_only() {
         err.contains("not installed") && !err.contains("[y/N]"),
         "{err}"
     );
-    assert_eq!(
-        logins_of(&w.calls()),
-        [(Run::Plain, false), (Run::Bootstrap, false)]
-    );
+    assert_eq!(logins_of(&w.calls()), [(Run::Bootstrap, false)]);
     assert!(!w.remote_home().join(".local").exists(), "nothing written");
 
     let never = World::with(
@@ -1053,10 +1104,7 @@ fn a_management_command_never_installs_even_on_a_terminal() {
             !text.contains("[y/N]") && !text.contains("not uploading"),
             "install = {install}: {text:?}"
         );
-        assert_eq!(
-            logins_of(&w.calls()),
-            [(Run::Plain, false), (Run::Bootstrap, false)]
-        );
+        assert_eq!(logins_of(&w.calls()), [(Run::Bootstrap, false)]);
         assert!(!w.remote_home().join(".local").exists());
     }
 }
@@ -1088,12 +1136,14 @@ fn a_reconnect_never_installs() {
     assert!(!copy.exists(), "nothing was installed");
 }
 
-/// `remote = "auto"`'s second trigger: the host's fil is of another wire, a major apart (the
-/// pipe's preamble says so) or a revision apart (the hello says so). The run tries the bootstrap
-/// once, which starts this version's installed copy, for an attach and for `fil ls`. When the
-/// bootstrap's fil is of that other wire too, the run fails after it: no third login.
+/// The host's fil on `PATH` is of another wire, a major apart or a revision apart: the
+/// bootstrap's `PATH` step skips it (its `--version` names another wire) and starts this
+/// version's installed copy, on one login, for an attach and for `fil ls`. When the installed
+/// copy is of that other wire too, the run fails on that one login, saying so (only an exact
+/// version directory or a fil of this wire is ever started, and the hello refuses another wire).
+/// With nothing installed, the bootstrap greets and the attach offers the install.
 #[test]
-fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
+fn a_fil_of_another_wire_on_path_is_skipped() {
     for major in [true, false] {
         let fresh = || {
             World::with(
@@ -1104,8 +1154,6 @@ fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
                 },
             )
         };
-        // Each in a world of its own: once a daemon of this wire runs there, a relay of another
-        // revision reaches it, and the plain command works.
         let w = fresh();
         let out = w.run(&["ls", HOST]);
         assert!(
@@ -1115,7 +1163,7 @@ fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
         );
         assert_eq!(
             logins_of(&w.calls()),
-            [(Run::Plain, false), (Run::Bootstrap, false)],
+            [(Run::Bootstrap, false)],
             "major={major}: ls"
         );
         let w = fresh();
@@ -1123,7 +1171,7 @@ fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
         a.live(1);
         assert_eq!(
             logins_of(&w.calls()),
-            [(Run::Plain, false), (Run::Bootstrap, false)],
+            [(Run::Bootstrap, false)],
             "major={major}: the attach"
         );
         drop(a);
@@ -1144,15 +1192,44 @@ fn a_fil_of_another_wire_falls_back_to_the_bootstrap_once() {
         );
         assert_eq!(
             logins_of(&both.calls()),
-            [(Run::Plain, false), (Run::Bootstrap, false)],
-            "major={major}: ls, no third login"
+            [(Run::Bootstrap, false)],
+            "major={major}: ls, no second login"
         );
         let text = both.attach();
         assert!(!text.is_empty());
         assert_eq!(
             logins_of(&both.calls()),
-            [(Run::Plain, false), (Run::Bootstrap, false)],
-            "major={major}: the attach, no third login: {text:?}"
+            [(Run::Bootstrap, false)],
+            "major={major}: the attach, no second login: {text:?}"
         );
+
+        // Only the other wire's fil on PATH, nothing installed: the greeting, so the attach
+        // offers the install (answered no) and `fil ls` says how, each on one login.
+        let only = World::with(PIPE_ONLY, Remote::Nowhere);
+        let on_path = only.root.join("remote-bin/fil");
+        std::fs::write(&on_path, other_wire_fil(major)).unwrap();
+        mode(&on_path, 0o755);
+        let mut a = only.start();
+        a.wait_for("[y/N]", 0);
+        a.type_bytes(b"n\r");
+        a.wait_exit();
+        assert!(
+            a.text().contains("not installing"),
+            "major={major}: {:?}",
+            a.text()
+        );
+        assert_eq!(
+            logins_of(&only.calls()),
+            [(Run::Bootstrap, false)],
+            "major={major}: the offer"
+        );
+        let out = only.run(&["ls", HOST]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("not installed"),
+            "major={major}: {err}"
+        );
+        assert_eq!(logins_of(&only.calls()), [(Run::Bootstrap, false)]);
+        assert!(!only.remote_home().join(".local").exists());
     }
 }

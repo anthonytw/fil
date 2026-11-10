@@ -3,9 +3,9 @@
 //!
 //! They reach the daemon in one of two ways:
 //!
-//! - **With a HOST**, over a new pipe to the host: `fil server --stdio`, and the install
-//!   bootstrap only as `remote = ...` says (`crate::install::fallback`: the plain command first;
-//!   the bootstrap once if it finds no fil of this wire, never with `remote = "plain"` or a custom
+//! - **With a HOST**, over a new pipe to the host: the install bootstrap or `fil server --stdio`,
+//!   as `remote = ...` says (`crate::install::fallback`: the bootstrap first, the plain command
+//!   once behind a forced command; only the plain command with `remote = "plain"` or a custom
 //!   `pipe`). These commands never install: a host with no fil gets the words that say how.
 //! - **Without one**, inside a session, through the Unix socket of the daemon on this machine
 //!   ([`connect_local`]). The session is `$FIL_SESSION`, which every session's shell has.
@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::connect::Connect;
 use crate::dialer::Connector;
 use crate::install::attach::Offer;
-use crate::install::fallback::{Command as InstallCommand, Next, Run};
+use crate::install::fallback::Run;
 use crate::link::AnyLink;
 use crate::ports_view::{PortsAnswer, ViewOptions, render_json, render_text};
 use crate::{localtime, mgmt};
@@ -193,8 +193,6 @@ struct Conn {
     /// The host as typed; `None` for the daemon on this machine.
     host: Option<String>,
     paths: Option<Paths>,
-    /// How the host was reached, for the one fallback a version mismatch may call for.
-    connector: Option<std::sync::Arc<Connect>>,
 }
 
 impl Conn {
@@ -208,31 +206,10 @@ impl Conn {
             p.shutdown().await;
         }
     }
-
-    /// `remote = "auto"`'s second trigger: the answer of the run's first connection was a
-    /// relay of another wire with no daemon of ours. Then a new connection, through the install
-    /// bootstrap (once; it never installs), replaces this one; otherwise `None`.
-    async fn after(&self, e: &mgmt::MgmtError) -> Option<Result<Conn, u8>> {
-        let connector = self.connector.as_ref()?;
-        let host = self.host.as_deref()?;
-        if !matches!(
-            e,
-            mgmt::MgmtError::Version(_) | mgmt::MgmtError::VersionRefused
-        ) || connector.run().version_mismatch() != Next::Retry(InstallCommand::Bootstrap)
-        {
-            return None;
-        }
-        tracing::info!("the remote host's fil is of another wire; trying the install bootstrap");
-        connector.run().set_trigger(e.to_string());
-        if let AnyLink::Pipe(p) = &self.link {
-            p.shutdown().await;
-        }
-        Some(open(host, connector.clone()).await)
-    }
 }
 
 /// One pipe run to `host`, with its words on failure.
-async fn open(host: &str, connector: std::sync::Arc<Connect>) -> Result<Conn, u8> {
+async fn open(host: &str, connector: &Connect) -> Result<Conn, u8> {
     // The user is waiting, so ssh may ask for a password or a Touch ID.
     let up = match connector.run_pipe(true).await {
         Ok(up) => up,
@@ -251,7 +228,6 @@ async fn open(host: &str, connector: std::sync::Arc<Connect>) -> Result<Conn, u8
         link: up.link,
         host: Some(host.to_string()),
         paths: None,
-        connector: Some(connector),
     })
 }
 
@@ -276,7 +252,7 @@ async fn connect(place: &Place<'_>, config: &Config) -> Result<Conn, u8> {
                         return Err(FAILED);
                     }
                 };
-            open(host, std::sync::Arc::new(connector)).await
+            open(host, &connector).await
         }
         Place::Here => {
             let paths = Paths::for_current_user();
@@ -285,7 +261,6 @@ async fn connect(place: &Place<'_>, config: &Config) -> Result<Conn, u8> {
                     link: AnyLink::Pipe(link),
                     host: None,
                     paths: Some(paths),
-                    connector: None,
                 }),
                 Err(e) => {
                     eprintln!("fil: {e}");
@@ -380,20 +355,11 @@ pub async fn forward(target: Target, op: fil_proto::msg::ForwardOp, config: &Con
 
 /// One request with a one-response answer, rendered.
 async fn single(place: &Place<'_>, request: Request, config: &Config) -> u8 {
-    let mut conn = match connect(place, config).await {
+    let conn = match connect(place, config).await {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let mut answer = mgmt::ask_one(&conn.link, request.clone()).await;
-    if let Err(e) = &answer
-        && let Some(again) = conn.after(e).await
-    {
-        conn = match again {
-            Ok(c) => c,
-            Err(code) => return code,
-        };
-        answer = mgmt::ask_one(&conn.link, request.clone()).await;
-    }
+    let answer = mgmt::ask_one(&conn.link, request.clone()).await;
     let code = match &answer {
         Ok(response) => match mgmt::render(&request, response, conn.label(), now_unix_ms()) {
             Ok(text) => {
@@ -453,7 +419,7 @@ pub async fn ports(target: Target, json: bool, probe_other: bool, config: &Confi
             }
         },
     };
-    let mut conn = match connect(&place, config).await {
+    let conn = match connect(&place, config).await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -461,16 +427,7 @@ pub async fn ports(target: Target, json: bool, probe_other: bool, config: &Confi
         session: focus.clone(),
         probe_other,
     };
-    let mut answer = mgmt::ask(&conn.link, request.clone()).await;
-    if let Err(e) = &answer
-        && let Some(again) = conn.after(e).await
-    {
-        conn = match again {
-            Ok(c) => c,
-            Err(code) => return code,
-        };
-        answer = mgmt::ask(&conn.link, request.clone()).await;
-    }
+    let answer = mgmt::ask(&conn.link, request.clone()).await;
     let code = match &answer {
         Ok(parts) => match parts.as_slice() {
             [Response::NoSuchSession] => {

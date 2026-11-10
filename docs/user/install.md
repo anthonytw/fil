@@ -84,7 +84,7 @@ fil: fil is not installed on devbox. Install fil <version> (wire <w>) into ~/.lo
 
 Answer `y` and the install login becomes your session. The `install` setting in your [config](config.md) changes the question: `ask` (the default), `never` (only say how to install), or `always`. A reconnect in the background never installs, and neither do `fil ls` and the other commands.
 
-The `remote` setting in the same file chooses the command fil runs on the host: `auto` (the default) tries `fil server --stdio` and falls back to the install command once if that finds no fil; `plain` runs only `fil server --stdio`, for hosts behind a forced-command gate; `installed` goes straight to the install command. After an install, fil prints the one config line that saves the second login on later runs.
+The `remote` setting in the same file chooses the command fil runs on the host: `auto` (the default) runs the install command first, which starts the copy fil installed, `~/.local/bin/fil` or the `fil` on the host's `PATH` (each only if it speaks your fil's wire), or asks to install, all on one ssh login; `plain` runs only `fil server --stdio`, for hosts behind a forced-command gate; `installed` is like `auto` but never falls back to `fil server --stdio`. fil writes nothing about the host on your machine.
 
 ## Upgrading
 

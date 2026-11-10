@@ -62,13 +62,16 @@ jobs:
     if: inputs.suite == 'check' || inputs.suite == 'all'
     name: check (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    # Intel runners take 62-72 min for this job (cargo-about alone is built
+    # from source there, about 5 min), so 75 cut 2 of 5 runs mid-suite on
+    # 2026-11-10 with every test passing. arm64 takes about 45 min.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: arm64, os: macos-15 }
-          - { label: x86_64, os: macos-15-intel }
+          - { label: arm64, os: macos-15, timeout: 75 }
+          - { label: x86_64, os: macos-15-intel, timeout: 105 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

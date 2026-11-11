@@ -1,8 +1,9 @@
 //! A scripted fake remote and a virtual-time link, for fast deterministic overlay tests.
 //!
 //! No PTY and no threads: a seeded random typist, a latency/jitter link that delivers in
-//! order and cuts the server's output at arbitrary byte positions (so escape sequences and
-//! UTF-8 characters arrive split), and a fake remote that behaves like a tty line discipline
+//! order and cuts the server's output into chunks ([`Writes`]: at arbitrary byte positions, so
+//! escape sequences and UTF-8 characters arrive split; only where the daemon would release them;
+//! or never inside a program's write), and a fake remote that behaves like a tty line discipline
 //! plus a program that disturbs the screen in the way each [`Scenario`] describes. The
 //! client side is a [`Driver`]: overlay, oracle, trace.
 //!
@@ -783,6 +784,38 @@ fn find(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// How the link cuts each program write into the chunks the client applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writes {
+    /// Each write arrives whole, as a PTY read of a keystroke's echo nearly always is
+    /// (consecutive writes still arrive as separate chunks).
+    Whole,
+    /// Cut at arbitrary bytes as by [`Writes::Arbitrary`] (the PTY read's split), then released
+    /// only up to the last place a terminal's parser is at rest, the rest held back and joined
+    /// with the next read, as the daemon releases output (`fil-session/src/core.rs`,
+    /// `Core::release_output`, with [`fil_term::Boundary`]): chunks end between escape sequences
+    /// and UTF-8 characters, never inside one. Not modeled: the daemon's own cuts on the wire at
+    /// a mode-change offset or a 16 KiB frame (`serve.rs`), which can split a sequence but are
+    /// rare for an echo; and its batching of queued reads into one chunk, which makes it cut
+    /// less often than this.
+    Boundaries,
+    /// Cut at arbitrary bytes, so escape sequences and UTF-8 characters arrive split (the
+    /// client's tracker must cope with any split).
+    Arbitrary,
+}
+
+impl Writes {
+    pub const ALL: [Writes; 3] = [Writes::Whole, Writes::Boundaries, Writes::Arbitrary];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Writes::Whole => "whole",
+            Writes::Boundaries => "boundaries",
+            Writes::Arbitrary => "arbitrary",
+        }
+    }
+}
+
 /// One simulated session.
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -792,14 +825,14 @@ pub struct SimConfig {
     pub keys: usize,
     pub one_way: Duration,
     pub jitter: Duration,
-    /// Server output is delivered in chunks of 1 to this many bytes (at random).
+    /// Server output is delivered in chunks of 1 to this many bytes (at random), unless
+    /// `writes` is [`Writes::Whole`].
     pub max_chunk: usize,
-    /// Cut the program's writes at arbitrary bytes (`true`), or deliver each write whole, as a
-    /// PTY read of a keystroke's echo nearly always is (`false`; consecutive writes still arrive
-    /// as separate chunks). The faithful bar is measured with whole writes: the core checks the
-    /// cursor after every chunk, so an echo cut where it passes the cursor through a place no
-    /// guess leaves it (a Backspace's `\b \b`, an insert's shifted rest) ends the epoch.
-    pub split_writes: bool,
+    /// Where the program's writes may be cut. The faithful bar is measured with whole writes:
+    /// the core checks the cursor after every chunk, so an echo cut where it passes the cursor
+    /// through a place no guess leaves it (a Backspace's `\b \b`, an insert's shifted rest) can
+    /// end the epoch.
+    pub writes: Writes,
     pub run: RunConfig,
 }
 
@@ -816,7 +849,7 @@ impl SimConfig {
             one_way: Duration::from_millis(60),
             jitter: Duration::from_millis(20),
             max_chunk: 7,
-            split_writes: true,
+            writes: Writes::Arbitrary,
             run,
         }
     }
@@ -1014,13 +1047,16 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     let mut link = Link {
         one_way: micros(cfg.one_way),
         jitter: micros(cfg.jitter),
-        max_chunk: if cfg.split_writes {
-            cfg.max_chunk as u64
-        } else {
+        max_chunk: if cfg.writes == Writes::Whole {
             u64::MAX / 2
+        } else {
+            cfg.max_chunk as u64
         },
         last_s2c: 0,
         last_c2s: 0,
+        boundaries: cfg.writes == Writes::Boundaries,
+        boundary: fil_term::Boundary::new(),
+        tail: Vec::new(),
     };
 
     let first = remote.setup();
@@ -1157,6 +1193,11 @@ struct Link {
     max_chunk: u64,
     last_s2c: u64,
     last_c2s: u64,
+    /// [`Writes::Boundaries`]: each read is released only up to its last boundary.
+    boundaries: bool,
+    boundary: fil_term::Boundary,
+    /// The bytes of a half sequence, held back until it completes.
+    tail: Vec<u8>,
 }
 
 impl Link {
@@ -1176,7 +1217,28 @@ impl Link {
                         } else {
                             (1 + rng.below(self.max_chunk) as usize).min(rest.len())
                         };
-                        q.put(t, Q::ToClient(rest[..n].to_vec()));
+                        let read = &rest[..n];
+                        if self.boundaries {
+                            // As `Core::release_output` (`fil-session/src/core.rs`): `scan`
+                            // returns 0 both when the read starts a sequence it does not finish
+                            // and when it never reaches a boundary; only the first case moves
+                            // the old tail on. (Its `MAX_TAIL` escape, a megabyte, never applies
+                            // here.)
+                            let was_at_rest = self.boundary.at_rest();
+                            let k = self.boundary.scan(read);
+                            if k == 0 && !was_at_rest {
+                                self.tail.extend_from_slice(read);
+                            } else {
+                                let mut out = std::mem::take(&mut self.tail);
+                                out.extend_from_slice(&read[..k]);
+                                self.tail = read[k..].to_vec();
+                                if !out.is_empty() {
+                                    q.put(t, Q::ToClient(out));
+                                }
+                            }
+                        } else {
+                            q.put(t, Q::ToClient(read.to_vec()));
+                        }
                         rest = &rest[n..];
                         t += 50;
                     }

@@ -321,8 +321,21 @@ pub(crate) struct Core {
     pub stats: PredictStats,
     /// Where the cursor was left by the current epoch's latest confirmed guess: in a confirmed
     /// epoch, a chunk that leaves the cursor there is explained (the second piece of an echo cut
-    /// after the glyph, `g ` then `\x1b[1D`, or a `\b \b` in pieces).
-    echoed_at: Option<(u16, u16)>,
+    /// after the glyph, `g ` then `\x1b[1D`, or a `\b \b` in pieces). One value, except for the
+    /// chain [`Core::confirm_as`] describes (a typed space over a blank confirmed in the same
+    /// chunk right after the glyph before it: `k ` then `\x1b[1D`, both cursors).
+    echoed_at: Vec<(u16, u16)>,
+    /// The same for kept guesses (rule 3), kept the same way; cleared when the epoch ends, and
+    /// started anew by the first confirmation of a later chunk or ack. In a
+    /// tentative epoch, a chunk that changes no glyph outside the exemptions and only leaves the
+    /// cursor at one of them, or where a kept guess still pending would leave it, is a piece of
+    /// a kept guess's echo (`h ` then `\x1b[1D` after an Esc, the first `\b` of a `\b \b`
+    /// after an Enter): neutral, not `Unexplained`. It confirms nothing; a kept guess never
+    /// confirms the new epoch.
+    kept_echoed_at: Vec<(u16, u16)>,
+    /// A chunk or an `EchoAck` came since the last confirmation: the next one starts the lists
+    /// above anew.
+    fresh_echo: bool,
     /// Counts the epochs: changes whenever one ends or the keys are forgotten (`CoreView::epoch`,
     /// for the predictor; nothing here reads it).
     pub epoch: u64,
@@ -346,7 +359,9 @@ impl Core {
             deferred: Vec::new(),
             settled: Vec::new(),
             stats: PredictStats::default(),
-            echoed_at: None,
+            echoed_at: Vec::new(),
+            kept_echoed_at: Vec::new(),
+            fresh_echo: false,
             epoch: 0,
         }
     }
@@ -832,7 +847,8 @@ impl Core {
         });
         self.state = State::Tentative;
         self.confirmed_once = false;
-        self.echoed_at = None;
+        self.echoed_at.clear();
+        self.kept_echoed_at.clear();
         self.awaiting_ack = None;
     }
 
@@ -865,7 +881,8 @@ impl Core {
         self.keys.clear();
         self.epoch += 1;
         // The geometry changed: no cursor an earlier echo left is evidence of anything now.
-        self.echoed_at = None;
+        self.echoed_at.clear();
+        self.kept_echoed_at.clear();
     }
 
     /// A snapshot replaces the shadow: the epoch ends (unless `Guards::snapshot` is off), and
@@ -905,7 +922,8 @@ impl Core {
         self.keys.clear();
         self.state = State::Tentative;
         self.confirmed_once = false;
-        self.echoed_at = None;
+        self.echoed_at.clear();
+        self.kept_echoed_at.clear();
         self.awaiting_ack = None;
         self.baseline = None;
         self.dirty = false;
@@ -920,7 +938,8 @@ impl Core {
         self.keys.clear();
         self.state = State::Tentative;
         self.confirmed_once = false;
-        self.echoed_at = None;
+        self.echoed_at.clear();
+        self.kept_echoed_at.clear();
         self.awaiting_ack = None;
         self.acked = 0;
     }
@@ -1045,11 +1064,38 @@ impl Core {
 
     /// Confirms key `i`'s guess, and the moves before it (the program handles keys in order).
     fn confirm(&mut self, i: usize, v: &dyn ScreenView, now: Time) {
+        self.confirm_as(i, v, now, true);
+    }
+
+    /// [`Core::confirm`], told whether the guess's cell changed to its glyph in this chunk. The
+    /// cursor its echo leaves replaces the one an earlier confirmation left (`echoed_at`, or
+    /// `kept_echoed_at` for a kept guess), as one value, with one exception: the guess of a typed
+    /// space (the key itself, `KeyClass::Printable(' ')`, not a blank the predictor chose)
+    /// confirmed in the same chunk on the cell where the last one left the cursor, whose cell
+    /// already showed the blank, adds its cursor and keeps the earlier ones, since the echo may
+    /// draw the cell as the rest of the line and move back (`k ` then `CSI 1 D`). A run of such
+    /// spaces makes a run of cursors. Anything else (a cell that changed, a guess elsewhere, any
+    /// other key) starts anew.
+    fn confirm_as(&mut self, i: usize, v: &dyn ScreenView, now: Time, changed: bool) {
         if let Some(g) = self.keys[i].guess.as_ref()
-            && !g.kept
-            && matches!(g.kind, GKind::Glyph { .. })
+            && let GKind::Glyph {
+                row, col, glyph, ..
+            } = g.kind
         {
-            self.echoed_at = Some(g.after);
+            if std::mem::take(&mut self.fresh_echo) {
+                self.echoed_at.clear();
+                self.kept_echoed_at.clear();
+            }
+            let list = if g.kept {
+                &mut self.kept_echoed_at
+            } else {
+                &mut self.echoed_at
+            };
+            let typed_space = self.keys[i].class == KeyClass::Printable(' ') && glyph == ' ';
+            if changed || !typed_space || list.last() != Some(&(row, col)) {
+                list.clear();
+            }
+            list.push(g.after);
         }
         for j in 0..i {
             if self.is_pending(j)
@@ -1096,6 +1142,7 @@ impl Core {
     /// Checks one output chunk against the epoch's guesses (rules 2, 3): contradiction and
     /// unexplained output first, then confirmation. Called only while guesses are pending.
     pub fn on_chunk(&mut self, v: &dyn ScreenView, now: Time) {
+        self.fresh_echo = true;
         let Some(base) = self.baseline.take() else {
             // Guesses with nothing to compare against: nothing can confirm them.
             self.end(Why::Unexplained, Some(v), now);
@@ -1172,7 +1219,7 @@ impl Core {
                 return self.rebase(v);
             }
             let allowed = !moved
-                || self.echoed_at == Some(cur)
+                || self.echoed_at.contains(&cur)
                 || self.keys.iter().any(|k| {
                     k.guess
                         .as_ref()
@@ -1191,21 +1238,25 @@ impl Core {
             contradict(self, &contradicted);
             return self.rebase(v);
         }
-        if !changed && !moved {
-            // Nothing outside the exemptions changed: a chunk that explains nothing and
-            // contradicts nothing (a bell, a title, a pen change, half a sequence).
-            if !contradicted.is_empty() {
-                contradict(self, &contradicted);
-            }
-            return self.rebase(v);
-        }
-        let explained = !self.g.explained_chunk || (!unexplained && !stray);
         // A kept guess settles by its glyph, but never confirms the new epoch.
         let kept_matched: Vec<usize> = matched
             .iter()
             .copied()
             .filter(|&i| self.is_kept(i))
             .collect();
+        if !changed && !moved {
+            // Nothing outside the exemptions changed: a chunk that explains nothing and
+            // contradicts nothing (a bell, a title, a pen change, half a sequence). A kept
+            // guess's cell at the cursor is exempt, so its echo can be such a chunk (the ` \b` of
+            // a Backspace's `\b \b` in pieces): it settles by its glyph, as on any other chunk.
+            if contradicted.is_empty() {
+                self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
+            } else {
+                contradict(self, &contradicted);
+            }
+            return self.rebase(v);
+        }
+        let explained = !self.g.explained_chunk || (!unexplained && !stray);
         let confirming: Vec<usize> = if self.g.changed_glyph {
             matched_changed.clone()
         } else {
@@ -1263,12 +1314,12 @@ impl Core {
         }
         // The echo of kept guesses alone (the line typed before an Enter): they are confirmed,
         // and the new epoch is still tentative.
-        let kept_cursor = !moved
-            || self.keys.iter().any(|k| {
-                k.guess
-                    .as_ref()
-                    .is_some_and(|g| g.kept && g.state == GState::Pending && g.after == cur)
-            });
+        let kept_after_cur = self.keys.iter().any(|k| {
+            k.guess
+                .as_ref()
+                .is_some_and(|g| g.kept && g.state == GState::Pending && g.after == cur)
+        });
+        let kept_cursor = !moved || kept_after_cur;
         if !kept_matched.is_empty()
             && contradicted.is_empty()
             && !unexplained
@@ -1277,6 +1328,15 @@ impl Core {
             && kept_cursor
         {
             self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
+            return self.rebase(v);
+        }
+        if !changed
+            && contradicted.is_empty()
+            && (kept_after_cur || self.kept_echoed_at.contains(&cur))
+        {
+            // Only the cursor moved, to where a kept guess's echo left it or will leave it: a
+            // piece of that echo (cut after its glyph, or a Backspace's first `\b`). Neutral,
+            // like a chunk that changes nothing: it confirms nothing and ends nothing.
             return self.rebase(v);
         }
         // Anything else breaks rule 2: the tentative epoch ends unwritten.
@@ -1315,7 +1375,7 @@ impl Core {
             .max();
         for &i in matched {
             if changed.contains(&i) || reached.is_some_and(|r| i <= r) {
-                self.confirm(i, v, now);
+                self.confirm_as(i, v, now, changed.contains(&i));
             }
         }
     }
@@ -1371,6 +1431,7 @@ impl Core {
         if input_upto > input_end {
             return;
         }
+        self.fresh_echo = true;
         self.acked = self.acked.max(input_upto);
         if !self.g.echo_ack {
             return;

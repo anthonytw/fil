@@ -9,7 +9,8 @@
 //! the predictor, keep them off the screen.
 
 use fil_predict::driver::{PredictorKind, Stats, shrink};
-use fil_predict::sim::{Category, Scenario, SimConfig, run};
+use fil_predict::overlay::Mispredicted;
+use fil_predict::sim::{Category, Scenario, SimConfig, Writes, run};
 use fil_term::backends;
 
 /// First seed (`FIL_PREDICT_SEED_BASE`), to run a different range in a soak.
@@ -28,15 +29,39 @@ fn seeds() -> u64 {
         .unwrap_or(2)
 }
 
+/// Visible mispredictions by kind: `ended`, `contradicted`, the rest.
+fn kinds(m: &Mispredicted, keys: u64) -> String {
+    let per = |n: u64| n as f64 * 1000.0 / keys.max(1) as f64;
+    let other = m.total() - m.ended - m.contradicted;
+    format!(
+        "ended {:.2} contradicted {:.2} other {:.2}",
+        per(m.ended),
+        per(m.contradicted),
+        per(other)
+    )
+}
+
+fn add(a: &mut Mispredicted, b: &Mispredicted) {
+    a.contradicted += b.contradicted;
+    a.echo_ack += b.echo_ack;
+    a.expired += b.expired;
+    a.password += b.password;
+    a.ended += b.ended;
+    a.withdrawn += b.withdrawn;
+}
+
 fn scenario(sc: Scenario) {
     let mut stats = Stats::default();
     // The default predictor's counts (`docs/m3/plan.md` §2.5): keys typed, guesses written,
     // visible mispredictions.
     let (mut keys, mut written, mut mispredicted) = (0u64, 0u64, 0u64);
-    // The faithful and slow programs again with their writes cut at arbitrary bytes: counted,
-    // not judged (see `SimConfig::split_writes`).
+    let mut by_kind = Mispredicted::default();
+    // The faithful and slow programs again with their writes cut where the daemon releases
+    // output and at arbitrary bytes: counted, not judged (see `SimConfig::writes`).
     let barred = matches!(sc.category(), Category::Faithful | Category::Slow);
-    let (mut cut_keys, mut cut_mispredicted) = (0u64, 0u64);
+    let mut cut_keys = 0u64;
+    let mut cut = [Mispredicted::default(), Mispredicted::default()];
+    let mut cut_written = [0u64; 2];
     for b in backends() {
         for hostile in [false, true] {
             // Fish keeps one guess in flight and the wide-character scenarios rarely paint: a few
@@ -57,21 +82,29 @@ fn scenario(sc: Scenario) {
                     // At most one written run per misprediction (the driver checks it).
                     cfg.run.bar = Some(Category::Adversarial);
                 } else if barred {
-                    let cut = run(&cfg);
-                    if let Some(f) = &cut.failure {
-                        panic!(
-                            "{} / {} / cut writes / seed {seed}: {:?}\n{}",
-                            b.name,
-                            sc.name(),
-                            f.violation.kind,
-                            f.violation.detail
-                        );
+                    for (i, writes) in [Writes::Arbitrary, Writes::Boundaries]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        cfg.writes = writes;
+                        let out = run(&cfg);
+                        if let Some(f) = &out.failure {
+                            panic!(
+                                "{} / {} / {} writes / seed {seed}: {:?}\n{}",
+                                b.name,
+                                sc.name(),
+                                writes.name(),
+                                f.violation.kind,
+                                f.violation.detail
+                            );
+                        }
+                        add(&mut cut[i], &out.predict.mispredicted);
+                        cut_written[i] += out.predict.written;
                     }
                     cut_keys += cfg.keys as u64;
-                    cut_mispredicted += cut.predict.mispredicted.total();
                     // The faithful and slow categories fail on any visible misprediction.
                     cfg.run.bar = Some(sc.category());
-                    cfg.split_writes = false;
+                    cfg.writes = Writes::Whole;
                 }
                 let out = run(&cfg);
                 stats.add(&out.stats);
@@ -79,6 +112,7 @@ fn scenario(sc: Scenario) {
                     keys += cfg.keys as u64;
                     written += out.predict.written;
                     mispredicted += out.predict.mispredicted.total();
+                    add(&mut by_kind, &out.predict.mispredicted);
                 }
                 if let Some(f) = out.failure {
                     let min = shrink(&out.trace, &cfg.run);
@@ -103,19 +137,29 @@ fn scenario(sc: Scenario) {
     // The soak's report (`-- --nocapture`): the adversarial bar is a rate.
     println!(
         "soak {:<14} {:<11?} keys {keys:>7} written {written:>7} mispredicted {mispredicted:>5} \
-         ({:.2} per 1,000 keys)",
+         ({:.2} per 1,000 keys: {})",
         sc.name(),
         sc.category(),
-        mispredicted as f64 * 1000.0 / keys.max(1) as f64
+        mispredicted as f64 * 1000.0 / keys.max(1) as f64,
+        kinds(&by_kind, keys)
     );
     if barred {
-        println!(
-            "soak {:<14} {:<11} keys {cut_keys:>7} cut writes, mispredicted {cut_mispredicted:>5} \
-             ({:.2} per 1,000 keys)",
-            sc.name(),
-            "(counted)",
-            cut_mispredicted as f64 * 1000.0 / cut_keys.max(1) as f64
-        );
+        for ((m, w), writes) in cut
+            .iter()
+            .zip(cut_written)
+            .zip([Writes::Arbitrary, Writes::Boundaries])
+        {
+            println!(
+                "soak {:<14} {:<11} keys {cut_keys:>7} {} writes, written {w:>7} mispredicted {:>5} \
+                 ({:.2} per 1,000 keys: {})",
+                sc.name(),
+                "(counted)",
+                writes.name(),
+                m.total(),
+                m.total() as f64 * 1000.0 / cut_keys.max(1) as f64,
+                kinds(m, cut_keys)
+            );
+        }
     }
 }
 

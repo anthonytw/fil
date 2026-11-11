@@ -994,3 +994,256 @@ fn a_kept_guess_does_not_explain_a_cursor_after_it() {
     t.server(b"\x1b[1;12H", 320); // the cursor to (0, 11), after the kept space
     assert!(!t.o.epoch_confirmed(), "a kept guess explained the cursor");
 }
+
+// ---- the soak with cuts at sequence boundaries ----------------------------------------------
+
+/// vi mode's echo in two pieces after an Esc (`k ` then `CSI 1 D`: the key, the rest of the line,
+/// the cursor back), with a typed space over a blank confirmed by the first piece. The second
+/// piece leaves the cursor where the kept `k` left it: neutral for the new, tentative epoch, so
+/// the kept guess after it stays and nothing blinks out.
+#[test]
+fn a_kept_echo_in_two_pieces_keeps_the_kept_guesses_after_it() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4), (0, 5)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"k", 200);
+    t.key(b" ", 210);
+    t.key(b"k", 220);
+    t.key(b"\x1b", 230); // a boundary: the written guesses are kept
+    assert!(t.painted());
+    t.server(b"k ", 300);
+    t.server(b"\x1b[1D", 301);
+    assert!(
+        t.painted(),
+        "the kept guess for the second `k` was taken off"
+    );
+    t.server(b"  \x1b[1D", 320);
+    t.server(b"k \x1b[1D", 340);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+    assert!(!t.painted());
+}
+
+/// A Backspace's `\b \b` in pieces after a boundary, its cell at the cursor (exempt): the first
+/// `\b` only moves the cursor to where the kept Backspace guess leaves it, and ` \b` changes
+/// only that cell. Neither ends the new epoch, and the kept blank settles by its glyph.
+#[test]
+fn a_kept_backspace_echo_in_pieces_settles_by_its_glyph() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 3)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"b", 200);
+    t.server(b"b", 300);
+    t.key(b"\x7f", 310);
+    assert!(t.painted());
+    t.key(b"\x15", 320); // Ctrl-U, a boundary: the written blank is kept
+    t.key(b"c", 330); // the new epoch's key, tentative
+    t.server(b"\x08", 400);
+    t.server(b" \x08", 401);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+    assert!(!t.painted(), "the kept blank did not settle");
+    t.server(b"\x1b[K", 420);
+    t.server(b"c", 430);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
+/// #72's review, F1: a cursor-only move back into the last echo is still `Unexplained` in a
+/// confirmed epoch. `bc` is echoed with `d` written and pending; a separate write moves the
+/// cursor back to after `b`. Only the latest confirmed guess's cursor explains a move (and the
+/// chain of a typed space over a blank right after it, which is not this case): the epoch ends,
+/// `d` is withdrawn and the next key is not written.
+#[test]
+fn a_move_back_into_the_last_echo_ends_a_confirmed_epoch() {
+    let mut t = T::trusted(); // `$ a`, cursor (0, 3)
+    t.key(b"b", 200);
+    t.key(b"c", 210);
+    t.key(b"d", 220);
+    t.server(b"bc", 300);
+    assert!(t.o.epoch_confirmed());
+    assert!(t.painted(), "`d` is not written");
+    t.server(b"\x1b[1D", 301);
+    assert!(!t.o.epoch_confirmed(), "the move back was explained");
+    assert!(!t.painted(), "`d` stayed");
+    assert_eq!(t.o.stats().mispredicted.ended, 1);
+    assert!(
+        t.key(b"e", 310).paint.is_empty(),
+        "the next key was written"
+    );
+}
+
+/// The same with a hostile choice of cells: guesses planted on cells that already show their
+/// glyph, confirmed with a real echo, leave only the last one's cursor, as before #72. A move to
+/// an earlier one's is `Unexplained`.
+#[test]
+fn guesses_planted_on_shown_glyphs_explain_one_cursor_at_most() {
+    let mut t = fixed(vec![(0, 2), (0, 10), (0, 12), (0, 3), (0, 4)]);
+    t.server(b"\x1b[1;11Hz\x1b[1;13Hy\x1b[1;1H", 0);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"z", 200); // planted on the `z` at (0, 10)
+    t.key(b"y", 210); // planted on the `y` at (0, 12)
+    t.key(b"b", 220);
+    t.key(b"d", 230);
+    t.server(b"b", 300); // confirms the plants and `b`
+    assert!(t.o.epoch_confirmed());
+    assert!(t.painted(), "`d` is not written");
+    t.server(b"\x1b[1;12H", 301); // after the first plant
+    assert!(
+        !t.o.epoch_confirmed(),
+        "an earlier plant's cursor was explained"
+    );
+    assert!(!t.painted(), "`d` stayed");
+}
+
+/// Guesses the n-th printable key at the n-th cell, as the n-th glyph (a forged one when it
+/// differs from the key: `OverlayEdit::Forged`, accepted only with `Guards::key_glyph` off).
+struct ForgingPredictor {
+    cells: Vec<(u16, u16, char)>,
+    next: usize,
+}
+
+impl Predictor for ForgingPredictor {
+    fn on_key(
+        &mut self,
+        key: &fil_predict::KeyEvent,
+        at: u64,
+        _ctx: &fil_predict::predictor::Ctx<'_>,
+    ) -> Vec<fil_predict::predictor::OverlayEdit> {
+        use fil_predict::KeyEvent;
+        use fil_predict::predictor::OverlayEdit;
+        let KeyEvent::Char(c) = key else {
+            return Vec::new();
+        };
+        let Some(&(row, col, ch)) = self.cells.get(self.next) else {
+            return Vec::new();
+        };
+        self.next += 1;
+        if ch == *c {
+            vec![OverlayEdit::Guess { row, col, at }]
+        } else {
+            vec![OverlayEdit::Forged { row, col, at, ch }]
+        }
+    }
+    fn on_output(
+        &mut self,
+        _ctx: &fil_predict::predictor::Ctx<'_>,
+    ) -> Vec<fil_predict::predictor::OverlayEdit> {
+        Vec::new()
+    }
+    fn on_settled(
+        &mut self,
+        _s: &[fil_predict::predictor::Settled],
+        _ctx: &fil_predict::predictor::Ctx<'_>,
+    ) {
+    }
+    fn on_echo_ack(&mut self, _upto: u64, _ctx: &fil_predict::predictor::Ctx<'_>) {}
+    fn on_tick(
+        &mut self,
+        _ctx: &fil_predict::predictor::Ctx<'_>,
+    ) -> Vec<fil_predict::predictor::OverlayEdit> {
+        Vec::new()
+    }
+    fn next_deadline(&self) -> Option<Duration> {
+        None
+    }
+    fn show(&self, _ctx: &fil_predict::predictor::Ctx<'_>) -> fil_predict::predictor::Show {
+        fil_predict::predictor::Show::Underline
+    }
+    fn reset(&mut self) {}
+    fn has_outstanding(&self) -> bool {
+        false
+    }
+}
+
+/// #72's re-check, R2: the chain of explained cursors grows only over typed spaces. A predictor
+/// that forges blanks for other keys (here with `Guards::key_glyph` off, so the forgery is
+/// accepted at all) gets the forged cells confirmed by a chunk that skips their echo, as on main,
+/// but no earlier cursor of that run explains a later move: it ends the epoch, as on main.
+#[test]
+fn forged_blanks_do_not_lengthen_the_chain() {
+    let mut g = Guards::ALL;
+    assert!(g.disable("key_glyph"));
+    let mut t = T::with(
+        Box::new(ForgingPredictor {
+            cells: vec![
+                (0, 2, 'a'),
+                (0, 3, 'b'),
+                (0, 4, ' '),
+                (0, 5, ' '),
+                (0, 6, 'd'),
+            ],
+            next: 0,
+        }),
+        g,
+        Size { cols: 40, rows: 10 },
+    );
+    t.confirm(); // `$ a`, cursor (0, 3)
+    for (i, k) in [b"b", b"x", b"y", b"d"].iter().enumerate() {
+        t.key(*k, 200 + 10 * i as u64);
+    }
+    t.server(b"b\x1b[2C", 300); // `b`, the cursor past the two forged blanks
+    assert!(t.o.epoch_confirmed());
+    assert!(t.painted(), "`d` is not written");
+    t.server(b"\x1b[2D", 301); // back to after `b`
+    assert!(
+        !t.o.epoch_confirmed(),
+        "a forged blank lengthened the chain"
+    );
+    assert!(!t.painted(), "`d` stayed");
+}
+
+/// The chain is a run: after `k` and two typed spaces over blanks, echoed `k  `, a move back
+/// over both spaces is explained (vi mode's insert before the rest of the line), as is one
+/// over the last.
+#[test]
+fn a_run_of_typed_spaces_over_blanks_is_one_chain() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"k", 200);
+    t.key(b" ", 210);
+    t.key(b" ", 220);
+    t.key(b"d", 230);
+    t.server(b"k  ", 300);
+    assert!(t.painted(), "`d` is not written");
+    t.server(b"\x1b[2D", 301);
+    assert!(
+        t.o.epoch_confirmed(),
+        "the move back over the run ended the epoch"
+    );
+    assert!(t.painted(), "`d` was taken off");
+}
+
+/// The same with the typed spaces themselves forged as a glyph the cells already show: they are
+/// confirmed as on main, but only a blank guessed for a typed space extends the chain.
+#[test]
+fn typed_spaces_forged_as_glyphs_do_not_lengthen_the_chain() {
+    let mut g = Guards::ALL;
+    assert!(g.disable("key_glyph"));
+    let mut t = T::with(
+        Box::new(ForgingPredictor {
+            cells: vec![
+                (0, 2, 'a'),
+                (0, 3, 'b'),
+                (0, 4, 'z'),
+                (0, 5, 'z'),
+                (0, 6, 'd'),
+            ],
+            next: 0,
+        }),
+        g,
+        Size { cols: 40, rows: 10 },
+    );
+    t.server(b"\x1b[1;5Hzz\x1b[1;1H", 0);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    for (i, k) in [b"b", b" ", b" ", b"d"].iter().enumerate() {
+        t.key(*k, 200 + 10 * i as u64);
+    }
+    t.server(b"b\x1b[2C", 300);
+    assert!(t.o.epoch_confirmed());
+    assert!(t.painted(), "`d` is not written");
+    t.server(b"\x1b[2D", 301);
+    assert!(
+        !t.o.epoch_confirmed(),
+        "a forged glyph lengthened the chain"
+    );
+    assert!(!t.painted(), "`d` stayed");
+}
